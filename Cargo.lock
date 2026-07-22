@@ -4989,6 +4989,7 @@ dependencies = [
  "deppy-core",
  "flate2",
  "fs2",
+ "libc",
  "mcp-store",
  "persist",
  "rusqlite",

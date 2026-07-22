@@ -16,7 +16,76 @@
 //! - deppy가 띄우는 셸에만 적용된다(ZDOTDIR는 spawn env로만 주입) — 사용자의
 //!   일반 터미널은 건드리지 않는다.
 
-use std::path::PathBuf;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+
+/// Generated zsh wrappers are all below 8 KiB; this leaves headroom without admitting bulk input.
+const HOOK_FILE_BYTES_MAX: usize = 16 * 1024;
+fn open_hook_file_read_only(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(target_os = "macos")]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0x20_000 | 0x800);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+fn hook_file_matches(path: &Path, expected: &[u8], max_bytes: usize) -> anyhow::Result<bool> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => anyhow::bail!("env_hook_metadata_failed"),
+    };
+    anyhow::ensure!(
+        before.file_type().is_file() && !before.file_type().is_symlink(),
+        "env_hook_file_type_invalid"
+    );
+    if before.len() > max_bytes as u64 {
+        return Ok(false);
+    }
+    let mut file =
+        open_hook_file_read_only(path).map_err(|_| anyhow::anyhow!("env_hook_open_failed"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("env_hook_metadata_failed"))?;
+    anyhow::ensure!(opened.is_file(), "env_hook_file_type_invalid");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            before.dev() == opened.dev() && before.ino() == opened.ino(),
+            "env_hook_file_changed"
+        );
+    }
+    if opened.len() > max_bytes as u64 {
+        return Ok(false);
+    }
+    let probe = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("env_hook_bytes_exceeded"))?;
+    let mut bytes = Vec::with_capacity((opened.len() as usize).min(probe));
+    file.by_ref()
+        .take(probe as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("env_hook_read_failed"))?;
+    anyhow::ensure!(bytes.len() <= max_bytes, "env_hook_bytes_exceeded");
+    let after = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("env_hook_metadata_failed"))?;
+    anyhow::ensure!(after.len() == bytes.len() as u64, "env_hook_file_changed");
+    Ok(bytes == expected)
+}
 
 /// 훅 루트 (`~/.deppy-sijo/zdot`).
 fn zdot_root() -> Option<PathBuf> {
@@ -89,35 +158,137 @@ fi
 
 # ── deppy env live-reload (옵트인 — 설정 › 환경) ──────────────────────────
 if [[ "$DEPPY_ENV_LIVE_RELOAD" == "1" && -n "$DEPPY_PROJECT_ROOT" ]]; then
-  zmodload -F zsh/stat b:zstat 2>/dev/null
-  typeset -g __deppy_env_sig=""
-  __deppy_env_reload() {
-    local f m sig=""
-    for f in "$DEPPY_PROJECT_ROOT/.env" "$DEPPY_PROJECT_ROOT/.env.local"; do
-      if [[ -f "$f" ]]; then
-        m="$(zstat +mtime "$f" 2>/dev/null)" || m="$(command stat -f %m "$f" 2>/dev/null)" || m=""
-        sig+="$f:$m;"
+  # 둘 다 builtin 모듈이다. 어느 쪽이든 없으면 외부 stat/cat/dd로 폴백하지 않고 비활성화한다.
+  if zmodload -F zsh/stat b:zstat 2>/dev/null &&
+     zmodload -F zsh/system b:sysopen b:sysread 2>/dev/null; then
+    typeset -g __deppy_env_sig=""
+    typeset -g __deppy_env_capture=""
+    typeset -gi __deppy_env_capture_bytes=0
+
+    # nofollow로 고정한 regular-file descriptor를 최대 limit+1까지 builtin sysread한다.
+    # source path를 다시 열지 않고 이 bounded snapshot만 eval하므로 검사 뒤 파일이 커져도
+    # 셸이 1MiB를 넘는 dotenv를 읽거나 실행하지 않는다.
+    __deppy_env_capture_bounded() {
+      local capture_path="$1" chunk=""
+      local -i capture_limit="$2" fd=-1 count=0 read_status=0 total=0
+      local -A file_stat
+      __deppy_env_capture=""
+      __deppy_env_capture_bytes=0
+      sysopen -r -o nofollow,cloexec -u fd -- "$capture_path" 2>/dev/null || return 1
+      if ! zstat -f "$fd" -H file_stat 2>/dev/null ||
+         (( (file_stat[mode] & 61440) != 32768 || file_stat[size] > capture_limit )); then
+        exec {fd}<&-
+        return 1
       fi
-    done
-    [[ "$sig" == "$__deppy_env_sig" ]] && return
-    __deppy_env_sig="$sig"
-    local rc_f
-    for rc_f in "$DEPPY_PROJECT_ROOT/.env" "$DEPPY_PROJECT_ROOT/.env.local"; do
-      if [[ -f "$rc_f" ]]; then
+      while true; do
+        chunk=""
+        count=0
+        sysread -i "$fd" -s 65536 -c count chunk 2>/dev/null
+        read_status=$?
+        (( read_status == 5 )) && break
+        if (( read_status != 0 || total + count > capture_limit )); then
+          __deppy_env_capture=""
+          exec {fd}<&-
+          return 1
+        fi
+        __deppy_env_capture+="$chunk"
+        (( total += count ))
+      done
+      file_stat=()
+      if ! zstat -f "$fd" -H file_stat 2>/dev/null || (( file_stat[size] != total )); then
+        __deppy_env_capture=""
+        exec {fd}<&-
+        return 1
+      fi
+      exec {fd}<&-
+      __deppy_env_capture_bytes=$total
+      return 0
+    }
+
+    __deppy_env_reload() {
+      local -a env_files env_present env_contents
+      env_files=("$DEPPY_PROJECT_ROOT/.env" "$DEPPY_PROJECT_ROOT/.env.local")
+      env_present=()
+      env_contents=()
+      local f m s content sig=""
+      local -A path_stat
+      local -i valid=1 total=0 remaining=1048576 index=0
+
+      # unchanged prompt는 metadata builtin 두 번뿐이다. 특수파일/symlink/합산 초과는
+      # signature만 기억하고 두 파일 모두 실행하지 않는다(부분 적용 금지).
+      for f in "${env_files[@]}"; do
+        if [[ ! -e "$f" && ! -L "$f" ]]; then
+          env_present+=(0)
+          sig+="missing;"
+          continue
+        fi
+        env_present+=(1)
+        path_stat=()
+        if [[ -L "$f" ]] || ! zstat -H path_stat "$f" 2>/dev/null ||
+           (( (path_stat[mode] & 61440) != 32768 )); then
+          valid=0
+          sig+="invalid;"
+          continue
+        fi
+        s="$path_stat[size]"
+        m="$path_stat[mtime]"
+        if [[ "$s" != <-> || "$m" != <-> ]] || (( s > 1048576 - total )); then
+          valid=0
+          sig+="invalid;"
+          continue
+        fi
+        (( total += s ))
+        sig+="$f:$m:$s;"
+      done
+      [[ "$sig" == "$__deppy_env_sig" ]] && return
+      # 안정적으로 invalid인 metadata는 다음 prompt마다 같은 검사를 반복하지 않는다.
+      # 반면 valid metadata의 descriptor capture/apply 실패는 signature를 commit하지 않아
+      # mtime/size가 그대로여도 다음 prompt에서 반드시 재시도한다.
+      if (( ! valid )); then
+        __deppy_env_sig="$sig"
+        return
+      fi
+
+      for (( index = 1; index <= ${#env_files}; index++ )); do
+        if (( env_present[index] )); then
+          if ! __deppy_env_capture_bounded "${env_files[index]}" "$remaining"; then
+            __deppy_env_capture=""
+            env_contents=()
+            return
+          fi
+          (( remaining -= __deppy_env_capture_bytes ))
+          env_contents+=("$__deppy_env_capture")
+          __deppy_env_capture=""
+          __deppy_env_capture_bytes=0
+        else
+          env_contents+=("")
+        fi
+      done
+
+      # 배열 순서가 .env → .env.local 우선순위를 보존한다. eval 대상은 위에서 확보한
+      # bounded descriptor snapshot뿐이며 path를 다시 source하지 않는다.
+      for content in "${env_contents[@]}"; do
+        [[ -z "$content" ]] && continue
         set -a
-        builtin source "$rc_f" 2>/dev/null
+        if ! builtin eval -- "$content" 2>/dev/null; then
+          set +a
+          env_contents=()
+          return
+        fi
         set +a
-      fi
-    done
-  }
-  autoload -Uz add-zsh-hook 2>/dev/null
-  if (( $+functions[add-zsh-hook] )); then
-    add-zsh-hook precmd __deppy_env_reload
-  else
-    typeset -ga precmd_functions
-    precmd_functions+=(__deppy_env_reload)
+      done
+      env_contents=()
+      __deppy_env_sig="$sig"
+    }
+    autoload -Uz add-zsh-hook 2>/dev/null
+    if (( $+functions[add-zsh-hook] )); then
+      add-zsh-hook precmd __deppy_env_reload
+    else
+      typeset -ga precmd_functions
+      precmd_functions+=(__deppy_env_reload)
+    fi
+    __deppy_env_reload
   fi
-  __deppy_env_reload
 fi
 "#;
 
@@ -127,7 +298,13 @@ pub fn ensure_hook_files() -> anyhow::Result<Option<PathBuf>> {
     let Some(root) = zdot_root() else {
         return Ok(None);
     };
-    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&root).map_err(|_| anyhow::anyhow!("env_hook_root_create_failed"))?;
+    let root_metadata = std::fs::symlink_metadata(&root)
+        .map_err(|_| anyhow::anyhow!("env_hook_root_metadata_failed"))?;
+    anyhow::ensure!(
+        root_metadata.file_type().is_dir() && !root_metadata.file_type().is_symlink(),
+        "env_hook_root_type_invalid"
+    );
     for (name, content) in [
         (".zshenv", ZSHENV),
         (".zprofile", ZPROFILE),
@@ -135,8 +312,13 @@ pub fn ensure_hook_files() -> anyhow::Result<Option<PathBuf>> {
         (".zshrc", ZSHRC),
     ] {
         let path = root.join(name);
-        if std::fs::read_to_string(&path).ok().as_deref() != Some(content) {
-            std::fs::write(&path, content)?;
+        if !hook_file_matches(&path, content.as_bytes(), HOOK_FILE_BYTES_MAX)? {
+            anyhow::ensure!(
+                content.len() <= HOOK_FILE_BYTES_MAX,
+                "env_hook_bytes_exceeded"
+            );
+            deppy_core::fs::atomic_write(&path, content.as_bytes())
+                .map_err(|_| anyhow::anyhow!("env_hook_write_failed"))?;
         }
     }
     Ok(Some(root))
@@ -154,8 +336,13 @@ pub fn shell_env() -> Vec<(String, String)> {
     let root = match ensure_hook_files() {
         Ok(Some(root)) => root,
         Ok(None) => return Vec::new(),
-        Err(e) => {
-            tracing::warn!("env 라이브 반영 훅 설치 실패 — 비활성: {e:#}");
+        Err(_) => {
+            tracing::warn!(
+                kind = "env_hook",
+                phase = "install",
+                error_code = "env_hook_install_failed",
+                "env live reload hook unavailable"
+            );
             return Vec::new();
         }
     };
@@ -170,6 +357,304 @@ pub fn shell_env() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Must match runtime::dotenv::DOTENV_TOTAL_BYTES_MAX and the generated zsh literal.
+    const ENV_LIVE_RELOAD_BYTES_MAX: usize = 1024 * 1024;
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "deppy-env-hook-bound-{tag}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn padded_dotenv(assignment: &str, total_bytes: usize) -> Vec<u8> {
+        assert!(assignment.len() <= total_bytes);
+        let mut bytes = assignment.as_bytes().to_vec();
+        bytes.resize(total_bytes, b'#');
+        bytes
+    }
+
+    fn run_live_reload(zshrc: &Path, user_dir: &Path, project: &Path) -> std::process::Output {
+        let script = format!(
+            r#"
+export DEPPY_ENV_LIVE_RELOAD=1
+export DEPPY_PROJECT_ROOT={project}
+export DEPPY_USER_ZDOTDIR={user}
+export DEPPY_BOUND=sentinel
+builtin source {zshrc}
+echo "value:$DEPPY_BOUND"
+"#,
+            project = project.display(),
+            user = user_dir.display(),
+            zshrc = zshrc.display(),
+        );
+        std::process::Command::new("/bin/zsh")
+            .arg("-c")
+            .arg(script)
+            .env_remove("ZDOTDIR")
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn generated_hook_reader_is_bounded_and_byte_exact() {
+        let path = temp_path("bytes");
+        std::fs::write(&path, vec![b'x'; 64]).unwrap();
+        assert!(hook_file_matches(&path, &[b'x'; 64], 64).unwrap());
+        std::fs::write(&path, vec![b'x'; 65]).unwrap();
+        assert!(!hook_file_matches(&path, &[b'x'; 64], 64).unwrap());
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(!hook_file_matches(&path, b"expected", 64).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_hook_reader_rejects_symlink_and_special_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_path("types");
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("regular");
+        let link = dir.join("link");
+        std::fs::write(&regular, b"ok").unwrap();
+        symlink(&regular, &link).unwrap();
+        assert_eq!(
+            hook_file_matches(&link, b"ok", 64).unwrap_err().to_string(),
+            "env_hook_file_type_invalid"
+        );
+        assert_eq!(
+            hook_file_matches(Path::new("/dev/null"), b"", 64)
+                .unwrap_err()
+                .to_string(),
+            "env_hook_file_type_invalid"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn production_hook_install_has_no_unbounded_whole_file_read() {
+        let production = include_str!("env_reload.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!production.contains("read_to_string"));
+        assert!(!production.contains("std::fs::read("));
+        assert!(production.contains(".take(probe as u64)"));
+        assert!(ZSHRC.contains("sysopen -r -o nofollow,cloexec"));
+        assert!(ZSHRC.contains("sysread -i \"$fd\" -s 65536"));
+        assert!(ZSHRC.contains(&ENV_LIVE_RELOAD_BYTES_MAX.to_string()));
+        assert!(!ZSHRC.contains("command stat"));
+        assert!(!ZSHRC.contains("command cat"));
+        assert!(!ZSHRC.contains("command dd"));
+        assert!(!ZSHRC.contains("$(zstat"));
+        assert!(!ZSHRC.contains("builtin source \"$rc_f\""));
+        let capture_start = ZSHRC.find("for (( index = 1;").unwrap();
+        let apply_start = ZSHRC.find("# 배열 순서가 .env").unwrap();
+        assert!(!ZSHRC[capture_start..apply_start].contains("__deppy_env_sig=\"$sig\""));
+        let final_commit = ZSHRC.rfind("__deppy_env_sig=\"$sig\"").unwrap();
+        let eval = ZSHRC.rfind("builtin eval -- \"$content\"").unwrap();
+        assert!(final_commit > eval);
+    }
+
+    #[test]
+    fn capture_일시실패는_동일metadata_다음_reload에서_재시도한다() {
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = temp_path("live-retry");
+        let zdot = dir.join("zdot");
+        let user = dir.join("user");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let zshrc = zdot.join(".zshrc");
+        std::fs::write(&zshrc, ZSHRC).unwrap();
+
+        let script = format!(
+            r#"
+export DEPPY_ENV_LIVE_RELOAD=1
+export DEPPY_PROJECT_ROOT={project}
+export DEPPY_USER_ZDOTDIR={user}
+export DEPPY_BOUND=sentinel
+builtin source {zshrc}
+echo "initial:$DEPPY_BOUND"
+typeset __deppy_sig_before="$__deppy_env_sig"
+builtin printf 'DEPPY_BOUND=updated\n' > {project}/.env
+functions[__deppy_env_capture_real]="${{functions[__deppy_env_capture_bounded]}}"
+typeset -gi __deppy_fail_once=1
+__deppy_env_capture_bounded() {{
+  if (( __deppy_fail_once )); then
+    (( __deppy_fail_once = 0 ))
+    return 1
+  fi
+  __deppy_env_capture_real "$@"
+}}
+__deppy_env_reload
+echo "first:$DEPPY_BOUND"
+if [[ "$__deppy_env_sig" == "$__deppy_sig_before" ]]; then
+  echo "pending:yes"
+else
+  echo "pending:no"
+fi
+__deppy_env_reload
+echo "second:$DEPPY_BOUND"
+echo "failures_left:$__deppy_fail_once"
+"#,
+            project = project.display(),
+            user = user.display(),
+            zshrc = zshrc.display(),
+        );
+        let output = std::process::Command::new("/bin/zsh")
+            .arg("-c")
+            .arg(script)
+            .env_remove("ZDOTDIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("initial:sentinel"), "{stdout}");
+        assert!(stdout.contains("first:sentinel"), "{stdout}");
+        assert!(stdout.contains("pending:yes"), "{stdout}");
+        assert!(stdout.contains("second:updated"), "{stdout}");
+        assert!(stdout.contains("failures_left:0"), "{stdout}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_reload_accepts_exact_aggregate_and_rejects_plus_one() {
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = temp_path("live-limit");
+        let zdot = dir.join("zdot");
+        let user = dir.join("user");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let zshrc = zdot.join(".zshrc");
+        std::fs::write(&zshrc, ZSHRC).unwrap();
+
+        let half = ENV_LIVE_RELOAD_BYTES_MAX / 2;
+        std::fs::write(
+            project.join(".env"),
+            padded_dotenv("DEPPY_BOUND=base\n", half),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".env.local"),
+            padded_dotenv("DEPPY_BOUND=local\n", half),
+        )
+        .unwrap();
+        let exact = run_live_reload(&zshrc, &user, &project);
+        assert!(
+            exact.status.success(),
+            "{}",
+            String::from_utf8_lossy(&exact.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&exact.stdout).contains("value:local"),
+            "{}",
+            String::from_utf8_lossy(&exact.stdout)
+        );
+
+        std::fs::write(
+            project.join(".env.local"),
+            padded_dotenv("DEPPY_BOUND=oversized\n", half + 1),
+        )
+        .unwrap();
+        let oversized = run_live_reload(&zshrc, &user, &project);
+        assert!(
+            oversized.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oversized.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&oversized.stdout).contains("value:sentinel"),
+            "{}",
+            String::from_utf8_lossy(&oversized.stdout)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_reload_rejects_symlink_and_special_input_without_partial_apply() {
+        use std::os::unix::fs::symlink;
+
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = temp_path("live-types");
+        let zdot = dir.join("zdot");
+        let user = dir.join("user");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let zshrc = zdot.join(".zshrc");
+        std::fs::write(&zshrc, ZSHRC).unwrap();
+        let target = dir.join("outside.env");
+        std::fs::write(&target, "DEPPY_BOUND=symlink\n").unwrap();
+        symlink(&target, project.join(".env")).unwrap();
+        std::fs::create_dir(project.join(".env.local")).unwrap();
+
+        let output = run_live_reload(&zshrc, &user, &project);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("value:sentinel"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disabled_live_reload_installs_no_reader_function() {
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = temp_path("live-disabled");
+        let zdot = dir.join("zdot");
+        let user = dir.join("user");
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let zshrc = zdot.join(".zshrc");
+        std::fs::write(&zshrc, ZSHRC).unwrap();
+        let script = format!(
+            "export DEPPY_ENV_LIVE_RELOAD=0\nexport DEPPY_USER_ZDOTDIR={}\n\
+             builtin source {}\necho installed:$+functions[__deppy_env_reload]:$+functions[__deppy_env_capture_bounded]\n",
+            user.display(),
+            zshrc.display()
+        );
+        let output = std::process::Command::new("/bin/zsh")
+            .arg("-c")
+            .arg(script)
+            .env_remove("ZDOTDIR")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "installed:0:0"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// 훅 스크립트 4개가 zsh 문법 검사(zsh -n)를 통과한다 — 셸 기동 실패로
     /// 사용자 터미널이 깨지는 최악을 CI에서 막는다. zsh 없는 환경은 skip.
@@ -318,9 +803,13 @@ echo "installed:$+functions[__deppy_prompt_precmd]"
             std::process::id(),
             line!()
         ));
+        let zdot = dir.join("zdot");
+        let user = dir.join("user");
         let project = dir.join("proj");
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(dir.join(".zshrc"), ZSHRC).unwrap();
+        std::fs::write(zdot.join(".zshrc"), ZSHRC).unwrap();
         std::fs::write(project.join(".env"), "KORAIL_ID=first\n").unwrap();
         // 비대화형이라 precmd는 자동으로 안 돈다 — 훅 함수를 직접 두 번 호출해
         // "프롬프트 두 번 사이 변경"을 시뮬레이션한다. mtime 초 단위 변화를 위해
@@ -329,8 +818,8 @@ echo "installed:$+functions[__deppy_prompt_precmd]"
             r#"
 export DEPPY_ENV_LIVE_RELOAD=1
 export DEPPY_PROJECT_ROOT={project}
-export DEPPY_USER_ZDOTDIR={dir}
-builtin source {dir}/.zshrc
+export DEPPY_USER_ZDOTDIR={user}
+builtin source {zdot}/.zshrc
 echo "1:$KORAIL_ID"
 command touch -t 202001010000 {project}/.env.stamp 2>/dev/null
 printf 'KORAIL_ID=second\n' > {project}/.env
@@ -339,7 +828,8 @@ __deppy_env_reload
 echo "2:$KORAIL_ID"
 "#,
             project = project.display(),
-            dir = dir.display(),
+            zdot = zdot.display(),
+            user = user.display(),
         );
         let out = std::process::Command::new("/bin/zsh")
             .arg("-c")

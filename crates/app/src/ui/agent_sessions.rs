@@ -24,7 +24,7 @@ use crate::config::AgentsConfig;
 pub const AGENT_SESSION_SENSITIVE_ITEM_MAX_BYTES: usize = 32 * 1024;
 const AGENT_SESSION_TEXT_INPUT_MAX_BYTES: usize = 1024 * 1024;
 const AGENT_SESSION_PATH_INPUT_MAX_BYTES: usize = 32 * 1024;
-const AGENT_SESSION_PERSISTED_MAX_ITEMS: usize = 500;
+pub(crate) const AGENT_SESSION_PERSISTED_MAX_ITEMS: usize = 500;
 const AGENT_SESSION_PERSISTED_ROW_MAX_BYTES: usize = 32 * 1024;
 const AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES: usize = 4 * 1024 * 1024;
 // This panel owns one API-key draft at a time, so it remains below the shared credential corpus
@@ -525,16 +525,47 @@ impl AgentSessionsUi {
             if duplicate_thread {
                 continue;
             }
+            // Reject a corrupt/hostile storage row before title/cwd cloning or
+            // constructing a placeholder session.
+            let row_bytes = persisted_row_retained_bytes(&row);
+            let previous_row_bytes = self
+                .persisted_threads
+                .get(&local_session_id)
+                .map_or(0, persisted_row_retained_bytes);
+            let next_retained_bytes = self
+                .persisted_thread_bytes
+                .saturating_sub(previous_row_bytes)
+                .saturating_add(row_bytes);
+            if row_bytes > AGENT_SESSION_PERSISTED_ROW_MAX_BYTES
+                || next_retained_bytes > AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES
+                || (!self.persisted_threads.contains_key(&local_session_id)
+                    && self.persisted_threads.len() >= AGENT_SESSION_PERSISTED_MAX_ITEMS)
+            {
+                continue;
+            }
 
             let was_persisted = self.persisted_threads.contains_key(&local_session_id);
+            let existing_session_index = self
+                .sessions
+                .iter()
+                .position(|session| session.id == local_session_id);
+            let pending_session = if existing_session_index.is_none() {
+                let Some(session) = AgentSession::try_new(
+                    local_session_id.clone(),
+                    persisted_title(&row, &self.catalog),
+                    non_empty(row.cwd.clone()),
+                ) else {
+                    continue;
+                };
+                Some(session)
+            } else {
+                None
+            };
             if !self.store_persisted_row(row.clone()) {
                 continue;
             }
-            if let Some(session) = self
-                .sessions
-                .iter_mut()
-                .find(|session| session.id == local_session_id)
-            {
+            if let Some(session_index) = existing_session_index {
+                let session = &mut self.sessions[session_index];
                 // A repeated DB projection may refresh a placeholder, but it
                 // must never regress a live session that already owns events.
                 if was_persisted && session.status == AgentSessionStatus::Stopped {
@@ -543,11 +574,7 @@ impl AgentSessionsUi {
                 continue;
             }
 
-            let mut session = AgentSession::new(
-                local_session_id,
-                persisted_title(&row, &self.catalog),
-                non_empty(row.cwd.clone()),
-            );
+            let mut session = pending_session.expect("validated missing persisted session");
             apply_persisted_metadata(&mut session, &row, &self.catalog);
             session.status = AgentSessionStatus::Stopped;
             self.sessions.push(session);
@@ -3835,6 +3862,18 @@ mod tests {
             ui.persisted_threads["local-0"].title.len(),
             AGENT_SESSION_PERSISTED_ROW_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn persisted_import_rejects_oversized_identity_without_panicking_or_retaining() {
+        let mut ui = AgentSessionsUi::new();
+        let row = persisted_row(&"i".repeat(1025), "thread-1");
+
+        ui.import_persisted_threads(vec![row]);
+
+        assert!(ui.sessions.is_empty());
+        assert!(ui.persisted_threads.is_empty());
+        assert_eq!(ui.persisted_thread_bytes, 0);
     }
 
     #[test]

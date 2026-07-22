@@ -8,6 +8,7 @@
 //! - 작업 설명: 최신 agent 응답/진행 메시지를 한 줄로 축약해 사이드바에 표시.
 //! - 승인(needsInput)은 transcript에 없다 → regex fallback(status detector)이 담당.
 
+use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -20,7 +21,7 @@ pub enum AgentActivity {
     Idle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct TranscriptState {
     /// 에이전트 자신의 세션 ID — 복원 시 `claude --resume <id>` / `codex resume <id>`에 씀.
     pub session_id: String,
@@ -37,23 +38,162 @@ pub struct TranscriptState {
     pub last_agent_summary: Option<String>,
 }
 
-/// 파일 끝 `max_bytes`만 읽는다 — transcript는 수십 MB가 될 수 있어 tail만 본다.
-/// seek로 잘린 첫 줄은 역순 파싱에서 JSON 파싱 실패로 자연히 건너뛴다.
-fn tail_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+impl fmt::Debug for TranscriptState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TranscriptState")
+            .field("session_id", &"REDACTED")
+            .field("cwd", &self.cwd.as_ref().map(|_| "REDACTED"))
+            .field("activity", &self.activity)
+            .field("model", &self.model.as_ref().map(|_| "REDACTED"))
+            .field("effort", &self.effort.as_ref().map(|_| "REDACTED"))
+            .field("context_pct", &self.context_pct)
+            .field(
+                "last_agent_summary",
+                &self.last_agent_summary.as_ref().map(|_| "REDACTED"),
+            )
+            .finish()
+    }
 }
 
 const TAIL_BYTES: u64 = 256 * 1024;
+const MAX_TRANSCRIPT_LINE_BYTES: usize = 64 * 1024;
+const MAX_TAIL_LINES: usize = 4_096;
+const MAX_CODEX_HEAD_LINES: usize = 3;
+const CODEX_HEAD_BYTES: u64 = (MAX_CODEX_HEAD_LINES * (MAX_TRANSCRIPT_LINE_BYTES + 1)) as u64;
+const MAX_TRANSCRIPT_PATH_BYTES: usize = 4 * 1024;
+const MAX_SESSION_ID_BYTES: usize = 256;
+const MAX_FILE_NAME_BYTES: usize = 512;
+const MAX_MODEL_BYTES: usize = 256;
+const MAX_EFFORT_BYTES: usize = 64;
+const MAX_MESSAGE_CONTENT_ITEMS: usize = 256;
 const AGENT_SUMMARY_CHARS: usize = 120;
+const AGENT_SUMMARY_BYTES: usize = AGENT_SUMMARY_CHARS * 4 + '…'.len_utf8();
+
+fn invalid_input(code: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, code)
+}
+
+fn validate_input_path(path: &Path) -> std::io::Result<()> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_TRANSCRIPT_PATH_BYTES {
+        return Err(invalid_input("transcript_path_invalid"));
+    }
+    Ok(())
+}
+
+fn open_regular_file(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
+    open_regular_file_with_before_open(path, || {})
+}
+
+fn open_regular_file_with_before_open(
+    path: &Path,
+    before_open: impl FnOnce(),
+) -> std::io::Result<(std::fs::File, u64)> {
+    validate_input_path(path)?;
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(invalid_input("transcript_not_regular"));
+    }
+    before_open();
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let file_metadata = file.metadata()?;
+    if !file_metadata.file_type().is_file() {
+        return Err(invalid_input("transcript_not_regular"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(invalid_input("transcript_replaced"));
+        }
+    }
+    Ok((file, file_metadata.len()))
+}
+
+/// `snapshot_len` 이후 reader가 늘어나더라도 해당 snapshot의 tail만 정확히 유지한다.
+fn tail_text_from_snapshot<R: Read + Seek>(
+    reader: &mut R,
+    snapshot_len: u64,
+    max_bytes: u64,
+) -> std::io::Result<String> {
+    if max_bytes > TAIL_BYTES {
+        return Err(invalid_input("tail_limit_invalid"));
+    }
+    let retained = snapshot_len.min(max_bytes);
+    let retained = usize::try_from(retained).map_err(|_| invalid_input("tail_limit_invalid"))?;
+    let start = snapshot_len.saturating_sub(max_bytes);
+    let starts_at_line_boundary = if start == 0 {
+        true
+    } else {
+        reader.seek(SeekFrom::Start(start - 1))?;
+        let mut previous = [0_u8; 1];
+        reader.read_exact(&mut previous)?;
+        previous[0] == b'\n'
+    };
+    reader.seek(SeekFrom::Start(start))?;
+    let mut bytes = vec![0_u8; retained];
+    reader.read_exact(&mut bytes)?;
+
+    if !starts_at_line_boundary {
+        let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+            bytes.clear();
+            return Ok(String::new());
+        };
+        bytes.drain(..=first_newline);
+    }
+    String::from_utf8(bytes).map_err(|_| invalid_input("transcript_utf8_invalid"))
+}
+
+/// 파일 끝 `max_bytes`만 읽는다. metadata snapshot 이후 append는 다음 poll에서 보고,
+/// 현재 poll에서는 버퍼가 상한을 넘지 않도록 정확한 snapshot 바이트만 읽는다.
+fn tail_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let (mut file, snapshot_len) = open_regular_file(path)?;
+    let text = tail_text_from_snapshot(&mut file, snapshot_len, max_bytes)?;
+    if file.metadata()?.len() < snapshot_len {
+        return Err(invalid_input("transcript_shrank_during_read"));
+    }
+    Ok(text)
+}
+
+fn validate_tail_text(text: &str) -> Option<()> {
+    let mut lines = 0_usize;
+    for line in text.lines() {
+        lines = lines.checked_add(1)?;
+        if lines > MAX_TAIL_LINES || line.len() > MAX_TRANSCRIPT_LINE_BYTES {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn bounded_owned(value: &str, max_bytes: usize) -> Option<String> {
+    (value.len() <= max_bytes).then(|| value.to_owned())
+}
+
+fn bounded_path_owned(value: &str) -> Option<String> {
+    (!value.is_empty() && value.len() <= MAX_TRANSCRIPT_PATH_BYTES && !value.contains('\0'))
+        .then(|| value.to_owned())
+}
 
 fn clean_agent_summary(text: &str) -> Option<String> {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut visible = compact.as_str();
+    let mut visible = text.trim_start();
     // 렌더링용 이미지 첨부 표식이 앞에 붙은 메시지는 경로 표식만 걷어낸다.
     while visible.starts_with("<image ") {
         visible = visible.split_once('>')?.1.trim_start();
@@ -68,9 +208,40 @@ fn clean_agent_summary(text: &str) -> Option<String> {
     {
         return None;
     }
-    let mut chars = visible.chars();
-    let mut summary: String = chars.by_ref().take(AGENT_SUMMARY_CHARS).collect();
-    if chars.next().is_some() {
+
+    let mut summary = String::with_capacity(text.len().min(AGENT_SUMMARY_BYTES));
+    let mut summary_chars = 0_usize;
+    let mut pending_space = false;
+    let mut truncated = false;
+    for ch in visible.chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            pending_space |= !summary.is_empty();
+            continue;
+        }
+        if pending_space {
+            if summary_chars + 2 > AGENT_SUMMARY_CHARS {
+                truncated = true;
+                break;
+            }
+            summary.push(' ');
+            summary_chars += 1;
+            pending_space = false;
+        }
+        if summary_chars == AGENT_SUMMARY_CHARS {
+            truncated = true;
+            break;
+        }
+        if summary.len().checked_add(ch.len_utf8())? > AGENT_SUMMARY_BYTES - '…'.len_utf8() {
+            truncated = true;
+            break;
+        }
+        summary.push(ch);
+        summary_chars += 1;
+    }
+    if summary.is_empty() {
+        return None;
+    }
+    if truncated {
         summary.push('…');
     }
     Some(summary)
@@ -81,13 +252,27 @@ fn claude_assistant_summary(value: &Value) -> Option<String> {
     if let Some(text) = content.as_str() {
         return clean_agent_summary(text);
     }
-    let text = content
-        .as_array()?
+    let items = content.as_array()?;
+    if items.len() > MAX_MESSAGE_CONTENT_ITEMS {
+        return None;
+    }
+    let text_parts = items
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
+        .filter_map(|item| item.get("text").and_then(Value::as_str));
+    let total_bytes = text_parts.clone().try_fold(0_usize, |total, text| {
+        total.checked_add(text.len())?.checked_add(1)
+    })?;
+    if total_bytes > MAX_TRANSCRIPT_LINE_BYTES {
+        return None;
+    }
+    let mut text = String::with_capacity(total_bytes);
+    for part in text_parts {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(part);
+    }
     clean_agent_summary(&text)
 }
 
@@ -130,8 +315,13 @@ fn claude_synthetic_assistant_event(value: &Value, summary: Option<&str>) -> boo
 /// 파일명이 곧 세션 ID. 마지막 assistant/user 이벤트로 상태를 파생한다:
 /// assistant `stop_reason=end_turn` → Idle(유저 차례), 그 외(tool_use) → Working.
 pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
-    let session_id = path.file_stem()?.to_str()?.to_owned();
+    let raw_session_id = path.file_stem()?.to_str()?;
+    if raw_session_id.is_empty() || raw_session_id.len() > MAX_SESSION_ID_BYTES {
+        return None;
+    }
+    let session_id = raw_session_id.to_owned();
     let text = tail_text(path, TAIL_BYTES).ok()?;
+    validate_tail_text(&text)?;
     let mut cwd = None;
     let mut activity: Option<AgentActivity> = None;
     // 최신 assistant message.model = 현재 모델(effort/context는 statusLine→DB, Phase 2b).
@@ -143,8 +333,10 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if cwd.is_none() {
-            cwd = v.get("cwd").and_then(Value::as_str).map(str::to_owned);
+        if cwd.is_none()
+            && let Some(value) = v.get("cwd").and_then(Value::as_str)
+        {
+            cwd = Some(bounded_path_owned(value)?);
         }
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") => {
@@ -155,11 +347,10 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
                 if last_agent_summary.is_none() && !summary_boundary_reached {
                     last_agent_summary = summary;
                 }
-                if model.is_none() {
-                    model = v
-                        .pointer("/message/model")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
+                if model.is_none()
+                    && let Some(value) = v.pointer("/message/model").and_then(Value::as_str)
+                {
+                    model = Some(bounded_owned(value, MAX_MODEL_BYTES)?);
                 }
                 if activity.is_none() {
                     let end = v.pointer("/message/stop_reason").and_then(Value::as_str)
@@ -206,8 +397,8 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
 /// `task_complete`/`turn_aborted` → Idle, 그 외(task_started/agent_message 등) → Working.
 pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     let session_id = codex_session_id(path.file_name()?.to_str()?)?;
-    let cwd = codex_cwd_from_head(path);
-    let text = tail_text(path, TAIL_BYTES).ok()?;
+    let (cwd, text) = codex_snapshot(path).ok()?;
+    validate_tail_text(&text)?;
     // 역순 1-pass로 activity(첫 event_msg) + model/effort(첫 turn_context) +
     // context%(첫 token_count)를 모은다. 셋 다 채워지면 조기 종료.
     let mut activity: Option<AgentActivity> = None;
@@ -250,14 +441,12 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
                 }
             }
             Some("turn_context") if model.is_none() => {
-                model = v
-                    .pointer("/payload/model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                effort = v
-                    .pointer("/payload/effort")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                if let Some(value) = v.pointer("/payload/model").and_then(Value::as_str) {
+                    model = Some(bounded_owned(value, MAX_MODEL_BYTES)?);
+                }
+                if let Some(value) = v.pointer("/payload/effort").and_then(Value::as_str) {
+                    effort = Some(bounded_owned(value, MAX_EFFORT_BYTES)?);
+                }
             }
             Some("token_count") if context_pct.is_none() => {
                 let info = v.pointer("/payload/info");
@@ -295,22 +484,97 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     })
 }
 
-/// 파일명에서 UUID(마지막 5개 하이픈 그룹)를 뽑는다 — 타임스탬프에도 하이픈이 있어 정규식으로.
+/// 파일명에서 UUID(마지막 5개 하이픈 그룹)를 뽑는다. 입력은 512B로 먼저
+/// 제한하고 ASCII window를 선형 스캔해 매 poll마다 regex를 재생성하지 않는다.
 pub(crate) fn codex_session_id(file_name: &str) -> Option<String> {
-    let re =
-        regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").ok()?;
-    re.find(file_name).map(|m| m.as_str().to_owned())
+    if file_name.is_empty() || file_name.len() > MAX_FILE_NAME_BYTES {
+        return None;
+    }
+    const UUID_BYTES: usize = 36;
+    let bytes = file_name.as_bytes();
+    if bytes.len() < UUID_BYTES {
+        return None;
+    }
+    for start in 0..=bytes.len() - UUID_BYTES {
+        let candidate = &bytes[start..start + UUID_BYTES];
+        let valid = candidate.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+            }
+        });
+        if valid {
+            return file_name.get(start..start + UUID_BYTES).map(str::to_owned);
+        }
+    }
+    None
 }
 
 /// codex의 cwd는 첫 줄 session_meta의 `payload.cwd`에 있다. 그 줄엔 base_instructions
-/// (전체 시스템 프롬프트, 수십 KB)가 cwd보다 앞서므로 고정 바이트 헤드로는 잘린다 —
-/// 앞쪽 몇 줄을 통째로(BufReader) 읽어 session_meta를 파싱한다.
-fn codex_cwd_from_head(path: &Path) -> Option<String> {
-    use std::io::BufRead;
-    let f = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(f);
-    for line in reader.lines().take(3).map_while(Result::ok) {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+/// (전체 시스템 프롬프트, 수십 KB)가 cwd보다 앞서므로 줄당 64KiB, 3줄을
+/// snapshot 상한 안에서 검증한 뒤 session_meta를 파싱한다.
+#[cfg(test)]
+fn codex_cwd_from_head(path: &Path) -> std::io::Result<Option<String>> {
+    let (mut file, snapshot_len) = open_regular_file(path)?;
+    let cwd = codex_cwd_from_head_snapshot(&mut file, snapshot_len)?;
+    if file.metadata()?.len() < snapshot_len {
+        return Err(invalid_input("transcript_shrank_during_read"));
+    }
+    Ok(cwd)
+}
+
+fn codex_snapshot(path: &Path) -> std::io::Result<(Option<String>, String)> {
+    let (mut file, snapshot_len) = open_regular_file(path)?;
+    let cwd = codex_cwd_from_head_snapshot(&mut file, snapshot_len)?;
+    let tail = tail_text_from_snapshot(&mut file, snapshot_len, TAIL_BYTES)?;
+    if file.metadata()?.len() < snapshot_len {
+        return Err(invalid_input("transcript_shrank_during_read"));
+    }
+    Ok((cwd, tail))
+}
+
+fn codex_cwd_from_head_snapshot<R: Read + Seek>(
+    reader: &mut R,
+    snapshot_len: u64,
+) -> std::io::Result<Option<String>> {
+    let retained = snapshot_len.min(CODEX_HEAD_BYTES);
+    let retained = usize::try_from(retained).map_err(|_| invalid_input("head_limit_invalid"))?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut bytes = vec![0_u8; retained];
+    reader.read_exact(&mut bytes)?;
+
+    let source_truncated = snapshot_len > CODEX_HEAD_BYTES;
+    let mut lines = Vec::with_capacity(MAX_CODEX_HEAD_LINES);
+    let mut start = 0_usize;
+    while start < bytes.len() && lines.len() < MAX_CODEX_HEAD_LINES {
+        let newline = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| start + offset);
+        let (end, next_start) = match newline {
+            Some(end) => (end, end + 1),
+            None => {
+                if source_truncated {
+                    return Err(invalid_input("transcript_head_truncated"));
+                }
+                (bytes.len(), bytes.len())
+            }
+        };
+        let mut line = &bytes[start..end];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        if line.len() > MAX_TRANSCRIPT_LINE_BYTES {
+            return Err(invalid_input("transcript_line_too_large"));
+        }
+        lines
+            .push(std::str::from_utf8(line).map_err(|_| invalid_input("transcript_utf8_invalid"))?);
+        start = next_start;
+    }
+
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if v.get("type").and_then(Value::as_str) == Some("session_meta") {
@@ -318,10 +582,13 @@ fn codex_cwd_from_head(path: &Path) -> Option<String> {
                 .pointer("/payload/cwd")
                 .or_else(|| v.get("cwd"))
                 .and_then(Value::as_str)
-                .map(str::to_owned);
+                .map(|cwd| {
+                    bounded_path_owned(cwd).ok_or_else(|| invalid_input("transcript_cwd_invalid"))
+                })
+                .transpose();
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -330,13 +597,271 @@ mod tests {
     use std::io::Write;
 
     fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
+        write_tmp_bytes(name, content.as_bytes())
+    }
+
+    fn write_tmp_bytes(name: &str, content: &[u8]) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("deppy-transcript-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
         let mut f = std::fs::File::create(&p).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
+        f.write_all(content).unwrap();
         p
+    }
+
+    #[test]
+    fn tail_snapshot_never_retains_concurrent_append() {
+        let snapshot = b"snapshot";
+        let mut bytes = snapshot.to_vec();
+        bytes.extend_from_slice(b"-appended-after-metadata");
+        let mut reader = std::io::Cursor::new(bytes);
+
+        let text = tail_text_from_snapshot(&mut reader, snapshot.len() as u64, 64).unwrap();
+
+        assert_eq!(text, "snapshot");
+        assert!(text.len() <= 64);
+    }
+
+    #[test]
+    fn codex_head_never_reads_concurrent_append() {
+        let snapshot = br#"{"type":"event_msg","payload":{"type":"task_started"}}"#;
+        let mut bytes = snapshot.to_vec();
+        bytes.extend_from_slice(
+            br#"
+{"type":"session_meta","payload":{"cwd":"/appended"}}"#,
+        );
+        let mut reader = std::io::Cursor::new(bytes);
+
+        let cwd = codex_cwd_from_head_snapshot(&mut reader, snapshot.len() as u64).unwrap();
+
+        assert_eq!(cwd, None);
+    }
+
+    #[test]
+    fn tail_snapshot_exact_cap_and_short_read_fail_closed() {
+        let exact = "x".repeat(32);
+        let mut exact_reader = std::io::Cursor::new(exact.as_bytes());
+        assert_eq!(
+            tail_text_from_snapshot(&mut exact_reader, 32, 32).unwrap(),
+            exact
+        );
+
+        let mut short_reader = std::io::Cursor::new(b"short".as_slice());
+        assert!(tail_text_from_snapshot(&mut short_reader, 6, 32).is_err());
+
+        let mut empty_reader = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(
+            tail_text_from_snapshot(&mut empty_reader, 0, TAIL_BYTES + 1).is_err(),
+            "configured tail cap + 1 must fail before allocation"
+        );
+    }
+
+    #[test]
+    fn tail_cut_discards_only_partial_first_line() {
+        let content = b"old-partial\nnew-line\n";
+        let mut reader = std::io::Cursor::new(content.as_slice());
+        let text = tail_text_from_snapshot(&mut reader, content.len() as u64, 12).unwrap();
+        assert_eq!(text, "new-line\n");
+
+        let boundary = b"old\nnew-line\n";
+        let mut reader = std::io::Cursor::new(boundary.as_slice());
+        let text = tail_text_from_snapshot(&mut reader, boundary.len() as u64, 9).unwrap();
+        assert_eq!(text, "new-line\n");
+    }
+
+    #[test]
+    fn tail_line_and_item_limits_accept_exact_and_reject_plus_one() {
+        let exact_line = "x".repeat(MAX_TRANSCRIPT_LINE_BYTES);
+        assert_eq!(validate_tail_text(&exact_line), Some(()));
+        assert_eq!(
+            validate_tail_text(&(exact_line + "x")),
+            None,
+            "line cap + 1 must fail closed"
+        );
+
+        let exact_items = "{}\n".repeat(MAX_TAIL_LINES);
+        assert_eq!(validate_tail_text(&exact_items), Some(()));
+        let plus_one_item = format!("{exact_items}{{}}\n");
+        assert_eq!(validate_tail_text(&plus_one_item), None);
+    }
+
+    #[test]
+    fn transcript_paths_accept_exact_cap_and_reject_plus_one() {
+        let exact = "a".repeat(MAX_TRANSCRIPT_PATH_BYTES);
+        let plus_one = "a".repeat(MAX_TRANSCRIPT_PATH_BYTES + 1);
+        assert!(validate_input_path(Path::new(&exact)).is_ok());
+        assert!(validate_input_path(Path::new(&plus_one)).is_err());
+        assert!(bounded_path_owned(&exact).is_some());
+        assert!(bounded_path_owned(&plus_one).is_none());
+    }
+
+    #[test]
+    fn file_name_and_message_item_caps_reject_plus_one() {
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        let exact_name = format!("{}{}", "x".repeat(MAX_FILE_NAME_BYTES - uuid.len()), uuid);
+        assert_eq!(codex_session_id(&exact_name).as_deref(), Some(uuid));
+        let plus_one_name = format!("x{exact_name}");
+        assert!(codex_session_id(&plus_one_name).is_none());
+        assert_eq!(
+            codex_session_id(&format!("rollout-한글-{uuid}-suffix")).as_deref(),
+            Some(uuid)
+        );
+        assert!(codex_session_id("11111111-2222-3333-4444-55555555555G").is_none());
+        assert!(codex_session_id("11111111-2222-3333-4444-55555555555_").is_none());
+
+        let exact_items = (0..MAX_MESSAGE_CONTENT_ITEMS)
+            .map(|_| serde_json::json!({"type": "text", "text": "a"}))
+            .collect::<Vec<_>>();
+        let exact = serde_json::json!({"message": {"content": exact_items}});
+        assert!(claude_assistant_summary(&exact).is_some());
+
+        let plus_one_items = (0..=MAX_MESSAGE_CONTENT_ITEMS)
+            .map(|_| serde_json::json!({"type": "text", "text": "a"}))
+            .collect::<Vec<_>>();
+        let plus_one = serde_json::json!({"message": {"content": plus_one_items}});
+        assert!(claude_assistant_summary(&plus_one).is_none());
+    }
+
+    #[test]
+    fn hostile_utf8_and_nonregular_inputs_fail_closed() {
+        let invalid = write_tmp_bytes(
+            "sess-invalid-utf8.jsonl",
+            b"{\"type\":\"assistant\",\"cwd\":\"/safe\",\"message\":{\"stop_reason\":\"end_turn\"}}\n\xff",
+        );
+        assert!(parse_claude(&invalid).is_none());
+
+        let dir = invalid.parent().unwrap();
+        assert!(tail_text(dir, TAIL_BYTES).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let target = write_tmp("symlink-target.jsonl", "{}\n");
+        let link = target.with_file_name("symlink-input.jsonl");
+        let _ = std::fs::remove_file(&link);
+        symlink(&target, &link).unwrap();
+        assert!(tail_text(&link, TAIL_BYTES).is_err());
+        std::fs::remove_file(link).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_same_inode_symlink_replacement_is_rejected_at_open() {
+        use std::os::unix::fs::symlink;
+
+        let victim = write_tmp("replacement-victim.jsonl", "{}\n");
+        let moved = victim.with_file_name("replacement-original.jsonl");
+        let _ = std::fs::remove_file(&moved);
+        let result = open_regular_file_with_before_open(&victim, || {
+            std::fs::rename(&victim, &moved).unwrap();
+            symlink(&moved, &victim).unwrap();
+        });
+        assert!(result.is_err());
+        std::fs::remove_file(victim).unwrap();
+        std::fs::remove_file(moved).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_fifo_replacement_cannot_block_or_pass() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let victim = write_tmp("replacement-fifo.jsonl", "{}\n");
+        let result = open_regular_file_with_before_open(&victim, || {
+            std::fs::remove_file(&victim).unwrap();
+            let path = CString::new(victim.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `path` is a live NUL-terminated copy and mode contains only permission bits.
+            let created = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+            assert_eq!(created, 0);
+        });
+        assert!(result.is_err());
+        std::fs::remove_file(victim).unwrap();
+    }
+
+    #[test]
+    fn codex_head_line_accepts_exact_cap_and_rejects_plus_one() {
+        let prefix = r#"{"type":"session_meta","payload":{"cwd":"/bounded"}}"#;
+        let mut exact = prefix.to_owned();
+        exact.push_str(&" ".repeat(MAX_TRANSCRIPT_LINE_BYTES - prefix.len()));
+        exact.push('\n');
+        let exact_path = write_tmp("codex-head-exact.jsonl", &exact);
+        assert_eq!(
+            codex_cwd_from_head(&exact_path).unwrap().as_deref(),
+            Some("/bounded")
+        );
+
+        let mut plus_one = prefix.to_owned();
+        plus_one.push_str(&" ".repeat(MAX_TRANSCRIPT_LINE_BYTES + 1 - prefix.len()));
+        plus_one.push('\n');
+        let plus_one_path = write_tmp("codex-head-plus-one.jsonl", &plus_one);
+        assert!(codex_cwd_from_head(&plus_one_path).is_err());
+    }
+
+    #[test]
+    fn oversized_codex_cwd_fails_closed_before_copy() {
+        let cwd = "a".repeat(MAX_TRANSCRIPT_PATH_BYTES + 1);
+        let content = format!(r#"{{"type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#);
+        let path = write_tmp("codex-head-cwd-plus-one.jsonl", &content);
+        assert!(codex_cwd_from_head(&path).is_err());
+    }
+
+    #[test]
+    fn transcript_debug_redacts_content_fields() {
+        let state = TranscriptState {
+            session_id: "secret-session".to_owned(),
+            cwd: Some("/private/project".to_owned()),
+            activity: AgentActivity::Working,
+            model: Some("hostile-model".to_owned()),
+            effort: Some("hidden-effort".to_owned()),
+            context_pct: Some(42),
+            last_agent_summary: Some("private transcript text".to_owned()),
+        };
+        let debug = format!("{state:?}");
+        for raw in [
+            "secret-session",
+            "/private/project",
+            "hostile-model",
+            "hidden-effort",
+            "private transcript text",
+        ] {
+            assert!(!debug.contains(raw));
+        }
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn production_transcript_reads_have_bounded_source_laws() {
+        let production = include_str!("agent_transcript.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in [
+            ".read_to_end(",
+            "reader.lines()",
+            "from_utf8_lossy",
+            ".collect::<Vec",
+            "regex::Regex::new",
+            "std::fs::File::open",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "unbounded transcript read pattern: {forbidden}"
+            );
+        }
+        assert!(
+            production.contains("#[derive(PartialEq, Eq)]\npub struct TranscriptState"),
+            "TranscriptState must remain non-Clone"
+        );
+        #[cfg(unix)]
+        assert!(
+            production.contains("libc::O_NOFOLLOW | libc::O_NONBLOCK"),
+            "transcript open must reject symlink/FIFO replacement races"
+        );
     }
 
     #[test]

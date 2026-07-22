@@ -10,10 +10,8 @@
 //! - dotenv 파일이 하나도 없으면 아무것도 만들지 않고, 기존 dotenv profile은 그대로 둔다
 //!   (일시적 체크아웃 차이로 저장된 환경이 사라지지 않게).
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
-
-use anyhow::Context;
 
 use crate::env::EnvValue;
 
@@ -29,8 +27,128 @@ pub use runtime::dotenv::is_secret_key;
 use runtime::dotenv::parse_dotenv;
 use runtime::dotenv::{
     DOTENV_ENTRIES_MAX, DOTENV_KEY_BYTES_MAX, DOTENV_TOTAL_BYTES_MAX, DOTENV_VALUE_BYTES_MAX,
-    parse_dotenv_bounded, read_dotenv_file_bounded, read_dotenv_merged_bounded,
+    parse_dotenv_bounded,
 };
+
+/// Comments and blank lines are retained by the editor, so cap them separately from parsed vars.
+const DOTENV_LINES_MAX: usize = 8_192;
+/// `.gitignore` is control text. Larger repositories keep generated ignore data elsewhere.
+const GITIGNORE_BYTES_MAX: usize = 256 * 1024;
+
+fn configure_no_follow(options: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(target_os = "macos")]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0x20_000 | 0x800);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+fn read_dotenv_file_app_bounded(
+    path: &Path,
+    remaining_bytes: &mut usize,
+) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        *remaining_bytes <= DOTENV_TOTAL_BYTES_MAX,
+        "dotenv_total_bytes_exceeded"
+    );
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("dotenv_read_failed"),
+    };
+    anyhow::ensure!(
+        before.file_type().is_file() && !before.file_type().is_symlink(),
+        "dotenv_file_type_invalid"
+    );
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    configure_no_follow(&mut options);
+    let mut file = options
+        .open(path)
+        .map_err(|_| anyhow::anyhow!("dotenv_read_failed"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("dotenv_metadata_failed"))?;
+    anyhow::ensure!(opened.is_file(), "dotenv_file_type_invalid");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            before.dev() == opened.dev() && before.ino() == opened.ino(),
+            "dotenv_file_changed"
+        );
+    }
+    anyhow::ensure!(
+        opened.len() <= *remaining_bytes as u64,
+        "dotenv_total_bytes_exceeded"
+    );
+    let probe = remaining_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("dotenv_total_bytes_exceeded"))?;
+    let mut bytes = Vec::with_capacity((opened.len() as usize).min(probe));
+    std::io::Read::by_ref(&mut file)
+        .take(probe as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("dotenv_read_failed"))?;
+    anyhow::ensure!(
+        bytes.len() <= *remaining_bytes,
+        "dotenv_total_bytes_exceeded"
+    );
+    let after = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("dotenv_metadata_failed"))?;
+    anyhow::ensure!(after.len() == bytes.len() as u64, "dotenv_file_changed");
+    *remaining_bytes -= bytes.len();
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("dotenv_utf8_invalid"))
+}
+
+fn read_dotenv_merged_app_bounded(root: &Path) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    let mut positions = std::collections::HashMap::<String, usize>::new();
+    let mut remaining_bytes = DOTENV_TOTAL_BYTES_MAX;
+    let mut remaining_entries = DOTENV_ENTRIES_MAX;
+    let mut found = false;
+
+    for name in DOTENV_FILE_NAMES {
+        let Some(content) = read_dotenv_file_app_bounded(&root.join(name), &mut remaining_bytes)?
+        else {
+            continue;
+        };
+        found = true;
+        let parsed = parse_dotenv_bounded(&content, remaining_entries)?;
+        remaining_entries -= parsed.len();
+        for (key, value) in parsed {
+            if let Some(index) = positions.get(&key).copied() {
+                merged[index].1 = value;
+            } else {
+                anyhow::ensure!(merged.len() < DOTENV_ENTRIES_MAX, "dotenv_entries_exceeded");
+                positions.insert(key.clone(), merged.len());
+                merged.push((key, value));
+            }
+        }
+    }
+    Ok(found.then_some(merged))
+}
+
+fn collect_dotenv_lines_bounded(content: &str) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::with_capacity(128);
+    for line in content.lines() {
+        anyhow::ensure!(lines.len() < DOTENV_LINES_MAX, "dotenv_lines_exceeded");
+        lines.push(line.to_owned());
+    }
+    Ok(lines)
+}
 
 /// 동기화 결과 요약 (로그/알림용).
 #[derive(Debug, Default, PartialEq)]
@@ -477,9 +595,10 @@ impl Drop for TempFileGuard {
 }
 
 fn atomic_write_env(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(contents.len() <= DOTENV_TOTAL_BYTES_MAX, ERROR_DOTENV_BYTES);
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!(".env 상위 디렉터리 없음: {}", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("dotenv_parent_missing"))?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -496,37 +615,38 @@ fn atomic_write_env(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
+    configure_no_follow(&mut options);
     let mut file = options
         .open(&temp)
-        .with_context(|| format!("dotenv 임시 파일 생성 실패: {}", temp.display()))?;
+        .map_err(|_| anyhow::anyhow!("dotenv_temp_create_failed"))?;
     let mut guard = TempFileGuard(Some(temp.clone()));
 
     // 기존 파일의 접근 권한을 유지한다. 새 파일은 OpenOptions의 0600(Unix) 기본을 쓴다.
-    match std::fs::metadata(path) {
+    match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "dotenv_target_type_invalid"
+            );
             std::fs::set_permissions(&temp, metadata.permissions())
-                .with_context(|| format!("dotenv 임시 파일 권한 설정 실패: {}", temp.display()))?;
+                .map_err(|_| anyhow::anyhow!("dotenv_temp_permissions_failed"))?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("dotenv 원본 권한 조회 실패: {}", path.display()));
-        }
+        Err(_) => anyhow::bail!("dotenv_target_metadata_failed"),
     }
     file.write_all(contents)
-        .with_context(|| format!("dotenv 임시 파일 쓰기 실패: {}", temp.display()))?;
+        .map_err(|_| anyhow::anyhow!("dotenv_temp_write_failed"))?;
     file.sync_all()
-        .with_context(|| format!("dotenv 임시 파일 sync 실패: {}", temp.display()))?;
+        .map_err(|_| anyhow::anyhow!("dotenv_temp_sync_failed"))?;
     drop(file);
 
-    atomic_replace(&temp, path)
-        .with_context(|| format!("dotenv 원자 교체 실패: {}", path.display()))?;
+    atomic_replace(&temp, path).map_err(|_| anyhow::anyhow!("dotenv_replace_failed"))?;
     guard.disarm();
 
     #[cfg(unix)]
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("dotenv 디렉터리 sync 실패: {}", parent.display()))?;
+        .map_err(|_| anyhow::anyhow!("dotenv_directory_sync_failed"))?;
     Ok(())
 }
 
@@ -588,7 +708,7 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
     let mut remaining_bytes = DOTENV_TOTAL_BYTES_MAX;
     let mut contents: [Option<String>; DOTENV_FILE_NAMES.len()] = std::array::from_fn(|_| None);
     for (index, name) in DOTENV_FILE_NAMES.iter().enumerate() {
-        contents[index] = read_dotenv_file_bounded(&root.join(name), &mut remaining_bytes)?;
+        contents[index] = read_dotenv_file_app_bounded(&root.join(name), &mut remaining_bytes)?;
     }
     let total_input_bytes = DOTENV_TOTAL_BYTES_MAX - remaining_bytes;
 
@@ -633,7 +753,7 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
         }
     };
 
-    let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+    let mut lines = collect_dotenv_lines_bounded(&content)?;
     let matches_key = |line: &str| -> bool {
         let t = line.trim();
         let t = t.strip_prefix("export ").unwrap_or(t).trim_start();
@@ -659,7 +779,10 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
             // 하나만 지우면 뒤의 중복 정의가 살아나 삭제가 무효화되므로 전부 제거한다.
             lines.retain(|line| !matches_key(line));
         }
-        (None, Some(v)) => lines.push(render(v)?),
+        (None, Some(v)) => {
+            anyhow::ensure!(lines.len() < DOTENV_LINES_MAX, "dotenv_lines_exceeded");
+            lines.push(render(v)?);
+        }
         (None, None) => return Ok(()), // 지울 것 없음
     }
     let mut out = lines.join("\n");
@@ -688,8 +811,7 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
             remaining_entries -= parsed.len();
         }
     }
-    atomic_write_env(&path, out.as_bytes())
-        .with_context(|| format!(".env 기록 실패: {}", path.display()))?;
+    atomic_write_env(&path, out.as_bytes())?;
     // 유출 방지(E2): deppy가 .env를 기록하는 유일한 지점 — git 저장소면 .gitignore
     // 보호를 함께 보장한다. best-effort(경고만) — 파일 기록 자체는 실패시키지 않는다.
     if ensure_env_gitignored(root).is_err() {
@@ -714,18 +836,67 @@ fn ensure_env_gitignored(root: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let gitignore = root.join(".gitignore");
-    let content = match std::fs::read_to_string(&gitignore) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!(".gitignore 읽기 실패: {}", gitignore.display()));
+    let before = match std::fs::symlink_metadata(&gitignore) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "dotenv_gitignore_type_invalid"
+            );
+            Some(metadata)
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => anyhow::bail!("dotenv_gitignore_metadata_failed"),
     };
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).append(true);
+    configure_no_follow(&mut options);
+    let mut file = options
+        .open(&gitignore)
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_open_failed"))?;
+    file.try_lock()
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_lock_failed"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_metadata_failed"))?;
+    anyhow::ensure!(opened.is_file(), "dotenv_gitignore_type_invalid");
+    #[cfg(unix)]
+    if let Some(before) = before.as_ref() {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            before.dev() == opened.dev() && before.ino() == opened.ino(),
+            "dotenv_gitignore_changed"
+        );
+    }
+    anyhow::ensure!(
+        opened.len() <= GITIGNORE_BYTES_MAX as u64,
+        "dotenv_gitignore_bytes_exceeded"
+    );
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_seek_failed"))?;
+    let probe = GITIGNORE_BYTES_MAX + 1;
+    let mut bytes = Vec::with_capacity((opened.len() as usize).min(probe));
+    std::io::Read::by_ref(&mut file)
+        .take(probe as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_read_failed"))?;
+    anyhow::ensure!(
+        bytes.len() <= GITIGNORE_BYTES_MAX,
+        "dotenv_gitignore_bytes_exceeded"
+    );
+    let after_read = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_metadata_failed"))?;
+    anyhow::ensure!(
+        after_read.len() == bytes.len() as u64,
+        "dotenv_gitignore_changed"
+    );
+    let content =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("dotenv_gitignore_utf8_invalid"))?;
     let covers = |name: &str| -> bool {
+        let rooted = format!("/{name}");
         content.lines().map(str::trim).any(|line| {
             line == name
-                || line == format!("/{name}")
+                || line == rooted
                 || line == ".env*"
                 || (name.starts_with(".env.") && line == ".env.*")
         })
@@ -747,14 +918,29 @@ fn ensure_env_gitignored(root: &Path) -> anyhow::Result<()> {
         block.push_str(name);
         block.push('\n');
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&gitignore)
-        .with_context(|| format!(".gitignore 열기 실패: {}", gitignore.display()))?;
+    anyhow::ensure!(
+        content.len().saturating_add(block.len()) <= GITIGNORE_BYTES_MAX,
+        "dotenv_gitignore_bytes_exceeded"
+    );
+    let end = std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_seek_failed"))?;
+    let before_append = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_metadata_failed"))?;
+    anyhow::ensure!(
+        end == content.len() as u64 && before_append.len() == content.len() as u64,
+        "dotenv_gitignore_changed"
+    );
     file.write_all(block.as_bytes())
-        .with_context(|| format!(".gitignore 기록 실패: {}", gitignore.display()))?;
-    tracing::info!(added = ?missing, ".gitignore에 .env 보호 추가");
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_write_failed"))?;
+    file.sync_all()
+        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_sync_failed"))?;
+    tracing::info!(
+        kind = "dotenv_gitignore",
+        phase = "protect",
+        added_count = missing.len(),
+        "dotenv ignore protection added"
+    );
     Ok(())
 }
 
@@ -883,7 +1069,7 @@ pub fn remove_workspace_dotenv(
 /// "파일 없음"으로 취급하면 다른 파일의 부분 결과로 동기화가 진행되어, 읽지 못한 파일의
 /// 키를 DB/keyring에서 삭제된 것으로 오판할 수 있다.
 fn read_merged_dotenv(root: &Path) -> anyhow::Result<Option<Vec<(String, String)>>> {
-    read_dotenv_merged_bounded(root)
+    read_dotenv_merged_app_bounded(root)
 }
 
 /// Performs only bounded dotenv source I/O + parsing and returns a redacted plan. No DB or keyring
@@ -1496,6 +1682,119 @@ INVALID LINE
         assert!(write_env_var(&dir, "KEY", Some(&"v".repeat(DOTENV_VALUE_BYTES_MAX + 1))).is_err());
         assert_eq!(std::fs::read_to_string(&env).unwrap(), original);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dotenv_editor_caps_retained_comment_and_blank_lines() {
+        let exact = "#\n".repeat(DOTENV_LINES_MAX);
+        assert_eq!(
+            collect_dotenv_lines_bounded(&exact).unwrap().len(),
+            DOTENV_LINES_MAX
+        );
+        let plus_one = "#\n".repeat(DOTENV_LINES_MAX + 1);
+        assert_eq!(
+            collect_dotenv_lines_bounded(&plus_one)
+                .unwrap_err()
+                .to_string(),
+            "dotenv_lines_exceeded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dotenv_source_reader_rejects_symlink_and_special_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-types-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("regular");
+        let link = dir.join(".env");
+        std::fs::write(&regular, b"A=1\n").unwrap();
+        symlink(&regular, &link).unwrap();
+        assert_eq!(
+            read_merged_dotenv(&dir).unwrap_err().to_string(),
+            "dotenv_file_type_invalid"
+        );
+        let mut remaining = DOTENV_TOTAL_BYTES_MAX;
+        assert_eq!(
+            read_dotenv_file_app_bounded(Path::new("/dev/null"), &mut remaining)
+                .unwrap_err()
+                .to_string(),
+            "dotenv_file_type_invalid"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gitignore_reader_accepts_exact_and_rejects_plus_one_and_invalid_utf8() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-gitignore-bound-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let gitignore = dir.join(".gitignore");
+        let mut exact = vec![b'#'; GITIGNORE_BYTES_MAX - b"\n.env*\n".len()];
+        exact.extend_from_slice(b"\n.env*\n");
+        assert_eq!(exact.len(), GITIGNORE_BYTES_MAX);
+        std::fs::write(&gitignore, &exact).unwrap();
+        ensure_env_gitignored(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&gitignore).unwrap().len(),
+            exact.len() as u64
+        );
+
+        std::fs::write(&gitignore, vec![b'#'; GITIGNORE_BYTES_MAX + 1]).unwrap();
+        assert_eq!(
+            ensure_env_gitignored(&dir).unwrap_err().to_string(),
+            "dotenv_gitignore_bytes_exceeded"
+        );
+        std::fs::write(&gitignore, [0xff]).unwrap();
+        assert_eq!(
+            ensure_env_gitignored(&dir).unwrap_err().to_string(),
+            "dotenv_gitignore_utf8_invalid"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitignore_reader_rejects_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-gitignore-link-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, b"keep\n").unwrap();
+        symlink(&target, dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            ensure_env_gitignored(&dir).unwrap_err().to_string(),
+            "dotenv_gitignore_type_invalid"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn production_dotenv_inputs_have_bounded_read_and_line_collection_laws() {
+        let production = include_str!("dotenv_sync.rs")
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .unwrap();
+        assert!(!production.contains("read_to_string"));
+        assert!(!production.contains("content.lines().map(str::to_owned).collect"));
+        assert!(production.contains(".take(probe as u64)"));
+        assert!(production.contains("DOTENV_LINES_MAX"));
+        assert!(production.contains("GITIGNORE_BYTES_MAX"));
+        assert!(production.contains("dotenv_gitignore_sync_failed"));
     }
 
     #[test]

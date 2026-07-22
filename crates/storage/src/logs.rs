@@ -13,6 +13,7 @@ use deppy_core::SessionId;
 const ANSI_LOG_FILE: &str = "redacted.ansi.log";
 const PLAIN_LOG_FILE: &str = "redacted.plain.txt";
 const EVENTS_LOG_FILE: &str = "events.redacted.jsonl";
+const TERMINAL_SIZE_BYTES_MAX: usize = 64;
 
 /// 런타임 복원이 읽는 ANSI tail 상한과 동일하다. 이보다 오래된 출력은 재시작 때도
 /// 사용되지 않으므로 디스크에 무기한 중복 보관하지 않는다.
@@ -45,11 +46,7 @@ enum TailBoundary {
 
 impl BoundedLogFile {
     fn open(path: &Path, max_bytes: u64, tail_boundary: TailBoundary) -> anyhow::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)
+        let file = open_regular_log_file(path, true)
             .with_context(|| format!("로그 파일 열기 실패: {}", path.display()))?;
         let mut bounded = Self {
             file,
@@ -107,6 +104,50 @@ impl BoundedLogFile {
     fn flush(&mut self) {
         self.file.flush().ok();
     }
+}
+
+fn open_regular_log_file(path: &Path, create: bool) -> std::io::Result<File> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
+        Ok(_) => return Err(std::io::Error::other("log_file_not_regular")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => None,
+        Err(error) => return Err(error),
+    };
+
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(std::io::Error::other("log_file_not_regular"));
+    }
+    let path_after = std::fs::symlink_metadata(path)?;
+    if !path_after.file_type().is_file() {
+        return Err(std::io::Error::other("log_file_replaced"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.as_ref().is_some_and(|metadata| {
+            metadata.dev() != opened.dev() || metadata.ino() != opened.ino()
+        }) || opened.dev() != path_after.dev()
+            || opened.ino() != path_after.ino()
+        {
+            return Err(std::io::Error::other("log_file_replaced"));
+        }
+    }
+    Ok(file)
 }
 
 pub struct SessionLogWriter {
@@ -182,13 +223,8 @@ impl SessionLogWriter {
         session_key: &str,
     ) -> anyhow::Result<Option<(u16, u16)>> {
         let path = Self::terminal_size_path(logs_root, session_key)?;
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("터미널 크기 읽기 실패: {}", path.display()));
-            }
+        let Some(raw) = read_terminal_size_bounded(&path)? else {
+            return Ok(None);
         };
         let mut fields = raw.split_whitespace();
         let cols: u16 = fields
@@ -221,8 +257,8 @@ impl SessionLogWriter {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()))?;
         let path = dir.join("terminal.size");
-        std::fs::write(&path, format!("{cols} {rows}\n"))
-            .with_context(|| format!("터미널 크기 기록 실패: {}", path.display()))
+        deppy_core::fs::atomic_write(&path, format!("{cols} {rows}\n").as_bytes())
+            .map_err(|_| anyhow::anyhow!("terminal_size_write_failed"))
     }
 
     /// append 재개 시 offset을 기존 파일 길이부터 이어가기 위한 길이 조회.
@@ -268,6 +304,94 @@ impl SessionLogWriter {
     }
 }
 
+fn read_terminal_size_bounded(path: &Path) -> anyhow::Result<Option<String>> {
+    read_terminal_size_bounded_with_hook(path, || {})
+}
+
+fn read_terminal_size_bounded_with_hook(
+    path: &Path,
+    after_snapshot: impl FnOnce(),
+) -> anyhow::Result<Option<String>> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => anyhow::bail!("terminal_size_not_regular"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("terminal_size_metadata_failed"),
+    };
+    anyhow::ensure!(
+        before.len() <= TERMINAL_SIZE_BYTES_MAX as u64,
+        "terminal_size_bytes_exceeded"
+    );
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| anyhow::anyhow!("terminal_size_open_failed"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("terminal_size_metadata_failed"))?;
+    anyhow::ensure!(opened.file_type().is_file(), "terminal_size_not_regular");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            before.dev() == opened.dev() && before.ino() == opened.ino(),
+            "terminal_size_replaced"
+        );
+    }
+    anyhow::ensure!(
+        opened.len() <= TERMINAL_SIZE_BYTES_MAX as u64,
+        "terminal_size_bytes_exceeded"
+    );
+
+    let declared_len = usize::try_from(opened.len())
+        .map_err(|_| anyhow::anyhow!("terminal_size_bytes_exceeded"))?;
+    after_snapshot();
+    let mut bytes = vec![0_u8; declared_len];
+    file.read_exact(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("terminal_size_changed"))?;
+    let mut overflow = [0_u8; 1];
+    anyhow::ensure!(
+        file.read(&mut overflow)
+            .map_err(|_| anyhow::anyhow!("terminal_size_read_failed"))?
+            == 0,
+        "terminal_size_changed"
+    );
+    let after = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("terminal_size_metadata_failed"))?;
+    anyhow::ensure!(after.len() == opened.len(), "terminal_size_changed");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let path_after = std::fs::symlink_metadata(path)
+            .map_err(|_| anyhow::anyhow!("terminal_size_replaced"))?;
+        anyhow::ensure!(
+            path_after.file_type().is_file()
+                && opened.dev() == after.dev()
+                && opened.ino() == after.ino()
+                && after.dev() == path_after.dev()
+                && after.ino() == path_after.ino(),
+            "terminal_size_replaced"
+        );
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("terminal_size_utf8_invalid"))
+}
+
 /// 열린 파일의 끝 `retain_bytes`만 같은 inode에 다시 쓴다. writer handle을 교체/rename하지
 /// 않으므로 런타임이 계속 가진 append handle에도 즉시 적용된다. text/JSONL은 LF가 있으면
 /// 첫 완전한 줄로 정렬하고, line-oriented가 아닌 ANSI는 UTF-8/escape 경계에 맞춘다.
@@ -275,6 +399,15 @@ fn compact_open_file_to_tail(
     file: &mut File,
     retain_bytes: u64,
     tail_boundary: TailBoundary,
+) -> std::io::Result<u64> {
+    compact_open_file_to_tail_with_hook(file, retain_bytes, tail_boundary, || {})
+}
+
+fn compact_open_file_to_tail_with_hook(
+    file: &mut File,
+    retain_bytes: u64,
+    tail_boundary: TailBoundary,
+    after_snapshot: impl FnOnce(),
 ) -> std::io::Result<u64> {
     file.flush()?;
     let len = file.metadata()?.len();
@@ -285,13 +418,16 @@ fn compact_open_file_to_tail(
         file.set_len(0)?;
         return Ok(0);
     }
+    after_snapshot();
     let mut start = len.saturating_sub(retain_bytes);
     if matches!(tail_boundary, TailBoundary::Ansi) {
-        start = seek_ansi_tail_boundary(file, start, false)?;
+        start = seek_ansi_tail_boundary_snapshot(file, start, len, false)?;
     }
     file.seek(std::io::SeekFrom::Start(start))?;
-    let mut tail = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
-    file.read_to_end(&mut tail)?;
+    let tail_len = usize::try_from(len.saturating_sub(start))
+        .map_err(|_| std::io::Error::other("log_tail_size_invalid"))?;
+    let mut tail = vec![0_u8; tail_len];
+    file.read_exact(&mut tail)?;
     if start > 0
         && matches!(tail_boundary, TailBoundary::NextNewlineIfPresent)
         && let Some(newline) = tail.iter().position(|byte| *byte == b'\n')
@@ -300,6 +436,9 @@ fn compact_open_file_to_tail(
     } else if start > 0 && matches!(tail_boundary, TailBoundary::NextNewlineIfPresent) {
         let continuation_bytes = tail.iter().take_while(|byte| **byte & 0xc0 == 0x80).count();
         tail.drain(..continuation_bytes);
+    }
+    if file.metadata()?.len() != len {
+        return Err(std::io::Error::other("log_changed_during_compaction"));
     }
     file.set_len(0)?;
     file.write_all(&tail)?;
@@ -410,19 +549,34 @@ pub fn seek_ansi_tail_boundary(
     requested_start: u64,
     prefer_newline: bool,
 ) -> std::io::Result<u64> {
-    let len = file.metadata()?.len();
-    let requested_start = requested_start.min(len);
+    let snapshot_end = file.metadata()?.len();
+    seek_ansi_tail_boundary_snapshot(file, requested_start, snapshot_end, prefer_newline)
+}
+
+/// `snapshot_end`를 잡은 caller가 concurrent append 이후에도 그 snapshot 바깥을 읽지
+/// 않도록 하는 경계 탐색 variant. 파일이 짧아지면 부분 결과를 사용하지 않고 실패한다.
+pub fn seek_ansi_tail_boundary_snapshot(
+    file: &mut File,
+    requested_start: u64,
+    snapshot_end: u64,
+    prefer_newline: bool,
+) -> std::io::Result<u64> {
+    let requested_start = requested_start.min(snapshot_end);
     file.seek(std::io::SeekFrom::Start(0))?;
 
     let mut scanner = AnsiBoundaryScanner::default();
     let mut first_safe = (requested_start == 0).then_some(0);
     let mut position = 0u64;
     let mut buffer = [0u8; 8192];
-    while position < len {
-        let remaining = usize::try_from((len - position).min(buffer.len() as u64)).unwrap_or(0);
+    while position < snapshot_end {
+        let remaining =
+            usize::try_from((snapshot_end - position).min(buffer.len() as u64)).unwrap_or(0);
         let read = file.read(&mut buffer[..remaining])?;
         if read == 0 {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "ansi_snapshot_short_read",
+            ));
         }
         for &byte in &buffer[..read] {
             if position >= requested_start && first_safe.is_none() && scanner.at_boundary() {
@@ -441,7 +595,7 @@ pub fn seek_ansi_tail_boundary(
         }
     }
 
-    let start = first_safe.unwrap_or(len);
+    let start = first_safe.unwrap_or(snapshot_end);
     file.seek(std::io::SeekFrom::Start(start))?;
     Ok(start)
 }
@@ -532,7 +686,7 @@ fn collect_session_log_bundles(logs_root: &Path) -> anyhow::Result<Vec<SessionLo
                 .metadata()
                 .with_context(|| format!("세션 로그 metadata 실패: {}", path.display()))?;
             if original.len() > max_bytes {
-                let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
+                let mut file = open_regular_log_file(&path, false)?;
                 compact_open_file_to_tail(&mut file, retain_bytes, tail_boundary).with_context(
                     || format!("기존 세션 로그 상한 적용 실패: {}", path.display()),
                 )?;
@@ -807,6 +961,145 @@ mod tests {
     }
 
     #[test]
+    fn terminal_size_reader는_byte상한과_snapshot변경을_거부한다() {
+        let root = temp_root("terminal-size-bounds");
+        let path = root.join("terminal.size");
+        std::fs::write(&path, vec![b'x'; TERMINAL_SIZE_BYTES_MAX]).unwrap();
+        assert_eq!(
+            read_terminal_size_bounded(&path).unwrap().unwrap().len(),
+            TERMINAL_SIZE_BYTES_MAX
+        );
+        std::fs::write(&path, vec![b'x'; TERMINAL_SIZE_BYTES_MAX + 1]).unwrap();
+        assert_eq!(
+            read_terminal_size_bounded(&path).unwrap_err().to_string(),
+            "terminal_size_bytes_exceeded"
+        );
+
+        std::fs::write(&path, b"121 47\n").unwrap();
+        assert_eq!(
+            read_terminal_size_bounded_with_hook(&path, || {
+                OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"1")
+                    .unwrap();
+            })
+            .unwrap_err()
+            .to_string(),
+            "terminal_size_changed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_size_reader는_symlink와_fifo를_block없이_거부한다() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("terminal-size-types");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::write(&target, b"80 24\n").unwrap();
+        symlink(&target, &link).unwrap();
+        assert_eq!(
+            read_terminal_size_bounded(&link).unwrap_err().to_string(),
+            "terminal_size_not_regular"
+        );
+
+        let fifo = root.join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            read_terminal_size_bounded(&fifo).unwrap_err().to_string(),
+            "terminal_size_not_regular"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_log_open과_gc는_symlink와_fifo를_block없이_거부한다() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("bounded-log-types");
+        let target = root.join("target.log");
+        let link = root.join("link.log");
+        std::fs::write(&target, b"safe").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(open_regular_log_file(&link, true).is_err());
+        assert!(open_regular_log_file(&link, false).is_err());
+
+        let fifo = root.join("fifo.log");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(open_regular_log_file(&fifo, true).is_err());
+        assert!(open_regular_log_file(&fifo, false).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let regular = root.join("regular.log");
+        open_regular_log_file(&regular, true)
+            .unwrap()
+            .write_all(b"created")
+            .unwrap();
+        assert_eq!(std::fs::read(&regular).unwrap(), b"created");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn log_compaction은_snapshot뒤_append를_truncate하지_않는다() {
+        let root = temp_root("compaction-append");
+        let path = root.join("bounded.log");
+        std::fs::write(&path, vec![b'a'; 128]).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            compact_open_file_to_tail_with_hook(
+                &mut file,
+                64,
+                TailBoundary::NextNewlineIfPresent,
+                || {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"late")
+                        .unwrap();
+                },
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::Other
+        );
+        let retained = std::fs::read(&path).unwrap();
+        assert_eq!(retained.len(), 132);
+        assert!(retained.ends_with(b"late"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_log_restore와_compaction은_eof_following_read를_금지한다() {
+        let production = include_str!("logs.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(!production.contains("std::fs::read_to_string(&path)"));
+        assert!(!production.contains("file.read_to_end(&mut tail)"));
+        assert!(production.contains("file.read_exact(&mut tail)"));
+        assert!(production.contains("TERMINAL_SIZE_BYTES_MAX"));
+        assert!(production.contains("open_regular_log_file(path, true)"));
+        assert!(production.contains("open_regular_log_file(&path, false)"));
+    }
+
+    #[test]
     fn bounded_log는_상한을_넘으면_최근_완전한_줄만_남긴다() {
         let root = temp_root("bounded-tail");
         let path = root.join("bounded.log");
@@ -874,6 +1167,36 @@ mod tests {
             std::str::from_utf8(&compact(utf8, "prefix".len() + 1)).unwrap(),
             "글-tail"
         );
+    }
+
+    #[test]
+    fn ansi_snapshot_boundary는_append를_읽지_않고_shrink를_거부한다() {
+        let root = temp_root("ansi-frozen-snapshot");
+        let path = root.join("snapshot.log");
+        let original = b"prefix\nVISIBLE";
+        std::fs::write(&path, original).unwrap();
+        let snapshot_end = original.len() as u64;
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&vec![b'x'; 128 * 1024]).unwrap();
+        let start = seek_ansi_tail_boundary_snapshot(&mut file, 3, snapshot_end, true).unwrap();
+        assert_eq!(start, b"prefix\n".len() as u64);
+        let mut snapshot_tail = vec![0_u8; original.len() - start as usize];
+        file.read_exact(&mut snapshot_tail).unwrap();
+        assert_eq!(snapshot_tail, b"VISIBLE");
+
+        file.set_len(snapshot_end - 1).unwrap();
+        assert_eq!(
+            seek_ansi_tail_boundary_snapshot(&mut file, 0, snapshot_end, false)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

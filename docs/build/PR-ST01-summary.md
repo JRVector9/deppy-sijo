@@ -152,3 +152,24 @@ do not treat it as an ST01 storage/audit failure.
   metadata, and logical/physical identifiers. New errors are static marker-free messages.
 - Root verification: storage tests passed 142/142 plus doc-tests; all-target check, strict Clippy,
   package rustfmt, and scoped diff-check passed.
+
+## Bounded app projections and hook-state retention
+
+Storage now exposes SQL-preflighted bounded projections for environment profiles/variables,
+dotenv-owned credential IDs, environment project counts, hook/status/turn prefixes, global
+waiting rows, and per-workspace agent restore. Selection uses deterministic LIMIT+1 windows,
+validates SQLite types and row/aggregate bytes before String allocation, and captures one snapshot
+epoch for every TTL preflight/select pair. App production callers no longer full-materialize these
+tables and retain the last complete UI snapshot when a bounded read fails. A failed agent-restore
+projection leaves the workspace unloaded and retries from cached bindings on the next bounded
+agent-state refresh, so detector outcome deduplication cannot suppress recovery.
+
+Every hook/status/needs/turn writer validates a 1-KiB control-free workspace/session key and, in
+its IMMEDIATE transaction, keeps at most 256 deterministic newest rows for the literal workspace
+prefix and 4,096 rows globally. The protected write survives eviction; clear on a missing key keeps
+the full 256. Exact/plus-one, `%`/`_` isolation, cross-workspace retention, corrupt row/type/byte
+preflight, stable TTL cutoff, and injected eviction rollback regressions are included.
+
+Root verification passes storage 183/183 plus doc tests, app 790/790 with five explicit ignores,
+logging policy 15/15, app/storage all-target checks, dependency-inclusive strict Clippy, zero-
+allowlist boundary, the 23-crate dependency DAG, full workspace fmt, and diff-check.

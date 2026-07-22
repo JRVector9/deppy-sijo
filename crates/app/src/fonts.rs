@@ -1,6 +1,90 @@
 //! egui 기본 폰트에는 한글 글리프가 없다 — 시스템 CJK 폰트를 fallback으로 등록한다.
 //! (PR-05 완료 기준: 한글 렌더링 깨짐 없음)
 
+use std::io::Read as _;
+use std::path::Path;
+
+/// AppleSDGothicNeo.ttc is currently 55,373,848 bytes; 64 MiB admits it without making arbitrary
+/// custom font paths a bulk-file allocation surface.
+const FONT_FILE_BYTES_MAX: usize = 64 * 1024 * 1024;
+const FONT_PATH_BYTES_MAX: usize = 4 * 1024;
+const FONT_NAME_BYTES_MAX: usize = 256;
+const FONT_DIRECTORY_ENTRIES_MAX: usize = 4_096;
+const UI_FONT_OPTIONS_MAX: usize = 256;
+
+fn open_font_read_only(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(target_os = "macos")]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0x20_000 | 0x800);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+fn read_font_file_bounded(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        path.as_os_str().as_encoded_bytes().len() <= FONT_PATH_BYTES_MAX,
+        "font_path_bytes_exceeded"
+    );
+    let before =
+        std::fs::symlink_metadata(path).map_err(|_| anyhow::anyhow!("font_metadata_failed"))?;
+    anyhow::ensure!(
+        before.file_type().is_file() && !before.file_type().is_symlink(),
+        "font_file_type_invalid"
+    );
+    let mut file = open_font_read_only(path).map_err(|_| anyhow::anyhow!("font_open_failed"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("font_metadata_failed"))?;
+    anyhow::ensure!(opened.is_file(), "font_file_type_invalid");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            before.dev() == opened.dev() && before.ino() == opened.ino(),
+            "font_file_changed"
+        );
+    }
+    anyhow::ensure!(opened.len() <= max_bytes as u64, "font_bytes_exceeded");
+    let probe = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("font_bytes_exceeded"))?;
+    let initial_capacity = usize::try_from(opened.len()).unwrap_or(probe).min(probe);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    file.by_ref()
+        .take(probe as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("font_read_failed"))?;
+    anyhow::ensure!(bytes.len() <= max_bytes, "font_bytes_exceeded");
+    let after = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("font_metadata_failed"))?;
+    anyhow::ensure!(after.len() == bytes.len() as u64, "font_file_changed");
+    Ok(bytes)
+}
+
+fn font_path_is_admissible(path: &Path) -> bool {
+    if path.as_os_str().as_encoded_bytes().len() > FONT_PATH_BYTES_MAX {
+        return false;
+    }
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= FONT_FILE_BYTES_MAX as u64
+    })
+}
+
 /// 번들 터미널 모노 폰트 두 가족 (둘 다 OFL — assets/fonts/*-OFL.txt).
 /// - **D2Coding**(기본, 2026-07-13): 네이버 한글 코딩 폰트 — 한글·영문이 한 폰트에서
 ///   2:1 폭 정합이라 한글 섞인 출력의 정렬이 정확하다. 번들은 Regular만 유지한다.
@@ -81,12 +165,14 @@ fn cjk_font_data() -> Option<CachedFontData> {
     CJK_FONT_DATA
         .get_or_init(|| {
             CJK_FONT_CANDIDATES.iter().find_map(|path| {
-                std::fs::read(path).ok().map(|bytes| {
-                    (
-                        *path,
-                        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-                    )
-                })
+                read_font_file_bounded(Path::new(path), FONT_FILE_BYTES_MAX)
+                    .ok()
+                    .map(|bytes| {
+                        (
+                            *path,
+                            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                        )
+                    })
             })
         })
         .clone()
@@ -96,11 +182,13 @@ fn cjk_font_data() -> Option<CachedFontData> {
 fn sidebar_font_data() -> Option<CachedFontData> {
     SIDEBAR_FONT_DATA
         .get_or_init(|| {
-            std::fs::read(SIDEBAR_FONT_PATH).ok().map(|bytes| {
-                let mut data = egui::FontData::from_owned(bytes);
-                data.index = 0;
-                (SIDEBAR_FONT_PATH, std::sync::Arc::new(data))
-            })
+            read_font_file_bounded(Path::new(SIDEBAR_FONT_PATH), FONT_FILE_BYTES_MAX)
+                .ok()
+                .map(|bytes| {
+                    let mut data = egui::FontData::from_owned(bytes);
+                    data.index = 0;
+                    (SIDEBAR_FONT_PATH, std::sync::Arc::new(data))
+                })
         })
         .clone()
 }
@@ -192,7 +280,7 @@ fn build_font_definitions(
                 .or_default()
                 .push("cjk".to_owned());
         }
-        tracing::info!(font = path, "한글 fallback 폰트 등록");
+        tracing::info!(kind = "cjk_fallback", "font registered");
     } else {
         tracing::warn!("한글 폰트를 찾지 못함 — 한글이 깨질 수 있음");
     }
@@ -212,11 +300,16 @@ fn build_font_definitions(
                 .or_default();
             family.retain(|name| name != "cjk");
             family.insert(0, "cjk".to_owned());
-            tracing::info!(font = path, "UI 폰트 등록(CJK 데이터 공유)");
+            tracing::info!(kind = "ui_shared_cjk", "font registered");
             break;
         }
-        let Ok(bytes) = std::fs::read(path) else {
-            tracing::warn!(font = path, "UI 폰트 로드 실패 — 다음 후보로");
+        let Ok(bytes) = read_font_file_bounded(Path::new(path), FONT_FILE_BYTES_MAX) else {
+            tracing::warn!(
+                kind = "ui_font",
+                phase = "admission",
+                error_code = "font_unavailable",
+                "font candidate unavailable"
+            );
             continue;
         };
         let mut fd = egui::FontData::from_owned(bytes);
@@ -227,7 +320,7 @@ fn build_font_definitions(
             .entry(egui::FontFamily::Proportional)
             .or_default()
             .insert(0, "ui".to_owned());
-        tracing::info!(font = path, "UI 폰트 등록");
+        tracing::info!(kind = "ui_font", "font registered");
         break;
     }
 
@@ -241,13 +334,13 @@ fn build_font_definitions(
         .cloned()
         .unwrap_or_default();
     #[cfg(target_os = "macos")]
-    if let Some((path, font_data)) = sidebar_font_data() {
+    if let Some((_path, font_data)) = sidebar_font_data() {
         fonts
             .font_data
             .insert("sidebar_apple_sd_gothic".to_owned(), font_data);
         sidebar_fallback.retain(|name| name != "sidebar_apple_sd_gothic");
         sidebar_fallback.insert(0, "sidebar_apple_sd_gothic".to_owned());
-        tracing::info!(font = path, "좌측 사이드바 Apple SD Gothic 폰트 등록");
+        tracing::info!(kind = "sidebar_font", "font registered");
     }
     fonts.families.insert(sidebar_family, sidebar_fallback);
 
@@ -270,7 +363,7 @@ pub fn ui_font_options() -> Vec<(String, String)> {
             "/System/Library/Fonts/AppleSDGothicNeo.ttc",
         ),
     ] {
-        if !path.is_empty() && std::path::Path::new(path).is_file() {
+        if !path.is_empty() && font_path_is_admissible(Path::new(path)) {
             out.push((name.to_owned(), path.to_owned()));
         }
     }
@@ -292,15 +385,34 @@ pub fn ui_font_options() -> Vec<(String, String)> {
     if let Some(home) = crate::paths::home_dir() {
         dirs.push(home.join("Library/Fonts"));
     }
-    for dir in dirs {
+    let mut scanned_entries = 0usize;
+    'directories: for dir in dirs {
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|metadata| {
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink()
+        }) {
+            continue;
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for e in rd.flatten() {
+        for entry in rd {
+            if scanned_entries >= FONT_DIRECTORY_ENTRIES_MAX || out.len() >= UI_FONT_OPTIONS_MAX {
+                break 'directories;
+            }
+            scanned_entries += 1;
+            let Ok(e) = entry else {
+                continue;
+            };
+            if !e.file_type().is_ok_and(|file_type| file_type.is_file()) {
+                continue;
+            }
             let path = e.path();
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+            if stem.len() > FONT_NAME_BYTES_MAX || !font_path_is_admissible(&path) {
+                continue;
+            }
             let ext_ok = path
                 .extension()
                 .and_then(|s| s.to_str())
@@ -309,7 +421,9 @@ pub fn ui_font_options() -> Vec<(String, String)> {
                 });
             let lower = stem.to_ascii_lowercase();
             if ext_ok && KOREAN_MARKERS.iter().any(|m| lower.contains(m)) {
-                let p = path.display().to_string();
+                let Some(p) = path.to_str().map(str::to_owned) else {
+                    continue;
+                };
                 if !out.iter().any(|(_, existing)| existing == &p) {
                     out.push((stem.to_owned(), p));
                 }
@@ -341,6 +455,69 @@ pub fn effective_ui_font_name(selected_path: Option<&str>, options: &[(String, S
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_UI_FONT_NAME, effective_ui_font_name};
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "deppy-font-bound-{tag}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn font_reader_accepts_exact_and_rejects_plus_one() {
+        let path = temp_path("bytes");
+        std::fs::write(&path, vec![b'x'; 64]).unwrap();
+        assert_eq!(super::read_font_file_bounded(&path, 64).unwrap().len(), 64);
+        std::fs::write(&path, vec![b'x'; 65]).unwrap();
+        assert_eq!(
+            super::read_font_file_bounded(&path, 64)
+                .unwrap_err()
+                .to_string(),
+            "font_bytes_exceeded"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn font_reader_rejects_symlink_and_special_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_path("types");
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("regular");
+        let link = dir.join("link");
+        std::fs::write(&regular, b"font").unwrap();
+        symlink(&regular, &link).unwrap();
+        assert_eq!(
+            super::read_font_file_bounded(&link, 64)
+                .unwrap_err()
+                .to_string(),
+            "font_file_type_invalid"
+        );
+        assert_eq!(
+            super::read_font_file_bounded(std::path::Path::new("/dev/null"), 64)
+                .unwrap_err()
+                .to_string(),
+            "font_file_type_invalid"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn production_font_admission_has_no_unbounded_file_materialization() {
+        let production = include_str!("fonts.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!production.contains("std::fs::read("));
+        assert!(!production.contains("read_to_string"));
+        assert!(production.contains(".take(probe as u64)"));
+    }
 
     #[test]
     fn d2coding은_regular만_번들하고_bold요청도_regular로_폴백한다() {

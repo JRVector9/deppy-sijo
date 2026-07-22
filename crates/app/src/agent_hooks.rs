@@ -11,12 +11,84 @@
 //! 포맷 보존). codex는 features.hooks=true로 켜지고 최초 1회 codex TUI trust 승인이 필요하다
 //! (codex 자체 동작, deppy는 프롬프트 안 띄움).
 
-use std::path::PathBuf;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 /// 우리 hook 항목을 식별하는 커맨드 마커.
 const MARKER: &str = "--deppy-hook";
+/// Third-party hook settings are control data; refuse bulk files before JSON/TOML allocation.
+const HOOK_CONFIG_BYTES_MAX: usize = 1024 * 1024;
+
+fn open_hook_config_read_only(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(target_os = "macos")]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0x20_000 | 0x800);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+fn read_hook_config_bounded(path: &Path, max_bytes: usize) -> anyhow::Result<Option<String>> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("agent_hook_config_read_failed"),
+    };
+    anyhow::ensure!(
+        before.file_type().is_file() && !before.file_type().is_symlink(),
+        "agent_hook_config_type_invalid"
+    );
+    let mut file = open_hook_config_read_only(path)
+        .map_err(|_| anyhow::anyhow!("agent_hook_config_open_failed"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("agent_hook_config_metadata_failed"))?;
+    anyhow::ensure!(opened.is_file(), "agent_hook_config_type_invalid");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            before.dev() == opened.dev() && before.ino() == opened.ino(),
+            "agent_hook_config_changed"
+        );
+    }
+    anyhow::ensure!(
+        opened.len() <= max_bytes as u64,
+        "agent_hook_config_bytes_exceeded"
+    );
+    let probe = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("agent_hook_config_bytes_exceeded"))?;
+    let mut bytes = Vec::with_capacity((opened.len() as usize).min(probe));
+    std::io::Read::by_ref(&mut file)
+        .take(probe as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("agent_hook_config_read_failed"))?;
+    anyhow::ensure!(bytes.len() <= max_bytes, "agent_hook_config_bytes_exceeded");
+    let after = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("agent_hook_config_metadata_failed"))?;
+    anyhow::ensure!(
+        after.len() == bytes.len() as u64,
+        "agent_hook_config_changed"
+    );
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("agent_hook_config_utf8_invalid"))
+}
 
 /// 셸 커맨드 인자로 안전하게 감싼다 — 작은따옴표 안에 넣되 내부 작은따옴표는 '\'' 로 이스케이프.
 /// 경로에 공백/작은따옴표(예: /Users/O'Connor/…)가 있어도 hook 커맨드가 안 깨진다(codex 지적).
@@ -64,9 +136,17 @@ fn is_ours(entry: &Value) -> bool {
 /// 설정 JSON을 원자적으로 쓴다 (tmp+rename).
 fn write_atomic(path: &std::path::Path, root: &Value) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|_| anyhow::anyhow!("agent_hook_directory_create_failed"))?;
     }
-    deppy_core::fs::atomic_write(path, serde_json::to_string_pretty(root)?.as_bytes())?;
+    let text = serde_json::to_string_pretty(root)
+        .map_err(|_| anyhow::anyhow!("agent_hook_config_serialize_failed"))?;
+    anyhow::ensure!(
+        text.len() <= HOOK_CONFIG_BYTES_MAX,
+        "agent_hook_config_bytes_exceeded"
+    );
+    deppy_core::fs::atomic_write(path, text.as_bytes())
+        .map_err(|_| anyhow::anyhow!("agent_hook_config_write_failed"))?;
     Ok(())
 }
 
@@ -75,10 +155,9 @@ pub fn uninstall_claude() -> anyhow::Result<()> {
     let Some(path) = claude_settings_path() else {
         return Ok(());
     };
-    if !path.exists() {
+    let Some(text) = read_hook_config_bounded(&path, HOOK_CONFIG_BYTES_MAX)? else {
         return Ok(());
-    }
-    let text = std::fs::read_to_string(&path)?;
+    };
     let Ok(mut root) = serde_json::from_str::<Value>(&text) else {
         return Ok(()); // 파싱 실패면 건드리지 않음
     };
@@ -119,17 +198,48 @@ fn codex_group_is_ours(group: &toml_edit::Value) -> bool {
 }
 
 /// TOML 텍스트를 최초 1회 백업 + 원자적으로 쓴다.
-fn codex_write(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
-    if path.exists() {
-        let backup = path.with_extension("toml.pre-deppy");
-        if !backup.exists() {
-            let _ = std::fs::copy(path, &backup);
+fn codex_write(path: &std::path::Path, text: &str, original: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        text.len() <= HOOK_CONFIG_BYTES_MAX,
+        "agent_hook_config_bytes_exceeded"
+    );
+    let backup = path.with_extension("toml.pre-deppy");
+    match std::fs::symlink_metadata(&backup) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+                #[cfg(target_os = "macos")]
+                options.custom_flags(libc::O_NOFOLLOW);
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                options.custom_flags(0x20_000);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            match options.open(&backup) {
+                Ok(mut file) => file
+                    .write_all(original.as_bytes())
+                    .map_err(|_| anyhow::anyhow!("agent_hook_backup_write_failed"))?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => anyhow::bail!("agent_hook_backup_open_failed"),
+            }
         }
+        Err(_) => anyhow::bail!("agent_hook_backup_metadata_failed"),
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|_| anyhow::anyhow!("agent_hook_directory_create_failed"))?;
     }
-    deppy_core::fs::atomic_write(path, text.as_bytes())?;
+    deppy_core::fs::atomic_write(path, text.as_bytes())
+        .map_err(|_| anyhow::anyhow!("agent_hook_config_write_failed"))?;
     Ok(())
 }
 
@@ -138,14 +248,14 @@ pub fn uninstall_codex() -> anyhow::Result<()> {
     let Some(path) = codex_config_path() else {
         return Ok(());
     };
-    if !path.exists() {
+    let Some(text) = read_hook_config_bounded(&path, HOOK_CONFIG_BYTES_MAX)? else {
         return Ok(());
-    }
-    let Ok(mut doc) = std::fs::read_to_string(&path)?.parse::<toml_edit::DocumentMut>() else {
+    };
+    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
         return Ok(()); // 파싱 실패면 건드리지 않음
     };
     codex_remove(&mut doc);
-    codex_write(&path, &doc.to_string())
+    codex_write(&path, &doc.to_string(), &text)
 }
 
 /// codex config 문서에서 우리 hook만 제거한다(파일 I/O 없음 — 테스트 가능).
@@ -193,6 +303,74 @@ fn codex_remove(doc: &mut toml_edit::DocumentMut) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "deppy-hook-bound-{tag}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn hook_config_reader_accepts_exact_and_rejects_plus_one_and_invalid_utf8() {
+        let path = temp_path("bytes");
+        std::fs::write(&path, vec![b'x'; 64]).unwrap();
+        assert_eq!(
+            read_hook_config_bounded(&path, 64).unwrap().unwrap().len(),
+            64
+        );
+        std::fs::write(&path, vec![b'x'; 65]).unwrap();
+        assert_eq!(
+            read_hook_config_bounded(&path, 64).unwrap_err().to_string(),
+            "agent_hook_config_bytes_exceeded"
+        );
+        std::fs::write(&path, [0xff]).unwrap();
+        assert_eq!(
+            read_hook_config_bounded(&path, 64).unwrap_err().to_string(),
+            "agent_hook_config_utf8_invalid"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_config_reader_rejects_symlink_and_special_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_path("types");
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("regular");
+        let link = dir.join("link");
+        std::fs::write(&regular, b"ok").unwrap();
+        symlink(&regular, &link).unwrap();
+        assert_eq!(
+            read_hook_config_bounded(&link, 64).unwrap_err().to_string(),
+            "agent_hook_config_type_invalid"
+        );
+        assert_eq!(
+            read_hook_config_bounded(Path::new("/dev/null"), 64)
+                .unwrap_err()
+                .to_string(),
+            "agent_hook_config_type_invalid"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn production_hook_config_has_no_unbounded_read_or_copy() {
+        let production = include_str!("agent_hooks.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!production.contains("read_to_string"));
+        assert!(!production.contains("std::fs::copy"));
+        assert!(production.contains(".take(probe as u64)"));
+        assert!(production.contains("HOOK_CONFIG_BYTES_MAX"));
+    }
 
     #[test]
     fn sh_quote_escapes_single_quotes() {

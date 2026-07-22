@@ -694,6 +694,693 @@ pub struct StructuredThreadRow {
     pub updated_at: i64,
 }
 
+const STRUCTURED_THREAD_ID_BYTES_MAX: usize = 1024;
+const STRUCTURED_THREAD_CWD_BYTES_MAX: usize = 4 * 1024;
+const STRUCTURED_THREAD_MODEL_BYTES_MAX: usize = 1024;
+const STRUCTURED_THREAD_ROW_BYTES_MAX: usize = 32 * 1024;
+const STRUCTURED_THREADS_RETAINED_BYTES_MAX: usize = 4 * 1024 * 1024;
+const STRUCTURED_THREAD_INPUT_INVALID: &str = "structured thread input invalid";
+const STRUCTURED_THREAD_ROW_INVALID: &str = "structured thread row invalid";
+const STRUCTURED_THREAD_QUERY_FAILED: &str = "structured thread query failed";
+const STRUCTURED_THREAD_PERSIST_FAILED: &str = "structured thread persistence failed";
+
+const STRUCTURED_THREADS_BOUNDED_QUERY: &str = "WITH selected AS MATERIALIZED (
+        SELECT rowid
+          FROM structured_threads
+         WHERE workspace_id = ?1 AND (?2 = 1 OR archived = 0)
+         ORDER BY favorite DESC, updated_at DESC,
+                  substr(CAST(local_session_id AS BLOB), 1, ?4), rowid
+         LIMIT ?3
+     ), validation AS MATERIALIZED (
+        SELECT COALESCE(SUM(CASE WHEN
+                   typeof(thread.local_session_id) != 'text'
+                OR length(CAST(thread.local_session_id AS BLOB)) NOT BETWEEN 1 AND ?4
+                OR typeof(thread.workspace_id) != 'text'
+                OR length(CAST(thread.workspace_id AS BLOB)) NOT BETWEEN 1 AND ?4
+                OR typeof(thread.thread_id) != 'text'
+                OR length(CAST(thread.thread_id AS BLOB)) NOT BETWEEN 1 AND ?4
+                OR typeof(thread.title) != 'text'
+                OR typeof(thread.cwd) != 'text'
+                OR length(CAST(thread.cwd AS BLOB)) > ?5
+                OR (typeof(thread.model) NOT IN ('null', 'text'))
+                OR (typeof(thread.model) = 'text'
+                    AND length(CAST(thread.model AS BLOB)) > ?6)
+                OR typeof(thread.favorite) != 'integer'
+                OR thread.favorite NOT IN (0, 1)
+                OR typeof(thread.archived) != 'integer'
+                OR thread.archived NOT IN (0, 1)
+                OR typeof(thread.created_at) != 'integer'
+                OR typeof(thread.updated_at) != 'integer'
+                OR length(CAST(thread.local_session_id AS BLOB))
+                   + length(CAST(thread.workspace_id AS BLOB))
+                   + length(CAST(thread.thread_id AS BLOB))
+                   + length(CAST(thread.title AS BLOB))
+                   + length(CAST(thread.cwd AS BLOB))
+                   + COALESCE(length(CAST(thread.model AS BLOB)), 0) > ?7
+                THEN 1 ELSE 0 END), 0) AS invalid_rows,
+               COALESCE(SUM(
+                   length(CAST(thread.local_session_id AS BLOB))
+                   + length(CAST(thread.workspace_id AS BLOB))
+                   + length(CAST(thread.thread_id AS BLOB))
+                   + length(CAST(thread.title AS BLOB))
+                   + length(CAST(thread.cwd AS BLOB))
+                   + COALESCE(length(CAST(thread.model AS BLOB)), 0)
+               ), 0) AS retained_bytes
+          FROM selected
+         CROSS JOIN structured_threads AS thread
+         WHERE thread.rowid = selected.rowid
+     )
+     SELECT 0 AS row_kind,
+            NULL AS local_session_id, NULL AS workspace_id, NULL AS thread_id,
+            NULL AS title, NULL AS cwd, NULL AS model,
+            NULL AS favorite, NULL AS archived,
+            NULL AS created_at, NULL AS updated_at,
+            validation.invalid_rows, validation.retained_bytes,
+            NULL AS selected_rowid
+       FROM validation
+     UNION ALL
+     SELECT 1 AS row_kind,
+            thread.local_session_id, thread.workspace_id, thread.thread_id,
+            thread.title, thread.cwd, thread.model,
+            thread.favorite, thread.archived, thread.created_at, thread.updated_at,
+            validation.invalid_rows, validation.retained_bytes,
+            selected.rowid AS selected_rowid
+       FROM validation
+      CROSS JOIN selected
+      CROSS JOIN structured_threads AS thread
+      WHERE validation.invalid_rows = 0
+        AND validation.retained_bytes BETWEEN 0 AND ?8
+        AND thread.rowid = selected.rowid
+      ORDER BY row_kind, favorite DESC, updated_at DESC, local_session_id";
+
+fn structured_thread_id_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= STRUCTURED_THREAD_ID_BYTES_MAX
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn structured_thread_input_bytes(
+    local_session_id: &str,
+    workspace_id: &str,
+    thread_id: &str,
+    title: &str,
+    cwd: &str,
+    model: Option<&str>,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        structured_thread_id_is_valid(local_session_id)
+            && structured_thread_id_is_valid(workspace_id)
+            && structured_thread_id_is_valid(thread_id)
+            && cwd.len() <= STRUCTURED_THREAD_CWD_BYTES_MAX
+            && !cwd.as_bytes().contains(&0)
+            && model.is_none_or(|value| value.len() <= STRUCTURED_THREAD_MODEL_BYTES_MAX),
+        STRUCTURED_THREAD_INPUT_INVALID
+    );
+    let retained_bytes = [
+        local_session_id.len(),
+        workspace_id.len(),
+        thread_id.len(),
+        title.len(),
+        cwd.len(),
+        model.map_or(0, str::len),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .ok_or_else(|| anyhow::anyhow!(STRUCTURED_THREAD_INPUT_INVALID))?;
+    anyhow::ensure!(
+        retained_bytes <= STRUCTURED_THREAD_ROW_BYTES_MAX,
+        STRUCTURED_THREAD_INPUT_INVALID
+    );
+    Ok(retained_bytes)
+}
+
+fn structured_thread_required_text<'row>(
+    row: &'row rusqlite::Row<'_>,
+    index: usize,
+    max_bytes: usize,
+    require_nonempty: bool,
+    reject_ascii_control: bool,
+    reject_nul: bool,
+) -> anyhow::Result<&'row str> {
+    let rusqlite::types::ValueRef::Text(bytes) = row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_ROW_INVALID))?
+    else {
+        anyhow::bail!(STRUCTURED_THREAD_ROW_INVALID);
+    };
+    anyhow::ensure!(
+        bytes.len() <= max_bytes
+            && (!require_nonempty || !bytes.is_empty())
+            && (!reject_ascii_control || !bytes.iter().any(|byte| byte.is_ascii_control()))
+            && (!reject_nul || !bytes.contains(&0)),
+        STRUCTURED_THREAD_ROW_INVALID
+    );
+    std::str::from_utf8(bytes).map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_ROW_INVALID))
+}
+
+fn structured_thread_optional_text<'row>(
+    row: &'row rusqlite::Row<'_>,
+    index: usize,
+    max_bytes: usize,
+) -> anyhow::Result<Option<&'row str>> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_ROW_INVALID))?
+    {
+        rusqlite::types::ValueRef::Null => Ok(None),
+        rusqlite::types::ValueRef::Text(bytes) if bytes.len() <= max_bytes => {
+            std::str::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_ROW_INVALID))
+        }
+        _ => anyhow::bail!(STRUCTURED_THREAD_ROW_INVALID),
+    }
+}
+
+fn structured_thread_integer(row: &rusqlite::Row<'_>, index: usize) -> anyhow::Result<i64> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_ROW_INVALID))?
+    {
+        rusqlite::types::ValueRef::Integer(value) => Ok(value),
+        _ => anyhow::bail!(STRUCTURED_THREAD_ROW_INVALID),
+    }
+}
+
+const BOUNDED_ID_BYTES_MAX: usize = 1024;
+const BOUNDED_TEXT_BYTES_MAX: usize = 4 * 1024;
+const BOUNDED_MESSAGE_BYTES_MAX: usize = 32 * 1024;
+const BOUNDED_ROW_BYTES_MAX: usize = 32 * 1024;
+const BOUNDED_RETAINED_BYTES_MAX: usize = 4 * 1024 * 1024;
+const HOOK_STATE_ROWS_MAX: usize = 4_096;
+const ENV_PROFILE_ROWS_MAX: usize = 256;
+const ENV_VAR_ROWS_MAX: usize = 4_096;
+const DOTENV_CREDENTIAL_ROWS_MAX: usize = 4_096;
+const ENV_API_PROJECT_ROWS_MAX: usize = 256;
+const HOOK_PREFIX_ROWS_MAX: usize = 256;
+const WAITING_SESSION_ROWS_MAX: usize = 4_096;
+const AGENT_SESSION_ROWS_MAX: usize = 256;
+const BOUNDED_READ_INPUT_INVALID: &str = "bounded read input invalid";
+const BOUNDED_READ_LIMIT_EXCEEDED: &str = "bounded read limit exceeded";
+const BOUNDED_READ_ROW_INVALID: &str = "bounded read row invalid";
+const BOUNDED_READ_QUERY_FAILED: &str = "bounded read query failed";
+const BOUNDED_WRITE_INPUT_INVALID: &str = "bounded write input invalid";
+const BOUNDED_WRITE_FAILED: &str = "bounded write failed";
+const AGENT_SESSION_CAPACITY_EXCEEDED: &str = "agent session capacity exceeded";
+
+const ENV_PROFILES_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM env_profiles WHERE workspace_id = ?1
+     ORDER BY created_at, substr(CAST(id AS BLOB), 1, ?3), rowid LIMIT ?2
+), sized AS MATERIALIZED (
+    SELECT profile.*,
+           length(CAST(profile.id AS BLOB)) + length(CAST(profile.name AS BLOB))
+           + length(CAST(profile.kind AS BLOB)) AS row_bytes
+      FROM selected JOIN env_profiles profile ON profile.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(id) != 'text' OR length(CAST(id AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(name) != 'text' OR length(CAST(name AS BLOB)) > ?4
+    OR typeof(kind) != 'text' OR length(CAST(kind AS BLOB)) > ?4
+    OR typeof(is_production) != 'integer' OR is_production NOT IN (0, 1)
+    OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const ENV_PROFILES_BOUNDED_SELECT: &str = "SELECT id, name, kind, is_production
+    FROM env_profiles WHERE workspace_id = ?1
+    ORDER BY created_at, substr(CAST(id AS BLOB), 1, ?3), rowid LIMIT ?2";
+
+const ENV_VARS_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM env_vars WHERE profile_id = ?1
+     ORDER BY substr(CAST(key AS BLOB), 1, ?4), rowid LIMIT ?2
+), sized AS MATERIALIZED (
+    SELECT env.*, length(CAST(env.key AS BLOB)) + length(CAST(env.kind AS BLOB))
+         + COALESCE(length(CAST(env.plain_value AS BLOB)), 0)
+         + COALESCE(length(CAST(env.credential_id AS BLOB)), 0) AS row_bytes
+      FROM selected JOIN env_vars env ON env.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(key) != 'text' OR length(CAST(key AS BLOB)) NOT BETWEEN 1 AND ?4
+    OR typeof(kind) != 'text' OR kind NOT IN ('plain', 'secret')
+    OR typeof(plain_value) NOT IN ('null', 'text')
+    OR (typeof(plain_value) = 'text' AND length(CAST(plain_value AS BLOB)) > ?5)
+    OR typeof(credential_id) NOT IN ('null', 'text')
+    OR (typeof(credential_id) = 'text'
+        AND length(CAST(credential_id AS BLOB)) NOT BETWEEN 1 AND ?3)
+    OR (kind = 'plain' AND credential_id IS NOT NULL)
+    OR (kind = 'secret' AND (plain_value IS NOT NULL OR credential_id IS NULL))
+    OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const ENV_VARS_BOUNDED_SELECT: &str = "SELECT key, kind, plain_value, credential_id
+    FROM env_vars WHERE profile_id = ?1
+    ORDER BY substr(CAST(key AS BLOB), 1, ?4), rowid LIMIT ?2";
+
+const DOTENV_CREDENTIALS_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT credential.rowid
+      FROM credentials credential
+     WHERE credential.provider = 'env'
+     ORDER BY substr(CAST(credential.id AS BLOB), 1, ?2), credential.rowid LIMIT ?1
+), sized AS MATERIALIZED (
+    SELECT credential.id, length(CAST(credential.id AS BLOB)) AS row_bytes
+      FROM selected JOIN credentials credential ON credential.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(id) != 'text' OR length(CAST(id AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const DOTENV_CREDENTIALS_BOUNDED_SELECT: &str = "SELECT credential.id
+      FROM credentials credential
+     WHERE credential.provider = 'env'
+     ORDER BY substr(CAST(credential.id AS BLOB), 1, ?2), credential.rowid LIMIT ?1";
+
+const ENV_API_COUNTS_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM workspaces
+     ORDER BY created_at, substr(CAST(id AS BLOB), 1, ?2), rowid LIMIT ?1
+), counted AS MATERIALIZED (
+    SELECT workspace.id,
+           (SELECT COUNT(*) FROM env_profiles profile
+             JOIN env_vars env ON env.profile_id = profile.id
+            WHERE profile.workspace_id = workspace.id) AS env_count,
+           (SELECT COUNT(*) FROM credentials credential
+             WHERE (credential.workspace_id IS NULL OR credential.workspace_id = workspace.id)
+               AND NOT EXISTS (SELECT 1 FROM env_vars hidden_env
+                 JOIN env_profiles hidden_profile ON hidden_profile.id = hidden_env.profile_id
+                WHERE hidden_profile.kind = 'dotenv'
+                  AND hidden_env.credential_id = credential.id)) AS key_count,
+           length(CAST(workspace.id AS BLOB)) AS row_bytes
+      FROM selected JOIN workspaces workspace ON workspace.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(id) != 'text' OR length(CAST(id AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(env_count) != 'integer' OR env_count < 0
+    OR typeof(key_count) != 'integer' OR key_count < 0
+    OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM counted";
+const ENV_API_COUNTS_BOUNDED_SELECT: &str = "SELECT workspace.id,
+       (SELECT COUNT(*) FROM env_profiles profile JOIN env_vars env ON env.profile_id = profile.id
+         WHERE profile.workspace_id = workspace.id),
+       (SELECT COUNT(*) FROM credentials credential
+         WHERE (credential.workspace_id IS NULL OR credential.workspace_id = workspace.id)
+           AND NOT EXISTS (SELECT 1 FROM env_vars hidden_env
+             JOIN env_profiles hidden_profile ON hidden_profile.id = hidden_env.profile_id
+            WHERE hidden_profile.kind = 'dotenv'
+              AND hidden_env.credential_id = credential.id))
+    FROM workspaces workspace
+    ORDER BY workspace.created_at, substr(CAST(workspace.id AS BLOB), 1, ?2), workspace.rowid
+    LIMIT ?1";
+
+const HOOK_SESSIONS_PREFIX_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_hook_sessions
+     WHERE updated_at > ?6 - 86400
+       AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2
+), sized AS MATERIALIZED (
+    SELECT hook.*, length(CAST(hook.session_key AS BLOB)) + length(CAST(hook.kind AS BLOB))
+         + length(CAST(hook.agent_session_id AS BLOB))
+         + length(CAST(hook.transcript_path AS BLOB)) AS row_bytes
+      FROM selected JOIN agent_hook_sessions hook ON hook.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(session_key) != 'text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(kind) != 'text' OR length(CAST(kind AS BLOB)) > ?4
+    OR typeof(agent_session_id) != 'text'
+       OR length(CAST(agent_session_id AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(transcript_path) != 'text' OR length(CAST(transcript_path AS BLOB)) > ?4
+    OR typeof(updated_at) != 'integer' OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const HOOK_SESSIONS_PREFIX_SELECT: &str =
+    "SELECT session_key, kind, agent_session_id, transcript_path
+    FROM agent_hook_sessions
+    WHERE updated_at > ?4 - 86400
+      AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+    ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2";
+
+const STATUSLINES_PREFIX_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_statusline
+     WHERE updated_at > ?6 - 3600
+       AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2
+), sized AS MATERIALIZED (
+    SELECT status.*, length(CAST(status.session_key AS BLOB))
+         + COALESCE(length(CAST(status.effort AS BLOB)), 0)
+         + COALESCE(length(CAST(status.model AS BLOB)), 0) AS row_bytes
+      FROM selected JOIN agent_statusline status ON status.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(session_key) != 'text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(effort) NOT IN ('null', 'text')
+       OR (typeof(effort) = 'text' AND length(CAST(effort AS BLOB)) > ?4)
+    OR typeof(model) NOT IN ('null', 'text')
+       OR (typeof(model) = 'text' AND length(CAST(model AS BLOB)) > ?4)
+    OR typeof(context_pct) NOT IN ('null', 'integer')
+    OR typeof(updated_at) != 'integer' OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const STATUSLINES_PREFIX_SELECT: &str = "SELECT session_key, effort, model, context_pct
+    FROM agent_statusline
+    WHERE updated_at > ?4 - 3600
+      AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+    ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2";
+
+const TURN_DONE_PREFIX_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_needs_input
+     WHERE turn_done = 1 AND updated_at > ?5 - 3600
+       AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2
+), sized AS MATERIALIZED (
+    SELECT state.*, length(CAST(state.session_key AS BLOB)) AS row_bytes
+      FROM selected JOIN agent_needs_input state ON state.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(session_key) != 'text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(updated_at) != 'integer' OR typeof(turn_done) != 'integer' OR turn_done != 1
+    OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const TURN_DONE_PREFIX_SELECT: &str = "SELECT session_key, updated_at FROM agent_needs_input
+    WHERE turn_done = 1 AND updated_at > ?4 - 3600
+      AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+    ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2";
+
+const WAITING_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_needs_input
+     WHERE waiting = 1 AND updated_at > ?5 - 3600
+     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
+), sized AS MATERIALIZED (
+    SELECT state.*, length(CAST(state.session_key AS BLOB))
+         + COALESCE(length(CAST(state.message AS BLOB)), 0) AS row_bytes
+      FROM selected JOIN agent_needs_input state ON state.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(session_key) != 'text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(message) NOT IN ('null', 'text')
+       OR (typeof(message) = 'text' AND length(CAST(message AS BLOB)) > ?3)
+    OR typeof(updated_at) != 'integer' OR typeof(waiting) != 'integer' OR waiting != 1
+    OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const WAITING_SESSIONS_SELECT: &str = "SELECT session_key, message FROM agent_needs_input
+    WHERE waiting = 1 AND updated_at > ?3 - 3600
+    ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
+
+const AGENT_SESSIONS_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_sessions WHERE workspace_id = ?1
+     ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2
+), sized AS MATERIALIZED (
+    SELECT session.*, length(CAST(session.pane_id AS BLOB))
+         + length(CAST(session.kind AS BLOB)) + length(CAST(session.session_id AS BLOB))
+         AS row_bytes
+      FROM selected JOIN agent_sessions session ON session.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(pane_id) != 'text' OR length(CAST(pane_id AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(kind) != 'text' OR length(CAST(kind AS BLOB)) > ?4
+    OR typeof(session_id) != 'text' OR length(CAST(session_id AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(updated_at) != 'integer' OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id
+    FROM agent_sessions WHERE workspace_id = ?1
+    ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2";
+
+#[derive(Debug, Clone, Copy)]
+struct BoundedReadProbe {
+    count: usize,
+}
+
+fn bounded_id_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= BOUNDED_ID_BYTES_MAX
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn bounded_session_key_prefix(session_key: &str) -> anyhow::Result<&str> {
+    anyhow::ensure!(
+        bounded_id_is_valid(session_key),
+        BOUNDED_WRITE_INPUT_INVALID
+    );
+    let (workspace_id, session_id) = session_key
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!(BOUNDED_WRITE_INPUT_INVALID))?;
+    anyhow::ensure!(
+        bounded_id_is_valid(workspace_id)
+            && bounded_id_is_valid(session_id)
+            && workspace_id.len() < BOUNDED_ID_BYTES_MAX,
+        BOUNDED_WRITE_INPUT_INVALID
+    );
+    Ok(&session_key[..workspace_id.len() + 1])
+}
+
+fn bounded_limit_plus_one(limit: usize, max: usize) -> anyhow::Result<i64> {
+    anyhow::ensure!(limit <= max, BOUNDED_READ_INPUT_INVALID);
+    let plus_one = limit
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!(BOUNDED_READ_INPUT_INVALID))?;
+    i64::try_from(plus_one).map_err(|_| anyhow::anyhow!(BOUNDED_READ_INPUT_INVALID))
+}
+
+fn bounded_text_is_valid(value: &str, max_bytes: usize) -> bool {
+    value.len() <= max_bytes && !value.as_bytes().contains(&0)
+}
+
+fn bounded_input_row_bytes(fields: &[&str]) -> anyhow::Result<usize> {
+    let bytes = fields
+        .iter()
+        .map(|field| field.len())
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| anyhow::anyhow!(BOUNDED_WRITE_INPUT_INVALID))?;
+    anyhow::ensure!(bytes <= BOUNDED_ROW_BYTES_MAX, BOUNDED_WRITE_INPUT_INVALID);
+    Ok(bytes)
+}
+
+fn bounded_read_preflight<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    limit: usize,
+) -> anyhow::Result<BoundedReadProbe> {
+    let raw = conn
+        .query_row(sql, params, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+    let count = usize::try_from(raw.0).map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?;
+    let invalid_rows =
+        usize::try_from(raw.1).map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?;
+    let retained_bytes =
+        usize::try_from(raw.2).map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?;
+    let max_row_bytes =
+        usize::try_from(raw.3).map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?;
+    anyhow::ensure!(count <= limit, BOUNDED_READ_LIMIT_EXCEEDED);
+    anyhow::ensure!(
+        invalid_rows == 0
+            && retained_bytes <= BOUNDED_RETAINED_BYTES_MAX
+            && max_row_bytes <= BOUNDED_ROW_BYTES_MAX,
+        BOUNDED_READ_ROW_INVALID
+    );
+    Ok(BoundedReadProbe { count })
+}
+
+fn bounded_snapshot_epoch(conn: &Connection) -> anyhow::Result<i64> {
+    let epoch = conn
+        .query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+    anyhow::ensure!(epoch >= 0, BOUNDED_READ_ROW_INVALID);
+    Ok(epoch)
+}
+
+fn bounded_required_text<'row>(
+    row: &'row rusqlite::Row<'_>,
+    index: usize,
+    max_bytes: usize,
+    require_nonempty: bool,
+    reject_ascii_control: bool,
+) -> anyhow::Result<&'row str> {
+    let rusqlite::types::ValueRef::Text(bytes) = row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?
+    else {
+        anyhow::bail!(BOUNDED_READ_ROW_INVALID);
+    };
+    anyhow::ensure!(
+        bytes.len() <= max_bytes
+            && (!require_nonempty || !bytes.is_empty())
+            && !bytes.contains(&0)
+            && (!reject_ascii_control || !bytes.iter().any(|byte| byte.is_ascii_control())),
+        BOUNDED_READ_ROW_INVALID
+    );
+    std::str::from_utf8(bytes).map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))
+}
+
+fn bounded_optional_text<'row>(
+    row: &'row rusqlite::Row<'_>,
+    index: usize,
+    max_bytes: usize,
+) -> anyhow::Result<Option<&'row str>> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?
+    {
+        rusqlite::types::ValueRef::Null => Ok(None),
+        rusqlite::types::ValueRef::Text(bytes)
+            if bytes.len() <= max_bytes && !bytes.contains(&0) =>
+        {
+            std::str::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))
+        }
+        _ => anyhow::bail!(BOUNDED_READ_ROW_INVALID),
+    }
+}
+
+fn bounded_integer(row: &rusqlite::Row<'_>, index: usize) -> anyhow::Result<i64> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?
+    {
+        rusqlite::types::ValueRef::Integer(value) => Ok(value),
+        _ => anyhow::bail!(BOUNDED_READ_ROW_INVALID),
+    }
+}
+
+fn bounded_optional_integer(row: &rusqlite::Row<'_>, index: usize) -> anyhow::Result<Option<i64>> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?
+    {
+        rusqlite::types::ValueRef::Null => Ok(None),
+        rusqlite::types::ValueRef::Integer(value) => Ok(Some(value)),
+        _ => anyhow::bail!(BOUNDED_READ_ROW_INVALID),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HookStateTable {
+    HookSessions,
+    NeedsInput,
+    Statusline,
+}
+
+fn evict_hook_state_overflow(
+    tx: &rusqlite::Transaction<'_>,
+    table: HookStateTable,
+    protected_session_key: &str,
+) -> anyhow::Result<()> {
+    let sql = match table {
+        HookStateTable::HookSessions => {
+            "DELETE FROM agent_hook_sessions
+              WHERE rowid IN (
+                    SELECT rowid FROM agent_hook_sessions
+                     WHERE session_key != ?1
+                     ORDER BY updated_at ASC,
+                              substr(CAST(session_key AS BLOB), 1, 1024), rowid
+                     LIMIT MAX((SELECT COUNT(*) FROM agent_hook_sessions) - ?2, 0)
+              )"
+        }
+        HookStateTable::NeedsInput => {
+            "DELETE FROM agent_needs_input
+              WHERE rowid IN (
+                    SELECT rowid FROM agent_needs_input
+                     WHERE session_key != ?1
+                     ORDER BY updated_at ASC,
+                              substr(CAST(session_key AS BLOB), 1, 1024), rowid
+                     LIMIT MAX((SELECT COUNT(*) FROM agent_needs_input) - ?2, 0)
+              )"
+        }
+        HookStateTable::Statusline => {
+            "DELETE FROM agent_statusline
+              WHERE rowid IN (
+                    SELECT rowid FROM agent_statusline
+                     WHERE session_key != ?1
+                     ORDER BY updated_at ASC,
+                              substr(CAST(session_key AS BLOB), 1, 1024), rowid
+                     LIMIT MAX((SELECT COUNT(*) FROM agent_statusline) - ?2, 0)
+              )"
+        }
+    };
+    tx.execute(
+        sql,
+        rusqlite::params![protected_session_key, HOOK_STATE_ROWS_MAX as i64],
+    )
+    .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+    Ok(())
+}
+
+fn evict_hook_state_prefix_overflow(
+    tx: &rusqlite::Transaction<'_>,
+    table: HookStateTable,
+    workspace_prefix: &str,
+    protected_session_key: &str,
+) -> anyhow::Result<()> {
+    let sql = match table {
+        HookStateTable::HookSessions => {
+            "DELETE FROM agent_hook_sessions
+              WHERE rowid IN (
+                    SELECT rowid FROM agent_hook_sessions
+                     WHERE substr(CAST(session_key AS BLOB), 1,
+                                  length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+                       AND session_key != ?2
+                     ORDER BY updated_at DESC,
+                              substr(CAST(session_key AS BLOB), 1, 1024) DESC,
+                              rowid DESC
+                     LIMIT -1 OFFSET CASE WHEN EXISTS (
+                         SELECT 1 FROM agent_hook_sessions
+                          WHERE substr(CAST(session_key AS BLOB), 1,
+                                       length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+                            AND session_key = ?2
+                     ) THEN ?3 - 1 ELSE ?3 END
+              )"
+        }
+        HookStateTable::NeedsInput => {
+            "DELETE FROM agent_needs_input
+              WHERE rowid IN (
+                    SELECT rowid FROM agent_needs_input
+                     WHERE substr(CAST(session_key AS BLOB), 1,
+                                  length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+                       AND session_key != ?2
+                     ORDER BY updated_at DESC,
+                              substr(CAST(session_key AS BLOB), 1, 1024) DESC,
+                              rowid DESC
+                     LIMIT -1 OFFSET CASE WHEN EXISTS (
+                         SELECT 1 FROM agent_needs_input
+                          WHERE substr(CAST(session_key AS BLOB), 1,
+                                       length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+                            AND session_key = ?2
+                     ) THEN ?3 - 1 ELSE ?3 END
+              )"
+        }
+        HookStateTable::Statusline => {
+            "DELETE FROM agent_statusline
+              WHERE rowid IN (
+                    SELECT rowid FROM agent_statusline
+                     WHERE substr(CAST(session_key AS BLOB), 1,
+                                  length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+                       AND session_key != ?2
+                     ORDER BY updated_at DESC,
+                              substr(CAST(session_key AS BLOB), 1, 1024) DESC,
+                              rowid DESC
+                     LIMIT -1 OFFSET CASE WHEN EXISTS (
+                         SELECT 1 FROM agent_statusline
+                          WHERE substr(CAST(session_key AS BLOB), 1,
+                                       length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
+                            AND session_key = ?2
+                     ) THEN ?3 - 1 ELSE ?3 END
+              )"
+        }
+    };
+    tx.execute(
+        sql,
+        rusqlite::params![
+            workspace_prefix,
+            protected_session_key,
+            HOOK_PREFIX_ROWS_MAX as i64,
+        ],
+    )
+    .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+    Ok(())
+}
+
 /// hook이 보고한 세션 바인딩 행 (v15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookSessionRow {
@@ -2741,6 +3428,49 @@ impl Db {
         Ok(out)
     }
 
+    /// Dotenv가 소유한 env-provider credential id만 SQL에서 제한·필터한다. 호출자는
+    /// 필요하면 이 deterministic Vec를 HashSet으로 투영할 수 있다.
+    pub fn list_dotenv_owned_credential_ids_bounded(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let sql_limit = bounded_limit_plus_one(limit, DOTENV_CREDENTIAL_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let probe = bounded_read_preflight(
+            &tx,
+            DOTENV_CREDENTIALS_BOUNDED_PREFLIGHT,
+            rusqlite::params![
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(DOTENV_CREDENTIALS_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![sql_limit, BOUNDED_ID_BYTES_MAX as i64])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(
+                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                );
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// MCP 서버 env가 참조하는 credential id 집합 — orphan 정리의 live set에 포함해
     /// 실제 사용 중인 MCP secret을 지우지 않게 한다(codex Med 2026-07-09).
     pub fn mcp_referenced_credential_ids(
@@ -3109,6 +3839,54 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    pub fn env_api_project_counts_bounded(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<EnvApiProjectCount>> {
+        let sql_limit = bounded_limit_plus_one(limit, ENV_API_PROJECT_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let probe = bounded_read_preflight(
+            &tx,
+            ENV_API_COUNTS_BOUNDED_PREFLIGHT,
+            rusqlite::params![
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(ENV_API_COUNTS_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![sql_limit, BOUNDED_ID_BYTES_MAX as i64])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                let workspace_id = bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?;
+                let env_count = bounded_integer(row, 1)?;
+                let key_count = bounded_integer(row, 2)?;
+                result.push(EnvApiProjectCount {
+                    workspace_id: workspace_id.to_owned(),
+                    env_count: usize::try_from(env_count)
+                        .map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?,
+                    key_count: usize::try_from(key_count)
+                        .map_err(|_| anyhow::anyhow!(BOUNDED_READ_ROW_INVALID))?,
+                });
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// workspace의 프로젝트 경로를 설정한다 (FT-0 — 컬럼은 v2부터 존재, 값 채움만).
     /// 감지된 에이전트 세션 하나를 upsert한다(옵션2). replace-all이 아니라 차등 upsert라
     /// 시작 직후(감지 전) 저장된 복원 데이터를 지우지 않는다.
@@ -3119,14 +3897,46 @@ impl Db {
         kind: &str,
         session_id: &str,
     ) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO agent_sessions
+        anyhow::ensure!(
+            bounded_id_is_valid(workspace_id)
+                && bounded_id_is_valid(pane_id)
+                && bounded_id_is_valid(session_id)
+                && !kind.is_empty()
+                && bounded_text_is_valid(kind, BOUNDED_TEXT_BYTES_MAX),
+            BOUNDED_WRITE_INPUT_INVALID
+        );
+        bounded_input_row_bytes(&[workspace_id, pane_id, kind, session_id])?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        let exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_sessions
+                  WHERE workspace_id = ?1 AND pane_id = ?2)",
+                (workspace_id, pane_id),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?
+            != 0;
+        let count = tx
+            .query_row(
+                "SELECT COUNT(*) FROM agent_sessions WHERE workspace_id = ?1",
+                [workspace_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        anyhow::ensure!(
+            exists || count < AGENT_SESSION_ROWS_MAX as i64,
+            AGENT_SESSION_CAPACITY_EXCEEDED
+        );
+        tx.execute(
+            "INSERT OR REPLACE INTO agent_sessions
                    (workspace_id, pane_id, kind, session_id, updated_at)
                  VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))",
-                (workspace_id, pane_id, kind, session_id),
-            )
-            .with_context(|| format!("agent session 저장 실패: {pane_id}"))?;
+            (workspace_id, pane_id, kind, session_id),
+        )
+        .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         Ok(())
     }
 
@@ -3167,15 +3977,34 @@ impl Db {
         agent_session_id: &str,
         transcript_path: &str,
     ) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO agent_hook_sessions
+        let workspace_prefix = bounded_session_key_prefix(session_key)?;
+        anyhow::ensure!(
+            bounded_id_is_valid(agent_session_id)
+                && !kind.is_empty()
+                && bounded_text_is_valid(kind, BOUNDED_TEXT_BYTES_MAX)
+                && bounded_text_is_valid(transcript_path, BOUNDED_TEXT_BYTES_MAX),
+            BOUNDED_WRITE_INPUT_INVALID
+        );
+        bounded_input_row_bytes(&[session_key, kind, agent_session_id, transcript_path])?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO agent_hook_sessions
                  (session_key, kind, agent_session_id, transcript_path, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
-                rusqlite::params![session_key, kind, agent_session_id, transcript_path],
-            )
-            .map(|_| ())
-            .map_err(Into::into)
+                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))",
+            rusqlite::params![session_key, kind, agent_session_id, transcript_path],
+        )
+        .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        evict_hook_state_prefix_overflow(
+            &tx,
+            HookStateTable::HookSessions,
+            workspace_prefix,
+            session_key,
+        )?;
+        evict_hook_state_overflow(&tx, HookStateTable::HookSessions, session_key)?;
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        Ok(())
     }
 
     /// hook이 보고한 바인딩 목록 (최근 24h — 죽은 세션 행이 영원히 남지 않게).
@@ -3197,6 +4026,77 @@ impl Db {
         Ok(rows)
     }
 
+    pub fn list_hook_sessions_for_prefix_bounded(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<HookSessionRow>> {
+        anyhow::ensure!(bounded_id_is_valid(prefix), BOUNDED_READ_INPUT_INVALID);
+        let sql_limit = bounded_limit_plus_one(limit, HOOK_PREFIX_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let snapshot_epoch = bounded_snapshot_epoch(&tx)?;
+        let probe = bounded_read_preflight(
+            &tx,
+            HOOK_SESSIONS_PREFIX_PREFLIGHT,
+            rusqlite::params![
+                prefix,
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+                snapshot_epoch,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(HOOK_SESSIONS_PREFIX_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    prefix,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(HookSessionRow {
+                    session_key: bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?
+                        .to_owned(),
+                    kind: bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?
+                        .to_owned(),
+                    agent_session_id: bounded_required_text(
+                        row,
+                        2,
+                        BOUNDED_ID_BYTES_MAX,
+                        true,
+                        true,
+                    )?
+                    .to_owned(),
+                    transcript_path: bounded_required_text(
+                        row,
+                        3,
+                        BOUNDED_TEXT_BYTES_MAX,
+                        false,
+                        false,
+                    )?
+                    .to_owned(),
+                });
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// needsInput 기록. `message`는 hook이 보고한 대기 사유 문구(claude Notification의
     /// payload.message) — 없으면 None. clear(waiting=false) 시에는 문구도 함께 지운다
     /// (해소된 질문이 다음 대기에 되살아나면 안 된다).
@@ -3206,14 +4106,30 @@ impl Db {
         waiting: bool,
         message: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO agent_needs_input
+        let workspace_prefix = bounded_session_key_prefix(session_key)?;
+        anyhow::ensure!(
+            message.is_none_or(|value| { bounded_text_is_valid(value, BOUNDED_MESSAGE_BYTES_MAX) }),
+            BOUNDED_WRITE_INPUT_INVALID
+        );
+        bounded_input_row_bytes(&[session_key, message.unwrap_or_default()])?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO agent_needs_input
                      (session_key, waiting, updated_at, message)
                  VALUES (?1, ?2, CAST(strftime('%s','now') AS INTEGER), ?3)",
-                (session_key, waiting as i64, message.filter(|_| waiting)),
-            )
-            .with_context(|| format!("needsInput 저장 실패: {session_key}"))?;
+            (session_key, waiting as i64, message.filter(|_| waiting)),
+        )
+        .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        evict_hook_state_prefix_overflow(
+            &tx,
+            HookStateTable::NeedsInput,
+            workspace_prefix,
+            session_key,
+        )?;
+        evict_hook_state_overflow(&tx, HookStateTable::NeedsInput, session_key)?;
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         Ok(())
     }
 
@@ -3229,16 +4145,76 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn list_waiting_sessions_bounded(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, Option<String>)>> {
+        let sql_limit = bounded_limit_plus_one(limit, WAITING_SESSION_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let snapshot_epoch = bounded_snapshot_epoch(&tx)?;
+        let probe = bounded_read_preflight(
+            &tx,
+            WAITING_SESSIONS_PREFLIGHT,
+            rusqlite::params![
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_MESSAGE_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+                snapshot_epoch,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(WAITING_SESSIONS_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push((
+                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                    bounded_optional_text(row, 1, BOUNDED_MESSAGE_BYTES_MAX)?.map(str::to_owned),
+                ));
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// 턴 완료(Stop hook) 기록 — waiting은 0으로 함께 리셋한다(턴이 끝났으므로).
     pub fn set_agent_turn_done(&self, session_key: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO agent_needs_input
+        let workspace_prefix = bounded_session_key_prefix(session_key)?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO agent_needs_input
                      (session_key, waiting, turn_done, updated_at)
                  VALUES (?1, 0, 1, CAST(strftime('%s','now') AS INTEGER))",
-                (session_key,),
-            )
-            .with_context(|| format!("turn_done 저장 실패: {session_key}"))?;
+            (session_key,),
+        )
+        .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        evict_hook_state_prefix_overflow(
+            &tx,
+            HookStateTable::NeedsInput,
+            workspace_prefix,
+            session_key,
+        )?;
+        evict_hook_state_overflow(&tx, HookStateTable::NeedsInput, session_key)?;
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         Ok(())
     }
 
@@ -3246,13 +4222,24 @@ impl Db {
     /// `seen_at`(내가 읽은 updated_at) 이후에 도착한 새 완료 이벤트는 지우지 않는다 —
     /// 읽기~clear 사이 새 Stop이 오면 그 알림까지 유실되던 레이스 방지(codex 리뷰).
     pub fn clear_agent_turn_done(&self, session_key: &str, seen_at: i64) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE agent_needs_input SET turn_done = 0
+        let workspace_prefix = bounded_session_key_prefix(session_key)?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        tx.execute(
+            "UPDATE agent_needs_input SET turn_done = 0
                  WHERE session_key = ?1 AND updated_at <= ?2",
-                (session_key, seen_at),
-            )
-            .with_context(|| format!("turn_done 해제 실패: {session_key}"))?;
+            (session_key, seen_at),
+        )
+        .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        evict_hook_state_prefix_overflow(
+            &tx,
+            HookStateTable::NeedsInput,
+            workspace_prefix,
+            session_key,
+        )?;
+        evict_hook_state_overflow(&tx, HookStateTable::NeedsInput, session_key)?;
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         Ok(())
     }
 
@@ -3265,14 +4252,36 @@ impl Db {
         model: Option<&str>,
         context_pct: Option<i64>,
     ) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO agent_statusline
+        let workspace_prefix = bounded_session_key_prefix(session_key)?;
+        anyhow::ensure!(
+            effort.is_none_or(|value| { bounded_text_is_valid(value, BOUNDED_TEXT_BYTES_MAX) })
+                && model
+                    .is_none_or(|value| { bounded_text_is_valid(value, BOUNDED_TEXT_BYTES_MAX) }),
+            BOUNDED_WRITE_INPUT_INVALID
+        );
+        bounded_input_row_bytes(&[
+            session_key,
+            effort.unwrap_or_default(),
+            model.unwrap_or_default(),
+        ])?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO agent_statusline
                      (session_key, effort, model, context_pct, updated_at)
                  VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))",
-                (session_key, effort, model, context_pct),
-            )
-            .with_context(|| format!("statusline 저장 실패: {session_key}"))?;
+            (session_key, effort, model, context_pct),
+        )
+        .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        evict_hook_state_prefix_overflow(
+            &tx,
+            HookStateTable::Statusline,
+            workspace_prefix,
+            session_key,
+        )?;
+        evict_hook_state_overflow(&tx, HookStateTable::Statusline, session_key)?;
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         Ok(())
     }
 
@@ -3293,6 +4302,64 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn list_statuslines_for_prefix_bounded(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<StatuslineRow>> {
+        anyhow::ensure!(bounded_id_is_valid(prefix), BOUNDED_READ_INPUT_INVALID);
+        let sql_limit = bounded_limit_plus_one(limit, HOOK_PREFIX_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let snapshot_epoch = bounded_snapshot_epoch(&tx)?;
+        let probe = bounded_read_preflight(
+            &tx,
+            STATUSLINES_PREFIX_PREFLIGHT,
+            rusqlite::params![
+                prefix,
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+                snapshot_epoch,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(STATUSLINES_PREFIX_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    prefix,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(StatuslineRow {
+                    session_key: bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?
+                        .to_owned(),
+                    effort: bounded_optional_text(row, 1, BOUNDED_TEXT_BYTES_MAX)?
+                        .map(str::to_owned),
+                    model: bounded_optional_text(row, 2, BOUNDED_TEXT_BYTES_MAX)?
+                        .map(str::to_owned),
+                    context_pct: bounded_optional_integer(row, 3)?,
+                });
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// 턴 완료(미확인) 세션 (key, updated_at) 목록. waiting과 같은 1시간 stale 컷오프.
     /// updated_at은 소비 시 조건부 clear의 세대 기준으로 쓴다.
     pub fn list_turn_done_sessions(&self) -> anyhow::Result<Vec<(String, i64)>> {
@@ -3305,6 +4372,58 @@ impl Db {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_turn_done_sessions_for_prefix_bounded(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, i64)>> {
+        anyhow::ensure!(bounded_id_is_valid(prefix), BOUNDED_READ_INPUT_INVALID);
+        let sql_limit = bounded_limit_plus_one(limit, HOOK_PREFIX_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let snapshot_epoch = bounded_snapshot_epoch(&tx)?;
+        let probe = bounded_read_preflight(
+            &tx,
+            TURN_DONE_PREFIX_PREFLIGHT,
+            rusqlite::params![
+                prefix,
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+                snapshot_epoch,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(TURN_DONE_PREFIX_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    prefix,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push((
+                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                    bounded_integer(row, 1)?,
+                ));
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
     }
 
     /// 워크스페이스의 저장된 에이전트 세션 (복원 시 resume 대상).
@@ -3322,6 +4441,63 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn list_agent_sessions_bounded(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSessionRow>> {
+        anyhow::ensure!(
+            bounded_id_is_valid(workspace_id),
+            BOUNDED_READ_INPUT_INVALID
+        );
+        let sql_limit = bounded_limit_plus_one(limit, AGENT_SESSION_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let probe = bounded_read_preflight(
+            &tx,
+            AGENT_SESSIONS_BOUNDED_PREFLIGHT,
+            rusqlite::params![
+                workspace_id,
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(AGENT_SESSIONS_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    workspace_id,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(AgentSessionRow {
+                    pane_id: bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?
+                        .to_owned(),
+                    kind: bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?
+                        .to_owned(),
+                    session_id: bounded_required_text(row, 2, BOUNDED_ID_BYTES_MAX, true, true)?
+                        .to_owned(),
+                });
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// 구조화 Codex thread 메타데이터를 저장한다. local/thread ID는 모두 durable하며,
     /// 갱신 시 created_at은 보존하고 updated_at만 현재 시각으로 올린다.
     #[allow(clippy::too_many_arguments)]
@@ -3336,6 +4512,14 @@ impl Db {
         favorite: bool,
         archived: bool,
     ) -> anyhow::Result<()> {
+        structured_thread_input_bytes(
+            local_session_id,
+            workspace_id,
+            thread_id,
+            title,
+            cwd,
+            model,
+        )?;
         self.conn
             .execute(
                 "INSERT INTO structured_threads
@@ -3364,7 +4548,7 @@ impl Db {
                     archived as i64,
                 ],
             )
-            .with_context(|| format!("structured thread 저장 실패: {thread_id}"))?;
+            .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_PERSIST_FAILED))?;
         Ok(())
     }
 
@@ -3379,30 +4563,140 @@ impl Db {
         workspace_id: &str,
         include_archived: bool,
     ) -> anyhow::Result<Vec<StructuredThreadRow>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT local_session_id, workspace_id, thread_id, title, cwd, model,
-                    favorite, archived, created_at, updated_at
-               FROM structured_threads
-              WHERE workspace_id = ?1 AND (?2 = 1 OR archived = 0)
-              ORDER BY favorite DESC, updated_at DESC, local_session_id
-              LIMIT {}",
-            Self::STRUCTURED_THREADS_LIST_CAP
-        ))?;
-        let rows = stmt.query_map((workspace_id, include_archived as i64), |row| {
-            Ok(StructuredThreadRow {
-                local_session_id: row.get(0)?,
-                workspace_id: row.get(1)?,
-                thread_id: row.get(2)?,
-                title: row.get(3)?,
-                cwd: row.get(4)?,
-                model: row.get(5)?,
-                favorite: row.get::<_, i64>(6)? != 0,
-                archived: row.get::<_, i64>(7)? != 0,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        self.list_structured_threads_bounded(
+            workspace_id,
+            include_archived,
+            Self::STRUCTURED_THREADS_LIST_CAP,
+        )
+    }
+
+    /// `list_structured_threads`와 같은 정렬/필터를 사용하되 호출자가 현재 남은
+    /// projection 용량만 요청할 수 있게 한다. 선택된 SQLite 행 전체의 타입과 byte
+    /// budget을 같은 statement snapshot에서 검증한 뒤에만 Rust String을 만든다.
+    pub fn list_structured_threads_bounded(
+        &self,
+        workspace_id: &str,
+        include_archived: bool,
+        limit: usize,
+    ) -> anyhow::Result<Vec<StructuredThreadRow>> {
+        anyhow::ensure!(
+            structured_thread_id_is_valid(workspace_id)
+                && limit <= Self::STRUCTURED_THREADS_LIST_CAP,
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit =
+            i64::try_from(limit).map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_INPUT_INVALID))?;
+        let mut stmt = self
+            .conn
+            .prepare(STRUCTURED_THREADS_BOUNDED_QUERY)
+            .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_QUERY_FAILED))?;
+        let mut rows = stmt
+            .query(rusqlite::params![
+                workspace_id,
+                include_archived as i64,
+                limit,
+                STRUCTURED_THREAD_ID_BYTES_MAX as i64,
+                STRUCTURED_THREAD_CWD_BYTES_MAX as i64,
+                STRUCTURED_THREAD_MODEL_BYTES_MAX as i64,
+                STRUCTURED_THREAD_ROW_BYTES_MAX as i64,
+                STRUCTURED_THREADS_RETAINED_BYTES_MAX as i64,
+            ])
+            .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_QUERY_FAILED))?;
+        let mut result = Vec::with_capacity(limit as usize);
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_QUERY_FAILED))?
+        {
+            let row_kind = structured_thread_integer(row, 0)?;
+            let invalid_rows = structured_thread_integer(row, 11)?;
+            let retained_bytes = structured_thread_integer(row, 12)?;
+            anyhow::ensure!(
+                invalid_rows == 0
+                    && retained_bytes >= 0
+                    && usize::try_from(retained_bytes)
+                        .is_ok_and(|bytes| { bytes <= STRUCTURED_THREADS_RETAINED_BYTES_MAX }),
+                STRUCTURED_THREAD_ROW_INVALID
+            );
+            if row_kind == 0 {
+                continue;
+            }
+            anyhow::ensure!(row_kind == 1, STRUCTURED_THREAD_ROW_INVALID);
+
+            let local_session_id = structured_thread_required_text(
+                row,
+                1,
+                STRUCTURED_THREAD_ID_BYTES_MAX,
+                true,
+                true,
+                false,
+            )?;
+            let row_workspace_id = structured_thread_required_text(
+                row,
+                2,
+                STRUCTURED_THREAD_ID_BYTES_MAX,
+                true,
+                true,
+                false,
+            )?;
+            let thread_id = structured_thread_required_text(
+                row,
+                3,
+                STRUCTURED_THREAD_ID_BYTES_MAX,
+                true,
+                true,
+                false,
+            )?;
+            let title = structured_thread_required_text(
+                row,
+                4,
+                STRUCTURED_THREAD_ROW_BYTES_MAX,
+                false,
+                false,
+                false,
+            )?;
+            let cwd = structured_thread_required_text(
+                row,
+                5,
+                STRUCTURED_THREAD_CWD_BYTES_MAX,
+                false,
+                false,
+                true,
+            )?;
+            let model = structured_thread_optional_text(row, 6, STRUCTURED_THREAD_MODEL_BYTES_MAX)?;
+            let favorite = structured_thread_integer(row, 7)?;
+            let archived = structured_thread_integer(row, 8)?;
+            let created_at = structured_thread_integer(row, 9)?;
+            let updated_at = structured_thread_integer(row, 10)?;
+            anyhow::ensure!(
+                matches!(favorite, 0 | 1) && matches!(archived, 0 | 1),
+                STRUCTURED_THREAD_ROW_INVALID
+            );
+            structured_thread_input_bytes(
+                local_session_id,
+                row_workspace_id,
+                thread_id,
+                title,
+                cwd,
+                model,
+            )
+            .map_err(|_| anyhow::anyhow!(STRUCTURED_THREAD_ROW_INVALID))?;
+            result.push(StructuredThreadRow {
+                local_session_id: local_session_id.to_owned(),
+                workspace_id: row_workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                title: title.to_owned(),
+                cwd: cwd.to_owned(),
+                model: model.map(str::to_owned),
+                favorite: favorite != 0,
+                archived: archived != 0,
+                created_at,
+                updated_at,
+            });
+        }
+        Ok(result)
     }
 
     pub fn set_structured_thread_favorite(
@@ -4855,6 +6149,66 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    pub fn list_env_profiles_bounded(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<EnvProfileRow>> {
+        anyhow::ensure!(
+            bounded_id_is_valid(workspace_id),
+            BOUNDED_READ_INPUT_INVALID
+        );
+        let sql_limit = bounded_limit_plus_one(limit, ENV_PROFILE_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let probe = bounded_read_preflight(
+            &tx,
+            ENV_PROFILES_BOUNDED_PREFLIGHT,
+            rusqlite::params![
+                workspace_id,
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(ENV_PROFILES_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    workspace_id,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                let id = bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?;
+                let name = bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, false, false)?;
+                let kind = bounded_required_text(row, 2, BOUNDED_TEXT_BYTES_MAX, false, false)?;
+                let is_production = bounded_integer(row, 3)?;
+                anyhow::ensure!(matches!(is_production, 0 | 1), BOUNDED_READ_ROW_INVALID);
+                result.push(EnvProfileRow {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    kind: kind.to_owned(),
+                    is_production: is_production != 0,
+                });
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// profile과 소속 env var를 한 트랜잭션으로 삭제한다.
     pub fn delete_env_profile(&mut self, id: &str) -> anyhow::Result<()> {
         let tx = self.conn.transaction()?;
@@ -4918,6 +6272,68 @@ impl Db {
             Ok(EnvVarRow { key, value })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn list_env_vars_bounded(
+        &self,
+        profile_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<EnvVarRow>> {
+        anyhow::ensure!(bounded_id_is_valid(profile_id), BOUNDED_READ_INPUT_INVALID);
+        let sql_limit = bounded_limit_plus_one(limit, ENV_VAR_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let probe = bounded_read_preflight(
+            &tx,
+            ENV_VARS_BOUNDED_PREFLIGHT,
+            rusqlite::params![
+                profile_id,
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(ENV_VARS_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    profile_id,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_TEXT_BYTES_MAX as i64,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                let key = bounded_required_text(row, 0, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                let kind = bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                let plain = bounded_optional_text(row, 2, BOUNDED_MESSAGE_BYTES_MAX)?;
+                let credential_id = bounded_optional_text(row, 3, BOUNDED_ID_BYTES_MAX)?;
+                let value = match (kind, plain, credential_id) {
+                    ("secret", None, Some(id)) if !id.is_empty() => EnvValue::Secret {
+                        credential_id: id.to_owned(),
+                    },
+                    ("plain", value, None) => EnvValue::Plain(value.unwrap_or_default().to_owned()),
+                    _ => anyhow::bail!(BOUNDED_READ_ROW_INVALID),
+                };
+                result.push(EnvVarRow {
+                    key: key.to_owned(),
+                    value,
+                });
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
     }
 
     pub fn delete_env_var(&self, profile_id: &str, key: &str) -> anyhow::Result<()> {
@@ -5876,11 +7292,356 @@ mod tests {
     }
 
     #[test]
+    fn structured_thread_admission은_필드와_행_byte_상한의_exact만_허용한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("structured-bounds").unwrap();
+        let exact_id = "i".repeat(STRUCTURED_THREAD_ID_BYTES_MAX);
+        let exact_thread_id = "t".repeat(STRUCTURED_THREAD_ID_BYTES_MAX);
+        let exact_cwd = "c".repeat(STRUCTURED_THREAD_CWD_BYTES_MAX);
+        let exact_model = "m".repeat(STRUCTURED_THREAD_MODEL_BYTES_MAX);
+        db.upsert_structured_thread(
+            &exact_id,
+            &ws,
+            &exact_thread_id,
+            "",
+            &exact_cwd,
+            Some(&exact_model),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let id_too_large = "i".repeat(STRUCTURED_THREAD_ID_BYTES_MAX + 1);
+        assert_eq!(
+            db.upsert_structured_thread(
+                &id_too_large,
+                &ws,
+                "thread-id-plus-one",
+                "",
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string(),
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+        let cwd_too_large = "c".repeat(STRUCTURED_THREAD_CWD_BYTES_MAX + 1);
+        assert_eq!(
+            db.upsert_structured_thread(
+                "local-cwd-plus-one",
+                &ws,
+                "thread-cwd-plus-one",
+                "",
+                &cwd_too_large,
+                None,
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string(),
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+        let model_too_large = "m".repeat(STRUCTURED_THREAD_MODEL_BYTES_MAX + 1);
+        assert_eq!(
+            db.upsert_structured_thread(
+                "local-model-plus-one",
+                &ws,
+                "thread-model-plus-one",
+                "",
+                "",
+                Some(&model_too_large),
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string(),
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+
+        let exact_local = "local-row-exact";
+        let exact_thread = "thread-row-exact";
+        let exact_title_bytes =
+            STRUCTURED_THREAD_ROW_BYTES_MAX - exact_local.len() - ws.len() - exact_thread.len();
+        db.upsert_structured_thread(
+            exact_local,
+            &ws,
+            exact_thread,
+            &"x".repeat(exact_title_bytes),
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let plus_local = "local-row-plus-one";
+        let plus_thread = "thread-row-plus-one";
+        let plus_title_bytes =
+            STRUCTURED_THREAD_ROW_BYTES_MAX + 1 - plus_local.len() - ws.len() - plus_thread.len();
+        assert_eq!(
+            db.upsert_structured_thread(
+                plus_local,
+                &ws,
+                plus_thread,
+                &"x".repeat(plus_title_bytes),
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string(),
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+        assert_eq!(
+            db.upsert_structured_thread(
+                "local\ncontrol",
+                &ws,
+                "thread-control-id",
+                "",
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string(),
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+        assert_eq!(
+            db.upsert_structured_thread(
+                "local-cwd-nul",
+                &ws,
+                "thread-cwd-nul",
+                "",
+                "/repo\0hidden",
+                None,
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string(),
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+        assert_eq!(db.list_structured_threads(&ws, true).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn structured_thread_selected_cte는_rowid만_materialize한다() {
+        let selected_projection = STRUCTURED_THREADS_BOUNDED_QUERY
+            .split_once("FROM structured_threads")
+            .unwrap()
+            .0;
+        assert!(selected_projection.contains("SELECT rowid"));
+        for raw_field in [
+            "local_session_id",
+            "workspace_id",
+            "thread_id",
+            "title",
+            "cwd",
+            "model",
+        ] {
+            assert!(!selected_projection.contains(raw_field), "{raw_field}");
+        }
+        assert!(STRUCTURED_THREADS_BOUNDED_QUERY.contains("selected AS MATERIALIZED"));
+        assert!(STRUCTURED_THREADS_BOUNDED_QUERY.contains("validation AS MATERIALIZED"));
+    }
+
+    #[test]
+    fn structured_thread_bounded_list는_기존_tie_break_order를_보존한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("structured-order").unwrap();
+        for id in ["z", "b", "a"] {
+            db.upsert_structured_thread(
+                &format!("local-{id}"),
+                &ws,
+                &format!("thread-{id}"),
+                "",
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        db.conn
+            .execute(
+                "UPDATE structured_threads SET updated_at = 1 WHERE workspace_id = ?1",
+                [&ws],
+            )
+            .unwrap();
+
+        let ids = db
+            .list_structured_threads_bounded(&ws, true, 2)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.local_session_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["local-a", "local-b"]);
+    }
+
+    #[test]
+    fn structured_thread_query는_bounded_control_id를_clone전에_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("structured-control").unwrap();
+        db.upsert_structured_thread(
+            "local-control",
+            &ws,
+            "thread-control",
+            "title",
+            "/repo",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE structured_threads SET thread_id = 'thread' || char(10) || 'control'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.list_structured_threads_bounded(&ws, true, 1)
+                .unwrap_err()
+                .to_string(),
+            STRUCTURED_THREAD_ROW_INVALID
+        );
+        db.conn
+            .execute(
+                "UPDATE structured_threads
+                    SET thread_id = 'thread-control', cwd = '/repo' || char(0) || 'hidden'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_structured_threads_bounded(&ws, true, 1)
+                .unwrap_err()
+                .to_string(),
+            STRUCTURED_THREAD_ROW_INVALID
+        );
+        assert_eq!(
+            db.list_structured_threads_bounded("workspace\u{7f}control", true, 0)
+                .unwrap_err()
+                .to_string(),
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+    }
+
+    #[test]
+    fn structured_thread_bounded_list는_zero_small_limit과_corrupt_sqlite_type을_처리한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("structured-limit").unwrap();
+        for index in 0..3 {
+            db.upsert_structured_thread(
+                &format!("local-{index}"),
+                &ws,
+                &format!("thread-{index}"),
+                "title",
+                "/repo",
+                None,
+                index == 0,
+                false,
+            )
+            .unwrap();
+        }
+
+        assert!(
+            db.list_structured_threads_bounded(&ws, true, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.list_structured_threads_bounded(&ws, true, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.list_structured_threads_bounded(&ws, true, 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            db.list_structured_threads_bounded(&ws, true, Db::STRUCTURED_THREADS_LIST_CAP + 1,)
+                .unwrap_err()
+                .to_string(),
+            STRUCTURED_THREAD_INPUT_INVALID
+        );
+
+        db.conn
+            .execute(
+                "UPDATE structured_threads SET title = x'ff' WHERE local_session_id = 'local-0'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.list_structured_threads_bounded(&ws, true, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.list_structured_threads_bounded(&ws, true, 1)
+                .unwrap_err()
+                .to_string(),
+            STRUCTURED_THREAD_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn structured_thread_bounded_list는_aggregate_retained_budget을_넘지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("structured-aggregate").unwrap();
+        let exact_row_count =
+            STRUCTURED_THREADS_RETAINED_BYTES_MAX / STRUCTURED_THREAD_ROW_BYTES_MAX;
+        assert_eq!(exact_row_count, 128);
+        for index in 0..=exact_row_count {
+            let local_session_id = format!("local-{index:03}");
+            let thread_id = format!("thread-{index:03}");
+            let title_bytes = STRUCTURED_THREAD_ROW_BYTES_MAX
+                - local_session_id.len()
+                - ws.len()
+                - thread_id.len();
+            db.upsert_structured_thread(
+                &local_session_id,
+                &ws,
+                &thread_id,
+                &"x".repeat(title_bytes),
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.list_structured_threads_bounded(&ws, true, exact_row_count)
+                .unwrap()
+                .len(),
+            exact_row_count
+        );
+        assert_eq!(
+            db.list_structured_threads_bounded(&ws, true, exact_row_count + 1)
+                .unwrap_err()
+                .to_string(),
+            STRUCTURED_THREAD_ROW_INVALID
+        );
+    }
+
+    #[test]
     fn agent_needs_input_set_clear_list() {
         let db = Db::open_in_memory().unwrap();
-        db.set_agent_needs_input("pane-1", true, None).unwrap();
-        db.set_agent_needs_input("pane-2", true, None).unwrap();
-        db.set_agent_needs_input("pane-3", false, None).unwrap();
+        db.set_agent_needs_input("workspace:pane-1", true, None)
+            .unwrap();
+        db.set_agent_needs_input("workspace:pane-2", true, None)
+            .unwrap();
+        db.set_agent_needs_input("workspace:pane-3", false, None)
+            .unwrap();
         let mut waiting: Vec<String> = db
             .list_waiting_sessions()
             .unwrap()
@@ -5888,12 +7649,19 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         waiting.sort();
-        assert_eq!(waiting, vec!["pane-1".to_string(), "pane-2".to_string()]);
+        assert_eq!(
+            waiting,
+            vec![
+                "workspace:pane-1".to_string(),
+                "workspace:pane-2".to_string()
+            ]
+        );
         // clear → 목록에서 빠짐
-        db.set_agent_needs_input("pane-1", false, None).unwrap();
+        db.set_agent_needs_input("workspace:pane-1", false, None)
+            .unwrap();
         assert_eq!(
             db.list_waiting_sessions().unwrap(),
-            vec![("pane-2".to_string(), None)]
+            vec![("workspace:pane-2".to_string(), None)]
         );
     }
 
@@ -5903,7 +7671,7 @@ mod tests {
     fn agent_needs_input_message_저장과_clear시_소거() {
         let db = Db::open_in_memory().unwrap();
         db.set_agent_needs_input(
-            "pane-1",
+            "workspace:pane-1",
             true,
             Some("Claude needs your permission to use Bash"),
         )
@@ -5911,16 +7679,18 @@ mod tests {
         assert_eq!(
             db.list_waiting_sessions().unwrap(),
             vec![(
-                "pane-1".to_string(),
+                "workspace:pane-1".to_string(),
                 Some("Claude needs your permission to use Bash".to_string())
             )]
         );
         // clear 후 다시 대기 — 이전 문구가 남아 있으면 안 된다.
-        db.set_agent_needs_input("pane-1", false, None).unwrap();
-        db.set_agent_needs_input("pane-1", true, None).unwrap();
+        db.set_agent_needs_input("workspace:pane-1", false, None)
+            .unwrap();
+        db.set_agent_needs_input("workspace:pane-1", true, None)
+            .unwrap();
         assert_eq!(
             db.list_waiting_sessions().unwrap(),
-            vec![("pane-1".to_string(), None)]
+            vec![("workspace:pane-1".to_string(), None)]
         );
     }
 
@@ -5928,25 +7698,28 @@ mod tests {
     fn agent_turn_done_set_clear_및_needs_input과_상호리셋() {
         let db = Db::open_in_memory().unwrap();
         // Stop hook → turn_done=1, waiting=0
-        db.set_agent_turn_done("pane-1").unwrap();
+        db.set_agent_turn_done("workspace:pane-1").unwrap();
         let listed = db.list_turn_done_sessions().unwrap();
         assert_eq!(listed.len(), 1);
         let (key, seen_at) = listed[0].clone();
-        assert_eq!(key, "pane-1");
+        assert_eq!(key, "workspace:pane-1");
         assert!(db.list_waiting_sessions().unwrap().is_empty());
         // 읽은 세대 이전 이벤트만 소비 — 더 새 이벤트(seen_at 미래)는 남는다(레이스 방지)
-        db.clear_agent_turn_done("pane-1", seen_at - 1).unwrap();
+        db.clear_agent_turn_done("workspace:pane-1", seen_at - 1)
+            .unwrap();
         assert_eq!(db.list_turn_done_sessions().unwrap().len(), 1);
         // 확인(소비) → turn_done만 내림
-        db.clear_agent_turn_done("pane-1", seen_at).unwrap();
+        db.clear_agent_turn_done("workspace:pane-1", seen_at)
+            .unwrap();
         assert!(db.list_turn_done_sessions().unwrap().is_empty());
         // needs-input(REPLACE)이 turn_done을 자연 리셋
-        db.set_agent_turn_done("pane-2").unwrap();
-        db.set_agent_needs_input("pane-2", true, None).unwrap();
+        db.set_agent_turn_done("workspace:pane-2").unwrap();
+        db.set_agent_needs_input("workspace:pane-2", true, None)
+            .unwrap();
         assert!(db.list_turn_done_sessions().unwrap().is_empty());
         assert_eq!(
             db.list_waiting_sessions().unwrap(),
-            vec![("pane-2".to_string(), None)]
+            vec![("workspace:pane-2".to_string(), None)]
         );
     }
 
@@ -11259,6 +13032,694 @@ mod tests {
             db.poll_approval("approval-delete-fail").unwrap().status,
             ApprovalStatus::Pending
         );
+    }
+
+    #[test]
+    fn bounded_env_projection은_sql_filter_order와_limit_plus_one을_강제한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.ensure_default_workspace().unwrap();
+        let dotenv = db.insert_env_profile(&workspace, ".env", "dotenv").unwrap();
+        let local = db.insert_env_profile(&workspace, "local", "local").unwrap();
+        let mut owned = sample("owned-env");
+        owned.provider = "env".to_owned();
+        let mut foreign = sample("foreign-provider");
+        foreign.provider = "github".to_owned();
+        let mut unreferenced_owned = sample("orphan-env");
+        unreferenced_owned.provider = "env".to_owned();
+        db.insert_credential(&owned).unwrap();
+        db.insert_credential(&foreign).unwrap();
+        db.insert_credential(&unreferenced_owned).unwrap();
+        db.upsert_env_var(
+            &dotenv,
+            "OWNED",
+            &EnvValue::Secret {
+                credential_id: owned.id.clone(),
+            },
+        )
+        .unwrap();
+        db.upsert_env_var(
+            &dotenv,
+            "FOREIGN",
+            &EnvValue::Secret {
+                credential_id: foreign.id.clone(),
+            },
+        )
+        .unwrap();
+        db.upsert_env_var(&local, "PORT", &EnvValue::Plain("3000".to_owned()))
+            .unwrap();
+
+        assert_eq!(
+            db.list_env_profiles_bounded(&workspace, 2).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            db.list_env_profiles_bounded(&workspace, 1)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_LIMIT_EXCEEDED
+        );
+        assert_eq!(db.list_env_vars_bounded(&dotenv, 2).unwrap().len(), 2);
+        assert_eq!(
+            db.list_dotenv_owned_credential_ids_bounded(2).unwrap(),
+            vec![unreferenced_owned.id, owned.id]
+        );
+        assert_eq!(db.env_api_project_counts_bounded(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bounded_projection_empty_snapshot은_zero_limit으로_완전하다() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(
+            db.list_env_profiles_bounded("workspace", 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.list_env_vars_bounded("profile", 0).unwrap().is_empty());
+        assert!(
+            db.list_dotenv_owned_credential_ids_bounded(0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.env_api_project_counts_bounded(0).unwrap().is_empty());
+        assert!(
+            db.list_hook_sessions_for_prefix_bounded("workspace:", 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_statuslines_for_prefix_bounded("workspace:", 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_turn_done_sessions_for_prefix_bounded("workspace:", 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.list_waiting_sessions_bounded(0).unwrap().is_empty());
+        assert!(
+            db.list_agent_sessions_bounded("workspace", 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_env_projection은_4mib_exact와_plus_one을_구분한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.ensure_default_workspace().unwrap();
+        let profile = db
+            .insert_env_profile(&workspace, "aggregate", "local")
+            .unwrap();
+        for index in 0..128 {
+            let key = format!("K{index:03}");
+            let value_bytes = BOUNDED_ROW_BYTES_MAX - key.len() - "plain".len();
+            db.upsert_env_var(&profile, &key, &EnvValue::Plain("x".repeat(value_bytes)))
+                .unwrap();
+        }
+        assert_eq!(db.list_env_vars_bounded(&profile, 128).unwrap().len(), 128);
+
+        let key = "K128";
+        let value_bytes = BOUNDED_ROW_BYTES_MAX - key.len() - "plain".len();
+        db.upsert_env_var(&profile, key, &EnvValue::Plain("x".repeat(value_bytes)))
+            .unwrap();
+        assert_eq!(
+            db.list_env_vars_bounded(&profile, 129)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn bounded_projection은_corrupt_sqlite_type과_huge_blob을_preflight에서_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.ensure_default_workspace().unwrap();
+        let profile = db.insert_env_profile(&workspace, "valid", "local").unwrap();
+        db.conn
+            .execute(
+                "UPDATE env_profiles SET name = x'ff' WHERE id = ?1",
+                [&profile],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_env_profiles_bounded(&workspace, 1)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+
+        db.upsert_statusline("prefix:session", Some("effort"), Some("model"), Some(50))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE agent_statusline SET model = zeroblob(5000)
+                  WHERE session_key = 'prefix:session'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_statuslines_for_prefix_bounded("prefix:", 1)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn hook_prefix_bounded_reads는_percent와_underscore를_literal로_격리한다() {
+        let db = Db::open_in_memory().unwrap();
+        for key in ["ws%:one", "wsX:two", "ws_:three"] {
+            db.upsert_hook_session(key, "claude", &format!("agent-{key}"), "/tmp")
+                .unwrap();
+            db.upsert_statusline(key, Some("high"), Some("model"), Some(50))
+                .unwrap();
+            db.set_agent_turn_done(key).unwrap();
+        }
+        db.set_agent_needs_input("waiting:one", true, Some("first"))
+            .unwrap();
+        db.set_agent_needs_input("waiting:two", true, Some("second"))
+            .unwrap();
+
+        assert_eq!(
+            db.list_hook_sessions_for_prefix_bounded("ws%:", 1).unwrap()[0].session_key,
+            "ws%:one"
+        );
+        assert_eq!(
+            db.list_statuslines_for_prefix_bounded("ws_:", 1).unwrap()[0].session_key,
+            "ws_:three"
+        );
+        assert_eq!(
+            db.list_turn_done_sessions_for_prefix_bounded("wsX:", 1)
+                .unwrap()[0]
+                .0,
+            "wsX:two"
+        );
+        assert_eq!(
+            db.list_hook_sessions_for_prefix_bounded("ws", 2)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_LIMIT_EXCEEDED
+        );
+        assert_eq!(db.list_waiting_sessions_bounded(2).unwrap().len(), 2);
+        assert_eq!(
+            db.list_waiting_sessions_bounded(1).unwrap_err().to_string(),
+            BOUNDED_READ_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn hook_state_4097번째_write는_원자적으로_oldest를_evict한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 4095)
+                 INSERT INTO agent_hook_sessions
+                    (session_key, kind, agent_session_id, transcript_path, updated_at)
+                 SELECT printf('workspace-%04d:session', n), 'claude', printf('agent-%04d', n), '/tmp', 0
+                   FROM seq;
+                 WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 4095)
+                 INSERT INTO agent_needs_input
+                    (session_key, waiting, turn_done, updated_at, message)
+                 SELECT printf('workspace-%04d:session', n), 1, 0, 0, NULL FROM seq;
+                 WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 4095)
+                 INSERT INTO agent_statusline
+                    (session_key, effort, model, context_pct, updated_at)
+                 SELECT printf('workspace-%04d:session', n), NULL, NULL, NULL, 0 FROM seq;",
+            )
+            .unwrap();
+
+        db.upsert_hook_session("new-workspace:new-hook", "claude", "new-agent", "/tmp")
+            .unwrap();
+        db.set_agent_needs_input("new-workspace:new-needs", true, Some("waiting"))
+            .unwrap();
+        db.upsert_statusline("new-workspace:new-status", None, None, None)
+            .unwrap();
+        for (table, new_key) in [
+            ("agent_hook_sessions", "new-workspace:new-hook"),
+            ("agent_needs_input", "new-workspace:new-needs"),
+            ("agent_statusline", "new-workspace:new-status"),
+        ] {
+            let count: i64 = db
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let retained: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_key = ?1"),
+                    [new_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let oldest: i64 = db
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} \
+                         WHERE session_key = 'workspace-0000:session'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, HOOK_STATE_ROWS_MAX as i64);
+            assert_eq!(retained, 1);
+            assert_eq!(oldest, 0);
+        }
+    }
+
+    #[test]
+    fn hook_state_prefix_257번째_write는_같은_workspace의_oldest만_evict한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 255)
+                 INSERT INTO agent_hook_sessions
+                    (session_key, kind, agent_session_id, transcript_path, updated_at)
+                 SELECT printf('same_:seed-%03d', n), 'claude', printf('agent-%03d', n), '/tmp',
+                        CAST(strftime('%s','now') AS INTEGER)
+                   FROM seq;
+                 WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 255)
+                 INSERT INTO agent_needs_input
+                    (session_key, waiting, turn_done, updated_at, message)
+                 SELECT printf('same_:seed-%03d', n), 1, 1,
+                        CAST(strftime('%s','now') AS INTEGER), NULL FROM seq;
+                 WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 255)
+                 INSERT INTO agent_statusline
+                    (session_key, effort, model, context_pct, updated_at)
+                 SELECT printf('same_:seed-%03d', n), NULL, NULL, NULL,
+                        CAST(strftime('%s','now') AS INTEGER) FROM seq;
+                 INSERT INTO agent_hook_sessions
+                    (session_key, kind, agent_session_id, transcript_path, updated_at)
+                 VALUES ('sameX:other', 'claude', 'other-agent', '/other',
+                         CAST(strftime('%s','now') AS INTEGER));
+                 INSERT INTO agent_needs_input
+                    (session_key, waiting, turn_done, updated_at, message)
+                 VALUES ('sameX:other', 1, 0, CAST(strftime('%s','now') AS INTEGER), NULL);
+                 INSERT INTO agent_statusline
+                    (session_key, effort, model, context_pct, updated_at)
+                 VALUES ('sameX:other', NULL, NULL, NULL,
+                         CAST(strftime('%s','now') AS INTEGER));",
+            )
+            .unwrap();
+
+        for table in [
+            "agent_hook_sessions",
+            "agent_needs_input",
+            "agent_statusline",
+        ] {
+            let count: i64 = db
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table}
+                          WHERE substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB)))
+                                = CAST(?1 AS BLOB)"
+                    ),
+                    ["same_:"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, HOOK_PREFIX_ROWS_MAX as i64);
+        }
+        assert_eq!(
+            db.list_hook_sessions_for_prefix_bounded("same_:", HOOK_PREFIX_ROWS_MAX)
+                .unwrap()
+                .len(),
+            HOOK_PREFIX_ROWS_MAX
+        );
+        assert_eq!(
+            db.list_statuslines_for_prefix_bounded("same_:", HOOK_PREFIX_ROWS_MAX)
+                .unwrap()
+                .len(),
+            HOOK_PREFIX_ROWS_MAX
+        );
+        assert_eq!(
+            db.list_turn_done_sessions_for_prefix_bounded("same_:", HOOK_PREFIX_ROWS_MAX)
+                .unwrap()
+                .len(),
+            HOOK_PREFIX_ROWS_MAX
+        );
+
+        db.upsert_hook_session("same_:new-hook", "claude", "new-agent", "/tmp")
+            .unwrap();
+        db.set_agent_needs_input("same_:new-needs", true, Some("waiting"))
+            .unwrap();
+        db.upsert_statusline("same_:new-status", None, None, None)
+            .unwrap();
+
+        for (table, new_key) in [
+            ("agent_hook_sessions", "same_:new-hook"),
+            ("agent_needs_input", "same_:new-needs"),
+            ("agent_statusline", "same_:new-status"),
+        ] {
+            let prefix_count: i64 = db
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table}
+                          WHERE substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB)))
+                                = CAST(?1 AS BLOB)"
+                    ),
+                    ["same_:"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let retained: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_key = ?1"),
+                    [new_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let oldest: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_key = 'same_:seed-000'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let other_workspace: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_key = 'sameX:other'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(prefix_count, HOOK_PREFIX_ROWS_MAX as i64);
+            assert_eq!(retained, 1);
+            assert_eq!(oldest, 0);
+            assert_eq!(other_workspace, 1);
+        }
+        assert_eq!(
+            db.list_hook_sessions_for_prefix_bounded("same_:", HOOK_PREFIX_ROWS_MAX)
+                .unwrap()
+                .len(),
+            HOOK_PREFIX_ROWS_MAX
+        );
+        assert_eq!(
+            db.list_statuslines_for_prefix_bounded("same_:", HOOK_PREFIX_ROWS_MAX)
+                .unwrap()
+                .len(),
+            HOOK_PREFIX_ROWS_MAX
+        );
+
+        db.set_agent_turn_done("same_:new-turn").unwrap();
+        let turn_done = db
+            .list_turn_done_sessions_for_prefix_bounded("same_:", HOOK_PREFIX_ROWS_MAX)
+            .unwrap();
+        let seen_at = turn_done
+            .iter()
+            .find_map(|(session_key, updated_at)| {
+                (session_key == "same_:new-turn").then_some(*updated_at)
+            })
+            .unwrap();
+        db.clear_agent_turn_done("same_:new-turn", seen_at).unwrap();
+        assert!(
+            db.list_turn_done_sessions_for_prefix_bounded("same_:", HOOK_PREFIX_ROWS_MAX)
+                .unwrap()
+                .iter()
+                .all(|(session_key, _)| session_key != "same_:new-turn")
+        );
+        db.clear_agent_turn_done("same_:missing", i64::MAX).unwrap();
+        let needs_prefix_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_needs_input
+                  WHERE substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB)))
+                        = CAST(?1 AS BLOB)",
+                ["same_:"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(needs_prefix_count, HOOK_PREFIX_ROWS_MAX as i64);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_needs_input
+                      WHERE session_key = 'sameX:other'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn hook_state_prefix_eviction_실패는_insert까지_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 255)
+                 INSERT INTO agent_hook_sessions
+                    (session_key, kind, agent_session_id, transcript_path, updated_at)
+                 SELECT printf('rollback:seed-%03d', n), 'claude', printf('agent-%03d', n), '/tmp', 0
+                   FROM seq;
+                 CREATE TRIGGER fail_prefix_evict
+                 BEFORE DELETE ON agent_hook_sessions
+                 WHEN OLD.session_key = 'rollback:seed-000'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected prefix eviction failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.upsert_hook_session("rollback:new", "claude", "new-agent", "/new")
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_WRITE_FAILED
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_hook_sessions
+                      WHERE substr(CAST(session_key AS BLOB), 1,
+                                   length(CAST('rollback:' AS BLOB)))
+                            = CAST('rollback:' AS BLOB)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            HOOK_PREFIX_ROWS_MAX as i64
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_hook_sessions
+                      WHERE session_key = 'rollback:new'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_hook_sessions
+                      WHERE session_key = 'rollback:seed-000'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn hook_state_writer는_bounded_workspace_prefix를_요구한다() {
+        let db = Db::open_in_memory().unwrap();
+        for result in [
+            db.upsert_hook_session("bare-key", "claude", "agent", "/tmp"),
+            db.set_agent_needs_input("workspace:", true, None),
+            db.set_agent_turn_done(":session"),
+            db.upsert_statusline("workspace:\u{7f}session", None, None, None),
+        ] {
+            assert_eq!(result.unwrap_err().to_string(), BOUNDED_WRITE_INPUT_INVALID);
+        }
+    }
+
+    #[test]
+    fn oversized_hook_payload는_existing_row를_변경하지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_hook_session("workspace:stable", "claude", "agent", "/stable")
+            .unwrap();
+        assert_eq!(
+            db.upsert_hook_session(
+                "workspace:stable",
+                "claude",
+                "agent",
+                &"x".repeat(BOUNDED_TEXT_BYTES_MAX + 1),
+            )
+            .unwrap_err()
+            .to_string(),
+            BOUNDED_WRITE_INPUT_INVALID
+        );
+        let row = db
+            .conn
+            .query_row(
+                "SELECT transcript_path FROM agent_hook_sessions \
+                 WHERE session_key = 'workspace:stable'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(row, "/stable");
+    }
+
+    #[test]
+    fn agent_session_workspace_cap은_256_exact만_admit한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.ensure_default_workspace().unwrap();
+        for index in 0..AGENT_SESSION_ROWS_MAX {
+            db.upsert_agent_session(
+                &workspace,
+                &format!("pane-{index:03}"),
+                "claude",
+                &format!("session-{index:03}"),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.list_agent_sessions_bounded(&workspace, AGENT_SESSION_ROWS_MAX)
+                .unwrap()
+                .len(),
+            AGENT_SESSION_ROWS_MAX
+        );
+        assert_eq!(
+            db.upsert_agent_session(&workspace, "pane-overflow", "claude", "session-overflow")
+                .unwrap_err()
+                .to_string(),
+            AGENT_SESSION_CAPACITY_EXCEEDED
+        );
+        db.upsert_agent_session(&workspace, "pane-000", "codex", "session-updated")
+            .unwrap();
+        assert_eq!(
+            db.list_agent_sessions_bounded(&workspace, AGENT_SESSION_ROWS_MAX)
+                .unwrap()
+                .len(),
+            AGENT_SESSION_ROWS_MAX
+        );
+    }
+
+    #[test]
+    fn bounded_projection_sql_source_laws() {
+        for preflight in [
+            ENV_PROFILES_BOUNDED_PREFLIGHT,
+            ENV_VARS_BOUNDED_PREFLIGHT,
+            DOTENV_CREDENTIALS_BOUNDED_PREFLIGHT,
+            ENV_API_COUNTS_BOUNDED_PREFLIGHT,
+            HOOK_SESSIONS_PREFIX_PREFLIGHT,
+            STATUSLINES_PREFIX_PREFLIGHT,
+            TURN_DONE_PREFIX_PREFLIGHT,
+            WAITING_SESSIONS_PREFLIGHT,
+            AGENT_SESSIONS_BOUNDED_PREFLIGHT,
+        ] {
+            assert!(preflight.contains("selected AS MATERIALIZED"));
+            assert!(preflight.contains("typeof("));
+            assert!(preflight.contains("LIMIT ?"));
+            assert!(preflight.contains("row_bytes"));
+        }
+        for prefix_query in [
+            HOOK_SESSIONS_PREFIX_PREFLIGHT,
+            HOOK_SESSIONS_PREFIX_SELECT,
+            STATUSLINES_PREFIX_PREFLIGHT,
+            STATUSLINES_PREFIX_SELECT,
+            TURN_DONE_PREFIX_PREFLIGHT,
+            TURN_DONE_PREFIX_SELECT,
+        ] {
+            assert!(prefix_query.contains("substr(CAST(session_key AS BLOB)"));
+            assert!(!prefix_query.to_ascii_uppercase().contains(" LIKE "));
+        }
+        for (preflight, projection, cutoff) in [
+            (
+                HOOK_SESSIONS_PREFIX_PREFLIGHT,
+                HOOK_SESSIONS_PREFIX_SELECT,
+                "86400",
+            ),
+            (
+                STATUSLINES_PREFIX_PREFLIGHT,
+                STATUSLINES_PREFIX_SELECT,
+                "3600",
+            ),
+            (TURN_DONE_PREFIX_PREFLIGHT, TURN_DONE_PREFIX_SELECT, "3600"),
+            (WAITING_SESSIONS_PREFLIGHT, WAITING_SESSIONS_SELECT, "3600"),
+        ] {
+            assert!(!preflight.contains("strftime"));
+            assert!(!projection.contains("strftime"));
+            assert!(preflight.contains(&format!("- {cutoff}")));
+            assert!(projection.contains(&format!("- {cutoff}")));
+            assert!(preflight.contains("updated_at > ?"));
+            assert!(projection.contains("updated_at > ?"));
+        }
+        let source = include_str!("db.rs");
+        for method in [
+            "list_hook_sessions_for_prefix_bounded",
+            "list_statuslines_for_prefix_bounded",
+            "list_turn_done_sessions_for_prefix_bounded",
+            "list_waiting_sessions_bounded",
+        ] {
+            let body = source
+                .split_once(&format!("pub fn {method}"))
+                .unwrap()
+                .1
+                .split("\n    pub fn ")
+                .next()
+                .unwrap();
+            assert_eq!(body.matches("bounded_snapshot_epoch(&tx)?").count(), 1);
+        }
+        for method in [
+            "upsert_hook_session",
+            "set_agent_needs_input",
+            "set_agent_turn_done",
+            "clear_agent_turn_done",
+            "upsert_statusline",
+        ] {
+            let body = source
+                .split_once(&format!("pub fn {method}"))
+                .unwrap()
+                .1
+                .split("\n    pub fn ")
+                .next()
+                .unwrap();
+            assert_eq!(
+                body.matches("bounded_session_key_prefix(session_key)?")
+                    .count(),
+                1,
+                "{method} must validate exactly one workspace prefix"
+            );
+            assert_eq!(
+                body.matches("evict_hook_state_prefix_overflow(").count(),
+                1,
+                "{method} must enforce the prefix cap in its write transaction"
+            );
+            assert_eq!(
+                body.matches("evict_hook_state_overflow(").count(),
+                1,
+                "{method} must retain the global cap"
+            );
+        }
+        let prefix_evict_body = source
+            .split_once("fn evict_hook_state_prefix_overflow")
+            .unwrap()
+            .1
+            .split("\n/// hook")
+            .next()
+            .unwrap();
+        assert!(prefix_evict_body.contains("substr(CAST(session_key AS BLOB)"));
+        assert!(!prefix_evict_body.to_ascii_uppercase().contains(" LIKE "));
+        assert!(prefix_evict_body.contains("ORDER BY updated_at DESC"));
+        assert!(prefix_evict_body.contains("THEN ?3 - 1 ELSE ?3 END"));
+        assert!(DOTENV_CREDENTIALS_BOUNDED_PREFLIGHT.contains("credential.provider = 'env'"));
+        assert!(DOTENV_CREDENTIALS_BOUNDED_SELECT.contains("credential.provider = 'env'"));
     }
 
     #[test]

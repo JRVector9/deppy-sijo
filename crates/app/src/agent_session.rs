@@ -651,11 +651,17 @@ impl fmt::Debug for AgentSession {
 
 impl AgentSession {
     pub fn new(id: AgentSessionId, prompt: String, cwd: Option<String>) -> Self {
-        assert!(
-            valid_identifier(&id),
-            "AgentSessionId must be a non-empty identifier of at most 1 KiB"
-        );
-        Self {
+        Self::try_new(id, prompt, cwd)
+            .expect("AgentSessionId must be a non-empty identifier of at most 1 KiB")
+    }
+
+    /// Admit an identifier received from persistence or another fallible host
+    /// boundary without turning corrupted local state into a process panic.
+    pub fn try_new(id: AgentSessionId, prompt: String, cwd: Option<String>) -> Option<Self> {
+        if !valid_identifier(&id) {
+            return None;
+        }
+        Some(Self {
             id,
             workspace_id: None,
             prompt: bounded_owned(prompt, MAX_PROMPT_BYTES),
@@ -674,7 +680,7 @@ impl AgentSession {
             table_rows: Vec::new(),
             retained_item_bytes: 0,
             retained_table_bytes: 0,
-        }
+        })
     }
 
     pub fn apply(&mut self, event: AgentSessionEvent) {
@@ -2025,12 +2031,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "AgentSessionId must be a non-empty identifier")]
-    fn oversized_session_identity_is_rejected_instead_of_truncated() {
-        let _ = AgentSession::new(
-            "i".repeat(MAX_IDENTIFIER_BYTES + 1),
-            "bounded".to_owned(),
-            None,
+    fn fallible_session_identity_admission_accepts_exact_and_rejects_plus_one() {
+        assert!(
+            AgentSession::try_new("i".repeat(MAX_IDENTIFIER_BYTES), "bounded".to_owned(), None,)
+                .is_some()
+        );
+        assert!(
+            AgentSession::try_new(
+                "i".repeat(MAX_IDENTIFIER_BYTES + 1),
+                "bounded".to_owned(),
+                None,
+            )
+            .is_none()
         );
     }
 

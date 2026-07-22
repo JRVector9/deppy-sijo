@@ -1,10 +1,78 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 const MIN_OUTPUT_BATCH_MS: u64 = 16;
+/// `config.toml` is human-authored control data, not a bulk storage surface.
+const CONFIG_BYTES_MAX: usize = 256 * 1024;
+
+fn open_config_read_only(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(target_os = "macos")]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0x20_000 | 0x800);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+/// Reads one stable regular UTF-8 config snapshot. The opened handle, not path metadata, owns the
+/// byte proof so replacement or growth cannot turn an oversized file into an accepted prefix.
+fn read_config_bounded(path: &Path, max_bytes: usize) -> anyhow::Result<Option<String>> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("config_read_failed"),
+    };
+    anyhow::ensure!(
+        before.file_type().is_file() && !before.file_type().is_symlink(),
+        "config_file_type_invalid"
+    );
+    let mut file =
+        open_config_read_only(path).map_err(|_| anyhow::anyhow!("config_open_failed"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("config_metadata_failed"))?;
+    anyhow::ensure!(opened.is_file(), "config_file_type_invalid");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            before.dev() == opened.dev() && before.ino() == opened.ino(),
+            "config_file_changed"
+        );
+    }
+    anyhow::ensure!(opened.len() <= max_bytes as u64, "config_bytes_exceeded");
+
+    let probe = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("config_bytes_exceeded"))?;
+    let mut bytes = Vec::with_capacity((opened.len() as usize).min(probe));
+    file.by_ref()
+        .take(probe as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("config_read_failed"))?;
+    anyhow::ensure!(bytes.len() <= max_bytes, "config_bytes_exceeded");
+    let after = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("config_metadata_failed"))?;
+    anyhow::ensure!(after.len() == bytes.len() as u64, "config_file_changed");
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("config_utf8_invalid"))
+}
 
 /// live warm 워크스페이스 상한을 이 기기 RAM에서 유도한다 — live warm 1슬롯당 4GB 예산으로
 /// 잡아(에이전트 실측 수백 MB보다 넉넉) 활성 작업+브라우저+IDE와 공존해도 스왑에 안 빠지게
@@ -361,11 +429,9 @@ impl Config {
     /// config.toml을 읽고, 없으면 기본값으로 생성한다.
     pub fn load_or_create(config_dir: &Path) -> anyhow::Result<Self> {
         let path = config_path(config_dir);
-        if path.exists() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("config 읽기 실패: {}", path.display()))?;
-            let mut config: Self = toml::from_str(&text)
-                .with_context(|| format!("config 파싱 실패: {}", path.display()))?;
+        if let Some(text) = read_config_bounded(&path, CONFIG_BYTES_MAX)? {
+            let mut config: Self =
+                toml::from_str(&text).map_err(|_| anyhow::anyhow!("config_parse_failed"))?;
             // TOML을 손으로 고친 경우 UI 위젯 범위 밖 값이 들어올 수 있다 —
             // 로드 경계에서 정규화 (codex 리뷰: batch 0 = busy-poll, 폭주 scrollback)
             config.normalize();
@@ -447,15 +513,84 @@ impl Config {
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         // 원자 기록 — 쓰기 중 크래시로 빈/부분 TOML이 남아 다음 시작이
         // 파싱 실패로 죽는 것 방지 (codex 리뷰)
-        let text = toml::to_string_pretty(self)?;
+        let text =
+            toml::to_string_pretty(self).map_err(|_| anyhow::anyhow!("config_serialize_failed"))?;
+        anyhow::ensure!(text.len() <= CONFIG_BYTES_MAX, "config_bytes_exceeded");
         deppy_core::fs::atomic_write(path, text.as_bytes())
-            .with_context(|| format!("config 저장 실패: {}", path.display()))
+            .map_err(|_| anyhow::anyhow!("config_write_failed"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "deppy-config-bound-{tag}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn config_reader_accepts_exact_and_rejects_plus_one_and_invalid_utf8() {
+        let path = temp_path("bytes");
+        std::fs::write(&path, vec![b'x'; 64]).unwrap();
+        assert_eq!(read_config_bounded(&path, 64).unwrap().unwrap().len(), 64);
+        std::fs::write(&path, vec![b'x'; 65]).unwrap();
+        assert_eq!(
+            read_config_bounded(&path, 64).unwrap_err().to_string(),
+            "config_bytes_exceeded"
+        );
+        std::fs::write(&path, [0xff]).unwrap();
+        assert_eq!(
+            read_config_bounded(&path, 64).unwrap_err().to_string(),
+            "config_utf8_invalid"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_reader_rejects_symlink_and_special_file_without_opening_it() {
+        use std::os::unix::fs::{FileTypeExt as _, symlink};
+
+        let dir = temp_path("types");
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("regular");
+        let link = dir.join("link");
+        std::fs::write(&regular, b"ok").unwrap();
+        symlink(&regular, &link).unwrap();
+        assert_eq!(
+            read_config_bounded(&link, 64).unwrap_err().to_string(),
+            "config_file_type_invalid"
+        );
+        let metadata = std::fs::symlink_metadata("/dev/null").unwrap();
+        assert!(metadata.file_type().is_char_device());
+        assert_eq!(
+            read_config_bounded(Path::new("/dev/null"), 64)
+                .unwrap_err()
+                .to_string(),
+            "config_file_type_invalid"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn production_config_load_has_no_unbounded_whole_file_read() {
+        let production = include_str!("config.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!production.contains("read_to_string"));
+        assert!(!production.contains("std::fs::read("));
+        assert!(production.contains(".take(probe as u64)"));
+        assert!(production.contains("CONFIG_BYTES_MAX"));
+    }
 
     /// 컴포저 토글(2026-07-17 사용자): 기본은 **켜짐**이어야 한다 — `#[serde(default)]`를
     /// 쓰면 bool이 false가 되어 기존 사용자의 도크가 조용히 사라진다(default_true 함수 필수).

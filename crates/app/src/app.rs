@@ -17,6 +17,22 @@ const APPROVAL_LAUNCH_CAP: usize = 8;
 const APPROVAL_SPAWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const APPROVAL_DENIAL_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 const APP_NOTICE_TEXT_MAX_BYTES: usize = 4 * 1024;
+const ENV_PROFILE_PROJECTION_MAX: usize = 256;
+const ENV_VARIABLE_PROJECTION_MAX: usize = 4_096;
+const ENV_PROJECT_PROJECTION_MAX: usize = 256;
+const HOOK_PREFIX_PROJECTION_MAX: usize = 256;
+const WAITING_SESSION_PROJECTION_MAX: usize = 4_096;
+const AGENT_SESSION_PROJECTION_MAX: usize = 256;
+
+fn replace_complete_projection<T, E>(target: &mut T, projection: Result<T, E>) -> Result<(), E> {
+    match projection {
+        Ok(value) => {
+            *target = value;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 
 struct ApprovalSnapshot {
     rows: Vec<ui::approvals::PendingApprovalItem>,
@@ -107,8 +123,7 @@ impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
         workspace_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<crate::dotenv_sync::DotenvProfile>> {
-        let rows = Db::list_env_profiles(self.0, workspace_id)?;
-        anyhow::ensure!(rows.len() <= limit, "dotenv_profile_scan_limit");
+        let rows = Db::list_env_profiles_bounded(self.0, workspace_id, limit)?;
         Ok(rows
             .into_iter()
             .map(|row| crate::dotenv_sync::DotenvProfile {
@@ -132,8 +147,7 @@ impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
         profile_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<crate::dotenv_sync::DotenvVariable>> {
-        let rows = Db::list_env_vars(self.0, profile_id)?;
-        anyhow::ensure!(rows.len() <= limit, "dotenv_variable_scan_limit");
+        let rows = Db::list_env_vars_bounded(self.0, profile_id, limit)?;
         Ok(rows
             .into_iter()
             .map(|row| crate::dotenv_sync::DotenvVariable {
@@ -147,12 +161,8 @@ impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
         &mut self,
         limit: usize,
     ) -> anyhow::Result<std::collections::HashSet<String>> {
-        let rows = Db::list_credentials(self.0)?;
-        anyhow::ensure!(rows.len() <= limit, "dotenv_credential_scan_limit");
-        Ok(rows
+        Ok(Db::list_dotenv_owned_credential_ids_bounded(self.0, limit)?
             .into_iter()
-            .filter(|row| row.provider == "env")
-            .map(|row| row.id)
             .collect())
     }
 
@@ -692,11 +702,11 @@ fn dotenv_state_for_root(root: Option<&std::path::Path>) -> DotenvState {
 fn load_dotenv_default_env(db: &Db, workspace_id: &str) -> anyhow::Result<(EnvPairs, EnvPairs)> {
     let (mut env_plain, mut env_secrets) = (Vec::new(), Vec::new());
     if let Some(profile) = db
-        .list_env_profiles(workspace_id)?
+        .list_env_profiles_bounded(workspace_id, ENV_PROFILE_PROJECTION_MAX)?
         .into_iter()
         .find(|profile| profile.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
     {
-        for var in db.list_env_vars(&profile.id)? {
+        for var in db.list_env_vars_bounded(&profile.id, ENV_VARIABLE_PROJECTION_MAX)? {
             match var.value {
                 crate::env::EnvValue::Plain(value) => env_plain.push((var.key, value)),
                 crate::env::EnvValue::Secret { credential_id } => {
@@ -1596,7 +1606,8 @@ fn execute_settings_job(
         }
         SettingsJobAction::DeleteLegacyVar { profile_id, key } => {
             let result = (|| -> anyhow::Result<()> {
-                let profiles = db.list_env_profiles(&workspace_id)?;
+                let profiles =
+                    db.list_env_profiles_bounded(&workspace_id, ENV_PROFILE_PROJECTION_MAX)?;
                 let profile = profiles
                     .iter()
                     .find(|profile| profile.id == profile_id)
@@ -1606,7 +1617,10 @@ fn execute_settings_job(
                     "settings_dotenv_delete_wrong_path"
                 );
                 db.delete_env_var(&profile_id, &key)?;
-                if db.list_env_vars(&profile_id)?.is_empty() {
+                if db
+                    .list_env_vars_bounded(&profile_id, ENV_VARIABLE_PROJECTION_MAX)?
+                    .is_empty()
+                {
                     db.delete_env_profile(&profile_id)?;
                 }
                 Ok(())
@@ -2064,29 +2078,30 @@ impl EnvProjectRowsWorker {
                             db = Some(Db::open(&db_path)?);
                         }
                         let db = db.as_ref().expect("DB initialized above");
-                        db.env_api_project_counts().map(|counts| {
-                            let counts: std::collections::HashMap<_, _> = counts
-                                .into_iter()
-                                .map(|count| (count.workspace_id.clone(), count))
-                                .collect();
-                            job.workspaces
-                                .iter()
-                                .map(|workspace| {
-                                    let count = counts.get(&workspace.id);
-                                    let path = workspace.path.clone();
-                                    ui::env_project_list::EnvProjectRow {
-                                        id: workspace.id.clone(),
-                                        name: App::workspace_display_name(workspace),
-                                        alias: workspace.name.clone(),
-                                        path_missing: !path.trim().is_empty()
-                                            && !std::path::Path::new(&path).is_dir(),
-                                        path,
-                                        env_count: count.map_or(0, |count| count.env_count),
-                                        key_count: count.map_or(0, |count| count.key_count),
-                                    }
-                                })
-                                .collect()
-                        })
+                        db.env_api_project_counts_bounded(ENV_PROJECT_PROJECTION_MAX)
+                            .map(|counts| {
+                                let counts: std::collections::HashMap<_, _> = counts
+                                    .into_iter()
+                                    .map(|count| (count.workspace_id.clone(), count))
+                                    .collect();
+                                job.workspaces
+                                    .iter()
+                                    .map(|workspace| {
+                                        let count = counts.get(&workspace.id);
+                                        let path = workspace.path.clone();
+                                        ui::env_project_list::EnvProjectRow {
+                                            id: workspace.id.clone(),
+                                            name: App::workspace_display_name(workspace),
+                                            alias: workspace.name.clone(),
+                                            path_missing: !path.trim().is_empty()
+                                                && !std::path::Path::new(&path).is_dir(),
+                                            path,
+                                            env_count: count.map_or(0, |count| count.env_count),
+                                            key_count: count.map_or(0, |count| count.key_count),
+                                        }
+                                    })
+                                    .collect()
+                            })
                     })();
                     if results
                         .send(EnvProjectRowsOutcome {
@@ -5280,7 +5295,10 @@ fn initial_workspace_id(
     closed_workspace_ids: &std::collections::BTreeSet<String>,
 ) -> anyhow::Result<String> {
     let fallback = db.ensure_default_workspace()?;
-    let workspaces = db.list_workspaces()?;
+    // Startup uses the same SQL-preflighted 256-row/byte-bounded projection as settings. The
+    // legacy full-row list remains test/compatibility surface only and must not materialize an
+    // attacker-sized workspace table before choosing one id.
+    let workspaces = db.settings_workspace_projection_rows()?;
     if let Some(last) = last_workspace_id
         && !closed_workspace_ids.contains(last)
         && workspaces.iter().any(|workspace| workspace.id == last)
@@ -6872,6 +6890,43 @@ fn run_app_host_io(
     }
 }
 
+const AGENT_HOOK_QUERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn agent_hook_query_due(session_count: usize, elapsed: std::time::Duration) -> bool {
+    session_count > 0 && elapsed >= AGENT_HOOK_QUERY_INTERVAL
+}
+
+fn should_process_agent_bindings(
+    has_new_bindings: bool,
+    restore_loaded_for: Option<&str>,
+    active_workspace_id: &str,
+    bounded_refresh_due: bool,
+) -> bool {
+    has_new_bindings || (bounded_refresh_due && restore_loaded_for != Some(active_workspace_id))
+}
+
+fn append_structured_thread_projection(
+    target: &mut Vec<ui::agent_sessions::AgentSessionPersistedRow>,
+    rows: impl IntoIterator<Item = storage::StructuredThreadRow>,
+) {
+    let remaining =
+        ui::agent_sessions::AGENT_SESSION_PERSISTED_MAX_ITEMS.saturating_sub(target.len());
+    target.extend(rows.into_iter().take(remaining).map(|row| {
+        ui::agent_sessions::AgentSessionPersistedRow {
+            local_session_id: row.local_session_id,
+            workspace_id: row.workspace_id,
+            thread_id: row.thread_id,
+            title: row.title,
+            cwd: row.cwd,
+            model: row.model,
+            favorite: row.favorite,
+            archived: row.archived,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }));
+}
+
 impl App {
     fn apply_app_host_completion(&mut self, completion: AppHostIoCompletion) {
         match completion {
@@ -7855,48 +7910,73 @@ impl App {
             .collect();
         // 터미널 경로 더블클릭의 상대경로 해석용 — 같은 목록을 workspace UI에도 나른다.
         self.active.workspace_ui.set_session_pids(&sessions);
+        // 감지할 세션이 없으면 hook/statusline DB에도 접근하지 않는다. 캐시를 비워 두면
+        // empty input의 latest-only worker가 thread/backend/repaint 모두 유휴 상태로 남는다.
+        let bounded_refresh_due =
+            agent_hook_query_due(sessions.len(), self.last_hook_query.elapsed());
+        if sessions.is_empty() {
+            self.hook_overrides.clear();
+            self.statuslines.clear();
         // hook이 보고한 결정적 바인딩(활성 워크스페이스 것만) — 워커 탐색을 대체한다.
-        // poll_agent_detect는 매 프레임 돌므로 DB 조회는 1초 스로틀 + 캐시.
-        if self.last_hook_query.elapsed() >= std::time::Duration::from_secs(1) {
+        // poll_agent_detect는 매 프레임 돌므로 세션이 있을 때만 DB 조회를 1초 스로틀한다.
+        } else if bounded_refresh_due {
             self.last_hook_query = std::time::Instant::now();
             let ws_prefix = format!("{}:", self.active.id);
-            self.hook_overrides = self
+            let hook_projection = self
                 .db
-                .list_hook_sessions()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|r| {
-                    let sid = r
-                        .session_key
-                        .strip_prefix(&ws_prefix)?
-                        .parse::<u64>()
-                        .ok()?;
-                    let kind = crate::agent_detect::kind_from_str(&r.kind)?;
-                    Some((
-                        runtime::SessionId(sid),
-                        crate::agent_detect::AgentBinding {
-                            kind,
-                            session_id: r.agent_session_id,
-                            transcript: std::path::PathBuf::from(r.transcript_path),
-                        },
-                    ))
-                })
-                .collect();
+                .list_hook_sessions_for_prefix_bounded(&ws_prefix, HOOK_PREFIX_PROJECTION_MAX)
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter_map(|r| {
+                            let sid = r
+                                .session_key
+                                .strip_prefix(&ws_prefix)?
+                                .parse::<u64>()
+                                .ok()?;
+                            let kind = crate::agent_detect::kind_from_str(&r.kind)?;
+                            Some((
+                                runtime::SessionId(sid),
+                                crate::agent_detect::AgentBinding {
+                                    kind,
+                                    session_id: r.agent_session_id,
+                                    transcript: std::path::PathBuf::from(r.transcript_path),
+                                },
+                            ))
+                        })
+                        .collect()
+                });
+            if replace_complete_projection(&mut self.hook_overrides, hook_projection).is_err() {
+                tracing::warn!(
+                    kind = "agent_state",
+                    phase = "hook_projection",
+                    error_code = "bounded_read_failed",
+                    "agent state projection failed"
+                );
+            }
             // claude statusLine 표시 정보(effort/model/context%) — 활성 워크스페이스 것만.
-            self.statuslines = self
+            let status_projection = self
                 .db
-                .list_statuslines()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|r| {
-                    let sid = r
-                        .session_key
-                        .strip_prefix(&ws_prefix)?
-                        .parse::<u64>()
-                        .ok()?;
-                    Some((runtime::SessionId(sid), r))
-                })
-                .collect();
+                .list_statuslines_for_prefix_bounded(&ws_prefix, HOOK_PREFIX_PROJECTION_MAX)
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter_map(|r| {
+                            let sid = r
+                                .session_key
+                                .strip_prefix(&ws_prefix)?
+                                .parse::<u64>()
+                                .ok()?;
+                            Some((runtime::SessionId(sid), r))
+                        })
+                        .collect()
+                });
+            if replace_complete_projection(&mut self.statuslines, status_projection).is_err() {
+                tracing::warn!(
+                    kind = "agent_state",
+                    phase = "status_projection",
+                    error_code = "bounded_read_failed",
+                    "agent state projection failed"
+                );
+            }
         }
         let _ = self.agent_detect_input.publish(
             self.agent_detect_epoch,
@@ -7964,7 +8044,14 @@ impl App {
             self.agent_activity = activity;
             self.refresh_needs_input();
         }
-        if let Some(bindings) = latest_bindings {
+        let has_new_bindings = latest_bindings.is_some();
+        if should_process_agent_bindings(
+            has_new_bindings,
+            self.restore_loaded_for.as_deref(),
+            &self.active.id,
+            bounded_refresh_due,
+        ) {
+            let bindings = latest_bindings.unwrap_or_else(|| self.agent_bindings.clone());
             self.agent_bindings = bindings.clone();
             self.process_agent_bindings(&bindings);
         }
@@ -7976,51 +8063,69 @@ impl App {
     /// 것만 남긴다(사이드바/상태 레일용, 의미 불변).
     fn refresh_needs_input(&mut self) {
         let ws = self.active.id.clone();
-        let waiting_keys = self.db.list_waiting_sessions().unwrap_or_default();
         let to_id = |k: &str| -> Option<runtime::SessionId> {
             let (w, s) = k.rsplit_once(':')?;
             (w == ws).then_some(())?;
             s.parse::<u64>().ok().map(runtime::SessionId)
         };
-        self.agent_needs_input = waiting_keys
-            .iter()
-            .filter_map(|(key, _)| to_id(key))
-            .collect();
-        // v3.9 N3: 전역(모든 워크스페이스) 대기 — 같은 DB 조회 결과를 재사용해 새 쿼리
-        // 없이 벨 팝오버 PTY 카드 소스를 채운다. 표시용 제목/미리보기는 팝오버가 열렸을
-        // 때 build_waiting_cards가 지연 해석한다.
-        // **카드를 만들 수 있는 대기만** 남긴다 — 뱃지는 이 목록을 세고 카드도 이
-        // 목록으로 만들어지므로 둘이 항상 일치한다. 조건은 build_waiting_cards와 같다:
-        //  ① 워크스페이스가 활성이거나 warm이어야 한다(suspended는 주입할 런타임이 없다).
-        //  ② 그 워크스페이스에 세션이 실제로 있어야 한다(hook 행은 세션이 죽어도 TTL
-        //     1시간 동안 남는다 — 세션 존재를 안 보면 카드 없는 유령 뱃지가 된다,
-        //     2026-07-17 실측: PTY 대기 3건이 뱃지에만 잡히고 카드는 0장).
-        let session_alive = |ws: &str, session: &runtime::SessionId| -> bool {
-            if ws == self.active.id {
-                self.active.session_titles.contains_key(session)
-            } else if let Some(rt) = self.warm.get(ws) {
-                rt.session_titles.contains_key(session)
-            } else {
-                false
+        match self
+            .db
+            .list_waiting_sessions_bounded(WAITING_SESSION_PROJECTION_MAX)
+        {
+            Ok(waiting_keys) => {
+                self.agent_needs_input = waiting_keys
+                    .iter()
+                    .filter_map(|(key, _)| to_id(key))
+                    .collect();
+                // v3.9 N3: 전역(모든 워크스페이스) 대기 — 같은 DB 조회 결과를 재사용해 새
+                // 쿼리 없이 벨 팝오버 PTY 카드 소스를 채운다. 읽기 실패 시에는 직전의 완전한
+                // snapshot을 유지해 transient storage 오류가 알림을 거짓으로 지우지 않는다.
+                let session_alive = |ws: &str, session: &runtime::SessionId| -> bool {
+                    if ws == self.active.id {
+                        self.active.session_titles.contains_key(session)
+                    } else if let Some(rt) = self.warm.get(ws) {
+                        rt.session_titles.contains_key(session)
+                    } else {
+                        false
+                    }
+                };
+                self.global_waiting = waiting_keys
+                    .iter()
+                    .filter_map(|(key, message)| {
+                        let (ws, session) = ui::inbox_waiting::parse_session_key(key)?;
+                        Some((ws, session, message.clone()))
+                    })
+                    .filter(|(ws, session, _)| session_alive(ws, session))
+                    .collect();
             }
-        };
-        self.global_waiting = waiting_keys
-            .iter()
-            .filter_map(|(key, message)| {
-                let (ws, session) = ui::inbox_waiting::parse_session_key(key)?;
-                Some((ws, session, message.clone()))
-            })
-            .filter(|(ws, session, _)| session_alive(ws, session))
-            .collect();
+            Err(_) => tracing::warn!(
+                kind = "agent_state",
+                phase = "waiting_projection",
+                error_code = "bounded_read_failed",
+                "agent state projection failed"
+            ),
+        }
         // 턴 완료(Stop hook) — 확인(포커스) 시 update_session_alerts가 소비한다.
         // updated_at을 함께 들고 있다가 조건부 clear의 세대 기준으로 쓴다(레이스 방지).
-        self.agent_turn_done = self
+        let turn_projection = self
             .db
-            .list_turn_done_sessions()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|(k, at)| Some((to_id(k)?, *at)))
-            .collect();
+            .list_turn_done_sessions_for_prefix_bounded(
+                &format!("{}:", self.active.id),
+                HOOK_PREFIX_PROJECTION_MAX,
+            )
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|(k, at)| Some((to_id(k)?, *at)))
+                    .collect()
+            });
+        if replace_complete_projection(&mut self.agent_turn_done, turn_projection).is_err() {
+            tracing::warn!(
+                kind = "agent_state",
+                phase = "turn_projection",
+                error_code = "bounded_read_failed",
+                "agent state projection failed"
+            );
+        }
     }
 
     /// 워커 raw(agent_info) + claude statusLine(statuslines)을 병합해 최종 표시정보를
@@ -8156,13 +8261,22 @@ impl App {
     ) {
         // 복원용 저장 데이터를 먼저 로드한다(아래 persistence가 지우기 전에). 전환 시 재로드.
         if self.restore_loaded_for.as_deref() != Some(self.active.id.as_str()) {
-            self.restore_agents = self
+            let rows = match self
                 .db
-                .list_agent_sessions(&self.active.id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| (r.pane_id.clone(), r))
-                .collect();
+                .list_agent_sessions_bounded(&self.active.id, AGENT_SESSION_PROJECTION_MAX)
+            {
+                Ok(rows) => rows,
+                Err(_) => {
+                    tracing::warn!(
+                        kind = "agent_state",
+                        phase = "restore_projection",
+                        error_code = "bounded_read_failed",
+                        "agent state projection failed"
+                    );
+                    return;
+                }
+            };
+            self.restore_agents = rows.into_iter().map(|r| (r.pane_id.clone(), r)).collect();
             // pane이 살아 있는 동안 마지막 agent mapping은 resume 원천으로 보존한다.
             // 프로세스 미감지는 정상 종료·앱 shutdown race에서도 발생하므로 삭제 조건이 아니다.
             self.persisted_agents = self.restore_agents.clone();
@@ -8760,11 +8874,15 @@ impl App {
     /// known_hosts 파일을 (host, 지문) 목록으로 로드한다 (표시 전용 — 파일 없으면 빈 목록).
     fn load_known_hosts(&self) -> Vec<(String, String)> {
         let path = self.known_hosts_path();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => parse_known_hosts(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => {
-                tracing::warn!("known_hosts 읽기 실패: {e:#}");
+        match runtime::known_hosts::KnownHosts::load(&path) {
+            Ok(known_hosts) => known_hosts.into_entries().collect(),
+            Err(_) => {
+                tracing::warn!(
+                    kind = "known_hosts",
+                    phase = "load",
+                    error_code = "known_hosts_read_failed",
+                    "known_hosts read failed"
+                );
                 Vec::new()
             }
         }
@@ -11594,21 +11712,16 @@ impl App {
         }
         let mut structured_threads = Vec::new();
         for workspace in &self.workspaces {
-            match self.db.list_structured_threads(&workspace.id, false) {
-                Ok(rows) => structured_threads.extend(rows.into_iter().map(|row| {
-                    ui::agent_sessions::AgentSessionPersistedRow {
-                        local_session_id: row.local_session_id,
-                        workspace_id: row.workspace_id,
-                        thread_id: row.thread_id,
-                        title: row.title,
-                        cwd: row.cwd,
-                        model: row.model,
-                        favorite: row.favorite,
-                        archived: row.archived,
-                        created_at: row.created_at,
-                        updated_at: row.updated_at,
-                    }
-                })),
+            let remaining = ui::agent_sessions::AGENT_SESSION_PERSISTED_MAX_ITEMS
+                .saturating_sub(structured_threads.len());
+            if remaining == 0 {
+                break;
+            }
+            match self
+                .db
+                .list_structured_threads_bounded(&workspace.id, false, remaining)
+            {
+                Ok(rows) => append_structured_thread_projection(&mut structured_threads, rows),
                 Err(error) => tracing::warn!(
                     workspace_id = %workspace.id,
                     "구조화 Codex thread 목록 복구 실패: {error:#}"
@@ -15161,31 +15274,6 @@ fn elapsed_ms(started: std::time::Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
-/// known_hosts 파일 텍스트를 (host, 지문) 목록으로 파싱한다 (settings 표시 전용 —
-/// forget/pin은 runtime::known_hosts API로 처리). 포맷은 한 줄에 `host 지문`, `#` 주석·빈
-/// 줄은 스킵 (known_hosts 파일 계약과 동일). 파일 순서를 보존한다.
-fn parse_known_hosts(text: &str) -> Vec<(String, String)> {
-    // 표시도 KnownHosts::load와 같은 **effective view**를 쓴다 — host 중복은 last-wins,
-    // 지문은 소문자 정규화. 수동 편집으로 duplicate가 생겨도 실제 신뢰 판단과 다른 낡은
-    // 지문을 "신뢰 기록"처럼 보여주지 않는다 (codex xhigh Low).
-    let mut rows: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        if let (Some(host), Some(fp)) = (parts.next(), parts.next()) {
-            let fp = fp.to_ascii_lowercase();
-            match rows.iter_mut().find(|(h, _)| h == host) {
-                Some(row) => row.1 = fp, // last-wins (KnownHosts HashMap과 동일)
-                None => rows.push((host.to_owned(), fp)),
-            }
-        }
-    }
-    rows
-}
-
 /// 세션이 붙어 있는 pane id를 mux 스냅샷에서 찾는다 (알림 클릭 → focus용).
 /// 인박스 응답을 PTY에 보낼 바이트 — 끝은 **CR(`\r`)이다**.
 ///
@@ -15540,6 +15628,22 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    #[test]
+    fn bounded_projection_failure_keeps_last_complete_snapshot() {
+        let mut snapshot = vec!["last-complete".to_owned()];
+
+        let error = replace_complete_projection::<_, &'static str>(
+            &mut snapshot,
+            Err("bounded_read_failed"),
+        );
+        assert_eq!(error, Err("bounded_read_failed"));
+        assert_eq!(snapshot, ["last-complete"]);
+
+        replace_complete_projection::<_, &'static str>(&mut snapshot, Ok(vec!["fresh".to_owned()]))
+            .expect("complete projection replaces the snapshot");
+        assert_eq!(snapshot, ["fresh"]);
+    }
+
     fn slack_inventory_row(
         id: &str,
         enabled: bool,
@@ -15566,6 +15670,71 @@ mod tests {
         assert_eq!(projection.server_id, None);
         assert_eq!(projection.tool_count, 0);
         assert!(!projection.can_choose_workspace);
+    }
+
+    #[test]
+    fn agent_hook_query는_세션이_없으면_경과시간과_무관하게_idle이다() {
+        assert!(!agent_hook_query_due(0, std::time::Duration::from_secs(60)));
+        assert!(!agent_hook_query_due(
+            1,
+            AGENT_HOOK_QUERY_INTERVAL - std::time::Duration::from_nanos(1)
+        ));
+        assert!(agent_hook_query_due(1, AGENT_HOOK_QUERY_INTERVAL));
+    }
+
+    #[test]
+    fn agent_restore_failure는_unchanged_binding에서도_다음_bounded_refresh에_재시도한다() {
+        assert!(should_process_agent_bindings(
+            true,
+            None,
+            "workspace",
+            false
+        ));
+        assert!(should_process_agent_bindings(
+            false,
+            None,
+            "workspace",
+            true
+        ));
+        assert!(!should_process_agent_bindings(
+            false,
+            None,
+            "workspace",
+            false
+        ));
+        assert!(!should_process_agent_bindings(
+            false,
+            Some("workspace"),
+            "workspace",
+            true
+        ));
+    }
+
+    #[test]
+    fn structured_thread_projection은_workspace를_넘어_500행으로_유계다() {
+        let rows = |start: usize, count: usize| {
+            (start..start + count).map(|index| storage::StructuredThreadRow {
+                local_session_id: format!("local-{index}"),
+                workspace_id: format!("ws-{}", index / 300),
+                thread_id: format!("thread-{index}"),
+                title: "bounded".to_owned(),
+                cwd: "/repo".to_owned(),
+                model: None,
+                favorite: false,
+                archived: false,
+                created_at: index as i64,
+                updated_at: index as i64,
+            })
+        };
+        let mut projection = Vec::new();
+
+        append_structured_thread_projection(&mut projection, rows(0, 300));
+        append_structured_thread_projection(&mut projection, rows(300, 300));
+        append_structured_thread_projection(&mut projection, rows(600, 300));
+
+        assert_eq!(projection.len(), 500);
+        assert_eq!(projection[0].local_session_id, "local-0");
+        assert_eq!(projection[499].local_session_id, "local-499");
     }
 
     #[test]
@@ -16460,36 +16629,6 @@ mod tests {
             App::workspace_path_to_tree_root(Some(" /tmp/project ".to_owned())),
             Some(PathBuf::from(" /tmp/project "))
         );
-    }
-
-    #[test]
-    fn parse_known_hosts_주석_빈줄_손상행_스킵하고_순서보존() {
-        let text = "# deppy remote TLS known_hosts\n\
-                    127.0.0.1:7777 aa:bb:cc\n\
-                    \n\
-                    host-only-no-fp\n\
-                    [::1]:9000 dd:ee:ff\n";
-        let rows = parse_known_hosts(text);
-        assert_eq!(
-            rows,
-            vec![
-                ("127.0.0.1:7777".to_owned(), "aa:bb:cc".to_owned()),
-                ("[::1]:9000".to_owned(), "dd:ee:ff".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_known_hosts_중복host는_last_wins_소문자정규화() {
-        // KnownHosts::load(HashMap)와 동일한 effective view — 낡은 지문을 표시하지 않는다
-        let text = "h:1 AA:BB
-h:2 cc:dd
-h:1 EE:FF
-";
-        let rows = parse_known_hosts(text);
-        assert_eq!(rows.len(), 2);
-        assert!(rows.contains(&("h:1".to_owned(), "ee:ff".to_owned())));
-        assert!(rows.contains(&("h:2".to_owned(), "cc:dd".to_owned())));
     }
 
     #[test]

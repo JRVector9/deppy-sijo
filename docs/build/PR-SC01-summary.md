@@ -183,3 +183,17 @@ Every secret-backed external execution path must acquire one `RedactionLease` fo
 secrets before permission/audit execution reaches the transport, abort with external-call count
 zero on acquisition error, and hold the lease through subprocess/session teardown and redactor
 flush. PR-IN01/PR-AU01 must not call the legacy unchecked registration API for this path.
+
+## Pre-IN01 diagnostic hardening
+
+- `LogicalCredentialId`, `PhysicalSecretSlot`, `SecretBundleStagePlan`, and
+  `StagedSecretBundle` now have fixed redacted `Debug` output. Secret-bearing bundle types remain
+  non-Clone/non-Serialize and their ownership/accessor APIs are unchanged.
+- Physical-slot parser sources and every `SecretStore` error crossing the public
+  inspect/stage/read/delete/inventory/reconcile boundary are replaced by fixed low-cardinality
+  codes. Rollback and deletion no longer retain logical IDs, UUIDs, keyring coordinates, secret
+  input, or backend error chains.
+- Hostile-store and unique-marker regressions cover every public bundle diagnostic surface,
+  nested holders, rollback-incomplete paths, and the bounded diagnostic scanner.
+- Root verification: `cargo test -p secret -- --test-threads=1` passed 59/59 plus doc-tests;
+  all-target check, strict Clippy, package rustfmt, and scoped diff-check passed.

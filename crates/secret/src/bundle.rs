@@ -5,7 +5,6 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::Context;
 use uuid::Uuid;
 
 use crate::{SecretStore, SecretString, VERSIONED_SECRET_BUNDLE_SLOT_CEILING, hex};
@@ -13,6 +12,24 @@ use crate::{SecretStore, SecretString, VERSIONED_SECRET_BUNDLE_SLOT_CEILING, hex
 const SLOT_PREFIX: &str = "deppy.oauth.v1.";
 const REFRESH_SUFFIX: &str = ".refresh";
 const DCR_SUFFIX: &str = ".dcr";
+
+const ERROR_SLOT_PREFIX_INVALID: &str = "secret_bundle_slot_prefix_invalid";
+const ERROR_SLOT_SHAPE_INVALID: &str = "secret_bundle_slot_shape_invalid";
+const ERROR_SLOT_LOGICAL_ENCODING_INVALID: &str = "secret_bundle_slot_logical_encoding_invalid";
+const ERROR_SLOT_LOGICAL_UTF8_INVALID: &str = "secret_bundle_slot_logical_utf8_invalid";
+const ERROR_SLOT_VERSION_INVALID: &str = "secret_bundle_slot_version_invalid";
+const ERROR_INSPECT_ACCESS_FAILED: &str = "secret_bundle_inspect_access_failed";
+const ERROR_INSPECT_REFRESH_FAILED: &str = "secret_bundle_inspect_refresh_failed";
+const ERROR_INSPECT_DCR_FAILED: &str = "secret_bundle_inspect_dcr_failed";
+const ERROR_STAGE_ROLLBACK_COMPLETE: &str = "secret_bundle_stage_failed_rollback_complete";
+const ERROR_STAGE_ROLLBACK_INCOMPLETE: &str = "secret_bundle_stage_failed_rollback_incomplete";
+const ERROR_READ_ACCESS_FAILED: &str = "secret_bundle_read_access_failed";
+const ERROR_READ_REFRESH_PRESENCE_FAILED: &str = "secret_bundle_read_refresh_presence_failed";
+const ERROR_READ_REFRESH_FAILED: &str = "secret_bundle_read_refresh_failed";
+const ERROR_READ_DCR_PRESENCE_FAILED: &str = "secret_bundle_read_dcr_presence_failed";
+const ERROR_READ_DCR_FAILED: &str = "secret_bundle_read_dcr_failed";
+const ERROR_DELETE_FAILED: &str = "secret_bundle_delete_failed";
+const ERROR_INVENTORY_FAILED: &str = "secret_bundle_inventory_failed";
 
 /// Stable database identity. This is never accepted as a physical keyring username implicitly.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -35,7 +52,7 @@ impl LogicalCredentialId {
 
 impl std::fmt::Debug for LogicalCredentialId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("LogicalCredentialId").field(&self.0).finish()
+        f.write_str("LogicalCredentialId(REDACTED)")
     }
 }
 
@@ -62,22 +79,23 @@ impl PhysicalSecretSlot {
         anyhow::ensure!(value.len() <= 255, "physical secret slot is too long");
         let rest = value
             .strip_prefix(SLOT_PREFIX)
-            .context("physical secret slot prefix is invalid")?;
+            .ok_or_else(|| static_bundle_error(ERROR_SLOT_PREFIX_INVALID))?;
         let (logical_hex, version) = rest
             .split_once('.')
-            .context("physical secret slot shape is invalid")?;
+            .ok_or_else(|| static_bundle_error(ERROR_SLOT_SHAPE_INVALID))?;
         anyhow::ensure!(
             !logical_hex.is_empty(),
             "physical secret slot logical id is empty"
         );
-        let logical_bytes =
-            hex::from_hex(logical_hex).context("physical slot logical id encoding")?;
+        let logical_bytes = hex::from_hex(logical_hex)
+            .map_err(|_| static_bundle_error(ERROR_SLOT_LOGICAL_ENCODING_INVALID))?;
         anyhow::ensure!(
             !logical_bytes.is_empty(),
             "physical slot logical id is empty"
         );
-        std::str::from_utf8(&logical_bytes).context("physical slot logical id is not UTF-8")?;
-        Uuid::parse_str(version).context("physical secret slot version is invalid")?;
+        std::str::from_utf8(&logical_bytes)
+            .map_err(|_| static_bundle_error(ERROR_SLOT_LOGICAL_UTF8_INVALID))?;
+        Uuid::parse_str(version).map_err(|_| static_bundle_error(ERROR_SLOT_VERSION_INVALID))?;
         Ok(Self(value))
     }
 
@@ -104,7 +122,7 @@ impl PhysicalSecretSlot {
 
 impl std::fmt::Debug for PhysicalSecretSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PhysicalSecretSlot").field(&self.0).finish()
+        f.write_str("PhysicalSecretSlot(REDACTED)")
     }
 }
 
@@ -183,11 +201,17 @@ impl std::fmt::Debug for SecretBundleRef<'_> {
 }
 
 /// Adapter-neutral stage plan. The new physical slot is written before the database pointer swap.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecretBundleStagePlan {
     logical_id: LogicalCredentialId,
     new_slot: PhysicalSecretSlot,
     previous_slot: Option<PhysicalSecretSlot>,
+}
+
+impl std::fmt::Debug for SecretBundleStagePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretBundleStagePlan(REDACTED)")
+    }
 }
 
 impl SecretBundleStagePlan {
@@ -255,12 +279,18 @@ impl BundleEntryPresence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StagedSecretBundle {
     pub logical_id: LogicalCredentialId,
     pub new_slot: PhysicalSecretSlot,
     pub previous_slot: Option<PhysicalSecretSlot>,
     pub entries: BundleEntryPresence,
+}
+
+impl std::fmt::Debug for StagedSecretBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StagedSecretBundle(REDACTED)")
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -280,9 +310,15 @@ pub fn inspect_secret_bundle(
     slot: &PhysicalSecretSlot,
 ) -> anyhow::Result<BundleEntryPresence> {
     Ok(BundleEntryPresence {
-        access: store.has_secret(slot.as_str())?,
-        refresh: store.has_secret(&slot.refresh_entry_id())?,
-        dcr: store.has_secret(&slot.dcr_entry_id())?,
+        access: store
+            .has_secret(slot.as_str())
+            .map_err(|_| static_bundle_error(ERROR_INSPECT_ACCESS_FAILED))?,
+        refresh: store
+            .has_secret(&slot.refresh_entry_id())
+            .map_err(|_| static_bundle_error(ERROR_INSPECT_REFRESH_FAILED))?,
+        dcr: store
+            .has_secret(&slot.dcr_entry_id())
+            .map_err(|_| static_bundle_error(ERROR_INSPECT_DCR_FAILED))?,
     })
 }
 
@@ -298,17 +334,23 @@ pub fn stage_secret_bundle(
     let refresh_id = slot.refresh_entry_id();
     let dcr_id = slot.dcr_entry_id();
     let write_result = (|| {
-        store.set_secret(slot.as_str(), bundle.access)?;
+        store
+            .set_secret(slot.as_str(), bundle.access)
+            .map_err(|_| static_bundle_error(ERROR_STAGE_ROLLBACK_COMPLETE))?;
         if let Some(refresh) = bundle.refresh {
-            store.set_secret(&refresh_id, refresh)?;
+            store
+                .set_secret(&refresh_id, refresh)
+                .map_err(|_| static_bundle_error(ERROR_STAGE_ROLLBACK_COMPLETE))?;
         }
         if let Some(dcr) = bundle.dcr {
-            store.set_secret(&dcr_id, dcr)?;
+            store
+                .set_secret(&dcr_id, dcr)
+                .map_err(|_| static_bundle_error(ERROR_STAGE_ROLLBACK_COMPLETE))?;
         }
         Ok::<(), anyhow::Error>(())
     })();
-    if let Err(error) = write_result {
-        let mut rollback_errors = Vec::new();
+    if write_result.is_err() {
+        let mut rollback_incomplete = false;
         // A backend may persist an entry and still report an error. The slot was confirmed empty,
         // so remove every entry that this stage could have touched, including the failed write.
         let mut attempted = vec![slot.as_str()];
@@ -319,17 +361,12 @@ pub fn stage_secret_bundle(
             attempted.push(&dcr_id);
         }
         for id in attempted.into_iter().rev() {
-            if let Err(rollback) = store.delete_secret(id) {
-                rollback_errors.push(format!("{id}: {rollback:#}"));
-            }
+            rollback_incomplete |= store.delete_secret(id).is_err();
         }
-        if rollback_errors.is_empty() {
-            return Err(error).context("physical secret bundle stage failed; rollback complete");
+        if rollback_incomplete {
+            return Err(static_bundle_error(ERROR_STAGE_ROLLBACK_INCOMPLETE));
         }
-        return Err(error).context(format!(
-            "physical secret bundle stage failed; rollback errors: {}",
-            rollback_errors.join(", ")
-        ));
+        return Err(static_bundle_error(ERROR_STAGE_ROLLBACK_COMPLETE));
     }
 
     Ok(StagedSecretBundle {
@@ -350,19 +387,21 @@ pub fn read_secret_bundle(
 ) -> anyhow::Result<SecretBundle> {
     let access = store
         .get_secret(slot.as_str())
-        .context("physical secret bundle access read failed")?;
+        .map_err(|_| static_bundle_error(ERROR_READ_ACCESS_FAILED))?;
     let refresh_id = slot.refresh_entry_id();
     let refresh = store
-        .has_secret(&refresh_id)?
+        .has_secret(&refresh_id)
+        .map_err(|_| static_bundle_error(ERROR_READ_REFRESH_PRESENCE_FAILED))?
         .then(|| store.get_secret(&refresh_id))
         .transpose()
-        .context("physical secret bundle refresh read failed")?;
+        .map_err(|_| static_bundle_error(ERROR_READ_REFRESH_FAILED))?;
     let dcr_id = slot.dcr_entry_id();
     let dcr = store
-        .has_secret(&dcr_id)?
+        .has_secret(&dcr_id)
+        .map_err(|_| static_bundle_error(ERROR_READ_DCR_PRESENCE_FAILED))?
         .then(|| store.get_secret(&dcr_id))
         .transpose()
-        .context("physical secret bundle DCR read failed")?;
+        .map_err(|_| static_bundle_error(ERROR_READ_DCR_FAILED))?;
     Ok(SecretBundle::new(access, refresh, dcr))
 }
 
@@ -376,20 +415,18 @@ pub fn delete_secret_bundle(
         (slot.refresh_entry_id(), presence.refresh),
         (slot.dcr_entry_id(), presence.dcr),
     ];
-    let mut errors = Vec::new();
+    let mut delete_failed = false;
     let mut deleted = 0;
     for (id, existed) in entries {
-        if let Err(error) = store.delete_secret(&id) {
-            errors.push(format!("{id}: {error:#}"));
+        if store.delete_secret(&id).is_err() {
+            delete_failed = true;
         } else if existed {
             deleted += 1;
         }
     }
-    anyhow::ensure!(
-        errors.is_empty(),
-        "physical secret bundle delete failed: {}",
-        errors.join(", ")
-    );
+    if delete_failed {
+        return Err(static_bundle_error(ERROR_DELETE_FAILED));
+    }
     Ok(BundleDeleteResult {
         entries_deleted: deleted,
     })
@@ -399,7 +436,9 @@ pub fn list_secret_bundle_slots(
     store: &dyn SecretStore,
     logical_id: Option<&LogicalCredentialId>,
 ) -> anyhow::Result<Vec<PhysicalSecretSlot>> {
-    let entries = store.list_secret_ids_bounded(SLOT_PREFIX)?;
+    let entries = store
+        .list_secret_ids_bounded(SLOT_PREFIX)
+        .map_err(|_| static_bundle_error(ERROR_INVENTORY_FAILED))?;
     let mut slots = BTreeSet::new();
     for entry in entries {
         let base = entry
@@ -446,12 +485,103 @@ pub fn reconcile_orphan_secret_slots(
     Ok(result)
 }
 
+fn static_bundle_error(code: &'static str) -> anyhow::Error {
+    anyhow::Error::msg(code)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::sync::Mutex;
 
+    use anyhow::Context;
+
     use super::*;
+
+    const HOSTILE_ERROR_MARKER: &str = "Authorization: Bearer hostile-bundle-backend-marker-7349";
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum EntryKind {
+        Access,
+        Refresh,
+        Dcr,
+    }
+
+    #[derive(Default)]
+    struct HostileStore {
+        fail_set: bool,
+        fail_has: Option<EntryKind>,
+        fail_get: Option<EntryKind>,
+        fail_delete: bool,
+        fail_list: bool,
+        presence: BundleEntryPresence,
+        inventory: Vec<String>,
+    }
+
+    impl HostileStore {
+        fn entry_kind(id: &str) -> EntryKind {
+            if id.ends_with(REFRESH_SUFFIX) {
+                EntryKind::Refresh
+            } else if id.ends_with(DCR_SUFFIX) {
+                EntryKind::Dcr
+            } else {
+                EntryKind::Access
+            }
+        }
+
+        fn hostile_error(id: &str) -> anyhow::Error {
+            anyhow::anyhow!(
+                "{HOSTILE_ERROR_MARKER}; keyring_id={id}; service={}",
+                crate::KEYRING_SERVICE
+            )
+        }
+    }
+
+    impl SecretStore for HostileStore {
+        fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
+            if self.fail_set {
+                return Err(anyhow::anyhow!(
+                    "{HOSTILE_ERROR_MARKER}; keyring_id={id}; secret={}; service={}",
+                    secret.expose(),
+                    crate::KEYRING_SERVICE
+                ));
+            }
+            Ok(())
+        }
+
+        fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
+            if self.fail_get == Some(Self::entry_kind(id)) {
+                return Err(Self::hostile_error(id));
+            }
+            Ok(SecretString::new("hostile-store-placeholder".to_owned()))
+        }
+
+        fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
+            if self.fail_delete {
+                return Err(Self::hostile_error(id));
+            }
+            Ok(())
+        }
+
+        fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
+            let kind = Self::entry_kind(id);
+            if self.fail_has == Some(kind) {
+                return Err(Self::hostile_error(id));
+            }
+            Ok(match kind {
+                EntryKind::Access => self.presence.access,
+                EntryKind::Refresh => self.presence.refresh,
+                EntryKind::Dcr => self.presence.dcr,
+            })
+        }
+
+        fn list_secret_ids(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            if self.fail_list {
+                return Err(Self::hostile_error(prefix));
+            }
+            Ok(self.inventory.clone())
+        }
+    }
 
     #[derive(Default)]
     struct MemStore {
@@ -547,6 +677,387 @@ mod tests {
             Some(SecretString::new(refresh.to_owned())),
             Some(SecretString::new(dcr.to_owned())),
         )
+    }
+
+    fn captured_error(error: anyhow::Error) -> String {
+        format!("display={error}; alternate={error:#}; debug={error:?}")
+    }
+
+    fn assert_sanitized_diagnostic(diagnostic: &str, forbidden: &[&str]) {
+        for marker in forbidden {
+            assert!(!diagnostic.contains(marker));
+        }
+        assert!(crate::scan_diagnostic_bytes(diagnostic.as_bytes()).is_safe());
+    }
+
+    fn assert_static_error(error: anyhow::Error, expected: &'static str, forbidden: &[&str]) {
+        assert_eq!(error.to_string(), expected);
+        let diagnostic = captured_error(error);
+        assert_sanitized_diagnostic(&diagnostic, forbidden);
+    }
+
+    #[test]
+    fn every_public_bundle_debug_surface_is_redacted_or_low_cardinality() {
+        const LOGICAL_MARKER: &str = "diagnostic-logical-marker-8427";
+        const ACCESS_MARKER: &str = "Authorization: Bearer diagnostic-access-marker-6149";
+        const REFRESH_MARKER: &str = "refresh_token=diagnostic-refresh-marker-5821";
+        const DCR_MARKER: &str = "client_secret=diagnostic-dcr-marker-3076";
+
+        let logical = LogicalCredentialId::new(LOGICAL_MARKER).unwrap();
+        let logical_hex = hex::to_hex(LOGICAL_MARKER.as_bytes());
+        let version = Uuid::from_u128(0xdecafbad_decafbad_decafbad_decafbad);
+        let version_marker = version.simple().to_string();
+        let new_slot = PhysicalSecretSlot::with_version(&logical, version);
+        let previous_slot = PhysicalSecretSlot::with_version(&logical, Uuid::from_u128(41));
+        let plan = SecretBundleStagePlan::with_slot(
+            logical.clone(),
+            new_slot.clone(),
+            Some(previous_slot.clone()),
+        )
+        .unwrap();
+        let secrets = bundle(ACCESS_MARKER, REFRESH_MARKER, DCR_MARKER);
+        let staged = StagedSecretBundle {
+            logical_id: logical.clone(),
+            new_slot: new_slot.clone(),
+            previous_slot: Some(previous_slot.clone()),
+            entries: BundleEntryPresence {
+                access: true,
+                refresh: true,
+                dcr: true,
+            },
+        };
+        let presence = staged.entries;
+        let deletion = BundleDeleteResult { entries_deleted: 3 };
+        let reconciliation = ReconcileSecretSlotsResult {
+            slots_seen: 2,
+            orphan_slots_deleted: 1,
+            entries_deleted: 3,
+        };
+
+        let diagnostics = [
+            format!("{logical:?}"),
+            format!("{new_slot:?}"),
+            format!("{plan:?}"),
+            format!("{secrets:?}"),
+            format!("{:?}", secrets.as_ref()),
+            format!("{staged:?}"),
+            format!("{presence:?}"),
+            format!("{deletion:?}"),
+            format!("{reconciliation:?}"),
+            format!(
+                "{:?}",
+                (
+                    Some(logical.clone()),
+                    vec![new_slot.clone()],
+                    BTreeSet::from([previous_slot]),
+                    plan.clone(),
+                    staged.clone(),
+                )
+            ),
+        ];
+        assert_eq!(diagnostics[0], "LogicalCredentialId(REDACTED)");
+        assert_eq!(diagnostics[1], "PhysicalSecretSlot(REDACTED)");
+        assert_eq!(diagnostics[2], "SecretBundleStagePlan(REDACTED)");
+        assert_eq!(diagnostics[3], "SecretBundle(REDACTED)");
+        assert_eq!(diagnostics[4], "SecretBundleRef(REDACTED)");
+        assert_eq!(diagnostics[5], "StagedSecretBundle(REDACTED)");
+
+        let forbidden = [
+            LOGICAL_MARKER,
+            logical_hex.as_str(),
+            version_marker.as_str(),
+            new_slot.as_str(),
+            crate::KEYRING_SERVICE,
+            ACCESS_MARKER,
+            REFRESH_MARKER,
+            DCR_MARKER,
+        ];
+        for diagnostic in diagnostics {
+            assert_sanitized_diagnostic(&diagnostic, &forbidden);
+        }
+    }
+
+    #[test]
+    fn public_validation_errors_never_echo_identifier_or_version_material() {
+        const LOGICAL_MARKER: &str = "validation-logical-marker-4381";
+        const SLOT_MARKER: &str = "validation-slot-marker-7253";
+        const VERSION_MARKER: &str = "validation-version-marker-1964";
+
+        let too_long = format!("{LOGICAL_MARKER}{}", "x".repeat(97));
+        assert_static_error(
+            LogicalCredentialId::new(too_long).unwrap_err(),
+            "logical credential id is too long",
+            &[LOGICAL_MARKER],
+        );
+        assert_static_error(
+            LogicalCredentialId::new(String::new()).unwrap_err(),
+            "logical credential id is empty",
+            &[LOGICAL_MARKER],
+        );
+
+        let valid_version = Uuid::from_u128(9).simple().to_string();
+        let invalid_slots = [
+            (
+                format!("{SLOT_MARKER}{}", "x".repeat(256)),
+                "physical secret slot is too long",
+            ),
+            (
+                format!("{SLOT_MARKER}.{valid_version}"),
+                ERROR_SLOT_PREFIX_INVALID,
+            ),
+            (
+                format!("{SLOT_PREFIX}{SLOT_MARKER}"),
+                ERROR_SLOT_SHAPE_INVALID,
+            ),
+            (
+                format!("{SLOT_PREFIX}.{valid_version}"),
+                "physical secret slot logical id is empty",
+            ),
+            (
+                format!("{SLOT_PREFIX}{SLOT_MARKER}.{valid_version}"),
+                ERROR_SLOT_LOGICAL_ENCODING_INVALID,
+            ),
+            (
+                format!("{SLOT_PREFIX}ff.{valid_version}"),
+                ERROR_SLOT_LOGICAL_UTF8_INVALID,
+            ),
+            (
+                format!(
+                    "{SLOT_PREFIX}{}.{VERSION_MARKER}",
+                    hex::to_hex(LOGICAL_MARKER.as_bytes())
+                ),
+                ERROR_SLOT_VERSION_INVALID,
+            ),
+        ];
+        for (value, expected) in invalid_slots {
+            assert_static_error(
+                PhysicalSecretSlot::parse(value).unwrap_err(),
+                expected,
+                &[LOGICAL_MARKER, SLOT_MARKER, VERSION_MARKER],
+            );
+        }
+
+        let logical = LogicalCredentialId::new(LOGICAL_MARKER).unwrap();
+        let other = LogicalCredentialId::new("validation-other-owner-marker-5508").unwrap();
+        let own_slot = PhysicalSecretSlot::with_version(&logical, Uuid::from_u128(10));
+        let other_slot = PhysicalSecretSlot::with_version(&other, Uuid::from_u128(11));
+        assert_static_error(
+            SecretBundleStagePlan::with_slot(logical.clone(), other_slot.clone(), None)
+                .unwrap_err(),
+            "physical slot does not belong to logical credential",
+            &[LOGICAL_MARKER, other.as_str(), other_slot.as_str()],
+        );
+        assert_static_error(
+            SecretBundleStagePlan::with_slot(
+                logical.clone(),
+                own_slot.clone(),
+                Some(own_slot.clone()),
+            )
+            .unwrap_err(),
+            "new physical slot must differ from previous slot",
+            &[LOGICAL_MARKER, own_slot.as_str()],
+        );
+        assert_static_error(
+            SecretBundleStagePlan::with_slot(logical, own_slot.clone(), Some(other_slot.clone()))
+                .unwrap_err(),
+            "previous physical slot does not belong to logical credential",
+            &[LOGICAL_MARKER, own_slot.as_str(), other_slot.as_str()],
+        );
+    }
+
+    #[test]
+    fn hostile_store_errors_are_replaced_on_every_public_bundle_boundary() {
+        const LOGICAL_MARKER: &str = "store-boundary-logical-marker-3901";
+        const SECRET_MARKER: &str = "Authorization: Bearer store-input-marker-4672";
+        let logical = LogicalCredentialId::new(LOGICAL_MARKER).unwrap();
+        let physical = PhysicalSecretSlot::with_version(&logical, Uuid::from_u128(17));
+        let plan =
+            SecretBundleStagePlan::with_slot(logical.clone(), physical.clone(), None).unwrap();
+        let forbidden = [
+            HOSTILE_ERROR_MARKER,
+            LOGICAL_MARKER,
+            physical.as_str(),
+            crate::KEYRING_SERVICE,
+            SECRET_MARKER,
+        ];
+
+        for (kind, expected) in [
+            (EntryKind::Access, ERROR_INSPECT_ACCESS_FAILED),
+            (EntryKind::Refresh, ERROR_INSPECT_REFRESH_FAILED),
+            (EntryKind::Dcr, ERROR_INSPECT_DCR_FAILED),
+        ] {
+            let store = HostileStore {
+                fail_has: Some(kind),
+                ..HostileStore::default()
+            };
+            assert_static_error(
+                inspect_secret_bundle(&store, &physical).unwrap_err(),
+                expected,
+                &forbidden,
+            );
+        }
+
+        let stage_inspect_store = HostileStore {
+            fail_has: Some(EntryKind::Access),
+            ..HostileStore::default()
+        };
+        assert_static_error(
+            stage_secret_bundle(
+                &stage_inspect_store,
+                &plan,
+                bundle(SECRET_MARKER, "refresh", "dcr").as_ref(),
+            )
+            .unwrap_err(),
+            ERROR_INSPECT_ACCESS_FAILED,
+            &forbidden,
+        );
+
+        let occupied_store = MemStore::default();
+        occupied_store.insert_inventory_id(physical.as_str().to_owned());
+        assert_static_error(
+            stage_secret_bundle(
+                &occupied_store,
+                &plan,
+                bundle(SECRET_MARKER, "refresh", "dcr").as_ref(),
+            )
+            .unwrap_err(),
+            "new physical secret slot already exists",
+            &forbidden,
+        );
+
+        for (fail_delete, expected) in [
+            (false, ERROR_STAGE_ROLLBACK_COMPLETE),
+            (true, ERROR_STAGE_ROLLBACK_INCOMPLETE),
+        ] {
+            let store = HostileStore {
+                fail_set: true,
+                fail_delete,
+                ..HostileStore::default()
+            };
+            assert_static_error(
+                stage_secret_bundle(
+                    &store,
+                    &plan,
+                    bundle(SECRET_MARKER, "refresh", "dcr").as_ref(),
+                )
+                .unwrap_err(),
+                expected,
+                &forbidden,
+            );
+        }
+
+        let read_cases = [
+            (
+                HostileStore {
+                    fail_get: Some(EntryKind::Access),
+                    ..HostileStore::default()
+                },
+                ERROR_READ_ACCESS_FAILED,
+            ),
+            (
+                HostileStore {
+                    fail_has: Some(EntryKind::Refresh),
+                    ..HostileStore::default()
+                },
+                ERROR_READ_REFRESH_PRESENCE_FAILED,
+            ),
+            (
+                HostileStore {
+                    fail_get: Some(EntryKind::Refresh),
+                    presence: BundleEntryPresence {
+                        refresh: true,
+                        ..BundleEntryPresence::default()
+                    },
+                    ..HostileStore::default()
+                },
+                ERROR_READ_REFRESH_FAILED,
+            ),
+            (
+                HostileStore {
+                    fail_has: Some(EntryKind::Dcr),
+                    ..HostileStore::default()
+                },
+                ERROR_READ_DCR_PRESENCE_FAILED,
+            ),
+            (
+                HostileStore {
+                    fail_get: Some(EntryKind::Dcr),
+                    presence: BundleEntryPresence {
+                        dcr: true,
+                        ..BundleEntryPresence::default()
+                    },
+                    ..HostileStore::default()
+                },
+                ERROR_READ_DCR_FAILED,
+            ),
+        ];
+        for (store, expected) in read_cases {
+            assert_static_error(
+                read_secret_bundle(&store, &physical).unwrap_err(),
+                expected,
+                &forbidden,
+            );
+        }
+
+        let delete_store = HostileStore {
+            fail_delete: true,
+            ..HostileStore::default()
+        };
+        assert_static_error(
+            delete_secret_bundle(&delete_store, &physical).unwrap_err(),
+            ERROR_DELETE_FAILED,
+            &forbidden,
+        );
+
+        let list_store = HostileStore {
+            fail_list: true,
+            ..HostileStore::default()
+        };
+        assert_static_error(
+            list_secret_bundle_slots(&list_store, Some(&logical)).unwrap_err(),
+            ERROR_INVENTORY_FAILED,
+            &forbidden,
+        );
+
+        let reconcile_store = HostileStore {
+            fail_delete: true,
+            inventory: vec![physical.as_str().to_owned()],
+            ..HostileStore::default()
+        };
+        assert_static_error(
+            reconcile_orphan_secret_slots(&reconcile_store, &BTreeSet::new()).unwrap_err(),
+            ERROR_DELETE_FAILED,
+            &forbidden,
+        );
+    }
+
+    #[test]
+    fn redaction_changes_do_not_change_accessors_clone_or_owned_secret_transfer() {
+        const LOGICAL_MARKER: &str = "ownership-logical-marker-2308";
+        let logical = LogicalCredentialId::new(LOGICAL_MARKER).unwrap();
+        let new_slot = PhysicalSecretSlot::with_version(&logical, Uuid::from_u128(21));
+        let previous_slot = PhysicalSecretSlot::with_version(&logical, Uuid::from_u128(20));
+        let plan = SecretBundleStagePlan::with_slot(
+            logical.clone(),
+            new_slot.clone(),
+            Some(previous_slot.clone()),
+        )
+        .unwrap();
+        let cloned = plan.clone();
+        assert_eq!(cloned.logical_id().as_str(), LOGICAL_MARKER);
+        assert_eq!(cloned.new_slot(), &new_slot);
+        assert_eq!(cloned.previous_slot(), Some(&previous_slot));
+        assert!(cloned.new_slot().belongs_to(cloned.logical_id()));
+        assert_eq!(
+            PhysicalSecretSlot::parse(new_slot.as_str().to_owned()).unwrap(),
+            new_slot
+        );
+
+        let secrets = bundle("owned-access", "owned-refresh", "owned-dcr");
+        let (access, refresh, dcr) = secrets.into_parts();
+        assert_eq!(access.expose(), "owned-access");
+        assert_eq!(refresh.unwrap().expose(), "owned-refresh");
+        assert_eq!(dcr.unwrap().expose(), "owned-dcr");
     }
 
     #[test]
@@ -704,7 +1215,12 @@ mod tests {
             store.insert_inventory_id(slot(version as u128).as_str().to_owned());
         }
         let error = list_secret_bundle_slots(&store, None).unwrap_err();
-        assert!(error.to_string().contains("fixed slot ceiling"));
+        let first = slot(1);
+        assert_static_error(
+            error,
+            "versioned secret bundle inventory exceeds fixed slot ceiling",
+            &[first.as_str()],
+        );
     }
 
     #[test]
@@ -744,7 +1260,11 @@ mod tests {
             store.insert_inventory_id(format!("{SLOT_PREFIX}malformed-overflow-{index}"));
         }
         let before = store.entry_count();
-        assert!(reconcile_orphan_secret_slots(&store, &BTreeSet::new()).is_err());
+        assert_static_error(
+            reconcile_orphan_secret_slots(&store, &BTreeSet::new()).unwrap_err(),
+            ERROR_INVENTORY_FAILED,
+            &[HOSTILE_ERROR_MARKER],
+        );
         assert_eq!(store.delete_call_count(), 0);
         assert_eq!(store.entry_count(), before);
     }
@@ -757,7 +1277,11 @@ mod tests {
         let referenced = (1..=VERSIONED_SECRET_BUNDLE_SLOT_CEILING + 1)
             .map(|version| slot(version as u128))
             .collect::<BTreeSet<_>>();
-        assert!(reconcile_orphan_secret_slots(&store, &referenced).is_err());
+        assert_static_error(
+            reconcile_orphan_secret_slots(&store, &referenced).unwrap_err(),
+            "referenced secret bundle inventory exceeds fixed slot ceiling",
+            &[orphan.as_str()],
+        );
         assert_eq!(store.delete_call_count(), 0);
         assert_eq!(store.entry_count(), 1);
     }

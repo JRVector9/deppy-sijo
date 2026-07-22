@@ -22,6 +22,34 @@ pub(crate) const AGENT_STATE_BINDING_RECONCILE_BYTES_MAX: usize = AGENT_STATE_PE
 const AGENT_STATE_SINGLE_EXACT_BYTES_MAX: usize = 32 * 1024;
 const AGENT_STATE_PROJECTION_JOB_BYTES_MAX: usize = 4 * 1024 * 1024;
 const AGENT_STATE_PROJECTION_RESULT_BYTES_MAX: usize = 4 * 1024 * 1024;
+const AGENT_STATE_SHUTDOWN_RECEIPT_MAX: usize = AGENT_STATE_CONTINUATION_MAX + 1;
+
+/// Reserves bytes already retained by non-storage projection output and returns the nonzero
+/// remainder that a storage snapshot may consume. Composition-root adapters use this before
+/// entering a transaction, so a committed storage mutation cannot subsequently fail the worker's
+/// aggregate result ceiling merely because filesystem output was appended.
+pub(crate) fn checked_projection_result_remaining(
+    reserved_bytes: usize,
+) -> Result<usize, AgentStateErrorCode> {
+    let remaining = AGENT_STATE_PROJECTION_RESULT_BYTES_MAX
+        .checked_sub(reserved_bytes)
+        .ok_or(AgentStateErrorCode::ResourceLimit)?;
+    if remaining == 0 {
+        return Err(AgentStateErrorCode::ResourceLimit);
+    }
+    Ok(remaining)
+}
+
+/// Applies the same aggregate result ceiling to storage-free projection jobs without duplicating
+/// the limit literal in the composition-root adapter.
+pub(crate) fn check_projection_result_total(
+    retained_bytes: usize,
+) -> Result<(), AgentStateErrorCode> {
+    if retained_bytes > AGENT_STATE_PROJECTION_RESULT_BYTES_MAX {
+        return Err(AgentStateErrorCode::ResourceLimit);
+    }
+    Ok(())
+}
 
 /// Stable low-cardinality failures. Backend implementations must map raw storage/filesystem
 /// errors to one of these values before crossing the worker boundary.
@@ -363,9 +391,7 @@ fn execute_job<B: AgentStateBackend>(
     let result = backend
         .execute_job(exact, &projections)
         .and_then(|snapshot| {
-            if snapshot.retained_bytes() > AGENT_STATE_PROJECTION_RESULT_BYTES_MAX {
-                return Err(AgentStateErrorCode::ResourceLimit);
-            }
+            check_projection_result_total(snapshot.retained_bytes())?;
             Ok(Arc::new(snapshot))
         });
 
@@ -439,6 +465,32 @@ pub(crate) enum StageError {
     Backpressure,
     ResourceLimit,
     Closed,
+}
+
+fn validate_exact_limits(kind: ExactKind, retained_bytes: usize) -> Result<(), StageError> {
+    match kind {
+        ExactKind::TurnDoneClear | ExactKind::BindingDelete => {
+            if retained_bytes > AGENT_STATE_SINGLE_EXACT_BYTES_MAX {
+                return Err(StageError::ResourceLimit);
+            }
+        }
+        ExactKind::BindingReconcile { items } => {
+            if items > AGENT_STATE_BINDING_RECONCILE_MAX
+                || retained_bytes > AGENT_STATE_BINDING_RECONCILE_BYTES_MAX
+            {
+                return Err(StageError::ResourceLimit);
+            }
+        }
+        ExactKind::StructuredBatch { items } => {
+            if items == 0
+                || items > AGENT_STATE_STRUCTURED_BATCH_MAX
+                || retained_bytes > AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX
+            {
+                return Err(StageError::ResourceLimit);
+            }
+        }
+    }
+    Ok(())
 }
 
 impl StageError {
@@ -539,6 +591,115 @@ impl<E> fmt::Debug for ExactCompletion<E> {
             .debug_struct("ExactCompletion")
             .field("continuation", &self.continuation)
             .field("result", &self.result)
+            .finish()
+    }
+}
+
+/// Payload-free shutdown settlement. Operation IDs remain available for the App-owned correlation
+/// ledger but are deliberately omitted from `Debug` output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExactReceipt {
+    operation_id: u64,
+    kind: ExactKind,
+    result: Result<(), AgentStateErrorCode>,
+}
+
+impl ExactReceipt {
+    fn from_completion<E>(completion: ExactCompletion<E>) -> Self {
+        let (continuation, result) = completion.into_parts();
+        Self::from_continuation(continuation, result)
+    }
+
+    fn from_continuation<E>(
+        continuation: Arc<ExactContinuation<E>>,
+        result: Result<(), AgentStateErrorCode>,
+    ) -> Self {
+        let receipt = Self {
+            operation_id: continuation.operation_id(),
+            kind: continuation.kind(),
+            result,
+        };
+        // This explicit drop is the shutdown memory boundary: final payload construction is not
+        // reached until every prior continuation allocation has been released here.
+        drop(continuation);
+        receipt
+    }
+
+    const fn failed(operation_id: u64, kind: ExactKind, error: AgentStateErrorCode) -> Self {
+        Self {
+            operation_id,
+            kind,
+            result: Err(error),
+        }
+    }
+
+    pub(crate) const fn operation_id(self) -> u64 {
+        self.operation_id
+    }
+
+    pub(crate) const fn kind(self) -> ExactKind {
+        self.kind
+    }
+
+    pub(crate) const fn result(self) -> Result<(), AgentStateErrorCode> {
+        self.result
+    }
+}
+
+impl fmt::Debug for ExactReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExactReceipt")
+            .field("kind", &self.kind)
+            .field("result", &self.result)
+            .finish()
+    }
+}
+
+/// Bounded shutdown result: at most eight pre-existing exact operations plus one final binding
+/// reconcile. It never retains an exact request payload.
+pub(crate) struct AgentStateShutdownReport {
+    receipts: Vec<ExactReceipt>,
+    overflowed: bool,
+}
+
+impl AgentStateShutdownReport {
+    fn new(existing: usize) -> Self {
+        Self {
+            receipts: Vec::with_capacity(
+                existing
+                    .saturating_add(1)
+                    .min(AGENT_STATE_SHUTDOWN_RECEIPT_MAX),
+            ),
+            overflowed: false,
+        }
+    }
+
+    fn push(&mut self, receipt: ExactReceipt) {
+        if self.receipts.len() < AGENT_STATE_SHUTDOWN_RECEIPT_MAX {
+            self.receipts.push(receipt);
+        } else {
+            // Unreachable under exact admission invariants, but remain bounded and diagnostic
+            // instead of panicking if a future protocol change violates that invariant.
+            self.overflowed = true;
+        }
+    }
+
+    pub(crate) fn receipts(&self) -> &[ExactReceipt] {
+        &self.receipts
+    }
+
+    pub(crate) const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
+impl fmt::Debug for AgentStateShutdownReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentStateShutdownReport")
+            .field("receipt_count", &self.receipts.len())
+            .field("overflowed", &self.overflowed)
             .finish()
     }
 }
@@ -682,28 +843,7 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
             return Err(StageError::Backpressure);
         }
         let retained_bytes = payload.retained_bytes();
-        match kind {
-            ExactKind::TurnDoneClear | ExactKind::BindingDelete => {
-                if retained_bytes > AGENT_STATE_SINGLE_EXACT_BYTES_MAX {
-                    return Err(StageError::ResourceLimit);
-                }
-            }
-            ExactKind::BindingReconcile { items } => {
-                if items > AGENT_STATE_BINDING_RECONCILE_MAX
-                    || retained_bytes > AGENT_STATE_BINDING_RECONCILE_BYTES_MAX
-                {
-                    return Err(StageError::ResourceLimit);
-                }
-            }
-            ExactKind::StructuredBatch { items } => {
-                if items == 0
-                    || items > AGENT_STATE_STRUCTURED_BATCH_MAX
-                    || retained_bytes > AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX
-                {
-                    return Err(StageError::ResourceLimit);
-                }
-            }
-        }
+        validate_exact_limits(kind, retained_bytes)?;
         let next_bytes = self
             .exact_retained_bytes
             .checked_add(retained_bytes)
@@ -1040,6 +1180,190 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
         }
     }
 
+    fn drain_queued_exact_as_receipts_failed(
+        &mut self,
+        error: AgentStateErrorCode,
+        report: &mut AgentStateShutdownReport,
+    ) {
+        while let Some(continuation) = self.exact_queue.pop_front() {
+            let completion = ExactCompletion {
+                continuation,
+                result: Err(error),
+            };
+            self.release_exact(Some(&completion));
+            report.push(ExactReceipt::from_completion(completion));
+        }
+    }
+
+    fn drain_existing_exact_receipts(
+        &mut self,
+        report: &mut AgentStateShutdownReport,
+        known_unsent_restart_used: &mut bool,
+    ) {
+        loop {
+            if self.in_flight.is_some() {
+                match self.recv_outcome_blocking() {
+                    Ok(mut outcome) => {
+                        if let Some(exact) = outcome.take_exact() {
+                            report.push(ExactReceipt::from_completion(exact));
+                        }
+                        // Drop all Arc-shared projection results before considering final payload
+                        // construction or the next exact continuation.
+                        drop(outcome);
+                    }
+                    Err(_) => {
+                        // An in-flight operation may already have reached the backend. Settle it
+                        // once as unknown delivery and never place it back in the FIFO.
+                        if let Some(in_flight) = self.in_flight.take()
+                            && let Some(continuation) = in_flight.exact
+                        {
+                            let completion = ExactCompletion {
+                                continuation,
+                                result: Err(AgentStateErrorCode::WorkerUnavailable),
+                            };
+                            self.release_exact(Some(&completion));
+                            report.push(ExactReceipt::from_completion(completion));
+                        }
+                    }
+                }
+                continue;
+            }
+            if self.exact_queue.is_empty() {
+                break;
+            }
+            match self.admit() {
+                Ok(()) => {}
+                Err(AdmissionError::WorkerUnavailable) => {
+                    // `admit` restored this job before returning, so it is known unsent. One fresh
+                    // worker is allowed across the complete shutdown, including the final exact.
+                    if !*known_unsent_restart_used {
+                        *known_unsent_restart_used = true;
+                        continue;
+                    }
+                    self.drain_queued_exact_as_receipts_failed(
+                        AgentStateErrorCode::WorkerUnavailable,
+                        report,
+                    );
+                    break;
+                }
+                Err(AdmissionError::Empty | AdmissionError::Busy | AdmissionError::Closed) => {
+                    self.drain_queued_exact_as_receipts_failed(
+                        AgentStateErrorCode::WorkerUnavailable,
+                        report,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    fn enqueue_final_binding_reconcile(
+        &mut self,
+        operation_id: u64,
+        items: usize,
+        payload: Arc<B::ExactRequest>,
+    ) -> Result<(), StageError> {
+        if self.state != AgentStateWorkerState::Draining {
+            return Err(StageError::Closed);
+        }
+        if self.in_flight.is_some()
+            || !self.exact_queue.is_empty()
+            || !self.exact_operation_ids.is_empty()
+            || self.exact_retained_bytes != 0
+        {
+            return Err(StageError::Backpressure);
+        }
+        let kind = ExactKind::BindingReconcile { items };
+        let retained_bytes = payload.retained_bytes();
+        validate_exact_limits(kind, retained_bytes)?;
+        self.exact_operation_ids.insert(operation_id);
+        self.exact_retained_bytes = retained_bytes;
+        self.exact_queue.push_back(Arc::new(ExactContinuation {
+            operation_id,
+            kind,
+            payload,
+            retained_bytes,
+        }));
+        Ok(())
+    }
+
+    /// Closes admission, releases every pre-existing exact payload, constructs one final
+    /// authoritative binding reconcile only after that release boundary, dispatches it at most
+    /// once, and closes/joins the worker. The final builder is caught and mapped to a static
+    /// failure receipt so shutdown does not unwind through the composition root.
+    ///
+    /// `items` is `max(live_pane_ids.len(), desired_bindings.len())`. The caller must preflight its
+    /// borrowed source data before allocating the final payload; this method independently enforces
+    /// the shared 256-item/4-MiB exact limits after construction.
+    pub(crate) fn shutdown_with_final_binding_reconcile<F>(
+        &mut self,
+        operation_id: u64,
+        items: usize,
+        build_final: F,
+    ) -> AgentStateShutdownReport
+    where
+        F: FnOnce() -> Result<Arc<B::ExactRequest>, AgentStateErrorCode>,
+    {
+        let final_kind = ExactKind::BindingReconcile { items };
+        let mut report = AgentStateShutdownReport::new(self.exact_operation_ids.len());
+        if self.state == AgentStateWorkerState::Closed {
+            report.push(ExactReceipt::failed(
+                operation_id,
+                final_kind,
+                AgentStateErrorCode::WorkerUnavailable,
+            ));
+            return report;
+        }
+
+        self.begin_shutdown();
+        let mut known_unsent_restart_used = false;
+        self.drain_existing_exact_receipts(&mut report, &mut known_unsent_restart_used);
+
+        let duplicate_operation = report
+            .receipts()
+            .iter()
+            .any(|receipt| receipt.operation_id() == operation_id);
+        if duplicate_operation {
+            report.push(ExactReceipt::failed(
+                operation_id,
+                final_kind,
+                AgentStateErrorCode::Backpressure,
+            ));
+        } else {
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build_final));
+            let payload = match built {
+                Ok(Ok(payload)) => Some(payload),
+                Ok(Err(error)) => {
+                    report.push(ExactReceipt::failed(operation_id, final_kind, error));
+                    None
+                }
+                Err(_) => {
+                    report.push(ExactReceipt::failed(
+                        operation_id,
+                        final_kind,
+                        AgentStateErrorCode::WorkerUnavailable,
+                    ));
+                    None
+                }
+            };
+            if let Some(payload) = payload {
+                match self.enqueue_final_binding_reconcile(operation_id, items, payload) {
+                    Ok(()) => self
+                        .drain_existing_exact_receipts(&mut report, &mut known_unsent_restart_used),
+                    Err(error) => report.push(ExactReceipt::failed(
+                        operation_id,
+                        final_kind,
+                        error.error_code(),
+                    )),
+                }
+            }
+        }
+
+        self.close_slot();
+        self.state = AgentStateWorkerState::Closed;
+        report
+    }
+
     /// Stops admission, discards coalescible projections, and deterministically settles every
     /// already queued or in-flight exact continuation in FIFO order. An in-flight job whose result
     /// channel disconnects is reported once as `WorkerUnavailable`; it is never retried because
@@ -1326,6 +1650,34 @@ mod tests {
         assert_eq!(outcome.projections().len(), 1);
         assert_eq!(harness.opens.load(Ordering::Acquire), 1);
         assert_eq!(harness.wakes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn projection_result_helpers_share_the_exact_aggregate_boundary() {
+        assert_eq!(
+            checked_projection_result_remaining(0),
+            Ok(AGENT_STATE_PROJECTION_RESULT_BYTES_MAX)
+        );
+        assert_eq!(
+            checked_projection_result_remaining(AGENT_STATE_PROJECTION_RESULT_BYTES_MAX - 1),
+            Ok(1)
+        );
+        assert_eq!(
+            checked_projection_result_remaining(AGENT_STATE_PROJECTION_RESULT_BYTES_MAX),
+            Err(AgentStateErrorCode::ResourceLimit)
+        );
+        assert_eq!(
+            checked_projection_result_remaining(AGENT_STATE_PROJECTION_RESULT_BYTES_MAX + 1),
+            Err(AgentStateErrorCode::ResourceLimit)
+        );
+        assert_eq!(
+            check_projection_result_total(AGENT_STATE_PROJECTION_RESULT_BYTES_MAX),
+            Ok(())
+        );
+        assert_eq!(
+            check_projection_result_total(AGENT_STATE_PROJECTION_RESULT_BYTES_MAX + 1),
+            Err(AgentStateErrorCode::ResourceLimit)
+        );
     }
 
     #[test]
@@ -1688,6 +2040,198 @@ mod tests {
         );
         assert_eq!(harness.state.aggregate_calls.load(Ordering::Acquire), 2);
         assert_eq!(harness.opens.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn final_shutdown_drops_a_full_exact_budget_before_building_the_final_payload() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        let mut prior_payloads = Vec::new();
+        for operation_id in 0..AGENT_STATE_CONTINUATION_MAX as u64 {
+            let payload = Arc::new(TestPayload {
+                marker: "queued",
+                bytes: AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX,
+            });
+            prior_payloads.push(Arc::downgrade(&payload));
+            harness
+                .worker
+                .stage_exact(
+                    operation_id,
+                    ExactKind::StructuredBatch { items: 1 },
+                    payload,
+                )
+                .unwrap();
+        }
+        let projection_payload = Arc::new(TestPayload {
+            marker: "discarded-projection",
+            bytes: AGENT_STATE_PROJECTION_JOB_BYTES_MAX,
+        });
+        let pending_projection = Arc::downgrade(&projection_payload);
+        harness
+            .worker
+            .stage_projection(
+                AgentStateSection::Hooks,
+                AgentStateRevision::new(1, 1),
+                Arc::clone(&projection_payload),
+            )
+            .unwrap();
+        drop(projection_payload);
+        assert_eq!(
+            harness.worker.pending_exact_bytes(),
+            AGENT_STATE_PENDING_BYTES_MAX
+        );
+
+        let report = harness.worker.shutdown_with_final_binding_reconcile(
+            99,
+            AGENT_STATE_BINDING_RECONCILE_MAX,
+            move || {
+                assert!(
+                    prior_payloads
+                        .iter()
+                        .all(|payload| payload.upgrade().is_none()),
+                    "the final 4-MiB payload must not overlap a prior exact payload"
+                );
+                assert!(
+                    pending_projection.upgrade().is_none(),
+                    "pending projections must be discarded before final construction"
+                );
+                Ok(Arc::new(TestPayload {
+                    marker: "final",
+                    bytes: AGENT_STATE_BINDING_RECONCILE_BYTES_MAX,
+                }))
+            },
+        );
+
+        assert!(!report.overflowed());
+        assert_eq!(report.receipts().len(), AGENT_STATE_SHUTDOWN_RECEIPT_MAX);
+        assert_eq!(
+            report
+                .receipts()
+                .iter()
+                .map(|receipt| receipt.operation_id())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 99]
+        );
+        assert!(
+            report
+                .receipts()
+                .iter()
+                .all(|receipt| receipt.result() == Ok(()))
+        );
+        assert_eq!(
+            report.receipts().last().map(|receipt| receipt.kind()),
+            Some(ExactKind::BindingReconcile {
+                items: AGENT_STATE_BINDING_RECONCILE_MAX
+            })
+        );
+        let calls = lock_unpoisoned(&harness.state.calls);
+        assert_eq!(calls.len(), AGENT_STATE_SHUTDOWN_RECEIPT_MAX);
+        assert_eq!(calls.last().map(|(marker, _)| *marker), Some("final"));
+        assert_eq!(
+            harness.state.aggregate_calls.load(Ordering::Acquire),
+            AGENT_STATE_SHUTDOWN_RECEIPT_MAX
+        );
+        assert_eq!(harness.worker.pending_exact_count(), 0);
+        assert_eq!(harness.worker.pending_exact_bytes(), 0);
+        assert!(!harness.worker.has_live_slot());
+    }
+
+    #[test]
+    fn final_shutdown_maps_builder_failures_to_payload_free_receipts() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        let report = harness
+            .worker
+            .shutdown_with_final_binding_reconcile(40, 0, || {
+                Err(AgentStateErrorCode::ResourceLimit)
+            });
+        assert_eq!(report.receipts().len(), 1);
+        assert_eq!(report.receipts()[0].operation_id(), 40);
+        assert_eq!(
+            report.receipts()[0].result(),
+            Err(AgentStateErrorCode::ResourceLimit)
+        );
+        assert_eq!(harness.state.aggregate_calls.load(Ordering::Acquire), 0);
+        assert!(!harness.worker.has_live_slot());
+
+        let mut panic_harness = Harness::new(Duration::from_secs(30));
+        let panic_report =
+            panic_harness
+                .worker
+                .shutdown_with_final_binding_reconcile(41, 0, || {
+                    panic!("injected final builder panic")
+                });
+        assert_eq!(panic_report.receipts().len(), 1);
+        assert_eq!(panic_report.receipts()[0].operation_id(), 41);
+        assert_eq!(
+            panic_report.receipts()[0].result(),
+            Err(AgentStateErrorCode::WorkerUnavailable)
+        );
+        assert_eq!(
+            panic_harness.state.aggregate_calls.load(Ordering::Acquire),
+            0
+        );
+        assert!(!panic_harness.worker.has_live_slot());
+    }
+
+    #[test]
+    fn final_shutdown_uses_the_shared_binding_reconcile_limits() {
+        let mut item_harness = Harness::new(Duration::from_secs(30));
+        let item_report = item_harness.worker.shutdown_with_final_binding_reconcile(
+            50,
+            AGENT_STATE_BINDING_RECONCILE_MAX + 1,
+            || Ok(Harness::payload("too-many")),
+        );
+        assert_eq!(
+            item_report.receipts()[0].result(),
+            Err(AgentStateErrorCode::ResourceLimit)
+        );
+        assert_eq!(
+            item_harness.state.aggregate_calls.load(Ordering::Acquire),
+            0
+        );
+
+        let mut byte_harness = Harness::new(Duration::from_secs(30));
+        let byte_report = byte_harness
+            .worker
+            .shutdown_with_final_binding_reconcile(51, 0, || {
+                Ok(Arc::new(TestPayload {
+                    marker: "too-large",
+                    bytes: AGENT_STATE_BINDING_RECONCILE_BYTES_MAX + 1,
+                }))
+            });
+        assert_eq!(
+            byte_report.receipts()[0].result(),
+            Err(AgentStateErrorCode::ResourceLimit)
+        );
+        assert_eq!(
+            byte_harness.state.aggregate_calls.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn final_shutdown_never_retries_unknown_delivery() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        harness.state.panic_after_next_record();
+        let report = harness
+            .worker
+            .shutdown_with_final_binding_reconcile(77, 1, || Ok(Harness::payload("final-unknown")));
+
+        assert_eq!(report.receipts().len(), 1);
+        assert_eq!(report.receipts()[0].operation_id(), 77);
+        assert_eq!(
+            report.receipts()[0].result(),
+            Err(AgentStateErrorCode::WorkerUnavailable)
+        );
+        assert_eq!(
+            lock_unpoisoned(&harness.state.calls)
+                .iter()
+                .filter(|(marker, _)| *marker == "final-unknown")
+                .count(),
+            1
+        );
+        assert_eq!(harness.state.aggregate_calls.load(Ordering::Acquire), 1);
+        assert_eq!(harness.opens.load(Ordering::Acquire), 1);
+        assert!(!harness.worker.has_live_slot());
     }
 
     #[test]

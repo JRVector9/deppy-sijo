@@ -25,7 +25,6 @@ mod paths;
 mod perf;
 mod shortcuts;
 mod status_feed;
-mod storage;
 mod tailscale;
 mod theme;
 mod ui;

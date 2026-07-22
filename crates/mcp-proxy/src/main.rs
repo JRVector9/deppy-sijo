@@ -209,6 +209,8 @@ fn run() -> Result<(), ProxyRunFailure> {
         manager,
         Arc::clone(&db),
         redaction.clone(),
+        Arc::new(secret::KeyringSecretStore),
+        Some(Arc::new(secret::init_platform_store)),
         DEFAULT_BACKEND_IDLE_TTL,
     );
     let backend = Arc::new(BackendClient::managed(
@@ -491,6 +493,35 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn concrete_keyring_store는_proxy_main_composition_root에만_존재한다() {
+        fn production(source: &str) -> &str {
+            source
+                .split_once("\n#[cfg(test)]\nmod tests")
+                .map_or(source, |(production, _)| production)
+        }
+
+        for (module, source) in [
+            ("approval_notify.rs", include_str!("approval_notify.rs")),
+            ("cli.rs", include_str!("cli.rs")),
+            ("forwarder.rs", include_str!("forwarder.rs")),
+            ("hook.rs", include_str!("hook.rs")),
+            ("session.rs", include_str!("session.rs")),
+        ] {
+            assert!(
+                !production(source).contains("KeyringSecretStore"),
+                "concrete keyring escaped proxy main: {module}"
+            );
+        }
+        assert_eq!(
+            production(include_str!("main.rs"))
+                .matches("KeyringSecretStore")
+                .count(),
+            1,
+            "proxy main must remain the single concrete keyring composition seam"
+        );
     }
 
     #[test]

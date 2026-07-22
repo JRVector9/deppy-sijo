@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use runtime::{
-    LayoutNode, MuxSnapshot, RuntimeClient, RuntimeCommand, RuntimeEvent, SessionId, SessionStatus,
-    SpawnKind, SplitDirection,
+    LayoutNode, MuxSnapshot, RuntimeCommand, RuntimeEvent, SessionId, SessionStatus, SpawnKind,
+    SplitDirection,
 };
 use terminal::{TerminalViewportSnapshot, input_mapper, renderer_egui};
 
@@ -27,6 +27,15 @@ const TERMINAL_CLIPBOARD_TEXT_MAX_BYTES: usize = 1024 * 1024;
 const WORKSPACE_NOTICE_SUMMARY_MAX_BYTES: usize = 4 * 1024;
 const WORKSPACE_NOTICE_BODY_MAX_BYTES: usize = 2 * 1024;
 const WORKSPACE_NOTICE_TOTAL_MAX_BYTES: usize = 5 * 1024;
+const WORKSPACE_PROTOCOL_CAP: usize = 8;
+// Terminal paste accepts files/selections up to the existing 1 MiB clipboard ceiling. This is a
+// local PTY byte stream, not the Connector/MCP tool-argument contract whose independent cap is
+// 32 KiB.
+const WORKSPACE_PROTOCOL_INPUT_MAX_BYTES: usize = 1024 * 1024;
+const WORKSPACE_PROTOCOL_QUERY_MAX_BYTES: usize = 32 * 1024;
+const WORKSPACE_PROTOCOL_ID_MAX_BYTES: usize = 128;
+const WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS: usize = 256;
+const WORKSPACE_PROTOCOL_SCROLLBACK_MAX_LINES: usize = 100_000;
 
 /// Capacity-one, immutable request for the composition root to deliver through
 /// the operating-system notification API. Workspace rendering only stages this
@@ -68,6 +77,176 @@ impl fmt::Debug for WorkspaceNotice {
             .debug_struct("WorkspaceNotice")
             .field("payload", &"[REDACTED]")
             .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WorkspaceProtocolOperation(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceProtocolErrorCode {
+    Busy,
+    InvalidCommand,
+    PayloadTooLarge,
+    DeliveryFailed,
+}
+
+/// One validated UI-to-runtime command. This value is non-Clone/non-Serialize and its Debug
+/// implementation exposes only bounded correlation metadata and a low-cardinality command kind.
+pub struct WorkspaceProtocolIntent {
+    operation: WorkspaceProtocolOperation,
+    generation: u64,
+    command: RuntimeCommand,
+}
+
+impl WorkspaceProtocolIntent {
+    pub fn operation(&self) -> WorkspaceProtocolOperation {
+        self.operation
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn into_command(self) -> RuntimeCommand {
+        self.command
+    }
+}
+
+impl fmt::Debug for WorkspaceProtocolIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceProtocolIntent")
+            .field("operation", &self.operation)
+            .field("generation", &self.generation)
+            .field("kind", &workspace_protocol_kind(&self.command))
+            .finish()
+    }
+}
+
+pub struct WorkspaceProtocolCompletion {
+    pub operation: WorkspaceProtocolOperation,
+    pub generation: u64,
+    pub result: Result<(), WorkspaceProtocolErrorCode>,
+}
+
+struct PendingProtocolIntent {
+    spawn: bool,
+}
+
+fn workspace_protocol_kind(command: &RuntimeCommand) -> &'static str {
+    match command {
+        RuntimeCommand::SpawnShell { .. } => "spawn_shell",
+        RuntimeCommand::WriteInput { .. } => "write_input",
+        RuntimeCommand::Resize { .. } => "resize",
+        RuntimeCommand::Scroll { .. } => "scroll",
+        RuntimeCommand::SplitPane { .. } => "split_pane",
+        RuntimeCommand::ClosePane { .. } => "close_pane",
+        RuntimeCommand::FocusPane { .. } => "focus_pane",
+        RuntimeCommand::ResizeSplit { .. } => "resize_split",
+        RuntimeCommand::SearchScrollback { .. } => "search_scrollback",
+        RuntimeCommand::ScrollToBottom { .. } => "scroll_to_bottom",
+        RuntimeCommand::ScrollToPrompt { .. } => "scroll_to_prompt",
+        RuntimeCommand::ExtractLastOutput { .. } => "extract_last_output",
+        _ => "invalid",
+    }
+}
+
+fn workspace_protocol_command_is_valid(
+    command: &RuntimeCommand,
+) -> Result<(), WorkspaceProtocolErrorCode> {
+    let id_is_valid = |id: &str| {
+        !id.is_empty() && id.len() <= WORKSPACE_PROTOCOL_ID_MAX_BYTES && !id.as_bytes().contains(&0)
+    };
+    match command {
+        RuntimeCommand::SpawnShell {
+            cols,
+            rows,
+            scrollback_lines,
+        } => {
+            if *cols > 0
+                && *rows > 0
+                && *scrollback_lines <= WORKSPACE_PROTOCOL_SCROLLBACK_MAX_LINES
+            {
+                Ok(())
+            } else {
+                Err(WorkspaceProtocolErrorCode::InvalidCommand)
+            }
+        }
+        RuntimeCommand::Resize { cols, rows, .. } => {
+            if *cols > 0 && *rows > 0 {
+                Ok(())
+            } else {
+                Err(WorkspaceProtocolErrorCode::InvalidCommand)
+            }
+        }
+        RuntimeCommand::Scroll { .. }
+        | RuntimeCommand::ScrollToBottom { .. }
+        | RuntimeCommand::ExtractLastOutput { .. } => Ok(()),
+        RuntimeCommand::WriteInput { bytes, .. } => {
+            if bytes.len() <= WORKSPACE_PROTOCOL_INPUT_MAX_BYTES {
+                Ok(())
+            } else {
+                Err(WorkspaceProtocolErrorCode::PayloadTooLarge)
+            }
+        }
+        RuntimeCommand::SplitPane {
+            pane,
+            scrollback_lines,
+            ..
+        } => {
+            if id_is_valid(&pane.0) && *scrollback_lines <= WORKSPACE_PROTOCOL_SCROLLBACK_MAX_LINES
+            {
+                Ok(())
+            } else {
+                Err(WorkspaceProtocolErrorCode::InvalidCommand)
+            }
+        }
+        RuntimeCommand::ClosePane { pane } | RuntimeCommand::FocusPane { pane } => {
+            if id_is_valid(&pane.0) {
+                Ok(())
+            } else {
+                Err(WorkspaceProtocolErrorCode::InvalidCommand)
+            }
+        }
+        RuntimeCommand::ResizeSplit {
+            tab, path, ratio, ..
+        } => {
+            if id_is_valid(&tab.0)
+                && !path.is_empty()
+                && path.len() <= WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS
+                && path.iter().all(|part| *part <= 1)
+                && ratio.is_finite()
+                && (0.0..=1.0).contains(ratio)
+            {
+                Ok(())
+            } else {
+                Err(WorkspaceProtocolErrorCode::InvalidCommand)
+            }
+        }
+        RuntimeCommand::SearchScrollback {
+            query, max_matches, ..
+        } => {
+            if !query.is_empty()
+                && query.len() <= WORKSPACE_PROTOCOL_QUERY_MAX_BYTES
+                && !query.as_bytes().contains(&0)
+                && (1..=SEARCH_MAX_MATCHES).contains(max_matches)
+            {
+                Ok(())
+            } else if query.len() > WORKSPACE_PROTOCOL_QUERY_MAX_BYTES {
+                Err(WorkspaceProtocolErrorCode::PayloadTooLarge)
+            } else {
+                Err(WorkspaceProtocolErrorCode::InvalidCommand)
+            }
+        }
+        RuntimeCommand::ScrollToPrompt { direction, .. } => {
+            if matches!(direction, -1 | 1) {
+                Ok(())
+            } else {
+                Err(WorkspaceProtocolErrorCode::InvalidCommand)
+            }
+        }
+        _ => Err(WorkspaceProtocolErrorCode::InvalidCommand),
     }
 }
 
@@ -298,6 +477,10 @@ pub struct WorkspaceUi {
     io_generation: u64,
     next_io_operation: u64,
     io_intents: VecDeque<WorkspaceIoIntent>,
+    protocol_generation: u64,
+    next_protocol_operation: u64,
+    protocol_intents: VecDeque<WorkspaceProtocolIntent>,
+    protocol_inflight: HashMap<(WorkspaceProtocolOperation, u64), PendingProtocolIntent>,
     pending_path_resolution: Option<PendingPathResolution>,
     /// 직전 폴더 클릭 (경로, 시각) — 더블클릭이 clicked를 두 번 발화시켜 같은 cd가
     /// 연속 주입되는 것을 막는다.
@@ -727,6 +910,10 @@ impl WorkspaceUi {
             io_generation: 1,
             next_io_operation: 1,
             io_intents: VecDeque::with_capacity(WORKSPACE_IO_QUEUE_CAP),
+            protocol_generation: 1,
+            next_protocol_operation: 1,
+            protocol_intents: VecDeque::with_capacity(WORKSPACE_PROTOCOL_CAP),
+            protocol_inflight: HashMap::with_capacity(WORKSPACE_PROTOCOL_CAP),
             pending_path_resolution: None,
             last_dir_click: None,
             last_url_click: None,
@@ -796,9 +983,110 @@ impl WorkspaceUi {
         self.io_intents.pop_front()
     }
 
+    fn next_protocol_operation(&mut self) -> (WorkspaceProtocolOperation, u64) {
+        let operation = WorkspaceProtocolOperation(self.next_protocol_operation);
+        let generation = self.protocol_generation;
+        self.next_protocol_operation = self.next_protocol_operation.wrapping_add(1);
+        if self.next_protocol_operation == 0 {
+            self.next_protocol_operation = 1;
+            self.protocol_generation = self.protocol_generation.wrapping_add(1).max(1);
+        }
+        (operation, generation)
+    }
+
+    fn queue_protocol_intent(
+        &mut self,
+        command: RuntimeCommand,
+    ) -> Result<(), WorkspaceProtocolErrorCode> {
+        workspace_protocol_command_is_valid(&command)?;
+
+        if let RuntimeCommand::WriteInput {
+            session: next_session,
+            bytes: next_bytes,
+        } = &command
+            && let Some(WorkspaceProtocolIntent {
+                command:
+                    RuntimeCommand::WriteInput {
+                        session: queued_session,
+                        bytes: queued_bytes,
+                    },
+                ..
+            }) = self.protocol_intents.back_mut()
+            && queued_session == next_session
+        {
+            let combined = queued_bytes
+                .len()
+                .checked_add(next_bytes.len())
+                .ok_or(WorkspaceProtocolErrorCode::PayloadTooLarge)?;
+            if combined > WORKSPACE_PROTOCOL_INPUT_MAX_BYTES {
+                return Err(WorkspaceProtocolErrorCode::PayloadTooLarge);
+            }
+            queued_bytes.extend_from_slice(next_bytes);
+            self.command_sent = true;
+            return Ok(());
+        }
+
+        if self
+            .protocol_intents
+            .len()
+            .saturating_add(self.protocol_inflight.len())
+            >= WORKSPACE_PROTOCOL_CAP
+        {
+            return Err(WorkspaceProtocolErrorCode::Busy);
+        }
+        let (operation, generation) = self.next_protocol_operation();
+        self.protocol_intents.push_back(WorkspaceProtocolIntent {
+            operation,
+            generation,
+            command,
+        });
+        self.command_sent = true;
+        Ok(())
+    }
+
+    /// Drains one validated protocol request for the composition root. A taken request occupies
+    /// one of the same eight slots until an exact completion is applied, preventing a hidden
+    /// in-flight backlog when a host adapter stalls.
+    pub fn take_protocol_intent(&mut self) -> Option<WorkspaceProtocolIntent> {
+        let intent = self.protocol_intents.pop_front()?;
+        let key = (intent.operation, intent.generation);
+        self.protocol_inflight.insert(
+            key,
+            PendingProtocolIntent {
+                spawn: matches!(
+                    &intent.command,
+                    RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }
+                ),
+            },
+        );
+        Some(intent)
+    }
+
+    /// Applies only the exact operation/generation currently in flight. Unknown, duplicate, or
+    /// pre-wrap completions are discarded without mutating UI lifecycle state.
+    pub fn complete_protocol(&mut self, completion: WorkspaceProtocolCompletion) {
+        let Some(pending) = self
+            .protocol_inflight
+            .remove(&(completion.operation, completion.generation))
+        else {
+            return;
+        };
+        match completion.result {
+            Ok(()) => {
+                if pending.spawn {
+                    self.pending_spawns = self.pending_spawns.saturating_add(1);
+                }
+            }
+            Err(_) => {
+                self.error_is_pressure = false;
+                self.error = Some("terminal protocol delivery failed".to_owned());
+            }
+        }
+    }
+
     /// App host 결과를 적용한다. operation/generation이 현재 pending과 정확히 일치하지
     /// 않으면 늦은 결과로 간주해 버린다.
-    pub fn complete_io(&mut self, completion: WorkspaceIoCompletion, client: &dyn RuntimeClient) {
+    pub fn complete_io(&mut self, completion: WorkspaceIoCompletion) {
         match completion {
             WorkspaceIoCompletion::PathResolved {
                 operation,
@@ -866,13 +1154,10 @@ impl WorkspaceUi {
                     pending.bracketed,
                 );
                 if let Some(bytes) = bytes {
-                    self.send(
-                        client,
-                        RuntimeCommand::WriteInput {
-                            session: pending.session,
-                            bytes,
-                        },
-                    );
+                    self.send(RuntimeCommand::WriteInput {
+                        session: pending.session,
+                        bytes,
+                    });
                 }
             }
         }
@@ -989,7 +1274,6 @@ impl WorkspaceUi {
         origin: egui::Pos2,
         cell_size: egui::Vec2,
         snapshot: &TerminalViewportSnapshot,
-        client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
         // 이 pane의 세션에 대한 검색만 그린다.
@@ -1041,7 +1325,7 @@ impl WorkspaceUi {
             }
         };
         if let Some(delta) = scroll_delta {
-            self.send(client, RuntimeCommand::Scroll { session, delta });
+            self.send(RuntimeCommand::Scroll { session, delta });
         }
 
         // 3) 우상단 검색 바.
@@ -1181,14 +1465,11 @@ impl WorkspaceUi {
                 }
             }
             if !empty {
-                self.send(
-                    client,
-                    RuntimeCommand::SearchScrollback {
-                        session: sess,
-                        query: q,
-                        max_matches: SEARCH_MAX_MATCHES,
-                    },
-                );
+                self.send(RuntimeCommand::SearchScrollback {
+                    session: sess,
+                    query: q,
+                    max_matches: SEARCH_MAX_MATCHES,
+                });
             }
         }
     }
@@ -1397,12 +1678,7 @@ impl WorkspaceUi {
         }
     }
 
-    fn handle_events(
-        &mut self,
-        client: &dyn RuntimeClient,
-        events: &[RuntimeEvent],
-        catalog: &i18n::Catalog,
-    ) {
+    fn handle_events(&mut self, events: &[RuntimeEvent], catalog: &i18n::Catalog) {
         for event in events {
             match event {
                 RuntimeEvent::MuxUpdated { snapshot } => {
@@ -1558,13 +1834,10 @@ impl WorkspaceUi {
                             self.session_shell_kind(*session),
                             false,
                         );
-                        self.send(
-                            client,
-                            RuntimeCommand::WriteInput {
-                                session: *session,
-                                bytes,
-                            },
-                        );
+                        self.send(RuntimeCommand::WriteInput {
+                            session: *session,
+                            bytes,
+                        });
                     }
                 }
                 // Launch correlation is app-owned lifecycle state (approval listener/runtime host),
@@ -1624,7 +1897,6 @@ impl WorkspaceUi {
     fn prepare_frame(
         &mut self,
         ctx: &egui::Context,
-        client: &dyn RuntimeClient,
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
     ) {
@@ -1639,7 +1911,7 @@ impl WorkspaceUi {
         // 파일 트리 ⌘V/⌘C 소비 프레임 — 요청을 이번 프레임 확정값으로 옮긴다(이월 없음).
         self.paste_suppressed = std::mem::take(&mut self.suppress_paste_request);
         self.copy_suppressed = std::mem::take(&mut self.suppress_copy_request);
-        self.handle_events(client, events, catalog);
+        self.handle_events(events, catalog);
         // 「마지막 출력 복사」 — handle_events에는 Context가 없어 여기서 수행한다.
         if let Some(text) = self.pending_copy.take() {
             ctx.copy_text(text);
@@ -1651,22 +1923,21 @@ impl WorkspaceUi {
     pub fn update_hidden(
         &mut self,
         ctx: &egui::Context,
-        client: &dyn RuntimeClient,
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
     ) {
-        self.prepare_frame(ctx, client, events, catalog);
+        self.prepare_frame(ctx, events, catalog);
+        self.flush_command_repaint(ctx);
     }
 
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         config: &TerminalConfig,
-        client: &dyn RuntimeClient,
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
     ) {
-        self.prepare_frame(ui.ctx(), client, events, catalog);
+        self.prepare_frame(ui.ctx(), events, catalog);
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
@@ -1690,14 +1961,11 @@ impl WorkspaceUi {
                     .on_hover_text(catalog.t("workspace.start_shell_prompt", &[]))
                     .clicked()
                 {
-                    self.send(
-                        client,
-                        RuntimeCommand::SpawnShell {
-                            cols: 80,
-                            rows: 24,
-                            scrollback_lines: config.scrollback_lines as usize,
-                        },
-                    );
+                    self.send(RuntimeCommand::SpawnShell {
+                        cols: 80,
+                        rows: 24,
+                        scrollback_lines: config.scrollback_lines as usize,
+                    });
                 }
             });
             self.flush_command_repaint(ui.ctx());
@@ -1739,14 +2007,11 @@ impl WorkspaceUi {
                     .on_hover_text(catalog.t("workspace.start_shell_prompt", &[]))
                     .clicked()
                 {
-                    self.send(
-                        client,
-                        RuntimeCommand::SpawnShell {
-                            cols: 80,
-                            rows: 24,
-                            scrollback_lines: config.scrollback_lines as usize,
-                        },
-                    );
+                    self.send(RuntimeCommand::SpawnShell {
+                        cols: 80,
+                        rows: 24,
+                        scrollback_lines: config.scrollback_lines as usize,
+                    });
                 }
             });
             self.flush_command_repaint(ui.ctx());
@@ -1759,7 +2024,7 @@ impl WorkspaceUi {
         // 소모했다. 이제 worker의 wake가 Viewport(dirty 게이트)·상태 이벤트 모두를
         // 깨우므로 폴링이 불필요하다: 출력/상태가 있을 때만 프레임이 돈다.
 
-        self.close_confirm_dialog(ui.ctx(), client, catalog);
+        self.close_confirm_dialog(ui.ctx(), catalog);
 
         let rect = ui.available_rect_before_wrap();
         let layout = active_tab.layout.clone();
@@ -1771,7 +2036,6 @@ impl WorkspaceUi {
             &layout,
             &mux,
             config,
-            client,
             &tab_id,
             &mut split_path,
             catalog,
@@ -1789,7 +2053,6 @@ impl WorkspaceUi {
         pane: &runtime::PaneSnapshot,
         focused: bool,
         config: &TerminalConfig,
-        client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
         let osc = self.session_osc_title(pane.session_id);
@@ -1864,9 +2127,9 @@ impl WorkspaceUi {
             egui::Sense::click(),
         );
         if header_response.clicked() && !focused {
-            self.request_pane_focus(client, pane.id.clone());
+            self.request_pane_focus(pane.id.clone());
         }
-        self.pane_context_menu(&header_response, &pane.id, config, client, catalog);
+        self.pane_context_menu(&header_response, &pane.id, config, catalog);
 
         let status_color = if focused {
             status_green
@@ -1935,7 +2198,7 @@ impl WorkspaceUi {
             .on_hover_text(catalog.t("workspace.close_pane", &[]))
             .clicked()
         {
-            self.request_close_pane(client, pane.id.clone());
+            self.request_close_pane(pane.id.clone());
         }
 
         let first_toolbar = toolbar_icons.len() - buttons.toolbar.len();
@@ -1959,9 +2222,9 @@ impl WorkspaceUi {
             };
             if response.on_hover_text(tooltip).clicked() {
                 if !focused {
-                    self.request_pane_focus(client, pane.id.clone());
+                    self.request_pane_focus(pane.id.clone());
                 }
-                self.activate_terminal_toolbar(icon, &pane.id, config, client);
+                self.activate_terminal_toolbar(icon, &pane.id, config);
             }
         }
     }
@@ -1971,7 +2234,6 @@ impl WorkspaceUi {
         icon: TerminalToolbarIcon,
         pane: &runtime::MuxPaneId,
         config: &TerminalConfig,
-        client: &dyn RuntimeClient,
     ) {
         match icon {
             TerminalToolbarIcon::Search => {
@@ -1989,30 +2251,21 @@ impl WorkspaceUi {
                     self.open_search_for_session(session);
                 }
             }
-            TerminalToolbarIcon::NewTerminal => self.send(
-                client,
-                RuntimeCommand::SpawnShell {
-                    cols: 80,
-                    rows: 24,
-                    scrollback_lines: config.scrollback_lines as usize,
-                },
-            ),
-            TerminalToolbarIcon::SplitColumns => self.send(
-                client,
-                RuntimeCommand::SplitPane {
-                    pane: pane.clone(),
-                    direction: SplitDirection::Horizontal,
-                    scrollback_lines: config.scrollback_lines as usize,
-                },
-            ),
-            TerminalToolbarIcon::SplitRows => self.send(
-                client,
-                RuntimeCommand::SplitPane {
-                    pane: pane.clone(),
-                    direction: SplitDirection::Vertical,
-                    scrollback_lines: config.scrollback_lines as usize,
-                },
-            ),
+            TerminalToolbarIcon::NewTerminal => self.send(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: config.scrollback_lines as usize,
+            }),
+            TerminalToolbarIcon::SplitColumns => self.send(RuntimeCommand::SplitPane {
+                pane: pane.clone(),
+                direction: SplitDirection::Horizontal,
+                scrollback_lines: config.scrollback_lines as usize,
+            }),
+            TerminalToolbarIcon::SplitRows => self.send(RuntimeCommand::SplitPane {
+                pane: pane.clone(),
+                direction: SplitDirection::Vertical,
+                scrollback_lines: config.scrollback_lines as usize,
+            }),
         }
     }
 
@@ -2025,7 +2278,6 @@ impl WorkspaceUi {
         node: &LayoutNode,
         mux: &MuxSnapshot,
         config: &TerminalConfig,
-        client: &dyn RuntimeClient,
         tab_id: &runtime::MuxTabId,
         path: &mut Vec<u8>,
         catalog: &i18n::Catalog,
@@ -2036,7 +2288,7 @@ impl WorkspaceUi {
                 // max_rect는 배치만 제한한다 — 이전 크기의 스냅샷이 이웃 pane을
                 // 덮어 그리지 않게 페인터 클립도 pane 영역으로 줄인다
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
-                self.render_pane(&mut child, pane_id, mux, config, client, catalog);
+                self.render_pane(&mut child, pane_id, mux, config, catalog);
                 // 포커스 표시는 각 pane 헤더의 accent top line이 담당한다.
             }
             LayoutNode::Split {
@@ -2086,27 +2338,15 @@ impl WorkspaceUi {
                     }
                 };
                 path.push(0);
-                self.render_node(
-                    ui, first_rect, first, mux, config, client, tab_id, path, catalog,
-                );
+                self.render_node(ui, first_rect, first, mux, config, tab_id, path, catalog);
                 path.pop();
                 path.push(1);
-                self.render_node(
-                    ui,
-                    second_rect,
-                    second,
-                    mux,
-                    config,
-                    client,
-                    tab_id,
-                    path,
-                    catalog,
-                );
+                self.render_node(ui, second_rect, second, mux, config, tab_id, path, catalog);
                 path.pop();
                 // 핸들은 자식 pane들 **뒤에** 등록 — egui 히트테스트는 나중 등록이
                 // 우선이라, ±2px 확장 히트영역이 터미널 선택 드래그에 밀리지 않는다
                 // (codex 리뷰: 가장자리에서 리사이즈 대신 선택이 잡히는 문제).
-                self.split_handle(ui, rect, gap_rect, *direction, gap, client, tab_id, path);
+                self.split_handle(ui, rect, gap_rect, *direction, gap, tab_id, path);
             }
         }
     }
@@ -2121,7 +2361,6 @@ impl WorkspaceUi {
         gap_rect: egui::Rect,
         direction: SplitDirection,
         gap: f32,
-        client: &dyn RuntimeClient,
         tab_id: &runtime::MuxTabId,
         path: &[u8],
     ) {
@@ -2159,14 +2398,11 @@ impl WorkspaceUi {
             && let Some((drag_path, ratio)) = self.split_drag.take()
             && drag_path == path
         {
-            self.send(
-                client,
-                RuntimeCommand::ResizeSplit {
-                    tab: tab_id.clone(),
-                    path: drag_path,
-                    ratio,
-                },
-            );
+            self.send(RuntimeCommand::ResizeSplit {
+                tab: tab_id.clone(),
+                path: drag_path,
+                ratio,
+            });
         }
     }
 
@@ -2176,7 +2412,6 @@ impl WorkspaceUi {
         pane_id: &runtime::MuxPaneId,
         mux: &MuxSnapshot,
         config: &TerminalConfig,
-        client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
         let Some(pane) = mux
@@ -2192,15 +2427,7 @@ impl WorkspaceUi {
         let pane_rect = pane_layout.surface;
         ui.painter()
             .rect_filled(pane_rect, 0.0, egui::Color32::from_rgb(0x0f, 0x11, 0x17));
-        self.render_pane_header(
-            ui,
-            pane_layout.header,
-            pane,
-            focused,
-            config,
-            client,
-            catalog,
-        );
+        self.render_pane_header(ui, pane_layout.header, pane, focused, config, catalog);
         // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
         // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
         // (codex P2). 터미널 위에서는 나중에 등록되는 터미널 위젯이 입력을 받는다.
@@ -2210,9 +2437,9 @@ impl WorkspaceUi {
             egui::Sense::click(),
         );
         if pane_resp.clicked() && !focused {
-            self.request_pane_focus(client, pane_id.clone());
+            self.request_pane_focus(pane_id.clone());
         }
-        self.pane_context_menu(&pane_resp, pane_id, config, client, catalog);
+        self.pane_context_menu(&pane_resp, pane_id, config, catalog);
 
         // 제목/닫기/검색/새 셸/분할은 각 leaf의 얇은 헤더에 있고, 본문은 그 아래를
         // 카드 외곽 여백 없이 채운다.
@@ -2238,14 +2465,14 @@ impl WorkspaceUi {
                         self.session_shell_kind(session),
                         self.session_bracketed_paste(session),
                     );
-                    self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                    self.send(RuntimeCommand::WriteInput { session, bytes });
                 }
                 if let Some(text) = pane_resp.dnd_release_payload::<TerminalTextDragPayload>() {
                     let bytes = terminal_text_paste_bytes(
                         &text.text,
                         self.session_bracketed_paste(session),
                     );
-                    self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                    self.send(RuntimeCommand::WriteInput { session, bytes });
                 }
             }
         }
@@ -2278,14 +2505,11 @@ impl WorkspaceUi {
         let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y);
         if self.sent_sizes.get(&session) != Some(&(cols, rows)) {
             self.sent_sizes.insert(session, (cols, rows));
-            self.send(
-                client,
-                RuntimeCommand::Resize {
-                    session,
-                    cols,
-                    rows,
-                },
-            );
+            self.send(RuntimeCommand::Resize {
+                session,
+                cols,
+                rows,
+            });
         }
 
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
@@ -2410,7 +2634,7 @@ impl WorkspaceUi {
                                     self.session_shell_kind(session),
                                     bracketed,
                                 );
-                                self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                                self.send(RuntimeCommand::WriteInput { session, bytes });
                                 // cd로 셸 cwd가 바뀐다 — 방금 만든 해석 캐시도 무효.
                                 self.invalidate_path_resolution();
                             }
@@ -2488,13 +2712,10 @@ impl WorkspaceUi {
                         self.drag_autoscroll_residual -= step as f32;
                         // send()가 아니라 선택 보존 경로 — send의 Scroll 선택 해제(휠 UX)와
                         // 충돌하면 첫 스크롤 직후 선택·오토스크롤이 함께 죽는다(A3 버그 #1).
-                        self.send_keep_selection(
-                            client,
-                            RuntimeCommand::Scroll {
-                                session,
-                                delta: step,
-                            },
-                        );
+                        self.send_keep_selection(RuntimeCommand::Scroll {
+                            session,
+                            delta: step,
+                        });
                     }
                     // egui는 이벤트 드리븐 — 포인터가 안 움직여도 매 프레임 이어가도록
                     // 예약한다. 버튼 릴리즈 시 이 분기에 안 들어와 예약이 끊긴다(idle 0).
@@ -2530,7 +2751,7 @@ impl WorkspaceUi {
             }
             // pane 배경이 같은 클릭을 먼저 받았다면 이미 FocusPane을 보냈다.
             if !focused && !terminal_refocus_pending {
-                self.request_pane_focus(client, pane_id.clone());
+                self.request_pane_focus(pane_id.clone());
             }
         }
 
@@ -2538,9 +2759,9 @@ impl WorkspaceUi {
         // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
         if let Some(path) = output.response.dnd_release_payload::<std::path::PathBuf>() {
             let bytes = path_insert_paste_bytes(&path, self.session_shell_kind(session), bracketed);
-            self.send(client, RuntimeCommand::WriteInput { session, bytes });
+            self.send(RuntimeCommand::WriteInput { session, bytes });
             if !focused {
-                self.request_pane_focus(client, pane_id.clone());
+                self.request_pane_focus(pane_id.clone());
             }
         }
         if let Some(text) = output
@@ -2548,13 +2769,13 @@ impl WorkspaceUi {
             .dnd_release_payload::<TerminalTextDragPayload>()
         {
             let bytes = terminal_text_paste_bytes(&text.text, bracketed);
-            self.send(client, RuntimeCommand::WriteInput { session, bytes });
+            self.send(RuntimeCommand::WriteInput { session, bytes });
             if !focused {
-                self.request_pane_focus(client, pane_id.clone());
+                self.request_pane_focus(pane_id.clone());
             }
         }
         // 터미널 위 우클릭도 같은 메뉴 (터미널 위젯이 topmost라 배경 interact가 못 받음)
-        self.pane_context_menu(&output.response, pane_id, config, client, catalog);
+        self.pane_context_menu(&output.response, pane_id, config, catalog);
 
         // 터미널 텍스트 검색 (T3): 매치 하이라이트 + 우상단 검색 바 + 스크롤 이동.
         self.render_terminal_search(
@@ -2564,7 +2785,6 @@ impl WorkspaceUi {
             output.origin,
             output.cell_size,
             &snapshot,
-            client,
             catalog,
         );
 
@@ -2749,13 +2969,10 @@ impl WorkspaceUi {
             }
             if !pending.is_empty() {
                 // 선택 해제는 send()가 WriteInput 공통 지점에서 처리한다.
-                self.send(
-                    client,
-                    RuntimeCommand::WriteInput {
-                        session,
-                        bytes: pending,
-                    },
-                );
+                self.send(RuntimeCommand::WriteInput {
+                    session,
+                    bytes: pending,
+                });
             }
         }
 
@@ -2767,13 +2984,10 @@ impl WorkspaceUi {
             let whole_rows = self.scroll_residual.trunc() as i32;
             if whole_rows != 0 {
                 self.scroll_residual -= whole_rows as f32;
-                self.send(
-                    client,
-                    RuntimeCommand::Scroll {
-                        session,
-                        delta: whole_rows,
-                    },
-                );
+                self.send(RuntimeCommand::Scroll {
+                    session,
+                    delta: whole_rows,
+                });
             }
         }
 
@@ -2884,18 +3098,13 @@ impl WorkspaceUi {
     }
 
     /// 선택 본문을 대상 에이전트들에 주입하고 단일 대상이면 pane 포커스까지 옮긴다.
-    fn dispatch_agent_prompt(
-        &mut self,
-        client: &dyn RuntimeClient,
-        mut send_to: Vec<SessionId>,
-        body: &str,
-    ) {
+    fn dispatch_agent_prompt(&mut self, mut send_to: Vec<SessionId>, body: &str) {
         // 주입 시점에 대상을 재확인한다 — 메뉴가 열린(또는 추출 응답을 기다린) 사이 감지
         // tick(2.5s)이 에이전트를 제거했을 수 있다(stale 대상 오주입 방지, 2026-07-17
         // 리뷰 P3).
         send_to.retain(|session| self.agent_info.contains_key(session));
         for session in &send_to {
-            self.send_agent_prompt(client, *session, body);
+            self.send_agent_prompt(*session, body);
         }
         // 단일 대상이면 그 pane으로 포커스를 옮겨 Enter만 치면 되게 한다. **자동 전송은
         // 하지 않는다** — 보내기 전에 프롬프트를 다듬을 수 있어야 한다(확정 사항).
@@ -2907,7 +3116,7 @@ impl WorkspaceUi {
             // request_pane_focus로 pending_focus까지 세팅한다 — FocusPane 직접 전송은
             // 스냅샷이 돌아올 때까지 terminal_input_owner가 이전 pane을 보므로 첫
             // 타이핑/Enter가 소스 pane에 들어갈 수 있다(리뷰 P2).
-            self.request_pane_focus(client, pane);
+            self.request_pane_focus(pane);
         }
     }
 
@@ -2915,13 +3124,7 @@ impl WorkspaceUi {
     /// 프리셋들), 2개 이상이면 「모든 에이전트에게 (N)」까지. 대상이 없으면 아무것도
     /// 그리지 않는다(등록만 되고 실행 중이 아닌 에이전트는 대상이 아니다 — 2026-07-17).
     /// 그리기/선택은 draw_agent_send_menu, 주입/포커스는 dispatch_agent_prompt로 분리한다.
-    fn send_to_agent_menu(
-        &mut self,
-        ui: &mut egui::Ui,
-        selection: &str,
-        client: &dyn RuntimeClient,
-        catalog: &i18n::Catalog,
-    ) {
+    fn send_to_agent_menu(&mut self, ui: &mut egui::Ui, selection: &str, catalog: &i18n::Catalog) {
         let targets = self.agent_send_targets();
         if targets.is_empty() {
             return;
@@ -2938,7 +3141,7 @@ impl WorkspaceUi {
             None => selection.to_owned(),
             Some(preset) => format!("{preset}:\n{selection}"),
         };
-        self.dispatch_agent_prompt(client, send_to, &body);
+        self.dispatch_agent_prompt(send_to, &body);
     }
 
     /// 「마지막 출력 복사」 — 드래그 선택 없이 OSC 133 C~D 범위를 워커에서 추출한다.
@@ -2947,7 +3150,6 @@ impl WorkspaceUi {
         &mut self,
         ui: &mut egui::Ui,
         session: SessionId,
-        client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
         if ui
@@ -2955,7 +3157,7 @@ impl WorkspaceUi {
             .clicked()
         {
             self.last_output_copy_pending.insert(session);
-            self.send(client, RuntimeCommand::ExtractLastOutput { session });
+            self.send(RuntimeCommand::ExtractLastOutput { session });
             ui.close();
         }
     }
@@ -2979,7 +3181,7 @@ impl WorkspaceUi {
     /// 보낸다 — raw 개행은 줄마다 즉시 명령으로 실행돼 선택문 안의 문장이 셸 명령이 될 수
     /// 있다(2026-07-17 리뷰 P1). claude/codex는 실행 중 bracketed paste를 켜므로 정상
     /// 대상에는 영향이 없다.
-    fn send_agent_prompt(&mut self, client: &dyn RuntimeClient, session: SessionId, body: &str) {
+    fn send_agent_prompt(&mut self, session: SessionId, body: &str) {
         let bracketed = self.session_bracketed_paste(session);
         let folded;
         let body = if bracketed {
@@ -2989,7 +3191,7 @@ impl WorkspaceUi {
             folded.as_str()
         };
         let bytes = terminal_text_paste_bytes(body, bracketed);
-        self.send(client, RuntimeCommand::WriteInput { session, bytes });
+        self.send(RuntimeCommand::WriteInput { session, bytes });
     }
 
     /// session이 지금 어느 pane에 붙어 있는지 — 워크트리 삭제 후 같은 cwd를 쓰던
@@ -3008,14 +3210,14 @@ impl WorkspaceUi {
     /// 쓴다(워크트리 삭제 완료 후, 2026-07-18). `request_close_pane`과 달리 실행 중
     /// 세션이어도 확인창을 띄우지 않는다 — 지운 뒤라 "닫을지 말지"가 아니라 이미
     /// 죽은 셸을 치우는 것뿐이라 확인이 의미 없다.
-    pub fn close_pane_now(&mut self, client: &dyn RuntimeClient, pane: runtime::MuxPaneId) {
-        self.send(client, RuntimeCommand::ClosePane { pane });
+    pub fn close_pane_now(&mut self, pane: runtime::MuxPaneId) {
+        self.send(RuntimeCommand::ClosePane { pane });
     }
 
     /// pane 닫기 요청 — 실행 중 세션이면 확인을 거치고, 아니면 즉시 닫는다.
     /// (세션 상태를 모르면 보수적으로 확인을 띄운다 — 실수 즉사 방지가 목적.)
     /// 사이드바 컨텍스트 메뉴(App 경유)도 같은 경로를 쓴다.
-    pub fn request_close_pane(&mut self, client: &dyn RuntimeClient, pane: runtime::MuxPaneId) {
+    pub fn request_close_pane(&mut self, pane: runtime::MuxPaneId) {
         let running = self
             .mux
             .as_ref()
@@ -3038,17 +3240,12 @@ impl WorkspaceUi {
             // 예약해 × 클릭 직후 확인창이 바로 뜨게 한다 (codex).
             self.command_sent = true;
         } else {
-            self.send(client, RuntimeCommand::ClosePane { pane });
+            self.send(RuntimeCommand::ClosePane { pane });
         }
     }
 
     /// 닫기 확인 다이얼로그 (request_close_pane이 세팅) — 실행 중 세션 종료 경고.
-    fn close_confirm_dialog(
-        &mut self,
-        ctx: &egui::Context,
-        client: &dyn RuntimeClient,
-        catalog: &i18n::Catalog,
-    ) {
+    fn close_confirm_dialog(&mut self, ctx: &egui::Context, catalog: &i18n::Catalog) {
         let Some(pane) = self.confirm_close.clone() else {
             return;
         };
@@ -3072,7 +3269,7 @@ impl WorkspaceUi {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button(catalog.t("action.close", &[])).clicked() {
-                        self.send(client, RuntimeCommand::ClosePane { pane: pane.clone() });
+                        self.send(RuntimeCommand::ClosePane { pane: pane.clone() });
                         self.confirm_close = None;
                     }
                     if ui.button(catalog.t("action.cancel", &[])).clicked() {
@@ -3091,7 +3288,6 @@ impl WorkspaceUi {
         resp: &egui::Response,
         pane_id: &runtime::MuxPaneId,
         config: &TerminalConfig,
-        client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
         resp.context_menu(|ui| {
@@ -3167,13 +3363,13 @@ impl WorkspaceUi {
                     // 복사→pane 전환→붙여넣기→타이핑하던 흐름을 우클릭 두 번으로 줄인다.
                     // 대상은 **실행 중으로 감지된 에이전트 pane**(등록 목록이 아니라
                     // agent_info) — 없으면 이 메뉴 자체가 안 보인다.
-                    self.send_to_agent_menu(ui, &text, client, catalog);
+                    self.send_to_agent_menu(ui, &text, catalog);
                 }
             }
             // 마지막 명령 출력 복사/전송 (셸 통합 2단계) — 드래그 선택 없이도 세션이
             // 있으면 표시. OSC 133 C~D 마크 범위를 워커에서 추출해 되받는다.
             if let Some(out_session) = session {
-                self.last_output_menu_items(ui, out_session, client, catalog);
+                self.last_output_menu_items(ui, out_session, catalog);
             }
             // 붙여넣기: 세션이 있으면 항상 표시. 드래그앤드롭 텍스트 붙여넣기(위 dnd_release_payload
             // 처리)와 동일한 경로(terminal_text_paste_bytes + session_bracketed_paste)로 주입한다.
@@ -3193,28 +3389,22 @@ impl WorkspaceUi {
                 .button(catalog.t("workspace.split_horizontal", &[]))
                 .clicked()
             {
-                self.send(
-                    client,
-                    RuntimeCommand::SplitPane {
-                        pane: pane_id.clone(),
-                        direction: SplitDirection::Horizontal,
-                        scrollback_lines: config.scrollback_lines as usize,
-                    },
-                );
+                self.send(RuntimeCommand::SplitPane {
+                    pane: pane_id.clone(),
+                    direction: SplitDirection::Horizontal,
+                    scrollback_lines: config.scrollback_lines as usize,
+                });
                 ui.close();
             }
             if ui
                 .button(catalog.t("workspace.split_vertical", &[]))
                 .clicked()
             {
-                self.send(
-                    client,
-                    RuntimeCommand::SplitPane {
-                        pane: pane_id.clone(),
-                        direction: SplitDirection::Vertical,
-                        scrollback_lines: config.scrollback_lines as usize,
-                    },
-                );
+                self.send(RuntimeCommand::SplitPane {
+                    pane: pane_id.clone(),
+                    direction: SplitDirection::Vertical,
+                    scrollback_lines: config.scrollback_lines as usize,
+                });
                 ui.close();
             }
             ui.separator();
@@ -3224,7 +3414,7 @@ impl WorkspaceUi {
                     .button(catalog.t("workspace.menu.scroll_bottom", &[]))
                     .clicked()
             {
-                self.send(client, RuntimeCommand::ScrollToBottom { session });
+                self.send(RuntimeCommand::ScrollToBottom { session });
                 ui.close();
             }
             // 세션 폴더 진입 동선 (2026-07-18 사용자): 파일 트리를 이 세션의 현재
@@ -3235,7 +3425,7 @@ impl WorkspaceUi {
             // (수동 상태 지정 U17b 서브메뉴는 사이드바와 함께 제거 — hook 감지 정착,
             // 2026-07-17 사용자. wire 명령 SetUserStatusOverride는 계약상 유지.)
             if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
-                self.request_close_pane(client, pane_id.clone());
+                self.request_close_pane(pane_id.clone());
                 ui.close();
             }
             ui.separator();
@@ -3382,41 +3572,45 @@ impl WorkspaceUi {
         self.pending_spawns
     }
 
-    pub fn spawn_shell(&mut self, client: &dyn RuntimeClient, scrollback_lines: usize) {
-        self.send(
-            client,
-            RuntimeCommand::SpawnShell {
-                cols: 80,
-                rows: 24,
-                scrollback_lines,
-            },
-        );
+    pub fn spawn_shell(&mut self, scrollback_lines: usize) {
+        self.send(RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines,
+        });
     }
 
     /// 새 셸 + 스폰 완료 시 해당 폴더로 cd 1회 주입 — 사이드바 '같은 폴더에서 새 셀'.
     /// SpawnShell wire에 cwd 필드를 더하는 대신(계약 변경) ShellSpawned 응답에서
     /// cd를 주입한다 (자동 resume의 cd prefix와 같은 관례). cwd가 None이면 일반 스폰.
-    pub fn spawn_shell_at(
-        &mut self,
-        client: &dyn RuntimeClient,
-        scrollback_lines: usize,
-        cwd: Option<String>,
-    ) {
-        self.pending_spawn_cd = cwd;
-        self.spawn_shell(client, scrollback_lines);
+    pub fn spawn_shell_at(&mut self, scrollback_lines: usize, cwd: Option<String>) {
+        if cwd.as_ref().is_some_and(|cwd| {
+            cwd.is_empty() || cwd.len() > WORKSPACE_PATH_MAX_BYTES || cwd.as_bytes().contains(&0)
+        }) {
+            self.error_is_pressure = false;
+            self.error = Some("terminal spawn path rejected".to_owned());
+            return;
+        }
+        if self.send_keep_selection(RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines,
+        }) {
+            self.pending_spawn_cd = cwd;
+        }
     }
 
     /// 단축키용 현재 pane 닫기. 실행 중인 세션은 마우스 ×와 동일하게 확인창을 거친다.
-    pub fn close_focused_pane(&mut self, client: &dyn RuntimeClient) {
+    pub fn close_focused_pane(&mut self) {
         if let Some(pane) = self.mux.as_ref().and_then(|mux| mux.focused_pane.clone()) {
-            self.request_close_pane(client, pane);
+            self.request_close_pane(pane);
         }
     }
 
     /// 단축키(⌘↓)용 포커스된 pane을 스크롤백 맨 아래로 되돌린다. close_focused_pane과
     /// 동일 구조 — 호출부(app crate의 단축키 처리부) 배선은 workspace.rs 밖이라 이 PR
     /// 범위 밖이다 (호출부가 없어 현재는 미사용).
-    pub fn scroll_focused_to_bottom(&mut self, client: &dyn RuntimeClient) {
+    pub fn scroll_focused_to_bottom(&mut self) {
         let session = self.mux.as_ref().and_then(|mux| {
             mux.focused_pane.as_ref().and_then(|pane| {
                 mux.tabs
@@ -3427,13 +3621,13 @@ impl WorkspaceUi {
             })
         });
         if let Some(session) = session {
-            self.send(client, RuntimeCommand::ScrollToBottom { session });
+            self.send(RuntimeCommand::ScrollToBottom { session });
         }
     }
 
     /// 단축키(⌘⇧↑/↓)용 포커스된 pane을 이전/다음 프롬프트 마크(OSC 133)로 점프한다.
     /// 마크 조회·델타 계산은 워커(세션) 소유 — scroll_focused_to_bottom과 동일 구조.
-    pub fn scroll_focused_to_prompt(&mut self, client: &dyn RuntimeClient, direction: i8) {
+    pub fn scroll_focused_to_prompt(&mut self, direction: i8) {
         let session = self.mux.as_ref().and_then(|mux| {
             mux.focused_pane.as_ref().and_then(|pane| {
                 mux.tabs
@@ -3444,37 +3638,26 @@ impl WorkspaceUi {
             })
         });
         if let Some(session) = session {
-            self.send(
-                client,
-                RuntimeCommand::ScrollToPrompt { session, direction },
-            );
+            self.send(RuntimeCommand::ScrollToPrompt { session, direction });
         }
     }
 
     /// 단축키용 현재 pane 분할. UI 버튼과 같은 runtime 명령을 사용한다.
-    pub fn split_focused_pane(
-        &mut self,
-        client: &dyn RuntimeClient,
-        direction: SplitDirection,
-        scrollback_lines: usize,
-    ) {
+    pub fn split_focused_pane(&mut self, direction: SplitDirection, scrollback_lines: usize) {
         // focused_pane이 없으면(복원 직후·pane 미클릭·단일 pane) 활성 탭의 첫 pane으로
         // 폴백한다 — 안 그러면 분할 단축키/버튼이 조용히 아무 것도 안 해 "고장난 것처럼"
         // 보인다(사용자 보고 2026-07-12).
         if let Some(pane) = self.mux.as_deref().and_then(split_target_pane) {
-            self.send(
-                client,
-                RuntimeCommand::SplitPane {
-                    pane,
-                    direction,
-                    scrollback_lines,
-                },
-            );
+            self.send(RuntimeCommand::SplitPane {
+                pane,
+                direction,
+                scrollback_lines,
+            });
         }
     }
 
     /// 활성 탭의 pane 벡터 순서로 포커스를 순환한다. 끝에서는 반대편으로 이어진다.
-    pub fn focus_relative_pane(&mut self, client: &dyn RuntimeClient, delta: isize) {
+    pub fn focus_relative_pane(&mut self, delta: isize) {
         let next = self.mux.as_ref().and_then(|mux| {
             let active = mux.active_tab.as_ref()?;
             let tab = mux.tabs.iter().find(|tab| &tab.id == active)?;
@@ -3487,7 +3670,7 @@ impl WorkspaceUi {
             Some(tab.panes[next].id.clone())
         });
         if let Some(pane) = next {
-            self.request_pane_focus(client, pane);
+            self.request_pane_focus(pane);
         }
     }
 
@@ -3548,7 +3731,7 @@ impl WorkspaceUi {
         })
     }
 
-    fn send(&mut self, client: &dyn RuntimeClient, command: RuntimeCommand) {
+    fn send(&mut self, command: RuntimeCommand) {
         // 터미널에 입력/스크롤을 보내면 그 세션 선택을 해제한다 — 선택 중엔 화면이 freeze돼
         // (선택 정확성) 있어, 안 지우면 타이핑·스크롤해도 화면이 멈춘 듯 보인다(사용자:
         // 드래그 선택 후 스크롤이 안 내려감). 공통 지점이라 여기서 한 번에 처리한다.
@@ -3564,7 +3747,7 @@ impl WorkspaceUi {
         {
             self.selection = None;
         }
-        self.send_keep_selection(client, command);
+        self.send_keep_selection(command);
     }
 
     /// Runtime snapshot을 기다리지 않는 터미널 refocus를 시작한다. egui의 TextEdit state가
@@ -3576,26 +3759,20 @@ impl WorkspaceUi {
 
     /// Runtime의 mux snapshot이 도착하기 전에도 입력을 새 pane으로 보낸다. 그렇지 않으면
     /// pane을 클릭하거나 검색을 닫은 직후의 첫 `.`, 공백, 한글 조합이 버려질 수 있다.
-    fn request_pane_focus(&mut self, client: &dyn RuntimeClient, pane: runtime::MuxPaneId) {
+    fn request_pane_focus(&mut self, pane: runtime::MuxPaneId) {
         self.begin_terminal_refocus(pane.clone());
-        self.send(client, RuntimeCommand::FocusPane { pane });
+        self.send(RuntimeCommand::FocusPane { pane });
     }
 
     /// 선택을 해제하지 않는 send — 드래그 오토스크롤 전용(선택을 유지·확장하며
     /// 스크롤해야 한다). 휠/타이핑은 반드시 [`Self::send`]를 쓴다.
-    fn send_keep_selection(&mut self, client: &dyn RuntimeClient, command: RuntimeCommand) {
-        let is_spawn = matches!(
-            command,
-            RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }
-        );
-        if let Err(e) = client.send_command(command) {
+    fn send_keep_selection(&mut self, command: RuntimeCommand) -> bool {
+        if self.queue_protocol_intent(command).is_err() {
             self.error_is_pressure = false;
-            self.error = Some(format!("{e:#}"));
+            self.error = Some("terminal protocol request rejected".to_owned());
+            false
         } else {
-            self.command_sent = true;
-            if is_spawn {
-                self.pending_spawns += 1;
-            }
+            true
         }
     }
 }
@@ -4209,8 +4386,22 @@ fn visible_mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
 mod tests {
     use super::*;
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
-    use std::sync::Mutex;
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    fn drain_protocol(ui: &mut WorkspaceUi) -> Vec<RuntimeCommand> {
+        let mut commands = Vec::new();
+        while let Some(intent) = ui.take_protocol_intent() {
+            let operation = intent.operation();
+            let generation = intent.generation();
+            commands.push(intent.into_command());
+            ui.complete_protocol(WorkspaceProtocolCompletion {
+                operation,
+                generation,
+                result: Ok(()),
+            });
+        }
+        commands
+    }
 
     #[test]
     fn 분할_터미널은_32pt_헤더와_좌우3_상하6_본문여백을_유지한다() {
@@ -4359,42 +4550,19 @@ mod tests {
             }
             other => panic!("unexpected intent: {other:?}"),
         };
-        ui.complete_io(
-            WorkspaceIoCompletion::PathResolved {
-                operation,
-                generation,
-                result: Some(WorkspacePathResolution {
-                    kind: WorkspacePathKind::Directory,
-                    path: WorkspacePathPayload::try_new(PathBuf::from("/workspace/src")).unwrap(),
-                }),
-            },
-            &RecordingRuntime::default(),
-        );
+        ui.complete_io(WorkspaceIoCompletion::PathResolved {
+            operation,
+            generation,
+            result: Some(WorkspacePathResolution {
+                kind: WorkspacePathKind::Directory,
+                path: WorkspacePathPayload::try_new(PathBuf::from("/workspace/src")).unwrap(),
+            }),
+        });
         assert!(matches!(
             ui.resolve_path_cached(session, "src"),
             Some(PathClick::Dir(_))
         ));
     }
-
-    #[derive(Default)]
-    struct RecordingRuntime {
-        commands: Mutex<Vec<RuntimeCommand>>,
-    }
-
-    impl runtime::RuntimeCommandSink for RecordingRuntime {
-        fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
-            self.commands.lock().unwrap().push(command);
-            Ok(())
-        }
-    }
-
-    impl runtime::RuntimeEventStream for RecordingRuntime {
-        fn subscribe(&self) -> runtime::RuntimeEventReceiver {
-            panic!("paste controller test does not subscribe")
-        }
-    }
-
-    impl runtime::RuntimeClient for RecordingRuntime {}
 
     fn pane_id(name: &str) -> MuxPaneId {
         MuxPaneId(name.to_owned())
@@ -4412,25 +4580,19 @@ mod tests {
             )],
             "p",
         ));
-        let runtime = RecordingRuntime::default();
         let config = TerminalConfig::default();
         let target = pane_id("p");
 
-        ui.activate_terminal_toolbar(TerminalToolbarIcon::Search, &target, &config, &runtime);
+        ui.activate_terminal_toolbar(TerminalToolbarIcon::Search, &target, &config);
         assert_eq!(
             ui.search.as_ref().map(|search| search.session),
             Some(SessionId(7))
         );
-        ui.activate_terminal_toolbar(TerminalToolbarIcon::NewTerminal, &target, &config, &runtime);
-        ui.activate_terminal_toolbar(
-            TerminalToolbarIcon::SplitColumns,
-            &target,
-            &config,
-            &runtime,
-        );
-        ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitRows, &target, &config, &runtime);
+        ui.activate_terminal_toolbar(TerminalToolbarIcon::NewTerminal, &target, &config);
+        ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitColumns, &target, &config);
+        ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitRows, &target, &config);
 
-        let commands = runtime.commands.lock().unwrap();
+        let commands = drain_protocol(&mut ui);
         assert!(matches!(commands[0], RuntimeCommand::SpawnShell { .. }));
         assert!(matches!(
             &commands[1],
@@ -4712,7 +4874,6 @@ mod tests {
         );
 
         ui.handle_events(
-            &RecordingRuntime::default(),
             &[
                 RuntimeEvent::MuxUpdated {
                     snapshot: mux("a", vec![tab_a.clone(), tab_b.clone()], "pa"),
@@ -4728,7 +4889,6 @@ mod tests {
         assert!(ui.sessions.get(&hidden).unwrap().snapshot.is_some());
 
         ui.handle_events(
-            &RecordingRuntime::default(),
             &[
                 RuntimeEvent::MuxUpdated {
                     snapshot: mux("b", vec![tab_a, tab_b], "pb"),
@@ -4769,7 +4929,6 @@ mod tests {
         );
 
         ui.handle_events(
-            &RecordingRuntime::default(),
             &[
                 RuntimeEvent::MuxUpdated {
                     snapshot: mux("active", vec![active], "left"),
@@ -4800,12 +4959,10 @@ mod tests {
     fn last_output_extracted는_copy요청만_클립보드에_예약한다() {
         let mut ui = WorkspaceUi::new();
         let catalog = catalog();
-        let client = RecordingRuntime::default();
         let source = SessionId(1);
 
         // intent가 없으면 stale 응답 — 무시된다.
         ui.handle_events(
-            &client,
             &[RuntimeEvent::LastOutputExtracted {
                 session: source,
                 text: "stale".to_owned(),
@@ -4818,7 +4975,6 @@ mod tests {
         // Copy 요청 — pending_copy에 예약되고 요청은 1회용으로 소비된다.
         ui.last_output_copy_pending.insert(source);
         ui.handle_events(
-            &client,
             &[RuntimeEvent::LastOutputExtracted {
                 session: source,
                 text: "out".to_owned(),
@@ -4834,12 +4990,10 @@ mod tests {
     fn last_output이_비면_native_effect대신_notice_intent를_발행한다() {
         let mut ui = WorkspaceUi::new();
         let catalog = catalog();
-        let client = RecordingRuntime::default();
         let source = SessionId(2);
         ui.last_output_copy_pending.insert(source);
 
         ui.handle_events(
-            &client,
             &[RuntimeEvent::LastOutputExtracted {
                 session: source,
                 text: String::new(),
@@ -4915,12 +5069,265 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("production source");
-        for forbidden in ["platform::notify(", "notify_rust", "osascript"] {
+        for forbidden in [
+            "platform::notify(",
+            "notify_rust",
+            "osascript",
+            "RuntimeClient",
+            "send_command(",
+            "RuntimeCommandSink",
+        ] {
             assert!(
                 !production.contains(forbidden),
-                "workspace production source contains native notification effect: {forbidden}"
+                "workspace production source contains a direct effect: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn protocol_payload_caps_accept_exact_and_reject_plus_one() {
+        let exact_scrollback = RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: WORKSPACE_PROTOCOL_SCROLLBACK_MAX_LINES,
+        };
+        assert_eq!(
+            workspace_protocol_command_is_valid(&exact_scrollback),
+            Ok(())
+        );
+        let too_much_scrollback = RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: WORKSPACE_PROTOCOL_SCROLLBACK_MAX_LINES + 1,
+        };
+        assert_eq!(
+            workspace_protocol_command_is_valid(&too_much_scrollback),
+            Err(WorkspaceProtocolErrorCode::InvalidCommand)
+        );
+
+        let exact_input = RuntimeCommand::WriteInput {
+            session: SessionId(1),
+            bytes: vec![b'x'; WORKSPACE_PROTOCOL_INPUT_MAX_BYTES],
+        };
+        assert_eq!(workspace_protocol_command_is_valid(&exact_input), Ok(()));
+        let too_large_input = RuntimeCommand::WriteInput {
+            session: SessionId(1),
+            bytes: vec![b'x'; WORKSPACE_PROTOCOL_INPUT_MAX_BYTES + 1],
+        };
+        assert_eq!(
+            workspace_protocol_command_is_valid(&too_large_input),
+            Err(WorkspaceProtocolErrorCode::PayloadTooLarge)
+        );
+
+        let exact_query = RuntimeCommand::SearchScrollback {
+            session: SessionId(1),
+            query: "q".repeat(WORKSPACE_PROTOCOL_QUERY_MAX_BYTES),
+            max_matches: SEARCH_MAX_MATCHES,
+        };
+        assert_eq!(workspace_protocol_command_is_valid(&exact_query), Ok(()));
+        let too_large_query = RuntimeCommand::SearchScrollback {
+            session: SessionId(1),
+            query: "q".repeat(WORKSPACE_PROTOCOL_QUERY_MAX_BYTES + 1),
+            max_matches: SEARCH_MAX_MATCHES,
+        };
+        assert_eq!(
+            workspace_protocol_command_is_valid(&too_large_query),
+            Err(WorkspaceProtocolErrorCode::PayloadTooLarge)
+        );
+        let too_many_matches = RuntimeCommand::SearchScrollback {
+            session: SessionId(1),
+            query: "q".to_owned(),
+            max_matches: SEARCH_MAX_MATCHES + 1,
+        };
+        assert_eq!(
+            workspace_protocol_command_is_valid(&too_many_matches),
+            Err(WorkspaceProtocolErrorCode::InvalidCommand)
+        );
+
+        let exact_path = RuntimeCommand::ResizeSplit {
+            tab: MuxTabId("t".repeat(WORKSPACE_PROTOCOL_ID_MAX_BYTES)),
+            path: vec![0; WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS],
+            ratio: 0.5,
+        };
+        assert_eq!(workspace_protocol_command_is_valid(&exact_path), Ok(()));
+        let too_deep_path = RuntimeCommand::ResizeSplit {
+            tab: MuxTabId("t".to_owned()),
+            path: vec![0; WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS + 1],
+            ratio: 0.5,
+        };
+        assert_eq!(
+            workspace_protocol_command_is_valid(&too_deep_path),
+            Err(WorkspaceProtocolErrorCode::InvalidCommand)
+        );
+    }
+
+    #[test]
+    fn protocol_queue_and_inflight_share_the_exact_eight_slot_cap() {
+        let mut ui = WorkspaceUi::new();
+        for delta in 1..=WORKSPACE_PROTOCOL_CAP {
+            assert_eq!(
+                ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                    session: SessionId(delta as u64),
+                    delta: 1,
+                }),
+                Ok(())
+            );
+        }
+        assert_eq!(ui.protocol_intents.len(), WORKSPACE_PROTOCOL_CAP);
+
+        let first = ui.take_protocol_intent().expect("first intent");
+        let operation = first.operation();
+        let generation = first.generation();
+        assert_eq!(ui.protocol_intents.len(), WORKSPACE_PROTOCOL_CAP - 1);
+        assert_eq!(ui.protocol_inflight.len(), 1);
+        assert_eq!(
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(99),
+                delta: 1,
+            }),
+            Err(WorkspaceProtocolErrorCode::Busy)
+        );
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation,
+            generation: generation.wrapping_add(1),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+        assert_eq!(
+            ui.protocol_inflight.len(),
+            1,
+            "stale completion must not release"
+        );
+        assert_eq!(
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(100),
+                delta: 1,
+            }),
+            Err(WorkspaceProtocolErrorCode::Busy)
+        );
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation,
+            generation,
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+        assert!(ui.protocol_inflight.is_empty());
+        assert!(
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(101),
+                delta: 1,
+            })
+            .is_ok()
+        );
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation,
+            generation,
+            result: Ok(()),
+        });
+        assert_eq!(ui.protocol_intents.len(), WORKSPACE_PROTOCOL_CAP);
+        assert_eq!(
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(102),
+                delta: 1,
+            }),
+            Err(WorkspaceProtocolErrorCode::Busy),
+            "duplicate completion must not release another slot"
+        );
+
+        let success = ui.take_protocol_intent().expect("success intent");
+        let success_operation = success.operation();
+        let success_generation = success.generation();
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: success_operation,
+            generation: success_generation,
+            result: Ok(()),
+        });
+        assert!(ui.protocol_inflight.is_empty());
+        assert!(
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(103),
+                delta: 1,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn adjacent_terminal_input_coalesces_without_exceeding_one_mib() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(7);
+        assert!(
+            ui.queue_protocol_intent(RuntimeCommand::WriteInput {
+                session,
+                bytes: vec![b'a'; WORKSPACE_PROTOCOL_INPUT_MAX_BYTES - 1],
+            })
+            .is_ok()
+        );
+        assert!(
+            ui.queue_protocol_intent(RuntimeCommand::WriteInput {
+                session,
+                bytes: vec![b'b'],
+            })
+            .is_ok()
+        );
+        assert_eq!(ui.protocol_intents.len(), 1);
+        assert_eq!(
+            ui.queue_protocol_intent(RuntimeCommand::WriteInput {
+                session,
+                bytes: vec![b'c'],
+            }),
+            Err(WorkspaceProtocolErrorCode::PayloadTooLarge)
+        );
+        let commands = drain_protocol(&mut ui);
+        assert!(matches!(
+            &commands[0],
+            RuntimeCommand::WriteInput { bytes, .. }
+                if bytes.len() == WORKSPACE_PROTOCOL_INPUT_MAX_BYTES
+                    && bytes.last() == Some(&b'b')
+        ));
+    }
+
+    #[test]
+    fn protocol_debug_redacts_terminal_input_and_search_query() {
+        let mut ui = WorkspaceUi::new();
+        ui.queue_protocol_intent(RuntimeCommand::WriteInput {
+            session: SessionId(1),
+            bytes: b"private terminal input".to_vec(),
+        })
+        .unwrap();
+        let input = ui.take_protocol_intent().unwrap();
+        let debug = format!("{input:?}");
+        assert!(debug.contains("write_input"));
+        assert!(!debug.contains("private terminal input"));
+    }
+
+    #[test]
+    fn spawn_count_changes_only_after_exact_successful_completion() {
+        let mut ui = WorkspaceUi::new();
+        ui.spawn_shell(1_000);
+        let intent = ui.take_protocol_intent().unwrap();
+        let operation = intent.operation();
+        let generation = intent.generation();
+        assert_eq!(ui.pending_spawns(), 0);
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation,
+            generation: generation.wrapping_add(1),
+            result: Ok(()),
+        });
+        assert_eq!(ui.pending_spawns(), 0);
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation,
+            generation,
+            result: Ok(()),
+        });
+        assert_eq!(ui.pending_spawns(), 1);
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation,
+            generation,
+            result: Ok(()),
+        });
+        assert_eq!(ui.pending_spawns(), 1);
     }
 
     /// 「마지막 출력 복사」만 남고 제거된 agent 전송 항목은 다시 나타나지 않는다.
@@ -4928,7 +5335,6 @@ mod tests {
     fn kittest_마지막_출력_메뉴가_추출을_요청한다() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let client = RecordingRuntime::default();
         let session = SessionId(7);
         let mut ws = WorkspaceUi::new();
         ws.mux = Some(mux(
@@ -4942,7 +5348,7 @@ mod tests {
         ));
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, ws: &mut WorkspaceUi| {
-                ws.last_output_menu_items(ui, SessionId(7), &client, &catalog);
+                ws.last_output_menu_items(ui, SessionId(7), &catalog);
             },
             ws,
         );
@@ -4963,10 +5369,12 @@ mod tests {
                 .last_output_copy_pending
                 .contains(&SessionId(7))
         );
-        assert!(client.commands.lock().unwrap().iter().any(|c| matches!(
-            c,
-            RuntimeCommand::ExtractLastOutput { session } if *session == SessionId(7)
-        )));
+        assert!(drain_protocol(harness.state_mut()).iter().any(|command| {
+            matches!(
+                command,
+                RuntimeCommand::ExtractLastOutput { session } if *session == SessionId(7)
+            )
+        }));
     }
 
     #[test]
@@ -5012,7 +5420,6 @@ mod tests {
     #[test]
     fn kittest_좁은_pane_닫기_클릭은_분할이_아니라_닫기를_요청한다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let client = RecordingRuntime::default();
         let config = TerminalConfig::default();
         let mut ws = WorkspaceUi::new();
         ws.mux = Some(mux(
@@ -5031,7 +5438,7 @@ mod tests {
         let snapshot = pane("p", SessionId(7));
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, ws: &mut WorkspaceUi| {
-                ws.render_pane_header(ui, header, &snapshot, true, &config, &client, &catalog);
+                ws.render_pane_header(ui, header, &snapshot, true, &config, &catalog);
             },
             ws,
         );
@@ -5051,10 +5458,7 @@ mod tests {
             "닫기 자리 클릭은 닫기 확인을 띄워야 한다"
         );
         assert!(
-            !client
-                .commands
-                .lock()
-                .unwrap()
+            !drain_protocol(harness.state_mut())
                 .iter()
                 .any(|command| matches!(command, RuntimeCommand::SplitPane { .. })),
             "닫기 자리 클릭이 분할을 실행하면 안 된다"
@@ -5171,7 +5575,6 @@ mod tests {
         use crate::ui::file_tree::ShellKind;
 
         let mut ui = WorkspaceUi::new();
-        let runtime = RecordingRuntime::default();
         let session = SessionId(77);
         let paths = vec![std::path::PathBuf::from("/tmp/clipboard image.png")];
         ui.request_terminal_clipboard(session, true, ShellKind::Posix, None);
@@ -5183,33 +5586,24 @@ mod tests {
             } => (operation, generation),
             other => panic!("unexpected intent: {other:?}"),
         };
-        ui.complete_io(
-            WorkspaceIoCompletion::TerminalClipboardRead {
-                operation,
-                generation: generation.wrapping_add(1),
-                result: TerminalClipboardPayload::try_new(paths.clone(), None),
-            },
-            &runtime,
-        );
-        assert!(runtime.commands.lock().unwrap().is_empty());
-        ui.complete_io(
-            WorkspaceIoCompletion::TerminalClipboardRead {
-                operation,
-                generation,
-                result: TerminalClipboardPayload::try_new(paths.clone(), None),
-            },
-            &runtime,
-        );
-        ui.complete_io(
-            WorkspaceIoCompletion::TerminalClipboardRead {
-                operation,
-                generation,
-                result: TerminalClipboardPayload::try_new(paths.clone(), None),
-            },
-            &runtime,
-        );
+        ui.complete_io(WorkspaceIoCompletion::TerminalClipboardRead {
+            operation,
+            generation: generation.wrapping_add(1),
+            result: TerminalClipboardPayload::try_new(paths.clone(), None),
+        });
+        assert!(drain_protocol(&mut ui).is_empty());
+        ui.complete_io(WorkspaceIoCompletion::TerminalClipboardRead {
+            operation,
+            generation,
+            result: TerminalClipboardPayload::try_new(paths.clone(), None),
+        });
+        ui.complete_io(WorkspaceIoCompletion::TerminalClipboardRead {
+            operation,
+            generation,
+            result: TerminalClipboardPayload::try_new(paths.clone(), None),
+        });
 
-        let commands = runtime.commands.lock().unwrap();
+        let commands = drain_protocol(&mut ui);
         assert_eq!(commands.len(), 1);
         assert!(matches!(
             &commands[0],

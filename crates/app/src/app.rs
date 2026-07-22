@@ -6,9 +6,9 @@ use runtime::{InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver};
 use crate::config::Config;
 use std::sync::Arc;
 
-use crate::storage::Db;
 use crate::ui;
 use secret::KeyringSecretStore;
+use storage::Db;
 
 const APPROVAL_WAKE_MARKER: u8 = 1;
 const APPROVAL_CONTROL_MARKER: u8 = 2;
@@ -64,7 +64,7 @@ impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
     ) -> anyhow::Result<()> {
         Db::insert_credential_with_secret_slot(
             self.0,
-            &crate::storage::CredentialMeta {
+            &storage::CredentialMeta {
                 id: draft.id().to_owned(),
                 provider: draft.provider().to_owned(),
                 label: draft.label().to_owned(),
@@ -357,7 +357,7 @@ impl ApprovalGlobalReconcile {
 
 struct EnvProjectRowsJob {
     generation: u64,
-    workspaces: Vec<crate::storage::WorkspaceRow>,
+    workspaces: Vec<storage::WorkspaceRow>,
 }
 
 struct EnvProjectRowsOutcome {
@@ -1185,7 +1185,7 @@ fn add_settings_credential(
         }
         return Err(error);
     }
-    let meta = crate::storage::CredentialMeta {
+    let meta = storage::CredentialMeta {
         id: logical.as_str().to_owned(),
         provider,
         label,
@@ -5050,7 +5050,7 @@ pub struct App {
     db_path: PathBuf,
     logs_base: PathBuf,
     runtime_host_factory: Arc<runtime::InProcessRuntimeHostFactory>,
-    workspaces: Vec<crate::storage::WorkspaceRow>,
+    workspaces: Vec<storage::WorkspaceRow>,
     /// Bounded workspace projection의 all-or-nothing filesystem identity. Render/rename
     /// detection은 path/anchor를 per-workspace로 다시 조회하지 않는다.
     workspace_anchors: std::collections::HashMap<String, storage::WorkspaceFolderAnchor>,
@@ -5082,7 +5082,7 @@ pub struct App {
     hook_overrides:
         std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
-    persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
+    persisted_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
     agent_needs_input: std::collections::HashSet<runtime::SessionId>,
     /// v3.9 N3: 전역(모든 워크스페이스) 입력 대기 — 벨 팝오버 PTY 카드의 소스.
@@ -5101,9 +5101,9 @@ pub struct App {
     /// effort/context를 statusLine DB(아래)에서 병합해 최종본을 WorkspaceUi로 넘긴다.
     agent_info: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
     /// claude statusLine이 보고한 effort/model/context% — 1s 스로틀로 DB에서 읽어 병합.
-    statuslines: std::collections::HashMap<runtime::SessionId, crate::storage::StatuslineRow>,
+    statuslines: std::collections::HashMap<runtime::SessionId, storage::StatuslineRow>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
-    restore_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
+    restore_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
     restore_loaded_for: Option<String>,
     /// 이번 workspace 활성화에서 자동 resume 판단을 끝낸 pane. 명령을 보낸 경우뿐 아니라
@@ -5257,7 +5257,7 @@ fn workspace_visible_after_close(
 /// 설정 창의 workspace context만 결정한다. DB 목록 존재 여부만 보며 sidebar의
 /// `closed_workspaces`나 active runtime은 입력조차 받지 않아 선택만으로 재노출/전환할 수 없다.
 fn resolve_settings_workspace_id(
-    workspaces: &[crate::storage::WorkspaceRow],
+    workspaces: &[storage::WorkspaceRow],
     requested: Option<&str>,
     current: Option<&str>,
     active_id: &str,
@@ -5507,6 +5507,7 @@ enum WorkspaceControllerAction {
         summary: String,
         body: String,
     },
+    ComposerPrompt(Arc<str>),
     SyncDotenv,
 }
 
@@ -6726,9 +6727,7 @@ impl App {
                     self.warm.get_mut(&workspace_id)
                 };
                 if let Some(runtime) = runtime {
-                    runtime
-                        .workspace_ui
-                        .complete_io(completion, &runtime.runtime);
+                    runtime.workspace_ui.complete_io(completion);
                 }
             }
             AppHostIoCompletion::FileTree(completion) => {
@@ -8036,7 +8035,7 @@ impl App {
                 self.resumed_panes.remove(&pane_id);
             }
         }
-        let current: std::collections::HashMap<String, crate::storage::AgentSessionRow> = bindings
+        let current: std::collections::HashMap<String, storage::AgentSessionRow> = bindings
             .iter()
             .filter_map(|(sid, b)| {
                 let pane = mux.as_ref().and_then(|m| pane_of_session(m, *sid))?;
@@ -8046,7 +8045,7 @@ impl App {
                 };
                 Some((
                     pane.0.clone(),
-                    crate::storage::AgentSessionRow {
+                    storage::AgentSessionRow {
                         pane_id: pane.0,
                         kind: kind.to_owned(),
                         session_id: b.session_id.clone(),
@@ -8698,11 +8697,9 @@ impl App {
             }
             WorkspaceControllerAction::SpawnShellAt { cwd } => {
                 self.reveal_active_workspace_for_new_session();
-                self.active.workspace_ui.spawn_shell_at(
-                    &self.active.runtime,
-                    self.config.terminal.scrollback_lines as usize,
-                    cwd,
-                );
+                self.active
+                    .workspace_ui
+                    .spawn_shell_at(self.config.terminal.scrollback_lines as usize, cwd);
             }
             WorkspaceControllerAction::ResumeAgent {
                 pane_key,
@@ -8714,9 +8711,7 @@ impl App {
                 self.resumed_panes.insert(pane_key);
             }
             WorkspaceControllerAction::ClosePane(pane) => {
-                self.active
-                    .workspace_ui
-                    .request_close_pane(&self.active.runtime, pane);
+                self.active.workspace_ui.request_close_pane(pane);
             }
             WorkspaceControllerAction::CloseWorkspace(workspace_id) => {
                 let was_active = workspace_id == self.active.id;
@@ -8762,7 +8757,35 @@ impl App {
             WorkspaceControllerAction::Notify { summary, body } => {
                 platform::notify(&summary, &body);
             }
+            WorkspaceControllerAction::ComposerPrompt(prompt) => {
+                self.send_composer_prompt(&prompt);
+            }
             WorkspaceControllerAction::SyncDotenv => self.sync_dotenv_env(),
+        }
+    }
+
+    fn drain_workspace_protocol_intents(runtime: &mut WorkspaceRuntime) {
+        while let Some(intent) = runtime.workspace_ui.take_protocol_intent() {
+            let operation = intent.operation();
+            let generation = intent.generation();
+            let result = runtime
+                .runtime
+                .send_command(intent.into_command())
+                .map_err(|_| ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed);
+            runtime
+                .workspace_ui
+                .complete_protocol(ui::workspace::WorkspaceProtocolCompletion {
+                    operation,
+                    generation,
+                    result,
+                });
+        }
+    }
+
+    fn poll_workspace_protocol_intents(&mut self) {
+        Self::drain_workspace_protocol_intents(&mut self.active);
+        for runtime in self.warm.values_mut() {
+            Self::drain_workspace_protocol_intents(runtime);
         }
     }
 
@@ -9029,7 +9052,6 @@ impl App {
                         if decision == crate::worktree::SpawnDecision::Spawn {
                             self.reveal_active_workspace_for_new_session();
                             self.active.workspace_ui.spawn_shell_at(
-                                &self.active.runtime,
                                 self.config.terminal.scrollback_lines as usize,
                                 Some(path.to_string_lossy().into_owned()),
                             );
@@ -9100,11 +9122,13 @@ impl App {
                     }
                     for (workspace_id, pane) in targets {
                         if workspace_id == self.active.id {
-                            self.active
-                                .workspace_ui
-                                .close_pane_now(&self.active.runtime, pane);
+                            Self::drain_workspace_protocol_intents(&mut self.active);
+                            self.active.workspace_ui.close_pane_now(pane);
+                            Self::drain_workspace_protocol_intents(&mut self.active);
                         } else if let Some(runtime) = self.warm.get_mut(&workspace_id) {
-                            runtime.workspace_ui.close_pane_now(&runtime.runtime, pane);
+                            Self::drain_workspace_protocol_intents(runtime);
+                            runtime.workspace_ui.close_pane_now(pane);
+                            Self::drain_workspace_protocol_intents(runtime);
                         }
                     }
                     let branch_note = (branch == crate::worktree::BranchCleanup::PreservedUnmerged)
@@ -9496,27 +9520,14 @@ impl App {
             A::OpenAgents => self.handle_agent_shortcut(action, ctx),
             A::NewShell => {
                 self.reveal_active_workspace_for_new_session();
-                self.active.workspace_ui.spawn_shell(
-                    &self.active.runtime,
-                    self.config.terminal.scrollback_lines as usize,
-                );
+                self.active
+                    .workspace_ui
+                    .spawn_shell(self.config.terminal.scrollback_lines as usize);
             }
-            A::ClosePane => self
-                .active
-                .workspace_ui
-                .close_focused_pane(&self.active.runtime),
-            A::ScrollToBottom => self
-                .active
-                .workspace_ui
-                .scroll_focused_to_bottom(&self.active.runtime),
-            A::PromptJumpPrev => self
-                .active
-                .workspace_ui
-                .scroll_focused_to_prompt(&self.active.runtime, -1),
-            A::PromptJumpNext => self
-                .active
-                .workspace_ui
-                .scroll_focused_to_prompt(&self.active.runtime, 1),
+            A::ClosePane => self.active.workspace_ui.close_focused_pane(),
+            A::ScrollToBottom => self.active.workspace_ui.scroll_focused_to_bottom(),
+            A::PromptJumpPrev => self.active.workspace_ui.scroll_focused_to_prompt(-1),
+            A::PromptJumpNext => self.active.workspace_ui.scroll_focused_to_prompt(1),
             A::SplitVertical | A::SplitHorizontal => {
                 self.reveal_active_workspace_for_new_session();
                 let direction = if action == A::SplitVertical {
@@ -9524,20 +9535,12 @@ impl App {
                 } else {
                     runtime::SplitDirection::Horizontal
                 };
-                self.active.workspace_ui.split_focused_pane(
-                    &self.active.runtime,
-                    direction,
-                    self.config.terminal.scrollback_lines as usize,
-                );
+                self.active
+                    .workspace_ui
+                    .split_focused_pane(direction, self.config.terminal.scrollback_lines as usize);
             }
-            A::FocusNextPane => self
-                .active
-                .workspace_ui
-                .focus_relative_pane(&self.active.runtime, 1),
-            A::FocusPreviousPane => self
-                .active
-                .workspace_ui
-                .focus_relative_pane(&self.active.runtime, -1),
+            A::FocusNextPane => self.active.workspace_ui.focus_relative_pane(1),
+            A::FocusPreviousPane => self.active.workspace_ui.focus_relative_pane(-1),
             A::NextWorkspace => self.cycle_workspace(1),
             A::PreviousWorkspace => self.cycle_workspace(-1),
             A::IncreaseTerminalFont | A::DecreaseTerminalFont => {
@@ -9828,9 +9831,9 @@ impl App {
                 ),
             );
             for pane in panes {
-                self.active
-                    .workspace_ui
-                    .close_pane_now(&self.active.runtime, pane);
+                Self::drain_workspace_protocol_intents(&mut self.active);
+                self.active.workspace_ui.close_pane_now(pane);
+                Self::drain_workspace_protocol_intents(&mut self.active);
             }
         } else if self.warm.contains_key(workspace_id) {
             // warm 종료는 runtime shutdown까지 동기로 끝난다 — 죽어가는 pane 추적 불필요.
@@ -9860,7 +9863,9 @@ impl App {
                     "워크스페이스 종료 — warm pane 정리 후 runtime shutdown"
                 );
                 for pane in panes {
-                    rt.workspace_ui.close_pane_now(&rt.runtime, pane);
+                    Self::drain_workspace_protocol_intents(&mut rt);
+                    rt.workspace_ui.close_pane_now(pane);
+                    Self::drain_workspace_protocol_intents(&mut rt);
                 }
                 self.close_approval_workspace(workspace_id);
                 rt.runtime.shutdown();
@@ -10350,7 +10355,7 @@ impl App {
     /// 이 함수가 절대 건드리지 않는다 — 표시 전용. 자동 폴더명 추종
     /// (update_workspace_folder_name)은 경로·별칭이 모두 없는 부트스트랩에만
     /// 남아 있어 사용자 별칭을 덮어쓰지 않는다.
-    fn workspace_display_name(row: &crate::storage::WorkspaceRow) -> String {
+    fn workspace_display_name(row: &storage::WorkspaceRow) -> String {
         let alias = row.name.trim();
         let alias = (!alias.is_empty() && alias != "default").then_some(alias);
         let folder = {
@@ -10369,7 +10374,7 @@ impl App {
 
     fn upsert_workspace_projection(&mut self, row: storage::SettingsWorkspaceProjectionRow) {
         let anchor = row.folder_anchor;
-        let workspace = crate::storage::WorkspaceRow {
+        let workspace = storage::WorkspaceRow {
             id: row.id,
             name: row.name,
             path: row.path,
@@ -11165,10 +11170,9 @@ impl App {
                             }
                             if created {
                                 self.sync_dotenv_env();
-                                self.active.workspace_ui.spawn_shell(
-                                    &self.active.runtime,
-                                    self.config.terminal.scrollback_lines as usize,
-                                );
+                                self.active
+                                    .workspace_ui
+                                    .spawn_shell(self.config.terminal.scrollback_lines as usize);
                             }
                         }
                     }
@@ -11387,7 +11391,7 @@ impl App {
                         if let Some(anchor) = row.folder_anchor {
                             anchors.insert(row.id.clone(), anchor);
                         }
-                        crate::storage::WorkspaceRow {
+                        storage::WorkspaceRow {
                             id: row.id,
                             name: row.name,
                             path: row.path,
@@ -12209,20 +12213,26 @@ impl App {
         match composer_action {
             Some(ui::composer::ComposerAction::Send(submission)) => {
                 let (prompt, history) = submission.into_parts();
-                self.send_composer_prompt(&prompt);
-                self.pending_composer_history = Some(history);
-                ui.ctx().request_repaint();
+                if self.stage_workspace_controller_action(
+                    WorkspaceControllerAction::ComposerPrompt(prompt),
+                ) {
+                    self.pending_composer_history = Some(history);
+                }
             }
             Some(ui::composer::ComposerAction::RequestMcpToolPage { server_id, offset }) => {
-                if self
-                    .connector_coordinator
-                    .dispatch(connector_contract::ConnectorIntent::RequestToolPage {
-                        server_id,
-                        offset,
-                    })
-                    .is_err()
-                {
-                    tracing::warn!("Composer Connector tool-page request dispatch failed");
+                if self.pending_connector_dispatch.is_none() {
+                    self.pending_connector_dispatch = Some((
+                        connector_contract::ConnectorIntent::RequestToolPage { server_id, offset },
+                        None,
+                    ));
+                    ui.ctx().request_repaint();
+                } else {
+                    tracing::warn!(
+                        kind = "connector",
+                        phase = "dispatch",
+                        error_code = "backpressure",
+                        "Composer Connector tool-page request rejected"
+                    );
                 }
             }
             Some(ui::composer::ComposerAction::RequestContextFile(request)) => {
@@ -13047,6 +13057,10 @@ impl eframe::App for App {
         }
 
         self.refresh_activity_snapshot_if_needed();
+        // Render and non-render WorkspaceUi producers share one capacity-eight protocol contract.
+        // Drain each resident runtime only in logic, returning exact operation/generation
+        // completions so queue and in-flight slots cannot accumulate across frames.
+        self.poll_workspace_protocol_intents();
         while let Some(intent) = self.notifications_ui.pop_native_intent() {
             platform::notify(intent.summary(), intent.body());
         }
@@ -13674,7 +13688,7 @@ impl eframe::App for App {
         if home_visible || inbox_visible {
             self.active
                 .workspace_ui
-                .update_hidden(ui.ctx(), &self.active.runtime, &events, &text);
+                .update_hidden(ui.ctx(), &events, &text);
         }
 
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함은 전체 폭 페이지가 중앙 영역을 쓴다.
@@ -13708,13 +13722,9 @@ impl eframe::App for App {
                 } else if inbox_visible {
                     inbox_page_click = self.render_inbox_page(ui, &text);
                 } else {
-                    self.active.workspace_ui.show(
-                        ui,
-                        &self.config.terminal,
-                        &self.active.runtime,
-                        &events,
-                        &text,
-                    );
+                    self.active
+                        .workspace_ui
+                        .show(ui, &self.config.terminal, &events, &text);
                 }
             });
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
@@ -15777,7 +15787,7 @@ mod tests {
     /// 별칭 우선(2026-07-18): 별칭이 있으면 폴더명 병기 없이 별칭만, 없으면 폴더명.
     #[test]
     fn 워크스페이스_표시명은_별칭이_있으면_별칭만_보여준다() {
-        let row = |name: &str, path: &str| crate::storage::WorkspaceRow {
+        let row = |name: &str, path: &str| storage::WorkspaceRow {
             id: "w".into(),
             name: name.into(),
             path: path.into(),
@@ -16121,7 +16131,7 @@ mod tests {
             secret::SecretBundleRef::new(&access, None, None),
         )
         .unwrap();
-        let meta = crate::storage::CredentialMeta {
+        let meta = storage::CredentialMeta {
             id: logical.as_str().to_owned(),
             provider: "test".to_owned(),
             label: "unit".to_owned(),
@@ -16163,7 +16173,7 @@ mod tests {
             .unwrap();
         secret::SecretStore::set_secret(&store, &auth::dcr_secret_entry_id(&logical_id), &dcr)
             .unwrap();
-        db.insert_credential(&crate::storage::CredentialMeta {
+        db.insert_credential(&storage::CredentialMeta {
             id: logical_id.clone(),
             provider: "legacy".to_owned(),
             label: "migration".to_owned(),
@@ -17332,7 +17342,7 @@ h:1 EE:FF
 
     #[test]
     fn 설정_워크스페이스_선택은_숨김과_active를_변경하지_않는다() {
-        let row = |id: &str| crate::storage::WorkspaceRow {
+        let row = |id: &str| storage::WorkspaceRow {
             id: id.to_owned(),
             name: id.to_owned(),
             path: format!("/projects/{id}"),

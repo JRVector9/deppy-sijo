@@ -441,8 +441,12 @@ const BOUNDARY_RULES: &[BoundaryRule] = &[
         label: "app UI must not name terminal backend trait directly",
     },
     BoundaryRule {
-        pattern: "InProcessRuntimeClient",
-        label: "leaf UI must not name concrete runtime client",
+        pattern: "RuntimeClient",
+        label: "leaf UI must return protocol intents instead of owning a runtime client",
+    },
+    BoundaryRule {
+        pattern: "send_command(",
+        label: "leaf UI must not execute runtime protocol commands directly",
     },
 ];
 
@@ -487,6 +491,7 @@ fn check_boundary() -> anyhow::Result<()> {
     check_session_secret_boundary(&root, &mut violations)?;
     check_authorization_capability_boundary(&root, &mut violations)?;
     check_app_render_source_boundary(&root, &mut violations)?;
+    check_app_composition_root_boundary(&root, &mut violations)?;
 
     if violations.is_empty() {
         println!("check-boundary OK — UI leaf boundary guard passed; zero allowlist capability");
@@ -499,6 +504,68 @@ fn check_boundary() -> anyhow::Result<()> {
         }
         bail!("check-boundary 실패: {}건", violations.len());
     }
+}
+
+fn check_app_composition_root_boundary(
+    root: &Path,
+    violations: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let app_rs = root.join("crates/app/src/app.rs");
+    for path in rust_files_under(&root.join("crates/app/src"))? {
+        if path == app_rs {
+            continue;
+        }
+        let rel = rel_path(root, &path)?;
+        let source = std::fs::read_to_string(&path).with_context(|| format!("{rel} 읽기 실패"))?;
+        let test_region_start = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == "#[cfg(test)]")
+            .map(|(idx, _)| idx)
+            .last();
+        const FORBIDDEN: &[(&str, &str)] = &[
+            (
+                "Db::open(",
+                "production concrete database construction belongs in app.rs",
+            ),
+            (
+                "use storage::Db",
+                "production concrete database ownership belongs in app.rs",
+            ),
+            (
+                "storage::Db",
+                "production concrete database ownership belongs in app.rs",
+            ),
+            (
+                "crate::storage",
+                "app-local concrete storage re-export shims are forbidden",
+            ),
+            (
+                "KeyringSecretStore",
+                "production concrete keyring ownership belongs in app.rs",
+            ),
+        ];
+        for (line_idx, line) in source.lines().enumerate() {
+            if test_region_start.is_some_and(|start| line_idx >= start) {
+                break;
+            }
+            for (pattern, reason) in FORBIDDEN {
+                if line.contains(pattern) {
+                    violations.push(format!(
+                        "{rel}:{}: composition-root violation: '{pattern}' ({reason})",
+                        line_idx + 1
+                    ));
+                }
+            }
+        }
+    }
+    if root.join("crates/app/src/storage.rs").exists() {
+        violations.push(
+            "crates/app/src/storage.rs: app-local concrete storage re-export shim is forbidden"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn check_app_render_source_boundary(
@@ -560,6 +627,14 @@ fn check_app_render_source_boundary(
         (
             "self.sync_dotenv_env(",
             "render must not admit dotenv filesystem/storage work",
+        ),
+        (
+            "self.send_composer_prompt(",
+            "render must stage terminal composer input for logic",
+        ),
+        (
+            "self.connector_coordinator.dispatch(",
+            "render must stage Connector worker dispatch for logic",
         ),
         (
             "platform::notify(",
@@ -897,6 +972,14 @@ mod tests {
     #[test]
     fn 현재_boundary는_허용된_예외만_남는다() {
         check_boundary().unwrap();
+    }
+
+    #[test]
+    fn production_app_concrete_stores는_app_rs에만_존재한다() {
+        let root = workspace_root().unwrap();
+        let mut violations = Vec::new();
+        check_app_composition_root_boundary(&root, &mut violations).unwrap();
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]

@@ -181,12 +181,14 @@ trait BackendFactory: Send + Sync {
     ) -> anyhow::Result<ConnectedTransport>;
 }
 
+type SecretStoreInitializer = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
+
 struct ManagerBackendFactory {
     manager: LocalMcpManager,
     db: Arc<Mutex<storage::Db>>,
     redaction: RedactionService,
     secret_store: Arc<dyn SecretStore>,
-    initialize_platform_store: bool,
+    secret_store_initializer: Option<SecretStoreInitializer>,
 }
 
 struct SecretConnectionGuard {
@@ -257,9 +259,8 @@ impl ManagerBackendFactory {
         let (secrets, secret_guard) = if auth_revision.is_empty() {
             (Vec::new(), None)
         } else {
-            if self.initialize_platform_store {
-                secret::init_platform_store()
-                    .map_err(|_| anyhow::anyhow!("keyring_backend_init_failed"))?;
+            if let Some(initialize) = &self.secret_store_initializer {
+                initialize().map_err(|_| anyhow::anyhow!("keyring_backend_init_failed"))?;
             }
             let mut secrets = Vec::with_capacity(auth_revision.len());
             for entry in auth_revision {
@@ -413,10 +414,12 @@ pub struct BackendSession {
 }
 
 impl BackendSession {
-    pub fn production(
+    pub(crate) fn production(
         manager: LocalMcpManager,
         db: Arc<Mutex<storage::Db>>,
         redaction: RedactionService,
+        secret_store: Arc<dyn SecretStore>,
+        secret_store_initializer: Option<SecretStoreInitializer>,
         idle_ttl: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -424,8 +427,8 @@ impl BackendSession {
                 manager,
                 db,
                 redaction,
-                secret_store: Arc::new(secret::KeyringSecretStore),
-                initialize_platform_store: true,
+                secret_store,
+                secret_store_initializer,
             }),
             clock: Arc::new(SystemClock::new()),
             idle_ttl,
@@ -1304,12 +1307,17 @@ mod tests {
         store.seed(logical.as_str(), "legacy-secret-must-not-read");
         store.seed(slot_one.as_str(), "access-token-generation-one");
         let redaction = RedactionService::new();
+        let initializer_calls = Arc::new(AtomicUsize::new(0));
+        let initializer_calls_for_factory = Arc::clone(&initializer_calls);
         let factory = ManagerBackendFactory {
             manager: LocalMcpManager::new(redaction.clone()),
             db: Arc::clone(&db),
             redaction: redaction.clone(),
             secret_store: store.clone(),
-            initialize_platform_store: false,
+            secret_store_initializer: Some(Arc::new(move || {
+                initializer_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })),
         };
         let config = BackendConfig::Stdio(StdioBackendConfig {
             name: "server".to_owned(),
@@ -1324,13 +1332,16 @@ mod tests {
             store.take_reads().is_empty(),
             "startup must not read keyring"
         );
+        assert_eq!(initializer_calls.load(Ordering::SeqCst), 0);
         let revision_one = factory.auth_revision(&config).unwrap();
         assert_eq!(revision_one, vec![slot_one.as_str().to_owned()]);
         assert!(
             store.take_reads().is_empty(),
             "pointer check must not read keyring"
         );
+        assert_eq!(initializer_calls.load(Ordering::SeqCst), 0);
         let resolved = factory.resolve(&config, &revision_one).unwrap();
+        assert_eq!(initializer_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.take_reads(), vec![slot_one.as_str().to_owned()]);
         assert_eq!(redaction.corpus_stats().active_leases, 1);
         let ResolvedBackendConfig::Stdio(resolved_config) = &resolved.config else {
@@ -1355,6 +1366,7 @@ mod tests {
         assert_eq!(revision_two, vec![slot_two.as_str().to_owned()]);
         assert_ne!(revision_one, revision_two);
         let resolved = factory.resolve(&config, &revision_two).unwrap();
+        assert_eq!(initializer_calls.load(Ordering::SeqCst), 2);
         assert_eq!(store.take_reads(), vec![slot_two.as_str().to_owned()]);
         drop(resolved);
 
@@ -1404,7 +1416,7 @@ mod tests {
             db: Arc::clone(&db),
             redaction,
             secret_store: store.clone(),
-            initialize_platform_store: false,
+            secret_store_initializer: None,
         };
         let config = BackendConfig::Stdio(StdioBackendConfig {
             name: "server".to_owned(),
@@ -1484,7 +1496,7 @@ mod tests {
             db: Arc::clone(&db),
             redaction,
             secret_store: store,
-            initialize_platform_store: false,
+            secret_store_initializer: None,
         };
         let config = BackendConfig::Stdio(StdioBackendConfig {
             name: "server".to_owned(),
@@ -1573,6 +1585,8 @@ mod tests {
             manager,
             Arc::clone(&db),
             redaction,
+            Arc::new(RecordingSecretStore::default()),
+            None,
             DEFAULT_BACKEND_IDLE_TTL,
         );
         let backend = BackendClient::new(
@@ -1618,6 +1632,8 @@ mod tests {
             LocalMcpManager::new(redaction.clone()).with_request_timeout(Duration::from_secs(5)),
             Arc::clone(&db),
             redaction,
+            Arc::new(RecordingSecretStore::default()),
+            None,
             DEFAULT_BACKEND_IDLE_TTL,
         );
         let backend = BackendClient::new(
@@ -2143,6 +2159,8 @@ IFS= read -r _until_cancel
             LocalMcpManager::new(redaction.clone()).with_request_timeout(Duration::from_secs(5)),
             Arc::clone(&db),
             redaction,
+            Arc::new(RecordingSecretStore::default()),
+            None,
             idle_ttl,
         );
         let backend = BackendClient::new(
@@ -2278,6 +2296,8 @@ read -r _until_cancel
             LocalMcpManager::new(redaction.clone()).with_request_timeout(Duration::from_secs(5)),
             Arc::clone(&db),
             redaction,
+            Arc::new(RecordingSecretStore::default()),
+            None,
             idle_ttl,
         );
         let backend = BackendClient::new(

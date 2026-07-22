@@ -56,3 +56,28 @@ network client, or dependency.
   Concurrent Workspace/FileTree and web-remote lanes also had mid-edit API/test mismatches. This is
   not accepted as test evidence; focused tests, app check, and strict Clippy remain for root after
   all three APIs are integrated.
+
+## Integrated closeout update
+
+The root integration listed above is complete. Workspace, FileTree, Diff, Inbox, approval,
+Activity, Notifications, Agent Sessions, dotenv, and status-feed projections are wired through
+bounded snapshot/intent or host-adapter paths. Composer prompt submission and Connector tool-page
+requests are staged for the next logic tick, so render starts neither runtime writes nor Connector
+worker/database lifecycle.
+
+Production `workspace.rs` now contains zero `RuntimeClient`, `RuntimeCommandSink`, `send_command`,
+or native-notification effect. Queue plus in-flight protocol work has one hard capacity of eight;
+local terminal input is capped at its existing 1-MiB clipboard ceiling, search at 32 KiB/1,000
+matches, pane/tab IDs at 128 bytes, split paths at 256 items, and scrollback at 100,000 lines.
+Exact operation/generation completion releases capacity on success or sanitized delivery failure;
+stale/duplicate completion does not.
+
+The current integrated evidence is Workspace 55/55, status-feed 17/17, notice translation 11/11,
+and xtask 9/9, plus app all-target check, strict app/xtask Clippy, full rustfmt, diff-check,
+zero-allowlist boundary, and the clean 23-crate dependency DAG. The earlier pre-integration test
+paragraph remains as historical failed-attempt evidence and is not counted as a pass.
+
+Remaining development before final BG01 hardware approval is tracked in the handoff: bounded
+app-server queues, bounded Git/local-LLM/Tailscale output, clipboard-cache limits, and latest-only
+agent-detection delivery. The 30-minute and Scenario A-E measurements remain deferred until those
+development changes freeze.

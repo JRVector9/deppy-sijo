@@ -5,11 +5,16 @@
 //! 신선도), **공지 4시간**(사용자 지정) + 홈의 수동 갱신 버튼(refresh 채널).
 //! 실패 시 해당 provider만 None (오프라인이어도 앱 동작 무영향).
 
+use std::fmt;
+use std::io::Read;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet, VecDeque},
+    path::Path,
+};
 
 pub const CLAUDE_STATUS_URL: &str = "https://status.claude.com";
 pub const OPENAI_STATUS_URL: &str = "https://status.openai.com";
@@ -22,6 +27,19 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(300);
 /// 공지(인시던트 목록) 갱신 주기 (2026-07-21 사용자: 4시간).
 const INCIDENTS_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const STATUS_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+const NOTICE_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const PROVIDER_DESCRIPTION_MAX_BYTES: usize = 4 * 1024;
+const NOTICE_TITLE_MAX_BYTES: usize = 4 * 1024;
+const NOTICE_STATUS_MAX_BYTES: usize = 256;
+const NOTICE_DATE_MAX_BYTES: usize = 32;
+const NOTICE_URL_MAX_BYTES: usize = 8 * 1024;
+const NOTICE_READ_PROVIDERS_MAX_ITEMS: usize = 16;
+const NOTICE_READ_PROVIDER_MAX_BYTES: usize = 64;
+const NOTICE_READ_IDS_MAX_ITEMS: usize = 512;
+const NOTICE_READ_ID_MAX_BYTES: usize = 16 * 1024;
+const NOTICE_READ_IDS_MAX_BYTES: usize = 512 * 1024;
+const NOTICE_READ_STATE_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// 홈 공지 카드 수 (provider당, 2026-07-20 사용자: "5줄").
 const INCIDENTS_PER_PROVIDER: usize = 5;
 const NOTICE_READ_STATE_VERSION: u32 = 1;
@@ -264,23 +282,43 @@ struct NoticeReadStateFile {
 }
 
 /// 홈 공지의 읽음 기준. 공급자별 첫 성공 조회는 기존 공지로 기준화하고, 이후 새 URL만
-/// 배지에 센다. 읽은 ID는 누적해 한때 최신 5건 밖으로 밀린 공지가 다시 목록에 들어와도
-/// 새 공지로 잘못 세지 않으며, 앱을 재시작해도 같은 공지를 다시 알리지 않는다.
-#[derive(Debug, Default)]
+/// 배지에 센다. 읽은 ID는 최근 512건/512 KiB rolling window로 유지해 한때 최신 5건
+/// 밖으로 밀린 공지의 재진입을 막되, 장기 실행에서 RAM/상태 파일이 계속 자라지 않는다.
+#[derive(Default)]
 pub struct NoticeReadState {
     initialized_providers: BTreeSet<String>,
-    read_ids: BTreeSet<String>,
+    read_ids: HashSet<String>,
+    read_order: VecDeque<String>,
+    read_bytes: usize,
+}
+
+impl fmt::Debug for NoticeReadState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NoticeReadState")
+            .field("initialized_providers", &self.initialized_providers.len())
+            .field("read_ids", &self.read_ids.len())
+            .field("read_bytes", &self.read_bytes)
+            .finish()
+    }
 }
 
 impl NoticeReadState {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
             Err(error) => return Err(error.into()),
         };
+        let mut bytes = Vec::new();
+        file.take((NOTICE_READ_STATE_FILE_MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= NOTICE_READ_STATE_FILE_MAX_BYTES,
+            "공지 읽음 상태 파일이 크기 상한을 초과했습니다"
+        );
         let file: NoticeReadStateFile = serde_json::from_slice(&bytes)?;
         if file.version != NOTICE_READ_STATE_VERSION {
             anyhow::bail!(
@@ -288,18 +326,20 @@ impl NoticeReadState {
                 file.version
             );
         }
-        Ok(Self {
-            initialized_providers: file
-                .initialized_providers
-                .into_iter()
-                .filter(|provider| !provider.trim().is_empty())
-                .collect(),
-            read_ids: file
-                .read_ids
-                .into_iter()
-                .filter(|id| !id.trim().is_empty())
-                .collect(),
-        })
+        let initialized_providers = file
+            .initialized_providers
+            .into_iter()
+            .filter(|provider| valid_bounded_text(provider, NOTICE_READ_PROVIDER_MAX_BYTES, false))
+            .take(NOTICE_READ_PROVIDERS_MAX_ITEMS)
+            .collect();
+        let mut state = Self {
+            initialized_providers,
+            ..Self::default()
+        };
+        for id in file.read_ids {
+            let _ = state.insert_read_id(id);
+        }
+        Ok(state)
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -309,9 +349,14 @@ impl NoticeReadState {
         let file = NoticeReadStateFile {
             version: NOTICE_READ_STATE_VERSION,
             initialized_providers: self.initialized_providers.iter().cloned().collect(),
-            read_ids: self.read_ids.iter().cloned().collect(),
+            read_ids: self.read_order.iter().cloned().collect(),
         };
-        deppy_core::fs::atomic_write(path, &serde_json::to_vec_pretty(&file)?)?;
+        let bytes = serde_json::to_vec_pretty(&file)?;
+        anyhow::ensure!(
+            bytes.len() <= NOTICE_READ_STATE_FILE_MAX_BYTES,
+            "공지 읽음 상태 직렬화가 크기 상한을 초과했습니다"
+        );
+        deppy_core::fs::atomic_write(path, &bytes)?;
         Ok(())
     }
 
@@ -321,7 +366,15 @@ impl NoticeReadState {
         let mut changed = false;
         for (provider, status) in announcement_providers(feed) {
             let Some(status) = status else { continue };
-            let first_success = self.initialized_providers.insert(provider.to_owned());
+            let first_success = if self.initialized_providers.contains(provider) {
+                false
+            } else if self.initialized_providers.len() < NOTICE_READ_PROVIDERS_MAX_ITEMS
+                && valid_bounded_text(provider, NOTICE_READ_PROVIDER_MAX_BYTES, false)
+            {
+                self.initialized_providers.insert(provider.to_owned())
+            } else {
+                false
+            };
             changed |= first_success;
             if first_success || mark_read {
                 changed |= self.mark_provider_read(provider, status);
@@ -351,14 +404,31 @@ impl NoticeReadState {
     }
 
     fn mark_provider_read(&mut self, provider: &str, status: &ProviderStatus) -> bool {
-        let before = self.read_ids.len();
-        self.read_ids.extend(
-            status
-                .incidents
-                .iter()
-                .map(|incident| notice_id(provider, incident)),
-        );
-        self.read_ids.len() != before
+        let mut changed = false;
+        for incident in &status.incidents {
+            changed |= self.insert_read_id(notice_id(provider, incident));
+        }
+        changed
+    }
+
+    fn insert_read_id(&mut self, id: String) -> bool {
+        if !valid_bounded_text(&id, NOTICE_READ_ID_MAX_BYTES, false) || self.read_ids.contains(&id)
+        {
+            return false;
+        }
+        self.read_bytes = self.read_bytes.saturating_add(id.len());
+        self.read_ids.insert(id.clone());
+        self.read_order.push_back(id);
+        while self.read_order.len() > NOTICE_READ_IDS_MAX_ITEMS
+            || self.read_bytes > NOTICE_READ_IDS_MAX_BYTES
+        {
+            let Some(evicted) = self.read_order.pop_front() else {
+                break;
+            };
+            self.read_bytes = self.read_bytes.saturating_sub(evicted.len());
+            self.read_ids.remove(&evicted);
+        }
+        true
     }
 }
 
@@ -513,42 +583,57 @@ pub fn spawn(egui_ctx: egui::Context) -> (StatusFeedReceiver, StatusFeedRefresh)
 }
 
 fn fetch_status(agent: &ureq::Agent, base: &str) -> anyhow::Result<(ServiceIndicator, String)> {
-    let status_json = agent
-        .get(&format!("{base}/api/v2/status.json"))
-        .call()?
-        .into_string()?;
+    let response = agent.get(&format!("{base}/api/v2/status.json")).call()?;
+    let status_json = read_response_limited(response, STATUS_RESPONSE_MAX_BYTES)?;
     parse_status(&status_json)
 }
 
 fn fetch_incidents(agent: &ureq::Agent, base: &str) -> anyhow::Result<Vec<IncidentNotice>> {
-    let incidents_json = agent
-        .get(&format!("{base}/api/v2/incidents.json"))
-        .call()?
-        .into_string()?;
+    let response = agent.get(&format!("{base}/api/v2/incidents.json")).call()?;
+    let incidents_json = read_response_limited(response, NOTICE_RESPONSE_MAX_BYTES)?;
     parse_incidents(&incidents_json, base)
 }
 
 fn fetch_hugging_face_models(agent: &ureq::Agent) -> anyhow::Result<Vec<IncidentNotice>> {
-    let json = agent
+    let response = agent
         .get(HUGGING_FACE_MODELS_API)
         .set("Accept", "application/json")
         .set("User-Agent", "Deppy-Sijo/External-Updates")
-        .call()?
-        .into_string()?;
+        .call()?;
+    let json = read_response_limited(response, NOTICE_RESPONSE_MAX_BYTES)?;
     parse_hugging_face_models(&json)
 }
 
 fn fetch_grok_status(agent: &ureq::Agent) -> anyhow::Result<Vec<IncidentNotice>> {
-    let json = agent
+    let response = agent
         .get(GROK_STATUS_RSS)
         .set(
             "Accept",
             "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
         )
         .set("User-Agent", "Deppy-Sijo/External-Updates")
-        .call()?
-        .into_string()?;
+        .call()?;
+    let json = read_response_limited(response, NOTICE_RESPONSE_MAX_BYTES)?;
     parse_grok_status_rss(&json)
+}
+
+fn read_response_limited(response: ureq::Response, max_bytes: usize) -> anyhow::Result<String> {
+    read_utf8_limited(response.into_reader(), max_bytes)
+}
+
+fn read_utf8_limited(reader: impl Read, max_bytes: usize) -> anyhow::Result<String> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    reader
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= max_bytes, "HTTP 응답 크기 상한 초과");
+    String::from_utf8(bytes).map_err(Into::into)
+}
+
+fn valid_bounded_text(value: &str, max_bytes: usize, allow_empty: bool) -> bool {
+    (allow_empty || !value.trim().is_empty())
+        && value.len() <= max_bytes
+        && !value.as_bytes().contains(&0)
 }
 
 /// `/api/v2/status.json` → (indicator, description).
@@ -565,9 +650,12 @@ fn parse_status(json: &str) -> anyhow::Result<(ServiceIndicator, String)> {
     let description = status
         .get("description")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-    Ok((indicator, description))
+        .unwrap_or("");
+    anyhow::ensure!(
+        valid_bounded_text(description, PROVIDER_DESCRIPTION_MAX_BYTES, true),
+        "status description 크기 상한 초과"
+    );
+    Ok((indicator, description.to_owned()))
 }
 
 /// `/api/v2/incidents.json` → 최신 5건. 링크는 shortlink 우선, 없으면(OpenAI가 그렇다)
@@ -581,16 +669,20 @@ fn parse_incidents(json: &str, base: &str) -> anyhow::Result<Vec<IncidentNotice>
     Ok(incidents
         .iter()
         .filter_map(|incident| {
-            let title = incident.get("name")?.as_str()?.to_owned();
+            let title = incident.get("name")?.as_str()?;
             let status = incident
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
+                .unwrap_or("");
+            if !valid_bounded_text(title, NOTICE_TITLE_MAX_BYTES, false)
+                || !valid_bounded_text(status, NOTICE_STATUS_MAX_BYTES, true)
+            {
+                return None;
+            }
             let date = incident
                 .get("created_at")
                 .and_then(|v| v.as_str())
-                .map(|s| s.chars().take(10).collect())
+                .map(|s| s.chars().take(10).collect::<String>())
                 .unwrap_or_default();
             let url = incident
                 .get("shortlink")
@@ -603,9 +695,14 @@ fn parse_incidents(json: &str, base: &str) -> anyhow::Result<Vec<IncidentNotice>
                         .map(|id| format!("{base}/incidents/{id}"))
                 })
                 .unwrap_or_else(|| base.to_owned());
+            if !valid_bounded_text(&date, NOTICE_DATE_MAX_BYTES, true)
+                || !valid_bounded_text(&url, NOTICE_URL_MAX_BYTES, false)
+            {
+                return None;
+            }
             Some(IncidentNotice {
-                title,
-                status,
+                title: title.to_owned(),
+                status: status.to_owned(),
                 date,
                 url,
             })
@@ -619,19 +716,24 @@ fn parse_hugging_face_models(json: &str) -> anyhow::Result<Vec<IncidentNotice>> 
     Ok(models
         .into_iter()
         .filter_map(|model| {
-            let title = model
-                .get("id")
-                .or_else(|| model.get("modelId"))?
-                .as_str()?
-                .to_owned();
+            let title = model.get("id").or_else(|| model.get("modelId"))?.as_str()?;
+            if !valid_bounded_text(title, NOTICE_TITLE_MAX_BYTES, false) {
+                return None;
+            }
             let date = model
                 .get("createdAt")
                 .and_then(|value| value.as_str())
-                .map(|value| value.chars().take(10).collect())
+                .map(|value| value.chars().take(10).collect::<String>())
                 .unwrap_or_default();
+            let url = format!("https://huggingface.co/{title}");
+            if !valid_bounded_text(&date, NOTICE_DATE_MAX_BYTES, true)
+                || !valid_bounded_text(&url, NOTICE_URL_MAX_BYTES, false)
+            {
+                return None;
+            }
             Some(IncidentNotice {
-                url: format!("https://huggingface.co/{title}"),
-                title,
+                url,
+                title: title.to_owned(),
                 status: "trending".to_owned(),
                 date,
             })
@@ -666,7 +768,9 @@ fn parse_grok_status_rss(xml: &str) -> anyhow::Result<Vec<IncidentNotice>> {
     for item in feed.channel.item {
         let title = item.title.trim();
         let link = item.link.trim();
-        if title.is_empty() || link.is_empty() {
+        if !valid_bounded_text(title, NOTICE_TITLE_MAX_BYTES, false)
+            || !valid_bounded_text(link, NOTICE_URL_MAX_BYTES, false)
+        {
             continue;
         }
         // Status RSS가 같은 사건을 반복 게시하는 경우가 있어, 대소문자와 연속 공백을
@@ -679,10 +783,14 @@ fn parse_grok_status_rss(xml: &str) -> anyhow::Result<Vec<IncidentNotice>> {
         if !seen_titles.insert(dedupe_key) {
             continue;
         }
+        let date = rss_date(&item.published_at);
+        if !valid_bounded_text(&date, NOTICE_DATE_MAX_BYTES, true) {
+            continue;
+        }
         notices.push(IncidentNotice {
             title: title.to_owned(),
             status: "update".to_owned(),
-            date: rss_date(&item.published_at),
+            date,
             url: link.to_owned(),
         });
         if notices.len() == INCIDENTS_PER_PROVIDER {
@@ -835,6 +943,64 @@ mod tests {
     }
 
     #[test]
+    fn http_body_reader는_exact_byte_cap만_허용한다() {
+        let exact = vec![b'a'; STATUS_RESPONSE_MAX_BYTES];
+        assert_eq!(
+            read_utf8_limited(std::io::Cursor::new(exact.clone()), exact.len()).unwrap(),
+            String::from_utf8(exact).unwrap()
+        );
+        assert!(
+            read_utf8_limited(
+                std::io::Cursor::new(vec![b'b'; STATUS_RESPONSE_MAX_BYTES + 1]),
+                STATUS_RESPONSE_MAX_BYTES,
+            )
+            .is_err()
+        );
+        assert!(read_utf8_limited(std::io::Cursor::new(vec![0xff]), 1).is_err());
+    }
+
+    #[test]
+    fn read_state는_rotation뒤에도_item과_byte_cap을_유지한다() {
+        let mut state = NoticeReadState::default();
+        for index in 0..2_000 {
+            let feed = StatusFeedSnapshot {
+                openai: Some(test_provider(&[&format!("https://status.test/{index}")])),
+                ..StatusFeedSnapshot::default()
+            };
+            assert!(state.reconcile(&feed, true));
+        }
+
+        assert!(state.read_ids.len() <= NOTICE_READ_IDS_MAX_ITEMS);
+        assert_eq!(state.read_order.len(), state.read_ids.len());
+        assert!(state.read_bytes <= NOTICE_READ_IDS_MAX_BYTES);
+        assert!(!state.read_ids.contains("OpenAI\u{1f}https://status.test/0"));
+        assert!(
+            state
+                .read_ids
+                .contains("OpenAI\u{1f}https://status.test/1999")
+        );
+        let debug = format!("{state:?}");
+        assert!(!debug.contains("status.test"));
+    }
+
+    #[test]
+    fn oversized_read_state_file은_deserialize전에_거부한다() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "deppy-notice-read-oversized-{}-{unique}.json",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((NOTICE_READ_STATE_FILE_MAX_BYTES + 1) as u64)
+            .unwrap();
+        assert!(NoticeReadState::load(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn 첫_성공_목록은_기준화하고_그_다음_url만_새_공지로_센다() {
         let mut state = NoticeReadState::default();
         let mut feed = StatusFeedSnapshot {
@@ -910,6 +1076,14 @@ mod tests {
         // 미지의 indicator는 Unknown — 표시 쪽에서 회색 점.
         let json = r#"{"status":{"indicator":"weird","description":""}}"#;
         assert_eq!(parse_status(json).unwrap().0, ServiceIndicator::Unknown);
+
+        let oversized = serde_json::json!({
+            "status": {
+                "indicator": "none",
+                "description": "x".repeat(PROVIDER_DESCRIPTION_MAX_BYTES + 1)
+            }
+        });
+        assert!(parse_status(&oversized.to_string()).is_err());
     }
 
     #[test]
@@ -934,6 +1108,19 @@ mod tests {
         assert_eq!(
             notices[2].url, "https://status.openai.com/incidents/abc123",
             "shortlink 없으면 id로 조립"
+        );
+
+        let invalid = serde_json::json!({
+            "incidents": [{
+                "name": "x".repeat(NOTICE_TITLE_MAX_BYTES + 1),
+                "status": "resolved",
+                "shortlink": "https://status.test/oversized"
+            }]
+        });
+        assert!(
+            parse_incidents(&invalid.to_string(), "https://status.test")
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -992,5 +1179,18 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].title, "Visible");
         assert!(notices[0].date.is_empty());
+    }
+
+    #[test]
+    fn production_fetch_source에는_unbounded_into_string이_없다() {
+        let source = include_str!("status_feed.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(!production.contains(".into_string()"));
+        assert!(production.contains("read_response_limited"));
+        assert!(production.contains("NOTICE_READ_IDS_MAX_ITEMS"));
+        assert!(production.contains("NOTICE_READ_IDS_MAX_BYTES"));
     }
 }

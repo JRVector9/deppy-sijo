@@ -1061,7 +1061,7 @@ pub fn apply_workspace_dotenv_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Db;
+    use storage::Db;
 
     impl DotenvRepository for Db {
         fn credential_secret_location(
@@ -1099,7 +1099,7 @@ mod tests {
         ) -> anyhow::Result<()> {
             Db::insert_credential_with_secret_slot(
                 self,
-                &crate::storage::CredentialMeta {
+                &storage::CredentialMeta {
                     id: draft.id().to_owned(),
                     provider: draft.provider().to_owned(),
                     label: draft.label().to_owned(),
@@ -1632,7 +1632,7 @@ INVALID LINE
         )
         .unwrap();
         db.insert_credential_with_secret_slot(
-            &crate::storage::CredentialMeta {
+            &storage::CredentialMeta {
                 id: credential_id.to_owned(),
                 provider: provider.to_owned(),
                 label: "fixture".to_owned(),
@@ -1660,7 +1660,7 @@ INVALID LINE
         std::fs::create_dir_all(&dir).unwrap();
         let mut db = Db::open(&dir.join("test.db")).unwrap();
         let marker = "hostile-logical-coordinate-marker";
-        db.insert_credential(&crate::storage::CredentialMeta {
+        db.insert_credential(&storage::CredentialMeta {
             id: marker.to_owned(),
             provider: "legacy".to_owned(),
             label: "fixture".to_owned(),

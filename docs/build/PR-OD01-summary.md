@@ -142,3 +142,19 @@ The count-bounded soaks do not sample process RSS or OS socket inventories. A 30
 RSS/thread/socket/queue slope run and release Scenario A-E hardware CPU/RSS/frame-p95 comparison
 remain final production gates. The completed slices add no production timer, polling loop,
 network, process, or retained source/sample backlog.
+
+## Notice resource pipeline
+
+Status HTTP bodies are capped before parsing at 64 KiB for service status and 4 MiB for notices.
+Projected description/title/status/date/URL values have explicit byte ceilings and invalid or
+oversized values fail closed. Persistent read state is a rolling 512-item/512-KiB corpus with a
+4-MiB file ceiling instead of an ever-growing set.
+
+Translation cache retention is capped at 256 items/512 KiB with a 4-MiB file ceiling. Translation
+batches are limited to 32 items and 128 KiB, result delivery is capacity one, and subprocess
+stdout is capped at 256 KiB. The named stdout reader is joined after child reap on success, error,
+and timeout. Debug redacts title-like content, and no 30-minute measurement is included here.
+
+Focused status-feed tests pass 17/17 and notice-translation tests pass 11/11. The integrated app
+all-target check, strict Clippy, full rustfmt, diff-check, zero-allowlist boundary, and dependency
+gates pass.

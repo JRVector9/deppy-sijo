@@ -356,6 +356,17 @@ pub struct CredentialSecretLocation {
     pub keyring_username: String,
 }
 
+/// Bootstrap/migration view of one credential and its logical-to-physical keyring pointer.
+/// Secret values are never loaded into this DTO. The pointer remains a string because pre-IN01
+/// databases can still contain the legacy logical credential id in `keyring_username`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CredentialSecretRecord {
+    pub meta: CredentialMeta,
+    pub keyring_service: String,
+    pub keyring_username: String,
+    pub oauth_json: Option<String>,
+}
+
 /// workspace 한 행 (WorkspaceSidebar 표시용).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceRow {
@@ -791,6 +802,44 @@ impl Db {
         Ok(())
     }
 
+    /// Inserts credential metadata with an already-staged, owned physical keyring slot. This is
+    /// the only new-credential path suitable for the post-IN01 physical bundle model: it never
+    /// publishes the logical credential id as a keyring pointer. `None` preserves SQL NULL for
+    /// credentials without OAuth metadata.
+    pub fn insert_credential_with_secret_slot(
+        &self,
+        meta: &CredentialMeta,
+        physical_slot: &str,
+        oauth_json: Option<&str>,
+    ) -> anyhow::Result<()> {
+        validate_owned_physical_secret_slot(&meta.id, physical_slot)?;
+        if let Some(json) = oauth_json {
+            validate_oauth_metadata_json(json)?;
+        }
+        self.conn
+            .execute(
+                "INSERT INTO credentials
+                   (id, provider, label, credential_kind,
+                    keyring_service, keyring_username, masked_hint, workspace_id, oauth_json,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                (
+                    &meta.id,
+                    &meta.provider,
+                    &meta.label,
+                    &meta.credential_kind,
+                    secret::KEYRING_SERVICE,
+                    physical_slot,
+                    &meta.masked_hint,
+                    &meta.workspace_id,
+                    oauth_json,
+                ),
+            )
+            .with_context(|| format!("physical-slot credential 저장 실패: {}", meta.id))?;
+        Ok(())
+    }
+
     pub fn list_credentials(&self) -> anyhow::Result<Vec<CredentialMeta>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, provider, label, credential_kind, masked_hint, workspace_id
@@ -807,6 +856,46 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Returns one consistent, bounded scan of credential metadata and keyring pointers for
+    /// bootstrap migration/reconciliation. Exactly `limit` rows are allowed; one extra row is
+    /// fetched only to prove that the caller-provided bound was exceeded.
+    pub fn list_credential_secret_records(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<CredentialSecretRecord>> {
+        let fetch_limit = limit
+            .checked_add(1)
+            .context("credential secret record limit overflow")?;
+        let fetch_limit = i64::try_from(fetch_limit)
+            .context("credential secret record limit exceeds SQLite range")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, provider, label, credential_kind, masked_hint, workspace_id,
+                    keyring_service, keyring_username, oauth_json
+             FROM credentials ORDER BY created_at, id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([fetch_limit], |row| {
+            Ok(CredentialSecretRecord {
+                meta: CredentialMeta {
+                    id: row.get(0)?,
+                    provider: row.get(1)?,
+                    label: row.get(2)?,
+                    credential_kind: row.get(3)?,
+                    masked_hint: row.get(4)?,
+                    workspace_id: row.get(5)?,
+                },
+                keyring_service: row.get(6)?,
+                keyring_username: row.get(7)?,
+                oauth_json: row.get(8)?,
+            })
+        })?;
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            records.len() <= limit,
+            "credential secret record limit exceeded: limit={limit}"
+        );
+        Ok(records)
     }
 
     /// 이 workspace에서 보이는 credential — 소속(workspace_id=ws) + 전역(NULL). (#2)
@@ -876,6 +965,45 @@ impl Db {
         anyhow::ensure!(affected == 1, "credential 없음: {id}");
         tx.commit()
             .context("credential secret slot/metadata commit 실패")
+    }
+
+    /// Compare-and-swap publishes an already-staged physical slot together with its optional
+    /// OAuth metadata and masked hint. The update occurs only while the stored pointer exactly
+    /// matches `expected_previous_pointer`; stale or missing rows return `false` without changing
+    /// any column. `None` writes SQL NULL, preserving the non-OAuth representation.
+    pub fn publish_credential_secret_slot_cas(
+        &self,
+        logical_id: &str,
+        expected_previous_pointer: &str,
+        physical_slot: &str,
+        oauth_json: Option<&str>,
+        masked_hint: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        validate_owned_physical_secret_slot(logical_id, physical_slot)?;
+        if let Some(json) = oauth_json {
+            validate_oauth_metadata_json(json)?;
+        }
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE credentials
+                 SET keyring_username = ?3, oauth_json = ?4, masked_hint = ?5,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1 AND keyring_username = ?2",
+                (
+                    logical_id,
+                    expected_previous_pointer,
+                    physical_slot,
+                    oauth_json,
+                    masked_hint,
+                ),
+            )
+            .with_context(|| format!("credential secret slot CAS publish 실패: {logical_id}"))?;
+        anyhow::ensure!(
+            affected <= 1,
+            "credential secret slot CAS가 여러 행을 변경했습니다"
+        );
+        Ok(affected == 1)
     }
 
     /// logical credential id를 keyring physical slot으로 해석한다. secret 본문은 반환하지 않는다.
@@ -2769,6 +2897,14 @@ mod tests {
         }
     }
 
+    fn credential_secret_record(db: &Db, id: &str) -> CredentialSecretRecord {
+        db.list_credential_secret_records(32)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.meta.id == id)
+            .unwrap()
+    }
+
     /// PR-22 완료 기준 "secret이 DB에 없음" — 파일 바이트 레벨 스캔.
     /// credential 저장/env secret 참조/agent 등록의 전 경로를 지난 뒤
     /// SQLite 파일 원문에 secret 평문이 없어야 한다 (metadata는 keyring 좌표만 — §6.3).
@@ -2853,6 +2989,178 @@ mod tests {
         );
         // 없는 credential은 에러
         assert!(db.set_credential_oauth_json("cred-missing", "{}").is_err());
+    }
+
+    #[test]
+    fn credential_secret_record_scan은_inclusive_limit과_full_pointer를_보존한다() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.list_credential_secret_records(0).unwrap().is_empty());
+        db.insert_credential(&sample("cred-a")).unwrap();
+        db.insert_credential(&sample("cred-b")).unwrap();
+        db.set_credential_oauth_json("cred-a", r#"{"server_id":"srv-a"}"#)
+            .unwrap();
+
+        let records = db.list_credential_secret_records(2).unwrap();
+        assert_eq!(records.len(), 2, "exactly-at-limit must be accepted");
+        assert_eq!(records[0].meta, sample("cred-a"));
+        assert_eq!(records[0].keyring_service, secret::KEYRING_SERVICE);
+        assert_eq!(records[0].keyring_username, "cred-a");
+        assert_eq!(
+            records[0].oauth_json.as_deref(),
+            Some(r#"{"server_id":"srv-a"}"#)
+        );
+        assert_eq!(records[1].meta, sample("cred-b"));
+        assert_eq!(records[1].keyring_username, "cred-b");
+        assert_eq!(records[1].oauth_json, None);
+        assert!(
+            db.list_credential_secret_records(1).is_err(),
+            "the +1 probe must reject a truncated bootstrap scan"
+        );
+        assert!(db.list_credential_secret_records(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn physical_slot_credential_insert는_owned_pointer와_nullable_metadata만_publish한다() {
+        let db = Db::open_in_memory().unwrap();
+        let plain = secret::LogicalCredentialId::new("cred-plain").unwrap();
+        let plain_slot = secret::PhysicalSecretSlot::with_version(&plain, uuid::Uuid::new_v4());
+        db.insert_credential_with_secret_slot(&sample(plain.as_str()), plain_slot.as_str(), None)
+            .unwrap();
+        let plain_record = credential_secret_record(&db, plain.as_str());
+        assert_eq!(plain_record.keyring_service, secret::KEYRING_SERVICE);
+        assert_eq!(plain_record.keyring_username, plain_slot.as_str());
+        assert_ne!(plain_record.keyring_username, plain.as_str());
+        assert_eq!(plain_record.oauth_json, None);
+
+        let oauth = secret::LogicalCredentialId::new("cred-oauth-new").unwrap();
+        let oauth_slot = secret::PhysicalSecretSlot::with_version(&oauth, uuid::Uuid::new_v4());
+        db.insert_credential_with_secret_slot(
+            &sample(oauth.as_str()),
+            oauth_slot.as_str(),
+            Some(r#"{"server_id":"srv-1","client_id":"cid-1"}"#),
+        )
+        .unwrap();
+        let oauth_record = credential_secret_record(&db, oauth.as_str());
+        assert_eq!(oauth_record.keyring_username, oauth_slot.as_str());
+        assert_eq!(
+            oauth_record.oauth_json.as_deref(),
+            Some(r#"{"server_id":"srv-1","client_id":"cid-1"}"#)
+        );
+    }
+
+    #[test]
+    fn physical_slot_credential_insert는_cross_owner_corrupt_unversioned를_reject한다() {
+        let logical = secret::LogicalCredentialId::new("cred-owner-new").unwrap();
+        let other = secret::LogicalCredentialId::new("cred-other-new").unwrap();
+        let other_slot = secret::PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        for invalid in [
+            other_slot.as_str(),
+            "deppy.oauth.v1.not-hex.not-a-uuid",
+            logical.as_str(),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            assert!(
+                db.insert_credential_with_secret_slot(
+                    &sample(logical.as_str()),
+                    invalid,
+                    Some(r#"{"server_id":"must-not-insert"}"#),
+                )
+                .is_err(),
+                "invalid pointer unexpectedly inserted: {invalid}"
+            );
+            assert!(db.list_credential_secret_records(1).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn physical_slot_cas는_success후_stale_expected를_noop처리한다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("cred-cas").unwrap();
+        let first = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let stale_candidate =
+            secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
+
+        assert!(
+            db.publish_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                first.as_str(),
+                None,
+                Some("…1111"),
+            )
+            .unwrap()
+        );
+        let published = credential_secret_record(&db, logical.as_str());
+        assert_eq!(published.keyring_username, first.as_str());
+        assert_eq!(published.oauth_json, None);
+        assert_eq!(published.meta.masked_hint.as_deref(), Some("…1111"));
+
+        assert!(
+            !db.publish_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                stale_candidate.as_str(),
+                Some(r#"{"server_id":"stale"}"#),
+                Some("…9999"),
+            )
+            .unwrap()
+        );
+        assert_eq!(credential_secret_record(&db, logical.as_str()), published);
+    }
+
+    #[test]
+    fn physical_slot_cas는_invalid_pointer와_storage_failure에서_no_mutation이다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("cred-cas-rollback").unwrap();
+        let other = secret::LogicalCredentialId::new("cred-cas-other").unwrap();
+        let current = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let next = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let other_slot = secret::PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        db.insert_credential_with_secret_slot(
+            &sample(logical.as_str()),
+            current.as_str(),
+            Some(r#"{"server_id":"old"}"#),
+        )
+        .unwrap();
+        let before = credential_secret_record(&db, logical.as_str());
+
+        for invalid in [
+            other_slot.as_str(),
+            "deppy.oauth.v1.not-hex.not-a-uuid",
+            logical.as_str(),
+        ] {
+            assert!(
+                db.publish_credential_secret_slot_cas(
+                    logical.as_str(),
+                    current.as_str(),
+                    invalid,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "invalid CAS pointer unexpectedly accepted: {invalid}"
+            );
+            assert_eq!(credential_secret_record(&db, logical.as_str()), before);
+        }
+
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_secret_slot_cas AFTER UPDATE OF keyring_username ON credentials
+                 BEGIN SELECT RAISE(ABORT, 'injected CAS failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.publish_credential_secret_slot_cas(
+                logical.as_str(),
+                current.as_str(),
+                next.as_str(),
+                None,
+                Some("…2222"),
+            )
+            .is_err()
+        );
+        assert_eq!(credential_secret_record(&db, logical.as_str()), before);
     }
 
     #[test]

@@ -182,6 +182,7 @@ impl std::fmt::Debug for ActiveAuthorizationOwner {
 /// 27: durable Connector config revision + mutation triggers (PR-IN01 prerequisite).
 /// 28: exact physical secret-slot lifecycle ledger (PR-SC01 prerequisite).
 /// 29: exact pending-approval session cleanup index (event-driven session exit).
+/// 30: durable exact cleanup obligations for legacy logical keyring sources (PR-SC01).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -610,6 +611,39 @@ CREATE INDEX idx_pending_approvals_session_pending
     ON pending_approvals(pane_id)
     WHERE status = 'pending';
 ",
+    // v30: publishing a legacy logical keyring username to a versioned physical slot must not
+    // lose the post-commit obligation to delete the exact legacy base/.refresh/.dcr entries. The
+    // nullable source coordinate remains on the same bounded ledger row, so no second unbounded
+    // corpus is introduced. It stores an identifier only, never a keyring value.
+    "
+ALTER TABLE physical_secret_slot_ledger
+    ADD COLUMN legacy_cleanup_username TEXT
+    CHECK (legacy_cleanup_username IS NULL OR (
+        state IN ('published', 'orphan')
+        AND
+        legacy_cleanup_username = logical_credential_id
+        AND length(CAST(legacy_cleanup_username AS BLOB)) BETWEEN 1 AND 255
+        AND instr(legacy_cleanup_username, char(0)) = 0
+    ));
+
+CREATE UNIQUE INDEX idx_physical_secret_slot_one_legacy_cleanup
+    ON physical_secret_slot_ledger(legacy_cleanup_username)
+    WHERE legacy_cleanup_username IS NOT NULL;
+
+CREATE TRIGGER physical_secret_slot_legacy_cleanup_transition
+BEFORE UPDATE OF legacy_cleanup_username ON physical_secret_slot_ledger
+WHEN NOT (
+    OLD.legacy_cleanup_username IS NEW.legacy_cleanup_username
+    OR (OLD.legacy_cleanup_username IS NULL
+        AND NEW.legacy_cleanup_username = OLD.logical_credential_id
+        AND OLD.state = 'published')
+    OR (OLD.legacy_cleanup_username IS NOT NULL
+        AND NEW.legacy_cleanup_username IS NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid legacy cleanup marker transition');
+END;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -707,6 +741,9 @@ pub struct PhysicalSecretSlotLedgerRow {
     pub logical_credential_id: String,
     pub physical_slot: String,
     pub state: PhysicalSecretSlotState,
+    /// Exact legacy keyring base username. Callers derive only the fixed `.refresh` and `.dcr`
+    /// suffixes after this bounded durable coordinate has been read. Secret values are absent.
+    pub legacy_cleanup_username: Option<String>,
 }
 
 impl std::fmt::Debug for PhysicalSecretSlotLedgerRow {
@@ -716,6 +753,10 @@ impl std::fmt::Debug for PhysicalSecretSlotLedgerRow {
             .field("logical_credential_id", &"REDACTED")
             .field("physical_slot", &"REDACTED")
             .field("state", &self.state)
+            .field(
+                "legacy_cleanup_username",
+                &self.legacy_cleanup_username.as_ref().map(|_| "REDACTED"),
+            )
             .finish()
     }
 }
@@ -1070,6 +1111,24 @@ fn validate_owned_physical_secret_slot(logical_id: &str, slot: &str) -> anyhow::
     Ok(())
 }
 
+fn validate_legacy_cleanup_username(logical_id: &str, legacy_username: &str) -> anyhow::Result<()> {
+    secret::LogicalCredentialId::new(logical_id.to_owned())
+        .context("legacy cleanup logical credential id 검증 실패")?;
+    anyhow::ensure!(
+        !legacy_username.is_empty() && legacy_username.len() <= 255,
+        "legacy cleanup username byte 길이가 유효하지 않습니다"
+    );
+    anyhow::ensure!(
+        !legacy_username.contains('\0'),
+        "legacy cleanup username에 NUL을 허용하지 않습니다"
+    );
+    anyhow::ensure!(
+        legacy_username == logical_id,
+        "legacy cleanup username은 logical credential id와 같아야 합니다"
+    );
+    Ok(())
+}
+
 fn validate_oauth_metadata_json(json: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         json.len() <= CREDENTIAL_OAUTH_BINDING_BYTES_MAX,
@@ -1279,6 +1338,30 @@ impl Db {
         from: PhysicalSecretSlotState,
         to: PhysicalSecretSlotState,
     ) -> anyhow::Result<()> {
+        if let Some(growth) = to.as_str().len().checked_sub(from.as_str().len())
+            && growth > 0
+        {
+            let row_bytes: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(
+                            length(CAST(physical_slot AS BLOB)) +
+                            length(CAST(logical_credential_id AS BLOB)) +
+                            length(CAST(state AS BLOB)) +
+                            COALESCE(length(CAST(legacy_cleanup_username AS BLOB)), 0)
+                        ), 0)
+                 FROM physical_secret_slot_ledger",
+                [],
+                |row| row.get(0),
+            )?;
+            let row_bytes =
+                usize::try_from(row_bytes).context("physical secret slot bytes 변환 실패")?;
+            anyhow::ensure!(
+                row_bytes
+                    .checked_add(growth)
+                    .context("physical secret slot state byte overflow")?
+                    <= PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX,
+                "physical secret slot ledger byte capacity 초과"
+            );
+        }
         let affected = conn.execute(
             "UPDATE physical_secret_slot_ledger
              SET state = ?4, updated_at = CAST(strftime('%s','now') AS INTEGER)
@@ -1301,7 +1384,8 @@ impl Db {
             "SELECT COUNT(*), COALESCE(SUM(
                         length(CAST(physical_slot AS BLOB)) +
                         length(CAST(logical_credential_id AS BLOB)) +
-                        length(CAST(state AS BLOB))
+                        length(CAST(state AS BLOB)) +
+                        COALESCE(length(CAST(legacy_cleanup_username AS BLOB)), 0)
                     ), 0)
              FROM physical_secret_slot_ledger",
             [],
@@ -1323,6 +1407,39 @@ impl Db {
         let next_bytes = row_bytes
             .checked_add(added_bytes)
             .context("physical secret slot ledger byte capacity overflow")?;
+        anyhow::ensure!(
+            next_bytes <= PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX,
+            "physical secret slot ledger byte capacity 초과"
+        );
+        Ok(())
+    }
+
+    fn ensure_legacy_cleanup_marker_capacity(
+        conn: &Connection,
+        legacy_username: &str,
+    ) -> anyhow::Result<()> {
+        let row_bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(
+                        length(CAST(physical_slot AS BLOB)) +
+                        length(CAST(logical_credential_id AS BLOB)) +
+                        length(CAST(state AS BLOB)) +
+                        COALESCE(length(CAST(legacy_cleanup_username AS BLOB)), 0)
+                    ), 0)
+             FROM physical_secret_slot_ledger",
+            [],
+            |row| row.get(0),
+        )?;
+        let row_bytes =
+            usize::try_from(row_bytes).context("physical secret slot bytes 변환 실패")?;
+        let next_bytes = row_bytes
+            .checked_add(legacy_username.len())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    PhysicalSecretSlotState::Published.as_str().len()
+                        - PhysicalSecretSlotState::Staging.as_str().len(),
+                )
+            })
+            .context("legacy cleanup marker byte capacity overflow")?;
         anyhow::ensure!(
             next_bytes <= PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX,
             "physical secret slot ledger byte capacity 초과"
@@ -1404,14 +1521,14 @@ impl Db {
             physical_slot,
             PhysicalSecretSlotState::Staging,
         )?;
-        let current_pointer = conn
-            .query_row(
-                "SELECT keyring_username FROM credentials WHERE id = ?1",
-                [logical_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if current_pointer.as_deref() != Some(expected_previous_pointer) {
+        let expected_pointer_is_live: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM credentials WHERE id = ?1 AND keyring_username = ?2
+             )",
+            (logical_id, expected_previous_pointer),
+            |row| row.get(0),
+        )?;
+        if !expected_pointer_is_live {
             Self::transition_physical_secret_slot_state(
                 conn,
                 logical_id,
@@ -1515,9 +1632,20 @@ impl Db {
             ),
             "published physical secret slot 삭제 acknowledgement를 거부합니다"
         );
+        let legacy_cleanup_username: Option<String> = tx.query_row(
+            "SELECT legacy_cleanup_username FROM physical_secret_slot_ledger
+             WHERE physical_slot = ?1 AND logical_credential_id = ?2",
+            (physical_slot, logical_id),
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            legacy_cleanup_username.is_none(),
+            "legacy source cleanup acknowledgement 전 physical slot 삭제를 거부합니다"
+        );
         let deleted = tx.execute(
             "DELETE FROM physical_secret_slot_ledger
-             WHERE physical_slot = ?1 AND logical_credential_id = ?2 AND state = ?3",
+             WHERE physical_slot = ?1 AND logical_credential_id = ?2 AND state = ?3
+               AND legacy_cleanup_username IS NULL",
             (physical_slot, logical_id, state.as_str()),
         )?;
         anyhow::ensure!(
@@ -1548,10 +1676,11 @@ impl Db {
             "SELECT COUNT(*), COALESCE(SUM(
                         length(CAST(physical_slot AS BLOB)) +
                         length(CAST(logical_credential_id AS BLOB)) +
-                        length(CAST(state AS BLOB))
+                        length(CAST(state AS BLOB)) +
+                        COALESCE(length(CAST(legacy_cleanup_username AS BLOB)), 0)
                     ), 0)
              FROM (
-                 SELECT physical_slot, logical_credential_id, state
+                 SELECT physical_slot, logical_credential_id, state, legacy_cleanup_username
                  FROM physical_secret_slot_ledger
                  ORDER BY created_at, physical_slot LIMIT ?1
              )",
@@ -1573,6 +1702,7 @@ impl Db {
         let rows = {
             let mut statement = tx.prepare(
                 "SELECT ledger.physical_slot, ledger.logical_credential_id, ledger.state,
+                        ledger.legacy_cleanup_username,
                         (SELECT COUNT(*) FROM credentials c
                          WHERE c.keyring_username = ledger.physical_slot),
                         (SELECT COUNT(*) FROM credentials c
@@ -1586,14 +1716,25 @@ impl Db {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?;
             let mut rows = Vec::with_capacity(row_count);
             for row in mapped {
-                let (physical_slot, logical_credential_id, state, any_refs, exact_refs) = row?;
+                let (
+                    physical_slot,
+                    logical_credential_id,
+                    state,
+                    legacy_cleanup_username,
+                    any_refs,
+                    exact_refs,
+                ) = row?;
                 validate_owned_physical_secret_slot(&logical_credential_id, &physical_slot)?;
+                if let Some(username) = legacy_cleanup_username.as_deref() {
+                    validate_legacy_cleanup_username(&logical_credential_id, username)?;
+                }
                 let state = PhysicalSecretSlotState::from_persisted(&state)?;
                 match state {
                     PhysicalSecretSlotState::Published => anyhow::ensure!(
@@ -1611,6 +1752,7 @@ impl Db {
                     logical_credential_id,
                     physical_slot,
                     state,
+                    legacy_cleanup_username,
                 });
             }
             rows
@@ -1622,6 +1764,39 @@ impl Db {
         tx.commit()
             .context("physical secret slot reconciliation read commit 실패")?;
         Ok(rows)
+    }
+
+    /// Exact idempotent acknowledgement after the legacy base, `.refresh`, and `.dcr` entries are
+    /// all absent. It clears only the marker on the exact published-slot ledger row; physical-slot
+    /// reconciliation may delete an orphan row only after this succeeds.
+    pub fn acknowledge_legacy_secret_source_deleted(
+        &self,
+        logical_id: &str,
+        published_physical_slot: &str,
+        expected_legacy_username: &str,
+    ) -> anyhow::Result<bool> {
+        validate_owned_physical_secret_slot(logical_id, published_physical_slot)?;
+        validate_legacy_cleanup_username(logical_id, expected_legacy_username)?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE physical_secret_slot_ledger
+             SET legacy_cleanup_username = NULL,
+                 updated_at = CAST(strftime('%s','now') AS INTEGER)
+             WHERE physical_slot = ?1 AND logical_credential_id = ?2
+               AND legacy_cleanup_username = ?3",
+            (
+                published_physical_slot,
+                logical_id,
+                expected_legacy_username,
+            ),
+        )?;
+        anyhow::ensure!(
+            updated <= 1,
+            "legacy cleanup acknowledgement 대상이 유일하지 않습니다"
+        );
+        tx.commit()
+            .context("legacy cleanup acknowledgement commit 실패")?;
+        Ok(updated == 1)
     }
 
     /// credential metadata 추가. created_at/updated_at은 SQLite가 UTC로 기록한다.
@@ -1871,6 +2046,71 @@ impl Db {
         anyhow::ensure!(published, "credential pointer publish 대상 없음: {id}");
         tx.commit()
             .context("credential secret slot/metadata/ledger commit 실패")
+    }
+
+    /// Dedicated one-time legacy migration publish. Unlike regular creation/rotation, a successful
+    /// logical-username CAS records the exact access/refresh/DCR source cleanup obligation in the
+    /// same transaction as the physical pointer and ledger publication. Passing any expected
+    /// pointer other than the logical credential id is rejected, preventing regular rotations from
+    /// accidentally creating legacy cleanup markers.
+    pub fn publish_legacy_credential_secret_slot_cas(
+        &self,
+        logical_id: &str,
+        expected_legacy_pointer: &str,
+        physical_slot: &str,
+        oauth_json: Option<&str>,
+        masked_hint: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        validate_owned_physical_secret_slot(logical_id, physical_slot)?;
+        anyhow::ensure!(
+            expected_legacy_pointer == logical_id,
+            "legacy migration expected pointer는 logical credential id여야 합니다"
+        );
+        if let Some(json) = oauth_json {
+            validate_oauth_metadata_json(json)?;
+        }
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+
+        validate_legacy_cleanup_username(logical_id, expected_legacy_pointer)?;
+        let marker_ready: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM credentials WHERE id = ?1 AND keyring_username = ?2
+             )",
+            (logical_id, expected_legacy_pointer),
+            |row| row.get(0),
+        )?;
+        if marker_ready {
+            Self::ensure_legacy_cleanup_marker_capacity(&tx, expected_legacy_pointer)?;
+        }
+
+        let published = Self::publish_credential_secret_slot_in_transaction(
+            &tx,
+            logical_id,
+            expected_legacy_pointer,
+            physical_slot,
+            oauth_json,
+            masked_hint,
+        )?;
+        if published {
+            anyhow::ensure!(
+                marker_ready,
+                "legacy publish source marker가 준비되지 않았습니다"
+            );
+            let marked = tx.execute(
+                "UPDATE physical_secret_slot_ledger
+                 SET legacy_cleanup_username = ?3,
+                     updated_at = CAST(strftime('%s','now') AS INTEGER)
+                 WHERE physical_slot = ?1 AND logical_credential_id = ?2
+                   AND state = 'published' AND legacy_cleanup_username IS NULL",
+                (physical_slot, logical_id, expected_legacy_pointer),
+            )?;
+            anyhow::ensure!(marked == 1, "legacy cleanup marker publish 대상 불일치");
+        } else {
+            anyhow::ensure!(!marker_ready, "legacy pointer CAS 결과가 일관되지 않습니다");
+        }
+        tx.commit()
+            .context("legacy credential pointer/cleanup marker commit 실패")?;
+        Ok(published)
     }
 
     /// Compare-and-swap publishes an already-staged physical slot together with its optional
@@ -5259,6 +5499,7 @@ mod tests {
                 logical_credential_id: logical.as_str().to_owned(),
                 physical_slot: missing.as_str().to_owned(),
                 state: PhysicalSecretSlotState::Staging,
+                legacy_cleanup_username: None,
             }]
         );
         assert!(
@@ -5334,6 +5575,251 @@ mod tests {
         );
         drop(db);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_cleanup_marker는_publish와_atomic하고_crash후_exact_order로_수렴한다() {
+        let (dir, path, db) = file_db("legacy-cleanup-crash");
+        let logical = secret::LogicalCredentialId::new("legacy-cleanup-crash").unwrap();
+        let first = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
+        stage_slot(&db, &logical, &first);
+
+        let staged = db.physical_secret_slots_for_reconciliation(1).unwrap();
+        assert_eq!(staged[0].state, PhysicalSecretSlotState::Staging);
+        assert_eq!(staged[0].legacy_cleanup_username, None);
+        assert_eq!(
+            credential_secret_record(&db, logical.as_str()).keyring_username,
+            logical.as_str()
+        );
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        assert!(
+            db.publish_legacy_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                first.as_str(),
+                Some(r#"{"server_id":"legacy"}"#),
+                Some("…1234"),
+            )
+            .unwrap()
+        );
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            credential_secret_record(&db, logical.as_str()).keyring_username,
+            first.as_str()
+        );
+        let published = db.physical_secret_slots_for_reconciliation(1).unwrap();
+        assert_eq!(published[0].state, PhysicalSecretSlotState::Published);
+        assert_eq!(
+            published[0].legacy_cleanup_username.as_deref(),
+            Some(logical.as_str())
+        );
+        let debug = format!("{:?}", published[0]);
+        assert!(!debug.contains(logical.as_str()));
+        assert!(!debug.contains(first.as_str()));
+
+        let second = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &second);
+        db.rotate_credential_secret_slot(
+            logical.as_str(),
+            second.as_str(),
+            r#"{"server_id":"rotated"}"#,
+            None,
+        )
+        .unwrap();
+        let rows = db.physical_secret_slots_for_reconciliation(2).unwrap();
+        let old = rows
+            .iter()
+            .find(|row| row.physical_slot == first.as_str())
+            .unwrap();
+        let live = rows
+            .iter()
+            .find(|row| row.physical_slot == second.as_str())
+            .unwrap();
+        assert_eq!(old.state, PhysicalSecretSlotState::Orphan);
+        assert_eq!(
+            old.legacy_cleanup_username.as_deref(),
+            Some(logical.as_str())
+        );
+        assert_eq!(live.state, PhysicalSecretSlotState::Published);
+        assert_eq!(live.legacy_cleanup_username, None);
+        assert!(
+            db.acknowledge_physical_secret_slot_deleted(logical.as_str(), first.as_str())
+                .is_err(),
+            "legacy access/refresh/dcr source cleanup must be acknowledged first"
+        );
+
+        let mut legacy_sources = std::collections::BTreeSet::from([
+            logical.as_str().to_owned(),
+            format!("{}.refresh", logical.as_str()),
+            format!("{}.dcr", logical.as_str()),
+        ]);
+        for exact in [
+            logical.as_str().to_owned(),
+            format!("{}.refresh", logical.as_str()),
+            format!("{}.dcr", logical.as_str()),
+        ] {
+            assert!(legacy_sources.remove(&exact));
+        }
+        assert!(legacy_sources.is_empty());
+        assert!(
+            db.acknowledge_legacy_secret_source_deleted(
+                logical.as_str(),
+                first.as_str(),
+                logical.as_str(),
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.acknowledge_legacy_secret_source_deleted(
+                logical.as_str(),
+                first.as_str(),
+                logical.as_str(),
+            )
+            .unwrap()
+        );
+        assert!(
+            db.acknowledge_physical_secret_slot_deleted(logical.as_str(), first.as_str())
+                .unwrap()
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_cleanup_marker_failpoint는_pointer_ledger_ack를_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("legacy-cleanup-failpoint").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
+        stage_slot(&db, &logical, &slot);
+        let before = db.connector_config_revision().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_legacy_cleanup_publish
+                 BEFORE UPDATE OF legacy_cleanup_username ON physical_secret_slot_ledger
+                 WHEN NEW.legacy_cleanup_username IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'injected legacy marker failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.publish_legacy_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                slot.as_str(),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(db.connector_config_revision().unwrap(), before);
+        assert_eq!(
+            credential_secret_record(&db, logical.as_str()).keyring_username,
+            logical.as_str()
+        );
+        let staged = db.physical_secret_slots_for_reconciliation(1).unwrap();
+        assert_eq!(staged[0].state, PhysicalSecretSlotState::Staging);
+        assert_eq!(staged[0].legacy_cleanup_username, None);
+
+        db.conn
+            .execute_batch("DROP TRIGGER fail_legacy_cleanup_publish;")
+            .unwrap();
+        assert!(
+            db.publish_legacy_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                slot.as_str(),
+                None,
+                None,
+            )
+            .unwrap()
+        );
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_legacy_cleanup_ack
+                 BEFORE UPDATE OF legacy_cleanup_username ON physical_secret_slot_ledger
+                 WHEN OLD.legacy_cleanup_username IS NOT NULL
+                      AND NEW.legacy_cleanup_username IS NULL
+                 BEGIN SELECT RAISE(ABORT, 'injected legacy ack failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.acknowledge_legacy_secret_source_deleted(
+                logical.as_str(),
+                slot.as_str(),
+                logical.as_str(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(1).unwrap()[0]
+                .legacy_cleanup_username
+                .as_deref(),
+            Some(logical.as_str())
+        );
+    }
+
+    #[test]
+    fn legacy_publish_stale_cas는_live_pointer와_source를_보존하고_candidate를_orphan한다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("legacy-cleanup-stale").unwrap();
+        let live = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let candidate = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
+        stage_slot(&db, &logical, &live);
+        assert!(
+            db.publish_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                live.as_str(),
+                None,
+                None,
+            )
+            .unwrap()
+        );
+        stage_slot(&db, &logical, &candidate);
+        assert!(
+            !db.publish_legacy_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                candidate.as_str(),
+                None,
+                None,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            credential_secret_record(&db, logical.as_str()).keyring_username,
+            live.as_str()
+        );
+        let rows = db.physical_secret_slots_for_reconciliation(2).unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.physical_slot == live.as_str())
+                .unwrap()
+                .state,
+            PhysicalSecretSlotState::Published
+        );
+        let orphan = rows
+            .iter()
+            .find(|row| row.physical_slot == candidate.as_str())
+            .unwrap();
+        assert_eq!(orphan.state, PhysicalSecretSlotState::Orphan);
+        assert_eq!(orphan.legacy_cleanup_username, None);
+        assert!(
+            db.publish_legacy_credential_secret_slot_cas(
+                logical.as_str(),
+                "validated-alias-is-not-supported",
+                candidate.as_str(),
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5587,7 +6073,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let tx = db.conn.unchecked_transaction().unwrap();
-        for index in 0..3_100usize {
+        for index in 0..2_500usize {
             let suffix = format!("{index:04}");
             let logical = secret::LogicalCredentialId::new(format!(
                 "{}{}",
@@ -5601,8 +6087,9 @@ mod tests {
             );
             tx.execute(
                 "INSERT INTO physical_secret_slot_ledger
-                   (physical_slot, logical_credential_id, state, created_at, updated_at)
-                 VALUES (?1, ?2, 'staging', ?3, ?3)",
+                   (physical_slot, logical_credential_id, state, created_at, updated_at,
+                    legacy_cleanup_username)
+                 VALUES (?1, ?2, 'orphan', ?3, ?3, ?2)",
                 (
                     slot.as_str(),
                     logical.as_str(),
@@ -5666,6 +6153,7 @@ mod tests {
                     logical_credential_id: logical.as_str().to_owned(),
                     physical_slot: slot.as_str().to_owned(),
                     state: PhysicalSecretSlotState::Published,
+                    legacy_cleanup_username: None,
                 }]
             );
         }
@@ -5722,6 +6210,132 @@ mod tests {
         assert_eq!(ledger_exists, 0, "failed migration must roll back its DDL");
         drop(conn);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v29에서_v30_legacy_marker로_upgrade하고_ddl_failure는_version과_alter를_rollback한다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-legacy-marker-migration-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let good_path = dir.join("good.sqlite3");
+        {
+            let conn = Connection::open(&good_path).unwrap();
+            for sql in &MIGRATIONS[..29] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 29).unwrap();
+        }
+        let db = Db::open(&good_path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        let marker_columns: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('physical_secret_slot_ledger')
+                 WHERE name = 'legacy_cleanup_username'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_columns, 1);
+        drop(db);
+
+        let rollback_path = dir.join("rollback.sqlite3");
+        {
+            let conn = Connection::open(&rollback_path).unwrap();
+            for sql in &MIGRATIONS[..29] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute_batch(
+                "CREATE INDEX idx_physical_secret_slot_one_legacy_cleanup
+                 ON credentials(id);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 29).unwrap();
+        }
+        assert!(Db::open(&rollback_path).is_err());
+        let conn = Connection::open(&rollback_path).unwrap();
+        assert_eq!(Db::read_user_version(&conn).unwrap(), 29);
+        let marker_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('physical_secret_slot_ledger')
+                 WHERE name = 'legacy_cleanup_username'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_columns, 0, "failed v30 must roll back ALTER TABLE");
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_marker_schema는_duplicate_invalid_transition과_corrupt_data를_fail_closed한다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("legacy-marker-constraints").unwrap();
+        let first = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let second = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
+        stage_slot(&db, &logical, &first);
+        assert!(
+            db.publish_legacy_credential_secret_slot_cas(
+                logical.as_str(),
+                logical.as_str(),
+                first.as_str(),
+                None,
+                None,
+            )
+            .unwrap()
+        );
+        stage_slot(&db, &logical, &second);
+        db.rotate_credential_secret_slot(
+            logical.as_str(),
+            second.as_str(),
+            r#"{"server_id":"constraints"}"#,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            db.conn
+                .execute(
+                    "UPDATE physical_secret_slot_ledger
+                     SET legacy_cleanup_username = ?2 WHERE physical_slot = ?1",
+                    (second.as_str(), logical.as_str()),
+                )
+                .is_err(),
+            "one logical legacy source cannot have duplicate cleanup obligations"
+        );
+        for invalid in ["wrong-logical", "nul\0marker"] {
+            assert!(
+                db.conn
+                    .execute(
+                        "UPDATE physical_secret_slot_ledger
+                         SET legacy_cleanup_username = ?2 WHERE physical_slot = ?1",
+                        (second.as_str(), invalid),
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            db.conn
+                .execute(
+                    "UPDATE physical_secret_slot_ledger
+                     SET legacy_cleanup_username = ?2 WHERE physical_slot = ?1",
+                    (second.as_str(), "x".repeat(256)),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(2)
+                .unwrap()
+                .iter()
+                .filter(|row| row.legacy_cleanup_username.is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]

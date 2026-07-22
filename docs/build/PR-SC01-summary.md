@@ -30,6 +30,26 @@ transaction during PR-IN01; keeping a second legacy production path after cutove
 - `SecretString`, retained redaction pattern bytes, and streaming redactor carry overwrite owned
   byte allocations on drop.
 
+### v30 legacy-source cleanup amendment
+
+- `physical_secret_slot_ledger.legacy_cleanup_username` is a nullable durable cleanup marker on the
+  existing bounded ledger row. It stores only the exact legacy base username; access, `.refresh`,
+  and `.dcr` values never enter SQLite. The marker is constrained to the logical credential id,
+  unique across live obligations, NUL-free, and included in the existing 4,096-item/1 MiB ledger
+  ceiling.
+- `Db::publish_legacy_credential_secret_slot_cas` is the only API that creates the marker. An
+  IMMEDIATE transaction verifies the expected legacy pointer, publishes staging to the versioned
+  physical slot, updates OAuth metadata, and sets the marker atomically. Regular credential
+  creation and rotation never set it. A stale pointer leaves the live pointer unchanged and moves
+  only the new staging slot to orphan.
+- `physical_secret_slots_for_reconciliation` preflights deterministic `(created_at, physical_slot)`
+  item and aggregate byte totals before materializing rows, then returns the redacted marker field.
+- After exact keyring deletion, `acknowledge_legacy_secret_source_deleted(logical, published_slot,
+  expected_legacy)` clears only that marker and is idempotent. A marker-bearing orphan cannot be
+  acknowledged as physically deleted until legacy cleanup acknowledgement succeeds.
+- v30 migration tests cover forward upgrade, DDL rollback with `user_version=29` retained, duplicate
+  and malformed marker rejection, and all historical migration prefixes.
+
 ## OAuth stage and refresh contract
 
 - `auth::stage_oauth_token_bundle` stages an `OAuthToken` and optional DCR secret without cloning a
@@ -90,6 +110,11 @@ SC01 memory invariant. Process RSS is allocator- and platform-dependent; PR-OD01
 30-minute slope together with thread/socket/queue slopes instead of adding a flaky RSS unit-test
 threshold here.
 
+The v30 storage amendment additionally covers pre-publish crash recovery, atomic marker/pointer
+rollback, post-commit restart, exact three-source acknowledgement, acknowledgement failure,
+stale-pointer orphaning, 4,097-row and 1 MiB preflight rejection, and regular rotation producing no
+marker.
+
 ## Verification
 
 - `cargo test -p secret --no-fail-fast` — pass (34 tests; doc-tests pass).
@@ -101,9 +126,12 @@ threshold here.
   entry was added.
 - `cargo run -q -p xtask -- security-scan` — boundary/dependency, storage secret persistence 4/4,
   mcp-store secret persistence 2/2, and audit 37/37 pass. The aggregate cannot finish in this
-  managed sandbox because 29 MCP HTTP fixtures are denied at local `TcpListener::bind` with
-  `Operation not permitted`; the other 49 MCP tests pass before the command stops.
+  managed sandbox because MCP HTTP fixtures are denied at local `TcpListener::bind` with
+  `Operation not permitted`; the storage persistence scans pass before the command stops.
 - Scoped rustfmt and `git diff --check` — pass.
+- `cargo test -p storage --no-fail-fast -- --test-threads=1` — pass (132 tests; doc-tests pass).
+- `cargo check -p storage` — pass.
+- `cargo clippy -p storage --all-targets -- -D warnings` — pass.
 
 The auth tests own many localhost fixtures. A default parallel run collided with other lanes'
 simultaneous listener tests in the managed sandbox and hung its final callback timeout; the same
@@ -114,19 +142,27 @@ service was used.
 
 For initial authorization or token rotation, the `app.rs` adapter must use this exact order:
 
-1. Resolve `credentials.keyring_username`. Parse a versioned username as `PhysicalSecretSlot`;
+1. Call `physical_secret_slots_for_reconciliation(4_096)` before accepting secret-backed work. For
+   every row with `legacy_cleanup_username`, delete exactly `base`, `base.refresh`, and `base.dcr`
+   from `secret::KEYRING_SERVICE`, then call `acknowledge_legacy_secret_source_deleted`. On any
+   inventory/delete/ack error, remain fail-closed. If the row is also orphan, only then delete its
+   physical bundle and call `acknowledge_physical_secret_slot_deleted`.
+2. Resolve `credentials.keyring_username`. Parse a versioned username as `PhysicalSecretSlot`;
    leave a legacy username untouched until a successful migration.
-2. Allocate `SecretBundleStagePlan(logical_id, previous_typed_slot)` and call
+3. Allocate `SecretBundleStagePlan(logical_id, previous_typed_slot)` and call
    `stage_oauth_token_bundle` for the new access/refresh/DCR bundle.
-3. Call `Db::rotate_credential_secret_slot(logical_id, new_slot, sanitized_oauth_json, hint)`.
-4. If the database transaction fails, delete the new slot and return failure. If it commits, make
-   success visible to refresh waiters, then delete the previous typed slot. A failed old-slot delete
-   is reported and recovered by the next startup reconciliation; it must not roll the committed
-   pointer back.
-5. During bootstrap, enumerate every database-referenced versioned slot and call
+4. For a legacy logical pointer call `Db::publish_legacy_credential_secret_slot_cas`; for an already
+   versioned pointer call `Db::rotate_credential_secret_slot`. A false legacy CAS result means the
+   new physical slot is orphan and must never cause deletion of the legacy source.
+5. If the database call definitely fails before commit, delete the new slot and return failure. If
+   commit outcome is unknown, delete neither new nor legacy sources and reconcile after restart. If
+   it commits, make success visible to refresh waiters, then delete the previous typed slot. A
+   failed old-slot delete is reported and recovered by the next startup reconciliation; it must not
+   roll the committed pointer back.
+6. During bootstrap, enumerate every database-referenced versioned slot and call
    `reconcile_orphan_secret_slots` before Connector/proxy workers accept secret-backed work. Treat
-   inventory/reconciliation failure as fail-closed. Legacy usernames are outside the versioned
-   prefix and must not be deleted.
+   inventory/reconciliation failure as fail-closed. Legacy usernames are deleted only through the
+   durable v30 marker sequence in step 1, never by prefix enumeration.
 
 For typed refresh, allocate the plan before calling `refresh_access_token_for_slot`. Its callback
 receives `(&OAuthToken, Option<&SecretString>)`; stage those token values plus the borrowed DCR,

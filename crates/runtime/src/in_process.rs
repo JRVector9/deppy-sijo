@@ -20,7 +20,10 @@ use crate::client::{
     RuntimeEventStream,
 };
 use crate::command::{RuntimeCommand, SessionId};
-use crate::event::{MessagePayload, RuntimeEvent, SpawnKind};
+use crate::event::{AgentConfigCorrelationId, MessagePayload, RuntimeEvent, SpawnKind};
+use crate::host::{
+    RuntimeCommandDispatcher, RuntimeHost, RuntimeSecret, RuntimeSecretResolver, RuntimeWake,
+};
 use crate::resource_monitor::{
     ProcessResourceMonitor, ProcessResourceMonitorConfig, SessionResourceTarget,
 };
@@ -99,6 +102,16 @@ pub struct InProcessRuntimeClient {
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct SecretStoreResolver(Arc<dyn SecretStore>);
+
+impl RuntimeSecretResolver for SecretStoreResolver {
+    fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<RuntimeSecret> {
+        self.0
+            .get_secret(logical_credential_id)
+            .map(RuntimeSecret::from_secret_string)
+    }
+}
+
 impl InProcessRuntimeClient {
     /// `output_batch_ms`: 출력/명령이 없을 때 worker fallback poll 주기
     /// (설계문서 10.1, config.performance 소비). 실제 출력은 PTY reader wake로 즉시
@@ -140,6 +153,49 @@ impl InProcessRuntimeClient {
         shell: CommandSpec,
         persist: Option<crate::persistence::PersistConfig>,
     ) -> Self {
+        Self::try_with_shell_and_resolver(
+            output_batch_ms,
+            Arc::new(SecretStoreResolver(secret_store)),
+            logs_root,
+            redaction,
+            shell,
+            persist,
+        )
+        .expect("runtime worker thread 생성")
+    }
+
+    /// App composition adapter entry point. The resolver receives only logical
+    /// credential ids and can atomically map them to published physical slots.
+    pub fn try_new_with_resolver(
+        output_batch_ms: u64,
+        resolver: Arc<dyn RuntimeSecretResolver>,
+        logs_root: PathBuf,
+        redaction: RedactionService,
+        persist: Option<crate::persistence::PersistConfig>,
+        cwd: Option<PathBuf>,
+        extra_env: Vec<(String, String)>,
+    ) -> anyhow::Result<Self> {
+        let mut shell = pty::default_shell();
+        shell.cwd = cwd;
+        shell.env.extend(extra_env);
+        Self::try_with_shell_and_resolver(
+            output_batch_ms,
+            resolver,
+            logs_root,
+            redaction,
+            shell,
+            persist,
+        )
+    }
+
+    fn try_with_shell_and_resolver(
+        output_batch_ms: u64,
+        resolver: Arc<dyn RuntimeSecretResolver>,
+        logs_root: PathBuf,
+        redaction: RedactionService,
+        shell: CommandSpec,
+        persist: Option<crate::persistence::PersistConfig>,
+    ) -> anyhow::Result<Self> {
         // 세션 id(u64)는 실행마다 1부터 다시 시작한다 — 이전 실행 로그에
         // append되지 않도록 실행(run) 단위 하위 디렉터리로 격리한다.
         // (영속 세션 id 도입은 PR-14)
@@ -191,7 +247,7 @@ impl InProcessRuntimeClient {
                     logs_root,
                     run_logs_root,
                     redaction,
-                    secret_store,
+                    secret_resolver: resolver,
                     mux: MuxState::new(),
                     tab_counter: 0,
                     persist: persist_pipe,
@@ -214,15 +270,15 @@ impl InProcessRuntimeClient {
                 }
                 .run();
             })
-            .expect("runtime worker thread 생성");
+            .map_err(|error| anyhow::anyhow!("runtime worker thread 생성 실패: {error}"))?;
         let worker_thread = Some(worker.thread().clone());
-        Self {
+        Ok(Self {
             command_tx: Some(command_tx),
             subscribers,
             worker: Some(worker),
             worker_thread,
             shutdown_flag,
-        }
+        })
     }
 
     /// worker로 명령을 보내는 복제 가능한 싱크 (P5b — 웹 계층 등 다른 스레드용).
@@ -374,6 +430,47 @@ impl InProcessRuntimeClient {
 
 impl RuntimeClient for InProcessRuntimeClient {}
 
+impl RuntimeHost for InProcessRuntimeClient {
+    fn submit(&self, command: RuntimeCommand) -> anyhow::Result<()> {
+        crate::command::validate_host_command(&command)?;
+        RuntimeCommandSink::send_command(self, command)
+    }
+
+    fn command_dispatcher(&self) -> Option<RuntimeCommandDispatcher> {
+        let tx = self.command_tx.as_ref()?.clone();
+        let worker_thread = self.worker_thread.clone();
+        Some(Arc::new(move |command| {
+            crate::command::validate_host_command(&command)?;
+            match tx.try_send(command) {
+                Ok(()) => {
+                    if let Some(worker_thread) = &worker_thread {
+                        worker_thread.unpark();
+                    }
+                    Ok(())
+                }
+                Err(TrySendError::Full(_)) => {
+                    anyhow::bail!("runtime 명령 큐 가득참 — local runtime backpressure")
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("runtime worker가 종료됨")
+                }
+            }
+        }))
+    }
+
+    fn subscribe_with_wake(&self, wake: RuntimeWake) -> RuntimeEventReceiver {
+        InProcessRuntimeClient::subscribe_with_wake(self, wake)
+    }
+
+    fn subscribe_with_wake_background(&self, wake: RuntimeWake) -> RuntimeEventReceiver {
+        InProcessRuntimeClient::subscribe_with_wake_background(self, wake)
+    }
+
+    fn shutdown(&mut self) {
+        InProcessRuntimeClient::shutdown(self);
+    }
+}
+
 /// 터미널 검색 매치 수 하드캡 (T3) — 기형 클라이언트가 과대한 상한을 보내도 방어한다.
 const SEARCH_MAX_MATCHES_HARD_CAP: usize = 5_000;
 
@@ -421,7 +518,7 @@ struct Worker {
     /// 다중 세션 (PR-08 Session Runtime). 세션 로직은 session crate 소관.
     sessions: std::collections::HashMap<SessionId, Session>,
     /// spawn 직전 secret resolve 전용 (6.3). worker 단일 스레드 접근 (1.4).
-    secret_store: Arc<dyn SecretStore>,
+    secret_resolver: Arc<dyn RuntimeSecretResolver>,
     /// 세션별 redacted 로그 (7장). raw 평문 로그는 만들지 않는다.
     logs: std::collections::HashMap<SessionId, SessionLog>,
     /// 세션별 status detector (PR-12) — regex 있는 agent만
@@ -769,6 +866,19 @@ impl Worker {
         self.emit_gated(event, true)
     }
 
+    fn emit_agent_spawn_resolved(
+        &self,
+        agent_config_id: Option<AgentConfigCorrelationId>,
+        session: Option<SessionId>,
+    ) {
+        if let Some(agent_config_id) = agent_config_id {
+            self.emit(RuntimeEvent::AgentSpawnResolved {
+                agent_config_id,
+                session,
+            });
+        }
+    }
+
     /// `gui_viewport`: 이 Viewport가 GUI 렌더 대상(visible pane + Active)인가.
     /// false(원격 시청 전용 스냅샷)면 render_bound 구독자(GUI)는 깨우지 않는다 —
     /// slot 기록은 유지해 탭 전환/Active 복귀 시 따라잡는다 (P5 리뷰 P1).
@@ -984,39 +1094,58 @@ impl Worker {
                 error_regex,
                 done_regex,
             } => {
+                if agent_config_id
+                    .as_deref()
+                    .is_some_and(|id| !crate::command::agent_config_id_is_valid(id))
+                {
+                    // Legacy/direct and remote clients can bypass RuntimeHost's
+                    // synchronous validation. Fail before secret lookup or
+                    // process spawn and never reflect the invalid id.
+                    self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Agent,
+                        message: MessagePayload::new(
+                            "runtime.spawn_failed.invalid_agent_config_id",
+                        ),
+                    });
+                    return;
+                }
+                let correlation_id = agent_config_id
+                    .as_ref()
+                    .map(|id| AgentConfigCorrelationId::from_validated(id.clone()));
                 if self.suspended {
                     self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Agent,
                         message: MessagePayload::new("runtime.spawn_failed.suspended"),
                     });
+                    self.emit_agent_spawn_resolved(correlation_id, None);
                     return;
                 }
                 // secret은 여기(spawn 직전)에서만 resolve된다 — PR-09 완료 기준.
                 // 실패 시 아무것도 spawn하지 않는다 (부분 주입 금지).
                 let mut env = env_plain;
-                let mut resolve_failed = None;
+                let mut resolve_failed = false;
                 for (key, credential_id) in env_secrets {
-                    match self.secret_store.get_secret(&credential_id) {
+                    match self.secret_resolver.resolve(&credential_id) {
                         Ok(value) => {
                             // 주입되는 secret은 로그 redaction 대상으로 등록 (6.3/7장)
-                            self.redaction.register(&value);
-                            env.push((key, value.expose().to_owned()));
+                            self.redaction.register(value.as_secret_string());
+                            env.push((key, value.into_string()));
                         }
-                        Err(e) => {
-                            // credential id만 로그 — secret 값/키 이름은 남기지 않는다
-                            resolve_failed = Some((credential_id, format!("{e:#}")));
+                        Err(_) => {
+                            // App adapters may include physical keyring coordinates in
+                            // their error chain. Never cross that detail into runtime
+                            // events, diagnostics, or logs.
+                            resolve_failed = true;
                             break;
                         }
                     }
                 }
-                if let Some((credential_id, error)) = resolve_failed {
+                if resolve_failed {
                     self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Agent,
-                        message: MessagePayload::new("runtime.spawn_failed.agent_secret")
-                            .arg("credential_id", credential_id)
-                            .arg("error", error.clone())
-                            .diagnostic(error),
+                        message: MessagePayload::new("runtime.spawn_failed.agent_secret"),
                     });
+                    self.emit_agent_spawn_resolved(correlation_id, None);
                     return;
                 }
                 let id = SessionId(self.next_id);
@@ -1071,14 +1200,18 @@ impl Worker {
                         self.open_session_log(id);
                         self.emit_mux_snapshot();
                         self.emit(RuntimeEvent::AgentSpawned { session: id });
+                        self.emit_agent_spawn_resolved(correlation_id, Some(id));
                         self.push_watched_viewports();
                     }
-                    Err(e) => self.emit(RuntimeEvent::SpawnFailed {
-                        kind: SpawnKind::Agent,
-                        message: MessagePayload::new("runtime.spawn_failed.agent")
-                            .arg("error", format!("{e:#}"))
-                            .diagnostic(format!("{e:#}")),
-                    }),
+                    Err(e) => {
+                        self.emit(RuntimeEvent::SpawnFailed {
+                            kind: SpawnKind::Agent,
+                            message: MessagePayload::new("runtime.spawn_failed.agent")
+                                .arg("error", format!("{e:#}"))
+                                .diagnostic(format!("{e:#}")),
+                        });
+                        self.emit_agent_spawn_resolved(correlation_id, None);
+                    }
                 }
             }
             RuntimeCommand::SetSessionDefaultEnv {
@@ -1243,18 +1376,24 @@ impl Worker {
             RuntimeCommand::SeedRedaction { credential_ids } => {
                 // 기존 저장 credential을 로그 redaction 대상으로 등록 (7장).
                 // resolve는 worker 단일 스레드에서만 (1.4) — UI는 id만 넘긴다 (2.1).
+                let mut resolve_failures = 0usize;
                 for id in credential_ids {
-                    match self.secret_store.get_secret(&id) {
+                    match self.secret_resolver.resolve(&id) {
                         Ok(value) => {
-                            self.redaction.register(&value);
+                            self.redaction.register(value.as_secret_string());
                             // OAuth 토큰처럼 JSON blob으로 저장된 credential은
                             // 개별 필드(access/refresh token)도 등록 (PR-18)
-                            self.redaction.register_json_fields(&value);
+                            self.redaction
+                                .register_json_fields(value.as_secret_string());
                         }
-                        Err(e) => {
-                            tracing::warn!("redaction 시드 실패 (credential {id}): {e:#}")
-                        }
+                        Err(_) => resolve_failures = resolve_failures.saturating_add(1),
                     }
+                }
+                if resolve_failures > 0 {
+                    tracing::warn!(
+                        failures = resolve_failures,
+                        "redaction seed secret resolution failed"
+                    );
                 }
             }
             RuntimeCommand::KillSession { session } => {
@@ -1546,20 +1685,21 @@ impl Worker {
         // 워크스페이스 기본 env(.env 자동 주입). secret은 여기(spawn 직전)에서만 resolve.
         // 셸은 에이전트와 달리 spawn 실패보다 부분 주입이 낫다 — 실패 키는 건너뛰고 경고.
         spec.env.extend(self.default_env_plain.iter().cloned());
+        let mut resolve_failures = 0usize;
         for (key, credential_id) in &self.default_env_secrets {
-            match self.secret_store.get_secret(credential_id) {
+            match self.secret_resolver.resolve(credential_id) {
                 Ok(value) => {
-                    self.redaction.register(&value);
-                    spec.env.push((key.clone(), value.expose().to_owned()));
+                    self.redaction.register(value.as_secret_string());
+                    spec.env.push((key.clone(), value.into_string()));
                 }
-                Err(e) => {
-                    // credential id만 로그 — secret 값/키 이름은 남기지 않는다(6.3 관례).
-                    tracing::warn!(
-                        credential_id,
-                        "기본 env secret resolve 실패 — 건너뜀: {e:#}"
-                    );
-                }
+                Err(_) => resolve_failures = resolve_failures.saturating_add(1),
             }
+        }
+        if resolve_failures > 0 {
+            tracing::warn!(
+                failures = resolve_failures,
+                "default env secret resolution failed; entries skipped"
+            );
         }
         spec
     }
@@ -2775,6 +2915,24 @@ mod tests {
     use crate::command::{SplitDirection, WorkspaceRuntimeState};
     use std::time::Instant;
 
+    struct RecordingResolver {
+        calls: Mutex<Vec<String>>,
+        value: Option<String>,
+    }
+
+    impl RuntimeSecretResolver for RecordingResolver {
+        fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<RuntimeSecret> {
+            self.calls
+                .lock()
+                .expect("resolver calls lock")
+                .push(logical_credential_id.to_owned());
+            match &self.value {
+                Some(value) => Ok(RuntimeSecret::new(value.clone())),
+                None => anyhow::bail!("physical-slot-never-leak: injected resolver failure"),
+            }
+        }
+    }
+
     #[test]
     fn runtime_cache_share_accepts_values_below_global_32mib_minimum() {
         assert_eq!(clamp_runtime_cache_budget_bytes(0), 1024 * 1024);
@@ -3744,16 +3902,19 @@ mod tests {
                 done_regex: None,
             })
             .unwrap();
-        // resolve 실패 → SpawnFailed, payload에 secret 값 없음 (credential id만)
+        // resolve 실패 → SpawnFailed. Adapter error/credential coordinates are
+        // deliberately absent because a physical keyring slot may be present.
         let message = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SpawnFailed { message, .. } => Some(message.clone()),
             _ => None,
         });
         assert_eq!(message.message_id, "runtime.spawn_failed.agent_secret");
-        assert_eq!(message.arg_value("credential_id"), Some("cred-없음"));
+        assert!(message.args.is_empty());
+        assert!(message.diagnostic.is_none());
         assert!(
-            !format!("{message:?}").contains("누출되면 안 됨"),
-            "failed spawn payload must not include command args"
+            !format!("{message:?}").contains("누출되면 안 됨")
+                && !format!("{message:?}").contains("cred-없음"),
+            "failed spawn payload must not include command args or credential coordinates"
         );
         // 실패 시 아무것도 spawn되지 않아야 한다 (부분 주입 금지)
         std::thread::sleep(Duration::from_millis(150));
@@ -3765,6 +3926,190 @@ mod tests {
                 .any(|e| matches!(e, RuntimeEvent::AgentSpawned { .. })),
             "resolve 실패 후 AgentSpawned가 발행됨"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn valid_spawn_agent_emits_legacy_then_exact_correlation_once() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("agent-correlation-success"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: Some("agent-cfg-success".to_owned()),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".to_owned(),
+                args: vec!["-c".to_owned(), "sleep 1".to_owned()],
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawnResolved {
+                agent_config_id,
+                session: Some(session),
+            } if agent_config_id.as_str() == "agent-cfg-success" => Some(*session),
+            _ => None,
+        });
+
+        let correlations: Vec<_> = probe
+            .seen
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, RuntimeEvent::AgentSpawnResolved { .. }).then_some(index)
+            })
+            .collect();
+        assert_eq!(correlations.len(), 1);
+        assert!(matches!(
+            probe.seen.get(correlations[0].saturating_sub(1)),
+            Some(RuntimeEvent::AgentSpawned { session: spawned }) if *spawned == session
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn valid_spawn_failure_emits_legacy_then_exact_correlation_once() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let client = InProcessRuntimeClient::try_with_shell_and_resolver(
+            5,
+            resolver.clone(),
+            test_logs_root("agent-correlation-failure"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        )
+        .unwrap();
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: Some("agent-cfg-failure".to_owned()),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/echo".to_owned(),
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: vec![("SECRET".to_owned(), "logical-slot".to_owned())],
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawnResolved {
+                agent_config_id,
+                session: None,
+            } if agent_config_id.as_str() == "agent-cfg-failure" => Some(()),
+            _ => None,
+        });
+
+        let correlations: Vec<_> = probe
+            .seen
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, RuntimeEvent::AgentSpawnResolved { .. }).then_some(index)
+            })
+            .collect();
+        assert_eq!(correlations.len(), 1);
+        assert!(matches!(
+            probe.seen.get(correlations[0].saturating_sub(1)),
+            Some(RuntimeEvent::SpawnFailed {
+                kind: SpawnKind::Agent,
+                ..
+            })
+        ));
+        let failure_message = probe.seen.iter().find_map(|event| match event {
+            RuntimeEvent::SpawnFailed { message, .. } => Some(message),
+            _ => None,
+        });
+        assert!(failure_message.is_some_and(|message| {
+            message.args.is_empty()
+                && message.diagnostic.is_none()
+                && !format!("{message:?}").contains("physical-slot-never-leak")
+                && !format!("{message:?}").contains("logical-slot")
+        }));
+        assert_eq!(
+            *resolver.calls.lock().expect("resolver calls lock"),
+            vec!["logical-slot"]
+        );
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::AgentSpawned { .. }))
+        );
+    }
+
+    #[test]
+    fn invalid_legacy_spawn_fails_without_correlation_or_secret_resolution() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: Some("must-not-resolve".to_owned()),
+        });
+        let client = InProcessRuntimeClient::try_with_shell_and_resolver(
+            5,
+            resolver.clone(),
+            test_logs_root("agent-invalid-correlation"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        )
+        .unwrap();
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: Some(String::new()),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/echo".to_owned(),
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: vec![("SECRET".to_owned(), "logical-slot".to_owned())],
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SpawnFailed { kind, message }
+                if *kind == SpawnKind::Agent
+                    && message.message_id == "runtime.spawn_failed.invalid_agent_config_id" =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        assert!(
+            resolver
+                .calls
+                .lock()
+                .expect("resolver calls lock")
+                .is_empty()
+        );
+        assert!(!probe.seen.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::AgentSpawned { .. } | RuntimeEvent::AgentSpawnResolved { .. }
+        )));
     }
 
     #[test]

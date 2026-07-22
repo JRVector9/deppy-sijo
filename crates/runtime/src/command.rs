@@ -1,6 +1,29 @@
 pub use deppy_core::{MuxPaneId, MuxTabId, SessionId};
 pub use mux::SplitDirection;
 
+/// Opaque launch correlation ids are bounded before entering the final host
+/// queue. Current UUID producers fit comfortably while future adapters retain
+/// room for namespaced ids without making durable event queues attacker-sized.
+pub const AGENT_CONFIG_ID_MAX_BYTES: usize = 128;
+
+pub(crate) fn agent_config_id_is_valid(id: &str) -> bool {
+    !id.is_empty() && id.len() <= AGENT_CONFIG_ID_MAX_BYTES && !id.as_bytes().contains(&0)
+}
+
+pub(crate) fn validate_host_command(command: &RuntimeCommand) -> anyhow::Result<()> {
+    if let RuntimeCommand::SpawnAgent {
+        agent_config_id: Some(id),
+        ..
+    } = command
+        && !agent_config_id_is_valid(id)
+    {
+        anyhow::bail!(
+            "agent_config_id must be 1..={AGENT_CONFIG_ID_MAX_BYTES} bytes and contain no NUL"
+        );
+    }
+    Ok(())
+}
+
 /// workspace 런타임 상태 (설계문서 §14.1). 현재 단일 workspace 앱에서 실효 있는 전이는
 /// Active↔Warm(앱 최소화/가림 시 render/snapshot 중단, 세션은 유지). Suspended/Closed는
 /// workspace "닫기"(세션 종료)가 전제라 multi-workspace 관리 도입 시 완성된다 —
@@ -400,5 +423,51 @@ mod tests {
         assert!(text.contains("args_count"));
         assert!(text.contains("bytes_len"));
         assert!(text.contains("credential_count"));
+    }
+
+    #[test]
+    fn spawn_agent_postcard_golden_bytes_are_unchanged() {
+        let command = RuntimeCommand::SpawnAgent {
+            cols: 1,
+            rows: 1,
+            scrollback_lines: 0,
+            agent_config_id: Some("a".to_owned()),
+            command: "x".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+
+        assert_eq!(
+            postcard::to_allocvec(&command).unwrap(),
+            vec![1, 1, 1, 0, 1, 1, b'a', 1, b'x', 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn host_validation_bounds_opaque_agent_config_id() {
+        let command_with = |id: String| RuntimeCommand::SpawnAgent {
+            cols: 1,
+            rows: 1,
+            scrollback_lines: 0,
+            agent_config_id: Some(id),
+            command: "x".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+
+        assert!(validate_host_command(&command_with("a".repeat(128))).is_ok());
+        assert!(validate_host_command(&command_with(String::new())).is_err());
+        assert!(validate_host_command(&command_with("a".repeat(129))).is_err());
+        assert!(validate_host_command(&command_with("a\0b".to_owned())).is_err());
     }
 }

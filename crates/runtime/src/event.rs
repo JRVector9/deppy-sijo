@@ -9,6 +9,35 @@ use session::{SessionStatus, SessionStatusView};
 use crate::command::SessionId;
 use crate::resource_monitor::{ProcessResourceSnapshot, SessionResourceUsage};
 
+/// Bounded opaque correlation id for one app-owned agent configuration.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct AgentConfigCorrelationId(String);
+
+impl AgentConfigCorrelationId {
+    pub(crate) fn from_validated(value: String) -> Self {
+        debug_assert!(crate::command::agent_config_id_is_valid(&value));
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        crate::command::agent_config_id_is_valid(&self.0)
+    }
+}
+
+impl std::fmt::Debug for AgentConfigCorrelationId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentConfigCorrelationId")
+            .field("bytes", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// SpawnFailed의 출처 구분 — 셸/에이전트 UI가 서로의 실패를 오귀속하지 않게 한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SpawnKind {
@@ -140,6 +169,15 @@ pub enum RuntimeEvent {
         text: String,
         truncated: bool,
     },
+    /// Terminal correlation for an app-requested agent launch. This is emitted
+    /// immediately after the legacy `AgentSpawned`/agent `SpawnFailed` event in
+    /// the same worker turn. `None` means the launch failed; delivery is never
+    /// retried from this event.
+    /// **variant는 enum 끝에만 추가** (postcard discriminant — wire 호환).
+    AgentSpawnResolved {
+        agent_config_id: AgentConfigCorrelationId,
+        session: Option<SessionId>,
+    },
 }
 
 /// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의
@@ -206,6 +244,39 @@ mod tests {
                 is_alt_screen: false,
             }),
             bracketed_paste: false,
+        }
+    }
+
+    #[test]
+    fn legacy_agent_spawned_postcard_bytes_are_unchanged() {
+        let event = RuntimeEvent::AgentSpawned {
+            session: SessionId(7),
+        };
+        assert_eq!(postcard::to_allocvec(&event).unwrap(), vec![1, 7]);
+    }
+
+    #[test]
+    fn agent_spawn_correlation_debug_hides_raw_id_and_roundtrips() {
+        let id = AgentConfigCorrelationId::from_validated("raw-correlation-marker".to_owned());
+        let debug = format!("{id:?}");
+        assert!(!debug.contains("raw-correlation-marker"));
+
+        let event = RuntimeEvent::AgentSpawnResolved {
+            agent_config_id: id,
+            session: Some(SessionId(7)),
+        };
+        let bytes = postcard::to_allocvec(&event).unwrap();
+        assert_eq!(bytes.first().copied(), Some(13));
+        let decoded: RuntimeEvent = postcard::from_bytes(&bytes).unwrap();
+        match decoded {
+            RuntimeEvent::AgentSpawnResolved {
+                agent_config_id,
+                session,
+            } => {
+                assert_eq!(agent_config_id.as_str(), "raw-correlation-marker");
+                assert_eq!(session, Some(SessionId(7)));
+            }
+            _ => panic!("wrong event variant"),
         }
     }
 

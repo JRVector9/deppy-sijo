@@ -39,7 +39,9 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// LastOutputExtracted 이벤트를 enum 끝에 append — v7과 같은 이유(구버전 피어의 미지
 /// variant 오해독 방지)로 handshake에서 거부되도록 버전을 올린다. 1단계(ScrollToPrompt)가
 /// bump를 누락해 이 bump가 두 변경을 함께 커버한다.
-pub(crate) const PROTO_VERSION: u16 = 9;
+/// **v10 (B00b)**: terminal AgentSpawnResolved correlation event를 enum 끝에 append.
+/// 구버전 피어가 새 variant를 오해독하지 않도록 handshake에서 정확 버전을 거부한다.
+pub(crate) const PROTO_VERSION: u16 = 10;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;

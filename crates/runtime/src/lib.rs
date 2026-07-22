@@ -6,6 +6,7 @@ mod client;
 mod command;
 pub mod dotenv;
 mod event;
+mod host;
 mod in_process;
 pub mod known_hosts;
 mod persistence;
@@ -18,7 +19,11 @@ pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, Runtim
 pub use command::{
     MuxPaneId, MuxTabId, RuntimeCommand, SessionId, SplitDirection, WorkspaceRuntimeState,
 };
-pub use event::{MessageArg, MessagePayload, RuntimeEvent, SpawnKind};
+pub use event::{AgentConfigCorrelationId, MessageArg, MessagePayload, RuntimeEvent, SpawnKind};
+pub use host::{
+    InProcessRuntimeHostFactory, RuntimeCommandDispatcher, RuntimeHost, RuntimeHostConfig,
+    RuntimeHostFactory, RuntimeSecret, RuntimeSecretResolver, RuntimeWake,
+};
 pub use in_process::InProcessRuntimeClient;
 pub use mux::{LayoutNode, MuxSnapshot, PaneSnapshot, TabSnapshot};
 pub use persistence::PersistConfig;

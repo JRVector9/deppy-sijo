@@ -309,6 +309,10 @@ fn tls_pump_read(conn: &mut rustls::Connection, sock: &mut TcpStream) -> std::io
 /// 매직/버전 검증 → 토큰 상수시간 비교 → features 교집합 → [`ServerHello`] 회신.
 /// 성공 시 협상된 접속 [`Codec`]을 반환한다. 실패(침묵/기형/구버전 프레임/토큰 불일치)는
 /// 소켓을 닫고 `None` — hang 없이 조기 거부한다(v1의 "인증 실패 = 즉시 종료" 계약 유지).
+fn client_hello_matches_protocol(hello: &ClientHello) -> bool {
+    hello.magic == PROTO_MAGIC && hello.proto_version == PROTO_VERSION
+}
+
 fn server_handshake(stream: &TcpStream, auth_token: &str) -> Option<Codec> {
     // 침묵 peer가 서버를 잡아두지 못하게 timeout (v1의 AUTH_TIMEOUT 계약).
     let _ = stream.set_read_timeout(Some(AUTH_TIMEOUT));
@@ -323,7 +327,7 @@ fn server_handshake(stream: &TcpStream, auth_token: &str) -> Option<Codec> {
     };
     // 매직/버전 불일치 또는 기형(구버전 원시 토큰 프레임 포함)은 조기 거부 (hang 없음).
     let hello = match postcard::from_bytes::<ClientHello>(&frame) {
-        Ok(hello) if hello.magic == PROTO_MAGIC && hello.proto_version == PROTO_VERSION => hello,
+        Ok(hello) if client_hello_matches_protocol(&hello) => hello,
         _ => {
             tracing::warn!("remote 핸드셰이크 실패(매직/버전/기형) — 접속 거부");
             reject();
@@ -360,6 +364,14 @@ fn server_handshake(stream: &TcpStream, auth_token: &str) -> Option<Codec> {
 /// 서버가 수신한 명령의 와이어 값 검증 (codex 리뷰: 악성/기형 클라이언트 방어).
 /// 터미널 모델은 내부에서 clamp하지만 PTY 경로는 원값을 받으므로 여기서 거른다.
 fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
+    if let RuntimeCommand::SpawnAgent {
+        agent_config_id: Some(id),
+        ..
+    } = command
+        && !crate::command::agent_config_id_is_valid(id)
+    {
+        return Err("agent_config_id가 비었거나 상한/NUL 규칙 위반");
+    }
     match command {
         RuntimeCommand::SpawnShell {
             cols,
@@ -413,6 +425,11 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
                     return Err("layout ratio가 0..=1 finite 범위 밖");
                 }
             }
+        }
+        RuntimeEvent::AgentSpawnResolved {
+            agent_config_id, ..
+        } if !agent_config_id.is_valid() => {
+            return Err("agent_config_id가 비었거나 상한/NUL 규칙 위반");
         }
         _ => {}
     }
@@ -1277,7 +1294,7 @@ fn tls_server_handshake(
     };
 
     let hello = match postcard::from_bytes::<ClientHello>(&hello_frame) {
-        Ok(hello) if hello.magic == PROTO_MAGIC && hello.proto_version == PROTO_VERSION => hello,
+        Ok(hello) if client_hello_matches_protocol(&hello) => hello,
         _ => {
             tracing::warn!("remote TLS 핸드셰이크 실패(매직/버전/기형) — 접속 거부");
             return None;
@@ -2415,6 +2432,18 @@ mod tests {
         server.shutdown();
     }
 
+    #[test]
+    fn v9_peer_is_rejected_at_hello_before_event_decode() {
+        let old = ClientHello {
+            magic: PROTO_MAGIC,
+            proto_version: 9,
+            features: CLIENT_FEATURES,
+            token: b"irrelevant".to_vec(),
+        };
+        assert_eq!(PROTO_VERSION, 10);
+        assert!(!client_hello_matches_protocol(&old));
+    }
+
     /// 단계 A off-path 불변 (§3.2, §8 #1): delta 미협상(Plain 코덱)에서 이벤트/명령
     /// 프레임은 봉투 없는 기존 `postcard(RuntimeCommand)`/`postcard(RuntimeEvent)`와
     /// **바이트 동일**해야 한다. Plain 코덱을 A 이전 경로와 직접 대조해 못 박는다.
@@ -2448,6 +2477,30 @@ mod tests {
             postcard::to_allocvec(&event).unwrap(),
             "Plain 이벤트 프레임이 기존 postcard와 바이트 동일해야 한다"
         );
+
+        let correlation = RuntimeEvent::AgentSpawnResolved {
+            agent_config_id: crate::AgentConfigCorrelationId::from_validated("cfg-1".to_owned()),
+            session: Some(SessionId(7)),
+        };
+        assert_eq!(
+            Codec::Plain.encode_event(&correlation).unwrap(),
+            postcard::to_allocvec(&correlation).unwrap(),
+            "new correlation must preserve the Plain postcard contract"
+        );
+        for codec in [Codec::Plain, Codec::Delta] {
+            let frame = codec.encode_event(&correlation).unwrap();
+            let DecodedEvent::Event(decoded) = codec.decode_event(&frame).unwrap() else {
+                panic!("correlation decoded as a viewport frame");
+            };
+            validate_event(&decoded).unwrap();
+            assert!(matches!(
+                decoded,
+                RuntimeEvent::AgentSpawnResolved {
+                    agent_config_id,
+                    session: Some(SessionId(7)),
+                } if agent_config_id.as_str() == "cfg-1"
+            ));
+        }
 
         // 디코드도 기존 경로가 만든 프레임을 그대로 받아들인다(왕복).
         let cmd_frame = postcard::to_allocvec(&command).unwrap();
@@ -2744,6 +2797,24 @@ mod tests {
             })
             .is_err()
         );
+        let malformed_id = "raw-id-never-reflect".repeat(16);
+        let malformed_spawn = RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            agent_config_id: Some(malformed_id.clone()),
+            command: "/bin/echo".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        let reason = validate_command(&malformed_spawn).unwrap_err();
+        assert!(!reason.contains(&malformed_id));
+        assert!(reason.contains("agent_config_id"));
         // 이벤트: 셀 수 불일치, 비정상 ratio
         let bad_viewport = RuntimeEvent::Viewport {
             session: SessionId(1),
@@ -3044,6 +3115,7 @@ mod tests {
             RuntimeEvent::SessionRestored { .. } => "SessionRestored",
             RuntimeEvent::ScrollbackSearchResult { .. } => "ScrollbackSearchResult",
             RuntimeEvent::LastOutputExtracted { .. } => "LastOutputExtracted",
+            RuntimeEvent::AgentSpawnResolved { .. } => "AgentSpawnResolved",
         }
     }
 

@@ -1175,7 +1175,10 @@ impl WorkspaceUi {
                         );
                     }
                 }
-                RuntimeEvent::AgentSpawned { .. } => {}
+                // Launch correlation is app-owned lifecycle state (approval listener/runtime host),
+                // not terminal rendering state. The app consumes this event before forwarding the
+                // same batch here, so the workspace leaf intentionally performs no action.
+                RuntimeEvent::AgentSpawned { .. } | RuntimeEvent::AgentSpawnResolved { .. } => {}
                 RuntimeEvent::ResourceUsage { .. } => {}
                 RuntimeEvent::ScrollbackSearchResult {
                     session,

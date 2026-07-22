@@ -71,8 +71,27 @@ same single worker used by tracing. Root verification passes 14 in-module plus 1
 policy tests, app all-target check, strict Clippy, fmt, and scoped diff-check. Errors, Debug, and
 stats expose only static codes and counts, never paths, source lines, or raw I/O errors.
 
+## MCP proxy diagnostic sanitization
+
+The proxy process boundary now converts every lower-level source into a private
+`ProxyRunFailure { phase, error_code }` and emits only fixed `kind`, `phase`, and `error_code`
+fields. Startup, protocol, shutdown, approval maintenance, and authorization-owner shutdown no
+longer format raw `anyhow` chains, dynamic cleanup counts, server/session identifiers, or backend
+values.
+
+CLI and backend configuration/session errors use static codes. Hostile marker regressions cover
+CLI arguments, server ID/name/kind/URL, credentials, backend sources, `Display`, alternate/debug
+formatting, and a captured tracing subscriber. No thread, poller, runtime, or dependency was added.
+
+Root verification passes mcp-proxy 51/51, all-target check, strict Clippy, package rustfmt, scoped
+diff-check, and the production trace scan. The existing stdio fixture measured cold 96.80 ms,
+warm 131.67 microseconds, and 2,064 KiB retained RSS in this run; these local fixture values are
+evidence, not the final hardware release gate.
+
 ## Remaining OD01 scope
 
-The env-only RSS/thread/socket/queue slope soak harness and remaining raw tracing-field
-sanitization remain for the final OD01 cutover. The completed slices add no production timer,
-polling loop, network, process, or retained source/sample backlog.
+The env-only RSS/thread/socket/queue slope soak harness and MCP-owned dynamic traces at
+`mcp/src/http.rs:323,416,742,757` and `mcp/src/transport.rs:494,496` remain for the final OD01
+cutover. Static but schema-inconsistent MCP events remain at HTTP 531/554/931 and transport
+263/282. The completed slices add no production timer, polling loop, network, process, or retained
+source/sample backlog.

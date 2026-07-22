@@ -580,7 +580,12 @@ impl ProxyAuthorizationExecutor {
             .map_err(|_| anyhow::anyhow!("authorization DB unavailable"))
             .and_then(|db| db.close_authorization_owner(owner));
         if result.is_err() {
-            tracing::warn!("authorization owner shutdown persistence failed");
+            tracing::warn!(
+                kind = "authorization",
+                phase = "shutdown",
+                error_code = "owner_close_failed",
+                "mcp proxy authorization persistence failed"
+            );
         }
     }
 }

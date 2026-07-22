@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use mcp::{
     LocalMcpManager, McpConnection, McpDeliveryUnknown, McpHttpServerConfig, McpServerConfig,
     McpServerResponseError, McpTool, validate_mcp_url,
@@ -70,7 +69,7 @@ impl BackendConfig {
                     .command
                     .as_ref()
                     .filter(|command| !command.trim().is_empty())
-                    .with_context(|| format!("stdio 서버 '{}'에 command가 없음", row.id))?;
+                    .ok_or_else(|| anyhow::anyhow!("backend_stdio_command_missing"))?;
                 Ok(Self::Stdio(StdioBackendConfig {
                     name: row.name.clone(),
                     command: command.clone(),
@@ -89,27 +88,15 @@ impl BackendConfig {
                     .url
                     .as_ref()
                     .filter(|url| !url.trim().is_empty())
-                    .with_context(|| format!("http 서버 '{}'에 url이 없음", row.id))?;
-                validate_mcp_url(url)
-                    .with_context(|| format!("http 서버 '{}' url 정책 위반", row.id))?;
+                    .ok_or_else(|| anyhow::anyhow!("backend_http_url_missing"))?;
+                validate_mcp_url(url).map_err(|_| anyhow::anyhow!("backend_http_url_invalid"))?;
                 Ok(Self::Http(HttpBackendConfig {
                     name: row.name.clone(),
                     url: url.clone(),
                     bearer_credential_id: None,
                 }))
             }
-            other => anyhow::bail!(
-                "서버 '{}'의 kind가 '{}' — 프록시는 stdio|http만 지원",
-                row.id,
-                other
-            ),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Stdio(config) => &config.name,
-            Self::Http(config) => &config.name,
+            _ => anyhow::bail!("backend_transport_unsupported"),
         }
     }
 
@@ -239,7 +226,7 @@ impl BackendFactory for ManagerBackendFactory {
             ResolvedBackendConfig::Stdio(config) => self.manager.connect(config),
             ResolvedBackendConfig::Http(config) => self.manager.connect_http(config),
         }
-        .with_context(|| format!("백엔드 '{}' connect 실패", config.name()))?;
+        .map_err(|_| anyhow::anyhow!("backend_connect_failed"))?;
         Ok(ConnectedTransport {
             connection: Box::new(connection),
             _secret_guard: resolved.secret_guard,
@@ -271,21 +258,22 @@ impl ManagerBackendFactory {
             (Vec::new(), None)
         } else {
             if self.initialize_platform_store {
-                secret::init_platform_store().context("keyring backend lazy init 실패")?;
+                secret::init_platform_store()
+                    .map_err(|_| anyhow::anyhow!("keyring_backend_init_failed"))?;
             }
             let mut secrets = Vec::with_capacity(auth_revision.len());
             for entry in auth_revision {
                 secrets.push(
                     self.secret_store
                         .get_secret(entry)
-                        .context("active physical credential 조회 실패")?,
+                        .map_err(|_| anyhow::anyhow!("active_credential_read_failed"))?,
                 );
             }
             let refs = secrets.iter().collect::<Vec<_>>();
             let lease = self
                 .redaction
                 .acquire_execution_lease(&refs)
-                .context("secret redaction capacity 확보 실패")?;
+                .map_err(|_| anyhow::anyhow!("secret_redaction_capacity_unavailable"))?;
             (
                 secrets,
                 Some(SecretConnectionGuard {
@@ -329,16 +317,17 @@ impl ManagerBackendFactory {
 
 fn resolve_credential_entry(db: &storage::Db, logical_id: &str) -> anyhow::Result<String> {
     let logical_id = LogicalCredentialId::new(logical_id.to_owned())
-        .context("backend logical credential id 검증 실패")?;
+        .map_err(|_| anyhow::anyhow!("backend_logical_credential_invalid"))?;
     let location = db
-        .credential_secret_location(logical_id.as_str())?
-        .with_context(|| format!("credential metadata 없음: {}", logical_id.as_str()))?;
+        .credential_secret_location(logical_id.as_str())
+        .map_err(|_| anyhow::anyhow!("credential_metadata_read_failed"))?
+        .ok_or_else(|| anyhow::anyhow!("credential_metadata_missing"))?;
     anyhow::ensure!(
         location.keyring_service == secret::KEYRING_SERVICE,
         "credential keyring service가 현재 backend와 일치하지 않습니다"
     );
     let physical_slot = PhysicalSecretSlot::parse(location.keyring_username)
-        .context("credential physical slot 검증 실패")?;
+        .map_err(|_| anyhow::anyhow!("credential_physical_slot_invalid"))?;
     anyhow::ensure!(
         physical_slot.belongs_to(&logical_id),
         "credential physical slot이 logical credential에 속하지 않습니다"
@@ -726,8 +715,9 @@ impl BackendClient {
             .lock()
             .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))
             .and_then(|db| {
-                db.mcp_server(&backend_id)?
-                    .with_context(|| format!("MCP server '{backend_id}' is missing"))
+                db.mcp_server(&backend_id)
+                    .map_err(|_| anyhow::anyhow!("backend_target_read_failed"))?
+                    .ok_or_else(|| anyhow::anyhow!("backend_target_missing"))
             })
             .and_then(|row| BackendConfig::from_server_row(&row));
         let refreshed = match refreshed {
@@ -1228,6 +1218,57 @@ mod tests {
             assert_eq!(captured.lock().unwrap().len(), 4);
         });
         Some((format!("http://{address}/mcp"), methods, handle))
+    }
+
+    #[test]
+    fn backend_config_error는_server_controlled_marker를_보존하지_않는다() {
+        const MARKER: &str = "HOSTILE_BACKEND_DIAGNOSTIC_MARKER";
+        let cases = [
+            McpServerRow {
+                id: MARKER.to_owned(),
+                name: MARKER.to_owned(),
+                kind: "stdio".to_owned(),
+                command: None,
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                inherit_env: false,
+                url: None,
+                enabled: true,
+            },
+            McpServerRow {
+                id: MARKER.to_owned(),
+                name: MARKER.to_owned(),
+                kind: "http".to_owned(),
+                command: None,
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                inherit_env: false,
+                url: Some(format!("https://[{MARKER}")),
+                enabled: true,
+            },
+            McpServerRow {
+                id: MARKER.to_owned(),
+                name: MARKER.to_owned(),
+                kind: MARKER.to_owned(),
+                command: None,
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                inherit_env: false,
+                url: None,
+                enabled: true,
+            },
+        ];
+
+        for row in cases {
+            let error = BackendConfig::from_server_row(&row)
+                .err()
+                .expect("hostile backend config must fail");
+            let rendered = format!("{error:#}");
+            assert!(!rendered.contains(MARKER));
+        }
     }
 
     #[test]

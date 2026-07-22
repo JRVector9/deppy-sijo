@@ -15,7 +15,6 @@ mod session;
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::Context;
 use deppy_core::time::unix_secs_i64;
 use mcp::{LocalMcpManager, run_authorized_proxy};
 #[cfg(test)]
@@ -36,40 +35,104 @@ use crate::session::{BackendClient, BackendConfig, BackendSession, DEFAULT_BACKE
 const ORPHAN_CUTOFF_SECS: i64 = cli::MAX_APPROVAL_TIMEOUT_SECS as i64;
 const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
-fn main() -> anyhow::Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProxyRunFailure {
+    phase: &'static str,
+    error_code: &'static str,
+}
+
+impl ProxyRunFailure {
+    const fn new(phase: &'static str, error_code: &'static str) -> Self {
+        Self { phase, error_code }
+    }
+
+    fn from_error<E>(phase: &'static str, error_code: &'static str, _source: E) -> Self {
+        Self::new(phase, error_code)
+    }
+}
+
+impl std::fmt::Debug for ProxyRunFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxyRunFailure")
+            .field("phase", &self.phase)
+            .field("error_code", &self.error_code)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ProxyRunFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "mcp proxy failure: phase={}, error_code={}",
+            self.phase, self.error_code
+        )
+    }
+}
+
+impl std::error::Error for ProxyRunFailure {}
+
+fn emit_proxy_run_failure(failure: ProxyRunFailure) {
+    tracing::error!(
+        kind = "mcp_proxy",
+        phase = failure.phase,
+        error_code = failure.error_code,
+        "mcp proxy operation failed"
+    );
+}
+
+fn main() {
     // stdout은 JSON-RPC 전용 → 로그는 stderr로만.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
 
+    if let Err(failure) = run() {
+        emit_proxy_run_failure(failure);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), ProxyRunFailure> {
     // `deppy-mcp-proxy hooks --db <path> --event <needs-input|clear>` — claude/codex hook
     // 수신부. env DEPPY_SESSION_ID(=pane_id)로 needsInput을 DB에 set/clear하고 즉시 종료
     // (프록시 안 뜬다). stdin(hook payload)은 소비만 하고 안 씀 — 이벤트 타입으로 충분.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("hooks") {
-        return run_hooks(&args[2..]);
+        return run_hooks(&args[2..])
+            .map_err(|error| ProxyRunFailure::from_error("hook", "hook_execution_failed", error));
     }
     // `deppy-mcp-proxy statusline --db <path>` — claude statusLine 오버레이가 렌더마다
     // 호출. stdin JSON에서 effort/model/남은 context%를 뽑아 (변경 시에만) DB에 기록하고,
     // 사용자 원래 statusLine을 체이닝 호출해 그 출력을 통과시킨다(사용자 바 보존).
     if args.get(1).map(String::as_str) == Some("statusline") {
-        return run_statusline(&args[2..]);
+        return run_statusline(&args[2..]).map_err(|error| {
+            ProxyRunFailure::from_error("statusline", "statusline_execution_failed", error)
+        });
     }
 
-    let cli = Cli::from_env()?;
-    let db = Arc::new(Mutex::new(storage::Db::open(&cli.db_path)?));
+    let cli = Cli::from_env().map_err(|error| {
+        ProxyRunFailure::from_error("startup", "cli_configuration_invalid", error)
+    })?;
+    let db = Arc::new(Mutex::new(storage::Db::open(&cli.db_path).map_err(
+        |error| ProxyRunFailure::from_error("startup", "database_open_failed", error),
+    )?));
 
     // 프론트할 백엔드 서버 spec을 DB에서 찾는다.
     let server = db
         .lock()
-        .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))?
-        .mcp_server(&cli.server_id)?
-        .with_context(|| format!("MCP 서버 '{}'를 DB에서 찾을 수 없음", cli.server_id))?;
+        .map_err(|error| ProxyRunFailure::from_error("startup", "database_unavailable", error))?
+        .mcp_server(&cli.server_id)
+        .map_err(|error| ProxyRunFailure::from_error("startup", "target_lookup_failed", error))?
+        .ok_or_else(|| ProxyRunFailure::new("startup", "target_not_found"))?;
     // No credential/keyring access occurs at startup. Cold backend connect resolves only the
     // target's logical refs to current physical slots and holds a bounded redaction lease.
     let redaction = RedactionService::new();
-    let config = BackendConfig::from_server_row(&server)?;
+    let config = BackendConfig::from_server_row(&server).map_err(|error| {
+        ProxyRunFailure::from_error("startup", "target_configuration_invalid", error)
+    })?;
 
     // 이전에 크래시한 프록시가 남긴 orphan pending 승인을 정리한다 — GUI가 죽은 팝업을
     // 띄우지 않게. best-effort(실패해도 서빙 계속). db를 hook으로 넘기기 전에 한다.
@@ -78,16 +141,36 @@ fn main() -> anyhow::Result<()> {
     let now = unix_secs_i64();
     let db_guard = db
         .lock()
-        .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))?;
+        .map_err(|error| ProxyRunFailure::from_error("startup", "database_unavailable", error))?;
     match db_guard.expire_pending_approvals(now - ORPHAN_CUTOFF_SECS, now) {
-        Ok(n) if n > 0 => tracing::info!("orphan pending 승인 {n}건 정리(이전 크래시 잔여)"),
+        Ok(n) if n > 0 => tracing::info!(
+            kind = "approval",
+            phase = "orphan_cleanup",
+            error_code = "none",
+            "mcp proxy maintenance completed"
+        ),
         Ok(_) => {}
-        Err(e) => tracing::warn!("orphan pending 승인 정리 실패(무시하고 계속): {e:#}"),
+        Err(_) => tracing::warn!(
+            kind = "approval",
+            phase = "orphan_cleanup",
+            error_code = "pending_expire_failed",
+            "mcp proxy maintenance failed"
+        ),
     }
     match db_guard.prune_resolved_approvals(now - RESOLVED_APPROVAL_RETENTION_SECS) {
-        Ok(n) if n > 0 => tracing::info!("resolved approval {n}건 정리"),
+        Ok(n) if n > 0 => tracing::info!(
+            kind = "approval",
+            phase = "resolved_cleanup",
+            error_code = "none",
+            "mcp proxy maintenance completed"
+        ),
         Ok(_) => {}
-        Err(e) => tracing::warn!("resolved approval 정리 실패(무시하고 계속): {e:#}"),
+        Err(_) => tracing::warn!(
+            kind = "approval",
+            phase = "resolved_cleanup",
+            error_code = "approval_prune_failed",
+            "mcp proxy maintenance failed"
+        ),
     }
     drop(db_guard);
 
@@ -99,21 +182,26 @@ fn main() -> anyhow::Result<()> {
     // Validate and split the runtime-owned key before it can enter owner scope, approval rows, or
     // audit subject persistence. The executor derives the same subject again at construction so
     // non-main callers cannot pass a mismatched pane/subject pair.
-    let _subject = authorization_subject_from_runtime_session_key(pane_id.as_deref())?;
+    let _subject =
+        authorization_subject_from_runtime_session_key(pane_id.as_deref()).map_err(|error| {
+            ProxyRunFailure::from_error("startup", "session_identity_invalid", error)
+        })?;
     let owner_id = pane_id.clone().or_else(|| {
         std::env::var("DEPPY_AUTHORIZATION_OWNER")
             .ok()
             .filter(|value| !value.trim().is_empty())
     });
-    let owner_id = owner_id.context(
-        "DEPPY_SESSION_ID 또는 DEPPY_AUTHORIZATION_OWNER가 authorization scope에 필요합니다",
-    )?;
+    let owner_id =
+        owner_id.ok_or_else(|| ProxyRunFailure::new("startup", "authorization_owner_missing"))?;
     let cleanup_session_key = pane_id.clone();
     let authorization_scope = format!("proxy:{owner_id}:{}", cli.server_id);
     let owner = db
         .lock()
-        .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))?
-        .acquire_authorization_owner(&authorization_scope)?;
+        .map_err(|error| ProxyRunFailure::from_error("startup", "database_unavailable", error))?
+        .acquire_authorization_owner(&authorization_scope)
+        .map_err(|error| {
+            ProxyRunFailure::from_error("startup", "authorization_owner_acquire_failed", error)
+        })?;
 
     // hook live-schema와 forwarder call이 같은 lazy initialized connection을 공유한다.
     let manager = LocalMcpManager::new(redaction.clone());
@@ -140,7 +228,10 @@ fn main() -> anyhow::Result<()> {
         pane_id,
         cli.approval_notifier
             .map(|notifier| Arc::new(notifier) as Arc<dyn ApprovalWakeNotifier>),
-    )?;
+    )
+    .map_err(|error| {
+        ProxyRunFailure::from_error("startup", "authorization_executor_failed", error)
+    })?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -152,8 +243,16 @@ fn main() -> anyhow::Result<()> {
     backend_session.shutdown();
     let cleanup_result = deny_proxy_session_pending(&db, cleanup_session_key.as_deref());
     match (result, cleanup_result) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(_)) => Err(anyhow::anyhow!("proxy session cleanup failed")),
+        (Err(error), _) => Err(ProxyRunFailure::from_error(
+            "protocol",
+            "proxy_protocol_failed",
+            error,
+        )),
+        (Ok(()), Err(error)) => Err(ProxyRunFailure::from_error(
+            "shutdown",
+            "session_cleanup_failed",
+            error,
+        )),
         (Ok(()), Ok(_)) => Ok(()),
     }
 }
@@ -377,7 +476,51 @@ fn chain_user_statusline(json: &serde_json::Value, payload: &str) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
+
+    struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn process_failure_debug_display_trace는_source_marker를_보존하지_않는다() {
+        const MARKER: &str = "HOSTILE_PROXY_SOURCE_MARKER";
+        let failure = ProxyRunFailure::from_error(
+            "startup",
+            "target_configuration_invalid",
+            anyhow::anyhow!(MARKER),
+        );
+        assert!(std::error::Error::source(&failure).is_none());
+        assert!(!format!("{failure:?}").contains(MARKER));
+        assert!(!format!("{failure}").contains(MARKER));
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer_buffer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || TraceWriter(Arc::clone(&writer_buffer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || emit_proxy_run_failure(failure));
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("kind=\"mcp_proxy\""));
+        assert!(output.contains("phase=\"startup\""));
+        assert!(output.contains("error_code=\"target_configuration_invalid\""));
+        assert!(!output.contains(MARKER));
+    }
 
     #[test]
     fn backend_target은_secret대신_logical_refs만_보관한다() {

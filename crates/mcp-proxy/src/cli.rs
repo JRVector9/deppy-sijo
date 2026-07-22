@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 
 use crate::approval_notify::UnixDatagramApprovalNotifier;
 
@@ -52,26 +52,26 @@ impl Cli {
                 "--poll-ms" => {
                     poll_ms = value(&mut args, "--poll-ms")?
                         .parse()
-                        .context("--poll-ms는 정수여야 함")?;
+                        .map_err(|_| anyhow::anyhow!("cli_poll_interval_invalid"))?;
                 }
                 "--approval-timeout-secs" => {
                     approval_timeout_secs = value(&mut args, "--approval-timeout-secs")?
                         .parse()
-                        .context("--approval-timeout-secs는 정수여야 함")?;
+                        .map_err(|_| anyhow::anyhow!("cli_approval_timeout_invalid"))?;
                 }
                 "--approval-notify-socket" => {
                     approval_notifier = Some(UnixDatagramApprovalNotifier::new(PathBuf::from(
                         value(&mut args, "--approval-notify-socket")?,
                     ))?);
                 }
-                other => bail!("알 수 없는 인자: {other}"),
+                _ => bail!("cli_unknown_argument"),
             }
         }
 
-        let db_path = db_path.context("--db <path> 인자가 필요합니다")?;
-        let server_id = server_id.context("--server <mcp_server_id> 인자가 필요합니다")?;
+        let db_path = db_path.ok_or_else(|| anyhow::anyhow!("cli_database_path_missing"))?;
+        let server_id = server_id.ok_or_else(|| anyhow::anyhow!("cli_server_id_missing"))?;
         if poll_ms == 0 {
-            bail!("--poll-ms는 1 이상이어야 함 (busy-loop 방지)");
+            bail!("cli_poll_interval_zero");
         }
         // orphan sweep이 live pending을 오살하지 않도록 상한을 강제한다 (cutoff 불변식).
         let approval_timeout_secs = approval_timeout_secs.min(MAX_APPROVAL_TIMEOUT_SECS);
@@ -88,8 +88,15 @@ impl Cli {
 
 /// `--flag` 다음의 값 하나를 꺼낸다 (없으면 에러).
 fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
-    args.next()
-        .with_context(|| format!("{flag} 뒤에 값이 필요합니다"))
+    let error_code = match flag {
+        "--db" => "cli_database_path_value_missing",
+        "--server" => "cli_server_id_value_missing",
+        "--poll-ms" => "cli_poll_interval_value_missing",
+        "--approval-timeout-secs" => "cli_approval_timeout_value_missing",
+        "--approval-notify-socket" => "cli_approval_socket_value_missing",
+        _ => "cli_argument_value_missing",
+    };
+    args.next().ok_or_else(|| anyhow::anyhow!(error_code))
 }
 
 #[cfg(test)]
@@ -161,6 +168,11 @@ mod tests {
 
     #[test]
     fn 알수없는_인자는_에러() {
-        assert!(Cli::parse(argv(&["--db", "/tmp/x", "--server", "s", "--nope"])).is_err());
+        let marker = "--HOSTILE_CLI_MARKER";
+        let error = Cli::parse(argv(&["--db", "/tmp/x", "--server", "s", marker]))
+            .err()
+            .expect("unknown argument must fail");
+        assert_eq!(error.to_string(), "cli_unknown_argument");
+        assert!(!format!("{error:#}").contains(marker));
     }
 }

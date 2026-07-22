@@ -184,3 +184,21 @@ strict Clippy, full fmt, and the manual forbidden scan pass. Optional all-featur
 environment-blocked because `libghostty-vt-sys` attempts a GitHub DNS fetch; no source workaround
 was added. Root still must compute and install the projection off-render, incrementing its revision
 on cwd or name-style changes.
+
+## Authoritative structured-session catalog
+
+`AgentSessionsUi::replace_persisted_threads` accepts only a complete multi-workspace snapshot. It
+prevalidates the existing 500-row, 32 KiB/row, and 4 MiB total ceilings, checked byte arithmetic,
+local-session identity, and duplicate local/thread IDs before mutating UI state. Persisted-only
+placeholders have explicit ownership and are removed when omitted by a complete catalog; the first
+runtime request or event promotes a placeholder, so attached, pending, running, and event-bearing
+sessions survive replacement even if their persisted row disappears. Rejected input leaves rows,
+byte counts, sessions, selection, and placeholder ownership unchanged. Row Debug output contains
+only field lengths/flags and rejection codes contain no row data.
+
+Root independently reran all 41 AgentSessions tests and diff-check. Exact replacement/removal,
+runtime-state preservation, overflow/duplicate/invalid rollback, and hostile Debug regressions
+pass, as do all-target check, dead-code-exempt strict Clippy, and targeted fmt. One test initially
+needed an explicit `sum::<usize>()`; a concurrent app API mismatch transiently blocked a full run,
+which passed after root stabilized the shared tree. Root must now apply this API only for a current
+complete Catalog completion; partial or stale pages may never replace the catalog.

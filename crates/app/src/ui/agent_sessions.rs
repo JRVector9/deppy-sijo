@@ -163,7 +163,7 @@ pub struct AgentSessionsFrameInput<'a> {
 
 /// Storage-neutral projection of one persisted structured thread. The composition root maps its
 /// concrete repository row into this DTO before the UI controller sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentSessionPersistedRow {
     pub local_session_id: String,
     pub workspace_id: String,
@@ -175,6 +175,36 @@ pub struct AgentSessionPersistedRow {
     pub archived: bool,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl std::fmt::Debug for AgentSessionPersistedRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentSessionPersistedRow")
+            .field("local_session_id_bytes", &self.local_session_id.len())
+            .field("workspace_id_bytes", &self.workspace_id.len())
+            .field("thread_id_bytes", &self.thread_id.len())
+            .field("title_bytes", &self.title.len())
+            .field("cwd", &"[REDACTED]")
+            .field("model_present", &self.model.is_some())
+            .field("favorite", &self.favorite)
+            .field("archived", &self.archived)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+/// Stable, data-free rejection codes for an authoritative persisted catalog replacement.
+/// Invalid input is rejected before any controller state is changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSessionPersistedCatalogError {
+    TooManyItems,
+    RowTooLarge,
+    TotalBytesExceeded,
+    DuplicateLocalSession,
+    DuplicateThread,
+    InvalidLocalSession,
 }
 
 struct AgentSecretRender<'a> {
@@ -339,6 +369,10 @@ pub struct AgentSessionsUi {
     transport_error: Option<CatalogMessage>,
     persisted_threads: HashMap<AgentSessionId, AgentSessionPersistedRow>,
     persisted_thread_bytes: usize,
+    /// Exact sessions synthesized only as DB catalog placeholders. Runtime admission or the first
+    /// runtime-owned event removes the ID, so a later authoritative DB snapshot can never erase a
+    /// live session merely because both happen to be in `Stopped` state.
+    persisted_placeholders: HashSet<AgentSessionId>,
     attached_threads: HashSet<AgentSessionId>,
     pending_thread_requests: Vec<PendingThreadRequest>,
     persistence_mutations: Vec<AgentSessionPersistenceMutation>,
@@ -398,6 +432,7 @@ impl AgentSessionsUi {
             transport_error: None,
             persisted_threads: HashMap::new(),
             persisted_thread_bytes: 0,
+            persisted_placeholders: HashSet::new(),
             attached_threads: HashSet::new(),
             pending_thread_requests: Vec::new(),
             persistence_mutations: Vec::new(),
@@ -568,7 +603,7 @@ impl AgentSessionsUi {
                 let session = &mut self.sessions[session_index];
                 // A repeated DB projection may refresh a placeholder, but it
                 // must never regress a live session that already owns events.
-                if was_persisted && session.status == AgentSessionStatus::Stopped {
+                if was_persisted && self.persisted_placeholders.contains(&local_session_id) {
                     apply_persisted_metadata(session, &row, &self.catalog);
                 }
                 continue;
@@ -578,7 +613,135 @@ impl AgentSessionsUi {
             apply_persisted_metadata(&mut session, &row, &self.catalog);
             session.status = AgentSessionStatus::Stopped;
             self.sessions.push(session);
+            self.persisted_placeholders.insert(local_session_id);
         }
+    }
+
+    /// Atomically replaces the complete, multi-workspace persisted-thread catalog.
+    ///
+    /// The caller must provide an authoritative snapshot, not a page. Every limit and duplicate
+    /// invariant is validated before mutation. Rows absent from the snapshot lose their persisted
+    /// projection; only UI-synthesized placeholders are removed from `sessions`. Runtime-owned,
+    /// attached, in-flight, or event-bearing sessions are retained unchanged.
+    pub fn replace_persisted_threads(
+        &mut self,
+        rows: Vec<AgentSessionPersistedRow>,
+    ) -> Result<(), AgentSessionPersistedCatalogError> {
+        if rows.len() > AGENT_SESSION_PERSISTED_MAX_ITEMS {
+            return Err(AgentSessionPersistedCatalogError::TooManyItems);
+        }
+
+        let mut local_ids = HashSet::with_capacity(rows.len());
+        let mut thread_ids = HashSet::with_capacity(rows.len());
+        let mut retained_bytes = 0usize;
+        for row in &rows {
+            let row_bytes = persisted_row_retained_bytes(row);
+            if row_bytes > AGENT_SESSION_PERSISTED_ROW_MAX_BYTES {
+                return Err(AgentSessionPersistedCatalogError::RowTooLarge);
+            }
+            retained_bytes = retained_bytes
+                .checked_add(row_bytes)
+                .ok_or(AgentSessionPersistedCatalogError::TotalBytesExceeded)?;
+            if retained_bytes > AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES {
+                return Err(AgentSessionPersistedCatalogError::TotalBytesExceeded);
+            }
+            if !local_ids.insert(row.local_session_id.as_str()) {
+                return Err(AgentSessionPersistedCatalogError::DuplicateLocalSession);
+            }
+            if !thread_ids.insert(row.thread_id.as_str()) {
+                return Err(AgentSessionPersistedCatalogError::DuplicateThread);
+            }
+            if AgentSession::try_new(row.local_session_id.clone(), String::new(), None).is_none() {
+                return Err(AgentSessionPersistedCatalogError::InvalidLocalSession);
+            }
+        }
+
+        let next_rows = rows
+            .into_iter()
+            .map(|row| (row.local_session_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let existing_ids = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut new_placeholders = Vec::new();
+        for row in next_rows
+            .values()
+            .filter(|row| !existing_ids.contains(row.local_session_id.as_str()))
+        {
+            let mut session = AgentSession::try_new(
+                row.local_session_id.clone(),
+                persisted_title(row, &self.catalog),
+                non_empty(row.cwd.clone()),
+            )
+            .ok_or(AgentSessionPersistedCatalogError::InvalidLocalSession)?;
+            apply_persisted_metadata(&mut session, row, &self.catalog);
+            session.status = AgentSessionStatus::Stopped;
+            new_placeholders.push(session);
+        }
+
+        // Defensive ownership promotion: even if a caller staged a runtime request directly, a
+        // placeholder with live state must become runtime-owned before stale catalog rows prune.
+        let pending_ids = self
+            .pending_thread_requests
+            .iter()
+            .map(PendingThreadRequest::session_id)
+            .collect::<HashSet<_>>();
+        let promoted = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                self.persisted_placeholders.contains(&session.id)
+                    && (self.attached_threads.contains(&session.id)
+                        || pending_ids.contains(session.id.as_str())
+                        || session_has_runtime_state(session))
+            })
+            .map(|session| session.id.clone())
+            .collect::<HashSet<_>>();
+        self.persisted_placeholders
+            .retain(|session_id| !promoted.contains(session_id));
+
+        let removed_placeholders = self
+            .persisted_placeholders
+            .iter()
+            .filter(|session_id| !next_rows.contains_key(session_id.as_str()))
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.sessions
+            .retain(|session| !removed_placeholders.contains(&session.id));
+        self.persisted_placeholders
+            .retain(|session_id| !removed_placeholders.contains(session_id));
+        self.localized_session_errors
+            .retain(|session_id, _| !removed_placeholders.contains(session_id));
+
+        for session in &mut self.sessions {
+            if self.persisted_placeholders.contains(&session.id)
+                && let Some(row) = next_rows.get(&session.id)
+            {
+                apply_persisted_metadata(session, row, &self.catalog);
+                session.status = AgentSessionStatus::Stopped;
+            }
+        }
+        for session in new_placeholders {
+            self.persisted_placeholders.insert(session.id.clone());
+            self.sessions.push(session);
+        }
+
+        self.persisted_threads = next_rows;
+        self.persisted_thread_bytes = retained_bytes;
+        if self
+            .selected_session
+            .as_ref()
+            .is_some_and(|selected| removed_placeholders.contains(selected))
+        {
+            self.selected_session = None;
+            self.selected_surface = None;
+            self.selected_item = None;
+            self.follow_up.clear();
+            self.steer_input.clear();
+        }
+        Ok(())
     }
 
     /// Mutations are ordered exactly as emitted by the controller. In
@@ -711,6 +874,13 @@ impl AgentSessionsUi {
             .retain(|session| !target_ids.contains(&session.id));
         self.persisted_threads
             .retain(|session_id, _| !target_ids.contains(session_id));
+        self.persisted_placeholders
+            .retain(|session_id| !target_ids.contains(session_id));
+        self.persisted_thread_bytes = self
+            .persisted_threads
+            .values()
+            .map(persisted_row_retained_bytes)
+            .sum();
         self.localized_session_errors
             .retain(|session_id, _| !target_ids.contains(session_id));
         self.status_notices
@@ -1231,6 +1401,7 @@ impl AgentSessionsUi {
     }
 
     fn mark_history_request_started(&mut self, session_id: &str) {
+        self.persisted_placeholders.remove(session_id);
         self.localized_session_errors.remove(session_id);
         if let Some(session) = self
             .sessions
@@ -1441,6 +1612,7 @@ impl AgentSessionsUi {
     }
 
     fn remove_persisted_row(&mut self, session_id: &str) {
+        self.persisted_placeholders.remove(session_id);
         if let Some(row) = self.persisted_threads.remove(session_id) {
             self.persisted_thread_bytes = self
                 .persisted_thread_bytes
@@ -2882,6 +3054,10 @@ impl AgentSessionsUi {
     }
 
     fn apply_session_event(&mut self, session_id: &str, event: AgentSessionEvent) {
+        // Any event delivered by the runtime promotes a DB-synthesized row into controller-owned
+        // state. It must survive an authoritative catalog refresh even when the event itself leaves
+        // the visible lifecycle in `Stopped`.
+        self.persisted_placeholders.remove(session_id);
         self.localized_session_errors.remove(session_id);
         let gained_thread = matches!(&event, AgentSessionEvent::ThreadStarted { .. });
         let changed = self
@@ -3052,6 +3228,17 @@ fn persisted_row_retained_bytes(row: &AgentSessionPersistedRow) -> usize {
         .saturating_add(row.title.len())
         .saturating_add(row.cwd.len())
         .saturating_add(row.model.as_ref().map_or(0, String::len))
+}
+
+fn session_has_runtime_state(session: &AgentSession) -> bool {
+    session.status != AgentSessionStatus::Stopped
+        || session.turn_id.is_some()
+        || session.thread_status.is_some()
+        || !session.items.is_empty()
+        || !session.approvals.is_empty()
+        || session.error.is_some()
+        || session.effort.is_some()
+        || !session.skills.is_empty()
 }
 
 #[allow(dead_code)] // Reachable from the pending App-level history import.
@@ -3874,6 +4061,192 @@ mod tests {
         assert!(ui.sessions.is_empty());
         assert!(ui.persisted_threads.is_empty());
         assert_eq!(ui.persisted_thread_bytes, 0);
+    }
+
+    #[test]
+    fn authoritative_persisted_catalog_replaces_exactly_and_removes_stale_placeholders() {
+        let mut ui = AgentSessionsUi::new();
+        ui.import_persisted_threads(vec![
+            persisted_row("local-1", "thread-1"),
+            persisted_row("local-stale", "thread-stale"),
+        ]);
+        assert!(ui.open_session("local-stale"));
+        let mut refreshed = persisted_row("local-1", "thread-1");
+        refreshed.title = "authoritative title".to_owned();
+        refreshed.workspace_id = "ws-2".to_owned();
+
+        ui.replace_persisted_threads(vec![
+            refreshed.clone(),
+            persisted_row("local-2", "thread-2"),
+        ])
+        .unwrap();
+
+        assert_eq!(ui.persisted_threads.len(), 2);
+        assert_eq!(ui.persisted_threads["local-1"], refreshed);
+        assert!(!ui.persisted_threads.contains_key("local-stale"));
+        assert!(
+            !ui.sessions
+                .iter()
+                .any(|session| session.id == "local-stale")
+        );
+        assert_eq!(
+            ui.sessions
+                .iter()
+                .find(|session| session.id == "local-1")
+                .unwrap()
+                .prompt,
+            "authoritative title"
+        );
+        assert!(ui.sessions.iter().any(|session| session.id == "local-2"));
+        assert!(ui.selected_session.is_none());
+        assert!(ui.selected_surface.is_none());
+        assert_eq!(
+            ui.persisted_thread_bytes,
+            ui.persisted_threads
+                .values()
+                .map(persisted_row_retained_bytes)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn authoritative_catalog_never_removes_running_pending_or_runtime_event_sessions() {
+        let mut ui = AgentSessionsUi::new();
+        ui.import_persisted_threads(vec![
+            persisted_row("event-owned", "thread-event"),
+            persisted_row("pending-owned", "thread-pending"),
+        ]);
+        ui.apply_session_event(
+            "event-owned",
+            AgentSessionEvent::TurnStarted {
+                turn_id: "turn-1".to_owned(),
+            },
+        );
+        ui.apply_session_event("event-owned", AgentSessionEvent::Stopped);
+        let (_pending_tx, pending_rx) = mpsc::channel();
+        ui.pending_thread_requests.push(PendingThreadRequest::Read {
+            session_id: "pending-owned".to_owned(),
+            reply: pending_rx,
+        });
+        let mut running = AgentSession::new("running-owned".to_owned(), "runtime".to_owned(), None);
+        running.status = AgentSessionStatus::Running;
+        ui.sessions.push(running);
+
+        ui.replace_persisted_threads(Vec::new()).unwrap();
+
+        assert!(ui.persisted_threads.is_empty());
+        assert_eq!(ui.persisted_thread_bytes, 0);
+        assert!(ui.sessions.iter().any(|session| {
+            session.id == "event-owned"
+                && session.status == AgentSessionStatus::Stopped
+                && session.turn_id.as_deref() == Some("turn-1")
+        }));
+        assert!(
+            ui.sessions
+                .iter()
+                .any(|session| session.id == "pending-owned")
+        );
+        assert!(
+            ui.sessions
+                .iter()
+                .any(|session| session.id == "running-owned")
+        );
+        assert_eq!(ui.pending_thread_requests.len(), 1);
+        assert!(ui.persisted_placeholders.is_empty());
+    }
+
+    #[test]
+    fn authoritative_catalog_rejections_roll_back_without_partial_application() {
+        let mut ui = AgentSessionsUi::new();
+        ui.import_persisted_threads(vec![persisted_row("kept", "thread-kept")]);
+        let expected_rows = ui.persisted_threads.clone();
+        let expected_bytes = ui.persisted_thread_bytes;
+        let expected_sessions = ui.session_ids();
+        let expected_placeholders = ui.persisted_placeholders.clone();
+
+        let assert_unchanged = |ui: &AgentSessionsUi| {
+            assert_eq!(ui.persisted_threads, expected_rows);
+            assert_eq!(ui.persisted_thread_bytes, expected_bytes);
+            assert_eq!(ui.session_ids(), expected_sessions);
+            assert_eq!(ui.persisted_placeholders, expected_placeholders);
+        };
+
+        let too_many = (0..=AGENT_SESSION_PERSISTED_MAX_ITEMS)
+            .map(|index| persisted_row(&format!("local-{index}"), &format!("thread-{index}")))
+            .collect();
+        assert_eq!(
+            ui.replace_persisted_threads(too_many).unwrap_err(),
+            AgentSessionPersistedCatalogError::TooManyItems
+        );
+        assert_unchanged(&ui);
+
+        let mut oversized = persisted_row("valid-first", "thread-valid-first");
+        oversized.title = "secret-row".repeat(AGENT_SESSION_PERSISTED_ROW_MAX_BYTES);
+        assert_eq!(
+            ui.replace_persisted_threads(vec![
+                persisted_row("would-partially-apply", "thread-new"),
+                oversized,
+            ])
+            .unwrap_err(),
+            AgentSessionPersistedCatalogError::RowTooLarge
+        );
+        assert_unchanged(&ui);
+
+        let total_overflow = (0..AGENT_SESSION_PERSISTED_MAX_ITEMS)
+            .map(|index| {
+                let mut row =
+                    persisted_row(&format!("total-{index}"), &format!("total-thread-{index}"));
+                row.title = "x".repeat(9_000);
+                row
+            })
+            .collect();
+        assert_eq!(
+            ui.replace_persisted_threads(total_overflow).unwrap_err(),
+            AgentSessionPersistedCatalogError::TotalBytesExceeded
+        );
+        assert_unchanged(&ui);
+
+        assert_eq!(
+            ui.replace_persisted_threads(vec![
+                persisted_row("duplicate", "thread-a"),
+                persisted_row("duplicate", "thread-b"),
+            ])
+            .unwrap_err(),
+            AgentSessionPersistedCatalogError::DuplicateLocalSession
+        );
+        assert_unchanged(&ui);
+        assert_eq!(
+            ui.replace_persisted_threads(vec![
+                persisted_row("local-a", "duplicate-thread"),
+                persisted_row("local-b", "duplicate-thread"),
+            ])
+            .unwrap_err(),
+            AgentSessionPersistedCatalogError::DuplicateThread
+        );
+        assert_unchanged(&ui);
+        assert_eq!(
+            ui.replace_persisted_threads(vec![persisted_row(
+                &"invalid".repeat(1_024),
+                "thread-invalid",
+            )])
+            .unwrap_err(),
+            AgentSessionPersistedCatalogError::InvalidLocalSession
+        );
+        assert_unchanged(&ui);
+    }
+
+    #[test]
+    fn persisted_catalog_debug_never_exposes_hostile_row_text() {
+        let secret = "super-secret-prompt-and-path";
+        let mut row = persisted_row(secret, secret);
+        row.workspace_id = secret.to_owned();
+        row.title = secret.to_owned();
+        row.cwd = secret.to_owned();
+        row.model = Some(secret.to_owned());
+
+        let row_debug = format!("{row:?}");
+        assert!(!row_debug.contains(secret));
+        assert!(!format!("{:?}", AgentSessionPersistedCatalogError::RowTooLarge).contains(secret));
     }
 
     #[test]

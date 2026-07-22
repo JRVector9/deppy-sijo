@@ -3,15 +3,15 @@
 
 mod db;
 pub use db::{
-    AGENT_STATE_BINDING_ROWS_MAX, AGENT_STATE_EXACT_MUTATIONS_MAX, AGENT_STATE_SNAPSHOT_BYTES_MAX,
-    AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX, AGENT_STATE_STRUCTURED_MUTATIONS_MAX,
-    AGENT_STATE_STRUCTURED_PROJECTION_MAX, AGENT_STATE_STRUCTURED_WORKSPACE_MAX,
-    ActiveAuthorizationOwner, ActivePendingApprovalOwner, AgentConfigRow,
-    AgentSessionBindingReconcile, AgentSessionIdentity, AgentSessionRow, AgentStateJob,
-    AgentStateSnapshot, AgentTurnDoneClear, ApprovalOutcome, ApprovalStatus,
-    CREDENTIAL_OAUTH_BINDING_BYTES_MAX, CREDENTIAL_SECRET_LOCATION_BYTES_MAX,
-    CREDENTIAL_SECRET_RECORD_BYTES_MAX, ConnectorConfigCas, ConnectorConfigRead,
-    ConnectorConfigRevision, CredentialMeta, CredentialOAuthBindingRecord,
+    AGENT_STATE_BINDING_ROWS_MAX, AGENT_STATE_EXACT_MUTATIONS_MAX, AGENT_STATE_JOB_BYTES_MAX,
+    AGENT_STATE_SNAPSHOT_BYTES_MAX, AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX,
+    AGENT_STATE_STRUCTURED_MUTATIONS_MAX, AGENT_STATE_STRUCTURED_PROJECTION_MAX,
+    AGENT_STATE_STRUCTURED_WORKSPACE_MAX, ActiveAuthorizationOwner, ActivePendingApprovalOwner,
+    AgentConfigRow, AgentSessionBindingReconcile, AgentSessionIdentity, AgentSessionRow,
+    AgentStateJob, AgentStateJobRetention, AgentStatePreparationErrorCode, AgentStateSnapshot,
+    AgentTurnDoneClear, ApprovalOutcome, ApprovalStatus, CREDENTIAL_OAUTH_BINDING_BYTES_MAX,
+    CREDENTIAL_SECRET_LOCATION_BYTES_MAX, CREDENTIAL_SECRET_RECORD_BYTES_MAX, ConnectorConfigCas,
+    ConnectorConfigRead, ConnectorConfigRevision, CredentialMeta, CredentialOAuthBindingRecord,
     CredentialSecretLocation, CredentialSecretRecord, Db, EnvApiProjectCount, EnvProfileRow,
     EnvValue, EnvVarRow, HookSessionRow, MCP_REQUEST_TARGET_CREDENTIAL_BYTES_MAX,
     MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX, McpRequestTargetRecord,
@@ -20,7 +20,7 @@ pub use db::{
     PendingApprovalRow, PermissionRuleRow, PhysicalSecretSlotLedgerRow, PhysicalSecretSlotState,
     SettingsWorkspaceProjectionRow, StatuslineRow, StructuredThreadMutation, StructuredThreadRow,
     WebPushSubscriptionRow, WorkspaceFindOrCreateResult, WorkspaceFolderAnchor,
-    WorkspaceMovedPathUpdate, WorkspaceRow,
+    WorkspaceMovedPathUpdate, WorkspaceRow, prepare_agent_state_job_for_retention,
 };
 pub use mcp_store::{
     MCP_PERMISSION_POINT_BYTES_MAX, MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX,

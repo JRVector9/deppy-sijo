@@ -202,3 +202,47 @@ pass, as do all-target check, dead-code-exempt strict Clippy, and targeted fmt. 
 needed an explicit `sum::<usize>()`; a concurrent app API mismatch transiently blocked a full run,
 which passed after root stabilized the shared tree. Root must now apply this API only for a current
 complete Catalog completion; partial or stale pages may never replace the catalog.
+
+## Bounded AgentState production cutover
+
+Agent hook/status, attention, persisted PTY binding, structured-session catalog, activity catalog,
+project-name, and resume-transcript state now flow through one lazy App-owned AgentState worker.
+Construction opens no database and creates no thread; the first real request opens one worker-owned
+connection. UI code consumes immutable snapshots and emits bounded mutations. Resume transcript
+inspection is off-thread, globally single-flight, item/byte/depth bounded, and returns only sanitized
+results. The production source-law test rejects the removed direct storage receivers, synchronous
+transcript probes, cached project-name path, and legacy persisted-thread import path.
+
+Exact work remains FIFO 8 with an aggregate 4 MiB ceiling. The UI retains at most one coalesced
+mutation per 500 persisted sessions, 32 KiB per row, and 4 MiB total. App prepares the largest
+actual-retained-byte prefix that fits the existing 16-item/512-KiB worker request ceiling, including
+Vec capacity, enum storage, String capacities, and the request wrapper. A maximum-size valid
+16-row UI batch therefore splits instead of being rejected; only a successfully staged prefix is
+removed. Shutdown quiesces producers, drains old scope, then drains at most 65 structured waves in
+the worst one-item-prefix case before one final binding/turn reconcile. Unknown delivery is reported
+once and never retried.
+
+Storage exposes independent hook/status, attention, binding, structured, and activity projection
+flags while preserving the legacy complete-projection constructor defaults. App starts every flag
+false and opts in only for the requested section; exact-only work performs no projection query.
+Omitted sections skip epoch lookup where possible, SQL preflight/select, parameter buffers, and
+output allocation. Selected projection validation, exact mutation, actual retained-byte validation,
+and commit remain in one IMMEDIATE transaction, so any selected-section failure rolls all co-staged
+mutations back and no fallible operation follows commit.
+
+Verification passes: app all-target check and literal strict Clippy; worker 22/22; transcript and
+detector 34/34 with one real-process smoke ignored; AgentSessions UI 47/47; structured-prefix 2/2;
+AgentState boundary 4/4; storage AgentState 25/25 and full storage 214/214; zero-allowlist boundary;
+the clean 23-crate dependency graph; full rustfmt and diff-check; and the complete security scan,
+including audit 52/52, MCP 103/103, and proxy 53/53 with one env-gated soak ignored. Three independent
+read-only audits found no remaining loss, shutdown, scope, selective-query, transaction, or retained-
+accounting blocker. Wall-clock 30-minute and Scenario A-E hardware measurements remain deliberately
+deferred until CR01/BG01 structural development is complete.
+
+The root full app run passed 841 executable unit tests with five explicit real-resource ignores;
+the only four unit failures were the checkout's previously recorded managed-sandbox bind denial in
+three approval Unix-datagram cases and one loopback LLM-proxy case. All four fail at resource bind
+before product behavior. The run also exposed a stale committed dotenv source-law sentinel that
+still named the deleted synchronous resume helper. It now inspects `apply_resume_probe_results` and
+requires the completion-time dotenv source-stamp and shell-only guards around the tracked WriteInput
+process exception; the corrected integration test passes 5/5 and literal strict Clippy passes again.

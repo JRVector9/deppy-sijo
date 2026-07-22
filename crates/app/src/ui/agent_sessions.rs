@@ -25,7 +25,7 @@ pub const AGENT_SESSION_SENSITIVE_ITEM_MAX_BYTES: usize = 32 * 1024;
 const AGENT_SESSION_TEXT_INPUT_MAX_BYTES: usize = 1024 * 1024;
 const AGENT_SESSION_PATH_INPUT_MAX_BYTES: usize = 32 * 1024;
 pub(crate) const AGENT_SESSION_PERSISTED_MAX_ITEMS: usize = 500;
-const AGENT_SESSION_PERSISTED_ROW_MAX_BYTES: usize = 32 * 1024;
+pub(crate) const AGENT_SESSION_PERSISTED_ROW_MAX_BYTES: usize = 32 * 1024;
 const AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES: usize = 4 * 1024 * 1024;
 // This panel owns one API-key draft at a time, so it remains below the shared credential corpus
 // budget of 64 items / 1 MiB while enforcing the same 32 KiB redaction-safe item ceiling.
@@ -293,7 +293,7 @@ pub(crate) fn agents_window_id() -> egui::Id {
 /// Storage mutations emitted by the structured-session controller. `App` owns
 /// the `Db`, so it drains and executes these after the frame without exposing a
 /// database connection to UI code.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AgentSessionPersistenceMutation {
     Upsert {
         local_session_id: AgentSessionId,
@@ -312,6 +312,264 @@ pub enum AgentSessionPersistenceMutation {
     Delete {
         local_session_id: AgentSessionId,
     },
+}
+
+impl AgentSessionPersistenceMutation {
+    fn local_session_id(&self) -> &str {
+        match self {
+            Self::Upsert {
+                local_session_id, ..
+            }
+            | Self::SetArchived {
+                local_session_id, ..
+            }
+            | Self::Delete { local_session_id } => local_session_id,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Upsert {
+                local_session_id,
+                workspace_id,
+                thread_id,
+                title,
+                cwd,
+                model,
+                ..
+            } => local_session_id
+                .len()
+                .saturating_add(workspace_id.len())
+                .saturating_add(thread_id.len())
+                .saturating_add(title.len())
+                .saturating_add(cwd.len())
+                .saturating_add(model.as_ref().map_or(0, String::len)),
+            Self::SetArchived {
+                local_session_id, ..
+            }
+            | Self::Delete { local_session_id } => local_session_id.len(),
+        }
+    }
+
+    fn canonicalize(mut self) -> Result<Self, AgentSessionPersistenceBacklogError> {
+        let valid_local_session =
+            AgentSession::try_new(self.local_session_id().to_owned(), String::new(), None)
+                .is_some();
+        let valid_fields = match &self {
+            Self::Upsert {
+                workspace_id,
+                thread_id,
+                title,
+                cwd,
+                model,
+                ..
+            } => {
+                !workspace_id.is_empty()
+                    && !thread_id.is_empty()
+                    && [workspace_id, thread_id, title, cwd]
+                        .into_iter()
+                        .all(|value| !value.as_bytes().contains(&0))
+                    && model
+                        .as_ref()
+                        .is_none_or(|value| !value.as_bytes().contains(&0))
+            }
+            Self::SetArchived { .. } | Self::Delete { .. } => true,
+        };
+        if !valid_local_session || !valid_fields {
+            return Err(AgentSessionPersistenceBacklogError::InvalidInput);
+        }
+        if self.retained_bytes() > AGENT_SESSION_PERSISTED_ROW_MAX_BYTES {
+            return Err(AgentSessionPersistenceBacklogError::RowTooLarge);
+        }
+        match &mut self {
+            Self::Upsert {
+                local_session_id,
+                workspace_id,
+                thread_id,
+                title,
+                cwd,
+                model,
+                ..
+            } => {
+                canonicalize_persistence_string(local_session_id);
+                canonicalize_persistence_string(workspace_id);
+                canonicalize_persistence_string(thread_id);
+                canonicalize_persistence_string(title);
+                canonicalize_persistence_string(cwd);
+                if let Some(model) = model {
+                    canonicalize_persistence_string(model);
+                }
+            }
+            Self::SetArchived {
+                local_session_id, ..
+            }
+            | Self::Delete { local_session_id } => {
+                canonicalize_persistence_string(local_session_id);
+            }
+        }
+        Ok(self)
+    }
+}
+
+impl std::fmt::Debug for AgentSessionPersistenceMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, archived) = match self {
+            Self::Upsert { archived, .. } => ("upsert", Some(*archived)),
+            Self::SetArchived { archived, .. } => ("set_archived", Some(*archived)),
+            Self::Delete { .. } => ("delete", None),
+        };
+        formatter
+            .debug_struct("AgentSessionPersistenceMutation")
+            .field("kind", &kind)
+            .field("archived", &archived)
+            .field("local_session_id", &"REDACTED")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AgentSessionPersistenceBacklogError {
+    InvalidInput,
+    TooManyItems,
+    RowTooLarge,
+    TotalBytesExceeded,
+}
+
+impl AgentSessionPersistenceBacklogError {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::TooManyItems => "too_many_items",
+            Self::RowTooLarge => "row_too_large",
+            Self::TotalBytesExceeded => "total_bytes_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Debug for AgentSessionPersistenceBacklogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for AgentSessionPersistenceBacklogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for AgentSessionPersistenceBacklogError {}
+
+#[derive(Default)]
+struct AgentSessionPersistenceBacklog {
+    entries: Vec<AgentSessionPersistenceMutation>,
+    retained_bytes: usize,
+}
+
+impl AgentSessionPersistenceBacklog {
+    fn try_push(
+        &mut self,
+        incoming: AgentSessionPersistenceMutation,
+    ) -> Result<(), AgentSessionPersistenceBacklogError> {
+        let incoming = incoming.canonicalize()?;
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|existing| existing.local_session_id() == incoming.local_session_id())
+        {
+            let candidate =
+                coalesce_persistence_mutation(&self.entries[index], incoming).canonicalize()?;
+            let previous_bytes = self.entries[index].retained_bytes();
+            let candidate_bytes = candidate.retained_bytes();
+            let next_bytes = self
+                .retained_bytes
+                .checked_sub(previous_bytes)
+                .and_then(|bytes| bytes.checked_add(candidate_bytes))
+                .ok_or(AgentSessionPersistenceBacklogError::TotalBytesExceeded)?;
+            if next_bytes > AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES {
+                return Err(AgentSessionPersistenceBacklogError::TotalBytesExceeded);
+            }
+            self.entries[index] = candidate;
+            self.retained_bytes = next_bytes;
+            return Ok(());
+        }
+        if self.entries.len() >= AGENT_SESSION_PERSISTED_MAX_ITEMS {
+            return Err(AgentSessionPersistenceBacklogError::TooManyItems);
+        }
+        let next_bytes = self
+            .retained_bytes
+            .checked_add(incoming.retained_bytes())
+            .ok_or(AgentSessionPersistenceBacklogError::TotalBytesExceeded)?;
+        if next_bytes > AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES {
+            return Err(AgentSessionPersistenceBacklogError::TotalBytesExceeded);
+        }
+        self.entries.push(incoming);
+        self.retained_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn drain_bounded(&mut self, limit: usize) -> Vec<AgentSessionPersistenceMutation> {
+        let take = self.entries.len().min(limit);
+        if take == 0 {
+            return Vec::new();
+        }
+        let drained = self.entries.drain(..take).collect::<Vec<_>>();
+        self.retained_bytes = self
+            .entries
+            .iter()
+            .map(AgentSessionPersistenceMutation::retained_bytes)
+            .sum();
+        canonicalize_persistence_vec(&mut self.entries);
+        drained.into_boxed_slice().into_vec()
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&AgentSessionPersistenceMutation) -> bool) {
+        self.entries.retain(|mutation| keep(mutation));
+        self.retained_bytes = self
+            .entries
+            .iter()
+            .map(AgentSessionPersistenceMutation::retained_bytes)
+            .sum();
+        canonicalize_persistence_vec(&mut self.entries);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn canonicalize_persistence_string(value: &mut String) {
+    *value = std::mem::take(value).into_boxed_str().into_string();
+}
+
+fn canonicalize_persistence_vec(values: &mut Vec<AgentSessionPersistenceMutation>) {
+    *values = std::mem::take(values).into_boxed_slice().into_vec();
+}
+
+fn coalesce_persistence_mutation(
+    existing: &AgentSessionPersistenceMutation,
+    incoming: AgentSessionPersistenceMutation,
+) -> AgentSessionPersistenceMutation {
+    match (existing, incoming) {
+        (
+            AgentSessionPersistenceMutation::Upsert { .. },
+            AgentSessionPersistenceMutation::SetArchived { archived, .. },
+        ) => {
+            let mut candidate = existing.clone();
+            if let AgentSessionPersistenceMutation::Upsert {
+                archived: current, ..
+            } = &mut candidate
+            {
+                *current = archived;
+            }
+            candidate
+        }
+        (
+            AgentSessionPersistenceMutation::Delete { .. },
+            AgentSessionPersistenceMutation::SetArchived { .. },
+        ) => existing.clone(),
+        (_, incoming) => incoming,
+    }
 }
 
 enum PendingThreadRequest {
@@ -375,7 +633,7 @@ pub struct AgentSessionsUi {
     persisted_placeholders: HashSet<AgentSessionId>,
     attached_threads: HashSet<AgentSessionId>,
     pending_thread_requests: Vec<PendingThreadRequest>,
-    persistence_mutations: Vec<AgentSessionPersistenceMutation>,
+    persistence_backlog: AgentSessionPersistenceBacklog,
     model_catalog: Vec<CodexModelInfo>,
     skill_catalog: Vec<CodexSkillInfo>,
     selected_skill_paths: HashSet<String>,
@@ -435,7 +693,7 @@ impl AgentSessionsUi {
             persisted_placeholders: HashSet::new(),
             attached_threads: HashSet::new(),
             pending_thread_requests: Vec::new(),
-            persistence_mutations: Vec::new(),
+            persistence_backlog: AgentSessionPersistenceBacklog::default(),
             model_catalog: Vec::new(),
             skill_catalog: Vec::new(),
             selected_skill_paths: HashSet::new(),
@@ -744,11 +1002,17 @@ impl AgentSessionsUi {
         Ok(())
     }
 
-    /// Mutations are ordered exactly as emitted by the controller. In
-    /// particular, archive is not emitted until `thread/archive` succeeds.
-    #[allow(dead_code)] // App wiring executes these against its owned Db.
-    pub fn drain_persistence_mutations(&mut self) -> Vec<AgentSessionPersistenceMutation> {
-        std::mem::take(&mut self.persistence_mutations)
+    /// Drain the oldest independent final-state mutations. Each local session occupies at most one
+    /// bounded slot; repeated changes are coalesced before App observes them.
+    pub fn drain_persistence_mutations_bounded(
+        &mut self,
+        limit: usize,
+    ) -> Vec<AgentSessionPersistenceMutation> {
+        self.persistence_backlog.drain_bounded(limit)
+    }
+
+    pub fn pending_persistence_mutation_count(&self) -> usize {
+        self.persistence_backlog.len()
     }
 
     /// Surface App-owned database failures in the existing Agents error area.
@@ -756,6 +1020,20 @@ impl AgentSessionsUi {
     #[allow(dead_code)] // Called by the App-level Db mutation executor.
     pub fn report_persistence_error(&mut self, message: String) {
         self.transport_error = Some(CatalogMessage::raw(message));
+    }
+
+    fn queue_persistence_mutation(
+        &mut self,
+        mutation: AgentSessionPersistenceMutation,
+    ) -> Result<(), AgentSessionPersistenceBacklogError> {
+        self.persistence_backlog
+            .try_push(mutation)
+            .inspect_err(|error| {
+                self.transport_error = Some(CatalogMessage::raw(format!(
+                    "structured_persistence_{}",
+                    error.as_str()
+                )));
+            })
     }
 
     pub fn read_selected_persisted(&mut self, ctx: &egui::Context) -> anyhow::Result<()> {
@@ -825,15 +1103,14 @@ impl AgentSessionsUi {
             self.catalog
                 .t("agent_sessions.error.delete_attached_thread", &[])
         );
+        self.queue_persistence_mutation(AgentSessionPersistenceMutation::Delete {
+            local_session_id: session_id.clone(),
+        })?;
         self.remove_persisted_row(&session_id);
         self.sessions.retain(|session| session.id != session_id);
         self.localized_session_errors.remove(&session_id);
         self.pending_thread_requests
             .retain(|pending| pending.session_id() != session_id);
-        self.persistence_mutations
-            .push(AgentSessionPersistenceMutation::Delete {
-                local_session_id: session_id.clone(),
-            });
         if self.selected_session.as_deref() == Some(session_id.as_str()) {
             self.selected_session = None;
             self.selected_surface = None;
@@ -885,18 +1162,17 @@ impl AgentSessionsUi {
             .retain(|session_id, _| !target_ids.contains(session_id));
         self.status_notices
             .retain(|notice| notice.workspace_id != workspace_id);
-        self.persistence_mutations
-            .retain(|mutation| match mutation {
-                AgentSessionPersistenceMutation::Upsert {
-                    workspace_id: id, ..
-                } => id != workspace_id,
-                AgentSessionPersistenceMutation::SetArchived {
-                    local_session_id, ..
-                }
-                | AgentSessionPersistenceMutation::Delete { local_session_id } => {
-                    !target_ids.contains(local_session_id)
-                }
-            });
+        self.persistence_backlog.retain(|mutation| match mutation {
+            AgentSessionPersistenceMutation::Upsert {
+                workspace_id: id, ..
+            } => id != workspace_id,
+            AgentSessionPersistenceMutation::SetArchived {
+                local_session_id, ..
+            }
+            | AgentSessionPersistenceMutation::Delete { local_session_id } => {
+                !target_ids.contains(local_session_id)
+            }
+        });
         if self
             .selected_session
             .as_ref()
@@ -1463,6 +1739,15 @@ impl AgentSessionsUi {
             },
             PendingThreadRequest::Archive { session_id, .. } => match result {
                 Ok(_) => {
+                    if self
+                        .queue_persistence_mutation(AgentSessionPersistenceMutation::SetArchived {
+                            local_session_id: session_id.clone(),
+                            archived: true,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                     self.attached_threads.remove(&session_id);
                     self.remove_persisted_row(&session_id);
                     self.sessions.retain(|session| session.id != session_id);
@@ -1473,11 +1758,6 @@ impl AgentSessionsUi {
                         self.selected_item = None;
                         self.follow_up.clear();
                     }
-                    self.persistence_mutations
-                        .push(AgentSessionPersistenceMutation::SetArchived {
-                            local_session_id: session_id,
-                            archived: true,
-                        });
                 }
                 Err(error) => {
                     self.fail_session_localized(
@@ -1560,7 +1840,7 @@ impl AgentSessionsUi {
         let (created_at, updated_at) = existing
             .map(|row| (row.created_at, row.updated_at))
             .unwrap_or((0, 0));
-        self.store_persisted_row(AgentSessionPersistedRow {
+        let row = AgentSessionPersistedRow {
             local_session_id: session_id.to_owned(),
             workspace_id: workspace_id.clone(),
             thread_id: thread_id.clone(),
@@ -1571,22 +1851,28 @@ impl AgentSessionsUi {
             archived,
             created_at,
             updated_at,
-        });
-        self.persistence_mutations
-            .push(AgentSessionPersistenceMutation::Upsert {
-                local_session_id: session_id.to_owned(),
-                workspace_id,
-                thread_id,
-                title,
-                cwd,
-                model,
-                favorite,
-                archived,
-            });
+        };
+        if !self.can_store_persisted_row(&row)
+            || self
+                .queue_persistence_mutation(AgentSessionPersistenceMutation::Upsert {
+                    local_session_id: session_id.to_owned(),
+                    workspace_id,
+                    thread_id,
+                    title,
+                    cwd,
+                    model,
+                    favorite,
+                    archived,
+                })
+                .is_err()
+        {
+            return;
+        }
+        debug_assert!(self.store_persisted_row(row));
     }
 
-    fn store_persisted_row(&mut self, row: AgentSessionPersistedRow) -> bool {
-        let row_bytes = persisted_row_retained_bytes(&row);
+    fn can_store_persisted_row(&self, row: &AgentSessionPersistedRow) -> bool {
+        let row_bytes = persisted_row_retained_bytes(row);
         if row_bytes > AGENT_SESSION_PERSISTED_ROW_MAX_BYTES {
             return false;
         }
@@ -1602,9 +1888,22 @@ impl AgentSessionsUi {
             .persisted_thread_bytes
             .saturating_sub(previous_bytes)
             .saturating_add(row_bytes);
-        if next_bytes > AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES {
+        next_bytes <= AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES
+    }
+
+    fn store_persisted_row(&mut self, row: AgentSessionPersistedRow) -> bool {
+        if !self.can_store_persisted_row(&row) {
             return false;
         }
+        let row_bytes = persisted_row_retained_bytes(&row);
+        let previous_bytes = self
+            .persisted_threads
+            .get(&row.local_session_id)
+            .map_or(0, persisted_row_retained_bytes);
+        let next_bytes = self
+            .persisted_thread_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(row_bytes);
         self.persisted_thread_bytes = next_bytes;
         self.persisted_threads
             .insert(row.local_session_id.clone(), row);
@@ -3552,6 +3851,36 @@ mod tests {
         }
     }
 
+    fn upsert_mutation(
+        local_session_id: &str,
+        title: impl Into<String>,
+        archived: bool,
+    ) -> AgentSessionPersistenceMutation {
+        AgentSessionPersistenceMutation::Upsert {
+            local_session_id: local_session_id.to_owned(),
+            workspace_id: "w".to_owned(),
+            thread_id: format!("thread-{local_session_id}"),
+            title: title.into(),
+            cwd: "/".to_owned(),
+            model: None,
+            favorite: false,
+            archived,
+        }
+    }
+
+    fn archive_mutation(local_session_id: &str, archived: bool) -> AgentSessionPersistenceMutation {
+        AgentSessionPersistenceMutation::SetArchived {
+            local_session_id: local_session_id.to_owned(),
+            archived,
+        }
+    }
+
+    fn delete_mutation(local_session_id: &str) -> AgentSessionPersistenceMutation {
+        AgentSessionPersistenceMutation::Delete {
+            local_session_id: local_session_id.to_owned(),
+        }
+    }
+
     fn thread_result(thread_id: &str) -> serde_json::Value {
         json!({
             "thread": {
@@ -4310,6 +4639,249 @@ mod tests {
     }
 
     #[test]
+    fn persistence_backlog_coalesces_every_transition_pair() {
+        let cases = [
+            (
+                upsert_mutation("local", "old", false),
+                upsert_mutation("local", "new", true),
+                upsert_mutation("local", "new", true),
+            ),
+            (
+                upsert_mutation("local", "old", false),
+                archive_mutation("local", true),
+                upsert_mutation("local", "old", true),
+            ),
+            (
+                upsert_mutation("local", "old", false),
+                delete_mutation("local"),
+                delete_mutation("local"),
+            ),
+            (
+                archive_mutation("local", false),
+                upsert_mutation("local", "new", true),
+                upsert_mutation("local", "new", true),
+            ),
+            (
+                archive_mutation("local", false),
+                archive_mutation("local", true),
+                archive_mutation("local", true),
+            ),
+            (
+                archive_mutation("local", false),
+                delete_mutation("local"),
+                delete_mutation("local"),
+            ),
+            (
+                delete_mutation("local"),
+                upsert_mutation("local", "recreated", false),
+                upsert_mutation("local", "recreated", false),
+            ),
+            (
+                delete_mutation("local"),
+                archive_mutation("local", true),
+                delete_mutation("local"),
+            ),
+            (
+                delete_mutation("local"),
+                delete_mutation("local"),
+                delete_mutation("local"),
+            ),
+        ];
+        for (first, second, expected) in cases {
+            let mut backlog = AgentSessionPersistenceBacklog::default();
+            backlog.try_push(first).unwrap();
+            backlog.try_push(second).unwrap();
+            assert_eq!(backlog.entries, vec![expected]);
+            assert_eq!(backlog.retained_bytes, backlog.entries[0].retained_bytes());
+        }
+    }
+
+    #[test]
+    fn persistence_backlog_preserves_first_seen_order_across_independent_ids() {
+        let mut backlog = AgentSessionPersistenceBacklog::default();
+        backlog
+            .try_push(upsert_mutation("local-a", "a", false))
+            .unwrap();
+        backlog.try_push(delete_mutation("local-b")).unwrap();
+        backlog.try_push(archive_mutation("local-a", true)).unwrap();
+        backlog
+            .try_push(upsert_mutation("local-c", "c", false))
+            .unwrap();
+        backlog
+            .try_push(upsert_mutation("local-b", "recreated", false))
+            .unwrap();
+
+        let drained = backlog.drain_bounded(AGENT_SESSION_PERSISTED_MAX_ITEMS);
+        assert_eq!(
+            drained
+                .iter()
+                .map(AgentSessionPersistenceMutation::local_session_id)
+                .collect::<Vec<_>>(),
+            vec!["local-a", "local-b", "local-c"]
+        );
+        assert!(matches!(
+            &drained[0],
+            AgentSessionPersistenceMutation::Upsert { archived: true, .. }
+        ));
+        assert!(matches!(
+            &drained[1],
+            AgentSessionPersistenceMutation::Upsert { title, .. } if title == "recreated"
+        ));
+    }
+
+    #[test]
+    fn persistence_backlog_accepts_exact_item_and_byte_bounds_then_rolls_back_plus_one() {
+        let mut items = AgentSessionPersistenceBacklog::default();
+        for index in 0..AGENT_SESSION_PERSISTED_MAX_ITEMS {
+            items
+                .try_push(delete_mutation(&format!("item-{index}")))
+                .unwrap();
+        }
+        let item_bytes = items.retained_bytes;
+        assert_eq!(items.len(), AGENT_SESSION_PERSISTED_MAX_ITEMS);
+        assert_eq!(
+            items.try_push(delete_mutation("item-overflow")),
+            Err(AgentSessionPersistenceBacklogError::TooManyItems)
+        );
+        assert_eq!(items.len(), AGENT_SESSION_PERSISTED_MAX_ITEMS);
+        assert_eq!(items.retained_bytes, item_bytes);
+
+        let mut bytes = AgentSessionPersistenceBacklog::default();
+        for index in
+            0..(AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES / AGENT_SESSION_PERSISTED_ROW_MAX_BYTES)
+        {
+            let local_session_id = format!("byte-{index}");
+            let thread_id = format!("thread-{local_session_id}");
+            let fixed_bytes = local_session_id.len() + 1 + thread_id.len() + 1;
+            let title = "x".repeat(AGENT_SESSION_PERSISTED_ROW_MAX_BYTES - fixed_bytes);
+            bytes
+                .try_push(AgentSessionPersistenceMutation::Upsert {
+                    local_session_id,
+                    workspace_id: "w".to_owned(),
+                    thread_id,
+                    title,
+                    cwd: "/".to_owned(),
+                    model: None,
+                    favorite: false,
+                    archived: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            bytes.retained_bytes,
+            AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES
+        );
+        let exact_entries = bytes.len();
+        assert_eq!(
+            bytes.try_push(delete_mutation("byte-overflow")),
+            Err(AgentSessionPersistenceBacklogError::TotalBytesExceeded)
+        );
+        assert_eq!(bytes.len(), exact_entries);
+        assert_eq!(
+            bytes.retained_bytes,
+            AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn persistence_backlog_canonicalizes_allocations_and_bounded_drain_releases_capacity() {
+        let mut oversized_capacity = String::with_capacity(1024 * 1024);
+        oversized_capacity.push_str("canonical");
+        let mut backlog = AgentSessionPersistenceBacklog::default();
+        backlog
+            .try_push(upsert_mutation(
+                "local-canonical",
+                oversized_capacity,
+                false,
+            ))
+            .unwrap();
+        let AgentSessionPersistenceMutation::Upsert { title, .. } = &backlog.entries[0] else {
+            panic!("expected upsert")
+        };
+        assert_eq!(title.capacity(), title.len());
+
+        for index in 0..31 {
+            backlog
+                .try_push(delete_mutation(&format!("drain-{index}")))
+                .unwrap();
+        }
+        let drained = backlog.drain_bounded(7);
+        assert_eq!(drained.len(), 7);
+        assert_eq!(drained.capacity(), drained.len());
+        assert_eq!(backlog.entries.capacity(), backlog.entries.len());
+        let remaining = backlog.len();
+        assert_eq!(backlog.drain_bounded(usize::MAX).len(), remaining);
+        assert!(backlog.entries.is_empty());
+        assert_eq!(backlog.entries.capacity(), 0);
+        assert_eq!(backlog.retained_bytes, 0);
+    }
+
+    #[test]
+    fn persistence_backlog_failure_is_fail_closed_and_debug_is_hostile_safe() {
+        let secret = "private-session-marker";
+        let mutation = AgentSessionPersistenceMutation::Upsert {
+            local_session_id: secret.to_owned(),
+            workspace_id: "private-workspace".to_owned(),
+            thread_id: "private-thread".to_owned(),
+            title: "private-title".to_owned(),
+            cwd: "/private/cwd".to_owned(),
+            model: Some("private-model".to_owned()),
+            favorite: false,
+            archived: false,
+        };
+        let debug = format!("{mutation:?}");
+        for raw in [
+            secret,
+            "private-workspace",
+            "private-thread",
+            "private-title",
+            "/private/cwd",
+            "private-model",
+        ] {
+            assert!(!debug.contains(raw));
+        }
+
+        let mut backlog = AgentSessionPersistenceBacklog::default();
+        backlog.try_push(delete_mutation("safe")).unwrap();
+        let before = backlog.entries.clone();
+        let before_bytes = backlog.retained_bytes;
+        assert_eq!(
+            backlog.try_push(delete_mutation("../invalid\0id")),
+            Err(AgentSessionPersistenceBacklogError::InvalidInput)
+        );
+        assert_eq!(backlog.entries, before);
+        assert_eq!(backlog.retained_bytes, before_bytes);
+        assert_eq!(
+            format!("{:?}", AgentSessionPersistenceBacklogError::InvalidInput),
+            "invalid_input"
+        );
+    }
+
+    #[test]
+    fn delete_admission_failure_preserves_ui_projection() {
+        let mut ui = AgentSessionsUi::new();
+        ui.import_persisted_threads(vec![persisted_row("delete-target", "thread-target")]);
+        assert!(ui.open_session("delete-target"));
+        for index in 0..AGENT_SESSION_PERSISTED_MAX_ITEMS {
+            ui.persistence_backlog
+                .try_push(delete_mutation(&format!("pending-{index}")))
+                .unwrap();
+        }
+
+        let error = ui.delete_selected_persisted().unwrap_err();
+        assert_eq!(error.to_string(), "too_many_items");
+        assert!(ui.persisted_threads.contains_key("delete-target"));
+        assert!(
+            ui.sessions
+                .iter()
+                .any(|session| session.id == "delete-target")
+        );
+        assert_eq!(ui.selected_session.as_deref(), Some("delete-target"));
+        let rendered = ui.transport_error.as_ref().unwrap().render(&ui.catalog);
+        assert_eq!(rendered, "structured_persistence_too_many_items");
+    }
+
+    #[test]
     fn read_and_resume_replies_poll_nonblocking_and_keep_recovery_selected() {
         let mut read_ui = AgentSessionsUi::new();
         read_ui.import_persisted_threads(vec![persisted_row("local-read", "thread-read")]);
@@ -4329,7 +4901,11 @@ mod tests {
         assert_eq!(read_ui.sessions[0].items[0].summary, "restored");
         assert_eq!(read_ui.sessions[0].status, AgentSessionStatus::Ready);
         assert!(!read_ui.attached_threads.contains("local-read"));
-        assert!(read_ui.drain_persistence_mutations().is_empty());
+        assert!(
+            read_ui
+                .drain_persistence_mutations_bounded(AGENT_SESSION_PERSISTED_MAX_ITEMS)
+                .is_empty()
+        );
 
         let mut resume_ui = AgentSessionsUi::new();
         resume_ui.import_persisted_threads(vec![persisted_row("local-1", "thread-1")]);
@@ -4352,7 +4928,7 @@ mod tests {
             Some(AgentSurfaceId::Structured { ref session_id }) if session_id == "local-1"
         ));
         assert_eq!(
-            resume_ui.drain_persistence_mutations(),
+            resume_ui.drain_persistence_mutations_bounded(AGENT_SESSION_PERSISTED_MAX_ITEMS),
             vec![AgentSessionPersistenceMutation::Upsert {
                 local_session_id: "local-1".to_owned(),
                 workspace_id: "ws-1".to_owned(),
@@ -4379,7 +4955,10 @@ mod tests {
             });
 
         ui.poll_thread_replies();
-        assert!(ui.drain_persistence_mutations().is_empty());
+        assert!(
+            ui.drain_persistence_mutations_bounded(AGENT_SESSION_PERSISTED_MAX_ITEMS)
+                .is_empty()
+        );
         assert!(!ui.persisted_threads["local-1"].archived);
         assert_eq!(ui.selected_session.as_deref(), Some("local-1"));
 
@@ -4390,7 +4969,7 @@ mod tests {
         assert!(ui.selected_session.is_none());
         assert!(ui.selected_surface.is_none());
         assert_eq!(
-            ui.drain_persistence_mutations(),
+            ui.drain_persistence_mutations_bounded(AGENT_SESSION_PERSISTED_MAX_ITEMS),
             vec![AgentSessionPersistenceMutation::SetArchived {
                 local_session_id: "local-1".to_owned(),
                 archived: true,
@@ -4414,7 +4993,7 @@ mod tests {
         assert!(ui.persisted_threads.contains_key("local-2"));
         assert!(ui.selected_surface.is_none());
         assert_eq!(
-            ui.drain_persistence_mutations(),
+            ui.drain_persistence_mutations_bounded(AGENT_SESSION_PERSISTED_MAX_ITEMS),
             vec![AgentSessionPersistenceMutation::Delete {
                 local_session_id: "local-1".to_owned(),
             }]
@@ -4442,7 +5021,7 @@ mod tests {
             );
         }
 
-        let mutations = ui.drain_persistence_mutations();
+        let mutations = ui.drain_persistence_mutations_bounded(AGENT_SESSION_PERSISTED_MAX_ITEMS);
         assert_eq!(mutations.len(), 1);
         assert!(matches!(
             &mutations[0],
@@ -4543,23 +5122,25 @@ mod tests {
         ws2.workspace_id = "ws-2".to_owned();
         safe.import_persisted_threads(vec![ws1, ws2]);
         safe.open_session("local-1");
-        safe.persistence_mutations
-            .push(AgentSessionPersistenceMutation::Delete {
+        safe.persistence_backlog
+            .try_push(AgentSessionPersistenceMutation::Delete {
                 local_session_id: "local-1".to_owned(),
-            });
-        safe.persistence_mutations
-            .push(AgentSessionPersistenceMutation::Delete {
+            })
+            .unwrap();
+        safe.persistence_backlog
+            .try_push(AgentSessionPersistenceMutation::Delete {
                 local_session_id: "local-2".to_owned(),
-            });
+            })
+            .unwrap();
 
         safe.prepare_workspace_delete("ws-1").unwrap();
         assert_eq!(safe.session_ids(), vec!["local-2".to_owned()]);
         assert!(!safe.persisted_threads.contains_key("local-1"));
         assert!(safe.persisted_threads.contains_key("local-2"));
         assert!(safe.selected_surface.is_none());
-        assert_eq!(safe.persistence_mutations.len(), 1);
+        assert_eq!(safe.persistence_backlog.len(), 1);
         assert!(matches!(
-            &safe.persistence_mutations[0],
+            &safe.persistence_backlog.entries[0],
             AgentSessionPersistenceMutation::Delete { local_session_id }
                 if local_session_id == "local-2"
         ));
@@ -4722,7 +5303,7 @@ mod tests {
         );
 
         assert_eq!(ui.sessions[0].model.as_deref(), Some("gpt-new"));
-        let mutations = ui.drain_persistence_mutations();
+        let mutations = ui.drain_persistence_mutations_bounded(AGENT_SESSION_PERSISTED_MAX_ITEMS);
         assert_eq!(mutations.len(), 1);
         assert!(matches!(
             &mutations[0],

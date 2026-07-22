@@ -105,15 +105,17 @@ fn production_perf_harness_still_uses_its_frozen_entrypoints() {
 
 #[test]
 fn agent_resume_write_input_process_exception_is_explicitly_tracked() {
-    let body = function_body(production_source(), "send_agent_resume");
+    let body = function_body(production_source(), "apply_resume_probe_results");
     for marker in [
         "claude --resume",
         "codex resume",
         "RuntimeCommand::WriteInput",
+        "dotenv_state_for_root",
+        "resume_probe_completion_allowed",
     ] {
         assert!(
             body.contains(marker),
-            "the known ResumeAgent WriteInput process exception changed ({}); decide whether resume now has a safe freshness gate, then update or remove this debt sentinel",
+            "the known ResumeAgent WriteInput process exception or its completion-time freshness gate changed ({}); update the gated flow or remove this debt sentinel",
             marker
         );
     }

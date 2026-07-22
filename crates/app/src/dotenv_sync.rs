@@ -1321,6 +1321,7 @@ impl std::fmt::Debug for DotenvWorkerCorrelation {
 /// Static, low-cardinality failure codes crossing the worker boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DotenvWorkerErrorCode {
+    #[cfg(test)]
     ResourceOpenFailed,
     ExecuteFailed,
     WorkerPanicked,
@@ -1333,6 +1334,7 @@ pub enum DotenvWorkerErrorCode {
 impl std::fmt::Display for DotenvWorkerErrorCode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            #[cfg(test)]
             Self::ResourceOpenFailed => "dotenv_worker_resource_open_failed",
             Self::ExecuteFailed => "dotenv_worker_execute_failed",
             Self::WorkerPanicked => "dotenv_worker_panicked",
@@ -1369,12 +1371,18 @@ pub struct ReplacedDotenvState<J> {
 }
 
 impl<J> ReplacedDotenvState<J> {
+    #[cfg(test)]
     pub fn correlation(&self) -> DotenvWorkerCorrelation {
         self.correlation
     }
 
+    #[cfg(test)]
     pub fn into_payload(self) -> J {
         self.payload
+    }
+
+    pub fn into_parts(self) -> (DotenvWorkerCorrelation, J) {
+        (self.correlation, self.payload)
     }
 }
 
@@ -1395,16 +1403,23 @@ pub struct DotenvWorkerSubmitError<J> {
 }
 
 impl<J> DotenvWorkerSubmitError<J> {
+    #[cfg(test)]
     pub fn code(&self) -> DotenvWorkerErrorCode {
         self.code
     }
 
+    #[cfg(test)]
     pub fn correlation(&self) -> DotenvWorkerCorrelation {
         self.correlation
     }
 
+    #[cfg(test)]
     pub fn into_payload(self) -> J {
         self.payload
+    }
+
+    pub fn into_parts(self) -> (DotenvWorkerErrorCode, DotenvWorkerCorrelation, J) {
+        (self.code, self.correlation, self.payload)
     }
 }
 
@@ -1426,10 +1441,6 @@ pub struct DotenvWorkerOutcome<O> {
 }
 
 impl<O> DotenvWorkerOutcome<O> {
-    pub fn correlation(&self) -> DotenvWorkerCorrelation {
-        self.correlation
-    }
-
     pub fn operation_id(&self) -> u64 {
         self.correlation.operation_id()
     }
@@ -1659,6 +1670,7 @@ impl<J: Send + 'static, O: Send + 'static, R: Send + 'static> LazyDotenvWorker<J
         None
     }
 
+    #[cfg(test)]
     pub fn is_thread_running(&self) -> bool {
         self.slot.as_ref().is_some_and(|slot| {
             slot.state
@@ -1669,6 +1681,7 @@ impl<J: Send + 'static, O: Send + 'static, R: Send + 'static> LazyDotenvWorker<J
         })
     }
 
+    #[cfg(test)]
     pub fn continuation_outstanding(&self) -> usize {
         self.continuation_operations.len()
     }

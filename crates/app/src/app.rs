@@ -20,12 +20,221 @@ const APP_NOTICE_TEXT_MAX_BYTES: usize = 4 * 1024;
 const ENV_PROFILE_PROJECTION_MAX: usize = 256;
 const ENV_VARIABLE_PROJECTION_MAX: usize = 4_096;
 const ENV_PROJECT_PROJECTION_MAX: usize = 256;
-const HOOK_PREFIX_PROJECTION_MAX: usize = 256;
-const WAITING_SESSION_PROJECTION_MAX: usize = 4_096;
-const AGENT_SESSION_PROJECTION_MAX: usize = 256;
-const ACTIVITY_PANE_PROJECTION_MAX: usize =
-    ui::activity::MAX_ACTIVITY_WORKSPACES * ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE;
+#[derive(Clone, PartialEq, Eq)]
+struct AppAgentStateScope {
+    epoch: u64,
+    workspace_id: String,
+    structured_workspace_ids: Arc<[String]>,
+    retained_bytes: usize,
+}
 
+impl AppAgentStateScope {
+    fn new(
+        epoch: u64,
+        workspace_id: String,
+        mut structured_workspace_ids: Vec<String>,
+    ) -> Option<Self> {
+        structured_workspace_ids.sort_unstable();
+        structured_workspace_ids.dedup();
+        if epoch == 0
+            || structured_workspace_ids.is_empty()
+            || structured_workspace_ids.len() > storage::AGENT_STATE_STRUCTURED_WORKSPACE_MAX
+        {
+            return None;
+        }
+        for value in std::iter::once(&workspace_id).chain(structured_workspace_ids.iter()) {
+            if value.is_empty() || value.len() > 1_024 || value.as_bytes().contains(&0) {
+                return None;
+            }
+        }
+        let retained_bytes = std::mem::size_of::<Self>()
+            .checked_add(workspace_id.capacity())?
+            .checked_add(
+                std::mem::size_of::<String>().checked_mul(structured_workspace_ids.capacity())?,
+            )?
+            .checked_add(
+                structured_workspace_ids
+                    .iter()
+                    .try_fold(0usize, |total, value| total.checked_add(value.capacity()))?,
+            )?;
+        Some(Self {
+            epoch,
+            workspace_id,
+            structured_workspace_ids: structured_workspace_ids.into(),
+            retained_bytes,
+        })
+    }
+}
+
+impl std::fmt::Debug for AppAgentStateScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppAgentStateScope")
+            .field("workspace_count", &self.structured_workspace_ids.len())
+            .finish_non_exhaustive()
+    }
+}
+
+struct AppResumeCandidate {
+    pane_id: String,
+    pane_title: String,
+    session: runtime::SessionId,
+    identity: storage::AgentSessionIdentity,
+    manual: bool,
+}
+
+impl std::fmt::Debug for AppResumeCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppResumeCandidate")
+            .field("manual", &self.manual)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
+
+struct AppProjectNameRequest {
+    session: Option<runtime::SessionId>,
+    cwd: String,
+}
+
+enum AppAgentStateProjectionKind {
+    Hooks,
+    Attention,
+    Restore,
+    BindingSync(storage::AgentSessionBindingReconcile),
+    ResumeProbe {
+        probes: Vec<crate::agent_detect::ResumeTranscriptProbe>,
+        candidates: Vec<AppResumeCandidate>,
+    },
+    Catalog,
+    ProjectNames {
+        style: crate::config::SessionNameStyle,
+        rows: Vec<AppProjectNameRequest>,
+    },
+}
+
+struct AppAgentStateProjection {
+    scope: Arc<AppAgentStateScope>,
+    kind: AppAgentStateProjectionKind,
+    retained_bytes: usize,
+}
+
+impl crate::agent_state_worker::RetainedBytes for AppAgentStateProjection {
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+}
+
+impl std::fmt::Debug for AppAgentStateProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.kind {
+            AppAgentStateProjectionKind::Hooks => "hooks",
+            AppAgentStateProjectionKind::Attention => "attention",
+            AppAgentStateProjectionKind::Restore => "restore",
+            AppAgentStateProjectionKind::BindingSync(_) => "binding_sync",
+            AppAgentStateProjectionKind::ResumeProbe { .. } => "resume_probe",
+            AppAgentStateProjectionKind::Catalog => "catalog",
+            AppAgentStateProjectionKind::ProjectNames { .. } => "project_names",
+        };
+        formatter
+            .debug_struct("AppAgentStateProjection")
+            .field("kind", &kind)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
+
+enum AppAgentStateExactKind {
+    TurnDoneClear(storage::AgentTurnDoneClear),
+    BindingDelete(storage::AgentSessionIdentity),
+    StructuredBatch(Vec<storage::StructuredThreadMutation>),
+    FinalBindingReconcile {
+        binding: storage::AgentSessionBindingReconcile,
+        turn_done_clears: Vec<storage::AgentTurnDoneClear>,
+        structured_mutations: Vec<storage::StructuredThreadMutation>,
+    },
+}
+
+struct AppAgentStateExactRequest {
+    scope: Arc<AppAgentStateScope>,
+    kind: AppAgentStateExactKind,
+    retained_bytes: usize,
+}
+
+impl crate::agent_state_worker::RetainedBytes for AppAgentStateExactRequest {
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+}
+
+impl std::fmt::Debug for AppAgentStateExactRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.kind {
+            AppAgentStateExactKind::TurnDoneClear(_) => "turn_done_clear",
+            AppAgentStateExactKind::BindingDelete(_) => "binding_delete",
+            AppAgentStateExactKind::StructuredBatch(_) => "structured_batch",
+            AppAgentStateExactKind::FinalBindingReconcile { .. } => "binding_reconcile",
+        };
+        formatter
+            .debug_struct("AppAgentStateExactRequest")
+            .field("kind", &kind)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
+
+struct AppResumeProbeResult {
+    pane_id: String,
+    pane_title: String,
+    session: runtime::SessionId,
+    identity: storage::AgentSessionIdentity,
+    found: bool,
+    cwd: Option<String>,
+    manual: bool,
+}
+
+struct AppProjectNameResult {
+    session: Option<runtime::SessionId>,
+    cwd: String,
+    name: Option<String>,
+}
+
+struct AppAgentStateSnapshot {
+    scope: Arc<AppAgentStateScope>,
+    storage: Option<storage::AgentStateSnapshot>,
+    resume: Option<Vec<AppResumeProbeResult>>,
+    project_names: Option<Vec<AppProjectNameResult>>,
+    project_name_style: Option<crate::config::SessionNameStyle>,
+    retained_bytes: usize,
+}
+
+impl crate::agent_state_worker::RetainedBytes for AppAgentStateSnapshot {
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+}
+
+impl std::fmt::Debug for AppAgentStateSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppAgentStateSnapshot")
+            .field("has_storage", &self.storage.is_some())
+            .field("resume_count", &self.resume.as_ref().map_or(0, Vec::len))
+            .field(
+                "project_name_count",
+                &self.project_names.as_ref().map_or(0, Vec::len),
+            )
+            .finish()
+    }
+}
+
+struct AppAgentStateBackend {
+    db_path: PathBuf,
+    db: Option<Db>,
+}
+
+#[cfg(test)]
 fn replace_complete_projection<T, E>(target: &mut T, projection: Result<T, E>) -> Result<(), E> {
     match projection {
         Ok(value) => {
@@ -33,6 +242,461 @@ fn replace_complete_projection<T, E>(target: &mut T, projection: Result<T, E>) -
             Ok(())
         }
         Err(error) => Err(error),
+    }
+}
+
+fn retained_string_bytes(value: &String) -> usize {
+    value.capacity()
+}
+
+fn retained_string_vec_bytes(values: &[String], capacity: usize) -> Option<usize> {
+    std::mem::size_of::<String>()
+        .checked_mul(capacity)?
+        .checked_add(
+            values
+                .iter()
+                .try_fold(0usize, |total, value| total.checked_add(value.capacity()))?,
+        )
+}
+
+fn retained_agent_session_row_bytes(row: &storage::AgentSessionRow) -> Option<usize> {
+    std::mem::size_of::<storage::AgentSessionRow>()
+        .checked_add(row.pane_id.capacity())?
+        .checked_add(row.kind.capacity())?
+        .checked_add(row.session_id.capacity())
+}
+
+fn retained_binding_reconcile_bytes(
+    value: &storage::AgentSessionBindingReconcile,
+) -> Option<usize> {
+    std::mem::size_of::<storage::AgentSessionBindingReconcile>()
+        .checked_add(retained_string_vec_bytes(
+            &value.live_pane_ids,
+            value.live_pane_ids.capacity(),
+        )?)?
+        .checked_add(
+            std::mem::size_of::<storage::AgentSessionRow>()
+                .checked_mul(value.desired_bindings.capacity())?,
+        )?
+        .checked_add(
+            value
+                .desired_bindings
+                .iter()
+                .try_fold(0usize, |total, row| {
+                    total.checked_add(
+                        retained_agent_session_row_bytes(row)?
+                            .saturating_sub(std::mem::size_of::<storage::AgentSessionRow>()),
+                    )
+                })?,
+        )
+}
+
+fn retained_structured_mutations_bytes(
+    values: &Vec<storage::StructuredThreadMutation>,
+) -> Option<usize> {
+    let mut total =
+        std::mem::size_of::<storage::StructuredThreadMutation>().checked_mul(values.capacity())?;
+    for value in values {
+        let bytes = match value {
+            storage::StructuredThreadMutation::Upsert(row) => [
+                &row.local_session_id,
+                &row.workspace_id,
+                &row.thread_id,
+                &row.title,
+                &row.cwd,
+            ]
+            .into_iter()
+            .try_fold(0usize, |sum, value| {
+                sum.checked_add(retained_string_bytes(value))
+            })?
+            .checked_add(row.model.as_ref().map_or(0, String::capacity))?,
+            storage::StructuredThreadMutation::SetArchived {
+                local_session_id, ..
+            }
+            | storage::StructuredThreadMutation::Delete { local_session_id } => {
+                retained_string_bytes(local_session_id)
+            }
+        };
+        total = total.checked_add(bytes)?;
+    }
+    Some(total)
+}
+
+fn retained_turn_done_clears_bytes(values: &Vec<storage::AgentTurnDoneClear>) -> Option<usize> {
+    std::mem::size_of::<storage::AgentTurnDoneClear>()
+        .checked_mul(values.capacity())?
+        .checked_add(values.iter().try_fold(0usize, |total, value| {
+            total.checked_add(value.session_key.capacity())
+        })?)
+}
+
+fn turn_done_clear_matches_workspace(
+    clear: &storage::AgentTurnDoneClear,
+    workspace_id: &str,
+) -> bool {
+    clear
+        .session_key
+        .rsplit_once(':')
+        .is_some_and(|(workspace, session)| workspace == workspace_id && !session.is_empty())
+}
+
+impl AppAgentStateProjection {
+    fn try_new(scope: Arc<AppAgentStateScope>, kind: AppAgentStateProjectionKind) -> Option<Self> {
+        let payload_bytes = match &kind {
+            AppAgentStateProjectionKind::Hooks
+            | AppAgentStateProjectionKind::Attention
+            | AppAgentStateProjectionKind::Restore
+            | AppAgentStateProjectionKind::Catalog => 0,
+            AppAgentStateProjectionKind::BindingSync(value) => {
+                retained_binding_reconcile_bytes(value)?
+            }
+            AppAgentStateProjectionKind::ResumeProbe { probes, candidates } => {
+                if probes.len() != candidates.len() {
+                    return None;
+                }
+                std::mem::size_of::<AppResumeCandidate>()
+                    .checked_mul(candidates.capacity())?
+                    .checked_add(
+                        std::mem::size_of::<crate::agent_detect::ResumeTranscriptProbe>()
+                            .checked_mul(probes.capacity().checked_sub(probes.len())?)?,
+                    )?
+                    .checked_add(candidates.iter().try_fold(0usize, |total, value| {
+                        total
+                            .checked_add(value.pane_id.capacity())?
+                            .checked_add(value.pane_title.capacity())?
+                            .checked_add(value.identity.pane_id.capacity())?
+                            .checked_add(value.identity.kind.capacity())?
+                            .checked_add(value.identity.session_id.capacity())
+                    })?)?
+                    .checked_add(probes.iter().try_fold(0usize, |total, value| {
+                        total.checked_add(value.retained_bytes())
+                    })?)?
+            }
+            AppAgentStateProjectionKind::ProjectNames { rows, .. } => {
+                std::mem::size_of::<AppProjectNameRequest>()
+                    .checked_mul(rows.capacity())?
+                    .checked_add(
+                        rows.iter()
+                            .try_fold(0usize, |total, row| total.checked_add(row.cwd.capacity()))?,
+                    )?
+            }
+        };
+        let retained_bytes = std::mem::size_of::<Self>().checked_add(payload_bytes)?;
+        Some(Self {
+            scope,
+            kind,
+            retained_bytes,
+        })
+    }
+}
+
+impl AppAgentStateExactRequest {
+    fn try_new(scope: Arc<AppAgentStateScope>, kind: AppAgentStateExactKind) -> Option<Self> {
+        let payload_bytes = match &kind {
+            AppAgentStateExactKind::TurnDoneClear(value) => {
+                std::mem::size_of::<storage::AgentTurnDoneClear>()
+                    .checked_add(value.session_key.capacity())?
+            }
+            AppAgentStateExactKind::BindingDelete(value) => {
+                std::mem::size_of::<storage::AgentSessionIdentity>()
+                    .checked_add(value.pane_id.capacity())?
+                    .checked_add(value.kind.capacity())?
+                    .checked_add(value.session_id.capacity())?
+            }
+            AppAgentStateExactKind::StructuredBatch(values) => {
+                retained_structured_mutations_bytes(values)?
+            }
+            AppAgentStateExactKind::FinalBindingReconcile {
+                binding,
+                turn_done_clears,
+                structured_mutations,
+            } => retained_binding_reconcile_bytes(binding)?
+                .checked_add(retained_turn_done_clears_bytes(turn_done_clears)?)?
+                .checked_add(retained_structured_mutations_bytes(structured_mutations)?)?,
+        };
+        let retained_bytes = std::mem::size_of::<Self>().checked_add(payload_bytes)?;
+        Some(Self {
+            scope,
+            kind,
+            retained_bytes,
+        })
+    }
+}
+
+fn prepare_structured_agent_state_prefix(
+    scope: &Arc<AppAgentStateScope>,
+    pending: &[storage::StructuredThreadMutation],
+) -> Option<(usize, AppAgentStateExactRequest)> {
+    let max_items = pending
+        .len()
+        .min(crate::agent_state_worker::AGENT_STATE_STRUCTURED_BATCH_MAX);
+    for items in (1..=max_items).rev() {
+        let mutations = pending[..items].to_vec().into_boxed_slice().into_vec();
+        let Some(request) = AppAgentStateExactRequest::try_new(
+            Arc::clone(scope),
+            AppAgentStateExactKind::StructuredBatch(mutations),
+        ) else {
+            continue;
+        };
+        if request.retained_bytes
+            <= crate::agent_state_worker::AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX
+        {
+            return Some((items, request));
+        }
+    }
+    None
+}
+
+fn app_agent_state_result_bytes(
+    resume: Option<&Vec<AppResumeProbeResult>>,
+    project_names: Option<&Vec<AppProjectNameResult>>,
+) -> Option<usize> {
+    let resume_bytes = resume.map_or(Some(0), |values| {
+        std::mem::size_of::<AppResumeProbeResult>()
+            .checked_mul(values.capacity())?
+            .checked_add(values.iter().try_fold(0usize, |total, value| {
+                total
+                    .checked_add(value.pane_id.capacity())?
+                    .checked_add(value.pane_title.capacity())?
+                    .checked_add(value.identity.pane_id.capacity())?
+                    .checked_add(value.identity.kind.capacity())?
+                    .checked_add(value.identity.session_id.capacity())?
+                    .checked_add(value.cwd.as_ref().map_or(0, String::capacity))
+            })?)
+    })?;
+    let project_bytes = project_names.map_or(Some(0), |values| {
+        std::mem::size_of::<AppProjectNameResult>()
+            .checked_mul(values.capacity())?
+            .checked_add(values.iter().try_fold(0usize, |total, value| {
+                total
+                    .checked_add(value.cwd.capacity())?
+                    .checked_add(value.name.as_ref().map_or(0, String::capacity))
+            })?)
+    })?;
+    resume_bytes.checked_add(project_bytes)
+}
+
+fn app_agent_state_reserved_bytes(
+    resume: Option<&Vec<AppResumeProbeResult>>,
+    project_names: Option<&Vec<AppProjectNameResult>>,
+) -> Option<usize> {
+    std::mem::size_of::<AppAgentStateSnapshot>()
+        .checked_add(app_agent_state_result_bytes(resume, project_names)?)
+}
+
+impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
+    type ProjectionRequest = AppAgentStateProjection;
+    type Snapshot = AppAgentStateSnapshot;
+    type ExactRequest = AppAgentStateExactRequest;
+
+    fn execute_job(
+        &mut self,
+        exact: Option<crate::agent_state_worker::AgentStateExactInput<'_, Self::ExactRequest>>,
+        projections: &[crate::agent_state_worker::AgentStateProjectionInput<
+            '_,
+            Self::ProjectionRequest,
+        >],
+    ) -> Result<Self::Snapshot, crate::agent_state_worker::AgentStateErrorCode> {
+        let scope = exact
+            .as_ref()
+            .map(|request| Arc::clone(&request.payload().scope))
+            .or_else(|| {
+                projections
+                    .first()
+                    .map(|request| Arc::clone(&request.payload().scope))
+            })
+            .ok_or(crate::agent_state_worker::AgentStateErrorCode::InvalidData)?;
+        if exact
+            .as_ref()
+            .is_some_and(|request| request.payload().scope.as_ref() != scope.as_ref())
+            || projections
+                .iter()
+                .any(|request| request.payload().scope.as_ref() != scope.as_ref())
+        {
+            return Err(crate::agent_state_worker::AgentStateErrorCode::Stale);
+        }
+
+        let mut storage_job = storage::AgentStateJob::projection(scope.workspace_id.clone());
+        storage_job.structured_workspace_ids = scope.structured_workspace_ids.to_vec();
+        storage_job.include_hook_status = false;
+        storage_job.include_attention = false;
+        storage_job.include_agent_sessions = false;
+        storage_job.include_structured_threads = false;
+        storage_job.include_archived_threads = false;
+        let mut storage_needed = exact.is_some();
+        if let Some(exact) = exact {
+            match &exact.payload().kind {
+                AppAgentStateExactKind::TurnDoneClear(value) => {
+                    storage_job.turn_done_clears.push(value.clone());
+                }
+                AppAgentStateExactKind::BindingDelete(value) => {
+                    storage_job.stale_binding_deletes.push(value.clone());
+                }
+                AppAgentStateExactKind::StructuredBatch(values) => {
+                    storage_job.structured_mutations.clone_from(values);
+                }
+                AppAgentStateExactKind::FinalBindingReconcile {
+                    binding,
+                    turn_done_clears,
+                    structured_mutations,
+                } => {
+                    storage_job.binding_reconcile = Some(binding.clone());
+                    storage_job.turn_done_clears.clone_from(turn_done_clears);
+                    storage_job
+                        .structured_mutations
+                        .clone_from(structured_mutations);
+                }
+            }
+        }
+
+        let mut resume = None;
+        let mut project_names = None;
+        let mut project_name_style = None;
+        for projection in projections {
+            match (projection.section(), &projection.payload().kind) {
+                (
+                    crate::agent_state_worker::AgentStateSection::Hooks,
+                    AppAgentStateProjectionKind::Hooks,
+                ) => {
+                    storage_job.include_hook_status = true;
+                    storage_needed = true;
+                }
+                (
+                    crate::agent_state_worker::AgentStateSection::Attention,
+                    AppAgentStateProjectionKind::Attention,
+                ) => {
+                    storage_job.include_attention = true;
+                    storage_needed = true;
+                }
+                (
+                    crate::agent_state_worker::AgentStateSection::Restore,
+                    AppAgentStateProjectionKind::Restore,
+                ) => {
+                    storage_job.include_agent_sessions = true;
+                    storage_needed = true;
+                }
+                (
+                    crate::agent_state_worker::AgentStateSection::Catalog,
+                    AppAgentStateProjectionKind::Catalog,
+                ) => {
+                    storage_job.include_structured_threads = true;
+                    storage_job.include_activity_panes = true;
+                    storage_needed = true;
+                }
+                (
+                    crate::agent_state_worker::AgentStateSection::BindingSync,
+                    AppAgentStateProjectionKind::BindingSync(value),
+                ) => {
+                    if storage_job.binding_reconcile.is_some() {
+                        return Err(crate::agent_state_worker::AgentStateErrorCode::InvalidData);
+                    }
+                    storage_job.binding_reconcile = Some(value.clone());
+                    storage_job.include_agent_sessions = true;
+                    storage_needed = true;
+                }
+                (
+                    crate::agent_state_worker::AgentStateSection::ResumeProbe,
+                    AppAgentStateProjectionKind::ResumeProbe { probes, candidates },
+                ) => {
+                    if resume.is_some() {
+                        return Err(crate::agent_state_worker::AgentStateErrorCode::InvalidData);
+                    }
+                    if probes.len() != candidates.len() {
+                        return Err(crate::agent_state_worker::AgentStateErrorCode::InvalidData);
+                    }
+                    let results = crate::agent_detect::probe_resume_transcripts(probes);
+                    let results = results.map_err(|error| match error {
+                        crate::agent_detect::ResumeTranscriptProbeError::InvalidRequest => {
+                            crate::agent_state_worker::AgentStateErrorCode::InvalidData
+                        }
+                        crate::agent_detect::ResumeTranscriptProbeError::ResourceLimit => {
+                            crate::agent_state_worker::AgentStateErrorCode::ResourceLimit
+                        }
+                    })?;
+                    let mut output = Vec::with_capacity(candidates.len());
+                    for (candidate, result) in candidates.iter().zip(results) {
+                        output.push(AppResumeProbeResult {
+                            pane_id: candidate.pane_id.clone(),
+                            pane_title: candidate.pane_title.clone(),
+                            session: candidate.session,
+                            identity: candidate.identity.clone(),
+                            found: result.found(),
+                            cwd: result.cwd().map(str::to_owned),
+                            manual: candidate.manual,
+                        });
+                    }
+                    resume = Some(output);
+                }
+                (
+                    crate::agent_state_worker::AgentStateSection::ProjectNames,
+                    AppAgentStateProjectionKind::ProjectNames { style, rows },
+                ) => {
+                    if project_names.is_some() {
+                        return Err(crate::agent_state_worker::AgentStateErrorCode::InvalidData);
+                    }
+                    let output = rows
+                        .iter()
+                        .map(|row| AppProjectNameResult {
+                            session: row.session,
+                            cwd: row.cwd.clone(),
+                            name: crate::agent_detect::project_display_name(&row.cwd, *style)
+                                .filter(|name| !name.trim().is_empty()),
+                        })
+                        .collect();
+                    project_names = Some(output);
+                    project_name_style = Some(*style);
+                }
+                _ => return Err(crate::agent_state_worker::AgentStateErrorCode::InvalidData),
+            }
+        }
+
+        let reserved_bytes =
+            app_agent_state_reserved_bytes(resume.as_ref(), project_names.as_ref())
+                .ok_or(crate::agent_state_worker::AgentStateErrorCode::ResourceLimit)?;
+        let storage =
+            if storage_needed {
+                storage_job.snapshot_bytes_max =
+                    crate::agent_state_worker::checked_projection_result_remaining(reserved_bytes)?;
+                let _retention = storage::prepare_agent_state_job_for_retention(&mut storage_job)
+                    .map_err(|error| match error {
+                    storage::AgentStatePreparationErrorCode::InvalidInput => {
+                        crate::agent_state_worker::AgentStateErrorCode::InvalidData
+                    }
+                    storage::AgentStatePreparationErrorCode::ResourceLimit => {
+                        crate::agent_state_worker::AgentStateErrorCode::ResourceLimit
+                    }
+                })?;
+                let db = match &mut self.db {
+                    Some(db) => db,
+                    slot @ None => slot.insert(Db::open(&self.db_path).map_err(|_| {
+                        crate::agent_state_worker::AgentStateErrorCode::StorageUnavailable
+                    })?),
+                };
+                Some(db.apply_agent_state_job(&storage_job).map_err(|_| {
+                    crate::agent_state_worker::AgentStateErrorCode::StorageUnavailable
+                })?)
+            } else {
+                crate::agent_state_worker::check_projection_result_total(reserved_bytes)?;
+                None
+            };
+        // `apply_agent_state_job` checks actual output capacity against the exact remaining
+        // budget before commit. Therefore this sum is proven bounded on every successful return;
+        // do not introduce a fallible post-commit branch that could misreport a durable exact.
+        let retained_bytes = reserved_bytes
+            + storage
+                .as_ref()
+                .map_or(0, storage::AgentStateSnapshot::retained_bytes);
+        debug_assert!(
+            crate::agent_state_worker::check_projection_result_total(retained_bytes).is_ok()
+        );
+        Ok(AppAgentStateSnapshot {
+            scope,
+            storage,
+            resume,
+            project_names,
+            project_name_style,
+            retained_bytes,
+        })
     }
 }
 
@@ -5009,10 +5673,23 @@ pub struct App {
     pending_agent_sessions_action: Option<ui::agent_sessions::AgentSessionsDeferredAction>,
     /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」).
     diff_panel_ui: ui::diff_panel::DiffPanelUi,
-    /// DB mutation은 controller projection과 분리돼 실패할 수 있다. 성공할 때까지 FIFO로
-    /// 보존해 새 thread가 복구 불가능해지거나 archive가 재시작 후 되살아나는 것을 막는다.
-    agent_persistence_queue: Vec<ui::agent_sessions::AgentSessionPersistenceMutation>,
-    agent_persistence_retry_at: Option<std::time::Instant>,
+    /// Lazy aggregate boundary for hook/attention/restore/binding/resume/catalog/project-name
+    /// persistence and filesystem projections. Construction opens no DB and starts no thread.
+    agent_state_worker: crate::agent_state_worker::AgentStateWorker<AppAgentStateBackend>,
+    agent_state_scope: Arc<AppAgentStateScope>,
+    pending_agent_state_scope: Option<Arc<AppAgentStateScope>>,
+    agent_state_next_revision: u64,
+    agent_state_next_operation_id: u64,
+    /// Set only after two immediate known-unsent worker admissions fail. It is cleared by a
+    /// relevant new exact/scope/manual action, never by a frame timer or scheduled repaint.
+    agent_state_admission_blocked: bool,
+    /// Filesystem-derived names applied only from a current bounded ProjectNames completion.
+    activity_project_names: std::collections::HashMap<String, Option<String>>,
+    activity_project_name_style: crate::config::SessionNameStyle,
+    project_name_projection_dirty: bool,
+    project_name_projection_pending: bool,
+    /// One bounded structured mutation batch retained until worker admission succeeds.
+    pending_agent_state_structured: Vec<storage::StructuredThreadMutation>,
     /// Lazy Connector service + latest-only render snapshot. Construction performs no DB open,
     /// thread, process, network request, polling, or scheduled repaint.
     connector_coordinator: connector_service::ConnectorCoordinator,
@@ -5188,6 +5865,7 @@ pub struct App {
     /// 이미 에이전트/ssh 등 다른 작업이 있어 건너뛴 경우도 포함한다. 그래야 사용자가
     /// 작업을 종료한 뒤 뒤늦게 resume 명령이 주입되지 않는다.
     resumed_panes: std::collections::HashSet<String>,
+    resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
@@ -5239,12 +5917,6 @@ pub struct App {
     ts_detect_overwrite: bool,
     /// 웹 스냅샷 마지막 동기화 시각 — 프레임마다 구축하지 않도록 스로틀(리뷰 P2-2).
     last_web_sync: Option<std::time::Instant>,
-    /// (스타일, cwd) → 프로젝트 표시명 캐시. Repo 스타일은 .git 상향 stat을 하므로
-    /// 활동 패널/웹 스냅샷의 세션별 호출을 메모이즈한다. 키에 스타일을 포함해
-    /// 설정 전환 시 별도 무효화가 필요 없다(유계).
-    project_name_cache: std::cell::RefCell<
-        std::collections::HashMap<(crate::config::SessionNameStyle, String), Option<String>>,
-    >,
     /// serve 진단/설정 1회성 스레드의 결과 수신 (진행 중일 때만 Some) — O1.
     serve_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::ServeState>>,
     /// 마지막 serve 진단 결과. None = 이 세션에서 아직 진단 안 함.
@@ -5256,56 +5928,6 @@ pub struct App {
     agent_workspace_cwd: Option<String>,
     /// 폴더 트리 사이드바 (file-tree-design §6). OFF면 None — Panel 미생성 + 상태 drop(리소스 0).
     file_tree: Option<ui::file_tree::FileTreeUi>,
-}
-
-fn apply_agent_persistence_batch(
-    db: &Db,
-    queue: &mut Vec<ui::agent_sessions::AgentSessionPersistenceMutation>,
-) -> anyhow::Result<()> {
-    use ui::agent_sessions::AgentSessionPersistenceMutation as Mutation;
-
-    let pending = std::mem::take(queue);
-    let mut pending = pending.into_iter();
-    while let Some(mutation) = pending.next() {
-        let result = match &mutation {
-            Mutation::Upsert {
-                local_session_id,
-                workspace_id,
-                thread_id,
-                title,
-                cwd,
-                model,
-                favorite,
-                archived,
-            } => db.upsert_structured_thread(
-                local_session_id,
-                workspace_id,
-                thread_id,
-                title,
-                cwd,
-                model.as_deref(),
-                *favorite,
-                *archived,
-            ),
-            Mutation::SetArchived {
-                local_session_id,
-                archived,
-            } => db
-                .set_structured_thread_archived(local_session_id, *archived)
-                .map(|_| ()),
-            Mutation::Delete { local_session_id } => {
-                db.delete_structured_thread(local_session_id).map(|_| ())
-            }
-        };
-        if let Err(error) = result {
-            // 같은 local_session_id의 후속 archive/delete가 앞선 upsert를 추월하면
-            // 재시작 복구 상태가 뒤집힌다. 첫 실패부터 남은 FIFO 전체를 보존한다.
-            queue.push(mutation);
-            queue.extend(pending);
-            return Err(error);
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5431,6 +6053,7 @@ fn clear_closed_workspace_state(
     runtime_removed || persisted_removed
 }
 
+#[cfg(test)]
 fn stale_agent_session_panes<'a>(
     persisted_panes: impl IntoIterator<Item = &'a str>,
     live_panes: &std::collections::HashSet<String>,
@@ -5475,6 +6098,20 @@ fn auto_resume_decision(
         Some(1) => AutoResumeDecision::Resume,
         Some(2..) => AutoResumeDecision::MarkHandled,
         Some(0) | None => AutoResumeDecision::Wait,
+    }
+}
+
+fn resume_probe_completion_allowed(
+    manual: bool,
+    already_handled: bool,
+    agent_running: bool,
+    live_process_count: Option<usize>,
+) -> bool {
+    if manual {
+        !agent_running && live_process_count == Some(1)
+    } else {
+        auto_resume_decision(already_handled, agent_running, live_process_count)
+            == AutoResumeDecision::Resume
     }
 }
 
@@ -6968,26 +7605,43 @@ fn should_process_agent_bindings(
     has_new_bindings || (bounded_refresh_due && restore_loaded_for != Some(active_workspace_id))
 }
 
-fn append_structured_thread_projection(
-    target: &mut Vec<ui::agent_sessions::AgentSessionPersistedRow>,
-    rows: impl IntoIterator<Item = storage::StructuredThreadRow>,
-) {
-    let remaining =
-        ui::agent_sessions::AGENT_SESSION_PERSISTED_MAX_ITEMS.saturating_sub(target.len());
-    target.extend(rows.into_iter().take(remaining).map(|row| {
-        ui::agent_sessions::AgentSessionPersistedRow {
-            local_session_id: row.local_session_id,
-            workspace_id: row.workspace_id,
-            thread_id: row.thread_id,
-            title: row.title,
-            cwd: row.cwd,
-            model: row.model,
-            favorite: row.favorite,
-            archived: row.archived,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+fn storage_structured_mutation(
+    mutation: ui::agent_sessions::AgentSessionPersistenceMutation,
+) -> storage::StructuredThreadMutation {
+    use ui::agent_sessions::AgentSessionPersistenceMutation as Mutation;
+    match mutation {
+        Mutation::Upsert {
+            local_session_id,
+            workspace_id,
+            thread_id,
+            title,
+            cwd,
+            model,
+            favorite,
+            archived,
+        } => storage::StructuredThreadMutation::Upsert(storage::StructuredThreadRow {
+            local_session_id,
+            workspace_id,
+            thread_id,
+            title,
+            cwd,
+            model,
+            favorite,
+            archived,
+            created_at: 0,
+            updated_at: 0,
+        }),
+        Mutation::SetArchived {
+            local_session_id,
+            archived,
+        } => storage::StructuredThreadMutation::SetArchived {
+            local_session_id,
+            archived,
+        },
+        Mutation::Delete { local_session_id } => {
+            storage::StructuredThreadMutation::Delete { local_session_id }
         }
-    }));
+    }
 }
 
 impl App {
@@ -7448,6 +8102,23 @@ impl App {
             SettingsSnapshotWorker::new(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let dotenv_sync_worker =
             new_dotenv_sync_worker(db_path.clone(), redaction.clone(), egui_ctx.clone());
+        let initial_agent_state_scope = Arc::new(
+            AppAgentStateScope::new(1, workspace_id.clone(), vec![workspace_id.clone()])
+                .expect("initial agent state scope is bounded"),
+        );
+        let agent_state_worker = {
+            let worker_db_path = db_path.clone();
+            let wake_ctx = egui_ctx.clone();
+            crate::agent_state_worker::AgentStateWorker::new(
+                Arc::new(move || {
+                    Ok(AppAgentStateBackend {
+                        db_path: worker_db_path.clone(),
+                        db: None,
+                    })
+                }),
+                Arc::new(move || wake_ctx.request_repaint()),
+            )
+        };
         let status_feed_rx_channel = crate::status_feed::spawn(egui_ctx.clone());
         let notice_translation_cache_path = db_path
             .parent()
@@ -7490,6 +8161,7 @@ impl App {
         let last_ui_font = config.ui.ui_font.clone();
         let last_mono_font = config.terminal.mono_font.clone();
         let last_mono_weight = config.terminal.mono_weight.clone();
+        let initial_project_name_style = config.ui.session_name_style;
         let agent_sessions_secrets_snapshot = match secret::SecretStore::has_secret(
             &KeyringSecretStore,
             CODEX_LLM_API_KEY_ENTRY_ID,
@@ -7564,8 +8236,17 @@ impl App {
                 })),
             pending_agent_sessions_action: None,
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
-            agent_persistence_queue: Vec::new(),
-            agent_persistence_retry_at: None,
+            agent_state_worker,
+            agent_state_scope: initial_agent_state_scope,
+            pending_agent_state_scope: None,
+            agent_state_next_revision: 0,
+            agent_state_next_operation_id: 0,
+            agent_state_admission_blocked: false,
+            activity_project_names: std::collections::HashMap::new(),
+            activity_project_name_style: initial_project_name_style,
+            project_name_projection_dirty: true,
+            project_name_projection_pending: false,
+            pending_agent_state_structured: Vec::new(),
             connector_coordinator,
             connector_snapshot_reader,
             connector_ui: connector_ui::ConnectorUi::new(&i18n),
@@ -7648,6 +8329,7 @@ impl App {
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
             resumed_panes: std::collections::HashSet::new(),
+            resume_probe_pending_panes: std::collections::HashSet::new(),
             pending_focus: None,
             pending_shutdowns: Vec::new(),
             closed_workspaces: persisted_closed_workspaces
@@ -7667,7 +8349,6 @@ impl App {
             ts_detected: None,
             ts_detect_overwrite: false,
             last_web_sync: None,
-            project_name_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             serve_rx: None,
             serve_state: None,
             known_hosts_cache: None,
@@ -8007,6 +8688,639 @@ impl App {
         }))
     }
 
+    fn request_agent_state_scope(&mut self) {
+        let structured_workspace_ids = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        if structured_workspace_ids.is_empty() {
+            return;
+        }
+        // refresh_workspaces is event-driven (startup or an explicit workspace mutation), so it
+        // may re-arm one bounded admission attempt after an earlier thread-spawn failure.
+        self.agent_state_admission_blocked = false;
+        let next_epoch = self
+            .pending_agent_state_scope
+            .as_ref()
+            .map_or(self.agent_state_scope.epoch, |scope| scope.epoch)
+            .wrapping_add(1)
+            .max(1);
+        let Some(scope) =
+            AppAgentStateScope::new(next_epoch, self.active.id.clone(), structured_workspace_ids)
+        else {
+            tracing::warn!(
+                kind = "agent_state",
+                phase = "scope",
+                error_code = "invalid_data",
+                "agent state scope update rejected"
+            );
+            return;
+        };
+        if self
+            .pending_agent_state_scope
+            .as_ref()
+            .is_some_and(|pending| {
+                scope.workspace_id == pending.workspace_id
+                    && scope.structured_workspace_ids == pending.structured_workspace_ids
+            })
+        {
+            return;
+        }
+        if scope.workspace_id == self.agent_state_scope.workspace_id
+            && scope.structured_workspace_ids == self.agent_state_scope.structured_workspace_ids
+        {
+            // A rapid A -> B -> A switch can cancel a metadata-only pending transition. No
+            // new-scope payload is ever constructed before the drain barrier, so continuing on
+            // the still-current A scope is safe and avoids installing the obsolete B scope.
+            self.pending_agent_state_scope = None;
+            return;
+        }
+        self.pending_agent_state_scope = Some(Arc::new(scope));
+    }
+
+    fn agent_state_scope_ready(&self) -> bool {
+        self.pending_agent_state_scope.is_none()
+            && self.agent_state_scope.workspace_id == self.active.id
+    }
+
+    fn next_agent_state_revision(&mut self) -> crate::agent_state_worker::AgentStateRevision {
+        self.agent_state_next_revision = self.agent_state_next_revision.wrapping_add(1).max(1);
+        crate::agent_state_worker::AgentStateRevision::new(
+            self.agent_state_scope.epoch,
+            self.agent_state_next_revision,
+        )
+    }
+
+    fn next_agent_state_operation_id(&mut self) -> u64 {
+        self.agent_state_next_operation_id =
+            self.agent_state_next_operation_id.wrapping_add(1).max(1);
+        self.agent_state_next_operation_id
+    }
+
+    fn stage_agent_state_projection(
+        &mut self,
+        section: crate::agent_state_worker::AgentStateSection,
+        kind: AppAgentStateProjectionKind,
+    ) -> bool {
+        if !self.agent_state_scope_ready() {
+            return false;
+        }
+        let Some(payload) =
+            AppAgentStateProjection::try_new(Arc::clone(&self.agent_state_scope), kind)
+        else {
+            tracing::warn!(
+                kind = "agent_state",
+                phase = "projection_stage",
+                error_code = "resource_limit",
+                "agent state projection rejected"
+            );
+            return false;
+        };
+        let key = self.next_agent_state_revision();
+        match self
+            .agent_state_worker
+            .stage_projection(section, key, Arc::new(payload))
+        {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    kind = "agent_state",
+                    phase = "projection_stage",
+                    error_code = error.error_code().as_str(),
+                    "agent state projection rejected"
+                );
+                false
+            }
+        }
+    }
+
+    fn stage_prepared_agent_state_exact(
+        &mut self,
+        worker_kind: crate::agent_state_worker::ExactKind,
+        payload: AppAgentStateExactRequest,
+    ) -> bool {
+        let operation_id = self.next_agent_state_operation_id();
+        match self
+            .agent_state_worker
+            .stage_exact(operation_id, worker_kind, Arc::new(payload))
+        {
+            Ok(()) => {
+                // A new exact mutation is a relevant event, not a render/frame retry.
+                self.agent_state_admission_blocked = false;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    kind = "agent_state",
+                    phase = "exact_stage",
+                    error_code = error.error_code().as_str(),
+                    "agent state exact request rejected"
+                );
+                false
+            }
+        }
+    }
+
+    fn stage_agent_state_exact(&mut self, kind: AppAgentStateExactKind) -> bool {
+        if !self.agent_state_scope_ready() {
+            return false;
+        }
+        let worker_kind = match &kind {
+            AppAgentStateExactKind::TurnDoneClear(_) => {
+                crate::agent_state_worker::ExactKind::TurnDoneClear
+            }
+            AppAgentStateExactKind::BindingDelete(_) => {
+                crate::agent_state_worker::ExactKind::BindingDelete
+            }
+            AppAgentStateExactKind::StructuredBatch(values) => {
+                crate::agent_state_worker::ExactKind::StructuredBatch {
+                    items: values.len(),
+                }
+            }
+            AppAgentStateExactKind::FinalBindingReconcile { binding: value, .. } => {
+                crate::agent_state_worker::ExactKind::BindingReconcile {
+                    items: value.live_pane_ids.len().max(value.desired_bindings.len()),
+                }
+            }
+        };
+        let Some(payload) =
+            AppAgentStateExactRequest::try_new(Arc::clone(&self.agent_state_scope), kind)
+        else {
+            tracing::warn!(
+                kind = "agent_state",
+                phase = "exact_stage",
+                error_code = "resource_limit",
+                "agent state exact request rejected"
+            );
+            return false;
+        };
+        self.stage_prepared_agent_state_exact(worker_kind, payload)
+    }
+
+    fn request_project_name_projection(&mut self) {
+        self.project_name_projection_dirty = true;
+    }
+
+    fn admit_agent_state_once(&mut self) {
+        use crate::agent_state_worker::AdmissionError;
+
+        if self.agent_state_admission_blocked
+            || self.agent_state_worker.has_in_flight()
+            || (self.agent_state_worker.pending_exact_count() == 0
+                && self.agent_state_worker.pending_projection_count() == 0)
+        {
+            return;
+        }
+        match self.agent_state_worker.admit() {
+            Ok(()) | Err(AdmissionError::Busy | AdmissionError::Empty) => {}
+            Err(AdmissionError::WorkerUnavailable) => {
+                // The first failure is proven known-unsent and restores the complete job. Retry
+                // exactly once now; a second failure retains the bounded queue fail-closed until
+                // a relevant event explicitly re-arms admission.
+                if let Err(error) = self.agent_state_worker.admit()
+                    && matches!(
+                        error,
+                        AdmissionError::WorkerUnavailable | AdmissionError::Closed
+                    )
+                {
+                    self.agent_state_admission_blocked = true;
+                    tracing::warn!(
+                        kind = "agent_state",
+                        phase = "admission",
+                        error_code = "worker_unavailable",
+                        "agent state worker admission failed closed"
+                    );
+                }
+            }
+            Err(AdmissionError::Closed) => {
+                self.agent_state_admission_blocked = true;
+            }
+        }
+    }
+
+    fn stage_project_name_projection(&mut self) -> bool {
+        const PROJECT_NAME_ITEMS_MAX: usize = 256;
+        if !self.agent_state_scope_ready() {
+            return false;
+        }
+        let mut rows = Vec::with_capacity(self.session_cwds.len().min(PROJECT_NAME_ITEMS_MAX));
+        let mut seen_cwds = std::collections::HashSet::new();
+        for (session, cwd) in &self.session_cwds {
+            if rows.len() >= PROJECT_NAME_ITEMS_MAX {
+                break;
+            }
+            if cwd.is_empty() || cwd.len() > 4 * 1024 || cwd.as_bytes().contains(&0) {
+                continue;
+            }
+            seen_cwds.insert(cwd.clone());
+            rows.push(AppProjectNameRequest {
+                session: Some(*session),
+                cwd: cwd.clone(),
+            });
+        }
+        for (_, cwd) in self
+            .persisted_activity_panes
+            .values()
+            .flat_map(|panes| panes.iter())
+        {
+            if rows.len() >= PROJECT_NAME_ITEMS_MAX {
+                break;
+            }
+            if cwd.is_empty()
+                || cwd.len() > 4 * 1024
+                || cwd.as_bytes().contains(&0)
+                || !seen_cwds.insert(cwd.clone())
+            {
+                continue;
+            }
+            rows.push(AppProjectNameRequest {
+                session: None,
+                cwd: cwd.clone(),
+            });
+        }
+        self.stage_agent_state_projection(
+            crate::agent_state_worker::AgentStateSection::ProjectNames,
+            AppAgentStateProjectionKind::ProjectNames {
+                style: self.config.ui.session_name_style,
+                rows,
+            },
+        )
+    }
+
+    fn apply_agent_state_storage_projection(
+        &mut self,
+        section: crate::agent_state_worker::AgentStateSection,
+        snapshot: &storage::AgentStateSnapshot,
+    ) {
+        let workspace_prefix = format!("{}:", self.agent_state_scope.workspace_id);
+        let session_id = |key: &str| {
+            key.strip_prefix(&workspace_prefix)
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(runtime::SessionId)
+        };
+        match section {
+            crate::agent_state_worker::AgentStateSection::Hooks => {
+                self.hook_overrides = snapshot
+                    .hook_sessions
+                    .iter()
+                    .filter_map(|row| {
+                        Some((
+                            session_id(&row.session_key)?,
+                            crate::agent_detect::AgentBinding {
+                                kind: crate::agent_detect::kind_from_str(&row.kind)?,
+                                session_id: row.agent_session_id.clone(),
+                                transcript: PathBuf::from(&row.transcript_path),
+                            },
+                        ))
+                    })
+                    .collect();
+                self.statuslines = snapshot
+                    .statuslines
+                    .iter()
+                    .filter_map(|row| Some((session_id(&row.session_key)?, row.clone())))
+                    .collect();
+                self.push_agent_display();
+            }
+            crate::agent_state_worker::AgentStateSection::Attention => {
+                self.agent_needs_input = snapshot
+                    .waiting_sessions
+                    .iter()
+                    .filter_map(|(key, _)| session_id(key))
+                    .collect();
+                self.global_waiting = snapshot
+                    .waiting_sessions
+                    .iter()
+                    .filter_map(|(key, message)| {
+                        let (workspace_id, session) = ui::inbox_waiting::parse_session_key(key)?;
+                        let alive = if workspace_id == self.active.id {
+                            self.active.session_titles.contains_key(&session)
+                        } else {
+                            self.warm.get(&workspace_id).is_some_and(|runtime| {
+                                runtime.session_titles.contains_key(&session)
+                            })
+                        };
+                        alive.then(|| (workspace_id, session, message.clone()))
+                    })
+                    .collect();
+                self.agent_turn_done = snapshot
+                    .turn_done_sessions
+                    .iter()
+                    .filter_map(|(key, at)| Some((session_id(key)?, *at)))
+                    .collect();
+            }
+            crate::agent_state_worker::AgentStateSection::Restore => {
+                let rows = snapshot
+                    .agent_sessions
+                    .iter()
+                    .cloned()
+                    .map(|row| (row.pane_id.clone(), row))
+                    .collect::<std::collections::HashMap<_, _>>();
+                self.restore_agents = rows.clone();
+                self.persisted_agents = rows;
+                self.restore_loaded_for = Some(self.active.id.clone());
+                self.resumed_panes.clear();
+            }
+            crate::agent_state_worker::AgentStateSection::BindingSync => {
+                let rows = snapshot
+                    .agent_sessions
+                    .iter()
+                    .cloned()
+                    .map(|row| (row.pane_id.clone(), row))
+                    .collect::<std::collections::HashMap<_, _>>();
+                self.persisted_agents = rows.clone();
+                self.restore_agents = rows;
+            }
+            crate::agent_state_worker::AgentStateSection::Catalog => {
+                let rows = snapshot
+                    .structured_threads
+                    .iter()
+                    .map(|row| ui::agent_sessions::AgentSessionPersistedRow {
+                        local_session_id: row.local_session_id.clone(),
+                        workspace_id: row.workspace_id.clone(),
+                        thread_id: row.thread_id.clone(),
+                        title: row.title.clone(),
+                        cwd: row.cwd.clone(),
+                        model: row.model.clone(),
+                        favorite: row.favorite,
+                        archived: row.archived,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                    })
+                    .collect();
+                if self
+                    .agent_sessions_ui
+                    .replace_persisted_threads(rows)
+                    .is_err()
+                {
+                    tracing::warn!(
+                        kind = "agent_state",
+                        phase = "catalog_apply",
+                        error_code = "invalid_data",
+                        "agent state catalog projection rejected"
+                    );
+                }
+                let mut by_workspace: std::collections::HashMap<String, Vec<(String, String)>> =
+                    std::collections::HashMap::new();
+                for (workspace_id, title, cwd) in &snapshot.activity_panes {
+                    by_workspace
+                        .entry(workspace_id.clone())
+                        .or_default()
+                        .push((title.clone(), cwd.clone()));
+                }
+                self.persisted_activity_panes = by_workspace;
+                self.request_project_name_projection();
+            }
+            crate::agent_state_worker::AgentStateSection::ResumeProbe
+            | crate::agent_state_worker::AgentStateSection::ProjectNames => {}
+        }
+    }
+
+    fn apply_project_name_results(
+        &mut self,
+        revision: u64,
+        style: crate::config::SessionNameStyle,
+        results: &[AppProjectNameResult],
+    ) {
+        if style != self.config.ui.session_name_style {
+            return;
+        }
+        let mut activity_names = std::collections::HashMap::with_capacity(results.len());
+        let mut session_names = Vec::new();
+        for result in results {
+            activity_names.insert(result.cwd.clone(), result.name.clone());
+            if let (Some(session), Some(name)) = (result.session, result.name.clone()) {
+                session_names.push((session, result.cwd.clone(), name));
+            }
+        }
+        if let Ok(snapshot) =
+            ui::workspace::SessionProjectNameSnapshot::try_new(revision, session_names)
+        {
+            self.activity_project_names = activity_names;
+            self.activity_project_name_style = style;
+            self.active.workspace_ui.set_session_project_names(snapshot);
+            if let Some(cwd) = self
+                .active
+                .workspace_ui
+                .focused_session()
+                .and_then(|session| self.session_cwds.get(&session))
+                .cloned()
+            {
+                self.update_workspace_folder_name(&cwd);
+            }
+        }
+    }
+
+    fn apply_resume_probe_results(&mut self, results: &[AppResumeProbeResult]) {
+        for result in results {
+            self.resume_probe_pending_panes.remove(&result.pane_id);
+            let identity_is_current =
+                self.restore_agents
+                    .get(&result.pane_id)
+                    .is_some_and(|saved| {
+                        saved.kind == result.identity.kind
+                            && saved.session_id == result.identity.session_id
+                    });
+            let pane_is_current = self
+                .active
+                .workspace_ui
+                .mux()
+                .and_then(|mux| pane_of_session(mux, result.session))
+                .is_some_and(|pane| pane.0 == result.pane_id);
+            if !identity_is_current || !pane_is_current {
+                continue;
+            }
+            if !result.found {
+                if self.stage_agent_state_exact(AppAgentStateExactKind::BindingDelete(
+                    result.identity.clone(),
+                )) {
+                    let title = self.activity_session_name(&self.active.id, &result.pane_title);
+                    let message = self
+                        .i18n
+                        .t("workspace.wake.resume_missing", &[("title", &title)]);
+                    self.set_web_notice(Some(message));
+                    self.egui_ctx.request_repaint_after(Self::WEB_NOTICE_TTL);
+                }
+                continue;
+            }
+            let source_state = dotenv_state_for_root(self.active_tree_root().as_deref());
+            if self.active.session_dotenv_states.get(&result.session) != Some(&source_state) {
+                continue;
+            }
+            let live_process_count = self
+                .active
+                .session_resource_usage
+                .iter()
+                .find(|usage| usage.session == result.session)
+                .and_then(|usage| usage.pid.map(|_| usage.process_count));
+            if !resume_probe_completion_allowed(
+                result.manual,
+                self.resumed_panes.contains(&result.pane_id),
+                self.agent_bindings.contains_key(&result.session),
+                live_process_count,
+            ) {
+                continue;
+            }
+            let cd_prefix = result
+                .cwd
+                .as_deref()
+                .map(|cwd| format!("cd {} && ", crate::agent_hooks::sh_quote(cwd)))
+                .unwrap_or_default();
+            let command = match result.identity.kind.as_str() {
+                "claude" => format!(
+                    "{cd_prefix}claude --resume {}\n",
+                    result.identity.session_id
+                ),
+                "codex" => format!("{cd_prefix}codex resume {}\n", result.identity.session_id),
+                _ => continue,
+            };
+            self.active.workspace_ui.clear_selection(result.session);
+            if self
+                .active
+                .runtime
+                .send_command(runtime::RuntimeCommand::WriteInput {
+                    session: result.session,
+                    bytes: command.into_bytes(),
+                })
+                .is_ok()
+            {
+                self.resumed_panes.insert(result.pane_id.clone());
+            }
+        }
+    }
+
+    fn poll_agent_state_worker(&mut self) {
+        while let Ok(mut outcome) = self.agent_state_worker.try_recv() {
+            if let Some(exact) = outcome.take_exact() {
+                let (continuation, result) = exact.into_parts();
+                if let Err(error) = result {
+                    tracing::warn!(
+                        kind = "agent_state",
+                        phase = "exact_complete",
+                        error_code = error.as_str(),
+                        "agent state exact request failed"
+                    );
+                } else {
+                    if let AppAgentStateExactKind::BindingDelete(identity) =
+                        &continuation.payload().kind
+                        && self
+                            .restore_agents
+                            .get(&identity.pane_id)
+                            .is_some_and(|saved| {
+                                saved.kind == identity.kind
+                                    && saved.session_id == identity.session_id
+                            })
+                    {
+                        self.restore_agents.remove(&identity.pane_id);
+                        self.persisted_agents.remove(&identity.pane_id);
+                        self.resumed_panes.remove(&identity.pane_id);
+                    }
+                }
+            }
+            for projection in outcome.into_projections() {
+                let section = projection.section();
+                let key = projection.key();
+                if section == crate::agent_state_worker::AgentStateSection::ProjectNames {
+                    self.project_name_projection_pending = false;
+                }
+                if section == crate::agent_state_worker::AgentStateSection::ResumeProbe {
+                    self.resume_probe_pending_panes.clear();
+                }
+                // Scope transitions retain metadata only until every old-scope payload has
+                // settled. Coalescible old projections are deliberately discarded: applying a
+                // resume completion could derive a new exact delete while staging is barred,
+                // and all state projections are requested again immediately after cutover.
+                if self.pending_agent_state_scope.is_some() {
+                    continue;
+                }
+                if key.workspace_epoch() != self.agent_state_scope.epoch {
+                    continue;
+                }
+                match projection.into_result() {
+                    Ok(snapshot)
+                        if snapshot.scope.as_ref() == self.agent_state_scope.as_ref()
+                            && snapshot.scope.workspace_id == self.active.id =>
+                    {
+                        if let Some(storage) = snapshot.storage.as_ref() {
+                            self.apply_agent_state_storage_projection(section, storage);
+                        }
+                        if section == crate::agent_state_worker::AgentStateSection::ResumeProbe
+                            && let Some(results) = snapshot.resume.as_deref()
+                        {
+                            self.apply_resume_probe_results(results);
+                        }
+                        if section == crate::agent_state_worker::AgentStateSection::ProjectNames
+                            && let Some(results) = snapshot.project_names.as_deref()
+                            && let Some(style) = snapshot.project_name_style
+                        {
+                            self.apply_project_name_results(key.revision(), style, results);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        kind = "agent_state",
+                        phase = "projection_complete",
+                        error_code = error.as_str(),
+                        "agent state projection failed"
+                    ),
+                }
+            }
+        }
+
+        if self.pending_agent_state_scope.is_some() {
+            if !self.agent_state_worker.has_in_flight()
+                && (self.agent_state_worker.pending_exact_count() > 0
+                    || self.agent_state_worker.pending_projection_count() > 0)
+            {
+                self.admit_agent_state_once();
+                return;
+            }
+            if self.agent_state_worker.pending_exact_count() == 0
+                && self.agent_state_worker.pending_projection_count() == 0
+                && !self.agent_state_worker.has_in_flight()
+            {
+                self.agent_state_scope = self
+                    .pending_agent_state_scope
+                    .take()
+                    .expect("pending scope exists");
+                self.agent_state_next_revision = 0;
+                self.restore_loaded_for = None;
+                self.resume_probe_pending_panes.clear();
+                self.project_name_projection_pending = false;
+                self.project_name_projection_dirty = true;
+                self.stage_agent_state_projection(
+                    crate::agent_state_worker::AgentStateSection::Hooks,
+                    AppAgentStateProjectionKind::Hooks,
+                );
+                self.stage_agent_state_projection(
+                    crate::agent_state_worker::AgentStateSection::Attention,
+                    AppAgentStateProjectionKind::Attention,
+                );
+                self.stage_agent_state_projection(
+                    crate::agent_state_worker::AgentStateSection::Restore,
+                    AppAgentStateProjectionKind::Restore,
+                );
+                self.stage_agent_state_projection(
+                    crate::agent_state_worker::AgentStateSection::Catalog,
+                    AppAgentStateProjectionKind::Catalog,
+                );
+            }
+        }
+        if self.project_name_projection_dirty
+            && !self.project_name_projection_pending
+            && self.stage_project_name_projection()
+        {
+            self.project_name_projection_dirty = false;
+            self.project_name_projection_pending = true;
+        }
+        if !self.agent_state_worker.has_in_flight()
+            && (self.agent_state_worker.pending_exact_count() > 0
+                || self.agent_state_worker.pending_projection_count() > 0)
+        {
+            self.admit_agent_state_once();
+        }
+    }
+
     /// 에이전트 감지 워커의 입력 갱신 + 결과 드레인 — ui()가 아닌 logic()에서 돈다.
     /// hidden/minimized로 ui()가 스킵돼도 결과를 소비해 unbounded 채널 누적을 막는다
     /// (§14.1 Warm: 창이 안 보이면 logic()만 호출됨, codex 리뷰). UI(egui)에 의존하지 않는
@@ -8029,66 +9343,12 @@ impl App {
         if sessions.is_empty() {
             self.hook_overrides.clear();
             self.statuslines.clear();
-        // hook이 보고한 결정적 바인딩(활성 워크스페이스 것만) — 워커 탐색을 대체한다.
-        // poll_agent_detect는 매 프레임 돌므로 세션이 있을 때만 DB 조회를 1초 스로틀한다.
         } else if bounded_refresh_due {
             self.last_hook_query = std::time::Instant::now();
-            let ws_prefix = format!("{}:", self.active.id);
-            let hook_projection = self
-                .db
-                .list_hook_sessions_for_prefix_bounded(&ws_prefix, HOOK_PREFIX_PROJECTION_MAX)
-                .map(|rows| {
-                    rows.into_iter()
-                        .filter_map(|r| {
-                            let sid = r
-                                .session_key
-                                .strip_prefix(&ws_prefix)?
-                                .parse::<u64>()
-                                .ok()?;
-                            let kind = crate::agent_detect::kind_from_str(&r.kind)?;
-                            Some((
-                                runtime::SessionId(sid),
-                                crate::agent_detect::AgentBinding {
-                                    kind,
-                                    session_id: r.agent_session_id,
-                                    transcript: std::path::PathBuf::from(r.transcript_path),
-                                },
-                            ))
-                        })
-                        .collect()
-                });
-            if replace_complete_projection(&mut self.hook_overrides, hook_projection).is_err() {
-                tracing::warn!(
-                    kind = "agent_state",
-                    phase = "hook_projection",
-                    error_code = "bounded_read_failed",
-                    "agent state projection failed"
-                );
-            }
-            // claude statusLine 표시 정보(effort/model/context%) — 활성 워크스페이스 것만.
-            let status_projection = self
-                .db
-                .list_statuslines_for_prefix_bounded(&ws_prefix, HOOK_PREFIX_PROJECTION_MAX)
-                .map(|rows| {
-                    rows.into_iter()
-                        .filter_map(|r| {
-                            let sid = r
-                                .session_key
-                                .strip_prefix(&ws_prefix)?
-                                .parse::<u64>()
-                                .ok()?;
-                            Some((runtime::SessionId(sid), r))
-                        })
-                        .collect()
-                });
-            if replace_complete_projection(&mut self.statuslines, status_projection).is_err() {
-                tracing::warn!(
-                    kind = "agent_state",
-                    phase = "status_projection",
-                    error_code = "bounded_read_failed",
-                    "agent state projection failed"
-                );
-            }
+            self.stage_agent_state_projection(
+                crate::agent_state_worker::AgentStateSection::Hooks,
+                AppAgentStateProjectionKind::Hooks,
+            );
         }
         let _ = self.agent_detect_input.publish(
             self.agent_detect_epoch,
@@ -8141,6 +9401,7 @@ impl App {
             self.active
                 .workspace_ui
                 .set_session_cwds(self.session_cwds.clone(), self.config.ui.session_name_style);
+            self.request_project_name_projection();
             // Rename recovery is driven by a fresh detector projection. There is no periodic
             // filesystem stat or repaint when session cwd state is idle.
             self.detect_workspace_folder_rename();
@@ -8157,7 +9418,10 @@ impl App {
         }
         if let Some(activity) = latest_activity {
             self.agent_activity = activity;
-            self.refresh_needs_input();
+            self.stage_agent_state_projection(
+                crate::agent_state_worker::AgentStateSection::Attention,
+                AppAgentStateProjectionKind::Attention,
+            );
         }
         let has_new_bindings = latest_bindings.is_some();
         if should_process_agent_bindings(
@@ -8169,77 +9433,6 @@ impl App {
             let bindings = latest_bindings.unwrap_or_else(|| self.agent_bindings.clone());
             self.agent_bindings = bindings.clone();
             self.process_agent_bindings(&bindings);
-        }
-    }
-
-    /// hook이 보고한 입력 대기 세션(needsInput)을 DB에서 읽어 갱신한다. session_key는
-    /// `{workspace_id}:{session_id}` — SessionId가 워커마다 1부터라 전역 유일하지 않아
-    /// workspace_id로 스코프한다(codex High). agent_needs_input은 활성 워크스페이스
-    /// 것만 남긴다(사이드바/상태 레일용, 의미 불변).
-    fn refresh_needs_input(&mut self) {
-        let ws = self.active.id.clone();
-        let to_id = |k: &str| -> Option<runtime::SessionId> {
-            let (w, s) = k.rsplit_once(':')?;
-            (w == ws).then_some(())?;
-            s.parse::<u64>().ok().map(runtime::SessionId)
-        };
-        match self
-            .db
-            .list_waiting_sessions_bounded(WAITING_SESSION_PROJECTION_MAX)
-        {
-            Ok(waiting_keys) => {
-                self.agent_needs_input = waiting_keys
-                    .iter()
-                    .filter_map(|(key, _)| to_id(key))
-                    .collect();
-                // v3.9 N3: 전역(모든 워크스페이스) 대기 — 같은 DB 조회 결과를 재사용해 새
-                // 쿼리 없이 벨 팝오버 PTY 카드 소스를 채운다. 읽기 실패 시에는 직전의 완전한
-                // snapshot을 유지해 transient storage 오류가 알림을 거짓으로 지우지 않는다.
-                let session_alive = |ws: &str, session: &runtime::SessionId| -> bool {
-                    if ws == self.active.id {
-                        self.active.session_titles.contains_key(session)
-                    } else if let Some(rt) = self.warm.get(ws) {
-                        rt.session_titles.contains_key(session)
-                    } else {
-                        false
-                    }
-                };
-                self.global_waiting = waiting_keys
-                    .iter()
-                    .filter_map(|(key, message)| {
-                        let (ws, session) = ui::inbox_waiting::parse_session_key(key)?;
-                        Some((ws, session, message.clone()))
-                    })
-                    .filter(|(ws, session, _)| session_alive(ws, session))
-                    .collect();
-            }
-            Err(_) => tracing::warn!(
-                kind = "agent_state",
-                phase = "waiting_projection",
-                error_code = "bounded_read_failed",
-                "agent state projection failed"
-            ),
-        }
-        // 턴 완료(Stop hook) — 확인(포커스) 시 update_session_alerts가 소비한다.
-        // updated_at을 함께 들고 있다가 조건부 clear의 세대 기준으로 쓴다(레이스 방지).
-        let turn_projection = self
-            .db
-            .list_turn_done_sessions_for_prefix_bounded(
-                &format!("{}:", self.active.id),
-                HOOK_PREFIX_PROJECTION_MAX,
-            )
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|(k, at)| Some((to_id(k)?, *at)))
-                    .collect()
-            });
-        if replace_complete_projection(&mut self.agent_turn_done, turn_projection).is_err() {
-            tracing::warn!(
-                kind = "agent_state",
-                phase = "turn_projection",
-                error_code = "bounded_read_failed",
-                "agent state projection failed"
-            );
         }
     }
 
@@ -8374,56 +9567,7 @@ impl App {
         &mut self,
         bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     ) {
-        // 복원용 저장 데이터를 먼저 로드한다(아래 persistence가 지우기 전에). 전환 시 재로드.
-        if self.restore_loaded_for.as_deref() != Some(self.active.id.as_str()) {
-            let rows = match self
-                .db
-                .list_agent_sessions_bounded(&self.active.id, AGENT_SESSION_PROJECTION_MAX)
-            {
-                Ok(rows) => rows,
-                Err(_) => {
-                    tracing::warn!(
-                        kind = "agent_state",
-                        phase = "restore_projection",
-                        error_code = "bounded_read_failed",
-                        "agent state projection failed"
-                    );
-                    return;
-                }
-            };
-            self.restore_agents = rows.into_iter().map(|r| (r.pane_id.clone(), r)).collect();
-            // pane이 살아 있는 동안 마지막 agent mapping은 resume 원천으로 보존한다.
-            // 프로세스 미감지는 정상 종료·앱 shutdown race에서도 발생하므로 삭제 조건이 아니다.
-            self.persisted_agents = self.restore_agents.clone();
-            self.resumed_panes.clear();
-            self.restore_loaded_for = Some(self.active.id.clone());
-        }
-
         let mux = self.active.workspace_ui.mux().cloned();
-        // RestoreWorkspace가 아직 layout을 emit하기 전의 빈 snapshot은 삭제 근거가 아니다.
-        // pane 하나 이상을 관측한 뒤에만 실제로 사라진 mapping을 정리한다.
-        if let Some(mux) = &mux
-            && mux.tabs.iter().any(|tab| !tab.panes.is_empty())
-        {
-            let live_panes: std::collections::HashSet<String> = mux
-                .tabs
-                .iter()
-                .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.0.clone()))
-                .collect();
-            let stale = stale_agent_session_panes(
-                self.persisted_agents.keys().map(String::as_str),
-                &live_panes,
-            );
-            for pane_id in stale {
-                if let Err(error) = self.db.delete_agent_session(&self.active.id, &pane_id) {
-                    tracing::warn!(pane = %pane_id, "삭제된 pane의 agent session 정리 실패: {error:#}");
-                    continue;
-                }
-                self.persisted_agents.remove(&pane_id);
-                self.restore_agents.remove(&pane_id);
-                self.resumed_panes.remove(&pane_id);
-            }
-        }
         let current: std::collections::HashMap<String, storage::AgentSessionRow> = bindings
             .iter()
             .filter_map(|(sid, b)| {
@@ -8442,20 +9586,30 @@ impl App {
                 ))
             })
             .collect();
-        for (pane_id, row) in &current {
-            if self.persisted_agents.get(pane_id) == Some(row) {
-                continue;
+        if let Some(mux) = &mux {
+            let live_pane_ids = mux
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.0.clone()))
+                .collect::<Vec<_>>();
+            if !live_pane_ids.is_empty() {
+                self.stage_agent_state_projection(
+                    crate::agent_state_worker::AgentStateSection::BindingSync,
+                    AppAgentStateProjectionKind::BindingSync(
+                        storage::AgentSessionBindingReconcile {
+                            live_pane_ids,
+                            desired_bindings: current.values().cloned().collect(),
+                        },
+                    ),
+                );
             }
-            match self
-                .db
-                .upsert_agent_session(&self.active.id, pane_id, &row.kind, &row.session_id)
-            {
-                Ok(()) => {
-                    self.persisted_agents.insert(pane_id.clone(), row.clone());
-                    self.restore_agents.insert(pane_id.clone(), row.clone());
-                }
-                Err(error) => tracing::warn!("agent session 저장 실패: {error:#}"),
-            }
+        }
+        if self.restore_loaded_for.as_deref() != Some(self.active.id.as_str()) {
+            self.stage_agent_state_projection(
+                crate::agent_state_worker::AgentStateSection::Restore,
+                AppAgentStateProjectionKind::Restore,
+            );
+            return;
         }
 
         // 복원 resume 주입: workspace 활성화 시 저장된 에이전트가 있고 **셸만** 살아 있는
@@ -8463,19 +9617,22 @@ impl App {
         // 이미 실행 중인 agent나 ssh/tmux/editor 등 다른 child process가 있으면 처리 완료로
         // 표시한다. 이후 그 프로세스가 끝나도 자동 resume이 뒤늦게 끼어들면 안 된다.
         if self.config.ui.auto_resume_agents
+            && self.resume_probe_pending_panes.is_empty()
             && let Some(mux) = &mux
         {
-            // codex transcript 존재확인은 세션 디렉터리 스캔이라, 복원 pane마다
-            // 반복하지 않게 finder가 1회 스캔을 이 pass 전체에 재사용한다.
-            let mut transcript_finder = crate::agent_detect::TranscriptFinder::new();
+            let mut probes = Vec::new();
+            let mut candidates = Vec::new();
             for pane in mux.tabs.iter().flat_map(|t| &t.panes) {
                 let pane_key = pane.id.0.clone();
-                if !self.restore_agents.contains_key(&pane_key) {
+                let Some(saved) = self.restore_agents.get(&pane_key).cloned() else {
                     continue;
-                }
+                };
                 let Some(session) = pane.session_id else {
                     continue;
                 };
+                if self.resume_probe_pending_panes.contains(&pane_key) {
+                    continue;
+                }
                 // ResourceUsage는 background sampler가 셸 pid/process tree를 이미 계산한 값.
                 // UI 스레드에서 ps를 새로 spawn하지 않고, snapshot이 없거나 0이면 fail closed.
                 let live_process_count = self
@@ -8496,27 +9653,65 @@ impl App {
                     }
                     AutoResumeDecision::Resume => {}
                 }
-                self.send_agent_resume(&pane_key, &pane.title, session, &mut transcript_finder);
-                self.resumed_panes.insert(pane_key);
+                let identity = storage::AgentSessionIdentity {
+                    pane_id: saved.pane_id.clone(),
+                    kind: saved.kind.clone(),
+                    session_id: saved.session_id.clone(),
+                };
+                let Some(kind) = crate::agent_detect::kind_from_str(&saved.kind) else {
+                    if self.stage_agent_state_exact(AppAgentStateExactKind::BindingDelete(identity))
+                    {
+                        self.resumed_panes.insert(pane_key);
+                    }
+                    continue;
+                };
+                let Ok(probe) = crate::agent_detect::ResumeTranscriptProbe::try_new(
+                    kind,
+                    saved.session_id.clone(),
+                ) else {
+                    if self.stage_agent_state_exact(AppAgentStateExactKind::BindingDelete(identity))
+                    {
+                        self.resumed_panes.insert(pane_key);
+                    }
+                    continue;
+                };
+                probes.push(probe);
+                candidates.push(AppResumeCandidate {
+                    pane_id: pane_key,
+                    pane_title: pane.title.clone(),
+                    session,
+                    identity,
+                    manual: false,
+                });
+            }
+            if !candidates.is_empty() {
+                let pending_panes = candidates
+                    .iter()
+                    .map(|candidate| candidate.pane_id.clone())
+                    .collect::<Vec<_>>();
+                if self.stage_agent_state_projection(
+                    crate::agent_state_worker::AgentStateSection::ResumeProbe,
+                    AppAgentStateProjectionKind::ResumeProbe { probes, candidates },
+                ) {
+                    self.resume_probe_pending_panes.extend(pending_panes);
+                }
             }
         }
     }
 
-    /// 저장된 에이전트를 pane 셸에 resume 명령으로 주입한다 — 시작 자동 이어가기와
-    /// 사이드바 수동 '이어가기'의 공용 경로. transcript가 사라졌으면 저장 행을 지우고
-    /// 웹 공지 후 false.
-    fn send_agent_resume(
+    /// A manual resume follows the same bounded off-thread transcript probe as auto-resume.
+    fn stage_agent_resume(
         &mut self,
         pane_key: &str,
         pane_title: &str,
         session: runtime::SessionId,
-        finder: &mut crate::agent_detect::TranscriptFinder,
     ) -> bool {
-        let Some((saved_kind, saved_sid)) = self
-            .restore_agents
-            .get(pane_key)
-            .map(|saved| (saved.kind.clone(), saved.session_id.clone()))
-        else {
+        if !self.resume_probe_pending_panes.is_empty() {
+            return false;
+        }
+        // Manual resume is an explicit user event and may re-arm one bounded worker admission.
+        self.agent_state_admission_blocked = false;
+        let Some(saved) = self.restore_agents.get(pane_key).cloned() else {
             return false;
         };
         let source_state = dotenv_state_for_root(self.active_tree_root().as_deref());
@@ -8529,52 +9724,38 @@ impl App {
             );
             return false;
         }
-        // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume 안 던짐.
-        let kind = crate::agent_detect::kind_from_str(&saved_kind);
-        let transcript = kind.and_then(|k| finder.find(k, &saved_sid));
-        let Some(transcript) = transcript else {
-            let _ = self.db.delete_agent_session(&self.active.id, pane_key);
-            // 폰 안내(I1b-3): 기록이 사라져 이어받지 못함 — 셸은 이미 복원돼 있어
-            // 조용히 넘어가면 폰 사용자는 에이전트가 왜 없는지 모른다. 제목은
-            // 활동 패널과 같은 프로젝트명 규칙으로 해석해 보낸다.
-            let title = self.activity_session_name(&self.active.id, pane_title);
-            let msg = self
-                .i18n
-                .t("workspace.wake.resume_missing", &[("title", &title)]);
-            self.set_web_notice(Some(msg));
-            self.egui_ctx.request_repaint_after(Self::WEB_NOTICE_TTL);
+        let identity = storage::AgentSessionIdentity {
+            pane_id: saved.pane_id.clone(),
+            kind: saved.kind.clone(),
+            session_id: saved.session_id.clone(),
+        };
+        let Some(kind) = crate::agent_detect::kind_from_str(&saved.kind) else {
+            let _ = self.stage_agent_state_exact(AppAgentStateExactKind::BindingDelete(identity));
             return false;
         };
-        // session_id는 그대로 셸 문자열에 들어간다 — 안전 문자만 허용(비정상
-        // transcript/DB 값의 셸 메타문자 실행 방지, codex Low).
-        if !saved_sid
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            tracing::warn!(pane = %pane_key, "비정상 세션 id — resume 생략");
+        let Ok(probe) =
+            crate::agent_detect::ResumeTranscriptProbe::try_new(kind, saved.session_id.clone())
+        else {
+            let _ = self.stage_agent_state_exact(AppAgentStateExactKind::BindingDelete(identity));
             return false;
+        };
+        let staged = self.stage_agent_state_projection(
+            crate::agent_state_worker::AgentStateSection::ResumeProbe,
+            AppAgentStateProjectionKind::ResumeProbe {
+                probes: vec![probe],
+                candidates: vec![AppResumeCandidate {
+                    pane_id: pane_key.to_owned(),
+                    pane_title: pane_title.to_owned(),
+                    session,
+                    identity,
+                    manual: true,
+                }],
+            },
+        );
+        if staged {
+            self.resume_probe_pending_panes.insert(pane_key.to_owned());
         }
-        // 세션의 원래 폴더로 cd 후 resume — 셸이 workspace 루트에서 떠서 대화는
-        // 이어지는데 실제 작업 폴더가 달랐던 문제(2026-07-08 사용자 #6).
-        let cd_prefix = crate::agent_detect::transcript_cwd(&transcript)
-            .filter(|p| std::path::Path::new(p).is_dir())
-            .map(|p| format!("cd {} && ", crate::agent_hooks::sh_quote(&p)))
-            .unwrap_or_default();
-        let cmd = match saved_kind.as_str() {
-            "claude" => format!("{cd_prefix}claude --resume {saved_sid}\n"),
-            "codex" => format!("{cd_prefix}codex resume {saved_sid}\n"),
-            _ => return false,
-        };
-        // 선택 중 freeze 해제 — 이 경로도 WorkspaceUi::send를 우회한다(codex).
-        self.active.workspace_ui.clear_selection(session);
-        let _ = self
-            .active
-            .runtime
-            .send_command(runtime::RuntimeCommand::WriteInput {
-                session,
-                bytes: cmd.into_bytes(),
-            });
-        true
+        staged
     }
 
     /// 세션의 현재 작업 폴더 — 감지 워커 캐시 우선, 없으면 pid로 일회성 lsof 조회
@@ -9030,6 +10211,9 @@ impl App {
                 .file_tree_enabled
                 .then(|| self.make_file_tree());
         }
+        if self.activity_project_name_style != self.config.ui.session_name_style {
+            self.request_project_name_projection();
+        }
         if self.config.save(&self.config_path).is_err() {
             tracing::warn!(
                 kind = "config",
@@ -9125,8 +10309,7 @@ impl App {
                 title,
                 session,
             } => {
-                let mut finder = crate::agent_detect::TranscriptFinder::new();
-                self.send_agent_resume(&pane_key, &title, session, &mut finder);
+                self.stage_agent_resume(&pane_key, &title, session);
                 self.resumed_panes.insert(pane_key);
             }
             WorkspaceControllerAction::ClosePane(pane) => {
@@ -9292,17 +10475,15 @@ impl App {
         let Some((session_key, seen_at)) = self.pending_turn_done_clear.take() else {
             return;
         };
-        if self
-            .db
-            .clear_agent_turn_done(&session_key, seen_at)
-            .is_err()
-        {
-            tracing::warn!(
-                kind = "agent_status",
-                phase = "clear_done",
-                error_code = "storage_failed",
-                "agent completion acknowledgement failed"
-            );
+        let clear = storage::AgentTurnDoneClear {
+            session_key,
+            seen_at,
+        };
+        if !turn_done_clear_matches_workspace(&clear, &self.agent_state_scope.workspace_id) {
+            return;
+        }
+        if !self.stage_agent_state_exact(AppAgentStateExactKind::TurnDoneClear(clear.clone())) {
+            self.pending_turn_done_clear = Some((clear.session_key, clear.seen_at));
         }
     }
 
@@ -9836,6 +11017,9 @@ impl App {
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
+        // Retain only the pending scope metadata before any old-scope completion can be applied
+        // against the new active runtime. The worker drain barrier installs the new epoch later.
+        self.request_agent_state_scope();
         // 웹 대시보드가 켜져 있으면 새 활성 worker로 재구독한다(전환 후 상태 스트림 유지).
         self.rebind_web_dashboard();
         // agent 감지 워커: 전환 시 epoch을 올려 이전 워크스페이스의 잔여 결과를 폐기하고,
@@ -9845,6 +11029,7 @@ impl App {
         self.agent_activity.clear();
         self.agent_needs_input.clear();
         self.agent_turn_done.clear();
+        self.pending_turn_done_clear = None;
         self.session_alerts.clear();
         self.session_cwds.clear();
         self.workspace_rename_prompt = None; // 워크스페이스 전환 시 옛 rename 제안 폐기
@@ -10491,14 +11676,24 @@ impl App {
             force,
             migrate_legacy: force,
         };
-        if let Err(error) = self.dotenv_sync_worker.request_state(correlation, job) {
-            tracing::warn!(
-                kind = "dotenv",
-                phase = "admission",
-                error_code = %error.code(),
-                "dotenv synchronization admission failed"
-            );
-            self.last_dotenv_state = None;
+        match self.dotenv_sync_worker.request_state(correlation, job) {
+            Ok(replaced) => {
+                if let Some(replaced) = replaced {
+                    // The latest-only state slot intentionally displaced this bounded job.
+                    let _ = replaced.into_parts();
+                }
+            }
+            Err(error) => {
+                let (code, rejected_correlation, _rejected_job) = error.into_parts();
+                debug_assert_eq!(rejected_correlation, correlation);
+                tracing::warn!(
+                    kind = "dotenv",
+                    phase = "admission",
+                    error_code = %code,
+                    "dotenv synchronization admission failed"
+                );
+                self.last_dotenv_state = None;
+            }
         }
     }
 
@@ -10566,10 +11761,12 @@ impl App {
             .dotenv_sync_worker
             .request_continuation(correlation, job)
         {
+            let (code, rejected_correlation, _rejected_job) = error.into_parts();
+            debug_assert_eq!(rejected_correlation, correlation);
             tracing::warn!(
                 kind = "dotenv",
                 phase = "continuation_admission",
-                error_code = %error.code(),
+                error_code = %code,
                 "dotenv launch admission failed"
             );
             let pending = self
@@ -12035,9 +13232,8 @@ impl App {
         if keep {
             return;
         }
-        let Some(name) =
-            crate::agent_detect::project_display_name(cwd, self.config.ui.session_name_style)
-        else {
+        let Some(name) = self.activity_project_names.get(cwd).cloned().flatten() else {
+            self.request_project_name_projection();
             return;
         };
         if name.is_empty() || name == "default" {
@@ -12144,49 +13340,12 @@ impl App {
         {
             tracing::warn!("삭제 워크스페이스 UI 숨김 표식 정리 저장 실패: {error:#}");
         }
-        let mut structured_threads = Vec::new();
-        for workspace in &self.workspaces {
-            let remaining = ui::agent_sessions::AGENT_SESSION_PERSISTED_MAX_ITEMS
-                .saturating_sub(structured_threads.len());
-            if remaining == 0 {
-                break;
-            }
-            match self
-                .db
-                .list_structured_threads_bounded(&workspace.id, false, remaining)
-            {
-                Ok(rows) => append_structured_thread_projection(&mut structured_threads, rows),
-                Err(_) => tracing::warn!(
-                    kind = "agent_state",
-                    phase = "structured_thread_projection",
-                    error_code = "bounded_read_failed",
-                    "agent state projection failed"
-                ),
-            }
-        }
-        self.agent_sessions_ui
-            .import_persisted_threads(structured_threads);
-        match self
-            .db
-            .list_persisted_activity_panes_bounded(ACTIVITY_PANE_PROJECTION_MAX)
-        {
-            Ok(rows) => {
-                let mut by_workspace: std::collections::HashMap<String, Vec<(String, String)>> =
-                    std::collections::HashMap::new();
-                for (workspace_id, title, cwd) in rows {
-                    by_workspace
-                        .entry(workspace_id)
-                        .or_default()
-                        .push((title, cwd));
-                }
-                self.persisted_activity_panes = by_workspace;
-            }
-            Err(_) => tracing::warn!(
-                kind = "activity",
-                phase = "persisted_pane_projection",
-                error_code = "bounded_read_failed",
-                "activity projection failed"
-            ),
+        self.request_agent_state_scope();
+        if self.agent_state_scope_ready() {
+            self.stage_agent_state_projection(
+                crate::agent_state_worker::AgentStateSection::Catalog,
+                AppAgentStateProjectionKind::Catalog,
+            );
         }
         // 워크스페이스 목록/이름/경로가 바뀌었을 수 있다 — env/API 프로젝트 행 캐시 무효화.
         self.invalidate_env_api_projects();
@@ -12216,24 +13375,8 @@ impl App {
             .get(workspace_id)
             .and_then(|panes| pane_cwd(panes, raw_title));
         activity_session_name(raw_title, cwd, &self.i18n, |cwd| {
-            self.cached_project_name(cwd)
+            self.activity_project_names.get(cwd).cloned().flatten()
         })
-    }
-
-    /// cwd의 프로젝트 표시명 (메모이즈 — Repo 스타일의 .git 상향 stat이 프레임마다
-    /// 반복되지 않게). 키에 현재 스타일을 포함해 설정 전환이 즉시 반영된다.
-    fn cached_project_name(&self, cwd: &str) -> Option<String> {
-        let style = self.config.ui.session_name_style;
-        let key = (style, cwd.to_owned());
-        if let Some(hit) = self.project_name_cache.borrow().get(&key) {
-            return hit.clone();
-        }
-        let name = crate::agent_detect::project_display_name(cwd, style)
-            .filter(|name| !name.trim().is_empty());
-        self.project_name_cache
-            .borrow_mut()
-            .insert(key, name.clone());
-        name
     }
 
     /// 최신 feed를 읽음 기준과 대조해 Home 배지 수를 갱신한다. Home이 선택된 동안에는
@@ -12646,38 +13789,48 @@ impl App {
         }
     }
 
-    fn persist_agent_session_mutations(&mut self) {
-        self.persist_agent_session_mutations_with_policy(false);
-    }
-
-    fn persist_agent_session_mutations_with_policy(&mut self, force: bool) {
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-
-        self.agent_persistence_queue
-            .extend(self.agent_sessions_ui.drain_persistence_mutations());
-        if self.agent_persistence_queue.is_empty() {
-            self.agent_persistence_retry_at = None;
+    fn stage_structured_agent_state(&mut self, refresh_catalog: bool) {
+        if self.pending_agent_state_structured.is_empty() {
+            let mutations = self.agent_sessions_ui.drain_persistence_mutations_bounded(
+                crate::agent_state_worker::AGENT_STATE_STRUCTURED_BATCH_MAX,
+            );
+            self.pending_agent_state_structured = mutations
+                .into_iter()
+                .map(storage_structured_mutation)
+                .collect();
+        }
+        if self.pending_agent_state_structured.is_empty() || !self.agent_state_scope_ready() {
             return;
         }
-        let now = std::time::Instant::now();
-        if !force
-            && self
-                .agent_persistence_retry_at
-                .is_some_and(|retry_at| now < retry_at)
-        {
-            return;
+        if refresh_catalog {
+            self.stage_agent_state_projection(
+                crate::agent_state_worker::AgentStateSection::Catalog,
+                AppAgentStateProjectionKind::Catalog,
+            );
         }
-
-        if let Err(error) =
-            apply_agent_persistence_batch(&self.db, &mut self.agent_persistence_queue)
-        {
-            let message = format!("구조화 Codex thread 저장 실패: {error:#}");
-            tracing::warn!("{message}");
-            self.agent_sessions_ui.report_persistence_error(message);
-            self.agent_persistence_retry_at = Some(now + RETRY_DELAY);
+        let Some((items, payload)) = prepare_structured_agent_state_prefix(
+            &self.agent_state_scope,
+            &self.pending_agent_state_structured,
+        ) else {
+            self.agent_sessions_ui.report_persistence_error(
+                "구조화 세션 저장 요청이 현재 처리 한도를 초과했습니다".to_owned(),
+            );
             return;
+        };
+        if self.stage_prepared_agent_state_exact(
+            crate::agent_state_worker::ExactKind::StructuredBatch { items },
+            payload,
+        ) {
+            self.pending_agent_state_structured.drain(..items);
+            self.pending_agent_state_structured =
+                std::mem::take(&mut self.pending_agent_state_structured)
+                    .into_boxed_slice()
+                    .into_vec();
+        } else {
+            self.agent_sessions_ui.report_persistence_error(
+                "구조화 세션 저장 요청이 현재 처리 한도를 초과했습니다".to_owned(),
+            );
         }
-        self.agent_persistence_retry_at = None;
     }
 
     fn record_activity_events(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
@@ -13401,13 +14554,171 @@ impl App {
             let _ = task.handle.join();
         }
         // 마지막 App Server 이벤트가 만든 thread metadata를 종료 전에 한 번 더 반영한다.
-        // 평상시 실패분도 FIFO queue에 남아 있으므로 retry deadline과 무관하게 flush한다.
         self.agent_sessions_ui.poll();
-        self.persist_agent_session_mutations_with_policy(true);
         // App Server는 PTY runtime과 독립된 child process라 여기서 명시적으로 종료·reap한다.
         self.agent_sessions_ui.shutdown();
-        // shutdown join 중 도착한 마지막 thread/start/resume 결과도 controller가 drain한다.
-        self.persist_agent_session_mutations_with_policy(true);
+
+        // First settle every pre-existing exact under its original scope and release all
+        // projection payloads. The blocking seam keeps admission open for bounded structured
+        // waves and never retries an in-flight unknown delivery.
+        let initial_report = self.agent_state_worker.drain_exact_wave_for_shutdown();
+        let mut shutdown_agent_state_failed = initial_report.overflowed()
+            || initial_report
+                .receipts()
+                .iter()
+                .any(|receipt| receipt.result().is_err());
+
+        // No worker payload remains, so installing the final active/catalog scope cannot mix
+        // epochs. This also resolves a metadata-only transition that was pending at shutdown.
+        let final_epoch = self
+            .pending_agent_state_scope
+            .as_ref()
+            .map_or(self.agent_state_scope.epoch, |scope| scope.epoch)
+            .wrapping_add(1)
+            .max(1);
+        let final_scope = AppAgentStateScope::new(
+            final_epoch,
+            self.active.id.clone(),
+            self.workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect(),
+        )
+        .map(Arc::new);
+        if let Some(scope) = final_scope.as_ref() {
+            self.agent_state_scope = Arc::clone(scope);
+            self.pending_agent_state_scope = None;
+            self.agent_state_next_revision = 0;
+        } else {
+            shutdown_agent_state_failed = true;
+        }
+
+        // The UI backlog has at most one coalesced mutation per bounded persisted session. Drain
+        // it in finite <=16-item exact batches, settling each <=8-item worker FIFO wave before
+        // admitting more. No timer, repaint, or unbounded retry participates in shutdown.
+        const SHUTDOWN_STRUCTURED_WAVES_MAX: usize =
+            ui::agent_sessions::AGENT_SESSION_PERSISTED_MAX_ITEMS
+                .div_ceil(crate::agent_state_worker::AGENT_STATE_CONTINUATION_MAX)
+                + 2;
+        for _ in 0..SHUTDOWN_STRUCTURED_WAVES_MAX {
+            while self.agent_state_worker.pending_exact_count()
+                < crate::agent_state_worker::AGENT_STATE_CONTINUATION_MAX
+                && (!self.pending_agent_state_structured.is_empty()
+                    || self.agent_sessions_ui.pending_persistence_mutation_count() > 0)
+            {
+                let before = (
+                    self.agent_state_worker.pending_exact_count(),
+                    self.pending_agent_state_structured.len(),
+                    self.agent_sessions_ui.pending_persistence_mutation_count(),
+                );
+                self.stage_structured_agent_state(false);
+                let after = (
+                    self.agent_state_worker.pending_exact_count(),
+                    self.pending_agent_state_structured.len(),
+                    self.agent_sessions_ui.pending_persistence_mutation_count(),
+                );
+                if after == before {
+                    break;
+                }
+            }
+            if self.agent_state_worker.pending_exact_count() == 0 {
+                break;
+            }
+            let report = self.agent_state_worker.drain_exact_wave_for_shutdown();
+            shutdown_agent_state_failed |= report.overflowed()
+                || report
+                    .receipts()
+                    .iter()
+                    .any(|receipt| receipt.result().is_err());
+        }
+        if !self.pending_agent_state_structured.is_empty()
+            || self.agent_sessions_ui.pending_persistence_mutation_count() > 0
+        {
+            shutdown_agent_state_failed = true;
+            tracing::warn!(
+                kind = "agent_state",
+                phase = "shutdown",
+                error_code = "backpressure",
+                "agent state shutdown mutation backlog did not settle"
+            );
+        }
+        let final_structured = Vec::new();
+        let operation_id = self.next_agent_state_operation_id();
+        let mux = self.active.workspace_ui.mux();
+        let live_items = mux.map_or(0, |mux| {
+            mux.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>()
+        });
+        let desired_items = mux.map_or(0, |mux| {
+            self.agent_bindings
+                .keys()
+                .filter(|session| pane_of_session(mux, **session).is_some())
+                .count()
+        });
+        let final_items = live_items.max(desired_items);
+        let bindings = &self.agent_bindings;
+        let pending_turn_done_clear = &mut self.pending_turn_done_clear;
+        let report = self
+            .agent_state_worker
+            .shutdown_with_final_binding_reconcile(operation_id, final_items, || {
+                let scope = final_scope
+                    .ok_or(crate::agent_state_worker::AgentStateErrorCode::InvalidData)?;
+                let live_pane_ids = mux
+                    .into_iter()
+                    .flat_map(|mux| &mux.tabs)
+                    .flat_map(|tab| &tab.panes)
+                    .map(|pane| pane.id.0.clone())
+                    .collect::<Vec<_>>();
+                let desired_bindings = bindings
+                    .iter()
+                    .filter_map(|(session, binding)| {
+                        let pane = mux.and_then(|mux| pane_of_session(mux, *session))?;
+                        Some(storage::AgentSessionRow {
+                            pane_id: pane.0,
+                            kind: match binding.kind {
+                                crate::agent_detect::AgentKind::Claude => "claude".to_owned(),
+                                crate::agent_detect::AgentKind::Codex => "codex".to_owned(),
+                            },
+                            session_id: binding.session_id.clone(),
+                        })
+                    })
+                    .collect();
+                let turn_done_clears = pending_turn_done_clear
+                    .take()
+                    .map(|(session_key, seen_at)| storage::AgentTurnDoneClear {
+                        session_key,
+                        seen_at,
+                    })
+                    .filter(|clear| turn_done_clear_matches_workspace(clear, &scope.workspace_id))
+                    .into_iter()
+                    .collect();
+                AppAgentStateExactRequest::try_new(
+                    scope,
+                    AppAgentStateExactKind::FinalBindingReconcile {
+                        binding: storage::AgentSessionBindingReconcile {
+                            live_pane_ids,
+                            desired_bindings,
+                        },
+                        turn_done_clears,
+                        structured_mutations: final_structured,
+                    },
+                )
+                .map(Arc::new)
+                .ok_or(crate::agent_state_worker::AgentStateErrorCode::ResourceLimit)
+            });
+        if shutdown_agent_state_failed
+            || report.overflowed()
+            || report
+                .receipts()
+                .iter()
+                .any(|receipt| receipt.result().is_err())
+        {
+            tracing::warn!(
+                kind = "agent_state",
+                phase = "shutdown",
+                error_code = "persistence_failed",
+                "agent state shutdown did not settle cleanly"
+            );
+        }
         self.fail_pending_proxy_launches();
         if self
             .db
@@ -13472,6 +14783,7 @@ impl eframe::App for App {
         self.handle_configured_shortcut(ctx);
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
+        self.poll_agent_state_worker();
         self.pump_perf_harness();
         if let Some((intent, subject)) = self.pending_connector_dispatch.take() {
             let result = match subject {
@@ -13500,7 +14812,7 @@ impl eframe::App for App {
         }
         // 창이 숨겨져도 App Server JSON-RPC 이벤트를 드레인해 structured session 상태를 최신화한다.
         self.agent_sessions_ui.poll();
-        self.persist_agent_session_mutations();
+        self.stage_structured_agent_state(true);
         for notice in self.agent_sessions_ui.drain_status_notices() {
             self.notifications_ui.on_structured_status(
                 &notice.workspace_id,
@@ -16168,33 +17480,6 @@ mod tests {
     }
 
     #[test]
-    fn structured_thread_projection은_workspace를_넘어_500행으로_유계다() {
-        let rows = |start: usize, count: usize| {
-            (start..start + count).map(|index| storage::StructuredThreadRow {
-                local_session_id: format!("local-{index}"),
-                workspace_id: format!("ws-{}", index / 300),
-                thread_id: format!("thread-{index}"),
-                title: "bounded".to_owned(),
-                cwd: "/repo".to_owned(),
-                model: None,
-                favorite: false,
-                archived: false,
-                created_at: index as i64,
-                updated_at: index as i64,
-            })
-        };
-        let mut projection = Vec::new();
-
-        append_structured_thread_projection(&mut projection, rows(0, 300));
-        append_structured_thread_projection(&mut projection, rows(300, 300));
-        append_structured_thread_projection(&mut projection, rows(600, 300));
-
-        assert_eq!(projection.len(), 500);
-        assert_eq!(projection[0].local_session_id, "local-0");
-        assert_eq!(projection[499].local_session_id, "local-499");
-    }
-
-    #[test]
     fn slack_projection은_single_canonical_row만_exposes한다() {
         let projection = connector_slack_projection(&[slack_inventory_row("slack-a", true, 2)]);
 
@@ -16524,65 +17809,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn structured_persistence_batch_preserves_fifo_from_first_db_failure() {
-        use ui::agent_sessions::AgentSessionPersistenceMutation as Mutation;
-
-        let dir = std::env::temp_dir().join(format!(
-            "deppy-agent-persistence-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("metadata.sqlite3")).unwrap();
-        let mut failed = vec![
-            Mutation::Upsert {
-                local_session_id: "local-bad".to_owned(),
-                workspace_id: "missing-workspace".to_owned(),
-                thread_id: "thread-bad".to_owned(),
-                title: "bad".to_owned(),
-                cwd: "/repo".to_owned(),
-                model: None,
-                favorite: false,
-                archived: false,
-            },
-            Mutation::Delete {
-                local_session_id: "must-not-overtake".to_owned(),
-            },
-        ];
-        assert!(apply_agent_persistence_batch(&db, &mut failed).is_err());
-        assert!(matches!(
-            failed.as_slice(),
-            [Mutation::Upsert { local_session_id, .. }, Mutation::Delete { .. }]
-                if local_session_id == "local-bad"
-        ));
-
-        let workspace_id = db.create_workspace("retry-ok").unwrap();
-        let mut successful = vec![
-            Mutation::Upsert {
-                local_session_id: "local-1".to_owned(),
-                workspace_id: workspace_id.clone(),
-                thread_id: "thread-1".to_owned(),
-                title: "saved".to_owned(),
-                cwd: "/repo".to_owned(),
-                model: Some("gpt-test".to_owned()),
-                favorite: false,
-                archived: false,
-            },
-            Mutation::SetArchived {
-                local_session_id: "local-1".to_owned(),
-                archived: true,
-            },
-        ];
-        apply_agent_persistence_batch(&db, &mut successful).unwrap();
-        assert!(successful.is_empty());
-        let rows = db.list_structured_threads(&workspace_id, true).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].archived);
-        drop(db);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -18317,5 +19543,115 @@ mod tests {
         // 최초 관측에서 처리 완료로 표시한 뒤 agent가 종료돼 셸만 남더라도 재주입 금지.
         let after_exit = auto_resume_decision(true, false, Some(1));
         assert_eq!(after_exit, AutoResumeDecision::Skip);
+    }
+
+    #[test]
+    fn 수동_resume_완료도_현재_shell_only_상태만_허용한다() {
+        assert!(resume_probe_completion_allowed(true, true, false, Some(1)));
+        for process_count in [None, Some(0), Some(2), Some(3)] {
+            assert!(!resume_probe_completion_allowed(
+                true,
+                false,
+                false,
+                process_count
+            ));
+        }
+        assert!(!resume_probe_completion_allowed(true, false, true, Some(1)));
+    }
+
+    #[test]
+    fn agent_state_결과예산은_storage_transaction_전에_wrapper를_예약한다() {
+        assert_eq!(
+            app_agent_state_reserved_bytes(None, None),
+            Some(std::mem::size_of::<AppAgentStateSnapshot>())
+        );
+        assert!(
+            crate::agent_state_worker::checked_projection_result_remaining(
+                app_agent_state_reserved_bytes(None, None).unwrap()
+            )
+            .is_ok()
+        );
+    }
+
+    fn max_valid_structured_mutation(index: usize) -> storage::StructuredThreadMutation {
+        let local_session_id = format!("local-{index:04}");
+        let workspace_id = "workspace".to_owned();
+        let thread_id = format!("thread-{index:04}");
+        let cwd = String::new();
+        let model = None;
+        let fixed_bytes = local_session_id.len() + workspace_id.len() + thread_id.len() + cwd.len();
+        let title = "x"
+            .repeat(ui::agent_sessions::AGENT_SESSION_PERSISTED_ROW_MAX_BYTES - fixed_bytes)
+            .into_boxed_str()
+            .into_string();
+        storage::StructuredThreadMutation::Upsert(storage::StructuredThreadRow {
+            local_session_id,
+            workspace_id,
+            thread_id,
+            title,
+            cwd,
+            model,
+            favorite: false,
+            archived: false,
+            created_at: 0,
+            updated_at: 0,
+        })
+    }
+
+    #[test]
+    fn structured_agent_state는_ui유효최대행을worker_byte_prefix로분할한다() {
+        let scope = Arc::new(
+            AppAgentStateScope::new(1, "workspace".to_owned(), vec!["workspace".to_owned()])
+                .unwrap(),
+        );
+        let pending = (0..crate::agent_state_worker::AGENT_STATE_STRUCTURED_BATCH_MAX)
+            .map(max_valid_structured_mutation)
+            .collect::<Vec<_>>();
+
+        let (items, request) = prepare_structured_agent_state_prefix(&scope, &pending).unwrap();
+        assert!(items > 0);
+        assert!(items < pending.len(), "wrapper and Vec capacity must count");
+        assert!(
+            request.retained_bytes
+                <= crate::agent_state_worker::AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX
+        );
+        assert!(prepare_structured_agent_state_prefix(&scope, &pending[items..]).is_some());
+    }
+
+    #[test]
+    fn structured_agent_state는작은행16개를한batch로유지한다() {
+        let scope = Arc::new(
+            AppAgentStateScope::new(1, "workspace".to_owned(), vec!["workspace".to_owned()])
+                .unwrap(),
+        );
+        let pending = (0..crate::agent_state_worker::AGENT_STATE_STRUCTURED_BATCH_MAX)
+            .map(|index| storage::StructuredThreadMutation::Delete {
+                local_session_id: format!("local-{index}"),
+            })
+            .collect::<Vec<_>>();
+
+        let (items, request) = prepare_structured_agent_state_prefix(&scope, &pending).unwrap();
+        assert_eq!(
+            items,
+            crate::agent_state_worker::AGENT_STATE_STRUCTURED_BATCH_MAX
+        );
+        assert!(
+            request.retained_bytes
+                <= crate::agent_state_worker::AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX
+        );
+    }
+
+    #[test]
+    fn turn_done_clear는_현재_workspace_scope에만_포함한다() {
+        let current = storage::AgentTurnDoneClear {
+            session_key: "workspace-a:42".to_owned(),
+            seen_at: 7,
+        };
+        let stale = storage::AgentTurnDoneClear {
+            session_key: "workspace-b:42".to_owned(),
+            seen_at: 7,
+        };
+        assert!(turn_done_clear_matches_workspace(&current, "workspace-a"));
+        assert!(!turn_done_clear_matches_workspace(&stale, "workspace-a"));
     }
 }

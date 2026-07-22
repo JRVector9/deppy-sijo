@@ -790,14 +790,79 @@ pub struct AgentStateJob {
     /// from `workspace_id`, but every existing and replacement workspace touched by a structured
     /// mutation must be a member of this bounded set.
     pub structured_workspace_ids: Vec<String>,
-    /// Maximum retained string bytes the caller can accept in the returned snapshot. This output
+    /// Maximum actual heap bytes the caller can accept in the returned snapshot. This output
     /// budget is independent from the separately bounded retained input payload.
     pub snapshot_bytes_max: usize,
     pub binding_reconcile: Option<AgentSessionBindingReconcile>,
     pub stale_binding_deletes: Vec<AgentSessionIdentity>,
     pub turn_done_clears: Vec<AgentTurnDoneClear>,
     pub structured_mutations: Vec<StructuredThreadMutation>,
+    /// Projects hook sessions and statuslines for the active workspace. False performs no query
+    /// or output allocation for either section.
+    pub include_hook_status: bool,
+    /// Projects waiting and completed-turn attention state. False performs no query or output
+    /// allocation for either section.
+    pub include_attention: bool,
+    /// Projects persisted PTY-to-agent bindings for the active workspace. False performs no query
+    /// or output allocation for this section. Binding mutations remain atomic regardless.
+    pub include_agent_sessions: bool,
+    /// Projects the bounded structured-thread catalog. False performs no projection query or
+    /// output allocation for this section. Structured mutations remain atomic regardless.
+    pub include_structured_threads: bool,
     pub include_archived_threads: bool,
+    /// Opt-in complete persisted activity-pane catalog. False performs no activity-pane query or
+    /// allocation, keeping non-Catalog AgentState jobs free of this global projection cost.
+    pub include_activity_panes: bool,
+}
+
+/// Stable payload-free failure returned while preparing an [`AgentStateJob`] for bounded
+/// retention outside storage. Raw workspace, session, and thread values never cross this API.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatePreparationErrorCode {
+    InvalidInput,
+    ResourceLimit,
+}
+
+impl AgentStatePreparationErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::ResourceLimit => "resource_limit",
+        }
+    }
+}
+
+impl std::fmt::Debug for AgentStatePreparationErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for AgentStatePreparationErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for AgentStatePreparationErrorCode {}
+
+/// Actual heap bytes retained by a validated, capacity-canonicalized [`AgentStateJob`]. Debug
+/// deliberately omits the value so diagnostics remain low-cardinality.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AgentStateJobRetention {
+    retained_bytes: usize,
+}
+
+impl AgentStateJobRetention {
+    pub const fn retained_bytes(self) -> usize {
+        self.retained_bytes
+    }
+}
+
+impl std::fmt::Debug for AgentStateJobRetention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AgentStateJobRetention")
+    }
 }
 
 impl AgentStateJob {
@@ -811,7 +876,12 @@ impl AgentStateJob {
             stale_binding_deletes: Vec::new(),
             turn_done_clears: Vec::new(),
             structured_mutations: Vec::new(),
+            include_hook_status: true,
+            include_attention: true,
+            include_agent_sessions: true,
+            include_structured_threads: true,
             include_archived_threads: true,
+            include_activity_panes: false,
         }
     }
 }
@@ -835,13 +905,22 @@ impl std::fmt::Debug for AgentStateJob {
                 "structured_mutation_count",
                 &self.structured_mutations.len(),
             )
+            .field("include_hook_status", &self.include_hook_status)
+            .field("include_attention", &self.include_attention)
+            .field("include_agent_sessions", &self.include_agent_sessions)
+            .field(
+                "include_structured_threads",
+                &self.include_structured_threads,
+            )
             .field("include_archived_threads", &self.include_archived_threads)
+            .field("include_activity_panes", &self.include_activity_panes)
             .finish()
     }
 }
 
-/// Complete-or-error bounded projection returned after an [`AgentStateJob`] commits. Every row is
-/// read from the same transaction snapshot and total retained string bytes are capped globally.
+/// Requested complete-or-error bounded projection returned after an [`AgentStateJob`] commits.
+/// Every included row is read from the same transaction snapshot, omitted sections are empty, and
+/// total retained heap bytes are capped globally.
 #[derive(Clone, PartialEq)]
 pub struct AgentStateSnapshot {
     pub hook_sessions: Vec<HookSessionRow>,
@@ -850,6 +929,9 @@ pub struct AgentStateSnapshot {
     pub turn_done_sessions: Vec<(String, i64)>,
     pub agent_sessions: Vec<AgentSessionRow>,
     pub structured_threads: Vec<StructuredThreadRow>,
+    /// Complete bounded `(workspace_id, title, cwd)` activity catalog when requested; otherwise
+    /// empty without querying activity storage.
+    pub activity_panes: Vec<(String, String, String)>,
 }
 
 impl std::fmt::Debug for AgentStateSnapshot {
@@ -862,7 +944,18 @@ impl std::fmt::Debug for AgentStateSnapshot {
             .field("turn_done_session_count", &self.turn_done_sessions.len())
             .field("agent_session_count", &self.agent_sessions.len())
             .field("structured_thread_count", &self.structured_threads.len())
+            .field("activity_pane_count", &self.activity_panes.len())
             .finish()
+    }
+}
+
+impl AgentStateSnapshot {
+    /// Actual heap bytes retained by this storage snapshot, including every Vec backing buffer and
+    /// String capacity. `apply_agent_state_job` checks this value before commit, so composition-
+    /// root adapters may combine it with separately reserved filesystem output without repeating
+    /// storage row formulas.
+    pub fn retained_bytes(&self) -> usize {
+        agent_state_snapshot_retained_bytes(self).unwrap_or(usize::MAX)
     }
 }
 
@@ -1152,7 +1245,9 @@ pub const AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX: usize = 512 * 1024;
 pub const AGENT_STATE_STRUCTURED_WORKSPACE_MAX: usize = 256;
 /// Maximum structured rows returned across the requested workspace catalog.
 pub const AGENT_STATE_STRUCTURED_PROJECTION_MAX: usize = 500;
-/// Aggregate retained string bytes across every section of one worker snapshot.
+/// Aggregate heap bytes retained by one prepared storage job.
+pub const AGENT_STATE_JOB_BYTES_MAX: usize = BOUNDED_RETAINED_BYTES_MAX;
+/// Aggregate retained heap bytes across every section of one worker snapshot.
 pub const AGENT_STATE_SNAPSHOT_BYTES_MAX: usize = 4 * 1024 * 1024;
 const ACTIVITY_PANE_ROWS_MAX: usize = 256 * 256;
 const WEB_PUSH_SUBSCRIPTION_ROWS_MAX: usize = 8;
@@ -1625,6 +1720,233 @@ fn agent_session_row_input_bytes(row: &AgentSessionRow) -> anyhow::Result<usize>
     agent_session_identity_input_bytes(&row.pane_id, &row.kind, &row.session_id)
 }
 
+fn canonicalize_agent_state_string(value: &mut String) {
+    *value = std::mem::take(value).into_boxed_str().into_string();
+}
+
+fn canonicalize_agent_state_optional_string(value: &mut Option<String>) {
+    if let Some(value) = value {
+        canonicalize_agent_state_string(value);
+    }
+}
+
+fn canonicalize_agent_state_vec<T>(values: &mut Vec<T>) {
+    *values = std::mem::take(values).into_boxed_slice().into_vec();
+}
+
+fn canonicalize_agent_session_row(row: &mut AgentSessionRow) {
+    canonicalize_agent_state_string(&mut row.pane_id);
+    canonicalize_agent_state_string(&mut row.kind);
+    canonicalize_agent_state_string(&mut row.session_id);
+}
+
+fn canonicalize_structured_thread_row(row: &mut StructuredThreadRow) {
+    canonicalize_agent_state_string(&mut row.local_session_id);
+    canonicalize_agent_state_string(&mut row.workspace_id);
+    canonicalize_agent_state_string(&mut row.thread_id);
+    canonicalize_agent_state_string(&mut row.title);
+    canonicalize_agent_state_string(&mut row.cwd);
+    canonicalize_agent_state_optional_string(&mut row.model);
+}
+
+fn canonicalize_agent_state_job(job: &mut AgentStateJob) {
+    canonicalize_agent_state_string(&mut job.workspace_id);
+    for workspace_id in &mut job.structured_workspace_ids {
+        canonicalize_agent_state_string(workspace_id);
+    }
+    canonicalize_agent_state_vec(&mut job.structured_workspace_ids);
+
+    if let Some(reconcile) = &mut job.binding_reconcile {
+        for pane_id in &mut reconcile.live_pane_ids {
+            canonicalize_agent_state_string(pane_id);
+        }
+        canonicalize_agent_state_vec(&mut reconcile.live_pane_ids);
+        for row in &mut reconcile.desired_bindings {
+            canonicalize_agent_session_row(row);
+        }
+        canonicalize_agent_state_vec(&mut reconcile.desired_bindings);
+    }
+    for identity in &mut job.stale_binding_deletes {
+        canonicalize_agent_state_string(&mut identity.pane_id);
+        canonicalize_agent_state_string(&mut identity.kind);
+        canonicalize_agent_state_string(&mut identity.session_id);
+    }
+    canonicalize_agent_state_vec(&mut job.stale_binding_deletes);
+    for clear in &mut job.turn_done_clears {
+        canonicalize_agent_state_string(&mut clear.session_key);
+    }
+    canonicalize_agent_state_vec(&mut job.turn_done_clears);
+    for mutation in &mut job.structured_mutations {
+        match mutation {
+            StructuredThreadMutation::Upsert(row) => canonicalize_structured_thread_row(row),
+            StructuredThreadMutation::SetArchived {
+                local_session_id, ..
+            }
+            | StructuredThreadMutation::Delete { local_session_id } => {
+                canonicalize_agent_state_string(local_session_id);
+            }
+        }
+    }
+    canonicalize_agent_state_vec(&mut job.structured_mutations);
+}
+
+fn checked_agent_state_retained_add(
+    total: &mut usize,
+    additional: usize,
+) -> Result<(), AgentStatePreparationErrorCode> {
+    *total = total
+        .checked_add(additional)
+        .ok_or(AgentStatePreparationErrorCode::ResourceLimit)?;
+    Ok(())
+}
+
+fn checked_agent_state_vec_allocation<T>(
+    total: &mut usize,
+    values: &Vec<T>,
+) -> Result<(), AgentStatePreparationErrorCode> {
+    let bytes = values
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(AgentStatePreparationErrorCode::ResourceLimit)?;
+    checked_agent_state_retained_add(total, bytes)
+}
+
+fn checked_agent_state_string_capacity(
+    total: &mut usize,
+    value: &String,
+) -> Result<(), AgentStatePreparationErrorCode> {
+    checked_agent_state_retained_add(total, value.capacity())
+}
+
+fn checked_agent_state_optional_string_capacity(
+    total: &mut usize,
+    value: &Option<String>,
+) -> Result<(), AgentStatePreparationErrorCode> {
+    if let Some(value) = value {
+        checked_agent_state_string_capacity(total, value)?;
+    }
+    Ok(())
+}
+
+fn agent_state_job_retained_bytes(
+    job: &AgentStateJob,
+) -> Result<usize, AgentStatePreparationErrorCode> {
+    let mut total = std::mem::size_of::<AgentStateJob>();
+    checked_agent_state_string_capacity(&mut total, &job.workspace_id)?;
+    checked_agent_state_vec_allocation(&mut total, &job.structured_workspace_ids)?;
+    for workspace_id in &job.structured_workspace_ids {
+        checked_agent_state_string_capacity(&mut total, workspace_id)?;
+    }
+    if let Some(reconcile) = &job.binding_reconcile {
+        checked_agent_state_vec_allocation(&mut total, &reconcile.live_pane_ids)?;
+        for pane_id in &reconcile.live_pane_ids {
+            checked_agent_state_string_capacity(&mut total, pane_id)?;
+        }
+        checked_agent_state_vec_allocation(&mut total, &reconcile.desired_bindings)?;
+        for row in &reconcile.desired_bindings {
+            checked_agent_state_string_capacity(&mut total, &row.pane_id)?;
+            checked_agent_state_string_capacity(&mut total, &row.kind)?;
+            checked_agent_state_string_capacity(&mut total, &row.session_id)?;
+        }
+    }
+    checked_agent_state_vec_allocation(&mut total, &job.stale_binding_deletes)?;
+    for identity in &job.stale_binding_deletes {
+        checked_agent_state_string_capacity(&mut total, &identity.pane_id)?;
+        checked_agent_state_string_capacity(&mut total, &identity.kind)?;
+        checked_agent_state_string_capacity(&mut total, &identity.session_id)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &job.turn_done_clears)?;
+    for clear in &job.turn_done_clears {
+        checked_agent_state_string_capacity(&mut total, &clear.session_key)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &job.structured_mutations)?;
+    for mutation in &job.structured_mutations {
+        match mutation {
+            StructuredThreadMutation::Upsert(row) => {
+                checked_agent_state_string_capacity(&mut total, &row.local_session_id)?;
+                checked_agent_state_string_capacity(&mut total, &row.workspace_id)?;
+                checked_agent_state_string_capacity(&mut total, &row.thread_id)?;
+                checked_agent_state_string_capacity(&mut total, &row.title)?;
+                checked_agent_state_string_capacity(&mut total, &row.cwd)?;
+                checked_agent_state_optional_string_capacity(&mut total, &row.model)?;
+            }
+            StructuredThreadMutation::SetArchived {
+                local_session_id, ..
+            }
+            | StructuredThreadMutation::Delete { local_session_id } => {
+                checked_agent_state_string_capacity(&mut total, local_session_id)?;
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn agent_state_snapshot_retained_bytes(
+    snapshot: &AgentStateSnapshot,
+) -> Result<usize, AgentStatePreparationErrorCode> {
+    let mut total = std::mem::size_of::<AgentStateSnapshot>();
+    checked_agent_state_vec_allocation(&mut total, &snapshot.hook_sessions)?;
+    for row in &snapshot.hook_sessions {
+        checked_agent_state_string_capacity(&mut total, &row.session_key)?;
+        checked_agent_state_string_capacity(&mut total, &row.kind)?;
+        checked_agent_state_string_capacity(&mut total, &row.agent_session_id)?;
+        checked_agent_state_string_capacity(&mut total, &row.transcript_path)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.statuslines)?;
+    for row in &snapshot.statuslines {
+        checked_agent_state_string_capacity(&mut total, &row.session_key)?;
+        checked_agent_state_optional_string_capacity(&mut total, &row.effort)?;
+        checked_agent_state_optional_string_capacity(&mut total, &row.model)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.waiting_sessions)?;
+    for (session_key, message) in &snapshot.waiting_sessions {
+        checked_agent_state_string_capacity(&mut total, session_key)?;
+        checked_agent_state_optional_string_capacity(&mut total, message)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.turn_done_sessions)?;
+    for (session_key, _) in &snapshot.turn_done_sessions {
+        checked_agent_state_string_capacity(&mut total, session_key)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.agent_sessions)?;
+    for row in &snapshot.agent_sessions {
+        checked_agent_state_string_capacity(&mut total, &row.pane_id)?;
+        checked_agent_state_string_capacity(&mut total, &row.kind)?;
+        checked_agent_state_string_capacity(&mut total, &row.session_id)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.structured_threads)?;
+    for row in &snapshot.structured_threads {
+        checked_agent_state_string_capacity(&mut total, &row.local_session_id)?;
+        checked_agent_state_string_capacity(&mut total, &row.workspace_id)?;
+        checked_agent_state_string_capacity(&mut total, &row.thread_id)?;
+        checked_agent_state_string_capacity(&mut total, &row.title)?;
+        checked_agent_state_string_capacity(&mut total, &row.cwd)?;
+        checked_agent_state_optional_string_capacity(&mut total, &row.model)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.activity_panes)?;
+    for (workspace_id, title, cwd) in &snapshot.activity_panes {
+        checked_agent_state_string_capacity(&mut total, workspace_id)?;
+        checked_agent_state_string_capacity(&mut total, title)?;
+        checked_agent_state_string_capacity(&mut total, cwd)?;
+    }
+    Ok(total)
+}
+
+/// Validates an AgentState job before mutation, canonicalizes every owned backing allocation to
+/// its bounded logical length, and returns the actual heap bytes retained by the prepared value.
+/// Invalid input is left untouched; success is ready for bounded worker retention and one
+/// `Db::apply_agent_state_job` call.
+pub fn prepare_agent_state_job_for_retention(
+    job: &mut AgentStateJob,
+) -> Result<AgentStateJobRetention, AgentStatePreparationErrorCode> {
+    validate_agent_state_job(job).map_err(|_| AgentStatePreparationErrorCode::InvalidInput)?;
+    canonicalize_agent_state_job(job);
+    let retained_bytes = agent_state_job_retained_bytes(job)?;
+    if retained_bytes > AGENT_STATE_JOB_BYTES_MAX {
+        return Err(AgentStatePreparationErrorCode::ResourceLimit);
+    }
+    Ok(AgentStateJobRetention { retained_bytes })
+}
+
 fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
     anyhow::ensure!(
         bounded_id_is_valid(&job.workspace_id)
@@ -1746,7 +2068,7 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
         .checked_add(structured_bytes)
         .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
     anyhow::ensure!(
-        retained_input_bytes <= BOUNDED_RETAINED_BYTES_MAX,
+        retained_input_bytes <= AGENT_STATE_JOB_BYTES_MAX,
         AGENT_STATE_INPUT_INVALID
     );
     Ok(workspace_prefix)
@@ -5096,10 +5418,11 @@ impl Db {
         Ok(result)
     }
 
-    /// Applies one bounded AgentStateWorker job and returns the complete post-mutation projection
-    /// from the same IMMEDIATE SQLite transaction. Projection validation happens before any output
-    /// String/Vec materialization; if a row is corrupt, a section exceeds its item limit, the
-    /// aggregate snapshot exceeds its byte limit, or commit fails, all job mutations roll back.
+    /// Applies one bounded AgentStateWorker job and returns the requested post-mutation projection
+    /// from the same IMMEDIATE SQLite transaction. Row, item, and logical-byte validation happens
+    /// before any output String/Vec materialization; omitted sections perform neither step. Actual
+    /// backing capacities are measured before commit. If either stage or commit fails, all job
+    /// mutations roll back.
     pub fn apply_agent_state_job(&self, job: &AgentStateJob) -> anyhow::Result<AgentStateSnapshot> {
         let workspace_prefix = validate_agent_state_job(job)?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
@@ -5267,125 +5590,200 @@ impl Db {
             }
         }
 
-        let snapshot_epoch = bounded_snapshot_epoch(&tx)?;
-        let hook_sql_limit = bounded_limit_plus_one(HOOK_PREFIX_ROWS_MAX, HOOK_PREFIX_ROWS_MAX)?;
-        let waiting_sql_limit =
-            bounded_limit_plus_one(WAITING_SESSION_ROWS_MAX, WAITING_SESSION_ROWS_MAX)?;
-        let agent_sql_limit =
-            bounded_limit_plus_one(AGENT_SESSION_ROWS_MAX, AGENT_SESSION_ROWS_MAX)?;
-        let structured_sql_limit = bounded_limit_plus_one(
-            AGENT_STATE_STRUCTURED_PROJECTION_MAX,
-            AGENT_STATE_STRUCTURED_PROJECTION_MAX,
-        )?;
+        let snapshot_epoch = if job.include_hook_status || job.include_attention {
+            Some(bounded_snapshot_epoch(&tx)?)
+        } else {
+            None
+        };
 
-        // Preflight every section before materializing the first output allocation.
-        let hook_probe = bounded_read_preflight(
-            &tx,
-            HOOK_SESSIONS_PREFIX_PREFLIGHT,
-            rusqlite::params![
-                workspace_prefix,
-                hook_sql_limit,
-                BOUNDED_ID_BYTES_MAX as i64,
-                BOUNDED_TEXT_BYTES_MAX as i64,
-                BOUNDED_ROW_BYTES_MAX as i64,
-                snapshot_epoch,
-            ],
-            HOOK_PREFIX_ROWS_MAX,
-        )?;
-        let status_probe = bounded_read_preflight(
-            &tx,
-            STATUSLINES_PREFIX_PREFLIGHT,
-            rusqlite::params![
-                workspace_prefix,
-                hook_sql_limit,
-                BOUNDED_ID_BYTES_MAX as i64,
-                BOUNDED_TEXT_BYTES_MAX as i64,
-                BOUNDED_ROW_BYTES_MAX as i64,
-                snapshot_epoch,
-            ],
-            HOOK_PREFIX_ROWS_MAX,
-        )?;
-        let waiting_probe = bounded_read_preflight(
-            &tx,
-            WAITING_SESSIONS_PREFLIGHT,
-            rusqlite::params![
+        // Preflight only requested sections before materializing the first output allocation.
+        // Every omitted section remains `None`: no query, SQL parameter Vec, or output buffer.
+        let hook_status_probes = if job.include_hook_status {
+            let snapshot_epoch =
+                snapshot_epoch.ok_or_else(|| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
+            let sql_limit = bounded_limit_plus_one(HOOK_PREFIX_ROWS_MAX, HOOK_PREFIX_ROWS_MAX)?;
+            let hook = bounded_read_preflight(
+                &tx,
+                HOOK_SESSIONS_PREFIX_PREFLIGHT,
+                rusqlite::params![
+                    workspace_prefix,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_TEXT_BYTES_MAX as i64,
+                    BOUNDED_ROW_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ],
+                HOOK_PREFIX_ROWS_MAX,
+            )?;
+            let status = bounded_read_preflight(
+                &tx,
+                STATUSLINES_PREFIX_PREFLIGHT,
+                rusqlite::params![
+                    workspace_prefix,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_TEXT_BYTES_MAX as i64,
+                    BOUNDED_ROW_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ],
+                HOOK_PREFIX_ROWS_MAX,
+            )?;
+            Some((hook, status, sql_limit, snapshot_epoch))
+        } else {
+            None
+        };
+        let attention_probes = if job.include_attention {
+            let snapshot_epoch =
+                snapshot_epoch.ok_or_else(|| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
+            let waiting_sql_limit =
+                bounded_limit_plus_one(WAITING_SESSION_ROWS_MAX, WAITING_SESSION_ROWS_MAX)?;
+            let turn_sql_limit =
+                bounded_limit_plus_one(HOOK_PREFIX_ROWS_MAX, HOOK_PREFIX_ROWS_MAX)?;
+            let waiting = bounded_read_preflight(
+                &tx,
+                WAITING_SESSIONS_PREFLIGHT,
+                rusqlite::params![
+                    waiting_sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_MESSAGE_BYTES_MAX as i64,
+                    BOUNDED_ROW_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ],
+                WAITING_SESSION_ROWS_MAX,
+            )?;
+            let turn = bounded_read_preflight(
+                &tx,
+                TURN_DONE_PREFIX_PREFLIGHT,
+                rusqlite::params![
+                    workspace_prefix,
+                    turn_sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_ROW_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ],
+                HOOK_PREFIX_ROWS_MAX,
+            )?;
+            Some((
+                waiting,
+                turn,
                 waiting_sql_limit,
-                BOUNDED_ID_BYTES_MAX as i64,
-                BOUNDED_MESSAGE_BYTES_MAX as i64,
-                BOUNDED_ROW_BYTES_MAX as i64,
+                turn_sql_limit,
                 snapshot_epoch,
-            ],
-            WAITING_SESSION_ROWS_MAX,
-        )?;
-        let turn_probe = bounded_read_preflight(
-            &tx,
-            TURN_DONE_PREFIX_PREFLIGHT,
-            rusqlite::params![
-                workspace_prefix,
-                hook_sql_limit,
-                BOUNDED_ID_BYTES_MAX as i64,
-                BOUNDED_ROW_BYTES_MAX as i64,
-                snapshot_epoch,
-            ],
-            HOOK_PREFIX_ROWS_MAX,
-        )?;
-        let agent_probe = bounded_read_preflight(
-            &tx,
-            AGENT_SESSIONS_BOUNDED_PREFLIGHT,
-            rusqlite::params![
-                job.workspace_id,
-                agent_sql_limit,
-                BOUNDED_ID_BYTES_MAX as i64,
-                BOUNDED_TEXT_BYTES_MAX as i64,
-                BOUNDED_ROW_BYTES_MAX as i64,
-            ],
-            AGENT_SESSION_ROWS_MAX,
-        )?;
-        let structured_preflight_sql =
-            agent_state_structured_scope_sql(job.structured_workspace_ids.len(), false);
-        let mut structured_preflight_params =
-            Vec::with_capacity(job.structured_workspace_ids.len() + 10);
-        structured_preflight_params.extend(
-            job.structured_workspace_ids
-                .iter()
-                .cloned()
-                .map(rusqlite::types::Value::Text),
-        );
-        structured_preflight_params.extend([
-            rusqlite::types::Value::Integer(job.include_archived_threads as i64),
-            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
-            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
-            rusqlite::types::Value::Integer(structured_sql_limit),
-            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
-            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
-            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
-            rusqlite::types::Value::Integer(STRUCTURED_THREAD_CWD_BYTES_MAX as i64),
-            rusqlite::types::Value::Integer(STRUCTURED_THREAD_MODEL_BYTES_MAX as i64),
-            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ROW_BYTES_MAX as i64),
-        ]);
-        let structured_probe = bounded_read_preflight(
-            &tx,
-            &structured_preflight_sql,
-            rusqlite::params_from_iter(&structured_preflight_params),
-            AGENT_STATE_STRUCTURED_PROJECTION_MAX,
-        )?;
-        let retained_bytes = [
-            hook_probe.retained_bytes,
-            status_probe.retained_bytes,
-            waiting_probe.retained_bytes,
-            turn_probe.retained_bytes,
-            agent_probe.retained_bytes,
-            structured_probe.retained_bytes,
+            ))
+        } else {
+            None
+        };
+        let agent_probe = if job.include_agent_sessions {
+            let sql_limit = bounded_limit_plus_one(AGENT_SESSION_ROWS_MAX, AGENT_SESSION_ROWS_MAX)?;
+            Some((
+                bounded_read_preflight(
+                    &tx,
+                    AGENT_SESSIONS_BOUNDED_PREFLIGHT,
+                    rusqlite::params![
+                        job.workspace_id,
+                        sql_limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                        BOUNDED_TEXT_BYTES_MAX as i64,
+                        BOUNDED_ROW_BYTES_MAX as i64,
+                    ],
+                    AGENT_SESSION_ROWS_MAX,
+                )?,
+                sql_limit,
+            ))
+        } else {
+            None
+        };
+        let structured_probe = if job.include_structured_threads {
+            let sql_limit = bounded_limit_plus_one(
+                AGENT_STATE_STRUCTURED_PROJECTION_MAX,
+                AGENT_STATE_STRUCTURED_PROJECTION_MAX,
+            )?;
+            let preflight_sql =
+                agent_state_structured_scope_sql(job.structured_workspace_ids.len(), false);
+            let mut params = Vec::with_capacity(job.structured_workspace_ids.len() + 10);
+            params.extend(
+                job.structured_workspace_ids
+                    .iter()
+                    .cloned()
+                    .map(rusqlite::types::Value::Text),
+            );
+            params.extend([
+                rusqlite::types::Value::Integer(job.include_archived_threads as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(sql_limit),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_CWD_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_MODEL_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_ROW_BYTES_MAX as i64),
+            ]);
+            Some((
+                bounded_read_preflight(
+                    &tx,
+                    &preflight_sql,
+                    rusqlite::params_from_iter(&params),
+                    AGENT_STATE_STRUCTURED_PROJECTION_MAX,
+                )?,
+                sql_limit,
+            ))
+        } else {
+            None
+        };
+        let activity_sql_limit = job
+            .include_activity_panes
+            .then(|| bounded_limit_plus_one(ACTIVITY_PANE_ROWS_MAX, ACTIVITY_PANE_ROWS_MAX))
+            .transpose()?;
+        let activity_probe = if let Some(sql_limit) = activity_sql_limit {
+            Some(bounded_read_preflight(
+                &tx,
+                ACTIVITY_PANES_BOUNDED_PREFLIGHT,
+                rusqlite::params![
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_TEXT_BYTES_MAX as i64,
+                    BOUNDED_ROW_BYTES_MAX as i64,
+                ],
+                ACTIVITY_PANE_ROWS_MAX,
+            )?)
+        } else {
+            None
+        };
+        let logical_retained_bytes = [
+            hook_status_probes
+                .as_ref()
+                .map_or(0, |(probe, _, _, _)| probe.retained_bytes),
+            hook_status_probes
+                .as_ref()
+                .map_or(0, |(_, probe, _, _)| probe.retained_bytes),
+            attention_probes
+                .as_ref()
+                .map_or(0, |(probe, _, _, _, _)| probe.retained_bytes),
+            attention_probes
+                .as_ref()
+                .map_or(0, |(_, probe, _, _, _)| probe.retained_bytes),
+            agent_probe
+                .as_ref()
+                .map_or(0, |(probe, _)| probe.retained_bytes),
+            structured_probe
+                .as_ref()
+                .map_or(0, |(probe, _)| probe.retained_bytes),
+            activity_probe
+                .as_ref()
+                .map_or(0, |probe| probe.retained_bytes),
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
         anyhow::ensure!(
-            retained_bytes <= job.snapshot_bytes_max,
+            logical_retained_bytes <= job.snapshot_bytes_max,
             AGENT_STATE_SNAPSHOT_INVALID
         );
 
-        let hook_sessions = {
+        let hook_sessions = if let Some((hook_probe, _, sql_limit, snapshot_epoch)) =
+            &hook_status_probes
+        {
             let mut result = Vec::with_capacity(hook_probe.count);
             let mut stmt = tx
                 .prepare(HOOK_SESSIONS_PREFIX_SELECT)
@@ -5393,7 +5791,7 @@ impl Db {
             let mut rows = stmt
                 .query(rusqlite::params![
                     workspace_prefix,
-                    hook_sql_limit,
+                    sql_limit,
                     BOUNDED_ID_BYTES_MAX as i64,
                     snapshot_epoch,
                 ])
@@ -5426,8 +5824,12 @@ impl Db {
                 });
             }
             result
+        } else {
+            Vec::new()
         };
-        let statuslines = {
+        let statuslines = if let Some((_, status_probe, sql_limit, snapshot_epoch)) =
+            &hook_status_probes
+        {
             let mut result = Vec::with_capacity(status_probe.count);
             let mut stmt = tx
                 .prepare(STATUSLINES_PREFIX_SELECT)
@@ -5435,7 +5837,7 @@ impl Db {
             let mut rows = stmt
                 .query(rusqlite::params![
                     workspace_prefix,
-                    hook_sql_limit,
+                    sql_limit,
                     BOUNDED_ID_BYTES_MAX as i64,
                     snapshot_epoch,
                 ])
@@ -5455,15 +5857,19 @@ impl Db {
                 });
             }
             result
+        } else {
+            Vec::new()
         };
-        let waiting_sessions = {
+        let waiting_sessions = if let Some((waiting_probe, _, sql_limit, _, snapshot_epoch)) =
+            &attention_probes
+        {
             let mut result = Vec::with_capacity(waiting_probe.count);
             let mut stmt = tx
                 .prepare(WAITING_SESSIONS_SELECT)
                 .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
             let mut rows = stmt
                 .query(rusqlite::params![
-                    waiting_sql_limit,
+                    sql_limit,
                     BOUNDED_ID_BYTES_MAX as i64,
                     snapshot_epoch,
                 ])
@@ -5478,32 +5884,37 @@ impl Db {
                 ));
             }
             result
+        } else {
+            Vec::new()
         };
-        let turn_done_sessions = {
-            let mut result = Vec::with_capacity(turn_probe.count);
-            let mut stmt = tx
-                .prepare(TURN_DONE_PREFIX_SELECT)
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
-            let mut rows = stmt
-                .query(rusqlite::params![
-                    workspace_prefix,
-                    hook_sql_limit,
-                    BOUNDED_ID_BYTES_MAX as i64,
-                    snapshot_epoch,
-                ])
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
-            while let Some(row) = rows
-                .next()
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
-            {
-                result.push((
-                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
-                    bounded_integer(row, 1)?,
-                ));
-            }
-            result
-        };
-        let agent_sessions = {
+        let turn_done_sessions =
+            if let Some((_, turn_probe, _, sql_limit, snapshot_epoch)) = &attention_probes {
+                let mut result = Vec::with_capacity(turn_probe.count);
+                let mut stmt = tx
+                    .prepare(TURN_DONE_PREFIX_SELECT)
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                let mut rows = stmt
+                    .query(rusqlite::params![
+                        workspace_prefix,
+                        sql_limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                        snapshot_epoch,
+                    ])
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+                {
+                    result.push((
+                        bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                        bounded_integer(row, 1)?,
+                    ));
+                }
+                result
+            } else {
+                Vec::new()
+            };
+        let agent_sessions = if let Some((agent_probe, sql_limit)) = &agent_probe {
             let mut result = Vec::with_capacity(agent_probe.count);
             let mut stmt = tx
                 .prepare(AGENT_SESSIONS_BOUNDED_SELECT)
@@ -5511,7 +5922,7 @@ impl Db {
             let mut rows = stmt
                 .query(rusqlite::params![
                     job.workspace_id,
-                    agent_sql_limit,
+                    sql_limit,
                     BOUNDED_ID_BYTES_MAX as i64,
                 ])
                 .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
@@ -5529,8 +5940,10 @@ impl Db {
                 });
             }
             result
+        } else {
+            Vec::new()
         };
-        let structured_threads = {
+        let structured_threads = if let Some((structured_probe, sql_limit)) = &structured_probe {
             let mut result = Vec::with_capacity(structured_probe.count);
             let sql = agent_state_structured_scope_sql(job.structured_workspace_ids.len(), true);
             let mut params = Vec::with_capacity(job.structured_workspace_ids.len() + 4);
@@ -5544,7 +5957,7 @@ impl Db {
                 rusqlite::types::Value::Integer(job.include_archived_threads as i64),
                 rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
                 rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
-                rusqlite::types::Value::Integer(structured_sql_limit),
+                rusqlite::types::Value::Integer(*sql_limit),
             ]);
             let mut stmt = tx
                 .prepare(&sql)
@@ -5618,18 +6031,55 @@ impl Db {
                 });
             }
             result
+        } else {
+            Vec::new()
+        };
+        let activity_panes = if let (Some(sql_limit), Some(probe)) =
+            (activity_sql_limit, activity_probe)
+        {
+            let mut result = Vec::with_capacity(probe.count);
+            let mut stmt = tx
+                .prepare(ACTIVITY_PANES_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_TEXT_BYTES_MAX as i64,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                let workspace_id = bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?;
+                let title = bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                let cwd = bounded_required_text(row, 2, BOUNDED_TEXT_BYTES_MAX, false, false)?;
+                result.push((workspace_id.to_owned(), title.to_owned(), cwd.to_owned()));
+            }
+            result
+        } else {
+            Vec::new()
         };
 
-        tx.commit()
-            .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
-        Ok(AgentStateSnapshot {
+        let snapshot = AgentStateSnapshot {
             hook_sessions,
             statuslines,
             waiting_sessions,
             turn_done_sessions,
             agent_sessions,
             structured_threads,
-        })
+            activity_panes,
+        };
+        let actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
+        anyhow::ensure!(
+            actual_retained_bytes <= job.snapshot_bytes_max,
+            AGENT_STATE_SNAPSHOT_INVALID
+        );
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+        Ok(snapshot)
     }
 
     /// 구조화 Codex thread 메타데이터를 저장한다. local/thread ID는 모두 durable하며,
@@ -8925,6 +9375,15 @@ mod tests {
         }
     }
 
+    fn agent_state_mutation_only_job(workspace_id: &str) -> AgentStateJob {
+        let mut job = AgentStateJob::projection(workspace_id);
+        job.include_hook_status = false;
+        job.include_attention = false;
+        job.include_agent_sessions = false;
+        job.include_structured_threads = false;
+        job
+    }
+
     #[test]
     fn agent_state_job은_mutation뒤_complete_projection을_한_transaction에서_반환한다() {
         let db = Db::open_in_memory().unwrap();
@@ -8997,6 +9456,7 @@ mod tests {
             std::collections::HashSet::from(["pane-preserved", "pane-desired"])
         );
         assert!(snapshot.structured_threads[0].archived);
+        assert!(snapshot.activity_panes.is_empty());
         assert_eq!(
             db.conn
                 .query_row(
@@ -9007,6 +9467,394 @@ mod tests {
                 )
                 .unwrap(),
             7
+        );
+    }
+
+    #[test]
+    fn agent_state_projection_legacy_default는_기존section을모두요청한다() {
+        let job = AgentStateJob::projection("legacy-workspace");
+        assert!(job.include_hook_status);
+        assert!(job.include_attention);
+        assert!(job.include_agent_sessions);
+        assert!(job.include_structured_threads);
+        assert!(job.include_archived_threads);
+        assert!(!job.include_activity_panes);
+    }
+
+    #[test]
+    fn agent_state_hook_status_omission은_corrupt_rows를조회하거나할당하지않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-omit-hook-status").unwrap();
+        let key = format!("{ws}:hook");
+        db.conn
+            .execute(
+                "INSERT INTO agent_hook_sessions
+                    (session_key, kind, agent_session_id, transcript_path, updated_at)
+                 VALUES (?1, x'ff', 'agent', '', CAST(strftime('%s','now') AS INTEGER))",
+                [&key],
+            )
+            .unwrap();
+
+        let omitted = agent_state_mutation_only_job(&ws);
+        let snapshot = db.apply_agent_state_job(&omitted).unwrap();
+        assert_eq!(snapshot.hook_sessions.capacity(), 0);
+        assert_eq!(snapshot.statuslines.capacity(), 0);
+        let mut requested = omitted.clone();
+        requested.include_hook_status = true;
+        assert_eq!(
+            db.apply_agent_state_job(&requested)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+
+        db.conn
+            .execute("DELETE FROM agent_hook_sessions", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO agent_statusline
+                    (session_key, effort, model, context_pct, updated_at)
+                 VALUES (?1, NULL, x'ff', NULL, CAST(strftime('%s','now') AS INTEGER))",
+                [&key],
+            )
+            .unwrap();
+        assert!(db.apply_agent_state_job(&omitted).is_ok());
+        assert_eq!(
+            db.apply_agent_state_job(&requested)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn agent_state_attention_omission은_corrupt_rows를조회하거나할당하지않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-omit-attention").unwrap();
+        let waiting_key = format!("{ws}:waiting");
+        db.conn
+            .execute(
+                "INSERT INTO agent_needs_input
+                    (session_key, waiting, updated_at, turn_done, message)
+                 VALUES (?1, 1, CAST(strftime('%s','now') AS INTEGER), 0, x'ff')",
+                [&waiting_key],
+            )
+            .unwrap();
+
+        let omitted = agent_state_mutation_only_job(&ws);
+        let snapshot = db.apply_agent_state_job(&omitted).unwrap();
+        assert_eq!(snapshot.waiting_sessions.capacity(), 0);
+        assert_eq!(snapshot.turn_done_sessions.capacity(), 0);
+        let mut requested = omitted.clone();
+        requested.include_attention = true;
+        assert_eq!(
+            db.apply_agent_state_job(&requested)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+
+        db.conn
+            .execute("DELETE FROM agent_needs_input", [])
+            .unwrap();
+        let turn_key = format!("{ws}:turn");
+        db.conn
+            .execute(
+                "INSERT INTO agent_needs_input
+                    (session_key, waiting, updated_at, turn_done, message)
+                 VALUES (CAST(?1 AS BLOB), 0, CAST(strftime('%s','now') AS INTEGER), 1, NULL)",
+                [&turn_key],
+            )
+            .unwrap();
+        assert!(db.apply_agent_state_job(&omitted).is_ok());
+        assert_eq!(
+            db.apply_agent_state_job(&requested)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn agent_state_binding_omission은_corrupt_rows를조회하거나할당하지않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-omit-bindings").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO agent_sessions
+                    (workspace_id, pane_id, kind, session_id, updated_at)
+                 VALUES (?1, 'pane', x'ff', 'session',
+                         CAST(strftime('%s','now') AS INTEGER))",
+                [&ws],
+            )
+            .unwrap();
+
+        let omitted = agent_state_mutation_only_job(&ws);
+        let snapshot = db.apply_agent_state_job(&omitted).unwrap();
+        assert_eq!(snapshot.agent_sessions.capacity(), 0);
+        let mut requested = omitted;
+        requested.include_agent_sessions = true;
+        assert_eq!(
+            db.apply_agent_state_job(&requested)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn agent_state_structured_omission은_corrupt_rows를조회하거나할당하지않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-omit-structured").unwrap();
+        db.upsert_structured_thread(
+            "omit-structured-local",
+            &ws,
+            "omit-structured-thread",
+            "title",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE structured_threads SET title = x'ff'
+                  WHERE local_session_id = 'omit-structured-local'",
+                [],
+            )
+            .unwrap();
+
+        let omitted = agent_state_mutation_only_job(&ws);
+        let snapshot = db.apply_agent_state_job(&omitted).unwrap();
+        assert_eq!(snapshot.structured_threads.capacity(), 0);
+        let mut requested = omitted;
+        requested.include_structured_threads = true;
+        assert_eq!(
+            db.apply_agent_state_job(&requested)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn agent_state_selective_projection은_omitted_section_mutation도원자commit한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-selective-commit").unwrap();
+        db.upsert_agent_session(&ws, "old-pane", "codex", "old-session")
+            .unwrap();
+        db.upsert_structured_thread(
+            "selective-local",
+            &ws,
+            "selective-thread",
+            "title",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let key = format!("{ws}:turn");
+        db.set_agent_turn_done(&key).unwrap();
+        let seen_at = db.list_turn_done_sessions().unwrap()[0].1;
+
+        let mut job = agent_state_mutation_only_job(&ws);
+        job.include_attention = true;
+        job.binding_reconcile = Some(AgentSessionBindingReconcile {
+            live_pane_ids: vec!["new-pane".to_owned()],
+            desired_bindings: vec![AgentSessionRow {
+                pane_id: "new-pane".to_owned(),
+                kind: "codex".to_owned(),
+                session_id: "new-session".to_owned(),
+            }],
+        });
+        job.turn_done_clears.push(AgentTurnDoneClear {
+            session_key: key,
+            seen_at,
+        });
+        job.structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "selective-local".to_owned(),
+                archived: true,
+            });
+
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert!(snapshot.turn_done_sessions.is_empty());
+        assert_eq!(snapshot.hook_sessions.capacity(), 0);
+        assert_eq!(snapshot.agent_sessions.capacity(), 0);
+        assert_eq!(snapshot.structured_threads.capacity(), 0);
+        assert_eq!(
+            db.list_agent_sessions(&ws).unwrap(),
+            vec![AgentSessionRow {
+                pane_id: "new-pane".to_owned(),
+                kind: "codex".to_owned(),
+                session_id: "new-session".to_owned(),
+            }]
+        );
+        assert!(db.list_structured_threads(&ws, true).unwrap()[0].archived);
+    }
+
+    #[test]
+    fn agent_state_selective_projection실패는_omitted_section_mutation도rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db
+            .create_workspace("agent-state-selective-rollback")
+            .unwrap();
+        db.upsert_agent_session(&ws, "preserved-pane", "codex", "preserved-session")
+            .unwrap();
+        db.upsert_structured_thread(
+            "selective-rollback-local",
+            &ws,
+            "selective-rollback-thread",
+            "title",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let corrupt_key = format!("{ws}:corrupt");
+        db.conn
+            .execute(
+                "INSERT INTO agent_needs_input
+                    (session_key, waiting, updated_at, turn_done, message)
+                 VALUES (?1, 1, CAST(strftime('%s','now') AS INTEGER), 0, x'ff')",
+                [&corrupt_key],
+            )
+            .unwrap();
+
+        let mut job = agent_state_mutation_only_job(&ws);
+        job.include_attention = true;
+        job.stale_binding_deletes.push(AgentSessionIdentity {
+            pane_id: "preserved-pane".to_owned(),
+            kind: "codex".to_owned(),
+            session_id: "preserved-session".to_owned(),
+        });
+        job.structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "selective-rollback-local".to_owned(),
+                archived: true,
+            });
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+        assert_eq!(db.list_agent_sessions(&ws).unwrap().len(), 1);
+        assert!(
+            !db.list_structured_threads(&ws, true).unwrap()[0].archived,
+            "requested-section preflight failure must roll back omitted-section mutations"
+        );
+    }
+
+    #[test]
+    fn agent_state_activity_catalog는_opt_in으로같은_snapshot에포함된다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = seed_activity_panes(&db, 2, "saved shell");
+
+        let without_activity = db
+            .apply_agent_state_job(&AgentStateJob::projection(&workspace_id))
+            .unwrap();
+        assert!(without_activity.activity_panes.is_empty());
+
+        let mut job = AgentStateJob::projection(&workspace_id);
+        job.include_activity_panes = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert_eq!(snapshot.activity_panes.len(), 2);
+        assert!(
+            snapshot
+                .activity_panes
+                .iter()
+                .all(|(workspace, title, cwd)| workspace == &workspace_id
+                    && title == "saved shell"
+                    && cwd.is_empty())
+        );
+        assert!(snapshot.retained_bytes() <= AGENT_STATE_SNAPSHOT_BYTES_MAX);
+    }
+
+    #[test]
+    fn agent_state_activity_actual_byte_failure는_exact_mutation을_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = seed_activity_panes(&db, 2, "saved shell");
+        db.upsert_structured_thread(
+            "activity-rollback-local",
+            &workspace_id,
+            "activity-rollback-thread",
+            "title",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let mut projection = AgentStateJob::projection(&workspace_id);
+        projection.include_activity_panes = true;
+        let exact_bytes = db
+            .apply_agent_state_job(&projection)
+            .unwrap()
+            .retained_bytes();
+
+        let mut exact = projection.clone();
+        exact.snapshot_bytes_max = exact_bytes;
+        exact
+            .structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "activity-rollback-local".to_owned(),
+                archived: true,
+            });
+        assert!(db.apply_agent_state_job(&exact).is_ok());
+        assert!(db.list_structured_threads(&workspace_id, true).unwrap()[0].archived);
+        assert!(
+            db.set_structured_thread_archived("activity-rollback-local", false)
+                .unwrap()
+        );
+
+        exact.snapshot_bytes_max = exact_bytes - 1;
+        assert_eq!(
+            db.apply_agent_state_job(&exact).unwrap_err().to_string(),
+            AGENT_STATE_SNAPSHOT_INVALID
+        );
+        assert!(
+            !db.list_structured_threads(&workspace_id, true).unwrap()[0].archived,
+            "actual activity allocation failure must roll back the co-staged mutation"
+        );
+    }
+
+    #[test]
+    fn agent_state_activity_preflight_failure는_exact_mutation을_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = seed_activity_panes(&db, 1, "saved shell");
+        let session_key = format!("{workspace_id}:session");
+        db.set_agent_turn_done(&session_key).unwrap();
+        let seen_at = db.list_turn_done_sessions().unwrap()[0].1;
+        db.conn
+            .execute(
+                "UPDATE mux_panes SET title = CAST(x'7879' AS BLOB)
+                  WHERE id = 'activity-pane-00000'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.apply_agent_state_job(&AgentStateJob::projection(&workspace_id))
+                .is_ok(),
+            "activity storage must not be queried unless the projection is requested"
+        );
+
+        let mut job = AgentStateJob::projection(&workspace_id);
+        job.include_activity_panes = true;
+        job.turn_done_clears.push(AgentTurnDoneClear {
+            session_key: session_key.clone(),
+            seen_at,
+        });
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+        assert_eq!(
+            db.list_turn_done_sessions().unwrap(),
+            vec![(session_key, seen_at)]
         );
     }
 
@@ -9390,14 +10238,15 @@ mod tests {
         let second = db
             .create_workspace("agent-state-catalog-bytes-second")
             .unwrap();
+        let row_retained_bytes =
+            (AGENT_STATE_SNAPSHOT_BYTES_MAX - std::mem::size_of::<AgentStateSnapshot>()) / 128
+                - std::mem::size_of::<StructuredThreadRow>();
         for index in 0..129 {
             let workspace_id = if index < 65 { &first } else { &second };
             let local_session_id = format!("catalog-byte-local-{index}");
             let thread_id = format!("catalog-byte-thread-{index}");
-            let title_bytes = STRUCTURED_THREAD_ROW_BYTES_MAX
-                - local_session_id.len()
-                - workspace_id.len()
-                - thread_id.len();
+            let title_bytes =
+                row_retained_bytes - local_session_id.len() - workspace_id.len() - thread_id.len();
             db.upsert_structured_thread(
                 &local_session_id,
                 workspace_id,
@@ -9469,16 +10318,10 @@ mod tests {
             false,
         )
         .unwrap();
-        let retained_bytes = [
-            local_session_id.len(),
-            workspace_id.len(),
-            thread_id.len(),
-            title.len(),
-            cwd.len(),
-            model.len(),
-        ]
-        .into_iter()
-        .sum();
+        let retained_bytes = db
+            .apply_agent_state_job(&AgentStateJob::projection(&workspace_id))
+            .unwrap()
+            .retained_bytes();
 
         let mut exact = AgentStateJob::projection(&workspace_id);
         assert_eq!(exact.snapshot_bytes_max, AGENT_STATE_SNAPSHOT_BYTES_MAX);
@@ -9524,6 +10367,83 @@ mod tests {
             !db.list_structured_threads(&workspace_id, true).unwrap()[0].archived,
             "custom output cap failure must roll back the exact mutation"
         );
+    }
+
+    #[test]
+    fn agent_state_retention_preflight는_validate후_capacity를정규화한다() {
+        fn spare_string(value: &str, capacity: usize) -> String {
+            let mut output = String::with_capacity(capacity);
+            output.push_str(value);
+            output
+        }
+
+        let workspace = spare_string("workspace", AGENT_STATE_JOB_BYTES_MAX * 2);
+        let mut job = AgentStateJob::projection(workspace);
+        job.structured_workspace_ids = Vec::with_capacity(32);
+        job.structured_workspace_ids
+            .push(spare_string("workspace", 64 * 1024));
+        job.stale_binding_deletes = Vec::with_capacity(AGENT_STATE_EXACT_MUTATIONS_MAX * 4);
+        job.stale_binding_deletes.push(AgentSessionIdentity {
+            pane_id: spare_string("pane", 64 * 1024),
+            kind: spare_string("codex", 64 * 1024),
+            session_id: spare_string("session", 64 * 1024),
+        });
+        assert!(agent_state_job_retained_bytes(&job).unwrap() > AGENT_STATE_JOB_BYTES_MAX);
+
+        let retention = prepare_agent_state_job_for_retention(&mut job).unwrap();
+        assert_eq!(
+            retention.retained_bytes(),
+            agent_state_job_retained_bytes(&job).unwrap()
+        );
+        assert!(retention.retained_bytes() <= AGENT_STATE_JOB_BYTES_MAX);
+        assert_eq!(job.workspace_id.capacity(), job.workspace_id.len());
+        assert_eq!(
+            job.structured_workspace_ids.capacity(),
+            job.structured_workspace_ids.len()
+        );
+        assert_eq!(
+            job.stale_binding_deletes.capacity(),
+            job.stale_binding_deletes.len()
+        );
+        let identity = &job.stale_binding_deletes[0];
+        assert_eq!(identity.pane_id.capacity(), identity.pane_id.len());
+        assert_eq!(identity.kind.capacity(), identity.kind.len());
+        assert_eq!(identity.session_id.capacity(), identity.session_id.len());
+        assert_eq!(format!("{retention:?}"), "AgentStateJobRetention");
+        assert_eq!(
+            format!("{:?}", AgentStatePreparationErrorCode::InvalidInput),
+            "invalid_input"
+        );
+        assert_eq!(
+            format!("{:?}", AgentStatePreparationErrorCode::ResourceLimit),
+            "resource_limit"
+        );
+    }
+
+    #[test]
+    fn agent_state_retention_preflight는_plus_one을변경전거부하고overflow를닫는다() {
+        let workspace = "workspace";
+        let mut job = AgentStateJob::projection(workspace);
+        job.structured_mutations = Vec::with_capacity(AGENT_STATE_STRUCTURED_MUTATIONS_MAX * 2);
+        for index in 0..=AGENT_STATE_STRUCTURED_MUTATIONS_MAX {
+            job.structured_mutations
+                .push(StructuredThreadMutation::Delete {
+                    local_session_id: format!("local-{index}"),
+                });
+        }
+        let original_capacity = job.structured_mutations.capacity();
+        assert_eq!(
+            prepare_agent_state_job_for_retention(&mut job),
+            Err(AgentStatePreparationErrorCode::InvalidInput)
+        );
+        assert_eq!(job.structured_mutations.capacity(), original_capacity);
+
+        let mut total = usize::MAX;
+        assert_eq!(
+            checked_agent_state_retained_add(&mut total, 1),
+            Err(AgentStatePreparationErrorCode::ResourceLimit)
+        );
+        assert_eq!(total, usize::MAX);
     }
 
     #[test]
@@ -9620,7 +10540,12 @@ mod tests {
             stale_binding_deletes: vec![identity.clone()],
             turn_done_clears: vec![clear.clone()],
             structured_mutations: vec![mutation.clone()],
+            include_hook_status: true,
+            include_attention: true,
+            include_agent_sessions: true,
+            include_structured_threads: true,
             include_archived_threads: true,
+            include_activity_panes: true,
         };
         let snapshot = AgentStateSnapshot {
             hook_sessions: vec![HookSessionRow {
@@ -9639,6 +10564,7 @@ mod tests {
             turn_done_sessions: vec![(marker.to_owned(), i64::MAX)],
             agent_sessions: reconcile.desired_bindings.clone(),
             structured_threads: vec![structured],
+            activity_panes: vec![(marker.to_owned(), marker.to_owned(), marker.to_owned())],
         };
 
         for debug in [

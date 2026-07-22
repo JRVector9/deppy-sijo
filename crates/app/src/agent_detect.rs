@@ -37,6 +37,11 @@ const MAX_SCAN_FILES: usize = 4_096;
 const MAX_SCAN_ENTRIES: usize = 16_384;
 const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_SCAN_DEPTH: usize = 8;
+pub(crate) const RESUME_PROBE_ITEMS_MAX: usize = MAX_SESSIONS;
+pub(crate) const RESUME_PROBE_REQUEST_BYTES_MAX: usize =
+    RESUME_PROBE_ITEMS_MAX * (std::mem::size_of::<ResumeTranscriptProbe>() + MAX_SESSION_ID_BYTES);
+pub(crate) const RESUME_PROBE_RESULT_BYTES_MAX: usize =
+    RESUME_PROBE_ITEMS_MAX * (std::mem::size_of::<ResumeTranscriptProbeResult>() + MAX_PATH_BYTES);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PIPE_READER_STACK_BYTES: usize = 128 * 1024;
@@ -479,6 +484,172 @@ impl TranscriptFinder {
             }
         }
     }
+}
+
+/// Opaque, allocation-canonicalized input for one off-thread resume transcript probe.
+///
+/// The session identifier is deliberately private and its `Debug` representation is redacted.
+/// Turning the input `String` into a boxed string drops arbitrary spare capacity before the
+/// request can be retained by the AgentState worker.
+pub(crate) struct ResumeTranscriptProbe {
+    kind: AgentKind,
+    session_id: Box<str>,
+}
+
+impl ResumeTranscriptProbe {
+    pub(crate) fn try_new(
+        kind: AgentKind,
+        session_id: String,
+    ) -> Result<Self, ResumeTranscriptProbeError> {
+        if !valid_session_id(&session_id) {
+            return Err(ResumeTranscriptProbeError::InvalidRequest);
+        }
+        Ok(Self {
+            kind,
+            session_id: session_id.into_boxed_str(),
+        })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.session_id.len()
+    }
+}
+
+impl std::fmt::Debug for ResumeTranscriptProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResumeTranscriptProbe")
+            .field("kind", &self.kind)
+            .field("session_id", &"REDACTED")
+            .finish()
+    }
+}
+
+/// Sanitized worker-side probe output. Transcript paths never cross the worker boundary, and the
+/// cwd is retained only when it is a bounded absolute path to a directory at probe time.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ResumeTranscriptProbeResult {
+    found: bool,
+    cwd: Option<Box<str>>,
+}
+
+impl ResumeTranscriptProbeResult {
+    pub(crate) const fn found(&self) -> bool {
+        self.found
+    }
+
+    pub(crate) fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+}
+
+impl std::fmt::Debug for ResumeTranscriptProbeResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResumeTranscriptProbeResult")
+            .field("found", &self.found)
+            .field("cwd_present", &self.cwd.is_some())
+            .finish()
+    }
+}
+
+/// Low-cardinality failure returned before any raw identifier or filesystem error can escape the
+/// worker-side probe boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeTranscriptProbeError {
+    InvalidRequest,
+    ResourceLimit,
+}
+
+impl ResumeTranscriptProbeError {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::ResourceLimit => "resource_limit",
+        }
+    }
+}
+
+impl std::fmt::Debug for ResumeTranscriptProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+fn check_resume_probe_limit(
+    items: usize,
+    retained_bytes: usize,
+    bytes_max: usize,
+) -> Result<(), ResumeTranscriptProbeError> {
+    if items > RESUME_PROBE_ITEMS_MAX || retained_bytes > bytes_max {
+        return Err(ResumeTranscriptProbeError::ResourceLimit);
+    }
+    Ok(())
+}
+
+/// Resolve one bounded batch on the caller's worker thread. One finder is reused for the whole
+/// batch, so Codex's bounded recursive scan is performed at most once. All request item/byte caps
+/// are checked before the first filesystem lookup.
+pub(crate) fn probe_resume_transcripts(
+    requests: &[ResumeTranscriptProbe],
+) -> Result<Vec<ResumeTranscriptProbeResult>, ResumeTranscriptProbeError> {
+    let mut finder = TranscriptFinder::new();
+    probe_resume_transcripts_with(
+        requests,
+        |kind, session_id| finder.find(kind, session_id),
+        transcript_cwd,
+        |cwd| Path::new(cwd).is_dir(),
+    )
+}
+
+fn probe_resume_transcripts_with(
+    requests: &[ResumeTranscriptProbe],
+    mut find: impl FnMut(AgentKind, &str) -> Option<PathBuf>,
+    mut read_cwd: impl FnMut(&Path) -> Option<String>,
+    mut is_directory: impl FnMut(&str) -> bool,
+) -> Result<Vec<ResumeTranscriptProbeResult>, ResumeTranscriptProbeError> {
+    let request_bytes = requests.iter().try_fold(0usize, |total, request| {
+        total.checked_add(request.retained_bytes())
+    });
+    let request_bytes = request_bytes.ok_or(ResumeTranscriptProbeError::ResourceLimit)?;
+    check_resume_probe_limit(
+        requests.len(),
+        request_bytes,
+        RESUME_PROBE_REQUEST_BYTES_MAX,
+    )?;
+    let maximum_result_bytes = std::mem::size_of::<ResumeTranscriptProbeResult>()
+        .checked_add(MAX_PATH_BYTES)
+        .and_then(|bytes| bytes.checked_mul(requests.len()))
+        .ok_or(ResumeTranscriptProbeError::ResourceLimit)?;
+    check_resume_probe_limit(
+        requests.len(),
+        maximum_result_bytes,
+        RESUME_PROBE_RESULT_BYTES_MAX,
+    )?;
+
+    let mut results = Vec::with_capacity(requests.len());
+    let mut result_bytes = std::mem::size_of::<ResumeTranscriptProbeResult>()
+        .checked_mul(requests.len())
+        .ok_or(ResumeTranscriptProbeError::ResourceLimit)?;
+    for request in requests {
+        let Some(transcript) = find(request.kind, &request.session_id) else {
+            results.push(ResumeTranscriptProbeResult {
+                found: false,
+                cwd: None,
+            });
+            continue;
+        };
+        let cwd = read_cwd(&transcript)
+            .filter(|cwd| valid_absolute_path(cwd))
+            .filter(|cwd| is_directory(cwd))
+            .map(String::into_boxed_str);
+        result_bytes = result_bytes
+            .checked_add(cwd.as_ref().map_or(0, |cwd| cwd.len()))
+            .ok_or(ResumeTranscriptProbeError::ResourceLimit)?;
+        check_resume_probe_limit(requests.len(), result_bytes, RESUME_PROBE_RESULT_BYTES_MAX)?;
+        results.push(ResumeTranscriptProbeResult { found: true, cwd });
+    }
+    Ok(results)
 }
 
 /// transcript(jsonl) 앞부분에서 세션의 원래 cwd를 읽는다 — 복원 resume 시 그 폴더로
@@ -1308,6 +1479,156 @@ mod tests {
     }
 
     #[test]
+    fn resume_probe_limits_accept_exact_and_reject_plus_one() {
+        assert_eq!(
+            check_resume_probe_limit(
+                RESUME_PROBE_ITEMS_MAX,
+                RESUME_PROBE_REQUEST_BYTES_MAX,
+                RESUME_PROBE_REQUEST_BYTES_MAX,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_resume_probe_limit(
+                RESUME_PROBE_ITEMS_MAX + 1,
+                RESUME_PROBE_REQUEST_BYTES_MAX,
+                RESUME_PROBE_REQUEST_BYTES_MAX,
+            ),
+            Err(ResumeTranscriptProbeError::ResourceLimit)
+        );
+        assert_eq!(
+            check_resume_probe_limit(
+                RESUME_PROBE_ITEMS_MAX,
+                RESUME_PROBE_REQUEST_BYTES_MAX + 1,
+                RESUME_PROBE_REQUEST_BYTES_MAX,
+            ),
+            Err(ResumeTranscriptProbeError::ResourceLimit)
+        );
+        assert_eq!(
+            check_resume_probe_limit(
+                RESUME_PROBE_ITEMS_MAX,
+                RESUME_PROBE_RESULT_BYTES_MAX,
+                RESUME_PROBE_RESULT_BYTES_MAX,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_resume_probe_limit(
+                RESUME_PROBE_ITEMS_MAX,
+                RESUME_PROBE_RESULT_BYTES_MAX + 1,
+                RESUME_PROBE_RESULT_BYTES_MAX,
+            ),
+            Err(ResumeTranscriptProbeError::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn resume_probe_rejects_oversized_batch_before_lookup() {
+        let requests = (0..=RESUME_PROBE_ITEMS_MAX)
+            .map(|index| {
+                ResumeTranscriptProbe::try_new(AgentKind::Codex, format!("session-{index}"))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let lookups = std::cell::Cell::new(0usize);
+        let result = probe_resume_transcripts_with(
+            &requests,
+            |_, _| {
+                lookups.set(lookups.get() + 1);
+                None
+            },
+            |_| None,
+            |_| false,
+        );
+        assert_eq!(result, Err(ResumeTranscriptProbeError::ResourceLimit));
+        assert_eq!(lookups.get(), 0);
+    }
+
+    #[test]
+    fn resume_probe_sanitizes_missing_invalid_and_valid_transcripts() {
+        let root = temp_dir("resume-probe");
+        let valid_cwd = root.join("valid-cwd");
+        std::fs::create_dir_all(&valid_cwd).unwrap();
+        let malformed = root.join("malformed.jsonl");
+        let hostile_cwd = root.join("hostile-cwd.jsonl");
+        let missing_cwd = root.join("missing-cwd.jsonl");
+        let valid = root.join("valid.jsonl");
+        std::fs::write(&malformed, b"not-json\n").unwrap();
+        std::fs::write(&hostile_cwd, b"{\"cwd\":\"../private\"}\n").unwrap();
+        std::fs::write(
+            &missing_cwd,
+            b"{\"cwd\":\"/definitely/missing/deppy-resume-probe\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &valid,
+            format!("{{\"cwd\":{:?}}}\n", valid_cwd.to_str().unwrap()),
+        )
+        .unwrap();
+        let requests = [
+            ("missing", None),
+            ("malformed", Some(malformed)),
+            ("hostile", Some(hostile_cwd)),
+            ("missing-cwd", Some(missing_cwd)),
+            ("valid", Some(valid)),
+        ];
+        let probes = requests
+            .iter()
+            .map(|(session_id, _)| {
+                ResumeTranscriptProbe::try_new(AgentKind::Codex, (*session_id).to_owned()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let results = probe_resume_transcripts_with(
+            &probes,
+            |_, session_id| {
+                requests
+                    .iter()
+                    .find(|(candidate, _)| *candidate == session_id)
+                    .and_then(|(_, transcript)| transcript.clone())
+            },
+            transcript_cwd,
+            |cwd| Path::new(cwd).is_dir(),
+        )
+        .unwrap();
+
+        assert!(!results[0].found());
+        for result in &results[1..4] {
+            assert!(result.found());
+            assert_eq!(result.cwd(), None);
+        }
+        assert!(results[4].found());
+        assert_eq!(results[4].cwd(), valid_cwd.to_str());
+        assert!(results.iter().all(|result| {
+            result
+                .cwd
+                .as_ref()
+                .is_none_or(|cwd| cwd.len() <= MAX_PATH_BYTES)
+        }));
+
+        let request_debug = format!("{:?}", probes[4]);
+        let result_debug = format!("{:?}", results[4]);
+        assert!(request_debug.contains("REDACTED"));
+        assert!(!request_debug.contains("valid"));
+        assert!(!result_debug.contains(valid_cwd.to_str().unwrap()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_probe_rejects_invalid_identifier_without_retaining_spare_capacity() {
+        assert_eq!(
+            ResumeTranscriptProbe::try_new(AgentKind::Claude, "../secret".to_owned()).unwrap_err(),
+            ResumeTranscriptProbeError::InvalidRequest
+        );
+        let mut session_id = String::with_capacity(1024 * 1024);
+        session_id.push_str("session-id");
+        let probe = ResumeTranscriptProbe::try_new(AgentKind::Claude, session_id).unwrap();
+        assert_eq!(
+            probe.retained_bytes(),
+            std::mem::size_of::<ResumeTranscriptProbe>() + "session-id".len()
+        );
+    }
+
+    #[test]
     fn recursive_scan_budget_is_operation_wide_exact_then_plus_one() {
         let root = temp_dir("scan-budget");
         std::fs::write(root.join("rollout.jsonl"), b"{}\n").unwrap();
@@ -1444,6 +1765,12 @@ mod tests {
             assert!(!production.contains(forbidden), "found {forbidden}");
         }
         assert_eq!(production.matches("Command::new").count(), 1);
+        assert_eq!(
+            production
+                .matches("let mut finder = TranscriptFinder::new();")
+                .count(),
+            1
+        );
         assert!(production.contains("libc::WNOWAIT"));
         assert!(production.contains("process_group(0)"));
     }

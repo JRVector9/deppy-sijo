@@ -230,10 +230,6 @@ impl<E> ExactContinuation<E> {
     pub(crate) fn payload(&self) -> &E {
         &self.payload
     }
-
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.retained_bytes
-    }
 }
 
 impl<E> fmt::Debug for ExactContinuation<E> {
@@ -265,15 +261,10 @@ impl<P> fmt::Debug for ProjectionRequest<P> {
 
 /// Borrowed exact input for one aggregate backend transaction.
 pub(crate) struct AgentStateExactInput<'a, E> {
-    kind: ExactKind,
     payload: &'a E,
 }
 
 impl<E> AgentStateExactInput<'_, E> {
-    pub(crate) fn kind(&self) -> ExactKind {
-        self.kind
-    }
-
     pub(crate) fn payload(&self) -> &E {
         self.payload
     }
@@ -377,7 +368,6 @@ fn execute_job<B: AgentStateBackend>(
     job: AgentStateJob<B>,
 ) -> WorkerOutcome<B::Snapshot> {
     let exact = job.exact.as_ref().map(|request| AgentStateExactInput {
-        kind: request.kind,
         payload: request.payload(),
     });
     let projections = job
@@ -532,6 +522,7 @@ impl fmt::Debug for AdmissionError {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AgentStateWorkerState {
     Open,
+    ShutdownWaves,
     Draining,
     Closed,
 }
@@ -572,10 +563,12 @@ pub(crate) struct ExactCompletion<E> {
 }
 
 impl<E> ExactCompletion<E> {
+    #[cfg(test)]
     pub(crate) fn continuation(&self) -> &Arc<ExactContinuation<E>> {
         &self.continuation
     }
 
+    #[cfg(test)]
     pub(crate) fn result(&self) -> Result<(), AgentStateErrorCode> {
         self.result
     }
@@ -637,6 +630,7 @@ impl ExactReceipt {
         self.operation_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn kind(self) -> ExactKind {
         self.kind
     }
@@ -711,14 +705,11 @@ pub(crate) struct AgentStateOutcome<E, O> {
 }
 
 impl<E, O> AgentStateOutcome<E, O> {
-    pub(crate) fn exact(&self) -> Option<&ExactCompletion<E>> {
-        self.exact.as_ref()
-    }
-
     pub(crate) fn take_exact(&mut self) -> Option<ExactCompletion<E>> {
         self.exact.take()
     }
 
+    #[cfg(test)]
     pub(crate) fn projections(&self) -> &[ProjectionCompletion<O>] {
         &self.projections
     }
@@ -727,6 +718,7 @@ impl<E, O> AgentStateOutcome<E, O> {
         self.projections
     }
 
+    #[cfg(test)]
     pub(crate) fn stale_sections(&self) -> usize {
         self.stale_sections
     }
@@ -833,7 +825,10 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
         kind: ExactKind,
         payload: Arc<B::ExactRequest>,
     ) -> Result<(), StageError> {
-        if self.state != AgentStateWorkerState::Open {
+        if matches!(
+            self.state,
+            AgentStateWorkerState::Draining | AgentStateWorkerState::Closed
+        ) {
             return Err(StageError::Closed);
         }
         if self.exact_operation_ids.contains(&operation_id) {
@@ -867,6 +862,7 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
         self.exact_operation_ids.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_exact_bytes(&self) -> usize {
         self.exact_retained_bytes
     }
@@ -882,10 +878,12 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
         self.in_flight.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_live_slot(&self) -> bool {
         self.slot.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn worker_generation(&self) -> u64 {
         self.worker_generation
     }
@@ -1134,15 +1132,22 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
             .saturating_sub(exact.continuation.retained_bytes);
     }
 
-    fn begin_shutdown(&mut self) {
-        if self.state != AgentStateWorkerState::Open {
-            return;
-        }
-        self.state = AgentStateWorkerState::Draining;
+    fn discard_pending_projections(&mut self) {
         for pending in &mut self.pending_projections {
             pending.take();
         }
         self.pending_projection_bytes = 0;
+    }
+
+    fn begin_shutdown(&mut self) {
+        if matches!(
+            self.state,
+            AgentStateWorkerState::Draining | AgentStateWorkerState::Closed
+        ) {
+            return;
+        }
+        self.state = AgentStateWorkerState::Draining;
+        self.discard_pending_projections();
     }
 
     fn recv_outcome_blocking(
@@ -1285,6 +1290,37 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
             retained_bytes,
         }));
         Ok(())
+    }
+
+    /// Blocking shutdown-only seam that settles the current exact FIFO without closing future
+    /// exact admission. Pending coalescible projections are discarded, and any projection result
+    /// sharing an in-flight aggregate job is released before this method returns. Exact payloads
+    /// are converted to bounded, payload-free receipts in FIFO order.
+    ///
+    /// A disconnected in-flight job is reported once as `WorkerUnavailable` and is never retried,
+    /// because delivery may have occurred. A job that `admit` proves was not sent may use one fresh
+    /// worker during this wave. The composition root must quiesce normal producers before calling
+    /// this method; after it returns, it may stage one more bounded exact wave and call again before
+    /// finishing with [`Self::shutdown_with_final_binding_reconcile`].
+    pub(crate) fn drain_exact_wave_for_shutdown(&mut self) -> AgentStateShutdownReport {
+        let mut report = AgentStateShutdownReport::new(self.exact_operation_ids.len());
+        if matches!(
+            self.state,
+            AgentStateWorkerState::Draining | AgentStateWorkerState::Closed
+        ) {
+            return report;
+        }
+
+        self.state = AgentStateWorkerState::ShutdownWaves;
+        self.discard_pending_projections();
+        let mut known_unsent_restart_used = false;
+        self.drain_existing_exact_receipts(&mut report, &mut known_unsent_restart_used);
+
+        debug_assert!(self.in_flight.is_none());
+        debug_assert!(self.exact_queue.is_empty());
+        debug_assert!(self.exact_operation_ids.is_empty());
+        debug_assert_eq!(self.exact_retained_bytes, 0);
+        report
     }
 
     /// Closes admission, releases every pre-existing exact payload, constructs one final
@@ -1559,7 +1595,6 @@ mod tests {
             {
                 let mut calls = lock_unpoisoned(&self.state.calls);
                 if let Some(exact) = exact {
-                    let _kind = exact.kind();
                     calls.push((exact.payload().marker, AgentStateSection::BindingSync));
                 }
             }
@@ -2039,6 +2074,181 @@ mod tests {
             1
         );
         assert_eq!(harness.state.aggregate_calls.load(Ordering::Acquire), 2);
+        assert_eq!(harness.opens.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn shutdown_exact_wave_settles_a_full_fifo_as_payload_free_receipts() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        let mut payloads = Vec::new();
+        for operation_id in 0..AGENT_STATE_CONTINUATION_MAX as u64 {
+            let payload = Harness::payload("wave-one");
+            payloads.push(Arc::downgrade(&payload));
+            harness
+                .worker
+                .stage_exact(
+                    operation_id,
+                    ExactKind::StructuredBatch { items: 1 },
+                    payload,
+                )
+                .unwrap();
+        }
+
+        let report = harness.worker.drain_exact_wave_for_shutdown();
+
+        assert!(!report.overflowed());
+        assert_eq!(report.receipts().len(), AGENT_STATE_CONTINUATION_MAX);
+        assert_eq!(
+            report
+                .receipts()
+                .iter()
+                .map(|receipt| receipt.operation_id())
+                .collect::<Vec<_>>(),
+            (0..AGENT_STATE_CONTINUATION_MAX as u64).collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .receipts()
+                .iter()
+                .all(|receipt| receipt.result() == Ok(()))
+        );
+        assert!(payloads.iter().all(|payload| payload.upgrade().is_none()));
+        assert_eq!(harness.worker.pending_exact_count(), 0);
+        assert_eq!(harness.worker.pending_exact_bytes(), 0);
+    }
+
+    #[test]
+    fn shutdown_exact_wave_discards_projection_payload_before_the_next_wave() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        let exact_payload = Arc::new(TestPayload {
+            marker: "wave-one",
+            bytes: AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX,
+        });
+        let exact_weak = Arc::downgrade(&exact_payload);
+        harness
+            .worker
+            .stage_exact(
+                60,
+                ExactKind::StructuredBatch { items: 1 },
+                Arc::clone(&exact_payload),
+            )
+            .unwrap();
+        drop(exact_payload);
+
+        let projection_payload = Arc::new(TestPayload {
+            marker: "discarded-projection",
+            bytes: AGENT_STATE_PROJECTION_JOB_BYTES_MAX,
+        });
+        let projection_weak = Arc::downgrade(&projection_payload);
+        harness
+            .worker
+            .stage_projection(
+                AgentStateSection::Catalog,
+                AgentStateRevision::new(1, 1),
+                Arc::clone(&projection_payload),
+            )
+            .unwrap();
+        drop(projection_payload);
+
+        let report = harness.worker.drain_exact_wave_for_shutdown();
+        assert_eq!(report.receipts().len(), 1);
+        assert!(exact_weak.upgrade().is_none());
+        assert!(projection_weak.upgrade().is_none());
+        assert_eq!(harness.worker.pending_projection_count(), 0);
+        assert_eq!(
+            *lock_unpoisoned(&harness.state.calls),
+            [("wave-one", AgentStateSection::BindingSync)]
+        );
+    }
+
+    #[test]
+    fn shutdown_exact_wave_keeps_exact_admission_open_for_a_later_wave() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        harness
+            .worker
+            .stage_exact(
+                70,
+                ExactKind::StructuredBatch { items: 1 },
+                Harness::payload("wave-one"),
+            )
+            .unwrap();
+        let first = harness.worker.drain_exact_wave_for_shutdown();
+        assert_eq!(first.receipts()[0].result(), Ok(()));
+        assert_eq!(
+            harness.worker.stage_projection(
+                AgentStateSection::Hooks,
+                AgentStateRevision::new(1, 1),
+                Harness::payload("closed-projection"),
+            ),
+            Err(StageError::Closed)
+        );
+
+        harness
+            .worker
+            .stage_exact(
+                71,
+                ExactKind::StructuredBatch { items: 1 },
+                Harness::payload("wave-two"),
+            )
+            .unwrap();
+        let second = harness.worker.drain_exact_wave_for_shutdown();
+
+        assert_eq!(second.receipts().len(), 1);
+        assert_eq!(second.receipts()[0].operation_id(), 71);
+        assert_eq!(second.receipts()[0].result(), Ok(()));
+        assert_eq!(harness.opens.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *lock_unpoisoned(&harness.state.calls),
+            [
+                ("wave-one", AgentStateSection::BindingSync),
+                ("wave-two", AgentStateSection::BindingSync),
+            ]
+        );
+    }
+
+    #[test]
+    fn shutdown_exact_wave_never_retries_unknown_delivery() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        harness.state.panic_after_next_record();
+        harness
+            .worker
+            .stage_exact(80, ExactKind::BindingDelete, Harness::payload("unknown"))
+            .unwrap();
+        harness
+            .worker
+            .stage_exact(
+                81,
+                ExactKind::StructuredBatch { items: 1 },
+                Harness::payload("known-unsent"),
+            )
+            .unwrap();
+        harness.worker.admit().unwrap();
+
+        let report = harness.worker.drain_exact_wave_for_shutdown();
+
+        assert_eq!(report.receipts().len(), 2);
+        assert_eq!(report.receipts()[0].operation_id(), 80);
+        assert_eq!(
+            report.receipts()[0].result(),
+            Err(AgentStateErrorCode::WorkerUnavailable)
+        );
+        assert_eq!(report.receipts()[1].operation_id(), 81);
+        assert_eq!(report.receipts()[1].result(), Ok(()));
+        let calls = lock_unpoisoned(&harness.state.calls);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(marker, _)| *marker == "unknown")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(marker, _)| *marker == "known-unsent")
+                .count(),
+            1
+        );
         assert_eq!(harness.opens.load(Ordering::Acquire), 2);
     }
 

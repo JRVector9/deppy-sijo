@@ -34,6 +34,93 @@ pub struct Db {
     authorization_db_identity: String,
 }
 
+/// Durable, process-independent Connector configuration identity. SQLite stores revisions as a
+/// positive signed INTEGER; the public type prevents accidental arithmetic outside storage.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConnectorConfigRevision(u64);
+
+impl ConnectorConfigRevision {
+    pub const INITIAL: Self = Self(1);
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub fn try_from_u64(value: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            value >= Self::INITIAL.0,
+            "Connector config revision은 1 이상이어야 합니다"
+        );
+        i64::try_from(value).context("Connector config revision이 SQLite 범위를 초과했습니다")?;
+        Ok(Self(value))
+    }
+
+    fn from_sql(value: i64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            value >= 1,
+            "Connector config revision 저장값이 유효하지 않습니다"
+        );
+        Ok(Self(
+            u64::try_from(value).context("Connector config revision 변환 실패")?,
+        ))
+    }
+}
+
+impl std::fmt::Debug for ConnectorConfigRevision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ConnectorConfigRevision")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+/// Payload observed in the same SQLite read transaction as `revision`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectorConfigRead<T> {
+    pub revision: ConnectorConfigRevision,
+    pub value: T,
+}
+
+impl<T> std::fmt::Debug for ConnectorConfigRead<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorConfigRead")
+            .field("revision", &self.revision)
+            .field("value", &"ELIDED")
+            .finish()
+    }
+}
+
+/// Result of an IMMEDIATE expected-revision write. Stale writers never invoke the mutation and
+/// receive the current committed revision to refresh from.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ConnectorConfigCas<T> {
+    Committed {
+        revision: ConnectorConfigRevision,
+        value: T,
+    },
+    Stale {
+        current_revision: ConnectorConfigRevision,
+    },
+}
+
+impl<T> std::fmt::Debug for ConnectorConfigCas<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Committed { revision, .. } => formatter
+                .debug_struct("ConnectorConfigCas::Committed")
+                .field("revision", revision)
+                .field("value", &"ELIDED")
+                .finish(),
+            Self::Stale { current_revision } => formatter
+                .debug_struct("ConnectorConfigCas::Stale")
+                .field("current_revision", current_revision)
+                .finish(),
+        }
+    }
+}
+
 /// Active owner for one DB-bound authorization executor scope. This non-Clone token owns the OS
 /// lock for its full lifetime, so preflight/outcome APIs cannot outlive the ownership proof.
 pub struct ActiveAuthorizationOwner {
@@ -72,6 +159,7 @@ impl std::fmt::Debug for ActiveAuthorizationOwner {
 /// 12: mcp_servers scoped env metadata (plain-safe env + credential ids, PR-U10b).
 /// 25: tool audit operation lifecycle (PR-ST01).
 /// 26: authorization scope/run ownership columns (PR-AU01).
+/// 27: durable Connector config revision + mutation triggers (PR-IN01 prerequisite).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -292,6 +380,154 @@ ALTER TABLE agent_needs_input ADD COLUMN message TEXT;
     // Unknown으로 종결하며 operation_id unique guard로 같은 호출의 자동 retry를 막는다.
     audit::MIGRATION_AUDIT_LIFECYCLE,
     audit::MIGRATION_AUTHORIZATION_OWNERS,
+    // v27: all Connector-visible durable mutations advance one shared monotonic revision in the
+    // same SQLite transaction, including writes performed by another process or legacy API.
+    // Trigger increments may jump by more than one for batch/replace operations; consumers rely
+    // only on monotonic identity, never contiguity.
+    "
+CREATE TABLE connector_config_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    revision INTEGER NOT NULL CHECK (revision >= 1)
+);
+INSERT INTO connector_config_state (singleton, revision) VALUES (1, 1);
+
+CREATE TRIGGER connector_credentials_insert_revision
+AFTER INSERT ON credentials BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+CREATE TRIGGER connector_credentials_delete_revision
+AFTER DELETE ON credentials BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+CREATE TRIGGER connector_credentials_update_revision
+AFTER UPDATE OF id, provider, label, credential_kind, keyring_service, keyring_username,
+                masked_hint, workspace_id, oauth_json ON credentials
+WHEN OLD.id IS NOT NEW.id
+  OR OLD.provider IS NOT NEW.provider
+  OR OLD.label IS NOT NEW.label
+  OR OLD.credential_kind IS NOT NEW.credential_kind
+  OR OLD.keyring_service IS NOT NEW.keyring_service
+  OR OLD.keyring_username IS NOT NEW.keyring_username
+  OR OLD.masked_hint IS NOT NEW.masked_hint
+  OR OLD.workspace_id IS NOT NEW.workspace_id
+  OR OLD.oauth_json IS NOT NEW.oauth_json
+BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+
+CREATE TRIGGER connector_mcp_servers_insert_revision
+AFTER INSERT ON mcp_servers BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+CREATE TRIGGER connector_mcp_servers_delete_revision
+AFTER DELETE ON mcp_servers BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+CREATE TRIGGER connector_mcp_servers_update_revision
+AFTER UPDATE OF id, name, kind, command, args_json, env_json, env_credentials_json,
+                inherit_env, url, enabled ON mcp_servers
+WHEN OLD.id IS NOT NEW.id
+  OR OLD.name IS NOT NEW.name
+  OR OLD.kind IS NOT NEW.kind
+  OR OLD.command IS NOT NEW.command
+  OR OLD.args_json IS NOT NEW.args_json
+  OR OLD.env_json IS NOT NEW.env_json
+  OR OLD.env_credentials_json IS NOT NEW.env_credentials_json
+  OR OLD.inherit_env IS NOT NEW.inherit_env
+  OR OLD.url IS NOT NEW.url
+  OR OLD.enabled IS NOT NEW.enabled
+BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+
+CREATE TRIGGER connector_mcp_tools_insert_revision
+AFTER INSERT ON mcp_tools BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+CREATE TRIGGER connector_mcp_tools_delete_revision
+AFTER DELETE ON mcp_tools BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+CREATE TRIGGER connector_mcp_tools_update_revision
+AFTER UPDATE OF id, server_id, name, description, input_schema_json, trust_level, schema_hash
+ON mcp_tools
+WHEN OLD.id IS NOT NEW.id
+  OR OLD.server_id IS NOT NEW.server_id
+  OR OLD.name IS NOT NEW.name
+  OR OLD.description IS NOT NEW.description
+  OR OLD.input_schema_json IS NOT NEW.input_schema_json
+  OR OLD.trust_level IS NOT NEW.trust_level
+  OR OLD.schema_hash IS NOT NEW.schema_hash
+BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+
+CREATE TRIGGER connector_permission_insert_revision
+AFTER INSERT ON tool_permission_rules BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+CREATE TRIGGER connector_permission_delete_revision
+AFTER DELETE ON tool_permission_rules BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+CREATE TRIGGER connector_permission_update_revision
+AFTER UPDATE OF server_id, tool_name, rule, approved_schema_hash ON tool_permission_rules
+WHEN OLD.server_id IS NOT NEW.server_id
+  OR OLD.tool_name IS NOT NEW.tool_name
+  OR OLD.rule IS NOT NEW.rule
+  OR OLD.approved_schema_hash IS NOT NEW.approved_schema_hash
+BEGIN
+    UPDATE connector_config_state SET revision = CASE
+        WHEN revision < 9223372036854775807 THEN revision + 1
+        ELSE RAISE(ABORT, 'connector config revision overflow') END
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
+END;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -391,6 +627,7 @@ impl std::fmt::Debug for CredentialOAuthBindingRecord {
 }
 
 pub const CREDENTIAL_OAUTH_BINDING_BYTES_MAX: usize = 64 * 1024;
+pub const CREDENTIAL_SECRET_LOCATION_BYTES_MAX: usize = 1024;
 
 /// workspace 한 행 (WorkspaceSidebar 표시용).
 #[derive(Debug, Clone, PartialEq)]
@@ -798,6 +1035,57 @@ impl Db {
         storage_core::read_user_version(conn)
     }
 
+    fn read_connector_config_revision(
+        conn: &Connection,
+    ) -> anyhow::Result<ConnectorConfigRevision> {
+        let revision: i64 = conn.query_row(
+            "SELECT revision FROM connector_config_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        ConnectorConfigRevision::from_sql(revision)
+    }
+
+    pub fn connector_config_revision(&self) -> anyhow::Result<ConnectorConfigRevision> {
+        Self::read_connector_config_revision(&self.conn)
+    }
+
+    fn read_connector_config<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> anyhow::Result<T>,
+    ) -> anyhow::Result<ConnectorConfigRead<T>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let revision = Self::read_connector_config_revision(&tx)?;
+        let value = read(&tx)?;
+        tx.commit()
+            .context("Connector config read transaction 실패")?;
+        Ok(ConnectorConfigRead { revision, value })
+    }
+
+    fn write_connector_config_cas<T>(
+        &mut self,
+        expected: ConnectorConfigRevision,
+        write: impl FnOnce(&Connection) -> anyhow::Result<T>,
+    ) -> anyhow::Result<ConnectorConfigCas<T>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_revision = Self::read_connector_config_revision(&tx)?;
+        if current_revision != expected {
+            tx.commit()
+                .context("stale Connector config CAS transaction 실패")?;
+            return Ok(ConnectorConfigCas::Stale { current_revision });
+        }
+        let value = write(&tx)?;
+        let revision = Self::read_connector_config_revision(&tx)?;
+        anyhow::ensure!(
+            revision >= current_revision,
+            "Connector config revision이 감소했습니다"
+        );
+        tx.commit().context("Connector config CAS commit 실패")?;
+        Ok(ConnectorConfigCas::Committed { revision, value })
+    }
+
     /// credential metadata 추가. created_at/updated_at은 SQLite가 UTC로 기록한다.
     ///
     /// 이 기존 생성 경로는 IN01 migration/cutover 전까지 logical id 자체를 keyring username에
@@ -1031,24 +1319,105 @@ impl Db {
         Ok(affected == 1)
     }
 
+    /// Expected-config-revision CAS wrapped around the physical-pointer CAS. A stale config
+    /// writer never evaluates the pointer mutation; a stale physical pointer commits a no-op at
+    /// the unchanged revision and returns `value=false`.
+    pub fn publish_credential_secret_slot_revision_cas(
+        &mut self,
+        expected_revision: ConnectorConfigRevision,
+        logical_id: &str,
+        expected_previous_pointer: &str,
+        physical_slot: &str,
+        oauth_json: Option<&str>,
+        masked_hint: Option<&str>,
+    ) -> anyhow::Result<ConnectorConfigCas<bool>> {
+        validate_owned_physical_secret_slot(logical_id, physical_slot)?;
+        if let Some(json) = oauth_json {
+            validate_oauth_metadata_json(json)?;
+        }
+        self.write_connector_config_cas(expected_revision, |conn| {
+            let affected = conn
+                .execute(
+                    "UPDATE credentials
+                     SET keyring_username = ?3, oauth_json = ?4, masked_hint = ?5,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE id = ?1 AND keyring_username = ?2",
+                    (
+                        logical_id,
+                        expected_previous_pointer,
+                        physical_slot,
+                        oauth_json,
+                        masked_hint,
+                    ),
+                )
+                .with_context(|| {
+                    format!("credential secret slot revision CAS publish 실패: {logical_id}")
+                })?;
+            anyhow::ensure!(
+                affected <= 1,
+                "credential secret slot revision CAS가 여러 행을 변경했습니다"
+            );
+            Ok(affected == 1)
+        })
+    }
+
     /// logical credential id를 keyring physical slot으로 해석한다. secret 본문은 반환하지 않는다.
     pub fn credential_secret_location(
         &self,
         id: &str,
     ) -> anyhow::Result<Option<CredentialSecretLocation>> {
-        self.conn
+        let tx = self.conn.unchecked_transaction()?;
+        let location = Self::credential_secret_location_in_snapshot(&tx, id)?;
+        tx.commit()
+            .context("credential secret location read transaction 실패")?;
+        Ok(location)
+    }
+
+    fn credential_secret_location_in_snapshot(
+        conn: &Connection,
+        id: &str,
+    ) -> anyhow::Result<Option<CredentialSecretLocation>> {
+        anyhow::ensure!(
+            !conn.is_autocommit(),
+            "credential secret location snapshot은 caller-owned transaction이 필요합니다"
+        );
+        let location_bytes = conn
             .query_row(
-                "SELECT keyring_service, keyring_username FROM credentials WHERE id = ?1",
+                "SELECT length(CAST(keyring_service AS BLOB)) +
+                        length(CAST(keyring_username AS BLOB))
+                 FROM credentials WHERE id = ?1",
                 [id],
-                |row| {
-                    Ok(CredentialSecretLocation {
-                        keyring_service: row.get(0)?,
-                        keyring_username: row.get(1)?,
-                    })
-                },
+                |row| row.get::<_, i64>(0),
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        let Some(location_bytes) = location_bytes else {
+            return Ok(None);
+        };
+        let location_bytes = usize::try_from(location_bytes)
+            .context("credential secret location bytes 변환 실패")?;
+        anyhow::ensure!(
+            location_bytes <= CREDENTIAL_SECRET_LOCATION_BYTES_MAX,
+            "credential secret location byte 상한을 초과했습니다"
+        );
+        conn.query_row(
+            "SELECT keyring_service, keyring_username FROM credentials WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(CredentialSecretLocation {
+                    keyring_service: row.get(0)?,
+                    keyring_username: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn credential_secret_location_versioned(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<ConnectorConfigRead<Option<CredentialSecretLocation>>> {
+        self.read_connector_config(|conn| Self::credential_secret_location_in_snapshot(conn, id))
     }
 
     /// oauth_json이 있는 credential (id, json) 목록 — H5가 서버 바인딩을 찾는 데 쓴다.
@@ -1069,7 +1438,30 @@ impl Db {
         server_id: &str,
     ) -> anyhow::Result<Vec<CredentialOAuthBindingRecord>> {
         let tx = self.conn.unchecked_transaction()?;
-        let (candidate_count, candidate_bytes): (i64, i64) = tx.query_row(
+        let candidates = Self::credential_oauth_bindings_for_server_in_snapshot(&tx, server_id)?;
+        tx.commit()
+            .context("OAuth binding point lookup transaction 실패")?;
+        Ok(candidates)
+    }
+
+    pub fn credential_oauth_bindings_for_server_versioned(
+        &self,
+        server_id: &str,
+    ) -> anyhow::Result<ConnectorConfigRead<Vec<CredentialOAuthBindingRecord>>> {
+        self.read_connector_config(|conn| {
+            Self::credential_oauth_bindings_for_server_in_snapshot(conn, server_id)
+        })
+    }
+
+    fn credential_oauth_bindings_for_server_in_snapshot(
+        conn: &Connection,
+        server_id: &str,
+    ) -> anyhow::Result<Vec<CredentialOAuthBindingRecord>> {
+        anyhow::ensure!(
+            !conn.is_autocommit(),
+            "OAuth binding snapshot은 caller-owned transaction이 필요합니다"
+        );
+        let (candidate_count, candidate_bytes): (i64, i64) = conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(
                         length(CAST(id AS BLOB)) +
@@ -1098,7 +1490,7 @@ impl Db {
             "OAuth binding metadata byte 상한을 초과했습니다"
         );
         let candidates = {
-            let mut stmt = tx.prepare_cached(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, keyring_service, keyring_username, oauth_json
                  FROM credentials
                  WHERE oauth_json IS NOT NULL
@@ -1127,8 +1519,6 @@ impl Db {
                 &candidate.physical_pointer,
             )?;
         }
-        tx.commit()
-            .context("OAuth binding point lookup transaction 실패")?;
         Ok(candidates)
     }
 
@@ -1793,8 +2183,24 @@ impl Db {
         mcp_store::server_inventory(&self.conn, limit)
     }
 
+    /// Bounded inventory paired with the durable revision read from the same SQLite snapshot.
+    pub fn mcp_server_inventory_versioned(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<ConnectorConfigRead<Vec<mcp_store::McpServerInventoryRow>>> {
+        self.read_connector_config(|conn| mcp_store::server_inventory_in_snapshot(conn, limit))
+    }
+
     pub fn mcp_server(&self, server_id: &str) -> anyhow::Result<Option<mcp_store::McpServerRow>> {
         mcp_store::server(&self.conn, server_id)
+    }
+
+    /// Bounded selected-server lookup paired with its same-snapshot durable revision.
+    pub fn mcp_server_versioned(
+        &self,
+        server_id: &str,
+    ) -> anyhow::Result<ConnectorConfigRead<Option<mcp_store::McpServerRow>>> {
+        self.read_connector_config(|conn| mcp_store::server_in_snapshot(conn, server_id))
     }
 
     pub fn insert_mcp_server(&self, row: &mcp_store::McpServerRow) -> anyhow::Result<()> {
@@ -1809,13 +2215,33 @@ impl Db {
         mcp_store::save_server(&mut self.conn, row)
     }
 
+    pub fn save_mcp_server_revision_cas(
+        &mut self,
+        expected: ConnectorConfigRevision,
+        row: &mcp_store::McpServerRow,
+    ) -> anyhow::Result<ConnectorConfigCas<mcp_store::McpServerSaveOutcome>> {
+        self.write_connector_config_cas(expected, |conn| {
+            mcp_store::save_server_in_transaction(conn, row)
+        })
+    }
+
     /// Reject active agent-proxy references and delete the server plus live MCP metadata in one
     /// IMMEDIATE transaction. Durable audit history intentionally remains untouched.
     pub fn delete_mcp_server(&mut self, server_id: &str, resolved_at: i64) -> anyhow::Result<bool> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let referenced = tx
+        let deleted = Self::delete_mcp_server_in_transaction(&tx, server_id, resolved_at)?;
+        tx.commit().context("MCP server 삭제 commit 실패")?;
+        Ok(deleted)
+    }
+
+    fn delete_mcp_server_in_transaction(
+        conn: &Connection,
+        server_id: &str,
+        resolved_at: i64,
+    ) -> anyhow::Result<bool> {
+        let referenced = conn
             .query_row(
                 "SELECT 1 FROM agent_configs
                  WHERE deleted_at IS NULL AND mcp_proxy_server_id = ?1
@@ -1829,9 +2255,18 @@ impl Db {
             !referenced,
             "활성 agent proxy가 참조 중인 MCP server는 삭제할 수 없습니다: {server_id}"
         );
-        let deleted = mcp_store::delete_server_in_transaction(&tx, server_id, resolved_at)?;
-        tx.commit().context("MCP server 삭제 commit 실패")?;
-        Ok(deleted)
+        mcp_store::delete_server_in_transaction(conn, server_id, resolved_at)
+    }
+
+    pub fn delete_mcp_server_revision_cas(
+        &mut self,
+        expected: ConnectorConfigRevision,
+        server_id: &str,
+        resolved_at: i64,
+    ) -> anyhow::Result<ConnectorConfigCas<bool>> {
+        self.write_connector_config_cas(expected, |conn| {
+            Self::delete_mcp_server_in_transaction(conn, server_id, resolved_at)
+        })
     }
 
     /// canonical URL 기준 멱등 등록. built-in provider(Slack 등)의 중복 행을 막는다.
@@ -1842,12 +2277,32 @@ impl Db {
         mcp_store::ensure_server_by_url(&mut self.conn, row)
     }
 
+    pub fn ensure_mcp_server_by_url_revision_cas(
+        &mut self,
+        expected: ConnectorConfigRevision,
+        row: &mcp_store::McpServerRow,
+    ) -> anyhow::Result<ConnectorConfigCas<mcp_store::McpServerRow>> {
+        self.write_connector_config_cas(expected, |conn| {
+            mcp_store::ensure_server_by_url_in_transaction(conn, row)
+        })
+    }
+
     /// import 대상 전체를 all-or-nothing으로 저장한다.
     pub fn insert_mcp_servers_batch(
         &mut self,
         rows: &[mcp_store::McpServerRow],
     ) -> anyhow::Result<usize> {
         mcp_store::insert_servers_batch(&mut self.conn, rows)
+    }
+
+    pub fn insert_mcp_servers_batch_revision_cas(
+        &mut self,
+        expected: ConnectorConfigRevision,
+        rows: &[mcp_store::McpServerRow],
+    ) -> anyhow::Result<ConnectorConfigCas<usize>> {
+        self.write_connector_config_cas(expected, |conn| {
+            mcp_store::insert_servers_batch_in_transaction(conn, rows)
+        })
     }
 
     /// http MCP 서버의 url 갱신 (H3). 호출측(UI)이 Allow 규칙 초기화 +
@@ -1865,6 +2320,17 @@ impl Db {
         mcp_store::replace_tools_for_server(&mut self.conn, server_id, rows)
     }
 
+    pub fn replace_mcp_tools_revision_cas(
+        &mut self,
+        expected: ConnectorConfigRevision,
+        server_id: &str,
+        rows: &[mcp_store::McpToolRow],
+    ) -> anyhow::Result<ConnectorConfigCas<()>> {
+        self.write_connector_config_cas(expected, |conn| {
+            mcp_store::replace_tools_for_server_in_transaction(conn, server_id, rows)
+        })
+    }
+
     /// 저장된 tool 목록 (도구 실행 UI용).
     pub fn list_mcp_tools(&self, server_id: &str) -> anyhow::Result<Vec<mcp_store::McpToolRow>> {
         mcp_store::list_tools_for_server(&self.conn, server_id)
@@ -1875,6 +2341,16 @@ impl Db {
         mcp_store::tool_name(&self.conn, server_id, tool_id)
     }
 
+    pub fn mcp_tool_name_versioned(
+        &self,
+        server_id: &str,
+        tool_id: &str,
+    ) -> anyhow::Result<ConnectorConfigRead<Option<String>>> {
+        self.read_connector_config(|conn| {
+            mcp_store::tool_name_in_snapshot(conn, server_id, tool_id)
+        })
+    }
+
     /// Same-snapshot bounded tool page with permission rows joined in one page query.
     pub fn mcp_tool_page(
         &self,
@@ -1883,6 +2359,17 @@ impl Db {
         limit: usize,
     ) -> anyhow::Result<mcp_store::McpToolPage> {
         mcp_store::tool_page(&self.conn, server_id, offset, limit)
+    }
+
+    pub fn mcp_tool_page_versioned(
+        &self,
+        server_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<ConnectorConfigRead<mcp_store::McpToolPage>> {
+        self.read_connector_config(|conn| {
+            mcp_store::tool_page_in_snapshot(conn, server_id, offset, limit)
+        })
     }
 
     /// 저장된 tool 권한 규칙 전체 (앱 시작 시 PermissionPolicy로 로드).
@@ -1897,6 +2384,16 @@ impl Db {
         tool_name: &str,
     ) -> anyhow::Result<Option<PermissionRuleRow>> {
         mcp_store::permission_rule(&self.conn, server_id, tool_name)
+    }
+
+    pub fn permission_rule_versioned(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+    ) -> anyhow::Result<ConnectorConfigRead<Option<PermissionRuleRow>>> {
+        self.read_connector_config(|conn| {
+            mcp_store::permission_rule_in_snapshot(conn, server_id, tool_name)
+        })
     }
 
     /// 권한 규칙 저장/갱신 (AllowAlways/DenyAlways 결정 시).
@@ -1919,6 +2416,41 @@ impl Db {
     /// 권한 규칙 삭제 (Ask로 재설정 — 행이 없으면 기본값 Ask).
     pub fn delete_permission_rule(&self, server_id: &str, tool_name: &str) -> anyhow::Result<()> {
         mcp_store::delete_permission_rule(&self.conn, server_id, tool_name)
+    }
+
+    /// Resolve a tool id to its bounded persisted name and mutate that exact permission row inside
+    /// one IMMEDIATE expected-revision transaction. `ask` deletes the row; unknown rules fail.
+    pub fn set_permission_by_tool_id_revision_cas(
+        &mut self,
+        expected: ConnectorConfigRevision,
+        server_id: &str,
+        tool_id: &str,
+        rule: &str,
+        approved_schema_hash: Option<&str>,
+    ) -> anyhow::Result<ConnectorConfigCas<()>> {
+        anyhow::ensure!(
+            matches!(rule, "ask" | "allow" | "deny"),
+            "알 수 없는 MCP permission rule: {rule}"
+        );
+        anyhow::ensure!(
+            rule == "allow" || approved_schema_hash.is_none(),
+            "Allow 이외 permission에는 schema hash를 저장할 수 없습니다"
+        );
+        self.write_connector_config_cas(expected, |conn| {
+            let tool_name = mcp_store::tool_name_in_snapshot(conn, server_id, tool_id)?
+                .with_context(|| format!("MCP tool permission 대상 없음: {server_id}/{tool_id}"))?;
+            if rule == "ask" {
+                mcp_store::delete_permission_rule(conn, server_id, &tool_name)
+            } else {
+                mcp_store::upsert_permission_rule(
+                    conn,
+                    server_id,
+                    &tool_name,
+                    rule,
+                    approved_schema_hash,
+                )
+            }
+        })
     }
 
     /// 라이브 승인 요청 등록 (deppy-mcp-proxy → GUI). 세부 계약은 mcp_store 문서 참조.
@@ -2136,15 +2668,18 @@ impl Db {
             self.authorization_db_identity == owner.db_identity,
             "authorization owner가 다른 DB에 속합니다"
         );
-        let current_permission =
-            match mcp_store::permission_rule(&tx, plan.server_id(), plan.tool_name())? {
-                Some(row) => audit::PermissionFingerprint::Persisted {
-                    rule: audit::PermissionRule::from_persisted(&row.rule)
-                        .ok_or_else(|| anyhow::anyhow!("invalid persisted permission rule"))?,
-                    approved_schema_hash: row.approved_schema_hash,
-                },
-                None => audit::PermissionFingerprint::Absent,
-            };
+        let current_permission = match mcp_store::permission_rule_in_snapshot(
+            &tx,
+            plan.server_id(),
+            plan.tool_name(),
+        )? {
+            Some(row) => audit::PermissionFingerprint::Persisted {
+                rule: audit::PermissionRule::from_persisted(&row.rule)
+                    .ok_or_else(|| anyhow::anyhow!("invalid persisted permission rule"))?,
+                approved_schema_hash: row.approved_schema_hash,
+            },
+            None => audit::PermissionFingerprint::Absent,
+        };
         anyhow::ensure!(
             &current_permission == plan.expected_permission(),
             "permission changed after authorization evaluation"
@@ -3099,6 +3634,288 @@ mod tests {
             trust_level: "unknown".to_owned(),
             schema_hash: Some(format!("hash-{name}")),
         }
+    }
+
+    fn committed<T>(result: ConnectorConfigCas<T>) -> (ConnectorConfigRevision, T) {
+        match result {
+            ConnectorConfigCas::Committed { revision, value } => (revision, value),
+            ConnectorConfigCas::Stale { current_revision } => {
+                panic!("unexpected stale revision: {current_revision:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn connector_config_revision은_모든_가시_mutation과_versioned_read를_추적한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let initial = db.connector_config_revision().unwrap();
+        assert_eq!(initial, ConnectorConfigRevision::INITIAL);
+
+        // Credentials are a global Connector invalidation source, including workspace/global rows.
+        db.insert_credential(&sample("cred-global")).unwrap();
+        let after_credential = db.connector_config_revision().unwrap();
+        assert!(after_credential > initial);
+        db.set_credential_oauth_json("cred-global", r#"{"server_id":"srv"}"#)
+            .unwrap();
+        let after_oauth = db.connector_config_revision().unwrap();
+        assert!(after_oauth > after_credential);
+        db.conn
+            .execute(
+                "UPDATE credentials SET last_used_at = '2026-07-22T00:00:00Z' WHERE id = ?1",
+                ["cred-global"],
+            )
+            .unwrap();
+        assert_eq!(db.connector_config_revision().unwrap(), after_oauth);
+
+        let server = sample_mcp_server("srv");
+        let (after_server, outcome) = committed(
+            db.save_mcp_server_revision_cas(after_oauth, &server)
+                .unwrap(),
+        );
+        assert_eq!(outcome, mcp_store::McpServerSaveOutcome::Inserted);
+        assert!(after_server > after_oauth);
+        let inventory = db.mcp_server_inventory_versioned(8).unwrap();
+        assert_eq!(inventory.revision, after_server);
+        assert_eq!(inventory.value.len(), 1);
+        let selected = db.mcp_server_versioned("srv").unwrap();
+        assert_eq!(selected.revision, after_server);
+        assert_eq!(selected.value.unwrap().id, "srv");
+
+        let tool = sample_mcp_tool("srv", "tool-id", "tool-name");
+        let (after_tools, ()) = committed(
+            db.replace_mcp_tools_revision_cas(after_server, "srv", &[tool])
+                .unwrap(),
+        );
+        assert!(after_tools > after_server);
+        let name = db.mcp_tool_name_versioned("srv", "tool-id").unwrap();
+        assert_eq!(name.revision, after_tools);
+        assert_eq!(name.value.as_deref(), Some("tool-name"));
+        let page = db.mcp_tool_page_versioned("srv", 0, 8).unwrap();
+        assert_eq!(page.revision, after_tools);
+        assert_eq!(page.value.total, 1);
+
+        let (after_permission, ()) = committed(
+            db.set_permission_by_tool_id_revision_cas(
+                after_tools,
+                "srv",
+                "tool-id",
+                "allow",
+                Some("hash-tool-name"),
+            )
+            .unwrap(),
+        );
+        assert!(after_permission > after_tools);
+        let permission = db.permission_rule_versioned("srv", "tool-name").unwrap();
+        assert_eq!(permission.revision, after_permission);
+        assert_eq!(permission.value.unwrap().rule, "allow");
+    }
+
+    #[test]
+    fn connector_config_revision은_restart와_other_writer를_견디고_stale_writer를_거부한다() {
+        let (dir, path, mut db_a) = file_db("connector-revision-stale");
+        let mut db_b = Db::open(&path).unwrap();
+        let expected = db_a.connector_config_revision().unwrap();
+        let (committed_revision, _) = committed(
+            db_a.save_mcp_server_revision_cas(expected, &sample_mcp_server("winner"))
+                .unwrap(),
+        );
+        assert!(committed_revision > expected);
+
+        let stale = db_b
+            .save_mcp_server_revision_cas(expected, &sample_mcp_server("stale"))
+            .unwrap();
+        assert_eq!(
+            stale,
+            ConnectorConfigCas::Stale {
+                current_revision: committed_revision
+            }
+        );
+        assert!(db_b.mcp_server("stale").unwrap().is_none());
+        drop(db_a);
+        drop(db_b);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            reopened.connector_config_revision().unwrap(),
+            committed_revision
+        );
+        reopened
+            .insert_mcp_server(&sample_mcp_server("other-writer"))
+            .unwrap();
+        assert!(
+            reopened.connector_config_revision().unwrap() > committed_revision,
+            "legacy/other-process writer must use the same trigger-backed revision"
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn connector_config_revision_overflow와_injected_failure는_writer전체를_rollback한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "UPDATE connector_config_state SET revision = ?1 WHERE singleton = 1",
+                [i64::MAX],
+            )
+            .unwrap();
+        let maximum = db.connector_config_revision().unwrap();
+        assert_eq!(maximum.get(), u64::try_from(i64::MAX).unwrap());
+        assert!(
+            db.save_mcp_server_revision_cas(maximum, &sample_mcp_server("overflow"))
+                .is_err()
+        );
+        assert!(db.mcp_server("overflow").unwrap().is_none());
+        assert_eq!(db.connector_config_revision().unwrap(), maximum);
+
+        db.conn
+            .execute(
+                "UPDATE connector_config_state SET revision = 1 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        let reset = db.connector_config_revision().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_connector_revision
+                 BEFORE UPDATE ON connector_config_state
+                 BEGIN SELECT RAISE(ABORT, 'injected connector revision failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.save_mcp_server_revision_cas(reset, &sample_mcp_server("injected"))
+                .is_err()
+        );
+        assert!(db.mcp_server("injected").unwrap().is_none());
+        assert_eq!(db.connector_config_revision().unwrap(), reset);
+    }
+
+    #[test]
+    fn selected_server는_sql_byte_preflight에서_oversize를_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let oversized = "x".repeat(mcp_store::MCP_SERVER_POINT_BYTES_MAX + 1);
+        db.conn
+            .execute(
+                "INSERT INTO mcp_servers
+                   (id, name, kind, command, args_json, env_json, env_credentials_json,
+                    inherit_env, url, enabled, created_at, updated_at)
+                 VALUES ('oversized', 'name', 'stdio', ?1, NULL, NULL, NULL, 1, NULL, 1,
+                         'now', 'now')",
+                [&oversized],
+            )
+            .unwrap();
+        assert!(db.mcp_server_versioned("oversized").is_err());
+    }
+
+    #[test]
+    fn credential_secret_location은_materialize전에_sql_byte_preflight를_강제한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("oversized-location")).unwrap();
+        let oversized = "x".repeat(CREDENTIAL_SECRET_LOCATION_BYTES_MAX + 1);
+        db.conn
+            .execute(
+                "UPDATE credentials SET keyring_username = ?2 WHERE id = ?1",
+                ("oversized-location", oversized),
+            )
+            .unwrap();
+
+        assert!(
+            db.credential_secret_location_versioned("oversized-location")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn permission_tool_id_lookup과_write는_한_revision_cas로_직렬화된다() {
+        let (dir, path, mut db_a) = file_db("connector-permission-stale-tool");
+        db_a.insert_mcp_server(&sample_mcp_server("server"))
+            .unwrap();
+        db_a.replace_mcp_tools("server", &[sample_mcp_tool("server", "tool", "old-name")])
+            .unwrap();
+        let stale_revision = db_a.connector_config_revision().unwrap();
+
+        let mut db_b = Db::open(&path).unwrap();
+        let (current_revision, ()) = committed(
+            db_b.replace_mcp_tools_revision_cas(
+                stale_revision,
+                "server",
+                &[sample_mcp_tool("server", "tool", "new-name")],
+            )
+            .unwrap(),
+        );
+        let result = db_a
+            .set_permission_by_tool_id_revision_cas(
+                stale_revision,
+                "server",
+                "tool",
+                "allow",
+                Some("hash-old-name"),
+            )
+            .unwrap();
+        assert_eq!(result, ConnectorConfigCas::Stale { current_revision });
+        assert!(
+            db_a.permission_rule("server", "old-name")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db_a.permission_rule("server", "new-name")
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db_a);
+        drop(db_b);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oauth_pointer_publish와_auth_reads는_같은_durable_revision을_공유한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("oauth-revision").unwrap();
+        db.insert_credential(&sample(logical.as_str())).unwrap();
+        let before = db.connector_config_revision().unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let oauth_json = r#"{"server_id":"server"}"#;
+
+        let (published, changed) = committed(
+            db.publish_credential_secret_slot_revision_cas(
+                before,
+                logical.as_str(),
+                logical.as_str(),
+                slot.as_str(),
+                Some(oauth_json),
+                Some("masked"),
+            )
+            .unwrap(),
+        );
+        assert!(changed);
+        assert!(published > before);
+        let location = db
+            .credential_secret_location_versioned(logical.as_str())
+            .unwrap();
+        assert_eq!(location.revision, published);
+        assert_eq!(location.value.unwrap().keyring_username, slot.as_str());
+        let binding = db
+            .credential_oauth_bindings_for_server_versioned("server")
+            .unwrap();
+        assert_eq!(binding.revision, published);
+        assert_eq!(binding.value.len(), 1);
+        assert_eq!(binding.value[0].physical_pointer, slot.as_str());
+
+        let (unchanged, changed) = committed(
+            db.publish_credential_secret_slot_revision_cas(
+                published,
+                logical.as_str(),
+                "stale-pointer",
+                slot.as_str(),
+                Some(oauth_json),
+                Some("masked"),
+            )
+            .unwrap(),
+        );
+        assert!(!changed);
+        assert_eq!(unchanged, published);
     }
 
     fn credential_secret_record(db: &Db, id: &str) -> CredentialSecretRecord {

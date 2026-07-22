@@ -182,6 +182,42 @@ pub fn permission_rule(
     server_id: &str,
     tool_name: &str,
 ) -> anyhow::Result<Option<PermissionRuleRow>> {
+    let tx = conn.unchecked_transaction()?;
+    let permission = permission_rule_in_snapshot(&tx, server_id, tool_name)?;
+    tx.commit()
+        .context("MCP permission point read transaction 실패")?;
+    Ok(permission)
+}
+
+/// Bounded permission point lookup from a caller-owned stable snapshot.
+pub fn permission_rule_in_snapshot(
+    conn: &Connection,
+    server_id: &str,
+    tool_name: &str,
+) -> anyhow::Result<Option<PermissionRuleRow>> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP permission point snapshot은 caller-owned transaction이 필요합니다"
+    );
+    let row_bytes = conn
+        .query_row(
+            "SELECT length(CAST(server_id AS BLOB)) + length(CAST(tool_name AS BLOB)) +
+                    length(CAST(rule AS BLOB)) +
+                    length(CAST(COALESCE(approved_schema_hash, '') AS BLOB))
+             FROM tool_permission_rules
+             WHERE server_id = ?1 AND tool_name = ?2",
+            (server_id, tool_name),
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(row_bytes) = row_bytes else {
+        return Ok(None);
+    };
+    let row_bytes = usize::try_from(row_bytes).context("MCP permission point bytes 변환 실패")?;
+    anyhow::ensure!(
+        row_bytes <= MCP_PERMISSION_POINT_BYTES_MAX,
+        "MCP permission point byte 상한을 초과했습니다"
+    );
     conn.query_row(
         "SELECT server_id, tool_name, rule, approved_schema_hash
          FROM tool_permission_rules
@@ -506,10 +542,16 @@ pub const MCP_TOOL_PAGE_BYTES_MAX: usize = 8 * 1024 * 1024;
 /// but a single protocol method name never needs a multi-megabyte allocation.
 pub const MCP_TOOL_NAME_BYTES_MAX: usize = 4 * 1024;
 
+/// One permission row consists of two identities, a tiny rule, and one schema hash.
+pub const MCP_PERMISSION_POINT_BYTES_MAX: usize = 16 * 1024;
+
 /// Connector overview inventory ceiling. The +1 probe detects overflow without materializing the
 /// complete legacy server table.
 pub const MCP_SERVER_INVENTORY_LIMIT_MAX: usize = 256;
 pub const MCP_SERVER_INVENTORY_BYTES_MAX: usize = 1024 * 1024;
+/// One selected server may include command/args/env metadata, but is still bounded before any
+/// SQLite text is materialized. This matches the import-input ceiling and is independent of UI.
+pub const MCP_SERVER_POINT_BYTES_MAX: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpServerSaveOutcome {
@@ -799,6 +841,22 @@ pub fn save_server(
     conn: &mut Connection,
     row: &McpServerRow,
 ) -> anyhow::Result<McpServerSaveOutcome> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = save_server_in_transaction(&tx, row)?;
+    tx.commit().context("MCP server 전체 갱신 commit 실패")?;
+    Ok(outcome)
+}
+
+/// Transaction-inner variant used by storage's durable expected-revision CAS. The caller owns
+/// transaction behavior and commit; all transport invalidation remains atomic with the row write.
+pub fn save_server_in_transaction(
+    conn: &Connection,
+    row: &McpServerRow,
+) -> anyhow::Result<McpServerSaveOutcome> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP server save는 caller-owned transaction이 필요합니다"
+    );
     validate_server_args_for_persistence(&row.args)
         .with_context(|| format!("mcp_server args validation 실패: {}", row.name))?;
     validate_server_env_for_persistence(&row.env_plain, &row.env_secrets)
@@ -807,10 +865,8 @@ pub fn save_server(
     let env_json = env_pairs_json(&row.env_plain)?;
     let env_credentials_json = env_pairs_json(&row.env_secrets)?;
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(current) = server(&tx, &row.id)? else {
-        insert_server(&tx, row)?;
-        tx.commit().context("MCP server insert commit 실패")?;
+    let Some(current) = server_in_snapshot(conn, &row.id)? else {
+        insert_server(conn, row)?;
         return Ok(McpServerSaveOutcome::Inserted);
     };
 
@@ -826,11 +882,10 @@ pub fn save_server(
     let unchanged =
         !transport_changed && current.name == row.name && current.enabled == row.enabled;
     if unchanged {
-        tx.commit().context("MCP server no-op transaction 실패")?;
         return Ok(McpServerSaveOutcome::Unchanged);
     }
 
-    let affected = tx
+    let affected = conn
         .execute(
             "UPDATE mcp_servers
              SET name = ?2, kind = ?3, command = ?4, args_json = ?5,
@@ -854,15 +909,14 @@ pub fn save_server(
         .with_context(|| format!("mcp_server 전체 갱신 실패: {}", row.id))?;
     anyhow::ensure!(affected == 1, "mcp_server 전체 갱신 대상 없음: {}", row.id);
     if transport_changed {
-        tx.execute(
+        conn.execute(
             "DELETE FROM tool_permission_rules WHERE server_id = ?1 AND rule = 'allow'",
             [&row.id],
         )
         .with_context(|| format!("mcp_server Allow 권한 초기화 실패: {}", row.id))?;
-        tx.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [&row.id])
+        conn.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [&row.id])
             .with_context(|| format!("mcp_server tool cache 초기화 실패: {}", row.id))?;
     }
-    tx.commit().context("MCP server 전체 갱신 commit 실패")?;
     Ok(McpServerSaveOutcome::Updated { transport_changed })
 }
 
@@ -909,6 +963,21 @@ pub fn ensure_server_by_url(
     conn: &mut Connection,
     row: &McpServerRow,
 ) -> anyhow::Result<McpServerRow> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ensured = ensure_server_by_url_in_transaction(&tx, row)?;
+    tx.commit().context("MCP 서버 멱등 등록 commit 실패")?;
+    Ok(ensured)
+}
+
+/// Transaction-inner URL-idempotent registration for storage's expected-revision CAS.
+pub fn ensure_server_by_url_in_transaction(
+    conn: &Connection,
+    row: &McpServerRow,
+) -> anyhow::Result<McpServerRow> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP server 멱등 등록은 caller-owned transaction이 필요합니다"
+    );
     let url = row
         .url
         .as_deref()
@@ -918,40 +987,41 @@ pub fn ensure_server_by_url(
     let canonical = canonical_url(url);
     anyhow::ensure!(!canonical.is_empty(), "멱등 등록 URL이 비어 있습니다");
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let existing = tx
+    let existing_bytes = conn
         .query_row(
-            "SELECT id, name, kind, command, args_json, env_json, env_credentials_json,
-                    inherit_env, url, enabled
+            "SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(kind AS BLOB)) + length(CAST(COALESCE(command, '') AS BLOB)) +
+                    length(CAST(COALESCE(args_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(env_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(env_credentials_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(url, '') AS BLOB))
              FROM mcp_servers
              WHERE rtrim(trim(url), '/') = ?1
              ORDER BY created_at, id
              LIMIT 1",
             [canonical],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, bool>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, bool>(9)?,
-                ))
-            },
+            |row| row.get::<_, i64>(0),
         )
-        .optional()?
-        .map(parse_server_row)
-        .transpose()?;
-    if let Some(existing) = existing {
-        tx.commit()?;
-        return Ok(existing);
+        .optional()?;
+    if let Some(existing_bytes) = existing_bytes {
+        let existing_bytes = usize::try_from(existing_bytes)
+            .context("MCP canonical server point bytes 변환 실패")?;
+        anyhow::ensure!(
+            existing_bytes <= MCP_SERVER_POINT_BYTES_MAX,
+            "MCP canonical server point byte 상한을 초과했습니다"
+        );
+        let existing_id: String = conn.query_row(
+            "SELECT id FROM mcp_servers
+             WHERE rtrim(trim(url), '/') = ?1
+             ORDER BY created_at, id
+             LIMIT 1",
+            [canonical],
+            |row| row.get(0),
+        )?;
+        return server_in_snapshot(conn, &existing_id)?
+            .context("same-snapshot canonical MCP server가 byte preflight 후 사라졌습니다");
     }
-    insert_server(&tx, row)?;
-    tx.commit().context("MCP 서버 멱등 등록 commit 실패")?;
+    insert_server(conn, row)?;
     Ok(row.clone())
 }
 
@@ -959,17 +1029,30 @@ pub fn ensure_server_by_url(
 /// validation을 transaction 전에 끝내며, ID 충돌/trigger/commit 실패 시 일부 서버가
 /// 남지 않는다.
 pub fn insert_servers_batch(conn: &mut Connection, rows: &[McpServerRow]) -> anyhow::Result<usize> {
+    let tx = conn.transaction()?;
+    let inserted = insert_servers_batch_in_transaction(&tx, rows)?;
+    tx.commit().context("MCP server import batch commit 실패")?;
+    Ok(inserted)
+}
+
+/// Transaction-inner all-or-nothing import for storage's expected-revision CAS.
+pub fn insert_servers_batch_in_transaction(
+    conn: &Connection,
+    rows: &[McpServerRow],
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP server batch insert는 caller-owned transaction이 필요합니다"
+    );
     for row in rows {
         validate_server_args_for_persistence(&row.args)
             .with_context(|| format!("mcp_server args validation 실패: {}", row.name))?;
         validate_server_env_for_persistence(&row.env_plain, &row.env_secrets)
             .with_context(|| format!("mcp_server env validation 실패: {}", row.name))?;
     }
-    let tx = conn.transaction()?;
     for row in rows {
-        insert_server(&tx, row)?;
+        insert_server(conn, row)?;
     }
-    tx.commit().context("MCP server import batch commit 실패")?;
     Ok(rows.len())
 }
 
@@ -1011,6 +1094,22 @@ pub fn server_inventory(
     conn: &Connection,
     limit: usize,
 ) -> anyhow::Result<Vec<McpServerInventoryRow>> {
+    let tx = conn.unchecked_transaction()?;
+    let servers = server_inventory_in_snapshot(&tx, limit)?;
+    tx.commit()
+        .context("MCP server inventory read transaction 실패")?;
+    Ok(servers)
+}
+
+/// Read a bounded inventory from a caller-owned stable snapshot.
+pub fn server_inventory_in_snapshot(
+    conn: &Connection,
+    limit: usize,
+) -> anyhow::Result<Vec<McpServerInventoryRow>> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP server inventory snapshot은 caller-owned transaction이 필요합니다"
+    );
     anyhow::ensure!(limit > 0, "MCP server inventory limit은 0보다 커야 합니다");
     anyhow::ensure!(
         limit <= MCP_SERVER_INVENTORY_LIMIT_MAX,
@@ -1020,8 +1119,7 @@ pub fn server_inventory(
         .checked_add(1)
         .context("MCP server inventory +1 overflow")?;
     let sql_limit = i64::try_from(probe).context("MCP server inventory LIMIT 변환 실패")?;
-    let tx = conn.unchecked_transaction()?;
-    let (probe_count, inventory_bytes): (i64, i64) = tx.query_row(
+    let (probe_count, inventory_bytes): (i64, i64) = conn.query_row(
         "SELECT COUNT(*),
                 COALESCE(SUM(
                     length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
@@ -1046,7 +1144,7 @@ pub fn server_inventory(
         "MCP server inventory byte 상한을 초과했습니다"
     );
     let servers = {
-        let mut stmt = tx.prepare(
+        let mut stmt = conn.prepare(
             "SELECT s.id, s.name, s.kind, s.url, s.enabled, COUNT(t.id)
              FROM mcp_servers s
              LEFT JOIN mcp_tools t ON t.server_id = s.id
@@ -1079,13 +1177,48 @@ pub fn server_inventory(
         }
         servers
     };
-    tx.commit()
-        .context("MCP server inventory read transaction 실패")?;
     Ok(servers)
 }
 
 /// Bounded point lookup for live proxy target refresh. Missing rows are fail-closed upstream.
 pub fn server(conn: &Connection, server_id: &str) -> anyhow::Result<Option<McpServerRow>> {
+    let tx = conn.unchecked_transaction()?;
+    let row = server_in_snapshot(&tx, server_id)?;
+    tx.commit()
+        .context("MCP server point read transaction 실패")?;
+    Ok(row)
+}
+
+/// Read one server from a caller-owned stable snapshot after an SQL byte preflight.
+pub fn server_in_snapshot(
+    conn: &Connection,
+    server_id: &str,
+) -> anyhow::Result<Option<McpServerRow>> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP server point snapshot은 caller-owned transaction이 필요합니다"
+    );
+    let row_bytes = conn
+        .query_row(
+            "SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(kind AS BLOB)) + length(CAST(COALESCE(command, '') AS BLOB)) +
+                    length(CAST(COALESCE(args_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(env_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(env_credentials_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(url, '') AS BLOB))
+             FROM mcp_servers WHERE id = ?1",
+            [server_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(row_bytes) = row_bytes else {
+        return Ok(None);
+    };
+    let row_bytes = usize::try_from(row_bytes).context("MCP server point bytes 변환 실패")?;
+    anyhow::ensure!(
+        row_bytes <= MCP_SERVER_POINT_BYTES_MAX,
+        "MCP server point byte 상한을 초과했습니다"
+    );
     let row = conn
         .query_row(
             "SELECT id, name, kind, command, args_json, env_json, env_credentials_json,
@@ -1219,6 +1352,21 @@ pub fn replace_tools_for_server(
     server_id: &str,
     rows: &[McpToolRow],
 ) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    replace_tools_for_server_in_transaction(&tx, server_id, rows)?;
+    tx.commit().context("mcp_tools 교체 commit 실패")
+}
+
+/// Transaction-inner atomic tool replacement for storage's expected-revision CAS.
+pub fn replace_tools_for_server_in_transaction(
+    conn: &Connection,
+    server_id: &str,
+    rows: &[McpToolRow],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP tool replacement는 caller-owned transaction이 필요합니다"
+    );
     for row in rows {
         anyhow::ensure!(
             row.server_id == server_id,
@@ -1226,13 +1374,12 @@ pub fn replace_tools_for_server(
             row.server_id
         );
     }
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [server_id])
+    conn.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [server_id])
         .with_context(|| format!("mcp_tools 삭제 실패: {server_id}"))?;
     for row in rows {
-        insert_tool(&tx, row)?;
+        insert_tool(conn, row)?;
     }
-    tx.commit().context("mcp_tools 교체 commit 실패")
+    Ok(())
 }
 
 pub fn list_tools_for_server(
@@ -1271,7 +1418,23 @@ pub fn tool_name(
     tool_id: &str,
 ) -> anyhow::Result<Option<String>> {
     let tx = conn.unchecked_transaction()?;
-    let name_bytes = tx
+    let name = tool_name_in_snapshot(&tx, server_id, tool_id)?;
+    tx.commit()
+        .context("MCP tool name lookup transaction 실패")?;
+    Ok(name)
+}
+
+/// Read one bounded tool name from a caller-owned stable snapshot.
+pub fn tool_name_in_snapshot(
+    conn: &Connection,
+    server_id: &str,
+    tool_id: &str,
+) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP tool name snapshot은 caller-owned transaction이 필요합니다"
+    );
+    let name_bytes = conn
         .query_row(
             "SELECT length(CAST(name AS BLOB))
              FROM mcp_tools WHERE server_id = ?1 AND id = ?2",
@@ -1280,8 +1443,6 @@ pub fn tool_name(
         )
         .optional()?;
     let Some(name_bytes) = name_bytes else {
-        tx.commit()
-            .context("MCP tool name missing lookup transaction 실패")?;
         return Ok(None);
     };
     let name_bytes = usize::try_from(name_bytes).context("MCP tool name bytes 변환 실패")?;
@@ -1290,7 +1451,7 @@ pub fn tool_name(
         name_bytes <= MCP_TOOL_NAME_BYTES_MAX,
         "MCP tool name byte 상한을 초과했습니다"
     );
-    let name: String = tx.query_row(
+    let name: String = conn.query_row(
         "SELECT name FROM mcp_tools WHERE server_id = ?1 AND id = ?2",
         (server_id, tool_id),
         |row| row.get(0),
@@ -1299,8 +1460,6 @@ pub fn tool_name(
         name.len() == name_bytes,
         "MCP tool name same-snapshot byte 길이 불일치"
     );
-    tx.commit()
-        .context("MCP tool name lookup transaction 실패")?;
     Ok(Some(name))
 }
 
@@ -1312,6 +1471,23 @@ pub fn tool_page(
     offset: usize,
     limit: usize,
 ) -> anyhow::Result<McpToolPage> {
+    let tx = conn.unchecked_transaction()?;
+    let page = tool_page_in_snapshot(&tx, server_id, offset, limit)?;
+    tx.commit().context("MCP tool page read transaction 실패")?;
+    Ok(page)
+}
+
+/// Read one bounded tool page and its permission join from a caller-owned stable snapshot.
+pub fn tool_page_in_snapshot(
+    conn: &Connection,
+    server_id: &str,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<McpToolPage> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP tool page snapshot은 caller-owned transaction이 필요합니다"
+    );
     anyhow::ensure!(limit > 0, "MCP tool page limit은 0보다 커야 합니다");
     anyhow::ensure!(
         limit <= MCP_TOOL_PAGE_LIMIT_MAX,
@@ -1319,14 +1495,13 @@ pub fn tool_page(
     );
     let sql_offset = i64::try_from(offset).context("MCP tool page OFFSET 변환 실패")?;
     let sql_limit = i64::try_from(limit).context("MCP tool page LIMIT 변환 실패")?;
-    let tx = conn.unchecked_transaction()?;
-    let count: i64 = tx.query_row(
+    let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM mcp_tools WHERE server_id = ?1",
         [server_id],
         |row| row.get(0),
     )?;
     let total = usize::try_from(count).context("MCP tool count 변환 실패")?;
-    let page_bytes: i64 = tx.query_row(
+    let page_bytes: i64 = conn.query_row(
         "SELECT COALESCE(SUM(
                     length(CAST(t.id AS BLOB)) + length(CAST(t.server_id AS BLOB)) +
                     length(CAST(t.name AS BLOB)) +
@@ -1354,7 +1529,7 @@ pub fn tool_page(
         "MCP tool page byte 상한을 초과했습니다"
     );
     let rows = {
-        let mut stmt = tx.prepare(
+        let mut stmt = conn.prepare(
             "SELECT t.id, t.server_id, t.name, t.description,
                     p.server_id, p.tool_name, p.rule, p.approved_schema_hash
              FROM mcp_tools t
@@ -1386,7 +1561,6 @@ pub fn tool_page(
         })?;
         mapped.collect::<Result<Vec<_>, _>>()?
     };
-    tx.commit().context("MCP tool page read transaction 실패")?;
     Ok(McpToolPage { total, rows })
 }
 
@@ -2169,6 +2343,15 @@ mod tests {
                 remember: false,
             }
         );
+    }
+
+    #[test]
+    fn permission_point는_materialize전에_sql_byte_preflight를_강제한다() {
+        let conn = test_conn();
+        let oversized = "x".repeat(MCP_PERMISSION_POINT_BYTES_MAX + 1);
+        upsert_permission_rule(&conn, "srv-1", "read", "allow", Some(&oversized)).unwrap();
+
+        assert!(permission_rule(&conn, "srv-1", "read").is_err());
     }
 
     #[test]

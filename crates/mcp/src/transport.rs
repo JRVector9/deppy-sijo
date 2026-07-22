@@ -261,7 +261,9 @@ impl StdioClient {
             Err(WriteLineFailure::MaybeSent(error)) if method == "tools/call" => {
                 drop(error);
                 tracing::debug!(
-                    "tools/call stdio write outcome unknown; automatic retry forbidden"
+                    kind = "mcp_stdio",
+                    phase = "call_write",
+                    error_code = "unknown_delivery"
                 );
                 return Err(anyhow::Error::new(McpDeliveryUnknown { status: None }));
             }
@@ -280,7 +282,9 @@ impl StdioClient {
             Err(error) => {
                 drop(error);
                 tracing::debug!(
-                    "tools/call stdio response outcome unknown; automatic retry forbidden"
+                    kind = "mcp_stdio",
+                    phase = "call_response",
+                    error_code = "unknown_delivery"
                 );
                 Err(anyhow::Error::new(McpDeliveryUnknown { status: None }))
             }
@@ -488,12 +492,19 @@ impl StdioClient {
     }
 }
 
-fn debug_unsupported_server_message(value: &Value, ignored: bool) {
-    let method = value.get("method").and_then(Value::as_str).unwrap_or("?");
+fn debug_unsupported_server_message(_value: &Value, ignored: bool) {
     if ignored {
-        tracing::debug!(method = %method, "server발 MCP 메시지 무시 (v0 미지원)");
+        tracing::debug!(
+            kind = "mcp_stdio",
+            phase = "unsolicited_server_message",
+            error_code = "unsupported_message"
+        );
     } else {
-        tracing::debug!(method = %method, "server발 MCP 메시지 (v0 미지원)");
+        tracing::debug!(
+            kind = "mcp_stdio",
+            phase = "unsupported_server_message",
+            error_code = "unsupported_message"
+        );
     }
 }
 
@@ -991,14 +1002,14 @@ mod tests {
     }
 
     #[test]
-    fn unsolicited_debug_log는_params_전체를_기록하지_않는다() {
+    fn unsolicited_trace는_hostile_method와_params를_기록하지_않는다() {
         let fields = Arc::new(Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber {
             fields: Arc::clone(&fields),
         };
         let value = serde_json::json!({
             "jsonrpc": "2.0",
-            "method": "notifications/message",
+            "method": "notifications/hostile-marker-sk-should-not-appear",
             "params": {
                 "Authorization": "Bearer sk-should-not-appear"
             }
@@ -1009,11 +1020,23 @@ mod tests {
         });
 
         let captured = fields.lock().unwrap().join("\n");
+        assert!(captured.contains("kind=mcp_stdio"), "{captured}");
         assert!(
-            captured.contains("method=notifications/message"),
+            captured.contains("phase=unsolicited_server_message"),
             "{captured}"
         );
+        assert!(
+            captured.contains("error_code=unsupported_message"),
+            "{captured}"
+        );
+        assert!(!captured.contains("hostile-marker"), "{captured}");
         assert!(!captured.contains("sk-should-not-appear"), "{captured}");
         assert!(!captured.contains("Authorization"), "{captured}");
+        assert!(!captured.contains("method="), "{captured}");
+        assert!(captured.lines().all(|line| {
+            ["kind=", "phase=", "error_code="]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        }));
     }
 }

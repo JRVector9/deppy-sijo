@@ -321,10 +321,9 @@ impl HttpClient {
                 }
                 // 차용: mcpServer.ts:1292-1297 — 재시도는 1회 한정(allowRetry).
                 tracing::info!(
-                    server = %self.server_name,
-                    status,
-                    method,
-                    "MCP 세션 만료 응답 — 세션 재수립 후 1회 재시도"
+                    kind = "mcp_http",
+                    phase = "session_reconnect",
+                    error_code = "session_expired"
                 );
                 self.handshake()
                     .context("MCP 세션 재수립(initialize) 실패")?;
@@ -408,16 +407,13 @@ impl HttpClient {
     ) -> Result<Outcome, ExchangeError> {
         let body = SensitiveBytes::from_json(message)
             .with_context(|| format!("{method} 요청 직렬화 실패"))?;
-        let server = self.server_name.clone();
-        let method_name = method.to_owned();
         run_with_progress(
             PROGRESS_LOG_INTERVAL,
-            move |elapsed| {
+            |_| {
                 tracing::info!(
-                    server = %server,
-                    method = %method_name,
-                    elapsed_secs = elapsed.as_secs(),
-                    "MCP HTTP 응답 대기 중"
+                    kind = "mcp_http",
+                    phase = "awaiting_response",
+                    error_code = "none"
                 );
             },
             || self.exchange_once(&body, expect_id, method),
@@ -529,7 +525,9 @@ impl HttpClient {
                         if method == "tools/call" {
                             drop(error);
                             tracing::debug!(
-                                "tools/call HTTP transport outcome unknown; automatic retry forbidden"
+                                kind = "mcp_http",
+                                phase = "call_transport",
+                                error_code = "unknown_delivery"
                             );
                             return Err(ExchangeError::Other(anyhow::Error::new(
                                 McpDeliveryUnknown { status: None },
@@ -552,7 +550,9 @@ impl HttpClient {
                 {
                     drop(error);
                     tracing::debug!(
-                        "tools/call HTTP response outcome unknown; automatic retry forbidden"
+                        kind = "mcp_http",
+                        phase = "call_response",
+                        error_code = "unknown_delivery"
                     );
                     Err(ExchangeError::Other(anyhow::Error::new(
                         McpDeliveryUnknown { status: None },
@@ -739,7 +739,7 @@ impl HttpClient {
                 .into());
             }
             if event.event_type != "message" {
-                tracing::debug!(event_type = %event.event_type, "알 수 없는 SSE 이벤트 무시");
+                trace_unknown_sse_event(&event.event_type);
                 continue;
             }
             let value = validate_jsonrpc_message(&event.data).map_err(|reason| {
@@ -753,8 +753,7 @@ impl HttpClient {
                 if let Some(request_id) = value.get("id").cloned() {
                     self.post_method_not_found(request_id);
                 }
-                let server_method = value.get("method").and_then(Value::as_str).unwrap_or("?");
-                tracing::debug!(method = %server_method, "server발 MCP 메시지 (HTTP, v0 미지원)");
+                trace_unsupported_server_message(&value);
                 continue;
             }
             if value.get("id").and_then(Value::as_u64) == Some(expect_id) {
@@ -794,6 +793,22 @@ impl HttpClient {
             "method-not-found 회신",
         );
     }
+}
+
+fn trace_unknown_sse_event(_event_type: &str) {
+    tracing::debug!(
+        kind = "mcp_http",
+        phase = "unsupported_sse_event",
+        error_code = "unsupported_message"
+    );
+}
+
+fn trace_unsupported_server_message(_value: &Value) {
+    tracing::debug!(
+        kind = "mcp_http",
+        phase = "unsupported_server_message",
+        error_code = "unsupported_message"
+    );
 }
 
 impl Drop for HttpClient {
@@ -929,8 +944,9 @@ impl HttpSendGovernor {
             // handle detaches only this impossible-by-invariant overflow case and
             // preserves the hard retained-handle bound in release builds.
             tracing::error!(
-                max_http_sends = MAX_HTTP_SENDS,
-                "HTTP sender reaper capacity invariant violated"
+                kind = "mcp_http",
+                phase = "sender_reaper",
+                error_code = "capacity_invariant"
             );
             drop(sender);
             return;
@@ -1335,6 +1351,112 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone)]
+    struct CaptureSubscriber {
+        fields: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = CaptureVisitor {
+                fields: Arc::clone(&self.fields),
+            };
+            event.record(&mut visitor);
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct CaptureVisitor {
+        fields: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Visit for CaptureVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={}", field.name(), value));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    #[test]
+    fn http_traces_drop_hostile_event_type_method_and_payload() {
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            fields: Arc::clone(&fields),
+        };
+        let marker = "https://user:secret@example.invalid/Bearer-sk-hostile-marker";
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": marker,
+            "params": {
+                "Authorization": marker,
+                "arguments": marker,
+            }
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            trace_unknown_sse_event(marker);
+            trace_unsupported_server_message(&message);
+        });
+
+        let captured = fields.lock().unwrap().join("\n");
+        assert!(captured.contains("kind=mcp_http"), "{captured}");
+        assert!(
+            captured.contains("phase=unsupported_sse_event"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("phase=unsupported_server_message"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("error_code=unsupported_message"),
+            "{captured}"
+        );
+        for forbidden in [
+            "hostile-marker",
+            "Authorization",
+            "arguments",
+            "method=",
+            "event_type=",
+            "server=",
+            "url=",
+        ] {
+            assert!(!captured.contains(forbidden), "{forbidden}: {captured}");
+        }
+        assert!(captured.lines().all(|line| {
+            ["kind=", "phase=", "error_code="]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        }));
+    }
 
     #[test]
     fn timed_out_http_senders_keep_permits_and_reaper_is_bounded() {

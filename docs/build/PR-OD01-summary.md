@@ -88,10 +88,20 @@ diff-check, and the production trace scan. The existing stdio fixture measured c
 warm 131.67 microseconds, and 2,064 KiB retained RSS in this run; these local fixture values are
 evidence, not the final hardware release gate.
 
+## MCP transport trace sanitization
+
+HTTP session reconnect/progress, unsupported SSE/server messages, unknown-delivery outcomes, and
+sender-reaper invariants now emit only fixed `kind`, `phase`, and `error_code` fields. Stdio
+unknown-delivery and unsupported unsolicited server messages use the same schema. Server name,
+method, SSE event type, URL, arguments, headers, payload, and raw errors are never recorded.
+
+Hostile subscriber-capture regressions prove that dynamic event/method/payload markers are absent
+from HTTP and stdio traces. Root verification passes both exact tests, MCP all-target check, strict
+Clippy, package rustfmt, and scoped diff-check. The first root HTTP invocation used an unqualified
+name with `--exact` and selected zero tests; the fully qualified test was rerun and passed 1/1.
+
 ## Remaining OD01 scope
 
-The env-only RSS/thread/socket/queue slope soak harness and MCP-owned dynamic traces at
-`mcp/src/http.rs:323,416,742,757` and `mcp/src/transport.rs:494,496` remain for the final OD01
-cutover. Static but schema-inconsistent MCP events remain at HTTP 531/554/931 and transport
-263/282. The completed slices add no production timer, polling loop, network, process, or retained
-source/sample backlog.
+The env-only RSS/thread/socket/queue slope soak harness remains for the final OD01 cutover. The
+completed slices add no production timer, polling loop, network, process, or retained source/sample
+backlog.

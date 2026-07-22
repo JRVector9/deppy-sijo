@@ -131,11 +131,15 @@ impl Drop for SensitiveInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub command_queue: usize,
+    pub host_actions: usize,
     pub snapshot_backlog: usize,
     pub mcp_operations: usize,
     pub oauth_flows: usize,
+    pub session_trust_entries: usize,
     pub import_input_bytes: usize,
     pub import_servers: usize,
+    pub import_report_items: usize,
+    pub import_report_bytes: usize,
     pub tools_per_server: usize,
     pub tool_descriptor_bytes: usize,
     pub tool_input_bytes: usize,
@@ -148,11 +152,15 @@ pub struct ResourceLimits {
 impl ResourceLimits {
     pub const PRODUCTION_CEILING: Self = Self {
         command_queue: 8,
+        host_actions: 8,
         snapshot_backlog: 1,
         mcp_operations: 2,
         oauth_flows: 1,
+        session_trust_entries: 256,
         import_input_bytes: 1024 * 1024,
         import_servers: 256,
+        import_report_items: 256,
+        import_report_bytes: 64 * 1024,
         tools_per_server: 4_096,
         tool_descriptor_bytes: 8 * 1024 * 1024,
         tool_input_bytes: 32 * 1024,
@@ -166,6 +174,7 @@ impl ResourceLimits {
         let ceiling = Self::PRODUCTION_CEILING;
         let checks = [
             ("command_queue", self.command_queue, ceiling.command_queue),
+            ("host_actions", self.host_actions, ceiling.host_actions),
             (
                 "snapshot_backlog",
                 self.snapshot_backlog,
@@ -178,6 +187,11 @@ impl ResourceLimits {
             ),
             ("oauth_flows", self.oauth_flows, ceiling.oauth_flows),
             (
+                "session_trust_entries",
+                self.session_trust_entries,
+                ceiling.session_trust_entries,
+            ),
+            (
                 "import_input_bytes",
                 self.import_input_bytes,
                 ceiling.import_input_bytes,
@@ -186,6 +200,16 @@ impl ResourceLimits {
                 "import_servers",
                 self.import_servers,
                 ceiling.import_servers,
+            ),
+            (
+                "import_report_items",
+                self.import_report_items,
+                ceiling.import_report_items,
+            ),
+            (
+                "import_report_bytes",
+                self.import_report_bytes,
+                ceiling.import_report_bytes,
             ),
             (
                 "tools_per_server",
@@ -297,6 +321,111 @@ pub enum SlackStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackRecoveryKind {
+    ConfigureApp,
+    EnableMcpAccess,
+    RetryAuthorization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackProjection {
+    pub server_id: Option<ServerId>,
+    pub status: SlackStatus,
+    pub tool_count: usize,
+    /// Sanitized workspace label/domain. OAuth team IDs and tokens are never exposed here.
+    pub workspace_label: Option<String>,
+    pub can_choose_workspace: bool,
+    pub recovery: Option<SlackRecoveryKind>,
+}
+
+impl Default for SlackProjection {
+    fn default() -> Self {
+        Self {
+            server_id: None,
+            status: SlackStatus::NotConfigured,
+            tool_count: 0,
+            workspace_label: None,
+            can_choose_workspace: false,
+            recovery: None,
+        }
+    }
+}
+
+/// Validated endpoint text intended only for direct user display. Debug deliberately hides the
+/// raw URL so derived snapshot/prompt diagnostics cannot log it accidentally.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EndpointDisplay(String);
+
+impl EndpointDisplay {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EndpointDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EndpointDisplay(REDACTED)")
+    }
+}
+
+/// SHA-256 fingerprint of the exact validated endpoint/config identity. UI echoes this opaque
+/// value with its decision; the service still re-checks the live endpoint before any network I/O.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EndpointFingerprint(String);
+
+impl EndpointFingerprint {
+    pub fn parse(value: impl Into<String>) -> Result<Self, EndpointFingerprintError> {
+        let value = value.into();
+        if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Ok(Self(value.to_ascii_lowercase()))
+        } else {
+            Err(EndpointFingerprintError)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointFingerprintError;
+
+impl fmt::Display for EndpointFingerprintError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("endpoint fingerprint must be 64 hexadecimal characters")
+    }
+}
+
+impl std::error::Error for EndpointFingerprintError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteTrustPurpose {
+    Discover,
+    Invoke,
+    OAuth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteTrustPrompt {
+    pub operation_id: OperationId,
+    pub server_id: ServerId,
+    pub server_name: String,
+    pub purpose: RemoteTrustPurpose,
+    pub display_endpoint: EndpointDisplay,
+    pub endpoint_fingerprint: EndpointFingerprint,
+    pub config_revision: Revision,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSummary {
     pub id: ServerId,
@@ -347,8 +476,7 @@ pub struct OperationSummary {
 pub struct ConnectorSnapshot {
     pub revision: Revision,
     pub config_revision: Revision,
-    pub slack_status: SlackStatus,
-    pub slack_tool_count: usize,
+    pub slack: SlackProjection,
     pub servers: Arc<[ServerSummary]>,
     pub selected_server: Option<ServerId>,
     /// Editable transport configuration is loaded only for the selected server.
@@ -356,11 +484,14 @@ pub struct ConnectorSnapshot {
     pub selected_server_config: Option<ServerDraft>,
     pub tool_page: Option<ToolPage>,
     pub approval: Option<ApprovalPrompt>,
-    /// Service request for manual OAuth client input. Contains no token/client secret.
     #[serde(default)]
-    pub oauth_client_prompt: Option<OAuthClientPrompt>,
+    pub remote_trust: Option<RemoteTrustPrompt>,
+    #[serde(default)]
+    pub oauth: Option<OAuthUiState>,
     pub operations: Arc<[OperationSummary]>,
     pub result: Option<OperationResult>,
+    #[serde(default)]
+    pub import_report: Option<ImportReport>,
     pub diagnostics: DiagnosticsSnapshot,
 }
 
@@ -369,16 +500,17 @@ impl Default for ConnectorSnapshot {
         Self {
             revision: Revision::ZERO,
             config_revision: Revision::ZERO,
-            slack_status: SlackStatus::NotConfigured,
-            slack_tool_count: 0,
+            slack: SlackProjection::default(),
             servers: Arc::from([]),
             selected_server: None,
             selected_server_config: None,
             tool_page: None,
             approval: None,
-            oauth_client_prompt: None,
+            remote_trust: None,
+            oauth: None,
             operations: Arc::from([]),
             result: None,
+            import_report: None,
             diagnostics: DiagnosticsSnapshot::default(),
         }
     }
@@ -392,13 +524,86 @@ pub struct OperationResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OAuthClientPrompt {
+pub struct OAuthUiState {
     pub operation_id: OperationId,
     pub server_id: ServerId,
     pub server_name: String,
-    pub workspace_hint: Option<String>,
-    /// Sanitized, user-facing reason; raw HTTP/OAuth errors are not allowed here.
-    pub reason: Option<String>,
+    pub config_revision: Revision,
+    pub phase: OAuthUiPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum OAuthUiPhase {
+    DiscoveringAuth,
+    AwaitingConsent {
+        authority: EndpointDisplay,
+        resource: EndpointDisplay,
+        scopes: Arc<[String]>,
+    },
+    AwaitingClient {
+        reason: ErrorCode,
+        workspace_hint: Option<String>,
+    },
+    PreparingCallback,
+    /// Callback listener is bound and the one-shot app host action is ready to be queued.
+    BrowserReady,
+    AwaitingCallback,
+    Failed {
+        error_code: ErrorCode,
+        recovery: Arc<[OAuthRecoveryAction]>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthRecoveryAction {
+    Retry,
+    ChooseWorkspace,
+    OpenSlackMcpSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportSource {
+    Paste,
+    File,
+    ClaudeDesktop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportSourceRequest {
+    FilePicker,
+    ClaudeDesktop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportOutcome {
+    Added,
+    SkippedDuplicate,
+    SkippedUnsupported,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReportItem {
+    pub name: String,
+    pub outcome: ImportOutcome,
+    pub error_code: Option<ErrorCode>,
+    pub omitted_secret_env_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub operation_id: OperationId,
+    pub source: ImportSource,
+    pub added: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub items: Arc<[ImportReportItem]>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +629,7 @@ pub struct DiagnosticTransition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
+    Trust,
     Discover,
     Invoke,
     OAuth,
@@ -438,7 +644,14 @@ pub enum OperationKind {
 pub enum OperationPhase {
     Queued,
     Validating,
+    AwaitingTrust,
     DiscoveringSchema,
+    DiscoveringAuth,
+    AwaitingConsent,
+    AwaitingClient,
+    PreparingCallback,
+    BrowserReady,
+    AwaitingCallback,
     Authorizing,
     AuditPreflight,
     Calling,
@@ -459,10 +672,13 @@ pub enum ErrorCode {
     Backpressure,
     StorageUnavailable,
     SecretUnavailable,
+    TrustDenied,
+    HostUnavailable,
     PermissionDenied,
     AuditUnavailable,
     AuthenticationRequired,
     AuthenticationFailed,
+    OAuthCallbackFailed,
     NetworkTimeout,
     TransportFailed,
     ProtocolViolation,
@@ -544,6 +760,12 @@ pub enum TransportDraft {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalLinkKind {
+    SlackAppSettings,
+}
+
 /// A single frame may emit at most one user intent. The UI retains drafts locally and does not
 /// clone/serialize secret-bearing variants.
 #[derive(Debug)]
@@ -563,13 +785,35 @@ pub enum ConnectorIntent {
         arguments_json: SensitiveInput,
     },
     Cancel(OperationId),
+    ResolveRemoteTrust {
+        operation_id: OperationId,
+        config_revision: Revision,
+        endpoint_fingerprint: EndpointFingerprint,
+        accepted: bool,
+    },
     BeginOAuth(ServerId),
+    ResolveOAuthConsent {
+        operation_id: OperationId,
+        config_revision: Revision,
+        accepted: bool,
+    },
     SubmitOAuthClient {
-        operation_id: Option<OperationId>,
+        operation_id: OperationId,
+        config_revision: Revision,
         server_id: ServerId,
         client_id: String,
         client_secret: SensitiveInput,
         workspace_hint: Option<String>,
+    },
+    SubmitSlackWorkspace {
+        operation_id: OperationId,
+        config_revision: Revision,
+        workspace: String,
+    },
+    RetryOAuth(ServerId),
+    ResolveOAuthRecovery {
+        operation_id: OperationId,
+        action: OAuthRecoveryAction,
     },
     ResolveApproval {
         operation_id: OperationId,
@@ -580,24 +824,31 @@ pub enum ConnectorIntent {
         tool_id: ToolId,
         rule: PermissionRule,
     },
-    EnsureSlackServer,
-    RequestImportPicker,
+    ConnectSlack,
+    ChooseSlackWorkspace(ServerId),
+    OpenSlackRecovery {
+        server_id: ServerId,
+        kind: SlackRecoveryKind,
+    },
+    RequestImportSource(ImportSourceRequest),
     /// App-owned file picker/read path re-enters the same intent dispatcher with bounded bytes.
     /// The service validates the byte/item ceilings before parsing or persistence.
     ImportConfiguration {
-        source_name: String,
+        source: ImportSource,
+        display_name: Option<String>,
         contents: SensitiveInput,
     },
-    OpenExternalUrl {
-        url: String,
-    },
+    OpenExternalLink(ExternalLinkKind),
     DismissResult(OperationId),
+    DismissImportReport(OperationId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorEvent {
     pub operation_id: OperationId,
+    pub snapshot_revision: Revision,
     pub config_revision: Revision,
+    pub server_id: Option<ServerId>,
     pub kind: OperationKind,
     pub phase: OperationPhase,
     pub error_code: Option<ErrorCode>,
@@ -619,11 +870,15 @@ mod tests {
     fn production_limits_match_the_frozen_ceiling() {
         let limits = ResourceLimits::default().validate().unwrap();
         assert_eq!(limits.command_queue, 8);
+        assert_eq!(limits.host_actions, 8);
         assert_eq!(limits.snapshot_backlog, 1);
         assert_eq!(limits.mcp_operations, 2);
         assert_eq!(limits.oauth_flows, 1);
+        assert_eq!(limits.session_trust_entries, 256);
         assert_eq!(limits.import_input_bytes, 1024 * 1024);
         assert_eq!(limits.import_servers, 256);
+        assert_eq!(limits.import_report_items, 256);
+        assert_eq!(limits.import_report_bytes, 64 * 1024);
         assert_eq!(limits.tools_per_server, 4_096);
         assert_eq!(limits.tool_descriptor_bytes, 8 * 1024 * 1024);
         assert_eq!(limits.tool_input_bytes, 32 * 1024);
@@ -656,11 +911,39 @@ mod tests {
     #[test]
     fn import_intent_never_debugs_file_contents() {
         let intent = ConnectorIntent::ImportConfiguration {
-            source_name: "mcp.json".to_owned(),
+            source: ImportSource::File,
+            display_name: Some("mcp.json".to_owned()),
             contents: SensitiveInput::from("client_secret=do-not-log".to_owned()),
         };
         let debug = format!("{intent:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("do-not-log"));
+    }
+
+    #[test]
+    fn endpoint_display_debug_never_exposes_raw_url() {
+        let endpoint = EndpointDisplay::new("https://sensitive.example/mcp");
+        let debug = format!("{endpoint:?}");
+        assert_eq!(debug, "EndpointDisplay(REDACTED)");
+        assert!(!debug.contains("sensitive.example"));
+        assert_eq!(endpoint.as_str(), "https://sensitive.example/mcp");
+    }
+
+    #[test]
+    fn endpoint_fingerprint_requires_exact_sha256_hex_shape() {
+        let upper = "A".repeat(64);
+        let fingerprint = EndpointFingerprint::parse(upper).unwrap();
+        assert_eq!(fingerprint.as_str(), "a".repeat(64));
+        assert!(EndpointFingerprint::parse("a".repeat(63)).is_err());
+        assert!(EndpointFingerprint::parse("z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn default_snapshot_has_no_interactive_or_import_backlog() {
+        let snapshot = ConnectorSnapshot::default();
+        assert_eq!(snapshot.slack, SlackProjection::default());
+        assert!(snapshot.remote_trust.is_none());
+        assert!(snapshot.oauth.is_none());
+        assert!(snapshot.import_report.is_none());
     }
 }

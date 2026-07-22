@@ -13,6 +13,11 @@ const REPLACEMENT: &[u8] = b"[REDACTED]";
 const MIN_SECRET_LEN: usize = 6;
 const DEFAULT_GRACE: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+thread_local! {
+    static REDACT_BUFFER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedactionCorpusLimits {
     pub max_items: usize,
@@ -128,9 +133,12 @@ struct Patterns {
     entries: Vec<PatternEntry>,
     max_len: usize,
     bytes: usize,
+    next_expiry: Option<Duration>,
     next_id: u64,
     active_leases: usize,
     fail_closed: bool,
+    #[cfg(test)]
+    prune_scans: usize,
 }
 
 struct PatternEntry {
@@ -166,6 +174,15 @@ impl Drop for PatternBytes {
 
 impl Patterns {
     fn prune(&mut self, now: Duration) {
+        // Matching is a hot path. Retain/recompute/sort only when the earliest grace deadline is
+        // actually due; registration and lease acquisition also enter through this same gate.
+        if self.next_expiry.is_none_or(|expiry| expiry > now) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.prune_scans = self.prune_scans.saturating_add(1);
+        }
         self.entries.retain(|entry| {
             entry.permanent
                 || entry.rotating_refs > 0
@@ -182,6 +199,12 @@ impl Patterns {
             .map(|entry| entry.bytes.len())
             .max()
             .unwrap_or(0);
+        self.next_expiry = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.permanent && entry.rotating_refs == 0)
+            .filter_map(|entry| entry.expires_at)
+            .min();
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.bytes.len()));
     }
@@ -511,13 +534,22 @@ impl RedactionLease {
             .patterns
             .lock()
             .expect("redaction patterns lock");
+        let mut scheduled_expiry = false;
         for id in &self.pattern_ids {
             if let Some(entry) = patterns.entries.iter_mut().find(|entry| entry.id == *id) {
                 entry.rotating_refs = entry.rotating_refs.saturating_sub(1);
                 if entry.rotating_refs == 0 && !entry.permanent {
                     entry.expires_at = Some(expires_at);
+                    scheduled_expiry = true;
                 }
             }
+        }
+        if scheduled_expiry {
+            patterns.next_expiry = Some(
+                patterns
+                    .next_expiry
+                    .map_or(expires_at, |scheduled| scheduled.min(expires_at)),
+            );
         }
         patterns.active_leases = patterns.active_leases.saturating_sub(1);
         self.released = true;
@@ -595,6 +627,9 @@ impl StreamRedactor {
                 .lock()
                 .expect("redaction patterns lock");
             patterns.prune(now);
+            if patterns.entries.is_empty() && !patterns.fail_closed {
+                return std::mem::take(&mut self.carry);
+            }
             let (redacted, stripped_len) =
                 redact_buffer(&self.carry, &patterns.entries, patterns.fail_closed);
             (redacted, stripped_len, patterns.max_len)
@@ -627,6 +662,9 @@ impl StreamRedactor {
             .lock()
             .expect("redaction patterns lock");
         patterns.prune(now);
+        if patterns.entries.is_empty() && !patterns.fail_closed {
+            return std::mem::take(&mut self.carry);
+        }
         let (redacted, _) = redact_buffer(&self.carry, &patterns.entries, patterns.fail_closed);
         self.carry.clear();
         redacted
@@ -637,6 +675,9 @@ impl StreamRedactor {
 /// 매칭은 ANSI escape를 제거한 텍스트에서 하고(escape 삽입 우회 방지 — 7장),
 /// 치환은 원본 범위(escape 포함)에 적용한다. (stripped 길이도 반환)
 fn redact_buffer(buffer: &[u8], patterns: &[PatternEntry], fail_closed: bool) -> (Vec<u8>, usize) {
+    #[cfg(test)]
+    REDACT_BUFFER_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+
     let (stripped, index_map) = strip_ansi_with_map(buffer);
     if fail_closed && !stripped.is_empty() {
         return (REPLACEMENT.to_vec(), stripped.len());
@@ -900,6 +941,70 @@ mod tests {
         }
         out.extend(redactor.flush());
         out
+    }
+
+    #[test]
+    fn empty_safe_corpus_bypasses_pattern_and_ansi_work() {
+        REDACT_BUFFER_CALLS.with(|calls| calls.set(0));
+        let mut redactor = RedactionService::new().stream_redactor();
+        let chunk = b"plain \x1b[31mterminal\x1b[0m output";
+
+        assert_eq!(redactor.redact_chunk(chunk), chunk);
+        assert!(redactor.flush().is_empty());
+        assert_eq!(
+            REDACT_BUFFER_CALLS.with(std::cell::Cell::get),
+            0,
+            "an empty safe corpus must not allocate stripped/index-map buffers"
+        );
+    }
+
+    #[test]
+    fn grace_prune_scans_only_when_the_earliest_expiry_is_due() {
+        let (service, clock) = bounded_service(256, 256 * 1024, Duration::from_secs(10));
+        let rotating = SecretString::new("rotating-hot-path-secret".to_owned());
+        drop(service.acquire_rotating(&rotating).unwrap());
+        let mut redactor = service.stream_redactor();
+
+        for _ in 0..300 {
+            let _ = redactor.redact_chunk(b"ordinary terminal output");
+        }
+        assert_eq!(
+            service
+                .inner
+                .patterns
+                .lock()
+                .expect("redaction patterns lock")
+                .prune_scans,
+            0,
+            "matching before grace expiry must not rescan or sort the corpus"
+        );
+
+        clock.advance(Duration::from_secs(10));
+        let _ = redactor.redact_chunk(b"expiry-triggering output");
+        {
+            let patterns = service
+                .inner
+                .patterns
+                .lock()
+                .expect("redaction patterns lock");
+            assert_eq!(patterns.prune_scans, 1);
+            assert!(patterns.entries.is_empty());
+            assert!(patterns.next_expiry.is_none());
+        }
+
+        for _ in 0..300 {
+            let _ = redactor.redact_chunk(b"post-expiry output");
+        }
+        assert_eq!(
+            service
+                .inner
+                .patterns
+                .lock()
+                .expect("redaction patterns lock")
+                .prune_scans,
+            1,
+            "an empty corpus must stay on the constant-time prune gate"
+        );
     }
 
     /// PR-22 완료 기준: redaction corpus — 각 변형에 대한 fixture.

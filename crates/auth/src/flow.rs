@@ -62,7 +62,6 @@ type ConfiguredClient =
     ProviderClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 /// 사용자가 입력하는 provider 설정 (§11.0 mcp_servers.url과 별개 — 커넥터 등록 폼).
-#[derive(Debug)]
 pub struct OAuthProviderConfig {
     pub auth_url: String,
     pub token_url: String,
@@ -76,6 +75,20 @@ pub struct OAuthProviderConfig {
     /// provider authorize 힌트. Slack은 이전 승인에서 확인한 workspace ID를
     /// `team` 파라미터로 넣어 다음 승인 대상을 고정한다.
     pub extra_authorize_params: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for OAuthProviderConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthProviderConfig")
+            .field("endpoints", &"REDACTED")
+            .field("client", &"REDACTED")
+            .field("has_client_secret", &self.client_secret.is_some())
+            .field("client_secret_post", &self.client_secret_post)
+            .field("scope_count", &self.scopes.len())
+            .field("extra_parameter_count", &self.extra_authorize_params.len())
+            .finish()
+    }
 }
 
 /// begin이 만든 진행 상태 — 브라우저가 돌아올 때까지 보관한다.
@@ -115,7 +128,10 @@ impl std::fmt::Debug for OAuthToken {
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("expires_in_secs", &self.expires_in_secs)
-            .field("provider_workspace_id", &self.provider_workspace_id)
+            .field(
+                "has_provider_workspace_id",
+                &self.provider_workspace_id.is_some(),
+            )
             .finish()
     }
 }
@@ -194,7 +210,7 @@ pub fn complete(
     // 응답이 멎은 token endpoint에 flow가 영구히 매달리지 않게 timeout.
     // redirect 금지도 함께 강제된다 (H4 리뷰 P1) — token 응답의 302를 따라가면
     // code/PKCE verifier가 redirect 대상으로 유출될 수 있다 (CWE-918).
-    let http = crate::oauth_http_agent(Duration::from_secs(30));
+    let http = crate::http::BoundedOAuthHttpClient::new(Duration::from_secs(30));
     let mut request = pending
         .client
         .exchange_code(AuthorizationCode::new(params.code))
@@ -203,7 +219,9 @@ pub fn complete(
         // RFC 8707: authorize에 실었던 resource를 token 교환에도 동일하게
         request = request.add_extra_param("resource", resource.as_str());
     }
-    let response = request.request(&http).context("token 교환 실패")?;
+    let response = request
+        .request(&http)
+        .map_err(|_| anyhow::anyhow!("OAuth token exchange failed"))?;
     let provider_workspace_id = response
         .extra_fields()
         .team

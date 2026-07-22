@@ -12,14 +12,13 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context;
 use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthType, ClientId, ClientSecret, HttpClientError, RefreshToken, RequestTokenError,
-    TokenResponse, TokenUrl,
+    AuthType, ClientId, ClientSecret, RefreshToken, RequestTokenError, TokenResponse, TokenUrl,
 };
 use secret::{
     LogicalCredentialId, PhysicalSecretSlot, SecretStore, SecretString, read_secret_bundle,
 };
 
-use crate::{OAuthToken, oauth_http_agent, refresh_entry_id, store_token};
+use crate::{OAuthToken, refresh_entry_id, store_token};
 
 /// 만료 전 선제 refresh 마진 (VS Code DynamicAuthProvider와 동일한 5분).
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
@@ -73,7 +72,6 @@ impl RefreshCoordinator {
 }
 
 /// refresh 교환 파라미터 (비밀은 client_secret뿐 — Debug에서 자동 은닉).
-#[derive(Debug)]
 pub struct RefreshParams {
     pub token_url: String,
     pub client_id: String,
@@ -85,8 +83,19 @@ pub struct RefreshParams {
     pub resource: Option<String>,
 }
 
+impl std::fmt::Debug for RefreshParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RefreshParams")
+            .field("binding", &"REDACTED")
+            .field("has_client_secret", &self.client_secret.is_some())
+            .field("client_secret_post", &self.client_secret_post)
+            .field("has_resource", &self.resource.is_some())
+            .finish()
+    }
+}
+
 /// refresh 결과.
-#[derive(Debug)]
 pub enum RefreshOutcome {
     /// 이 호출이 직접 갱신했다. Legacy [`refresh_access_token`]은 기존 username에 저장한
     /// 뒤 반환하고, [`refresh_access_token_for_slot`]은 publish callback의 pointer commit이
@@ -97,6 +106,18 @@ pub enum RefreshOutcome {
     /// AS가 refresh를 거부했다. Legacy 경로는 기존 access+refresh를 폐기하며, typed slot
     /// 경로는 pointer transaction/reconciliation을 위해 기존 slot을 건드리지 않는다.
     ReauthorizationRequired { reason: String },
+}
+
+impl std::fmt::Debug for RefreshOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refreshed(_) => formatter.write_str("Refreshed(REDACTED)"),
+            Self::AlreadyRefreshed => formatter.write_str("AlreadyRefreshed"),
+            Self::ReauthorizationRequired { .. } => {
+                formatter.write_str("ReauthorizationRequired(REDACTED)")
+            }
+        }
+    }
 }
 
 /// access token을 refresh한다. 성공 시 새 토큰은 이미 keyring에 저장돼 있다
@@ -267,7 +288,7 @@ fn exchange_refresh(
     // redirect 금지 Agent (H4 리뷰 P1) — token 응답의 302를 따라가면 refresh token이
     // redirect 대상으로 흘러갈 수 있다. 302는 oauth2가 비200 응답으로 에러 처리하며
     // 아래 분류에서 Transient(폐기 없음)로 떨어진다.
-    let http = oauth_http_agent(timeout);
+    let http = crate::http::BoundedOAuthHttpClient::new(timeout);
     match request.request(&http) {
         Ok(response) => {
             let token = OAuthToken {
@@ -305,11 +326,10 @@ enum RefreshFailure {
 }
 
 type RefreshExchangeError =
-    RequestTokenError<HttpClientError<ureq::Error>, oauth2::basic::BasicErrorResponse>;
+    RequestTokenError<crate::http::BoundedOAuthHttpError, oauth2::basic::BasicErrorResponse>;
 
-/// oauth2 5의 ureq 어댑터는 4xx/5xx를 `ureq::Error::Status`로 감싼 Request 에러로
-/// 돌려준다 (`ServerResponse`에 도달하지 않음) — 여기서 RFC 6749 §5.2 error 응답을
-/// 직접 복원해 "AS 거부"와 "일시 장애"를 가른다.
+/// The bounded adapter preserves 4xx response status/body, allowing oauth2 to parse typed RFC 6749
+/// errors. All non-server-response failures are collapsed to sanitized transient categories.
 fn classify_refresh_error(error: RefreshExchangeError) -> RefreshFailure {
     match error {
         // 정석 경로 — 어댑터가 4xx 응답을 그대로 넘겨주게 되면 여기로 온다
@@ -321,40 +341,29 @@ fn classify_refresh_error(error: RefreshExchangeError) -> RefreshFailure {
                 None => format!("AS 거부: {}", response.error().as_ref()),
             })
         }
-        RequestTokenError::Request(HttpClientError::Reqwest(boxed)) => match *boxed {
-            ureq::Error::Status(status, response) if (400..500).contains(&status) => {
-                #[derive(serde::Deserialize)]
-                struct TokenErrorBody {
-                    error: String,
-                    error_description: Option<String>,
-                }
-                let body = response.into_string().unwrap_or_default();
-                match serde_json::from_str::<TokenErrorBody>(&body) {
-                    Ok(parsed) => RefreshFailure::Rejected(match parsed.error_description {
-                        Some(description) => format!("AS 거부: {} ({description})", parsed.error),
-                        None => format!("AS 거부: {}", parsed.error),
-                    }),
-                    // RFC 6749 형식이 아닌 4xx — 명시적 거부로 단정하지 않는다
-                    Err(_) => RefreshFailure::Transient(anyhow::anyhow!(
-                        "token endpoint HTTP {status}: {}",
-                        body.chars().take(200).collect::<String>()
-                    )),
-                }
-            }
-            other => RefreshFailure::Transient(anyhow::Error::new(other)),
-        },
-        other => RefreshFailure::Transient(anyhow::Error::new(other)),
+        RequestTokenError::Request(_) => {
+            RefreshFailure::Transient(anyhow::anyhow!("OAuth refresh request failed"))
+        }
+        RequestTokenError::Parse(_, _) => {
+            RefreshFailure::Transient(anyhow::anyhow!("OAuth refresh response is invalid"))
+        }
+        RequestTokenError::Other(_) => {
+            RefreshFailure::Transient(anyhow::anyhow!("OAuth refresh response was rejected"))
+        }
     }
 }
 
 /// keyring 규약: 삭제는 access(credential id)와 refresh(`{id}.refresh`) 두 entry 모두.
 /// DCR client_secret(`{id}.dcr`)은 등록 정보라 유지한다 — 재승인 flow가 재사용.
 fn discard_tokens(store: &dyn SecretStore, credential_id: &str) {
-    if let Err(e) = store.delete_secret(credential_id) {
-        tracing::warn!("access token 폐기 실패 ({credential_id}): {e:#}");
+    if store.delete_secret(credential_id).is_err() {
+        tracing::warn!("access token deletion failed; orphan reconciliation is required");
     }
-    if let Err(e) = store.delete_secret(&refresh_entry_id(credential_id)) {
-        tracing::warn!("refresh token 폐기 실패 ({credential_id}): {e:#}");
+    if store
+        .delete_secret(&refresh_entry_id(credential_id))
+        .is_err()
+    {
+        tracing::warn!("refresh token deletion failed; orphan reconciliation is required");
     }
 }
 
@@ -768,5 +777,30 @@ mod tests {
             |_, _| panic!("mismatched slot must not publish"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn refresh_debug는_binding과_failure_detail을_숨긴다() {
+        let params = RefreshParams {
+            token_url: "https://auth.example.test/token".to_owned(),
+            client_id: "client-identifier".to_owned(),
+            client_secret: Some(SecretString::new("client-secret-value".to_owned())),
+            client_secret_post: true,
+            resource: Some("https://mcp.example.test/mcp".to_owned()),
+        };
+        let params_debug = format!("{params:?}");
+        for forbidden in [
+            "auth.example.test",
+            "client-identifier",
+            "client-secret-value",
+            "mcp.example.test",
+        ] {
+            assert!(!params_debug.contains(forbidden), "{params_debug}");
+        }
+
+        let outcome = RefreshOutcome::ReauthorizationRequired {
+            reason: "provider raw failure".to_owned(),
+        };
+        assert!(!format!("{outcome:?}").contains("provider raw failure"));
     }
 }

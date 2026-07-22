@@ -33,7 +33,6 @@ pub struct DynamicRegistration {
 }
 
 /// DCR 실패 분류 — H5가 "수동 client_id 입력 폴백"으로 넘어갈지 판단한다.
-#[derive(Debug)]
 pub enum RegistrationError {
     /// AS가 DCR을 지원하지 않음 (registration_endpoint 없음 / 404 / code grant 미지원).
     Unsupported(String),
@@ -43,12 +42,27 @@ pub enum RegistrationError {
     Other(anyhow::Error),
 }
 
+impl std::fmt::Debug for RegistrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let category = match self {
+            Self::Unsupported(_) => "unsupported",
+            Self::Rejected(_) => "rejected",
+            Self::Other(_) => "other",
+        };
+        formatter
+            .debug_struct("RegistrationError")
+            .field("category", &category)
+            .field("detail", &"REDACTED")
+            .finish()
+    }
+}
+
 impl std::fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unsupported(message) => write!(f, "DCR 미지원: {message}"),
-            Self::Rejected(message) => write!(f, "DCR 거부: {message}"),
-            Self::Other(error) => write!(f, "DCR 실패: {error:#}"),
+            Self::Unsupported(_) => f.write_str("OAuth dynamic registration is unsupported"),
+            Self::Rejected(_) => f.write_str("OAuth dynamic registration was rejected"),
+            Self::Other(_) => f.write_str("OAuth dynamic registration failed"),
         }
     }
 }
@@ -105,18 +119,18 @@ pub fn register_client(
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(404, _)) => {
-            return Err(RegistrationError::Unsupported(format!(
-                "registration endpoint 404: {endpoint}"
-            )));
+            return Err(RegistrationError::Unsupported(
+                "registration endpoint unavailable".to_owned(),
+            ));
         }
         Err(ureq::Error::Status(code, response)) if (400..500).contains(&code) => {
             return Err(RegistrationError::Rejected(rejection_reason(
                 code, response,
             )));
         }
-        Err(e) => {
+        Err(_) => {
             return Err(RegistrationError::Other(anyhow::anyhow!(
-                "등록 요청 실패: {e}"
+                "OAuth registration request failed"
             )));
         }
     };
@@ -131,11 +145,11 @@ pub fn register_client(
     }
 
     // RFC 7591 §3.2.1 성공은 201 — 200을 주는 실서버도 수용 (2xx는 ureq가 Ok로 준다)
-    let body = response
-        .into_string()
-        .map_err(|e| RegistrationError::Other(anyhow::anyhow!("등록 응답 본문 읽기 실패: {e}")))?;
-    let parsed: RegistrationResponse = serde_json::from_str(&body).map_err(|e| {
-        RegistrationError::Other(anyhow::anyhow!("등록 응답 파싱 실패 (client_id 필수): {e}"))
+    let body = crate::http::read_ureq_body_bounded(response).map_err(|_| {
+        RegistrationError::Other(anyhow::anyhow!("OAuth registration response is invalid"))
+    })?;
+    let parsed: RegistrationResponse = serde_json::from_slice(&body).map_err(|_| {
+        RegistrationError::Other(anyhow::anyhow!("OAuth registration response is invalid"))
     })?;
     Ok(DynamicRegistration {
         client_id: parsed.client_id,
@@ -150,15 +164,16 @@ fn rejection_reason(code: u16, response: ureq::Response) -> String {
         error: String,
         error_description: Option<String>,
     }
-    let body = response.into_string().unwrap_or_default();
-    match serde_json::from_str::<ErrorBody>(&body) {
+    let Ok(body) = crate::http::read_ureq_body_bounded(response) else {
+        return format!("HTTP {code}: bounded error response unavailable");
+    };
+    match serde_json::from_slice::<ErrorBody>(&body) {
         Ok(parsed) => match parsed.error_description {
             Some(description) => format!("HTTP {code} {}: {description}", parsed.error),
             None => format!("HTTP {code} {}", parsed.error),
         },
         Err(_) => {
-            let truncated: String = body.chars().take(200).collect();
-            format!("HTTP {code}: {truncated}")
+            format!("HTTP {code}: invalid error response")
         }
     }
 }
@@ -269,7 +284,10 @@ mod tests {
             matches!(error, RegistrationError::Unsupported(_)),
             "{error}"
         );
-        assert!(error.to_string().contains("404"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "OAuth dynamic registration is unsupported"
+        );
     }
 
     #[test]
@@ -287,9 +305,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, RegistrationError::Rejected(_)), "{error}");
-        let message = error.to_string();
-        assert!(message.contains("invalid_redirect_uri"), "{message}");
-        assert!(message.contains("loopback only"), "{message}");
+        assert_eq!(error.to_string(), "OAuth dynamic registration was rejected");
     }
 
     #[test]
@@ -327,7 +343,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, RegistrationError::Other(_)), "{error}");
-        assert!(error.to_string().contains("redirect 거부"), "{error}");
+        assert_eq!(error.to_string(), "OAuth dynamic registration failed");
         // redirect 대상 경로로는 요청이 가지 않았다
         let requests = server.requests();
         assert_eq!(requests.len(), 1);
@@ -351,5 +367,64 @@ mod tests {
             "{error}"
         );
         assert_eq!(server.requests().len(), 0);
+    }
+
+    #[test]
+    fn registration_error_debug는_raw_detail을_숨긴다() {
+        let error = RegistrationError::Rejected(
+            "https://auth.example.test rejected client-secret-value".to_owned(),
+        );
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        assert!(!debug.contains("auth.example.test"), "{debug}");
+        assert!(!debug.contains("client-secret-value"), "{debug}");
+        assert!(!display.contains("auth.example.test"), "{display}");
+        assert!(!display.contains("client-secret-value"), "{display}");
+    }
+
+    #[test]
+    fn registration_success_body_accepts_exact_limit_and_rejects_plus_one() {
+        let prefix = r#"{"client_id":"cid-bounded","padding":""#;
+        let suffix = r#""}"#;
+        let exact_padding = crate::OAUTH_HTTP_RESPONSE_MAX_BYTES - prefix.len() - suffix.len();
+        let exact_body = format!("{prefix}{}{suffix}", "x".repeat(exact_padding));
+        assert_eq!(exact_body.len(), crate::OAUTH_HTTP_RESPONSE_MAX_BYTES);
+        let exact_server =
+            MockHttpServer::start(move |_| MockResponse::json(201, exact_body.clone()));
+        let registration = register_client(
+            TIMEOUT,
+            &metadata(Some(exact_server.url("/register")), None),
+            &options(),
+        )
+        .unwrap();
+        assert_eq!(registration.client_id, "cid-bounded");
+
+        let plus_one = "x".repeat(crate::OAUTH_HTTP_RESPONSE_MAX_BYTES + 1);
+        let plus_one_server =
+            MockHttpServer::start(move |_| MockResponse::json(201, plus_one.clone()));
+        let error = register_client(
+            TIMEOUT,
+            &metadata(Some(plus_one_server.url("/register")), None),
+            &options(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RegistrationError::Other(_)));
+        assert_eq!(error.to_string(), "OAuth dynamic registration failed");
+    }
+
+    #[test]
+    fn registration_rejection_body_is_bounded_and_formatting_is_sanitized() {
+        let oversized = "https://secret.example/"
+            .repeat(crate::OAUTH_HTTP_RESPONSE_MAX_BYTES / "https://secret.example/".len() + 1);
+        let server = MockHttpServer::start(move |_| MockResponse::json(400, oversized.clone()));
+        let error = register_client(
+            TIMEOUT,
+            &metadata(Some(server.url("/register")), None),
+            &options(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RegistrationError::Rejected(_)));
+        assert!(!error.to_string().contains("secret.example"));
+        assert!(!format!("{error:?}").contains("secret.example"));
     }
 }

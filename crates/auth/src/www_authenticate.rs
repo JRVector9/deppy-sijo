@@ -6,11 +6,22 @@
 //! `scope`를 읽는 데 쓴다.
 
 /// 파싱된 챌린지 하나: scheme + auth 파라미터 (등장 순서 유지).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthChallenge {
     pub scheme: String,
     /// (키, 값) 목록 — 키는 원문 보존, 조회는 [`AuthChallenge::param`]으로 대소문자 무시.
     pub params: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for AuthChallenge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthChallenge")
+            .field("scheme", &self.scheme)
+            .field("parameter_count", &self.params.len())
+            .field("parameters", &"REDACTED")
+            .finish()
+    }
 }
 
 impl AuthChallenge {
@@ -227,5 +238,15 @@ mod tests {
         assert!(parse_www_authenticate(", , ,").is_empty());
         // 챌린지 없이 시작하는 param 조각은 버린다
         assert!(parse_www_authenticate(r#"realm="orphan""#).is_empty());
+    }
+
+    #[test]
+    fn challenge_debug는_url과_scope를_숨긴다() {
+        let challenge = &parse_www_authenticate(
+            r#"Bearer resource_metadata="https://secret.example.test/prm", scope="sensitive.scope""#,
+        )[0];
+        let debug = format!("{challenge:?}");
+        assert!(!debug.contains("secret.example.test"), "{debug}");
+        assert!(!debug.contains("sensitive.scope"), "{debug}");
     }
 }

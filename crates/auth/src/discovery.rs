@@ -7,6 +7,7 @@
 //! `getDefaultMetadataForUrl`(well-known 3경로 → 기본 endpoint 폴백).
 //! 커스텀 헤더의 same-origin 제한은 extHostMcp.ts `sameOriginHeaders`.
 
+use std::io::Read as _;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -15,7 +16,9 @@ use oauth2::url::Url;
 use crate::{oauth_http_agent, validate_https_or_loopback};
 
 /// RFC 9728 보호 리소스 메타데이터 (필요 필드만 — 나머지는 무시).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub const OAUTH_DISCOVERY_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProtectedResourceMetadata {
     /// 보호 리소스 식별자 — 서버 URL과 정규화 후 정확히 일치해야 한다 (RFC 9728 §3.3).
     pub resource: String,
@@ -26,8 +29,22 @@ pub struct ProtectedResourceMetadata {
     pub scopes_supported: Option<Vec<String>>,
 }
 
+impl std::fmt::Debug for ProtectedResourceMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProtectedResourceMetadata")
+            .field("resource", &"REDACTED")
+            .field(
+                "authorization_server_count",
+                &self.authorization_servers.len(),
+            )
+            .field("scope_count", &self.scopes_supported.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
 /// RFC 8414 authorization server 메타데이터 (필요 필드만 — 나머지는 무시).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizationServerMetadata {
     pub issuer: String,
     pub authorization_endpoint: String,
@@ -45,12 +62,43 @@ pub struct AuthorizationServerMetadata {
     pub code_challenge_methods_supported: Option<Vec<String>>,
 }
 
+impl std::fmt::Debug for AuthorizationServerMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizationServerMetadata")
+            .field("endpoints", &"REDACTED")
+            .field(
+                "has_registration_endpoint",
+                &self.registration_endpoint.is_some(),
+            )
+            .field("scope_count", &self.scopes_supported.as_ref().map(Vec::len))
+            .field(
+                "auth_method_count",
+                &self
+                    .token_endpoint_auth_methods_supported
+                    .as_ref()
+                    .map(Vec::len),
+            )
+            .finish()
+    }
+}
+
 /// 발견 요청에 same-origin일 때만 부착하는 커스텀 헤더 (MCP-Protocol-Version 등).
 /// 기준 origin은 MCP 서버 URL — 교차 출처(다른 host의 AS/PRM)로 헤더가 새지 않게 한다.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscoveryHeaders {
     origin: Url,
     headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for DiscoveryHeaders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscoveryHeaders")
+            .field("origin", &"REDACTED")
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
 }
 
 impl DiscoveryHeaders {
@@ -194,10 +242,7 @@ pub fn discover_authorization_server(
             failures.join("\n")
         );
     }
-    tracing::warn!(
-        "AS 메타데이터 발견 실패 — 기본 endpoint로 폴백 ({authorization_server}):\n{}",
-        failures.join("\n")
-    );
+    tracing::warn!("OAuth authorization-server discovery failed; using validated defaults");
     Ok(default_authorization_server_metadata(&issuer))
 }
 
@@ -254,8 +299,18 @@ fn fetch_discovery_json(
             "redirect 거부 (HTTP {status} → {location}) — OAuth 발견 요청은 redirect를 따라가지 않습니다"
         );
     }
-    let body = response.into_string().context("응답 본문 읽기 실패")?;
-    serde_json::from_str(&body).context("JSON 파싱 실패")
+    let probe = OAUTH_DISCOVERY_RESPONSE_MAX_BYTES + 1;
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(probe as u64)
+        .read_to_end(&mut body)
+        .context("응답 본문 읽기 실패")?;
+    anyhow::ensure!(
+        body.len() <= OAUTH_DISCOVERY_RESPONSE_MAX_BYTES,
+        "OAuth discovery response byte limit exceeded"
+    );
+    serde_json::from_slice(&body).context("JSON 파싱 실패")
 }
 
 /// well-known path-insertion에 붙일 서버 path. 루트("/")면 빈 문자열,

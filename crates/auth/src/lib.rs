@@ -14,23 +14,39 @@ mod browser;
 mod callback;
 mod discovery;
 mod flow;
+mod http;
+mod mcp_oauth;
+mod metadata;
 mod refresh;
 mod registration;
+mod slack;
 #[cfg(test)]
 mod test_support;
 mod www_authenticate;
 
 pub use browser::open_in_browser;
 pub use callback::{
-    CallbackParams, FIXED_CALLBACK_PORT, LocalhostCallbackServer, registration_redirect_uris,
+    CallbackBindError, CallbackParams, FIXED_CALLBACK_BIND_ATTEMPTS,
+    FIXED_CALLBACK_BIND_RETRY_DELAY, FIXED_CALLBACK_PORT, LocalhostCallbackServer,
+    bind_fixed_localhost_cancellable, registration_redirect_uris,
 };
 pub use discovery::{
-    AuthorizationServerMetadata, DiscoveryHeaders, ProtectedResourceMetadata,
-    discover_authorization_server, discover_protected_resource,
+    AuthorizationServerMetadata, DiscoveryHeaders, OAUTH_DISCOVERY_RESPONSE_MAX_BYTES,
+    ProtectedResourceMetadata, discover_authorization_server, discover_protected_resource,
 };
 pub use flow::{
     OAuthProviderConfig, OAuthToken, PendingAuthorization, begin, begin_with_resource, complete,
     run_flow, run_flow_with_resource, run_flow_with_resource_fixed_localhost,
+};
+pub use http::OAUTH_HTTP_RESPONSE_MAX_BYTES;
+pub use mcp_oauth::{
+    McpOAuthChallenge, McpOAuthDiscovery, McpOAuthPrimitiveError, PreparedOAuthProviderConfig,
+    canonical_mcp_oauth_resource, discover_mcp_oauth_cancellable, oauth_authority_display,
+    parse_scopes_bounded, prepare_oauth_provider_config, select_token_endpoint_auth_method,
+};
+pub use metadata::{
+    StoredOAuthMetadata, StoredOAuthMetadataDraft, StoredOAuthMetadataError,
+    StoredOAuthMetadataLimits, TokenEndpointAuthMethod,
 };
 pub use refresh::{
     REFRESH_MARGIN, RefreshCoordinator, RefreshOutcome, RefreshParams, refresh_access_token,
@@ -38,6 +54,12 @@ pub use refresh::{
 };
 pub use registration::{
     DynamicRegistration, RegistrationError, RegistrationOptions, register_client,
+};
+pub use slack::{
+    SLACK_MCP_URL, SLACK_OAUTH_RESOURCE, SLACK_WORKSPACE_HTML_MAX_BYTES, SlackWorkspaceError,
+    SlackWorkspaceTarget, is_valid_slack_team_id, normalize_slack_workspace_domain,
+    parse_slack_workspace_html, resolve_slack_workspace_cancellable, slack_callback_redirect_uri,
+    slack_mcp_enable_url,
 };
 pub use www_authenticate::{AuthChallenge, find_bearer_challenge, parse_www_authenticate};
 
@@ -149,8 +171,8 @@ pub fn store_token(
         && let Err(e) = store.set_secret(&refresh_entry_id(keyring_username), refresh)
     {
         // 부분 실패 시 access 고아 entry가 남지 않게 롤백 — 호출측은 id를 버린다
-        if let Err(rollback) = store.delete_secret(keyring_username) {
-            tracing::warn!("access token 롤백 실패 (고아 keyring entry 가능): {rollback:#}");
+        if store.delete_secret(keyring_username).is_err() {
+            tracing::warn!("access token rollback failed; orphan reconciliation is required");
         }
         return Err(e);
     }

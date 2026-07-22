@@ -850,7 +850,7 @@ fn workspace_totals(rows: &[ActivityWorkspaceRow]) -> WorkspaceTotals {
                 })
                 .or_insert(resource);
         }
-        for resource in &row.session_resources {
+        for resource in row.session_resources.iter() {
             totals.session_rss_bytes = totals.session_rss_bytes.saturating_add(resource.rss_bytes);
             if let Some(cpu) = resource.cpu_percent {
                 totals.cpu_percent += cpu;
@@ -944,7 +944,7 @@ mod tests {
         // 앱(중복 pid 1회)과 세션 프로세스 합을 분리 집계해야 한다 — 합쳐 "RAM"으로
         // 표시하면 에이전트 메모리가 앱 급증으로 오독된다(2026-07-18 사용자 보고).
         let row = |child_session: u64, child_rss: u64| ActivityWorkspaceRow {
-            name: "ws".to_owned(),
+            name: "ws".into(),
             state: ActivityWorkspaceState::Warm,
             session_count: 1,
             pending_events: 0,
@@ -970,8 +970,9 @@ mod tests {
                 cpu_percent: None,
                 high_cpu: false,
                 high_rss: false,
-            }],
-            sessions: Vec::new(),
+            }]
+            .into(),
+            sessions: std::sync::Arc::from([]),
         };
         let totals = workspace_totals(&[row(1, 700), row(2, 300)]);
         assert_eq!(totals.app_rss_bytes, 100, "같은 앱 pid는 한 번만");

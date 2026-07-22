@@ -1,8 +1,20 @@
 use super::format_bytes;
+use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq)]
+pub const MAX_ACTIVITY_WORKSPACES: usize = 256;
+pub const MAX_ACTIVITY_ITEMS: usize = 4_096;
+pub const MAX_ACTIVITY_ITEMS_PER_WORKSPACE: usize = 256;
+pub const MAX_ACTIVITY_TEXT_BYTES: usize = 32 * 1024;
+pub const MAX_ACTIVITY_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+
+const REDACTED: &str = "[REDACTED]";
+// Two usize words conservatively cover the strong/weak counters retained by an Arc allocation.
+// Shared strings may therefore be counted more than once, which keeps the memory ceiling safe.
+const ARC_ALLOCATION_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
+
+#[derive(Clone, PartialEq)]
 pub struct ActivityWorkspaceRow {
-    pub name: String,
+    pub name: Arc<str>,
     pub state: ActivityWorkspaceState,
     pub session_count: usize,
     pub pending_events: usize,
@@ -10,24 +22,217 @@ pub struct ActivityWorkspaceRow {
     pub backgrounded_for_secs: Option<u64>,
     pub auto_suspend_remaining_secs: Option<u64>,
     pub resource: Option<runtime::ProcessResourceSnapshot>,
-    pub session_resources: Vec<runtime::SessionResourceUsage>,
+    pub session_resources: Arc<[runtime::SessionResourceUsage]>,
     /// pane(세션)별 모니터링 서브행 — 워크스페이스 행 아래 들여쓰기로 렌더(2026-07-08).
-    pub sessions: Vec<ActivitySessionRow>,
+    pub sessions: Arc<[ActivitySessionRow]>,
+}
+
+impl std::fmt::Debug for ActivityWorkspaceRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivityWorkspaceRow")
+            .field("name", &REDACTED)
+            .field("state", &self.state)
+            .field("session_count", &self.session_count)
+            .field("pending_events", &self.pending_events)
+            .field("input_pressure", &self.input_pressure)
+            .field("backgrounded_for_secs", &self.backgrounded_for_secs)
+            .field(
+                "auto_suspend_remaining_secs",
+                &self.auto_suspend_remaining_secs,
+            )
+            .field("resource", &self.resource)
+            .field("session_resources", &self.session_resources)
+            .field("sessions", &self.sessions)
+            .finish()
+    }
 }
 
 /// pane(세션) 하나의 모니터링 행. 활성 워크스페이스는 제목·에이전트·상태까지,
 /// warm은 제목·자원만 채워진다(감지 워커가 활성에서만 돈다).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ActivitySessionRow {
-    pub name: String,
+    pub name: Arc<str>,
     /// "Codex · gpt-5.5 · xhigh" — 에이전트가 아니면 None(셸).
-    pub agent_line: Option<String>,
+    pub agent_line: Option<Arc<str>>,
     /// "실행 중 · ctx 69%" — warm/셸은 None.
-    pub status_line: Option<String>,
+    pub status_line: Option<Arc<str>>,
     /// 세션별 자원 샘플 (자식 프로세스 트리 합산).
     pub resource: Option<runtime::SessionResourceUsage>,
     /// 세션별 마지막 입력 backpressure 신호.
     pub pressure: Option<runtime::PtyInputPressure>,
+}
+
+impl std::fmt::Debug for ActivitySessionRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivitySessionRow")
+            .field("name", &REDACTED)
+            .field("agent_line", &self.agent_line.as_ref().map(|_| REDACTED))
+            .field("status_line", &self.status_line.as_ref().map(|_| REDACTED))
+            .field("resource", &self.resource)
+            .field("pressure", &self.pressure)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivitySnapshotError {
+    TooManyWorkspaces,
+    TooManyItems,
+    TooManyItemsInWorkspace,
+    TextTooLong,
+    TooManyRetainedBytes,
+}
+
+impl std::fmt::Display for ActivitySnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TooManyWorkspaces => "activity workspace limit exceeded",
+            Self::TooManyItems => "activity item limit exceeded",
+            Self::TooManyItemsInWorkspace => "activity per-workspace item limit exceeded",
+            Self::TextTooLong => "activity text limit exceeded",
+            Self::TooManyRetainedBytes => "activity retained-byte limit exceeded",
+        })
+    }
+}
+
+impl std::error::Error for ActivitySnapshotError {}
+
+/// Immutable, shallow-cloneable render projection. Construction validates every nested collection
+/// and retained string/allocation byte before the snapshot can reach a frame.
+#[derive(Clone, PartialEq)]
+pub struct ActivitySnapshot {
+    rows: Arc<[ActivityWorkspaceRow]>,
+    item_count: usize,
+    retained_bytes: usize,
+}
+
+impl ActivitySnapshot {
+    pub fn empty() -> Self {
+        Self {
+            rows: Arc::from([]),
+            item_count: 0,
+            retained_bytes: 0,
+        }
+    }
+
+    pub fn try_new(
+        rows: impl IntoIterator<Item = ActivityWorkspaceRow>,
+    ) -> Result<Self, ActivitySnapshotError> {
+        let iter = rows.into_iter();
+        let mut rows = Vec::with_capacity(iter.size_hint().0.min(MAX_ACTIVITY_WORKSPACES));
+        for row in iter {
+            if rows.len() == MAX_ACTIVITY_WORKSPACES {
+                return Err(ActivitySnapshotError::TooManyWorkspaces);
+            }
+            rows.push(row);
+        }
+
+        let mut item_count = rows.len();
+        let rows_bytes = rows
+            .len()
+            .checked_mul(std::mem::size_of::<ActivityWorkspaceRow>())
+            .ok_or(ActivitySnapshotError::TooManyRetainedBytes)?;
+        let mut retained_bytes = checked_retained_add(ARC_ALLOCATION_OVERHEAD, rows_bytes)?;
+
+        for row in &rows {
+            let workspace_items = row
+                .sessions
+                .len()
+                .checked_add(row.session_resources.len())
+                .ok_or(ActivitySnapshotError::TooManyItemsInWorkspace)?;
+            if row.sessions.len() > MAX_ACTIVITY_ITEMS_PER_WORKSPACE
+                || row.session_resources.len() > MAX_ACTIVITY_ITEMS_PER_WORKSPACE
+                || workspace_items > MAX_ACTIVITY_ITEMS_PER_WORKSPACE
+            {
+                return Err(ActivitySnapshotError::TooManyItemsInWorkspace);
+            }
+            item_count = item_count
+                .checked_add(workspace_items)
+                .ok_or(ActivitySnapshotError::TooManyItems)?;
+            if item_count > MAX_ACTIVITY_ITEMS {
+                return Err(ActivitySnapshotError::TooManyItems);
+            }
+
+            retained_bytes = checked_retained_add(retained_bytes, ARC_ALLOCATION_OVERHEAD)?;
+            retained_bytes = checked_retained_add(retained_bytes, row.name.len())?;
+            retained_bytes = checked_retained_add(retained_bytes, ARC_ALLOCATION_OVERHEAD)?;
+            retained_bytes = checked_retained_add(
+                retained_bytes,
+                row.sessions
+                    .len()
+                    .checked_mul(std::mem::size_of::<ActivitySessionRow>())
+                    .ok_or(ActivitySnapshotError::TooManyRetainedBytes)?,
+            )?;
+            retained_bytes = checked_retained_add(retained_bytes, ARC_ALLOCATION_OVERHEAD)?;
+            retained_bytes = checked_retained_add(
+                retained_bytes,
+                row.session_resources
+                    .len()
+                    .checked_mul(std::mem::size_of::<runtime::SessionResourceUsage>())
+                    .ok_or(ActivitySnapshotError::TooManyRetainedBytes)?,
+            )?;
+
+            validate_text(row.name.as_ref())?;
+            for session in row.sessions.iter() {
+                validate_text(session.name.as_ref())?;
+                retained_bytes = checked_retained_add(retained_bytes, ARC_ALLOCATION_OVERHEAD)?;
+                retained_bytes = checked_retained_add(retained_bytes, session.name.len())?;
+                for text in [&session.agent_line, &session.status_line]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_text(text.as_ref())?;
+                    retained_bytes = checked_retained_add(retained_bytes, ARC_ALLOCATION_OVERHEAD)?;
+                    retained_bytes = checked_retained_add(retained_bytes, text.len())?;
+                }
+            }
+        }
+
+        Ok(Self {
+            rows: rows.into(),
+            item_count,
+            retained_bytes,
+        })
+    }
+
+    pub fn rows(&self) -> &[ActivityWorkspaceRow] {
+        &self.rows
+    }
+}
+
+impl Default for ActivitySnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::fmt::Debug for ActivitySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivitySnapshot")
+            .field("workspaces", &self.rows.len())
+            .field("item_count", &self.item_count)
+            .field("retained_bytes", &self.retained_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+fn validate_text(text: &str) -> Result<(), ActivitySnapshotError> {
+    if text.len() > MAX_ACTIVITY_TEXT_BYTES || text.as_bytes().contains(&0) {
+        Err(ActivitySnapshotError::TextTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+fn checked_retained_add(current: usize, additional: usize) -> Result<usize, ActivitySnapshotError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or(ActivitySnapshotError::TooManyRetainedBytes)?;
+    if total > MAX_ACTIVITY_RETAINED_BYTES {
+        Err(ActivitySnapshotError::TooManyRetainedBytes)
+    } else {
+        Ok(total)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +260,9 @@ impl ActivityUi {
         &mut self,
         ui: &mut egui::Ui,
         catalog: &i18n::Catalog,
-        rows: &[ActivityWorkspaceRow],
+        snapshot: &ActivitySnapshot,
     ) -> Option<ActivityAction> {
+        let rows = snapshot.rows();
         let mut action = None;
         egui::Frame::NONE
             .inner_margin(egui::Margin {
@@ -159,7 +365,7 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
                 })
                 .or_insert(resource);
         }
-        for resource in &row.session_resources {
+        for resource in row.session_resources.iter() {
             summary.child_rss_bytes = summary.child_rss_bytes.saturating_add(resource.rss_bytes);
             if let Some(value) = resource.cpu_percent {
                 cpu += value;
@@ -283,7 +489,7 @@ fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWork
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(&row.name).strong().size(14.0));
+                    ui.label(egui::RichText::new(row.name.as_ref()).strong().size(14.0));
                     ui.add_space(4.0);
                     state_label(ui, catalog, row);
                 });
@@ -314,14 +520,14 @@ fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWork
             if !row.sessions.is_empty() {
                 ui.add_space(10.0);
                 activity_hairline(ui);
-                for session in &row.sessions {
+                for session in row.sessions.iter() {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.set_min_height(38.0);
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(&session.name).size(13.0));
+                            ui.label(egui::RichText::new(session.name.as_ref()).size(13.0));
                             if let Some(agent) = &session.agent_line {
-                                ui.weak(egui::RichText::new(agent).size(11.0));
+                                ui.weak(egui::RichText::new(agent.as_ref()).size(11.0));
                             }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -335,7 +541,7 @@ fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWork
                                 input_pressure_badge(ui, catalog, pressure);
                             }
                             if let Some(status) = &session.status_line {
-                                ui.weak(egui::RichText::new(status).size(11.0));
+                                ui.weak(egui::RichText::new(status.as_ref()).size(11.0));
                             }
                         });
                     });
@@ -522,6 +728,63 @@ fn input_pressure_badge_text(
 mod tests {
     use super::*;
 
+    fn session(name: impl Into<Arc<str>>) -> ActivitySessionRow {
+        ActivitySessionRow {
+            name: name.into(),
+            agent_line: None,
+            status_line: None,
+            resource: None,
+            pressure: None,
+        }
+    }
+
+    fn workspace(
+        name: impl Into<Arc<str>>,
+        sessions: Vec<ActivitySessionRow>,
+    ) -> ActivityWorkspaceRow {
+        ActivityWorkspaceRow {
+            name: name.into(),
+            state: ActivityWorkspaceState::Idle,
+            session_count: sessions.len(),
+            pending_events: 0,
+            input_pressure: None,
+            backgrounded_for_secs: None,
+            auto_suspend_remaining_secs: None,
+            resource: None,
+            session_resources: Arc::from([]),
+            sessions: sessions.into(),
+        }
+    }
+
+    fn snapshot_with_retained_bytes(target: usize) -> ActivitySnapshot {
+        const WORKSPACES: usize = 16;
+        const SESSIONS_PER_WORKSPACE: usize = 255;
+        let fixed = retained_fixture_fixed_bytes(WORKSPACES, SESSIONS_PER_WORKSPACE);
+        assert!(target >= fixed);
+        let mut remaining = target - fixed;
+        let mut rows = Vec::with_capacity(WORKSPACES);
+        for _ in 0..WORKSPACES {
+            let mut sessions = Vec::with_capacity(SESSIONS_PER_WORKSPACE);
+            for _ in 0..SESSIONS_PER_WORKSPACE {
+                let bytes = remaining.min(MAX_ACTIVITY_TEXT_BYTES);
+                remaining -= bytes;
+                sessions.push(session(Arc::<str>::from("x".repeat(bytes))));
+            }
+            rows.push(workspace(Arc::<str>::from(""), sessions));
+        }
+        assert_eq!(remaining, 0);
+        ActivitySnapshot::try_new(rows).unwrap()
+    }
+
+    fn retained_fixture_fixed_bytes(workspaces: usize, sessions_per_workspace: usize) -> usize {
+        let sessions = workspaces * sessions_per_workspace;
+        ARC_ALLOCATION_OVERHEAD
+            + workspaces * std::mem::size_of::<ActivityWorkspaceRow>()
+            + workspaces * 3 * ARC_ALLOCATION_OVERHEAD
+            + sessions * std::mem::size_of::<ActivitySessionRow>()
+            + sessions * ARC_ALLOCATION_OVERHEAD
+    }
+
     #[test]
     fn bytes_format_uses_mib_and_gib() {
         assert_eq!(format_bytes(512 * 1024 * 1024), "512.0 MiB");
@@ -530,7 +793,7 @@ mod tests {
 
     #[test]
     fn empty_activity_summary_is_zeroed() {
-        let summary = activity_summary(&[]);
+        let summary = activity_summary(ActivitySnapshot::empty().rows());
         assert_eq!(summary.workspaces, 0);
         assert_eq!(summary.idle, 0);
         assert_eq!(summary.sessions, 0);
@@ -545,7 +808,7 @@ mod tests {
     fn summary_deduplicates_app_pid_but_keeps_distinct_session_children() {
         let row =
             |name: &str, app_cpu: f32, child_session: u64, child_rss: u64| ActivityWorkspaceRow {
-                name: name.to_owned(),
+                name: Arc::from(name),
                 state: ActivityWorkspaceState::Warm,
                 session_count: 1,
                 pending_events: 0,
@@ -560,7 +823,7 @@ mod tests {
                     high_cpu: false,
                     high_rss: false,
                 }),
-                session_resources: vec![runtime::SessionResourceUsage {
+                session_resources: Arc::from([runtime::SessionResourceUsage {
                     session: runtime::SessionId(child_session),
                     pid: Some(child_session as u32),
                     process_group: Some(child_session as u32),
@@ -571,8 +834,8 @@ mod tests {
                     cpu_percent: Some(child_rss as f32),
                     high_cpu: false,
                     high_rss: false,
-                }],
-                sessions: Vec::new(),
+                }]),
+                sessions: Arc::from([]),
             };
 
         let summary = activity_summary(&[row("one", 10.0, 7, 20), row("two", 99.0, 8, 30)]);
@@ -589,7 +852,7 @@ mod tests {
     #[test]
     fn idle_workspace_is_kept_in_the_full_summary() {
         let rows = [ActivityWorkspaceRow {
-            name: "idle-project".to_owned(),
+            name: Arc::from("idle-project"),
             state: ActivityWorkspaceState::Idle,
             session_count: 0,
             pending_events: 0,
@@ -597,8 +860,8 @@ mod tests {
             backgrounded_for_secs: None,
             auto_suspend_remaining_secs: None,
             resource: None,
-            session_resources: Vec::new(),
-            sessions: Vec::new(),
+            session_resources: Arc::from([]),
+            sessions: Arc::from([]),
         }];
         let summary = activity_summary(&rows);
         assert_eq!(summary.workspaces, 1);
@@ -690,5 +953,211 @@ mod tests {
         ] {
             assert!(!input_pressure_is_transient(reason));
         }
+    }
+
+    #[test]
+    fn snapshot_accepts_exact_workspace_cap_and_rejects_plus_one() {
+        let rows = (0..MAX_ACTIVITY_WORKSPACES)
+            .map(|_| workspace(Arc::<str>::from("w"), Vec::new()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ActivitySnapshot::try_new(rows.clone())
+                .unwrap()
+                .rows()
+                .len(),
+            MAX_ACTIVITY_WORKSPACES
+        );
+        let mut plus_one = rows;
+        plus_one.push(workspace(Arc::<str>::from("w"), Vec::new()));
+        assert_eq!(
+            ActivitySnapshot::try_new(plus_one),
+            Err(ActivitySnapshotError::TooManyWorkspaces)
+        );
+
+        let consumed = std::cell::Cell::new(0);
+        let unbounded_source = (0..).map(|_| {
+            consumed.set(consumed.get() + 1);
+            workspace(Arc::<str>::from("w"), Vec::new())
+        });
+        assert_eq!(
+            ActivitySnapshot::try_new(unbounded_source),
+            Err(ActivitySnapshotError::TooManyWorkspaces)
+        );
+        assert_eq!(consumed.get(), MAX_ACTIVITY_WORKSPACES + 1);
+    }
+
+    #[test]
+    fn snapshot_accepts_exact_item_cap_and_rejects_plus_one() {
+        const WORKSPACES: usize = 16;
+        const SESSIONS_PER_WORKSPACE: usize = 255;
+        let rows = (0..WORKSPACES)
+            .map(|_| {
+                workspace(
+                    Arc::<str>::from("w"),
+                    (0..SESSIONS_PER_WORKSPACE)
+                        .map(|_| session(Arc::<str>::from("s")))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let snapshot = ActivitySnapshot::try_new(rows.clone()).unwrap();
+        assert_eq!(snapshot.item_count, MAX_ACTIVITY_ITEMS);
+
+        let mut too_many = rows;
+        too_many.push(workspace(Arc::<str>::from("w"), Vec::new()));
+        assert_eq!(
+            ActivitySnapshot::try_new(too_many),
+            Err(ActivitySnapshotError::TooManyItems)
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_per_workspace_item_plus_one() {
+        let exact = workspace(
+            Arc::<str>::from("w"),
+            (0..MAX_ACTIVITY_ITEMS_PER_WORKSPACE)
+                .map(|_| session(Arc::<str>::from("s")))
+                .collect(),
+        );
+        assert!(ActivitySnapshot::try_new(vec![exact]).is_ok());
+        let plus_one = workspace(
+            Arc::<str>::from("w"),
+            (0..=MAX_ACTIVITY_ITEMS_PER_WORKSPACE)
+                .map(|_| session(Arc::<str>::from("s")))
+                .collect(),
+        );
+        assert_eq!(
+            ActivitySnapshot::try_new(vec![plus_one]),
+            Err(ActivitySnapshotError::TooManyItemsInWorkspace)
+        );
+    }
+
+    #[test]
+    fn snapshot_accepts_exact_text_cap_and_rejects_plus_one_or_nul() {
+        let exact = workspace(
+            Arc::<str>::from("w"),
+            vec![session(Arc::<str>::from(
+                "x".repeat(MAX_ACTIVITY_TEXT_BYTES),
+            ))],
+        );
+        assert!(ActivitySnapshot::try_new(vec![exact]).is_ok());
+
+        for rejected in [
+            Arc::<str>::from("x".repeat(MAX_ACTIVITY_TEXT_BYTES + 1)),
+            Arc::<str>::from("not\0safe"),
+        ] {
+            assert_eq!(
+                ActivitySnapshot::try_new(vec![workspace("w", vec![session(rejected)])]),
+                Err(ActivitySnapshotError::TextTooLong)
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_accepts_exact_retained_byte_cap_and_rejects_plus_one() {
+        let exact = snapshot_with_retained_bytes(MAX_ACTIVITY_RETAINED_BYTES);
+        assert_eq!(exact.retained_bytes, MAX_ACTIVITY_RETAINED_BYTES);
+
+        let fixed = retained_fixture_fixed_bytes(16, 255);
+        let mut remaining = MAX_ACTIVITY_RETAINED_BYTES + 1 - fixed;
+        let mut rows = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let mut sessions = Vec::with_capacity(255);
+            for _ in 0..255 {
+                let bytes = remaining.min(MAX_ACTIVITY_TEXT_BYTES);
+                remaining -= bytes;
+                sessions.push(session(Arc::<str>::from("x".repeat(bytes))));
+            }
+            rows.push(workspace("", sessions));
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            ActivitySnapshot::try_new(rows),
+            Err(ActivitySnapshotError::TooManyRetainedBytes)
+        );
+    }
+
+    #[test]
+    fn snapshot_clone_and_render_reuse_the_same_arc_rows() {
+        let snapshot = ActivitySnapshot::try_new(vec![workspace(
+            Arc::<str>::from("workspace"),
+            vec![session(Arc::<str>::from("session"))],
+        )])
+        .unwrap();
+        let cloned = snapshot.clone();
+        assert!(Arc::ptr_eq(&snapshot.rows, &cloned.rows));
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let ctx = egui::Context::default();
+        let mut activity = ActivityUi::new();
+        let before = Arc::strong_count(&snapshot.rows);
+        for _ in 0..300 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                assert!(activity.contents(ui, &catalog, &snapshot).is_none());
+            });
+        }
+        assert_eq!(Arc::strong_count(&snapshot.rows), before);
+    }
+
+    #[test]
+    fn debug_redacts_all_title_like_content() {
+        let row = workspace(
+            Arc::<str>::from("/private/workspace"),
+            vec![ActivitySessionRow {
+                name: Arc::from("secret pane title"),
+                agent_line: Some(Arc::from("provider and model")),
+                status_line: Some(Arc::from("private status")),
+                resource: None,
+                pressure: None,
+            }],
+        );
+        let row_debug = format!("{row:?}");
+        for secret in [
+            "/private/workspace",
+            "secret pane title",
+            "provider and model",
+            "private status",
+        ] {
+            assert!(!row_debug.contains(secret));
+        }
+        let snapshot = ActivitySnapshot::try_new(vec![row]).unwrap();
+        let snapshot_debug = format!("{snapshot:?}");
+        assert!(!snapshot_debug.contains("private"));
+        assert!(!snapshot_debug.contains("title"));
+    }
+
+    #[test]
+    fn production_source_has_no_render_host_or_polling_edges() {
+        let source = include_str!("activity.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            "std::fs",
+            "Db::",
+            "Keyring",
+            "std::process",
+            "Command::",
+            "TcpStream",
+            "reqwest",
+            "ureq",
+            "std::thread",
+            "thread::spawn",
+            "mpsc",
+            "channel(",
+            "recv(",
+            "try_recv(",
+            ".poll(",
+            "sleep(",
+            "request_repaint",
+            "request_repaint_after",
+            "Instant::now",
+            "SystemTime",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "activity leaf must not contain {forbidden}"
+            );
+        }
+        let render = production.split("pub fn contents").nth(1).unwrap();
+        assert!(!render.contains(".clone("));
     }
 }

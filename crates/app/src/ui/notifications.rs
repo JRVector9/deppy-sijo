@@ -1,11 +1,62 @@
 //! 내부 알림 센터 (설계문서 PR-13). SessionStatusChanged를 받아
-//! waiting/needs-approval/error/done을 알림으로 만들고, OS 알림도 띄운다.
+//! waiting/needs-approval/error/done을 알림으로 만들고, native 알림 intent를 반환한다.
 //! 항목 클릭 시 해당 세션의 pane으로 focus 이동 (완료 기준: session focus).
+
+use std::collections::VecDeque;
+use std::fmt;
 
 use runtime::{SessionId, SessionStatus};
 
 use crate::agent_session::AgentSessionStatus;
 use crate::agent_surface::AgentProvider;
+
+const MAX_NOTIFICATION_HISTORY: usize = 100;
+const MAX_NATIVE_INTENTS: usize = 8;
+const MAX_WORKSPACE_ID_BYTES: usize = 1_024;
+const MAX_STRUCTURED_SESSION_ID_BYTES: usize = 1_024;
+const MAX_NATIVE_BODY_BYTES: usize = 2 * 1_024;
+const MAX_NATIVE_SUMMARY_BYTES: usize = 4 * 1_024;
+const MAX_NATIVE_PAYLOAD_BYTES: usize = 5 * 1_024;
+
+/// One immutable, bounded request for the composition root to deliver through
+/// the operating-system notification API. The leaf never executes that effect.
+/// The payload is intentionally non-`Clone` and its `Debug` output is redacted.
+pub struct NativeNotificationIntent {
+    summary: Box<str>,
+    body: Box<str>,
+}
+
+impl NativeNotificationIntent {
+    fn new(summary: String, body: &str) -> Option<Self> {
+        if !bounded_text(&summary, MAX_NATIVE_SUMMARY_BYTES)
+            || !bounded_text(body, MAX_NATIVE_BODY_BYTES)
+            || summary.len().saturating_add(body.len()) > MAX_NATIVE_PAYLOAD_BYTES
+        {
+            return None;
+        }
+        Some(Self {
+            summary: summary.into(),
+            body: body.into(),
+        })
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+impl fmt::Debug for NativeNotificationIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeNotificationIntent")
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
 
 /// Focus target carried by an item in the existing Settings > Notifications
 /// area. PTY runtime IDs are namespaced by workspace; structured session IDs
@@ -52,6 +103,7 @@ impl AgentNotificationSource {
 
 pub struct NotificationsUi {
     items: Vec<NotificationItem>,
+    native_intents: VecDeque<NativeNotificationIntent>,
 }
 
 struct NotificationItem {
@@ -67,7 +119,17 @@ struct NotificationItem {
 
 impl NotificationsUi {
     pub fn new() -> Self {
-        Self { items: Vec::new() }
+        Self {
+            items: Vec::new(),
+            native_intents: VecDeque::with_capacity(MAX_NATIVE_INTENTS),
+        }
+    }
+
+    /// Returns one pending native notification for `App::logic` to execute.
+    /// The fixed-capacity queue keeps the latest burst and never creates a
+    /// worker, channel, timer, or polling lifecycle.
+    pub fn pop_native_intent(&mut self) -> Option<NativeNotificationIntent> {
+        self.native_intents.pop_front()
     }
 
     /// 표시 시 모든 항목을 읽음 처리한다. 읽지 않은 게 있었으면 true (repaint 필요).
@@ -110,6 +172,9 @@ impl NotificationsUi {
         provider: Option<AgentProvider>,
         catalog: &i18n::Catalog,
     ) {
+        if !bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES) {
+            return;
+        }
         let target = AgentNotificationTarget::Pty {
             workspace_id: workspace_id.to_owned(),
             session,
@@ -133,6 +198,11 @@ impl NotificationsUi {
         title: &str,
         catalog: &i18n::Catalog,
     ) {
+        if !bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES)
+            || !bounded_text(session_id, MAX_STRUCTURED_SESSION_ID_BYTES)
+        {
+            return;
+        }
         let status = match status {
             AgentSessionStatus::AwaitingApproval => SessionStatus::NeedsApproval,
             AgentSessionStatus::Completed => SessionStatus::Done,
@@ -163,7 +233,7 @@ impl NotificationsUi {
     /// 같은 세션의 연속 승인도 **매번** 알린다(dedupe=false) — 상태 전이 알림과 달리
     /// 승인 행은 각각이 개별 사건이고, 에이전트는 도구 승인을 연달아 요청한다. 상태
     /// 기반 중복 억제를 그대로 걸면 첫 건만 알리고 나머지는 조용해진다(2026-07-17 실측:
-    /// 같은 세션 2번째 승인에서 osascript 미발화 확인). 스팸 방지는 호출측
+    /// 같은 세션 2번째 승인에서 native 알림 미발화 확인). 스팸 방지는 호출측
     /// (`App::approval_notified`)이 승인 id 단위로 이미 한다.
     pub fn on_mcp_approval(
         &mut self,
@@ -172,6 +242,9 @@ impl NotificationsUi {
         tool_name: &str,
         catalog: &i18n::Catalog,
     ) {
+        if !bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES) {
+            return;
+        }
         self.push_status_with_dedupe(
             AgentNotificationTarget::Pty {
                 workspace_id: workspace_id.to_owned(),
@@ -211,6 +284,9 @@ impl NotificationsUi {
             // 진행 재개는 알림 아님
             return;
         };
+        if !bounded_text(title, MAX_NATIVE_BODY_BYTES) || !bounded_target(&target) {
+            return;
+        }
         let rendered = catalog.t(message_id, &[("title", title)]);
         match status {
             SessionStatus::Running => return, // 진행 재개는 알림 아님
@@ -232,9 +308,13 @@ impl NotificationsUi {
         if duplicate {
             return;
         }
-        #[cfg(not(test))] // 테스트에서 실제 OS 알림을 띄우지 않는다
-        platform::notify(&rendered, title);
-        let _ = rendered;
+        let Some(native_intent) = NativeNotificationIntent::new(rendered, title) else {
+            return;
+        };
+        if self.native_intents.len() == MAX_NATIVE_INTENTS {
+            self.native_intents.pop_front();
+        }
+        self.native_intents.push_back(native_intent);
         self.items.push(NotificationItem {
             target,
             source,
@@ -249,8 +329,8 @@ impl NotificationsUi {
             created_at_secs: deppy_core::time::unix_secs_i64(),
         });
         // 최근 100개만 유지
-        if self.items.len() > 100 {
-            let cut = self.items.len() - 100;
+        if self.items.len() > MAX_NOTIFICATION_HISTORY {
+            let cut = self.items.len() - MAX_NOTIFICATION_HISTORY;
             self.items.drain(..cut);
         }
     }
@@ -279,6 +359,11 @@ impl NotificationsUi {
         provider: Option<AgentProvider>,
         catalog: &i18n::Catalog,
     ) {
+        if !bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES)
+            || !bounded_text(title, MAX_NATIVE_BODY_BYTES)
+        {
+            return;
+        }
         let status = if exit_code == Some(0) {
             SessionStatus::Done
         } else {
@@ -479,6 +564,25 @@ impl NotificationsUi {
     }
 }
 
+fn bounded_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.as_bytes().contains(&0)
+}
+
+fn bounded_target(target: &AgentNotificationTarget) -> bool {
+    match target {
+        AgentNotificationTarget::Pty { workspace_id, .. } => {
+            bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES)
+        }
+        AgentNotificationTarget::Structured {
+            workspace_id,
+            session_id,
+        } => {
+            bounded_text(workspace_id, MAX_WORKSPACE_ID_BYTES)
+                && bounded_text(session_id, MAX_STRUCTURED_SESSION_ID_BYTES)
+        }
+    }
+}
+
 /// 팝오버 섹션 제목 — 좌측 세로 막대 + 작은 라벨 (대기/최근 공용).
 pub fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
@@ -611,6 +715,149 @@ mod tests {
         assert_eq!(n.unread(), 2);
         assert_eq!(n.items[0].title, "write_file");
         assert_eq!(n.items[1].title, "run_command");
+    }
+
+    #[test]
+    fn 상태_알림은_native_intent로만_발행된다() {
+        let mut notifications = NotificationsUi::new();
+        let catalog = catalog();
+
+        notifications.on_status(
+            WS,
+            SessionId(1),
+            SessionStatus::NeedsApproval,
+            "review",
+            &catalog,
+        );
+
+        let intent = notifications.pop_native_intent().expect("native intent");
+        assert_eq!(intent.summary(), "Approval needed: review");
+        assert_eq!(intent.body(), "review");
+        let debug = format!("{intent:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("review"));
+        assert!(notifications.pop_native_intent().is_none());
+    }
+
+    #[test]
+    fn 상태_중복은_history와_native_intent_모두_억제한다() {
+        let mut notifications = NotificationsUi::new();
+        let catalog = catalog();
+
+        for _ in 0..2 {
+            notifications.on_status(WS, SessionId(1), SessionStatus::Waiting, "same", &catalog);
+        }
+
+        assert_eq!(notifications.items.len(), 1);
+        assert!(notifications.pop_native_intent().is_some());
+        assert!(notifications.pop_native_intent().is_none());
+    }
+
+    #[test]
+    fn native_intent_queue는_최근_고정용량만_유지한다() {
+        let mut notifications = NotificationsUi::new();
+        let catalog = catalog();
+
+        for index in 0..(MAX_NATIVE_INTENTS + 2) {
+            notifications.on_mcp_approval(WS, SessionId(1), &format!("tool-{index}"), &catalog);
+        }
+
+        assert_eq!(notifications.items.len(), MAX_NATIVE_INTENTS + 2);
+        let titles: Vec<_> = std::iter::from_fn(|| notifications.pop_native_intent())
+            .map(|intent| intent.body().to_owned())
+            .collect();
+        assert_eq!(titles.len(), MAX_NATIVE_INTENTS);
+        assert_eq!(titles.first().map(String::as_str), Some("tool-2"));
+        assert_eq!(titles.last().map(String::as_str), Some("tool-9"));
+    }
+
+    #[test]
+    fn invalid_or_oversized_payload는_history와_intent를_만들지_않는다() {
+        let mut notifications = NotificationsUi::new();
+        let catalog = catalog();
+        let oversized_title = "x".repeat(MAX_NATIVE_BODY_BYTES + 1);
+        let oversized_workspace = "w".repeat(MAX_WORKSPACE_ID_BYTES + 1);
+        let oversized_session = "s".repeat(MAX_STRUCTURED_SESSION_ID_BYTES + 1);
+
+        notifications.on_status(
+            WS,
+            SessionId(1),
+            SessionStatus::Done,
+            &oversized_title,
+            &catalog,
+        );
+        notifications.on_status(
+            &oversized_workspace,
+            SessionId(2),
+            SessionStatus::Done,
+            "title",
+            &catalog,
+        );
+        notifications.on_structured_status(
+            WS,
+            &oversized_session,
+            AgentSessionStatus::Completed,
+            "title",
+            &catalog,
+        );
+        notifications.on_mcp_approval(WS, SessionId(3), "contains\0nul", &catalog);
+
+        assert!(notifications.items.is_empty());
+        assert!(notifications.pop_native_intent().is_none());
+    }
+
+    #[test]
+    fn native_intent의_각_field와_total_byte_budget은_fail_closed다() {
+        assert!(NativeNotificationIntent::new("summary".to_owned(), "body").is_some());
+        assert!(
+            NativeNotificationIntent::new("s".repeat(MAX_NATIVE_SUMMARY_BYTES + 1), "body")
+                .is_none()
+        );
+        assert!(
+            NativeNotificationIntent::new(
+                "summary".to_owned(),
+                &"b".repeat(MAX_NATIVE_BODY_BYTES + 1),
+            )
+            .is_none()
+        );
+        assert!(NativeNotificationIntent::new("s".repeat(3_500), &"b".repeat(1_800)).is_none());
+        assert!(NativeNotificationIntent::new("contains\0nul".to_owned(), "body").is_none());
+        assert!(NativeNotificationIntent::new("summary".to_owned(), "contains\0nul").is_none());
+    }
+
+    #[test]
+    fn history는_100개로_유계다() {
+        let mut notifications = NotificationsUi::new();
+        let catalog = catalog();
+
+        for index in 0..(MAX_NOTIFICATION_HISTORY + 20) {
+            notifications.on_mcp_approval(WS, SessionId(1), &format!("tool-{index}"), &catalog);
+        }
+
+        assert_eq!(notifications.items.len(), MAX_NOTIFICATION_HISTORY);
+        assert_eq!(notifications.items[0].title, "tool-20");
+        assert_eq!(notifications.items[99].title, "tool-119");
+    }
+
+    #[test]
+    fn production_leaf에는_platform_notification_effect가_없다() {
+        let source = include_str!("notifications.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        for forbidden in [
+            "platform::",
+            "std::process::Command",
+            "Command::new(",
+            "osascript",
+            "notify-rust",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "production notification leaf contains forbidden native effect: {forbidden}"
+            );
+        }
     }
 
     /// 반면 상태 전이(PTY 감지)는 같은 대상·같은 상태가 반복되면 억제한다 —

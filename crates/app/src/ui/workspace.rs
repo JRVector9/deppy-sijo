@@ -3,6 +3,7 @@
 //! mux 배치는 MuxUpdated 스냅샷이 유일한 근거, active tab visible pane만 live render (14.4).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,6 +24,52 @@ const WORKSPACE_URL_MAX_BYTES: usize = 32 * 1024;
 const TERMINAL_CLIPBOARD_PATH_MAX_ITEMS: usize = 16;
 const TERMINAL_CLIPBOARD_PATH_MAX_BYTES: usize = 256 * 1024;
 const TERMINAL_CLIPBOARD_TEXT_MAX_BYTES: usize = 1024 * 1024;
+const WORKSPACE_NOTICE_SUMMARY_MAX_BYTES: usize = 4 * 1024;
+const WORKSPACE_NOTICE_BODY_MAX_BYTES: usize = 2 * 1024;
+const WORKSPACE_NOTICE_TOTAL_MAX_BYTES: usize = 5 * 1024;
+
+/// Capacity-one, immutable request for the composition root to deliver through
+/// the operating-system notification API. Workspace rendering only stages this
+/// value; it never executes the native effect. Payload Debug is always redacted.
+pub struct WorkspaceNotice {
+    summary: Box<str>,
+    body: Box<str>,
+}
+
+impl WorkspaceNotice {
+    fn try_new(summary: String, body: &str) -> Option<Self> {
+        if summary.is_empty()
+            || summary.len() > WORKSPACE_NOTICE_SUMMARY_MAX_BYTES
+            || body.len() > WORKSPACE_NOTICE_BODY_MAX_BYTES
+            || summary.len().saturating_add(body.len()) > WORKSPACE_NOTICE_TOTAL_MAX_BYTES
+            || summary.as_bytes().contains(&0)
+            || body.as_bytes().contains(&0)
+        {
+            return None;
+        }
+        Some(Self {
+            summary: summary.into(),
+            body: body.into(),
+        })
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+impl fmt::Debug for WorkspaceNotice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceNotice")
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
 
 // 각 split leaf가 독립 터미널이 되는 패널형 구조. 헤더는 한 줄로 얇게 유지하고
 // PTY는 외곽 카드 여백 없이 패널 면을 채운다.
@@ -336,6 +383,9 @@ pub struct WorkspaceUi {
     /// handle_events가 예약한 「마지막 출력 복사」 텍스트 — 그 자리엔 egui Context가
     /// 없어 show()가 같은 프레임에 ctx.copy_text로 수행한다.
     pending_copy: Option<String>,
+    /// Latest-only native notice request. Repeated render events overwrite the
+    /// prior pending value instead of growing a queue or starting a worker.
+    notice_intent: Option<WorkspaceNotice>,
     /// 이번 프레임에 그린 pane들의 렌더 카운터 합 (B1 실측). show() 시작에서 리셋하고
     /// pane마다 누적한다 — 정수 덧셈뿐이라 게이트 없이 항상 집계한다.
     frame_counters: renderer_egui::RenderCounters,
@@ -691,6 +741,7 @@ impl WorkspaceUi {
             search: None,
             last_output_copy_pending: HashSet::new(),
             pending_copy: None,
+            notice_intent: None,
             frame_counters: renderer_egui::RenderCounters::default(),
         }
     }
@@ -705,6 +756,18 @@ impl WorkspaceUi {
     /// workspace and can otherwise re-request its deferred TextEdit focus.
     pub fn take_terminal_focus_claimed(&mut self) -> bool {
         std::mem::take(&mut self.terminal_focus_claimed)
+    }
+
+    /// Drains the latest native notice for `App::logic` to execute. Empty reads
+    /// perform no I/O and schedule no polling or repaint lifecycle.
+    pub fn take_notice_intent(&mut self) -> Option<WorkspaceNotice> {
+        self.notice_intent.take()
+    }
+
+    fn stage_notice(&mut self, summary: String, body: &str) {
+        if let Some(notice) = WorkspaceNotice::try_new(summary, body) {
+            self.notice_intent = Some(notice);
+        }
     }
 
     /// 세션 스냅샷이 하나라도 도착했는가 — 워크스페이스 생성 burst의 `first_snapshot`
@@ -1538,7 +1601,7 @@ impl WorkspaceUi {
                     if text.is_empty() {
                         // 마크 없음(복원 세션·훅 없는 셸·alt screen) 또는 출력 없는 명령 —
                         // 조용한 실패 금지, 1회 알림.
-                        platform::notify(&catalog.t("shell.no_output_marks", &[]), "");
+                        self.stage_notice(catalog.t("shell.no_output_marks", &[]), "");
                         continue;
                     }
                     if *truncated {
@@ -4765,6 +4828,99 @@ mod tests {
         );
         assert_eq!(ui.pending_copy.as_deref(), Some("out"));
         assert!(ui.last_output_copy_pending.is_empty());
+    }
+
+    #[test]
+    fn last_output이_비면_native_effect대신_notice_intent를_발행한다() {
+        let mut ui = WorkspaceUi::new();
+        let catalog = catalog();
+        let client = RecordingRuntime::default();
+        let source = SessionId(2);
+        ui.last_output_copy_pending.insert(source);
+
+        ui.handle_events(
+            &client,
+            &[RuntimeEvent::LastOutputExtracted {
+                session: source,
+                text: String::new(),
+                truncated: false,
+            }],
+            &catalog,
+        );
+
+        assert!(ui.pending_copy.is_none());
+        assert!(ui.last_output_copy_pending.is_empty());
+        let notice = ui.take_notice_intent().expect("no-output notice intent");
+        assert_eq!(notice.summary(), catalog.t("shell.no_output_marks", &[]));
+        assert_eq!(notice.body(), "");
+        let debug = format!("{notice:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(notice.summary()));
+        assert!(ui.take_notice_intent().is_none());
+    }
+
+    #[test]
+    fn workspace_notice는_capacity_one_latest_overwrite다() {
+        let mut ui = WorkspaceUi::new();
+        ui.stage_notice("first".to_owned(), "first body");
+        ui.stage_notice("second".to_owned(), "second body");
+
+        let notice = ui.take_notice_intent().expect("latest notice");
+        assert_eq!(notice.summary(), "second");
+        assert_eq!(notice.body(), "second body");
+        assert!(ui.take_notice_intent().is_none());
+    }
+
+    #[test]
+    fn workspace_notice_payload는_field와_total_byte_budget을_지킨다() {
+        assert!(WorkspaceNotice::try_new("summary".to_owned(), "").is_some());
+        assert!(
+            WorkspaceNotice::try_new(
+                "s".repeat(WORKSPACE_NOTICE_SUMMARY_MAX_BYTES),
+                &"b".repeat(1024),
+            )
+            .is_some()
+        );
+        assert!(
+            WorkspaceNotice::try_new("s".repeat(WORKSPACE_NOTICE_SUMMARY_MAX_BYTES + 1), "",)
+                .is_none()
+        );
+        assert!(
+            WorkspaceNotice::try_new(
+                "summary".to_owned(),
+                &"b".repeat(WORKSPACE_NOTICE_BODY_MAX_BYTES + 1),
+            )
+            .is_none()
+        );
+        assert!(WorkspaceNotice::try_new("s".repeat(3500), &"b".repeat(1800)).is_none());
+        assert!(WorkspaceNotice::try_new(String::new(), "").is_none());
+        assert!(WorkspaceNotice::try_new("contains\0nul".to_owned(), "").is_none());
+        assert!(WorkspaceNotice::try_new("summary".to_owned(), "contains\0nul").is_none());
+
+        let mut ui = WorkspaceUi::new();
+        ui.stage_notice("retained".to_owned(), "");
+        ui.stage_notice("x".repeat(WORKSPACE_NOTICE_SUMMARY_MAX_BYTES + 1), "");
+        assert_eq!(
+            ui.take_notice_intent()
+                .expect("invalid overwrite keeps valid notice")
+                .summary(),
+            "retained"
+        );
+    }
+
+    #[test]
+    fn workspace_production_source에는_platform_notification_effect가_없다() {
+        let source = include_str!("workspace.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        for forbidden in ["platform::notify(", "notify_rust", "osascript"] {
+            assert!(
+                !production.contains(forbidden),
+                "workspace production source contains native notification effect: {forbidden}"
+            );
+        }
     }
 
     /// 「마지막 출력 복사」만 남고 제거된 agent 전송 항목은 다시 나타나지 않는다.

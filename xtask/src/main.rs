@@ -538,6 +538,34 @@ fn check_app_render_source_boundary(
             "render must stage settings jobs for logic-owned admission",
         ),
         (
+            "send_command(",
+            "render must stage runtime protocol commands for logic",
+        ),
+        (
+            "self.switch_workspace(",
+            "render must stage workspace lifecycle transitions for logic",
+        ),
+        (
+            "self.close_workspace_sessions(",
+            "render must not shut down or join workspace runtimes",
+        ),
+        (
+            "self.reveal_active_workspace_for_new_session(",
+            "render must not persist workspace lifecycle state",
+        ),
+        (
+            "self.send_agent_resume(",
+            "render must not scan transcripts or write runtime input",
+        ),
+        (
+            "self.sync_dotenv_env(",
+            "render must not admit dotenv filesystem/storage work",
+        ),
+        (
+            "platform::notify(",
+            "render must return native notification intents",
+        ),
+        (
             "crate::fonts::",
             "render must not read or install font files",
         ),

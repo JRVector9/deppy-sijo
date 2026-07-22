@@ -16,6 +16,7 @@ const APPROVAL_COMMAND_CAP: usize = 8;
 const APPROVAL_LAUNCH_CAP: usize = 8;
 const APPROVAL_SPAWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const APPROVAL_DENIAL_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+const APP_NOTICE_TEXT_MAX_BYTES: usize = 4 * 1024;
 
 struct ApprovalSnapshot {
     rows: Vec<ui::approvals::PendingApprovalItem>,
@@ -4960,6 +4961,11 @@ pub struct App {
     file_tree_watcher: Option<AppFileTreeWatcher>,
     /// Settings가 반환한 lifecycle action 한 건. 다음 logic tick에서만 실행한다.
     pending_app_controller_action: Option<AppControllerAction>,
+    /// Render가 반환한 workspace/runtime action 한 건. 다음 logic tick에서만 실행한다.
+    pending_workspace_controller_action: Option<WorkspaceControllerAction>,
+    /// Focused completion acknowledgement. Render removes the in-memory generation and stages at
+    /// most one durable clear; SQLite is touched only by the following logic tick.
+    pending_turn_done_clear: Option<(String, i64)>,
     /// 설정 전체 변경과 단순 config 저장은 각각 latest-only bit로 합쳐 backlog를 막는다.
     pending_settings_config_apply: bool,
     pending_config_save: bool,
@@ -4977,7 +4983,7 @@ pub struct App {
     /// 상태바·홈이 쓰는 activity_rows 500ms 캐시 — 매 프레임(타이핑 중 60~120fps)
     /// 전 워크스페이스 × 세션의 String/Vec 재조립을 피한다. 리소스 샘플 주기(2s)보다
     /// 짧아 표시 신선도는 유지된다.
-    activity_rows_cache: Option<(std::time::Instant, Vec<ui::activity::ActivityWorkspaceRow>)>,
+    activity_rows_cache: Option<(std::time::Instant, ui::activity::ActivitySnapshot)>,
     /// 홈 업데이트 피드 수신(Claude/OpenAI 상태 5분, 공지/HF/Grok 4시간) + 최신
     /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
     status_feed_rx: crate::status_feed::StatusFeedReceiver,
@@ -5466,6 +5472,42 @@ enum AppControllerAction {
     DetectHostname,
     CheckServe,
     ConfigureServe,
+}
+
+/// Capacity-one high-level terminal/workspace action emitted by the render pass. Runtime
+/// protocol, persistence, process/session lifecycle, and transcript filesystem work execute only
+/// when `logic` drains this slot on the next tick.
+enum WorkspaceControllerAction {
+    SwitchWorkspace(String),
+    FocusSession {
+        workspace_id: String,
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+    },
+    Runtime(runtime::RuntimeCommand),
+    SpawnShellAt {
+        cwd: Option<String>,
+    },
+    ResumeAgent {
+        pane_key: String,
+        title: String,
+        session: runtime::SessionId,
+    },
+    ClosePane(runtime::MuxPaneId),
+    CloseWorkspace(String),
+    FocusPty {
+        switch_workspace: Option<String>,
+        session: runtime::SessionId,
+    },
+    OpenStructured {
+        switch_workspace: Option<String>,
+        session_id: String,
+    },
+    Notify {
+        summary: String,
+        body: String,
+    },
+    SyncDotenv,
 }
 
 #[derive(Clone)]
@@ -7273,6 +7315,8 @@ impl App {
             pending_file_tree_maintenance: None,
             file_tree_watcher: None,
             pending_app_controller_action: None,
+            pending_workspace_controller_action: None,
+            pending_turn_done_clear: None,
             pending_settings_config_apply: false,
             pending_config_save: false,
             pending_composer_history: None,
@@ -7910,10 +7954,11 @@ impl App {
                     if alert.seen
                         && status == S::Done
                         && let Some(&seen_at) = self.agent_turn_done.get(&sid)
+                        && self.pending_turn_done_clear.is_none()
                     {
                         // 내가 읽은 세대(seen_at)까지만 소비 — 그 뒤 도착한 새 완료는 남긴다.
                         let key = format!("{}:{}", self.active.id, sid.0);
-                        let _ = self.db.clear_agent_turn_done(&key, seen_at);
+                        self.pending_turn_done_clear = Some((key, seen_at));
                         self.agent_turn_done.remove(&sid);
                     }
                     entry.attention = !alert.seen;
@@ -8591,6 +8636,174 @@ impl App {
                 "config save failed"
             );
             self.remote_error = Some("설정 저장 실패".to_owned());
+        }
+    }
+
+    fn stage_workspace_controller_action(&mut self, action: WorkspaceControllerAction) -> bool {
+        if self.pending_workspace_controller_action.is_some() {
+            return false;
+        }
+        self.pending_workspace_controller_action = Some(action);
+        self.egui_ctx.request_repaint();
+        true
+    }
+
+    fn poll_workspace_controller(&mut self) {
+        let Some(action) = self.pending_workspace_controller_action.take() else {
+            return;
+        };
+        match action {
+            WorkspaceControllerAction::SwitchWorkspace(workspace_id) => {
+                self.switch_workspace(&workspace_id);
+            }
+            WorkspaceControllerAction::FocusSession {
+                workspace_id,
+                tab,
+                pane,
+            } => {
+                if workspace_id != self.active.id {
+                    self.switch_workspace(&workspace_id);
+                }
+                if workspace_id == self.active.id {
+                    let is_active_tab = self
+                        .active
+                        .workspace_ui
+                        .mux()
+                        .and_then(|mux| mux.active_tab.clone())
+                        == Some(tab.clone());
+                    if !is_active_tab {
+                        let _ = self
+                            .active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::SelectTab { tab });
+                    }
+                    let _ = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::FocusPane { pane });
+                }
+            }
+            WorkspaceControllerAction::Runtime(command) => {
+                if let runtime::RuntimeCommand::WriteInput { session, .. } = &command {
+                    self.active.workspace_ui.clear_selection(*session);
+                }
+                if self.active.runtime.send_command(command).is_err() {
+                    tracing::warn!(
+                        kind = "workspace",
+                        phase = "runtime_command",
+                        error_code = "delivery_failed",
+                        "workspace runtime command failed"
+                    );
+                }
+            }
+            WorkspaceControllerAction::SpawnShellAt { cwd } => {
+                self.reveal_active_workspace_for_new_session();
+                self.active.workspace_ui.spawn_shell_at(
+                    &self.active.runtime,
+                    self.config.terminal.scrollback_lines as usize,
+                    cwd,
+                );
+            }
+            WorkspaceControllerAction::ResumeAgent {
+                pane_key,
+                title,
+                session,
+            } => {
+                let mut finder = crate::agent_detect::TranscriptFinder::new();
+                self.send_agent_resume(&pane_key, &title, session, &mut finder);
+                self.resumed_panes.insert(pane_key);
+            }
+            WorkspaceControllerAction::ClosePane(pane) => {
+                self.active
+                    .workspace_ui
+                    .request_close_pane(&self.active.runtime, pane);
+            }
+            WorkspaceControllerAction::CloseWorkspace(workspace_id) => {
+                let was_active = workspace_id == self.active.id;
+                self.close_workspace_sessions(&workspace_id);
+                if was_active
+                    && let Some(fallback) = self
+                        .workspaces
+                        .iter()
+                        .map(|workspace| workspace.id.clone())
+                        .find(|id| *id != workspace_id && !self.closed_workspaces.contains_key(id))
+                {
+                    self.switch_workspace(&fallback);
+                }
+            }
+            WorkspaceControllerAction::FocusPty {
+                switch_workspace,
+                session,
+            } => {
+                if let Some(workspace_id) = switch_workspace {
+                    self.switch_workspace(&workspace_id);
+                    self.pending_focus = Some((workspace_id, session));
+                } else if let Some(pane) = self
+                    .active
+                    .workspace_ui
+                    .mux()
+                    .and_then(|mux| pane_of_session(mux, session))
+                {
+                    let _ = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::FocusPane { pane });
+                }
+            }
+            WorkspaceControllerAction::OpenStructured {
+                switch_workspace,
+                session_id,
+            } => {
+                if let Some(workspace_id) = switch_workspace {
+                    self.switch_workspace(&workspace_id);
+                }
+                self.agent_sessions_ui.open_session(&session_id);
+            }
+            WorkspaceControllerAction::Notify { summary, body } => {
+                platform::notify(&summary, &body);
+            }
+            WorkspaceControllerAction::SyncDotenv => self.sync_dotenv_env(),
+        }
+    }
+
+    fn poll_pending_workspace_focus(&mut self) {
+        let Some((workspace_id, session)) = self.pending_focus.clone() else {
+            return;
+        };
+        if workspace_id != self.active.id {
+            self.pending_focus = None;
+            return;
+        }
+        let Some(pane) = self
+            .active
+            .workspace_ui
+            .mux()
+            .and_then(|mux| pane_of_session(mux, session))
+        else {
+            return;
+        };
+        let _ = self
+            .active
+            .runtime
+            .send_command(runtime::RuntimeCommand::FocusPane { pane });
+        self.pending_focus = None;
+    }
+
+    fn poll_turn_done_clear(&mut self) {
+        let Some((session_key, seen_at)) = self.pending_turn_done_clear.take() else {
+            return;
+        };
+        if self
+            .db
+            .clear_agent_turn_done(&session_key, seen_at)
+            .is_err()
+        {
+            tracing::warn!(
+                kind = "agent_status",
+                phase = "clear_done",
+                error_code = "storage_failed",
+                "agent completion acknowledgement failed"
+            );
         }
     }
 
@@ -11465,14 +11678,16 @@ impl App {
         }
     }
 
-    fn activity_rows(&self) -> Vec<ui::activity::ActivityWorkspaceRow> {
+    fn activity_rows(&self) -> ui::activity::ActivitySnapshot {
         let now = std::time::Instant::now();
-        self.workspaces
+        let rows: Vec<ui::activity::ActivityWorkspaceRow> = self
+            .workspaces
             .iter()
             // 사이드바 「워크스페이스 종료」는 DB 프로젝트 삭제가 아니라 이번 실행의
             // 명시적 숨김이다. 홈도 사이드바와 같은 visible set을 써야 종료한 프로젝트가
             // 유휴 카드로 되살아나지 않는다(2026-07-19 사용자).
             .filter(|ws| workspace_visible_after_close(&self.closed_workspaces, &ws.id))
+            .take(ui::activity::MAX_ACTIVITY_WORKSPACES + 1)
             .map(|ws| {
                 if ws.id == self.active.id {
                     // pane별 서브행 — 사이드바 3줄 행과 같은 원천(session_entries)에
@@ -11485,10 +11700,11 @@ impl App {
                     );
                     let sessions = entries
                         .iter()
+                        .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
                         .map(|e| ui::activity::ActivitySessionRow {
-                            name: e.title.clone(),
-                            agent_line: e.agent_line.clone(),
-                            status_line: e.status_line.clone(),
+                            name: Arc::from(e.title.as_str()),
+                            agent_line: e.agent_line.as_deref().map(Arc::from),
+                            status_line: e.status_line.as_deref().map(Arc::from),
                             resource: e.session.and_then(|s| {
                                 self.active
                                     .session_resource_usage
@@ -11504,7 +11720,7 @@ impl App {
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
-                        name: Self::workspace_display_name(ws),
+                        name: Self::workspace_display_name(ws).into(),
                         state: ui::activity::ActivityWorkspaceState::Active,
                         session_count: entries.len(),
                         pending_events: self.active.pending_events.len(),
@@ -11515,8 +11731,15 @@ impl App {
                         backgrounded_for_secs: None,
                         auto_suspend_remaining_secs: None,
                         resource: self.active.resource_usage,
-                        session_resources: self.active.session_resource_usage.clone(),
-                        sessions,
+                        session_resources: self
+                            .active
+                            .session_resource_usage
+                            .iter()
+                            .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .into(),
+                        sessions: sessions.into(),
                     };
                 }
                 if let Some(rt) = self.warm.get(&ws.id) {
@@ -11531,7 +11754,12 @@ impl App {
                             .saturating_sub(duration.as_secs())
                     });
                     // warm은 감지 워커가 안 돌아 제목·자원·압력만 채운다 (id 순 정렬).
-                    let mut ids: Vec<_> = rt.session_titles.keys().copied().collect();
+                    let mut ids: Vec<_> = rt
+                        .session_titles
+                        .keys()
+                        .copied()
+                        .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
+                        .collect();
                     ids.sort_by_key(|s| s.0);
                     let sessions = ids
                         .iter()
@@ -11541,10 +11769,11 @@ impl App {
                                 .session_titles
                                 .get(s)
                                 .map(|raw| self.activity_session_name(&ws.id, raw))
-                                .unwrap_or_default(),
+                                .unwrap_or_default()
+                                .into(),
                             // 대기(warm)는 에이전트가 살아있음 — 활성일 때 감지한 마지막 에이전트
                             // 줄을 유지해 보여준다(방안①). 셸이면 None.
-                            agent_line: rt.workspace_ui.agent_line_for(*s),
+                            agent_line: rt.workspace_ui.agent_line_for(*s).map(Into::into),
                             status_line: None,
                             resource: rt
                                 .session_resource_usage
@@ -11555,7 +11784,7 @@ impl App {
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
-                        name: Self::workspace_display_name(ws),
+                        name: Self::workspace_display_name(ws).into(),
                         state: ui::activity::ActivityWorkspaceState::Warm,
                         session_count: rt.session_titles.len(),
                         pending_events: rt.pending_events.len(),
@@ -11563,8 +11792,14 @@ impl App {
                         backgrounded_for_secs: elapsed.map(|duration| duration.as_secs()),
                         auto_suspend_remaining_secs: remaining,
                         resource: rt.resource_usage,
-                        session_resources: rt.session_resource_usage.clone(),
-                        sessions,
+                        session_resources: rt
+                            .session_resource_usage
+                            .iter()
+                            .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .into(),
+                        sessions: sessions.into(),
                     };
                 }
                 let sessions = self
@@ -11572,9 +11807,10 @@ impl App {
                     .get(&ws.id)
                     .into_iter()
                     .flatten()
+                    .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
                     .map(|(title, _cwd)| ui::activity::ActivitySessionRow {
                         // 유휴 워크스페이스도 프로젝트명으로 표시 (활성/warm과 동일 규칙).
-                        name: self.activity_session_name(&ws.id, title),
+                        name: self.activity_session_name(&ws.id, title).into(),
                         agent_line: None,
                         status_line: None,
                         resource: None,
@@ -11582,7 +11818,7 @@ impl App {
                     })
                     .collect::<Vec<_>>();
                 ui::activity::ActivityWorkspaceRow {
-                    name: Self::workspace_display_name(ws),
+                    name: Self::workspace_display_name(ws).into(),
                     // DB에는 있으나 active/warm runtime이 없는 워크스페이스도 숨기지 않고
                     // 유휴 카드로 표시한다. 현재 복원 레이아웃의 pane은 위 snapshot에서
                     // 하위 세션 행으로 복구한다.
@@ -11593,11 +11829,33 @@ impl App {
                     backgrounded_for_secs: None,
                     auto_suspend_remaining_secs: None,
                     resource: None,
-                    session_resources: Vec::new(),
-                    sessions,
+                    session_resources: Arc::from([]),
+                    sessions: sessions.into(),
                 }
             })
-            .collect()
+            .collect();
+        ui::activity::ActivitySnapshot::try_new(rows).unwrap_or_else(|_| {
+            tracing::warn!(
+                kind = "activity",
+                phase = "snapshot",
+                error_code = "invalid_projection",
+                "activity snapshot rejected"
+            );
+            ui::activity::ActivitySnapshot::empty()
+        })
+    }
+
+    fn refresh_activity_snapshot_if_needed(&mut self) {
+        const TTL: std::time::Duration = std::time::Duration::from_millis(500);
+        if self
+            .activity_rows_cache
+            .as_ref()
+            .is_some_and(|(created_at, _)| created_at.elapsed() <= TTL)
+        {
+            return;
+        }
+        let snapshot = self.activity_rows();
+        self.activity_rows_cache = Some((std::time::Instant::now(), snapshot));
     }
 
     /// 한 workspace의 이벤트에서 제목을 누적(session_titles)하고 상태/exit을 알림으로
@@ -12524,6 +12782,14 @@ impl eframe::App for App {
         // 해제된다. Host task는 그 뒤 한 건만 적용/시작한다.
         self.poll_app_host_io(ctx);
         self.poll_app_controller(ctx);
+        // Drain the notice from the runtime that rendered it before a queued workspace switch can
+        // move that runtime into the warm pool.
+        if let Some(intent) = self.active.workspace_ui.take_notice_intent() {
+            platform::notify(intent.summary(), intent.body());
+        }
+        self.poll_workspace_controller();
+        self.poll_pending_workspace_focus();
+        self.poll_turn_done_clear();
         self.apply_pending_visual_settings(ctx);
         self.poll_worktree_jobs();
         self.refresh_agent_workspace_cwd();
@@ -12778,6 +13044,11 @@ impl eframe::App for App {
                 != previous_connector_config_revision
         {
             self.invalidate_env_profile_ui();
+        }
+
+        self.refresh_activity_snapshot_if_needed();
+        while let Some(intent) = self.notifications_ui.pop_native_intent() {
+            platform::notify(intent.summary(), intent.body());
         }
 
         // 폰 대시보드가 볼 워크스페이스 스냅샷(전체 + 해석된 세션 이름) 동기화.
@@ -13055,13 +13326,12 @@ impl eframe::App for App {
         // 500ms 캐시에서 꺼내 쓰고 프레임 끝에 되돌린다(take/put-back) — 참조로 들면
         // 아래 render_composer_dock(&mut self)와 빌림이 충돌한다. 상태 스트립은
         // 사이드바보다 먼저 선언해야 좌측 도크 아래까지 창 전체 폭을 차지한다.
-        const ACTIVITY_ROWS_TTL: std::time::Duration = std::time::Duration::from_millis(500);
         let (activity_rows_stamp, activity_rows) = match self.activity_rows_cache.take() {
-            // Runtime/resource/status workers already wake on a changed snapshot. No timer is
-            // needed merely to expire this allocation cache: the next real event/frame rebuilds
-            // it if stale, while an idle terminal schedules no periodic repaint.
-            Some((at, rows)) if at.elapsed() <= ACTIVITY_ROWS_TTL => (at, rows),
-            _ => (std::time::Instant::now(), self.activity_rows()),
+            Some(snapshot) => snapshot,
+            None => (
+                std::time::Instant::now(),
+                ui::activity::ActivitySnapshot::empty(),
+            ),
         };
         let waiting_count = self.approvals_ui.pending().len() + self.global_waiting.len();
         // 상태바도 Home/Connector와 동일한 immutable overview snapshot을 사용한다.
@@ -13082,7 +13352,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 self.agent_terminal_ui.status_bar(
                     ui,
-                    &activity_rows,
+                    activity_rows.rows(),
                     waiting_count,
                     mcp_count,
                     &self.status_feed,
@@ -13105,7 +13375,7 @@ impl eframe::App for App {
                 .as_mut()
                 .is_some_and(|tree| !tree.take_env_warning_candidates().is_empty());
             if env_changed {
-                self.sync_dotenv_env();
+                self.stage_workspace_controller_action(WorkspaceControllerAction::SyncDotenv);
             }
             // 파일 트리가 이번 프레임 ⌘V/⌘C를 소비했으면 같은 제스처가 터미널로도 흘러
             // 이중 처리(경로 삽입 붙여넣기/선택 복사 pasteboard 덮어쓰기)되는 것을
@@ -13124,7 +13394,9 @@ impl eframe::App for App {
                 Some(ui::file_tree::SidebarAction::SwitchWorkspace(workspace_id)) => {
                     self.agent_terminal_ui
                         .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-                    self.switch_workspace(&workspace_id);
+                    self.stage_workspace_controller_action(
+                        WorkspaceControllerAction::SwitchWorkspace(workspace_id),
+                    );
                 }
                 Some(ui::file_tree::SidebarAction::ShowHome) => {
                     // 재클릭 토글 — 이미 홈이면 터미널로 복귀 (2026-07-18 확정 디자인).
@@ -13180,13 +13452,11 @@ impl eframe::App for App {
                             let bytes = ui::workspace::path_insert_paste_bytes(
                                 &path, shell_kind, bracketed,
                             );
-                            // 선택 중 freeze 해제 — 이 경로는 WorkspaceUi::send를 우회한다(codex).
-                            self.active.workspace_ui.clear_selection(session);
-                            if let Err(e) = self.active.runtime.send_command(
-                                runtime::RuntimeCommand::WriteInput { session, bytes },
-                            ) {
-                                tracing::warn!("경로 삽입 실패: {e:#}");
-                            }
+                            self.stage_workspace_controller_action(
+                                WorkspaceControllerAction::Runtime(
+                                    runtime::RuntimeCommand::WriteInput { session, bytes },
+                                ),
+                            );
                         }
                         None => tracing::info!("경로 삽입: 활성 터미널 세션 없음 — 무시"),
                     }
@@ -13208,12 +13478,11 @@ impl eframe::App for App {
                                 self.active.workspace_ui.session_bracketed_paste(session);
                             let shell_kind = self.active.workspace_ui.session_shell_kind(session);
                             let bytes = ui::workspace::cd_paste_bytes(&path, shell_kind, bracketed);
-                            self.active.workspace_ui.clear_selection(session);
-                            if let Err(e) = self.active.runtime.send_command(
-                                runtime::RuntimeCommand::WriteInput { session, bytes },
-                            ) {
-                                tracing::warn!("cd 삽입 실패: {e:#}");
-                            }
+                            self.stage_workspace_controller_action(
+                                WorkspaceControllerAction::Runtime(
+                                    runtime::RuntimeCommand::WriteInput { session, bytes },
+                                ),
+                            );
                         }
                         None => tracing::info!("cd: 활성 터미널 세션 없음 — 무시"),
                     }
@@ -13226,45 +13495,20 @@ impl eframe::App for App {
                 }) => {
                     self.agent_terminal_ui
                         .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-                    if workspace_id != self.active.id {
-                        self.switch_workspace(&workspace_id);
-                    }
-                    // live-warm 상한으로 전환이 거부된 경우 다른 runtime의 pane id를
-                    // 현재 active에 보내면 안 된다. workspace 행 포커스만 그대로 둔다.
-                    if workspace_id == self.active.id {
-                        let is_active_tab = self
-                            .active
-                            .workspace_ui
-                            .mux()
-                            .and_then(|m| m.active_tab.clone())
-                            == Some(tab.clone());
-                        if !is_active_tab
-                            && let Err(e) = self
-                                .active
-                                .runtime
-                                .send_command(runtime::RuntimeCommand::SelectTab { tab })
-                        {
-                            tracing::warn!("탭 전환 실패: {e:#}");
-                        }
-                        if let Err(e) = self
-                            .active
-                            .runtime
-                            .send_command(runtime::RuntimeCommand::FocusPane { pane })
-                        {
-                            tracing::warn!("pane 포커스 실패: {e:#}");
-                        }
-                    }
+                    self.stage_workspace_controller_action(
+                        WorkspaceControllerAction::FocusSession {
+                            workspace_id,
+                            tab,
+                            pane,
+                        },
+                    );
                 }
                 // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)
                 // 세션 이름 변경 — pane 제목 갱신(mux 반영 + 영속).
                 Some(ui::file_tree::SidebarAction::RenameSession { pane, title }) => {
-                    if let Err(e) = self
-                        .active
-                        .runtime
-                        .send_command(runtime::RuntimeCommand::RenamePane { pane, title })
-                    {
-                        tracing::warn!("세션 이름 변경 실패: {e:#}");
-                    }
+                    self.stage_workspace_controller_action(WorkspaceControllerAction::Runtime(
+                        runtime::RuntimeCommand::RenamePane { pane, title },
+                    ));
                 }
                 // 세션 폴더 열기/경로 복사 — cwd는 감지 캐시 우선, 없으면 일회성 lsof.
                 Some(ui::file_tree::SidebarAction::OpenSessionFolder { session }) => {
@@ -13350,11 +13594,8 @@ impl eframe::App for App {
                 // 같은 폴더에서 새 셸 — cwd 미확인이면 일반 새 셸로 폴백.
                 Some(ui::file_tree::SidebarAction::NewShellSameFolder { session }) => {
                     let cwd = self.cached_session_cwd(session);
-                    self.reveal_active_workspace_for_new_session();
-                    self.active.workspace_ui.spawn_shell_at(
-                        &self.active.runtime,
-                        self.config.terminal.scrollback_lines as usize,
-                        cwd,
+                    self.stage_workspace_controller_action(
+                        WorkspaceControllerAction::SpawnShellAt { cwd },
                     );
                 }
                 // 저장된 에이전트 수동 이어가기 — 자동 이어가기 OFF여도 동작한다.
@@ -13363,14 +13604,18 @@ impl eframe::App for App {
                     session,
                     title,
                 }) => {
-                    let mut finder = crate::agent_detect::TranscriptFinder::new();
-                    self.send_agent_resume(&pane.0.clone(), &title, session, &mut finder);
-                    self.resumed_panes.insert(pane.0);
+                    self.stage_workspace_controller_action(
+                        WorkspaceControllerAction::ResumeAgent {
+                            pane_key: pane.0,
+                            title,
+                            session,
+                        },
+                    );
                 }
                 Some(ui::file_tree::SidebarAction::ClosePane { pane }) => {
-                    self.active
-                        .workspace_ui
-                        .request_close_pane(&self.active.runtime, pane);
+                    self.stage_workspace_controller_action(WorkspaceControllerAction::ClosePane(
+                        pane,
+                    ));
                 }
                 Some(ui::file_tree::SidebarAction::CloseWorkspace(workspace_id)) => {
                     // 세션·실행 중 수는 사이드바 행이 그린 것과 같은 원천(summary) —
@@ -13617,20 +13862,7 @@ impl eframe::App for App {
                 ui.ctx().request_repaint();
             }
         }
-        // 전환 후 대상 workspace의 mux가 재구성되면(재emit) 알림이 가리킨 세션 pane으로
-        // 이동한다 — 전환은 즉시지만 mux는 다음 몇 프레임에 채워지므로 pending으로 둔다.
-        if let Some((ws_id, session)) = self.pending_focus.clone() {
-            if ws_id != self.active.id {
-                self.pending_focus = None; // 다른 곳으로 전환됨 — 취소
-            } else if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
-                let _ = self
-                    .active
-                    .runtime
-                    .send_command(runtime::RuntimeCommand::FocusPane { pane });
-                self.pending_focus = None;
-            }
-        }
-        // (알림 클릭 → focus/전환 처리는 통합 설정 창 렌더 이후로 이동 — 클로저에서 캡처)
+        // 알림 클릭으로 예약된 runtime focus는 다음 logic tick에서만 실행한다.
 
         // agent-proxy 승인은 벨 팝오버의 「대기 중」 섹션이 처리한다 (v3.9 N4) — 화면 중앙
         // 모달은 **표시하지 않는다**.
@@ -13719,24 +13951,9 @@ impl eframe::App for App {
             match decision {
                 Some(true) => {
                     self.ws_close_confirm = None;
-                    let was_active = close_id == self.active.id;
-                    self.close_workspace_sessions(&close_id);
-                    // 활성을 종료하면 사이드바에서도 숨는다(closed_workspaces) — 남은
-                    // (숨김 아닌) 워크스페이스가 있으면 생성순 첫 항목으로 전환하고,
-                    // 없으면 활성인 채 빈 상태로 남아 사이드바가 빈 상태 CTA를 보인다.
-                    // switch_workspace가 warm 상한으로 거부하면(방금 닫은 pane의 exit
-                    // 이벤트가 아직 안 와 live로 집계될 수 있다) 활성 유지 — 기존
-                    // 상한 경고 모달이 사유를 안내한다.
-                    if was_active {
-                        let fallback = self
-                            .workspaces
-                            .iter()
-                            .map(|workspace| workspace.id.clone())
-                            .find(|id| *id != close_id && !self.closed_workspaces.contains_key(id));
-                        if let Some(id) = fallback {
-                            self.switch_workspace(&id);
-                        }
-                    }
+                    self.stage_workspace_controller_action(
+                        WorkspaceControllerAction::CloseWorkspace(close_id),
+                    );
                 }
                 Some(false) => self.ws_close_confirm = None,
                 None => {}
@@ -13812,10 +14029,16 @@ impl eframe::App for App {
                                 },
                             )
                         {
-                            platform::notify(
-                                &text.t("workspace.rename_ws.failed", &[]),
-                                "workspace settings worker unavailable",
-                            );
+                            let summary = text.t("workspace.rename_ws.failed", &[]);
+                            let body = "workspace settings worker unavailable".to_owned();
+                            if summary.len() <= APP_NOTICE_TEXT_MAX_BYTES
+                                && body.len() <= APP_NOTICE_TEXT_MAX_BYTES
+                                && !summary.contains('\0')
+                            {
+                                self.stage_workspace_controller_action(
+                                    WorkspaceControllerAction::Notify { summary, body },
+                                );
+                            }
                         }
                     }
                     Some(false) => {}
@@ -14032,9 +14255,12 @@ impl eframe::App for App {
         // 조건에 넣으면 탭 전환 프레임에 빈 행이 한 프레임 번쩍이므로(category가 show() 안에서
         // 갱신) 창 열림만 본다.
         let activity_rows = if self.settings_open {
-            self.activity_rows()
+            self.activity_rows_cache
+                .as_ref()
+                .map(|(_, snapshot)| snapshot.clone())
+                .unwrap_or_default()
         } else {
-            Vec::new()
+            ui::activity::ActivitySnapshot::empty()
         };
         let wsid = self.active.id.clone();
         let is_environment = self.settings_category == ui::settings::Category::Environment;
@@ -14526,7 +14752,7 @@ impl eframe::App for App {
             self.pending_config_save = true;
             ui.ctx().request_repaint();
             // 다음 동기화가 세션 기본 env(활성 조건)를 갱신한다 — 새 셸부터 적용.
-            self.sync_dotenv_env();
+            self.stage_workspace_controller_action(WorkspaceControllerAction::SyncDotenv);
         }
         if let Some(name) = workspace_rename {
             // E3: name 컬럼은 별칭 — 빈 값 허용(별칭 해제, 폴더명만 표시).
@@ -14653,28 +14879,34 @@ impl eframe::App for App {
             if let Some(navigation) = navigation {
                 match navigation {
                     AgentNotificationNavigation::FocusCurrentPty { session } => {
-                        if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
-                            let _ = self
-                                .active
-                                .runtime
-                                .send_command(runtime::RuntimeCommand::FocusPane { pane });
-                        }
+                        self.stage_workspace_controller_action(
+                            WorkspaceControllerAction::FocusPty {
+                                switch_workspace: None,
+                                session,
+                            },
+                        );
                     }
                     AgentNotificationNavigation::SwitchAndFocusPty {
                         workspace_id,
                         session,
                     } => {
-                        self.switch_workspace(&workspace_id);
-                        self.pending_focus = Some((workspace_id, session));
+                        self.stage_workspace_controller_action(
+                            WorkspaceControllerAction::FocusPty {
+                                switch_workspace: Some(workspace_id),
+                                session,
+                            },
+                        );
                     }
                     AgentNotificationNavigation::OpenStructured {
                         switch_workspace,
                         session_id,
                     } => {
-                        if let Some(workspace_id) = switch_workspace {
-                            self.switch_workspace(&workspace_id);
-                        }
-                        self.agent_sessions_ui.open_session(&session_id);
+                        self.stage_workspace_controller_action(
+                            WorkspaceControllerAction::OpenStructured {
+                                switch_workspace,
+                                session_id,
+                            },
+                        );
                     }
                 }
                 // Settings는 별도 native viewport다. 대상 전환 후 그대로 앞에 남으면

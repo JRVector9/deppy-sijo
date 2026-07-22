@@ -52,8 +52,8 @@ pub use metadata::{
 pub use refresh::{
     REFRESH_COORDINATOR_ACTIVE_ID_LIMIT, REFRESH_COORDINATOR_ID_BYTES_MAX,
     REFRESH_COORDINATOR_RETAINED_ID_BYTES_MAX, REFRESH_MARGIN, RefreshCoordinator,
-    RefreshCoordinatorStats, RefreshOutcome, RefreshParams, refresh_access_token,
-    refresh_access_token_for_slot, should_refresh, should_refresh_at,
+    RefreshCoordinatorStats, RefreshOutcome, RefreshParams, exchange_refresh_token_once,
+    refresh_access_token, refresh_access_token_for_slot, should_refresh, should_refresh_at,
 };
 pub use registration::{
     DynamicRegistration, RegistrationError, RegistrationOptions, register_client,

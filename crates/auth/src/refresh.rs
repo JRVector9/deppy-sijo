@@ -269,7 +269,7 @@ pub fn refresh_access_token_for_slot(
         store,
         logical_id,
         current_slot,
-        |refresh_token| exchange_refresh(timeout, refresh_token, params),
+        |refresh_token| exchange_refresh_token_once(timeout, refresh_token, params),
         publish,
     )
 }
@@ -378,7 +378,7 @@ fn do_refresh_legacy(
         .get_secret(&refresh_id)
         .context("refresh token 조회 실패")?;
 
-    let outcome = exchange_refresh(timeout, refresh_token, params)?;
+    let outcome = exchange_refresh_token_once(timeout, refresh_token, params)?;
     match &outcome {
         RefreshOutcome::Refreshed(token) => {
             store_token(store, credential_id, token).context("갱신 토큰 저장 실패")?;
@@ -391,7 +391,13 @@ fn do_refresh_legacy(
     Ok(outcome)
 }
 
-fn exchange_refresh(
+/// Performs exactly one bounded refresh-token HTTP exchange without persistence or coordination.
+///
+/// The caller owns single-flight coordination and any physical-slot publish. This function does
+/// not read or write a database/keyring, invoke a publish callback, or retry an indeterminate
+/// request. Redirects remain disabled, `timeout` applies to the one request, and the shared OAuth
+/// response-byte ceiling is enforced by [`crate::OAUTH_HTTP_RESPONSE_MAX_BYTES`].
+pub fn exchange_refresh_token_once(
     timeout: Duration,
     refresh_token: SecretString,
     params: &RefreshParams,
@@ -522,6 +528,138 @@ mod tests {
             client_secret_post: false,
             resource: Some("https://mcp.example/api".to_owned()),
         }
+    }
+
+    #[test]
+    fn one_shot_exchange_succeeds_with_exactly_one_request() {
+        crate::http::reset_http_call_count();
+        let server = MockHttpServer::start(|_| {
+            MockResponse::json(
+                200,
+                r#"{"access_token":"one-shot-at","token_type":"bearer","refresh_token":"one-shot-rt","expires_in":60}"#,
+            )
+        });
+
+        let outcome = exchange_refresh_token_once(
+            TIMEOUT,
+            SecretString::new("input-refresh-token".to_owned()),
+            &params(server.url("/token")),
+        )
+        .unwrap();
+
+        let RefreshOutcome::Refreshed(token) = outcome else {
+            panic!("expected refreshed token: {outcome:?}");
+        };
+        assert_eq!(token.access_token.expose(), "one-shot-at");
+        assert_eq!(
+            token.refresh_token.as_ref().map(SecretString::expose),
+            Some("one-shot-rt")
+        );
+        assert_eq!(crate::http::http_call_count(), 1);
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn one_shot_exchange_timeout_is_sanitized_and_not_retried() {
+        crate::http::reset_http_call_count();
+        let server = MockHttpServer::start(|_| {
+            std::thread::sleep(Duration::from_millis(250));
+            MockResponse::json(
+                200,
+                r#"{"access_token":"late-secret-token","token_type":"bearer"}"#,
+            )
+        });
+        let token_url = server.url("/hostile-secret-path");
+
+        let error = exchange_refresh_token_once(
+            Duration::from_millis(25),
+            SecretString::new("timeout-refresh-secret".to_owned()),
+            &params(token_url.clone()),
+        )
+        .unwrap_err();
+
+        let diagnostic = format!("{error:#}");
+        for forbidden in [
+            "timeout-refresh-secret",
+            "late-secret-token",
+            "hostile-secret-path",
+            token_url.as_str(),
+        ] {
+            assert!(!diagnostic.contains(forbidden), "{diagnostic}");
+        }
+        assert_eq!(crate::http::http_call_count(), 1);
+    }
+
+    #[test]
+    fn one_shot_exchange_provider_error_is_sanitized_and_not_retried() {
+        crate::http::reset_http_call_count();
+        let server = MockHttpServer::start(|_| {
+            MockResponse::text(500, "hostile-provider-body secret-token-marker")
+        });
+        let token_url = server.url("/secret-provider-path");
+
+        let error = exchange_refresh_token_once(
+            TIMEOUT,
+            SecretString::new("provider-refresh-secret".to_owned()),
+            &params(token_url.clone()),
+        )
+        .unwrap_err();
+
+        let diagnostic = format!("{error:#}");
+        for forbidden in [
+            "hostile-provider-body",
+            "secret-token-marker",
+            "provider-refresh-secret",
+            "secret-provider-path",
+            token_url.as_str(),
+        ] {
+            assert!(!diagnostic.contains(forbidden), "{diagnostic}");
+        }
+        assert_eq!(crate::http::http_call_count(), 1);
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn one_shot_exchange_transport_failure_is_sanitized_and_not_retried() {
+        crate::http::reset_http_call_count();
+        let token_url = "http://127.0.0.1:0/secret-transport-path";
+
+        let error = exchange_refresh_token_once(
+            Duration::from_millis(25),
+            SecretString::new("transport-refresh-secret".to_owned()),
+            &params(token_url.to_owned()),
+        )
+        .unwrap_err();
+
+        let diagnostic = format!("{error:#}");
+        for forbidden in [
+            "transport-refresh-secret",
+            "secret-transport-path",
+            token_url,
+        ] {
+            assert!(!diagnostic.contains(forbidden), "{diagnostic}");
+        }
+        assert_eq!(crate::http::http_call_count(), 1);
+    }
+
+    #[test]
+    fn one_shot_exchange_rejects_oversized_response_without_retry() {
+        crate::http::reset_http_call_count();
+        let server = MockHttpServer::start(|_| {
+            MockResponse::json(200, "x".repeat(crate::OAUTH_HTTP_RESPONSE_MAX_BYTES + 1))
+        });
+
+        let error = exchange_refresh_token_once(
+            TIMEOUT,
+            SecretString::new("oversized-refresh-secret".to_owned()),
+            &params(server.url("/token")),
+        )
+        .unwrap_err();
+
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains("oversized-refresh-secret"));
+        assert_eq!(crate::http::http_call_count(), 1);
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

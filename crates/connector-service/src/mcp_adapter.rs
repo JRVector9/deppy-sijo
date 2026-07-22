@@ -967,6 +967,8 @@ sleep 30
             },
             schema_hash,
         )
+        .unwrap()
+        .bind_subject(audit::AuthorizationSubject::global())
         .unwrap();
         let audit::AuthorizationEvaluation::Plan(plan) = evaluation else {
             panic!("fixture authorization should be immediate");
@@ -978,6 +980,7 @@ sleep 30
         };
         let request = AuthorizedInvokeRequest::new(
             grant,
+            &audit::AuthorizationSubject::global(),
             &ServerId::new("fixture-server"),
             server,
             "echo".to_owned(),

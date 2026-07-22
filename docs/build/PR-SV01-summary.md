@@ -1,5 +1,14 @@
 # PR-SV01 — Lazy Connector coordinator and latest-only snapshots
 
+## 2026-07-22 invocation-envelope amendment
+
+The bounded command envelope now carries an `InvocationContext` only for `InvokeTool`; every other
+intent retains no subject payload. Remote trust, credential refresh, approval wait, and resumed
+work transfer that exact context without coordinator-wide mutable identity. Regression coverage
+proves sequential workspace A/B dispatch isolation, legacy global compatibility, pending and
+refresh continuation preservation, and stale/mismatched call-zero behavior. The amended service
+suite passes 69/69 under root verification.
+
 ## 2026-07-22 production-adapter freeze amendment
 
 The service core now includes the production MCP and OAuth adapters that were still follow-up work

@@ -1,5 +1,22 @@
 # PR-AU01 — Shared Authorization and Durable Audit Lifecycle
 
+## 2026-07-22 per-invocation service subject amendment
+
+`connector-service::InvocationContext` lets the app bind each tool invocation to one validated,
+bounded workspace without exposing that identifier in the UI contract or Debug. The context is
+stored only for `InvokeTool`, survives remote-trust, OAuth-refresh, pending-approval, and stale
+continuations, and is bound exactly once immediately after live-schema authorization evaluation.
+There is no coordinator-global subject state; the compatibility `dispatch` path explicitly uses
+the global subject.
+
+The Prepared grant must match the pending subject before call construction, and
+`AuthorizedInvokeRequest` consumes it through `bind_call_for_subject`. Mismatch is durably closed
+as Failed and performs zero external calls; request Debug no longer includes operation IDs. Root
+verification passes connector-service 69/69 plus doc-tests, all-target check, strict Clippy, fmt,
+diff-check, dependency law, and the unchanged 53-exception boundary gate. The combined security
+scan reached storage, mcp-store, and audit successfully, then 32 MCP HTTP fixtures were denied at
+loopback bind by the managed sandbox; no production workaround was added.
+
 ## 2026-07-22 execution-subject amendment
 
 `AuthorizationSubject` now binds the permission evaluation, opaque pending approval or plan,
@@ -9,7 +26,8 @@ subject from the validated runtime session key before approval/audit work; the s
 persists workspace/session on the audit record. A subject-bound grant cannot fall back to the
 legacy global call path or be consumed for another subject. Root verification passes audit 52/52,
 storage 134/134, and mcp-proxy 49/49 plus all-target check, strict Clippy, package fmt, and scoped
-diff-check. Connector-service/app per-invocation subject wiring remains an explicit pre-IN01 item.
+diff-check. Connector-service per-invocation wiring is completed by the amendment above; app must
+supply the active workspace context during IN01.
 
 ## 2026-07-22 service-state amendment
 

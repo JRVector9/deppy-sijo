@@ -18,10 +18,11 @@ use connector_contract::{
 use crate::ports::{
     AuthorizedInvokeRequest, CancellationToken, ConnectorMcp, ConnectorOAuth, ConnectorRepository,
     ConnectorRepositoryFactory, ConnectorSecrets, CredentialResolutionRequest, DiscoverOutput,
-    LiveToolSchema, McpRequestTarget, McpTransportSnapshot, OAuthAuthorizeOutput,
-    OAuthContinuation, OAuthDiscovery, OAuthEventSink, OAuthFailure, OAuthPublishDescriptor,
-    OAuthPublishMode, OAuthPublishResult, OAuthRecoveryTarget, OAuthRefreshOutcome,
-    OAuthRefreshRequest, Observed, RepositoryCas, ServiceError, StoredOAuthClient,
+    InvocationContext, LiveToolSchema, McpRequestTarget, McpTransportSnapshot,
+    OAuthAuthorizeOutput, OAuthContinuation, OAuthDiscovery, OAuthEventSink, OAuthFailure,
+    OAuthPublishDescriptor, OAuthPublishMode, OAuthPublishResult, OAuthRecoveryTarget,
+    OAuthRefreshOutcome, OAuthRefreshRequest, Observed, RepositoryCas, ServiceError,
+    StoredOAuthClient,
 };
 use crate::snapshot::{SnapshotCell, SnapshotReader};
 
@@ -426,6 +427,7 @@ struct WorkerSlot {
 struct CommandEnvelope {
     intent: ConnectorIntent,
     dispatch_epoch: u64,
+    invocation_context: Option<InvocationContext>,
 }
 
 struct Inner {
@@ -521,6 +523,22 @@ impl ConnectorCoordinator {
     }
 
     pub fn dispatch(&self, intent: ConnectorIntent) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_with_context(intent, InvocationContext::global())
+    }
+
+    pub fn dispatch_for_subject(
+        &self,
+        intent: ConnectorIntent,
+        subject: InvocationContext,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_with_context(intent, subject)
+    }
+
+    fn dispatch_with_context(
+        &self,
+        intent: ConnectorIntent,
+        invocation_context: InvocationContext,
+    ) -> Result<DispatchOutcome, DispatchError> {
         if let ConnectorIntent::Cancel(operation_id) = &intent {
             if self.inner.pending_host_import.cancel(operation_id) {
                 self.inner
@@ -595,6 +613,8 @@ impl ConnectorCoordinator {
                 return Ok(DispatchOutcome::Queued);
             }
             intent => {
+                let invocation_context = matches!(&intent, ConnectorIntent::InvokeTool { .. })
+                    .then_some(invocation_context);
                 let _dispatch = self
                     .inner
                     .dispatch_serialization
@@ -633,6 +653,7 @@ impl ConnectorCoordinator {
                 self.enqueue(CommandEnvelope {
                     intent,
                     dispatch_epoch,
+                    invocation_context,
                 })?;
             }
         }
@@ -841,6 +862,7 @@ struct ActiveJob {
 }
 
 struct PendingInvocation {
+    subject: audit::AuthorizationSubject,
     server_id: ServerId,
     server: ServerDraft,
     tool_id: ToolId,
@@ -866,6 +888,7 @@ enum DeferredRemote {
         server: ServerDraft,
         tool_id: ToolId,
         arguments_json: SensitiveInput,
+        invocation_context: InvocationContext,
     },
     OAuth {
         server: ServerDraft,
@@ -908,6 +931,7 @@ enum PendingAfterRefresh {
     Invoke {
         tool_id: ToolId,
         arguments_json: SensitiveInput,
+        invocation_context: InvocationContext,
     },
 }
 
@@ -1179,7 +1203,7 @@ impl Worker {
                 self.reload_overview();
             }
         }
-        self.handle_command(command.intent);
+        self.handle_command(command.intent, command.invocation_context);
     }
 
     fn invalidate_pending_singletons(&mut self) {
@@ -1212,7 +1236,11 @@ impl Worker {
         }
     }
 
-    fn handle_command(&mut self, command: ConnectorIntent) {
+    fn handle_command(
+        &mut self,
+        command: ConnectorIntent,
+        invocation_context: Option<InvocationContext>,
+    ) {
         if !self.pending_outcomes.is_empty()
             && matches!(&command, ConnectorIntent::InvokeTool { .. })
         {
@@ -1236,7 +1264,16 @@ impl Worker {
                 server_id,
                 tool_id,
                 arguments_json,
-            } => self.start_invoke(server_id, tool_id, arguments_json),
+            } => match invocation_context {
+                Some(invocation_context) => {
+                    self.start_invoke(server_id, tool_id, arguments_json, invocation_context)
+                }
+                None => self.publish_error(
+                    OperationKind::Invoke,
+                    ErrorCode::PermissionDenied,
+                    "invocation subject is unavailable",
+                ),
+            },
             ConnectorIntent::Cancel(operation_id) => self.cancel(operation_id),
             ConnectorIntent::ResolveRemoteTrust {
                 operation_id,
@@ -1918,8 +1955,15 @@ impl Worker {
             DeferredRemote::Invoke {
                 tool_id,
                 arguments_json,
+                invocation_context,
                 ..
-            } => self.start_invoke_with_id(operation_id, server_id, tool_id, arguments_json),
+            } => self.start_invoke_with_id(
+                operation_id,
+                server_id,
+                tool_id,
+                arguments_json,
+                invocation_context,
+            ),
             DeferredRemote::OAuth {
                 choose_workspace, ..
             } => self.start_oauth_with_id(operation_id, server_id, choose_workspace),
@@ -2110,9 +2154,16 @@ impl Worker {
         server_id: ServerId,
         tool_id: ToolId,
         arguments_json: connector_contract::SensitiveInput,
+        invocation_context: InvocationContext,
     ) {
         let operation_id = self.new_operation_id();
-        self.start_invoke_with_id(operation_id, server_id, tool_id, arguments_json);
+        self.start_invoke_with_id(
+            operation_id,
+            server_id,
+            tool_id,
+            arguments_json,
+            invocation_context,
+        );
     }
 
     fn start_invoke_with_id(
@@ -2121,6 +2172,7 @@ impl Worker {
         server_id: ServerId,
         tool_id: ToolId,
         arguments_json: connector_contract::SensitiveInput,
+        invocation_context: InvocationContext,
     ) {
         if audit::validate_tool_input(arguments_json.expose_bytes()).is_err() {
             self.publish_operation_error(
@@ -2187,6 +2239,7 @@ impl Worker {
             server,
             tool_id,
             arguments_json,
+            invocation_context,
         }) = self.remote_after_trust(
             operation_id.clone(),
             &server,
@@ -2195,6 +2248,7 @@ impl Worker {
                 server: server.clone(),
                 tool_id: tool_id.clone(),
                 arguments_json,
+                invocation_context,
             },
         )
         else {
@@ -2210,6 +2264,7 @@ impl Worker {
                     PendingAfterRefresh::Invoke {
                         tool_id,
                         arguments_json,
+                        invocation_context,
                     },
                 );
                 return;
@@ -2326,6 +2381,7 @@ impl Worker {
         self.pending_invocations.insert(
             operation_id,
             PendingInvocation {
+                subject: invocation_context.into_subject(),
                 server_id,
                 server,
                 tool_id,
@@ -3290,7 +3346,14 @@ impl Worker {
             PendingAfterRefresh::Invoke {
                 tool_id,
                 arguments_json,
-            } => self.start_invoke_with_id(operation_id, server_id, tool_id, arguments_json),
+                invocation_context,
+            } => self.start_invoke_with_id(
+                operation_id,
+                server_id,
+                tool_id,
+                arguments_json,
+                invocation_context,
+            ),
         }
     }
 
@@ -3604,6 +3667,19 @@ impl Worker {
                 return;
             }
         };
+        let authorization = match authorization.bind_subject(pending.subject.clone()) {
+            Ok(authorization) => authorization,
+            Err(_) => {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::PermissionDenied,
+                    "invocation subject binding failed",
+                );
+                return;
+            }
+        };
         match authorization {
             audit::AuthorizationEvaluation::Plan(plan) => {
                 self.commit_preflight(operation_id, pending, plan)
@@ -3782,6 +3858,7 @@ impl Worker {
             || grant.server_id() != pending.server_id.as_str()
             || grant.tool_name() != pending.tool_name.as_str()
             || grant.live_schema_hash() != pending.live_schema_hash.as_str()
+            || grant.subject() != &pending.subject
         {
             let completion = self.persist_authorization_outcome(
                 &operation_id,
@@ -3826,8 +3903,10 @@ impl Worker {
         let config_revision = pending.config_revision;
         let dispatch_epoch = pending.dispatch_epoch;
         let cancellation_for_thread = cancellation.clone();
+        let expected_subject = pending.subject;
         let request = match AuthorizedInvokeRequest::new(
             grant,
+            &expected_subject,
             &pending.server_id,
             pending.server,
             pending.tool_name,
@@ -5217,6 +5296,7 @@ mod tests {
     use std::sync::Condvar;
     use std::sync::atomic::AtomicBool;
 
+    use audit::evaluate_authorization_with_fingerprint as evaluate_fixture_authorization;
     use connector_contract::{
         ConnectionState, PermissionRule, SensitiveInput, ServerSummary, SlackProjection,
         SlackStatus, ToolId, ToolListItem, TransportDraft, TransportKind,
@@ -5271,6 +5351,8 @@ mod tests {
         loaded_server_override: Mutex<Option<ServerDraft>>,
         outcome_failure: AtomicBool,
         preflight_input_override: Mutex<Option<Vec<u8>>>,
+        preflight_subject_override: Mutex<Option<audit::AuthorizationSubject>>,
+        preflight_subjects: Mutex<Vec<audit::AuthorizationSubject>>,
         mcp_target_error_once: AtomicBool,
         authorization_ledger: audit::InMemoryAuthorizationLedger,
         oauth_slot: Mutex<Option<secret::PhysicalSecretSlot>>,
@@ -5298,6 +5380,8 @@ mod tests {
                 loaded_server_override: Mutex::new(None),
                 outcome_failure: AtomicBool::new(false),
                 preflight_input_override: Mutex::new(None),
+                preflight_subject_override: Mutex::new(None),
+                preflight_subjects: Mutex::new(Vec::new()),
                 mcp_target_error_once: AtomicBool::new(false),
                 authorization_ledger: audit::InMemoryAuthorizationLedger::new(
                     "connector-service-test",
@@ -5661,7 +5745,7 @@ mod tests {
         fn commit_authorization_preflight(
             &mut self,
             expected_revision: Revision,
-            plan: audit::AuthorizationPlan,
+            mut plan: audit::AuthorizationPlan,
             arguments_json: &SensitiveInput,
         ) -> Result<RepositoryCas<audit::AuthorizationPreflight>, ServiceError> {
             if self.revision() != expected_revision {
@@ -5698,6 +5782,40 @@ mod tests {
                     "fixture permission changed before preflight",
                 ));
             }
+            if let Some(subject) = self
+                .state
+                .preflight_subject_override
+                .lock()
+                .expect("preflight subject override lock")
+                .take()
+            {
+                let evaluation = evaluate_fixture_authorization(
+                    plan.operation_id().to_owned(),
+                    plan.server_id().to_owned(),
+                    plan.tool_name().to_owned(),
+                    plan.expected_permission().clone(),
+                    plan.live_schema_hash().to_owned(),
+                )
+                .and_then(|evaluation| evaluation.bind_subject(subject))
+                .map_err(|_| {
+                    ServiceError::new(
+                        ErrorCode::AuditUnavailable,
+                        "fixture authorization subject override failed",
+                    )
+                })?;
+                let audit::AuthorizationEvaluation::Plan(replacement) = evaluation else {
+                    return Err(ServiceError::new(
+                        ErrorCode::AuditUnavailable,
+                        "fixture authorization subject override required an immediate plan",
+                    ));
+                };
+                plan = replacement;
+            }
+            self.state
+                .preflight_subjects
+                .lock()
+                .expect("preflight subjects lock")
+                .push(plan.subject().clone());
             let remembered = matches!(
                 plan.decision(),
                 audit::ToolDecision::AllowAlways | audit::ToolDecision::DenyAlways
@@ -6796,6 +6914,101 @@ mod tests {
     }
 
     #[test]
+    fn invoke_subject_survives_remote_trust_and_oauth_refresh_resume() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(1));
+        enable_auto_allow(&fixture);
+
+        let server_id = ServerId::new("refresh-invoke-server");
+        let server_url = "https://mcp.example.test/mcp";
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") =
+            Some(http_server_draft(server_id.as_str(), server_url));
+        let logical_id = secret::LogicalCredentialId::new("refresh-invoke-credential").unwrap();
+        let current_slot = secret::PhysicalSecretSlot::allocate(&logical_id);
+        *fixture.repo.oauth_slot.lock().expect("OAuth slot lock") = Some(current_slot.clone());
+        *fixture.repo.http_auth.lock().expect("HTTP auth lock") = Some(crate::HttpAuthBinding {
+            credential_id: connector_contract::CredentialId::new(logical_id.as_str()),
+            physical_slot: current_slot,
+            oauth_metadata: Some(oauth_metadata(server_id.as_str(), server_url, 0)),
+        });
+        let future_expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_add(3_600);
+        *fixture
+            .secrets
+            .refresh_output
+            .lock()
+            .expect("refresh output lock") = Some(crate::OAuthCredentialUpdate {
+            logical_id,
+            label: "refresh-invoke-server".to_owned(),
+            bundle: secret::SecretBundle::new(
+                secret::SecretString::new("new-access".to_owned()),
+                Some(secret::SecretString::new("new-refresh".to_owned())),
+                None,
+            ),
+            metadata: oauth_metadata(server_id.as_str(), server_url, future_expiry),
+            masked_hint: Some("****cess".to_owned()),
+        });
+
+        fixture
+            .coordinator
+            .dispatch_for_subject(
+                invoke_intent(server_id.as_str(), "tool-a", br#"{"refresh":true}"#),
+                workspace_context("refresh-workspace"),
+            )
+            .unwrap();
+        let first_trust = wait_for_remote_trust(&fixture.coordinator);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: first_trust.operation_id,
+                config_revision: first_trust.config_revision,
+                endpoint_fingerprint: first_trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| fixture.secrets.refreshes.load(Ordering::Acquire) == 1);
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(2));
+        assert_eq!(fixture.mcp.schema_calls.load(Ordering::Acquire), 0);
+
+        let second_trust = wait_for_remote_trust(&fixture.coordinator);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: second_trust.operation_id,
+                config_revision: second_trust.config_revision,
+                endpoint_fingerprint: second_trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+
+        let subjects = fixture
+            .repo
+            .preflight_subjects
+            .lock()
+            .expect("preflight subjects lock");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].workspace_id(), Some("refresh-workspace"));
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn accepted_remote_oauth_uses_its_exact_one_slot_and_releases_it() {
         let fixture = fixture(
             Arc::new(Gate::opened()),
@@ -7402,6 +7615,10 @@ mod tests {
             };
     }
 
+    fn workspace_context(workspace_id: &str) -> InvocationContext {
+        InvocationContext::for_workspace(workspace_id.to_owned()).expect("workspace context")
+    }
+
     fn first_called_operation(fixture: &Fixture) -> String {
         fixture
             .mcp
@@ -7411,6 +7628,162 @@ mod tests {
             .first()
             .expect("one call operation")
             .clone()
+    }
+
+    #[test]
+    fn legacy_dispatch_binds_a_global_subject_and_remains_compatible() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"global":true}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+
+        let subjects = fixture
+            .repo
+            .preflight_subjects
+            .lock()
+            .expect("preflight subjects lock");
+        assert_eq!(subjects.len(), 1);
+        assert!(subjects[0].is_global());
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn pending_approval_preserves_its_workspace_subject_through_preflight_and_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch_for_subject(
+                invoke_intent("server-1", "tool-a", br#"{"approval":true}"#),
+                workspace_context("approval-workspace"),
+            )
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().approval.is_some());
+        let operation_id = fixture
+            .coordinator
+            .current_snapshot()
+            .approval
+            .as_ref()
+            .expect("approval prompt")
+            .operation_id
+            .clone();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveApproval {
+                operation_id,
+                decision: ApprovalDecision::AllowOnce,
+            })
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+
+        let subjects = fixture
+            .repo
+            .preflight_subjects
+            .lock()
+            .expect("preflight subjects lock");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].workspace_id(), Some("approval-workspace"));
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn each_subject_dispatch_uses_only_the_current_workspace() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+
+        fixture
+            .coordinator
+            .dispatch_for_subject(
+                invoke_intent("server-1", "tool-a", br#"{"workspace":"a"}"#),
+                workspace_context("workspace-a"),
+            )
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+        fixture
+            .coordinator
+            .dispatch_for_subject(
+                invoke_intent("server-1", "tool-a", br#"{"workspace":"b"}"#),
+                workspace_context("workspace-b"),
+            )
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 2);
+
+        let subjects = fixture
+            .repo
+            .preflight_subjects
+            .lock()
+            .expect("preflight subjects lock");
+        let workspaces = subjects
+            .iter()
+            .map(|subject| subject.workspace_id())
+            .collect::<Vec<_>>();
+        assert_eq!(workspaces, [Some("workspace-a"), Some("workspace-b")]);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn prepared_grant_for_another_workspace_fails_durably_before_external_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        *fixture
+            .repo
+            .preflight_subject_override
+            .lock()
+            .expect("preflight subject override lock") = Some(
+            audit::AuthorizationSubject::try_new(Some("workspace-b".to_owned()), None).unwrap(),
+        );
+
+        fixture
+            .coordinator
+            .dispatch_for_subject(
+                invoke_intent("server-1", "tool-a", br#"{"workspace":"a"}"#),
+                workspace_context("workspace-a"),
+            )
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+        let operation_id = fixture
+            .coordinator
+            .current_snapshot()
+            .result
+            .as_ref()
+            .expect("subject mismatch result")
+            .operation_id
+            .clone();
+
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(operation_id.as_str())
+                .unwrap(),
+            Some(audit::AuditLifecycle::Failed)
+        );
     }
 
     #[test]
@@ -8203,7 +8576,10 @@ mod tests {
         );
         fixture
             .coordinator
-            .dispatch(invoke_intent("server-1", "tool-a", br#"{"a":1}"#))
+            .dispatch_for_subject(
+                invoke_intent("server-1", "tool-a", br#"{"a":1}"#),
+                workspace_context("stale-approval-workspace"),
+            )
             .unwrap();
         wait_until(|| fixture.coordinator.current_snapshot().approval.is_some());
         fixture

@@ -82,6 +82,51 @@ impl std::fmt::Display for ServiceError {
 
 impl std::error::Error for ServiceError {}
 
+/// App-supplied execution scope for one Connector tool invocation.
+///
+/// The audit subject remains private to this service boundary: UI contracts cannot inspect or
+/// retain raw workspace identifiers, and callers can only construct a validated, bounded scope.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InvocationContext {
+    subject: audit::AuthorizationSubject,
+}
+
+impl InvocationContext {
+    pub fn global() -> Self {
+        Self {
+            subject: audit::AuthorizationSubject::global(),
+        }
+    }
+
+    pub fn for_workspace(workspace_id: String) -> Result<Self, ServiceError> {
+        let subject =
+            audit::AuthorizationSubject::try_new(Some(workspace_id), None).map_err(|_| {
+                ServiceError::new(
+                    ErrorCode::InvalidInput,
+                    "connector invocation workspace is invalid",
+                )
+            })?;
+        Ok(Self { subject })
+    }
+
+    pub fn is_global(&self) -> bool {
+        self.subject.is_global()
+    }
+
+    pub(crate) fn into_subject(self) -> audit::AuthorizationSubject {
+        self.subject
+    }
+}
+
+impl std::fmt::Debug for InvocationContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InvocationContext")
+            .field("is_global", &self.is_global())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OverviewData {
     pub config_revision: Revision,
@@ -307,7 +352,6 @@ impl std::fmt::Debug for AuthorizedInvokeRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AuthorizedInvokeRequest")
-            .field("operation_id", &self.call.operation_id())
             .field("server", &"REDACTED")
             .field("tool_name", &"REDACTED")
             .field("arguments_json", &"REDACTED")
@@ -318,6 +362,7 @@ impl std::fmt::Debug for AuthorizedInvokeRequest {
 impl AuthorizedInvokeRequest {
     pub(crate) fn new(
         grant: audit::AuthorizationGrant,
+        expected_subject: &audit::AuthorizationSubject,
         server_id: &ServerId,
         server: ServerDraft,
         tool_name: String,
@@ -330,7 +375,8 @@ impl AuthorizedInvokeRequest {
             ));
         }
         let call = grant
-            .bind_call(
+            .bind_call_for_subject(
+                expected_subject,
                 server_id.as_str(),
                 &tool_name,
                 arguments_json.expose_bytes(),
@@ -978,6 +1024,103 @@ pub fn cancel_live_mcp_connection(connection: &mut mcp::McpConnection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_grant(
+        operation_id: &str,
+        subject: audit::AuthorizationSubject,
+    ) -> audit::AuthorizationGrant {
+        let schema_hash = audit::schema_hash(r#"{"type":"object"}"#);
+        let evaluation = audit::evaluate_authorization_with_fingerprint(
+            operation_id.to_owned(),
+            "fixture-server".to_owned(),
+            "fixture-tool".to_owned(),
+            audit::PermissionFingerprint::Persisted {
+                rule: audit::PermissionRule::Allow,
+                approved_schema_hash: Some(schema_hash.clone()),
+            },
+            schema_hash,
+        )
+        .expect("fixture authorization");
+        let audit::AuthorizationEvaluation::Plan(plan) = evaluation
+            .bind_subject(subject)
+            .expect("fixture subject binding")
+        else {
+            panic!("fixture authorization should be immediate")
+        };
+        let ledger = audit::InMemoryAuthorizationLedger::new(operation_id)
+            .expect("fixture authorization ledger");
+        let audit::AuthorizationPreflight::Prepared(grant) =
+            ledger.preflight(plan, b"{}").expect("fixture preflight")
+        else {
+            panic!("fixture authorization should prepare")
+        };
+        grant
+    }
+
+    fn fixture_server() -> ServerDraft {
+        ServerDraft {
+            id: Some(ServerId::new("fixture-server")),
+            name: "fixture-server".to_owned(),
+            transport: connector_contract::TransportDraft::Stdio {
+                command: "fixture-mcp".to_owned(),
+                args: Vec::new(),
+                plain_env: Vec::new(),
+                secret_env: Vec::new(),
+                inherit_env: false,
+            },
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn invocation_context_is_bounded_and_debug_never_exposes_workspace() {
+        let marker = "workspace-debug-marker";
+        let context = InvocationContext::for_workspace(marker.to_owned()).unwrap();
+        let debug = format!("{context:?}");
+
+        assert!(!context.is_global());
+        assert!(!debug.contains(marker), "Debug leaked workspace: {debug}");
+        assert!(InvocationContext::for_workspace(String::new()).is_err());
+        assert!(InvocationContext::for_workspace(" padded".to_owned()).is_err());
+        assert!(InvocationContext::for_workspace("nul\0workspace".to_owned()).is_err());
+        assert!(InvocationContext::for_workspace("w".repeat(129)).is_err());
+        assert!(InvocationContext::for_workspace("w".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn workspace_grant_cannot_cross_subject_and_request_debug_hides_operation() {
+        let subject_a =
+            audit::AuthorizationSubject::try_new(Some("workspace-a".to_owned()), None).unwrap();
+        let subject_b =
+            audit::AuthorizationSubject::try_new(Some("workspace-b".to_owned()), None).unwrap();
+        let mismatch = AuthorizedInvokeRequest::new(
+            prepared_grant("cross-workspace-operation", subject_a.clone()),
+            &subject_b,
+            &ServerId::new("fixture-server"),
+            fixture_server(),
+            "fixture-tool".to_owned(),
+            SensitiveInput::new(b"{}".to_vec()),
+        )
+        .expect_err("workspace B must not consume workspace A grant");
+        assert_eq!(mismatch.code, ErrorCode::PermissionDenied);
+
+        let operation_marker = "request-debug-operation-marker";
+        let request = AuthorizedInvokeRequest::new(
+            prepared_grant(operation_marker, subject_a.clone()),
+            &subject_a,
+            &ServerId::new("fixture-server"),
+            fixture_server(),
+            "fixture-tool".to_owned(),
+            SensitiveInput::new(b"{}".to_vec()),
+        )
+        .unwrap();
+        let debug = format!("{request:?}");
+        assert!(
+            !debug.contains(operation_marker),
+            "Debug leaked operation: {debug}"
+        );
+        assert!(debug.contains("REDACTED"));
+    }
 
     fn debug_oauth_metadata() -> auth::StoredOAuthMetadata {
         auth::StoredOAuthMetadata::new(

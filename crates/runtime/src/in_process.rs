@@ -639,12 +639,11 @@ impl QueuedRuntimeCommand {
 }
 
 fn prepare_queued_command(
-    command: RuntimeCommand,
+    mut command: RuntimeCommand,
     budget: &Arc<RuntimeCommandQueueBudget>,
 ) -> anyhow::Result<QueuedRuntimeCommand> {
-    crate::command::validate_host_command(&command)?;
-    let retained_bytes = crate::command::runtime_command_retained_bytes(&command)?;
-    let reservation = budget.reserve(retained_bytes)?;
+    let retention = crate::command::prepare_runtime_command_for_retention_internal(&mut command)?;
+    let reservation = budget.reserve(retention.retained_bytes())?;
     Ok(QueuedRuntimeCommand {
         command,
         reservation,
@@ -1379,11 +1378,13 @@ impl Worker {
     }
 
     fn handle_command(&mut self, mut command: RuntimeCommand) {
-        if crate::command::validate_host_command(&command).is_err() {
+        // All production senders already use this primitive before queue retention. Reapplying it
+        // here is an idempotent defense for direct/internal producers and preserves fail-closed
+        // worker semantics without duplicating validation or canonicalization rules.
+        if crate::command::prepare_runtime_command_for_retention_internal(&mut command).is_err() {
             self.reject_invalid_command(&command);
             return;
         }
-        crate::command::canonicalize_host_command(&mut command);
         match command {
             RuntimeCommand::SpawnShell {
                 cols,
@@ -4232,7 +4233,7 @@ mod tests {
     }
 
     #[test]
-    fn every_runtime_sender_uses_the_shared_nonclone_byte_reservation() {
+    fn every_runtime_sender_uses_shared_preparation_and_nonclone_byte_reservation() {
         let production = include_str!("in_process.rs")
             .split("#[cfg(test)]\nmod tests")
             .next()
@@ -4244,15 +4245,25 @@ mod tests {
         assert!(!production.contains("try_send(command)"));
         assert!(!production.contains("#[derive(Clone)]\nstruct QueuedRuntimeCommand"));
         assert!(production.contains("command.into_command()"));
+        let queue_preparation = production
+            .split("fn prepare_queued_command")
+            .nth(1)
+            .unwrap()
+            .split("struct Worker")
+            .next()
+            .unwrap();
+        assert!(
+            queue_preparation
+                .contains("prepare_runtime_command_for_retention_internal(&mut command)")
+        );
         let worker_handler = production.split("fn handle_command").nth(1).unwrap();
-        let validation = worker_handler
-            .find("validate_host_command(&command)")
-            .unwrap();
-        let canonicalization = worker_handler
-            .find("canonicalize_host_command(&mut command)")
-            .unwrap();
-        let dispatch = worker_handler.find("match command").unwrap();
-        assert!(validation < canonicalization && canonicalization < dispatch);
+        let worker_handler_prefix = worker_handler.split("match command").next().unwrap();
+        assert!(
+            worker_handler_prefix
+                .contains("prepare_runtime_command_for_retention_internal(&mut command)")
+        );
+        assert!(!worker_handler_prefix.contains("validate_host_command"));
+        assert!(!worker_handler_prefix.contains("canonicalize_host_command"));
     }
 
     #[test]

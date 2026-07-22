@@ -17,7 +17,9 @@ pub mod tls_identity;
 
 pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 pub use command::{
-    MuxPaneId, MuxTabId, RuntimeCommand, SessionId, SplitDirection, WorkspaceRuntimeState,
+    MuxPaneId, MuxTabId, RuntimeCommand, RuntimeCommandPreparationErrorCode,
+    RuntimeCommandRetention, SessionId, SplitDirection, WorkspaceRuntimeState,
+    checked_runtime_command_retention_total, prepare_runtime_command_for_retention,
 };
 pub use event::{AgentConfigCorrelationId, MessageArg, MessagePayload, RuntimeEvent, SpawnKind};
 pub use host::{

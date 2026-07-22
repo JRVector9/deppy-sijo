@@ -49,6 +49,70 @@ fn admission_error(code: &'static str) -> RuntimeAdmissionError {
     RuntimeAdmissionError(code)
 }
 
+/// Stable, payload-free failure returned by the public command-retention preflight.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCommandPreparationErrorCode {
+    InvalidCommand,
+    ResourceLimit,
+}
+
+impl RuntimeCommandPreparationErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidCommand => "invalid_command",
+            Self::ResourceLimit => "resource_limit",
+        }
+    }
+}
+
+impl std::fmt::Debug for RuntimeCommandPreparationErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for RuntimeCommandPreparationErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for RuntimeCommandPreparationErrorCode {}
+
+/// Actual bytes retained by a validated, capacity-canonicalized command. `Debug` deliberately
+/// omits the value so diagnostics remain low-cardinality; callers use the accessor for accounting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeCommandRetention {
+    retained_bytes: usize,
+}
+
+impl RuntimeCommandRetention {
+    pub const fn retained_bytes(self) -> usize {
+        self.retained_bytes
+    }
+}
+
+impl std::fmt::Debug for RuntimeCommandRetention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeCommandRetention")
+    }
+}
+
+/// Adds a prepared command to an App/runtime retention aggregate using the exact same 8-MiB
+/// ceiling as the in-process queue. This keeps composition-root accounting free of copied limits.
+pub fn checked_runtime_command_retention_total(
+    retained_bytes: usize,
+    additional_bytes: usize,
+) -> Result<usize, RuntimeCommandPreparationErrorCode> {
+    let total = retained_bytes
+        .checked_add(additional_bytes)
+        .ok_or(RuntimeCommandPreparationErrorCode::ResourceLimit)?;
+    if total > RUNTIME_COMMAND_QUEUE_BYTES_MAX {
+        return Err(RuntimeCommandPreparationErrorCode::ResourceLimit);
+    }
+    Ok(total)
+}
+
 /// Opaque launch correlation ids are bounded before entering the final host
 /// queue. Current UUID producers fit comfortably while future adapters retain
 /// room for namespaced ids without making durable event queues attacker-sized.
@@ -488,6 +552,36 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::ScrollToPrompt { .. }
         | RuntimeCommand::ExtractLastOutput { .. } => {}
     }
+}
+
+/// Validates a host command, canonicalizes all owned backing allocations to their logical
+/// lengths, and only then measures its actual retained capacity. Success leaves `command` ready
+/// for bounded App/runtime retention. Failure exposes only a stable low-cardinality code.
+///
+/// The individual command ceiling intentionally reuses the in-process queue's byte ceiling so an
+/// App-retained command can never pass this preflight but fail solely because the runtime uses a
+/// smaller per-command limit.
+pub fn prepare_runtime_command_for_retention(
+    command: &mut RuntimeCommand,
+) -> Result<RuntimeCommandRetention, RuntimeCommandPreparationErrorCode> {
+    prepare_runtime_command_for_retention_internal(command).map_err(|error| match error.0 {
+        "runtime_command_retained_bytes_invalid" | "runtime_command_retained_bytes_limit" => {
+            RuntimeCommandPreparationErrorCode::ResourceLimit
+        }
+        _ => RuntimeCommandPreparationErrorCode::InvalidCommand,
+    })
+}
+
+pub(crate) fn prepare_runtime_command_for_retention_internal(
+    command: &mut RuntimeCommand,
+) -> Result<RuntimeCommandRetention, RuntimeAdmissionError> {
+    validate_host_command(command)?;
+    canonicalize_host_command(command);
+    let retained_bytes = runtime_command_retained_bytes(command)?;
+    if retained_bytes > RUNTIME_COMMAND_QUEUE_BYTES_MAX {
+        return Err(admission_error("runtime_command_retained_bytes_limit"));
+    }
+    Ok(RuntimeCommandRetention { retained_bytes })
 }
 
 fn mux_pane_id_is_valid(id: &MuxPaneId) -> bool {
@@ -1433,6 +1527,126 @@ mod tests {
         let mut output = String::with_capacity(capacity);
         output.push_str(value);
         output
+    }
+
+    #[test]
+    fn retention_preflight_validates_then_canonicalizes_then_measures_capacity() {
+        let mut command = valid_agent_command();
+        let RuntimeCommand::SpawnAgent {
+            command: program, ..
+        } = &mut command
+        else {
+            unreachable!()
+        };
+        *program = spare_string("x", RUNTIME_COMMAND_QUEUE_BYTES_MAX * 2);
+        assert!(
+            runtime_command_retained_bytes(&command).unwrap() > RUNTIME_COMMAND_QUEUE_BYTES_MAX
+        );
+
+        let retention = prepare_runtime_command_for_retention(&mut command).unwrap();
+        assert!(retention.retained_bytes() <= RUNTIME_COMMAND_QUEUE_BYTES_MAX);
+        assert_eq!(
+            retention.retained_bytes(),
+            runtime_command_retained_bytes(&command).unwrap()
+        );
+        let RuntimeCommand::SpawnAgent {
+            command: program, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        assert_eq!(program.capacity(), program.len());
+        assert_eq!(format!("{retention:?}"), "RuntimeCommandRetention");
+
+        for invalid_program in [
+            spare_string("", 64 * 1024),
+            spare_string("bad\0program", 64 * 1024),
+            "x".repeat(COMMAND_BYTES_MAX + 1),
+        ] {
+            let mut invalid = valid_agent_command();
+            let RuntimeCommand::SpawnAgent {
+                command: program, ..
+            } = &mut invalid
+            else {
+                unreachable!()
+            };
+            *program = invalid_program;
+            let original_capacity = program.capacity();
+            assert_eq!(
+                prepare_runtime_command_for_retention(&mut invalid),
+                Err(RuntimeCommandPreparationErrorCode::InvalidCommand)
+            );
+            let RuntimeCommand::SpawnAgent {
+                command: program, ..
+            } = &invalid
+            else {
+                unreachable!()
+            };
+            assert_eq!(program.capacity(), original_capacity);
+        }
+        assert_eq!(
+            format!("{:?}", RuntimeCommandPreparationErrorCode::InvalidCommand),
+            "invalid_command"
+        );
+        assert_eq!(
+            format!("{:?}", RuntimeCommandPreparationErrorCode::ResourceLimit),
+            "resource_limit"
+        );
+    }
+
+    #[test]
+    fn retention_preflight_accepts_a_maximum_valid_agent_command() {
+        let argument_count = ARG_AGGREGATE_BYTES_MAX / ARG_BYTES_MAX;
+        let environment_count = ENV_AGGREGATE_BYTES_MAX / ENV_VALUE_BYTES_MAX;
+        let final_environment_value = ENV_AGGREGATE_BYTES_MAX
+            - environment_count
+            - (environment_count - 1) * ENV_VALUE_BYTES_MAX;
+        let mut command = RuntimeCommand::SpawnAgent {
+            cols: 256,
+            rows: 256,
+            scrollback_lines: SCROLLBACK_LINES_MAX,
+            agent_config_id: Some("a".repeat(AGENT_CONFIG_ID_MAX_BYTES)),
+            command: "x".repeat(COMMAND_BYTES_MAX),
+            args: vec!["x".repeat(ARG_BYTES_MAX); argument_count],
+            env_plain: (0..environment_count)
+                .map(|index| {
+                    let value_bytes = if index + 1 == environment_count {
+                        final_environment_value
+                    } else {
+                        ENV_VALUE_BYTES_MAX
+                    };
+                    ("K".to_owned(), "x".repeat(value_bytes))
+                })
+                .collect(),
+            env_secrets: Vec::new(),
+            waiting_regex: Some("x".repeat(REGEX_BYTES_MAX)),
+            approval_regex: Some("x".repeat(REGEX_BYTES_MAX)),
+            error_regex: Some("x".repeat(REGEX_BYTES_MAX)),
+            done_regex: Some("x".repeat(REGEX_BYTES_MAX)),
+        };
+
+        let retention = prepare_runtime_command_for_retention(&mut command).unwrap();
+        assert!(retention.retained_bytes() <= RUNTIME_COMMAND_QUEUE_BYTES_MAX);
+        assert_eq!(
+            retention.retained_bytes(),
+            runtime_command_retained_bytes(&command).unwrap()
+        );
+    }
+
+    #[test]
+    fn retention_aggregate_uses_the_exact_runtime_queue_ceiling() {
+        assert_eq!(
+            checked_runtime_command_retention_total(0, RUNTIME_COMMAND_QUEUE_BYTES_MAX),
+            Ok(RUNTIME_COMMAND_QUEUE_BYTES_MAX)
+        );
+        assert_eq!(
+            checked_runtime_command_retention_total(RUNTIME_COMMAND_QUEUE_BYTES_MAX, 1),
+            Err(RuntimeCommandPreparationErrorCode::ResourceLimit)
+        );
+        assert_eq!(
+            checked_runtime_command_retention_total(usize::MAX, 1),
+            Err(RuntimeCommandPreparationErrorCode::ResourceLimit)
+        );
     }
 
     #[test]

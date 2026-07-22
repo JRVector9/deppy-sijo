@@ -36,6 +36,146 @@ const WORKSPACE_PROTOCOL_QUERY_MAX_BYTES: usize = 32 * 1024;
 const WORKSPACE_PROTOCOL_ID_MAX_BYTES: usize = 128;
 const WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS: usize = 256;
 const WORKSPACE_PROTOCOL_SCROLLBACK_MAX_LINES: usize = 100_000;
+const SESSION_PROJECT_NAME_MAX_ITEMS: usize = 256;
+const SESSION_PROJECT_NAME_MAX_BYTES: usize = 1_024;
+const SESSION_PROJECT_NAME_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionProjectNameSnapshotError {
+    InvalidRevision,
+    TooManyItems,
+    InvalidCwd,
+    InvalidName,
+    DuplicateSession,
+    ByteBudgetExceeded,
+}
+
+#[derive(Clone)]
+struct SessionProjectNameEntry {
+    session: SessionId,
+    cwd: Arc<str>,
+    name: Arc<str>,
+}
+
+/// Bounded immutable projection of project display names computed by the App host.
+///
+/// Entries include the cwd used to compute the name so a late snapshot cannot label a session
+/// after that shell has moved. Cloning the snapshot clones only one `Arc`; render performs a
+/// binary-search lookup and never probes the filesystem.
+#[derive(Clone, Default)]
+pub struct SessionProjectNameSnapshot {
+    revision: u64,
+    entries: Arc<[SessionProjectNameEntry]>,
+    retained_bytes: usize,
+}
+
+impl SessionProjectNameSnapshot {
+    pub fn try_new(
+        revision: u64,
+        entries: Vec<(SessionId, String, String)>,
+    ) -> Result<Self, SessionProjectNameSnapshotError> {
+        if revision == 0 {
+            return Err(SessionProjectNameSnapshotError::InvalidRevision);
+        }
+        if entries.len() > SESSION_PROJECT_NAME_MAX_ITEMS {
+            return Err(SessionProjectNameSnapshotError::TooManyItems);
+        }
+
+        let mut retained_bytes = 0usize;
+        let mut entries = entries
+            .into_iter()
+            .map(|(session, cwd, name)| {
+                if cwd.is_empty()
+                    || cwd.len() > WORKSPACE_PATH_MAX_BYTES
+                    || cwd.as_bytes().contains(&0)
+                {
+                    return Err(SessionProjectNameSnapshotError::InvalidCwd);
+                }
+                if name.trim().is_empty()
+                    || name.len() > SESSION_PROJECT_NAME_MAX_BYTES
+                    || name.as_bytes().contains(&0)
+                {
+                    return Err(SessionProjectNameSnapshotError::InvalidName);
+                }
+                retained_bytes = retained_bytes
+                    .checked_add(cwd.len())
+                    .and_then(|bytes| bytes.checked_add(name.len()))
+                    .ok_or(SessionProjectNameSnapshotError::ByteBudgetExceeded)?;
+                if retained_bytes > SESSION_PROJECT_NAME_SNAPSHOT_MAX_BYTES {
+                    return Err(SessionProjectNameSnapshotError::ByteBudgetExceeded);
+                }
+                Ok(SessionProjectNameEntry {
+                    session,
+                    cwd: cwd.into(),
+                    name: name.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_unstable_by_key(|entry| entry.session.0);
+        if entries
+            .windows(2)
+            .any(|window| window[0].session == window[1].session)
+        {
+            return Err(SessionProjectNameSnapshotError::DuplicateSession);
+        }
+        Ok(Self {
+            revision,
+            entries: entries.into(),
+            retained_bytes,
+        })
+    }
+
+    fn project_name(&self, session: SessionId, cwd: &str) -> Option<&str> {
+        let index = self
+            .entries
+            .binary_search_by_key(&session.0, |entry| entry.session.0)
+            .ok()?;
+        let entry = &self.entries[index];
+        (entry.cwd.as_ref() == cwd).then_some(entry.name.as_ref())
+    }
+
+    fn retain_matching_cwds(&self, cwds: &HashMap<SessionId, String>) -> Self {
+        self.filtered(|entry| {
+            cwds.get(&entry.session)
+                .is_some_and(|cwd| cwd == entry.cwd.as_ref())
+        })
+    }
+
+    fn retain_live_sessions(&self, alive: &HashSet<SessionId>) -> Self {
+        self.filtered(|entry| alive.contains(&entry.session))
+    }
+
+    fn filtered(&self, keep: impl Fn(&SessionProjectNameEntry) -> bool) -> Self {
+        if self.entries.iter().all(&keep) {
+            return self.clone();
+        }
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| keep(entry))
+            .cloned()
+            .collect();
+        let retained_bytes = entries
+            .iter()
+            .map(|entry| entry.cwd.len() + entry.name.len())
+            .sum();
+        Self {
+            revision: self.revision,
+            entries: entries.into(),
+            retained_bytes,
+        }
+    }
+}
+
+impl fmt::Debug for SessionProjectNameSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionProjectNameSnapshot")
+            .field("entries", &self.entries.len())
+            .field("retained_bytes", &self.retained_bytes)
+            .finish()
+    }
+}
 
 /// Capacity-one, immutable request for the composition root to deliver through
 /// the operating-system notification API. Workspace rendering only stages this
@@ -546,8 +686,10 @@ pub struct WorkspaceUi {
     ui_scale: f32,
     /// 세션별 현재 작업 폴더(App이 매 프레임 set) — 1행 제목 폴더명/프로젝트명 원천.
     session_cwds: std::collections::HashMap<SessionId, String>,
-    /// 세션 위치 표시명 스타일(설정 미러 — set_session_cwds가 매 프레임 갱신).
-    session_name_style: crate::config::SessionNameStyle,
+    /// App host가 filesystem 밖에서 미리 계산한 세션별 프로젝트 표시명. cwd를 함께
+    /// 검증하므로 늦은 결과가 이동한 셸의 제목을 덮지 못하고, immutable Arc snapshot이라
+    /// 동일 revision setter는 전체 맵을 복제하지 않는다.
+    session_project_names: SessionProjectNameSnapshot,
     /// 세션별 에이전트 표시정보(model/effort/context — App이 병합해 set) — 3줄 행 2/3행.
     agent_info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
     /// App host가 수행 중인 terminal clipboard 요청. completion은 operation/generation을
@@ -920,7 +1062,7 @@ impl WorkspaceUi {
             last_text_paste: None,
             last_native_paste: None,
             session_cwds: std::collections::HashMap::new(),
-            session_name_style: crate::config::SessionNameStyle::default(),
+            session_project_names: SessionProjectNameSnapshot::default(),
             agent_info: std::collections::HashMap::new(),
             pending_paste: None,
             error: None,
@@ -1566,13 +1708,25 @@ impl WorkspaceUi {
     pub fn set_session_cwds(
         &mut self,
         cwds: std::collections::HashMap<SessionId, String>,
-        style: crate::config::SessionNameStyle,
+        _style: crate::config::SessionNameStyle,
     ) {
         if self.session_cwds != cwds {
             self.session_cwds = cwds;
+            self.session_project_names = self
+                .session_project_names
+                .retain_matching_cwds(&self.session_cwds);
             self.invalidate_path_resolution();
         }
-        self.session_name_style = style;
+    }
+
+    /// Installs an App-computed immutable project-name projection. Repeated calls with the same
+    /// revision are O(1) and retain the existing Arc. The App must update cwd state first; entries
+    /// for missing or already-moved sessions are discarded at this boundary.
+    pub fn set_session_project_names(&mut self, snapshot: SessionProjectNameSnapshot) {
+        if snapshot.revision <= self.session_project_names.revision {
+            return;
+        }
+        self.session_project_names = snapshot.retain_matching_cwds(&self.session_cwds);
     }
 
     /// 「에이전트로 보내기」 프리셋을 세팅한다(App이 설정에서 매 프레임 미러).
@@ -1635,13 +1789,17 @@ impl WorkspaceUi {
         if !is_default_session_title(raw) {
             return display_pane_title(raw, catalog); // 사용자 rename — 그대로 고정
         }
-        // 현재 작업 폴더명(git 프로젝트명) — 세션별 cwd(App이 매 프레임 set).
+        // 프로젝트명은 App host가 cwd별로 미리 계산한 bounded immutable projection이다.
         if let Some(n) = session
-            .and_then(|s| self.session_cwds.get(&s))
-            .and_then(|c| crate::agent_detect::project_display_name(c, self.session_name_style))
+            .and_then(|session| {
+                self.session_cwds.get(&session).and_then(|cwd| {
+                    self.session_project_names
+                        .project_name(session, cwd.as_str())
+                })
+            })
             .filter(|t| !t.trim().is_empty())
         {
-            return n;
+            return n.to_owned();
         }
         // cwd 미탐지(pid 없음/lsof 지연) 폴백: OSC 타이틀 > 프로젝트명 > 기본.
         if let Some(t) = osc.map(str::trim).filter(|t| !t.is_empty()) {
@@ -1686,6 +1844,8 @@ impl WorkspaceUi {
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
+                    self.session_project_names =
+                        self.session_project_names.retain_live_sessions(&alive);
                     self.last_output_copy_pending
                         .retain(|id| alive.contains(id));
                     // 검색 중인 세션이 사라지면 검색 바를 닫는다.
@@ -5082,6 +5242,114 @@ mod tests {
                 "workspace production source contains a direct effect: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_production_title_path에는_project_name_filesystem_probe가_없다() {
+        let source = include_str!("workspace.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        for forbidden in [
+            "agent_detect::project_display_name",
+            "std::fs::",
+            "fs::metadata(",
+            "read_dir(",
+            "canonicalize(",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "workspace production title path contains filesystem lookup: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn precomputed_project_name_snapshot은_exact_session_cwd에만_적용된다() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let session = SessionId(7);
+        let mut ui = WorkspaceUi::new();
+        ui.set_session_cwds(
+            HashMap::from([(session, "/workspace/repo".to_owned())]),
+            crate::config::SessionNameStyle::Repo,
+        );
+        let snapshot = SessionProjectNameSnapshot::try_new(
+            1,
+            vec![(
+                session,
+                "/workspace/repo".to_owned(),
+                "precomputed-repo".to_owned(),
+            )],
+        )
+        .unwrap();
+        ui.set_session_project_names(snapshot);
+
+        assert_eq!(
+            ui.resolve_session_title("workspace.spawn.shell 1", Some(session), None, &catalog),
+            "precomputed-repo"
+        );
+        ui.set_session_cwds(
+            HashMap::from([(session, "/workspace/other".to_owned())]),
+            crate::config::SessionNameStyle::Repo,
+        );
+        assert!(ui.session_project_names.entries.is_empty());
+        assert_eq!(
+            ui.resolve_session_title(
+                "workspace.spawn.shell 1",
+                Some(session),
+                Some("osc-title"),
+                &catalog,
+            ),
+            "osc-title"
+        );
+    }
+
+    #[test]
+    fn project_name_snapshot은_bounded이고_clone과_same_revision_setter는_arc만_공유한다() {
+        let session = SessionId(1);
+        let snapshot = SessionProjectNameSnapshot::try_new(
+            1,
+            vec![(session, "/workspace".to_owned(), "repo".to_owned())],
+        )
+        .unwrap();
+        let clone = snapshot.clone();
+        assert!(Arc::ptr_eq(&snapshot.entries, &clone.entries));
+
+        let mut ui = WorkspaceUi::new();
+        ui.set_session_cwds(
+            HashMap::from([(session, "/workspace".to_owned())]),
+            crate::config::SessionNameStyle::Folder,
+        );
+        ui.set_session_project_names(snapshot);
+        let retained = Arc::clone(&ui.session_project_names.entries);
+        ui.set_session_project_names(clone);
+        assert!(Arc::ptr_eq(&retained, &ui.session_project_names.entries));
+
+        let too_many = (0..=SESSION_PROJECT_NAME_MAX_ITEMS)
+            .map(|index| {
+                (
+                    SessionId(index as u64 + 1),
+                    format!("/workspace/{index}"),
+                    format!("repo-{index}"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            SessionProjectNameSnapshot::try_new(2, too_many).unwrap_err(),
+            SessionProjectNameSnapshotError::TooManyItems
+        );
+        assert_eq!(
+            SessionProjectNameSnapshot::try_new(
+                2,
+                vec![
+                    (session, "/workspace/a".to_owned(), "a".to_owned()),
+                    (session, "/workspace/b".to_owned(), "b".to_owned()),
+                ],
+            )
+            .unwrap_err(),
+            SessionProjectNameSnapshotError::DuplicateSession
+        );
     }
 
     #[test]

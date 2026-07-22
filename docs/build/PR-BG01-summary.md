@@ -168,3 +168,19 @@ app all-target check passes, and strict Clippy passes with only expected pre-wir
 excluded. Scoped rustfmt and diff-check pass. The eager app worker, timer fallbacks, and ungated
 launch paths remain the atomic root cutover and literal strict-Clippy gate; no production dual path
 is claimed by this foundation.
+
+## Workspace project-name render boundary
+
+`WorkspaceUi` no longer calls project-name discovery or filesystem APIs from title rendering.
+It consumes a revisioned immutable `(SessionId, cwd) -> display name` projection computed by the
+App host, bounded to 256 entries, 1 KiB per name, and 4 MiB retained text. Lookup is a binary
+search over one `Arc<[Entry]>`; clones and same-revision installs reuse that allocation, and cwd
+or mux-liveness changes prune stale labels before they can be rendered. Debug output contains only
+entry and byte counts.
+
+Root independently reran all 58 workspace tests and diff-check. Fake-snapshot exact/stale/bounds
+tests, the production-prefix filesystem source law, default all-target check, dead-code-exempt
+strict Clippy, full fmt, and the manual forbidden scan pass. Optional all-features validation is
+environment-blocked because `libghostty-vt-sys` attempts a GitHub DNS fetch; no source workaround
+was added. Root still must compute and install the projection off-render, incrementing its revision
+on cwd or name-style changes.

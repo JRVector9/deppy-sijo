@@ -9,9 +9,11 @@ const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// Runtime-generated approval session keys are `{workspace UUID}:{u64}`: at most 36 + 1 + 20
 /// bytes. Validate this borrowed input before opening a transaction or binding it to SQLite.
-pub const PENDING_APPROVAL_SESSION_KEY_BYTES_MAX: usize = 57;
+pub const PENDING_APPROVAL_SESSION_KEY_BYTES_MAX: usize =
+    mcp_store::PENDING_APPROVAL_SESSION_KEY_BYTES_MAX;
 /// One session exit may resolve only this many pending approvals in one bounded transaction.
-pub const PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX: usize = 256;
+pub const PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX: usize =
+    mcp_store::PENDING_APPROVAL_SESSION_LIMIT_MAX;
 
 const SESSION_CLOSED_APPROVAL_ERROR_CODE: &str = "session_closed";
 
@@ -3317,6 +3319,15 @@ impl Db {
         mcp_store::list_pending_approvals(&self.conn)
     }
 
+    /// Bounded pending page for event-driven approval wake handling. The storage layer performs
+    /// its byte preflight before materializing any SQLite text.
+    pub fn list_pending_approvals_bounded(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<mcp_store::PendingApprovalPage> {
+        mcp_store::list_pending_approvals_bounded(&self.conn, limit)
+    }
+
     /// GUI가 결정을 되쓴다 — first-writer-wins, 이미 해소된 id는 조용한 no-op.
     pub fn resolve_approval(
         &self,
@@ -3338,6 +3349,12 @@ impl Db {
         resolved_at: i64,
     ) -> anyhow::Result<usize> {
         mcp_store::expire_pending_approvals(&self.conn, older_than_epoch_secs, resolved_at)
+    }
+
+    /// Denies bounded session-owned pending rows left by a prior app/runtime incarnation. Rows
+    /// without a runtime session key are owned by another authorization scope and remain intact.
+    pub fn deny_session_scoped_pending_approvals(&self, resolved_at: i64) -> anyhow::Result<usize> {
+        mcp_store::deny_session_scoped_pending_approvals(&self.conn, resolved_at)
     }
 
     /// Ends pending approvals owned by one exact runtime session. The static
@@ -4625,7 +4642,7 @@ mod tests {
     }
 
     #[test]
-    fn session_cleanup은_key와_candidate_count를_선할당없이_제한한다() {
+    fn session_cleanup은_key와_insert_candidate_count를_선할당없이_제한한다() {
         let db = Db::open_in_memory().unwrap();
         let exact_max = "00000000-0000-0000-0000-000000000000:18446744073709551615";
         assert_eq!(exact_max.len(), PENDING_APPROVAL_SESSION_KEY_BYTES_MAX);
@@ -4648,7 +4665,7 @@ mod tests {
                 .is_err()
         );
 
-        for index in 0..=PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX {
+        for index in 0..PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX {
             db.insert_pending_approval(
                 &format!("bounded-cleanup-{index}"),
                 "srv",
@@ -4661,9 +4678,20 @@ mod tests {
             .unwrap();
         }
         let error = db
-            .deny_pending_approvals_for_session(exact_max, 200)
+            .insert_pending_approval(
+                "bounded-cleanup-overflow",
+                "srv",
+                "tool",
+                "{}",
+                None,
+                100,
+                Some(exact_max),
+            )
             .unwrap_err();
-        assert_eq!(error.to_string(), SESSION_CLOSED_APPROVAL_ERROR_CODE);
+        assert_eq!(
+            error.to_string(),
+            mcp_store::PENDING_APPROVAL_SESSION_LIMIT_ERROR
+        );
         let pending_count: i64 = db
             .conn
             .query_row(
@@ -4675,8 +4703,71 @@ mod tests {
             .unwrap();
         assert_eq!(
             pending_count,
-            i64::try_from(PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX + 1).unwrap()
+            i64::try_from(PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX).unwrap()
         );
+        assert_eq!(
+            db.deny_pending_approvals_for_session(exact_max, 200)
+                .unwrap(),
+            PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX
+        );
+    }
+
+    #[test]
+    fn pending_global_cap은_concurrent_immediate_writers에서_overshoot하지_않는다() {
+        let (dir, path, db) = file_db("pending-concurrent-cap");
+        let rows = (0..(mcp_store::PENDING_APPROVAL_GLOBAL_LIMIT_MAX - 1))
+            .map(|index| mcp_store::PendingApprovalInsert {
+                id: format!("seed-{index}"),
+                server_id: "srv".to_owned(),
+                tool_name: "tool".to_owned(),
+                arguments_preview: "{}".to_owned(),
+                schema_hash: None,
+                created_at: 1,
+                pane_id: None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mcp_store::insert_pending_approval_batch(&db.conn, &rows).unwrap(),
+            rows.len()
+        );
+        drop(db);
+
+        let db_a = Db::open(&path).unwrap();
+        let db_b = Db::open(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn_writer =
+            |db: Db, id: &'static str, barrier: std::sync::Arc<std::sync::Barrier>| {
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.insert_pending_approval(id, "srv", "tool", "{}", None, 2, None)
+                        .map_err(|error| error.to_string())
+                })
+            };
+        let writer_a = spawn_writer(db_a, "winner-a", barrier.clone());
+        let writer_b = spawn_writer(db_b, "winner-b", barrier.clone());
+        barrier.wait();
+        let results = [writer_a.join().unwrap(), writer_b.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![mcp_store::PENDING_APPROVAL_GLOBAL_LIMIT_ERROR]
+        );
+
+        let reopened = Db::open(&path).unwrap();
+        let page = reopened
+            .list_pending_approvals_bounded(mcp_store::PENDING_APPROVAL_LIST_LIMIT_MAX)
+            .unwrap();
+        assert_eq!(
+            page.rows.len(),
+            mcp_store::PENDING_APPROVAL_GLOBAL_LIMIT_MAX
+        );
+        assert!(!page.has_more);
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

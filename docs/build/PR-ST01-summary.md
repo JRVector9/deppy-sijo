@@ -1,5 +1,27 @@
 # PR-ST01 — Storage/Audit Transactions
 
+## 2026-07-22 bounded approval-inbox amendment
+
+The durable approval inbox now fails closed at 256 live rows globally and per runtime session, with
+a 1 MiB aggregate retained-text ceiling and fixed byte ceilings for every field. All text is
+validated for size and NUL before a transaction. Batch duplicates and aggregate bytes are checked
+before mutation; an IMMEDIATE transaction then serializes the same-snapshot count/byte/session
+preflight with insertion, so concurrent writers cannot overshoot the bound.
+
+Reads preflight `COUNT` and SQLite byte lengths before materializing `String` values and use
+`LIMIT n+1`; corrupt legacy overflow returns an error rather than a partial approval list. Startup
+reconciliation atomically denies at most 256 session-scoped pending rows and changes zero rows on
+overflow or injected failure. The public row/insert/page `Debug` output contains only presence
+booleans, row count, and `has_more`; operation/server/tool/preview/session/time values are excluded.
+
+Root verification for the amendment:
+
+- `cargo test -p mcp-store -- --test-threads=1`: 40/40 plus doc-tests passed.
+- `cargo test -p storage -- --test-threads=1`: 133/133 plus doc-tests passed.
+- The 255-row concurrent-writer regression admits exactly one writer and retains 256 rows.
+- All-target check, strict Clippy, rustfmt/diff-check, and the workspace security scan passed.
+- Dependency law passed and the boundary count remains the same 53 existing exceptions.
+
 ## Outcome
 
 PR-ST01 adds the durable transaction and audit primitives needed by the Connector service cutover.

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use mcp_store::PendingApprovalInsert;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 /// Background SQLite writer configuration for hot metadata paths.
 #[derive(Debug, Clone)]
@@ -501,7 +501,9 @@ fn flush_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    let tx = conn.transaction()?;
+    // Pending-approval cap probes must serialize with every other writer before they read the
+    // current count/byte budget. IMMEDIATE also keeps mixed status/log/approval batches atomic.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     if !batch.status_updates.is_empty() {
         let mut stmt = tx.prepare(

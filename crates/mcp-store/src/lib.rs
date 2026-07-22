@@ -128,7 +128,7 @@ pub struct ApprovalOutcome {
 }
 
 /// pending 상태 승인 요청 한 행 (GUI 목록/팝업용).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingApprovalRow {
     pub id: String,
     pub server_id: String,
@@ -148,8 +148,18 @@ pub struct PendingApprovalRow {
     pub pane_id: Option<String>,
 }
 
+impl std::fmt::Debug for PendingApprovalRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingApprovalRow")
+            .field("has_schema_hash", &self.schema_hash.is_some())
+            .field("has_session_key", &self.pane_id.is_some())
+            .finish()
+    }
+}
+
 /// 새 pending approval insert 요청. 표시 문자열은 이미 redacted된 preview만 허용한다.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingApprovalInsert {
     pub id: String,
     pub server_id: String,
@@ -159,6 +169,58 @@ pub struct PendingApprovalInsert {
     pub created_at: i64,
     /// 요청 pane_id (I2 — proxy가 env로 아는 값. 없으면 None → "세션 불명").
     pub pane_id: Option<String>,
+}
+
+impl std::fmt::Debug for PendingApprovalInsert {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingApprovalInsert")
+            .field("has_schema_hash", &self.schema_hash.is_some())
+            .field("has_session_key", &self.pane_id.is_some())
+            .finish()
+    }
+}
+
+/// Hard limits for the durable approval inbox. The GUI currently presents one bounded snapshot,
+/// so storage must reject a 257th live row instead of relying on every caller to paginate safely.
+pub const PENDING_APPROVAL_GLOBAL_LIMIT_MAX: usize = 256;
+pub const PENDING_APPROVAL_SESSION_LIMIT_MAX: usize = 256;
+pub const PENDING_APPROVAL_LIST_LIMIT_MAX: usize = 256;
+pub const PENDING_APPROVAL_RETAINED_BYTES_MAX: usize = 1024 * 1024;
+
+/// Per-field insert ceilings. Approval previews are produced from at most 500 Unicode scalar
+/// values by the authorization layer; 2 KiB covers their maximum UTF-8 representation with a
+/// small fixed margin. The other values are identifiers, method names, or fixed-size hashes.
+pub const PENDING_APPROVAL_ID_BYTES_MAX: usize = 128;
+pub const PENDING_APPROVAL_SERVER_ID_BYTES_MAX: usize = 256;
+pub const PENDING_APPROVAL_TOOL_NAME_BYTES_MAX: usize = 4 * 1024;
+pub const PENDING_APPROVAL_PREVIEW_BYTES_MAX: usize = 2 * 1024;
+pub const PENDING_APPROVAL_SCHEMA_HASH_BYTES_MAX: usize = 128;
+pub const PENDING_APPROVAL_SESSION_KEY_BYTES_MAX: usize = 57;
+
+pub const PENDING_APPROVAL_GLOBAL_LIMIT_ERROR: &str = "pending_approval_global_limit";
+pub const PENDING_APPROVAL_SESSION_LIMIT_ERROR: &str = "pending_approval_session_limit";
+pub const PENDING_APPROVAL_LIST_LIMIT_ERROR: &str = "pending_approval_list_limit";
+pub const PENDING_APPROVAL_RETAINED_BYTES_ERROR: &str = "pending_approval_retained_bytes_limit";
+pub const PENDING_APPROVAL_INSERT_ERROR: &str = "pending_approval_insert_failed";
+const PENDING_APPROVAL_FIELD_LIMIT_ERROR: &str = "pending_approval_field_limit";
+
+/// Bounded approval page. `has_more` is derived from a `LIMIT limit + 1` probe; the extra row is
+/// discarded before returning so callers never retain more than their requested bound.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingApprovalPage {
+    pub rows: Vec<PendingApprovalRow>,
+    pub has_more: bool,
+}
+
+impl std::fmt::Debug for PendingApprovalPage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingApprovalPage")
+            .field("row_count", &self.rows.len())
+            .field("has_more", &self.has_more)
+            .finish()
+    }
 }
 
 pub fn list_permission_rules(conn: &Connection) -> anyhow::Result<Vec<PermissionRuleRow>> {
@@ -284,6 +346,14 @@ pub fn insert_pending_approval(
     created_at: i64,
     pane_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    validate_pending_approval_values(
+        id,
+        server_id,
+        tool_name,
+        arguments_preview,
+        schema_hash,
+        pane_id,
+    )?;
     let row = PendingApprovalInsert {
         id: id.to_owned(),
         server_id: server_id.to_owned(),
@@ -305,6 +375,162 @@ pub fn insert_pending_approval_batch(
     if rows.is_empty() {
         return Ok(0);
     }
+
+    let incoming_bytes = validate_pending_approval_batch(rows)?;
+    if conn.is_autocommit() {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("pending approval write transaction unavailable")?;
+        let inserted = insert_pending_approval_batch_in_transaction(&tx, rows, incoming_bytes)?;
+        tx.commit()
+            .context("pending approval write transaction commit failed")?;
+        Ok(inserted)
+    } else {
+        // The storage write worker already owns the surrounding transaction. Its transaction is
+        // IMMEDIATE, so the cap probes and inserts are serialized with other SQLite writers.
+        insert_pending_approval_batch_in_transaction(conn, rows, incoming_bytes)
+    }
+}
+
+fn validate_pending_approval_batch(rows: &[PendingApprovalInsert]) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        rows.len() <= PENDING_APPROVAL_GLOBAL_LIMIT_MAX,
+        PENDING_APPROVAL_GLOBAL_LIMIT_ERROR
+    );
+    let mut ids = std::collections::HashSet::with_capacity(rows.len());
+    let mut retained_bytes = 0usize;
+    for row in rows {
+        anyhow::ensure!(
+            ids.insert(row.id.as_str()),
+            PENDING_APPROVAL_FIELD_LIMIT_ERROR
+        );
+        validate_pending_approval_values(
+            &row.id,
+            &row.server_id,
+            &row.tool_name,
+            &row.arguments_preview,
+            row.schema_hash.as_deref(),
+            row.pane_id.as_deref(),
+        )?;
+        retained_bytes = retained_bytes
+            .checked_add(pending_approval_insert_bytes(row))
+            .context(PENDING_APPROVAL_RETAINED_BYTES_ERROR)?;
+    }
+    anyhow::ensure!(
+        retained_bytes <= PENDING_APPROVAL_RETAINED_BYTES_MAX,
+        PENDING_APPROVAL_RETAINED_BYTES_ERROR
+    );
+    Ok(retained_bytes)
+}
+
+fn validate_pending_approval_values(
+    id: &str,
+    server_id: &str,
+    tool_name: &str,
+    arguments_preview: &str,
+    schema_hash: Option<&str>,
+    session_key: Option<&str>,
+) -> anyhow::Result<()> {
+    validate_required_pending_field(id, PENDING_APPROVAL_ID_BYTES_MAX)?;
+    validate_required_pending_field(server_id, PENDING_APPROVAL_SERVER_ID_BYTES_MAX)?;
+    validate_required_pending_field(tool_name, PENDING_APPROVAL_TOOL_NAME_BYTES_MAX)?;
+    validate_pending_field(arguments_preview, PENDING_APPROVAL_PREVIEW_BYTES_MAX)?;
+    if let Some(schema_hash) = schema_hash {
+        validate_pending_field(schema_hash, PENDING_APPROVAL_SCHEMA_HASH_BYTES_MAX)?;
+    }
+    if let Some(session_key) = session_key {
+        validate_required_pending_field(session_key, PENDING_APPROVAL_SESSION_KEY_BYTES_MAX)?;
+    }
+    Ok(())
+}
+
+fn validate_required_pending_field(value: &str, max_bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(!value.is_empty(), PENDING_APPROVAL_FIELD_LIMIT_ERROR);
+    validate_pending_field(value, max_bytes)
+}
+
+fn validate_pending_field(value: &str, max_bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.len() <= max_bytes && !value.as_bytes().contains(&0),
+        PENDING_APPROVAL_FIELD_LIMIT_ERROR
+    );
+    Ok(())
+}
+
+fn pending_approval_insert_bytes(row: &PendingApprovalInsert) -> usize {
+    row.id.len()
+        + row.server_id.len()
+        + row.tool_name.len()
+        + row.arguments_preview.len()
+        + row.schema_hash.as_ref().map_or(0, String::len)
+        + row.pane_id.as_ref().map_or(0, String::len)
+}
+
+fn pending_approval_count_and_bytes(conn: &Connection) -> anyhow::Result<(usize, usize)> {
+    let (count, retained_bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(
+                    length(CAST(id AS BLOB)) +
+                    length(CAST(server_id AS BLOB)) +
+                    length(CAST(tool_name AS BLOB)) +
+                    length(CAST(arguments_preview AS BLOB)) +
+                    length(CAST(COALESCE(schema_hash, '') AS BLOB)) +
+                    length(CAST(COALESCE(pane_id, '') AS BLOB))
+                ), 0)
+         FROM pending_approvals WHERE status = 'pending'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let count = usize::try_from(count).context(PENDING_APPROVAL_LIST_LIMIT_ERROR)?;
+    let retained_bytes =
+        usize::try_from(retained_bytes).context(PENDING_APPROVAL_RETAINED_BYTES_ERROR)?;
+    Ok((count, retained_bytes))
+}
+
+fn insert_pending_approval_batch_in_transaction(
+    conn: &Connection,
+    rows: &[PendingApprovalInsert],
+    incoming_bytes: usize,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "pending approval insert requires transaction"
+    );
+    let mut additions_by_session = std::collections::HashMap::<&str, usize>::new();
+    for row in rows {
+        if let Some(session_key) = row.pane_id.as_deref() {
+            *additions_by_session.entry(session_key).or_default() += 1;
+        }
+    }
+    let mut session_count = conn.prepare_cached(
+        "SELECT COUNT(*) FROM pending_approvals
+         WHERE status = 'pending' AND pane_id = ?1",
+    )?;
+    for (session_key, additions) in additions_by_session {
+        let current: i64 = session_count.query_row([session_key], |row| row.get(0))?;
+        let current = usize::try_from(current).context(PENDING_APPROVAL_SESSION_LIMIT_ERROR)?;
+        anyhow::ensure!(
+            current
+                .checked_add(additions)
+                .is_some_and(|total| total <= PENDING_APPROVAL_SESSION_LIMIT_MAX),
+            PENDING_APPROVAL_SESSION_LIMIT_ERROR
+        );
+    }
+    drop(session_count);
+
+    let (current_count, current_bytes) = pending_approval_count_and_bytes(conn)?;
+    anyhow::ensure!(
+        current_count
+            .checked_add(rows.len())
+            .is_some_and(|total| total <= PENDING_APPROVAL_GLOBAL_LIMIT_MAX),
+        PENDING_APPROVAL_GLOBAL_LIMIT_ERROR
+    );
+    anyhow::ensure!(
+        current_bytes
+            .checked_add(incoming_bytes)
+            .is_some_and(|total| total <= PENDING_APPROVAL_RETAINED_BYTES_MAX),
+        PENDING_APPROVAL_RETAINED_BYTES_ERROR
+    );
+
     let mut stmt = conn.prepare_cached(
         "INSERT INTO pending_approvals
            (id, server_id, tool_name, arguments_preview, schema_hash,
@@ -322,7 +548,7 @@ pub fn insert_pending_approval_batch(
             row.created_at,
             &row.pane_id,
         ))
-        .with_context(|| format!("pending approval 저장 실패: {}", row.id))?;
+        .context(PENDING_APPROVAL_INSERT_ERROR)?;
         inserted += 1;
     }
     Ok(inserted)
@@ -346,20 +572,58 @@ pub fn poll_approval(conn: &Connection, id: &str) -> anyhow::Result<ApprovalOutc
     })
 }
 
-/// pending 상태 요청만, 오래된 순으로 (GUI 목록). id는 tie-break(결정적 순서).
+/// pending 상태 요청만, 오래된 순으로 (GUI 목록). 기존 호출자도 무제한 할당할 수 없게
+/// 저장소 hard max를 적용하며, legacy/corrupt overflow는 일부 목록을 반환하지 않고 거부한다.
 pub fn list_pending_approvals(conn: &Connection) -> anyhow::Result<Vec<PendingApprovalRow>> {
-    // 승인 행만 읽는다. 예전엔 여기서 `LEFT JOIN mux_panes p ON p.id = a.pane_id`로
-    // 세션 UUID/제목을 채우려 했지만, a.pane_id는 런타임 세션 키(`{ws}:{u64}`)이고
-    // mux_panes.id는 UUID라 **절대 매칭되지 않았다** — 2026-07-17 실측으로 확인하고
-    // 조인을 걷어냈다(500ms 폴링마다 헛돌던 조인 2개도 함께 사라진다).
-    // 세션 해석은 pane_id를 파싱해 런타임 상태에서 하는 소비처의 몫이다.
+    let page = list_pending_approvals_bounded(conn, PENDING_APPROVAL_LIST_LIMIT_MAX)?;
+    anyhow::ensure!(!page.has_more, PENDING_APPROVAL_LIST_LIMIT_ERROR);
+    Ok(page.rows)
+}
+
+pub fn list_pending_approvals_bounded(
+    conn: &Connection,
+    limit: usize,
+) -> anyhow::Result<PendingApprovalPage> {
+    anyhow::ensure!(
+        (1..=PENDING_APPROVAL_LIST_LIMIT_MAX).contains(&limit),
+        PENDING_APPROVAL_LIST_LIMIT_ERROR
+    );
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction()?;
+        let page = list_pending_approvals_bounded_in_snapshot(&tx, limit)?;
+        tx.commit()
+            .context("pending approval read transaction commit failed")?;
+        Ok(page)
+    } else {
+        list_pending_approvals_bounded_in_snapshot(conn, limit)
+    }
+}
+
+fn list_pending_approvals_bounded_in_snapshot(
+    conn: &Connection,
+    limit: usize,
+) -> anyhow::Result<PendingApprovalPage> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "pending approval list requires transaction"
+    );
+    // Count and retained bytes are checked before SQLite materializes any TEXT into Rust Strings.
+    // This read and the LIMIT probe share one transaction, so a concurrent writer cannot create a
+    // TOCTOU window between the preflight and mapping.
+    let (_count, retained_bytes) = pending_approval_count_and_bytes(conn)?;
+    anyhow::ensure!(
+        retained_bytes <= PENDING_APPROVAL_RETAINED_BYTES_MAX,
+        PENDING_APPROVAL_RETAINED_BYTES_ERROR
+    );
+    let probe_limit = i64::try_from(limit + 1).context(PENDING_APPROVAL_LIST_LIMIT_ERROR)?;
     let mut stmt = conn.prepare(
         "SELECT a.id, a.server_id, a.tool_name, a.arguments_preview, a.schema_hash,
                 a.created_at, a.pane_id
          FROM pending_approvals a
-         WHERE a.status = 'pending' ORDER BY a.created_at, a.id",
+         WHERE a.status = 'pending' ORDER BY a.created_at, a.id
+         LIMIT ?1",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([probe_limit], |row| {
         Ok(PendingApprovalRow {
             id: row.get(0)?,
             server_id: row.get(1)?,
@@ -370,7 +634,12 @@ pub fn list_pending_approvals(conn: &Connection) -> anyhow::Result<Vec<PendingAp
             pane_id: row.get(6)?,
         })
     })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    let mut rows = rows.collect::<Result<Vec<_>, _>>()?;
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.pop();
+    }
+    Ok(PendingApprovalPage { rows, has_more })
 }
 
 /// GUI가 결정을 되쓴다. first-writer-wins — 없거나 이미 해소된 id면 조용한 no-op(Ok).
@@ -410,6 +679,64 @@ pub fn expire_pending_approvals(
             (older_than_epoch_secs, resolved_at),
         )
         .context("orphan pending 승인 만료 실패")?;
+    Ok(affected)
+}
+
+/// App bootstrap reconciliation for approvals owned by a previous runtime incarnation. Rows
+/// without a session key may belong to an independently managed authorization owner and are left
+/// untouched. The candidate probe and update share one IMMEDIATE transaction, and overflow fails
+/// without changing any row.
+pub fn deny_session_scoped_pending_approvals(
+    conn: &Connection,
+    resolved_at: i64,
+) -> anyhow::Result<usize> {
+    if conn.is_autocommit() {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("pending approval reconciliation transaction unavailable")?;
+        let affected = deny_session_scoped_pending_approvals_in_transaction(&tx, resolved_at)?;
+        tx.commit()
+            .context("pending approval reconciliation transaction commit failed")?;
+        Ok(affected)
+    } else {
+        deny_session_scoped_pending_approvals_in_transaction(conn, resolved_at)
+    }
+}
+
+fn deny_session_scoped_pending_approvals_in_transaction(
+    conn: &Connection,
+    resolved_at: i64,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "pending approval reconciliation requires transaction"
+    );
+    let probe_limit = i64::try_from(PENDING_APPROVAL_GLOBAL_LIMIT_MAX + 1)
+        .context(PENDING_APPROVAL_LIST_LIMIT_ERROR)?;
+    let candidate_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT 1 FROM pending_approvals
+             WHERE status = 'pending' AND pane_id IS NOT NULL
+             LIMIT ?1
+         )",
+        [probe_limit],
+        |row| row.get(0),
+    )?;
+    let candidate_count =
+        usize::try_from(candidate_count).context(PENDING_APPROVAL_LIST_LIMIT_ERROR)?;
+    anyhow::ensure!(
+        candidate_count <= PENDING_APPROVAL_GLOBAL_LIMIT_MAX,
+        PENDING_APPROVAL_LIST_LIMIT_ERROR
+    );
+    let affected = conn.execute(
+        "UPDATE pending_approvals
+         SET status = 'denied', remember = 0, resolved_at = ?1
+         WHERE status = 'pending' AND pane_id IS NOT NULL",
+        [resolved_at],
+    )?;
+    anyhow::ensure!(
+        affected == candidate_count,
+        PENDING_APPROVAL_LIST_LIMIT_ERROR
+    );
     Ok(affected)
 }
 
@@ -1632,6 +1959,18 @@ mod tests {
         conn
     }
 
+    fn pending_insert(id: impl Into<String>, pane_id: Option<&str>) -> PendingApprovalInsert {
+        PendingApprovalInsert {
+            id: id.into(),
+            server_id: "srv".to_owned(),
+            tool_name: "read_file".to_owned(),
+            arguments_preview: "{}".to_owned(),
+            schema_hash: Some("hash".to_owned()),
+            created_at: 10,
+            pane_id: pane_id.map(str::to_owned),
+        }
+    }
+
     fn sample_server() -> McpServerRow {
         McpServerRow {
             id: "srv-1".to_owned(),
@@ -2112,6 +2451,323 @@ mod tests {
         let ids: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert_eq!(rows[0].schema_hash.as_deref(), Some("hash"));
+    }
+
+    #[test]
+    fn pending_insert는_session과_global_256을_transaction에서_강제한다() {
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:2";
+        let conn = test_conn();
+        let rows = (0..PENDING_APPROVAL_SESSION_LIMIT_MAX)
+            .map(|index| pending_insert(format!("session-{index}"), Some(session)))
+            .collect::<Vec<_>>();
+        assert_eq!(insert_pending_approval_batch(&conn, &rows).unwrap(), 256);
+        let error = insert_pending_approval_batch(
+            &conn,
+            &[pending_insert("session-overflow", Some(session))],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), PENDING_APPROVAL_SESSION_LIMIT_ERROR);
+        assert_eq!(list_pending_approvals(&conn).unwrap().len(), 256);
+
+        let global = test_conn();
+        let rows = (0..PENDING_APPROVAL_GLOBAL_LIMIT_MAX)
+            .map(|index| pending_insert(format!("global-{index}"), None))
+            .collect::<Vec<_>>();
+        assert_eq!(insert_pending_approval_batch(&global, &rows).unwrap(), 256);
+        let error =
+            insert_pending_approval_batch(&global, &[pending_insert("global-overflow", None)])
+                .unwrap_err();
+        assert_eq!(error.to_string(), PENDING_APPROVAL_GLOBAL_LIMIT_ERROR);
+        assert_eq!(list_pending_approvals(&global).unwrap().len(), 256);
+    }
+
+    #[test]
+    fn pending_batch는_field_duplicate_bytes와_sql_failure를_insert전에_rollback한다() {
+        let conn = test_conn();
+        let duplicate = vec![pending_insert("same", None), pending_insert("same", None)];
+        assert_eq!(
+            insert_pending_approval_batch(&conn, &duplicate)
+                .unwrap_err()
+                .to_string(),
+            PENDING_APPROVAL_FIELD_LIMIT_ERROR
+        );
+
+        let mut oversized_field = pending_insert("oversized-field", None);
+        oversized_field.arguments_preview = "x".repeat(PENDING_APPROVAL_PREVIEW_BYTES_MAX + 1);
+        assert_eq!(
+            insert_pending_approval_batch(&conn, &[oversized_field])
+                .unwrap_err()
+                .to_string(),
+            PENDING_APPROVAL_FIELD_LIMIT_ERROR
+        );
+
+        let oversized_batch = (0..PENDING_APPROVAL_GLOBAL_LIMIT_MAX)
+            .map(|index| {
+                let mut row = pending_insert(format!("bytes-{index}"), None);
+                row.tool_name = "t".repeat(PENDING_APPROVAL_TOOL_NAME_BYTES_MAX);
+                row.arguments_preview = "p".repeat(PENDING_APPROVAL_PREVIEW_BYTES_MAX);
+                row
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            insert_pending_approval_batch(&conn, &oversized_batch)
+                .unwrap_err()
+                .to_string(),
+            PENDING_APPROVAL_RETAINED_BYTES_ERROR
+        );
+
+        conn.execute_batch(
+            "CREATE TRIGGER fail_pending_batch BEFORE INSERT ON pending_approvals
+             WHEN NEW.id = 'fail-second'
+             BEGIN SELECT RAISE(ABORT, 'injected pending batch failure'); END;",
+        )
+        .unwrap();
+        let error = insert_pending_approval_batch(
+            &conn,
+            &[
+                pending_insert("rollback-first", None),
+                pending_insert("fail-second", None),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), PENDING_APPROVAL_INSERT_ERROR);
+        assert!(!format!("{error:?}").contains("fail-second"));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn pending_insert는_모든_text_nul을_write전에_거부하고_marker를_노출하지_않는다() {
+        const MARKER: &str = "secret-like-operation-marker";
+        let nul = format!("{MARKER}\0tail");
+        let mut cases = Vec::new();
+
+        let mut id = pending_insert("valid-id", None);
+        id.id = nul.clone();
+        cases.push(id);
+        let mut server = pending_insert("valid-server", None);
+        server.server_id = nul.clone();
+        cases.push(server);
+        let mut tool = pending_insert("valid-tool", None);
+        tool.tool_name = nul.clone();
+        cases.push(tool);
+        let mut preview = pending_insert("valid-preview", None);
+        preview.arguments_preview = nul.clone();
+        cases.push(preview);
+        let mut schema = pending_insert("valid-schema", None);
+        schema.schema_hash = Some(nul.clone());
+        cases.push(schema);
+        let mut session = pending_insert("valid-session", None);
+        session.pane_id = Some(nul);
+        cases.push(session);
+
+        let conn = test_conn();
+        for row in cases {
+            let error = insert_pending_approval_batch(&conn, &[row]).unwrap_err();
+            assert_eq!(error.to_string(), PENDING_APPROVAL_FIELD_LIMIT_ERROR);
+            assert!(!format!("{error:?}").contains(MARKER));
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let error = insert_pending_approval(
+            &conn,
+            &format!("{MARKER}\0single"),
+            "srv",
+            "tool",
+            "{}",
+            None,
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), PENDING_APPROVAL_FIELD_LIMIT_ERROR);
+        assert!(!format!("{error:?}").contains(MARKER));
+    }
+
+    #[test]
+    fn pending_approval_debug는_count와_presence외_식별자와본문을_노출하지_않는다() {
+        const MARKER: &str = "unique-secret-like-approval-marker";
+        let row = PendingApprovalRow {
+            id: MARKER.to_owned(),
+            server_id: MARKER.to_owned(),
+            tool_name: MARKER.to_owned(),
+            arguments_preview: MARKER.to_owned(),
+            schema_hash: Some(MARKER.to_owned()),
+            created_at: 987_654_321,
+            pane_id: Some(MARKER.to_owned()),
+        };
+        let insert = PendingApprovalInsert {
+            id: MARKER.to_owned(),
+            server_id: MARKER.to_owned(),
+            tool_name: MARKER.to_owned(),
+            arguments_preview: MARKER.to_owned(),
+            schema_hash: Some(MARKER.to_owned()),
+            created_at: 987_654_321,
+            pane_id: Some(MARKER.to_owned()),
+        };
+        let page = PendingApprovalPage {
+            rows: vec![row.clone()],
+            has_more: true,
+        };
+
+        assert_eq!(
+            format!("{row:?}"),
+            "PendingApprovalRow { has_schema_hash: true, has_session_key: true }"
+        );
+        assert_eq!(
+            format!("{insert:?}"),
+            "PendingApprovalInsert { has_schema_hash: true, has_session_key: true }"
+        );
+        assert_eq!(
+            format!("{page:?}"),
+            "PendingApprovalPage { row_count: 1, has_more: true }"
+        );
+        for debug in [
+            format!("{row:?}"),
+            format!("{insert:?}"),
+            format!("{page:?}"),
+        ] {
+            assert!(!debug.contains(MARKER));
+            assert!(!debug.contains("987654321"));
+        }
+    }
+
+    #[test]
+    fn pending_list는_limit_plus_one과_sql_byte_preflight로_legacy를_제한한다() {
+        let conn = test_conn();
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO pending_approvals
+                   (id, server_id, tool_name, arguments_preview, schema_hash,
+                    status, remember, created_at, pane_id)
+                 VALUES (?1, 'srv', 'tool', '{}', NULL, 'pending', 0, ?2, NULL)",
+            )
+            .unwrap();
+        for index in 0..=PENDING_APPROVAL_LIST_LIMIT_MAX {
+            stmt.execute((format!("legacy-{index}"), index as i64))
+                .unwrap();
+        }
+        drop(stmt);
+        let page = list_pending_approvals_bounded(&conn, PENDING_APPROVAL_LIST_LIMIT_MAX).unwrap();
+        assert_eq!(page.rows.len(), PENDING_APPROVAL_LIST_LIMIT_MAX);
+        assert!(page.has_more);
+        assert_eq!(
+            list_pending_approvals(&conn).unwrap_err().to_string(),
+            PENDING_APPROVAL_LIST_LIMIT_ERROR
+        );
+
+        conn.execute("DELETE FROM pending_approvals", []).unwrap();
+        conn.execute(
+            "INSERT INTO pending_approvals
+               (id, server_id, tool_name, arguments_preview, schema_hash,
+                status, remember, created_at, pane_id)
+             VALUES ('huge', 'srv', 'tool', ?1, NULL, 'pending', 0, 1, NULL)",
+            ["x".repeat(PENDING_APPROVAL_RETAINED_BYTES_MAX + 1)],
+        )
+        .unwrap();
+        assert_eq!(
+            list_pending_approvals_bounded(&conn, 1)
+                .unwrap_err()
+                .to_string(),
+            PENDING_APPROVAL_RETAINED_BYTES_ERROR
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation은_session_rows만_bounded_transaction으로_denied한다() {
+        let conn = test_conn();
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:3";
+        insert_pending_approval(
+            &conn,
+            "session",
+            "srv",
+            "tool",
+            "{}",
+            None,
+            1,
+            Some(session),
+        )
+        .unwrap();
+        insert_pending_approval(&conn, "owner", "srv", "tool", "{}", None, 1, None).unwrap();
+        assert_eq!(deny_session_scoped_pending_approvals(&conn, 20).unwrap(), 1);
+        assert_eq!(
+            poll_approval(&conn, "session").unwrap().status,
+            ApprovalStatus::Denied
+        );
+        assert_eq!(
+            poll_approval(&conn, "owner").unwrap().status,
+            ApprovalStatus::Pending
+        );
+        assert_eq!(deny_session_scoped_pending_approvals(&conn, 30).unwrap(), 0);
+    }
+
+    #[test]
+    fn startup_reconciliation은_legacy_257에서_아무_row도_바꾸지_않는다() {
+        let conn = test_conn();
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:4";
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO pending_approvals
+                   (id, server_id, tool_name, arguments_preview, schema_hash,
+                    status, remember, created_at, pane_id)
+                 VALUES (?1, 'srv', 'tool', '{}', NULL, 'pending', 0, ?2, ?3)",
+            )
+            .unwrap();
+        for index in 0..=PENDING_APPROVAL_GLOBAL_LIMIT_MAX {
+            stmt.execute((format!("orphan-{index}"), index as i64, session))
+                .unwrap();
+        }
+        drop(stmt);
+
+        assert_eq!(
+            deny_session_scoped_pending_approvals(&conn, 50)
+                .unwrap_err()
+                .to_string(),
+            PENDING_APPROVAL_LIST_LIMIT_ERROR
+        );
+        let (pending, resolved): (i64, i64) = conn
+            .query_row(
+                "SELECT SUM(status = 'pending'), SUM(resolved_at IS NOT NULL)
+                 FROM pending_approvals",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, 257);
+        assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn startup_reconciliation_update_failure는_전체를_rollback한다() {
+        let conn = test_conn();
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:5";
+        insert_pending_approval(&conn, "first", "srv", "tool", "{}", None, 1, Some(session))
+            .unwrap();
+        insert_pending_approval(&conn, "second", "srv", "tool", "{}", None, 2, Some(session))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reconciliation AFTER UPDATE OF status ON pending_approvals
+             WHEN NEW.id = 'second' AND NEW.status = 'denied'
+             BEGIN SELECT RAISE(ABORT, 'injected reconciliation failure'); END;",
+        )
+        .unwrap();
+
+        assert!(deny_session_scoped_pending_approvals(&conn, 50).is_err());
+        for id in ["first", "second"] {
+            assert_eq!(
+                poll_approval(&conn, id).unwrap().status,
+                ApprovalStatus::Pending
+            );
+        }
     }
 
     #[test]

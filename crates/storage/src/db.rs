@@ -1870,6 +1870,11 @@ impl Db {
         mcp_store::list_tools_for_server(&self.conn, server_id)
     }
 
+    /// Exact invoke preparation lookup; no schema, description, or full tool list is loaded.
+    pub fn mcp_tool_name(&self, server_id: &str, tool_id: &str) -> anyhow::Result<Option<String>> {
+        mcp_store::tool_name(&self.conn, server_id, tool_id)
+    }
+
     /// Same-snapshot bounded tool page with permission rows joined in one page query.
     pub fn mcp_tool_page(
         &self,
@@ -4908,6 +4913,10 @@ mod tests {
         .unwrap();
         db.upsert_permission_rule("srv-page-a", "bravo", "deny", None)
             .unwrap();
+        assert_eq!(
+            db.mcp_tool_name("srv-page-a", "tool-a").unwrap(),
+            Some("alpha".to_owned())
+        );
         let page = db.mcp_tool_page("srv-page-a", 0, 1).unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.rows.len(), 1);

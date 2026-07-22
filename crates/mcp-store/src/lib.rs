@@ -502,6 +502,10 @@ pub const MCP_TOOL_PAGE_LIMIT_MAX: usize = 256;
 /// cannot raise them. SQL byte preflights run before text values are materialized.
 pub const MCP_TOOL_PAGE_BYTES_MAX: usize = 8 * 1024 * 1024;
 
+/// Exact invoke-name lookup ceiling. Tool descriptors may collectively use the larger page budget,
+/// but a single protocol method name never needs a multi-megabyte allocation.
+pub const MCP_TOOL_NAME_BYTES_MAX: usize = 4 * 1024;
+
 /// Connector overview inventory ceiling. The +1 probe detects overflow without materializing the
 /// complete legacy server table.
 pub const MCP_SERVER_INVENTORY_LIMIT_MAX: usize = 256;
@@ -1257,6 +1261,49 @@ pub fn list_tools_for_server(
     Ok(tools)
 }
 
+/// Exact `(server_id, tool_id)` lookup used immediately before live-schema authorization. The
+/// name byte length is proven in SQL before the String is materialized, and both reads share one
+/// snapshot so replacement cannot race the preflight. Missing or wrong-server IDs return None;
+/// empty and oversized persisted names fail closed.
+pub fn tool_name(
+    conn: &Connection,
+    server_id: &str,
+    tool_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let tx = conn.unchecked_transaction()?;
+    let name_bytes = tx
+        .query_row(
+            "SELECT length(CAST(name AS BLOB))
+             FROM mcp_tools WHERE server_id = ?1 AND id = ?2",
+            (server_id, tool_id),
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(name_bytes) = name_bytes else {
+        tx.commit()
+            .context("MCP tool name missing lookup transaction 실패")?;
+        return Ok(None);
+    };
+    let name_bytes = usize::try_from(name_bytes).context("MCP tool name bytes 변환 실패")?;
+    anyhow::ensure!(name_bytes > 0, "MCP tool name이 비어 있습니다");
+    anyhow::ensure!(
+        name_bytes <= MCP_TOOL_NAME_BYTES_MAX,
+        "MCP tool name byte 상한을 초과했습니다"
+    );
+    let name: String = tx.query_row(
+        "SELECT name FROM mcp_tools WHERE server_id = ?1 AND id = ?2",
+        (server_id, tool_id),
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        name.len() == name_bytes,
+        "MCP tool name same-snapshot byte 길이 불일치"
+    );
+    tx.commit()
+        .context("MCP tool name lookup transaction 실패")?;
+    Ok(Some(name))
+}
+
 /// Count and read one ordered tool page inside the same read transaction. Permission is joined in
 /// the page query, avoiding both an all-tools allocation and per-row permission lookups.
 pub fn tool_page(
@@ -2001,6 +2048,44 @@ mod tests {
         insert_tool(&conn, &tool).unwrap();
         assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap(), vec![tool]);
         assert!(list_tools_for_server(&conn, "srv-2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_name은_server와_id_exact_match에서_name만_반환한다() {
+        let conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        let mut tool = sample_tool("tool-exact", "파일_읽기");
+        tool.description = Some("description-must-not-be-returned".to_owned());
+        tool.input_schema_json = Some("schema-must-not-be-returned".to_owned());
+        insert_tool(&conn, &tool).unwrap();
+
+        assert_eq!(
+            tool_name(&conn, "srv-1", "tool-exact").unwrap(),
+            Some("파일_읽기".to_owned())
+        );
+        assert_eq!(
+            tool_name(&conn, "wrong-server", "tool-exact").unwrap(),
+            None
+        );
+        assert_eq!(tool_name(&conn, "srv-1", "missing-tool").unwrap(), None);
+    }
+
+    #[test]
+    fn tool_name은_empty와_oversized_persisted_name을_fail_closed한다() {
+        let conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        insert_tool(&conn, &sample_tool("tool-empty", "")).unwrap();
+        insert_tool(
+            &conn,
+            &sample_tool(
+                "tool-oversized-name",
+                &"x".repeat(MCP_TOOL_NAME_BYTES_MAX + 1),
+            ),
+        )
+        .unwrap();
+
+        assert!(tool_name(&conn, "srv-1", "tool-empty").is_err());
+        assert!(tool_name(&conn, "srv-1", "tool-oversized-name").is_err());
     }
 
     #[test]

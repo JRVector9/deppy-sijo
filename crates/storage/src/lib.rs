@@ -10,9 +10,9 @@ pub use db::{
     WebPushSubscriptionRow, WorkspaceRow,
 };
 pub use mcp_store::{
-    MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX, MCP_TOOL_PAGE_BYTES_MAX,
-    MCP_TOOL_PAGE_LIMIT_MAX, McpServerInventoryRow, McpServerSaveOutcome, McpToolPage,
-    McpToolPageRow, PendingApprovalInsert,
+    MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX, MCP_TOOL_NAME_BYTES_MAX,
+    MCP_TOOL_PAGE_BYTES_MAX, MCP_TOOL_PAGE_LIMIT_MAX, McpServerInventoryRow, McpServerSaveOutcome,
+    McpToolPage, McpToolPageRow, PendingApprovalInsert,
 };
 
 mod logs;

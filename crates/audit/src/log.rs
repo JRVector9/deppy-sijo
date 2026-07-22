@@ -127,14 +127,12 @@ pub struct AuditRecord<'a> {
 }
 
 impl std::fmt::Debug for AuditRecord<'_> {
-    /// input_json에 secret이 실릴 수 있으므로 Debug에서는 내용을 숨긴다 (7장 유출 방지)
+    /// Identifiers and raw input are intentionally absent from diagnostic formatting.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuditRecord")
-            .field("workspace_id", &self.workspace_id)
-            .field("session_id", &self.session_id)
-            .field("server_id", &self.server_id)
-            .field("tool_name", &self.tool_name)
-            .field("input_json", &"<elided>")
+            .field("has_workspace", &self.workspace_id.is_some())
+            .field("has_session", &self.session_id.is_some())
+            .field("has_server", &self.server_id.is_some())
             .field("decision", &self.decision)
             .finish()
     }
@@ -289,7 +287,7 @@ pub fn record_audit(
             record.decision.as_str(),
         ),
     )
-    .with_context(|| format!("tool audit log 저장 실패: {}", record.tool_name))?;
+    .context("tool_audit_insert_failed")?;
     Ok(id)
 }
 
@@ -330,8 +328,8 @@ pub(crate) fn prepare_authorization_operation(
     validate_operation_id(authorization_run_id)?;
     validate_tool_input(input_json.as_bytes())?;
     let record = AuditRecord {
-        workspace_id: None,
-        session_id: None,
+        workspace_id: plan.subject().workspace_id(),
+        session_id: plan.subject().session_id(),
         server_id: Some(plan.server_id()),
         tool_name: plan.tool_name(),
         input_json,
@@ -418,7 +416,7 @@ fn prepare_audit_operation_with_binding(
             authorization_run_id,
         ),
     )
-    .with_context(|| format!("tool audit preflight 저장 실패: {}", record.tool_name))?;
+    .context("authorization_preflight_insert_failed")?;
     Ok(AuditOperation {
         audit_id: id,
         operation_id: operation_id.to_owned(),
@@ -461,7 +459,7 @@ pub fn complete_authorization_operation(
                 error_code,
             ),
         )
-        .with_context(|| format!("authorization outcome 저장 실패: {operation_id}"))?;
+        .context("authorization_outcome_update_failed")?;
     if affected == 1 {
         return Ok(());
     }
@@ -484,7 +482,7 @@ pub fn complete_authorization_operation(
             .is_some_and(|(stored_lifecycle, stored_error)| {
                 stored_lifecycle == lifecycle.as_str() && stored_error.as_deref() == error_code
             }),
-        "완료 가능한 matching prepared authorization audit가 없음: {operation_id}"
+        "matching_prepared_authorization_audit_absent"
     );
     Ok(())
 }
@@ -516,11 +514,8 @@ pub(crate) fn complete_audit_operation(
                AND authorization_run_id IS NULL",
             (operation_id, outcome.as_str(), error_code),
         )
-        .with_context(|| format!("tool audit outcome 저장 실패: {operation_id}"))?;
-    anyhow::ensure!(
-        affected == 1,
-        "완료 가능한 prepared audit가 없음: {operation_id}"
-    );
+        .context("tool_audit_outcome_update_failed")?;
+    anyhow::ensure!(affected == 1, "prepared_tool_audit_absent");
     Ok(())
 }
 
@@ -732,6 +727,39 @@ mod tests {
             crate::schema_hash("schema-exact"),
             ApprovalDecision::AllowOnce,
         );
+        let operation = prepare_authorization_operation(
+            &conn,
+            &plan,
+            input_json,
+            &RedactionService::new(),
+            None,
+            "test-scope",
+            "test-run",
+        )
+        .unwrap();
+        let AuthorizationPreflight::Prepared(grant) =
+            AuthorizationPreflight::from_preflight(plan, operation).unwrap()
+        else {
+            panic!("allowed preflight must issue a grant")
+        };
+        grant
+    }
+
+    fn exact_grant_for_subject(
+        operation_id: &str,
+        input_json: &str,
+        subject: crate::AuthorizationSubject,
+    ) -> crate::AuthorizationGrant {
+        let conn = test_conn();
+        let plan = approval_plan(
+            operation_id,
+            "server-exact",
+            "tool-exact",
+            crate::schema_hash("schema-exact"),
+            ApprovalDecision::AllowOnce,
+        )
+        .bind_subject(subject)
+        .unwrap();
         let operation = prepare_authorization_operation(
             &conn,
             &plan,
@@ -1051,6 +1079,135 @@ mod tests {
             ApprovalDecision::AllowOnce,
         );
         assert!(AuthorizationPreflight::from_preflight(plan_b, operation).is_err());
+    }
+
+    #[test]
+    fn authorization_subject는_plan_proof_grant_persisted_record에_exact하게_결합된다() {
+        let conn = test_conn();
+        let subject_a = crate::AuthorizationSubject::try_new(
+            Some("workspace-a".to_owned()),
+            Some("17".to_owned()),
+        )
+        .unwrap();
+        let subject_b = crate::AuthorizationSubject::try_new(
+            Some("workspace-b".to_owned()),
+            Some("18".to_owned()),
+        )
+        .unwrap();
+        let hash = crate::schema_hash("subject-schema");
+        let plan_a = approval_plan(
+            "op-subject-proof",
+            "server",
+            "tool",
+            hash.clone(),
+            ApprovalDecision::AllowOnce,
+        )
+        .bind_subject(subject_a.clone())
+        .unwrap();
+        let operation = prepare_authorization_operation(
+            &conn,
+            &plan_a,
+            "{}",
+            &RedactionService::new(),
+            None,
+            "test-scope",
+            "test-run",
+        )
+        .unwrap();
+        let persisted: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT workspace_id, session_id FROM tool_audit_logs
+                 WHERE operation_id = 'op-subject-proof'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            (Some("workspace-a".to_owned()), Some("17".to_owned()))
+        );
+
+        let plan_b = approval_plan(
+            "op-subject-proof",
+            "server",
+            "tool",
+            hash,
+            ApprovalDecision::AllowOnce,
+        )
+        .bind_subject(subject_b)
+        .unwrap();
+        assert!(AuthorizationPreflight::from_preflight(plan_b, operation).is_err());
+
+        let grant = exact_grant_for_subject("op-subject-grant", "{}", subject_a.clone());
+        assert_eq!(grant.subject(), &subject_a);
+        assert!(
+            grant
+                .bind_call("server-exact", "tool-exact", b"{}")
+                .is_err(),
+            "subject-bound grant must not fall back to global bind_call"
+        );
+        assert!(
+            exact_grant_for_subject("op-subject-mismatch", "{}", subject_a.clone(),)
+                .bind_call_for_subject(
+                    &crate::AuthorizationSubject::try_new(
+                        Some("workspace-other".to_owned()),
+                        Some("17".to_owned()),
+                    )
+                    .unwrap(),
+                    "server-exact",
+                    "tool-exact",
+                    b"{}",
+                )
+                .is_err()
+        );
+        exact_grant_for_subject("op-subject-call", "{}", subject_a.clone())
+            .bind_call_for_subject(&subject_a, "server-exact", "tool-exact", b"{}")
+            .unwrap();
+
+        let global_plan = approval_plan(
+            "op-global-compat",
+            "server",
+            "tool",
+            crate::schema_hash("global-schema"),
+            ApprovalDecision::AllowOnce,
+        );
+        prepare_authorization_operation(
+            &conn,
+            &global_plan,
+            "{}",
+            &RedactionService::new(),
+            None,
+            "test-scope",
+            "test-run",
+        )
+        .unwrap();
+        let global_persisted: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT workspace_id, session_id FROM tool_audit_logs
+                 WHERE operation_id = 'op-global-compat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(global_persisted, (None, None));
+    }
+
+    #[test]
+    fn audit_record_debug는_subject_target_input_identifier를_숨긴다() {
+        const MARKER: &str = "audit-record-marker-never-debug";
+        let record = AuditRecord {
+            workspace_id: Some(MARKER),
+            session_id: Some(MARKER),
+            server_id: Some(MARKER),
+            tool_name: MARKER,
+            input_json: MARKER,
+            decision: ToolDecision::AllowOnce,
+        };
+        assert_eq!(
+            format!("{record:?}"),
+            "AuditRecord { has_workspace: true, has_session: true, has_server: true, decision: AllowOnce }"
+        );
+        assert!(!format!("{record:?}").contains(MARKER));
     }
 
     #[test]

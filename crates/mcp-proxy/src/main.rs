@@ -24,7 +24,7 @@ use secret::RedactionService;
 
 use crate::approval_notify::ApprovalWakeNotifier;
 use crate::cli::Cli;
-use crate::hook::authorized_proxy_executor;
+use crate::hook::{authorization_subject_from_runtime_session_key, authorized_proxy_executor};
 #[cfg(unix)]
 use crate::session::IdleDeadlineReader;
 use crate::session::{BackendClient, BackendConfig, BackendSession, DEFAULT_BACKEND_IDLE_TTL};
@@ -96,6 +96,10 @@ fn main() -> anyhow::Result<()> {
     let pane_id = std::env::var("DEPPY_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    // Validate and split the runtime-owned key before it can enter owner scope, approval rows, or
+    // audit subject persistence. The executor derives the same subject again at construction so
+    // non-main callers cannot pass a mismatched pane/subject pair.
+    let _subject = authorization_subject_from_runtime_session_key(pane_id.as_deref())?;
     let owner_id = pane_id.clone().or_else(|| {
         std::env::var("DEPPY_AUTHORIZATION_OWNER")
             .ok()
@@ -136,7 +140,7 @@ fn main() -> anyhow::Result<()> {
         pane_id,
         cli.approval_notifier
             .map(|notifier| Arc::new(notifier) as Arc<dyn ApprovalWakeNotifier>),
-    );
+    )?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

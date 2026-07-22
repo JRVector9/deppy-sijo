@@ -17,8 +17,9 @@ pub use log::{
     record_audit, sanitized_input_preview, validate_tool_input,
 };
 pub use policy::{
-    ApprovalDecision, ApprovalReason, AuthorizationEvaluation, AuthorizationGrant,
-    AuthorizationPlan, AuthorizationPreflight, AuthorizedCall, DeniedAuthorization,
+    AUTHORIZATION_SESSION_ID_BYTES_MAX, AUTHORIZATION_WORKSPACE_ID_BYTES_MAX, ApprovalDecision,
+    ApprovalReason, AuthorizationEvaluation, AuthorizationGrant, AuthorizationPlan,
+    AuthorizationPreflight, AuthorizationSubject, AuthorizedCall, DeniedAuthorization,
     PendingAuthorization, PermissionFingerprint, PermissionPolicy, PermissionRule,
     PolicyEvaluation, ToolApprovalRequest, ToolDecision, evaluate_authorization,
     evaluate_authorization_with_fingerprint, evaluate_permission,

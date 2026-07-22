@@ -132,6 +132,88 @@ impl ToolDecision {
     }
 }
 
+pub const AUTHORIZATION_WORKSPACE_ID_BYTES_MAX: usize = 128;
+pub const AUTHORIZATION_SESSION_ID_BYTES_MAX: usize = 128;
+const AUTHORIZATION_SUBJECT_INVALID: &str = "authorization_subject_invalid";
+const AUTHORIZATION_SUBJECT_ALREADY_BOUND: &str = "authorization_subject_already_bound";
+
+/// Owned execution subject carried through permission evaluation, durable audit preflight, grant,
+/// and external-call binding. Global calls use `(None, None)`. A session is meaningful only inside
+/// a workspace, so session-without-workspace is rejected before any persistence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthorizationSubject {
+    workspace_id: Option<String>,
+    session_id: Option<String>,
+}
+
+impl AuthorizationSubject {
+    pub fn global() -> Self {
+        Self {
+            workspace_id: None,
+            session_id: None,
+        }
+    }
+
+    pub fn try_new(
+        workspace_id: Option<String>,
+        session_id: Option<String>,
+    ) -> anyhow::Result<Self> {
+        if let Some(workspace_id) = workspace_id.as_deref() {
+            validate_subject_component(workspace_id, AUTHORIZATION_WORKSPACE_ID_BYTES_MAX)?;
+        }
+        if let Some(session_id) = session_id.as_deref() {
+            validate_subject_component(session_id, AUTHORIZATION_SESSION_ID_BYTES_MAX)?;
+        }
+        anyhow::ensure!(
+            session_id.is_none() || workspace_id.is_some(),
+            AUTHORIZATION_SUBJECT_INVALID
+        );
+        Ok(Self {
+            workspace_id,
+            session_id,
+        })
+    }
+
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub fn is_global(&self) -> bool {
+        self.workspace_id.is_none() && self.session_id.is_none()
+    }
+}
+
+impl Default for AuthorizationSubject {
+    fn default() -> Self {
+        Self::global()
+    }
+}
+
+impl std::fmt::Debug for AuthorizationSubject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizationSubject")
+            .field("has_workspace", &self.workspace_id.is_some())
+            .field("has_session", &self.session_id.is_some())
+            .finish()
+    }
+}
+
+fn validate_subject_component(value: &str, max_bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value == value.trim()
+            && value.len() <= max_bytes
+            && !value.as_bytes().contains(&0),
+        AUTHORIZATION_SUBJECT_INVALID
+    );
+    Ok(())
+}
+
 /// Pure permission/approval 결과를 durable preflight에 제출하는 계획.
 /// Raw tool arguments와 secret은 의도적으로 보유하지 않는다.
 pub struct AuthorizationPlan {
@@ -141,6 +223,8 @@ pub struct AuthorizationPlan {
     decision: ToolDecision,
     live_schema_hash: String,
     expected_permission: PermissionFingerprint,
+    subject: AuthorizationSubject,
+    subject_bound: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -149,6 +233,7 @@ pub(crate) struct AuthorizationBinding {
     pub(crate) tool_name: String,
     pub(crate) decision: ToolDecision,
     pub(crate) live_schema_hash: String,
+    pub(crate) subject: AuthorizationSubject,
     input_digest: [u8; 32],
 }
 
@@ -175,6 +260,8 @@ impl AuthorizationPlan {
             decision,
             live_schema_hash,
             expected_permission,
+            subject: AuthorizationSubject::global(),
+            subject_bound: false,
         })
     }
 
@@ -202,6 +289,19 @@ impl AuthorizationPlan {
         &self.expected_permission
     }
 
+    pub fn subject(&self) -> &AuthorizationSubject {
+        &self.subject
+    }
+
+    /// Rebinds the default global subject exactly once before durable preflight. Consuming `self`
+    /// prevents aliases; the private bit prevents a returned plan from being rebound again.
+    pub fn bind_subject(mut self, subject: AuthorizationSubject) -> anyhow::Result<Self> {
+        anyhow::ensure!(!self.subject_bound, AUTHORIZATION_SUBJECT_ALREADY_BOUND);
+        self.subject = subject;
+        self.subject_bound = true;
+        Ok(self)
+    }
+
     pub fn is_allowed(&self) -> bool {
         self.decision.is_allowed()
     }
@@ -214,6 +314,7 @@ impl AuthorizationPlan {
             tool_name: self.tool_name.clone(),
             decision: self.decision,
             live_schema_hash: self.live_schema_hash.clone(),
+            subject: self.subject.clone(),
             input_digest: Sha256::digest(input_json).into(),
         }
     }
@@ -257,6 +358,8 @@ pub struct PendingAuthorization {
     live_schema_hash: String,
     reason: ApprovalReason,
     expected_permission: PermissionFingerprint,
+    subject: AuthorizationSubject,
+    subject_bound: bool,
 }
 
 impl PendingAuthorization {
@@ -280,6 +383,17 @@ impl PendingAuthorization {
         self.reason
     }
 
+    pub fn subject(&self) -> &AuthorizationSubject {
+        &self.subject
+    }
+
+    pub fn bind_subject(mut self, subject: AuthorizationSubject) -> anyhow::Result<Self> {
+        anyhow::ensure!(!self.subject_bound, AUTHORIZATION_SUBJECT_ALREADY_BOUND);
+        self.subject = subject;
+        self.subject_bound = true;
+        Ok(self)
+    }
+
     pub fn resolve(self, decision: ApprovalDecision) -> AuthorizationPlan {
         // Fields were validated by evaluate_authorization, so this cannot fail.
         AuthorizationPlan {
@@ -289,6 +403,8 @@ impl PendingAuthorization {
             decision: decision.tool_decision(),
             live_schema_hash: self.live_schema_hash,
             expected_permission: self.expected_permission,
+            subject: self.subject,
+            subject_bound: self.subject_bound,
         }
     }
 }
@@ -306,6 +422,17 @@ impl std::fmt::Debug for PendingAuthorization {
 pub enum AuthorizationEvaluation {
     Plan(AuthorizationPlan),
     NeedsApproval(PendingAuthorization),
+}
+
+impl AuthorizationEvaluation {
+    /// Binds both immediate and approval-required outcomes before callers branch. This prevents an
+    /// approval token created for one subject from being resolved and then reassigned to another.
+    pub fn bind_subject(self, subject: AuthorizationSubject) -> anyhow::Result<Self> {
+        match self {
+            Self::Plan(plan) => plan.bind_subject(subject).map(Self::Plan),
+            Self::NeedsApproval(pending) => pending.bind_subject(subject).map(Self::NeedsApproval),
+        }
+    }
 }
 
 impl std::fmt::Debug for AuthorizationEvaluation {
@@ -327,6 +454,7 @@ pub struct AuthorizationGrant {
     tool_name: String,
     decision: ToolDecision,
     live_schema_hash: String,
+    subject: AuthorizationSubject,
     input_digest: [u8; 32],
 }
 
@@ -351,7 +479,8 @@ impl AuthorizationGrant {
             binding.server_id == plan.server_id
                 && binding.tool_name == plan.tool_name
                 && binding.decision == plan.decision
-                && binding.live_schema_hash == plan.live_schema_hash,
+                && binding.live_schema_hash == plan.live_schema_hash
+                && binding.subject == plan.subject,
             "preflight proof와 authorization plan binding이 일치하지 않습니다"
         );
         Ok(Self {
@@ -360,6 +489,7 @@ impl AuthorizationGrant {
             tool_name: plan.tool_name,
             decision: plan.decision,
             live_schema_hash: plan.live_schema_hash,
+            subject: plan.subject,
             input_digest: binding.input_digest,
         })
     }
@@ -388,9 +518,31 @@ impl AuthorizationGrant {
         self.decision.is_allowed()
     }
 
-    /// Exact server/tool/validated input bytes에 grant를 한 번만 consume해 묶는다.
+    pub fn subject(&self) -> &AuthorizationSubject {
+        &self.subject
+    }
+
+    /// Backward-compatible global call binding. A subject-bound grant cannot silently fall back to
+    /// the legacy global path.
     pub fn bind_call(
         self,
+        server_id: &str,
+        tool_name: &str,
+        input_json: &[u8],
+    ) -> anyhow::Result<AuthorizedCall> {
+        self.bind_call_for_subject(
+            &AuthorizationSubject::global(),
+            server_id,
+            tool_name,
+            input_json,
+        )
+    }
+
+    /// Exact subject/server/tool/validated-input binding. The grant is consumed on success or
+    /// mismatch, so a capability cannot be retried against a different workspace/session.
+    pub fn bind_call_for_subject(
+        self,
+        subject: &AuthorizationSubject,
         server_id: &str,
         tool_name: &str,
         input_json: &[u8],
@@ -398,7 +550,8 @@ impl AuthorizationGrant {
         use sha2::{Digest, Sha256};
 
         anyhow::ensure!(
-            self.server_id == server_id
+            self.subject == *subject
+                && self.server_id == server_id
                 && self.tool_name == tool_name
                 && self.input_digest == <[u8; 32]>::from(Sha256::digest(input_json)),
             "authorized call binding mismatch"
@@ -466,7 +619,8 @@ impl DeniedAuthorization {
             binding.server_id == plan.server_id
                 && binding.tool_name == plan.tool_name
                 && binding.decision == plan.decision
-                && binding.live_schema_hash == plan.live_schema_hash,
+                && binding.live_schema_hash == plan.live_schema_hash
+                && binding.subject == plan.subject,
             "preflight proof와 authorization plan binding이 일치하지 않습니다"
         );
         Ok(Self {
@@ -618,6 +772,8 @@ pub fn evaluate_authorization_with_fingerprint(
                 live_schema_hash,
                 reason,
                 expected_permission: permission,
+                subject: AuthorizationSubject::global(),
+                subject_bound: false,
             },
         )),
     }
@@ -742,6 +898,120 @@ fn key(server_id: &str, tool_name: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn automatic_allow_plan(operation_id: &str) -> AuthorizationPlan {
+        let hash = crate::schema_hash("subject-schema");
+        let AuthorizationEvaluation::Plan(plan) = evaluate_authorization(
+            operation_id.to_owned(),
+            "server".to_owned(),
+            "tool".to_owned(),
+            PermissionRule::Allow,
+            Some(&hash),
+            hash.clone(),
+        )
+        .unwrap() else {
+            panic!("matching Allow fingerprint must create a plan")
+        };
+        plan
+    }
+
+    #[test]
+    fn authorization_subject는_owned_bounded_nul_free이고_debug가_id를_숨긴다() {
+        const MARKER: &str = "workspace-marker-never-debug";
+        let subject = AuthorizationSubject::try_new(
+            Some(MARKER.to_owned()),
+            Some("session-marker-never-debug".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(subject.workspace_id(), Some(MARKER));
+        assert_eq!(subject.session_id(), Some("session-marker-never-debug"));
+        assert_eq!(
+            format!("{subject:?}"),
+            "AuthorizationSubject { has_workspace: true, has_session: true }"
+        );
+        assert!(!format!("{subject:?}").contains(MARKER));
+
+        assert!(
+            AuthorizationSubject::try_new(
+                Some("w".repeat(AUTHORIZATION_WORKSPACE_ID_BYTES_MAX)),
+                Some("s".repeat(AUTHORIZATION_SESSION_ID_BYTES_MAX)),
+            )
+            .is_ok()
+        );
+        for invalid in [
+            AuthorizationSubject::try_new(Some(String::new()), None),
+            AuthorizationSubject::try_new(Some(" leading".to_owned()), None),
+            AuthorizationSubject::try_new(Some("nul\0workspace".to_owned()), None),
+            AuthorizationSubject::try_new(
+                Some("w".repeat(AUTHORIZATION_WORKSPACE_ID_BYTES_MAX + 1)),
+                None,
+            ),
+            AuthorizationSubject::try_new(None, Some("orphan-session".to_owned())),
+        ] {
+            assert_eq!(
+                invalid.unwrap_err().to_string(),
+                AUTHORIZATION_SUBJECT_INVALID
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_plan은_global_호환을_유지하고_subject를_정확히_한번만_bind한다() {
+        let global = automatic_allow_plan("subject-global");
+        assert!(global.subject().is_global());
+
+        let subject =
+            AuthorizationSubject::try_new(Some("workspace".to_owned()), Some("7".to_owned()))
+                .unwrap();
+        let bound = automatic_allow_plan("subject-bound")
+            .bind_subject(subject.clone())
+            .unwrap();
+        assert_eq!(bound.subject(), &subject);
+        assert_eq!(
+            bound
+                .bind_subject(AuthorizationSubject::global())
+                .unwrap_err()
+                .to_string(),
+            AUTHORIZATION_SUBJECT_ALREADY_BOUND
+        );
+
+        let AuthorizationEvaluation::NeedsApproval(pending) = evaluate_authorization(
+            "subject-pending".to_owned(),
+            "server".to_owned(),
+            "tool".to_owned(),
+            PermissionRule::Ask,
+            None,
+            crate::schema_hash("subject-schema"),
+        )
+        .unwrap() else {
+            panic!("Ask must create pending authorization")
+        };
+        assert!(pending.subject().is_global());
+
+        let AuthorizationEvaluation::NeedsApproval(pending) = evaluate_authorization(
+            "subject-pending-bound".to_owned(),
+            "server".to_owned(),
+            "tool".to_owned(),
+            PermissionRule::Ask,
+            None,
+            crate::schema_hash("subject-schema"),
+        )
+        .unwrap()
+        .bind_subject(subject.clone())
+        .unwrap() else {
+            panic!("Ask must remain pending after subject bind")
+        };
+        assert_eq!(pending.subject(), &subject);
+        let resolved = pending.resolve(ApprovalDecision::AllowOnce);
+        assert_eq!(resolved.subject(), &subject);
+        assert_eq!(
+            resolved
+                .bind_subject(AuthorizationSubject::global())
+                .unwrap_err()
+                .to_string(),
+            AUTHORIZATION_SUBJECT_ALREADY_BOUND
+        );
+    }
 
     /// 라벨("hash-a")을 실제 형식(sha256 hex 64자)으로 변환 — fail-closed 검증 통과용.
     fn request(server_id: &str, tool_name: &str, schema_hash: &str) -> ToolApprovalRequest {

@@ -31,6 +31,20 @@ use crate::session::{BackendClient, BackendVersion};
 const APPROVAL_PREVIEW_CHARS: usize = 500;
 const OUTCOME_WRITE_ATTEMPTS: usize = 2;
 
+pub(crate) fn authorization_subject_from_runtime_session_key(
+    session_key: Option<&str>,
+) -> anyhow::Result<audit::AuthorizationSubject> {
+    let Some(session_key) = session_key else {
+        return Ok(audit::AuthorizationSubject::global());
+    };
+    let (workspace_id, session_id) = deppy_core::parse_session_key(session_key)
+        .ok_or_else(|| anyhow::anyhow!("invalid_runtime_session_key"))?;
+    audit::AuthorizationSubject::try_new(
+        Some(workspace_id.to_owned()),
+        Some(session_id.0.to_string()),
+    )
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AuthorizationStageCounters {
@@ -129,6 +143,7 @@ pub struct ProxyAuthorizationExecutor {
     approval_timeout: Duration,
     backend: Arc<dyn ToolBackend>,
     pane_id: Option<String>,
+    subject: audit::AuthorizationSubject,
     approval_notifier: Option<Arc<dyn ApprovalWakeNotifier>>,
     pending_outcome: RefCell<Option<PendingOutcome>>,
     counters: Rc<StageCounters>,
@@ -149,8 +164,9 @@ pub(crate) fn authorized_proxy_executor(
     backend: Arc<BackendClient>,
     pane_id: Option<String>,
     approval_notifier: Option<Arc<dyn ApprovalWakeNotifier>>,
-) -> ProxyAuthorizationExecutor {
-    ProxyAuthorizationExecutor {
+) -> anyhow::Result<ProxyAuthorizationExecutor> {
+    let subject = authorization_subject_from_runtime_session_key(pane_id.as_deref())?;
+    Ok(ProxyAuthorizationExecutor {
         db,
         owner: RefCell::new(Some(owner)),
         server_id,
@@ -159,6 +175,7 @@ pub(crate) fn authorized_proxy_executor(
         approval_timeout,
         backend,
         pane_id,
+        subject,
         approval_notifier,
         pending_outcome: RefCell::new(None),
         counters: Rc::new(StageCounters::default()),
@@ -166,7 +183,7 @@ pub(crate) fn authorized_proxy_executor(
         fail_post_preflight_parse: Cell::new(false),
         #[cfg(test)]
         before_preflight: RefCell::new(None),
-    }
+    })
 }
 
 impl ProxyAuthorizationExecutor {
@@ -415,7 +432,9 @@ impl ProxyAuthorizationExecutor {
             tool_name.clone(),
             permission,
             live_schema_hash,
-        ) {
+        )
+        .and_then(|evaluation| evaluation.bind_subject(self.subject.clone()))
+        {
             Ok(evaluation) => evaluation,
             Err(_) => {
                 return AuthorizedToolOutcome::Error(AuthorizedToolError::PermissionDenied);
@@ -452,7 +471,12 @@ impl ProxyAuthorizationExecutor {
             }
         };
         let operation_id = grant.operation_id().to_owned();
-        let authorization = match grant.bind_call(&self.server_id, &tool_name, input.as_bytes()) {
+        let authorization = match grant.bind_call_for_subject(
+            &self.subject,
+            &self.server_id,
+            &tool_name,
+            input.as_bytes(),
+        ) {
             Ok(authorization) => authorization,
             Err(_) => {
                 let persisted = self.persist_or_retain(
@@ -808,6 +832,7 @@ mod tests {
                 .unwrap();
             let backend = FakeBackend::new(schemas);
             let redaction = RedactionService::new();
+            let pane_id = "315f68b6-333f-409f-a2c5-922b9eacfd7e:2";
             let executor = ProxyAuthorizationExecutor {
                 db: Arc::clone(&db),
                 owner: RefCell::new(Some(owner)),
@@ -816,7 +841,8 @@ mod tests {
                 poll_interval: Duration::from_millis(1),
                 approval_timeout: Duration::from_secs(2),
                 backend: backend.clone(),
-                pane_id: Some("workspace:session".to_owned()),
+                pane_id: Some(pane_id.to_owned()),
+                subject: authorization_subject_from_runtime_session_key(Some(pane_id)).unwrap(),
                 approval_notifier: None,
                 pending_outcome: RefCell::new(None),
                 counters: Rc::new(StageCounters::default()),
@@ -860,6 +886,8 @@ mod tests {
         decision: String,
         redacted: Option<String>,
         encrypted: Option<Vec<u8>>,
+        workspace_id: Option<String>,
+        session_id: Option<String>,
     }
 
     fn audit_rows(path: &Path) -> Vec<AuditRow> {
@@ -867,7 +895,7 @@ mod tests {
         let mut stmt = conn
             .prepare(
                 "SELECT lifecycle, outcome_error_code, decision, input_redacted_json,
-                        input_encrypted_blob
+                        input_encrypted_blob, workspace_id, session_id
                  FROM tool_audit_logs ORDER BY rowid",
             )
             .unwrap();
@@ -878,6 +906,8 @@ mod tests {
                 decision: row.get(2)?,
                 redacted: row.get(3)?,
                 encrypted: row.get(4)?,
+                workspace_id: row.get(5)?,
+                session_id: row.get(6)?,
             })
         })
         .unwrap()
@@ -911,6 +941,31 @@ mod tests {
         response
             .pointer("/result/content/0/text")
             .and_then(Value::as_str)
+    }
+
+    #[test]
+    fn runtime_session_key는_validated_workspace_session_subject로만_분리된다() {
+        let key = "315f68b6-333f-409f-a2c5-922b9eacfd7e:18446744073709551615";
+        let subject = authorization_subject_from_runtime_session_key(Some(key)).unwrap();
+        assert_eq!(
+            subject.workspace_id(),
+            Some("315f68b6-333f-409f-a2c5-922b9eacfd7e")
+        );
+        assert_eq!(subject.session_id(), Some("18446744073709551615"));
+        assert!(
+            authorization_subject_from_runtime_session_key(None)
+                .unwrap()
+                .is_global()
+        );
+        for invalid in [
+            "workspace:not-a-number",
+            "missing-separator",
+            ":7",
+            "workspace:7\0tail",
+        ] {
+            assert!(authorization_subject_from_runtime_session_key(Some(invalid)).is_err());
+        }
+        assert!(!format!("{subject:?}").contains("315f68b6"));
     }
 
     fn spawn_approval(
@@ -1031,6 +1086,11 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].lifecycle, "succeeded");
         assert_eq!(rows[0].decision, "policy_allow");
+        assert_eq!(
+            rows[0].workspace_id.as_deref(),
+            Some("315f68b6-333f-409f-a2c5-922b9eacfd7e")
+        );
+        assert_eq!(rows[0].session_id.as_deref(), Some("2"));
         assert!(rows[0].encrypted.is_none());
         assert!(
             !rows[0]

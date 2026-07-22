@@ -7079,6 +7079,54 @@ mod tests {
     }
 
     #[test]
+    fn authorization_preflight는_plan_subject를_same_transaction_audit에_영속한다() {
+        let (dir, _path, db) = file_db("authorization-subject");
+        let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+        let owner = db.acquire_authorization_owner("gui:subject").unwrap();
+        let subject = audit::AuthorizationSubject::try_new(
+            Some("workspace-subject".to_owned()),
+            Some("session-subject".to_owned()),
+        )
+        .unwrap();
+        let plan = authorization_plan(
+            "operation-subject",
+            "server",
+            "tool",
+            audit::ApprovalDecision::AllowOnce,
+        )
+        .bind_subject(subject.clone())
+        .unwrap();
+        let audit::AuthorizationPreflight::Prepared(grant) = db
+            .commit_authorization_preflight(&owner, plan, "{}", &secret::RedactionService::new())
+            .unwrap()
+        else {
+            panic!("allow must prepare a grant")
+        };
+        assert_eq!(grant.subject(), &subject);
+        let persisted: (Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT workspace_id, session_id FROM tool_audit_logs
+                 WHERE operation_id = 'operation-subject'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                Some("workspace-subject".to_owned()),
+                Some("session-subject".to_owned())
+            )
+        );
+
+        drop(owner);
+        drop(db);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn authorization_revision_cas는_other_writer의_server_tool_credential변경을_거부한다() {
         let (dir, path, db_a) = file_db("authorization-config-stale");
         let lock_dir = authorization_lock_dir(&db_a.authorization_db_identity);

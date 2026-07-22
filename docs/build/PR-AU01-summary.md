@@ -1,5 +1,16 @@
 # PR-AU01 — Shared Authorization and Durable Audit Lifecycle
 
+## 2026-07-22 execution-subject amendment
+
+`AuthorizationSubject` now binds the permission evaluation, opaque pending approval or plan,
+durable preflight proof, grant, and exact external call. It accepts only bounded, trimmed,
+NUL-free workspace/session identifiers and omits their values from Debug. The proxy derives the
+subject from the validated runtime session key before approval/audit work; the same transaction
+persists workspace/session on the audit record. A subject-bound grant cannot fall back to the
+legacy global call path or be consumed for another subject. Root verification passes audit 52/52,
+storage 134/134, and mcp-proxy 49/49 plus all-target check, strict Clippy, package fmt, and scoped
+diff-check. Connector-service/app per-invocation subject wiring remains an explicit pre-IN01 item.
+
 ## 2026-07-22 service-state amendment
 
 The production Connector service now covers the previously deferred OAuth/remote-trust host state

@@ -14,6 +14,30 @@ pub enum PermissionRule {
     Ask,
 }
 
+/// Exact durable permission row observed before authorization evaluation. `Absent` is distinct
+/// from an explicitly persisted Ask row so storage can reject any concurrent policy mutation
+/// before it commits audit preflight or mints a call grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionFingerprint {
+    Absent,
+    Persisted {
+        rule: PermissionRule,
+        approved_schema_hash: Option<String>,
+    },
+}
+
+impl PermissionFingerprint {
+    pub fn evaluation(&self) -> (PermissionRule, Option<&str>) {
+        match self {
+            Self::Absent => (PermissionRule::Ask, None),
+            Self::Persisted {
+                rule,
+                approved_schema_hash,
+            } => (*rule, approved_schema_hash.as_deref()),
+        }
+    }
+}
+
 impl PermissionRule {
     /// 영속 문자열 (DB 저장/조회 양쪽에서 이것만 쓴다).
     pub fn as_str(self) -> &'static str {
@@ -36,7 +60,7 @@ impl PermissionRule {
 }
 
 /// approval dialog가 표시할 요청 model (dialog UI 자체는 crates/app 소관).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct ToolApprovalRequest {
     pub server_id: String,
     pub tool_name: String,
@@ -44,6 +68,17 @@ pub struct ToolApprovalRequest {
     pub input_json: String,
     /// 호출 시점 tool input schema의 해시 (crate::schema_hash)
     pub schema_hash: String,
+}
+
+impl Drop for ToolApprovalRequest {
+    fn drop(&mut self) {
+        // SAFETY: this request exclusively owns the raw input allocation.
+        for byte in unsafe { self.input_json.as_mut_vec() } {
+            // SAFETY: byte is exclusively borrowed from the owned allocation.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl std::fmt::Debug for ToolApprovalRequest {
@@ -97,6 +132,396 @@ impl ToolDecision {
     }
 }
 
+/// Pure permission/approval 결과를 durable preflight에 제출하는 계획.
+/// Raw tool arguments와 secret은 의도적으로 보유하지 않는다.
+pub struct AuthorizationPlan {
+    operation_id: String,
+    server_id: String,
+    tool_name: String,
+    decision: ToolDecision,
+    live_schema_hash: String,
+    expected_permission: PermissionFingerprint,
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct AuthorizationBinding {
+    pub(crate) server_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) decision: ToolDecision,
+    pub(crate) live_schema_hash: String,
+    input_digest: [u8; 32],
+}
+
+impl AuthorizationPlan {
+    fn build(
+        operation_id: String,
+        server_id: String,
+        tool_name: String,
+        decision: ToolDecision,
+        live_schema_hash: String,
+        expected_permission: PermissionFingerprint,
+    ) -> anyhow::Result<Self> {
+        crate::log::validate_operation_id(&operation_id)?;
+        anyhow::ensure!(!server_id.trim().is_empty(), "server id가 비어 있습니다");
+        anyhow::ensure!(!tool_name.trim().is_empty(), "tool name이 비어 있습니다");
+        anyhow::ensure!(
+            valid_schema_hash(&live_schema_hash),
+            "live schema hash는 64자리 sha256 hex여야 합니다"
+        );
+        Ok(Self {
+            operation_id,
+            server_id,
+            tool_name,
+            decision,
+            live_schema_hash,
+            expected_permission,
+        })
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    pub fn decision(&self) -> ToolDecision {
+        self.decision
+    }
+
+    pub fn live_schema_hash(&self) -> &str {
+        &self.live_schema_hash
+    }
+
+    pub fn expected_permission(&self) -> &PermissionFingerprint {
+        &self.expected_permission
+    }
+
+    pub fn is_allowed(&self) -> bool {
+        self.decision.is_allowed()
+    }
+
+    pub(crate) fn binding(&self, input_json: &[u8]) -> AuthorizationBinding {
+        use sha2::{Digest, Sha256};
+
+        AuthorizationBinding {
+            server_id: self.server_id.clone(),
+            tool_name: self.tool_name.clone(),
+            decision: self.decision,
+            live_schema_hash: self.live_schema_hash.clone(),
+            input_digest: Sha256::digest(input_json).into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthorizationPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationPlan")
+            .field("decision", &self.decision)
+            .field("state", &"planned")
+            .finish()
+    }
+}
+
+/// Approval UI/port가 opaque pending token을 resolve할 때 선택할 수 있는 결정만 표현한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowAlways,
+    DenyOnce,
+    DenyAlways,
+}
+
+impl ApprovalDecision {
+    fn tool_decision(self) -> ToolDecision {
+        match self {
+            Self::AllowOnce => ToolDecision::AllowOnce,
+            Self::AllowAlways => ToolDecision::AllowAlways,
+            Self::DenyOnce => ToolDecision::DenyOnce,
+            Self::DenyAlways => ToolDecision::DenyAlways,
+        }
+    }
+}
+
+/// Shared evaluation이 approval 필요 시에만 만드는 opaque, non-Clone pending token.
+/// Raw input/preview/secret은 보유하지 않는다.
+pub struct PendingAuthorization {
+    operation_id: String,
+    server_id: String,
+    tool_name: String,
+    live_schema_hash: String,
+    reason: ApprovalReason,
+    expected_permission: PermissionFingerprint,
+}
+
+impl PendingAuthorization {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    pub fn live_schema_hash(&self) -> &str {
+        &self.live_schema_hash
+    }
+
+    pub fn reason(&self) -> ApprovalReason {
+        self.reason
+    }
+
+    pub fn resolve(self, decision: ApprovalDecision) -> AuthorizationPlan {
+        // Fields were validated by evaluate_authorization, so this cannot fail.
+        AuthorizationPlan {
+            operation_id: self.operation_id,
+            server_id: self.server_id,
+            tool_name: self.tool_name,
+            decision: decision.tool_decision(),
+            live_schema_hash: self.live_schema_hash,
+            expected_permission: self.expected_permission,
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAuthorization")
+            .field("reason", &self.reason)
+            .field("state", &"awaiting_approval")
+            .finish()
+    }
+}
+
+/// Structural shared authorization result. Plan/Pending 모두 public raw constructor가 없다.
+pub enum AuthorizationEvaluation {
+    Plan(AuthorizationPlan),
+    NeedsApproval(PendingAuthorization),
+}
+
+impl std::fmt::Debug for AuthorizationEvaluation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plan(plan) => plan.fmt(f),
+            Self::NeedsApproval(pending) => pending.fmt(f),
+        }
+    }
+}
+
+/// Durable audit preflight가 commit됐음을 증명하는 opaque single-use authorization token.
+///
+/// Public constructor가 없으며 private/non-Clone AuditOperation proof와 plan을 함께
+/// consume해야만 생성된다. Raw tool arguments와 secret은 보유하지 않는다.
+pub struct AuthorizationGrant {
+    operation_id: String,
+    server_id: String,
+    tool_name: String,
+    decision: ToolDecision,
+    live_schema_hash: String,
+    input_digest: [u8; 32],
+}
+
+impl AuthorizationGrant {
+    fn from_preflight(
+        plan: AuthorizationPlan,
+        operation: crate::AuditOperation,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(plan.is_allowed(), "거부 plan은 grant를 만들 수 없습니다");
+        anyhow::ensure!(
+            operation.operation_id() == plan.operation_id,
+            "preflight operation id와 authorization plan이 일치하지 않습니다"
+        );
+        anyhow::ensure!(
+            operation.lifecycle() == crate::AuditLifecycle::Prepared,
+            "preflight lifecycle과 authorization decision이 일치하지 않습니다"
+        );
+        let binding = operation
+            .authorization_binding()
+            .ok_or_else(|| anyhow::anyhow!("authorization binding이 없는 preflight proof"))?;
+        anyhow::ensure!(
+            binding.server_id == plan.server_id
+                && binding.tool_name == plan.tool_name
+                && binding.decision == plan.decision
+                && binding.live_schema_hash == plan.live_schema_hash,
+            "preflight proof와 authorization plan binding이 일치하지 않습니다"
+        );
+        Ok(Self {
+            operation_id: plan.operation_id,
+            server_id: plan.server_id,
+            tool_name: plan.tool_name,
+            decision: plan.decision,
+            live_schema_hash: plan.live_schema_hash,
+            input_digest: binding.input_digest,
+        })
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    pub fn decision(&self) -> ToolDecision {
+        self.decision
+    }
+
+    pub fn live_schema_hash(&self) -> &str {
+        &self.live_schema_hash
+    }
+
+    pub fn is_allowed(&self) -> bool {
+        self.decision.is_allowed()
+    }
+
+    /// Exact server/tool/validated input bytes에 grant를 한 번만 consume해 묶는다.
+    pub fn bind_call(
+        self,
+        server_id: &str,
+        tool_name: &str,
+        input_json: &[u8],
+    ) -> anyhow::Result<AuthorizedCall> {
+        use sha2::{Digest, Sha256};
+
+        anyhow::ensure!(
+            self.server_id == server_id
+                && self.tool_name == tool_name
+                && self.input_digest == <[u8; 32]>::from(Sha256::digest(input_json)),
+            "authorized call binding mismatch"
+        );
+        Ok(AuthorizedCall {
+            operation_id: self.operation_id,
+        })
+    }
+}
+
+/// Durable Denied audit commit receipt. External-call 권한으로 사용할 수 없다.
+pub struct DeniedAuthorization {
+    operation_id: String,
+    decision: ToolDecision,
+}
+
+/// Exact grant binding을 consume한 뒤 external executor만 받는 single-use call capability.
+pub struct AuthorizedCall {
+    operation_id: String,
+}
+
+impl AuthorizedCall {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+impl std::fmt::Debug for AuthorizedCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedCall")
+            .field("state", &"exact_call_bound")
+            .finish()
+    }
+}
+
+impl DeniedAuthorization {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn decision(&self) -> ToolDecision {
+        self.decision
+    }
+
+    fn from_preflight(
+        plan: AuthorizationPlan,
+        operation: crate::AuditOperation,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !plan.is_allowed(),
+            "허용 plan은 denied receipt를 만들 수 없습니다"
+        );
+        anyhow::ensure!(
+            operation.operation_id() == plan.operation_id,
+            "preflight operation id와 authorization plan이 일치하지 않습니다"
+        );
+        anyhow::ensure!(
+            operation.lifecycle() == crate::AuditLifecycle::Denied,
+            "거부 preflight lifecycle이 denied가 아닙니다"
+        );
+        let binding = operation
+            .authorization_binding()
+            .ok_or_else(|| anyhow::anyhow!("authorization binding이 없는 preflight proof"))?;
+        anyhow::ensure!(
+            binding.server_id == plan.server_id
+                && binding.tool_name == plan.tool_name
+                && binding.decision == plan.decision
+                && binding.live_schema_hash == plan.live_schema_hash,
+            "preflight proof와 authorization plan binding이 일치하지 않습니다"
+        );
+        Ok(Self {
+            operation_id: plan.operation_id,
+            decision: plan.decision,
+        })
+    }
+}
+
+impl std::fmt::Debug for DeniedAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeniedAuthorization")
+            .field("decision", &self.decision)
+            .field("state", &"denied_committed")
+            .finish()
+    }
+}
+
+/// Durable preflight result. Only Prepared carries an external-call grant.
+pub enum AuthorizationPreflight {
+    Prepared(AuthorizationGrant),
+    Denied(DeniedAuthorization),
+}
+
+impl AuthorizationPreflight {
+    pub(crate) fn from_preflight(
+        plan: AuthorizationPlan,
+        operation: crate::AuditOperation,
+    ) -> anyhow::Result<Self> {
+        if plan.is_allowed() {
+            AuthorizationGrant::from_preflight(plan, operation).map(Self::Prepared)
+        } else {
+            DeniedAuthorization::from_preflight(plan, operation).map(Self::Denied)
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthorizationPreflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepared(grant) => grant.fmt(f),
+            Self::Denied(receipt) => receipt.fmt(f),
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthorizationGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationGrant")
+            .field("decision", &self.decision)
+            .field("state", &"preflight_committed")
+            .finish()
+    }
+}
+
 /// dialog가 필요한 이유 (dialog 문구 분기용)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalReason {
@@ -113,6 +538,93 @@ pub enum ApprovalReason {
 pub enum PolicyEvaluation {
     Decided(ToolDecision),
     NeedsApproval(ApprovalReason),
+}
+
+/// 저장된 rule/hash와 live schema만으로 permission을 평가하는 공용 pure function.
+/// GUI Connector와 mcp-proxy가 이 함수를 함께 사용해 동일한 fail-closed 규칙을 적용한다.
+pub fn evaluate_permission(
+    rule: PermissionRule,
+    approved_schema_hash: Option<&str>,
+    live_schema_hash: &str,
+) -> anyhow::Result<PolicyEvaluation> {
+    anyhow::ensure!(
+        valid_schema_hash(live_schema_hash),
+        "live schema hash는 64자리 sha256 hex여야 합니다"
+    );
+    Ok(match rule {
+        PermissionRule::Deny => PolicyEvaluation::Decided(ToolDecision::PolicyDeny),
+        PermissionRule::Ask => PolicyEvaluation::NeedsApproval(ApprovalReason::AskRule),
+        PermissionRule::Allow => match approved_schema_hash {
+            None => PolicyEvaluation::NeedsApproval(ApprovalReason::FirstUse),
+            Some(approved)
+                if valid_schema_hash(approved)
+                    && approved.eq_ignore_ascii_case(live_schema_hash) =>
+            {
+                PolicyEvaluation::Decided(ToolDecision::PolicyAllow)
+            }
+            _ => PolicyEvaluation::NeedsApproval(ApprovalReason::SchemaChanged),
+        },
+    })
+}
+
+/// GUI Connector와 proxy가 공통으로 쓰는 유일한 AuthorizationPlan mint.
+/// live schema를 먼저 검증한 뒤 pure permission 결과를 opaque plan/pending으로 봉인한다.
+pub fn evaluate_authorization(
+    operation_id: String,
+    server_id: String,
+    tool_name: String,
+    rule: PermissionRule,
+    approved_schema_hash: Option<&str>,
+    live_schema_hash: String,
+) -> anyhow::Result<AuthorizationEvaluation> {
+    evaluate_authorization_with_fingerprint(
+        operation_id,
+        server_id,
+        tool_name,
+        PermissionFingerprint::Persisted {
+            rule,
+            approved_schema_hash: approved_schema_hash.map(str::to_owned),
+        },
+        live_schema_hash,
+    )
+}
+
+pub fn evaluate_authorization_with_fingerprint(
+    operation_id: String,
+    server_id: String,
+    tool_name: String,
+    permission: PermissionFingerprint,
+    live_schema_hash: String,
+) -> anyhow::Result<AuthorizationEvaluation> {
+    crate::log::validate_operation_id(&operation_id)?;
+    anyhow::ensure!(!server_id.trim().is_empty(), "server id가 비어 있습니다");
+    anyhow::ensure!(!tool_name.trim().is_empty(), "tool name이 비어 있습니다");
+    let (rule, approved_schema_hash) = permission.evaluation();
+    match evaluate_permission(rule, approved_schema_hash, &live_schema_hash)? {
+        PolicyEvaluation::Decided(decision) => AuthorizationPlan::build(
+            operation_id,
+            server_id,
+            tool_name,
+            decision,
+            live_schema_hash,
+            permission,
+        )
+        .map(AuthorizationEvaluation::Plan),
+        PolicyEvaluation::NeedsApproval(reason) => Ok(AuthorizationEvaluation::NeedsApproval(
+            PendingAuthorization {
+                operation_id,
+                server_id,
+                tool_name,
+                live_schema_hash,
+                reason,
+                expected_permission: permission,
+            },
+        )),
+    }
+}
+
+fn valid_schema_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// tool_name → Allow/Deny/Ask 규칙 집합. 기본값은 Ask.
@@ -181,17 +693,14 @@ impl PermissionPolicy {
     /// 요청 평가 — 즉시 결정(Decided) 또는 approval dialog 필요(NeedsApproval).
     pub fn evaluate(&self, request: &ToolApprovalRequest) -> PolicyEvaluation {
         let key = key(&request.server_id, &request.tool_name);
-        match self.rules.get(&key).copied().unwrap_or_default() {
-            PermissionRule::Deny => PolicyEvaluation::Decided(ToolDecision::PolicyDeny),
-            PermissionRule::Ask => PolicyEvaluation::NeedsApproval(ApprovalReason::AskRule),
-            PermissionRule::Allow => match self.approved_schema.get(&key) {
-                None => PolicyEvaluation::NeedsApproval(ApprovalReason::FirstUse),
-                Some(hash) if *hash != request.schema_hash => {
-                    PolicyEvaluation::NeedsApproval(ApprovalReason::SchemaChanged)
-                }
-                Some(_) => PolicyEvaluation::Decided(ToolDecision::PolicyAllow),
-            },
-        }
+        evaluate_permission(
+            self.rules.get(&key).copied().unwrap_or_default(),
+            self.approved_schema.get(&key).map(String::as_str),
+            &request.schema_hash,
+        )
+        .unwrap_or(PolicyEvaluation::NeedsApproval(
+            ApprovalReason::SchemaChanged,
+        ))
     }
 
     /// dialog 결과 반영. Always 계열만 규칙·승인 이력을 바꾸고 Once 계열은 상태 불변.
@@ -424,5 +933,73 @@ mod tests {
         let req = request("srv-1", "read_file", "hash-a");
         let debug = format!("{req:?}");
         assert!(!debug.contains("/tmp/x"), "{debug}");
+    }
+
+    #[test]
+    fn shared_evaluation은_모든_rule에서_유효한_live_hash를_요구한다() {
+        for rule in [
+            PermissionRule::Allow,
+            PermissionRule::Deny,
+            PermissionRule::Ask,
+        ] {
+            assert!(evaluate_permission(rule, None, "").is_err());
+            assert!(evaluate_permission(rule, None, "malformed").is_err());
+        }
+    }
+
+    #[test]
+    fn plan은_shared_evaluation또는_opaque_pending_resolve로만_생성된다() {
+        let hash = crate::schema_hash("schema");
+        let AuthorizationEvaluation::NeedsApproval(pending) = evaluate_authorization(
+            "op-needs-approval".to_owned(),
+            "srv".to_owned(),
+            "tool".to_owned(),
+            PermissionRule::Ask,
+            None,
+            hash,
+        )
+        .unwrap() else {
+            panic!("Ask must create opaque pending")
+        };
+        assert_eq!(pending.reason(), ApprovalReason::AskRule);
+        let plan = pending.resolve(ApprovalDecision::AllowOnce);
+        assert_eq!(plan.decision(), ToolDecision::AllowOnce);
+
+        let source = include_str!("policy.rs");
+        let plan_impl = source
+            .split("impl AuthorizationPlan")
+            .nth(1)
+            .unwrap()
+            .split("impl std::fmt::Debug for AuthorizationPlan")
+            .next()
+            .unwrap();
+        assert!(!plan_impl.contains("pub fn new("), "{plan_impl}");
+        assert!(!plan_impl.contains("pub fn from_"), "{plan_impl}");
+    }
+
+    #[test]
+    fn plan_debug는_식별자와_schema를_숨긴다() {
+        let hash = crate::schema_hash("schema-secret-marker");
+        let AuthorizationEvaluation::NeedsApproval(pending) = evaluate_authorization(
+            "op-secret-marker".to_owned(),
+            "server-secret-marker".to_owned(),
+            "tool-secret-marker".to_owned(),
+            PermissionRule::Ask,
+            None,
+            hash.clone(),
+        )
+        .unwrap() else {
+            panic!("Ask must create pending")
+        };
+        let plan = pending.resolve(ApprovalDecision::AllowOnce);
+        let debug = format!("{plan:?}");
+        for hidden in [
+            "op-secret-marker",
+            "server-secret-marker",
+            "tool-secret-marker",
+            hash.as_str(),
+        ] {
+            assert!(!debug.contains(hidden), "{debug}");
+        }
     }
 }

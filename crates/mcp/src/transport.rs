@@ -17,8 +17,10 @@ use anyhow::{Context, bail};
 use secret::RedactionService;
 use serde_json::{Value, json};
 
+use crate::http::{McpDeliveryUnknown, McpServerResponseError};
 use crate::limits::MAX_RAW_MCP_RESPONSE_BYTES;
 use crate::metrics::{ThreadGuard, ThreadKind};
+use crate::sensitive::SensitiveBytes;
 
 /// stdout 한 줄 최대 길이 — newline 없는 무한 스트림으로 인한 메모리 폭주 방지
 const MAX_LINE_BYTES: usize = MAX_RAW_MCP_RESPONSE_BYTES;
@@ -40,6 +42,21 @@ enum ReaderEvent {
     Message(Value),
     /// stdout 프로토콜 위반 — 이 이벤트 이후 reader는 더 읽지 않는다
     Violation(String),
+}
+
+/// Distinguishes deterministic failures before any request byte can be written from failures
+/// where `write_all` may already have delivered a prefix (or the full request) to the server.
+enum WriteLineFailure {
+    BeforeIo(anyhow::Error),
+    MaybeSent(anyhow::Error),
+}
+
+impl WriteLineFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::BeforeIo(error) | Self::MaybeSent(error) => error,
+        }
+    }
 }
 
 struct StdioWiring {
@@ -66,6 +83,8 @@ pub(crate) struct StdioClient {
     violation: Option<String>,
     /// try_wait로 이미 reap된 child — 이후 kill/killpg 금지 (PID 재사용 위험)
     reaped: bool,
+    #[cfg(test)]
+    write_drop_observer: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl StdioClient {
@@ -110,6 +129,8 @@ impl StdioClient {
                 stderr_log: wiring.stderr_log,
                 violation: None,
                 reaped: false,
+                #[cfg(test)]
+                write_drop_observer: None,
             }),
             Err(error) => {
                 kill_and_reap(&mut child);
@@ -181,9 +202,38 @@ impl StdioClient {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.write_line(&msg)
-            .with_context(|| format!("{method} 요청 전송 실패"))?;
-        self.wait_response(id, method)
+        match self.write_line(msg) {
+            Ok(()) => {}
+            Err(WriteLineFailure::BeforeIo(error)) => {
+                return Err(error).with_context(|| format!("{method} 요청 전송 실패"));
+            }
+            Err(WriteLineFailure::MaybeSent(error)) if method == "tools/call" => {
+                drop(error);
+                tracing::debug!(
+                    "tools/call stdio write outcome unknown; automatic retry forbidden"
+                );
+                return Err(anyhow::Error::new(McpDeliveryUnknown { status: None }));
+            }
+            Err(error) => {
+                return Err(error.into_error()).with_context(|| format!("{method} 요청 전송 실패"));
+            }
+        }
+
+        let response = self.wait_response(id, method);
+        if method != "tools/call" {
+            return response;
+        }
+        match response {
+            Ok(value) => Ok(value),
+            Err(error) if error.downcast_ref::<McpServerResponseError>().is_some() => Err(error),
+            Err(error) => {
+                drop(error);
+                tracing::debug!(
+                    "tools/call stdio response outcome unknown; automatic retry forbidden"
+                );
+                Err(anyhow::Error::new(McpDeliveryUnknown { status: None }))
+            }
+        }
     }
 
     /// JSON-RPC notification 전송 (응답 없음).
@@ -192,7 +242,8 @@ impl StdioClient {
             bail!("{violation}");
         }
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.write_line(&msg)
+        self.write_line(msg)
+            .map_err(WriteLineFailure::into_error)
             .with_context(|| format!("{method} notification 전송 실패"))
     }
 
@@ -230,25 +281,40 @@ impl StdioClient {
 
     /// 한 줄 JSON-RPC 전송. stdin write도 timeout을 적용한다 — MCP 서버가 stdin을
     /// 읽지 않거나 큰 payload로 pipe가 차도 호출 thread가 영구 block되지 않아야 한다.
-    fn write_line(&mut self, msg: &Value) -> anyhow::Result<()> {
-        let mut line = serde_json::to_vec(msg)?;
+    fn write_line(&mut self, msg: Value) -> Result<(), WriteLineFailure> {
+        let mut line = SensitiveBytes::from_json(msg)
+            .map_err(|error| WriteLineFailure::BeforeIo(anyhow::Error::new(error)))?;
         line.push(b'\n');
-        if line.len() > MAX_WRITE_LINE_BYTES {
-            bail!(
+        if line.as_slice().len() > MAX_WRITE_LINE_BYTES {
+            return Err(WriteLineFailure::BeforeIo(anyhow::anyhow!(
                 "MCP 요청 크기 초과: {} bytes (max {MAX_WRITE_LINE_BYTES})",
-                line.len()
-            );
+                line.as_slice().len()
+            )));
         }
-        let mut stdin = self.stdin.take().context("stdin이 이미 닫힘")?;
+        #[cfg(test)]
+        if let Some(observer) = self.write_drop_observer.take() {
+            line.observe_zeroized_drop(observer);
+        }
+        let mut stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| WriteLineFailure::BeforeIo(anyhow::anyhow!("stdin이 이미 닫힘")))?;
         let (tx, rx) = sync_channel(1);
         let writer = std::thread::Builder::new()
             .name("mcp-stdin-write".into())
             .spawn(move || {
                 let _thread = ThreadGuard::enter(ThreadKind::StdioWriter);
-                let result = stdin.write_all(&line).and_then(|()| stdin.flush());
+                let result = stdin
+                    .write_all(line.as_slice())
+                    .and_then(|()| stdin.flush());
+                drop(line);
                 let _ = tx.send(result.map(|()| stdin));
             })
-            .context("mcp stdin write thread 생성 실패")?;
+            .map_err(|error| {
+                WriteLineFailure::BeforeIo(
+                    anyhow::Error::new(error).context("mcp stdin write thread 생성 실패"),
+                )
+            })?;
         match rx.recv_timeout(self.request_timeout) {
             Ok(Ok(stdin)) => {
                 let _ = writer.join();
@@ -257,19 +323,21 @@ impl StdioClient {
             }
             Ok(Err(e)) => {
                 let _ = writer.join();
-                Err(e.into())
+                Err(WriteLineFailure::MaybeSent(e.into()))
             }
             Err(RecvTimeoutError::Timeout) => {
                 let status = self.terminate();
                 let _ = writer.join();
-                bail!(
+                Err(WriteLineFailure::MaybeSent(anyhow::anyhow!(
                     "MCP stdin write timeout ({:?}, exit: {status:?})",
                     self.request_timeout
-                )
+                )))
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = writer.join();
-                bail!("MCP stdin write thread 종료")
+                Err(WriteLineFailure::MaybeSent(anyhow::anyhow!(
+                    "MCP stdin write thread 종료"
+                )))
             }
         }
     }
@@ -306,7 +374,7 @@ impl StdioClient {
                                 "id": request_id,
                                 "error": {"code": -32601, "message": "method not found"},
                             });
-                            let _ = self.write_line(&reply);
+                            let _ = self.write_line(reply);
                         }
                         debug_unsupported_server_message(&value, false);
                         continue;
@@ -411,7 +479,10 @@ fn kill_and_reap(child: &mut Child) -> Option<std::process::ExitStatus> {
 fn unwrap_response(mut value: Value, method: &str) -> anyhow::Result<Value> {
     let obj = value.as_object_mut().context("응답이 JSON object가 아님")?;
     if let Some(err) = obj.get("error") {
-        bail!("{method} 실패 — server error: {err}");
+        let _ = method;
+        return Err(anyhow::Error::new(McpServerResponseError::from_code(
+            err.get("code").and_then(Value::as_i64),
+        )));
     }
     obj.remove("result")
         .with_context(|| format!("{method} 응답에 result 없음"))
@@ -574,6 +645,144 @@ mod tests {
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata, Subscriber};
+
+    #[cfg(unix)]
+    fn scripted_stdio(script: &str, timeout: Duration) -> StdioClient {
+        StdioClient::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), script.to_owned()],
+            &[],
+            true,
+            &RedactionService::new(),
+            timeout,
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn assert_delivery_unknown(script: &str, timeout: Duration, params: Value) {
+        let mut client = scripted_stdio(script, timeout);
+        let observer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        client.write_drop_observer = Some(Arc::clone(&observer));
+        let error = client.request("tools/call", params).unwrap_err();
+        assert!(
+            error.downcast_ref::<McpDeliveryUnknown>().is_some(),
+            "unexpected error: {error:#}"
+        );
+        assert!(observer.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_success_zeroizes_serialized_write_body() {
+        let mut client = scripted_stdio(
+            "IFS= read -r _request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"isError\":false}}'",
+            Duration::from_secs(1),
+        );
+        let observer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        client.write_drop_observer = Some(Arc::clone(&observer));
+        client
+            .request(
+                "tools/call",
+                json!({"name":"ok","arguments":{"secret":"value"}}),
+            )
+            .unwrap();
+        assert!(observer.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_timeout_after_write_is_delivery_unknown() {
+        assert_delivery_unknown(
+            "IFS= read -r _request; sleep 30",
+            Duration::from_millis(50),
+            json!({"name":"slow","arguments":{}}),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_eof_after_write_is_delivery_unknown() {
+        assert_delivery_unknown(
+            "IFS= read -r _request; exit 0",
+            Duration::from_secs(1),
+            json!({"name":"exit","arguments":{}}),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_protocol_violation_after_write_is_delivery_unknown() {
+        assert_delivery_unknown(
+            "IFS= read -r _request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{}}'",
+            Duration::from_secs(1),
+            json!({"name":"wrong-id","arguments":{}}),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_partial_write_or_eof_is_delivery_unknown() {
+        let payload = "x".repeat(60 * 1024);
+        assert_delivery_unknown(
+            "dd bs=1 count=8 >/dev/null 2>/dev/null; exit 0",
+            Duration::from_secs(1),
+            json!({"name":"partial","arguments":{"payload":payload}}),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_external_cancel_after_write_is_delivery_unknown() {
+        let mut client = scripted_stdio("IFS= read -r _request; sleep 30", Duration::from_secs(2));
+        let process_group = client.child.id() as libc::pid_t;
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            // SAFETY: the fixture child is spawned as its own process group and remains owned by
+            // the request thread until it observes EOF and reaps it.
+            unsafe { libc::killpg(process_group, libc::SIGKILL) };
+        });
+
+        let error = client
+            .request("tools/call", json!({"name":"cancel","arguments":{}}))
+            .unwrap_err();
+        cancel.join().unwrap();
+        assert!(error.downcast_ref::<McpDeliveryUnknown>().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_pre_io_size_rejection_stays_failed() {
+        let mut client = scripted_stdio("sleep 30", Duration::from_secs(1));
+        let payload = "x".repeat(MAX_WRITE_LINE_BYTES);
+        let error = client
+            .request(
+                "tools/call",
+                json!({"name":"too-large","arguments":{"payload":payload}}),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<McpDeliveryUnknown>().is_none());
+        assert!(format!("{error:#}").contains("요청 크기 초과"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_call_jsonrpc_error_is_known_failed_not_unknown() {
+        let mut client = scripted_stdio(
+            "IFS= read -r _request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"failed\"}}'",
+            Duration::from_secs(1),
+        );
+        let error = client
+            .request("tools/call", json!({"name":"known","arguments":{}}))
+            .unwrap_err();
+        assert!(error.downcast_ref::<McpDeliveryUnknown>().is_none());
+        assert_eq!(
+            error
+                .downcast_ref::<McpServerResponseError>()
+                .and_then(|error| error.code()),
+            Some(-32000)
+        );
+    }
 
     #[cfg(unix)]
     #[test]

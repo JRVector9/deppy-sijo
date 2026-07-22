@@ -1,7 +1,9 @@
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension};
+use sha2::{Digest as _, Sha256};
 
 const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
@@ -29,6 +31,30 @@ impl std::fmt::Debug for EnvValue {
 /// credentials 행은 keyring 좌표와 masked_hint만 가진다 (6.3).
 pub struct Db {
     conn: Connection,
+    authorization_db_identity: String,
+}
+
+/// Active owner for one DB-bound authorization executor scope. This non-Clone token owns the OS
+/// lock for its full lifetime, so preflight/outcome APIs cannot outlive the ownership proof.
+pub struct ActiveAuthorizationOwner {
+    _scope_lock: File,
+    scope: String,
+    run_id: String,
+    db_identity: String,
+}
+
+impl ActiveAuthorizationOwner {
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+}
+
+impl std::fmt::Debug for ActiveAuthorizationOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveAuthorizationOwner")
+            .field("state", &"exclusive")
+            .finish()
+    }
 }
 
 /// user_version 기반 forward-only 마이그레이션 (설계문서 11.9).
@@ -45,6 +71,7 @@ pub struct Db {
 /// 11: agent_configs.mcp_config_flag (에이전트별 주입 플래그 커스텀 — NULL=기본 --mcp-config).
 /// 12: mcp_servers scoped env metadata (plain-safe env + credential ids, PR-U10b).
 /// 25: tool audit operation lifecycle (PR-ST01).
+/// 26: authorization scope/run ownership columns (PR-AU01).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -264,6 +291,7 @@ ALTER TABLE agent_needs_input ADD COLUMN message TEXT;
     // v25: 외부 tool call durable lifecycle. Prepared에서 crash한 operation은 시작 시
     // Unknown으로 종결하며 operation_id unique guard로 같은 호출의 자동 retry를 막는다.
     audit::MIGRATION_AUDIT_LIFECYCLE,
+    audit::MIGRATION_AUTHORIZATION_OWNERS,
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -614,16 +642,14 @@ fn looks_like_token_literal(value: &str) -> bool {
             || lower.starts_with("xoxp-"))
 }
 
-fn validate_physical_secret_slot(slot: &str) -> anyhow::Result<()> {
+fn validate_owned_physical_secret_slot(logical_id: &str, slot: &str) -> anyhow::Result<()> {
+    let logical_id = secret::LogicalCredentialId::new(logical_id.to_owned())
+        .context("logical credential id 검증 실패")?;
+    let slot = secret::PhysicalSecretSlot::parse(slot.to_owned())
+        .context("physical secret slot 검증 실패")?;
     anyhow::ensure!(
-        !slot.is_empty() && slot.len() <= 255,
-        "physical secret slot 길이가 잘못됐습니다"
-    );
-    anyhow::ensure!(
-        slot.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'@')
-        }),
-        "physical secret slot 형식이 잘못됐습니다"
+        slot.belongs_to(&logical_id),
+        "physical secret slot이 logical credential에 속하지 않습니다"
     );
     Ok(())
 }
@@ -652,31 +678,60 @@ fn oauth_metadata_contains_secret(value: &serde_json::Value) -> bool {
     }
 }
 
-fn validate_remembered_rule(
-    record: &audit::AuditRecord<'_>,
-    remembered_rule: Option<&PermissionRuleRow>,
-) -> anyhow::Result<()> {
-    let Some(rule) = remembered_rule else {
-        return Ok(());
-    };
-    anyhow::ensure!(
-        record.server_id == Some(rule.server_id.as_str()) && record.tool_name == rule.tool_name,
-        "permission rule과 audit 대상이 일치하지 않습니다"
-    );
-    match (rule.rule.as_str(), record.decision) {
-        ("allow", audit::ToolDecision::AllowAlways) => anyhow::ensure!(
-            rule.approved_schema_hash.as_deref().is_some_and(
-                |hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-            ),
-            "AllowAlways permission에는 64자리 hex schema hash가 필요합니다"
-        ),
-        ("deny", audit::ToolDecision::DenyAlways) => anyhow::ensure!(
-            rule.approved_schema_hash.is_none(),
-            "DenyAlways permission에는 schema hash를 저장하지 않습니다"
-        ),
-        _ => anyhow::bail!("remembered permission과 tool decision이 일치하지 않습니다"),
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
     }
-    Ok(())
+    out
+}
+
+fn open_lock_file(path: &Path) -> anyhow::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("authorization lock 열기 실패: {}", path.display()))
+}
+
+#[cfg(unix)]
+fn physical_db_identity(path: &Path) -> anyhow::Result<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("authorization DB metadata 조회 실패: {}", path.display()))?;
+    Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn physical_db_identity(path: &Path) -> anyhow::Result<String> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("authorization DB metadata 조회 실패: {}", path.display()))?;
+    if let (Some(volume), Some(index)) = (metadata.volume_serial_number(), metadata.file_index()) {
+        return Ok(format!("windows:{volume}:{index}"));
+    }
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("authorization DB 경로 정규화 실패: {}", path.display()))?;
+    Ok(format!("windows-path:{}", canonical.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn physical_db_identity(path: &Path) -> anyhow::Result<String> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("authorization DB 경로 정규화 실패: {}", path.display()))?;
+    Ok(format!("path:{}", canonical.display()))
+}
+
+fn authorization_lock_dir(db_identity: &str) -> PathBuf {
+    let digest = Sha256::digest(db_identity.as_bytes());
+    std::env::temp_dir()
+        .join("deppy-authorization-locks")
+        .join(hex_digest(&digest))
 }
 
 impl Db {
@@ -685,13 +740,20 @@ impl Db {
     /// 앱 수준 store/facade만 소유한다.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = storage_core::open_with_migrations(path, MIGRATIONS)?;
-        Ok(Self { conn })
+        let authorization_db_identity = physical_db_identity(path)?;
+        Ok(Self {
+            conn,
+            authorization_db_identity,
+        })
     }
 
     #[cfg(test)]
     fn open_in_memory() -> anyhow::Result<Self> {
         let conn = storage_core::open_in_memory_with_migrations(MIGRATIONS)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            authorization_db_identity: format!("memory:{}", uuid::Uuid::new_v4()),
+        })
     }
 
     /// 현재 user_version (테스트에서 마이그레이션 가드로 사용).
@@ -701,6 +763,10 @@ impl Db {
     }
 
     /// credential metadata 추가. created_at/updated_at은 SQLite가 UTC로 기록한다.
+    ///
+    /// 이 기존 생성 경로는 IN01 migration/cutover 전까지 logical id 자체를 keyring username에
+    /// 보관한다. 새 physical bundle publish와 secret-backed 실행은 이 legacy pointer를 허용하지
+    /// 않으며, [`Self::rotate_credential_secret_slot`]을 거쳐야 한다.
     pub fn insert_credential(&self, meta: &CredentialMeta) -> anyhow::Result<()> {
         self.conn
             .execute(
@@ -793,7 +859,9 @@ impl Db {
         oauth_json: &str,
         masked_hint: Option<&str>,
     ) -> anyhow::Result<()> {
-        validate_physical_secret_slot(physical_slot)?;
+        // Ownership and the versioned physical format must be proven before opening the
+        // transaction. A staged slot for another logical credential can never be published.
+        validate_owned_physical_secret_slot(id, physical_slot)?;
         validate_oauth_metadata_json(oauth_json)?;
         let tx = self.conn.unchecked_transaction()?;
         let affected = tx
@@ -1468,6 +1536,10 @@ impl Db {
         mcp_store::list_servers(&self.conn)
     }
 
+    pub fn mcp_server(&self, server_id: &str) -> anyhow::Result<Option<mcp_store::McpServerRow>> {
+        mcp_store::server(&self.conn, server_id)
+    }
+
     pub fn insert_mcp_server(&self, row: &mcp_store::McpServerRow) -> anyhow::Result<()> {
         mcp_store::insert_server(&self.conn, row)
     }
@@ -1511,6 +1583,15 @@ impl Db {
     /// 저장된 tool 권한 규칙 전체 (앱 시작 시 PermissionPolicy로 로드).
     pub fn list_permission_rules(&self) -> anyhow::Result<Vec<PermissionRuleRow>> {
         mcp_store::list_permission_rules(&self.conn)
+    }
+
+    /// Authorization hot-path point lookup. Missing rows are interpreted as Ask by the service.
+    pub fn permission_rule(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+    ) -> anyhow::Result<Option<PermissionRuleRow>> {
+        mcp_store::permission_rule(&self.conn, server_id, tool_name)
     }
 
     /// 권한 규칙 저장/갱신 (AllowAlways/DenyAlways 결정 시).
@@ -1684,42 +1765,158 @@ impl Db {
         audit::record_audit(&self.conn, redaction, record, encryptor)
     }
 
-    /// optional AllowAlways/DenyAlways 규칙 갱신과 audit preflight를 한 transaction으로
-    /// commit한다. 반환되기 전에는 외부 call을 시작하면 안 된다. Invalid JSON/audit write/
-    /// permission write 실패는 모두 rollback된다.
-    pub fn commit_tool_authorization_preflight(
+    /// Acquires one DB/scope owner for its whole lifetime and begins a fresh random run. Since the
+    /// exclusive scope lock is already held, any Prepared row from a different run in this scope
+    /// belongs to a dead executor and is atomically reconciled to Unknown. Other scopes are never
+    /// touched and there is no high-cardinality generation registry table.
+    pub fn acquire_authorization_owner(
         &self,
-        operation_id: &str,
-        record: &audit::AuditRecord<'_>,
-        remembered_rule: Option<&PermissionRuleRow>,
-        redaction: &secret::RedactionService,
-        encryptor: Option<&dyn secret::SecretStore>,
-    ) -> anyhow::Result<audit::AuditOperation> {
-        validate_remembered_rule(record, remembered_rule)?;
-        let tx = self.conn.unchecked_transaction()?;
-        if let Some(rule) = remembered_rule {
-            mcp_store::upsert_permission_rule(
-                &tx,
-                &rule.server_id,
-                &rule.tool_name,
-                &rule.rule,
-                rule.approved_schema_hash.as_deref(),
-            )?;
+        scope: &str,
+    ) -> anyhow::Result<ActiveAuthorizationOwner> {
+        let scope_key = audit::authorization_scope_lock_key(scope)?;
+        anyhow::ensure!(
+            !self.authorization_db_identity.starts_with("memory:"),
+            "file-backed DB만 authorization owner를 획득할 수 있습니다"
+        );
+        let lock_dir = authorization_lock_dir(&self.authorization_db_identity);
+        fs::create_dir_all(&lock_dir).with_context(|| {
+            format!(
+                "authorization lock directory 생성 실패: {}",
+                lock_dir.display()
+            )
+        })?;
+        // A fixed 256-stripe set is a hard filesystem bound per DB. Hash collisions only
+        // serialize unrelated scopes conservatively; they can never permit concurrent ownership.
+        let stripe = u8::from_str_radix(&scope_key[..2], 16)
+            .context("authorization scope stripe 계산 실패")?;
+        let lock_path = lock_dir.join(format!("stripe-{stripe:03}.lock"));
+        let scope_lock = open_lock_file(&lock_path)?;
+        if fs2::FileExt::try_lock_exclusive(&scope_lock).is_err() {
+            anyhow::bail!("authorization scope is already owned by a live executor");
         }
-        let operation =
-            audit::prepare_audit_operation(&tx, operation_id, redaction, record, encryptor)?;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE tool_audit_logs
+             SET lifecycle = 'unknown', outcome_error_code = 'owner_superseded',
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE authorization_scope = ?1
+               AND authorization_run_id != ?2
+               AND lifecycle = 'prepared'",
+            (scope, &run_id),
+        )?;
         tx.commit()
-            .context("permission/audit preflight commit 실패")?;
-        Ok(operation)
+            .context("authorization owner 시작 transaction 실패")?;
+        Ok(ActiveAuthorizationOwner {
+            _scope_lock: scope_lock,
+            scope: scope.to_owned(),
+            run_id,
+            db_identity: self.authorization_db_identity.clone(),
+        })
     }
 
-    pub fn complete_tool_audit(
+    /// Shared GUI/proxy AU01 preflight. AuthorizationPlan을 consume하고 exact binding에서
+    /// permission mutation + redacted audit row를 한 transaction으로 만든 뒤에만 opaque
+    /// AuthorizationGrant를 반환한다. Raw encrypted audit는 이 default path에서 항상 NULL이다.
+    pub fn commit_authorization_preflight(
         &self,
+        owner: &ActiveAuthorizationOwner,
+        plan: audit::AuthorizationPlan,
+        input_json: &str,
+        redaction: &secret::RedactionService,
+    ) -> anyhow::Result<audit::AuthorizationPreflight> {
+        audit::validate_tool_input(input_json.as_bytes())?;
+        let tx = self.conn.unchecked_transaction()?;
+        anyhow::ensure!(
+            self.authorization_db_identity == owner.db_identity,
+            "authorization owner가 다른 DB에 속합니다"
+        );
+        let current_permission =
+            match mcp_store::permission_rule(&tx, plan.server_id(), plan.tool_name())? {
+                Some(row) => audit::PermissionFingerprint::Persisted {
+                    rule: audit::PermissionRule::from_persisted(&row.rule)
+                        .ok_or_else(|| anyhow::anyhow!("invalid persisted permission rule"))?,
+                    approved_schema_hash: row.approved_schema_hash,
+                },
+                None => audit::PermissionFingerprint::Absent,
+            };
+        anyhow::ensure!(
+            &current_permission == plan.expected_permission(),
+            "permission changed after authorization evaluation"
+        );
+        match plan.decision() {
+            audit::ToolDecision::AllowAlways => mcp_store::upsert_permission_rule(
+                &tx,
+                plan.server_id(),
+                plan.tool_name(),
+                audit::PermissionRule::Allow.as_str(),
+                Some(plan.live_schema_hash()),
+            )?,
+            audit::ToolDecision::DenyAlways => mcp_store::upsert_permission_rule(
+                &tx,
+                plan.server_id(),
+                plan.tool_name(),
+                audit::PermissionRule::Deny.as_str(),
+                None,
+            )?,
+            _ => {}
+        }
+        let preflight = audit::prepare_owned_authorization_preflight(
+            &tx,
+            plan,
+            input_json,
+            redaction,
+            owner.scope(),
+            &owner.run_id,
+        )?;
+        tx.commit()
+            .context("authorization permission/audit preflight commit 실패")?;
+        Ok(preflight)
+    }
+
+    pub fn complete_authorization_outcome(
+        &self,
+        owner: &ActiveAuthorizationOwner,
         operation_id: &str,
-        outcome: audit::AuditLifecycle,
-        error_code: Option<&str>,
+        outcome: audit::AuthorizationOutcome,
     ) -> anyhow::Result<()> {
-        audit::complete_audit_operation(&self.conn, operation_id, outcome, error_code)
+        anyhow::ensure!(
+            self.authorization_db_identity == owner.db_identity,
+            "authorization owner가 다른 DB에 속합니다"
+        );
+        audit::complete_authorization_operation(
+            &self.conn,
+            owner.scope(),
+            &owner.run_id,
+            operation_id,
+            outcome,
+        )
+    }
+
+    /// Graceful executor shutdown after calls drain. Consuming the owner makes further preflight
+    /// or completion compiler-unrepresentable. If persistence fails, Drop still releases the OS
+    /// stripe lock and the next same-scope owner performs crash-safe reconciliation.
+    pub fn close_authorization_owner(
+        &self,
+        owner: ActiveAuthorizationOwner,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            self.authorization_db_identity == owner.db_identity,
+            "authorization owner가 다른 DB에 속합니다"
+        );
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE tool_audit_logs
+                 SET lifecycle = 'unknown', outcome_error_code = 'owner_shutdown',
+                     completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE authorization_scope = ?1
+                   AND authorization_run_id = ?2
+                   AND lifecycle = 'prepared'",
+                (owner.scope(), &owner.run_id),
+            )
+            .context("authorization owner shutdown 저장 실패")?;
+        Ok(affected)
     }
 
     pub fn tool_audit_lifecycle(
@@ -1727,11 +1924,6 @@ impl Db {
         operation_id: &str,
     ) -> anyhow::Result<Option<audit::AuditLifecycle>> {
         audit::audit_lifecycle(&self.conn, operation_id)
-    }
-
-    /// 앱 bootstrap에서 외부 call worker를 시작하기 전에 호출한다.
-    pub fn reconcile_prepared_tool_audits(&self) -> anyhow::Result<usize> {
-        audit::reconcile_prepared_audits(&self.conn)
     }
 
     /// 앱 시작 시 crash recovery (설계문서 PR-14): 이전 실행이 남긴 세션 중
@@ -1990,6 +2182,52 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_db(label: &str) -> (PathBuf, PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-au01-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        let db = Db::open(&path).unwrap();
+        (dir, path, db)
+    }
+
+    fn authorization_plan(
+        operation_id: &str,
+        server_id: &str,
+        tool_name: &str,
+        decision: audit::ApprovalDecision,
+    ) -> audit::AuthorizationPlan {
+        let audit::AuthorizationEvaluation::NeedsApproval(pending) =
+            audit::evaluate_authorization_with_fingerprint(
+                operation_id.to_owned(),
+                server_id.to_owned(),
+                tool_name.to_owned(),
+                audit::PermissionFingerprint::Absent,
+                audit::schema_hash(r#"{"type":"object"}"#),
+            )
+            .unwrap()
+        else {
+            panic!("Ask rule must require approval")
+        };
+        pending.resolve(decision)
+    }
+
+    fn scope_stripe(scope: &str) -> u8 {
+        let key = audit::authorization_scope_lock_key(scope).unwrap();
+        u8::from_str_radix(&key[..2], 16).unwrap()
+    }
+
+    fn noncolliding_scope(scope: &str) -> String {
+        let stripe = scope_stripe(scope);
+        (0..1024)
+            .map(|index| format!("other-scope-{index}"))
+            .find(|candidate| scope_stripe(candidate) != stripe)
+            .unwrap()
+    }
 
     #[test]
     fn delete_workspace는_자식env와_workspace만_지운다() {
@@ -2319,6 +2557,11 @@ mod tests {
         let read = rows.iter().find(|r| r.tool_name == "read_file").unwrap();
         assert_eq!(read.rule, "deny");
         assert_eq!(read.approved_schema_hash, None);
+        assert_eq!(
+            db.permission_rule("srv-1", "read_file").unwrap(),
+            Some(read.clone())
+        );
+        assert!(db.permission_rule("srv-1", "missing").unwrap().is_none());
         let del = rows.iter().find(|r| r.tool_name == "delete_file").unwrap();
         assert_eq!(del.rule, "deny");
         // 삭제(Ask 재설정) → 행이 사라진다
@@ -2615,21 +2858,23 @@ mod tests {
     #[test]
     fn oauth_secret_slot_pointer와_metadata는_원자적으로_publish된다() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_credential(&sample("cred-oauth")).unwrap();
+        let logical = secret::LogicalCredentialId::new("cred-oauth").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
         db.rotate_credential_secret_slot(
-            "cred-oauth",
-            "cred-oauth.v2",
+            logical.as_str(),
+            slot.as_str(),
             r#"{"server_id":"srv-1","client_id":"cid-1"}"#,
             Some("…7890"),
         )
         .unwrap();
 
         let location = db
-            .credential_secret_location("cred-oauth")
+            .credential_secret_location(logical.as_str())
             .unwrap()
             .unwrap();
         assert_eq!(location.keyring_service, secret::KEYRING_SERVICE);
-        assert_eq!(location.keyring_username, "cred-oauth.v2");
+        assert_eq!(location.keyring_username, slot.as_str());
         assert_eq!(
             db.list_credential_oauth_json().unwrap()[0].1,
             r#"{"server_id":"srv-1","client_id":"cid-1"}"#
@@ -2637,34 +2882,67 @@ mod tests {
     }
 
     #[test]
+    fn physical_slot_publish는_other_corrupt_unversioned_pointer를_fail_closed한다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("cred-owner").unwrap();
+        let other = secret::LogicalCredentialId::new("cred-other").unwrap();
+        let other_slot = secret::PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
+
+        for invalid in [
+            other_slot.as_str(),
+            "deppy.oauth.v1.not-hex.not-a-uuid",
+            logical.as_str(),
+        ] {
+            assert!(
+                db.rotate_credential_secret_slot(
+                    logical.as_str(),
+                    invalid,
+                    r#"{"server_id":"must-not-publish"}"#,
+                    None,
+                )
+                .is_err(),
+                "invalid pointer unexpectedly published: {invalid}"
+            );
+            let location = db
+                .credential_secret_location(logical.as_str())
+                .unwrap()
+                .unwrap();
+            assert_eq!(location.keyring_username, logical.as_str());
+            assert!(db.list_credential_oauth_json().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn oauth_secret_slot_publish_실패는_pointer와_metadata를_rollback한다() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_credential(&sample("cred-oauth")).unwrap();
-        db.set_credential_oauth_json("cred-oauth", r#"{"server_id":"old"}"#)
+        let logical = secret::LogicalCredentialId::new("cred-oauth").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
+        db.set_credential_oauth_json(logical.as_str(), r#"{"server_id":"old"}"#)
             .unwrap();
         db.conn
             .execute_batch(
                 "CREATE TRIGGER fail_slot_publish AFTER UPDATE OF keyring_username ON credentials
-                 WHEN NEW.keyring_username = 'cred-oauth.v2'
                  BEGIN SELECT RAISE(ABORT, 'injected slot publish failure'); END;",
             )
             .unwrap();
 
         assert!(
             db.rotate_credential_secret_slot(
-                "cred-oauth",
-                "cred-oauth.v2",
+                logical.as_str(),
+                slot.as_str(),
                 r#"{"server_id":"new"}"#,
                 None,
             )
             .is_err()
         );
         assert_eq!(
-            db.credential_secret_location("cred-oauth")
+            db.credential_secret_location(logical.as_str())
                 .unwrap()
                 .unwrap()
                 .keyring_username,
-            "cred-oauth"
+            logical.as_str()
         );
         assert_eq!(
             db.list_credential_oauth_json().unwrap()[0].1,
@@ -2675,11 +2953,13 @@ mod tests {
     #[test]
     fn oauth_metadata에는_concrete_token을_저장하지_않는다() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_credential(&sample("cred-oauth")).unwrap();
+        let logical = secret::LogicalCredentialId::new("cred-oauth").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential(&sample(logical.as_str())).unwrap();
         assert!(
             db.rotate_credential_secret_slot(
-                "cred-oauth",
-                "cred-oauth.v2",
+                logical.as_str(),
+                slot.as_str(),
                 r#"{"access_token":"plaintext"}"#,
                 None,
             )
@@ -2689,118 +2969,497 @@ mod tests {
     }
 
     #[test]
-    fn permission과_audit_preflight는_같이_commit되고_outcome으로_종결된다() {
-        let db = Db::open_in_memory().unwrap();
-        let rule = PermissionRuleRow {
-            server_id: "srv-1".to_owned(),
-            tool_name: "read".to_owned(),
-            rule: "allow".to_owned(),
-            approved_schema_hash: Some("a".repeat(64)),
-        };
-        let record = audit::AuditRecord {
-            workspace_id: Some("ws-1"),
-            session_id: Some("session-1"),
-            server_id: Some("srv-1"),
-            tool_name: "read",
-            input_json: r#"{"path":"/tmp/x"}"#,
-            decision: audit::ToolDecision::AllowAlways,
-        };
-        let operation = db
-            .commit_tool_authorization_preflight(
-                "operation-1",
-                &record,
-                Some(&rule),
+    fn authorization_owner는_live_scope를_배타화하고_drop후_same_scope만_unknown처리한다() {
+        let (dir, path, db_a) = file_db("owner-recovery");
+        let lock_dir = authorization_lock_dir(&db_a.authorization_db_identity);
+        let db_b = Db::open(&path).unwrap();
+        let scope_a = "proxy:pane-a:server-a";
+        let scope_b = noncolliding_scope(scope_a);
+        let owner_a = db_a.acquire_authorization_owner(scope_a).unwrap();
+        let old_run = owner_a.run_id.clone();
+
+        let audit::AuthorizationPreflight::Prepared(_grant_a) = db_a
+            .commit_authorization_preflight(
+                &owner_a,
+                authorization_plan(
+                    "operation-owner-a",
+                    "server-a",
+                    "tool-a",
+                    audit::ApprovalDecision::AllowOnce,
+                ),
+                "{}",
                 &secret::RedactionService::new(),
-                None,
             )
-            .unwrap();
-        assert_eq!(operation.lifecycle, audit::AuditLifecycle::Prepared);
-        assert_eq!(db.list_permission_rules().unwrap(), vec![rule]);
+            .unwrap()
+        else {
+            panic!("allow must prepare a grant")
+        };
 
-        db.complete_tool_audit(
-            "operation-1",
-            audit::AuditLifecycle::Failed,
-            Some("transport_timeout"),
-        )
-        .unwrap();
+        assert!(db_b.acquire_authorization_owner(scope_a).is_err());
         assert_eq!(
-            db.tool_audit_lifecycle("operation-1").unwrap(),
-            Some(audit::AuditLifecycle::Failed)
+            db_a.tool_audit_lifecycle("operation-owner-a").unwrap(),
+            Some(audit::AuditLifecycle::Prepared)
         );
-    }
 
-    #[test]
-    fn audit_preflight_insert_실패는_permission도_rollback한다() {
-        let db = Db::open_in_memory().unwrap();
-        db.conn
-            .execute_batch(
-                "CREATE TRIGGER fail_audit_preflight BEFORE INSERT ON tool_audit_logs
-                 BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
-            )
-            .unwrap();
-        let rule = PermissionRuleRow {
-            server_id: "srv-1".to_owned(),
-            tool_name: "read".to_owned(),
-            rule: "allow".to_owned(),
-            approved_schema_hash: Some("a".repeat(64)),
-        };
-        let record = audit::AuditRecord {
-            workspace_id: None,
-            session_id: None,
-            server_id: Some("srv-1"),
-            tool_name: "read",
-            input_json: r#"{"path":"/tmp/x"}"#,
-            decision: audit::ToolDecision::AllowAlways,
-        };
-
-        assert!(
-            db.commit_tool_authorization_preflight(
-                "operation-fail",
-                &record,
-                Some(&rule),
+        let owner_b = db_b.acquire_authorization_owner(&scope_b).unwrap();
+        let audit::AuthorizationPreflight::Prepared(_grant_b) = db_b
+            .commit_authorization_preflight(
+                &owner_b,
+                authorization_plan(
+                    "operation-owner-b",
+                    "server-b",
+                    "tool-b",
+                    audit::ApprovalDecision::AllowOnce,
+                ),
+                "{}",
                 &secret::RedactionService::new(),
-                None,
             )
-            .is_err()
-        );
-        assert!(db.list_permission_rules().unwrap().is_empty());
-        assert_eq!(db.tool_audit_lifecycle("operation-fail").unwrap(), None);
-    }
-
-    #[test]
-    fn prepared_crash_recovery는_unknown으로_종결하고_id_reuse를_막는다() {
-        let db = Db::open_in_memory().unwrap();
-        let record = audit::AuditRecord {
-            workspace_id: None,
-            session_id: None,
-            server_id: Some("srv-1"),
-            tool_name: "read",
-            input_json: r#"{"path":"/tmp/x"}"#,
-            decision: audit::ToolDecision::AllowOnce,
+            .unwrap()
+        else {
+            panic!("allow must prepare a grant")
         };
-        db.commit_tool_authorization_preflight(
-            "operation-crash",
-            &record,
-            None,
-            &secret::RedactionService::new(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(db.reconcile_prepared_tool_audits().unwrap(), 1);
+
+        drop(owner_a);
+        let owner_a_next = db_b.acquire_authorization_owner(scope_a).unwrap();
         assert_eq!(
-            db.tool_audit_lifecycle("operation-crash").unwrap(),
+            db_b.tool_audit_lifecycle("operation-owner-a").unwrap(),
             Some(audit::AuditLifecycle::Unknown)
         );
+        assert_eq!(
+            db_b.tool_audit_lifecycle("operation-owner-b").unwrap(),
+            Some(audit::AuditLifecycle::Prepared)
+        );
         assert!(
-            db.commit_tool_authorization_preflight(
-                "operation-crash",
-                &record,
-                None,
+            audit::complete_authorization_operation(
+                &db_b.conn,
+                scope_a,
+                &old_run,
+                "operation-owner-a",
+                audit::AuthorizationOutcome::Succeeded,
+            )
+            .is_err(),
+            "stale run must not complete a superseded operation"
+        );
+
+        drop(owner_a_next);
+        drop(owner_b);
+        drop(db_b);
+        drop(db_a);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authorization_owner는_db_identity에_묶이고_outcome은_멱등이다() {
+        let (dir_a, _path_a, db_a) = file_db("db-a");
+        let (dir_b, _path_b, db_b) = file_db("db-b");
+        let lock_dir = authorization_lock_dir(&db_a.authorization_db_identity);
+        let owner_a = db_a.acquire_authorization_owner("gui").unwrap();
+        assert!(
+            db_b.commit_authorization_preflight(
+                &owner_a,
+                authorization_plan(
+                    "operation-cross-db",
+                    "server",
+                    "tool",
+                    audit::ApprovalDecision::AllowOnce,
+                ),
+                "{}",
                 &secret::RedactionService::new(),
-                None,
             )
             .is_err()
         );
+
+        let audit::AuthorizationPreflight::Prepared(grant) = db_a
+            .commit_authorization_preflight(
+                &owner_a,
+                authorization_plan(
+                    "operation-idempotent",
+                    "server",
+                    "tool",
+                    audit::ApprovalDecision::AllowOnce,
+                ),
+                r#"{"token":"never-store-plaintext"}"#,
+                &secret::RedactionService::new(),
+            )
+            .unwrap()
+        else {
+            panic!("allow must prepare a grant")
+        };
+        assert_eq!(grant.operation_id(), "operation-idempotent");
+        let encrypted: Option<Vec<u8>> = db_a
+            .conn
+            .query_row(
+                "SELECT input_encrypted_blob FROM tool_audit_logs WHERE operation_id = ?1",
+                ["operation-idempotent"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(encrypted.is_none());
+        let outcome = audit::AuthorizationOutcome::Unknown {
+            error_code: "delivery_unknown",
+        };
+        db_a.complete_authorization_outcome(&owner_a, "operation-idempotent", outcome)
+            .unwrap();
+        db_a.complete_authorization_outcome(&owner_a, "operation-idempotent", outcome)
+            .unwrap();
+        assert_eq!(
+            db_a.tool_audit_lifecycle("operation-idempotent").unwrap(),
+            Some(audit::AuditLifecycle::Unknown)
+        );
+
+        drop(owner_a);
+        drop(db_a);
+        drop(db_b);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir_a).unwrap();
+        fs::remove_dir_all(dir_b).unwrap();
+    }
+
+    #[test]
+    fn authorization_outcome은_모든종결상태에서_same_idempotent_conflict_rejected다() {
+        let (dir, _path, db) = file_db("outcome-idempotency");
+        let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+        let owner = db.acquire_authorization_owner("proxy:outcomes").unwrap();
+        for (suffix, outcome, lifecycle, conflict) in [
+            (
+                "success",
+                audit::AuthorizationOutcome::Succeeded,
+                audit::AuditLifecycle::Succeeded,
+                audit::AuthorizationOutcome::Failed {
+                    error_code: "backend_error",
+                },
+            ),
+            (
+                "failed",
+                audit::AuthorizationOutcome::Failed {
+                    error_code: "backend_error",
+                },
+                audit::AuditLifecycle::Failed,
+                audit::AuthorizationOutcome::Unknown {
+                    error_code: "delivery_unknown",
+                },
+            ),
+            (
+                "unknown",
+                audit::AuthorizationOutcome::Unknown {
+                    error_code: "delivery_unknown",
+                },
+                audit::AuditLifecycle::Unknown,
+                audit::AuthorizationOutcome::Succeeded,
+            ),
+        ] {
+            let operation = format!("operation-outcome-{suffix}");
+            let audit::AuthorizationPreflight::Prepared(_grant) = db
+                .commit_authorization_preflight(
+                    &owner,
+                    authorization_plan(
+                        &operation,
+                        "server",
+                        &format!("tool-{suffix}"),
+                        audit::ApprovalDecision::AllowOnce,
+                    ),
+                    "{}",
+                    &secret::RedactionService::new(),
+                )
+                .unwrap()
+            else {
+                panic!("allow-once must prepare")
+            };
+            db.complete_authorization_outcome(&owner, &operation, outcome)
+                .unwrap();
+            db.complete_authorization_outcome(&owner, &operation, outcome)
+                .unwrap();
+            assert!(
+                db.complete_authorization_outcome(&owner, &operation, conflict)
+                    .is_err()
+            );
+            assert_eq!(
+                db.tool_audit_lifecycle(&operation).unwrap(),
+                Some(lifecycle)
+            );
+        }
+        drop(owner);
+        drop(db);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authorization_owner_graceful_close와_실패_fallback은_scope_run에_격리된다() {
+        let (dir, _path, db) = file_db("owner-close");
+        let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+        let scope_a = "proxy:pane-close:server";
+        let scope_b = noncolliding_scope(scope_a);
+        let owner_a = db.acquire_authorization_owner(scope_a).unwrap();
+        let owner_b = db.acquire_authorization_owner(&scope_b).unwrap();
+        for (owner, operation, server) in [
+            (&owner_a, "operation-close-a", "server-a"),
+            (&owner_b, "operation-close-b", "server-b"),
+        ] {
+            let audit::AuthorizationPreflight::Prepared(_grant) = db
+                .commit_authorization_preflight(
+                    owner,
+                    authorization_plan(
+                        operation,
+                        server,
+                        "tool",
+                        audit::ApprovalDecision::AllowOnce,
+                    ),
+                    "{}",
+                    &secret::RedactionService::new(),
+                )
+                .unwrap()
+            else {
+                panic!("allow must prepare a grant")
+            };
+        }
+        assert_eq!(db.close_authorization_owner(owner_a).unwrap(), 1);
+        assert_eq!(
+            db.tool_audit_lifecycle("operation-close-a").unwrap(),
+            Some(audit::AuditLifecycle::Unknown)
+        );
+        assert_eq!(
+            db.tool_audit_lifecycle("operation-close-b").unwrap(),
+            Some(audit::AuditLifecycle::Prepared)
+        );
+
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_owner_shutdown BEFORE UPDATE OF lifecycle ON tool_audit_logs
+                 WHEN NEW.outcome_error_code = 'owner_shutdown'
+                 BEGIN SELECT RAISE(ABORT, 'injected owner shutdown failure'); END;",
+            )
+            .unwrap();
+        assert!(db.close_authorization_owner(owner_b).is_err());
+        db.conn
+            .execute_batch("DROP TRIGGER fail_owner_shutdown;")
+            .unwrap();
+        let owner_b_next = db.acquire_authorization_owner(&scope_b).unwrap();
+        assert_eq!(
+            db.tool_audit_lifecycle("operation-close-b").unwrap(),
+            Some(audit::AuditLifecycle::Unknown)
+        );
+        drop(owner_b_next);
+        drop(db);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authorization_lock_files는_256_stripe로_상한되고_collision은_직렬화된다() {
+        let (dir, path, db_a) = file_db("lock-stripes");
+        let db_b = Db::open(&path).unwrap();
+        let mut by_stripe: [Option<String>; 256] = std::array::from_fn(|_| None);
+        let (scope_a, scope_b) = (0..4096)
+            .find_map(|index| {
+                let scope = format!("collision-{index}");
+                let stripe = usize::from(scope_stripe(&scope));
+                if let Some(existing) = by_stripe[stripe].take() {
+                    Some((existing, scope))
+                } else {
+                    by_stripe[stripe] = Some(scope);
+                    None
+                }
+            })
+            .unwrap();
+        let owner = db_a.acquire_authorization_owner(&scope_a).unwrap();
+        assert_ne!(scope_a, scope_b);
+        assert!(db_b.acquire_authorization_owner(&scope_b).is_err());
+        drop(owner);
+        drop(db_b.acquire_authorization_owner(&scope_b).unwrap());
+
+        for index in 0..1024 {
+            drop(
+                db_a.acquire_authorization_owner(&format!("bounded-{index}"))
+                    .unwrap(),
+            );
+        }
+        let lock_dir = authorization_lock_dir(&db_a.authorization_db_identity);
+        let lock_files = fs::read_dir(&lock_dir).unwrap().count();
+        assert!(lock_files <= 256, "lock file bound exceeded: {lock_files}");
+
+        drop(db_b);
+        drop(db_a);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_alias는_같은_physical_db_lock_namespace를_사용한다() {
+        let (dir, path, db_a) = file_db("hardlink-a");
+        let alias_dir = dir.join("alias");
+        fs::create_dir_all(&alias_dir).unwrap();
+        let alias = alias_dir.join("metadata-alias.sqlite3");
+        fs::hard_link(&path, &alias).unwrap();
+        let alias_identity = physical_db_identity(&alias).unwrap();
+        assert_eq!(db_a.authorization_db_identity, alias_identity);
+        let lock_dir = authorization_lock_dir(&db_a.authorization_db_identity);
+        assert_eq!(lock_dir, authorization_lock_dir(&alias_identity));
+        fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("stripe-000.lock");
+        let first = open_lock_file(&lock_path).unwrap();
+        let second = open_lock_file(&lock_path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&first).unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&second).is_err());
+        drop(second);
+        drop(first);
+        drop(db_a);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_path_replacement은_새_physical_identity를_얻는다() {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-au01-identity-replace-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        File::create(&path).unwrap().write_all(b"old").unwrap();
+        let old_identity = physical_db_identity(&path).unwrap();
+        let replacement = dir.join("replacement.sqlite3");
+        File::create(&replacement)
+            .unwrap()
+            .write_all(b"new")
+            .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let new_identity = physical_db_identity(&path).unwrap();
+        assert_ne!(old_identity, new_identity);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn allow_always_permission과_audit은_같이_rollback된다() {
+        let (dir, _path, db) = file_db("atomic-preflight");
+        let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+        let owner = db.acquire_authorization_owner("gui").unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_shared_preflight BEFORE INSERT ON tool_audit_logs
+                 BEGIN SELECT RAISE(ABORT, 'injected shared audit failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.commit_authorization_preflight(
+                &owner,
+                authorization_plan(
+                    "operation-atomic-fail",
+                    "server",
+                    "tool",
+                    audit::ApprovalDecision::AllowAlways,
+                ),
+                "{}",
+                &secret::RedactionService::new(),
+            )
+            .is_err()
+        );
+        assert!(db.permission_rule("server", "tool").unwrap().is_none());
+        assert_eq!(
+            db.tool_audit_lifecycle("operation-atomic-fail").unwrap(),
+            None
+        );
+        drop(owner);
+        drop(db);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn permission_fingerprint변경은_preflight와_grant를_막는다() {
+        let (dir, _path, db) = file_db("permission-fingerprint");
+        let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+        let owner = db.acquire_authorization_owner("gui:fingerprint").unwrap();
+        let plan = authorization_plan(
+            "operation-stale-permission",
+            "server",
+            "tool",
+            audit::ApprovalDecision::AllowAlways,
+        );
+        db.upsert_permission_rule("server", "tool", "deny", None)
+            .unwrap();
+        assert!(
+            db.commit_authorization_preflight(
+                &owner,
+                plan,
+                "{}",
+                &secret::RedactionService::new(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.permission_rule("server", "tool").unwrap().unwrap().rule,
+            "deny"
+        );
+        assert_eq!(
+            db.tool_audit_lifecycle("operation-stale-permission")
+                .unwrap(),
+            None
+        );
+        drop(owner);
+        drop(db);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn allow_always와_deny_always는_exact_fingerprint에서만_원자commit된다() {
+        for (label, decision, expected_rule, expected_hash) in [
+            (
+                "allow",
+                audit::ApprovalDecision::AllowAlways,
+                "allow",
+                Some(audit::schema_hash(r#"{"type":"object"}"#)),
+            ),
+            ("deny", audit::ApprovalDecision::DenyAlways, "deny", None),
+        ] {
+            let (dir, _path, db) = file_db(&format!("remember-{label}"));
+            let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+            let owner = db
+                .acquire_authorization_owner(&format!("gui:remember:{label}"))
+                .unwrap();
+            let operation = format!("operation-remember-{label}");
+            let preflight = db
+                .commit_authorization_preflight(
+                    &owner,
+                    authorization_plan(&operation, "server", "tool", decision),
+                    "{}",
+                    &secret::RedactionService::new(),
+                )
+                .unwrap();
+            let row = db.permission_rule("server", "tool").unwrap().unwrap();
+            assert_eq!(row.rule, expected_rule);
+            assert_eq!(row.approved_schema_hash, expected_hash);
+            match (decision, preflight) {
+                (
+                    audit::ApprovalDecision::AllowAlways,
+                    audit::AuthorizationPreflight::Prepared(grant),
+                ) => {
+                    assert_eq!(grant.operation_id(), operation);
+                    db.complete_authorization_outcome(
+                        &owner,
+                        &operation,
+                        audit::AuthorizationOutcome::Succeeded,
+                    )
+                    .unwrap();
+                }
+                (
+                    audit::ApprovalDecision::DenyAlways,
+                    audit::AuthorizationPreflight::Denied(receipt),
+                ) => assert_eq!(receipt.operation_id(), operation),
+                _ => panic!("remembered decision/preflight mismatch"),
+            }
+            drop(owner);
+            drop(db);
+            fs::remove_dir_all(lock_dir).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

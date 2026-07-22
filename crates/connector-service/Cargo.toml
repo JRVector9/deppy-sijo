@@ -12,3 +12,6 @@ auth = { path = "../auth" }
 audit = { path = "../audit" }
 secret = { path = "../secret" }
 tracing = { workspace = true }
+
+[dev-dependencies]
+audit = { path = "../audit", features = ["test-support"] }

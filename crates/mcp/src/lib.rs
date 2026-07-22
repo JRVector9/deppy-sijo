@@ -10,13 +10,20 @@ mod limits;
 mod manager;
 mod metrics;
 mod proxy;
+mod sensitive;
 mod transport;
 
-pub use http::{McpAuthRequired, McpDeliveryUnknown, McpHttpServerConfig, validate_mcp_url};
+pub use http::{
+    McpAuthRequired, McpDeliveryUnknown, McpHttpServerConfig, McpServerResponseError,
+    validate_mcp_url,
+};
 pub use limits::{
     MAX_HTTP_SENDS, MAX_RAW_MCP_RESPONSE_BYTES, MAX_TOOL_DESCRIPTOR_BYTES, MAX_TOOL_INPUT_BYTES,
     MAX_TOOLS_PER_SERVER, McpPayloadKind, enforce_json_payload, enforce_payload_bytes,
 };
 pub use manager::{LocalMcpManager, McpConnection, McpServerConfig, McpTool, PROTOCOL_VERSION};
 pub use metrics::{McpTransportMetrics, transport_metrics};
-pub use proxy::{PermissionHook, ProxyDecision, ToolForwarder, run_proxy};
+pub use proxy::{
+    AuthorizedToolError, AuthorizedToolExecutor, AuthorizedToolOutcome, SensitiveToolInput,
+    run_authorized_proxy,
+};

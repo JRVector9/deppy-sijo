@@ -8,7 +8,11 @@ use anyhow::Context;
 use rusqlite::Connection;
 use secret::RedactionService;
 
-use crate::ToolDecision;
+use crate::policy::AuthorizationBinding;
+use crate::{AuthorizationPlan, ToolDecision};
+
+pub const MAX_AUTHORIZATION_INPUT_BYTES: usize = 32 * 1024;
+pub const MAX_SANITIZED_PREVIEW_CHARS: usize = 500;
 
 /// 외부 tool call 한 건의 durable 상태. `Unknown`은 Prepared 상태에서 프로세스가
 /// 종료되어 전송 여부를 증명할 수 없는 경우이며, 다시 Prepared로 되돌릴 수 없다.
@@ -46,16 +50,72 @@ impl AuditLifecycle {
 
 /// preflight commit 결과. `audit_id`는 내부 row 식별자, `operation_id`는 policy/call/
 /// outcome을 잇는 호출자 제공 correlation key다.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct AuditOperation {
-    pub audit_id: String,
-    pub operation_id: String,
-    pub lifecycle: AuditLifecycle,
+    audit_id: String,
+    operation_id: String,
+    lifecycle: AuditLifecycle,
+    authorization_binding: Option<AuthorizationBinding>,
+}
+
+impl AuditOperation {
+    pub fn audit_id(&self) -> &str {
+        &self.audit_id
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn lifecycle(&self) -> AuditLifecycle {
+        self.lifecycle
+    }
+
+    pub(crate) fn authorization_binding(&self) -> Option<&AuthorizationBinding> {
+        self.authorization_binding.as_ref()
+    }
+}
+
+impl std::fmt::Debug for AuditOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditOperation")
+            .field("lifecycle", &self.lifecycle)
+            .field(
+                "has_authorization_binding",
+                &self.authorization_binding.is_some(),
+            )
+            .finish()
+    }
+}
+
+/// External call 이후 durable lifecycle에 기록할 sanitized outcome.
+/// Error code는 raw error를 받을 수 없도록 static low-cardinality 값만 허용한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationOutcome {
+    Succeeded,
+    Failed { error_code: &'static str },
+    Unknown { error_code: &'static str },
+}
+
+impl AuthorizationOutcome {
+    pub fn lifecycle(self) -> AuditLifecycle {
+        match self {
+            Self::Succeeded => AuditLifecycle::Succeeded,
+            Self::Failed { .. } => AuditLifecycle::Failed,
+            Self::Unknown { .. } => AuditLifecycle::Unknown,
+        }
+    }
+
+    pub fn error_code(self) -> Option<&'static str> {
+        match self {
+            Self::Succeeded => None,
+            Self::Failed { error_code } | Self::Unknown { error_code } => Some(error_code),
+        }
+    }
 }
 
 /// 감사 로그 한 행의 입력 model. input_json은 평문으로 받되
 /// record_audit 내부에서 redaction을 거친 뒤에만 DB에 닿는다.
-#[derive(Clone)]
 pub struct AuditRecord<'a> {
     pub workspace_id: Option<&'a str>,
     pub session_id: Option<&'a str>,
@@ -145,6 +205,51 @@ pub fn mask_sensitive_keys(value: &mut serde_json::Value) {
     }
 }
 
+/// AU01 authorization path의 공용 pre-I/O validator.
+pub fn validate_tool_input(input_json: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        input_json.len() <= MAX_AUTHORIZATION_INPUT_BYTES,
+        "tool input이 {} byte 상한을 초과했습니다",
+        MAX_AUTHORIZATION_INPUT_BYTES
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(input_json).context("tool input JSON 검증 실패")?;
+    anyhow::ensure!(value.is_object(), "tool input은 JSON object여야 합니다");
+    Ok(())
+}
+
+/// Validated input의 bounded/redacted approval preview. DB/I/O 없이 key-mask와 등록된
+/// redaction pattern만 적용하고 UTF-8 char 경계에서 자른다.
+pub fn sanitized_input_preview(
+    input_json: &[u8],
+    redaction: &RedactionService,
+    max_chars: usize,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        max_chars <= MAX_SANITIZED_PREVIEW_CHARS,
+        "preview 상한은 {}자를 넘을 수 없습니다",
+        MAX_SANITIZED_PREVIEW_CHARS
+    );
+    validate_tool_input(input_json)?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(input_json).context("tool input JSON 검증 실패")?;
+    mask_sensitive_keys(&mut value);
+    let serialized = value.to_string();
+    let mut redactor = redaction.stream_redactor();
+    let mut bytes = redactor.redact_chunk(serialized.as_bytes());
+    bytes.extend(redactor.flush());
+    let text = String::from_utf8(bytes).context("redacted preview UTF-8 검증 실패")?;
+    if text.chars().count() <= max_chars {
+        return Ok(text);
+    }
+    if max_chars == 0 {
+        return Ok(String::new());
+    }
+    let mut truncated: String = text.chars().take(max_chars - 1).collect();
+    truncated.push('…');
+    Ok(truncated)
+}
+
 /// JSON으로 파싱되지 않는 input의 gap marker (7장 "redaction 불확실 시 보수적 폐기")
 const INVALID_INPUT_MARKER: &str = "[INVALID_JSON_INPUT_OMITTED]";
 
@@ -191,12 +296,91 @@ pub fn record_audit(
 /// permission 검사가 끝난 tool call을 durable preflight로 기록한다. 허용 결정은
 /// `Prepared`, 거부 결정은 `Denied`로 바로 종결한다. Invalid JSON은 행을 만들지 않으며,
 /// 같은 operation id는 lifecycle과 무관하게 다시 준비할 수 없다.
-pub fn prepare_audit_operation(
+#[cfg(test)]
+pub(crate) fn prepare_audit_operation(
     conn: &Connection,
     operation_id: &str,
     redaction: &RedactionService,
     record: &AuditRecord<'_>,
     encryptor: Option<&dyn secret::SecretStore>,
+) -> anyhow::Result<AuditOperation> {
+    prepare_audit_operation_with_binding(
+        conn,
+        operation_id,
+        redaction,
+        record,
+        encryptor,
+        None,
+        None,
+    )
+}
+
+/// AuthorizationPlan의 exact target/decision/schema binding에서 audit row를 파생한다.
+/// 반환 proof는 같은 plan과만 AuthorizationGrant로 결합할 수 있다.
+pub(crate) fn prepare_authorization_operation(
+    conn: &Connection,
+    plan: &AuthorizationPlan,
+    input_json: &str,
+    redaction: &RedactionService,
+    encryptor: Option<&dyn secret::SecretStore>,
+    authorization_scope: &str,
+    authorization_run_id: &str,
+) -> anyhow::Result<AuditOperation> {
+    crate::authorization_scope_lock_key(authorization_scope)?;
+    validate_operation_id(authorization_run_id)?;
+    validate_tool_input(input_json.as_bytes())?;
+    let record = AuditRecord {
+        workspace_id: None,
+        session_id: None,
+        server_id: Some(plan.server_id()),
+        tool_name: plan.tool_name(),
+        input_json,
+        decision: plan.decision(),
+    };
+    prepare_audit_operation_with_binding(
+        conn,
+        plan.operation_id(),
+        redaction,
+        &record,
+        encryptor,
+        Some(plan.binding(input_json.as_bytes())),
+        Some((authorization_scope, authorization_run_id)),
+    )
+}
+
+/// Narrow cross-crate issuer used only inside an already-open owner/permission transaction.
+/// Rust has no friend-crate visibility, so repository dependency/callsite gates restrict this
+/// public entrypoint to storage; the independently composable raw proof and grant combiner remain
+/// crate-private. The caller must retain the matching OS owner lock for `scope`/`run_id`.
+#[doc(hidden)]
+pub fn prepare_owned_authorization_preflight(
+    conn: &Connection,
+    plan: AuthorizationPlan,
+    input_json: &str,
+    redaction: &RedactionService,
+    authorization_scope: &str,
+    authorization_run_id: &str,
+) -> anyhow::Result<crate::AuthorizationPreflight> {
+    let operation = prepare_authorization_operation(
+        conn,
+        &plan,
+        input_json,
+        redaction,
+        None,
+        authorization_scope,
+        authorization_run_id,
+    )?;
+    crate::AuthorizationPreflight::from_preflight(plan, operation)
+}
+
+fn prepare_audit_operation_with_binding(
+    conn: &Connection,
+    operation_id: &str,
+    redaction: &RedactionService,
+    record: &AuditRecord<'_>,
+    encryptor: Option<&dyn secret::SecretStore>,
+    authorization_binding: Option<AuthorizationBinding>,
+    authorization_owner: Option<(&str, &str)>,
 ) -> anyhow::Result<AuditOperation> {
     validate_operation_id(operation_id)?;
     let (input_redacted, encrypted_blob) =
@@ -207,14 +391,18 @@ pub fn prepare_audit_operation(
         AuditLifecycle::Denied
     };
     let id = uuid::Uuid::new_v4().to_string();
+    let (authorization_scope, authorization_run_id) = authorization_owner
+        .map(|(scope, run_id)| (Some(scope), Some(run_id)))
+        .unwrap_or((None, None));
     conn.execute(
         "INSERT INTO tool_audit_logs
            (id, operation_id, workspace_id, session_id, server_id, tool_name,
             input_redacted_json, input_encrypted_blob, decision, lifecycle, created_at,
-            completed_at)
+            completed_at, authorization_scope, authorization_run_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-            CASE WHEN ?10 = 'denied' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') END)",
+            CASE WHEN ?10 = 'denied' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
+            ?11, ?12)",
         (
             &id,
             operation_id,
@@ -226,6 +414,8 @@ pub fn prepare_audit_operation(
             encrypted_blob,
             record.decision.as_str(),
             lifecycle.as_str(),
+            authorization_scope,
+            authorization_run_id,
         ),
     )
     .with_context(|| format!("tool audit preflight 저장 실패: {}", record.tool_name))?;
@@ -233,20 +423,87 @@ pub fn prepare_audit_operation(
         audit_id: id,
         operation_id: operation_id.to_owned(),
         lifecycle,
+        authorization_binding,
     })
 }
 
-/// Prepared call을 알려진 최종 상태로 한 번만 전이한다. Unknown/Denied/이미 완료된 행은
+/// Owner-scoped AU01 completion. The exact scope/generation match prevents a stale executor from
+/// completing a newer owner's operation. Repeating the same final outcome is idempotent so an
+/// executor can safely resolve an acknowledgement-ambiguous persistence attempt without calling
+/// the external tool again.
+pub fn complete_authorization_operation(
+    conn: &Connection,
+    authorization_scope: &str,
+    authorization_run_id: &str,
+    operation_id: &str,
+    outcome: AuthorizationOutcome,
+) -> anyhow::Result<()> {
+    crate::authorization_scope_lock_key(authorization_scope)?;
+    validate_operation_id(authorization_run_id)?;
+    validate_operation_id(operation_id)?;
+    let lifecycle = outcome.lifecycle();
+    let error_code = outcome.error_code();
+    validate_error_code(lifecycle, error_code)?;
+    let affected = conn
+        .execute(
+            "UPDATE tool_audit_logs
+             SET lifecycle = ?4, outcome_error_code = ?5,
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE operation_id = ?1
+               AND authorization_scope = ?2
+               AND authorization_run_id = ?3
+               AND lifecycle = 'prepared'",
+            (
+                operation_id,
+                authorization_scope,
+                authorization_run_id,
+                lifecycle.as_str(),
+                error_code,
+            ),
+        )
+        .with_context(|| format!("authorization outcome 저장 실패: {operation_id}"))?;
+    if affected == 1 {
+        return Ok(());
+    }
+
+    use rusqlite::OptionalExtension as _;
+    let persisted: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT lifecycle, outcome_error_code
+             FROM tool_audit_logs
+             WHERE operation_id = ?1
+               AND authorization_scope = ?2
+               AND authorization_run_id = ?3",
+            (operation_id, authorization_scope, authorization_run_id),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    anyhow::ensure!(
+        persisted
+            .as_ref()
+            .is_some_and(|(stored_lifecycle, stored_error)| {
+                stored_lifecycle == lifecycle.as_str() && stored_error.as_deref() == error_code
+            }),
+        "완료 가능한 matching prepared authorization audit가 없음: {operation_id}"
+    );
+    Ok(())
+}
+
+/// Legacy ownerless Prepared call을 알려진 최종 상태로 한 번만 전이한다. Denied/이미 완료된 행은
 /// 갱신하지 않고 오류를 반환하므로 호출자가 무심코 같은 call 결과를 덮어쓰지 못한다.
-pub fn complete_audit_operation(
+#[cfg(test)]
+pub(crate) fn complete_audit_operation(
     conn: &Connection,
     operation_id: &str,
     outcome: AuditLifecycle,
     error_code: Option<&str>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        matches!(outcome, AuditLifecycle::Succeeded | AuditLifecycle::Failed),
-        "audit 완료 상태는 succeeded 또는 failed만 허용됩니다"
+        matches!(
+            outcome,
+            AuditLifecycle::Succeeded | AuditLifecycle::Failed | AuditLifecycle::Unknown
+        ),
+        "audit 완료 상태는 succeeded, failed 또는 unknown만 허용됩니다"
     );
     validate_error_code(outcome, error_code)?;
     let affected = conn
@@ -254,7 +511,9 @@ pub fn complete_audit_operation(
             "UPDATE tool_audit_logs
              SET lifecycle = ?2, outcome_error_code = ?3,
                  completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE operation_id = ?1 AND lifecycle = 'prepared'",
+             WHERE operation_id = ?1 AND lifecycle = 'prepared'
+               AND authorization_scope IS NULL
+               AND authorization_run_id IS NULL",
             (operation_id, outcome.as_str(), error_code),
         )
         .with_context(|| format!("tool audit outcome 저장 실패: {operation_id}"))?;
@@ -263,21 +522,6 @@ pub fn complete_audit_operation(
         "완료 가능한 prepared audit가 없음: {operation_id}"
     );
     Ok(())
-}
-
-/// 시작 시 남아 있는 Prepared는 전송 여부를 증명할 수 없으므로 Unknown으로 종결한다.
-/// 이 상태는 `prepare_audit_operation`의 unique operation id guard 때문에 자동 retry되지 않는다.
-pub fn reconcile_prepared_audits(conn: &Connection) -> anyhow::Result<usize> {
-    let affected = conn
-        .execute(
-            "UPDATE tool_audit_logs
-             SET lifecycle = 'unknown', outcome_error_code = 'process_interrupted',
-                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE lifecycle = 'prepared'",
-            [],
-        )
-        .context("prepared audit crash reconciliation 실패")?;
-    Ok(affected)
 }
 
 pub fn audit_lifecycle(
@@ -304,6 +548,9 @@ fn prepare_payload(
     encryptor: Option<&dyn secret::SecretStore>,
     reject_invalid_json: bool,
 ) -> anyhow::Result<(String, Option<Vec<u8>>)> {
+    if reject_invalid_json {
+        validate_tool_input(input_json.as_bytes())?;
+    }
     let keyed = match serde_json::from_str::<serde_json::Value>(input_json) {
         Ok(mut value) => {
             mask_sensitive_keys(&mut value);
@@ -329,7 +576,7 @@ fn prepare_payload(
     Ok((input_redacted, encrypted_blob))
 }
 
-fn validate_operation_id(operation_id: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_operation_id(operation_id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         operation_id == operation_id.trim(),
         "operation id 앞뒤 공백은 허용되지 않습니다"
@@ -400,7 +647,11 @@ mod tests {
     }
 
     use super::*;
-    use crate::{MIGRATION_AUDIT_LIFECYCLE, MIGRATION_SQL};
+    use crate::{
+        ApprovalDecision, AuthorizationEvaluation, AuthorizationPreflight,
+        MIGRATION_AUDIT_LIFECYCLE, MIGRATION_AUTHORIZATION_OWNERS, MIGRATION_SQL, PermissionRule,
+        evaluate_authorization,
+    };
 
     const SECRET: &str = "sk-abcdef123456";
 
@@ -408,6 +659,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(MIGRATION_SQL).unwrap();
         conn.execute_batch(MIGRATION_AUDIT_LIFECYCLE).unwrap();
+        conn.execute_batch(MIGRATION_AUTHORIZATION_OWNERS).unwrap();
         conn
     }
 
@@ -426,6 +678,76 @@ mod tests {
             input_json,
             decision: ToolDecision::AllowOnce,
         }
+    }
+
+    fn approval_plan(
+        operation_id: &str,
+        server_id: &str,
+        tool_name: &str,
+        hash: String,
+        decision: ApprovalDecision,
+    ) -> AuthorizationPlan {
+        let AuthorizationEvaluation::NeedsApproval(pending) = evaluate_authorization(
+            operation_id.to_owned(),
+            server_id.to_owned(),
+            tool_name.to_owned(),
+            PermissionRule::Ask,
+            None,
+            hash,
+        )
+        .unwrap() else {
+            panic!("Ask must create pending")
+        };
+        pending.resolve(decision)
+    }
+
+    fn policy_plan(
+        operation_id: &str,
+        server_id: &str,
+        tool_name: &str,
+        hash: String,
+        rule: PermissionRule,
+    ) -> AuthorizationPlan {
+        let approved = (rule == PermissionRule::Allow).then(|| hash.clone());
+        let AuthorizationEvaluation::Plan(plan) = evaluate_authorization(
+            operation_id.to_owned(),
+            server_id.to_owned(),
+            tool_name.to_owned(),
+            rule,
+            approved.as_deref(),
+            hash,
+        )
+        .unwrap() else {
+            panic!("decided policy must create plan")
+        };
+        plan
+    }
+
+    fn exact_grant(operation_id: &str, input_json: &str) -> crate::AuthorizationGrant {
+        let conn = test_conn();
+        let plan = approval_plan(
+            operation_id,
+            "server-exact",
+            "tool-exact",
+            crate::schema_hash("schema-exact"),
+            ApprovalDecision::AllowOnce,
+        );
+        let operation = prepare_authorization_operation(
+            &conn,
+            &plan,
+            input_json,
+            &RedactionService::new(),
+            None,
+            "test-scope",
+            "test-run",
+        )
+        .unwrap();
+        let AuthorizationPreflight::Prepared(grant) =
+            AuthorizationPreflight::from_preflight(plan, operation).unwrap()
+        else {
+            panic!("allowed preflight must issue a grant")
+        };
+        grant
     }
 
     #[test]
@@ -669,6 +991,183 @@ mod tests {
     }
 
     #[test]
+    fn shared_input_validator는_size_json_object를_pre_io에서_강제한다() {
+        assert!(validate_tool_input(br#"{"ok":true}"#).is_ok());
+        for invalid in [
+            b"not-json".as_slice(),
+            br#""scalar""#.as_slice(),
+            br#"[1,2,3]"#.as_slice(),
+            b"null".as_slice(),
+        ] {
+            assert!(validate_tool_input(invalid).is_err());
+        }
+        let oversized = format!(
+            r#"{{"value":"{}"}}"#,
+            "x".repeat(MAX_AUTHORIZATION_INPUT_BYTES)
+        );
+        assert!(oversized.len() > MAX_AUTHORIZATION_INPUT_BYTES);
+        assert!(validate_tool_input(oversized.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn sanitized_preview는_key_pattern과_utf8_char상한을_지킨다() {
+        let service = service_with_secret();
+        let input = format!(r#"{{"token":"unregistered-token","note":"{SECRET}가나다라마바사"}}"#);
+        let preview = sanitized_input_preview(input.as_bytes(), &service, 24).unwrap();
+        assert!(!preview.contains("unregistered-token"), "{preview}");
+        assert!(!preview.contains(SECRET), "{preview}");
+        assert!(preview.contains("[REDACTED]"), "{preview}");
+        assert!(preview.chars().count() <= 24);
+        assert!(sanitized_input_preview(input.as_bytes(), &service, 501).is_err());
+    }
+
+    #[test]
+    fn authorization_proof는_exact_plan_binding과만_결합된다() {
+        let conn = test_conn();
+        let redaction = RedactionService::new();
+        let hash = crate::schema_hash("schema");
+        let plan_a = approval_plan(
+            "op-binding-a",
+            "server-a",
+            "tool-a",
+            hash.clone(),
+            ApprovalDecision::AllowOnce,
+        );
+        let operation = prepare_authorization_operation(
+            &conn,
+            &plan_a,
+            "{}",
+            &redaction,
+            None,
+            "test-scope",
+            "test-run",
+        )
+        .unwrap();
+        let plan_b = approval_plan(
+            "op-binding-a",
+            "server-b",
+            "tool-b",
+            hash,
+            ApprovalDecision::AllowOnce,
+        );
+        assert!(AuthorizationPreflight::from_preflight(plan_b, operation).is_err());
+    }
+
+    #[test]
+    fn authorization_proof는_같은_allowedness의_다른_decision을_거부한다() {
+        let conn = test_conn();
+        let redaction = RedactionService::new();
+        let hash = crate::schema_hash("schema");
+        let plan_a = policy_plan(
+            "op-binding-decision",
+            "server",
+            "tool",
+            hash.clone(),
+            PermissionRule::Allow,
+        );
+        let operation = prepare_authorization_operation(
+            &conn,
+            &plan_a,
+            "{}",
+            &redaction,
+            None,
+            "test-scope",
+            "test-run",
+        )
+        .unwrap();
+        let plan_b = approval_plan(
+            "op-binding-decision",
+            "server",
+            "tool",
+            hash,
+            ApprovalDecision::AllowAlways,
+        );
+        assert!(AuthorizationPreflight::from_preflight(plan_b, operation).is_err());
+    }
+
+    #[test]
+    fn authorization_grant는_exact_server_tool_input_bytes에_한번만_결합된다() {
+        let input = br#"{"a":1}"#;
+        let call = exact_grant("op-exact-ok", std::str::from_utf8(input).unwrap())
+            .bind_call("server-exact", "tool-exact", input)
+            .unwrap();
+        assert_eq!(call.operation_id(), "op-exact-ok");
+
+        assert!(
+            exact_grant("op-wrong-server", r#"{"a":1}"#)
+                .bind_call("server-other", "tool-exact", input)
+                .is_err()
+        );
+        assert!(
+            exact_grant("op-wrong-tool", r#"{"a":1}"#)
+                .bind_call("server-exact", "tool-other", input)
+                .is_err()
+        );
+        assert!(
+            exact_grant("op-wrong-bytes", r#"{"a":1}"#)
+                .bind_call("server-exact", "tool-exact", br#"{"a":1 }"#)
+                .is_err(),
+            "semantically equal but byte-different JSON must not reuse a grant"
+        );
+    }
+
+    #[test]
+    fn grant와_bound_call_debug는_identifiers_schema_input을_숨긴다() {
+        let input = r#"{"marker":"input-never-debug"}"#;
+        let grant = exact_grant("operation-never-debug", input);
+        let grant_debug = format!("{grant:?}");
+        for marker in [
+            "operation-never-debug",
+            "server-exact",
+            "tool-exact",
+            "schema-exact",
+            "input-never-debug",
+        ] {
+            assert!(!grant_debug.contains(marker), "{grant_debug}");
+        }
+        let call = grant
+            .bind_call("server-exact", "tool-exact", input.as_bytes())
+            .unwrap();
+        let call_debug = format!("{call:?}");
+        for marker in [
+            "operation-never-debug",
+            "server-exact",
+            "tool-exact",
+            "schema-exact",
+            "input-never-debug",
+        ] {
+            assert!(!call_debug.contains(marker), "{call_debug}");
+        }
+    }
+
+    #[test]
+    fn denied_preflight는_external_call_grant를_만들지_않는다() {
+        let conn = test_conn();
+        let redaction = RedactionService::new();
+        let plan = policy_plan(
+            "op-denied-receipt",
+            "server",
+            "tool",
+            crate::schema_hash("schema"),
+            PermissionRule::Deny,
+        );
+        let operation = prepare_authorization_operation(
+            &conn,
+            &plan,
+            "{}",
+            &redaction,
+            None,
+            "test-scope",
+            "test-run",
+        )
+        .unwrap();
+        assert!(matches!(
+            AuthorizationPreflight::from_preflight(plan, operation).unwrap(),
+            AuthorizationPreflight::Denied(_)
+        ));
+    }
+
+    #[test]
     fn audit_operation은_prepared에서_한번만_완료된다() {
         let conn = test_conn();
         let operation = prepare_audit_operation(
@@ -693,6 +1192,41 @@ mod tests {
         assert!(
             complete_audit_operation(&conn, "op-allow-1", AuditLifecycle::Failed, Some("late"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_completion은_owner_scoped_prepared를_종결할수없다() {
+        let conn = test_conn();
+        let plan = approval_plan(
+            "owner-scoped-bypass",
+            "server",
+            "tool",
+            crate::schema_hash("schema"),
+            ApprovalDecision::AllowOnce,
+        );
+        prepare_authorization_operation(
+            &conn,
+            &plan,
+            "{}",
+            &RedactionService::new(),
+            None,
+            "proxy:owner",
+            "6d9959c7-036b-4a60-aa25-46fdc362e517",
+        )
+        .unwrap();
+        assert!(
+            complete_audit_operation(
+                &conn,
+                "owner-scoped-bypass",
+                AuditLifecycle::Succeeded,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            audit_lifecycle(&conn, "owner-scoped-bypass").unwrap(),
+            Some(AuditLifecycle::Prepared)
         );
     }
 
@@ -727,26 +1261,40 @@ mod tests {
     }
 
     #[test]
-    fn crash_recovery는_prepared를_unknown으로_바꾸고_같은_id_retry를_막는다() {
+    fn delivery_unknown은_prepared에서_한번만_unknown으로_종결되고_retry를_막는다() {
         let conn = test_conn();
         prepare_audit_operation(
             &conn,
-            "op-unknown-1",
+            "op-delivery-unknown",
             &RedactionService::new(),
             &record(r#"{"path":"/tmp/x"}"#),
             None,
         )
         .unwrap();
-
-        assert_eq!(reconcile_prepared_audits(&conn).unwrap(), 1);
+        complete_audit_operation(
+            &conn,
+            "op-delivery-unknown",
+            AuditLifecycle::Unknown,
+            Some("delivery_unknown"),
+        )
+        .unwrap();
         assert_eq!(
-            audit_lifecycle(&conn, "op-unknown-1").unwrap(),
+            audit_lifecycle(&conn, "op-delivery-unknown").unwrap(),
             Some(AuditLifecycle::Unknown)
+        );
+        assert!(
+            complete_audit_operation(
+                &conn,
+                "op-delivery-unknown",
+                AuditLifecycle::Failed,
+                Some("late_result"),
+            )
+            .is_err()
         );
         assert!(
             prepare_audit_operation(
                 &conn,
-                "op-unknown-1",
+                "op-delivery-unknown",
                 &RedactionService::new(),
                 &record(r#"{"path":"/tmp/x"}"#),
                 None,

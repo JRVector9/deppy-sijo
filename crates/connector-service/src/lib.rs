@@ -11,12 +11,13 @@ mod snapshot;
 pub use connector_contract as contract;
 pub use coordinator::{
     AppRequest, ConnectorCoordinator, ConnectorCoordinatorConfig, ConnectorServiceMetrics,
-    CoordinatorClock, DispatchError, DispatchOutcome, SystemCoordinatorClock,
+    CoordinatorClock, DispatchError, DispatchOutcome, OperationIdFactory, SystemCoordinatorClock,
+    SystemOperationIdFactory,
 };
 pub use ports::{
-    CancellationToken, ConnectorMcp, ConnectorOAuth, ConnectorRepository,
-    ConnectorRepositoryFactory, ConnectorSecrets, DiscoverOutput, DiscoveredTool, ImportPlan,
-    InvokeRequest, McpTransportSnapshot, OAuthOutput, OverviewData, RepositoryToolPage,
-    ServiceError, StoredOAuthClient, cancel_live_mcp_connection,
+    AuthorizationState, AuthorizedInvokeRequest, CancellationToken, ConnectorMcp, ConnectorOAuth,
+    ConnectorRepository, ConnectorRepositoryFactory, ConnectorSecrets, DiscoverOutput,
+    DiscoveredTool, ImportPlan, LiveToolSchema, McpTransportSnapshot, OAuthOutput, OverviewData,
+    RepositoryToolPage, ServiceError, StoredOAuthClient, cancel_live_mcp_connection,
 };
 pub use snapshot::SnapshotReader;

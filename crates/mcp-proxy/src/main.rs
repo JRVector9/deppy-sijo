@@ -12,20 +12,20 @@ mod forwarder;
 mod hook;
 mod session;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use deppy_core::time::unix_secs_i64;
-use mcp::{LocalMcpManager, McpHttpServerConfig, McpServerConfig, run_proxy, validate_mcp_url};
+use mcp::{LocalMcpManager, run_authorized_proxy};
+#[cfg(test)]
 use mcp_store::McpServerRow;
-use secret::{KeyringSecretStore, RedactionService, SecretStore};
+use secret::RedactionService;
 
 use crate::cli::Cli;
-use crate::forwarder::{BackendConfig, ManagerToolForwarder};
-use crate::hook::DbPermissionHook;
+use crate::hook::authorized_proxy_executor;
 #[cfg(unix)]
 use crate::session::IdleDeadlineReader;
-use crate::session::{BackendClient, BackendSession, DEFAULT_BACKEND_IDLE_TTL};
+use crate::session::{BackendClient, BackendConfig, BackendSession, DEFAULT_BACKEND_IDLE_TTL};
 
 /// orphan 판정 컷오프(초): created_at이 (now - 이 값)보다 오래된 pending은 죽은 프록시가
 /// 남긴 것으로 보고 시작 시 정리한다. **승인 대기 상한(MAX_APPROVAL_TIMEOUT_SECS)과 같게**
@@ -56,68 +56,75 @@ fn main() -> anyhow::Result<()> {
     }
 
     let cli = Cli::from_env()?;
-    let db = storage::Db::open(&cli.db_path)?;
+    let db = Arc::new(Mutex::new(storage::Db::open(&cli.db_path)?));
 
     // 프론트할 백엔드 서버 spec을 DB에서 찾는다.
     let server = db
-        .list_mcp_servers()?
-        .into_iter()
-        .find(|s| s.id == cli.server_id)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))?
+        .mcp_server(&cli.server_id)?
         .with_context(|| format!("MCP 서버 '{}'를 DB에서 찾을 수 없음", cli.server_id))?;
-    // keyring store 등록 (credential redaction 시드용).
-    // 실패해도 프록시는 동작한다 — 시드만 비활성 (best-effort, insecure fallback 아님).
-    let keyring_ok = match secret::init_platform_store() {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!("keyring store 초기화 실패 — redaction 시드 생략: {e:#}");
-            false
-        }
-    };
-
-    // 로그/프리뷰 redaction: 저장된 credential secret을 시드한다 (app/runtime과 동일 관례).
+    // No credential/keyring access occurs at startup. Cold backend connect resolves only the
+    // target's logical refs to current physical slots and holds a bounded redaction lease.
     let redaction = RedactionService::new();
-    let keyring_store = KeyringSecretStore;
-    if keyring_ok {
-        seed_redaction(&db, &keyring_store, &redaction);
-    }
-    let secret_store: Option<&dyn SecretStore> = if keyring_ok {
-        Some(&keyring_store)
-    } else {
-        None
-    };
-    let config = server_config(&server, secret_store, &redaction)?;
+    let config = BackendConfig::from_server_row(&server)?;
 
     // 이전에 크래시한 프록시가 남긴 orphan pending 승인을 정리한다 — GUI가 죽은 팝업을
     // 띄우지 않게. best-effort(실패해도 서빙 계속). db를 hook으로 넘기기 전에 한다.
     // cutoff(now-ORPHAN_CUTOFF_SECS)보다 최근 행(다른 살아있는 프록시)은 건드리지 않고,
     // 이 프록시가 앞으로 넣을 행은 아직 없다.
     let now = unix_secs_i64();
-    match db.expire_pending_approvals(now - ORPHAN_CUTOFF_SECS, now) {
+    let db_guard = db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))?;
+    match db_guard.expire_pending_approvals(now - ORPHAN_CUTOFF_SECS, now) {
         Ok(n) if n > 0 => tracing::info!("orphan pending 승인 {n}건 정리(이전 크래시 잔여)"),
         Ok(_) => {}
         Err(e) => tracing::warn!("orphan pending 승인 정리 실패(무시하고 계속): {e:#}"),
     }
-    match db.prune_resolved_approvals(now - RESOLVED_APPROVAL_RETENTION_SECS) {
+    match db_guard.prune_resolved_approvals(now - RESOLVED_APPROVAL_RETENTION_SECS) {
         Ok(n) if n > 0 => tracing::info!("resolved approval {n}건 정리"),
         Ok(_) => {}
         Err(e) => tracing::warn!("resolved approval 정리 실패(무시하고 계속): {e:#}"),
     }
+    drop(db_guard);
+
+    // Stable proxy ownership is mandatory for scoped crash recovery. Missing pane identity must be
+    // replaced explicitly; PID/random fallbacks would make every restart a new unrecoverable scope.
+    let pane_id = std::env::var("DEPPY_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let owner_id = pane_id.clone().or_else(|| {
+        std::env::var("DEPPY_AUTHORIZATION_OWNER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let owner_id = owner_id.context(
+        "DEPPY_SESSION_ID 또는 DEPPY_AUTHORIZATION_OWNER가 authorization scope에 필요합니다",
+    )?;
+    let authorization_scope = format!("proxy:{owner_id}:{}", cli.server_id);
+    let owner = db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))?
+        .acquire_authorization_owner(&authorization_scope)?;
 
     // hook live-schema와 forwarder call이 같은 lazy initialized connection을 공유한다.
     let manager = LocalMcpManager::new(redaction.clone());
-    let backend_session = BackendSession::production(manager, DEFAULT_BACKEND_IDLE_TTL);
-    let backend = Arc::new(BackendClient::new(
+    let backend_session = BackendSession::production(
+        manager,
+        Arc::clone(&db),
+        redaction.clone(),
+        DEFAULT_BACKEND_IDLE_TTL,
+    );
+    let backend = Arc::new(BackendClient::managed(
         cli.server_id.clone(),
         config,
         Arc::clone(&backend_session),
+        Arc::clone(&db),
     ));
-    let forwarder = ManagerToolForwarder::from_backend(Arc::clone(&backend));
-    // pane_id = env DEPPY_SESSION_ID — 승인이 어느 세션에서 났는지 표시/딥링크용 (I2).
-    let pane_id = std::env::var("DEPPY_SESSION_ID")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let hook = DbPermissionHook::with_backend(
-        db,
+    let executor = authorized_proxy_executor(
+        Arc::clone(&db),
+        owner,
         cli.server_id,
         redaction,
         cli.poll_interval,
@@ -132,7 +139,7 @@ fn main() -> anyhow::Result<()> {
     let reader = IdleDeadlineReader::new(stdin.lock(), Arc::clone(&backend_session));
     #[cfg(not(unix))]
     let reader = stdin.lock();
-    let result = run_proxy(reader, stdout.lock(), forwarder, hook);
+    let result = run_authorized_proxy(reader, stdout.lock(), executor);
     backend_session.shutdown();
     result
 }
@@ -341,103 +348,34 @@ fn chain_user_statusline(json: &serde_json::Value, payload: &str) -> Option<Stri
     result.map(|buf| String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// McpServerRow → kind별 BackendConfig (H3): stdio는 command 필수 + scoped env 해석,
-/// http는 url 필수 + 시작 시점 URL 정책 검증(https/localhost — 연결 때도 재검증된다).
-/// http bearer는 H3에서 항상 None — credential 연동(401 사다리)은 H5 소관.
-fn server_config(
-    row: &McpServerRow,
-    secret_store: Option<&dyn SecretStore>,
-    redaction: &RedactionService,
-) -> anyhow::Result<BackendConfig> {
-    match row.kind.as_str() {
-        "stdio" => {
-            let command = row
-                .command
-                .clone()
-                .with_context(|| format!("stdio 서버 '{}'에 command가 없음", row.id))?;
-            Ok(BackendConfig::Stdio(McpServerConfig::stdio(
-                row.name.clone(),
-                command,
-                row.args.clone(),
-                resolve_server_env(row, secret_store, redaction)?,
-                row.inherit_env,
-            )))
-        }
-        "http" => {
-            let url = row
-                .url
-                .clone()
-                .with_context(|| format!("http 서버 '{}'에 url이 없음", row.id))?;
-            validate_mcp_url(&url)
-                .with_context(|| format!("http 서버 '{}' url 정책 위반", row.id))?;
-            Ok(BackendConfig::Http(McpHttpServerConfig {
-                name: row.name.clone(),
-                url,
-                bearer: None,
-            }))
-        }
-        other => anyhow::bail!(
-            "서버 '{}'의 kind가 '{}' — 프록시는 stdio|http만 지원",
-            row.id,
-            other
-        ),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn resolve_server_env(
-    row: &McpServerRow,
-    secret_store: Option<&dyn SecretStore>,
-    redaction: &RedactionService,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let mut env = row.env_plain.clone();
-    if row.env_secrets.is_empty() {
-        return Ok(env);
-    }
-    let store = secret_store.with_context(|| {
-        format!(
-            "MCP 서버 '{}' scoped secret env를 해석할 keyring이 없음",
-            row.id
-        )
-    })?;
-    for (key, credential_id) in &row.env_secrets {
-        let secret = store
-            .get_secret(credential_id)
-            .with_context(|| format!("MCP 서버 '{}' env '{}' credential 조회 실패", row.id, key))?;
-        redaction.register(&secret);
-        redaction.register_json_fields(&secret);
-        env.push((key.clone(), secret.expose().to_owned()));
-    }
-    Ok(env)
-}
-
-/// 저장된 credential secret을 redaction 대상으로 등록한다 (프리뷰/로그 누출 방지).
-/// resolve는 이 단일 스레드에서만 일어난다 (secret 접근 직렬화, §1.4). best-effort —
-/// 개별 실패는 경고만 남기고 계속한다.
-fn seed_redaction(db: &storage::Db, store: &dyn SecretStore, redaction: &RedactionService) {
-    let credentials = match db.list_credentials() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("credential 목록 조회 실패 (redaction 시드 생략): {e:#}");
-            return;
-        }
-    };
-    for credential in credentials {
-        register_secret(store, redaction, &credential.id);
-        // OAuth 토큰은 refresh entry가 별도 keyring 좌표에 있다 (app.rs와 동일).
-        if credential.credential_kind == "oauth_token" {
-            register_secret(store, redaction, &auth::refresh_entry_id(&credential.id));
-        }
-    }
-}
-
-/// keyring에서 secret 하나를 읽어 원본 + (JSON이면) 내부 필드까지 redaction 등록한다.
-fn register_secret(store: &dyn SecretStore, redaction: &RedactionService, id: &str) {
-    match store.get_secret(id) {
-        Ok(value) => {
-            redaction.register(&value);
-            // OAuth 토큰 blob처럼 JSON이면 access/refresh 개별 필드도 등록 (PR-18).
-            redaction.register_json_fields(&value);
-        }
-        Err(e) => tracing::warn!("redaction 시드 실패 (credential {id}): {e:#}"),
+    #[test]
+    fn backend_target은_secret대신_logical_refs만_보관한다() {
+        let row = McpServerRow {
+            id: "server".to_owned(),
+            name: "server".to_owned(),
+            kind: "stdio".to_owned(),
+            command: Some("command".to_owned()),
+            args: Vec::new(),
+            env_plain: vec![("SAFE".to_owned(), "value".to_owned())],
+            env_secrets: vec![("TOKEN".to_owned(), "credential-logical".to_owned())],
+            inherit_env: false,
+            url: None,
+            enabled: true,
+        };
+        let BackendConfig::Stdio(config) = BackendConfig::from_server_row(&row).unwrap() else {
+            panic!("stdio target expected")
+        };
+        assert_eq!(
+            config.env_plain,
+            vec![("SAFE".to_owned(), "value".to_owned())]
+        );
+        assert_eq!(
+            config.env_credentials,
+            vec![("TOKEN".to_owned(), "credential-logical".to_owned())]
+        );
     }
 }

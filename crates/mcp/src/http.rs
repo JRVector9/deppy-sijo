@@ -32,6 +32,7 @@ use crate::metrics::{
     ThreadGuard, ThreadKind, http_send_permit_acquired, http_send_permit_released,
     set_reaper_pending_http_senders,
 };
+use crate::sensitive::SensitiveBytes;
 
 /// SSE 한 라인 최대 길이 — stdio `MAX_LINE_BYTES` 8MiB 관례 이식.
 const MAX_SSE_LINE_BYTES: usize = MAX_RAW_MCP_RESPONSE_BYTES;
@@ -139,6 +140,36 @@ impl std::fmt::Display for McpDeliveryUnknown {
 }
 
 impl std::error::Error for McpDeliveryUnknown {}
+
+/// The server returned a trustworthy JSON-RPC error response for the matching request.
+/// Unlike [`McpDeliveryUnknown`], this is a known failure and must not poison an otherwise
+/// healthy reusable connection. The server message is intentionally not retained because it may
+/// contain secret-bearing backend detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpServerResponseError {
+    code: Option<i64>,
+}
+
+impl McpServerResponseError {
+    /// Creates a sanitized known server-response failure without retaining a raw server message.
+    /// This is public so transport adapters and their tests can preserve healthy warm leases by
+    /// typed classification rather than error-string matching.
+    pub fn from_code(code: Option<i64>) -> Self {
+        Self { code }
+    }
+
+    pub fn code(self) -> Option<i64> {
+        self.code
+    }
+}
+
+impl std::fmt::Display for McpServerResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MCP server error: code {:?}", self.code)
+    }
+}
+
+impl std::error::Error for McpServerResponseError {}
 
 fn parse_validated_url(input: &str) -> anyhow::Result<Url> {
     let parsed = Url::parse(input)
@@ -275,11 +306,12 @@ impl HttpClient {
     /// 세션 만료(400/404)면 안전한 조회만 세션 재수립 후 정확히 1회 재시도한다.
     /// `tools/call`은 이미 전달됐을 수 있으므로 Unknown으로 반환하고 재시도하지 않는다.
     pub(crate) fn request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
-        self.request_inner(method, &params)
+        self.request_inner(method, params)
             .map_err(|error| self.masked(error))
     }
 
-    fn request_inner(&mut self, method: &str, params: &Value) -> anyhow::Result<Value> {
+    fn request_inner(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let retry_params = (method != "tools/call").then(|| params.clone());
         match self.send_request(method, params) {
             Err(ExchangeError::SessionExpired { status }) => {
                 if method == "tools/call" {
@@ -297,7 +329,7 @@ impl HttpClient {
                 self.handshake()
                     .context("MCP 세션 재수립(initialize) 실패")?;
                 // 두 번째 실패는 그대로 에러 (SessionExpired여도 재시도 없음)
-                self.send_request(method, params)
+                self.send_request(method, retry_params.expect("safe request retry params"))
                     .map_err(ExchangeError::into_error)
             }
             other => other.map_err(ExchangeError::into_error),
@@ -305,11 +337,14 @@ impl HttpClient {
     }
 
     /// 요청 1회 전송 (재시도 없음). request에 202가 오면 응답 없는 요청으로 에러.
-    fn send_request(&mut self, method: &str, params: &Value) -> Result<Value, ExchangeError> {
+    fn send_request(&mut self, method: &str, params: Value) -> Result<Value, ExchangeError> {
         let id = self.take_id();
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        match self.exchange(&message, Some(id), method)? {
+        match self.exchange(message, Some(id), method)? {
             Outcome::Result(value) => Ok(value),
+            Outcome::Accepted if method == "tools/call" => Err(ExchangeError::Other(
+                anyhow::Error::new(McpDeliveryUnknown { status: Some(202) }),
+            )),
             Outcome::Accepted => Err(ExchangeError::Other(anyhow::anyhow!(
                 "{method} 응답 없이 202 수신 (request에는 response가 필요)"
             ))),
@@ -337,7 +372,7 @@ impl HttpClient {
             },
         });
         let outcome = self
-            .exchange(&message, Some(id), "initialize")
+            .exchange(message, Some(id), "initialize")
             .map_err(ExchangeError::into_error)?;
         let Outcome::Result(initialize_result) = outcome else {
             bail!("initialize 응답이 비어 있음 (202)");
@@ -350,7 +385,7 @@ impl HttpClient {
         // notification부터 협상 버전이 실린다.
         let initialized =
             json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}});
-        self.exchange(&initialized, None, "notifications/initialized")
+        self.exchange(initialized, None, "notifications/initialized")
             .map_err(ExchangeError::into_error)
             .context("initialized notification 실패")?;
         Ok(initialize_result)
@@ -367,12 +402,12 @@ impl HttpClient {
     /// 기다리는지" 구분 — H1 이월 항목).
     fn exchange(
         &mut self,
-        message: &Value,
+        message: Value,
         expect_id: Option<u64>,
         method: &str,
     ) -> Result<Outcome, ExchangeError> {
-        let body =
-            serde_json::to_string(message).with_context(|| format!("{method} 요청 직렬화 실패"))?;
+        let body = SensitiveBytes::from_json(message)
+            .with_context(|| format!("{method} 요청 직렬화 실패"))?;
         let server = self.server_name.clone();
         let method_name = method.to_owned();
         run_with_progress(
@@ -413,7 +448,7 @@ impl HttpClient {
 
     fn exchange_once(
         &mut self,
-        body: &str,
+        body: &SensitiveBytes,
         expect_id: Option<u64>,
         method: &str,
     ) -> Result<Outcome, ExchangeError> {
@@ -442,13 +477,24 @@ impl HttpClient {
             // 느린 드립 서버에 벽시계 상한이 없다 — 오프로드로 deadline을 강제.
             let result = send_with_deadline(
                 request,
-                send_body.then(|| body.to_owned()),
+                send_body.then(|| SensitiveBytes::copy_from_slice(body.as_slice())),
                 deadline,
                 method,
             )?;
             let response = match result {
                 Ok(response) if (300..400).contains(&response.status()) => {
                     let status = response.status();
+                    // A redirect arrives only after the original request was transmitted. For a
+                    // mutating tools/call, following it would be an automatic second delivery;
+                    // the first server may already have acted before redirecting. Fail Unknown
+                    // immediately and let audit/manual reconciliation decide what happens next.
+                    if method == "tools/call" {
+                        return Err(ExchangeError::Other(anyhow::Error::new(
+                            McpDeliveryUnknown {
+                                status: Some(status),
+                            },
+                        )));
+                    }
                     let location = response
                         .header("location")
                         .with_context(|| format!("HTTP {status} redirect에 Location 헤더 없음"))?
@@ -480,6 +526,15 @@ impl HttpClient {
                         ));
                     }
                     error => {
+                        if method == "tools/call" {
+                            drop(error);
+                            tracing::debug!(
+                                "tools/call HTTP transport outcome unknown; automatic retry forbidden"
+                            );
+                            return Err(ExchangeError::Other(anyhow::Error::new(
+                                McpDeliveryUnknown { status: None },
+                            )));
+                        }
                         return Err(ExchangeError::Other(
                             anyhow::Error::new(error)
                                 .context(format!("MCP HTTP {method} 요청 실패")),
@@ -487,7 +542,24 @@ impl HttpClient {
                     }
                 },
             };
-            return self.handle_success(response, expect_id, method, deadline);
+            let outcome = self.handle_success(response, expect_id, method, deadline);
+            if method != "tools/call" {
+                return outcome;
+            }
+            return match outcome {
+                Err(ExchangeError::Other(error))
+                    if error.downcast_ref::<McpServerResponseError>().is_none() =>
+                {
+                    drop(error);
+                    tracing::debug!(
+                        "tools/call HTTP response outcome unknown; automatic retry forbidden"
+                    );
+                    Err(ExchangeError::Other(anyhow::Error::new(
+                        McpDeliveryUnknown { status: None },
+                    )))
+                }
+                other => other,
+            };
         }
         Err(ExchangeError::Other(anyhow::anyhow!(
             "redirect가 최대 추적 횟수({MAX_REDIRECTS}회)를 초과"
@@ -704,7 +776,7 @@ impl HttpClient {
             "id": request_id,
             "error": {"code": -32601, "message": "method not found"},
         });
-        let Ok(body) = serde_json::to_string(&reply) else {
+        let Ok(body) = SensitiveBytes::from_json(reply) else {
             return;
         };
         let request = self
@@ -786,7 +858,7 @@ fn run_with_progress<T>(
 /// 않으면서도 sender/socket 수는 `MAX_HTTP_SENDS`를 넘지 않는다.
 fn send_with_deadline(
     request: ureq::Request,
-    body: Option<String>,
+    body: Option<SensitiveBytes>,
     deadline: Instant,
     method: &str,
 ) -> anyhow::Result<Result<ureq::Response, Box<ureq::Error>>> {
@@ -795,7 +867,7 @@ fn send_with_deadline(
         deadline,
         method,
         move || match &body {
-            Some(body) => request.send_string(body).map_err(Box::new),
+            Some(body) => request.send_bytes(body.as_slice()).map_err(Box::new),
             None => request.call().map_err(Box::new),
         },
     )
@@ -1245,7 +1317,10 @@ fn is_valid_id(id: &Value, allow_null: bool) -> bool {
 fn unwrap_response(mut value: Value, method: &str) -> anyhow::Result<Value> {
     let obj = value.as_object_mut().context("응답이 JSON object가 아님")?;
     if let Some(err) = obj.get("error") {
-        bail!("{method} 실패 — server error: {err}");
+        let _ = method;
+        return Err(anyhow::Error::new(McpServerResponseError::from_code(
+            err.get("code").and_then(Value::as_i64),
+        )));
     }
     obj.remove("result")
         .with_context(|| format!("{method} 응답에 result 없음"))
@@ -1258,7 +1333,7 @@ mod tests {
     use secret::RedactionService;
     use std::io::{Cursor, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1292,6 +1367,49 @@ mod tests {
 
             std::thread::sleep(Duration::from_millis(100));
             assert_eq!(governor.counts(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn http_sensitive_body_zeroizes_on_success_error_and_detached_timeout() {
+        for mode in 0..3 {
+            let governor: &'static HttpSendGovernor = Box::leak(Box::new(HttpSendGovernor::new()));
+            let observer = Arc::new(AtomicBool::new(false));
+            let mut body = SensitiveBytes::copy_from_slice(br#"{"secret":"value"}"#);
+            body.observe_zeroized_drop(Arc::clone(&observer));
+            let result = run_blocking_send(
+                governor,
+                Instant::now()
+                    + if mode == 2 {
+                        Duration::from_millis(10)
+                    } else {
+                        Duration::from_secs(1)
+                    },
+                "tools/call",
+                move || {
+                    if mode == 2 {
+                        std::thread::sleep(Duration::from_millis(60));
+                    }
+                    drop(body);
+                    if mode == 1 { Err(()) } else { Ok(()) }
+                },
+            );
+            if mode == 2 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<McpDeliveryUnknown>()
+                        .is_some()
+                );
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !observer.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline, "detached body was not zeroized");
+                    std::thread::yield_now();
+                }
+            } else {
+                assert!(result.is_ok());
+                assert!(observer.load(Ordering::Acquire));
+            }
         }
     }
 
@@ -1906,6 +2024,129 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn tools_call_redirect는_unknown이며_두번째_endpoint로_재전송하지_않는다() {
+        let server = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), Some("s1")),
+            1 => accepted(),
+            2 => Reply::Raw(http_response(307, &[("Location", "/second")], b"")),
+            _ => not_found(),
+        });
+        let config = http_config(&server, None);
+
+        let error = manager()
+            .call_tool_http(&config, "mutating_tool", json!({"value": 1}))
+            .unwrap_err();
+        let unknown = error
+            .downcast_ref::<McpDeliveryUnknown>()
+            .expect("McpDeliveryUnknown downcast");
+        assert_eq!(unknown.status, Some(307));
+
+        let requests = server.wait_captured(4);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.rpc_method() == "tools/call")
+                .count(),
+            1
+        );
+        assert!(requests.iter().all(|request| request.path != "/second"));
+    }
+
+    #[test]
+    fn tools_call_accepted_without_outcome_is_unknown_and_not_retried() {
+        let server = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), Some("s1")),
+            1 => accepted(),
+            2 => accepted(),
+            _ => not_found(),
+        });
+        let error = manager()
+            .call_tool_http(
+                &http_config(&server, None),
+                "accepted_tool",
+                json!({"value": 1}),
+            )
+            .unwrap_err();
+        let unknown = error
+            .downcast_ref::<McpDeliveryUnknown>()
+            .expect("McpDeliveryUnknown downcast");
+        assert_eq!(unknown.status, Some(202));
+        assert_eq!(
+            server
+                .wait_captured(4)
+                .iter()
+                .filter(|request| request.rpc_method() == "tools/call")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tools_call_malformed_response_is_unknown_but_matching_server_error_is_known() {
+        let malformed = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), Some("s1")),
+            1 => accepted(),
+            2 => Reply::Raw(http_response(
+                200,
+                &[("Content-Type", "application/json")],
+                br#"{"not":"json-rpc"}"#,
+            )),
+            _ => not_found(),
+        });
+        let error = manager()
+            .call_tool_http(
+                &http_config(&malformed, None),
+                "malformed_tool",
+                json!({"value": 1}),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<McpDeliveryUnknown>().is_some());
+        assert_eq!(
+            malformed
+                .wait_captured(4)
+                .iter()
+                .filter(|request| request.rpc_method() == "tools/call")
+                .count(),
+            1
+        );
+
+        let known = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), Some("s1")),
+            1 => accepted(),
+            2 => {
+                let id = request.body_json().get("id").cloned().unwrap();
+                let body = json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "error":{"code":-32000,"message":"secret backend detail"},
+                })
+                .to_string();
+                Reply::Raw(http_response(
+                    200,
+                    &[("Content-Type", "application/json")],
+                    body.as_bytes(),
+                ))
+            }
+            _ => not_found(),
+        });
+        let error = manager()
+            .call_tool_http(
+                &http_config(&known, None),
+                "known_tool",
+                json!({"value": 1}),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<McpDeliveryUnknown>().is_none());
+        assert_eq!(
+            error
+                .downcast_ref::<McpServerResponseError>()
+                .and_then(|error| error.code()),
+            Some(-32000)
+        );
+        assert!(!format!("{error:#}").contains("secret backend detail"));
     }
 
     #[test]

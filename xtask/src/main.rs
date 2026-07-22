@@ -658,6 +658,7 @@ fn check_boundary() -> anyhow::Result<()> {
     }
 
     check_session_secret_boundary(&root, &mut violations)?;
+    check_authorization_capability_boundary(&root, &mut violations)?;
 
     if violations.is_empty() {
         let explicit_exceptions: usize = DB_CALL_ALLOW
@@ -680,6 +681,96 @@ fn check_boundary() -> anyhow::Result<()> {
         }
         bail!("check-boundary 실패: {}건", violations.len());
     }
+}
+
+fn check_authorization_capability_boundary(
+    root: &Path,
+    violations: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    const STORAGE_ISSUER: &str = "crates/storage/src/db.rs";
+    const EXACT_EVALUATORS: &[(&str, usize)] = &[
+        ("crates/connector-service/src/coordinator.rs", 1),
+        ("crates/mcp-proxy/src/hook.rs", 1),
+    ];
+
+    let mut issuer_count = 0usize;
+    let mut evaluator_counts: BTreeMap<&str, usize> = EXACT_EVALUATORS
+        .iter()
+        .map(|(path, _)| (*path, 0))
+        .collect();
+
+    for path in rust_files_under(&root.join("crates"))? {
+        let rel = rel_path(root, &path)?;
+        if rel.starts_with("crates/audit/") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).with_context(|| format!("{rel} 읽기 실패"))?;
+
+        // Capability identifiers are scanned across the complete source file. Unlike the leaf-UI
+        // allowlist, dropping everything after a `#[cfg(test)]` marker would let a later production
+        // item or an imported alias evade this security boundary.
+        let issuers = identifier_occurrences(&content, "prepare_owned_authorization_preflight");
+        if rel == STORAGE_ISSUER {
+            issuer_count += issuers;
+        } else if issuers != 0 {
+            violations.push(format!(
+                "{rel}: authorization grant issuer는 {STORAGE_ISSUER} transaction wrapper만 호출할 수 있습니다"
+            ));
+        }
+
+        for sealed in [
+            "prepare_authorization_operation",
+            "AuthorizationPreflight::from_preflight",
+        ] {
+            if content.contains(sealed) {
+                violations.push(format!(
+                    "{rel}: sealed authorization proof API '{sealed}' production callsite 금지"
+                ));
+            }
+        }
+
+        if identifier_occurrences(&content, "evaluate_authorization") != 0 {
+            violations.push(format!(
+                "{rel}: compatibility authorization evaluator 금지 — exact permission fingerprint를 사용하세요"
+            ));
+        }
+
+        let exact = content
+            .matches("audit::evaluate_authorization_with_fingerprint(")
+            .count();
+        if let Some(count) = evaluator_counts.get_mut(rel.as_str()) {
+            *count += exact;
+        }
+    }
+
+    if issuer_count != 1 {
+        violations.push(format!(
+            "{STORAGE_ISSUER}: owner-scoped authorization issuer expected 1 seen {issuer_count}"
+        ));
+    }
+    for (path, expected) in EXACT_EVALUATORS {
+        let seen = evaluator_counts.get(path).copied().unwrap_or_default();
+        if seen != *expected {
+            violations.push(format!(
+                "{path}: exact authorization evaluator expected {expected} seen {seen}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn identifier_occurrences(source: &str, identifier: &str) -> usize {
+    let bytes = source.as_bytes();
+    source
+        .match_indices(identifier)
+        .filter(|(offset, _)| {
+            let before = offset.checked_sub(1).and_then(|index| bytes.get(index));
+            let after = bytes.get(offset + identifier.len());
+            before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                && after.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+        })
+        .count()
 }
 
 fn check_session_secret_boundary(root: &Path, violations: &mut Vec<String>) -> anyhow::Result<()> {
@@ -926,5 +1017,39 @@ mod tests {
             expected.sort();
             assert_eq!(actual, expected, "{crate_name}");
         }
+    }
+
+    #[test]
+    fn authorization_capability는_단일_transaction_경로만_사용한다() {
+        let root = workspace_root().unwrap();
+        let mut violations = Vec::new();
+        check_authorization_capability_boundary(&root, &mut violations).unwrap();
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn authorization_identifier_scan은_midfile_cfg와_import_alias를_놓치지_않는다() {
+        let source = r#"
+#[cfg(test)]
+mod tests {}
+
+use audit::prepare_owned_authorization_preflight as mint;
+use audit::evaluate_authorization as compatibility_evaluator;
+
+fn production_item() {
+    mint();
+    compatibility_evaluator();
+    audit::evaluate_authorization_with_fingerprint();
+}
+"#;
+        assert_eq!(
+            identifier_occurrences(source, "prepare_owned_authorization_preflight"),
+            1
+        );
+        assert_eq!(identifier_occurrences(source, "evaluate_authorization"), 1);
+        assert_eq!(
+            identifier_occurrences(source, "evaluate_authorization_with_fingerprint"),
+            1
+        );
     }
 }

@@ -12,11 +12,17 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use mcp::{
     LocalMcpManager, McpConnection, McpDeliveryUnknown, McpHttpServerConfig, McpServerConfig,
-    McpTool,
+    McpServerResponseError, McpTool, validate_mcp_url,
+};
+use mcp_store::McpServerRow;
+use secret::{
+    LogicalCredentialId, PhysicalSecretSlot, RedactionLease, RedactionService, SecretStore,
+    SecretString,
 };
 use serde_json::Value;
 
 pub const MAX_BACKEND_LEASES: usize = 2;
+pub const MAX_BACKEND_CREDENTIALS: usize = 64;
 pub const DEFAULT_BACKEND_IDLE_TTL: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const BACKEND_IDLE_TTL_CANDIDATES: [Duration; 3] = [
@@ -25,18 +31,100 @@ const BACKEND_IDLE_TTL_CANDIDATES: [Duration; 3] = [
     Duration::from_secs(60),
 ];
 
-/// kind별 backend configuration. Secret-bearing values remain inside the MCP config types and
-/// their redacted Debug implementations.
+/// Non-secret backend target retained while idle. Keyring values are resolved only on a cold
+/// connection and remain inside that connection's bounded secret/redaction guard.
+#[derive(Clone, PartialEq, Eq)]
 pub enum BackendConfig {
-    Stdio(McpServerConfig),
-    Http(McpHttpServerConfig),
+    Stdio(StdioBackendConfig),
+    Http(HttpBackendConfig),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct StdioBackendConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env_plain: Vec<(String, String)>,
+    pub env_credentials: Vec<(String, String)>,
+    pub inherit_env: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpBackendConfig {
+    pub name: String,
+    pub url: String,
+    /// Logical credential ID only. The current physical access slot is resolved at cold connect.
+    pub bearer_credential_id: Option<String>,
 }
 
 impl BackendConfig {
+    pub fn from_server_row(row: &McpServerRow) -> anyhow::Result<Self> {
+        anyhow::ensure!(row.enabled, "MCP server is disabled");
+        anyhow::ensure!(
+            row.env_secrets.len() <= MAX_BACKEND_CREDENTIALS,
+            "backend credential item limit exceeded"
+        );
+        match row.kind.as_str() {
+            "stdio" => {
+                let command = row
+                    .command
+                    .as_ref()
+                    .filter(|command| !command.trim().is_empty())
+                    .with_context(|| format!("stdio 서버 '{}'에 command가 없음", row.id))?;
+                Ok(Self::Stdio(StdioBackendConfig {
+                    name: row.name.clone(),
+                    command: command.clone(),
+                    args: row.args.clone(),
+                    env_plain: row.env_plain.clone(),
+                    env_credentials: row.env_secrets.clone(),
+                    inherit_env: row.inherit_env,
+                }))
+            }
+            "http" => {
+                anyhow::ensure!(
+                    row.env_secrets.is_empty(),
+                    "HTTP credential mapping is not supported by this proxy target"
+                );
+                let url = row
+                    .url
+                    .as_ref()
+                    .filter(|url| !url.trim().is_empty())
+                    .with_context(|| format!("http 서버 '{}'에 url이 없음", row.id))?;
+                validate_mcp_url(url)
+                    .with_context(|| format!("http 서버 '{}' url 정책 위반", row.id))?;
+                Ok(Self::Http(HttpBackendConfig {
+                    name: row.name.clone(),
+                    url: url.clone(),
+                    bearer_credential_id: None,
+                }))
+            }
+            other => anyhow::bail!(
+                "서버 '{}'의 kind가 '{}' — 프록시는 stdio|http만 지원",
+                row.id,
+                other
+            ),
+        }
+    }
+
     pub fn name(&self) -> &str {
         match self {
             Self::Stdio(config) => &config.name,
             Self::Http(config) => &config.name,
+        }
+    }
+
+    fn credential_ids(&self) -> Vec<&str> {
+        match self {
+            Self::Stdio(config) => config
+                .env_credentials
+                .iter()
+                .map(|(_, credential_id)| credential_id.as_str())
+                .collect(),
+            Self::Http(config) => config
+                .bearer_credential_id
+                .iter()
+                .map(String::as_str)
+                .collect(),
         }
     }
 }
@@ -44,12 +132,20 @@ impl BackendConfig {
 static NEXT_CONFIG_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfigRevision(u64);
+pub(crate) struct ConfigRevision(u64);
 
 impl ConfigRevision {
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         Self(NEXT_CONFIG_REVISION.fetch_add(1, Ordering::Relaxed))
     }
+}
+
+/// Exact non-secret target generation used for one live-schema -> authorized-call handoff.
+/// Physical slot names are bounded metadata, not secret values; the token is intentionally
+/// non-Clone and exists only for the duration of one request.
+pub(crate) struct BackendVersion {
+    pub(crate) config_revision: ConfigRevision,
+    pub(crate) auth_revision: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -90,22 +186,164 @@ impl SessionTransport for McpConnection {
 }
 
 trait BackendFactory: Send + Sync {
-    fn connect(&self, config: &BackendConfig) -> anyhow::Result<Box<dyn SessionTransport>>;
+    fn auth_revision(&self, config: &BackendConfig) -> anyhow::Result<Vec<String>>;
+    fn connect(
+        &self,
+        config: &BackendConfig,
+        auth_revision: &[String],
+    ) -> anyhow::Result<ConnectedTransport>;
 }
 
 struct ManagerBackendFactory {
     manager: LocalMcpManager,
+    db: Arc<Mutex<storage::Db>>,
+    redaction: RedactionService,
+    secret_store: Arc<dyn SecretStore>,
+    initialize_platform_store: bool,
+}
+
+struct SecretConnectionGuard {
+    _secrets: Vec<SecretString>,
+    _redaction: RedactionLease,
+}
+
+struct ConnectedTransport {
+    connection: Box<dyn SessionTransport>,
+    _secret_guard: Option<SecretConnectionGuard>,
 }
 
 impl BackendFactory for ManagerBackendFactory {
-    fn connect(&self, config: &BackendConfig) -> anyhow::Result<Box<dyn SessionTransport>> {
-        let connection = match config {
-            BackendConfig::Stdio(config) => self.manager.connect(config),
-            BackendConfig::Http(config) => self.manager.connect_http(config),
+    fn auth_revision(&self, config: &BackendConfig) -> anyhow::Result<Vec<String>> {
+        let credential_ids = config.credential_ids();
+        anyhow::ensure!(
+            credential_ids.len() <= MAX_BACKEND_CREDENTIALS,
+            "backend credential item limit exceeded"
+        );
+        if credential_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let db = self.db.lock().expect("backend credential DB lock");
+        credential_ids
+            .into_iter()
+            .map(|logical_id| resolve_credential_entry(&db, logical_id))
+            .collect()
+    }
+
+    fn connect(
+        &self,
+        config: &BackendConfig,
+        auth_revision: &[String],
+    ) -> anyhow::Result<ConnectedTransport> {
+        let resolved = self.resolve(config, auth_revision)?;
+        let connection = match &resolved.config {
+            ResolvedBackendConfig::Stdio(config) => self.manager.connect(config),
+            ResolvedBackendConfig::Http(config) => self.manager.connect_http(config),
         }
         .with_context(|| format!("백엔드 '{}' connect 실패", config.name()))?;
-        Ok(Box::new(connection))
+        Ok(ConnectedTransport {
+            connection: Box::new(connection),
+            _secret_guard: resolved.secret_guard,
+        })
     }
+}
+
+enum ResolvedBackendConfig {
+    Stdio(McpServerConfig),
+    Http(McpHttpServerConfig),
+}
+
+struct ResolvedConnection {
+    config: ResolvedBackendConfig,
+    secret_guard: Option<SecretConnectionGuard>,
+}
+
+impl ManagerBackendFactory {
+    fn resolve(
+        &self,
+        config: &BackendConfig,
+        auth_revision: &[String],
+    ) -> anyhow::Result<ResolvedConnection> {
+        anyhow::ensure!(
+            config.credential_ids().len() == auth_revision.len(),
+            "backend auth revision shape mismatch"
+        );
+        let (secrets, secret_guard) = if auth_revision.is_empty() {
+            (Vec::new(), None)
+        } else {
+            if self.initialize_platform_store {
+                secret::init_platform_store().context("keyring backend lazy init 실패")?;
+            }
+            let mut secrets = Vec::with_capacity(auth_revision.len());
+            for entry in auth_revision {
+                secrets.push(
+                    self.secret_store
+                        .get_secret(entry)
+                        .context("active physical credential 조회 실패")?,
+                );
+            }
+            let refs = secrets.iter().collect::<Vec<_>>();
+            let lease = self
+                .redaction
+                .acquire_execution_lease(&refs)
+                .context("secret redaction capacity 확보 실패")?;
+            (
+                secrets,
+                Some(SecretConnectionGuard {
+                    _secrets: Vec::new(),
+                    _redaction: lease,
+                }),
+            )
+        };
+        let resolved_config = match config {
+            BackendConfig::Stdio(config) => {
+                let mut env = config.env_plain.clone();
+                for ((key, _), secret) in config.env_credentials.iter().zip(&secrets) {
+                    env.push((key.clone(), secret.expose().to_owned()));
+                }
+                ResolvedBackendConfig::Stdio(McpServerConfig::stdio(
+                    config.name.clone(),
+                    config.command.clone(),
+                    config.args.clone(),
+                    env,
+                    config.inherit_env,
+                ))
+            }
+            BackendConfig::Http(config) => ResolvedBackendConfig::Http(McpHttpServerConfig {
+                name: config.name.clone(),
+                url: config.url.clone(),
+                bearer: secrets
+                    .first()
+                    .map(|secret| SecretString::new(secret.expose().to_owned())),
+            }),
+        };
+        let secret_guard = secret_guard.map(|mut guard| {
+            guard._secrets = secrets;
+            guard
+        });
+        Ok(ResolvedConnection {
+            config: resolved_config,
+            secret_guard,
+        })
+    }
+}
+
+fn resolve_credential_entry(db: &storage::Db, logical_id: &str) -> anyhow::Result<String> {
+    let logical_id = LogicalCredentialId::new(logical_id.to_owned())
+        .context("backend logical credential id 검증 실패")?;
+    let location = db
+        .credential_secret_location(logical_id.as_str())?
+        .with_context(|| format!("credential metadata 없음: {}", logical_id.as_str()))?;
+    anyhow::ensure!(
+        location.keyring_service == secret::KEYRING_SERVICE,
+        "credential keyring service가 현재 backend와 일치하지 않습니다"
+    );
+    let physical_slot = PhysicalSecretSlot::parse(location.keyring_username)
+        .context("credential physical slot 검증 실패")?;
+    anyhow::ensure!(
+        physical_slot.belongs_to(&logical_id),
+        "credential physical slot이 logical credential에 속하지 않습니다"
+    );
+    Ok(physical_slot.as_str().to_owned())
 }
 
 trait Clock: Send + Sync {
@@ -150,7 +388,9 @@ impl Clock for SystemClock {
 struct LeaseEntry {
     backend_id: String,
     revision: ConfigRevision,
+    auth_revision: Vec<String>,
     connection: Box<dyn SessionTransport>,
+    _secret_guard: Option<SecretConnectionGuard>,
     last_used: Tick,
 }
 
@@ -184,9 +424,20 @@ pub struct BackendSession {
 }
 
 impl BackendSession {
-    pub fn production(manager: LocalMcpManager, idle_ttl: Duration) -> Arc<Self> {
+    pub fn production(
+        manager: LocalMcpManager,
+        db: Arc<Mutex<storage::Db>>,
+        redaction: RedactionService,
+        idle_ttl: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            factory: Arc::new(ManagerBackendFactory { manager }),
+            factory: Arc::new(ManagerBackendFactory {
+                manager,
+                db,
+                redaction,
+                secret_store: Arc::new(secret::KeyringSecretStore),
+                initialize_platform_store: true,
+            }),
             clock: Arc::new(SystemClock::new()),
             idle_ttl,
             state: Mutex::new(SessionState::default()),
@@ -207,39 +458,53 @@ impl BackendSession {
         })
     }
 
+    #[cfg(test)]
     fn use_connection<T>(
         &self,
         target: &BackendTarget,
         operation: impl FnOnce(&mut dyn SessionTransport) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        let auth_revision = self.factory.auth_revision(&target.config)?;
+        self.use_connection_at(target, auth_revision, operation)
+    }
+
+    fn use_connection_at<T>(
+        &self,
+        target: &BackendTarget,
+        auth_revision: Vec<String>,
+        operation: impl FnOnce(&mut dyn SessionTransport) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         let started = self.clock.now();
         let mut state = self.state.lock().expect("backend session lock");
         self.reap_expired_locked(&mut state, started);
-        self.invalidate_revision_locked(&mut state, &target.id, target.revision);
+        self.invalidate_target_locked(&mut state, &target.id, target.revision, &auth_revision);
 
-        let (mut lease, warm) =
-            if let Some(index) = state.leases.iter().position(|lease| {
-                lease.backend_id == target.id && lease.revision == target.revision
-            }) {
-                (state.leases.remove(index), true)
-            } else {
-                if state.leases.len() >= MAX_BACKEND_LEASES {
-                    let mut evicted = state.leases.remove(0);
-                    evicted.connection.cancel();
-                    state.stats.lru_evictions += 1;
-                }
-                let connection = self.factory.connect(&target.config)?;
-                state.stats.cold_connects += 1;
-                (
-                    LeaseEntry {
-                        backend_id: target.id.clone(),
-                        revision: target.revision,
-                        connection,
-                        last_used: started,
-                    },
-                    false,
-                )
-            };
+        let (mut lease, warm) = if let Some(index) = state.leases.iter().position(|lease| {
+            lease.backend_id == target.id
+                && lease.revision == target.revision
+                && lease.auth_revision == auth_revision
+        }) {
+            (state.leases.remove(index), true)
+        } else {
+            if state.leases.len() >= MAX_BACKEND_LEASES {
+                let mut evicted = state.leases.remove(0);
+                evicted.connection.cancel();
+                state.stats.lru_evictions += 1;
+            }
+            let connected = self.factory.connect(&target.config, &auth_revision)?;
+            state.stats.cold_connects += 1;
+            (
+                LeaseEntry {
+                    backend_id: target.id.clone(),
+                    revision: target.revision,
+                    auth_revision,
+                    connection: connected.connection,
+                    _secret_guard: connected._secret_guard,
+                    last_used: started,
+                },
+                false,
+            )
+        };
 
         let result = operation(lease.connection.as_mut());
         let finished = self.clock.now();
@@ -279,6 +544,16 @@ impl BackendSession {
         }
     }
 
+    fn auth_revision(&self, target: &BackendTarget) -> anyhow::Result<Vec<String>> {
+        self.factory.auth_revision(&target.config)
+    }
+
+    fn invalidate_auth_revision(&self, target: &BackendTarget, auth_revision: &[String]) {
+        let mut state = self.state.lock().expect("backend session lock");
+        self.reap_expired_locked(&mut state, self.clock.now());
+        self.invalidate_target_locked(&mut state, &target.id, target.revision, auth_revision);
+    }
+
     fn invalidate_revision_locked(
         &self,
         state: &mut SessionState,
@@ -289,6 +564,29 @@ impl BackendSession {
         while index < state.leases.len() {
             if state.leases[index].backend_id == backend_id
                 && state.leases[index].revision != revision
+            {
+                let mut stale = state.leases.remove(index);
+                stale.connection.cancel();
+                state.stats.revision_evictions += 1;
+            } else {
+                index += 1;
+            }
+        }
+        state.stats.active_leases = state.leases.len();
+    }
+
+    fn invalidate_target_locked(
+        &self,
+        state: &mut SessionState,
+        backend_id: &str,
+        revision: ConfigRevision,
+        auth_revision: &[String],
+    ) {
+        let mut index = 0;
+        while index < state.leases.len() {
+            if state.leases[index].backend_id == backend_id
+                && (state.leases[index].revision != revision
+                    || state.leases[index].auth_revision != auth_revision)
             {
                 let mut stale = state.leases.remove(index);
                 stale.connection.cancel();
@@ -335,7 +633,6 @@ impl BackendSession {
             .map(|deadline| deadline.elapsed_since(now))
     }
 
-    #[cfg(test)]
     fn invalidate(&self, backend_id: &str, revision: ConfigRevision) {
         let mut state = self.state.lock().expect("backend session lock");
         self.invalidate_revision_locked(&mut state, backend_id, revision);
@@ -371,7 +668,7 @@ impl Drop for BackendSession {
 fn preserves_connection(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .any(|cause| cause.to_string().contains("server error:"))
+        .any(|cause| cause.downcast_ref::<McpServerResponseError>().is_some())
 }
 
 /// A config handle shared by the permission hook and the forwarder. Updating it invalidates the
@@ -379,26 +676,33 @@ fn preserves_connection(error: &anyhow::Error) -> bool {
 pub struct BackendClient {
     session: Arc<BackendSession>,
     target: RwLock<BackendTarget>,
+    live_db: Option<Arc<Mutex<storage::Db>>>,
 }
 
 impl BackendClient {
+    #[cfg(test)]
     pub fn new(backend_id: String, config: BackendConfig, session: Arc<BackendSession>) -> Self {
         Self {
             session,
             target: RwLock::new(BackendTarget::new(backend_id, config)),
+            live_db: None,
+        }
+    }
+
+    pub fn managed(
+        backend_id: String,
+        config: BackendConfig,
+        session: Arc<BackendSession>,
+        live_db: Arc<Mutex<storage::Db>>,
+    ) -> Self {
+        Self {
+            session,
+            target: RwLock::new(BackendTarget::new(backend_id, config)),
+            live_db: Some(live_db),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn production(
-        backend_id: String,
-        config: BackendConfig,
-        manager: LocalMcpManager,
-    ) -> Arc<Self> {
-        let session = BackendSession::production(manager, DEFAULT_BACKEND_IDLE_TTL);
-        Arc::new(Self::new(backend_id, config, session))
-    }
-
     pub fn revision(&self) -> ConfigRevision {
         self.target.read().expect("backend target lock").revision
     }
@@ -413,14 +717,83 @@ impl BackendClient {
         revision
     }
 
-    pub fn list_tools(&self) -> anyhow::Result<Vec<McpTool>> {
-        let target = self.target.read().expect("backend target lock").clone();
-        self.session
-            .use_connection(&target, |connection| connection.list_tools())
+    fn refresh_target(&self) -> anyhow::Result<BackendTarget> {
+        let Some(db) = &self.live_db else {
+            return Ok(self.target.read().expect("backend target lock").clone());
+        };
+        let backend_id = self.target.read().expect("backend target lock").id.clone();
+        let refreshed = db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))
+            .and_then(|db| {
+                db.mcp_server(&backend_id)?
+                    .with_context(|| format!("MCP server '{backend_id}' is missing"))
+            })
+            .and_then(|row| BackendConfig::from_server_row(&row));
+        let refreshed = match refreshed {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                let current = self.target.read().expect("backend target lock").clone();
+                self.session.invalidate(&current.id, ConfigRevision::next());
+                return Err(error);
+            }
+        };
+
+        let mut target = self.target.write().expect("backend target lock");
+        if target.config.as_ref() != &refreshed {
+            let replacement = BackendTarget::new(target.id.clone(), refreshed);
+            self.session.invalidate(&target.id, replacement.revision);
+            *target = replacement;
+        }
+        Ok(target.clone())
     }
 
+    pub(crate) fn list_tools_versioned(&self) -> anyhow::Result<(BackendVersion, Vec<McpTool>)> {
+        let target = self.refresh_target()?;
+        let auth_revision = self.session.auth_revision(&target)?;
+        let tools =
+            self.session
+                .use_connection_at(&target, auth_revision.clone(), |connection| {
+                    connection.list_tools()
+                })?;
+        Ok((
+            BackendVersion {
+                config_revision: target.revision,
+                auth_revision,
+            },
+            tools,
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn list_tools(&self) -> anyhow::Result<Vec<McpTool>> {
+        self.list_tools_versioned().map(|(_, tools)| tools)
+    }
+
+    pub(crate) fn call_tool_versioned(
+        &self,
+        expected_version: BackendVersion,
+        name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
+        let target = self.refresh_target()?;
+        let auth_revision = self.session.auth_revision(&target)?;
+        if target.revision != expected_version.config_revision
+            || auth_revision != expected_version.auth_revision
+        {
+            self.session
+                .invalidate_auth_revision(&target, &auth_revision);
+            anyhow::bail!("backend target changed after live schema validation");
+        }
+        self.session
+            .use_connection_at(&target, auth_revision, |connection| {
+                connection.call_tool(name, arguments)
+            })
+    }
+
+    #[cfg(test)]
     pub fn call_tool(&self, name: &str, arguments: Value) -> anyhow::Result<Value> {
-        let target = self.target.read().expect("backend target lock").clone();
+        let target = self.refresh_target()?;
         self.session
             .use_connection(&target, |connection| connection.call_tool(name, arguments))
     }
@@ -482,9 +855,59 @@ impl<R: std::io::Read + std::os::fd::AsRawFd> std::io::Read for IdleDeadlineRead
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     static PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct RecordingSecretStore {
+        values: Mutex<HashMap<String, String>>,
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl RecordingSecretStore {
+        fn seed(&self, id: &str, value: &str) {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), value.to_owned());
+        }
+
+        fn take_reads(&self) -> Vec<String> {
+            std::mem::take(&mut *self.reads.lock().unwrap())
+        }
+    }
+
+    impl SecretStore for RecordingSecretStore {
+        fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
+            self.seed(id, secret.expose());
+            Ok(())
+        }
+
+        fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
+            self.reads.lock().unwrap().push(id.to_owned());
+            self.values
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .map(SecretString::new)
+                .ok_or_else(|| anyhow::anyhow!("missing test secret"))
+        }
+
+        fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(id);
+            Ok(())
+        }
+
+        fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
+            Ok(self.values.lock().unwrap().contains_key(id))
+        }
+    }
 
     #[derive(Default)]
     struct FakeClock {
@@ -518,6 +941,8 @@ mod tests {
         drops: AtomicUsize,
         cancels: AtomicUsize,
         retained_nanos: AtomicU64,
+        auth_revision: Mutex<Vec<String>>,
+        secret_reads: AtomicUsize,
     }
 
     struct FakeFactory {
@@ -525,20 +950,43 @@ mod tests {
         clock: Arc<FakeClock>,
         connect_cost: Duration,
         operation_cost: Duration,
+        redaction: Option<RedactionService>,
     }
 
     impl BackendFactory for FakeFactory {
-        fn connect(&self, _config: &BackendConfig) -> anyhow::Result<Box<dyn SessionTransport>> {
+        fn auth_revision(&self, _config: &BackendConfig) -> anyhow::Result<Vec<String>> {
+            Ok(self.resources.auth_revision.lock().unwrap().clone())
+        }
+
+        fn connect(
+            &self,
+            _config: &BackendConfig,
+            auth_revision: &[String],
+        ) -> anyhow::Result<ConnectedTransport> {
             self.resources.connects.fetch_add(1, Ordering::SeqCst);
+            self.resources
+                .secret_reads
+                .fetch_add(auth_revision.len(), Ordering::SeqCst);
             self.clock.advance(self.connect_cost);
             let live = self.resources.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.resources.peak.fetch_max(live, Ordering::SeqCst);
-            Ok(Box::new(FakeTransport {
-                resources: Arc::clone(&self.resources),
-                clock: Arc::clone(&self.clock),
-                connected_at: self.clock.now(),
-                operation_cost: self.operation_cost,
-            }))
+            let secret_guard = self.redaction.as_ref().map(|redaction| {
+                let secret = SecretString::new("fake-lease-secret-material".to_owned());
+                let lease = redaction.acquire_execution_lease(&[&secret]).unwrap();
+                SecretConnectionGuard {
+                    _secrets: vec![secret],
+                    _redaction: lease,
+                }
+            });
+            Ok(ConnectedTransport {
+                connection: Box::new(FakeTransport {
+                    resources: Arc::clone(&self.resources),
+                    clock: Arc::clone(&self.clock),
+                    connected_at: self.clock.now(),
+                    operation_cost: self.operation_cost,
+                }),
+                _secret_guard: secret_guard,
+            })
         }
     }
 
@@ -564,7 +1012,9 @@ mod tests {
             self.resources.calls.fetch_add(1, Ordering::SeqCst);
             self.clock.advance(self.operation_cost);
             match arguments.get("mode").and_then(Value::as_str) {
-                Some("server_error") => anyhow::bail!("tools/call 실패 — server error: rejected"),
+                Some("server_error") => Err(anyhow::Error::new(McpServerResponseError::from_code(
+                    Some(-32001),
+                ))),
                 Some("protocol_error") => anyhow::bail!("stdout 프로토콜 위반"),
                 Some("unknown") => Err(anyhow::Error::new(McpDeliveryUnknown { status: None })),
                 Some("tool_error") => Ok(serde_json::json!({"isError": true, "content": []})),
@@ -589,13 +1039,29 @@ mod tests {
     }
 
     fn stdio_config(name: &str) -> BackendConfig {
-        BackendConfig::Stdio(McpServerConfig::stdio(
-            name.to_owned(),
-            "/bin/false".to_owned(),
-            Vec::new(),
-            Vec::new(),
-            true,
-        ))
+        BackendConfig::Stdio(StdioBackendConfig {
+            name: name.to_owned(),
+            command: "/bin/false".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_credentials: Vec::new(),
+            inherit_env: true,
+        })
+    }
+
+    fn http_server_row(id: &str, url: &str, enabled: bool) -> McpServerRow {
+        McpServerRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            kind: "http".to_owned(),
+            command: None,
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
+            url: Some(url.to_owned()),
+            enabled,
+        }
     }
 
     fn fake_session(ttl: Duration) -> (Arc<BackendSession>, Arc<FakeClock>, Arc<FakeResources>) {
@@ -606,9 +1072,378 @@ mod tests {
             clock: Arc::clone(&clock),
             connect_cost: Duration::ZERO,
             operation_cost: Duration::ZERO,
+            redaction: None,
         });
         let session = BackendSession::with_seams(factory, clock.clone(), ttl);
         (session, clock, resources)
+    }
+
+    fn test_session_db(label: &str) -> (PathBuf, Arc<Mutex<storage::Db>>) {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-proxy-session-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = storage::Db::open(&dir.join("metadata.sqlite3")).unwrap();
+        (dir, Arc::new(Mutex::new(db)))
+    }
+
+    fn read_http_json(stream: &mut TcpStream) -> Option<Value> {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index;
+            }
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        while bytes.len().saturating_sub(body_start) < content_length {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        serde_json::from_slice(&bytes[body_start..body_start + content_length]).ok()
+    }
+
+    fn write_http_json(stream: &mut TcpStream, status: u16, body: Option<Value>) {
+        let body = body.map(|value| value.to_string()).unwrap_or_default();
+        let content_type = if body.is_empty() {
+            ""
+        } else {
+            "Content-Type: application/json\r\n"
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status} OK\r\nConnection: close\r\n{content_type}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    type HttpBackendFixture = (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>);
+
+    fn spawn_http_backend() -> Option<HttpBackendFixture> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("HTTP mock bind failed: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&methods);
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while captured.lock().unwrap().len() < 4 && Instant::now() < deadline {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("HTTP mock accept failed: {error}"),
+                };
+                let request = read_http_json(&mut stream).unwrap();
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("response")
+                    .to_owned();
+                captured.lock().unwrap().push(method.clone());
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                match method.as_str() {
+                    "initialize" => write_http_json(
+                        &mut stream,
+                        200,
+                        Some(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": "2025-11-25",
+                                "capabilities": {},
+                                "serverInfo": {"name": "proxy-http", "version": "1"}
+                            }
+                        })),
+                    ),
+                    "notifications/initialized" => write_http_json(&mut stream, 202, None),
+                    "tools/list" => write_http_json(
+                        &mut stream,
+                        200,
+                        Some(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"tools": [{
+                                "name": "echo",
+                                "description": "Echo",
+                                "inputSchema": {"type": "object"}
+                            }]}
+                        })),
+                    ),
+                    "tools/call" => write_http_json(
+                        &mut stream,
+                        200,
+                        Some(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{"type": "text", "text": "http-warm"}],
+                                "isError": false
+                            }
+                        })),
+                    ),
+                    other => panic!("unexpected HTTP MCP method: {other}"),
+                }
+            }
+            assert_eq!(captured.lock().unwrap().len(), 4);
+        });
+        Some((format!("http://{address}/mcp"), methods, handle))
+    }
+
+    #[test]
+    fn credential은_cold_resolve때만_active_physical_slot을_읽고_lease로_보호된다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-proxy-lazy-secret-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        let db = Arc::new(Mutex::new(storage::Db::open(&db_path).unwrap()));
+        let logical = LogicalCredentialId::new("credential-logical").unwrap();
+        db.lock()
+            .unwrap()
+            .insert_credential(&storage::CredentialMeta {
+                id: logical.as_str().to_owned(),
+                provider: "oauth".to_owned(),
+                label: "OAuth".to_owned(),
+                credential_kind: "oauth_token".to_owned(),
+                masked_hint: None,
+                workspace_id: None,
+            })
+            .unwrap();
+        let slot_one = PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.lock()
+            .unwrap()
+            .rotate_credential_secret_slot(logical.as_str(), slot_one.as_str(), "{}", None)
+            .unwrap();
+
+        let store = Arc::new(RecordingSecretStore::default());
+        store.seed(logical.as_str(), "legacy-secret-must-not-read");
+        store.seed(slot_one.as_str(), "access-token-generation-one");
+        let redaction = RedactionService::new();
+        let factory = ManagerBackendFactory {
+            manager: LocalMcpManager::new(redaction.clone()),
+            db: Arc::clone(&db),
+            redaction: redaction.clone(),
+            secret_store: store.clone(),
+            initialize_platform_store: false,
+        };
+        let config = BackendConfig::Stdio(StdioBackendConfig {
+            name: "server".to_owned(),
+            command: "/bin/false".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_credentials: vec![("TOKEN".to_owned(), logical.as_str().to_owned())],
+            inherit_env: false,
+        });
+
+        assert!(
+            store.take_reads().is_empty(),
+            "startup must not read keyring"
+        );
+        let revision_one = factory.auth_revision(&config).unwrap();
+        assert_eq!(revision_one, vec![slot_one.as_str().to_owned()]);
+        assert!(
+            store.take_reads().is_empty(),
+            "pointer check must not read keyring"
+        );
+        let resolved = factory.resolve(&config, &revision_one).unwrap();
+        assert_eq!(store.take_reads(), vec![slot_one.as_str().to_owned()]);
+        assert_eq!(redaction.corpus_stats().active_leases, 1);
+        let ResolvedBackendConfig::Stdio(resolved_config) = &resolved.config else {
+            panic!("stdio config expected")
+        };
+        assert_eq!(
+            resolved_config.env,
+            vec![("TOKEN".to_owned(), "access-token-generation-one".to_owned())]
+        );
+        drop(resolved);
+        assert_eq!(redaction.corpus_stats().active_leases, 0);
+
+        let slot_two = PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        store.seed(slot_two.as_str(), "access-token-generation-two");
+        db.lock()
+            .unwrap()
+            .rotate_credential_secret_slot(logical.as_str(), slot_two.as_str(), "{}", None)
+            .unwrap();
+        store.delete_secret(slot_one.as_str()).unwrap();
+        let revision_two = factory.auth_revision(&config).unwrap();
+        assert_eq!(revision_two, vec![slot_two.as_str().to_owned()]);
+        assert_ne!(revision_one, revision_two);
+        let resolved = factory.resolve(&config, &revision_two).unwrap();
+        assert_eq!(store.take_reads(), vec![slot_two.as_str().to_owned()]);
+        drop(resolved);
+
+        drop(factory);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credential_resolve는_own_versioned_slot만_keyring에서_읽는다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-proxy-owned-slot-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        let db = Arc::new(Mutex::new(storage::Db::open(&db_path).unwrap()));
+        let logical = LogicalCredentialId::new("credential-owner").unwrap();
+        let other = LogicalCredentialId::new("credential-other").unwrap();
+        db.lock()
+            .unwrap()
+            .insert_credential(&storage::CredentialMeta {
+                id: logical.as_str().to_owned(),
+                provider: "oauth".to_owned(),
+                label: "OAuth".to_owned(),
+                credential_kind: "oauth_token".to_owned(),
+                masked_hint: None,
+                workspace_id: None,
+            })
+            .unwrap();
+        let own_slot = PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let other_slot = PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        db.lock()
+            .unwrap()
+            .rotate_credential_secret_slot(logical.as_str(), own_slot.as_str(), "{}", None)
+            .unwrap();
+
+        let store = Arc::new(RecordingSecretStore::default());
+        store.seed(own_slot.as_str(), "owned-access-token");
+        store.seed(other_slot.as_str(), "other-access-token");
+        store.seed(logical.as_str(), "legacy-access-token");
+        let redaction = RedactionService::new();
+        let factory = ManagerBackendFactory {
+            manager: LocalMcpManager::new(redaction.clone()),
+            db: Arc::clone(&db),
+            redaction,
+            secret_store: store.clone(),
+            initialize_platform_store: false,
+        };
+        let config = BackendConfig::Stdio(StdioBackendConfig {
+            name: "server".to_owned(),
+            command: "/bin/false".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_credentials: vec![("TOKEN".to_owned(), logical.as_str().to_owned())],
+            inherit_env: false,
+        });
+
+        let revision = factory.auth_revision(&config).unwrap();
+        assert_eq!(revision, vec![own_slot.as_str().to_owned()]);
+        let resolved = factory.resolve(&config, &revision).unwrap();
+        assert_eq!(store.take_reads(), vec![own_slot.as_str().to_owned()]);
+        drop(resolved);
+
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        for invalid in [
+            other_slot.as_str(),
+            logical.as_str(),
+            "deppy.oauth.v1.not-hex.not-a-uuid",
+        ] {
+            raw.execute(
+                "UPDATE credentials SET keyring_username = ?2 WHERE id = ?1",
+                (logical.as_str(), invalid),
+            )
+            .unwrap();
+            assert!(
+                factory.auth_revision(&config).is_err(),
+                "invalid pointer unexpectedly resolved: {invalid}"
+            );
+            assert!(
+                store.take_reads().is_empty(),
+                "invalid pointer reached keyring: {invalid}"
+            );
+        }
+
+        drop(raw);
+        drop(factory);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn redaction_lease_확보실패는_backend_connect전에_fail_closed된다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-proxy-short-secret-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        let db = Arc::new(Mutex::new(storage::Db::open(&db_path).unwrap()));
+        let logical = LogicalCredentialId::new("short-secret").unwrap();
+        let slot = PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.lock()
+            .unwrap()
+            .insert_credential(&storage::CredentialMeta {
+                id: logical.as_str().to_owned(),
+                provider: "test".to_owned(),
+                label: "test".to_owned(),
+                credential_kind: "api_key".to_owned(),
+                masked_hint: None,
+                workspace_id: None,
+            })
+            .unwrap();
+        db.lock()
+            .unwrap()
+            .rotate_credential_secret_slot(logical.as_str(), slot.as_str(), "{}", None)
+            .unwrap();
+        let store = Arc::new(RecordingSecretStore::default());
+        store.seed(slot.as_str(), "tiny");
+        let redaction = RedactionService::new();
+        let factory = ManagerBackendFactory {
+            manager: LocalMcpManager::new(redaction.clone()),
+            db: Arc::clone(&db),
+            redaction,
+            secret_store: store,
+            initialize_platform_store: false,
+        };
+        let config = BackendConfig::Stdio(StdioBackendConfig {
+            name: "server".to_owned(),
+            command: "/bin/false".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_credentials: vec![("TOKEN".to_owned(), logical.as_str().to_owned())],
+            inherit_env: false,
+        });
+        let revision = factory.auth_revision(&config).unwrap();
+        assert!(factory.resolve(&config, &revision).is_err());
+
+        drop(factory);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -620,6 +1455,7 @@ mod tests {
             clock: Arc::clone(&clock),
             connect_cost: Duration::from_millis(120),
             operation_cost: Duration::from_millis(5),
+            redaction: None,
         });
         let session = BackendSession::with_seams(factory, clock, DEFAULT_BACKEND_IDLE_TTL);
         let backend = BackendClient::new("srv".to_owned(), stdio_config("one"), session.clone());
@@ -673,18 +1509,26 @@ mod tests {
              read -r _until_cancel\n",
             counter.display()
         );
-        let manager = LocalMcpManager::new(secret::RedactionService::new())
-            .with_request_timeout(Duration::from_secs(5));
-        let session = BackendSession::production(manager, DEFAULT_BACKEND_IDLE_TTL);
+        let redaction = secret::RedactionService::new();
+        let manager =
+            LocalMcpManager::new(redaction.clone()).with_request_timeout(Duration::from_secs(5));
+        let (db_dir, db) = test_session_db("same-stdio");
+        let session = BackendSession::production(
+            manager,
+            Arc::clone(&db),
+            redaction,
+            DEFAULT_BACKEND_IDLE_TTL,
+        );
         let backend = BackendClient::new(
             "stdio".to_owned(),
-            BackendConfig::Stdio(McpServerConfig::stdio(
-                "mock".to_owned(),
-                "/bin/sh".to_owned(),
-                vec!["-c".to_owned(), script],
-                Vec::new(),
-                true,
-            )),
+            BackendConfig::Stdio(StdioBackendConfig {
+                name: "mock".to_owned(),
+                command: "/bin/sh".to_owned(),
+                args: vec!["-c".to_owned(), script],
+                env_plain: Vec::new(),
+                env_credentials: Vec::new(),
+                inherit_env: true,
+            }),
             session.clone(),
         );
 
@@ -699,7 +1543,61 @@ mod tests {
         assert_eq!(session.stats().cold_connects, 1);
         assert_eq!(session.stats().warm_reuses, 1);
         session.shutdown();
+        drop(backend);
+        drop(session);
+        drop(db);
         let _ = std::fs::remove_file(counter);
+        std::fs::remove_dir_all(db_dir).unwrap();
+    }
+
+    #[test]
+    fn 실제_http_schema_discovery와_call은_한_backend_session을_공유한다() {
+        let Some((url, methods, server)) = spawn_http_backend() else {
+            eprintln!("loopback bind is forbidden in this sandbox; HTTP integration test skipped");
+            return;
+        };
+        let redaction = RedactionService::new();
+        let (db_dir, db) = test_session_db("same-http");
+        let session = BackendSession::production(
+            LocalMcpManager::new(redaction.clone()).with_request_timeout(Duration::from_secs(5)),
+            Arc::clone(&db),
+            redaction,
+            DEFAULT_BACKEND_IDLE_TTL,
+        );
+        let backend = BackendClient::new(
+            "http".to_owned(),
+            BackendConfig::Http(HttpBackendConfig {
+                name: "proxy-http".to_owned(),
+                url,
+                bearer_credential_id: None,
+            }),
+            session.clone(),
+        );
+
+        let tools = backend.list_tools().unwrap();
+        let result = backend.call_tool("echo", serde_json::json!({})).unwrap();
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(
+            result.pointer("/content/0/text").and_then(Value::as_str),
+            Some("http-warm")
+        );
+        assert_eq!(session.stats().cold_connects, 1);
+        assert_eq!(session.stats().warm_reuses, 1);
+        server.join().unwrap();
+        assert_eq!(
+            *methods.lock().unwrap(),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+        session.shutdown();
+        drop(backend);
+        drop(session);
+        drop(db);
+        std::fs::remove_dir_all(db_dir).unwrap();
     }
 
     #[test]
@@ -732,26 +1630,206 @@ mod tests {
         assert_eq!(resources.live.load(Ordering::SeqCst), 0);
         backend.list_tools().unwrap();
 
-        let http = BackendConfig::Http(McpHttpServerConfig {
+        let http = BackendConfig::Http(HttpBackendConfig {
             name: "http".to_owned(),
             url: "https://one.example/mcp".to_owned(),
-            bearer: Some(secret::SecretString::new("token-one".to_owned())),
+            bearer_credential_id: Some("credential-one".to_owned()),
         });
         let http_backend = BackendClient::new("http".to_owned(), http, session.clone());
         http_backend.list_tools().unwrap();
         let before = http_backend.revision();
-        let url_changed = http_backend.replace_config(BackendConfig::Http(McpHttpServerConfig {
+        let url_changed = http_backend.replace_config(BackendConfig::Http(HttpBackendConfig {
             name: "http".to_owned(),
             url: "https://two.example/mcp".to_owned(),
-            bearer: Some(secret::SecretString::new("token-one".to_owned())),
+            bearer_credential_id: Some("credential-one".to_owned()),
         }));
         assert_ne!(before, url_changed);
-        let auth_changed = http_backend.replace_config(BackendConfig::Http(McpHttpServerConfig {
+        let auth_changed = http_backend.replace_config(BackendConfig::Http(HttpBackendConfig {
             name: "http".to_owned(),
             url: "https://two.example/mcp".to_owned(),
-            bearer: Some(secret::SecretString::new("token-two".to_owned())),
+            bearer_credential_id: Some("credential-two".to_owned()),
         }));
         assert_ne!(url_changed, auth_changed);
+    }
+
+    #[test]
+    fn managed_target은_point_lookup으로_url변경을_교체하고_permission_reset을_관찰한다() {
+        let (db_dir, db) = test_session_db("live-config");
+        let initial = http_server_row("srv", "http://127.0.0.1:3010/mcp", true);
+        db.lock().unwrap().insert_mcp_server(&initial).unwrap();
+        db.lock()
+            .unwrap()
+            .upsert_permission_rule("srv", "echo", "allow", Some("old-schema"))
+            .unwrap();
+        let (session, _clock, resources) = fake_session(DEFAULT_BACKEND_IDLE_TTL);
+        let backend = BackendClient::managed(
+            "srv".to_owned(),
+            BackendConfig::from_server_row(&initial).unwrap(),
+            session.clone(),
+            Arc::clone(&db),
+        );
+
+        let (old_version, _) = backend.list_tools_versioned().unwrap();
+        let old_revision = old_version.config_revision;
+        assert_eq!(resources.connects.load(Ordering::SeqCst), 1);
+        db.lock()
+            .unwrap()
+            .update_mcp_server_url("srv", "http://127.0.0.1:3020/mcp")
+            .unwrap();
+        assert!(
+            db.lock()
+                .unwrap()
+                .permission_rule("srv", "echo")
+                .unwrap()
+                .is_none()
+        );
+
+        let calls_before = resources.calls.load(Ordering::SeqCst);
+        assert!(
+            backend
+                .call_tool_versioned(old_version, "echo", serde_json::json!({}))
+                .is_err()
+        );
+        assert_eq!(resources.calls.load(Ordering::SeqCst), calls_before);
+        assert_eq!(resources.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(resources.live.load(Ordering::SeqCst), 0);
+
+        let (new_version, _) = backend.list_tools_versioned().unwrap();
+        assert_ne!(old_revision, new_version.config_revision);
+        let target = backend.target.read().unwrap();
+        let BackendConfig::Http(config) = target.config.as_ref() else {
+            panic!("HTTP target expected")
+        };
+        assert_eq!(config.url, "http://127.0.0.1:3020/mcp");
+        assert_eq!(resources.connects.load(Ordering::SeqCst), 2);
+
+        session.shutdown();
+        drop(target);
+        drop(backend);
+        drop(session);
+        drop(db);
+        std::fs::remove_dir_all(db_dir).unwrap();
+    }
+
+    #[test]
+    fn physical_slot_rotation은_live_schema_version을_stale처리하고_call을_하지_않는다() {
+        let (session, _clock, resources) = fake_session(DEFAULT_BACKEND_IDLE_TTL);
+        *resources.auth_revision.lock().unwrap() = vec!["slot-v1".to_owned()];
+        let backend = BackendClient::new("srv".to_owned(), stdio_config("one"), session.clone());
+
+        let (version_v1, _) = backend.list_tools_versioned().unwrap();
+        assert_eq!(resources.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(resources.secret_reads.load(Ordering::SeqCst), 1);
+        *resources.auth_revision.lock().unwrap() = vec!["slot-v2".to_owned()];
+        assert!(
+            backend
+                .call_tool_versioned(version_v1, "echo", serde_json::json!({}))
+                .is_err()
+        );
+        assert_eq!(resources.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resources.secret_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(resources.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(session.stats().active_leases, 0);
+
+        let (version_v2, _) = backend.list_tools_versioned().unwrap();
+        backend
+            .call_tool_versioned(version_v2, "echo", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(resources.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resources.connects.load(Ordering::SeqCst), 2);
+        assert_eq!(resources.secret_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(session.stats().warm_reuses, 1);
+    }
+
+    #[test]
+    fn managed_target은_missing_disabled_malformed를_external_call전에_fail_closed한다() {
+        for (label, row) in [
+            (
+                "disabled",
+                Some(http_server_row("srv", "http://127.0.0.1:3030/mcp", false)),
+            ),
+            (
+                "malformed",
+                Some(http_server_row("srv", "http://public.example/mcp", true)),
+            ),
+            ("missing", None),
+        ] {
+            let (db_dir, db) = test_session_db(label);
+            if let Some(row) = &row {
+                db.lock().unwrap().insert_mcp_server(row).unwrap();
+            }
+            let (session, _clock, resources) = fake_session(DEFAULT_BACKEND_IDLE_TTL);
+            let backend = BackendClient::managed(
+                "srv".to_owned(),
+                BackendConfig::Http(HttpBackendConfig {
+                    name: "initial-safe-target".to_owned(),
+                    url: "http://127.0.0.1:3031/mcp".to_owned(),
+                    bearer_credential_id: None,
+                }),
+                session.clone(),
+                Arc::clone(&db),
+            );
+
+            assert!(backend.list_tools_versioned().is_err(), "case={label}");
+            assert_eq!(resources.connects.load(Ordering::SeqCst), 0, "case={label}");
+            assert_eq!(resources.calls.load(Ordering::SeqCst), 0, "case={label}");
+            assert_eq!(session.stats().active_leases, 0, "case={label}");
+
+            drop(backend);
+            drop(session);
+            drop(db);
+            std::fs::remove_dir_all(db_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_target은_active_secret_guard를_회수하고_수정후_lazy_reconnect한다() {
+        let (db_dir, db) = test_session_db("malformed-recovery");
+        let initial = http_server_row("srv", "http://127.0.0.1:3040/mcp", true);
+        db.lock().unwrap().insert_mcp_server(&initial).unwrap();
+        let clock = Arc::new(FakeClock::default());
+        let resources = Arc::new(FakeResources::default());
+        let redaction = RedactionService::new();
+        let factory = Arc::new(FakeFactory {
+            resources: Arc::clone(&resources),
+            clock: Arc::clone(&clock),
+            connect_cost: Duration::ZERO,
+            operation_cost: Duration::ZERO,
+            redaction: Some(redaction.clone()),
+        });
+        let session = BackendSession::with_seams(factory, clock, DEFAULT_BACKEND_IDLE_TTL);
+        let backend = BackendClient::managed(
+            "srv".to_owned(),
+            BackendConfig::from_server_row(&initial).unwrap(),
+            session.clone(),
+            Arc::clone(&db),
+        );
+
+        backend.list_tools_versioned().unwrap();
+        assert_eq!(session.stats().active_leases, 1);
+        assert_eq!(redaction.corpus_stats().active_leases, 1);
+        db.lock()
+            .unwrap()
+            .update_mcp_server_url("srv", "http://public.example/mcp")
+            .unwrap();
+        assert!(backend.list_tools_versioned().is_err());
+        assert_eq!(session.stats().active_leases, 0);
+        assert_eq!(redaction.corpus_stats().active_leases, 0);
+
+        db.lock()
+            .unwrap()
+            .update_mcp_server_url("srv", "http://127.0.0.1:3041/mcp")
+            .unwrap();
+        backend.list_tools_versioned().unwrap();
+        assert_eq!(resources.connects.load(Ordering::SeqCst), 2);
+        assert_eq!(redaction.corpus_stats().active_leases, 1);
+        session.shutdown();
+        assert_eq!(redaction.corpus_stats().active_leases, 0);
+
+        drop(backend);
+        drop(session);
+        drop(db);
+        std::fs::remove_dir_all(db_dir).unwrap();
     }
 
     #[test]
@@ -797,10 +1875,10 @@ mod tests {
             .unwrap();
         BackendClient::new(
             "http".to_owned(),
-            BackendConfig::Http(McpHttpServerConfig {
+            BackendConfig::Http(HttpBackendConfig {
                 name: "http".to_owned(),
                 url: "https://example.invalid/mcp".to_owned(),
-                bearer: None,
+                bearer_credential_id: None,
             }),
             session.clone(),
         )
@@ -859,20 +1937,24 @@ read -r _until_cancel
             pid_file.display()
         );
         let idle_ttl = Duration::from_millis(50);
+        let redaction = secret::RedactionService::new();
+        let (db_dir, db) = test_session_db("latency");
         let session = BackendSession::production(
-            LocalMcpManager::new(secret::RedactionService::new())
-                .with_request_timeout(Duration::from_secs(5)),
+            LocalMcpManager::new(redaction.clone()).with_request_timeout(Duration::from_secs(5)),
+            Arc::clone(&db),
+            redaction,
             idle_ttl,
         );
         let backend = BackendClient::new(
             "stdio".to_owned(),
-            BackendConfig::Stdio(McpServerConfig::stdio(
-                "mock".to_owned(),
-                "/bin/sh".to_owned(),
-                vec!["-c".to_owned(), script],
-                Vec::new(),
-                true,
-            )),
+            BackendConfig::Stdio(StdioBackendConfig {
+                name: "mock".to_owned(),
+                command: "/bin/sh".to_owned(),
+                args: vec!["-c".to_owned(), script],
+                env_plain: Vec::new(),
+                env_credentials: Vec::new(),
+                inherit_env: true,
+            }),
             session.clone(),
         );
 
@@ -904,7 +1986,11 @@ read -r _until_cancel
         eprintln!(
             "actual stdio benchmark: cold={cold:?} warm={warm:?} retained_rss_kib={retained_rss_kib:?}"
         );
+        drop(backend);
+        drop(session);
+        drop(db);
         let _ = std::fs::remove_file(pid_file);
+        std::fs::remove_dir_all(db_dir).unwrap();
     }
 
     #[derive(Debug, Clone, Copy)]

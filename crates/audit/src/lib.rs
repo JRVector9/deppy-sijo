@@ -6,16 +6,25 @@
 mod crypto;
 mod log;
 mod policy;
+#[cfg(feature = "test-support")]
+mod test_support;
 
 pub use crypto::{decrypt_input, encrypt_input};
 pub use log::{
-    AuditLifecycle, AuditOperation, AuditRecord, audit_lifecycle, complete_audit_operation,
-    mask_sensitive_keys, prepare_audit_operation, reconcile_prepared_audits, record_audit,
+    AuditLifecycle, AuditOperation, AuditRecord, AuthorizationOutcome,
+    MAX_AUTHORIZATION_INPUT_BYTES, MAX_SANITIZED_PREVIEW_CHARS, audit_lifecycle,
+    complete_authorization_operation, mask_sensitive_keys, prepare_owned_authorization_preflight,
+    record_audit, sanitized_input_preview, validate_tool_input,
 };
 pub use policy::{
-    ApprovalReason, PermissionPolicy, PermissionRule, PolicyEvaluation, ToolApprovalRequest,
-    ToolDecision,
+    ApprovalDecision, ApprovalReason, AuthorizationEvaluation, AuthorizationGrant,
+    AuthorizationPlan, AuthorizationPreflight, AuthorizedCall, DeniedAuthorization,
+    PendingAuthorization, PermissionFingerprint, PermissionPolicy, PermissionRule,
+    PolicyEvaluation, ToolApprovalRequest, ToolDecision, evaluate_authorization,
+    evaluate_authorization_with_fingerprint, evaluate_permission,
 };
+#[cfg(feature = "test-support")]
+pub use test_support::{InMemoryAuthorizationLedger, TestAuthorizationCounters};
 
 use sha2::{Digest, Sha256};
 
@@ -51,6 +60,30 @@ CREATE UNIQUE INDEX idx_tool_audit_operation_id
     ON tool_audit_logs(operation_id) WHERE operation_id IS NOT NULL;
 CREATE INDEX idx_tool_audit_lifecycle ON tool_audit_logs(lifecycle);
 ";
+
+/// AU01 owner-scoped durable recovery. A run is safe only while its caller holds the matching
+/// exclusive OS lifetime lock; storage owns that lock and run transaction.
+pub const MIGRATION_AUTHORIZATION_OWNERS: &str = "
+ALTER TABLE tool_audit_logs ADD COLUMN authorization_scope TEXT;
+ALTER TABLE tool_audit_logs ADD COLUMN authorization_run_id TEXT;
+CREATE INDEX idx_tool_audit_authorization_owner
+    ON tool_audit_logs(authorization_scope, authorization_run_id, lifecycle);
+";
+
+pub fn authorization_scope_lock_key(scope: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !scope.trim().is_empty(),
+        "authorization scope가 비어 있습니다"
+    );
+    anyhow::ensure!(scope.len() <= 512, "authorization scope가 너무 깁니다");
+    let digest = Sha256::digest(scope.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
 
 /// mcp_tools.schema_hash (설계문서 11.0) — tool input schema의 sha256 hex(64자).
 /// 도구 스키마 변경 감지 → 재승인 트리거(PR-22 "MCP tool 변경 시 재승인")에 쓴다.

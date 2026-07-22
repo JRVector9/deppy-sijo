@@ -6,6 +6,14 @@ use connector_contract::{
     SensitiveInput, ServerDraft, ServerId, ServerSummary, SlackStatus, ToolId, ToolListItem,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationState {
+    /// Exact durable row observed by the repository. `Absent` must not be collapsed into the
+    /// effective default Ask policy: preflight uses this fingerprint to reject a concurrent
+    /// insert just as it rejects a concurrent update or delete.
+    pub permission: audit::PermissionFingerprint,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceError {
     pub code: ErrorCode,
@@ -59,11 +67,73 @@ pub struct DiscoverOutput {
 }
 
 #[derive(Debug)]
-pub struct InvokeRequest {
-    pub operation_id: OperationId,
-    pub server: ServerDraft,
+pub struct AuthorizedInvokeRequest {
+    call: audit::AuthorizedCall,
+    server: ServerDraft,
+    tool_name: String,
+    arguments_json: SensitiveInput,
+}
+
+impl AuthorizedInvokeRequest {
+    pub(crate) fn new(
+        grant: audit::AuthorizationGrant,
+        server_id: &ServerId,
+        server: ServerDraft,
+        tool_name: String,
+        arguments_json: SensitiveInput,
+    ) -> Result<Self, ServiceError> {
+        if server.id.as_ref().map(ServerId::as_str) != Some(server_id.as_str()) {
+            return Err(ServiceError::new(
+                ErrorCode::StorageUnavailable,
+                "authorized server configuration binding mismatch",
+            ));
+        }
+        let call = grant
+            .bind_call(
+                server_id.as_str(),
+                &tool_name,
+                arguments_json.expose_bytes(),
+            )
+            .map_err(|_| {
+                ServiceError::new(
+                    ErrorCode::PermissionDenied,
+                    "authorized call binding mismatch",
+                )
+            })?;
+        Ok(Self {
+            call,
+            server,
+            tool_name,
+            arguments_json,
+        })
+    }
+
+    pub fn operation_id(&self) -> &str {
+        self.call.operation_id()
+    }
+
+    pub fn server(&self) -> &ServerDraft {
+        &self.server
+    }
+
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    pub fn arguments_json(&self) -> &[u8] {
+        self.arguments_json.expose_bytes()
+    }
+
+    pub fn call_capability(&self) -> &audit::AuthorizedCall {
+        &self.call
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveToolSchema {
     pub tool_id: ToolId,
-    pub arguments_json: SensitiveInput,
+    pub tool_name: String,
+    pub input_schema_json: String,
 }
 
 #[derive(Debug)]
@@ -151,6 +221,33 @@ pub trait ConnectorRepository: Send + 'static {
     fn parse_import(&mut self, source_name: &str, bytes: &[u8])
     -> Result<ImportPlan, ServiceError>;
     fn import_servers(&mut self, servers: Vec<ServerDraft>) -> Result<Revision, ServiceError>;
+
+    fn load_authorization_state(
+        &mut self,
+        server_id: &ServerId,
+        tool_name: &str,
+    ) -> Result<AuthorizationState, ServiceError>;
+
+    /// Atomically persists an optional remembered decision and durable audit preflight. The plan
+    /// is consumed and only the storage-produced opaque grant can unlock an external tool call.
+    fn commit_authorization_preflight(
+        &mut self,
+        plan: audit::AuthorizationPlan,
+        arguments_json: &SensitiveInput,
+    ) -> Result<audit::AuthorizationPreflight, ServiceError>;
+
+    fn complete_authorization(
+        &mut self,
+        operation_id: &OperationId,
+        outcome: audit::AuthorizationOutcome,
+    ) -> Result<(), ServiceError>;
+
+    /// Gracefully closes the repository authorization-owner lifetime exactly once. Concrete
+    /// adapters use this hook to reconcile this run's still-Prepared rows before releasing the
+    /// exclusive owner lock. Drop remains the crash fallback.
+    fn shutdown(&mut self) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 /// Keyring-neutral secret capability. Secret values cross the boundary only as
@@ -161,6 +258,14 @@ pub trait ConnectorSecrets: Send + Sync + 'static {
         credential_id: &CredentialId,
     ) -> Result<SensitiveInput, ServiceError>;
     fn store_oauth_client(&self, client: StoredOAuthClient) -> Result<(), ServiceError>;
+
+    /// Produces a registered-pattern and sensitive-key redacted preview. Implementations must
+    /// validate JSON and return at most `max_chars` Unicode scalar values.
+    fn sanitized_input_preview(
+        &self,
+        arguments_json: &SensitiveInput,
+        max_chars: usize,
+    ) -> Result<String, ServiceError>;
 }
 
 pub trait ConnectorMcp: Send + Sync + 'static {
@@ -171,11 +276,19 @@ pub trait ConnectorMcp: Send + Sync + 'static {
         cancellation: CancellationToken,
     ) -> Result<DiscoverOutput, ServiceError>;
 
-    /// Implementations must load live schema immediately before the call and must not
-    /// retry `mcp::McpDeliveryUnknown` outcomes.
-    fn load_schema_and_invoke(
+    fn load_live_schema(
         &self,
-        request: InvokeRequest,
+        operation_id: &OperationId,
+        server: ServerDraft,
+        tool_id: ToolId,
+        cancellation: CancellationToken,
+    ) -> Result<LiveToolSchema, ServiceError>;
+
+    /// The opaque preflight grant is consumed with the call, making a prepared authorization
+    /// single-use. Implementations must not retry `mcp::McpDeliveryUnknown` outcomes.
+    fn invoke_authorized(
+        &self,
+        request: AuthorizedInvokeRequest,
         cancellation: CancellationToken,
     ) -> Result<String, ServiceError>;
 

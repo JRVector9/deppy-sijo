@@ -176,6 +176,30 @@ pub fn list_permission_rules(conn: &Connection) -> anyhow::Result<Vec<Permission
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Bounded point lookup used on the authorization hot path. Missing rows mean Ask.
+pub fn permission_rule(
+    conn: &Connection,
+    server_id: &str,
+    tool_name: &str,
+) -> anyhow::Result<Option<PermissionRuleRow>> {
+    conn.query_row(
+        "SELECT server_id, tool_name, rule, approved_schema_hash
+         FROM tool_permission_rules
+         WHERE server_id = ?1 AND tool_name = ?2",
+        (server_id, tool_name),
+        |row| {
+            Ok(PermissionRuleRow {
+                server_id: row.get(0)?,
+                tool_name: row.get(1)?,
+                rule: row.get(2)?,
+                approved_schema_hash: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// 권한 규칙 저장/갱신 (AllowAlways/DenyAlways 결정 시).
 pub fn upsert_permission_rule(
     conn: &Connection,
@@ -788,40 +812,84 @@ pub fn list_servers(conn: &Connection) -> anyhow::Result<Vec<McpServerRow>> {
     })?;
     let mut servers = Vec::new();
     for row in rows {
-        let (
-            id,
-            name,
-            kind,
-            command,
-            args_json,
-            env_json,
-            env_credentials_json,
-            inherit_env,
-            url,
-            enabled,
-        ) = row?;
-        let args = match args_json {
-            Some(json) => {
-                serde_json::from_str(&json).with_context(|| format!("args_json 파싱 실패: {id}"))?
-            }
-            None => Vec::new(),
-        };
-        let env_plain = parse_env_pairs(&id, "env_json", env_json)?;
-        let env_secrets = parse_env_pairs(&id, "env_credentials_json", env_credentials_json)?;
-        servers.push(McpServerRow {
-            id,
-            name,
-            kind,
-            command,
-            args,
-            env_plain,
-            env_secrets,
-            inherit_env,
-            url,
-            enabled,
-        });
+        servers.push(parse_server_row(row?)?);
     }
     Ok(servers)
+}
+
+/// Bounded point lookup for live proxy target refresh. Missing rows are fail-closed upstream.
+pub fn server(conn: &Connection, server_id: &str) -> anyhow::Result<Option<McpServerRow>> {
+    let row = conn
+        .query_row(
+            "SELECT id, name, kind, command, args_json, env_json, env_credentials_json,
+                    inherit_env, url, enabled
+             FROM mcp_servers WHERE id = ?1",
+            [server_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, bool>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, bool>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(parse_server_row).transpose()
+}
+
+type RawServerRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+    bool,
+);
+
+fn parse_server_row(row: RawServerRow) -> anyhow::Result<McpServerRow> {
+    let (
+        id,
+        name,
+        kind,
+        command,
+        args_json,
+        env_json,
+        env_credentials_json,
+        inherit_env,
+        url,
+        enabled,
+    ) = row;
+    let args = match args_json {
+        Some(json) => {
+            serde_json::from_str(&json).with_context(|| format!("args_json 파싱 실패: {id}"))?
+        }
+        None => Vec::new(),
+    };
+    let env_plain = parse_env_pairs(&id, "env_json", env_json)?;
+    let env_secrets = parse_env_pairs(&id, "env_credentials_json", env_credentials_json)?;
+    Ok(McpServerRow {
+        id,
+        name,
+        kind,
+        command,
+        args,
+        env_plain,
+        env_secrets,
+        inherit_env,
+        url,
+        enabled,
+    })
 }
 
 fn env_pairs_json(pairs: &[(String, String)]) -> anyhow::Result<Option<String>> {

@@ -6,19 +6,21 @@ use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use connector_contract::{
-    ConnectorIntent, ConnectorSnapshot, DiagnosticTransition, DiagnosticsSnapshot, ErrorCode,
-    OperationId, OperationKind, OperationPhase, OperationResult, OperationSummary, ResourceLimits,
-    Revision, ServerDraft, ServerId, ToolPage, TransportDraft,
+    ApprovalDecision, ApprovalPrompt, ConnectorIntent, ConnectorSnapshot, DiagnosticTransition,
+    DiagnosticsSnapshot, ErrorCode, OperationId, OperationKind, OperationPhase, OperationResult,
+    OperationSummary, ResourceLimits, Revision, ServerDraft, ServerId, ToolId, ToolPage,
+    TransportDraft,
 };
 
 use crate::ports::{
-    CancellationToken, ConnectorMcp, ConnectorOAuth, ConnectorRepository,
-    ConnectorRepositoryFactory, ConnectorSecrets, DiscoverOutput, InvokeRequest,
+    AuthorizedInvokeRequest, CancellationToken, ConnectorMcp, ConnectorOAuth, ConnectorRepository,
+    ConnectorRepositoryFactory, ConnectorSecrets, DiscoverOutput, LiveToolSchema,
     McpTransportSnapshot, OAuthOutput, ServiceError, StoredOAuthClient,
 };
 use crate::snapshot::{SnapshotCell, SnapshotReader};
 
 const TOOL_PAGE_SIZE: usize = 256;
+const APPROVAL_PREVIEW_CHARS: usize = 500;
 
 pub trait CoordinatorClock: Send + Sync + 'static {
     fn now(&self) -> Duration;
@@ -27,6 +29,36 @@ pub trait CoordinatorClock: Send + Sync + 'static {
     /// return zero so idle expiry is deterministic without sleeping.
     fn wait_duration(&self, requested: Duration) -> Duration {
         requested
+    }
+}
+
+pub trait OperationIdFactory: Send + Sync + 'static {
+    fn next_id(&self) -> OperationId;
+}
+
+pub struct SystemOperationIdFactory {
+    prefix: String,
+    counter: AtomicU64,
+}
+
+impl Default for SystemOperationIdFactory {
+    fn default() -> Self {
+        static FACTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        let sequence = FACTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        Self {
+            prefix: format!("connector-{:x}-{nanos:x}-{sequence:x}", std::process::id()),
+            counter: AtomicU64::new(1),
+        }
+    }
+}
+
+impl OperationIdFactory for SystemOperationIdFactory {
+    fn next_id(&self) -> OperationId {
+        let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+        OperationId::new(format!("{}-{counter:x}", self.prefix))
     }
 }
 
@@ -56,6 +88,7 @@ pub struct ConnectorCoordinatorConfig {
     pub mcp: Arc<dyn ConnectorMcp>,
     pub oauth: Arc<dyn ConnectorOAuth>,
     pub clock: Arc<dyn CoordinatorClock>,
+    pub operation_ids: Arc<dyn OperationIdFactory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,9 +166,14 @@ impl Metrics {
 }
 
 struct WorkerSlot {
-    sender: SyncSender<ConnectorIntent>,
+    sender: SyncSender<CommandEnvelope>,
     thread: JoinHandle<()>,
     unparker: Thread,
+}
+
+struct CommandEnvelope {
+    intent: ConnectorIntent,
+    dispatch_epoch: u64,
 }
 
 struct Inner {
@@ -143,7 +181,9 @@ struct Inner {
     snapshot: Arc<SnapshotCell>,
     metrics: Arc<Metrics>,
     worker: Mutex<Option<WorkerSlot>>,
-    next_operation: Arc<AtomicU64>,
+    dispatch_serialization: Mutex<()>,
+    dispatch_epoch: Arc<AtomicU64>,
+    cancellations: Arc<Mutex<HashMap<OperationId, CancellationToken>>>,
 }
 
 impl Drop for Inner {
@@ -178,7 +218,9 @@ impl ConnectorCoordinator {
                 snapshot: Arc::new(SnapshotCell::new()),
                 metrics: Arc::new(Metrics::new()),
                 worker: Mutex::new(None),
-                next_operation: Arc::new(AtomicU64::new(1)),
+                dispatch_serialization: Mutex::new(()),
+                dispatch_epoch: Arc::new(AtomicU64::new(0)),
+                cancellations: Arc::new(Mutex::new(HashMap::new())),
             }),
         })
     }
@@ -201,7 +243,42 @@ impl ConnectorCoordinator {
                     url,
                 )));
             }
-            intent => self.enqueue(intent)?,
+            intent => {
+                let _dispatch = self
+                    .inner
+                    .dispatch_serialization
+                    .lock()
+                    .expect("connector dispatch serialization");
+                if let ConnectorIntent::Cancel(operation_id) = &intent
+                    && let Some(cancellation) = self
+                        .inner
+                        .cancellations
+                        .lock()
+                        .expect("connector cancellation registry")
+                        .get(operation_id)
+                {
+                    cancellation.cancel();
+                }
+                let dispatch_epoch = if invalidates_inflight(&intent) {
+                    let epoch = self.inner.dispatch_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                    for cancellation in self
+                        .inner
+                        .cancellations
+                        .lock()
+                        .expect("connector cancellation registry")
+                        .values()
+                    {
+                        cancellation.cancel();
+                    }
+                    epoch
+                } else {
+                    self.inner.dispatch_epoch.load(Ordering::Acquire)
+                };
+                self.enqueue(CommandEnvelope {
+                    intent,
+                    dispatch_epoch,
+                })?;
+            }
         }
         Ok(DispatchOutcome::Queued)
     }
@@ -221,7 +298,7 @@ impl ConnectorCoordinator {
         }
     }
 
-    fn enqueue(&self, mut intent: ConnectorIntent) -> Result<(), DispatchError> {
+    fn enqueue(&self, mut command: CommandEnvelope) -> Result<(), DispatchError> {
         for _attempt in 0..2 {
             let mut worker = self.inner.worker.lock().expect("connector worker lock");
             if worker
@@ -239,7 +316,7 @@ impl ConnectorCoordinator {
                 .metrics
                 .queue_depth
                 .fetch_add(1, Ordering::AcqRel);
-            match slot.sender.try_send(intent) {
+            match slot.sender.try_send(command) {
                 Ok(()) => {
                     slot.unparker.unpark();
                     return Ok(());
@@ -261,7 +338,7 @@ impl ConnectorCoordinator {
                         .metrics
                         .queue_depth
                         .fetch_sub(1, Ordering::AcqRel);
-                    intent = returned;
+                    command = returned;
                     if let Some(slot) = worker.take() {
                         let _ = slot.thread.join();
                     }
@@ -276,12 +353,15 @@ impl ConnectorCoordinator {
         let snapshot = Arc::clone(&self.inner.snapshot);
         let metrics = Arc::clone(&self.inner.metrics);
         let factory = Arc::clone(&self.inner.config.repository_factory);
+        let secrets = Arc::clone(&self.inner.config.secrets);
         let mcp = Arc::clone(&self.inner.config.mcp);
         let oauth = Arc::clone(&self.inner.config.oauth);
         let clock = Arc::clone(&self.inner.config.clock);
         let limits = self.inner.config.limits;
         let idle_ttl = self.inner.config.idle_ttl;
-        let next_operation = Arc::clone(&self.inner.next_operation);
+        let operation_ids = Arc::clone(&self.inner.config.operation_ids);
+        let dispatch_epoch = Arc::clone(&self.inner.dispatch_epoch);
+        let cancellations = Arc::clone(&self.inner.cancellations);
         let thread = std::thread::Builder::new()
             .name("connector-coordinator".to_owned())
             .spawn(move || {
@@ -292,8 +372,7 @@ impl ConnectorCoordinator {
                     Ok(repository) => repository,
                     Err(error) => {
                         metrics.queue_depth.store(0, Ordering::Release);
-                        let seed = next_operation.fetch_add(1, Ordering::Relaxed);
-                        publish_boot_error(&snapshot, error, seed);
+                        publish_boot_error(&snapshot, error, operation_ids.next_id());
                         return;
                     }
                 };
@@ -302,12 +381,15 @@ impl ConnectorCoordinator {
                     snapshot,
                     metrics,
                     repository,
+                    secrets,
                     mcp,
                     oauth,
                     clock,
                     limits,
                     idle_ttl,
-                    next_operation,
+                    operation_ids,
+                    dispatch_epoch,
+                    cancellations,
                 )
                 .run();
             })
@@ -329,10 +411,10 @@ impl Drop for WorkerAlive {
     }
 }
 
-fn publish_boot_error(snapshot: &SnapshotCell, error: ServiceError, seed: u64) {
+fn publish_boot_error(snapshot: &SnapshotCell, error: ServiceError, operation_id: OperationId) {
     let mut next = ConnectorSnapshot {
         result: Some(OperationResult {
-            operation_id: OperationId::new(format!("connector-{seed}")),
+            operation_id,
             text: error.message.to_owned(),
             truncated: false,
         }),
@@ -348,8 +430,27 @@ fn publish_boot_error(snapshot: &SnapshotCell, error: ServiceError, seed: u64) {
 
 enum JobPayload {
     Discover(Result<DiscoverOutput, ServiceError>),
-    Invoke(Result<String, ServiceError>),
+    InvokeSchema(Result<LiveToolSchema, ServiceError>),
+    InvokeCall(Result<String, ServiceError>),
     OAuth(Result<OAuthOutput, ServiceError>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobStage {
+    Discover,
+    InvokeSchema,
+    InvokeCall,
+    OAuth,
+}
+
+impl JobStage {
+    fn kind(self) -> OperationKind {
+        match self {
+            Self::Discover => OperationKind::Discover,
+            Self::InvokeSchema | Self::InvokeCall => OperationKind::Invoke,
+            Self::OAuth => OperationKind::OAuth,
+        }
+    }
 }
 
 struct JobCompletion {
@@ -357,7 +458,8 @@ struct JobCompletion {
     server_id: ServerId,
     generation: u64,
     config_revision: Revision,
-    kind: OperationKind,
+    dispatch_epoch: u64,
+    stage: JobStage,
     payload: JobPayload,
 }
 
@@ -365,28 +467,56 @@ struct ActiveJob {
     server_id: ServerId,
     generation: u64,
     config_revision: Revision,
-    kind: OperationKind,
+    dispatch_epoch: u64,
+    stage: JobStage,
     cancellation: CancellationToken,
     thread: Option<JoinHandle<()>>,
 }
 
+struct PendingInvocation {
+    server_id: ServerId,
+    server: ServerDraft,
+    tool_id: ToolId,
+    tool_name: String,
+    live_schema_hash: String,
+    arguments_json: connector_contract::SensitiveInput,
+    generation: u64,
+    config_revision: Revision,
+    dispatch_epoch: u64,
+    authorization: Option<audit::PendingAuthorization>,
+    arguments_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingOutcome {
+    outcome: audit::AuthorizationOutcome,
+    stage: JobStage,
+}
+
 struct Worker {
-    commands: Receiver<ConnectorIntent>,
+    commands: Receiver<CommandEnvelope>,
     result_sender: SyncSender<JobCompletion>,
     results: Receiver<JobCompletion>,
     snapshot_cell: Arc<SnapshotCell>,
     snapshot: ConnectorSnapshot,
     metrics: Arc<Metrics>,
     repository: Box<dyn ConnectorRepository>,
+    secrets: Arc<dyn ConnectorSecrets>,
     mcp: Arc<dyn ConnectorMcp>,
     oauth: Arc<dyn ConnectorOAuth>,
     clock: Arc<dyn CoordinatorClock>,
     limits: ResourceLimits,
     idle_ttl: Duration,
     last_activity: Duration,
-    next_operation: Arc<AtomicU64>,
+    operation_ids: Arc<dyn OperationIdFactory>,
+    dispatch_epoch: Arc<AtomicU64>,
+    current_dispatch_epoch: u64,
+    cancellations: Arc<Mutex<HashMap<OperationId, CancellationToken>>>,
     generations: HashMap<ServerId, u64>,
     jobs: HashMap<OperationId, ActiveJob>,
+    pending_invocations: HashMap<OperationId, PendingInvocation>,
+    pending_outcomes: HashMap<OperationId, PendingOutcome>,
+    approval_order: VecDeque<OperationId>,
     operations: Vec<OperationSummary>,
     transitions: VecDeque<DiagnosticTransition>,
     needs_initial_overview: bool,
@@ -396,16 +526,19 @@ struct Worker {
 impl Worker {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        commands: Receiver<ConnectorIntent>,
+        commands: Receiver<CommandEnvelope>,
         snapshot_cell: Arc<SnapshotCell>,
         metrics: Arc<Metrics>,
         repository: Box<dyn ConnectorRepository>,
+        secrets: Arc<dyn ConnectorSecrets>,
         mcp: Arc<dyn ConnectorMcp>,
         oauth: Arc<dyn ConnectorOAuth>,
         clock: Arc<dyn CoordinatorClock>,
         limits: ResourceLimits,
         idle_ttl: Duration,
-        next_operation: Arc<AtomicU64>,
+        operation_ids: Arc<dyn OperationIdFactory>,
+        dispatch_epoch: Arc<AtomicU64>,
+        cancellations: Arc<Mutex<HashMap<OperationId, CancellationToken>>>,
     ) -> Self {
         let (result_sender, results) = sync_channel(limits.mcp_operations + limits.oauth_flows);
         let last_activity = clock.now();
@@ -419,15 +552,22 @@ impl Worker {
             snapshot,
             metrics,
             repository,
+            secrets,
             mcp,
             oauth,
             clock,
             limits,
             idle_ttl,
             last_activity,
-            next_operation,
+            operation_ids,
+            current_dispatch_epoch: dispatch_epoch.load(Ordering::Acquire),
+            dispatch_epoch,
+            cancellations,
             generations: HashMap::new(),
             jobs: HashMap::new(),
+            pending_invocations: HashMap::new(),
+            pending_outcomes: HashMap::new(),
+            approval_order: VecDeque::new(),
             operations: Vec::new(),
             transitions: VecDeque::new(),
             needs_initial_overview,
@@ -439,7 +579,7 @@ impl Worker {
         loop {
             let mut progressed = self.drain_results();
             progressed |= self.drain_commands();
-            if self.shutting_down && self.jobs.is_empty() {
+            if self.shutting_down && self.jobs.is_empty() && self.pending_invocations.is_empty() {
                 break;
             }
             if progressed {
@@ -448,8 +588,13 @@ impl Worker {
             if self.jobs.is_empty() {
                 let elapsed = self.clock.now().saturating_sub(self.last_activity);
                 let remaining = self.idle_ttl.saturating_sub(elapsed);
-                if remaining.is_zero() && self.mcp.active_leases() == 0 {
-                    break;
+                if remaining.is_zero() {
+                    self.expire_pending_invocations();
+                    self.retry_pending_outcomes();
+                    self.mcp.reap_idle_leases();
+                    if self.mcp.active_leases() == 0 {
+                        break;
+                    }
                 }
                 let wait = self.clock.wait_duration(if remaining.is_zero() {
                     self.idle_ttl
@@ -458,9 +603,7 @@ impl Worker {
                 });
                 match self.commands.recv_timeout(wait) {
                     Ok(command) => self.accept_command(command),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        self.mcp.reap_idle_leases();
-                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         self.begin_shutdown();
                     }
@@ -475,6 +618,15 @@ impl Worker {
                 Ok(completion) => self.finish_job(completion),
                 Err(_) => break,
             }
+        }
+        self.retry_pending_outcomes();
+        self.release_pending_outcome_slots();
+        if self.repository.shutdown().is_err() {
+            self.publish_error(
+                OperationKind::Invoke,
+                ErrorCode::AuditUnavailable,
+                "connector authorization shutdown could not be persisted",
+            );
         }
     }
 
@@ -504,19 +656,32 @@ impl Worker {
         progressed
     }
 
-    fn accept_command(&mut self, command: ConnectorIntent) {
+    fn accept_command(&mut self, command: CommandEnvelope) {
         self.metrics.queue_depth.fetch_sub(1, Ordering::AcqRel);
         self.last_activity = self.clock.now();
+        self.current_dispatch_epoch = command.dispatch_epoch;
+        self.retry_pending_outcomes();
+        self.discard_cancelled_pending();
         if self.needs_initial_overview {
             self.needs_initial_overview = false;
-            if !matches!(&command, ConnectorIntent::Activate) {
+            if !matches!(&command.intent, ConnectorIntent::Activate) {
                 self.reload_overview();
             }
         }
-        self.handle_command(command);
+        self.handle_command(command.intent);
     }
 
     fn handle_command(&mut self, command: ConnectorIntent) {
+        if !self.pending_outcomes.is_empty()
+            && matches!(&command, ConnectorIntent::InvokeTool { .. })
+        {
+            self.publish_error(
+                OperationKind::Invoke,
+                ErrorCode::AuditUnavailable,
+                "a prior tool outcome is awaiting durable audit persistence",
+            );
+            return;
+        }
         match command {
             ConnectorIntent::Activate => self.reload_overview(),
             ConnectorIntent::SelectServer(server_id) => self.select_server(server_id),
@@ -569,13 +734,10 @@ impl Worker {
                     self.publish();
                 }
             }
-            ConnectorIntent::ResolveApproval { .. } => {
-                self.publish_error(
-                    OperationKind::Invoke,
-                    ErrorCode::Internal,
-                    "approval pending AU01",
-                );
-            }
+            ConnectorIntent::ResolveApproval {
+                operation_id,
+                decision,
+            } => self.resolve_approval(operation_id, decision),
             ConnectorIntent::RequestImportPicker | ConnectorIntent::OpenExternalUrl { .. } => {}
         }
     }
@@ -591,6 +753,7 @@ impl Worker {
                 self.snapshot.slack_status = overview.slack_status;
                 self.snapshot.slack_tool_count = overview.slack_tool_count;
                 self.snapshot.servers = Arc::from(overview.servers);
+                self.invalidate_stale_pending_invocations();
                 self.prune_generations();
                 if self
                     .snapshot
@@ -620,6 +783,10 @@ impl Worker {
         self.snapshot.selected_server_config = match server_id {
             Some(server_id) => match self.repository.load_server(&server_id) {
                 Ok(server) => {
+                    if let Err(error) = validate_loaded_server_id(&server_id, &server) {
+                        self.publish_service_error(OperationKind::SaveServer, error);
+                        return;
+                    }
                     if let Err(error) = validate_server_draft(&server, self.limits) {
                         self.publish_service_error(OperationKind::SaveServer, error);
                         return;
@@ -764,6 +931,10 @@ impl Worker {
                 return;
             }
         };
+        if let Err(error) = validate_loaded_server_id(&server_id, &server) {
+            self.publish_service_error(OperationKind::Discover, error);
+            return;
+        }
         if let Err(error) = validate_server_draft(&server, self.limits) {
             self.publish_service_error(OperationKind::Discover, error);
             return;
@@ -771,6 +942,7 @@ impl Worker {
         let operation_id = self.new_operation_id();
         let generation = self.bump_generation(&server_id);
         let config_revision = self.snapshot.config_revision;
+        let dispatch_epoch = self.current_dispatch_epoch;
         let cancellation = CancellationToken::default();
         let mcp = Arc::clone(&self.mcp);
         let sender = self.result_sender.clone();
@@ -789,17 +961,18 @@ impl Worker {
                     server_id: server_for_thread,
                     generation,
                     config_revision,
-                    kind: OperationKind::Discover,
+                    dispatch_epoch,
+                    stage: JobStage::Discover,
                     payload,
                 });
                 unparker.unpark();
             });
-        self.insert_job(
+        let _ = self.insert_job(
             operation_id,
             server_id,
             generation,
             config_revision,
-            OperationKind::Discover,
+            JobStage::Discover,
             cancellation,
             thread,
         );
@@ -808,53 +981,79 @@ impl Worker {
     fn start_invoke(
         &mut self,
         server_id: ServerId,
-        tool_id: connector_contract::ToolId,
+        tool_id: ToolId,
         arguments_json: connector_contract::SensitiveInput,
     ) {
-        if arguments_json.len() > self.limits.tool_input_bytes {
-            self.publish_error(
+        let operation_id = self.new_operation_id();
+        if audit::validate_tool_input(arguments_json.expose_bytes()).is_err() {
+            self.publish_operation_error(
+                operation_id,
                 OperationKind::Invoke,
-                ErrorCode::LimitExceeded,
-                "tool input limit exceeded",
+                ErrorCode::InvalidInput,
+                "tool input must be a bounded JSON object",
             );
             return;
         }
         if self.metrics.active_mcp.load(Ordering::Acquire) >= self.limits.mcp_operations {
-            self.reject_backpressure(OperationKind::Invoke);
+            self.publish_operation_error(
+                operation_id,
+                OperationKind::Invoke,
+                ErrorCode::Backpressure,
+                "connector operation limit reached",
+            );
+            self.metrics.backpressure.fetch_add(1, Ordering::AcqRel);
             return;
         }
         let server = match self.repository.load_server(&server_id) {
             Ok(server) => server,
             Err(error) => {
-                self.publish_service_error(OperationKind::Invoke, error);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    error.code,
+                    error.message,
+                );
                 return;
             }
         };
-        if let Err(error) = validate_server_draft(&server, self.limits) {
-            self.publish_service_error(OperationKind::Invoke, error);
+        if let Err(error) = validate_loaded_server_id(&server_id, &server) {
+            self.publish_operation_error(
+                operation_id,
+                OperationKind::Invoke,
+                error.code,
+                error.message,
+            );
             return;
         }
-        let operation_id = self.new_operation_id();
+        if let Err(error) = validate_server_draft(&server, self.limits) {
+            self.publish_operation_error(
+                operation_id,
+                OperationKind::Invoke,
+                error.code,
+                error.message,
+            );
+            return;
+        }
         let generation = self.bump_generation(&server_id);
         let config_revision = self.snapshot.config_revision;
+        let dispatch_epoch = self.current_dispatch_epoch;
         let cancellation = CancellationToken::default();
         let mcp = Arc::clone(&self.mcp);
         let sender = self.result_sender.clone();
         let unparker = std::thread::current();
         let operation_for_thread = operation_id.clone();
         let server_for_thread = server_id.clone();
+        let server_for_schema = server.clone();
+        let tool_for_schema = tool_id.clone();
         let cancellation_for_thread = cancellation.clone();
         let thread = std::thread::Builder::new()
             .name("connector-mcp-invoke".to_owned())
             .spawn(move || {
-                let payload = JobPayload::Invoke(run_backend_job(|| {
-                    mcp.load_schema_and_invoke(
-                        InvokeRequest {
-                            operation_id: operation_for_thread.clone(),
-                            server,
-                            tool_id,
-                            arguments_json,
-                        },
+                let payload = JobPayload::InvokeSchema(run_backend_job(|| {
+                    mcp.load_live_schema(
+                        &operation_for_thread,
+                        server_for_schema,
+                        tool_for_schema,
                         cancellation_for_thread,
                     )
                 }));
@@ -863,20 +1062,51 @@ impl Worker {
                     server_id: server_for_thread,
                     generation,
                     config_revision,
-                    kind: OperationKind::Invoke,
+                    dispatch_epoch,
+                    stage: JobStage::InvokeSchema,
                     payload,
                 });
                 unparker.unpark();
             });
-        self.insert_job(
-            operation_id,
-            server_id,
+        if !self.insert_job(
+            operation_id.clone(),
+            server_id.clone(),
             generation,
             config_revision,
-            OperationKind::Invoke,
+            JobStage::InvokeSchema,
             cancellation,
             thread,
+        ) {
+            return;
+        }
+        if let Some(job) = self.jobs.get_mut(&operation_id) {
+            job.stage = JobStage::InvokeSchema;
+        }
+        if let Some(operation) = self
+            .operations
+            .iter_mut()
+            .find(|operation| operation.id == operation_id)
+        {
+            operation.phase = OperationPhase::DiscoveringSchema;
+        }
+        // Keep the only raw arguments owner in the worker while live schema is loaded.
+        self.pending_invocations.insert(
+            operation_id,
+            PendingInvocation {
+                server_id,
+                server,
+                tool_id,
+                tool_name: String::new(),
+                live_schema_hash: String::new(),
+                arguments_json,
+                generation,
+                config_revision,
+                dispatch_epoch,
+                authorization: None,
+                arguments_preview: None,
+            },
         );
+        self.publish();
     }
 
     fn start_oauth(&mut self, server_id: ServerId) {
@@ -891,6 +1121,10 @@ impl Worker {
                 return;
             }
         };
+        if let Err(error) = validate_loaded_server_id(&server_id, &server) {
+            self.publish_service_error(OperationKind::OAuth, error);
+            return;
+        }
         if let Err(error) = validate_server_draft(&server, self.limits) {
             self.publish_service_error(OperationKind::OAuth, error);
             return;
@@ -932,6 +1166,7 @@ impl Worker {
     ) {
         let generation = self.bump_generation(&server_id);
         let config_revision = self.snapshot.config_revision;
+        let dispatch_epoch = self.current_dispatch_epoch;
         let cancellation = CancellationToken::default();
         let oauth = Arc::clone(&self.oauth);
         let sender = self.result_sender.clone();
@@ -950,17 +1185,18 @@ impl Worker {
                     server_id: server_for_thread,
                     generation,
                     config_revision,
-                    kind: OperationKind::OAuth,
+                    dispatch_epoch,
+                    stage: JobStage::OAuth,
                     payload,
                 });
                 unparker.unpark();
             });
-        self.insert_job(
+        let _ = self.insert_job(
             operation_id,
             server_id,
             generation,
             config_revision,
-            OperationKind::OAuth,
+            JobStage::OAuth,
             cancellation,
             thread,
         );
@@ -973,29 +1209,31 @@ impl Worker {
         server_id: ServerId,
         generation: u64,
         config_revision: Revision,
-        kind: OperationKind,
+        stage: JobStage,
         cancellation: CancellationToken,
         thread: Result<JoinHandle<()>, std::io::Error>,
-    ) {
+    ) -> bool {
+        let kind = stage.kind();
         let thread = match thread {
             Ok(thread) => thread,
             Err(_) => {
-                self.publish_error(
+                self.publish_operation_error(
+                    operation_id,
                     kind,
                     ErrorCode::Internal,
                     "connector job thread unavailable",
                 );
-                return;
+                return false;
             }
         };
-        match kind {
-            OperationKind::Discover | OperationKind::Invoke => {
+        match stage {
+            JobStage::Discover | JobStage::InvokeSchema => {
                 self.metrics.active_mcp.fetch_add(1, Ordering::AcqRel);
             }
-            OperationKind::OAuth => {
+            JobStage::OAuth => {
                 self.metrics.active_oauth.fetch_add(1, Ordering::AcqRel);
             }
-            _ => {}
+            JobStage::InvokeCall => {}
         }
         self.operations.push(OperationSummary {
             id: operation_id.clone(),
@@ -1004,19 +1242,25 @@ impl Worker {
             phase: OperationPhase::Queued,
             error_code: None,
         });
+        self.cancellations
+            .lock()
+            .expect("connector cancellation registry")
+            .insert(operation_id.clone(), cancellation.clone());
         self.jobs.insert(
             operation_id,
             ActiveJob {
                 server_id,
                 generation,
                 config_revision,
-                kind,
+                dispatch_epoch: self.current_dispatch_epoch,
+                stage,
                 cancellation,
                 thread: Some(thread),
             },
         );
         self.transition(kind, OperationPhase::Queued, None);
         self.publish();
+        true
     }
 
     fn finish_job(&mut self, completion: JobCompletion) {
@@ -1027,46 +1271,206 @@ impl Worker {
         if let Some(thread) = active.thread.take() {
             let _ = thread.join();
         }
-        match active.kind {
-            OperationKind::Discover | OperationKind::Invoke => {
-                self.metrics.active_mcp.fetch_sub(1, Ordering::AcqRel);
-            }
-            OperationKind::OAuth => {
-                self.metrics.active_oauth.fetch_sub(1, Ordering::AcqRel);
-            }
-            _ => {}
-        }
-        self.operations
-            .retain(|operation| operation.id != completion.operation_id);
-        self.prune_generations();
         let current_generation = self
             .generations
             .get(&completion.server_id)
             .copied()
             .unwrap_or_default();
-        if active.cancellation.is_cancelled()
+        let stale = active.cancellation.is_cancelled()
+            || completion.dispatch_epoch != self.dispatch_epoch.load(Ordering::Acquire)
             || current_generation != completion.generation
             || self.snapshot.config_revision != completion.config_revision
             || active.server_id != completion.server_id
             || active.generation != completion.generation
             || active.config_revision != completion.config_revision
-            || active.kind != completion.kind
-        {
-            self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
-            self.transition(
-                completion.kind,
-                OperationPhase::Cancelled,
-                Some(ErrorCode::StaleResult),
-            );
-            self.publish();
+            || active.dispatch_epoch != completion.dispatch_epoch
+            || active.stage != completion.stage;
+        match (completion.stage, completion.payload) {
+            (JobStage::Discover, JobPayload::Discover(result)) => {
+                self.finish_operation_slot(&completion.operation_id, JobStage::Discover);
+                if stale {
+                    self.publish_stale(JobStage::Discover);
+                } else {
+                    self.finish_discover(completion.server_id, result);
+                }
+            }
+            (JobStage::InvokeSchema, JobPayload::InvokeSchema(result)) => {
+                if stale {
+                    self.remove_pending_invocation(&completion.operation_id);
+                    self.finish_operation_slot(&completion.operation_id, JobStage::InvokeSchema);
+                    self.publish_stale(JobStage::InvokeSchema);
+                } else {
+                    self.finish_invoke_schema(completion.operation_id, result);
+                }
+            }
+            (JobStage::InvokeCall, JobPayload::InvokeCall(result)) => {
+                self.finish_invoke_call(completion.operation_id, result, stale);
+            }
+            (JobStage::OAuth, JobPayload::OAuth(result)) => {
+                self.finish_operation_slot(&completion.operation_id, JobStage::OAuth);
+                if stale {
+                    self.publish_stale(JobStage::OAuth);
+                } else {
+                    self.finish_oauth(result);
+                }
+            }
+            (stage, _) => {
+                self.finish_operation_slot(&completion.operation_id, stage);
+                self.publish_operation_error(
+                    completion.operation_id,
+                    stage.kind(),
+                    ErrorCode::Internal,
+                    "connector job completion type mismatch",
+                );
+            }
+        }
+    }
+
+    fn publish_stale(&mut self, stage: JobStage) {
+        self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
+        self.transition(
+            stage.kind(),
+            OperationPhase::Cancelled,
+            Some(ErrorCode::StaleResult),
+        );
+        self.publish();
+    }
+
+    fn finish_operation_slot(&mut self, operation_id: &OperationId, stage: JobStage) {
+        let operation_count = self.operations.len();
+        self.operations
+            .retain(|operation| &operation.id != operation_id);
+        if self.operations.len() == operation_count {
             return;
         }
-        match completion.payload {
-            JobPayload::Discover(result) => self.finish_discover(completion.server_id, result),
-            JobPayload::Invoke(result) => {
-                self.finish_invoke(completion.operation_id, result);
+        self.cancellations
+            .lock()
+            .expect("connector cancellation registry")
+            .remove(operation_id);
+        match stage {
+            JobStage::Discover | JobStage::InvokeSchema | JobStage::InvokeCall => {
+                self.metrics.active_mcp.fetch_sub(1, Ordering::AcqRel);
             }
-            JobPayload::OAuth(result) => self.finish_oauth(result),
+            JobStage::OAuth => {
+                self.metrics.active_oauth.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.remove_pending_invocation(operation_id);
+        self.prune_generations();
+    }
+
+    fn remove_pending_invocation(
+        &mut self,
+        operation_id: &OperationId,
+    ) -> Option<PendingInvocation> {
+        self.approval_order.retain(|queued| queued != operation_id);
+        let pending = self.pending_invocations.remove(operation_id);
+        self.refresh_approval_snapshot();
+        pending
+    }
+
+    fn refresh_approval_snapshot(&mut self) {
+        while self
+            .approval_order
+            .front()
+            .is_some_and(|operation_id| !self.pending_invocations.contains_key(operation_id))
+        {
+            self.approval_order.pop_front();
+        }
+        self.snapshot.approval = self.approval_order.front().and_then(|operation_id| {
+            let pending = self.pending_invocations.get(operation_id)?;
+            Some(ApprovalPrompt {
+                operation_id: operation_id.clone(),
+                server_id: pending.server_id.clone(),
+                server_name: pending.server.name.clone(),
+                tool_name: pending.tool_name.clone(),
+                arguments_preview: pending.arguments_preview.clone()?,
+                reason: map_approval_reason(pending.authorization.as_ref()?.reason()),
+            })
+        });
+    }
+
+    fn update_operation_phase(
+        &mut self,
+        operation_id: &OperationId,
+        phase: OperationPhase,
+        error_code: Option<ErrorCode>,
+    ) {
+        if let Some(operation) = self
+            .operations
+            .iter_mut()
+            .find(|operation| &operation.id == operation_id)
+        {
+            operation.phase = phase;
+            operation.error_code = error_code;
+        }
+    }
+
+    fn invocation_is_stale(&self, operation_id: &OperationId, pending: &PendingInvocation) -> bool {
+        self.cancellations
+            .lock()
+            .expect("connector cancellation registry")
+            .get(operation_id)
+            .is_some_and(CancellationToken::is_cancelled)
+            || self.dispatch_epoch.load(Ordering::Acquire) != pending.dispatch_epoch
+            || self.snapshot.config_revision != pending.config_revision
+            || self
+                .generations
+                .get(&pending.server_id)
+                .copied()
+                .unwrap_or_default()
+                != pending.generation
+    }
+
+    fn expire_pending_invocations(&mut self) {
+        let expired: Vec<OperationId> = self
+            .approval_order
+            .iter()
+            .filter(|operation_id| !self.jobs.contains_key(*operation_id))
+            .cloned()
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for operation_id in expired {
+            let Some(mut pending) = self.remove_pending_invocation(&operation_id) else {
+                continue;
+            };
+            let Some(authorization) = pending.authorization.take() else {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                continue;
+            };
+            let plan = authorization.resolve(audit::ApprovalDecision::DenyOnce);
+            self.commit_preflight(operation_id, pending, plan);
+        }
+    }
+
+    fn invalidate_stale_pending_invocations(&mut self) {
+        let stale: Vec<OperationId> = self
+            .pending_invocations
+            .iter()
+            .filter(|(operation_id, pending)| self.invocation_is_stale(operation_id, pending))
+            .map(|(operation_id, _)| operation_id.clone())
+            .collect();
+        for operation_id in stale {
+            if let Some(job) = self.jobs.get(&operation_id) {
+                job.cancellation.cancel();
+                self.mcp.cancel(&operation_id);
+                self.remove_pending_invocation(&operation_id);
+                self.update_operation_phase(
+                    &operation_id,
+                    OperationPhase::Cancelled,
+                    Some(ErrorCode::StaleResult),
+                );
+            } else {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
+                self.transition(
+                    OperationKind::Invoke,
+                    OperationPhase::Cancelled,
+                    Some(ErrorCode::StaleResult),
+                );
+            }
         }
     }
 
@@ -1095,7 +1499,395 @@ impl Worker {
         self.reload_overview();
     }
 
-    fn finish_invoke(&mut self, operation_id: OperationId, result: Result<String, ServiceError>) {
+    fn finish_invoke_schema(
+        &mut self,
+        operation_id: OperationId,
+        result: Result<LiveToolSchema, ServiceError>,
+    ) {
+        let Some(mut pending) = self.pending_invocations.remove(&operation_id) else {
+            self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+            self.publish_stale(JobStage::InvokeSchema);
+            return;
+        };
+        let live = match result {
+            Ok(live) => live,
+            Err(error) => {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    error.code,
+                    error.message,
+                );
+                return;
+            }
+        };
+        if live.tool_id != pending.tool_id
+            || live.tool_name.trim().is_empty()
+            || live
+                .tool_name
+                .len()
+                .checked_add(live.input_schema_json.len())
+                .is_none_or(|bytes| bytes > self.limits.tool_descriptor_bytes)
+        {
+            self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+            self.publish_operation_error(
+                operation_id,
+                OperationKind::Invoke,
+                ErrorCode::ProtocolViolation,
+                "live tool schema is invalid or exceeds limits",
+            );
+            return;
+        }
+        pending.tool_name = live.tool_name;
+        pending.live_schema_hash = audit::schema_hash(&live.input_schema_json);
+        self.update_operation_phase(&operation_id, OperationPhase::Authorizing, None);
+        self.transition(OperationKind::Invoke, OperationPhase::Authorizing, None);
+
+        let state = match self
+            .repository
+            .load_authorization_state(&pending.server_id, &pending.tool_name)
+        {
+            Ok(state) => state,
+            Err(error) => {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    error.code,
+                    error.message,
+                );
+                return;
+            }
+        };
+        let authorization = match audit::evaluate_authorization_with_fingerprint(
+            operation_id.as_str().to_owned(),
+            pending.server_id.as_str().to_owned(),
+            pending.tool_name.clone(),
+            state.permission,
+            pending.live_schema_hash.clone(),
+        ) {
+            Ok(authorization) => authorization,
+            Err(_) => {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::PermissionDenied,
+                    "live schema permission evaluation failed",
+                );
+                return;
+            }
+        };
+        match authorization {
+            audit::AuthorizationEvaluation::Plan(plan) => {
+                self.commit_preflight(operation_id, pending, plan)
+            }
+            audit::AuthorizationEvaluation::NeedsApproval(authorization) => {
+                let preview = match self
+                    .secrets
+                    .sanitized_input_preview(&pending.arguments_json, APPROVAL_PREVIEW_CHARS)
+                {
+                    Ok(preview) if preview.chars().count() <= APPROVAL_PREVIEW_CHARS => preview,
+                    Ok(_) | Err(_) => {
+                        self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                        self.publish_operation_error(
+                            operation_id,
+                            OperationKind::Invoke,
+                            ErrorCode::SecretUnavailable,
+                            "approval preview redaction failed",
+                        );
+                        return;
+                    }
+                };
+                pending.authorization = Some(authorization);
+                pending.arguments_preview = Some(preview);
+                self.last_activity = self.clock.now();
+                self.approval_order.push_back(operation_id.clone());
+                self.pending_invocations.insert(operation_id, pending);
+                self.refresh_approval_snapshot();
+                self.publish();
+            }
+        }
+    }
+
+    fn resolve_approval(&mut self, operation_id: OperationId, decision: ApprovalDecision) {
+        let Some(mut pending) = self.pending_invocations.remove(&operation_id) else {
+            return;
+        };
+        self.approval_order.retain(|queued| queued != &operation_id);
+        self.refresh_approval_snapshot();
+        if self.invocation_is_stale(&operation_id, &pending) {
+            self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+            self.publish_stale(JobStage::InvokeSchema);
+            return;
+        }
+        let Some(authorization) = pending.authorization.take() else {
+            self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+            self.publish_operation_error(
+                operation_id,
+                OperationKind::Invoke,
+                ErrorCode::PermissionDenied,
+                "approval authorization is unavailable",
+            );
+            return;
+        };
+        let plan = authorization.resolve(map_approval_decision(decision));
+        self.commit_preflight(operation_id, pending, plan);
+    }
+
+    fn commit_preflight(
+        &mut self,
+        operation_id: OperationId,
+        pending: PendingInvocation,
+        plan: audit::AuthorizationPlan,
+    ) {
+        if self.invocation_is_stale(&operation_id, &pending) {
+            self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+            self.publish_stale(JobStage::InvokeSchema);
+            return;
+        }
+        self.update_operation_phase(&operation_id, OperationPhase::AuditPreflight, None);
+        self.transition(OperationKind::Invoke, OperationPhase::AuditPreflight, None);
+        let preflight = match self
+            .repository
+            .commit_authorization_preflight(plan, &pending.arguments_json)
+        {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::AuditUnavailable,
+                    error.message,
+                );
+                return;
+            }
+        };
+        match preflight {
+            audit::AuthorizationPreflight::Denied(receipt) => {
+                debug_assert_eq!(receipt.operation_id(), operation_id.as_str());
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.snapshot.result = Some(OperationResult {
+                    operation_id,
+                    text: "tool call denied".to_owned(),
+                    truncated: false,
+                });
+                self.transition(
+                    OperationKind::Invoke,
+                    OperationPhase::Denied,
+                    Some(ErrorCode::PermissionDenied),
+                );
+                self.publish();
+            }
+            audit::AuthorizationPreflight::Prepared(grant) => {
+                self.start_authorized_call(operation_id, pending, grant);
+            }
+        }
+    }
+
+    fn start_authorized_call(
+        &mut self,
+        operation_id: OperationId,
+        pending: PendingInvocation,
+        grant: audit::AuthorizationGrant,
+    ) {
+        if self.invocation_is_stale(&operation_id, &pending) {
+            let outcome = audit::AuthorizationOutcome::Failed {
+                error_code: "cancelled_before_call",
+            };
+            let completion = self.persist_authorization_outcome(&operation_id, outcome);
+            if completion.is_err() {
+                self.retain_pending_outcome(operation_id.clone(), outcome, JobStage::InvokeSchema);
+            } else {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+            }
+            self.publish_stale(JobStage::InvokeSchema);
+            return;
+        }
+        if grant.operation_id() != operation_id.as_str()
+            || grant.server_id() != pending.server_id.as_str()
+            || grant.tool_name() != pending.tool_name.as_str()
+            || grant.live_schema_hash() != pending.live_schema_hash.as_str()
+        {
+            let completion = self.persist_authorization_outcome(
+                &operation_id,
+                audit::AuthorizationOutcome::Failed {
+                    error_code: "authorization_binding_mismatch",
+                },
+            );
+            if completion.is_err() {
+                self.retain_pending_outcome(
+                    operation_id.clone(),
+                    audit::AuthorizationOutcome::Failed {
+                        error_code: "authorization_binding_mismatch",
+                    },
+                    JobStage::InvokeSchema,
+                );
+                self.publish_unpersisted_outcome(operation_id);
+                return;
+            }
+            self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+            self.publish_operation_error(
+                operation_id,
+                OperationKind::Invoke,
+                ErrorCode::PermissionDenied,
+                "authorization binding mismatch; call was not attempted",
+            );
+            return;
+        }
+        let cancellation = self
+            .cancellations
+            .lock()
+            .expect("connector cancellation registry")
+            .get(&operation_id)
+            .cloned()
+            .unwrap_or_default();
+        let mcp = Arc::clone(&self.mcp);
+        let sender = self.result_sender.clone();
+        let unparker = std::thread::current();
+        let operation_for_thread = operation_id.clone();
+        let server_id = pending.server_id.clone();
+        let active_server_id = server_id.clone();
+        let generation = pending.generation;
+        let config_revision = pending.config_revision;
+        let dispatch_epoch = pending.dispatch_epoch;
+        let cancellation_for_thread = cancellation.clone();
+        let request = match AuthorizedInvokeRequest::new(
+            grant,
+            &pending.server_id,
+            pending.server,
+            pending.tool_name,
+            pending.arguments_json,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let completion = self.persist_authorization_outcome(
+                    &operation_id,
+                    audit::AuthorizationOutcome::Failed {
+                        error_code: "authorization_input_mismatch",
+                    },
+                );
+                if completion.is_err() {
+                    self.retain_pending_outcome(
+                        operation_id.clone(),
+                        audit::AuthorizationOutcome::Failed {
+                            error_code: "authorization_input_mismatch",
+                        },
+                        JobStage::InvokeSchema,
+                    );
+                    self.publish_unpersisted_outcome(operation_id);
+                    return;
+                }
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    error.code,
+                    "authorization input binding mismatch; call was not attempted",
+                );
+                return;
+            }
+        };
+        let thread = std::thread::Builder::new()
+            .name("connector-mcp-call".to_owned())
+            .spawn(move || {
+                let payload = JobPayload::InvokeCall(run_backend_job(|| {
+                    mcp.invoke_authorized(request, cancellation_for_thread)
+                }));
+                let _ = sender.send(JobCompletion {
+                    operation_id: operation_for_thread,
+                    server_id,
+                    generation,
+                    config_revision,
+                    dispatch_epoch,
+                    stage: JobStage::InvokeCall,
+                    payload,
+                });
+                unparker.unpark();
+            });
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(_) => {
+                let completion = self.persist_authorization_outcome(
+                    &operation_id,
+                    audit::AuthorizationOutcome::Failed {
+                        error_code: "call_thread_unavailable",
+                    },
+                );
+                if completion.is_err() {
+                    self.retain_pending_outcome(
+                        operation_id.clone(),
+                        audit::AuthorizationOutcome::Failed {
+                            error_code: "call_thread_unavailable",
+                        },
+                        JobStage::InvokeSchema,
+                    );
+                    self.publish_unpersisted_outcome(operation_id);
+                    return;
+                }
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::Internal,
+                    "authorized call thread unavailable; call was not retried",
+                );
+                return;
+            }
+        };
+        self.jobs.insert(
+            operation_id.clone(),
+            ActiveJob {
+                server_id: active_server_id,
+                generation,
+                config_revision,
+                dispatch_epoch,
+                stage: JobStage::InvokeCall,
+                cancellation,
+                thread: Some(thread),
+            },
+        );
+        self.update_operation_phase(&operation_id, OperationPhase::Calling, None);
+        self.transition(OperationKind::Invoke, OperationPhase::Calling, None);
+        self.publish();
+    }
+
+    fn finish_invoke_call(
+        &mut self,
+        operation_id: OperationId,
+        result: Result<String, ServiceError>,
+        stale: bool,
+    ) {
+        let (outcome, result_code) = match &result {
+            Ok(_) => (audit::AuthorizationOutcome::Succeeded, None),
+            Err(error) if error.code == ErrorCode::UnknownDelivery => (
+                audit::AuthorizationOutcome::Unknown {
+                    error_code: "unknown_delivery",
+                },
+                Some(ErrorCode::UnknownDelivery),
+            ),
+            Err(error) => (
+                audit::AuthorizationOutcome::Failed {
+                    error_code: error_code_label(error.code),
+                },
+                Some(error.code),
+            ),
+        };
+        // The backend call is never retried. Only the idempotent durable outcome write gets one
+        // immediate retry before the UI receives a non-retryable unknown audit state.
+        let completion = self.persist_authorization_outcome(&operation_id, outcome);
+        if completion.is_err() {
+            self.retain_pending_outcome(operation_id.clone(), outcome, JobStage::InvokeCall);
+            self.publish_unpersisted_outcome(operation_id);
+            return;
+        }
+        self.finish_operation_slot(&operation_id, JobStage::InvokeCall);
+        if stale {
+            self.publish_stale(JobStage::InvokeCall);
+            return;
+        }
         match result {
             Ok(text) => {
                 let (text, truncated) = truncate_utf8(text, self.limits.ui_result_bytes);
@@ -1107,7 +1899,138 @@ impl Worker {
                 self.transition(OperationKind::Invoke, OperationPhase::Succeeded, None);
                 self.publish();
             }
-            Err(error) => self.publish_service_error(OperationKind::Invoke, error),
+            Err(_error) if result_code == Some(ErrorCode::UnknownDelivery) => {
+                self.snapshot.result = Some(OperationResult {
+                    operation_id,
+                    text: "tool call delivery is unknown; it was not retried".to_owned(),
+                    truncated: false,
+                });
+                self.transition(
+                    OperationKind::Invoke,
+                    OperationPhase::Unknown,
+                    Some(ErrorCode::UnknownDelivery),
+                );
+                self.publish();
+            }
+            Err(error) => self.publish_operation_error(
+                operation_id,
+                OperationKind::Invoke,
+                error.code,
+                error.message,
+            ),
+        }
+    }
+
+    fn persist_authorization_outcome(
+        &mut self,
+        operation_id: &OperationId,
+        outcome: audit::AuthorizationOutcome,
+    ) -> Result<(), ServiceError> {
+        match self
+            .repository
+            .complete_authorization(operation_id, outcome)
+        {
+            Ok(()) => Ok(()),
+            Err(_) => self
+                .repository
+                .complete_authorization(operation_id, outcome),
+        }
+    }
+
+    fn publish_unpersisted_outcome(&mut self, operation_id: OperationId) {
+        self.update_operation_phase(
+            &operation_id,
+            OperationPhase::Unknown,
+            Some(ErrorCode::AuditUnavailable),
+        );
+        self.snapshot.result = Some(OperationResult {
+            operation_id,
+            text: "tool call outcome could not be persisted; it will not be retried".to_owned(),
+            truncated: false,
+        });
+        self.transition(
+            OperationKind::Invoke,
+            OperationPhase::Unknown,
+            Some(ErrorCode::AuditUnavailable),
+        );
+        self.publish();
+    }
+
+    fn retain_pending_outcome(
+        &mut self,
+        operation_id: OperationId,
+        outcome: audit::AuthorizationOutcome,
+        stage: JobStage,
+    ) {
+        debug_assert!(self.pending_outcomes.len() < self.limits.mcp_operations);
+        self.pending_outcomes
+            .insert(operation_id, PendingOutcome { outcome, stage });
+    }
+
+    fn retry_pending_outcomes(&mut self) {
+        let pending: Vec<(OperationId, PendingOutcome)> = self
+            .pending_outcomes
+            .iter()
+            .map(|(operation_id, pending)| (operation_id.clone(), *pending))
+            .collect();
+        let mut changed = false;
+        for (operation_id, pending) in pending {
+            if self
+                .repository
+                .complete_authorization(&operation_id, pending.outcome)
+                .is_ok()
+            {
+                self.pending_outcomes.remove(&operation_id);
+                self.finish_operation_slot(&operation_id, pending.stage);
+                changed = true;
+            }
+        }
+        if changed {
+            self.publish();
+        }
+    }
+
+    fn release_pending_outcome_slots(&mut self) {
+        let pending: Vec<(OperationId, JobStage)> = self
+            .pending_outcomes
+            .drain()
+            .map(|(operation_id, pending)| (operation_id, pending.stage))
+            .collect();
+        for (operation_id, stage) in pending {
+            self.finish_operation_slot(&operation_id, stage);
+        }
+    }
+
+    fn discard_cancelled_pending(&mut self) {
+        let cancelled: Vec<OperationId> = self
+            .pending_invocations
+            .keys()
+            .filter(|operation_id| !self.jobs.contains_key(*operation_id))
+            .filter(|operation_id| {
+                self.cancellations
+                    .lock()
+                    .expect("connector cancellation registry")
+                    .get(*operation_id)
+                    .is_some_and(CancellationToken::is_cancelled)
+            })
+            .cloned()
+            .collect();
+        let mut changed = false;
+        for operation_id in cancelled {
+            if let Some(pending) = self.remove_pending_invocation(&operation_id) {
+                self.bump_generation(&pending.server_id);
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.metrics.cancellations.fetch_add(1, Ordering::AcqRel);
+                self.transition(
+                    OperationKind::Invoke,
+                    OperationPhase::Cancelled,
+                    Some(ErrorCode::Cancelled),
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            self.publish();
         }
     }
 
@@ -1132,29 +2055,47 @@ impl Worker {
     }
 
     fn cancel(&mut self, operation_id: OperationId) {
-        let Some(job) = self.jobs.get(&operation_id) else {
-            return;
-        };
-        job.cancellation.cancel();
-        let server_id = job.server_id.clone();
-        let kind = job.kind;
-        self.bump_generation(&server_id);
-        match kind {
-            OperationKind::Discover | OperationKind::Invoke => self.mcp.cancel(&operation_id),
-            OperationKind::OAuth => self.oauth.cancel(&operation_id),
-            _ => {}
-        }
-        if let Some(operation) = self
-            .operations
-            .iter_mut()
-            .find(|operation| operation.id == operation_id)
+        if let Some((server_id, stage, cancellation)) = self
+            .jobs
+            .get(&operation_id)
+            .map(|job| (job.server_id.clone(), job.stage, job.cancellation.clone()))
         {
-            operation.phase = OperationPhase::Cancelled;
-            operation.error_code = Some(ErrorCode::Cancelled);
+            cancellation.cancel();
+            if stage == JobStage::InvokeSchema {
+                self.remove_pending_invocation(&operation_id);
+            }
+            self.bump_generation(&server_id);
+            match stage {
+                JobStage::Discover | JobStage::InvokeSchema | JobStage::InvokeCall => {
+                    self.mcp.cancel(&operation_id);
+                }
+                JobStage::OAuth => self.oauth.cancel(&operation_id),
+            }
+            self.update_operation_phase(
+                &operation_id,
+                OperationPhase::Cancelled,
+                Some(ErrorCode::Cancelled),
+            );
+            self.metrics.cancellations.fetch_add(1, Ordering::AcqRel);
+            self.transition(
+                stage.kind(),
+                OperationPhase::Cancelled,
+                Some(ErrorCode::Cancelled),
+            );
+            self.publish();
+            return;
         }
-        self.metrics.cancellations.fetch_add(1, Ordering::AcqRel);
-        self.transition(kind, OperationPhase::Cancelled, Some(ErrorCode::Cancelled));
-        self.publish();
+        if let Some(pending) = self.remove_pending_invocation(&operation_id) {
+            self.bump_generation(&pending.server_id);
+            self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+            self.metrics.cancellations.fetch_add(1, Ordering::AcqRel);
+            self.transition(
+                OperationKind::Invoke,
+                OperationPhase::Cancelled,
+                Some(ErrorCode::Cancelled),
+            );
+            self.publish();
+        }
     }
 
     fn begin_shutdown(&mut self) {
@@ -1162,20 +2103,33 @@ impl Worker {
             return;
         }
         self.shutting_down = true;
-        let jobs: Vec<(OperationId, ServerId, OperationKind)> = self
+        let unjoined_pending: Vec<OperationId> = self
+            .pending_invocations
+            .keys()
+            .filter(|operation_id| !self.jobs.contains_key(*operation_id))
+            .cloned()
+            .collect();
+        for operation_id in unjoined_pending {
+            self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+        }
+        let jobs: Vec<(OperationId, ServerId, JobStage)> = self
             .jobs
             .iter()
-            .map(|(id, job)| (id.clone(), job.server_id.clone(), job.kind))
+            .map(|(id, job)| (id.clone(), job.server_id.clone(), job.stage))
             .collect();
-        for (operation_id, server_id, kind) in jobs {
+        for (operation_id, server_id, stage) in jobs {
             if let Some(job) = self.jobs.get(&operation_id) {
                 job.cancellation.cancel();
             }
+            if stage == JobStage::InvokeSchema {
+                self.remove_pending_invocation(&operation_id);
+            }
             self.bump_generation(&server_id);
-            match kind {
-                OperationKind::Discover | OperationKind::Invoke => self.mcp.cancel(&operation_id),
-                OperationKind::OAuth => self.oauth.cancel(&operation_id),
-                _ => {}
+            match stage {
+                JobStage::Discover | JobStage::InvokeSchema | JobStage::InvokeCall => {
+                    self.mcp.cancel(&operation_id);
+                }
+                JobStage::OAuth => self.oauth.cancel(&operation_id),
             }
         }
     }
@@ -1195,6 +2149,16 @@ impl Worker {
 
     fn publish_error(&mut self, kind: OperationKind, code: ErrorCode, message: &'static str) {
         let operation_id = self.new_operation_id();
+        self.publish_operation_error(operation_id, kind, code, message);
+    }
+
+    fn publish_operation_error(
+        &mut self,
+        operation_id: OperationId,
+        kind: OperationKind,
+        code: ErrorCode,
+        message: &'static str,
+    ) {
         self.snapshot.result = Some(OperationResult {
             operation_id,
             text: message.to_owned(),
@@ -1237,8 +2201,7 @@ impl Worker {
     }
 
     fn new_operation_id(&mut self) -> OperationId {
-        let value = self.next_operation.fetch_add(1, Ordering::Relaxed);
-        OperationId::new(format!("connector-{value}"))
+        self.operation_ids.next_id()
     }
 
     fn bump_generation(&mut self, server_id: &ServerId) -> u64 {
@@ -1261,6 +2224,11 @@ impl Worker {
             .map(|server| server.id.clone())
             .collect();
         retained.extend(self.jobs.values().map(|job| job.server_id.clone()));
+        retained.extend(
+            self.pending_invocations
+                .values()
+                .map(|pending| pending.server_id.clone()),
+        );
         self.generations
             .retain(|server_id, _| retained.contains(server_id));
         self.metrics
@@ -1301,6 +2269,57 @@ fn validate_overview(
         }
     }
     Ok(())
+}
+
+fn invalidates_inflight(intent: &ConnectorIntent) -> bool {
+    matches!(
+        intent,
+        ConnectorIntent::SaveServer(_)
+            | ConnectorIntent::DeleteServer(_)
+            | ConnectorIntent::SetPermission { .. }
+            | ConnectorIntent::EnsureSlackServer
+            | ConnectorIntent::ImportConfiguration { .. }
+            | ConnectorIntent::SubmitOAuthClient { .. }
+    )
+}
+
+fn map_approval_reason(reason: audit::ApprovalReason) -> connector_contract::ApprovalReason {
+    match reason {
+        audit::ApprovalReason::AskRule => connector_contract::ApprovalReason::AskRule,
+        audit::ApprovalReason::FirstUse => connector_contract::ApprovalReason::FirstUse,
+        audit::ApprovalReason::SchemaChanged => connector_contract::ApprovalReason::SchemaChanged,
+    }
+}
+
+fn map_approval_decision(decision: ApprovalDecision) -> audit::ApprovalDecision {
+    match decision {
+        ApprovalDecision::AllowOnce => audit::ApprovalDecision::AllowOnce,
+        ApprovalDecision::AllowAlways => audit::ApprovalDecision::AllowAlways,
+        ApprovalDecision::DenyOnce => audit::ApprovalDecision::DenyOnce,
+        ApprovalDecision::DenyAlways => audit::ApprovalDecision::DenyAlways,
+    }
+}
+
+fn error_code_label(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::InvalidInput => "invalid_input",
+        ErrorCode::InvalidUrl => "invalid_url",
+        ErrorCode::LimitExceeded => "limit_exceeded",
+        ErrorCode::Backpressure => "backpressure",
+        ErrorCode::StorageUnavailable => "storage_unavailable",
+        ErrorCode::SecretUnavailable => "secret_unavailable",
+        ErrorCode::PermissionDenied => "permission_denied",
+        ErrorCode::AuditUnavailable => "audit_unavailable",
+        ErrorCode::AuthenticationRequired => "authentication_required",
+        ErrorCode::AuthenticationFailed => "authentication_failed",
+        ErrorCode::NetworkTimeout => "network_timeout",
+        ErrorCode::TransportFailed => "transport_failed",
+        ErrorCode::ProtocolViolation => "protocol_violation",
+        ErrorCode::StaleResult => "stale_result",
+        ErrorCode::Cancelled => "cancelled",
+        ErrorCode::UnknownDelivery => "unknown_delivery",
+        ErrorCode::Internal => "internal",
+    }
 }
 
 fn validate_discovered_tools(
@@ -1366,6 +2385,41 @@ fn validate_server_drafts(
 }
 
 fn validate_server_draft(draft: &ServerDraft, limits: ResourceLimits) -> Result<(), ServiceError> {
+    if draft.name.trim().is_empty() || draft.name.contains('\0') {
+        return Err(ServiceError::new(
+            ErrorCode::InvalidInput,
+            "connector server name is invalid",
+        ));
+    }
+    match &draft.transport {
+        TransportDraft::Stdio {
+            command,
+            args,
+            plain_env,
+            secret_env,
+            ..
+        } => {
+            let has_nul = command.contains('\0')
+                || args.iter().any(|value| value.contains('\0'))
+                || plain_env
+                    .iter()
+                    .any(|(key, value)| key.contains('\0') || value.contains('\0'))
+                || secret_env.iter().any(|(key, credential_id)| {
+                    key.contains('\0') || credential_id.as_str().contains('\0')
+                });
+            if command.trim().is_empty() || has_nul {
+                return Err(ServiceError::new(
+                    ErrorCode::InvalidInput,
+                    "connector stdio command or environment is invalid",
+                ));
+            }
+        }
+        TransportDraft::Http { url } => {
+            mcp::validate_mcp_url(url).map_err(|_| {
+                ServiceError::new(ErrorCode::InvalidUrl, "connector MCP URL is invalid")
+            })?;
+        }
+    }
     let (bytes, items) = server_draft_size(draft)?;
     if bytes > limits.import_input_bytes || items > limits.tools_per_server {
         return Err(ServiceError::new(
@@ -1374,6 +2428,20 @@ fn validate_server_draft(draft: &ServerDraft, limits: ResourceLimits) -> Result<
         ));
     }
     Ok(())
+}
+
+fn validate_loaded_server_id(
+    requested: &ServerId,
+    draft: &ServerDraft,
+) -> Result<(), ServiceError> {
+    if draft.id.as_ref().map(ServerId::as_str) == Some(requested.as_str()) {
+        Ok(())
+    } else {
+        Err(ServiceError::new(
+            ErrorCode::StorageUnavailable,
+            "repository returned a different server configuration",
+        ))
+    }
 }
 
 fn server_draft_size(draft: &ServerDraft) -> Result<(usize, usize), ServiceError> {
@@ -1545,6 +2613,18 @@ mod tests {
         slack_ensures: AtomicUsize,
         config_revision: AtomicU64,
         import_server_count: AtomicUsize,
+        server_loads: AtomicUsize,
+        authorization_loads: AtomicUsize,
+        preflights: AtomicUsize,
+        completions: AtomicUsize,
+        shutdowns: AtomicUsize,
+        permission: Mutex<audit::PermissionFingerprint>,
+        permission_mutation_on_preflight: Mutex<Option<audit::PermissionFingerprint>>,
+        loaded_server_override: Mutex<Option<ServerDraft>>,
+        outcome_failure: AtomicBool,
+        preflight_input_override: Mutex<Option<Vec<u8>>>,
+        authorization_ledger: audit::InMemoryAuthorizationLedger,
+        order: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl Default for RepoState {
@@ -1557,6 +2637,21 @@ mod tests {
                 slack_ensures: AtomicUsize::new(0),
                 config_revision: AtomicU64::new(1),
                 import_server_count: AtomicUsize::new(1),
+                server_loads: AtomicUsize::new(0),
+                authorization_loads: AtomicUsize::new(0),
+                preflights: AtomicUsize::new(0),
+                completions: AtomicUsize::new(0),
+                shutdowns: AtomicUsize::new(0),
+                permission: Mutex::new(audit::PermissionFingerprint::Absent),
+                permission_mutation_on_preflight: Mutex::new(None),
+                loaded_server_override: Mutex::new(None),
+                outcome_failure: AtomicBool::new(false),
+                preflight_input_override: Mutex::new(None),
+                authorization_ledger: audit::InMemoryAuthorizationLedger::new(
+                    "connector-service-test",
+                )
+                .expect("authorization ledger"),
+                order: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1605,7 +2700,15 @@ mod tests {
         }
 
         fn load_server(&mut self, server_id: &ServerId) -> Result<ServerDraft, ServiceError> {
-            Ok(server_draft(server_id.as_str()))
+            self.state.server_loads.fetch_add(1, Ordering::AcqRel);
+            let loaded = self
+                .state
+                .loaded_server_override
+                .lock()
+                .expect("server override lock")
+                .clone()
+                .unwrap_or_else(|| server_draft(server_id.as_str()));
+            Ok(loaded)
         }
 
         fn load_tool_page(
@@ -1674,6 +2777,110 @@ mod tests {
             self.state.imports.fetch_add(1, Ordering::AcqRel);
             Ok(self.mutate())
         }
+
+        fn load_authorization_state(
+            &mut self,
+            _server_id: &ServerId,
+            _tool_name: &str,
+        ) -> Result<crate::AuthorizationState, ServiceError> {
+            self.state
+                .authorization_loads
+                .fetch_add(1, Ordering::AcqRel);
+            self.state
+                .order
+                .lock()
+                .expect("order lock")
+                .push("permission");
+            Ok(crate::AuthorizationState {
+                permission: self
+                    .state
+                    .permission
+                    .lock()
+                    .expect("permission lock")
+                    .clone(),
+            })
+        }
+
+        fn commit_authorization_preflight(
+            &mut self,
+            plan: audit::AuthorizationPlan,
+            arguments_json: &SensitiveInput,
+        ) -> Result<audit::AuthorizationPreflight, ServiceError> {
+            self.state.preflights.fetch_add(1, Ordering::AcqRel);
+            self.state
+                .order
+                .lock()
+                .expect("order lock")
+                .push("preflight");
+            if let Some(replacement) = self
+                .state
+                .permission_mutation_on_preflight
+                .lock()
+                .expect("permission mutation lock")
+                .take()
+            {
+                *self.state.permission.lock().expect("permission lock") = replacement;
+            }
+            if self
+                .state
+                .permission
+                .lock()
+                .expect("permission lock")
+                .ne(plan.expected_permission())
+            {
+                return Err(ServiceError::new(
+                    ErrorCode::AuditUnavailable,
+                    "fixture permission changed before preflight",
+                ));
+            }
+            self.state
+                .authorization_ledger
+                .preflight(
+                    plan,
+                    self.state
+                        .preflight_input_override
+                        .lock()
+                        .expect("preflight input override lock")
+                        .as_deref()
+                        .unwrap_or_else(|| arguments_json.expose_bytes()),
+                )
+                .map_err(|_| {
+                    ServiceError::new(
+                        ErrorCode::AuditUnavailable,
+                        "fixture authorization preflight failed",
+                    )
+                })
+        }
+
+        fn complete_authorization(
+            &mut self,
+            operation_id: &OperationId,
+            outcome: audit::AuthorizationOutcome,
+        ) -> Result<(), ServiceError> {
+            self.state.completions.fetch_add(1, Ordering::AcqRel);
+            if self.state.outcome_failure.load(Ordering::Acquire) {
+                return Err(ServiceError::new(
+                    ErrorCode::AuditUnavailable,
+                    "fixture outcome failure",
+                ));
+            }
+            self.state
+                .authorization_ledger
+                .complete(operation_id.as_str(), outcome)
+                .map_err(|_| {
+                    ServiceError::new(
+                        ErrorCode::AuditUnavailable,
+                        "fixture authorization outcome failed",
+                    )
+                })?;
+            self.state.order.lock().expect("order lock").push("outcome");
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<(), ServiceError> {
+            self.state.shutdowns.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
     }
 
     struct FakeSecrets;
@@ -1692,6 +2899,14 @@ mod tests {
         fn store_oauth_client(&self, _client: StoredOAuthClient) -> Result<(), ServiceError> {
             Ok(())
         }
+
+        fn sanitized_input_preview(
+            &self,
+            _arguments_json: &SensitiveInput,
+            max_chars: usize,
+        ) -> Result<String, ServiceError> {
+            Ok("{}".chars().take(max_chars).collect())
+        }
     }
 
     struct FakeMcp {
@@ -1702,10 +2917,18 @@ mod tests {
         descriptor_bytes: AtomicUsize,
         cancel_releases: AtomicBool,
         panic_on_discover: AtomicBool,
+        schema_calls: AtomicUsize,
+        invoke_calls: AtomicUsize,
+        schema_tool_override: Mutex<Option<ToolId>>,
+        invoke_error: Mutex<Option<ServiceError>>,
+        call_operation_ids: Mutex<Vec<String>>,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        leases: AtomicUsize,
+        reap_calls: AtomicUsize,
     }
 
     impl FakeMcp {
-        fn new(gate: Arc<Gate>) -> Self {
+        fn new(gate: Arc<Gate>, order: Arc<Mutex<Vec<&'static str>>>) -> Self {
             Self {
                 gate,
                 active: AtomicUsize::new(0),
@@ -1714,6 +2937,14 @@ mod tests {
                 descriptor_bytes: AtomicUsize::new(1),
                 cancel_releases: AtomicBool::new(true),
                 panic_on_discover: AtomicBool::new(false),
+                schema_calls: AtomicUsize::new(0),
+                invoke_calls: AtomicUsize::new(0),
+                schema_tool_override: Mutex::new(None),
+                invoke_error: Mutex::new(None),
+                call_operation_ids: Mutex::new(Vec::new()),
+                order,
+                leases: AtomicUsize::new(0),
+                reap_calls: AtomicUsize::new(0),
             }
         }
 
@@ -1758,13 +2989,57 @@ mod tests {
             })
         }
 
-        fn load_schema_and_invoke(
+        fn load_live_schema(
             &self,
-            _request: InvokeRequest,
-            _cancellation: CancellationToken,
-        ) -> Result<String, ServiceError> {
-            let _active = self.enter();
+            _operation_id: &OperationId,
+            _server: ServerDraft,
+            tool_id: ToolId,
+            cancellation: CancellationToken,
+        ) -> Result<LiveToolSchema, ServiceError> {
+            self.schema_calls.fetch_add(1, Ordering::AcqRel);
+            self.order.lock().expect("order lock").push("schema");
             self.gate.wait();
+            if cancellation.is_cancelled() {
+                return Err(ServiceError::new(
+                    ErrorCode::Cancelled,
+                    "schema load cancelled",
+                ));
+            }
+            let tool_id = self
+                .schema_tool_override
+                .lock()
+                .expect("schema tool lock")
+                .clone()
+                .unwrap_or(tool_id);
+            Ok(LiveToolSchema {
+                tool_name: tool_id.as_str().to_owned(),
+                tool_id,
+                input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            })
+        }
+
+        fn invoke_authorized(
+            &self,
+            request: AuthorizedInvokeRequest,
+            cancellation: CancellationToken,
+        ) -> Result<String, ServiceError> {
+            if cancellation.is_cancelled() {
+                return Err(ServiceError::new(
+                    ErrorCode::Cancelled,
+                    "authorized call cancelled before send",
+                ));
+            }
+            let _active = self.enter();
+            self.invoke_calls.fetch_add(1, Ordering::AcqRel);
+            self.order.lock().expect("order lock").push("call");
+            self.call_operation_ids
+                .lock()
+                .expect("call ids lock")
+                .push(request.operation_id().to_owned());
+            self.gate.wait();
+            if let Some(error) = *self.invoke_error.lock().expect("invoke error lock") {
+                return Err(error);
+            }
             Ok("ok".to_owned())
         }
 
@@ -1772,6 +3047,15 @@ mod tests {
             if self.cancel_releases.load(Ordering::Acquire) {
                 self.gate.release();
             }
+        }
+
+        fn active_leases(&self) -> usize {
+            self.leases.load(Ordering::Acquire)
+        }
+
+        fn reap_idle_leases(&self) {
+            self.reap_calls.fetch_add(1, Ordering::AcqRel);
+            self.leases.store(0, Ordering::Release);
         }
     }
 
@@ -1856,11 +3140,11 @@ mod tests {
         clock: Arc<dyn CoordinatorClock>,
     ) -> Fixture {
         let repo = Arc::new(RepoState::default());
-        let mcp = Arc::new(FakeMcp::new(mcp_gate));
+        let mcp = Arc::new(FakeMcp::new(mcp_gate, Arc::clone(&repo.order)));
         let oauth = Arc::new(FakeOAuth::new(oauth_gate));
         let coordinator = ConnectorCoordinator::new(ConnectorCoordinatorConfig {
             limits: ResourceLimits::default(),
-            idle_ttl: Duration::from_millis(100),
+            idle_ttl: Duration::from_secs(5),
             repository_factory: Arc::new(FakeFactory {
                 state: Arc::clone(&repo),
                 open_gate: Arc::clone(&open_gate),
@@ -1869,6 +3153,7 @@ mod tests {
             mcp: mcp.clone(),
             oauth: oauth.clone(),
             clock,
+            operation_ids: Arc::new(SystemOperationIdFactory::default()),
         })
         .unwrap();
         Fixture {
@@ -2063,6 +3348,776 @@ mod tests {
         assert_eq!(fixture.repo.replacements.load(Ordering::Acquire), 0);
     }
 
+    fn invoke_intent(server_id: &str, tool_id: &str, input: &[u8]) -> ConnectorIntent {
+        ConnectorIntent::InvokeTool {
+            server_id: ServerId::new(server_id),
+            tool_id: ToolId::new(tool_id),
+            arguments_json: SensitiveInput::new(input.to_vec()),
+        }
+    }
+
+    fn enable_auto_allow(fixture: &Fixture) {
+        *fixture.repo.permission.lock().expect("permission lock") =
+            audit::PermissionFingerprint::Persisted {
+                rule: audit::PermissionRule::Allow,
+                approved_schema_hash: Some(audit::schema_hash(r#"{"type":"object"}"#)),
+            };
+    }
+
+    fn first_called_operation(fixture: &Fixture) -> String {
+        fixture
+            .mcp
+            .call_operation_ids
+            .lock()
+            .expect("call ids lock")
+            .first()
+            .expect("one call operation")
+            .clone()
+    }
+
+    #[test]
+    fn malformed_scalar_and_array_inputs_stop_before_all_authorization_work() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        for input in [b"{".as_slice(), b"42".as_slice(), b"[]".as_slice()] {
+            let previous = fixture.coordinator.current_snapshot().revision.0;
+            fixture
+                .coordinator
+                .dispatch(invoke_intent("server-1", "tool-a", input))
+                .unwrap();
+            wait_until(|| fixture.coordinator.current_snapshot().revision.0 > previous);
+            assert_eq!(
+                fixture
+                    .coordinator
+                    .current_snapshot()
+                    .diagnostics
+                    .transitions
+                    .last()
+                    .and_then(|transition| transition.error_code),
+                Some(ErrorCode::InvalidInput)
+            );
+        }
+        assert_eq!(fixture.repo.server_loads.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.schema_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.authorization_loads.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 0);
+    }
+
+    #[test]
+    fn authorized_success_uses_exact_order_operation_and_durable_outcome() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+        let operation_id = first_called_operation(&fixture);
+
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture.repo.order.lock().expect("order lock").as_slice(),
+            ["schema", "permission", "preflight", "call", "outcome"]
+        );
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(&operation_id)
+                .unwrap(),
+            Some(audit::AuditLifecycle::Succeeded)
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .result
+                .as_ref()
+                .map(|result| result.operation_id.as_str()),
+            Some(operation_id.as_str())
+        );
+    }
+
+    #[test]
+    fn durable_denial_never_reaches_external_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        *fixture.repo.permission.lock().expect("permission lock") =
+            audit::PermissionFingerprint::Persisted {
+                rule: audit::PermissionRule::Deny,
+                approved_schema_hash: None,
+            };
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.preflights.load(Ordering::Acquire) == 1);
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+        let operation_id = fixture
+            .coordinator
+            .current_snapshot()
+            .result
+            .as_ref()
+            .expect("denied result")
+            .operation_id
+            .clone();
+
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.repo.completions.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(operation_id.as_str())
+                .unwrap(),
+            Some(audit::AuditLifecycle::Denied)
+        );
+    }
+
+    #[test]
+    fn known_tool_error_is_failed_and_backend_is_not_retried() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        *fixture.mcp.invoke_error.lock().expect("invoke error lock") = Some(ServiceError::new(
+            ErrorCode::TransportFailed,
+            "known tool error",
+        ));
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+        let operation_id = first_called_operation(&fixture);
+
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(&operation_id)
+                .unwrap(),
+            Some(audit::AuditLifecycle::Failed)
+        );
+    }
+
+    #[test]
+    fn unknown_delivery_is_durable_unknown_and_backend_is_not_retried() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        *fixture.mcp.invoke_error.lock().expect("invoke error lock") = Some(ServiceError::new(
+            ErrorCode::UnknownDelivery,
+            "delivery unknown",
+        ));
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+        let operation_id = first_called_operation(&fixture);
+
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(&operation_id)
+                .unwrap(),
+            Some(audit::AuditLifecycle::Unknown)
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .diagnostics
+                .transitions
+                .last()
+                .and_then(|transition| transition.error_code),
+            Some(ErrorCode::UnknownDelivery)
+        );
+    }
+
+    #[test]
+    fn exact_input_grant_mismatch_is_failed_before_external_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        *fixture
+            .repo
+            .preflight_input_override
+            .lock()
+            .expect("preflight input override lock") = Some(br#"{"value":2}"#.to_vec());
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+        let operation_id = fixture
+            .coordinator
+            .current_snapshot()
+            .result
+            .as_ref()
+            .expect("binding mismatch result")
+            .operation_id
+            .clone();
+
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(operation_id.as_str())
+                .unwrap(),
+            Some(audit::AuditLifecycle::Failed)
+        );
+    }
+
+    #[test]
+    fn mismatched_live_tool_target_stops_before_permission_preflight_and_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        *fixture
+            .mcp
+            .schema_tool_override
+            .lock()
+            .expect("schema tool lock") = Some(ToolId::new("different-tool"));
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+
+        assert_eq!(fixture.repo.authorization_loads.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn repeated_outcome_failure_retains_one_slot_and_fails_closed_until_recovery() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        fixture.repo.outcome_failure.store(true, Ordering::Release);
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 2);
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 1);
+        let operation_id = first_called_operation(&fixture);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(&operation_id)
+                .unwrap(),
+            Some(audit::AuditLifecycle::Prepared)
+        );
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-2", "tool-b", br#"{"value":2}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 3);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 1);
+
+        fixture.repo.outcome_failure.store(false, Ordering::Release);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::DismissResult(OperationId::new(
+                "retry-audit",
+            )))
+            .unwrap();
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(&operation_id)
+                .unwrap(),
+            Some(audit::AuditLifecycle::Succeeded)
+        );
+    }
+
+    #[test]
+    fn dispatched_cancel_is_visible_before_blocked_schema_completion() {
+        let schema_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::clone(&schema_gate),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.mcp.schema_calls.load(Ordering::Acquire) == 1);
+        let operation_id = fixture.coordinator.current_snapshot().operations[0]
+            .id
+            .clone();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Cancel(operation_id))
+            .unwrap();
+        schema_gate.release();
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+
+        assert_eq!(fixture.repo.authorization_loads.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn dispatched_config_mutation_is_visible_before_blocked_schema_completion() {
+        let schema_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::clone(&schema_gate),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.mcp.schema_calls.load(Ordering::Acquire) == 1);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::SaveServer(server_draft("server-1")))
+            .unwrap();
+        schema_gate.release();
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+
+        assert_eq!(fixture.repo.authorization_loads.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn mismatched_repository_server_stops_before_schema_authorization_and_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") = Some(server_draft("server-b"));
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-a", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().result.is_some());
+
+        assert_eq!(fixture.repo.server_loads.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.mcp.schema_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.authorization_loads.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 0);
+        assert_eq!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .diagnostics
+                .transitions
+                .last()
+                .and_then(|transition| transition.error_code),
+            Some(ErrorCode::StorageUnavailable)
+        );
+    }
+
+    #[test]
+    fn invalid_http_url_stops_before_persistence_schema_and_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        let invalid = ServerDraft {
+            id: Some(ServerId::new("server-a")),
+            name: "server-a".to_owned(),
+            transport: TransportDraft::Http {
+                url: "http://example.com/mcp".to_owned(),
+            },
+            enabled: true,
+        };
+        let revision = fixture.repo.config_revision.load(Ordering::Acquire);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::SaveServer(invalid.clone()))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().result.is_some());
+        assert_eq!(
+            fixture.repo.config_revision.load(Ordering::Acquire),
+            revision
+        );
+
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") = Some(invalid);
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-a", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.server_loads.load(Ordering::Acquire) == 1);
+        assert_eq!(fixture.mcp.schema_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn empty_stdio_command_stops_before_persistence_schema_and_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        let invalid = ServerDraft {
+            id: Some(ServerId::new("server-a")),
+            name: "server-a".to_owned(),
+            transport: TransportDraft::Stdio {
+                command: " ".to_owned(),
+                args: Vec::new(),
+                plain_env: Vec::new(),
+                secret_env: Vec::new(),
+                inherit_env: false,
+            },
+            enabled: true,
+        };
+        let revision = fixture.repo.config_revision.load(Ordering::Acquire);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::SaveServer(invalid.clone()))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().result.is_some());
+        assert_eq!(
+            fixture.repo.config_revision.load(Ordering::Acquire),
+            revision
+        );
+
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") = Some(invalid);
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-a", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.server_loads.load(Ordering::Acquire) == 1);
+        assert_eq!(fixture.mcp.schema_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pending_approvals_retain_exactly_two_slots_and_cancel_drops_them() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"a":1}"#))
+            .unwrap();
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-2", "tool-b", br#"{"b":2}"#))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().operations.len() == 2);
+        wait_until(|| fixture.repo.authorization_loads.load(Ordering::Acquire) == 2);
+        assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 2);
+        assert!(fixture.coordinator.current_snapshot().approval.is_some());
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-3", "tool-c", br#"{"c":3}"#))
+            .unwrap();
+        wait_until(|| fixture.coordinator.metrics().backpressure_rejections >= 1);
+        assert_eq!(fixture.repo.server_loads.load(Ordering::Acquire), 2);
+        assert_eq!(fixture.mcp.schema_calls.load(Ordering::Acquire), 2);
+
+        let first = fixture
+            .coordinator
+            .current_snapshot()
+            .approval
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Cancel(first))
+            .unwrap();
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 1);
+        let second = fixture
+            .coordinator
+            .current_snapshot()
+            .approval
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Cancel(second))
+            .unwrap();
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+        assert!(fixture.coordinator.current_snapshot().approval.is_none());
+        assert!(fixture.coordinator.current_snapshot().operations.is_empty());
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn approval_preflight_failure_and_double_resolve_never_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"a":1}"#))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().approval.is_some());
+        fixture.repo.authorization_ledger.fail_next_preflight();
+        let operation_id = fixture
+            .coordinator
+            .current_snapshot()
+            .approval
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveApproval {
+                operation_id: operation_id.clone(),
+                decision: ApprovalDecision::AllowOnce,
+            })
+            .unwrap();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveApproval {
+                operation_id,
+                decision: ApprovalDecision::AllowOnce,
+            })
+            .unwrap();
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+        assert!(fixture.coordinator.current_snapshot().approval.is_none());
+    }
+
+    #[test]
+    fn absent_to_persisted_ask_mutation_fails_preflight_before_external_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        assert_eq!(
+            *fixture.repo.permission.lock().expect("permission lock"),
+            audit::PermissionFingerprint::Absent
+        );
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"a":1}"#))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().approval.is_some());
+        let operation_id = fixture
+            .coordinator
+            .current_snapshot()
+            .approval
+            .as_ref()
+            .expect("approval prompt")
+            .operation_id
+            .clone();
+        *fixture
+            .repo
+            .permission_mutation_on_preflight
+            .lock()
+            .expect("permission mutation lock") = Some(audit::PermissionFingerprint::Persisted {
+            rule: audit::PermissionRule::Ask,
+            approved_schema_hash: None,
+        });
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveApproval {
+                operation_id: operation_id.clone(),
+                decision: ApprovalDecision::AllowOnce,
+            })
+            .unwrap();
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(operation_id.as_str())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            *fixture.repo.permission.lock().expect("permission lock"),
+            audit::PermissionFingerprint::Persisted {
+                rule: audit::PermissionRule::Ask,
+                approved_schema_hash: None,
+            }
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .diagnostics
+                .transitions
+                .last()
+                .and_then(|transition| transition.error_code),
+            Some(ErrorCode::AuditUnavailable)
+        );
+    }
+
+    #[test]
+    fn config_change_immediately_drops_pending_without_audit_or_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"a":1}"#))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().approval.is_some());
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::SaveServer(server_draft("server-1")))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision.0 == 2);
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+        assert!(fixture.coordinator.current_snapshot().approval.is_none());
+        assert!(fixture.coordinator.current_snapshot().operations.is_empty());
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn system_operation_ids_are_unique_across_coordinator_instances() {
+        let first = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        let second = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        first
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", b"[]"))
+            .unwrap();
+        second
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", b"[]"))
+            .unwrap();
+        wait_until(|| first.coordinator.current_snapshot().result.is_some());
+        wait_until(|| second.coordinator.current_snapshot().result.is_some());
+        let first_id = first
+            .coordinator
+            .current_snapshot()
+            .result
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        let second_id = second
+            .coordinator
+            .current_snapshot()
+            .result
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        assert_ne!(first_id, second_id);
+        assert!(first_id.as_str().len() <= 128);
+        assert!(second_id.as_str().len() <= 128);
+    }
+
     #[test]
     fn cancelled_job_holds_capacity_until_backend_exits_then_is_removed() {
         let mcp_gate = Arc::new(Gate::closed());
@@ -2190,6 +4245,28 @@ mod tests {
         assert_eq!(fixture.repo.opens.load(Ordering::Acquire), 1);
         assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 0);
         assert_eq!(fixture.coordinator.metrics().active_oauth_flows, 0);
+    }
+
+    #[test]
+    fn idle_deadline_reaps_backend_lease_before_exit_without_second_ttl() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(FakeClock::default()),
+        );
+        fixture.mcp.leases.store(1, Ordering::Release);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+
+        wait_until(|| fixture.coordinator.metrics().worker_starts == 1);
+        wait_until(|| fixture.coordinator.metrics().worker_alive == 0);
+        assert_eq!(fixture.mcp.reap_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.mcp.leases.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.opens.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.repo.shutdowns.load(Ordering::Acquire), 1);
     }
 
     #[test]

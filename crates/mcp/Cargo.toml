@@ -11,7 +11,8 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 deppy-core = { path = "../core" }
 secret = { path = "../secret" }
 # Streamable HTTP transport (H2) — sync ureq만 사용 (tokio 금지 관례)

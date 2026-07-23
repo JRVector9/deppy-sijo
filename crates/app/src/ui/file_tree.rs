@@ -6374,6 +6374,10 @@ mod tests {
     /// `Style.debug.warn_if_rect_changes_id`(디버그 빌드 기본 on)는 같은 rect의
     /// 위젯 id가 패스 사이에 바뀌면 Color32::RED 2px 테두리를 그린다. show_rows
     /// 가상화 트리에서 스크롤이 행높이만큼 이동하면 이것이 오발화함을 고정한다.
+    // egui `Style::debug`(warn_if_rect_changes_id 등)는 debug_assertions로 게이트돼
+    // release egui에는 없다 — 이 테스트는 그 디버그 전용 경고 동작을 검증하므로 debug
+    // 빌드에서만 컴파일한다(release에서 bin unittest 타깃이 깨지던 문제 해소).
+    #[cfg(debug_assertions)]
     #[test]
     fn kittest_행높이만큼_스크롤하면_rect_id변경_빨간경고가_발화한다() {
         let mut harness = egui_kittest::Harness::new_ui_state(

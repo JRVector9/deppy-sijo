@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use super::Row;
 use super::compressed::CompressedRow;
+use crate::grid::GridCell;
 use crate::index::Line;
-use crate::term::cell::Cell;
+use crate::term::cell::{Cell, ResetDiscriminant};
 
 /// Maximum number of buffered lines outside of the grid for performance optimization.
 const MAX_CACHE_SIZE: usize = 1_000;
@@ -163,6 +164,33 @@ impl<T> Storage<T> {
     #[inline]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// 압축된 슬롯이 하나라도 있는지 (디버그 방어용). O(n)이라 debug_assert에서만 쓴다.
+    #[inline]
+    pub fn has_compressed(&self) -> bool {
+        self.compressed.iter().any(Option::is_some)
+    }
+
+    /// `line`을 template으로 초기화한다. **압축된 슬롯 재활용을 안전하게 처리한다**:
+    /// 압축된 placeholder(0용량)를 그대로 `Row::reset`하면 `inner[len-1]` 접근에서
+    /// 패닉/UB가 나므로, 압축돼 있으면 곁가지를 버리고(내용은 어차피 폐기됨) full-width
+    /// 행으로 되살린 뒤 reset한다. 비압축 슬롯이면 기존과 동일한 reset일 뿐이다.
+    #[inline]
+    pub fn reset_row<D>(&mut self, line: Line, template: &T, columns: usize)
+    where
+        T: ResetDiscriminant<D> + GridCell + Default,
+        D: PartialEq,
+    {
+        let idx = self.compute_index(line);
+        if !self.compressed.is_empty() {
+            if let Some(slot) = self.compressed.get_mut(idx) {
+                if slot.take().is_some() {
+                    self.inner[idx] = Row::new(columns);
+                }
+            }
+        }
+        self.inner[idx].reset(template);
     }
 
     /// Swap implementation for Row<T>.
@@ -334,6 +362,20 @@ impl Storage<Cell> {
             .filter_map(Option::as_ref)
             .map(CompressedRow::heap_bytes)
             .sum()
+    }
+
+    /// 모든 압축 슬롯을 복원해 stock 상태로 되돌린다(곁가지 비움). resize/reflow처럼
+    /// 히스토리 전체를 원시 인덱싱으로 훑는 연산 직전에 호출한다.
+    pub(crate) fn inflate_all(&mut self, columns: usize) {
+        if self.compressed.is_empty() {
+            return;
+        }
+        for idx in 0..self.inner.len() {
+            if let Some(compressed) = self.compressed[idx].take() {
+                self.inner[idx] = compressed.decode(columns);
+            }
+        }
+        self.compressed.clear();
     }
 }
 

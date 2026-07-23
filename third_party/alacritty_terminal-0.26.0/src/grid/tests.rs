@@ -455,6 +455,95 @@ fn deppy_compress_history_respects_hot_lines() {
     }
 }
 
+/// 현재 맨 아래 가시줄에 `n` 라벨을 쓰고 스크롤아웃한다(재활용 테스트용).
+fn push_labeled_line(grid: &mut Grid<Cell>, n: usize, cols: usize) {
+    let ch = char::from(b'A' + (n % 26) as u8);
+    for c in 0..cols {
+        grid[Line(0)][Column(c)] = cell(ch);
+    }
+    grid.scroll_up::<crate::vte::ansi::Color>(&(Line(0)..Line(1)), 1);
+}
+
+/// 스크롤백이 가득 찬 상태에서 압축된 가장 오래된 슬롯이 재활용될 때 — reset_row가
+/// placeholder를 안전하게 inflate하는지(패닉 없이) + 남은 줄 내용 정확성.
+#[test]
+fn deppy_compress_then_recycle_survives() {
+    let (cols, cap) = (4, 6);
+    let mut grid = Grid::<Cell>::new(1, cols, cap);
+    let mut wrote = 0usize;
+    for _ in 0..cap {
+        push_labeled_line(&mut grid, wrote, cols);
+        wrote += 1;
+    }
+    assert_eq!(grid.history_size(), cap);
+
+    grid.compress_history(0, cap);
+    assert!(grid.compressed_heap_bytes() > 0);
+
+    // 가득 찬 상태에서 4줄 더 → 가장 오래된 압축 슬롯 4개 재활용(패닉 없어야).
+    for _ in 0..4 {
+        push_labeled_line(&mut grid, wrote, cols);
+        wrote += 1;
+    }
+    assert_eq!(grid.history_size(), cap);
+
+    // Line(-1)=마지막 쓴 것(새 비압축), Line(-cap)=재활용에서 살아남은 압축 줄.
+    let mut scratch = Row::<Cell>::new(cols);
+    let newest = char::from(b'A' + ((wrote - 1) % 26) as u8);
+    let row = grid.read_line(Line(-1), &mut scratch);
+    for c in 0..cols {
+        assert_eq!(row[Column(c)].c, newest, "Line(-1) col {c}");
+    }
+    // cap=6, 총 10줄 → 남은 6줄은 wrote 4..=9 (E..J). Line(-cap)=가장 오래된 남은 줄 E.
+    let oldest_remaining = char::from(b'A' + ((wrote - cap) % 26) as u8);
+    let row = grid.read_line(Line(-(cap as i32)), &mut scratch);
+    for c in 0..cols {
+        assert_eq!(row[Column(c)].c, oldest_remaining, "Line(-cap) col {c}");
+    }
+}
+
+/// inflate_all 후에는 원시 Index로 직접 읽어도(비압축) 원본과 동일해야 한다.
+#[test]
+fn deppy_inflate_all_restores_stock_reads() {
+    let (rows, cols) = (6, 4);
+    let mut grid = grid_with_history(rows, cols);
+    let snap: Vec<Row<Cell>> = (1..=rows).map(|d| grid[Line(-(d as i32))].clone()).collect();
+
+    grid.compress_history(0, rows);
+    assert!(grid.compressed_heap_bytes() > 0);
+
+    grid.inflate_all();
+    assert_eq!(grid.compressed_heap_bytes(), 0);
+
+    for (i, expected) in snap.iter().enumerate() {
+        let line = Line(-((i + 1) as i32));
+        for c in 0..cols {
+            assert_eq!(grid[line][Column(c)], expected[Column(c)], "{line:?} col {c}");
+        }
+    }
+}
+
+/// inflate_all 후에는 resize(reflow)가 방어 assert 없이 통과한다.
+#[test]
+fn deppy_resize_after_inflate_ok() {
+    let (rows, cols) = (6, 4);
+    let mut grid = grid_with_history(rows, cols);
+    grid.compress_history(0, rows);
+    grid.inflate_all();
+    grid.resize::<crate::vte::ansi::Color>(true, 1, 2);
+    assert!(grid.history_size() >= 1);
+}
+
+/// 압축 상태에서 inflate 없이 resize하면 방어 debug_assert가 걸린다.
+#[test]
+#[should_panic(expected = "compressed")]
+fn deppy_resize_on_compressed_trips_assert() {
+    let (rows, cols) = (6, 4);
+    let mut grid = grid_with_history(rows, cols);
+    grid.compress_history(0, rows);
+    grid.resize::<crate::vte::ansi::Color>(true, 1, 2);
+}
+
 /// 압축된 그리드도 truncate(가장 오래된 history 제거) 후 남은 줄이 온전한지 —
 /// 곁가지 truncate 동기화 검증.
 #[test]

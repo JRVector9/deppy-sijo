@@ -16,6 +16,14 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        // deppy-sijo(D): resize/reflow는 히스토리 전체를 원시 인덱싱으로 훑으므로 압축
+        // 상태에서 실행하면 placeholder를 읽어 깨진다. 호출자(crates/terminal)가 반드시
+        // inflate_all을 먼저 부르게 하고, 실수는 테스트에서 잡는다.
+        debug_assert!(
+            !self.raw.has_compressed(),
+            "resize on a compressed grid — inflate_all() 먼저 호출해야 함"
+        );
+
         // Use empty template cell for resetting cells due to resize.
         let template = mem::take(&mut self.cursor.template);
 

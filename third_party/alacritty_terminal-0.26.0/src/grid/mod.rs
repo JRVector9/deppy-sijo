@@ -303,8 +303,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
 
         // Ensure all new lines are fully cleared.
+        //
+        // deppy-sijo(D): region.start == 0에서 스크롤백이 가득 차면 rotate가 가장
+        // 오래된(=압축됐을 수 있는) 물리 슬롯을 여기 bottom 행으로 재활용한다. 압축
+        // placeholder를 그냥 reset하면 패닉/UB이므로 reset_row로 안전 처리한다.
         for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
-            self.raw[i].reset(&self.cursor.template);
+            self.raw.reset_row(i, &self.cursor.template, self.columns);
         }
     }
 
@@ -484,6 +488,14 @@ impl Grid<crate::term::cell::Cell> {
     /// 현재 압축 곁가지가 점유하는 힙 바이트 추정 — RSS 실측용.
     pub fn compressed_heap_bytes(&self) -> usize {
         self.raw.compressed_heap_bytes()
+    }
+
+    /// 모든 압축 스크롤백을 복원해 stock 상태로 되돌린다. resize처럼 히스토리 전체를
+    /// 원시 인덱싱으로 훑는 연산 직전에 호출해야 한다(그렇지 않으면 압축 placeholder를
+    /// 읽어 깨진다).
+    pub fn inflate_all(&mut self) {
+        let columns = self.columns;
+        self.raw.inflate_all(columns);
     }
 }
 

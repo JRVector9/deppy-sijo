@@ -54,6 +54,10 @@ pub struct SessionResourceUsage {
     pub identity_source: ProcessIdentitySource,
     pub sampled_at_ms: u64,
     pub process_count: usize,
+    /// 세션 자손 프로세스들의 메모리 합. macOS는 pid별 phys_footprint 합 —
+    /// ps RSS 합산은 공유 페이지(dyld 캐시·런타임)를 자손 수만큼 중복 가산해
+    /// 수천 프로세스에서 수백 GiB 허수를 만든다(2026-07-23 실증). 조회 실패한
+    /// pid와 그 외 플랫폼은 ps RSS로 폴백한다(상한 근사치).
     pub rss_bytes: u64,
     pub cpu_percent: Option<f32>,
     pub high_cpu: bool,
@@ -178,6 +182,9 @@ impl ProcessResourceMonitor {
         }
         let rows = process_rows();
         let table = ProcessTable::new(&rows);
+        // 샘플마다 새로 만드는 pid→footprint 메모 — 여러 세션 타깃이 같은 자손을
+        // 공유해도 pid당 syscall 1회로 바운드된다(보존 없음).
+        let mut footprint_cache = std::collections::HashMap::new();
         targets
             .iter()
             .map(|target| {
@@ -187,6 +194,7 @@ impl ProcessResourceMonitor {
                     sampled_at_ms,
                     self.config.high_cpu_percent,
                     self.config.high_rss_bytes,
+                    &mut |row| descendant_rss_bytes(row, &mut footprint_cache),
                 )
             })
             .collect()
@@ -257,12 +265,15 @@ fn aggregate_session_usage(
     high_rss_bytes: u64,
 ) -> SessionResourceUsage {
     let table = ProcessTable::new(rows);
+    // 토폴로지 테스트는 합성 pid를 쓰므로 footprint 조회 없이 행 값 그대로 합산 —
+    // 실행 uid(예: root CI)에 따라 결과가 달라지지 않게 결정적으로 유지한다.
     aggregate_session_usage_with_table(
         target,
         &table,
         sampled_at_ms,
         high_cpu_percent,
         high_rss_bytes,
+        &mut |row| row.rss_bytes,
     )
 }
 
@@ -272,11 +283,12 @@ fn aggregate_session_usage_with_table(
     sampled_at_ms: u64,
     high_cpu_percent: f32,
     high_rss_bytes: u64,
+    rss_of: &mut dyn FnMut(&ProcessRow) -> u64,
 ) -> SessionResourceUsage {
     let matched = table.matching_rows(target.identity);
     let rss_bytes = matched
         .iter()
-        .fold(0u64, |acc, row| acc.saturating_add(row.rss_bytes));
+        .fold(0u64, |acc, row| acc.saturating_add(rss_of(row)));
     let mut cpu_seen = false;
     let cpu_total = matched.iter().fold(0.0f32, |acc, row| {
         if let Some(cpu) = row.cpu_percent {
@@ -772,20 +784,48 @@ fn read_statm_bounded(mut reader: impl Read) -> Option<StatmCapture> {
 /// ps 서브프로세스를 스폰하던 비용도 없다. 실패 시 ps RSS 폴백.
 #[cfg(target_os = "macos")]
 fn current_rss_bytes() -> Option<u64> {
+    phys_footprint_for_pid(std::process::id()).or_else(ps_rss_bytes)
+}
+
+/// 같은 uid 소유 프로세스는 특권 없이 조회 가능(2026-07-23 실측). 다른 uid(sudo 자손
+/// 등)나 이미 종료된 pid는 None — 호출부가 ps RSS로 폴백한다.
+#[cfg(target_os = "macos")]
+fn phys_footprint_for_pid(pid: u32) -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
     let rc = unsafe {
         libc::proc_pid_rusage(
-            std::process::id() as libc::c_int,
+            pid as libc::c_int,
             libc::RUSAGE_INFO_V4,
             info.as_mut_ptr().cast(),
         )
     };
-    if rc == 0 {
+    (rc == 0).then(|| {
         // SAFETY: rc == 0이면 커널이 요청한 flavor 구조체 전체를 채웠다.
         let info = unsafe { info.assume_init() };
-        return Some(info.ri_phys_footprint);
-    }
-    ps_rss_bytes()
+        info.ri_phys_footprint
+    })
+}
+
+/// 자손 프로세스 한 행의 메모리. macOS는 phys_footprint를 조회해 ps RSS의 공유
+/// 페이지 중복 합산을 제거하고, 실패한 행만 ps RSS로 폴백한다 — 절대 0으로
+/// 떨어뜨리지 않는다. 캐시는 같은 샘플 주기 안에서 pid당 syscall 1회 바운드용.
+#[cfg(target_os = "macos")]
+fn descendant_rss_bytes(
+    row: &ProcessRow,
+    cache: &mut std::collections::HashMap<u32, Option<u64>>,
+) -> u64 {
+    cache
+        .entry(row.pid)
+        .or_insert_with(|| phys_footprint_for_pid(row.pid))
+        .unwrap_or(row.rss_bytes)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn descendant_rss_bytes(
+    row: &ProcessRow,
+    _cache: &mut std::collections::HashMap<u32, Option<u64>>,
+) -> u64 {
+    row.rss_bytes
 }
 
 #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
@@ -821,6 +861,116 @@ fn page_size() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate는_주입된_rss_조회자로_합산한다() {
+        let rows = vec![
+            ProcessRow {
+                pid: 10,
+                ppid: Some(1),
+                pgid: Some(77),
+                rss_bytes: 10,
+                cpu_percent: None,
+            },
+            ProcessRow {
+                pid: 11,
+                ppid: Some(10),
+                pgid: Some(77),
+                rss_bytes: 20,
+                cpu_percent: None,
+            },
+        ];
+        let table = ProcessTable::new(&rows);
+        let usage = aggregate_session_usage_with_table(
+            SessionResourceTarget {
+                session: SessionId(1),
+                identity: ProcessIdentity {
+                    pid: Some(10),
+                    process_group: Some(77),
+                    source: ProcessIdentitySource::PlatformFallback,
+                },
+            },
+            &table,
+            123,
+            100.0,
+            1000,
+            &mut |row| row.rss_bytes * 100,
+        );
+        assert_eq!(usage.rss_bytes, 3000);
+        assert!(usage.high_rss);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_phys_footprint는_실행중_자식_pid에_성공한다() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .expect("sleep spawn");
+        let footprint = phys_footprint_for_pid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(footprint.is_some_and(|bytes| bytes > 0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reap된_pid는_footprint_조회가_실패해_ps_rss로_폴백한다() {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("true spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        let row = ProcessRow {
+            pid,
+            ppid: Some(1),
+            pgid: Some(pid),
+            rss_bytes: 1234,
+            cpu_percent: None,
+        };
+        let mut cache = std::collections::HashMap::new();
+        assert_eq!(descendant_rss_bytes(&row, &mut cache), 1234);
+        // 실패 결과도 메모이즈되어 같은 샘플 안에서 재조회하지 않는다.
+        assert_eq!(cache.get(&pid), Some(&None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_자식_다수의_footprint_합은_ps_rss_합보다_작다() {
+        let mut children: Vec<std::process::Child> = (0..5)
+            .map(|_| {
+                std::process::Command::new("/bin/sleep")
+                    .arg("10")
+                    .spawn()
+                    .expect("sleep spawn")
+            })
+            .collect();
+        let mut footprint_sum = 0u64;
+        let mut ps_rss_sum = 0u64;
+        for child in &children {
+            let pid = child.id();
+            footprint_sum += phys_footprint_for_pid(pid).expect("footprint");
+            let output = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps");
+            let kib: u64 = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .expect("rss parse");
+            ps_rss_sum += kib * 1024;
+        }
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // dyld 공유 캐시가 자식마다 ps RSS에 중복 가산되므로 footprint 합이
+        // 항상 작아야 한다 — 공유 페이지 중복 제거의 회귀 가드.
+        assert!(
+            footprint_sum < ps_rss_sum,
+            "footprint_sum={footprint_sum} ps_rss_sum={ps_rss_sum}"
+        );
+    }
 
     #[test]
     fn 변화_게이트는_idle에서_재발행하지_않는다() {

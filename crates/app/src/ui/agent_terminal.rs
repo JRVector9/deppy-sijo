@@ -161,8 +161,13 @@ impl AgentTerminalUi {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
-                status_dot(ui, egui::Color32::from_rgb(0x55, 0xc8, 0x79));
-                ui.weak(catalog.t("status_bar.connected", &[]));
+                // 서비스 연결/건강 집계 — 이전엔 항상 켜진 장식용 초록불이었으나
+                // 실제 상태를 반영하도록 바꿨다(2026-07-23 사용자). 폴링 전엔 회색,
+                // 정상=초록, 일부 이상=주황, 장애=빨강.
+                let (conn_color, conn_key) = connection_health(ui, feed);
+                status_dot(ui, conn_color);
+                ui.weak(catalog.t(conn_key, &[]))
+                    .on_hover_text(catalog.t("status_bar.connection_hover", &[]));
                 ui.separator();
                 ui.weak(catalog.t(
                     "status_bar.workspaces",
@@ -886,6 +891,48 @@ fn workspace_has_warning(row: &ActivityWorkspaceRow) -> bool {
 fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// 하단 "연결" 점등 — 상태페이지가 있는 provider(Claude/OpenAI/GitHub/Grok)를 집계한다.
+/// 아직 아무 응답도 없으면(오프라인/폴링 전) 회색 "확인 중", 하나라도 응답이 있으면
+/// 그중 가장 나쁜 상태로 정상(초록)/일부 이상(주황)/장애(빨강)를 표시한다.
+fn connection_health(ui: &egui::Ui, feed: &StatusFeedSnapshot) -> (egui::Color32, &'static str) {
+    let indicators: Vec<ServiceIndicator> = [
+        feed.claude.as_ref(),
+        feed.openai.as_ref(),
+        feed.github.as_ref(),
+        feed.grok.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|p| p.indicator)
+    .collect();
+    if indicators.is_empty() {
+        return (
+            ui.visuals().weak_text_color(),
+            "status_bar.connection.checking",
+        );
+    }
+    let severity = |indicator: &ServiceIndicator| match indicator {
+        ServiceIndicator::Operational => 0u8,
+        ServiceIndicator::Unknown => 1,
+        ServiceIndicator::Minor => 2,
+        ServiceIndicator::Major | ServiceIndicator::Critical => 3,
+    };
+    match indicators.iter().max_by_key(|i| severity(i)).map(severity) {
+        Some(3) => (
+            egui::Color32::from_rgb(0xed, 0x5b, 0x61),
+            "status_bar.connection.outage",
+        ),
+        Some(2) => (
+            egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+            "status_bar.connection.degraded",
+        ),
+        _ => (
+            egui::Color32::from_rgb(0x55, 0xc8, 0x79),
+            "status_bar.connection.ok",
+        ),
+    }
 }
 
 /// indicator → 점등 색. 미조회(None)/미지 값은 회색.

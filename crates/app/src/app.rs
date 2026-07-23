@@ -5821,6 +5821,9 @@ pub struct App {
     status_feed_rx: crate::status_feed::StatusFeedReceiver,
     /// 수동 갱신(홈 「AI 공지」 ⟳ 버튼) — 워커를 즉시 깨워 상태+공지 재조회.
     status_feed_refresh: crate::status_feed::StatusFeedRefresh,
+    /// 앱 시작 시 상태 점등을 즉시 채우도록 1회 폴링을 보냈는가 — 첫 logic tick에서
+    /// 소비한다(홈을 열지 않아도 하단 서비스 점등이 바로 켜지게, 2026-07-23 사용자).
+    status_feed_startup_polled: bool,
     status_feed: crate::status_feed::StatusFeedSnapshot,
     /// Home을 마지막으로 본 시점의 provider별 공지 ID와 현재 신규 공지 배지 수.
     /// 별도 작은 JSON으로 영속해 앱 재시작 때 기존 공지가 다시 새 알림이 되지 않는다.
@@ -8359,6 +8362,7 @@ impl App {
             activity_rows_cache: None,
             status_feed_rx: status_feed_rx_channel.0,
             status_feed_refresh: status_feed_rx_channel.1,
+            status_feed_startup_polled: false,
             status_feed: crate::status_feed::StatusFeedSnapshot::default(),
             notice_read_state,
             notice_read_state_path,
@@ -10297,6 +10301,12 @@ impl App {
             self.i18n = load_catalog(&self.config.i18n.locale);
             self.agent_sessions_ui.set_catalog(&self.i18n);
             self.connector_ui.set_catalog(&self.i18n);
+            // 홈 공지는 로케일별 캐시 키라 언어 변경 시 새 언어로 재번역돼야 한다.
+            // 번역 펌프가 다음 프레임에 새 로케일의 캐시 미스를 잡도록 리페인트를
+            // 확실히 깨우고, 대기 중이던 이전 로케일 번역이 새 로케일 시작을 막지
+            // 않도록 in-flight 핸들을 버린다(결과는 이전 로케일용이라 무의미).
+            self.notice_translate_rx = None;
+            ctx.request_repaint();
         }
         ctx.set_theme(self.config.ui.theme.to_egui());
         self.sync_agent_hooks();
@@ -15230,6 +15240,12 @@ impl eframe::App for App {
         let home_active = want_active
             && self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home;
         self.status_feed_rx.set_active(home_active);
+        // 앱 시작 직후 1회 폴링 — 홈을 열지 않아도 하단 서비스 점등이 바로 켜지게 한다.
+        // 이후엔 idle TTL로 워커가 회수되고, 홈 활성/수동 갱신 시 다시 조회한다.
+        if !self.status_feed_startup_polled {
+            self.status_feed_startup_polled = true;
+            let _ = self.status_feed_refresh.send(());
+        }
         // 외부 feed/번역/로컬 모델 worker 채널과 그에 따른 캐시 파일/CLI 작업은 render
         // 밖에서만 처리한다. 데이터가 없으면 try_recv와 조건 확인 외 추가 자원은 없다.
         let mut status_feed_received = false;

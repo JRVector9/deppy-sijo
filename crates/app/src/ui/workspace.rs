@@ -646,10 +646,10 @@ pub struct WorkspaceUi {
     command_sent: bool,
     /// mux focused_pane 변경 추적
     last_focused_pane: Option<runtime::MuxPaneId>,
-    /// 세션별 pane 강조 플래시 만료 시각 — 포커스 이동·입력요청·작업완료 시 now+PANE_FLASH로
-    /// 세팅해 pane 전체 테두리를 잠깐 포인트색으로 그린다(2026-07-12 사용자). 탑라인은 별도로
-    /// 포커스 동안 항상 유지된다.
-    session_flash: HashMap<SessionId, std::time::Instant>,
+    /// 세션별 pane 강조 플래시 (만료 시각, 총 지속시간). 포커스 이동은 FOCUS_FLASH(1초),
+    /// 입력요청·작업완료는 PANE_FLASH(2초)로 서로 다르게 쓰므로 페이드 비율 계산을 위해
+    /// 지속시간을 함께 보관한다(2026-07-12 사용자). 탑라인은 별도로 포커스 동안 유지.
+    session_flash: HashMap<SessionId, (std::time::Instant, std::time::Duration)>,
     /// egui 포커스 동기화와 입력 대상 전환 대기. Runtime의 `FocusPane` 반영은 비동기라,
     /// 클릭·검색 닫힘 직후에도 이 pane을 먼저 입력 대상으로 삼아 첫 문자를 잃지 않는다.
     pending_focus: Option<runtime::MuxPaneId>,
@@ -2151,13 +2151,15 @@ impl WorkspaceUi {
                 })
                 .and_then(|pane| pane.session_id)
             {
-                self.session_flash
-                    .insert(session, std::time::Instant::now() + PANE_FLASH);
+                self.session_flash.insert(
+                    session,
+                    (std::time::Instant::now() + FOCUS_FLASH, FOCUS_FLASH),
+                );
             }
         }
         // 만료된 플래시 정리(무한 성장 방지).
         let now = std::time::Instant::now();
-        self.session_flash.retain(|_, until| now < *until);
+        self.session_flash.retain(|_, (until, _)| now < *until);
         let Some(active_tab) = mux
             .active_tab
             .as_ref()
@@ -2814,7 +2816,13 @@ impl WorkspaceUi {
                     self.selection = Some((session, s, e));
                 }
             } else if output.response.drag_started()
-                && let Some(pos) = output.response.interact_pointer_pos()
+                // anchor(선택 시작 셀)는 "누른 지점"으로 잡는다. interact_pointer_pos()는
+                // drag_started 발화 시점의 현재 포인터라 egui의 6px 드래그 임계값(≈1셀)만큼
+                // 밀려 선택이 1칸 오른쪽에서 시작됐다(2026-07-23 사용자). press_origin이
+                // 실제 누른 픽셀이다. head(끝점)는 아래 dragged 분기가 현재 포인터를 따른다.
+                && let Some(pos) = ui
+                    .input(|i| i.pointer.press_origin())
+                    .or_else(|| output.response.interact_pointer_pos())
             {
                 let idx = cell_at(pos);
                 if let Some((start, end)) = selection_range
@@ -3168,14 +3176,14 @@ impl WorkspaceUi {
             );
         }
 
-        // pane 전체 강조 플래시 — 포커스 이동·입력요청·작업완료 시 2초 페이드(2026-07-12 사용자).
+        // pane 전체 강조 플래시 — 포커스 이동(1초)·입력요청·작업완료(2초) 페이드(2026-07-12 사용자).
         if let Some(session) = pane.session_id
-            && let Some(&until) = self.session_flash.get(&session)
+            && let Some(&(until, duration)) = self.session_flash.get(&session)
         {
             let now = std::time::Instant::now();
             if now < until {
                 let accent = ui.visuals().selection.bg_fill;
-                let remain = (until - now).as_secs_f32() / PANE_FLASH.as_secs_f32();
+                let remain = (until - now).as_secs_f32() / duration.as_secs_f32();
                 let alpha = (remain.clamp(0.0, 1.0) * 255.0) as u8;
                 let color = egui::Color32::from_rgba_unmultiplied(
                     accent.r(),
@@ -3183,12 +3191,24 @@ impl WorkspaceUi {
                     accent.b(),
                     alpha,
                 );
-                ui.painter().rect_stroke(
-                    pane_rect.shrink(1.0),
-                    2.0,
-                    egui::Stroke::new(2.0, color),
-                    egui::StrokeKind::Inside,
-                );
+                // 이 시점 `ui`는 pane 안쪽 여백(content)으로 클립된 terminal 자식 UI다.
+                // painter().with_clip_rect는 기존 clip과 **교집합**이라(content∩surface=
+                // content) 테두리 4변이 여전히 잘려 안 보였다(2026-07-23 사용자). layer_painter
+                // 는 clip이 화면 전체라 pane 전체(surface)로 새로 clip해 테두리가 보인다.
+                // 같은 layer라 그리드 뒤에 그려져 z-order상 맨 위다.
+                // 상/하/좌는 경계 중앙(Middle), **가장 우측 세로줄만 안쪽**으로 그린다
+                // (2026-07-23 사용자). rect_stroke는 4변을 같은 방식으로만 그려 per-edge가
+                // 안 되므로 4개 선으로 나눠 그린다. Middle 변의 바깥 절반이 잘리지 않게
+                // clip을 1px 넓힌다. 우측선은 right-1에 그려 2px가 pane 안에 들어온다.
+                let stroke = egui::Stroke::new(2.0, color);
+                let painter = ui
+                    .ctx()
+                    .layer_painter(ui.layer_id())
+                    .with_clip_rect(pane_rect.expand(1.0));
+                painter.hline(pane_rect.x_range(), pane_rect.top(), stroke);
+                painter.hline(pane_rect.x_range(), pane_rect.bottom(), stroke);
+                painter.vline(pane_rect.left(), pane_rect.y_range(), stroke);
+                painter.vline(pane_rect.right() - 1.0, pane_rect.y_range(), stroke);
                 ui.ctx().request_repaint(); // 페이드 애니메이션
             }
         }
@@ -3866,8 +3886,10 @@ impl WorkspaceUi {
     fn note_status_flash(&mut self, session: SessionId, new_status: SessionStatus) {
         let prev = self.sessions.get(&session).and_then(|view| view.status);
         if is_flash_status(new_status) && prev != Some(new_status) {
-            self.session_flash
-                .insert(session, std::time::Instant::now() + PANE_FLASH);
+            self.session_flash.insert(
+                session,
+                (std::time::Instant::now() + PANE_FLASH, PANE_FLASH),
+            );
         }
     }
 
@@ -4517,9 +4539,11 @@ fn split_target_pane(snapshot: &MuxSnapshot) -> Option<runtime::MuxPaneId> {
         .map(|pane| pane.id.clone())
 }
 
-/// pane 강조 플래시 지속 시간 — 포커스 이동·입력요청·작업완료 시 pane 전체 테두리를 이만큼
+/// pane 강조 플래시 지속 시간 — 입력요청·작업완료 시 pane 전체 테두리를 이만큼
 /// 포인트색으로 그리고 페이드아웃한다. 탑라인(포커스 지속 표시)은 이와 무관하다.
 const PANE_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
+/// 터미널 선택(포커스 이동) 시 pane 테두리 강조 지속 — 사용자 요청 2초(2026-07-23).
+const FOCUS_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// pane 전체 플래시를 유발하는 상태: 입력요청(Waiting/NeedsApproval)·작업종료(Done/Error).
 /// Running(작업 중)·Idle(쉬는 중)은 제외 — 주목이 필요한 순간만 번쩍인다.

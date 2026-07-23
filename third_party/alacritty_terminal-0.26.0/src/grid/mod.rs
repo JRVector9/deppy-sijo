@@ -448,29 +448,29 @@ impl<T> Grid<T> {
 
 /// deppy-sijo 옵션 D: 스크롤백 라인 압축(Cell 전용).
 impl Grid<crate::term::cell::Cell> {
-    /// `hot_lines`보다 오래된 스크롤백 history 행을 압축한다. 한 번 호출당 최대
-    /// `max_compress`행만 실제로 압축(feed 버스트 지연 방지). 반환: 회수 추정 바이트.
+    /// `hot_lines`보다 오래된 스크롤백 history 행을 압축한다. 반환: 회수 추정 바이트.
     ///
-    /// 오래된 행(depth 큰 쪽)부터 훑고 이미 압축된 슬롯은 건너뛴다. 트리거(누가 언제
-    /// 호출하는가)는 아직 없다 — 후속 PR에서 연결한다.
-    pub fn compress_history(&mut self, hot_lines: usize, max_compress: usize) -> usize {
+    /// 가장 최근의 '식은' 행(depth `hot_lines+1`)부터 오래된 쪽으로 훑다가, 이미 압축된
+    /// 행을 만나면 멈춘다 — 불변식 "depth D가 압축됐으면 D보다 깊은 행도 전부 압축"이
+    /// 유지되므로(항상 shallow→deep로 압축) 안전한 조기 종료다. 정상 상태에선 새로 식은
+    /// 몇 행만 처리하고, 첫 호출(또는 inflate_all 직후)만 전체 backlog를 한 번 압축한다.
+    pub fn compress_history(&mut self, hot_lines: usize) -> usize {
         let history = self.history_size();
-        if history <= hot_lines || max_compress == 0 {
+        if history <= hot_lines {
             return 0;
         }
 
         let columns = self.columns;
         let mut freed = 0;
-        let mut compressed = 0;
-        // depth: 1 = 가장 최근 history, history = 가장 오래된 것. 오래된 쪽부터.
-        let mut depth = history;
-        while depth > hot_lines && compressed < max_compress {
-            let saved = self.raw.compress_line(Line(-(depth as i32)), columns);
-            if saved > 0 {
-                freed += saved;
-                compressed += 1;
+        let mut depth = hot_lines + 1;
+        while depth <= history {
+            match self.raw.compress_line(Line(-(depth as i32)), columns) {
+                Some(saved) => {
+                    freed += saved;
+                    depth += 1;
+                },
+                None => break, // 압축 frontier 도달
             }
-            depth -= 1;
         }
         freed
     }

@@ -424,7 +424,7 @@ fn deppy_compress_history_roundtrip_and_frees_heap() {
     let snap: Vec<Row<Cell>> = (1..=rows).map(|d| grid[Line(-(d as i32))].clone()).collect();
 
     // hot_lines=0 → history 전체 압축.
-    let freed = grid.compress_history(0, rows);
+    let freed = grid.compress_history(0);
     assert!(freed > 0, "회수 바이트가 0");
     assert!(grid.compressed_heap_bytes() > 0, "압축 곁가지가 비어 있음");
 
@@ -434,7 +434,7 @@ fn deppy_compress_history_roundtrip_and_frees_heap() {
     }
 
     // 재호출은 idempotent(이미 압축된 것은 0 회수).
-    assert_eq!(grid.compress_history(0, rows), 0, "재압축이 추가 회수");
+    assert_eq!(grid.compress_history(0), 0, "재압축이 추가 회수");
 }
 
 #[test]
@@ -444,11 +444,11 @@ fn deppy_compress_history_respects_hot_lines() {
     let snap: Vec<Row<Cell>> = (1..=rows).map(|d| grid[Line(-(d as i32))].clone()).collect();
 
     // hot_lines >= history → 아무것도 압축 안 함.
-    assert_eq!(grid.compress_history(rows, rows), 0);
+    assert_eq!(grid.compress_history(rows), 0);
     assert_eq!(grid.compressed_heap_bytes(), 0);
 
     // hot_lines=2 → 오래된 rows-2줄만 압축. 그래도 모든 줄 read_line은 원본과 동일.
-    let freed = grid.compress_history(2, rows);
+    let freed = grid.compress_history(2);
     assert!(freed > 0);
     for (i, expected) in snap.iter().enumerate() {
         assert_line_eq(&grid, Line(-((i + 1) as i32)), expected, cols);
@@ -477,7 +477,7 @@ fn deppy_compress_then_recycle_survives() {
     }
     assert_eq!(grid.history_size(), cap);
 
-    grid.compress_history(0, cap);
+    grid.compress_history(0);
     assert!(grid.compressed_heap_bytes() > 0);
 
     // 가득 찬 상태에서 4줄 더 → 가장 오래된 압축 슬롯 4개 재활용(패닉 없어야).
@@ -509,7 +509,7 @@ fn deppy_inflate_all_restores_stock_reads() {
     let mut grid = grid_with_history(rows, cols);
     let snap: Vec<Row<Cell>> = (1..=rows).map(|d| grid[Line(-(d as i32))].clone()).collect();
 
-    grid.compress_history(0, rows);
+    grid.compress_history(0);
     assert!(grid.compressed_heap_bytes() > 0);
 
     grid.inflate_all();
@@ -528,7 +528,7 @@ fn deppy_inflate_all_restores_stock_reads() {
 fn deppy_resize_after_inflate_ok() {
     let (rows, cols) = (6, 4);
     let mut grid = grid_with_history(rows, cols);
-    grid.compress_history(0, rows);
+    grid.compress_history(0);
     grid.inflate_all();
     grid.resize::<crate::vte::ansi::Color>(true, 1, 2);
     assert!(grid.history_size() >= 1);
@@ -540,7 +540,7 @@ fn deppy_resize_after_inflate_ok() {
 fn deppy_resize_on_compressed_trips_assert() {
     let (rows, cols) = (6, 4);
     let mut grid = grid_with_history(rows, cols);
-    grid.compress_history(0, rows);
+    grid.compress_history(0);
     grid.resize::<crate::vte::ansi::Color>(true, 1, 2);
 }
 
@@ -552,7 +552,7 @@ fn deppy_compress_survives_history_shrink() {
     let mut grid = grid_with_history(rows, cols);
     let snap: Vec<Row<Cell>> = (1..=rows).map(|d| grid[Line(-(d as i32))].clone()).collect();
 
-    grid.compress_history(0, rows);
+    grid.compress_history(0);
 
     // 스크롤백을 3줄로 줄인다(가장 오래된 rows-3줄 제거).
     grid.update_history(3);

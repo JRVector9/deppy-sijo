@@ -309,20 +309,22 @@ impl<T> Storage<T> {
 }
 
 impl Storage<Cell> {
-    /// `line`을 압축한다. 이미 압축됐거나 빈(placeholder) 행이면 아무것도 안 하고 0
-    /// 반환. 반환값은 회수 추정 힙 바이트(원본 셀 배열 − 압축 표현).
+    /// `line`을 압축한다. 이미 압축됐거나 빈(placeholder) 행이면 `None`(=이 슬롯은
+    /// 압축 frontier), 새로 압축했으면 `Some(회수 추정 힙 바이트)`. 회수량이 0이어도
+    /// (거의 꽉 찬 incompressible 행) 상태는 바뀌었으므로 `Some(0)`이지 `None`이 아니다
+    /// — 호출자(compress_history)의 frontier 판정이 어긋나지 않게 하기 위함.
     ///
     /// 압축 후 `inner[idx]`는 힙 0인 placeholder가 되고, 실제 내용은 곁가지에 남는다.
     /// 이후 이 행을 읽으려면 반드시 [`read_line`](Self::read_line)을 거쳐야 한다
     /// (원시 `Index<Line>`은 placeholder를 돌려준다).
-    pub(crate) fn compress_line(&mut self, line: Line, columns: usize) -> usize {
+    pub(crate) fn compress_line(&mut self, line: Line, columns: usize) -> Option<usize> {
         let idx = self.compute_index(line);
         if self.compressed.get(idx).is_some_and(Option::is_some) {
-            return 0;
+            return None;
         }
         let raw_bytes = self.inner[idx].len() * mem::size_of::<Cell>();
         if raw_bytes == 0 {
-            return 0;
+            return None;
         }
         let compressed = CompressedRow::encode(&self.inner[idx], columns);
         let saved = raw_bytes.saturating_sub(compressed.heap_bytes());
@@ -334,7 +336,7 @@ impl Storage<Cell> {
         self.compressed[idx] = Some(compressed);
         // 셀 배열의 힙을 즉시 반납(용량까지 드롭).
         self.inner[idx] = Row::from_vec(Vec::new(), 0);
-        saved
+        Some(saved)
     }
 
     /// `line`을 읽는다. 압축돼 있으면 `scratch`로 복원해 그 참조를, 아니면 원시

@@ -673,6 +673,12 @@ impl<T> Term<T> {
         delta = cmp::min(cmp::max(delta, min_delta), history_size as i32);
         self.vi_mode_cursor.point.line += delta;
 
+        // deppy-sijo(D): resize/reflow는 히스토리 전체를 원시 인덱싱으로 훑으므로 압축
+        // 상태에선 깨진다. 양쪽 그리드를 먼저 stock으로 되돌린다(비압축이면 무비용).
+        // primary가 alt 화면 동안 inactive로 밀려 있어도 압축돼 있을 수 있으므로 둘 다.
+        self.grid.inflate_all();
+        self.inactive_grid.inflate_all();
+
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);

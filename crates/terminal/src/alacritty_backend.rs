@@ -179,6 +179,26 @@ fn estimated_terminal_bytes(cols: usize, rows: usize, history_lines: usize) -> u
         .saturating_mul(estimated_bytes_per_line(cols.max(1)))
 }
 
+/// grid의 `idx` 행 마지막 열이 WRAPLINE(soft wrap)인지 판정한다. 압축된 히스토리 행은
+/// read_line이 scratch로 복원해 주므로 스크롤백 깊은 곳도 안전하게 읽는다.
+fn line_soft_wrapped(
+    grid: &alacritty_terminal::grid::Grid<AlacrittyCell>,
+    idx: i32,
+    cols: usize,
+    scratch: &mut Row<AlacrittyCell>,
+) -> bool {
+    grid.read_line(alacritty_terminal::index::Line(idx), scratch)
+        [alacritty_terminal::index::Column(cols - 1)]
+        .flags
+        .contains(Flags::WRAPLINE)
+}
+
+/// deppy-sijo(D) 스크롤백 라인 압축: 이 줄 수만큼의 **최근** 스크롤아웃 히스토리는
+/// 비압축(셀 배열)으로 남긴다. 되돌려-스크롤이 이 범위 안이면 decode 없이 즉시 보이고,
+/// 그보다 더 과거로 스크롤할 때만 렌더가 행을 복원한다. 값이 클수록 스크롤 반응은 좋지만
+/// RSS 절감은 줄어든다 — 몇 화면 분량으로 잡는다.
+const HOT_SCROLLBACK_LINES: usize = 256;
+
 impl TerminalBackend for AlacrittyBackend {
     fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<TerminalChangeSet> {
         // 위치만 비교하면 DECTCEM(?25l/h) 가시성이나 DECSCUSR shape 변경을
@@ -190,6 +210,11 @@ impl TerminalBackend for AlacrittyBackend {
         );
         let alt_screen_before = self.term.mode().contains(TermMode::ALT_SCREEN);
         self.processor.advance(&mut self.term, bytes);
+
+        // deppy-sijo(D): 새로 스크롤아웃된 히스토리를 압축해 RSS를 낮춘다. 압축은
+        // 화면 밖 히스토리(Line<0, hot 범위 밖)만 건드리므로 damage/렌더 좌표에 영향이
+        // 없다. 정상 상태에선 갓 식은 몇 행만 처리한다(내부에서 압축 frontier에서 중단).
+        self.term.grid_mut().compress_history(HOT_SCROLLBACK_LINES);
 
         let screen_lines = self.term.screen_lines();
         let mut dirty_rows: Vec<u16> = match self.term.damage() {
@@ -254,70 +279,80 @@ impl TerminalBackend for AlacrittyBackend {
     }
 
     fn viewport_snapshot(&self) -> Option<TerminalViewportSnapshot> {
-        let content = self.term.renderable_content();
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
-        let display_offset = content.display_offset;
-        let colors = content.colors;
+        let colors = self.term.colors();
 
+        // 커서/스크롤 오프셋은 renderable_content 기준(vi 모드 반영)으로 뽑고 borrow를
+        // 즉시 놓는다. 셀은 아래에서 grid.read_line으로 직접 순회한다.
+        let (display_offset, cursor_point, cursor_shape) = {
+            let content = self.term.renderable_content();
+            (content.display_offset, content.cursor.point, content.cursor.shape)
+        };
+
+        // deppy-sijo(D): display_iter 대신 read_line으로 직접 순회한다 — 스크롤이 압축
+        // 영역까지 가면 read_line이 scratch로 행을 복원해 준다(비압축이면 원시 행 그대로).
+        // display_iter와 동일 매핑: 화면 row r ↔ grid line (r - display_offset).
+        let grid = self.term.grid();
+        let mut scratch = Row::<AlacrittyCell>::new(cols);
         let mut cells = vec![TerminalCell::default(); cols * rows];
-        for indexed in content.display_iter {
-            let row = indexed.point.line.0 + display_offset as i32;
-            let col = indexed.point.column.0;
-            if row < 0 || row as usize >= rows || col >= cols {
-                continue;
+        for screen_row in 0..rows {
+            let grid_line =
+                alacritty_terminal::index::Line(screen_row as i32 - display_offset as i32);
+            let line = grid.read_line(grid_line, &mut scratch);
+            for col in 0..cols {
+                let cell = &line[alacritty_terminal::index::Column(col)];
+                let flags = cell.flags;
+                let (mut fg, mut bg) = (
+                    resolve_color(cell.fg, colors, DEFAULT_FG),
+                    resolve_color(cell.bg, colors, DEFAULT_BG),
+                );
+                if flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                // SGR 텍스트 속성 (B-1, 2026-07-14): 이전엔 이 flag들을 읽지도 않고 버려
+                // bold/italic/underline이 화면에 전혀 반영되지 않았다. INVERSE/HIDDEN은
+                // 위에서 이미 fg/bg·문자에 반영했으므로 attrs에 담지 않는다.
+                let mut attrs = CellAttrs::empty();
+                attrs.set(CellAttrs::BOLD, flags.contains(Flags::BOLD));
+                attrs.set(CellAttrs::ITALIC, flags.contains(Flags::ITALIC));
+                // 밑줄 변형(이중/곡선/점선/파선)은 전부 단일 밑줄로 렌더한다 — egui가
+                // 밑줄 스타일을 구분하지 않는다(구분이 필요해지면 attrs에 비트를 늘린다).
+                attrs.set(
+                    CellAttrs::UNDERLINE,
+                    flags.intersects(
+                        Flags::UNDERLINE
+                            | Flags::DOUBLE_UNDERLINE
+                            | Flags::UNDERCURL
+                            | Flags::DOTTED_UNDERLINE
+                            | Flags::DASHED_UNDERLINE,
+                    ),
+                );
+                attrs.set(CellAttrs::STRIKEOUT, flags.contains(Flags::STRIKEOUT));
+                attrs.set(CellAttrs::DIM, flags.contains(Flags::DIM));
+                cells[screen_row * cols + col] = TerminalCell {
+                    // SGR conceal(ESC[8m)은 공백으로 — 속성은 유지
+                    c: if flags.contains(Flags::HIDDEN) {
+                        ' '
+                    } else {
+                        composed_char(cell.c, cell.zerowidth())
+                    },
+                    fg,
+                    bg,
+                    wide: flags.contains(Flags::WIDE_CHAR),
+                    wide_spacer: flags
+                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                    attrs,
+                };
             }
-            let cell = &mut cells[row as usize * cols + col];
-            let flags = indexed.flags;
-            let (mut fg, mut bg) = (
-                resolve_color(indexed.fg, colors, DEFAULT_FG),
-                resolve_color(indexed.bg, colors, DEFAULT_BG),
-            );
-            if flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            // SGR 텍스트 속성 (B-1, 2026-07-14): 이전엔 이 flag들을 읽지도 않고 버려
-            // bold/italic/underline이 화면에 전혀 반영되지 않았다. INVERSE/HIDDEN은
-            // 위에서 이미 fg/bg·문자에 반영했으므로 attrs에 담지 않는다.
-            let mut attrs = CellAttrs::empty();
-            attrs.set(CellAttrs::BOLD, flags.contains(Flags::BOLD));
-            attrs.set(CellAttrs::ITALIC, flags.contains(Flags::ITALIC));
-            // 밑줄 변형(이중/곡선/점선/파선)은 전부 단일 밑줄로 렌더한다 — egui가
-            // 밑줄 스타일을 구분하지 않는다(구분이 필요해지면 attrs에 비트를 늘린다).
-            attrs.set(
-                CellAttrs::UNDERLINE,
-                flags.intersects(
-                    Flags::UNDERLINE
-                        | Flags::DOUBLE_UNDERLINE
-                        | Flags::UNDERCURL
-                        | Flags::DOTTED_UNDERLINE
-                        | Flags::DASHED_UNDERLINE,
-                ),
-            );
-            attrs.set(CellAttrs::STRIKEOUT, flags.contains(Flags::STRIKEOUT));
-            attrs.set(CellAttrs::DIM, flags.contains(Flags::DIM));
-            *cell = TerminalCell {
-                // SGR conceal(ESC[8m)은 공백으로 — 속성은 유지
-                c: if flags.contains(Flags::HIDDEN) {
-                    ' '
-                } else {
-                    composed_char(indexed.c, indexed.zerowidth())
-                },
-                fg,
-                bg,
-                wide: flags.contains(Flags::WIDE_CHAR),
-                wide_spacer: flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
-                attrs,
-            };
         }
 
         // cursor.point는 grid 좌표 — 스크롤 중이면 viewport 밖일 수 있다
-        let cursor_row = content.cursor.point.line.0 + display_offset as i32;
+        let cursor_row = cursor_point.line.0 + display_offset as i32;
         let in_view = (0..rows as i32).contains(&cursor_row);
-        let (shape, shape_visible) = map_cursor_shape(content.cursor.shape);
+        let (shape, shape_visible) = map_cursor_shape(cursor_shape);
         let cursor = CursorSnapshot {
-            col: content.cursor.point.column.0 as u16,
+            col: cursor_point.column.0 as u16,
             row: cursor_row.max(0) as u16,
             shape,
             visible: shape_visible && in_view && self.term.mode().contains(TermMode::SHOW_CURSOR),
@@ -410,8 +445,10 @@ impl TerminalBackend for AlacrittyBackend {
         // 현재 SGR 상태 — 색이 바뀔 때만 시퀀스를 낸다
         let mut current: Option<([u8; 3], [u8; 3])> = None;
         let total = history as i32 + rows as i32;
+        // deppy-sijo(D): 압축된 히스토리 행은 read_line이 scratch로 복원해 준다.
+        let mut scratch = Row::<AlacrittyCell>::new(cols);
         for (emitted, line_idx) in (-(history as i32)..rows as i32).enumerate() {
-            let line = &grid[alacritty_terminal::index::Line(line_idx)];
+            let line = grid.read_line(alacritty_terminal::index::Line(line_idx), &mut scratch);
             let wrapped = line[alacritty_terminal::index::Column(cols - 1)]
                 .flags
                 .contains(Flags::WRAPLINE);
@@ -508,11 +545,13 @@ impl TerminalBackend for AlacrittyBackend {
         // 라인별 재사용 버퍼 (매 라인 할당 방지)
         let mut chars: Vec<char> = Vec::with_capacity(cols);
         let mut spans: Vec<(u16, u16)> = Vec::with_capacity(cols);
+        // deppy-sijo(D): 압축된 히스토리 행은 read_line이 scratch로 복원해 준다.
+        let mut scratch = Row::<AlacrittyCell>::new(cols);
         // 화면 최하단(rows-1)에서 위(가장 오래된 history)로. cap이 걸려도 최신 매치가 남는다.
         'lines: for line_idx in (-(history as i32)..rows as i32).rev() {
             chars.clear();
             spans.clear();
-            let line = &grid[alacritty_terminal::index::Line(line_idx)];
+            let line = grid.read_line(alacritty_terminal::index::Line(line_idx), &mut scratch);
             for col in 0..cols {
                 let cell = &line[alacritty_terminal::index::Column(col)];
                 if cell
@@ -570,15 +609,12 @@ impl TerminalBackend for AlacrittyBackend {
         }
         let grid = self.term.grid();
         let oldest = -(history as i32);
-        let soft_wrapped = |idx: i32| {
-            grid[alacritty_terminal::index::Line(idx)][alacritty_terminal::index::Column(cols - 1)]
-                .flags
-                .contains(Flags::WRAPLINE)
-        };
+        // deppy-sijo(D): 압축된 히스토리 행은 read_line이 scratch로 복원해 준다.
+        let mut scratch = Row::<AlacrittyCell>::new(cols);
         // 커서가 속한 논리 라인의 첫 행 — 위 행이 soft wrap이면 계속 위로.
         // cursor.point.line은 화면 좌표(0=최상단) — display_offset(스크롤)과 무관하다.
         let mut start = grid.cursor.point.line.0;
-        while start > oldest && soft_wrapped(start - 1) {
+        while start > oldest && line_soft_wrapped(grid, start - 1, cols, &mut scratch) {
             start -= 1;
         }
         // back 논리 라인 위로 — 각 단계는 이전 논리 라인의 첫 행까지 걷는다.
@@ -587,7 +623,7 @@ impl TerminalBackend for AlacrittyBackend {
                 return None; // 스크롤백 밖으로 트림된 라인
             }
             start -= 1;
-            while start > oldest && soft_wrapped(start - 1) {
+            while start > oldest && line_soft_wrapped(grid, start - 1, cols, &mut scratch) {
                 start -= 1;
             }
         }
@@ -596,8 +632,10 @@ impl TerminalBackend for AlacrittyBackend {
         let mut out = String::with_capacity(cols);
         let mut idx = start;
         loop {
-            let wrapped = soft_wrapped(idx);
-            let line = &grid[alacritty_terminal::index::Line(idx)];
+            let line = grid.read_line(alacritty_terminal::index::Line(idx), &mut scratch);
+            let wrapped = line[alacritty_terminal::index::Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE);
             for col in 0..cols {
                 let cell = &line[alacritty_terminal::index::Column(col)];
                 if cell
@@ -1222,5 +1260,83 @@ mod tests {
         assert!(cells[4].attrs.contains(CellAttrs::DIM), "dim 미반영");
         // 속성 없는 셀은 비어 있다
         assert!(snap.visible_cells[10].attrs.is_empty());
+    }
+
+    // ── deppy-sijo 옵션 D: 스크롤백 라인 압축 통합 ────────────────────────────
+
+    /// HOT_SCROLLBACK_LINES(256)를 넘는 히스토리를 만들어 압축을 실제로 유발한다.
+    fn backend_with_compressed_history() -> AlacrittyBackend {
+        let mut a = AlacrittyBackend::new(40, 5, 1000);
+        for i in 0..400 {
+            feed(&mut a, format!("line{i}\r\n").as_bytes());
+        }
+        assert!(
+            a.term.grid().compressed_heap_bytes() > 0,
+            "HOT 밖 히스토리가 압축되지 않았다"
+        );
+        a
+    }
+
+    /// 압축된 히스토리를 직렬화한 결과가, 전부 복원(inflate)한 뒤 직렬화한 것과 동일.
+    #[test]
+    fn deppy_압축_serialize는_inflate와_동일() {
+        let mut a = backend_with_compressed_history();
+        let compressed = a.serialize_scrollback().unwrap();
+
+        a.term.grid_mut().inflate_all();
+        assert_eq!(a.term.grid().compressed_heap_bytes(), 0);
+        let inflated = a.serialize_scrollback().unwrap();
+
+        assert_eq!(compressed, inflated, "압축/비압축 직렬화 불일치");
+    }
+
+    /// 압축 영역을 가로지르는 검색 결과가 복원본과 동일.
+    #[test]
+    fn deppy_압축_search는_inflate와_동일() {
+        let mut a = backend_with_compressed_history();
+        // "line3"은 line3, line30~39, line300~399 등 압축·비압축 영역에 두루 매치.
+        let compressed = a.search_scrollback("line3", 10_000);
+        a.term.grid_mut().inflate_all();
+        let inflated = a.search_scrollback("line3", 10_000);
+
+        assert_eq!(compressed, inflated, "압축/비압축 검색 결과 불일치");
+        assert!(!compressed.matches.is_empty(), "매치가 하나도 없다");
+    }
+
+    /// 압축 영역까지 깊이 스크롤한 뷰포트 렌더가 복원본과 동일(픽셀=셀 단위).
+    #[test]
+    fn deppy_압축영역_스크롤_렌더가_inflate와_동일() {
+        let mut a = backend_with_compressed_history();
+        a.scroll(350); // display_offset > HOT(256) → 뷰포트가 압축 영역에 들어감
+        let compressed_snap = a.viewport_snapshot().unwrap();
+        assert!(
+            (0..5).any(|r| row_text(&a, r).starts_with("line")),
+            "압축 영역 히스토리 텍스트가 렌더되지 않았다"
+        );
+
+        a.term.grid_mut().inflate_all();
+        let inflated_snap = a.viewport_snapshot().unwrap();
+        assert_eq!(
+            compressed_snap.visible_cells, inflated_snap.visible_cells,
+            "압축/비압축 뷰포트 셀 불일치"
+        );
+    }
+
+    /// 압축 세션이 계속 출력을 받아 스크롤백이 가득 차고 가장 오래된 압축 슬롯이
+    /// 재활용돼도(패닉 없이) 최근 내용이 온전한지 — end-to-end 재활용 검증.
+    #[test]
+    fn deppy_압축_가득참_재활용_후_최근줄_온전() {
+        // 작은 스크롤백으로 빨리 가득 채운다.
+        let mut a = AlacrittyBackend::new(40, 5, 300);
+        for i in 0..600 {
+            feed(&mut a, format!("row{i}\r\n").as_bytes());
+        }
+        // 스크롤백 상한(300) 도달 + 재활용 정상상태에서도 압축은 축적된다.
+        assert!(a.term.grid().compressed_heap_bytes() > 0);
+        // 마지막 "row599\r\n"의 개행으로 맨 아래(행4)는 빈 줄, row599는 행3.
+        assert_eq!(row_text(&a, 3), "row599");
+        // 직렬화가 패닉 없이 되고 최근 줄을 담는다(재활용이 최근 내용을 안 깨뜨림).
+        let dump = String::from_utf8_lossy(&a.serialize_scrollback().unwrap()).into_owned();
+        assert!(dump.contains("row599"), "최근 줄이 직렬화에 없음");
     }
 }

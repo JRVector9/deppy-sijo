@@ -7,6 +7,7 @@ mod agent_shim;
 mod agent_state_worker;
 mod agent_surface;
 mod agent_transcript;
+mod alloc;
 mod app;
 mod bench;
 mod codex_app_server;

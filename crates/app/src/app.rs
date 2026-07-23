@@ -15162,6 +15162,10 @@ impl eframe::App for App {
                 // 압박 알림 (로드맵 C3) — 격상 에피소드당 1회. 자리를 비운 사용자에게
                 // "곧 앱이 죽을 수 있다 + 어느 세션이 원인인지"를 알린다.
                 self.notify_memory_pressure();
+                // 해제됐지만 mimalloc이 보유 중인 페이지를 즉시 OS로 반환한다 —
+                // 압박 격상 순간에 phys_footprint를 낮춰 OOM-kill 여지를 줄인다.
+                // 격상 전이(드문 이벤트)에서만 호출하므로 렌더 핫패스 비용은 없다.
+                crate::alloc::purge();
             }
         }
         // Shortcut handling may persist config, switch runtimes, or start protocol/process work.

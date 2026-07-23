@@ -441,7 +441,8 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::SetRemoteViewing { .. }
         | RuntimeCommand::ScrollToBottom { .. }
         | RuntimeCommand::ScrollToPrompt { .. }
-        | RuntimeCommand::ExtractLastOutput { .. } => {}
+        | RuntimeCommand::ExtractLastOutput { .. }
+        | RuntimeCommand::EmergencyPersistFlush => {}
     }
     Ok(total)
 }
@@ -550,7 +551,8 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::SetRemoteViewing { .. }
         | RuntimeCommand::ScrollToBottom { .. }
         | RuntimeCommand::ScrollToPrompt { .. }
-        | RuntimeCommand::ExtractLastOutput { .. } => {}
+        | RuntimeCommand::ExtractLastOutput { .. }
+        | RuntimeCommand::EmergencyPersistFlush => {}
     }
 }
 
@@ -715,7 +717,8 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         | RuntimeCommand::SetRemoteViewing { .. }
         | RuntimeCommand::ScrollToBottom { .. }
         | RuntimeCommand::ScrollToPrompt { .. }
-        | RuntimeCommand::ExtractLastOutput { .. } => {}
+        | RuntimeCommand::ExtractLastOutput { .. }
+        | RuntimeCommand::EmergencyPersistFlush => {}
     }
     Ok(())
 }
@@ -896,6 +899,11 @@ pub enum RuntimeCommand {
     ExtractLastOutput {
         session: SessionId,
     },
+    /// 시스템 메모리 압박 시 비상 플러시 (로드맵 C2) — DbWriteWorker의 debounce
+    /// 배치(세션 status/log offset)를 즉시 커밋한다. OOM-kill은 Drop을 실행하지
+    /// 않으므로 압박 신호 시점의 이 명령이 유일한 사전 안전망이다.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    EmergencyPersistFlush,
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -995,6 +1003,9 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("ExtractLastOutput")
                 .field("session", session)
                 .finish(),
+            RuntimeCommand::EmergencyPersistFlush => {
+                f.debug_struct("EmergencyPersistFlush").finish()
+            }
             RuntimeCommand::KillSession { session } => f
                 .debug_struct("KillSession")
                 .field("session", session)
@@ -1783,6 +1794,7 @@ mod tests {
                 "ScrollToBottom",
                 "ScrollToPrompt",
                 "ExtractLastOutput",
+                "EmergencyPersistFlush",
             ]
         );
     }

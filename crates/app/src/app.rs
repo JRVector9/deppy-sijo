@@ -14967,7 +14967,7 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 시스템 메모리 압박 레벨 전이 (로드맵 C1 — 관측만, 소비는 C2/C3에서).
+        // 시스템 메모리 압박 레벨 전이 (로드맵 C1 관측 + C2 비상 플러시).
         if let Some((previous, current)) = crate::mem_pressure_monitor::take_level_transition() {
             tracing::warn!(
                 kind = "resource",
@@ -14975,6 +14975,24 @@ impl eframe::App for App {
                 previous = ?previous,
                 current = ?current,
             );
+            // 격상 시에만 1회 플러시 — OOM-kill은 Drop을 실행하지 않으므로 pending
+            // debounce 배치를 미리 커밋한다. send는 try_send 기반 non-blocking이라
+            // 큐가 가득해도 재시도 없이 넘어간다(압박 상황에 부하를 더하지 않는다).
+            if current > previous {
+                for workspace in std::iter::once(&self.active).chain(self.warm.values()) {
+                    if let Err(error) = workspace
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::EmergencyPersistFlush)
+                    {
+                        tracing::warn!(
+                            kind = "resource",
+                            phase = "emergency_flush_send_failed",
+                            workspace = %workspace.id,
+                            error = %error,
+                        );
+                    }
+                }
+            }
         }
         // Shortcut handling may persist config, switch runtimes, or start protocol/process work.
         // Consume egui input here so none of those effects are reachable from the render pass.

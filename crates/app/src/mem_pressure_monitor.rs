@@ -7,7 +7,8 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// discriminant 순서가 곧 심각도 — Ord 비교로 격상(escalation)을 판정한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum PressureLevel {
     Normal = 0,

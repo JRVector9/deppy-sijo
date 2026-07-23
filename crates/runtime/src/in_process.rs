@@ -1724,6 +1724,16 @@ impl Worker {
                     });
                 }
             }
+            RuntimeCommand::EmergencyPersistFlush => {
+                // 메모리 압박 사전 안전망 (로드맵 C2) — OOM-kill은 Drop을 실행하지
+                // 않으므로 pending debounce 배치를 지금 커밋한다. 실패해도 앱을 막지
+                // 않는 best-effort (압박 상황에서 부하를 더하지 않는다).
+                if let Some(pipe) = &mut self.persist
+                    && let Err(error) = pipe.flush_async_writes()
+                {
+                    trace_runtime_failure("emergency_persist_flush", "persist_flush_failed", error);
+                }
+            }
             RuntimeCommand::SearchScrollback {
                 session,
                 query,
@@ -5927,6 +5937,55 @@ mod tests {
     }
 
     /// 세션 영속 파이프라인 (runtime↔persist 배선): spawn→running 행,
+    /// 비상 플러시(로드맵 C2)가 persist 파이프 유무와 무관하게 워커를 막거나
+    /// 죽이지 않는다 — 플러시 자체의 커밋 정확성은 persistence.rs 단위 테스트 소관.
+    #[cfg(unix)]
+    #[test]
+    fn emergency_persist_flush는_워커를_막지_않는다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!("deppy-rtemflush-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-emflush');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("emergency-flush"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: "ws-emflush".into(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::EmergencyPersistFlush)
+            .unwrap();
+        // 플러시 뒤에도 워커가 정상 동작한다 — 후속 spawn이 처리되어야 한다.
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { .. } => Some(()),
+            _ => None,
+        });
+    }
+
     /// exit→exited 행, mux layout 저장. 재시작 시 reconcile(PR-14)과 맞물린다.
     #[cfg(unix)]
     #[test]

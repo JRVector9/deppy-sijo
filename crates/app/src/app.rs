@@ -5299,6 +5299,12 @@ struct WorkspaceRuntime {
     resource_usage: Option<runtime::ProcessResourceSnapshot>,
     /// 마지막 worker child-process resource samples. Runtime이 집계한 값만 보관한다.
     session_resource_usage: Vec<runtime::SessionResourceUsage>,
+    /// 세션별 자식 프로세스 폭주 판정 상태 (로드맵 B1). ResourceUsage 샘플로만
+    /// 갱신되고 세션 exit 시 제거 — live 세션 수로 유계.
+    storm_episodes:
+        std::collections::HashMap<runtime::SessionId, crate::process_storm::StormEpisode>,
+    /// 폭주 에피소드 id 발급 카운터 — 해소 후 재발생 구분(B2 재알림 근거).
+    storm_next_episode_id: u64,
     /// 마지막 PTY input pressure signal(+관측 시각). 회복 이벤트가 없어(QueueFull은
     /// writer drain으로 조용히 해소) 표시 시 TTL로 stale 뱃지를 걸러낸다(codex 2026-07-08).
     input_pressure: Option<(runtime::PtyInputPressure, std::time::Instant)>,
@@ -8538,6 +8544,8 @@ impl App {
             session_titles: std::collections::HashMap::new(),
             resource_usage: None,
             session_resource_usage: Vec::new(),
+            storm_episodes: std::collections::HashMap::new(),
+            storm_next_episode_id: 0,
             input_pressure: None,
             session_input_pressure: std::collections::HashMap::new(),
             session_dotenv_states: std::collections::HashMap::new(),
@@ -14033,6 +14041,11 @@ impl App {
             {
                 rt.resource_usage = Some(*snapshot);
                 rt.session_resource_usage = session_usage.clone();
+                update_storm_episodes(
+                    &mut rt.storm_episodes,
+                    &mut rt.storm_next_episode_id,
+                    session_usage,
+                );
             }
             if let runtime::RuntimeEvent::PtyInputPressure { session, pressure } = event {
                 if pressure.queued_messages == 0 && pressure.queued_bytes == 0 {
@@ -14055,6 +14068,7 @@ impl App {
             if let runtime::RuntimeEvent::SessionExited { session, .. } = event {
                 rt.session_input_pressure.remove(session);
                 rt.session_dotenv_states.remove(session);
+                rt.storm_episodes.remove(session);
                 rt.input_pressure = rt
                     .session_input_pressure
                     .values()
@@ -17400,6 +17414,44 @@ fn per_runtime_cache_budget_bytes(global_budget_mb: u32, resident_runtimes: usiz
 
 /// live shell 세션 모두가 단일 저CPU 셸 리더만 보유하는지 확인한다.
 /// 직접 셸에서 실행한 Codex/Claude는 UI 감지 또는 같은 process group의 자식 수로 보호한다.
+/// ResourceUsage 샘플로 세션별 폭주 판정 상태를 갱신한다 (로드맵 B1).
+/// 캡처 실패 샘플은 runtime이 마지막 발행값을 유지해 여기 오지 않는다.
+fn update_storm_episodes(
+    episodes: &mut std::collections::HashMap<
+        runtime::SessionId,
+        crate::process_storm::StormEpisode,
+    >,
+    next_episode_id: &mut u64,
+    session_usage: &[runtime::SessionResourceUsage],
+) {
+    for usage in session_usage {
+        let prev = episodes.get(&usage.session).copied();
+        let next = crate::process_storm::observe(
+            prev,
+            usage.process_count,
+            usage.sampled_at_ms,
+            next_episode_id,
+        );
+        if next.is_some_and(|e| e.confirmed) && !prev.is_some_and(|e| e.confirmed) {
+            // 확정 전이 1회 로그 — 경고 UI(B2) 전까지의 관측 가시성.
+            tracing::warn!(
+                kind = "resource",
+                phase = "process_storm_confirmed",
+                session = usage.session.0,
+                process_count = usage.process_count,
+            );
+        }
+        match next {
+            Some(episode) => {
+                episodes.insert(usage.session, episode);
+            }
+            None => {
+                episodes.remove(&usage.session);
+            }
+        }
+    }
+}
+
 fn shell_sessions_are_idle(
     sessions: &[runtime::SessionId],
     usage: &[runtime::SessionResourceUsage],
@@ -19487,6 +19539,34 @@ mod tests {
         // 방어적 0 count는 active runtime 하나로 취급하고, 비정상 0MB도 1MiB로 제한한다.
         assert_eq!(per_runtime_cache_budget_bytes(32, 0), 32 * MIB);
         assert_eq!(per_runtime_cache_budget_bytes(0, 12), MIB);
+    }
+
+    #[test]
+    fn 폭주_에피소드는_샘플로_갱신되고_해소되면_제거된다() {
+        let session = runtime::SessionId(1);
+        let sample = |process_count, sampled_at_ms| runtime::SessionResourceUsage {
+            session,
+            pid: Some(1),
+            process_group: Some(1),
+            identity_source: runtime::ProcessIdentitySource::PortablePty,
+            sampled_at_ms,
+            process_count,
+            rss_bytes: 0,
+            cpu_percent: None,
+            high_cpu: false,
+            high_rss: false,
+        };
+        let mut episodes = std::collections::HashMap::new();
+        let mut next_id = 0;
+        update_storm_episodes(&mut episodes, &mut next_id, &[sample(5_417, 0)]);
+        assert!(episodes.get(&session).is_some_and(|e| !e.confirmed));
+        update_storm_episodes(&mut episodes, &mut next_id, &[sample(5_417, 6_000)]);
+        assert!(episodes.get(&session).is_some_and(|e| e.confirmed));
+        // 확정 후 임계 미만 — 히스테리시스 창 안에서는 유지, 지속되면 제거.
+        update_storm_episodes(&mut episodes, &mut next_id, &[sample(1, 10_000)]);
+        assert!(episodes.contains_key(&session));
+        update_storm_episodes(&mut episodes, &mut next_id, &[sample(1, 16_000)]);
+        assert!(!episodes.contains_key(&session));
     }
 
     #[test]

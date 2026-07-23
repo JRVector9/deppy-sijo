@@ -181,7 +181,22 @@ impl ProcessResourceMonitor {
             return Vec::new();
         }
         let rows = process_rows();
-        let table = ProcessTable::new(&rows);
+        self.session_usage_from_rows(&rows, targets, sampled_at_ms)
+    }
+
+    fn session_usage_from_rows(
+        &self,
+        rows: &[ProcessRow],
+        targets: &[SessionResourceTarget],
+        sampled_at_ms: u64,
+    ) -> Vec<SessionResourceUsage> {
+        if rows.is_empty() {
+            // ps 캡처 실패/행 상한 초과 sentinel — 정상 시스템에서는 최소 자기 자신이
+            // 있어 빈 목록이 불가능하다. 0으로 덮으면 시스템이 가장 느린 폭주 절정에
+            // "전부 해소"로 오판되므로 마지막 발행값을 유지한다(2026-07-23 검토).
+            return self.last_emitted_sessions.clone();
+        }
+        let table = ProcessTable::new(rows);
         // 샘플마다 새로 만드는 pid→footprint 메모 — 여러 세션 타깃이 같은 자손을
         // 공유해도 pid당 syscall 1회로 바운드된다(보존 없음).
         let mut footprint_cache = std::collections::HashMap::new();
@@ -898,6 +913,35 @@ mod tests {
         );
         assert_eq!(usage.rss_bytes, 3000);
         assert!(usage.high_rss);
+    }
+
+    #[test]
+    fn 캡처_실패_빈_행은_마지막_발행_세션_usage를_유지한다() {
+        let mut monitor = ProcessResourceMonitor::new(ProcessResourceMonitorConfig::default());
+        let retained = SessionResourceUsage {
+            session: SessionId(7),
+            pid: Some(7),
+            process_group: Some(7),
+            identity_source: ProcessIdentitySource::PlatformFallback,
+            sampled_at_ms: 100,
+            process_count: 5_417,
+            rss_bytes: 123,
+            cpu_percent: Some(900.0),
+            high_cpu: true,
+            high_rss: false,
+        };
+        monitor.last_emitted_sessions = vec![retained.clone()];
+        let targets = [SessionResourceTarget {
+            session: SessionId(7),
+            identity: ProcessIdentity {
+                pid: Some(7),
+                process_group: Some(7),
+                source: ProcessIdentitySource::PlatformFallback,
+            },
+        }];
+        // 빈 행 = ps 캡처 실패 sentinel — 0으로 덮지 않고 마지막 발행값 유지.
+        let usage = monitor.session_usage_from_rows(&[], &targets, 200);
+        assert_eq!(usage, vec![retained]);
     }
 
     #[cfg(target_os = "macos")]

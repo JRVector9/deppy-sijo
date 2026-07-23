@@ -26,6 +26,7 @@ mod notice_translate;
 mod panic_policy;
 mod paths;
 mod perf;
+mod process_storm;
 mod shortcuts;
 mod status_feed;
 mod tailscale;

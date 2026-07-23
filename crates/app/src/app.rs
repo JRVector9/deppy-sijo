@@ -20,6 +20,8 @@ const APP_NOTICE_TEXT_MAX_BYTES: usize = 4 * 1024;
 const ENV_PROFILE_PROJECTION_MAX: usize = 256;
 const ENV_VARIABLE_PROJECTION_MAX: usize = 4_096;
 const ENV_PROJECT_PROJECTION_MAX: usize = 256;
+const ENV_AUX_WORKER_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const PENDING_SHUTDOWN_LIMIT: usize = 2;
 #[derive(Clone, PartialEq, Eq)]
 struct AppAgentStateScope {
     epoch: u64,
@@ -1041,9 +1043,98 @@ struct EnvProjectRowsOutcome {
     rows: anyhow::Result<Vec<ui::env_project_list::EnvProjectRow>>,
 }
 
-struct EnvProjectRowsWorker {
-    tx: std::sync::mpsc::SyncSender<EnvProjectRowsJob>,
-    rx: std::sync::mpsc::Receiver<EnvProjectRowsOutcome>,
+type EnvProjectRowsWorker =
+    crate::lazy_worker::LazyBoundedWorker<EnvProjectRowsJob, EnvProjectRowsOutcome>;
+
+#[derive(Default)]
+struct PendingShutdownRegistry {
+    entries: Vec<PendingShutdown>,
+}
+
+struct PendingShutdown {
+    workspace_id: String,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+struct PendingShutdownCompletion {
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    wake: egui::Context,
+}
+
+impl Drop for PendingShutdownCompletion {
+    fn drop(&mut self) {
+        // Publish completion before the only wake. The UI can therefore consume the wake and
+        // deterministically reap a slot even during the tiny pre-JoinHandle::is_finished gap.
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wake.request_repaint();
+    }
+}
+
+impl PendingShutdownRegistry {
+    fn reap_finished(&mut self) -> bool {
+        let mut reaped = false;
+        let mut index = 0;
+        while index < self.entries.len() {
+            if self.entries[index]
+                .completed
+                .load(std::sync::atomic::Ordering::Acquire)
+                || self.entries[index].handle.is_finished()
+            {
+                let pending = self.entries.remove(index);
+                let _ = pending.handle.join();
+                reaped = true;
+            } else {
+                index += 1;
+            }
+        }
+        reaped
+    }
+
+    fn can_start(&mut self) -> bool {
+        self.reap_finished();
+        self.entries.len() < PENDING_SHUTDOWN_LIMIT
+    }
+
+    fn register(
+        &mut self,
+        workspace_id: String,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+        handle: std::thread::JoinHandle<()>,
+    ) {
+        debug_assert!(self.entries.len() < PENDING_SHUTDOWN_LIMIT);
+        self.entries.push(PendingShutdown {
+            workspace_id,
+            completed,
+            handle,
+        });
+    }
+
+    fn join_workspace(&mut self, workspace_id: &str) {
+        let mut index = 0;
+        while index < self.entries.len() {
+            if self.entries[index].workspace_id == workspace_id {
+                let pending = self.entries.remove(index);
+                let _ = pending.handle.join();
+            } else {
+                index += 1;
+            }
+        }
+        self.reap_finished();
+    }
+
+    fn join_all(&mut self) {
+        for pending in self.entries.drain(..) {
+            let _ = pending.handle.join();
+        }
+    }
+}
+
+impl Drop for PendingShutdownRegistry {
+    fn drop(&mut self) {
+        self.join_all();
+    }
 }
 
 struct EnvSecretRevealJob {
@@ -1073,10 +1164,8 @@ impl EnvSecretRevealTarget {
     }
 }
 
-struct EnvSecretRevealWorker {
-    tx: std::sync::mpsc::SyncSender<EnvSecretRevealJob>,
-    rx: std::sync::mpsc::Receiver<EnvSecretRevealOutcome>,
-}
+type EnvSecretRevealWorker =
+    crate::lazy_worker::LazyBoundedWorker<EnvSecretRevealJob, EnvSecretRevealOutcome>;
 
 type DotenvState = (bool, Option<std::time::SystemTime>);
 
@@ -2727,120 +2816,93 @@ impl Drop for SettingsSnapshotWorker {
     }
 }
 
-impl EnvSecretRevealWorker {
-    fn spawn(db_path: PathBuf, ctx: egui::Context) -> Self {
-        let (tx, jobs) = std::sync::mpsc::sync_channel::<EnvSecretRevealJob>(64);
-        let (results, rx) = std::sync::mpsc::sync_channel::<EnvSecretRevealOutcome>(64);
-        std::thread::Builder::new()
-            .name("env-secret-reveal".to_owned())
-            .spawn(move || {
-                let mut db = None;
-                while let Ok(job) = jobs.recv() {
-                    let value = (|| -> anyhow::Result<secret::SecretString> {
-                        let db = match &mut db {
-                            Some(db) => db,
-                            slot @ None => slot.insert(Db::open(&db_path)?),
-                        };
-                        let location = db
-                            .credential_secret_location(job.target.credential_id())?
-                            .context("credential_secret_location_missing")?;
-                        anyhow::ensure!(
-                            location.keyring_service == secret::KEYRING_SERVICE,
-                            "credential_secret_service_mismatch"
-                        );
-                        let secret = secret::SecretStore::get_secret(
-                            &KeyringSecretStore,
-                            &location.keyring_username,
-                        )?;
-                        anyhow::ensure!(
-                            secret.expose().len() <= ui::env_profiles::ENV_REVEALED_VALUE_MAX_BYTES,
-                            "env_secret_value_limit"
-                        );
-                        Ok(secret)
-                    })();
-                    if results
-                        .send(EnvSecretRevealOutcome {
-                            generation: job.generation,
-                            target: job.target,
-                            value,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    ctx.request_repaint();
+fn new_env_secret_reveal_worker(db_path: PathBuf, ctx: egui::Context) -> EnvSecretRevealWorker {
+    EnvSecretRevealWorker::new(
+        "env-secret-reveal",
+        ENV_AUX_WORKER_IDLE_TTL,
+        move || {
+            let db_path = db_path.clone();
+            let mut db = None;
+            move |job: EnvSecretRevealJob| {
+                let value = (|| -> anyhow::Result<secret::SecretString> {
+                    let db = match &mut db {
+                        Some(db) => db,
+                        slot @ None => slot.insert(Db::open(&db_path)?),
+                    };
+                    let location = db
+                        .credential_secret_location(job.target.credential_id())?
+                        .context("credential_secret_location_missing")?;
+                    anyhow::ensure!(
+                        location.keyring_service == secret::KEYRING_SERVICE,
+                        "credential_secret_service_mismatch"
+                    );
+                    let secret = secret::SecretStore::get_secret(
+                        &KeyringSecretStore,
+                        &location.keyring_username,
+                    )?;
+                    anyhow::ensure!(
+                        secret.expose().len() <= ui::env_profiles::ENV_REVEALED_VALUE_MAX_BYTES,
+                        "env_secret_value_limit"
+                    );
+                    Ok(secret)
+                })();
+                EnvSecretRevealOutcome {
+                    generation: job.generation,
+                    target: job.target,
+                    value,
                 }
-            })
-            .expect("환경 secret reveal worker thread spawn");
-        Self { tx, rx }
-    }
-
-    fn try_request(&self, job: EnvSecretRevealJob) -> bool {
-        self.tx.try_send(job).is_ok()
-    }
+            }
+        },
+        move || ctx.request_repaint(),
+    )
 }
 
-impl EnvProjectRowsWorker {
-    fn spawn(db_path: PathBuf, ctx: egui::Context) -> Self {
-        let (tx, jobs) = std::sync::mpsc::sync_channel::<EnvProjectRowsJob>(1);
-        let (results, rx) = std::sync::mpsc::sync_channel::<EnvProjectRowsOutcome>(1);
-        std::thread::Builder::new()
-            .name("env-project-rows".to_owned())
-            .spawn(move || {
-                let mut db = None;
-                while let Ok(job) = jobs.recv() {
-                    let rows = (|| -> anyhow::Result<_> {
-                        if db.is_none() {
-                            db = Some(Db::open(&db_path)?);
-                        }
-                        let db = db.as_ref().expect("DB initialized above");
-                        db.env_api_project_counts_bounded(ENV_PROJECT_PROJECTION_MAX)
-                            .map(|counts| {
-                                let counts: std::collections::HashMap<_, _> = counts
-                                    .into_iter()
-                                    .map(|count| (count.workspace_id.clone(), count))
-                                    .collect();
-                                job.workspaces
-                                    .iter()
-                                    .map(|workspace| {
-                                        let count = counts.get(&workspace.id);
-                                        let path = workspace.path.clone();
-                                        ui::env_project_list::EnvProjectRow {
-                                            id: workspace.id.clone(),
-                                            name: App::workspace_display_name(workspace),
-                                            alias: workspace.name.clone(),
-                                            path_missing: !path.trim().is_empty()
-                                                && !std::path::Path::new(&path).is_dir(),
-                                            path,
-                                            env_count: count.map_or(0, |count| count.env_count),
-                                            key_count: count.map_or(0, |count| count.key_count),
-                                        }
-                                    })
-                                    .collect()
-                            })
-                    })();
-                    if results
-                        .send(EnvProjectRowsOutcome {
-                            generation: job.generation,
-                            rows,
-                        })
-                        .is_err()
-                    {
-                        return;
+fn new_env_project_rows_worker(db_path: PathBuf, ctx: egui::Context) -> EnvProjectRowsWorker {
+    EnvProjectRowsWorker::new(
+        "env-project-rows",
+        ENV_AUX_WORKER_IDLE_TTL,
+        move || {
+            let db_path = db_path.clone();
+            let mut db = None;
+            move |job: EnvProjectRowsJob| {
+                let rows = (|| -> anyhow::Result<_> {
+                    if db.is_none() {
+                        db = Some(Db::open(&db_path)?);
                     }
-                    ctx.request_repaint();
+                    let db = db.as_ref().expect("DB initialized above");
+                    db.env_api_project_counts_bounded(ENV_PROJECT_PROJECTION_MAX)
+                        .map(|counts| {
+                            let counts: std::collections::HashMap<_, _> = counts
+                                .into_iter()
+                                .map(|count| (count.workspace_id.clone(), count))
+                                .collect();
+                            job.workspaces
+                                .iter()
+                                .map(|workspace| {
+                                    let count = counts.get(&workspace.id);
+                                    let path = workspace.path.clone();
+                                    ui::env_project_list::EnvProjectRow {
+                                        id: workspace.id.clone(),
+                                        name: App::workspace_display_name(workspace),
+                                        alias: workspace.name.clone(),
+                                        path_missing: !path.trim().is_empty()
+                                            && !std::path::Path::new(&path).is_dir(),
+                                        path,
+                                        env_count: count.map_or(0, |count| count.env_count),
+                                        key_count: count.map_or(0, |count| count.key_count),
+                                    }
+                                })
+                                .collect()
+                        })
+                })();
+                EnvProjectRowsOutcome {
+                    generation: job.generation,
+                    rows,
                 }
-            })
-            .expect("환경 프로젝트 worker thread spawn");
-        Self { tx, rx }
-    }
-
-    fn try_request(
-        &self,
-        job: EnvProjectRowsJob,
-    ) -> Result<(), std::sync::mpsc::TrySendError<EnvProjectRowsJob>> {
-        self.tx.try_send(job)
-    }
+            }
+        },
+        move || ctx.request_repaint(),
+    )
 }
 
 fn load_approval_snapshot(db: &Db) -> anyhow::Result<ApprovalSnapshot> {
@@ -5633,19 +5695,21 @@ pub struct App {
     settings_workspace_id: Option<String>,
     settings_search: String,
     env_api_project_edit: EnvApiProjectEditState,
-    /// env/API 프로젝트 행 캐시 (행, 계산 시각) — 설정창이 열려 있는 동안 매 프레임
-    /// N+1 SQLite 조회(list_credentials + 워크스페이스별 list_env_profiles/list_env_vars)를
-    /// 막는다. 무효화: refresh_workspaces / sync_dotenv_env(명시) + 1s TTL(설정 UI 안에서의
-    /// env var·credential 직접 편집은 하위 UI 내부 상태라 TTL로 최대 1s 지연 반영).
-    env_api_projects_cache: Option<(Vec<ui::env_project_list::EnvProjectRow>, std::time::Instant)>,
+    /// Event-invalidated environment project snapshot. Every production mutation path calls
+    /// `invalidate_env_api_projects`; render only clones this Arc and no periodic TTL read exists.
+    env_api_projects_cache: Option<Arc<[ui::env_project_list::EnvProjectRow]>>,
     /// T1: pane 우클릭 → 환경설정 진입 시 감지한 focused 세션 폴더 배너.
     /// 우클릭 진입 시점에만 계산하고, 버튼 클릭 또는 설정 창 닫힘에 버린다.
     env_session_banner: Option<EnvSessionCwdBanner>,
     env_project_rows_worker: EnvProjectRowsWorker,
     env_project_rows_generation: u64,
-    env_project_rows_pending: bool,
+    /// Exact generation currently owned by the capacity-one worker. Invalidation advances the
+    /// desired generation but never clears this token; the stale completion releases it and the
+    /// same logic tick submits the newest projection.
+    env_project_rows_in_flight: Option<u64>,
     env_project_rows_failed: bool,
     env_secret_reveal_worker: EnvSecretRevealWorker,
+    pending_env_secret_reveal: Option<EnvSecretRevealJob>,
     env_secret_generation: u64,
     /// Agents/Environment leaf가 읽는 immutable snapshot과 mutation intent를 전담한다.
     /// 첫 설정 요청에서만 thread/SQLite connection을 만들고 30초 idle이면 둘 다 회수한다.
@@ -5870,7 +5934,12 @@ pub struct App {
     pending_focus: Option<(String, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
-    pending_shutdowns: Vec<(String, std::thread::JoinHandle<()>)>,
+    pending_shutdowns: PendingShutdownRegistry,
+    /// Earliest eligible warm-runtime suspension deadline. Recomputed only when warm lifecycle
+    /// state changes, so `logic()` does not scan the warm set on every frame.
+    next_warm_idle_eviction_at: Option<std::time::Instant>,
+    /// A capacity-blocked eviction is retried only after a shutdown completion wakes the app.
+    warm_eviction_deferred: bool,
     /// 사이드바 「워크스페이스 종료」로 숨긴 워크스페이스의 실행 중 상태.
     /// 종료 ≠ 삭제(DB·경로·별칭 보존) — 사이드바 목록에서만 감춘다(2026-07-18 사용자 요구).
     /// 영속 복원된 숨김은 stale layout pane만으로 자동 해제하면 안 된다. 현재 프로세스에서
@@ -8095,9 +8164,9 @@ impl App {
         let (agent_detect_worker, agent_detect_input, agent_detect_rx) =
             crate::agent_detect_worker::AgentDetectWorker::spawn(egui_ctx.clone());
         let env_project_rows_worker =
-            EnvProjectRowsWorker::spawn(db_path.clone(), egui_ctx.clone());
+            new_env_project_rows_worker(db_path.clone(), egui_ctx.clone());
         let env_secret_reveal_worker =
-            EnvSecretRevealWorker::spawn(db_path.clone(), egui_ctx.clone());
+            new_env_secret_reveal_worker(db_path.clone(), egui_ctx.clone());
         let settings_snapshot_worker =
             SettingsSnapshotWorker::new(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let dotenv_sync_worker =
@@ -8206,9 +8275,10 @@ impl App {
             env_session_banner: None,
             env_project_rows_worker,
             env_project_rows_generation: 0,
-            env_project_rows_pending: false,
+            env_project_rows_in_flight: None,
             env_project_rows_failed: false,
             env_secret_reveal_worker,
+            pending_env_secret_reveal: None,
             env_secret_generation: 0,
             settings_snapshot_worker,
             pending_settings_job: None,
@@ -8331,7 +8401,9 @@ impl App {
             resumed_panes: std::collections::HashSet::new(),
             resume_probe_pending_panes: std::collections::HashSet::new(),
             pending_focus: None,
-            pending_shutdowns: Vec::new(),
+            pending_shutdowns: PendingShutdownRegistry::default(),
+            next_warm_idle_eviction_at: None,
+            warm_eviction_deferred: false,
             closed_workspaces: persisted_closed_workspaces
                 .into_iter()
                 .map(|workspace_id| (workspace_id, ClosedWorkspaceState::Persisted))
@@ -8664,6 +8736,7 @@ impl App {
             runtime.runtime.shutdown();
         }
         self.warm_order.retain(|id| id != delete_id);
+        self.refresh_warm_idle_deadline();
         self.broadcast_terminal_cache_policy();
         self.notifications_ui.prune_workspace(delete_id);
         if let Err(e) = self.db.delete_workspace(delete_id) {
@@ -11045,6 +11118,7 @@ impl App {
         let old_id = old.id.clone();
         self.warm.insert(old_id.clone(), old);
         self.warm_order.push(old_id.clone());
+        self.refresh_warm_idle_deadline();
 
         // pending 상태 정리 (이전 워커 응답 못 받음, 교차-ws 감사 방지).
         // notifications는 리셋하지 않는다 — (ws, session)로 namespacing돼 전역 센터가
@@ -11370,17 +11444,62 @@ impl App {
     /// **live 세션(미종료 셸/에이전트)이 있는 workspace는 축출하지 않는다** — 진행 중
     /// 작업을 경고 없이 kill하지 않기 위해 상한 초과를 허용한다 (메모리 < 작업 보호).
     fn evict_warm(&mut self) {
+        self.warm_eviction_deferred = false;
         let max_warm = self.config.performance.max_warm as usize;
         let evictable = warm_eviction_candidates(&self.warm_order, max_warm, |id| {
             self.warm.get(id).is_some_and(|rt| rt.has_live_sessions())
         });
         for evict_id in evictable {
-            self.warm_order.retain(|id| id != &evict_id);
             self.suspend_warm_workspace(&evict_id, false);
+            if self.warm_eviction_deferred {
+                break;
+            }
+        }
+        self.refresh_warm_idle_deadline();
+    }
+
+    fn refresh_warm_idle_deadline(&mut self) {
+        if self.warm_eviction_deferred {
+            self.next_warm_idle_eviction_at = None;
+            return;
+        }
+        let previous = self.next_warm_idle_eviction_at;
+        let next = self
+            .warm
+            .values()
+            .filter(|runtime| {
+                !runtime.has_live_sessions() || runtime.can_auto_suspend_idle_shells()
+            })
+            .filter_map(|runtime| {
+                runtime
+                    .backgrounded_at
+                    .and_then(|at| at.checked_add(Self::WARM_AUTO_SUSPEND_AFTER))
+            })
+            .min();
+        self.next_warm_idle_eviction_at = next;
+        if let Some(delay) =
+            changed_deadline_repaint_delay(previous, next, std::time::Instant::now())
+        {
+            self.egui_ctx.request_repaint_after(delay);
+        }
+    }
+
+    fn maintain_warm_evictions(&mut self, now: std::time::Instant) {
+        let shutdown_finished = self.pending_shutdowns.reap_finished();
+        if shutdown_finished && self.warm_eviction_deferred {
+            self.evict_warm();
+        }
+        if !self.warm_eviction_deferred
+            && self
+                .next_warm_idle_eviction_at
+                .is_some_and(|deadline| deadline <= now)
+        {
+            self.evict_idle_warm(now);
         }
     }
 
     fn evict_idle_warm(&mut self, now: std::time::Instant) {
+        self.next_warm_idle_eviction_at = None;
         let resident_before = 1 + self.warm.len();
         let expired = expired_warm_workspace_ids(
             &self.warm_order,
@@ -11398,16 +11517,29 @@ impl App {
             {
                 continue;
             }
-            self.warm_order.retain(|warm_id| warm_id != &id);
             self.suspend_warm_workspace(&id, true);
         }
         if 1 + self.warm.len() != resident_before {
             self.broadcast_terminal_cache_policy();
         }
+        self.refresh_warm_idle_deadline();
     }
 
     fn suspend_warm_workspace(&mut self, workspace_id: &str, allow_idle_shells: bool) {
+        if !self.warm.contains_key(workspace_id) {
+            self.warm_order.retain(|id| id != workspace_id);
+            self.refresh_warm_idle_deadline();
+            return;
+        }
+        // A slow PTY/process reap must not let repeated warm evictions create an unbounded set of
+        // shutdown threads. Keep the runtime warm until a fixed slot is available.
+        if !self.pending_shutdowns.can_start() {
+            self.warm_eviction_deferred = true;
+            self.next_warm_idle_eviction_at = None;
+            return;
+        }
         if let Some(mut rt) = self.warm.remove(workspace_id) {
+            self.warm_order.retain(|id| id != workspace_id);
             // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
             let events = rt.events.drain();
@@ -11446,6 +11578,7 @@ impl App {
                 }));
                 self.warm.insert(workspace_id.to_owned(), rt);
                 self.warm_order.push(workspace_id.to_owned());
+                self.refresh_warm_idle_deadline();
                 return;
             }
             if idle_shells {
@@ -11454,31 +11587,39 @@ impl App {
             // 축출 = Suspended(워커 종료) — 그 workspace의 진행형 알림은 더는 조치
             // 불가하므로 정리한다 (결과 알림은 기록이라 유지, codex 리뷰).
             self.notifications_ui.prune_transient(workspace_id);
-            self.pending_shutdowns.retain(|(_, h)| !h.is_finished());
             let evict_id = workspace_id.to_owned();
-            let handle = std::thread::spawn(move || {
-                let mut runtime = rt.runtime;
-                let _ = runtime.send_command(runtime::RuntimeCommand::SetWorkspaceState(
-                    runtime::WorkspaceRuntimeState::Suspended,
-                ));
-                runtime.shutdown();
-            });
-            self.pending_shutdowns.push((evict_id, handle));
+            let wake = self.egui_ctx.clone();
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completion = PendingShutdownCompletion {
+                completed: Arc::clone(&completed),
+                wake,
+            };
+            match std::thread::Builder::new()
+                .name("workspace-shutdown".to_owned())
+                .spawn(move || {
+                    let _completion = completion;
+                    let mut runtime = rt.runtime;
+                    let _ = runtime.send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                        runtime::WorkspaceRuntimeState::Suspended,
+                    ));
+                    runtime.shutdown();
+                }) {
+                Ok(handle) => self.pending_shutdowns.register(evict_id, completed, handle),
+                Err(_) => tracing::warn!(
+                    kind = "runtime",
+                    phase = "shutdown_start",
+                    error_code = "thread_spawn_failed",
+                    "workspace shutdown could not start"
+                ),
+            }
+            self.refresh_warm_idle_deadline();
         }
     }
 
     /// 주어진 workspace의 대기 중 background shutdown들을 join한다 (같은 workspace 워커가
     /// 동시에 두 개 살아 layout 행을 경합하지 않도록). 다른 workspace 것은 남겨 둔다.
     fn join_pending_shutdown(&mut self, workspace_id: &str) {
-        let mut i = 0;
-        while i < self.pending_shutdowns.len() {
-            if self.pending_shutdowns[i].0 == workspace_id {
-                let (_, handle) = self.pending_shutdowns.remove(i);
-                let _ = handle.join();
-            } else {
-                i += 1;
-            }
-        }
+        self.pending_shutdowns.join_workspace(workspace_id);
     }
 
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
@@ -11554,6 +11695,7 @@ impl App {
                 rt.runtime.shutdown();
             }
             self.warm_order.retain(|id| id != workspace_id);
+            self.refresh_warm_idle_deadline();
             self.broadcast_terminal_cache_policy();
             // 내려간 워크스페이스의 진행형 알림은 더는 조치 불가 — suspend와 같은 정리
             // (결과 알림은 기록이라 유지).
@@ -12347,12 +12489,12 @@ impl App {
     fn invalidate_env_api_projects(&mut self) {
         self.env_api_projects_cache = None;
         self.env_project_rows_generation = self.env_project_rows_generation.wrapping_add(1);
-        self.env_project_rows_pending = false;
         self.env_project_rows_failed = false;
     }
 
     fn invalidate_env_profile_ui(&mut self) {
         self.pending_settings_job = None;
+        self.pending_env_secret_reveal = None;
         self.env_profiles_ui.invalidate_cache();
         self.agents_ui.invalidate_snapshot_selection();
         self.settings_snapshot_generation = self.settings_snapshot_generation.wrapping_add(1);
@@ -13100,7 +13242,21 @@ impl App {
     }
 
     fn poll_env_secret_reveals(&mut self) {
-        while let Ok(outcome) = self.env_secret_reveal_worker.rx.try_recv() {
+        while let Some(result) = self.env_secret_reveal_worker.try_recv() {
+            let outcome = match result.into_result() {
+                Ok(outcome) => outcome,
+                Err(code) => {
+                    tracing::warn!(
+                        kind = "settings",
+                        phase = "secret_reveal",
+                        error_code = code.as_str(),
+                        "settings auxiliary worker failed"
+                    );
+                    self.env_secret_generation = self.env_secret_generation.wrapping_add(1);
+                    self.env_profiles_ui.invalidate_cache();
+                    continue;
+                }
+            };
             if outcome.generation != self.env_secret_generation {
                 continue;
             }
@@ -13128,33 +13284,64 @@ impl App {
         }
     }
 
-    /// env/API 프로젝트 행 캐시 TTL — 설정 UI 안에서의 직접 편집(env var/credential
-    /// 추가·삭제)은 하위 UI 내부 상태라 App이 즉시 알 수 없으므로 1초 주기 재계산으로
-    /// 반영한다. 집계/경로 stat은 전용 worker에서 수행해 UI thread를 막지 않는다.
-    const ENV_API_PROJECTS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
-
-    /// env/API 프로젝트 행 캐시 재계산 필요 판정 (캐시 없음 또는 TTL 경과). 테스트용 분리.
-    fn env_api_cache_expired(
-        computed_at: Option<std::time::Instant>,
-        now: std::time::Instant,
-    ) -> bool {
-        computed_at.is_none_or(|at| now.saturating_duration_since(at) >= Self::ENV_API_PROJECTS_TTL)
+    fn poll_env_secret_reveal_admission(&mut self) {
+        let Some(job) = self.pending_env_secret_reveal.take() else {
+            return;
+        };
+        if let Err(error) = self.env_secret_reveal_worker.try_request(job) {
+            let error_code = error
+                .error_code()
+                .map_or("backpressure", |code| code.as_str());
+            tracing::warn!(
+                kind = "settings",
+                phase = "secret_reveal_admission",
+                error_code,
+                "settings auxiliary worker rejected work"
+            );
+            match error.into_job().target {
+                EnvSecretRevealTarget::EnvRow {
+                    profile_id, key, ..
+                } => self.env_profiles_ui.reject_reveal(&profile_id, &key),
+            }
+        }
     }
 
-    /// 캐시를 거쳐 env/API 프로젝트 행을 돌려준다. 명시 무효화(refresh_workspaces /
-    /// sync_dotenv_env)로 캐시가 비었거나 TTL이 지났으면 worker에 최신 snapshot을 요청하고,
-    /// generation이 맞는 결과만 적용한다.
-    fn env_api_project_rows_cached(&mut self) -> Vec<ui::env_project_list::EnvProjectRow> {
-        let now = std::time::Instant::now();
-        while let Ok(outcome) = self.env_project_rows_worker.rx.try_recv() {
+    /// Drains and requests the environment project projection from `logic()` only. Render reads
+    /// the immutable Arc cache and never starts a worker or clones the workspace collection.
+    fn poll_env_api_project_rows(&mut self) {
+        while let Some(result) = self.env_project_rows_worker.try_recv() {
+            let submitted_generation = self.env_project_rows_in_flight.take();
+            let outcome = match result.into_result() {
+                Ok(outcome) => outcome,
+                Err(code) => {
+                    if submitted_generation != Some(self.env_project_rows_generation) {
+                        continue;
+                    }
+                    tracing::warn!(
+                        kind = "settings",
+                        phase = "environment_projection",
+                        error_code = code.as_str(),
+                        "settings auxiliary worker failed"
+                    );
+                    self.env_project_rows_failed = true;
+                    self.env_api_projects_cache
+                        .get_or_insert_with(|| Arc::from([]));
+                    continue;
+                }
+            };
             if outcome.generation != self.env_project_rows_generation {
                 continue;
             }
-            self.env_project_rows_pending = false;
             match outcome.rows {
                 Ok(rows) => {
                     self.env_project_rows_failed = false;
-                    self.env_api_projects_cache = Some((rows, now));
+                    let rows = rows
+                        .into_iter()
+                        .filter(|project| {
+                            !self.config.ui.hidden_env_project_ids.contains(&project.id)
+                        })
+                        .collect::<Vec<_>>();
+                    self.env_api_projects_cache = Some(rows.into());
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -13164,16 +13351,15 @@ impl App {
                         "settings projection failed"
                     );
                     self.env_project_rows_failed = true;
-                    if let Some((_, computed_at)) = &mut self.env_api_projects_cache {
-                        *computed_at = now;
-                    } else {
-                        self.env_api_projects_cache = Some((Vec::new(), now));
-                    }
+                    self.env_api_projects_cache
+                        .get_or_insert_with(|| Arc::from([]));
                 }
             }
         }
-        if Self::env_api_cache_expired(self.env_api_projects_cache.as_ref().map(|(_, at)| *at), now)
-            && !self.env_project_rows_pending
+        if self.settings_open
+            && self.settings_category == ui::settings::Category::Environment
+            && self.env_api_projects_cache.is_none()
+            && self.env_project_rows_in_flight.is_none()
         {
             let generation = self.env_project_rows_generation;
             match self.env_project_rows_worker.try_request(EnvProjectRowsJob {
@@ -13181,37 +13367,25 @@ impl App {
                 workspaces: self.workspaces.clone(),
             }) {
                 Ok(()) => {
-                    self.env_project_rows_pending = true;
+                    self.env_project_rows_in_flight = Some(generation);
                     self.env_project_rows_failed = false;
                 }
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                    self.egui_ctx
-                        .request_repaint_after(std::time::Duration::from_millis(25));
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err(error) => {
+                    let error_code = error
+                        .error_code()
+                        .map_or("backpressure", |code| code.as_str());
+                    tracing::warn!(
+                        kind = "settings",
+                        phase = "environment_projection_admission",
+                        error_code,
+                        "settings auxiliary worker rejected work"
+                    );
                     self.env_project_rows_failed = true;
+                    self.env_api_projects_cache
+                        .get_or_insert_with(|| Arc::from([]));
                 }
             }
         }
-        self.env_api_projects_cache
-            .as_ref()
-            .map(|(rows, _)| rows.clone())
-            .unwrap_or_else(|| {
-                // 첫 background 결과 전에도 목록 골격은 즉시 보인다. count/path 상태만
-                // worker 결과에서 채워진다(UI thread filesystem/DB 접근 없음).
-                self.workspaces
-                    .iter()
-                    .map(|workspace| ui::env_project_list::EnvProjectRow {
-                        id: workspace.id.clone(),
-                        name: Self::workspace_display_name(workspace),
-                        alias: workspace.name.clone(),
-                        path: workspace.path.clone(),
-                        path_missing: false,
-                        env_count: 0,
-                        key_count: 0,
-                    })
-                    .collect()
-            })
     }
 
     /// 포커스 세션 cwd → 워크스페이스 이름(현재 작업 폴더/프로젝트명)을 갱신·영속한다.
@@ -13324,6 +13498,8 @@ impl App {
         let workspaces = &self.workspaces;
         self.closed_workspaces
             .retain(|id, _| workspaces.iter().any(|workspace| workspace.id == *id));
+        self.dismissed_renames
+            .retain(|id| workspaces.iter().any(|workspace| workspace.id == *id));
         let persisted_before = self.config.ui.closed_workspace_ids.len();
         self.config
             .ui
@@ -14548,6 +14724,7 @@ impl App {
         if let Some(bench) = self.bench.as_mut() {
             bench.finish();
         }
+        self.status_feed_rx.shutdown();
         if let Some(task) = self.app_host_io.take() {
             task.cancel
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -14755,9 +14932,7 @@ impl App {
         }
         // 전환으로 background 정리 중이던 옛 워커들도 끝까지 join한다 — detached
         // 스레드는 프로세스 종료 시 join되지 않아 PTY reap이 중단될 수 있다 (codex 리뷰).
-        for (_, handle) in self.pending_shutdowns.drain(..) {
-            let _ = handle.join();
-        }
+        self.pending_shutdowns.join_all();
     }
 }
 
@@ -14828,9 +15003,12 @@ impl eframe::App for App {
         // 설정이 닫혀도 stale generation 결과를 계속 버려 worker의 bounded 결과 큐가
         // 평문 secret을 붙잡은 채 막히지 않게 한다.
         self.poll_env_secret_reveals();
-        // 설정 창이 닫혀도 bounded result sender를 막지 않게 최신 settings 결과를 drain한다.
+        self.poll_env_secret_reveal_admission();
+        // Settings mutation completion can invalidate the Environment projection. Drain it before
+        // project admission so the same event-driven logic pass submits the newest generation.
         self.poll_settings_outcomes();
         self.poll_settings_job_admission();
+        self.poll_env_api_project_rows();
         self.poll_file_tree_maintenance(ctx);
         // Settings completion을 먼저 drain해야 folder-result backpressure가 같은 wake에서
         // 해제된다. Host task는 그 뒤 한 건만 적용/시작한다.
@@ -14847,6 +15025,10 @@ impl eframe::App for App {
         self.apply_pending_visual_settings(ctx);
         self.poll_worktree_jobs();
         self.refresh_agent_workspace_cwd();
+        let want_active = ctx.input(|input| input.viewport().visible()) != Some(false);
+        let home_active = want_active
+            && self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home;
+        self.status_feed_rx.set_active(home_active);
         // 외부 feed/번역/로컬 모델 worker 채널과 그에 따른 캐시 파일/CLI 작업은 render
         // 밖에서만 처리한다. 데이터가 없으면 try_recv와 조건 확인 외 추가 자원은 없다.
         let mut status_feed_received = false;
@@ -14869,9 +15051,7 @@ impl eframe::App for App {
             }
         }
         if status_feed_received {
-            let home_visible =
-                self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home;
-            self.sync_home_notice_badge(home_visible, ctx);
+            self.sync_home_notice_badge(home_active, ctx);
         }
         self.pump_notice_translations(ctx);
         self.pump_ollama_detect(ctx);
@@ -14913,7 +15093,6 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
-        let want_active = ctx.input(|i| i.viewport().visible()) != Some(false);
         if want_active != self.active.render_active {
             self.active.render_active = want_active;
             let state = if want_active {
@@ -14939,6 +15118,7 @@ impl eframe::App for App {
         let mut runtime_stream_overflowed = false;
         let mut approval_events_overflowed = false;
         let mut approval_runtime_events = Vec::new();
+        let mut warm_lifecycle_changed = false;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
             // active와 동일 — 예산 초과 backlog는 wake가 이미 소진돼 직접 예약해야 한다.
@@ -14951,6 +15131,7 @@ impl eframe::App for App {
                 rt.event_overflow_pending = true;
             }
             if !events.is_empty() {
+                warm_lifecycle_changed = true;
                 Self::record_activity_events(rt, &events);
                 approval_runtime_events.extend(
                     events
@@ -14996,7 +15177,10 @@ impl eframe::App for App {
             self.observe_approval_runtime_events(&workspace_id, std::slice::from_ref(&event));
         }
         self.runtime_stream_warning |= runtime_stream_overflowed;
-        self.evict_idle_warm(std::time::Instant::now());
+        if warm_lifecycle_changed {
+            self.refresh_warm_idle_deadline();
+        }
+        self.maintain_warm_evictions(std::time::Instant::now());
 
         // 이벤트 drain + 알림 생성은 non-render 경로인 여기서 한다 (§14.1 Warm:
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
@@ -16159,24 +16343,19 @@ impl eframe::App for App {
             }
         }
 
-        // env/API 프로젝트 행: Environment 카테고리를 보고 있을 때만 (캐시 만료 시) 재계산.
-        // 다른 카테고리 프레임에는 마지막 캐시를 그대로 넘긴다 — category가 show() 안에서
-        // 갱신되므로(activity_rows 주석 참조) 탭 전환 프레임에 빈 목록이 번쩍이지 않게.
-        // remote_view가 self를 immutable 차용하기 전에 갱신한다(&mut self, borrow 분리).
-        let mut env_api_projects = if self.settings_open
-            && self.settings_category == ui::settings::Category::Environment
-        {
-            self.env_api_project_rows_cached()
-        } else if self.settings_open {
-            self.env_api_projects_cache
-                .as_ref()
-                .map(|(rows, _)| rows.clone())
-                .unwrap_or_default()
+        // A prior infrastructure failure retries only on an explicit closed→open Settings edge;
+        // there is no TTL or frame retry. This mutation only invalidates bounded memory state.
+        if !self.settings_was_open && self.settings_open && self.env_project_rows_failed {
+            self.invalidate_env_api_projects();
+        }
+        // logic() owns worker admission/result application. Render clones only the immutable Arc;
+        // the first Environment frame may be empty until its edge-triggered result arrives.
+        let env_api_projects_snapshot = if self.settings_open {
+            self.env_api_projects_cache.as_ref().map(Arc::clone)
         } else {
-            Vec::new()
+            None
         };
-        env_api_projects
-            .retain(|project| !self.config.ui.hidden_env_project_ids.contains(&project.id));
+        let env_api_projects = env_api_projects_snapshot.as_deref().unwrap_or(&[]);
         // 설정창 닫힘 전이 — env secret 평문 캐시를 메모리에서 정리(codex Med:
         // 기본 노출로 상주하는 평문의 수명을 설정창 열림 동안으로 한정). remote_view가
         // self 일부를 immutable 차용하기 전에 처리한다.
@@ -16195,7 +16374,7 @@ impl eframe::App for App {
             let active_id = self.active.id.clone();
             let selected = if self.settings_category == ui::settings::Category::Environment {
                 resolve_settings_env_project_id(
-                    &env_api_projects,
+                    env_api_projects,
                     None,
                     self.settings_workspace_id.as_deref(),
                     &active_id,
@@ -16321,7 +16500,7 @@ impl eframe::App for App {
         let settings_env_wsid = is_environment
             .then(|| {
                 resolve_settings_env_project_id(
-                    &env_api_projects,
+                    env_api_projects,
                     None,
                     self.settings_workspace_id.as_deref(),
                     &wsid,
@@ -16361,7 +16540,7 @@ impl eframe::App for App {
                 .then(|| PathBuf::from(&project.path))
         });
         let env_project_rows_loading =
-            self.env_api_projects_cache.is_none() && self.env_project_rows_pending;
+            self.env_api_projects_cache.is_none() && self.env_project_rows_in_flight.is_some();
         let env_project_rows_failed = self.env_project_rows_failed;
         let mut activity_action = None;
         let mut notif_click = None;
@@ -16481,7 +16660,7 @@ impl eframe::App for App {
                                 );
                             match ui::env_project_list::render_with_style(
                                 ui,
-                                &env_api_projects,
+                                env_api_projects,
                                 settings_env_wsid.as_deref().unwrap_or(""),
                                 &text,
                                 &project_list_style,
@@ -16846,16 +17025,20 @@ impl eframe::App for App {
                         key,
                         reveal_handle,
                     } => {
-                        let queued =
-                            self.env_secret_reveal_worker
-                                .try_request(EnvSecretRevealJob {
-                                    generation: self.env_secret_generation,
-                                    target: EnvSecretRevealTarget::EnvRow {
-                                        profile_id: profile_id.clone(),
-                                        key: key.clone(),
-                                        credential_id: reveal_handle,
-                                    },
-                                });
+                        let queued = if self.pending_env_secret_reveal.is_none() {
+                            self.pending_env_secret_reveal = Some(EnvSecretRevealJob {
+                                generation: self.env_secret_generation,
+                                target: EnvSecretRevealTarget::EnvRow {
+                                    profile_id: profile_id.clone(),
+                                    key: key.clone(),
+                                    credential_id: reveal_handle,
+                                },
+                            });
+                            ui.ctx().request_repaint();
+                            true
+                        } else {
+                            false
+                        };
                         if !queued {
                             self.env_profiles_ui.reject_reveal(&profile_id, &key);
                         }
@@ -16895,12 +17078,13 @@ impl eframe::App for App {
                     let was_hidden = self.config.ui.hidden_env_project_ids.contains(&close_id);
                     self.settings_workspace_id = close_settings_env_project(
                         &mut self.config.ui.hidden_env_project_ids,
-                        &env_api_projects,
+                        env_api_projects,
                         &close_id,
                         self.settings_workspace_id.as_deref(),
                     );
                     if !was_hidden && self.config.ui.hidden_env_project_ids.contains(&close_id) {
                         self.pending_config_save = true;
+                        self.invalidate_env_api_projects();
                         ui.ctx().request_repaint();
                     }
                     self.invalidate_env_profile_ui();
@@ -17237,6 +17421,17 @@ fn shell_sessions_are_idle(
                         && !sample.high_rss
                 })
         })
+}
+
+fn changed_deadline_repaint_delay(
+    previous: Option<std::time::Instant>,
+    next: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    if next == previous {
+        return None;
+    }
+    next.map(|deadline| deadline.saturating_duration_since(now))
 }
 
 fn expired_warm_workspace_ids(
@@ -18621,6 +18816,129 @@ mod tests {
     }
 
     #[test]
+    fn workspace_shutdown_registry는_two_slot을넘지않고_join한다() {
+        let mut registry = PendingShutdownRegistry::default();
+        let mut releases = Vec::new();
+        for index in 0..PENDING_SHUTDOWN_LIMIT {
+            assert!(registry.can_start());
+            let (release, wait) = std::sync::mpsc::sync_channel::<()>(0);
+            releases.push(release);
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_in_thread = Arc::clone(&completed);
+            let handle = std::thread::spawn(move || {
+                let _ = wait.recv();
+                completed_in_thread.store(true, std::sync::atomic::Ordering::Release);
+            });
+            registry.register(format!("workspace-{index}"), completed, handle);
+        }
+        assert!(!registry.can_start());
+        assert_eq!(registry.entries.len(), PENDING_SHUTDOWN_LIMIT);
+
+        drop(releases);
+        registry.join_all();
+        assert!(registry.can_start());
+        assert!(registry.entries.is_empty());
+    }
+
+    #[test]
+    fn workspace_shutdown_registry는_finished_slot을_reap하고_drop에서_join한다() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_in_thread = Arc::clone(&completed);
+        let handle = std::thread::spawn(move || {
+            completed_in_thread.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut registry = PendingShutdownRegistry::default();
+        registry.register("finished".to_owned(), Arc::clone(&completed), handle);
+        while !registry.entries[0]
+            .completed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            std::thread::yield_now();
+        }
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(registry.reap_finished());
+        assert!(registry.entries.is_empty());
+
+        let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let joined_in_thread = Arc::clone(&joined);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            joined_in_thread.store(true, std::sync::atomic::Ordering::Release);
+        });
+        registry.register("drop-join".to_owned(), Arc::clone(&joined), handle);
+        drop(registry);
+        assert!(joined.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn workspace_shutdown_completion은_wake전에_flag를게시한다() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_in_callback = Arc::clone(&observed);
+        let completed_in_callback = Arc::clone(&completed);
+        let ctx = egui::Context::default();
+        ctx.set_request_repaint_callback(move |_| {
+            observed_in_callback.store(
+                completed_in_callback.load(std::sync::atomic::Ordering::Acquire),
+                std::sync::atomic::Ordering::Release,
+            );
+        });
+
+        drop(PendingShutdownCompletion {
+            completed,
+            wake: ctx,
+        });
+
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn env_aux_workers는_constructor에서_thread나_io를_시작하지_않는다() {
+        let path = temp_db_path("env-aux-construction");
+        let ctx = egui::Context::default();
+        let mut projects = new_env_project_rows_worker(path.clone(), ctx.clone());
+        let mut secrets = new_env_secret_reveal_worker(path, ctx);
+        assert!(!projects.has_live_worker());
+        assert!(!secrets.has_live_worker());
+    }
+
+    #[test]
+    fn env_project_invalidation은_inflight를보존하고_stale완료가해제한다() {
+        let source = include_str!("app.rs");
+        let invalidate_start = source.find("    fn invalidate_env_api_projects(").unwrap();
+        let invalidate_end = source[invalidate_start..]
+            .find("\n    fn invalidate_env_profile_ui(")
+            .map(|offset| invalidate_start + offset)
+            .unwrap();
+        let invalidate = &source[invalidate_start..invalidate_end];
+        assert!(!invalidate.contains("env_project_rows_in_flight"));
+
+        let poll_start = source.find("    fn poll_env_api_project_rows(").unwrap();
+        let poll_end = source[poll_start..]
+            .find("\n    fn update_workspace_folder_name(")
+            .map(|offset| poll_start + offset)
+            .unwrap();
+        let poll = &source[poll_start..poll_end];
+        assert!(poll.contains("self.env_project_rows_in_flight.take()"));
+        assert!(poll.contains("self.env_project_rows_in_flight = Some(generation)"));
+    }
+
+    #[test]
+    fn app_ui는_aux_worker를_직접_admit하지_않는다() {
+        let source = include_str!("app.rs");
+        let ui_start = source.find("    fn ui(&mut self, ui:").unwrap();
+        let tests_start = source[ui_start..]
+            .find("\n#[cfg(test)]\nmod tests")
+            .map(|offset| ui_start + offset)
+            .unwrap();
+        let ui_body = &source[ui_start..tests_start];
+        assert!(!ui_body.contains(".try_request("));
+        assert!(!ui_body.contains("env_api_project_rows_cached"));
+        assert!(!source.contains(&["ENV_API_", "PROJECTS_TTL"].concat()));
+        assert!(!source.contains(&["from_millis", "(25)"].concat()));
+    }
+
+    #[test]
     fn settings_snapshot_worker는_idle_exit_race와_queued_result를_유실하지_않는다() {
         let path = temp_db_path("settings-idle-race");
         let db = storage::Db::open(&path).unwrap();
@@ -19130,6 +19448,32 @@ mod tests {
     }
 
     #[test]
+    fn warm_idle_deadline은_변경될때만_one_shot_repaint를_예약한다() {
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(60);
+        assert_eq!(
+            changed_deadline_repaint_delay(None, Some(deadline), now),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            changed_deadline_repaint_delay(Some(deadline), Some(deadline), now),
+            None
+        );
+        assert_eq!(
+            changed_deadline_repaint_delay(Some(deadline), None, now),
+            None
+        );
+        assert_eq!(
+            changed_deadline_repaint_delay(
+                None,
+                Some(now - std::time::Duration::from_secs(1)),
+                now,
+            ),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
     fn global_terminal_cache_budget_is_divided_across_resident_runtimes() {
         const MIB: usize = 1024 * 1024;
         assert_eq!(per_runtime_cache_budget_bytes(128, 1), 128 * MIB);
@@ -19356,31 +19700,6 @@ mod tests {
             !tracker.has_live(),
             "복원된 exited 세션은 live 아님 — auto-suspend 정상 동작"
         );
-    }
-
-    /// env/API 프로젝트 행 캐시의 TTL 판정 — 캐시 없음/TTL 경과면 재계산, 그 안이면 재사용.
-    #[test]
-    fn env_api_cache_ttl_judgement() {
-        let base = std::time::Instant::now();
-        // 캐시 없음(명시 무효화 직후) → 재계산.
-        assert!(App::env_api_cache_expired(None, base));
-        // 방금 계산 → 재사용.
-        assert!(!App::env_api_cache_expired(Some(base), base));
-        // TTL(1s) 직전 → 재사용.
-        assert!(!App::env_api_cache_expired(
-            Some(base),
-            base + std::time::Duration::from_millis(999)
-        ));
-        // TTL 경과 → 재계산.
-        assert!(App::env_api_cache_expired(
-            Some(base),
-            base + std::time::Duration::from_millis(1000)
-        ));
-        // 계산 시각이 now보다 뒤(시계 보정 등) → saturating으로 0 취급, 재사용.
-        assert!(!App::env_api_cache_expired(
-            Some(base + std::time::Duration::from_secs(5)),
-            base
-        ));
     }
 
     #[test]

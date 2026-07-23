@@ -247,6 +247,42 @@ still named the deleted synchronous resume helper. It now inspects `apply_resume
 requires the completion-time dotenv source-stamp and shell-only guards around the tracked WriteInput
 process exception; the corrected integration test passes 5/5 and literal strict Clippy passes again.
 
+## Final structural freeze
+
+The remaining structural resource and release-gate work is integrated. Settings auxiliary workers
+and the Home status feed are inert until explicit use, capacity-one/latest-only, joined on shutdown,
+and release idle resources after 30 seconds without polling. Background workspace shutdown is
+owned by a two-slot registry whose panic-safe completion flag is published before its one wake.
+Environment invalidation preserves exact in-flight generations, and status workers publish stopped
+state under their lifecycle lock on both idle expiry and pre-first-cycle cancellation. Independent
+follow-up review found no remaining event-order or restart race.
+
+Settings writes now perform bounded same-transaction admission, while audit retention keeps 4,096
+finalized rows, 8 MiB, and 30 days through one steady-state indexed window. Legacy/aged overflow is
+normalized only after the exact typed marker rolls a lifecycle transaction back, in separate
+64-row/8-MiB transactions before one DB-only retry. Prepared rows remain durable and external calls
+cannot start before a successful preflight. Audit passes 64/64 and storage 233/233 plus doc-tests.
+
+Production packaging is trusted and fail-closed by default. The app and proxy are the only release
+build targets; the bundle and both executables must share an Apple-anchored Developer ID Application
+team, hardened-runtime flag, and trusted timestamp. Untrusted local packaging requires an explicit
+two-variable opt-in. The pending workflow template pins checkout to a full commit SHA and adds no
+protected workflow path to the least-privilege push history.
+
+Final integrated deterministic evidence is green for xtask 12/12, zero allowlist, the clean
+23-crate DAG, full workspace format, locked all-target check, literal strict Clippy, all v0..v31
+migration prefixes, performance smoke 16/16, failure injection 10/10, i18n, and proxy 53/53 with one
+explicit environment soak ignored. The serialized workspace run completed every target: 2,051 tests
+passed and eight real-resource tests were ignored. Exactly 146 tests failed across auth, app, MCP,
+runtime, and web-remote; every failure is the managed sandbox denying a local listener/socket bind
+with `EPERM`. The single BG01 entrypoint therefore passes through migration and stops at the same
+security-scan bind denial. No bypass was added.
+
+Structural development is frozen. Production approval still requires the unchanged security/full
+suite on a host that permits local sockets, the 30-minute idle/discover/cancel slope and release
+Scenario A–E hardware measurements, a trusted signed package build, and approved real external
+OAuth/account smoke. Those are release-environment gates, not additional architecture work.
+
 ## Deterministic gate hardening
 
 The local dependency graph now comes from Cargo metadata rather than hand-parsing direct `path =
@@ -263,3 +299,11 @@ credential cannot update `.github/workflows`; installing it there remains a cred
 Hardware Scenario A–E, wall-clock
 RSS/thread/socket slope, trusted Apple signing, and real external-account smoke deliberately remain
 separate release approvals rather than being reported as deterministic CI evidence.
+
+The macOS package path now signs the proxy helper and main executable before the outer bundle.
+Developer ID mode requires hardened runtime and a trusted timestamp; production mode rejects every
+fallback identity. A separate verifier checks exact plist identity/version/executable fields,
+required architectures, strict nested and deep signatures, Developer ID authority and TeamIdentifier,
+archive extraction, and binary hashes. The deterministic gate source-checks these steps and runs
+shell syntax validation. Building and signing a release artifact remains intentionally deferred to
+the final credentialed gate.

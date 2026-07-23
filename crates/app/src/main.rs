@@ -16,12 +16,14 @@ mod env;
 mod env_reload;
 mod fonts;
 mod git_cli;
+mod lazy_worker;
 mod llm_proxy;
 mod local_llm;
 mod logging;
 mod mcp_import;
 mod native_key_monitor;
 mod notice_translate;
+mod panic_policy;
 mod paths;
 mod perf;
 mod shortcuts;
@@ -34,6 +36,9 @@ mod worktree;
 use std::path::{Path, PathBuf};
 
 fn main() -> anyhow::Result<()> {
+    // Install before paths, logging, config, or any worker can panic. Payloads may contain user
+    // data; early static diagnostics can be dropped before tracing is ready, but never exposed.
+    panic_policy::install_sanitized_panic_hook();
     // 렌더러 A/B 실측(B1) — env 미설정이면 bench_log는 None이고 아래 경로는 전부 무시된다.
     // `start` 스테이지 RSS는 이 시점(창/렌더러 생성 전)에 이미 찍힌다.
     let bench_log = bench::init_log();

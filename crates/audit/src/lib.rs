@@ -6,15 +6,18 @@
 mod crypto;
 mod log;
 mod policy;
+mod retention;
 #[cfg(feature = "test-support")]
 mod test_support;
 
 pub use crypto::{decrypt_input, encrypt_input};
 pub use log::{
     AuditLifecycle, AuditOperation, AuditRecord, AuthorizationOutcome,
-    MAX_AUTHORIZATION_INPUT_BYTES, MAX_SANITIZED_PREVIEW_CHARS, audit_lifecycle,
-    complete_authorization_operation, mask_sensitive_keys, prepare_owned_authorization_preflight,
-    record_audit, sanitized_input_preview, validate_tool_input,
+    MAX_AUTHORIZATION_INPUT_BYTES, MAX_SANITIZED_PREVIEW_CHARS, OwnedAuthorizationOperation,
+    ValidatedOwnedAuthorizationOperation, audit_lifecycle, complete_authorization_operation,
+    finish_owned_authorization_preflight, mask_sensitive_keys,
+    prepare_owned_authorization_operation, record_audit, sanitized_input_preview,
+    validate_owned_authorization_operation, validate_tool_input,
 };
 pub use policy::{
     AUTHORIZATION_SESSION_ID_BYTES_MAX, AUTHORIZATION_WORKSPACE_ID_BYTES_MAX, ApprovalDecision,
@@ -23,6 +26,13 @@ pub use policy::{
     PendingAuthorization, PermissionFingerprint, PermissionPolicy, PermissionRule,
     PolicyEvaluation, ToolApprovalRequest, ToolDecision, evaluate_authorization,
     evaluate_authorization_with_fingerprint, evaluate_permission,
+};
+pub use retention::{
+    AUDIT_RETENTION_DELETE_BATCH_ITEMS, AUDIT_RETENTION_DELETE_BATCH_LOGICAL_BYTES,
+    AUDIT_RETENTION_MAX_AGE_SECONDS, AUDIT_RETENTION_MAX_FINALIZED_ITEMS,
+    AUDIT_RETENTION_MAX_LOGICAL_BYTES, AuditNormalizationReport, AuditPruneReport,
+    AuditRetentionNormalizationRequired, AuditRetentionPolicy, MIGRATION_AUDIT_RETENTION,
+    normalize_audit_retention_batch_in_transaction, prune_audit_logs_in_transaction,
 };
 #[cfg(feature = "test-support")]
 pub use test_support::{InMemoryAuthorizationLedger, TestAuthorizationCounters};

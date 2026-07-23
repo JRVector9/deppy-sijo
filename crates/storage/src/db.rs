@@ -205,6 +205,7 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 /// 28: exact physical secret-slot lifecycle ledger (PR-SC01 prerequisite).
 /// 29: exact pending-approval session cleanup index (event-driven session exit).
 /// 30: durable exact cleanup obligations for legacy logical keyring sources (PR-SC01).
+/// 31: bounded finalized-audit retention ordering index (PR-AU02 hardening).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -666,6 +667,10 @@ BEGIN
     SELECT RAISE(ABORT, 'invalid legacy cleanup marker transition');
 END;
 ",
+    // v31: steady-state retention must satisfy newest-first item/byte/age ceilings without sorting
+    // an unbounded legacy table inside a lifecycle transaction. The partial expression index makes
+    // the fixed policy-window + batch + sentinel scan an indexed walk.
+    audit::MIGRATION_AUDIT_RETENTION,
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -2587,6 +2592,121 @@ struct SettingsReadProbe {
     retained_bytes: usize,
 }
 
+impl SettingsReadProbe {
+    const EMPTY: Self = Self {
+        count: 0,
+        retained_bytes: 0,
+    };
+}
+
+#[derive(Clone, Copy)]
+enum SettingsWriteInventory {
+    Workspace,
+    Credential,
+    EnvProfile,
+    EnvVar,
+    Agent,
+}
+
+impl SettingsWriteInventory {
+    fn probe_code(self) -> &'static str {
+        match self {
+            Self::Workspace => "settings_workspace_write",
+            Self::Credential => "settings_credential_write",
+            Self::EnvProfile => "settings_env_profile_write",
+            Self::EnvVar => "settings_env_var_write",
+            Self::Agent => "settings_agent_write",
+        }
+    }
+
+    fn item_limit_error(self) -> &'static str {
+        match self {
+            Self::Workspace => "settings_workspace_write_item_limit",
+            Self::Credential => "settings_credential_write_item_limit",
+            Self::EnvProfile => "settings_env_profile_write_item_limit",
+            Self::EnvVar => "settings_env_var_write_item_limit",
+            Self::Agent => "settings_agent_write_item_limit",
+        }
+    }
+
+    fn row_bytes_error(self) -> &'static str {
+        match self {
+            Self::Workspace => "settings_workspace_write_row_bytes_limit",
+            Self::Credential => "settings_credential_write_row_bytes_limit",
+            Self::EnvProfile => "settings_env_profile_write_row_bytes_limit",
+            Self::EnvVar => "settings_env_var_write_row_bytes_limit",
+            Self::Agent => "settings_agent_write_row_bytes_limit",
+        }
+    }
+
+    fn retained_bytes_error(self) -> &'static str {
+        match self {
+            Self::Workspace => "settings_workspace_write_retained_bytes_limit",
+            Self::Credential => "settings_credential_write_retained_bytes_limit",
+            Self::EnvProfile => "settings_env_profile_write_retained_bytes_limit",
+            Self::EnvVar => "settings_env_var_write_retained_bytes_limit",
+            Self::Agent => "settings_agent_write_retained_bytes_limit",
+        }
+    }
+}
+
+fn settings_static_error(code: &'static str) -> anyhow::Error {
+    anyhow::anyhow!(code)
+}
+
+fn settings_checked_row_bytes(parts: &[&str]) -> anyhow::Result<usize> {
+    parts.iter().try_fold(0usize, |total, part| {
+        total
+            .checked_add(part.len())
+            .ok_or_else(|| settings_static_error("settings_write_row_bytes_overflow"))
+    })
+}
+
+fn settings_project_candidate(
+    existing: SettingsReadProbe,
+    candidate_bytes: usize,
+    item_limit: usize,
+    inventory: SettingsWriteInventory,
+) -> anyhow::Result<SettingsReadProbe> {
+    if candidate_bytes > SETTINGS_ROW_BYTES_MAX {
+        return Err(settings_static_error(inventory.row_bytes_error()));
+    }
+    let count = existing
+        .count
+        .checked_add(1)
+        .ok_or_else(|| settings_static_error(inventory.item_limit_error()))?;
+    if count > item_limit {
+        return Err(settings_static_error(inventory.item_limit_error()));
+    }
+    let retained_bytes = existing
+        .retained_bytes
+        .checked_add(candidate_bytes)
+        .ok_or_else(|| settings_static_error(inventory.retained_bytes_error()))?;
+    if retained_bytes > SETTINGS_SNAPSHOT_BYTES_MAX {
+        return Err(settings_static_error(inventory.retained_bytes_error()));
+    }
+    Ok(SettingsReadProbe {
+        count,
+        retained_bytes,
+    })
+}
+
+fn settings_validate_combined_retained_bytes(
+    probes: &[SettingsReadProbe],
+    overflow_error: &'static str,
+    limit_error: &'static str,
+) -> anyhow::Result<()> {
+    let retained_bytes = probes.iter().try_fold(0usize, |total, probe| {
+        total
+            .checked_add(probe.retained_bytes)
+            .ok_or_else(|| settings_static_error(overflow_error))
+    })?;
+    if retained_bytes > SETTINGS_SNAPSHOT_BYTES_MAX {
+        return Err(settings_static_error(limit_error));
+    }
+    Ok(())
+}
+
 fn settings_sql_probe_limit(limit: usize, error_code: &str) -> anyhow::Result<i64> {
     let probe = limit
         .checked_add(1)
@@ -2625,6 +2745,935 @@ fn settings_read_probe<P: rusqlite::Params>(
         count,
         retained_bytes,
     })
+}
+
+fn settings_candidate_probe_limit(limit: usize) -> anyhow::Result<i64> {
+    i64::try_from(limit).map_err(|_| settings_static_error("settings_write_probe_limit_conversion"))
+}
+
+struct SettingsWorkspaceWriteCandidate<'a> {
+    id: &'a str,
+    name: &'a str,
+    path: &'a str,
+    created_at: Option<&'a str>,
+    path_dev: Option<i64>,
+    path_ino: Option<i64>,
+}
+
+fn settings_workspace_candidate_bytes(
+    conn: &Connection,
+    candidate: &SettingsWorkspaceWriteCandidate<'_>,
+) -> anyhow::Result<usize> {
+    let bytes: i64 = conn.query_row(
+        "SELECT length(CAST(?1 AS BLOB)) + length(CAST(?2 AS BLOB)) +
+                length(CAST(?3 AS BLOB)) +
+                length(CAST(COALESCE(?4,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now')) AS BLOB)) +
+                length(CAST(COALESCE(?5, '') AS BLOB)) +
+                length(CAST(COALESCE(?6, '') AS BLOB))",
+        rusqlite::params![
+            candidate.id,
+            candidate.name,
+            candidate.path,
+            candidate.created_at,
+            candidate.path_dev,
+            candidate.path_ino
+        ],
+        |row| row.get(0),
+    )?;
+    usize::try_from(bytes)
+        .map_err(|_| settings_static_error("settings_workspace_write_bytes_invalid"))
+}
+
+fn settings_workspace_existing_probe(
+    conn: &Connection,
+    excluded_id: &str,
+) -> anyhow::Result<SettingsReadProbe> {
+    let sql_limit = settings_candidate_probe_limit(SETTINGS_WORKSPACE_LIMIT_MAX)?;
+    settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                    length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                    length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+             FROM workspaces WHERE id != ?1 ORDER BY created_at, id LIMIT ?2
+         )",
+        rusqlite::params![excluded_id, sql_limit],
+        SETTINGS_WORKSPACE_LIMIT_MAX,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        SettingsWriteInventory::Workspace.probe_code(),
+    )
+}
+
+fn settings_workspace_row_write_admission(
+    conn: &Connection,
+    candidate: &SettingsWorkspaceWriteCandidate<'_>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        candidate.path_dev.is_some() == candidate.path_ino.is_some(),
+        "settings_workspace_write_anchor_partial"
+    );
+    let existing = settings_workspace_existing_probe(conn, candidate.id)?;
+    let candidate_bytes = settings_workspace_candidate_bytes(conn, candidate)?;
+    settings_project_candidate(
+        existing,
+        candidate_bytes,
+        SETTINGS_WORKSPACE_LIMIT_MAX,
+        SettingsWriteInventory::Workspace,
+    )?;
+    Ok(())
+}
+
+fn settings_workspace_write_admission(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    path: &str,
+    path_dev: Option<i64>,
+    path_ino: Option<i64>,
+) -> anyhow::Result<()> {
+    settings_workspace_row_write_admission(
+        conn,
+        &SettingsWorkspaceWriteCandidate {
+            id,
+            name,
+            path,
+            created_at: None,
+            path_dev,
+            path_ino,
+        },
+    )?;
+    settings_validate_new_workspace_views(conn, id)
+}
+
+struct SettingsWorkspaceStoredRow {
+    id: String,
+    name: String,
+    path: String,
+    created_at: String,
+    path_dev: Option<i64>,
+    path_ino: Option<i64>,
+}
+
+impl SettingsWorkspaceStoredRow {
+    fn candidate(&self) -> SettingsWorkspaceWriteCandidate<'_> {
+        SettingsWorkspaceWriteCandidate {
+            id: &self.id,
+            name: &self.name,
+            path: &self.path,
+            created_at: Some(&self.created_at),
+            path_dev: self.path_dev,
+            path_ino: self.path_ino,
+        }
+    }
+}
+
+fn settings_workspace_row_for_update(
+    conn: &Connection,
+    workspace_id: &str,
+) -> anyhow::Result<Option<SettingsWorkspaceStoredRow>> {
+    let probe = settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                    length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                    length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+             FROM workspaces WHERE id = ?1 LIMIT 2
+         )",
+        [workspace_id],
+        1,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        "settings_workspace_update_target",
+    )?;
+    if probe.count == 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id, name, path, created_at, path_dev, path_ino
+         FROM workspaces WHERE id = ?1",
+        [workspace_id],
+        |row| {
+            Ok(SettingsWorkspaceStoredRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                created_at: row.get(3)?,
+                path_dev: row.get(4)?,
+                path_ino: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn settings_workspace_update_admission(
+    conn: &Connection,
+    row: &SettingsWorkspaceStoredRow,
+) -> anyhow::Result<()> {
+    settings_workspace_row_write_admission(conn, &row.candidate())
+}
+
+fn settings_workspace_scope_probe(conn: &Connection) -> anyhow::Result<SettingsReadProbe> {
+    let sql_limit = settings_sql_probe_limit(
+        SETTINGS_WORKSPACE_LIMIT_MAX,
+        "settings_write_workspace_scope",
+    )?;
+    settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                    length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                    length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+             FROM workspaces ORDER BY created_at, id LIMIT ?1
+         )",
+        [sql_limit],
+        SETTINGS_WORKSPACE_LIMIT_MAX,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        "settings_write_workspace_scope",
+    )
+}
+
+fn settings_all_profile_groups_probe(conn: &Connection) -> anyhow::Result<SettingsReadProbe> {
+    settings_workspace_scope_probe(conn)?;
+    let total_limit = SETTINGS_WORKSPACE_LIMIT_MAX
+        .checked_mul(SETTINGS_ENV_PROFILE_LIMIT_MAX)
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| settings_static_error("settings_env_profile_write_limit_overflow"))?;
+    let total_limit = i64::try_from(total_limit)
+        .map_err(|_| settings_static_error("settings_env_profile_write_limit_conversion"))?;
+    settings_read_probe(
+        conn,
+        "WITH profile_groups AS MATERIALIZED (
+             SELECT workspace_id, COUNT(*) AS item_count,
+                    COALESCE(SUM(row_bytes), 0) AS retained_bytes,
+                    COALESCE(MAX(row_bytes), 0) AS max_row_bytes
+             FROM (
+                 SELECT workspace_id,
+                        length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(kind AS BLOB)) AS row_bytes
+                 FROM env_profiles
+                 ORDER BY workspace_id, created_at, id LIMIT ?1
+             ) AS bounded_profiles GROUP BY workspace_id
+         )
+         SELECT MAX(COALESCE(MAX(item_count), 0), COUNT(*)),
+                COALESCE(MAX(retained_bytes), 0),
+                COALESCE(MAX(max_row_bytes), 0)
+         FROM profile_groups",
+        [total_limit],
+        SETTINGS_ENV_PROFILE_LIMIT_MAX,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        SettingsWriteInventory::EnvProfile.probe_code(),
+    )
+}
+
+fn settings_agent_existing_probe(
+    conn: &Connection,
+    excluded_id: Option<&str>,
+) -> anyhow::Result<SettingsReadProbe> {
+    let sql_limit = match excluded_id {
+        Some(_) => settings_candidate_probe_limit(SETTINGS_AGENT_LIMIT_MAX)?,
+        None => settings_sql_probe_limit(SETTINGS_AGENT_LIMIT_MAX, "settings_agent_write")?,
+    };
+    let probe = settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(command AS BLOB)) + length(CAST(args_json AS BLOB)) +
+                    length(CAST(COALESCE(waiting_regex, '') AS BLOB)) +
+                    length(CAST(COALESCE(approval_regex, '') AS BLOB)) +
+                    length(CAST(COALESCE(error_regex, '') AS BLOB)) +
+                    length(CAST(COALESCE(done_regex, '') AS BLOB)) +
+                    length(CAST(COALESCE(mcp_proxy_server_id, '') AS BLOB)) +
+                    length(CAST(COALESCE(mcp_config_flag, '') AS BLOB)) AS row_bytes
+             FROM agent_configs
+             WHERE deleted_at IS NULL AND (?1 IS NULL OR id != ?1)
+             ORDER BY created_at, id LIMIT ?2
+         )",
+        rusqlite::params![excluded_id, sql_limit],
+        SETTINGS_AGENT_LIMIT_MAX,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        SettingsWriteInventory::Agent.probe_code(),
+    )?;
+    Db::settings_agent_args_inventory_preflight(conn, sql_limit)?;
+    Ok(probe)
+}
+
+fn settings_profile_existing_probe(
+    conn: &Connection,
+    workspace_id: &str,
+    excluded_id: Option<&str>,
+) -> anyhow::Result<SettingsReadProbe> {
+    let sql_limit = match excluded_id {
+        Some(_) => settings_candidate_probe_limit(SETTINGS_ENV_PROFILE_LIMIT_MAX)?,
+        None => {
+            settings_sql_probe_limit(SETTINGS_ENV_PROFILE_LIMIT_MAX, "settings_env_profile_write")?
+        }
+    };
+    settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(kind AS BLOB)) AS row_bytes
+             FROM env_profiles
+             WHERE workspace_id = ?1 AND (?2 IS NULL OR id != ?2)
+             ORDER BY created_at, id LIMIT ?3
+         )",
+        rusqlite::params![workspace_id, excluded_id, sql_limit],
+        SETTINGS_ENV_PROFILE_LIMIT_MAX,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        SettingsWriteInventory::EnvProfile.probe_code(),
+    )
+}
+
+fn settings_credential_existing_probe(
+    conn: &Connection,
+    workspace_id: &str,
+    excluded_id: Option<&str>,
+) -> anyhow::Result<SettingsReadProbe> {
+    let sql_limit = match excluded_id {
+        Some(_) => settings_candidate_probe_limit(SETTINGS_CREDENTIAL_LIMIT_MAX)?,
+        None => {
+            settings_sql_probe_limit(SETTINGS_CREDENTIAL_LIMIT_MAX, "settings_credential_write")?
+        }
+    };
+    settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(provider AS BLOB)) +
+                    length(CAST(label AS BLOB)) + length(CAST(credential_kind AS BLOB)) +
+                    length(CAST(COALESCE(masked_hint, '') AS BLOB)) +
+                    length(CAST(COALESCE(workspace_id, '') AS BLOB)) AS row_bytes
+             FROM credentials
+             WHERE (workspace_id IS NULL OR workspace_id = ?1)
+               AND (?2 IS NULL OR id != ?2)
+             ORDER BY created_at, id LIMIT ?3
+         )",
+        rusqlite::params![workspace_id, excluded_id, sql_limit],
+        SETTINGS_CREDENTIAL_LIMIT_MAX,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        SettingsWriteInventory::Credential.probe_code(),
+    )
+}
+
+fn settings_env_var_existing_probe(
+    conn: &Connection,
+    workspace_id: &str,
+    excluded: Option<(&str, &str)>,
+) -> anyhow::Result<SettingsReadProbe> {
+    let sql_limit = match excluded {
+        Some(_) => settings_candidate_probe_limit(SETTINGS_ENV_VAR_LIMIT_MAX)?,
+        None => settings_sql_probe_limit(SETTINGS_ENV_VAR_LIMIT_MAX, "settings_env_var_write")?,
+    };
+    let (excluded_profile, excluded_key) = excluded
+        .map(|(profile, key)| (Some(profile), Some(key)))
+        .unwrap_or((None, None));
+    settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(p.id AS BLOB)) + length(CAST(v.key AS BLOB)) +
+                    length(CAST(v.kind AS BLOB)) +
+                    length(CAST(COALESCE(v.plain_value, '') AS BLOB)) +
+                    length(CAST(COALESCE(v.credential_id, '') AS BLOB)) AS row_bytes
+             FROM env_vars v JOIN env_profiles p ON p.id = v.profile_id
+             WHERE p.workspace_id = ?1
+               AND (?2 IS NULL OR v.profile_id != ?2 OR v.key != ?3)
+             ORDER BY p.created_at, p.id, v.key LIMIT ?4
+         )",
+        rusqlite::params![workspace_id, excluded_profile, excluded_key, sql_limit],
+        SETTINGS_ENV_VAR_LIMIT_MAX,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        SettingsWriteInventory::EnvVar.probe_code(),
+    )
+}
+
+fn settings_backend_existing_probe(conn: &Connection) -> anyhow::Result<SettingsReadProbe> {
+    let sql_limit = settings_sql_probe_limit(
+        SETTINGS_ENABLED_MCP_SERVER_LIMIT_MAX,
+        "settings_agent_backend_write_dependency",
+    )?;
+    settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) AS row_bytes
+             FROM mcp_servers WHERE enabled != 0 ORDER BY created_at, id LIMIT ?1
+         )",
+        [sql_limit],
+        SETTINGS_ENABLED_MCP_SERVER_LIMIT_MAX,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        "settings_agent_backend_write_dependency",
+    )
+}
+
+fn settings_validate_agent_snapshot_bytes(
+    agent_probe: SettingsReadProbe,
+    profile_probe: SettingsReadProbe,
+    backend_probe: SettingsReadProbe,
+) -> anyhow::Result<()> {
+    settings_validate_combined_retained_bytes(
+        &[agent_probe, profile_probe, backend_probe],
+        "settings_agents_write_bytes_overflow",
+        "settings_agents_write_retained_bytes_limit",
+    )
+}
+
+fn settings_validate_environment_snapshot_bytes(
+    credential_probe: SettingsReadProbe,
+    profile_probe: SettingsReadProbe,
+    env_var_probe: SettingsReadProbe,
+) -> anyhow::Result<()> {
+    settings_validate_combined_retained_bytes(
+        &[credential_probe, profile_probe, env_var_probe],
+        "settings_environment_write_bytes_overflow",
+        "settings_environment_write_retained_bytes_limit",
+    )
+}
+
+fn settings_validate_new_workspace_views(
+    conn: &Connection,
+    workspace_id: &str,
+) -> anyhow::Result<()> {
+    let agents = settings_agent_existing_probe(conn, None)?;
+    let backends = settings_backend_existing_probe(conn)?;
+    settings_validate_agent_snapshot_bytes(agents, SettingsReadProbe::EMPTY, backends)?;
+    let credentials = settings_credential_existing_probe(conn, workspace_id, None)?;
+    settings_validate_environment_snapshot_bytes(
+        credentials,
+        SettingsReadProbe::EMPTY,
+        SettingsReadProbe::EMPTY,
+    )
+}
+
+struct SettingsAgentWriteCandidate<'a> {
+    id: &'a str,
+    name: &'a str,
+    command: &'a str,
+    args_json: &'a str,
+    waiting_regex: Option<&'a str>,
+    approval_regex: Option<&'a str>,
+    error_regex: Option<&'a str>,
+    done_regex: Option<&'a str>,
+    mcp_proxy_server_id: Option<&'a str>,
+    mcp_config_flag: Option<&'a str>,
+}
+
+impl SettingsAgentWriteCandidate<'_> {
+    fn retained_bytes(&self) -> anyhow::Result<usize> {
+        settings_checked_row_bytes(&[
+            self.id,
+            self.name,
+            self.command,
+            self.args_json,
+            self.waiting_regex.unwrap_or_default(),
+            self.approval_regex.unwrap_or_default(),
+            self.error_regex.unwrap_or_default(),
+            self.done_regex.unwrap_or_default(),
+            self.mcp_proxy_server_id.unwrap_or_default(),
+            self.mcp_config_flag.unwrap_or_default(),
+        ])
+    }
+}
+
+fn settings_agent_write_admission(
+    conn: &Connection,
+    candidate: &SettingsAgentWriteCandidate<'_>,
+) -> anyhow::Result<()> {
+    let agents = settings_project_candidate(
+        settings_agent_existing_probe(conn, Some(candidate.id))?,
+        candidate.retained_bytes()?,
+        SETTINGS_AGENT_LIMIT_MAX,
+        SettingsWriteInventory::Agent,
+    )?;
+    let backends = settings_backend_existing_probe(conn)?;
+    let profiles = settings_all_profile_groups_probe(conn)?;
+    settings_validate_agent_snapshot_bytes(agents, profiles, backends)
+}
+
+const SETTINGS_GLOBAL_CREDENTIAL_WRITE_PREFLIGHT: &str = "WITH scopes AS MATERIALIZED (
+         SELECT id FROM workspaces ORDER BY created_at, id LIMIT ?3
+     ), effective_scopes AS MATERIALIZED (
+         SELECT id FROM scopes
+         UNION ALL SELECT '' WHERE NOT EXISTS (SELECT 1 FROM scopes)
+     ), credential_usage AS MATERIALIZED (
+         SELECT workspace_id, COUNT(*) AS item_count,
+                COALESCE(SUM(row_bytes), 0) AS retained_bytes,
+                COALESCE(MAX(row_bytes), 0) AS max_row_bytes
+         FROM (
+             SELECT workspace_id,
+                    length(CAST(id AS BLOB)) + length(CAST(provider AS BLOB)) +
+                    length(CAST(label AS BLOB)) + length(CAST(credential_kind AS BLOB)) +
+                    length(CAST(COALESCE(masked_hint, '') AS BLOB)) +
+                    length(CAST(COALESCE(workspace_id, '') AS BLOB)) AS row_bytes
+             FROM credentials WHERE id != ?1 LIMIT ?4
+         ) AS bounded_credentials GROUP BY workspace_id
+     ), credential_global AS (
+         SELECT COALESCE(SUM(item_count), 0) AS item_count,
+                COALESCE(SUM(retained_bytes), 0) AS retained_bytes,
+                COALESCE(MAX(max_row_bytes), 0) AS max_row_bytes
+         FROM credential_usage WHERE workspace_id IS NULL
+     ), profile_usage AS MATERIALIZED (
+         SELECT workspace_id, COUNT(*) AS item_count,
+                COALESCE(SUM(row_bytes), 0) AS retained_bytes,
+                COALESCE(MAX(row_bytes), 0) AS max_row_bytes
+         FROM (
+             SELECT workspace_id,
+                    length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(kind AS BLOB)) AS row_bytes
+             FROM env_profiles LIMIT ?5
+         ) AS bounded_profiles GROUP BY workspace_id
+     ), env_var_usage AS MATERIALIZED (
+         SELECT workspace_id, COUNT(*) AS item_count,
+                COALESCE(SUM(row_bytes), 0) AS retained_bytes,
+                COALESCE(MAX(row_bytes), 0) AS max_row_bytes
+         FROM (
+             SELECT p.workspace_id,
+                    length(CAST(p.id AS BLOB)) + length(CAST(v.key AS BLOB)) +
+                    length(CAST(v.kind AS BLOB)) +
+                    length(CAST(COALESCE(v.plain_value, '') AS BLOB)) +
+                    length(CAST(COALESCE(v.credential_id, '') AS BLOB)) AS row_bytes
+             FROM env_vars v JOIN env_profiles p ON p.id = v.profile_id LIMIT ?6
+         ) AS bounded_env_vars GROUP BY workspace_id
+     ), inventory_meta AS (
+         SELECT (SELECT COALESCE(SUM(item_count), 0) FROM credential_usage)
+                    AS credential_total,
+                (SELECT COALESCE(SUM(item_count), 0) FROM profile_usage) AS profile_total,
+                (SELECT COALESCE(SUM(item_count), 0) FROM env_var_usage) AS env_var_total,
+                (SELECT COALESCE(SUM(c.item_count), 0) FROM credential_usage c
+                   LEFT JOIN scopes s ON s.id = c.workspace_id
+                  WHERE c.workspace_id IS NOT NULL AND s.id IS NULL) AS credential_orphans,
+                (SELECT COALESCE(SUM(p.item_count), 0) FROM profile_usage p
+                   LEFT JOIN scopes s ON s.id = p.workspace_id
+                  WHERE s.id IS NULL) AS profile_orphans
+     )
+     SELECT g.item_count + COALESCE(c.item_count, 0) + 1,
+            g.retained_bytes + COALESCE(c.retained_bytes, 0) + ?2,
+            MAX(g.max_row_bytes, COALESCE(c.max_row_bytes, 0), ?2),
+            COALESCE(p.item_count, 0), COALESCE(p.retained_bytes, 0),
+            COALESCE(p.max_row_bytes, 0),
+            COALESCE(v.item_count, 0), COALESCE(v.retained_bytes, 0),
+            COALESCE(v.max_row_bytes, 0),
+            g.retained_bytes + COALESCE(c.retained_bytes, 0) + ?2 +
+                COALESCE(p.retained_bytes, 0) + COALESCE(v.retained_bytes, 0),
+            m.credential_total, m.profile_total, m.env_var_total,
+            m.credential_orphans, m.profile_orphans
+     FROM effective_scopes s CROSS JOIN credential_global g
+     LEFT JOIN credential_usage c ON c.workspace_id = s.id
+     LEFT JOIN profile_usage p ON p.workspace_id = s.id
+     LEFT JOIN env_var_usage v ON v.workspace_id = s.id
+     CROSS JOIN inventory_meta m";
+
+struct SettingsEnvironmentScopeProbe {
+    credentials: SettingsReadProbe,
+    profiles: SettingsReadProbe,
+    env_vars: SettingsReadProbe,
+    combined_retained_bytes: usize,
+    credential_total: usize,
+    profile_total: usize,
+    env_var_total: usize,
+    orphan_count: usize,
+}
+
+struct SettingsEnvironmentScopeProbeRaw {
+    credential_count: i64,
+    credential_bytes: i64,
+    credential_max_row_bytes: i64,
+    profile_count: i64,
+    profile_bytes: i64,
+    profile_max_row_bytes: i64,
+    env_var_count: i64,
+    env_var_bytes: i64,
+    env_var_max_row_bytes: i64,
+    combined_retained_bytes: i64,
+    credential_total: i64,
+    profile_total: i64,
+    env_var_total: i64,
+    credential_orphans: i64,
+    profile_orphans: i64,
+}
+
+fn settings_write_probe_from_sql(
+    count: i64,
+    retained_bytes: i64,
+    max_row_bytes: i64,
+    item_limit: usize,
+    inventory: SettingsWriteInventory,
+) -> anyhow::Result<SettingsReadProbe> {
+    let count =
+        usize::try_from(count).map_err(|_| settings_static_error(inventory.item_limit_error()))?;
+    let retained_bytes = usize::try_from(retained_bytes)
+        .map_err(|_| settings_static_error(inventory.retained_bytes_error()))?;
+    let max_row_bytes = usize::try_from(max_row_bytes)
+        .map_err(|_| settings_static_error(inventory.row_bytes_error()))?;
+    if count > item_limit {
+        return Err(settings_static_error(inventory.item_limit_error()));
+    }
+    if max_row_bytes > SETTINGS_ROW_BYTES_MAX {
+        return Err(settings_static_error(inventory.row_bytes_error()));
+    }
+    if retained_bytes > SETTINGS_SNAPSHOT_BYTES_MAX {
+        return Err(settings_static_error(inventory.retained_bytes_error()));
+    }
+    Ok(SettingsReadProbe {
+        count,
+        retained_bytes,
+    })
+}
+
+fn settings_total_inventory_probe_limit(
+    per_workspace_limit: usize,
+    error_code: &'static str,
+) -> anyhow::Result<(usize, i64)> {
+    let max = SETTINGS_WORKSPACE_LIMIT_MAX
+        .checked_mul(per_workspace_limit)
+        .ok_or_else(|| settings_static_error(error_code))?;
+    let sql_limit = max
+        .checked_add(1)
+        .and_then(|limit| i64::try_from(limit).ok())
+        .ok_or_else(|| settings_static_error(error_code))?;
+    Ok((max, sql_limit))
+}
+
+fn settings_nonnegative_sql_usize(value: i64, error_code: &'static str) -> anyhow::Result<usize> {
+    usize::try_from(value).map_err(|_| settings_static_error(error_code))
+}
+
+fn settings_global_credential_write_admission(
+    conn: &Connection,
+    meta: &CredentialMeta,
+    candidate_bytes: usize,
+) -> anyhow::Result<()> {
+    if candidate_bytes > SETTINGS_ROW_BYTES_MAX {
+        return Err(settings_static_error(
+            SettingsWriteInventory::Credential.row_bytes_error(),
+        ));
+    }
+    settings_workspace_scope_probe(conn)?;
+    let workspace_sql_limit = settings_sql_probe_limit(
+        SETTINGS_WORKSPACE_LIMIT_MAX,
+        "settings_global_credential_write_scope",
+    )?;
+    let (credential_total_max, credential_sql_limit) = settings_total_inventory_probe_limit(
+        SETTINGS_CREDENTIAL_LIMIT_MAX,
+        "settings_credential_write_limit_overflow",
+    )?;
+    let (profile_total_max, profile_sql_limit) = settings_total_inventory_probe_limit(
+        SETTINGS_ENV_PROFILE_LIMIT_MAX,
+        "settings_env_profile_write_limit_overflow",
+    )?;
+    let (env_var_total_max, env_var_sql_limit) = settings_total_inventory_probe_limit(
+        SETTINGS_ENV_VAR_LIMIT_MAX,
+        "settings_env_var_write_limit_overflow",
+    )?;
+    let candidate_bytes = i64::try_from(candidate_bytes)
+        .map_err(|_| settings_static_error("settings_credential_write_bytes_invalid"))?;
+    let mut stmt = conn.prepare(SETTINGS_GLOBAL_CREDENTIAL_WRITE_PREFLIGHT)?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            &meta.id,
+            candidate_bytes,
+            workspace_sql_limit,
+            credential_sql_limit,
+            profile_sql_limit,
+            env_var_sql_limit
+        ],
+        |row| {
+            Ok(SettingsEnvironmentScopeProbeRaw {
+                credential_count: row.get(0)?,
+                credential_bytes: row.get(1)?,
+                credential_max_row_bytes: row.get(2)?,
+                profile_count: row.get(3)?,
+                profile_bytes: row.get(4)?,
+                profile_max_row_bytes: row.get(5)?,
+                env_var_count: row.get(6)?,
+                env_var_bytes: row.get(7)?,
+                env_var_max_row_bytes: row.get(8)?,
+                combined_retained_bytes: row.get(9)?,
+                credential_total: row.get(10)?,
+                profile_total: row.get(11)?,
+                env_var_total: row.get(12)?,
+                credential_orphans: row.get(13)?,
+                profile_orphans: row.get(14)?,
+            })
+        },
+    )?;
+    let mut scope_count = 0usize;
+    for row in rows {
+        let raw = row?;
+        let row = SettingsEnvironmentScopeProbe {
+            credentials: settings_write_probe_from_sql(
+                raw.credential_count,
+                raw.credential_bytes,
+                raw.credential_max_row_bytes,
+                SETTINGS_CREDENTIAL_LIMIT_MAX,
+                SettingsWriteInventory::Credential,
+            )?,
+            profiles: settings_write_probe_from_sql(
+                raw.profile_count,
+                raw.profile_bytes,
+                raw.profile_max_row_bytes,
+                SETTINGS_ENV_PROFILE_LIMIT_MAX,
+                SettingsWriteInventory::EnvProfile,
+            )?,
+            env_vars: settings_write_probe_from_sql(
+                raw.env_var_count,
+                raw.env_var_bytes,
+                raw.env_var_max_row_bytes,
+                SETTINGS_ENV_VAR_LIMIT_MAX,
+                SettingsWriteInventory::EnvVar,
+            )?,
+            combined_retained_bytes: settings_nonnegative_sql_usize(
+                raw.combined_retained_bytes,
+                "settings_environment_write_bytes_invalid",
+            )?,
+            credential_total: settings_nonnegative_sql_usize(
+                raw.credential_total,
+                "settings_credential_write_count_invalid",
+            )?,
+            profile_total: settings_nonnegative_sql_usize(
+                raw.profile_total,
+                "settings_env_profile_write_count_invalid",
+            )?,
+            env_var_total: settings_nonnegative_sql_usize(
+                raw.env_var_total,
+                "settings_env_var_write_count_invalid",
+            )?,
+            orphan_count: settings_nonnegative_sql_usize(
+                raw.credential_orphans,
+                "settings_environment_write_scope_invalid",
+            )?
+            .checked_add(settings_nonnegative_sql_usize(
+                raw.profile_orphans,
+                "settings_environment_write_scope_invalid",
+            )?)
+            .ok_or_else(|| settings_static_error("settings_environment_write_scope_invalid"))?,
+        };
+        scope_count = scope_count
+            .checked_add(1)
+            .ok_or_else(|| settings_static_error("settings_credential_write_scope_limit"))?;
+        if scope_count > SETTINGS_WORKSPACE_LIMIT_MAX.max(1) {
+            return Err(settings_static_error(
+                "settings_credential_write_scope_limit",
+            ));
+        }
+        if row.credential_total > credential_total_max {
+            return Err(settings_static_error(
+                SettingsWriteInventory::Credential.item_limit_error(),
+            ));
+        }
+        if row.profile_total > profile_total_max {
+            return Err(settings_static_error(
+                SettingsWriteInventory::EnvProfile.item_limit_error(),
+            ));
+        }
+        if row.env_var_total > env_var_total_max {
+            return Err(settings_static_error(
+                SettingsWriteInventory::EnvVar.item_limit_error(),
+            ));
+        }
+        if row.orphan_count != 0 {
+            return Err(settings_static_error(
+                "settings_environment_write_scope_invalid",
+            ));
+        }
+        settings_validate_environment_snapshot_bytes(row.credentials, row.profiles, row.env_vars)?;
+        if row.combined_retained_bytes > SETTINGS_SNAPSHOT_BYTES_MAX {
+            return Err(settings_static_error(
+                "settings_environment_write_retained_bytes_limit",
+            ));
+        }
+    }
+    if scope_count == 0 {
+        return Err(settings_static_error(
+            "settings_credential_write_scope_missing",
+        ));
+    }
+    Ok(())
+}
+
+fn settings_credential_write_admission(
+    conn: &Connection,
+    meta: &CredentialMeta,
+) -> anyhow::Result<()> {
+    let duplicate: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM credentials WHERE id = ?1)",
+        [&meta.id],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        // Preserve the existing INSERT constraint error and avoid changing duplicate semantics.
+        return Ok(());
+    }
+    settings_credential_candidate_write_admission(conn, meta)
+}
+
+fn settings_credential_candidate_write_admission(
+    conn: &Connection,
+    meta: &CredentialMeta,
+) -> anyhow::Result<()> {
+    let candidate_bytes = settings_checked_row_bytes(&[
+        &meta.id,
+        &meta.provider,
+        &meta.label,
+        &meta.credential_kind,
+        meta.masked_hint.as_deref().unwrap_or_default(),
+        meta.workspace_id.as_deref().unwrap_or_default(),
+    ])?;
+    let Some(workspace_id) = meta.workspace_id.as_deref() else {
+        return settings_global_credential_write_admission(conn, meta, candidate_bytes);
+    };
+    let credentials = settings_project_candidate(
+        settings_credential_existing_probe(conn, workspace_id, Some(&meta.id))?,
+        candidate_bytes,
+        SETTINGS_CREDENTIAL_LIMIT_MAX,
+        SettingsWriteInventory::Credential,
+    )?;
+    let profiles = settings_profile_existing_probe(conn, workspace_id, None)?;
+    let env_vars = settings_env_var_existing_probe(conn, workspace_id, None)?;
+    settings_validate_environment_snapshot_bytes(credentials, profiles, env_vars)
+}
+
+fn settings_credential_for_publish(
+    conn: &Connection,
+    logical_id: &str,
+    expected_previous_pointer: &str,
+) -> anyhow::Result<Option<CredentialMeta>> {
+    let probe = settings_read_probe(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(provider AS BLOB)) +
+                    length(CAST(label AS BLOB)) + length(CAST(credential_kind AS BLOB)) +
+                    length(CAST(COALESCE(masked_hint, '') AS BLOB)) +
+                    length(CAST(COALESCE(workspace_id, '') AS BLOB)) AS row_bytes
+             FROM credentials WHERE id = ?1 AND keyring_username = ?2 LIMIT 2
+         )",
+        (logical_id, expected_previous_pointer),
+        1,
+        SETTINGS_SNAPSHOT_BYTES_MAX,
+        SETTINGS_ROW_BYTES_MAX,
+        "settings_credential_publish_target",
+    )?;
+    if probe.count == 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id, provider, label, credential_kind, masked_hint, workspace_id
+         FROM credentials WHERE id = ?1 AND keyring_username = ?2",
+        (logical_id, expected_previous_pointer),
+        |row| {
+            Ok(CredentialMeta {
+                id: row.get(0)?,
+                provider: row.get(1)?,
+                label: row.get(2)?,
+                credential_kind: row.get(3)?,
+                masked_hint: row.get(4)?,
+                workspace_id: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn settings_credential_publish_admission(
+    conn: &Connection,
+    meta: &mut CredentialMeta,
+    masked_hint: Option<&str>,
+) -> anyhow::Result<()> {
+    let candidate_bytes = settings_checked_row_bytes(&[
+        &meta.id,
+        &meta.provider,
+        &meta.label,
+        &meta.credential_kind,
+        masked_hint.unwrap_or_default(),
+        meta.workspace_id.as_deref().unwrap_or_default(),
+    ])?;
+    if candidate_bytes > SETTINGS_ROW_BYTES_MAX {
+        return Err(settings_static_error(
+            SettingsWriteInventory::Credential.row_bytes_error(),
+        ));
+    }
+    meta.masked_hint = masked_hint.map(str::to_owned);
+    settings_credential_candidate_write_admission(conn, meta)
+}
+
+fn settings_env_profile_write_admission(
+    conn: &Connection,
+    id: &str,
+    workspace_id: &str,
+    name: &str,
+    kind: &str,
+) -> anyhow::Result<()> {
+    let candidate_bytes = settings_checked_row_bytes(&[id, name, kind])?;
+    let profiles = settings_project_candidate(
+        settings_profile_existing_probe(conn, workspace_id, Some(id))?,
+        candidate_bytes,
+        SETTINGS_ENV_PROFILE_LIMIT_MAX,
+        SettingsWriteInventory::EnvProfile,
+    )?;
+    let agents = settings_agent_existing_probe(conn, None)?;
+    let backends = settings_backend_existing_probe(conn)?;
+    settings_validate_agent_snapshot_bytes(agents, profiles, backends)?;
+    let credentials = settings_credential_existing_probe(conn, workspace_id, None)?;
+    let env_vars = settings_env_var_existing_probe(conn, workspace_id, None)?;
+    settings_validate_environment_snapshot_bytes(credentials, profiles, env_vars)
+}
+
+fn settings_env_var_write_admission(
+    conn: &Connection,
+    profile_id: &str,
+    key: &str,
+    kind: &str,
+    plain_value: Option<&str>,
+    credential_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let workspace_id = conn
+        .query_row(
+            "SELECT workspace_id FROM env_profiles WHERE id = ?1",
+            [profile_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(workspace_id) = workspace_id else {
+        // Preserve the existing foreign-key error for a missing profile.
+        return Ok(());
+    };
+    let candidate_bytes = settings_checked_row_bytes(&[
+        profile_id,
+        key,
+        kind,
+        plain_value.unwrap_or_default(),
+        credential_id.unwrap_or_default(),
+    ])?;
+    let env_vars = settings_project_candidate(
+        settings_env_var_existing_probe(conn, &workspace_id, Some((profile_id, key)))?,
+        candidate_bytes,
+        SETTINGS_ENV_VAR_LIMIT_MAX,
+        SettingsWriteInventory::EnvVar,
+    )?;
+    let credentials = settings_credential_existing_probe(conn, &workspace_id, None)?;
+    let profiles = settings_profile_existing_probe(conn, &workspace_id, None)?;
+    settings_validate_environment_snapshot_bytes(credentials, profiles, env_vars)
 }
 
 type PersistedWorkspaceProjection = (String, String, String, String, Option<i64>, Option<i64>);
@@ -3353,6 +4402,7 @@ impl Db {
         physical_slot: &str,
         oauth_json: Option<&str>,
     ) -> anyhow::Result<()> {
+        settings_credential_write_admission(conn, meta)?;
         Self::require_physical_secret_slot_state(
             conn,
             &meta.id,
@@ -3402,14 +4452,9 @@ impl Db {
             physical_slot,
             PhysicalSecretSlotState::Staging,
         )?;
-        let expected_pointer_is_live: bool = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM credentials WHERE id = ?1 AND keyring_username = ?2
-             )",
-            (logical_id, expected_previous_pointer),
-            |row| row.get(0),
-        )?;
-        if !expected_pointer_is_live {
+        let Some(mut credential) =
+            settings_credential_for_publish(conn, logical_id, expected_previous_pointer)?
+        else {
             Self::transition_physical_secret_slot_state(
                 conn,
                 logical_id,
@@ -3418,7 +4463,8 @@ impl Db {
                 PhysicalSecretSlotState::Orphan,
             )?;
             return Ok(false);
-        }
+        };
+        settings_credential_publish_admission(conn, &mut credential, masked_hint)?;
         Self::orphan_published_physical_slot_if_versioned(
             conn,
             logical_id,
@@ -3686,27 +4732,28 @@ impl Db {
     /// 보관한다. 새 physical bundle publish와 secret-backed 실행은 이 legacy pointer를 허용하지
     /// 않으며, [`Self::rotate_credential_secret_slot`]을 거쳐야 한다.
     pub fn insert_credential(&self, meta: &CredentialMeta) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO credentials
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        settings_credential_write_admission(&tx, meta)?;
+        tx.execute(
+            "INSERT INTO credentials
                    (id, provider, label, credential_kind,
                     keyring_service, keyring_username, masked_hint, workspace_id,
                     created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                (
-                    &meta.id,
-                    &meta.provider,
-                    &meta.label,
-                    &meta.credential_kind,
-                    secret::KEYRING_SERVICE,
-                    &meta.id, // keyring username = credential id
-                    &meta.masked_hint,
-                    &meta.workspace_id,
-                ),
-            )
-            .with_context(|| format!("credential 저장 실패: {}", meta.id))?;
-        Ok(())
+            (
+                &meta.id,
+                &meta.provider,
+                &meta.label,
+                &meta.credential_kind,
+                secret::KEYRING_SERVICE,
+                &meta.id, // keyring username = credential id
+                &meta.masked_hint,
+                &meta.workspace_id,
+            ),
+        )
+        .with_context(|| format!("credential 저장 실패: {}", meta.id))?;
+        tx.commit().context("credential insert commit failed")
     }
 
     /// Inserts credential metadata with an already-staged, owned physical keyring slot. This is
@@ -4377,8 +5424,8 @@ impl Db {
 
     /// 기본 workspace를 보장하고 id를 돌려준다. 실제 workspace 관리는 PR-14.
     pub fn ensure_default_workspace(&self) -> anyhow::Result<String> {
-        if let Some(id) = self
-            .conn
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if let Some(id) = tx
             .query_row(
                 "SELECT id FROM workspaces ORDER BY created_at LIMIT 1",
                 [],
@@ -4386,15 +5433,20 @@ impl Db {
             )
             .optional()?
         {
+            tx.commit()
+                .context("default workspace existing transaction commit failed")?;
             return Ok(id);
         }
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        settings_workspace_write_admission(&tx, &id, "default", "", None, None)?;
+        tx.execute(
             "INSERT INTO workspaces (id, name, path, created_at, updated_at)
              VALUES (?1, 'default', '',
                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             [&id],
         )?;
+        tx.commit()
+            .context("default workspace create transaction commit failed")?;
         Ok(id)
     }
 
@@ -4548,6 +5600,14 @@ impl Db {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
+        settings_workspace_write_admission(
+            &tx,
+            &id,
+            name,
+            path,
+            Some(folder_anchor.dev),
+            Some(folder_anchor.ino),
+        )?;
         tx.execute(
             "INSERT INTO workspaces
                 (id, name, path, created_at, updated_at, path_dev, path_ino)
@@ -4615,6 +5675,21 @@ impl Db {
         }
 
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(mut row) = settings_workspace_row_for_update(&tx, workspace_id)? else {
+            tx.commit()?;
+            return Ok(WorkspaceMovedPathUpdate::Stale);
+        };
+        if row.path != expected_old_path
+            || row.path_dev != Some(expected_stored_anchor.dev)
+            || row.path_ino != Some(expected_stored_anchor.ino)
+        {
+            tx.commit()?;
+            return Ok(WorkspaceMovedPathUpdate::Stale);
+        }
+        row.path = new_path.to_owned();
+        row.path_dev = Some(new_filesystem_anchor.dev);
+        row.path_ino = Some(new_filesystem_anchor.ino);
+        settings_workspace_update_admission(&tx, &row)?;
         let affected = tx.execute(
             "UPDATE workspaces
              SET path = ?5, path_dev = ?6, path_ino = ?7,
@@ -6331,8 +7406,14 @@ impl Db {
 
     /// workspace 이름을 변경한다 (#3 — 사용자 지정 이름).
     pub fn rename_workspace(&self, id: &str, name: &str) -> anyhow::Result<()> {
-        let affected = self
-            .conn
+        validate_workspace_text_input(id, "id")?;
+        validate_workspace_text_input(name, "name")?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut row = settings_workspace_row_for_update(&tx, id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace 없음: {id}"))?;
+        row.name = name.to_owned();
+        settings_workspace_update_admission(&tx, &row)?;
+        let affected = tx
             .execute(
                 "UPDATE workspaces
                  SET name = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -6341,12 +7422,19 @@ impl Db {
             )
             .with_context(|| format!("workspace 이름 저장 실패: {id}"))?;
         anyhow::ensure!(affected == 1, "workspace 없음: {id}");
-        Ok(())
+        tx.commit()
+            .context("workspace rename transaction commit failed")
     }
 
     pub fn set_workspace_path(&self, id: &str, path: &str) -> anyhow::Result<()> {
-        let affected = self
-            .conn
+        validate_workspace_text_input(id, "id")?;
+        validate_workspace_text_input(path, "path")?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut row = settings_workspace_row_for_update(&tx, id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace 없음: {id}"))?;
+        row.path = path.to_owned();
+        settings_workspace_update_admission(&tx, &row)?;
+        let affected = tx
             .execute(
                 "UPDATE workspaces
                  SET path = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -6355,14 +7443,14 @@ impl Db {
             )
             .with_context(|| format!("workspace 경로 저장 실패: {id}"))?;
         anyhow::ensure!(affected == 1, "workspace 없음: {id}");
-        Ok(())
+        tx.commit()
+            .context("workspace path transaction commit failed")
     }
 
     /// Atomically replaces one exact workspace's project path and optional filesystem anchor.
     /// The anchor is all-or-nothing: a partial `(dev, ino)` pair is rejected before SQLite is
-    /// touched. The complete row is re-read under the same IMMEDIATE transaction and checked
-    /// against the settings projection bounds before commit, so an oversized postcondition rolls
-    /// the path and anchor back together.
+    /// touched. The complete candidate row is checked under the same IMMEDIATE transaction before
+    /// UPDATE, then re-read as a defensive postcondition before path and anchor commit together.
     pub fn set_workspace_path_and_anchor(
         &self,
         workspace_id: &str,
@@ -6386,6 +7474,12 @@ impl Db {
         );
 
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut row = settings_workspace_row_for_update(&tx, workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("settings_workspace_path_exact_id_missing"))?;
+        row.path = path.to_owned();
+        row.path_dev = path_dev;
+        row.path_ino = path_ino;
+        settings_workspace_update_admission(&tx, &row)?;
         let affected = tx
             .execute(
                 "UPDATE workspaces
@@ -6455,13 +7549,27 @@ impl Db {
         dev: Option<i64>,
         ino: Option<i64>,
     ) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE workspaces SET path_dev = ?2, path_ino = ?3 WHERE id = ?1",
-                (id, dev, ino),
-            )
-            .with_context(|| format!("workspace 앵커 저장 실패: {id}"))?;
-        Ok(())
+        validate_workspace_text_input(id, "id")?;
+        anyhow::ensure!(
+            dev.is_some() == ino.is_some(),
+            "settings_workspace_anchor_partial"
+        );
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(mut row) = settings_workspace_row_for_update(&tx, id)? else {
+            tx.commit()
+                .context("missing workspace anchor transaction commit failed")?;
+            return Ok(());
+        };
+        row.path_dev = dev;
+        row.path_ino = ino;
+        settings_workspace_update_admission(&tx, &row)?;
+        tx.execute(
+            "UPDATE workspaces SET path_dev = ?2, path_ino = ?3 WHERE id = ?1",
+            (id, dev, ino),
+        )
+        .with_context(|| format!("workspace 앵커 저장 실패: {id}"))?;
+        tx.commit()
+            .context("workspace anchor transaction commit failed")
     }
 
     /// 프로젝트 폴더 앵커(dev, ino) — 둘 다 있을 때만 Some.
@@ -6513,12 +7621,16 @@ impl Db {
     /// 새 workspace 생성 — 생성된 id 반환.
     pub fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        settings_workspace_write_admission(&tx, &id, name, "", None, None)?;
+        tx.execute(
             "INSERT INTO workspaces (id, name, path, created_at, updated_at)
              VALUES (?1, ?2, '',
                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             (&id, name),
         )?;
+        tx.commit()
+            .context("workspace create transaction commit failed")?;
         Ok(id)
     }
 
@@ -7508,6 +8620,53 @@ impl Db {
         Ok(count)
     }
 
+    /// Runs one explicit, bounded legacy-retention batch. This is private so no production caller
+    /// can accidentally forget the completion loop before admitting a lifecycle mutation.
+    fn normalize_audit_retention_batch(&self) -> anyhow::Result<audit::AuditNormalizationReport> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let report = audit::normalize_audit_retention_batch_in_transaction(
+            &tx,
+            audit::AuditRetentionPolicy::production(),
+            deppy_core::time::unix_secs_i64(),
+        )?;
+        tx.commit()
+            .context("audit retention normalization transaction commit failed")?;
+        Ok(report)
+    }
+
+    fn normalize_audit_retention_to_completion(&self) -> anyhow::Result<()> {
+        loop {
+            let report = self.normalize_audit_retention_batch()?;
+            if report.is_complete() {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                report.deleted_finalized_items() > 0,
+                "audit_retention_normalization_no_progress"
+            );
+        }
+    }
+
+    /// Runs the normal one-scan lifecycle path first. Only the exact opaque normalization marker
+    /// may trigger rollback, bounded legacy batches, and one DB-only retry. No external tool call or
+    /// authorization grant exists inside this helper.
+    fn with_audit_retention_normalization_retry<T>(
+        &self,
+        mut lifecycle_transaction: impl FnMut() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        match lifecycle_transaction() {
+            Err(error)
+                if error
+                    .downcast_ref::<audit::AuditRetentionNormalizationRequired>()
+                    .is_some() =>
+            {
+                self.normalize_audit_retention_to_completion()?;
+                lifecycle_transaction()
+            }
+            result => result,
+        }
+    }
+
     /// tool 실행 감사 기록 (PR-16). encryptor를 넘기면 전체 입력이 암호화 저장된다 (§7).
     pub fn record_tool_audit(
         &self,
@@ -7515,7 +8674,18 @@ impl Db {
         redaction: &secret::RedactionService,
         encryptor: Option<&dyn secret::SecretStore>,
     ) -> anyhow::Result<String> {
-        audit::record_audit(&self.conn, redaction, record, encryptor)
+        self.with_audit_retention_normalization_retry(|| {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            let audit_id = audit::record_audit(&tx, redaction, record, encryptor)?;
+            audit::prune_audit_logs_in_transaction(
+                &tx,
+                audit::AuditRetentionPolicy::production(),
+                deppy_core::time::unix_secs_i64(),
+            )?;
+            tx.commit().context("tool audit/retention commit failed")?;
+            Ok(audit_id)
+        })
     }
 
     /// Acquires one DB/scope owner for its whole lifetime and begins a fresh random run. Since the
@@ -7548,18 +8718,26 @@ impl Db {
             anyhow::bail!("authorization scope is already owned by a live executor");
         }
         let run_id = uuid::Uuid::new_v4().to_string();
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE tool_audit_logs
-             SET lifecycle = 'unknown', outcome_error_code = 'owner_superseded',
-                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE authorization_scope = ?1
-               AND authorization_run_id != ?2
-               AND lifecycle = 'prepared'",
-            (scope, &run_id),
-        )?;
-        tx.commit()
-            .context("authorization owner 시작 transaction 실패")?;
+        self.with_audit_retention_normalization_retry(|| {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE tool_audit_logs
+                 SET lifecycle = 'unknown', outcome_error_code = 'owner_superseded',
+                     completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE authorization_scope = ?1
+                   AND authorization_run_id != ?2
+                   AND lifecycle = 'prepared'",
+                (scope, &run_id),
+            )?;
+            audit::prune_audit_logs_in_transaction(
+                &tx,
+                audit::AuditRetentionPolicy::production(),
+                deppy_core::time::unix_secs_i64(),
+            )?;
+            tx.commit()
+                .context("authorization owner 시작 transaction 실패")
+        })?;
         Ok(ActiveAuthorizationOwner {
             _scope_lock: scope_lock,
             scope: scope.to_owned(),
@@ -7579,18 +8757,27 @@ impl Db {
         redaction: &secret::RedactionService,
     ) -> anyhow::Result<audit::AuthorizationPreflight> {
         audit::validate_tool_input(input_json.as_bytes())?;
-        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let preflight = Self::commit_authorization_preflight_in_transaction(
-            &self.authorization_db_identity,
-            &tx,
-            owner,
-            plan,
-            input_json,
-            redaction,
-        )?;
-        tx.commit()
-            .context("authorization permission/audit preflight commit 실패")?;
-        Ok(preflight)
+        let operation = self.with_audit_retention_normalization_retry(|| {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            let operation = Self::commit_authorization_preflight_in_transaction(
+                &self.authorization_db_identity,
+                &tx,
+                owner,
+                &plan,
+                input_json,
+                redaction,
+            )?;
+            audit::prune_audit_logs_in_transaction(
+                &tx,
+                audit::AuditRetentionPolicy::production(),
+                deppy_core::time::unix_secs_i64(),
+            )?;
+            tx.commit()
+                .context("authorization permission/audit preflight commit 실패")?;
+            Ok(operation)
+        })?;
+        Ok(audit::finish_owned_authorization_preflight(plan, operation))
     }
 
     /// Global-config CAS variant used after live schema validation. Acquiring IMMEDIATE before
@@ -7605,31 +8792,48 @@ impl Db {
         redaction: &secret::RedactionService,
     ) -> anyhow::Result<ConnectorConfigCas<audit::AuthorizationPreflight>> {
         audit::validate_tool_input(input_json.as_bytes())?;
-        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let current_revision = Self::read_connector_config_revision(&tx)?;
-        if current_revision != expected_revision {
+        let persisted = self.with_audit_retention_normalization_retry(|| {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            let current_revision = Self::read_connector_config_revision(&tx)?;
+            if current_revision != expected_revision {
+                tx.commit()
+                    .context("stale authorization revision CAS transaction 실패")?;
+                return Ok(ConnectorConfigCas::Stale { current_revision });
+            }
+            let operation = Self::commit_authorization_preflight_in_transaction(
+                &self.authorization_db_identity,
+                &tx,
+                owner,
+                &plan,
+                input_json,
+                redaction,
+            )?;
+            audit::prune_audit_logs_in_transaction(
+                &tx,
+                audit::AuditRetentionPolicy::production(),
+                deppy_core::time::unix_secs_i64(),
+            )?;
+            let revision = Self::read_connector_config_revision(&tx)?;
+            anyhow::ensure!(
+                revision >= current_revision,
+                "authorization preflight 중 Connector config revision이 감소했습니다"
+            );
             tx.commit()
-                .context("stale authorization revision CAS transaction 실패")?;
-            return Ok(ConnectorConfigCas::Stale { current_revision });
-        }
-        let preflight = Self::commit_authorization_preflight_in_transaction(
-            &self.authorization_db_identity,
-            &tx,
-            owner,
-            plan,
-            input_json,
-            redaction,
-        )?;
-        let revision = Self::read_connector_config_revision(&tx)?;
-        anyhow::ensure!(
-            revision >= current_revision,
-            "authorization preflight 중 Connector config revision이 감소했습니다"
-        );
-        tx.commit()
-            .context("authorization revision CAS preflight commit 실패")?;
-        Ok(ConnectorConfigCas::Committed {
-            revision,
-            value: preflight,
+                .context("authorization revision CAS preflight commit 실패")?;
+            Ok(ConnectorConfigCas::Committed {
+                revision,
+                value: operation,
+            })
+        })?;
+        Ok(match persisted {
+            ConnectorConfigCas::Stale { current_revision } => {
+                ConnectorConfigCas::Stale { current_revision }
+            }
+            ConnectorConfigCas::Committed { revision, value } => ConnectorConfigCas::Committed {
+                revision,
+                value: audit::finish_owned_authorization_preflight(plan, value),
+            },
         })
     }
 
@@ -7637,10 +8841,10 @@ impl Db {
         authorization_db_identity: &str,
         conn: &Connection,
         owner: &ActiveAuthorizationOwner,
-        plan: audit::AuthorizationPlan,
+        plan: &audit::AuthorizationPlan,
         input_json: &str,
         redaction: &secret::RedactionService,
-    ) -> anyhow::Result<audit::AuthorizationPreflight> {
+    ) -> anyhow::Result<audit::ValidatedOwnedAuthorizationOperation> {
         anyhow::ensure!(
             !conn.is_autocommit(),
             "authorization preflight는 caller-owned transaction이 필요합니다"
@@ -7680,14 +8884,15 @@ impl Db {
             )?,
             _ => {}
         }
-        audit::prepare_owned_authorization_preflight(
+        let operation = audit::prepare_owned_authorization_operation(
             conn,
             plan,
             input_json,
             redaction,
             owner.scope(),
             &owner.run_id,
-        )
+        )?;
+        audit::validate_owned_authorization_operation(plan, operation)
     }
 
     pub fn complete_authorization_outcome(
@@ -7700,13 +8905,24 @@ impl Db {
             self.authorization_db_identity == owner.db_identity,
             "authorization owner가 다른 DB에 속합니다"
         );
-        audit::complete_authorization_operation(
-            &self.conn,
-            owner.scope(),
-            &owner.run_id,
-            operation_id,
-            outcome,
-        )
+        self.with_audit_retention_normalization_retry(|| {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            audit::complete_authorization_operation(
+                &tx,
+                owner.scope(),
+                &owner.run_id,
+                operation_id,
+                outcome,
+            )?;
+            audit::prune_audit_logs_in_transaction(
+                &tx,
+                audit::AuditRetentionPolicy::production(),
+                deppy_core::time::unix_secs_i64(),
+            )?;
+            tx.commit()
+                .context("authorization outcome/retention commit failed")
+        })
     }
 
     /// Graceful executor shutdown after calls drain. Consuming the owner makes further preflight
@@ -7720,19 +8936,29 @@ impl Db {
             self.authorization_db_identity == owner.db_identity,
             "authorization owner가 다른 DB에 속합니다"
         );
-        let affected = self
-            .conn
-            .execute(
-                "UPDATE tool_audit_logs
-                 SET lifecycle = 'unknown', outcome_error_code = 'owner_shutdown',
-                     completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE authorization_scope = ?1
-                   AND authorization_run_id = ?2
-                   AND lifecycle = 'prepared'",
-                (owner.scope(), &owner.run_id),
-            )
-            .context("authorization owner shutdown 저장 실패")?;
-        Ok(affected)
+        self.with_audit_retention_normalization_retry(|| {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            let affected = tx
+                .execute(
+                    "UPDATE tool_audit_logs
+                     SET lifecycle = 'unknown', outcome_error_code = 'owner_shutdown',
+                         completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE authorization_scope = ?1
+                       AND authorization_run_id = ?2
+                       AND lifecycle = 'prepared'",
+                    (owner.scope(), &owner.run_id),
+                )
+                .context("authorization owner shutdown 저장 실패")?;
+            audit::prune_audit_logs_in_transaction(
+                &tx,
+                audit::AuditRetentionPolicy::production(),
+                deppy_core::time::unix_secs_i64(),
+            )?;
+            tx.commit()
+                .context("authorization owner shutdown/retention commit failed")?;
+            Ok(affected)
+        })
     }
 
     pub fn tool_audit_lifecycle(
@@ -7757,7 +8983,9 @@ impl Db {
         kind: &str,
     ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        settings_env_profile_write_admission(&tx, &id, workspace_id, name, kind)?;
+        tx
             .execute(
                 "INSERT INTO env_profiles (id, workspace_id, name, kind, is_production, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5,
@@ -7765,6 +8993,8 @@ impl Db {
                 (&id, workspace_id, name, kind, kind == "production"),
             )
             .with_context(|| format!("env profile 저장 실패: {name}"))?;
+        tx.commit()
+            .context("env profile insert transaction commit failed")?;
         Ok(id)
     }
 
@@ -7866,7 +9096,9 @@ impl Db {
             EnvValue::Plain(v) => ("plain", Some(v.as_str()), None),
             EnvValue::Secret { credential_id } => ("secret", None, Some(credential_id.as_str())),
         };
-        self.conn
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        settings_env_var_write_admission(&tx, profile_id, key, kind, plain_value, credential_id)?;
+        tx
             .execute(
                 "INSERT INTO env_vars (id, profile_id, key, kind, plain_value, credential_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6,
@@ -7886,7 +9118,8 @@ impl Db {
                 ),
             )
             .with_context(|| format!("env var 저장 실패: {key}"))?;
-        Ok(())
+        tx.commit()
+            .context("env var upsert transaction commit failed")
     }
 
     pub fn list_env_vars(&self, profile_id: &str) -> anyhow::Result<Vec<EnvVarRow>> {
@@ -8568,30 +9801,47 @@ impl Db {
         let args_json = serde_json::to_string(args)?;
         // 빈 문자열은 None으로 정규화 (mcp_proxy_server_id와 동일 관례 — stale/빈값 저장 방지)
         let mcp_config_flag = mcp_config_flag.filter(|s| !s.is_empty());
-        self.conn
-            .execute(
-                "INSERT INTO agent_configs
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        settings_agent_write_admission(
+            &tx,
+            &SettingsAgentWriteCandidate {
+                id: &id,
+                name,
+                command,
+                args_json: &args_json,
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
+                mcp_proxy_server_id,
+                mcp_config_flag,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO agent_configs
                    (id, name, command, args_json,
                     waiting_regex, approval_regex, error_regex, done_regex,
                     mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag,
                     created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                (
-                    &id,
-                    name,
-                    command,
-                    &args_json,
-                    waiting_regex,
-                    approval_regex,
-                    error_regex,
-                    done_regex,
-                    mcp_proxy_enabled as i64,
-                    mcp_proxy_server_id,
-                    mcp_config_flag,
-                ),
-            )
-            .with_context(|| format!("agent config 저장 실패: {name}"))?;
+            (
+                &id,
+                name,
+                command,
+                &args_json,
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
+                mcp_proxy_enabled as i64,
+                mcp_proxy_server_id,
+                mcp_config_flag,
+            ),
+        )
+        .with_context(|| format!("agent config 저장 실패: {name}"))?;
+        tx.commit()
+            .context("agent config insert transaction commit failed")?;
         Ok(id)
     }
 
@@ -8674,6 +9924,39 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct CountingAuditSecretStore {
+        value: std::sync::Mutex<Option<String>>,
+        set_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl secret::SecretStore for CountingAuditSecretStore {
+        fn set_secret(&self, _id: &str, value: &secret::SecretString) -> anyhow::Result<()> {
+            self.set_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.value.lock().unwrap() = Some(value.expose().to_owned());
+            Ok(())
+        }
+
+        fn get_secret(&self, _id: &str) -> anyhow::Result<secret::SecretString> {
+            self.value
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|value| secret::SecretString::new(value.clone()))
+                .ok_or_else(|| anyhow::anyhow!("missing audit key"))
+        }
+
+        fn delete_secret(&self, _id: &str) -> anyhow::Result<()> {
+            *self.value.lock().unwrap() = None;
+            Ok(())
+        }
+
+        fn has_secret(&self, _id: &str) -> anyhow::Result<bool> {
+            Ok(self.value.lock().unwrap().is_some())
+        }
+    }
 
     fn file_db(label: &str) -> (PathBuf, PathBuf, Db) {
         let dir = std::env::temp_dir().join(format!(
@@ -11497,7 +12780,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_path_anchor_atomic은_oversized_postcondition을_commit전에_rollback한다() {
+    fn workspace_path_anchor_atomic은_oversized_target을_update전에거부한다() {
         let db = Db::open_in_memory().unwrap();
         let oversized_name = "x".repeat(SETTINGS_ROW_BYTES_MAX);
         db.conn
@@ -11512,9 +12795,7 @@ mod tests {
         let error = db
             .set_workspace_path_and_anchor("oversized-workspace", "/new", Some(10), Some(12))
             .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("settings_workspace_path_postcondition_row_bytes_limit")
-        );
+        assert!(format!("{error:#}").contains("settings_workspace_update_target_row_bytes_limit"));
         assert_eq!(
             db.workspace_path("oversized-workspace").unwrap().as_deref(),
             Some("/old")
@@ -16361,14 +17642,34 @@ mod tests {
         for index in 0..128 {
             let key = format!("K{index:03}");
             let value_bytes = BOUNDED_ROW_BYTES_MAX - key.len() - "plain".len();
-            db.upsert_env_var(&profile, &key, &EnvValue::Plain("x".repeat(value_bytes)))
+            db.conn
+                .execute(
+                    "INSERT INTO env_vars
+                        (id, profile_id, key, kind, plain_value, credential_id, created_at,
+                         updated_at)
+                     VALUES (?1, ?2, ?3, 'plain', ?4, NULL, ?1, ?1)",
+                    (
+                        format!("bounded-env-{index:03}"),
+                        &profile,
+                        &key,
+                        "x".repeat(value_bytes),
+                    ),
+                )
                 .unwrap();
         }
         assert_eq!(db.list_env_vars_bounded(&profile, 128).unwrap().len(), 128);
 
         let key = "K128";
         let value_bytes = BOUNDED_ROW_BYTES_MAX - key.len() - "plain".len();
-        db.upsert_env_var(&profile, key, &EnvValue::Plain("x".repeat(value_bytes)))
+        db.conn
+            .execute(
+                "INSERT INTO env_vars
+                    (id, profile_id, key, kind, plain_value, credential_id, created_at,
+                     updated_at)
+                 VALUES ('bounded-env-128', ?1, ?2, 'plain', ?3, NULL,
+                         'bounded-env-128', 'bounded-env-128')",
+                (&profile, key, "x".repeat(value_bytes)),
+            )
             .unwrap();
         assert_eq!(
             db.list_env_vars_bounded(&profile, 129)
@@ -17001,5 +18302,922 @@ mod tests {
             .unwrap();
         assert_eq!(service, secret::KEYRING_SERVICE);
         assert_eq!(username, "cred-1");
+    }
+
+    fn seed_settings_workspaces(conn: &Connection, count: usize) {
+        conn.execute(
+            "WITH RECURSIVE seq(n) AS (
+                 SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?1
+             )
+             INSERT INTO workspaces (id, name, path, created_at, updated_at)
+             SELECT printf('write-workspace-%04d', n), 'workspace', '',
+                    printf('%08d', n), printf('%08d', n)
+             FROM seq",
+            [i64::try_from(count).unwrap()],
+        )
+        .unwrap();
+    }
+
+    fn assert_static_settings_error(error: anyhow::Error, expected: &str) {
+        assert_eq!(format!("{error:#}"), expected);
+    }
+
+    fn query_count(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> usize {
+        let count: i64 = conn.query_row(sql, params, |row| row.get(0)).unwrap();
+        usize::try_from(count).unwrap()
+    }
+
+    fn insert_workspace_with_logical_bytes(
+        conn: &Connection,
+        id: &str,
+        path: &str,
+        target_bytes: usize,
+    ) {
+        let fixed_bytes = id.len() + path.len() + "t".len() + "7".len() + "9".len();
+        let name = "x".repeat(target_bytes.checked_sub(fixed_bytes).unwrap());
+        conn.execute(
+            "INSERT INTO workspaces
+                (id, name, path, created_at, updated_at, path_dev, path_ino)
+             VALUES (?1, ?2, ?3, 't', 't', 7, 9)",
+            (id, name, path),
+        )
+        .unwrap();
+    }
+
+    fn seed_exact_workspace_update_budget(conn: &Connection) -> &'static str {
+        let target_id = "settings-update-target";
+        let target_name = "n";
+        let target_path = "/old";
+        let target_bytes = target_id.len()
+            + target_name.len()
+            + target_path.len()
+            + "t".len()
+            + "7".len()
+            + "9".len();
+        conn.execute(
+            "INSERT INTO workspaces
+                (id, name, path, created_at, updated_at, path_dev, path_ino)
+             VALUES (?1, ?2, ?3, 't', 't', 7, 9)",
+            (target_id, target_name, target_path),
+        )
+        .unwrap();
+        for index in 0..3 {
+            insert_workspace_with_logical_bytes(
+                conn,
+                &format!("settings-update-full-{index}"),
+                "/filler",
+                SETTINGS_ROW_BYTES_MAX,
+            );
+        }
+        insert_workspace_with_logical_bytes(
+            conn,
+            "settings-update-tail",
+            "/tail",
+            SETTINGS_ROW_BYTES_MAX - target_bytes,
+        );
+        target_id
+    }
+
+    #[test]
+    fn settings_global_write_admission은_workspace수에따른_query_loop가없다() {
+        let source = include_str!("db.rs");
+        let function_body = |name: &str| {
+            source
+                .split_once(&format!("fn {name}("))
+                .unwrap()
+                .1
+                .split("\nfn ")
+                .next()
+                .unwrap()
+        };
+        let agent = function_body("settings_agent_write_admission");
+        assert!(agent.contains("settings_all_profile_groups_probe"));
+        assert!(!agent.contains("for workspace"));
+        let credential = function_body("settings_credential_candidate_write_admission");
+        assert!(credential.contains("settings_global_credential_write_admission"));
+        assert!(!credential.contains("for workspace"));
+        assert_eq!(
+            source.matches("settings_workspace_ids_for_write").count(),
+            1
+        );
+        assert!(SETTINGS_GLOBAL_CREDENTIAL_WRITE_PREFLIGHT.contains("effective_scopes"));
+        assert_eq!(
+            SETTINGS_GLOBAL_CREDENTIAL_WRITE_PREFLIGHT
+                .matches("GROUP BY workspace_id")
+                .count(),
+            3
+        );
+        assert_eq!(
+            SETTINGS_GLOBAL_CREDENTIAL_WRITE_PREFLIGHT
+                .matches("AS MATERIALIZED")
+                .count(),
+            5
+        );
+        assert_eq!(
+            function_body("settings_global_credential_write_admission")
+                .matches("query_map(")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn settings_workspace_updates는_mutation전에aggregate_plus_one을거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let target = seed_exact_workspace_update_budget(&db.conn);
+        assert_eq!(db.settings_workspace_projection_rows().unwrap().len(), 5);
+        db.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER mutation_must_not_run
+                 BEFORE UPDATE ON workspaces
+                 WHEN OLD.id = 'settings-update-target'
+                 BEGIN SELECT RAISE(ABORT, 'workspace mutation reached'); END;",
+            )
+            .unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 7, ino: 9 };
+
+        let errors = [
+            db.rename_workspace(target, "nn").unwrap_err(),
+            db.set_workspace_path(target, "/oldx").unwrap_err(),
+            db.set_workspace_path_and_anchor(target, "/oldx", Some(7), Some(9))
+                .unwrap_err(),
+            db.set_workspace_anchor(target, Some(10), Some(9))
+                .unwrap_err(),
+            db.update_workspace_moved_path_cas(target, "/old", anchor, "/oldx", anchor)
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_static_settings_error(error, "settings_workspace_write_retained_bytes_limit");
+        }
+        assert_eq!(db.workspace_path(target).unwrap().as_deref(), Some("/old"));
+        assert_eq!(db.workspace_anchor(target).unwrap(), Some((7, 9)));
+        let name: String = db
+            .conn
+            .query_row(
+                "SELECT name FROM workspaces WHERE id = ?1",
+                [target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "n");
+    }
+
+    #[test]
+    fn settings_update_source_laws_require_pre_mutation_admission() {
+        let source = include_str!("db.rs");
+        let public_body = |name: &str| {
+            source
+                .split_once(&format!("pub fn {name}("))
+                .unwrap()
+                .1
+                .split("\n    pub fn ")
+                .next()
+                .unwrap()
+        };
+        for method in [
+            "rename_workspace",
+            "set_workspace_path",
+            "set_workspace_path_and_anchor",
+            "set_workspace_anchor",
+            "update_workspace_moved_path_cas",
+        ] {
+            let body = public_body(method);
+            assert!(body.contains("TransactionBehavior::Immediate"), "{method}");
+            let admission = body.find("settings_workspace_update_admission").unwrap();
+            let mutation = body.find(".execute(").unwrap();
+            assert!(admission < mutation, "{method}");
+        }
+        let publish = source
+            .split_once("fn publish_credential_secret_slot_in_transaction(")
+            .unwrap()
+            .1
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        let admission = publish
+            .find("settings_credential_publish_admission")
+            .unwrap();
+        assert!(admission < publish.find("orphan_published_physical_slot").unwrap());
+        assert!(admission < publish.find("\"UPDATE credentials").unwrap());
+        for method in [
+            "rotate_credential_secret_slot",
+            "publish_legacy_credential_secret_slot_cas",
+            "publish_credential_secret_slot_cas",
+            "publish_credential_secret_slot_revision_cas",
+        ] {
+            assert!(
+                public_body(method).contains("publish_credential_secret_slot_in_transaction"),
+                "{method}"
+            );
+        }
+        let credential_admission = source
+            .split_once("fn settings_credential_publish_admission(")
+            .unwrap()
+            .1
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        let byte_guard = credential_admission
+            .find("candidate_bytes > SETTINGS_ROW_BYTES_MAX")
+            .unwrap();
+        let clone = credential_admission
+            .find("masked_hint.map(str::to_owned)")
+            .unwrap();
+        assert!(
+            byte_guard < clone,
+            "masked_hint clone must follow its byte guard"
+        );
+    }
+
+    #[test]
+    fn credential_slot_publish는_masked_hint_admission전에아무것도변경하지않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("publish-admission").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let mut meta = sample(logical.as_str());
+        let fixed_bytes =
+            meta.id.len() + meta.provider.len() + meta.label.len() + meta.credential_kind.len();
+        let old_hint_bytes = SETTINGS_ROW_BYTES_MAX - fixed_bytes;
+        meta.masked_hint = Some("x".repeat(old_hint_bytes));
+        db.insert_credential(&meta).unwrap();
+        stage_slot(&db, &logical, &slot);
+        db.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER credential_mutation_must_not_run
+                 BEFORE UPDATE ON credentials
+                 WHEN OLD.id = 'publish-admission'
+                 BEGIN SELECT RAISE(ABORT, 'credential mutation reached'); END;",
+            )
+            .unwrap();
+
+        let oversized_hint = "x".repeat(old_hint_bytes + 1);
+        let error = db
+            .rotate_credential_secret_slot(
+                logical.as_str(),
+                slot.as_str(),
+                r#"{"server_id":"server"}"#,
+                Some(&oversized_hint),
+            )
+            .unwrap_err();
+
+        assert_static_settings_error(error, "settings_credential_write_row_bytes_limit");
+        assert_eq!(
+            db.credential_secret_location(logical.as_str())
+                .unwrap()
+                .unwrap()
+                .keyring_username,
+            logical.as_str()
+        );
+        let (hint_bytes, oauth_json): (i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT length(CAST(masked_hint AS BLOB)), oauth_json
+                 FROM credentials WHERE id = ?1",
+                [logical.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(usize::try_from(hint_bytes).unwrap(), old_hint_bytes);
+        assert!(oauth_json.is_none());
+        let state: String = db
+            .conn
+            .query_row(
+                "SELECT state FROM physical_secret_slot_ledger WHERE physical_slot = ?1",
+                [slot.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "staging");
+    }
+
+    #[test]
+    fn settings_workspace_write는_max_plus_one을_insert전에_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        seed_settings_workspaces(&db.conn, SETTINGS_WORKSPACE_LIMIT_MAX);
+
+        let error = db.create_workspace("must-not-persist").unwrap_err();
+
+        assert_static_settings_error(error, "settings_workspace_write_item_limit");
+        let count = query_count(&db.conn, "SELECT COUNT(*) FROM workspaces", []);
+        assert_eq!(count, SETTINGS_WORKSPACE_LIMIT_MAX);
+    }
+
+    #[test]
+    fn settings_workspace_exact_path는_cap에서도_existing을반환하고_new만거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        seed_settings_workspaces(&db.conn, SETTINGS_WORKSPACE_LIMIT_MAX);
+        db.conn
+            .execute(
+                "UPDATE workspaces
+                 SET path = '/existing', path_dev = 7, path_ino = 9
+                 WHERE id = 'write-workspace-0000'",
+                [],
+            )
+            .unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 7, ino: 9 };
+
+        let existing = db
+            .find_or_create_workspace_by_exact_path("ignored", "/existing", anchor)
+            .unwrap();
+        assert!(!existing.created);
+        assert_eq!(existing.row.id, "write-workspace-0000");
+        let error = db
+            .find_or_create_workspace_by_exact_path("new", "/new", anchor)
+            .unwrap_err();
+
+        assert_static_settings_error(error, "settings_workspace_write_item_limit");
+        let count = query_count(&db.conn, "SELECT COUNT(*) FROM workspaces", []);
+        assert_eq!(count, SETTINGS_WORKSPACE_LIMIT_MAX);
+    }
+
+    #[test]
+    fn settings_credential_write는_visible_inventory_max_plus_one을거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_workspace("scope").unwrap();
+        db.conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?1
+                 )
+                 INSERT INTO credentials
+                    (id, provider, label, credential_kind, keyring_service, keyring_username,
+                     masked_hint, workspace_id, created_at, updated_at)
+                 SELECT printf('write-credential-%05d', n), 'custom', 'credential', 'api_key',
+                        ?2, printf('slot-%05d', n), NULL, NULL,
+                        printf('%08d', n), printf('%08d', n)
+                 FROM seq",
+                rusqlite::params![
+                    i64::try_from(SETTINGS_CREDENTIAL_LIMIT_MAX).unwrap(),
+                    secret::KEYRING_SERVICE
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .insert_credential(&sample("must-not-persist"))
+            .unwrap_err();
+
+        assert_static_settings_error(error, "settings_credential_write_item_limit");
+        let count = query_count(&db.conn, "SELECT COUNT(*) FROM credentials", []);
+        assert_eq!(count, SETTINGS_CREDENTIAL_LIMIT_MAX);
+    }
+
+    #[test]
+    fn settings_env_profile_write는_workspace_max_plus_one을거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("scope").unwrap();
+        db.conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?2
+                 )
+                 INSERT INTO env_profiles
+                    (id, workspace_id, name, kind, is_production, created_at, updated_at)
+                 SELECT printf('write-profile-%04d', n), ?1, 'profile', 'custom', 0,
+                        printf('%08d', n), printf('%08d', n)
+                 FROM seq",
+                rusqlite::params![
+                    workspace,
+                    i64::try_from(SETTINGS_ENV_PROFILE_LIMIT_MAX).unwrap()
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .insert_env_profile(&workspace, "must-not-persist", "custom")
+            .unwrap_err();
+
+        assert_static_settings_error(error, "settings_env_profile_write_item_limit");
+        let count = query_count(
+            &db.conn,
+            "SELECT COUNT(*) FROM env_profiles WHERE workspace_id = ?1",
+            [&workspace],
+        );
+        assert_eq!(count, SETTINGS_ENV_PROFILE_LIMIT_MAX);
+    }
+
+    #[test]
+    fn settings_env_var_upsert는_cap에서update를보존하고new만거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("scope").unwrap();
+        let profile = db
+            .insert_env_profile(&workspace, "profile", "custom")
+            .unwrap();
+        db.conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?2
+                 )
+                 INSERT INTO env_vars
+                    (id, profile_id, key, kind, plain_value, credential_id, created_at, updated_at)
+                 SELECT printf('write-env-%05d', n), ?1, printf('KEY_%05d', n),
+                        'plain', 'value', NULL, printf('%08d', n), printf('%08d', n)
+                 FROM seq",
+                rusqlite::params![profile, i64::try_from(SETTINGS_ENV_VAR_LIMIT_MAX).unwrap()],
+            )
+            .unwrap();
+
+        db.upsert_env_var(&profile, "KEY_00000", &EnvValue::Plain("updated".into()))
+            .unwrap();
+        let updated: String = db
+            .conn
+            .query_row(
+                "SELECT plain_value FROM env_vars WHERE profile_id = ?1 AND key = 'KEY_00000'",
+                [&profile],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated, "updated");
+        let error = db
+            .upsert_env_var(
+                &profile,
+                "KEY_MUST_NOT_PERSIST",
+                &EnvValue::Plain("value".into()),
+            )
+            .unwrap_err();
+
+        assert_static_settings_error(error, "settings_env_var_write_item_limit");
+        let count = query_count(
+            &db.conn,
+            "SELECT COUNT(*) FROM env_vars WHERE profile_id = ?1",
+            [&profile],
+        );
+        assert_eq!(count, SETTINGS_ENV_VAR_LIMIT_MAX);
+    }
+
+    #[test]
+    fn settings_agent_write는_max_plus_one을거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_workspace("scope").unwrap();
+        db.conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?1
+                 )
+                 INSERT INTO agent_configs
+                    (id, name, command, args_json, waiting_regex, approval_regex, error_regex,
+                     done_regex, mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag,
+                     created_at, updated_at)
+                 SELECT printf('write-agent-%04d', n), 'agent', 'true', '[]',
+                        NULL, NULL, NULL, NULL, 0, NULL, NULL,
+                        printf('%08d', n), printf('%08d', n)
+                 FROM seq",
+                [i64::try_from(SETTINGS_AGENT_LIMIT_MAX).unwrap()],
+            )
+            .unwrap();
+
+        let error = db
+            .insert_agent_config(
+                "must-not-persist",
+                "true",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap_err();
+
+        assert_static_settings_error(error, "settings_agent_write_item_limit");
+        let count = query_count(
+            &db.conn,
+            "SELECT COUNT(*) FROM agent_configs WHERE deleted_at IS NULL",
+            [],
+        );
+        assert_eq!(count, SETTINGS_AGENT_LIMIT_MAX);
+    }
+
+    #[test]
+    fn settings_agent_write는_logical_byte_plus_one을insert전에거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_workspace("scope").unwrap();
+        for index in 0..4 {
+            let id = format!("byte-agent-{index}");
+            let name_bytes = SETTINGS_ROW_BYTES_MAX - id.len() - "true".len() - "[]".len();
+            let name = "x".repeat(name_bytes);
+            db.conn
+                .execute(
+                    "INSERT INTO agent_configs
+                        (id, name, command, args_json, waiting_regex, approval_regex, error_regex,
+                         done_regex, mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag,
+                         created_at, updated_at)
+                     VALUES (?1, ?2, 'true', '[]', NULL, NULL, NULL, NULL, 0, NULL, NULL,
+                             ?1, ?1)",
+                    (&id, &name),
+                )
+                .unwrap();
+        }
+
+        let error = db
+            .insert_agent_config(
+                "must-not-persist",
+                "true",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap_err();
+
+        assert_static_settings_error(error, "settings_agent_write_retained_bytes_limit");
+        let count = query_count(&db.conn, "SELECT COUNT(*) FROM agent_configs", []);
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn settings_workspace_concurrent_writers는하나만마지막slot을획득한다() {
+        let (dir, path, db) = file_db("settings-write-concurrent");
+        seed_settings_workspaces(&db.conn, SETTINGS_WORKSPACE_LIMIT_MAX - 1);
+        drop(db);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let db = Db::open(&path).unwrap();
+                    barrier.wait();
+                    db.create_workspace(&format!("concurrent-{index}"))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results.into_iter().find_map(Result::err).unwrap();
+        assert_static_settings_error(error, "settings_workspace_write_item_limit");
+        let db = Db::open(&path).unwrap();
+        let count = query_count(&db.conn, "SELECT COUNT(*) FROM workspaces", []);
+        assert_eq!(count, SETTINGS_WORKSPACE_LIMIT_MAX);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn seed_finalized_audit_rows(conn: &Connection, count: usize) {
+        conn.execute(
+            "WITH RECURSIVE seq(n) AS (
+                 SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?1
+             )
+             INSERT INTO tool_audit_logs
+                (id, tool_name, decision, created_at, lifecycle, completed_at)
+             SELECT printf('retained-audit-%05d', n), 'tool', 'allow_once',
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day'), 'succeeded',
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')
+             FROM seq",
+            [i64::try_from(count).unwrap()],
+        )
+        .unwrap();
+    }
+
+    fn seed_expired_finalized_audit_rows(conn: &Connection, count: usize) {
+        conn.execute(
+            "WITH RECURSIVE seq(n) AS (
+                 SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?1
+             )
+             INSERT INTO tool_audit_logs
+                (id, tool_name, decision, created_at, lifecycle, completed_at)
+             SELECT printf('expired-audit-%05d', n), 'tool', 'allow_once',
+                    '2000-01-01T00:00:00.000Z', 'succeeded',
+                    '2000-01-01T00:00:00.000Z'
+             FROM seq",
+            [i64::try_from(count).unwrap()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn production_audit_write는_finalized_n_plus_one을원자적으로정리한다() {
+        let db = Db::open_in_memory().unwrap();
+        seed_finalized_audit_rows(&db.conn, audit::AUDIT_RETENTION_MAX_FINALIZED_ITEMS);
+
+        let audit_id = db
+            .record_tool_audit(
+                &audit::AuditRecord {
+                    workspace_id: None,
+                    session_id: None,
+                    server_id: Some("server"),
+                    tool_name: "newest-tool",
+                    input_json: "{}",
+                    decision: audit::ToolDecision::AllowOnce,
+                },
+                &secret::RedactionService::new(),
+                None,
+            )
+            .unwrap();
+
+        let finalized = query_count(
+            &db.conn,
+            "SELECT COUNT(*) FROM tool_audit_logs
+             WHERE lifecycle IN ('succeeded', 'failed', 'unknown', 'denied')",
+            [],
+        );
+        assert_eq!(finalized, audit::AUDIT_RETENTION_MAX_FINALIZED_ITEMS);
+        let inserted: bool = db
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tool_audit_logs WHERE id = ?1)",
+                [&audit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(inserted);
+    }
+
+    #[test]
+    fn legacy_audit_oversize는한번의lazy_retry에서bounded_batch로수렴한다() {
+        let db = Db::open_in_memory().unwrap();
+        let encryptor = CountingAuditSecretStore::default();
+        seed_finalized_audit_rows(
+            &db.conn,
+            audit::AUDIT_RETENTION_MAX_FINALIZED_ITEMS
+                + audit::AUDIT_RETENTION_DELETE_BATCH_ITEMS
+                + 1,
+        );
+        let audit_id = db
+            .record_tool_audit(
+                &audit::AuditRecord {
+                    workspace_id: None,
+                    session_id: None,
+                    server_id: Some("server"),
+                    tool_name: "after-lazy-normalization",
+                    input_json: "{}",
+                    decision: audit::ToolDecision::AllowOnce,
+                },
+                &secret::RedactionService::new(),
+                Some(&encryptor),
+            )
+            .unwrap();
+        assert_eq!(
+            query_count(
+                &db.conn,
+                "SELECT COUNT(*) FROM tool_audit_logs WHERE lifecycle = 'succeeded'",
+                [],
+            ),
+            audit::AUDIT_RETENTION_MAX_FINALIZED_ITEMS,
+            "lazy batches must complete before the retried lifecycle transaction commits"
+        );
+        assert!(
+            db.conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tool_audit_logs WHERE id = ?1)",
+                    [&audit_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            encryptor
+                .set_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "rollback retry must reuse the exact audit key instead of creating another secret"
+        );
+        let encrypted: bool = db
+            .conn
+            .query_row(
+                "SELECT input_encrypted_blob IS NOT NULL FROM tool_audit_logs WHERE id = ?1",
+                [&audit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(encrypted);
+    }
+
+    #[test]
+    fn idle후_64개초과expired_audit도첫lifecycle호출에서수렴한다() {
+        let db = Db::open_in_memory().unwrap();
+        seed_expired_finalized_audit_rows(
+            &db.conn,
+            audit::AUDIT_RETENTION_DELETE_BATCH_ITEMS * 2 + 2,
+        );
+
+        let audit_id = db
+            .record_tool_audit(
+                &audit::AuditRecord {
+                    workspace_id: None,
+                    session_id: None,
+                    server_id: Some("server"),
+                    tool_name: "after-idle",
+                    input_json: "{}",
+                    decision: audit::ToolDecision::AllowOnce,
+                },
+                &secret::RedactionService::new(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            query_count(
+                &db.conn,
+                "SELECT COUNT(*) FROM tool_audit_logs WHERE lifecycle = 'succeeded'",
+                [],
+            ),
+            1
+        );
+        assert!(
+            db.conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tool_audit_logs WHERE id = ?1)",
+                    [&audit_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn audit_lifecycle_source_laws_keep_steady_state_to_one_window_scan() {
+        let source = include_str!("db.rs");
+        let public_body = |name: &str| {
+            source
+                .split_once(&format!("pub fn {name}("))
+                .unwrap()
+                .1
+                .split("\n    pub fn ")
+                .next()
+                .unwrap()
+        };
+        for method in [
+            "record_tool_audit",
+            "acquire_authorization_owner",
+            "commit_authorization_preflight",
+            "commit_authorization_preflight_revision_cas",
+            "complete_authorization_outcome",
+            "close_authorization_owner",
+        ] {
+            let body = public_body(method);
+            assert!(
+                body.contains("with_audit_retention_normalization_retry"),
+                "{method}"
+            );
+            assert_eq!(
+                body.matches("prune_audit_logs_in_transaction").count(),
+                1,
+                "{method} steady path must contain one bounded retention window"
+            );
+            assert!(
+                !body.contains("normalize_audit_retention_to_completion"),
+                "{method} must not pre-scan steady state"
+            );
+        }
+        let retry = source
+            .split_once("fn with_audit_retention_normalization_retry")
+            .unwrap()
+            .1
+            .split("\n    ///")
+            .next()
+            .unwrap();
+        assert_eq!(retry.matches("lifecycle_transaction()").count(), 2);
+        assert!(retry.contains("downcast_ref::<audit::AuditRetentionNormalizationRequired>()"));
+        assert!(!retry.contains("cause.to_string()"));
+        assert_eq!(
+            retry
+                .matches("normalize_audit_retention_to_completion")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn audit_retention_retry는동일문자열의비retention오류를재시도하지않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let attempts = std::cell::Cell::new(0_u8);
+
+        let result: anyhow::Result<()> = db.with_audit_retention_normalization_retry(|| {
+            attempts.set(attempts.get() + 1);
+            anyhow::bail!("audit_retention_normalization_required")
+        });
+
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "audit_retention_normalization_required"
+        );
+    }
+
+    #[test]
+    fn authorization_completion_retention_failure는transition과gc를함께rollback한다() {
+        let (dir, _path, db) = file_db("audit-completion-retention-rollback");
+        let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+        let owner = db
+            .acquire_authorization_owner("proxy:retention-completion")
+            .unwrap();
+        let operation = "operation-retention-completion";
+        let audit::AuthorizationPreflight::Prepared(_grant) = db
+            .commit_authorization_preflight(
+                &owner,
+                authorization_plan(
+                    operation,
+                    "server",
+                    "tool",
+                    audit::ApprovalDecision::AllowOnce,
+                ),
+                "{}",
+                &secret::RedactionService::new(),
+            )
+            .unwrap()
+        else {
+            panic!("allow-once must prepare")
+        };
+        seed_finalized_audit_rows(&db.conn, audit::AUDIT_RETENTION_MAX_FINALIZED_ITEMS);
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_storage_audit_retention_completion
+                 BEFORE DELETE ON tool_audit_logs
+                 BEGIN SELECT RAISE(ABORT, 'injected retention failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.complete_authorization_outcome(
+                &owner,
+                operation,
+                audit::AuthorizationOutcome::Succeeded,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.tool_audit_lifecycle(operation).unwrap(),
+            Some(audit::AuditLifecycle::Prepared)
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER fail_storage_audit_retention_completion")
+            .unwrap();
+        db.complete_authorization_outcome(
+            &owner,
+            operation,
+            audit::AuthorizationOutcome::Succeeded,
+        )
+        .unwrap();
+        assert_eq!(
+            db.tool_audit_lifecycle(operation).unwrap(),
+            Some(audit::AuditLifecycle::Succeeded)
+        );
+        db.close_authorization_owner(owner).unwrap();
+        drop(db);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authorization_recovery_retention_failure는unknown전이를rollback하고lock을해제한다() {
+        let (dir, _path, db) = file_db("audit-recovery-retention-rollback");
+        let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+        let scope = "proxy:retention-recovery";
+        let owner = db.acquire_authorization_owner(scope).unwrap();
+        let operation = "operation-retention-recovery";
+        let audit::AuthorizationPreflight::Prepared(_grant) = db
+            .commit_authorization_preflight(
+                &owner,
+                authorization_plan(
+                    operation,
+                    "server",
+                    "tool",
+                    audit::ApprovalDecision::AllowOnce,
+                ),
+                "{}",
+                &secret::RedactionService::new(),
+            )
+            .unwrap()
+        else {
+            panic!("allow-once must prepare")
+        };
+        drop(owner);
+        seed_finalized_audit_rows(&db.conn, audit::AUDIT_RETENTION_MAX_FINALIZED_ITEMS);
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_storage_audit_retention_recovery
+                 BEFORE DELETE ON tool_audit_logs
+                 BEGIN SELECT RAISE(ABORT, 'injected retention failure'); END;",
+            )
+            .unwrap();
+
+        assert!(db.acquire_authorization_owner(scope).is_err());
+        assert_eq!(
+            db.tool_audit_lifecycle(operation).unwrap(),
+            Some(audit::AuditLifecycle::Prepared)
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER fail_storage_audit_retention_recovery")
+            .unwrap();
+        let recovered_owner = db.acquire_authorization_owner(scope).unwrap();
+        assert_eq!(
+            db.tool_audit_lifecycle(operation).unwrap(),
+            Some(audit::AuditLifecycle::Unknown)
+        );
+        db.close_authorization_owner(recovered_owner).unwrap();
+        drop(db);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 }

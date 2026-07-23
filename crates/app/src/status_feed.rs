@@ -1,9 +1,11 @@
 //! 홈 업데이트 피드 — Claude/OpenAI/GitHub Statuspage, Hugging Face trending
 //! models, Grok 공식 상태 RSS. 하단 상태바의 서비스 점등과 홈 업데이트 목록이 쓴다
-//! (2026-07-18 사용자). 백그라운드 워커 1개가 폴링해 mpsc로 스냅샷을 보낸다 —
-//! UI 스레드 네트워크 금지 관례. 주기는 이원화: **상태 점등 5분**(터미널 작업용
-//! 신선도), **공지 4시간**(사용자 지정) + 홈의 수동 갱신 버튼(refresh 채널).
-//! 실패 시 해당 provider만 None (오프라인이어도 앱 동작 무영향).
+//! (2026-07-18 사용자). Home 활성 또는 수동 refresh가 처음 생길 때만 백그라운드
+//! 워커를 지연 시작해 mpsc로 스냅샷을 보낸다 — UI 스레드 네트워크 금지 관례.
+//! Home이 숨겨지면 네트워크와 repaint를 멈추고 idle TTL 뒤 worker를 회수한다.
+//! 활성 주기는 이원화: **상태 점등 5분**(터미널 작업용 신선도), **공지 4시간**
+//! (사용자 지정) + 홈의 수동 갱신 버튼(refresh 채널). 실패 시 해당 provider만 None
+//! (오프라인이어도 앱 동작 무영향).
 
 use std::fmt;
 use std::io::Read;
@@ -24,6 +26,8 @@ const HUGGING_FACE_MODELS_API: &str =
 const GROK_STATUS_RSS: &str = "https://status.x.ai/feed.xml";
 /// 상태(점등) 폴링 주기 — 장애 감지용이라 짧게 유지.
 const STATUS_INTERVAL: Duration = Duration::from_secs(300);
+/// Home이 숨겨진 뒤 bounded cache/HTTP pool/thread를 회수하기까지의 유예.
+const WORKER_IDLE_TTL: Duration = Duration::from_secs(30);
 /// 공지(인시던트 목록) 갱신 주기 (2026-07-21 사용자: 4시간).
 const INCIDENTS_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -101,14 +105,29 @@ pub struct StatusFeedSnapshot {
 pub struct StatusFeedReceiver {
     latest: Arc<Mutex<Option<StatusFeedSnapshot>>>,
     ready_rx: Receiver<()>,
+    sender: StatusFeedSender,
     control: Arc<WorkerControl>,
     worker: Option<JoinHandle<()>>,
+    egui_ctx: egui::Context,
+    idle_ttl: Duration,
+    worker_spawner: Arc<WorkerSpawner>,
 }
 
 impl StatusFeedReceiver {
+    /// Home 표시 상태를 전달한다. `true` 전환 또는 pending refresh만 worker를 지연
+    /// 시작한다. 같은 상태를 매 logic tick 전달해도 thread를 추가 생성하지 않는다.
+    pub fn set_active(&mut self, active: bool) {
+        self.reap_finished_worker();
+        self.control.set_active(active);
+        self.ensure_worker();
+    }
+
     /// 현재 pending인 최신 스냅샷 하나만 꺼낸다. publish/receive가 교차해 남은 wake
     /// token은 내부에서 버리며, 결과 payload backlog는 항상 0 또는 1이다.
-    pub fn try_recv(&self) -> Result<StatusFeedSnapshot, TryRecvError> {
+    /// pending refresh가 idle worker를 필요로 하면 이 호출에서 지연 시작한다.
+    pub fn try_recv(&mut self) -> Result<StatusFeedSnapshot, TryRecvError> {
+        self.reap_finished_worker();
+        self.ensure_worker();
         loop {
             match self.ready_rx.try_recv() {
                 Ok(()) => {
@@ -130,19 +149,82 @@ impl StatusFeedReceiver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
-}
 
-impl Drop for StatusFeedReceiver {
-    fn drop(&mut self) {
-        self.control.shutdown();
+    fn ensure_worker(&mut self) {
+        if !self.control.start_needed() {
+            return;
+        }
+
+        // idle-expired worker는 running=false를 같은 lifecycle lock 아래 기록한 뒤
+        // 반환한다. 새 start를 reserve하기 전에 짧게 join해 handle 수를 항상 1로 둔다.
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::debug!("status-feed worker exited after panic");
+        }
+        if !self.control.reserve_start() {
+            return;
+        }
+        match (self.worker_spawner)(
+            Arc::clone(&self.control),
+            self.sender.clone(),
+            self.egui_ctx.clone(),
+            self.idle_ttl,
+        ) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(_) => {
+                self.control.spawn_failed();
+                tracing::warn!(
+                    kind = "status_feed",
+                    phase = "worker_start",
+                    error_code = "thread_spawn_failed",
+                    "status-feed worker failed to start"
+                );
+            }
+        }
+    }
+
+    fn reap_finished_worker(&mut self) {
+        let handle_finished = self
+            .worker
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished);
+        let lifecycle_stopped = !self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running;
+        if !handle_finished && !lifecycle_stopped {
+            return;
+        }
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
             tracing::debug!("status-feed worker exited after panic");
         }
     }
+
+    /// 진행 중 HTTP 한 건의 bounded timeout 뒤 worker를 반드시 join한다. 반복 호출해도
+    /// 안전하며 pending result payload도 즉시 해제한다.
+    pub fn shutdown(&mut self) {
+        self.control.shutdown();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::debug!("status-feed worker exited after panic");
+        }
+        self.take_latest();
+    }
 }
 
+impl Drop for StatusFeedReceiver {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[derive(Clone)]
 struct StatusFeedSender {
     latest: Arc<Mutex<Option<StatusFeedSnapshot>>>,
     ready_tx: SyncSender<()>,
@@ -169,19 +251,38 @@ impl StatusFeedSender {
     }
 }
 
-fn status_feed_channel(control: Arc<WorkerControl>) -> (StatusFeedSender, StatusFeedReceiver) {
+type WorkerSpawner = dyn Fn(
+        Arc<WorkerControl>,
+        StatusFeedSender,
+        egui::Context,
+        Duration,
+    ) -> std::io::Result<JoinHandle<()>>
+    + Send
+    + Sync;
+
+fn status_feed_channel_with(
+    control: Arc<WorkerControl>,
+    egui_ctx: egui::Context,
+    idle_ttl: Duration,
+    worker_spawner: Arc<WorkerSpawner>,
+) -> (StatusFeedSender, StatusFeedReceiver) {
     let latest = Arc::new(Mutex::new(None));
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let sender = StatusFeedSender {
+        latest: Arc::clone(&latest),
+        ready_tx,
+    };
     (
-        StatusFeedSender {
-            latest: Arc::clone(&latest),
-            ready_tx,
-        },
+        sender.clone(),
         StatusFeedReceiver {
             latest,
             ready_rx,
+            sender,
             control,
             worker: None,
+            egui_ctx,
+            idle_ttl,
+            worker_spawner,
         },
     )
 }
@@ -191,22 +292,32 @@ fn status_feed_channel(control: Arc<WorkerControl>) -> (StatusFeedSender, Status
 #[derive(Clone)]
 pub struct StatusFeedRefresh {
     control: Arc<WorkerControl>,
+    egui_ctx: egui::Context,
 }
 
 impl StatusFeedRefresh {
     pub fn send(&self, _signal: ()) -> Result<(), std::sync::mpsc::SendError<()>> {
-        if self.control.request_refresh() {
-            Ok(())
-        } else {
-            Err(std::sync::mpsc::SendError(()))
+        match self.control.request_refresh() {
+            Some(newly_pending) => {
+                // refresh는 명시적 사용자 intent다. worker가 아직 없으면 다음 logic
+                // tick의 receiver drain이 지연 시작하도록 최초 pending 전환만 깨운다.
+                if newly_pending {
+                    self.egui_ctx.request_repaint();
+                }
+                Ok(())
+            }
+            None => Err(std::sync::mpsc::SendError(())),
         }
     }
 }
 
 #[derive(Default)]
 struct WorkerControlState {
+    active: bool,
     refresh_pending: bool,
     shutdown: bool,
+    running: bool,
+    restart_blocked: bool,
 }
 
 #[derive(Default)]
@@ -216,17 +327,38 @@ struct WorkerControl {
 }
 
 impl WorkerControl {
-    fn request_refresh(&self) -> bool {
+    fn set_active(&self, active: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.shutdown || state.active == active {
+            return;
+        }
+        state.active = active;
+        if active {
+            // spawn 실패/worker panic은 frame-loop retry하지 않는다. 새 활성 intent만
+            // latch를 해제한다.
+            state.restart_blocked = false;
+        }
+        self.wake.notify_one();
+    }
+
+    /// `Some(true)`는 새 pending 전환, `Some(false)`는 기존 request에 병합, `None`은
+    /// shutdown 뒤 거부다.
+    fn request_refresh(&self) -> Option<bool> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.shutdown {
-            return false;
+            return None;
         }
+        let newly_pending = !state.refresh_pending;
         state.refresh_pending = true;
+        state.restart_blocked = false;
         self.wake.notify_one();
-        true
+        Some(newly_pending)
     }
 
     fn shutdown(&self) {
@@ -235,43 +367,182 @@ impl WorkerControl {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.shutdown = true;
+        state.active = false;
         state.refresh_pending = false;
         self.wake.notify_one();
     }
 
-    fn is_shutdown(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shutdown
-    }
-
-    fn wait(&self, timeout: Duration) -> WorkerWake {
+    fn start_needed(&self) -> bool {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut state, _) = self
-            .wake
-            .wait_timeout_while(state, timeout, |state| {
-                !state.refresh_pending && !state.shutdown
-            })
+        !state.shutdown
+            && !state.running
+            && !state.restart_blocked
+            && (state.active || state.refresh_pending)
+    }
+
+    fn reserve_start(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.shutdown
+            || state.running
+            || state.restart_blocked
+            || (!state.active && !state.refresh_pending)
+        {
+            return false;
+        }
+        state.running = true;
+        true
+    }
+
+    fn spawn_failed(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.running = false;
+        state.refresh_pending = false;
+        state.restart_blocked = true;
+        self.wake.notify_all();
+    }
+
+    fn worker_exited(&self, unexpected: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.running = false;
+        if unexpected && !state.shutdown {
+            state.restart_blocked = true;
+        }
+        self.wake.notify_all();
+    }
+
+    fn take_initial_cycle(&self) -> Option<WorkerCycle> {
+        let mut state = self
+            .state
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.shutdown {
-            WorkerWake::Shutdown
+            state.running = false;
+            None
         } else if state.refresh_pending {
             state.refresh_pending = false;
-            WorkerWake::Refresh
+            Some(WorkerCycle::Refresh)
+        } else if state.active {
+            Some(WorkerCycle::Active)
         } else {
-            WorkerWake::Timeout
+            // A visibility transition can cancel the only requested cycle before the new thread
+            // starts. Publish the clean stop while holding the lifecycle lock so a concurrent
+            // reactivation joins this handle and reserves exactly one replacement.
+            state.running = false;
+            None
+        }
+    }
+
+    fn cycle_allowed(&self, cycle: WorkerCycle) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.shutdown && (cycle == WorkerCycle::Refresh || state.active)
+    }
+
+    fn is_active(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.shutdown && state.active
+    }
+
+    fn wait_for_work(&self, poll_interval: Duration, idle_ttl: Duration) -> WorkerWake {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if state.shutdown {
+                return WorkerWake::Shutdown;
+            }
+            if state.refresh_pending {
+                state.refresh_pending = false;
+                return WorkerWake::Refresh;
+            }
+            if state.active {
+                let (next, timeout) = self
+                    .wake
+                    .wait_timeout_while(state, poll_interval, |state| {
+                        state.active && !state.refresh_pending && !state.shutdown
+                    })
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                if timeout.timed_out() && state.active && !state.shutdown {
+                    return WorkerWake::Poll;
+                }
+                continue;
+            }
+
+            let (next, timeout) = self
+                .wake
+                .wait_timeout_while(state, idle_ttl, |state| {
+                    !state.active && !state.refresh_pending && !state.shutdown
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if timeout.timed_out() && !state.active && !state.refresh_pending && !state.shutdown {
+                // Make the clean idle exit observable under the same lifecycle lock as an
+                // activation intent. The receiver can now join this handle before reserving its
+                // replacement instead of losing the only activation edge in a pre-exit gap.
+                state.running = false;
+                return WorkerWake::IdleExpired;
+            }
+            if state.active && !state.shutdown {
+                return WorkerWake::Poll;
+            }
         }
     }
 }
 
 enum WorkerWake {
     Refresh,
-    Timeout,
+    Poll,
+    IdleExpired,
     Shutdown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerCycle {
+    Active,
+    Refresh,
+}
+
+struct WorkerExitGuard {
+    control: Arc<WorkerControl>,
+    clean: bool,
+}
+
+impl WorkerExitGuard {
+    fn new(control: Arc<WorkerControl>) -> Self {
+        Self {
+            control,
+            clean: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.clean = true;
+    }
+}
+
+impl Drop for WorkerExitGuard {
+    fn drop(&mut self) {
+        self.control.worker_exited(!self.clean);
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -452,134 +723,244 @@ fn notice_id(provider: &str, incident: &IncidentNotice) -> String {
     format!("{provider}\u{1f}{identity}")
 }
 
-/// 백그라운드 폴링 워커를 띄우고 (스냅샷 수신, 수동 갱신 송신) 채널 쌍을 돌려준다.
-/// 앱 수명 내내 돈다 — App(수신측)이 드롭되면 worker를 깨워 종료하고 join한다.
-/// 수동 갱신 신호가 오면 즉시 상태+공지를 모두 다시 가져온다.
-pub fn spawn(egui_ctx: egui::Context) -> (StatusFeedReceiver, StatusFeedRefresh) {
-    let control = Arc::new(WorkerControl::default());
-    let (tx, mut rx) = status_feed_channel(Arc::clone(&control));
-    let worker_control = Arc::clone(&control);
-    let spawned = std::thread::Builder::new()
-        .name("status-feed".into())
-        .spawn(move || {
-            let agent = ureq::builder().timeout(HTTP_TIMEOUT).build();
-            // 공지는 4시간 주기 — 사이 틱에서는 마지막 성공 목록을 스냅샷에 실어
-            // 보낸다(상태만 갱신돼도 공지가 사라지지 않게).
-            let mut incidents_at: Option<Instant> = None;
-            let mut claude_incidents: Vec<IncidentNotice> = Vec::new();
-            let mut openai_incidents: Vec<IncidentNotice> = Vec::new();
-            let mut hugging_face_updates: Option<Vec<IncidentNotice>> = None;
-            let mut grok_updates: Option<Vec<IncidentNotice>> = None;
-            loop {
-                if worker_control.is_shutdown() {
-                    return;
-                }
-                let incidents_due =
-                    incidents_at.is_none_or(|at| at.elapsed() >= INCIDENTS_INTERVAL);
-                if incidents_due {
-                    if let Ok(list) = fetch_incidents(&agent, CLAUDE_STATUS_URL)
-                        .map_err(|e| tracing::debug!("Claude 공지 조회 실패: {e:#}"))
-                    {
-                        claude_incidents = list;
-                    }
-                    if worker_control.is_shutdown() {
-                        return;
-                    }
-                    if let Ok(list) = fetch_incidents(&agent, OPENAI_STATUS_URL)
-                        .map_err(|e| tracing::debug!("OpenAI 공지 조회 실패: {e:#}"))
-                    {
-                        openai_incidents = list;
-                    }
-                    if worker_control.is_shutdown() {
-                        return;
-                    }
-                    if let Ok(list) = fetch_hugging_face_models(&agent)
-                        .map_err(|e| tracing::debug!("Hugging Face 모델 조회 실패: {e:#}"))
-                    {
-                        hugging_face_updates = Some(list);
-                    }
-                    if worker_control.is_shutdown() {
-                        return;
-                    }
-                    if let Ok(list) = fetch_grok_status(&agent)
-                        .map_err(|e| tracing::debug!("Grok 상태 RSS 조회 실패: {e:#}"))
-                    {
-                        grok_updates = Some(list);
-                    }
-                    incidents_at = Some(Instant::now());
-                }
-                let claude = fetch_status(&agent, CLAUDE_STATUS_URL)
-                    .map_err(|e| tracing::debug!("Claude 상태 조회 실패: {e:#}"))
-                    .ok()
-                    .map(|(indicator, description)| ProviderStatus {
-                        indicator,
-                        description,
-                        incidents: claude_incidents.clone(),
-                    });
-                if worker_control.is_shutdown() {
-                    return;
-                }
-                let openai = fetch_status(&agent, OPENAI_STATUS_URL)
-                    .map_err(|e| tracing::debug!("OpenAI 상태 조회 실패: {e:#}"))
-                    .ok()
-                    .map(|(indicator, description)| ProviderStatus {
-                        indicator,
-                        description,
-                        incidents: openai_incidents.clone(),
-                    });
-                if worker_control.is_shutdown() {
-                    return;
-                }
-                let github = fetch_status(&agent, GITHUB_STATUS_URL)
-                    .map_err(|e| tracing::debug!("GitHub 상태 조회 실패: {e:#}"))
-                    .ok()
-                    .map(|(indicator, description)| ProviderStatus {
-                        indicator,
-                        description,
-                        incidents: Vec::new(),
-                    });
-                let snapshot = StatusFeedSnapshot {
-                    claude,
-                    openai,
-                    github,
-                    hugging_face: hugging_face_updates.as_ref().map(|updates| ProviderStatus {
-                        indicator: ServiceIndicator::Operational,
-                        description: "Trending models".to_owned(),
-                        incidents: updates.clone(),
-                    }),
-                    grok: grok_updates.as_ref().map(|updates| ProviderStatus {
-                        indicator: ServiceIndicator::Operational,
-                        description: "Grok status updates".to_owned(),
-                        incidents: updates.clone(),
-                    }),
-                };
-                if worker_control.is_shutdown() {
-                    return;
-                }
-                if !tx.publish(snapshot) {
-                    return; // App 종료
-                }
-                egui_ctx.request_repaint();
-                // 상태 주기만큼 대기하되, 수동 갱신 신호가 오면 즉시 깨어나
-                // 공지까지 강제 재조회한다. Condvar는 polling이나 주기 repaint 없이
-                // refresh 하나 또는 receiver shutdown만 깨운다.
-                match worker_control.wait(STATUS_INTERVAL) {
-                    WorkerWake::Refresh => {
-                        incidents_at = None;
-                    }
-                    WorkerWake::Timeout => {}
-                    WorkerWake::Shutdown => return,
-                }
-            }
-        });
-    match spawned {
-        Ok(worker) => rx.worker = Some(worker),
-        Err(e) => {
-            control.shutdown();
-            tracing::warn!("status-feed 워커 spawn 실패: {e}");
+struct ProductionFeedFetcher {
+    agent: ureq::Agent,
+    incidents_at: Option<Instant>,
+    claude_incidents: Vec<IncidentNotice>,
+    openai_incidents: Vec<IncidentNotice>,
+    hugging_face_updates: Option<Vec<IncidentNotice>>,
+    grok_updates: Option<Vec<IncidentNotice>>,
+}
+
+impl ProductionFeedFetcher {
+    fn new() -> Self {
+        Self {
+            agent: ureq::builder().timeout(HTTP_TIMEOUT).build(),
+            incidents_at: None,
+            claude_incidents: Vec::new(),
+            openai_incidents: Vec::new(),
+            hugging_face_updates: None,
+            grok_updates: None,
         }
     }
-    (rx, StatusFeedRefresh { control })
+
+    fn fetch(&mut self, cycle: WorkerCycle, control: &WorkerControl) -> Option<StatusFeedSnapshot> {
+        if !control.cycle_allowed(cycle) {
+            return None;
+        }
+        let incidents_due = cycle == WorkerCycle::Refresh
+            || self
+                .incidents_at
+                .is_none_or(|at| at.elapsed() >= INCIDENTS_INTERVAL);
+        if incidents_due {
+            if let Ok(list) = fetch_incidents(&self.agent, CLAUDE_STATUS_URL).map_err(|_| {
+                tracing::debug!(
+                    kind = "status_feed",
+                    phase = "claude_notice",
+                    error_code = "fetch_failed",
+                    "status feed fetch failed"
+                )
+            }) {
+                self.claude_incidents = list;
+            }
+            if !control.cycle_allowed(cycle) {
+                return None;
+            }
+            if let Ok(list) = fetch_incidents(&self.agent, OPENAI_STATUS_URL).map_err(|_| {
+                tracing::debug!(
+                    kind = "status_feed",
+                    phase = "openai_notice",
+                    error_code = "fetch_failed",
+                    "status feed fetch failed"
+                )
+            }) {
+                self.openai_incidents = list;
+            }
+            if !control.cycle_allowed(cycle) {
+                return None;
+            }
+            if let Ok(list) = fetch_hugging_face_models(&self.agent).map_err(|_| {
+                tracing::debug!(
+                    kind = "status_feed",
+                    phase = "hugging_face_notice",
+                    error_code = "fetch_failed",
+                    "status feed fetch failed"
+                )
+            }) {
+                self.hugging_face_updates = Some(list);
+            }
+            if !control.cycle_allowed(cycle) {
+                return None;
+            }
+            if let Ok(list) = fetch_grok_status(&self.agent).map_err(|_| {
+                tracing::debug!(
+                    kind = "status_feed",
+                    phase = "grok_notice",
+                    error_code = "fetch_failed",
+                    "status feed fetch failed"
+                )
+            }) {
+                self.grok_updates = Some(list);
+            }
+            self.incidents_at = Some(Instant::now());
+        }
+
+        if !control.cycle_allowed(cycle) {
+            return None;
+        }
+        let claude = fetch_status(&self.agent, CLAUDE_STATUS_URL)
+            .map_err(|_| {
+                tracing::debug!(
+                    kind = "status_feed",
+                    phase = "claude_status",
+                    error_code = "fetch_failed",
+                    "status feed fetch failed"
+                )
+            })
+            .ok()
+            .map(|(indicator, description)| ProviderStatus {
+                indicator,
+                description,
+                incidents: self.claude_incidents.clone(),
+            });
+        if !control.cycle_allowed(cycle) {
+            return None;
+        }
+        let openai = fetch_status(&self.agent, OPENAI_STATUS_URL)
+            .map_err(|_| {
+                tracing::debug!(
+                    kind = "status_feed",
+                    phase = "openai_status",
+                    error_code = "fetch_failed",
+                    "status feed fetch failed"
+                )
+            })
+            .ok()
+            .map(|(indicator, description)| ProviderStatus {
+                indicator,
+                description,
+                incidents: self.openai_incidents.clone(),
+            });
+        if !control.cycle_allowed(cycle) {
+            return None;
+        }
+        let github = fetch_status(&self.agent, GITHUB_STATUS_URL)
+            .map_err(|_| {
+                tracing::debug!(
+                    kind = "status_feed",
+                    phase = "github_status",
+                    error_code = "fetch_failed",
+                    "status feed fetch failed"
+                )
+            })
+            .ok()
+            .map(|(indicator, description)| ProviderStatus {
+                indicator,
+                description,
+                incidents: Vec::new(),
+            });
+        Some(StatusFeedSnapshot {
+            claude,
+            openai,
+            github,
+            hugging_face: self
+                .hugging_face_updates
+                .as_ref()
+                .map(|updates| ProviderStatus {
+                    indicator: ServiceIndicator::Operational,
+                    description: "Trending models".to_owned(),
+                    incidents: updates.clone(),
+                }),
+            grok: self.grok_updates.as_ref().map(|updates| ProviderStatus {
+                indicator: ServiceIndicator::Operational,
+                description: "Grok status updates".to_owned(),
+                incidents: updates.clone(),
+            }),
+        })
+    }
+}
+
+fn run_status_feed_worker<F, R>(
+    control: &Arc<WorkerControl>,
+    sender: &StatusFeedSender,
+    idle_ttl: Duration,
+    mut fetch: F,
+    mut request_repaint: R,
+) where
+    F: FnMut(WorkerCycle, &WorkerControl) -> Option<StatusFeedSnapshot>,
+    R: FnMut(),
+{
+    let Some(mut cycle) = control.take_initial_cycle() else {
+        return;
+    };
+    loop {
+        if let Some(snapshot) = fetch(cycle, control)
+            && control.cycle_allowed(cycle)
+        {
+            if !sender.publish(snapshot) {
+                return;
+            }
+            // 명시적 hidden refresh 결과는 캐시에 남기되 inactive viewport를 깨우지 않는다.
+            if control.is_active() {
+                request_repaint();
+            }
+        }
+        cycle = match control.wait_for_work(STATUS_INTERVAL, idle_ttl) {
+            WorkerWake::Refresh => WorkerCycle::Refresh,
+            WorkerWake::Poll => WorkerCycle::Active,
+            WorkerWake::IdleExpired | WorkerWake::Shutdown => return,
+        };
+    }
+}
+
+fn production_worker_spawner() -> Arc<WorkerSpawner> {
+    Arc::new(|control, sender, egui_ctx, idle_ttl| {
+        std::thread::Builder::new()
+            .name("status-feed".into())
+            .spawn(move || {
+                let exit_guard = WorkerExitGuard::new(Arc::clone(&control));
+                let mut fetcher = ProductionFeedFetcher::new();
+                run_status_feed_worker(
+                    &control,
+                    &sender,
+                    idle_ttl,
+                    |cycle, control| fetcher.fetch(cycle, control),
+                    || egui_ctx.request_repaint(),
+                );
+                exit_guard.complete();
+            })
+    })
+}
+
+fn new_with_spawner(
+    egui_ctx: egui::Context,
+    idle_ttl: Duration,
+    worker_spawner: Arc<WorkerSpawner>,
+) -> (StatusFeedReceiver, StatusFeedRefresh) {
+    let control = Arc::new(WorkerControl::default());
+    let (_, receiver) = status_feed_channel_with(
+        Arc::clone(&control),
+        egui_ctx.clone(),
+        idle_ttl,
+        worker_spawner,
+    );
+    (receiver, StatusFeedRefresh { control, egui_ctx })
+}
+
+/// 스냅샷 수신/수동 갱신 handle만 만든다. thread, HTTP agent, timer, network request,
+/// repaint는 만들지 않으며 `StatusFeedReceiver::set_active(true)` 또는 pending refresh를
+/// 처음 관측할 때 worker를 지연 시작한다.
+pub fn new(egui_ctx: egui::Context) -> (StatusFeedReceiver, StatusFeedRefresh) {
+    new_with_spawner(egui_ctx, WORKER_IDLE_TTL, production_worker_spawner())
+}
+
+/// 기존 call site 호환 alias. 이름과 달리 생성 시 worker를 spawn하지 않는다.
+pub fn spawn(egui_ctx: egui::Context) -> (StatusFeedReceiver, StatusFeedRefresh) {
+    let (mut receiver, refresh) = new(egui_ctx);
+    // 기존 App call site도 새 lifecycle API를 통과해 명시적인 inactive 상태로 시작한다.
+    // false→false라 lock 확인 외 side effect는 없다.
+    receiver.set_active(false);
+    (receiver, refresh)
 }
 
 fn fetch_status(agent: &ureq::Agent, base: &str) -> anyhow::Result<(ServiceIndicator, String)> {
@@ -839,6 +1220,74 @@ fn rss_date(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn inert_worker_spawner() -> Arc<WorkerSpawner> {
+        Arc::new(|_, _, _, _| Err(std::io::Error::other("inert test spawner")))
+    }
+
+    fn test_status_feed_channel(
+        control: Arc<WorkerControl>,
+    ) -> (StatusFeedSender, StatusFeedReceiver) {
+        status_feed_channel_with(
+            control,
+            egui::Context::default(),
+            Duration::from_secs(60),
+            inert_worker_spawner(),
+        )
+    }
+
+    fn fake_worker_spawner(
+        starts: Arc<AtomicUsize>,
+        fetches: Arc<AtomicUsize>,
+    ) -> Arc<WorkerSpawner> {
+        Arc::new(move |control, sender, egui_ctx, idle_ttl| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            let fetches = Arc::clone(&fetches);
+            std::thread::Builder::new()
+                .name("status-feed-test".into())
+                .spawn(move || {
+                    let exit_guard = WorkerExitGuard::new(Arc::clone(&control));
+                    run_status_feed_worker(
+                        &control,
+                        &sender,
+                        idle_ttl,
+                        |_, _| {
+                            let number = fetches.fetch_add(1, Ordering::SeqCst) + 1;
+                            Some(numbered_snapshot(number))
+                        },
+                        || egui_ctx.request_repaint(),
+                    );
+                    exit_guard.complete();
+                })
+        })
+    }
+
+    fn receive_eventually(receiver: &mut StatusFeedReceiver) -> StatusFeedSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match receiver.try_recv() {
+                Ok(snapshot) => return snapshot,
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                result => panic!("status feed result did not arrive: {result:?}"),
+            }
+        }
+    }
+
+    fn wait_until_stopped(control: &WorkerControl) {
+        let state = control
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, timeout) = control
+            .wake
+            .wait_timeout_while(state, Duration::from_secs(1), |state| state.running)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!timeout.timed_out(), "status feed worker did not stop");
+        assert!(!state.running);
+    }
 
     fn test_notice(url: &str) -> IncidentNotice {
         IncidentNotice {
@@ -871,7 +1320,7 @@ mod tests {
     #[test]
     fn 결과_backlog는_하나이며_항상_최신값으로_병합한다() {
         let control = Arc::new(WorkerControl::default());
-        let (tx, rx) = status_feed_channel(control);
+        let (tx, mut rx) = test_status_feed_channel(control);
 
         assert!(tx.publish(numbered_snapshot(1)));
         assert!(tx.publish(numbered_snapshot(2)));
@@ -891,7 +1340,7 @@ mod tests {
     #[test]
     fn 결과_receiver가_사라지면_sender는_즉시_종료_신호를_받는다() {
         let control = Arc::new(WorkerControl::default());
-        let (tx, rx) = status_feed_channel(control);
+        let (tx, rx) = test_status_feed_channel(control);
         drop(rx);
 
         assert!(!tx.publish(numbered_snapshot(1)));
@@ -909,6 +1358,7 @@ mod tests {
         let control = Arc::new(WorkerControl::default());
         let refresh = StatusFeedRefresh {
             control: Arc::clone(&control),
+            egui_ctx: egui::Context::default(),
         };
 
         assert!(refresh.send(()).is_ok());
@@ -922,12 +1372,12 @@ mod tests {
     #[test]
     fn receiver_drop은_대기중_worker를_깨우고_join한다() {
         let control = Arc::new(WorkerControl::default());
-        let (_tx, mut rx) = status_feed_channel(Arc::clone(&control));
+        let (_tx, mut rx) = test_status_feed_channel(Arc::clone(&control));
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
         let worker_control = Arc::clone(&control);
         rx.worker = Some(std::thread::spawn(move || {
             assert!(matches!(
-                worker_control.wait(Duration::from_secs(60)),
+                worker_control.wait_for_work(Duration::from_secs(60), Duration::from_secs(60)),
                 WorkerWake::Shutdown
             ));
             finished_tx.send(()).unwrap();
@@ -935,6 +1385,141 @@ mod tests {
 
         drop(rx);
         assert_eq!(finished_rx.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn construction은_thread_network_timer_repaint를_시작하지_않는다() {
+        let repaints = Arc::new(AtomicUsize::new(0));
+        let ctx = egui::Context::default();
+        let repaint_counter = Arc::clone(&repaints);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let (receiver, _refresh) = new(ctx);
+
+        assert_eq!(repaints.load(Ordering::SeqCst), 0);
+        assert!(receiver.worker.is_none());
+        assert!(!receiver.control.state.lock().unwrap().running);
+    }
+
+    #[test]
+    fn active_intent만_lazy_start하고_hidden_idle_ttl뒤_join_reap한다() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let repaints = Arc::new(AtomicUsize::new(0));
+        let ctx = egui::Context::default();
+        let repaint_counter = Arc::clone(&repaints);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let (mut receiver, _refresh) = new_with_spawner(
+            ctx,
+            Duration::from_millis(20),
+            fake_worker_spawner(Arc::clone(&starts), Arc::clone(&fetches)),
+        );
+        let control = Arc::clone(&receiver.control);
+
+        receiver.set_active(true);
+        let first = receive_eventually(&mut receiver);
+        assert_eq!(
+            first.openai.unwrap().description,
+            "1",
+            "first active intent fetches exactly once"
+        );
+        receiver.set_active(true);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        while repaints.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+
+        receiver.set_active(false);
+        let repaints_when_hidden = repaints.load(Ordering::SeqCst);
+        wait_until_stopped(&control);
+        receiver.reap_finished_worker();
+        assert!(receiver.worker.is_none());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(repaints.load(Ordering::SeqCst), repaints_when_hidden);
+
+        receiver.set_active(true);
+        let second = receive_eventually(&mut receiver);
+        assert_eq!(second.openai.unwrap().description, "2");
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn refresh_intent는_latest_one으로_병합되고_inactive_repaint를_반복하지_않는다() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let repaints = Arc::new(AtomicUsize::new(0));
+        let ctx = egui::Context::default();
+        let repaint_counter = Arc::clone(&repaints);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let (mut receiver, refresh) = new_with_spawner(
+            ctx,
+            Duration::from_millis(20),
+            fake_worker_spawner(Arc::clone(&starts), Arc::clone(&fetches)),
+        );
+        let control = Arc::clone(&receiver.control);
+
+        refresh.send(()).unwrap();
+        refresh.send(()).unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(repaints.load(Ordering::SeqCst), 1);
+        let snapshot = receive_eventually(&mut receiver);
+        assert_eq!(snapshot.openai.unwrap().description, "1");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        wait_until_stopped(&control);
+        receiver.reap_finished_worker();
+        assert_eq!(repaints.load(Ordering::SeqCst), 1);
+        assert!(receiver.worker.is_none());
+    }
+
+    #[test]
+    fn idle_expiry는_return전에_stopped를게시해_reactivation을보존한다() {
+        let control = WorkerControl::default();
+        control.set_active(true);
+        assert!(control.reserve_start());
+        control.set_active(false);
+
+        assert!(matches!(
+            control.wait_for_work(Duration::from_secs(60), Duration::from_millis(1)),
+            WorkerWake::IdleExpired
+        ));
+        assert!(
+            !control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .running
+        );
+
+        control.set_active(true);
+        assert!(control.start_needed());
+    }
+
+    #[test]
+    fn initial_cycle취소는_return전에_stopped를게시해_reactivation을보존한다() {
+        let control = WorkerControl::default();
+        control.set_active(true);
+        assert!(control.reserve_start());
+        control.set_active(false);
+
+        assert!(control.take_initial_cycle().is_none());
+        assert!(
+            !control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .running
+        );
+
+        control.set_active(true);
+        assert!(control.start_needed());
     }
 
     #[test]
@@ -1192,5 +1777,7 @@ mod tests {
         assert!(production.contains("read_response_limited"));
         assert!(production.contains("NOTICE_READ_IDS_MAX_ITEMS"));
         assert!(production.contains("NOTICE_READ_IDS_MAX_BYTES"));
+        assert!(!production.contains(&["{", "error:#}"].concat()));
+        assert!(!production.contains("error_kind ="));
     }
 }

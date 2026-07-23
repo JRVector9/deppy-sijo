@@ -25,7 +25,8 @@
 //!   필수 locale key completeness, fallback, CJK path, layout smoke tests를 실행한다.
 //!
 //! `cargo run -p xtask -- bg01-deterministic-gate`
-//!   하드웨어 실측과 실제 외부 계정 smoke를 제외한 BG01 production gate를 한 번에 실행한다.
+//!   하드웨어 실측, trusted-signing 실행, 실제 외부 계정 smoke를 제외한 BG01 production
+//!   gate를 한 번에 실행한다.
 //!
 //! Cargo metadata가 해석한 모든 workspace-local 의존을 본다(외부 crate는 무관). crate 식별은
 //! 디렉터리명 기준(예: crates/core의 패키지명은 deppy-core지만 여기선 "core").
@@ -124,6 +125,9 @@ fn bg01_deterministic_gate() -> anyhow::Result<()> {
     // trusted signing, and real external-account smoke are explicit release gates outside CI.
     check_boundary()?;
     check_deps()?;
+    check_package_gate_source()?;
+    run_process("sh", &["-n", "scripts/package-macos.sh"])?;
+    run_process("sh", &["-n", "scripts/verify-macos-package.sh"])?;
     run_cargo(&["fmt", "--all", "--", "--check"])?;
     run_cargo(&["check", "--workspace", "--all-targets", "--locked"])?;
     run_cargo(&[
@@ -150,6 +154,62 @@ fn bg01_deterministic_gate() -> anyhow::Result<()> {
     ])?;
     println!(
         "bg01-deterministic-gate OK — structural, security, failure, performance smoke, and workspace regressions"
+    );
+    Ok(())
+}
+
+fn check_package_gate_source() -> anyhow::Result<()> {
+    let root = workspace_root()?;
+    let package = std::fs::read_to_string(root.join("scripts/package-macos.sh"))
+        .context("package-macos.sh read failed")?;
+    let verifier = std::fs::read_to_string(root.join("scripts/verify-macos-package.sh"))
+        .context("verify-macos-package.sh read failed")?;
+    let workflow = std::fs::read_to_string(root.join("docs/build/bg01-deterministic-workflow.yml"))
+        .context("BG01 workflow template read failed")?;
+    for required in [
+        "REQUIRE_TRUSTED=${DEPPY_REQUIRE_TRUSTED_SIGNING:-1}",
+        "ALLOW_UNTRUSTED=${DEPPY_ALLOW_UNTRUSTED_SIGNING:-0}",
+        "cargo build --release -p deppy-sijo -p mcp-proxy",
+        "Developer ID Application:",
+        "codesign --force --options runtime --timestamp",
+        "ditto -c -k --sequesterRsrc --keepParent",
+        "verify-macos-package.sh",
+    ] {
+        anyhow::ensure!(
+            package.contains(required),
+            "macOS package gate missing required step: {required}"
+        );
+    }
+    for required in [
+        "REQUIRE_TRUSTED=${DEPPY_REQUIRE_TRUSTED_SIGNING:-1}",
+        "ALLOW_UNTRUSTED=${DEPPY_ALLOW_UNTRUSTED_SIGNING:-0}",
+        "codesign --verify --deep --strict",
+        "lipo -archs",
+        "CFBundleIdentifier",
+        "TeamIdentifier",
+        "Signature=adhoc",
+        "anchor apple generic",
+        "certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
+        "flags=.*runtime",
+        "Timestamp=",
+        "verify_trusted_code \"$candidate\" \"$team_id\"",
+        "verify_trusted_code \"$candidate/Contents/MacOS/$BIN_NAME\" \"$team_id\"",
+        "verify_trusted_code \"$candidate/Contents/MacOS/$PROXY_NAME\" \"$team_id\"",
+        "shasum -a 256",
+    ] {
+        anyhow::ensure!(
+            verifier.contains(required),
+            "macOS package verifier missing required check: {required}"
+        );
+    }
+    anyhow::ensure!(
+        workflow.contains("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"),
+        "BG01 workflow template must pin checkout to the reviewed commit"
+    );
+    anyhow::ensure!(
+        !workflow.contains("uses: actions/checkout@v")
+            && !workflow.contains("uses: Swatinem/rust-cache@"),
+        "BG01 workflow template contains mutable action code"
     );
     Ok(())
 }
@@ -209,6 +269,41 @@ const PERF_SMOKE_TESTS: &[FailureMatrixCase] = &[
         point: "AppHarnessShape",
         package: "deppy-sijo",
         exact_test: "perf::tests::하네스_명령_구성",
+    },
+    FailureMatrixCase {
+        point: "StatusFeedLazyConstruction",
+        package: "deppy-sijo",
+        exact_test: "status_feed::tests::construction은_thread_network_timer_repaint를_시작하지_않는다",
+    },
+    FailureMatrixCase {
+        point: "StatusFeedIdleReap",
+        package: "deppy-sijo",
+        exact_test: "status_feed::tests::active_intent만_lazy_start하고_hidden_idle_ttl뒤_join_reap한다",
+    },
+    FailureMatrixCase {
+        point: "SettingsAuxLazyConstruction",
+        package: "deppy-sijo",
+        exact_test: "app::tests::env_aux_workers는_constructor에서_thread나_io를_시작하지_않는다",
+    },
+    FailureMatrixCase {
+        point: "SettingsAuxRenderBoundary",
+        package: "deppy-sijo",
+        exact_test: "app::tests::app_ui는_aux_worker를_직접_admit하지_않는다",
+    },
+    FailureMatrixCase {
+        point: "WorkspaceShutdownBound",
+        package: "deppy-sijo",
+        exact_test: "app::tests::workspace_shutdown_registry는_two_slot을넘지않고_join한다",
+    },
+    FailureMatrixCase {
+        point: "WorkspaceIdleOneShot",
+        package: "deppy-sijo",
+        exact_test: "app::tests::warm_idle_deadline은_변경될때만_one_shot_repaint를_예약한다",
+    },
+    FailureMatrixCase {
+        point: "SanitizedPanicHook",
+        package: "deppy-sijo",
+        exact_test: "production_panic_hook_drops_payload_before_diagnostics",
     },
     FailureMatrixCase {
         point: "RuntimeOutboundCoalescing",
@@ -409,16 +504,20 @@ fn i18n_check() -> anyhow::Result<()> {
 }
 
 fn run_cargo(args: &[&str]) -> anyhow::Result<()> {
+    run_process("cargo", args)
+}
+
+fn run_process(program: &str, args: &[&str]) -> anyhow::Result<()> {
     let root = workspace_root()?;
-    let status = std::process::Command::new("cargo")
+    let status = std::process::Command::new(program)
         .args(args)
         .current_dir(root)
         .status()
-        .with_context(|| format!("cargo {} 실행 실패", args.join(" ")))?;
+        .with_context(|| format!("{program} {} 실행 실패", args.join(" ")))?;
     if status.success() {
         Ok(())
     } else {
-        bail!("cargo {} 실패: {status}", args.join(" "));
+        bail!("{program} {} 실패: {status}", args.join(" "));
     }
 }
 
@@ -801,7 +900,8 @@ fn check_authorization_capability_boundary(
         ("crates/mcp-proxy/src/hook.rs", 1),
     ];
 
-    let mut issuer_count = 0usize;
+    let mut operation_issuer_count = 0usize;
+    let mut preflight_finisher_count = 0usize;
     let mut evaluator_counts: BTreeMap<&str, usize> = EXACT_EVALUATORS
         .iter()
         .map(|(path, _)| (*path, 0))
@@ -817,12 +917,14 @@ fn check_authorization_capability_boundary(
         // Capability identifiers are scanned across the complete source file. Unlike the leaf-UI
         // allowlist, dropping everything after a `#[cfg(test)]` marker would let a later production
         // item or an imported alias evade this security boundary.
-        let issuers = identifier_occurrences(&content, "prepare_owned_authorization_preflight");
+        let issuers = identifier_occurrences(&content, "prepare_owned_authorization_operation");
+        let finishers = identifier_occurrences(&content, "finish_owned_authorization_preflight");
         if rel == STORAGE_ISSUER {
-            issuer_count += issuers;
-        } else if issuers != 0 {
+            operation_issuer_count += issuers;
+            preflight_finisher_count += finishers;
+        } else if issuers != 0 || finishers != 0 {
             violations.push(format!(
-                "{rel}: authorization grant issuer는 {STORAGE_ISSUER} transaction wrapper만 호출할 수 있습니다"
+                "{rel}: authorization operation/grant issuer는 {STORAGE_ISSUER} transaction wrapper만 호출할 수 있습니다"
             ));
         }
 
@@ -851,10 +953,40 @@ fn check_authorization_capability_boundary(
         }
     }
 
-    if issuer_count != 1 {
+    if operation_issuer_count != 1 {
         violations.push(format!(
-            "{STORAGE_ISSUER}: owner-scoped authorization issuer expected 1 seen {issuer_count}"
+            "{STORAGE_ISSUER}: owner-scoped authorization operation issuer expected 1 seen {operation_issuer_count}"
         ));
+    }
+    if preflight_finisher_count != 2 {
+        violations.push(format!(
+            "{STORAGE_ISSUER}: post-commit authorization preflight finisher expected 2 seen {preflight_finisher_count}"
+        ));
+    }
+    let storage_source = std::fs::read_to_string(root.join(STORAGE_ISSUER))
+        .context("storage authorization boundary source read failed")?;
+    for method in [
+        "commit_authorization_preflight",
+        "commit_authorization_preflight_revision_cas",
+    ] {
+        let Some((_, tail)) = storage_source.split_once(&format!("pub fn {method}(")) else {
+            violations.push(format!("{STORAGE_ISSUER}: {method} is missing"));
+            continue;
+        };
+        let body = tail.split("\n    pub fn ").next().unwrap_or(tail);
+        let Some(finish_at) = body.find("audit::finish_owned_authorization_preflight(") else {
+            violations.push(format!(
+                "{STORAGE_ISSUER}: {method} does not finish the exact committed operation"
+            ));
+            continue;
+        };
+        let transaction_at = body.find("with_audit_retention_normalization_retry");
+        let commit_at = body[..finish_at].rfind("tx.commit()");
+        if transaction_at.is_none_or(|offset| offset >= finish_at) || commit_at.is_none() {
+            violations.push(format!(
+                "{STORAGE_ISSUER}: {method} must create the grant only after transaction commit"
+            ));
+        }
     }
     for (path, expected) in EXACT_EVALUATORS {
         let seen = evaluator_counts.get(path).copied().unwrap_or_default();
@@ -1238,6 +1370,11 @@ fn production_after_tests() {
     }
 
     #[test]
+    fn macos_package_gate는_trusted_signature와_archive를검증한다() {
+        check_package_gate_source().unwrap();
+    }
+
+    #[test]
     fn od01_failure_matrix는_missing_duplicate_unknown을_거부한다() {
         const DUPLICATE: &[FailureMatrixCase] = &[
             FailureMatrixCase {
@@ -1276,17 +1413,23 @@ fn production_after_tests() {
 #[cfg(test)]
 mod tests {}
 
-use audit::prepare_owned_authorization_preflight as mint;
+use audit::finish_owned_authorization_preflight as finish;
+use audit::prepare_owned_authorization_operation as mint;
 use audit::evaluate_authorization as compatibility_evaluator;
 
 fn production_item() {
     mint();
+    finish();
     compatibility_evaluator();
     audit::evaluate_authorization_with_fingerprint();
 }
 "#;
         assert_eq!(
-            identifier_occurrences(source, "prepare_owned_authorization_preflight"),
+            identifier_occurrences(source, "prepare_owned_authorization_operation"),
+            1
+        );
+        assert_eq!(
+            identifier_occurrences(source, "finish_owned_authorization_preflight"),
             1
         );
         assert_eq!(identifier_occurrences(source, "evaluate_authorization"), 1);

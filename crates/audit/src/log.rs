@@ -58,6 +58,53 @@ pub struct AuditOperation {
     authorization_binding: Option<AuthorizationBinding>,
 }
 
+/// Opaque storage-only proof produced from a borrowed one-shot plan. Its private fields guarantee
+/// that the post-commit combiner receives the exact binding emitted by the durable issuer.
+pub struct OwnedAuthorizationOperation {
+    operation_id: String,
+    lifecycle: AuditLifecycle,
+    authorization_binding: AuthorizationBinding,
+}
+
+/// Opaque proof that the borrowed plan and durable operation were checked while the transaction
+/// could still roll back. Only this type can be combined into a post-commit grant.
+pub struct ValidatedOwnedAuthorizationOperation(OwnedAuthorizationOperation);
+
+impl ValidatedOwnedAuthorizationOperation {
+    pub(crate) fn into_parts(self) -> (String, AuditLifecycle, AuthorizationBinding) {
+        self.0.into_parts()
+    }
+}
+
+impl std::fmt::Debug for ValidatedOwnedAuthorizationOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedOwnedAuthorizationOperation")
+            .field("state", &"validated_durable_operation")
+            .finish()
+    }
+}
+
+impl OwnedAuthorizationOperation {
+    pub(crate) fn into_parts(self) -> (String, AuditLifecycle, AuthorizationBinding) {
+        (
+            self.operation_id,
+            self.lifecycle,
+            self.authorization_binding,
+        )
+    }
+}
+
+impl std::fmt::Debug for OwnedAuthorizationOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedAuthorizationOperation")
+            .field("lifecycle", &self.lifecycle)
+            .field("state", &"durable_operation")
+            .finish()
+    }
+}
+
 impl AuditOperation {
     pub fn audit_id(&self) -> &str {
         &self.audit_id
@@ -71,6 +118,7 @@ impl AuditOperation {
         self.lifecycle
     }
 
+    #[cfg(test)]
     pub(crate) fn authorization_binding(&self) -> Option<&AuthorizationBinding> {
         self.authorization_binding.as_ref()
     }
@@ -346,29 +394,75 @@ pub(crate) fn prepare_authorization_operation(
     )
 }
 
-/// Narrow cross-crate issuer used only inside an already-open owner/permission transaction.
-/// Rust has no friend-crate visibility, so repository dependency/callsite gates restrict this
-/// public entrypoint to storage; the independently composable raw proof and grant combiner remain
-/// crate-private. The caller must retain the matching OS owner lock for `scope`/`run_id`.
+/// Narrow cross-crate operation issuer used only inside an already-open owner/permission
+/// transaction. It borrows the non-Clone plan so storage can roll the whole transaction back,
+/// normalize legacy retention in bounded transactions, and retry the DB operation once without
+/// cloning or reconstructing authorization authority. No external-call grant exists yet.
 #[doc(hidden)]
-pub fn prepare_owned_authorization_preflight(
+pub fn prepare_owned_authorization_operation(
     conn: &Connection,
-    plan: AuthorizationPlan,
+    plan: &AuthorizationPlan,
     input_json: &str,
     redaction: &RedactionService,
     authorization_scope: &str,
     authorization_run_id: &str,
-) -> anyhow::Result<crate::AuthorizationPreflight> {
+) -> anyhow::Result<OwnedAuthorizationOperation> {
     let operation = prepare_authorization_operation(
         conn,
-        &plan,
+        plan,
         input_json,
         redaction,
         None,
         authorization_scope,
         authorization_run_id,
     )?;
-    crate::AuthorizationPreflight::from_preflight(plan, operation)
+    let authorization_binding = operation
+        .authorization_binding
+        .context("owned authorization operation binding missing")?;
+    Ok(OwnedAuthorizationOperation {
+        operation_id: operation.operation_id,
+        lifecycle: operation.lifecycle,
+        authorization_binding,
+    })
+}
+
+/// Checks the exact plan/operation binding before transaction commit. Consuming the unvalidated
+/// operation prevents a caller from validating one proof and committing another.
+#[doc(hidden)]
+pub fn validate_owned_authorization_operation(
+    plan: &AuthorizationPlan,
+    operation: OwnedAuthorizationOperation,
+) -> anyhow::Result<ValidatedOwnedAuthorizationOperation> {
+    anyhow::ensure!(
+        operation.operation_id == plan.operation_id(),
+        "preflight operation id와 authorization plan이 일치하지 않습니다"
+    );
+    anyhow::ensure!(
+        (plan.is_allowed() && operation.lifecycle == AuditLifecycle::Prepared)
+            || (!plan.is_allowed() && operation.lifecycle == AuditLifecycle::Denied),
+        "preflight lifecycle과 authorization decision이 일치하지 않습니다"
+    );
+    let binding = &operation.authorization_binding;
+    anyhow::ensure!(
+        binding.server_id == plan.server_id()
+            && binding.tool_name == plan.tool_name()
+            && binding.decision == plan.decision()
+            && binding.live_schema_hash == plan.live_schema_hash()
+            && &binding.subject == plan.subject(),
+        "preflight proof와 authorization plan binding이 일치하지 않습니다"
+    );
+    Ok(ValidatedOwnedAuthorizationOperation(operation))
+}
+
+/// Consumes the exact plan and committed durable operation only after storage has committed the
+/// permission/audit/retention transaction. This prevents an external-call grant from existing
+/// during a rollback-and-normalize retry.
+#[doc(hidden)]
+pub fn finish_owned_authorization_preflight(
+    plan: AuthorizationPlan,
+    operation: ValidatedOwnedAuthorizationOperation,
+) -> crate::AuthorizationPreflight {
+    crate::AuthorizationPreflight::from_committed_owned(plan, operation)
 }
 
 fn prepare_audit_operation_with_binding(
@@ -563,8 +657,13 @@ fn prepare_payload(
     let encrypted_blob =
         encryptor.and_then(|store| match crate::encrypt_input(store, input_json) {
             Ok(blob) => Some(blob),
-            Err(error) => {
-                tracing::warn!("audit 입력 암호화 실패 (blob NULL로 저장): {error:#}");
+            Err(_) => {
+                tracing::warn!(
+                    kind = "audit",
+                    phase = "encrypt_input",
+                    error_code = "secret_store_error",
+                    "audit input encryption failed; encrypted blob omitted"
+                );
                 None
             }
         });
@@ -610,7 +709,8 @@ fn validate_error_code(outcome: AuditLifecycle, error_code: Option<&str>) -> any
 #[cfg(test)]
 mod tests {
     use secret::{SecretStore, SecretString};
-    use std::sync::Mutex;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
 
     /// 테스트용 인메모리 SecretStore (keyring 불필요).
     #[derive(Default)]
@@ -638,6 +738,72 @@ mod tests {
         }
         fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
             Ok(self.0.lock().unwrap().contains_key(id))
+        }
+    }
+
+    const HOSTILE_STORE_ERROR: &str = "never-log-secret-store-token-9f8e7d";
+
+    struct FailingStore;
+
+    impl SecretStore for FailingStore {
+        fn set_secret(&self, _id: &str, _secret: &SecretString) -> anyhow::Result<()> {
+            anyhow::bail!(HOSTILE_STORE_ERROR)
+        }
+
+        fn get_secret(&self, _id: &str) -> anyhow::Result<SecretString> {
+            anyhow::bail!(HOSTILE_STORE_ERROR)
+        }
+
+        fn delete_secret(&self, _id: &str) -> anyhow::Result<()> {
+            anyhow::bail!(HOSTILE_STORE_ERROR)
+        }
+
+        fn has_secret(&self, _id: &str) -> anyhow::Result<bool> {
+            anyhow::bail!(HOSTILE_STORE_ERROR)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureSubscriber {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = CaptureVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.fields);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct CaptureVisitor {
+        fields: String,
+    }
+
+    impl tracing::field::Visit for CaptureVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.fields, "{}={value:?};", field.name());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            let _ = write!(self.fields, "{}={value:?};", field.name());
         }
     }
 
@@ -858,6 +1024,42 @@ mod tests {
         // blob에 평문 secret이 없어야 하고, 복호 시 원본이 그대로 나와야 한다
         assert!(!String::from_utf8_lossy(&blob).contains("sk-secret-xyz"));
         assert_eq!(crate::decrypt_input(&store, &blob).unwrap(), plain);
+    }
+
+    #[test]
+    fn encryptor_failure_diagnostic은_static_fields만기록한다() {
+        let conn = test_conn();
+        let subscriber = CaptureSubscriber::default();
+        let events = Arc::clone(&subscriber.events);
+        let id = tracing::subscriber::with_default(subscriber, || {
+            record_audit(
+                &conn,
+                &RedactionService::new(),
+                &record(r#"{"path":"/tmp/x"}"#),
+                Some(&FailingStore),
+            )
+            .unwrap()
+        });
+
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT input_encrypted_blob FROM tool_audit_logs WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(blob.is_none());
+        let diagnostic = events.lock().unwrap().join("\n");
+        assert!(diagnostic.contains("kind=\"audit\""), "{diagnostic}");
+        assert!(
+            diagnostic.contains("phase=\"encrypt_input\""),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("error_code=\"secret_store_error\""),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains(HOSTILE_STORE_ERROR), "{diagnostic}");
     }
 
     #[test]
@@ -1190,6 +1392,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(global_persisted, (None, None));
+    }
+
+    #[test]
+    fn borrowed_owned_operation은_commit전에_exact_plan으로검증된다() {
+        let conn = test_conn();
+        let hash = crate::schema_hash("owned-operation-schema");
+        let plan_a = approval_plan(
+            "op-owned-operation",
+            "server-a",
+            "tool",
+            hash.clone(),
+            ApprovalDecision::AllowOnce,
+        );
+        let operation = prepare_owned_authorization_operation(
+            &conn,
+            &plan_a,
+            "{}",
+            &RedactionService::new(),
+            "test-scope",
+            "test-run",
+        )
+        .unwrap();
+        let plan_b = approval_plan(
+            "op-owned-operation",
+            "server-b",
+            "tool",
+            hash,
+            ApprovalDecision::AllowOnce,
+        );
+
+        assert!(validate_owned_authorization_operation(&plan_b, operation).is_err());
     }
 
     #[test]

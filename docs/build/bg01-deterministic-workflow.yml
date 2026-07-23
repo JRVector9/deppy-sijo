@@ -25,10 +25,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.2.2; pin executable supply-chain code, not a mutable tag.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install pinned Rust toolchain
         run: rustup show
-      - name: Restore Cargo build cache
-        uses: Swatinem/rust-cache@v2
       - name: Run BG01 deterministic gate
         run: cargo run --locked -p xtask -- bg01-deterministic-gate

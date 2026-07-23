@@ -459,6 +459,7 @@ pub struct AuthorizationGrant {
 }
 
 impl AuthorizationGrant {
+    #[cfg(test)]
     fn from_preflight(
         plan: AuthorizationPlan,
         operation: crate::AuditOperation,
@@ -596,6 +597,7 @@ impl DeniedAuthorization {
         self.decision
     }
 
+    #[cfg(test)]
     fn from_preflight(
         plan: AuthorizationPlan,
         operation: crate::AuditOperation,
@@ -646,6 +648,38 @@ pub enum AuthorizationPreflight {
 }
 
 impl AuthorizationPreflight {
+    pub(crate) fn from_committed_owned(
+        plan: AuthorizationPlan,
+        operation: crate::ValidatedOwnedAuthorizationOperation,
+    ) -> Self {
+        let (operation_id, lifecycle, binding) = operation.into_parts();
+        debug_assert_eq!(operation_id, plan.operation_id);
+        debug_assert_eq!(binding.server_id, plan.server_id);
+        debug_assert_eq!(binding.tool_name, plan.tool_name);
+        debug_assert_eq!(binding.decision, plan.decision);
+        debug_assert_eq!(binding.live_schema_hash, plan.live_schema_hash);
+        debug_assert_eq!(binding.subject, plan.subject);
+        if plan.is_allowed() {
+            debug_assert_eq!(lifecycle, crate::AuditLifecycle::Prepared);
+            Self::Prepared(AuthorizationGrant {
+                operation_id: plan.operation_id,
+                server_id: plan.server_id,
+                tool_name: plan.tool_name,
+                decision: plan.decision,
+                live_schema_hash: plan.live_schema_hash,
+                subject: plan.subject,
+                input_digest: binding.input_digest,
+            })
+        } else {
+            debug_assert_eq!(lifecycle, crate::AuditLifecycle::Denied);
+            Self::Denied(DeniedAuthorization {
+                operation_id: plan.operation_id,
+                decision: plan.decision,
+            })
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_preflight(
         plan: AuthorizationPlan,
         operation: crate::AuditOperation,

@@ -60,14 +60,16 @@ impl InMemoryAuthorizationLedger {
         let input_json = std::str::from_utf8(input_json)
             .map_err(|_| anyhow::anyhow!("tool input is not UTF-8 JSON"))?;
         let conn = self.conn.lock().expect("test authorization ledger lock");
-        let preflight = crate::prepare_owned_authorization_preflight(
+        let operation = crate::prepare_owned_authorization_operation(
             &conn,
-            plan,
+            &plan,
             input_json,
             &secret::RedactionService::new(),
             &self.scope,
             &self.run_id,
         )?;
+        let operation = crate::validate_owned_authorization_operation(&plan, operation)?;
+        let preflight = crate::finish_owned_authorization_preflight(plan, operation);
         self.preflights.fetch_add(1, Ordering::SeqCst);
         Ok(preflight)
     }

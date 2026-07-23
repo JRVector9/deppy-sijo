@@ -64,6 +64,8 @@ toml_edit = "0.25.12"
 [target.'cfg(target_os = "macos")'.dependencies]
 # renamex_np(RENAME_EXCL) — 덮어쓰기 금지 rename (§9-5 TOCTOU 회피)
 libc = { workspace = true }
+# 메모리 압박 감지 (로드맵 C1) — rfd가 이미 쓰는 crate라 추가 빌드 비용 없음.
+dispatch2 = "0.3"
 muda = "0.19.3"
 # 클립보드 PNG 바이트 직행(디코드/재인코딩 없이 파일로 — cmux 방식, 2026-07-08).
 # eframe/winit이 이미 쓰는 crate라 추가 빌드 비용 미미.

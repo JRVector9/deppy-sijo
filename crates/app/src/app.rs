@@ -14967,6 +14967,15 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 시스템 메모리 압박 레벨 전이 (로드맵 C1 — 관측만, 소비는 C2/C3에서).
+        if let Some((previous, current)) = crate::mem_pressure_monitor::take_level_transition() {
+            tracing::warn!(
+                kind = "resource",
+                phase = "memory_pressure_transition",
+                previous = ?previous,
+                current = ?current,
+            );
+        }
         // Shortcut handling may persist config, switch runtimes, or start protocol/process work.
         // Consume egui input here so none of those effects are reachable from the render pass.
         self.handle_configured_shortcut(ctx);

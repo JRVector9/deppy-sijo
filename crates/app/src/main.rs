@@ -21,6 +21,7 @@ mod llm_proxy;
 mod local_llm;
 mod logging;
 mod mcp_import;
+mod mem_pressure_monitor;
 mod native_key_monitor;
 mod notice_translate;
 mod panic_policy;
@@ -117,6 +118,8 @@ fn main() -> anyhow::Result<()> {
             );
             install_macos_menu();
             native_key_monitor::install();
+            // 메모리 압박 감지 (로드맵 C1) — 신호만 설치, 소비는 logic()에서.
+            mem_pressure_monitor::install(cc.egui_ctx.clone());
             // B1: 실제로 초기화된 백엔드/어댑터를 기록한다 (요청값이 아니라 결과값).
             let bench = bench_log.and_then(|log| {
                 log.emit("renderer", renderer_fields(cc, process_start));

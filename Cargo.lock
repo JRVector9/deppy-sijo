@@ -1150,6 +1150,7 @@ dependencies = [
  "connector-ui",
  "deppy-core",
  "directories",
+ "dispatch2",
  "eframe",
  "egui",
  "egui_kittest",

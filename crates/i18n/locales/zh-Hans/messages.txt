@@ -351,6 +351,11 @@ process_storm.dismiss = 关闭
 process_storm.notification.title = 检测到进程激增
 process_storm.notification.body = {session}：{count} 个进程 — 该终端会话可能耗尽系统内存
 process_storm.unknown_session = 终端会话
+
+# 메모리 압박 알림 (로드맵 C3)
+memory_pressure.notification.title = 系统内存不足
+memory_pressure.notification.body = 占用最多的会话：{session} — 应用可能被系统终止
+memory_pressure.notification.body_no_session = 应用可能被系统终止
 env.project_folder.clear = 清除
 env.add_var = 添加变量
 env.empty_value_placeholder = 值

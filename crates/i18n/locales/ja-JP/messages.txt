@@ -351,6 +351,11 @@ process_storm.dismiss = 閉じる
 process_storm.notification.title = プロセス急増を検知
 process_storm.notification.body = {session}: {count}プロセス — ターミナルセッションがシステムメモリを枯渇させる恐れがあります
 process_storm.unknown_session = ターミナルセッション
+
+# 메모리 압박 알림 (로드맵 C3)
+memory_pressure.notification.title = システムメモリが逼迫しています
+memory_pressure.notification.body = 最も使用中のセッション: {session} — アプリがシステムに終了される恐れがあります
+memory_pressure.notification.body_no_session = アプリがシステムに終了される恐れがあります
 env.project_folder.clear = 解除
 env.add_var = 変数追加
 env.empty_value_placeholder = 値

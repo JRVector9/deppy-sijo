@@ -13601,6 +13601,33 @@ impl App {
         }
     }
 
+    /// 메모리 압박 격상 시 최대 사용 세션을 담아 OS 알림을 1회 발화한다 (로드맵 C3).
+    /// 표시 수치는 A1 이후 정확해진 세션별 phys_footprint 합. logic()에서만 호출.
+    fn notify_memory_pressure(&mut self) {
+        // active+warm의 세션 자원 샘플에서 rss 최댓값 세션을 찾는다(새 샘플링 없음).
+        let mut top: Option<(String, runtime::SessionId, u64)> = None;
+        for workspace in std::iter::once(&self.active).chain(self.warm.values()) {
+            for usage in &workspace.session_resource_usage {
+                if top
+                    .as_ref()
+                    .is_none_or(|(_, _, rss)| usage.rss_bytes > *rss)
+                {
+                    top = Some((workspace.id.clone(), usage.session, usage.rss_bytes));
+                }
+            }
+        }
+        let session_name = top.map(|(workspace_id, session, _rss)| {
+            let raw = std::iter::once(&self.active)
+                .chain(self.warm.values())
+                .find(|w| w.id == workspace_id)
+                .and_then(|w| w.session_titles.get(&session).cloned());
+            raw.map(|raw| self.activity_session_name(&workspace_id, &raw))
+                .unwrap_or_else(|| self.i18n.t("process_storm.unknown_session", &[]))
+        });
+        let (summary, body) = memory_pressure_notification(&self.i18n, session_name.as_deref());
+        platform::notify(&summary, &body);
+    }
+
     /// 확정된 폭주 세션 수와 최대 peak 프로세스 수 (active+warm 전체). 배너 표시용
     /// 순수 읽기 — 렌더 경로에서 호출해도 안전하다.
     fn confirmed_storm_summary(&self) -> Option<(usize, usize)> {
@@ -15056,6 +15083,9 @@ impl eframe::App for App {
                         );
                     }
                 }
+                // 압박 알림 (로드맵 C3) — 격상 에피소드당 1회. 자리를 비운 사용자에게
+                // "곧 앱이 죽을 수 있다 + 어느 세션이 원인인지"를 알린다.
+                self.notify_memory_pressure();
             }
         }
         // Shortcut handling may persist config, switch runtimes, or start protocol/process work.
@@ -17553,6 +17583,20 @@ fn per_runtime_cache_budget_bytes(global_budget_mb: u32, resident_runtimes: usiz
 /// 직접 셸에서 실행한 Codex/Claude는 UI 감지 또는 같은 process group의 자식 수로 보호한다.
 /// ResourceUsage 샘플로 세션별 폭주 판정 상태를 갱신한다 (로드맵 B1).
 /// 캡처 실패 샘플은 runtime이 마지막 발행값을 유지해 여기 오지 않는다.
+/// 압박 알림 (summary, body) 문구 — 최대 사용 세션명이 있으면 지목하고, 없으면
+/// 세션 없이 압박만 알린다 (순수 — 테스트 대상).
+fn memory_pressure_notification(
+    i18n: &i18n::Catalog,
+    top_session_name: Option<&str>,
+) -> (String, String) {
+    let summary = i18n.t("memory_pressure.notification.title", &[]);
+    let body = match top_session_name {
+        Some(name) => i18n.t("memory_pressure.notification.body", &[("session", name)]),
+        None => i18n.t("memory_pressure.notification.body_no_session", &[]),
+    };
+    (summary, body)
+}
+
 fn update_storm_episodes(
     episodes: &mut std::collections::HashMap<
         runtime::SessionId,
@@ -19731,6 +19775,17 @@ mod tests {
         );
         assert!(!episodes.contains_key(&session));
         assert_eq!(notify.len(), 1, "해소 구간에서는 추가 알림 없음");
+    }
+
+    #[test]
+    fn 압박_알림은_세션_유무에_따라_문구가_달라진다() {
+        let i18n = load_catalog("en-US");
+        let (summary, with) = memory_pressure_notification(&i18n, Some("web-remote"));
+        assert!(!summary.is_empty());
+        assert!(with.contains("web-remote"));
+        let (_, without) = memory_pressure_notification(&i18n, None);
+        assert!(!without.contains("web-remote"));
+        assert_ne!(with, without);
     }
 
     #[test]

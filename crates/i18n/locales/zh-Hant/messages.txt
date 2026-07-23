@@ -351,6 +351,11 @@ process_storm.dismiss = 關閉
 process_storm.notification.title = 偵測到程序激增
 process_storm.notification.body = {session}：{count} 個程序 — 此終端工作階段可能耗盡系統記憶體
 process_storm.unknown_session = 終端工作階段
+
+# 메모리 압박 알림 (로드맵 C3)
+memory_pressure.notification.title = 系統記憶體不足
+memory_pressure.notification.body = 占用最多的工作階段：{session} — 應用程式可能被系統終止
+memory_pressure.notification.body_no_session = 應用程式可能被系統終止
 env.project_folder.clear = 清除
 env.add_var = 新增變數
 env.empty_value_placeholder = 值

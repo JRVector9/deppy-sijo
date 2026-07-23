@@ -343,6 +343,14 @@ env.project_folder.choose = 選擇資料夾
 env.session_cwd.detected = 工作階段資料夾: {path}
 env.session_cwd.register = 註冊為新專案
 env.session_cwd.set_project = 將此資料夾設為專案資料夾
+
+# 프로세스 폭주 경고 (로드맵 B2)
+process_storm.banner.title = 偵測到程序激增
+process_storm.banner.detail = {sessions} 個工作階段 · 最多 {count} 個程序
+process_storm.dismiss = 關閉
+process_storm.notification.title = 偵測到程序激增
+process_storm.notification.body = {session}：{count} 個程序 — 此終端工作階段可能耗盡系統記憶體
+process_storm.unknown_session = 終端工作階段
 env.project_folder.clear = 清除
 env.add_var = 新增變數
 env.empty_value_placeholder = 值
@@ -526,6 +534,7 @@ activity.cpu_pending = 等待中
 activity.resource_label = CPU {cpu} / RSS {rss}
 activity.child_resource_label = 子行程 CPU {cpu} / RSS {rss}
 activity.resource_high = 高負載
+activity.resource_storm = 激增
 activity.clear_caches = 清除渲染快取
 activity.session_count = {count} 個工作階段
 activity.clear_caches_hint = 清除所有工作區的終端渲染快取。不影響執行中的作業、程序與捲動記錄。

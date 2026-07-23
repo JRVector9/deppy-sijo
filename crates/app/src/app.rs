@@ -5305,6 +5305,9 @@ struct WorkspaceRuntime {
         std::collections::HashMap<runtime::SessionId, crate::process_storm::StormEpisode>,
     /// 폭주 에피소드 id 발급 카운터 — 해소 후 재발생 구분(B2 재알림 근거).
     storm_next_episode_id: u64,
+    /// 폭주 확정 전이 시 (세션, peak 프로세스 수)를 쌓는 알림 큐 (B2). logic()이
+    /// drain해 OS 알림을 1회 발화한다 — 에피소드당 확정 1회만 쌓인다.
+    storm_notify_pending: Vec<(runtime::SessionId, usize)>,
     /// 마지막 PTY input pressure signal(+관측 시각). 회복 이벤트가 없어(QueueFull은
     /// writer drain으로 조용히 해소) 표시 시 TTL로 stale 뱃지를 걸러낸다(codex 2026-07-08).
     input_pressure: Option<(runtime::PtyInputPressure, std::time::Instant)>,
@@ -5707,6 +5710,9 @@ pub struct App {
     /// T1: pane 우클릭 → 환경설정 진입 시 감지한 focused 세션 폴더 배너.
     /// 우클릭 진입 시점에만 계산하고, 버튼 클릭 또는 설정 창 닫힘에 버린다.
     env_session_banner: Option<EnvSessionCwdBanner>,
+    /// 폭주 경고 배너를 닫음 (로드맵 B2). 현재 폭주가 모두 해소되면 리셋돼 다음
+    /// 폭주에 다시 뜬다 — 에피소드별 상태를 안 들고도 유계.
+    storm_banner_dismissed: bool,
     env_project_rows_worker: EnvProjectRowsWorker,
     env_project_rows_generation: u64,
     /// Exact generation currently owned by the capacity-one worker. Invalidation advances the
@@ -8279,6 +8285,7 @@ impl App {
             env_api_project_edit: EnvApiProjectEditState::default(),
             env_api_projects_cache: None,
             env_session_banner: None,
+            storm_banner_dismissed: false,
             env_project_rows_worker,
             env_project_rows_generation: 0,
             env_project_rows_in_flight: None,
@@ -8546,6 +8553,7 @@ impl App {
             session_resource_usage: Vec::new(),
             storm_episodes: std::collections::HashMap::new(),
             storm_next_episode_id: 0,
+            storm_notify_pending: Vec::new(),
             input_pressure: None,
             session_input_pressure: std::collections::HashMap::new(),
             session_dotenv_states: std::collections::HashMap::new(),
@@ -13563,6 +13571,52 @@ impl App {
         })
     }
 
+    /// 폭주 확정 알림 큐(active+warm)를 비워 OS 알림을 1회씩 발화한다 (로드맵 B2).
+    /// notify-rust가 아닌 platform::notify(osascript)를 쓴다 — notify-rust는 번들
+    /// 미해석 시 Finder 다이얼로그 취소가 FFI panic→abort로 앱을 죽인 전례가 있다
+    /// (2026-07-05). logic()에서만 호출 — 렌더 경로 바깥.
+    fn dispatch_storm_notifications(&mut self) {
+        // 먼저 (워크스페이스, raw 제목, peak)을 모아 borrow를 풀고, 그다음 제목
+        // 해석 + 알림을 한다(activity_session_name이 &self를 빌리므로).
+        let mut drained: Vec<(String, Option<String>, usize)> = Vec::new();
+        for workspace in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
+            if workspace.storm_notify_pending.is_empty() {
+                continue;
+            }
+            for (session, peak) in workspace.storm_notify_pending.drain(..) {
+                let raw_title = workspace.session_titles.get(&session).cloned();
+                drained.push((workspace.id.clone(), raw_title, peak));
+            }
+        }
+        for (workspace_id, raw_title, peak) in drained {
+            let session_name = raw_title
+                .map(|raw| self.activity_session_name(&workspace_id, &raw))
+                .unwrap_or_else(|| self.i18n.t("process_storm.unknown_session", &[]));
+            let summary = self.i18n.t("process_storm.notification.title", &[]);
+            let body = self.i18n.t(
+                "process_storm.notification.body",
+                &[("session", &session_name), ("count", &peak.to_string())],
+            );
+            platform::notify(&summary, &body);
+        }
+    }
+
+    /// 확정된 폭주 세션 수와 최대 peak 프로세스 수 (active+warm 전체). 배너 표시용
+    /// 순수 읽기 — 렌더 경로에서 호출해도 안전하다.
+    fn confirmed_storm_summary(&self) -> Option<(usize, usize)> {
+        let mut count = 0usize;
+        let mut peak = 0usize;
+        for workspace in std::iter::once(&self.active).chain(self.warm.values()) {
+            for episode in workspace.storm_episodes.values() {
+                if episode.confirmed {
+                    count += 1;
+                    peak = peak.max(episode.peak_process_count);
+                }
+            }
+        }
+        (count > 0).then_some((count, peak))
+    }
+
     /// 최신 feed를 읽음 기준과 대조해 Home 배지 수를 갱신한다. Home이 선택된 동안에는
     /// 현재 목록을 곧바로 읽음 처리한다. 디스크 쓰기는 기준이 실제로 달라질 때만 한다.
     fn sync_home_notice_badge(&mut self, mark_read: bool, ctx: &egui::Context) {
@@ -13765,6 +13819,12 @@ impl App {
                                     .and_then(|s| self.active.session_input_pressure.get(&s)),
                                 now,
                             ),
+                            storm: e.session.is_some_and(|s| {
+                                self.active
+                                    .storm_episodes
+                                    .get(&s)
+                                    .is_some_and(|ep| ep.confirmed)
+                            }),
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
@@ -13829,6 +13889,7 @@ impl App {
                                 .find(|u| u.session == *s)
                                 .cloned(),
                             pressure: Self::fresh_pressure(rt.session_input_pressure.get(s), now),
+                            storm: rt.storm_episodes.get(s).is_some_and(|ep| ep.confirmed),
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
@@ -13863,6 +13924,8 @@ impl App {
                         status_line: None,
                         resource: None,
                         pressure: None,
+                        // 유휴(런타임 없음)는 감지 대상이 아니다.
+                        storm: false,
                     })
                     .collect::<Vec<_>>();
                 ui::activity::ActivityWorkspaceRow {
@@ -14044,6 +14107,7 @@ impl App {
                 update_storm_episodes(
                     &mut rt.storm_episodes,
                     &mut rt.storm_next_episode_id,
+                    &mut rt.storm_notify_pending,
                     session_usage,
                 );
             }
@@ -15333,6 +15397,7 @@ impl eframe::App for App {
         while let Some(intent) = self.notifications_ui.pop_native_intent() {
             platform::notify(intent.summary(), intent.body());
         }
+        self.dispatch_storm_notifications();
 
         // 폰 대시보드가 볼 워크스페이스 스냅샷(전체 + 해석된 세션 이름) 동기화.
         // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
@@ -15432,6 +15497,51 @@ impl eframe::App for App {
                 // 툴바-본문 경계선은 egui Panel::top이 자체로 그린다 — 커스텀 hairline을
                 // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
             });
+
+        // 폭주 경고 배너 (로드맵 B2) — 타이틀바 바로 아래, 어떤 탭을 보든 보이게
+        // top 패널로 얹는다. 정책상 여기엔 조치 버튼이 없고 [닫기]뿐이다(B3에서 추가).
+        match self.confirmed_storm_summary() {
+            Some(_) if self.storm_banner_dismissed => {}
+            Some((count, peak)) => {
+                let banner_frame = egui::Frame::side_top_panel(&ui.ctx().global_style())
+                    .fill(egui::Color32::from_rgb(120, 40, 40))
+                    .inner_margin(egui::Margin::symmetric(14, 8));
+                egui::Panel::top("process_storm_banner")
+                    .resizable(false)
+                    .frame(banner_frame)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(text.t("process_storm.banner.title", &[]))
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.label(
+                                egui::RichText::new(text.t(
+                                    "process_storm.banner.detail",
+                                    &[
+                                        ("sessions", &count.to_string()),
+                                        ("count", &peak.to_string()),
+                                    ],
+                                ))
+                                .color(egui::Color32::from_rgb(240, 220, 220)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button(text.t("process_storm.dismiss", &[])).clicked() {
+                                        self.storm_banner_dismissed = true;
+                                    }
+                                },
+                            );
+                        });
+                    });
+            }
+            None => {
+                // 모든 폭주 해소 — 다음 폭주에 배너가 다시 뜨도록 dismiss 리셋.
+                self.storm_banner_dismissed = false;
+            }
+        }
 
         // 세션 기본 제목을 "셀 N" 대신 프로젝트명(폴더명 ≈ 깃 레포명, 없으면 "~")으로
         // 표시하도록 활성 workspace 이름을 WorkspaceUi에 넘긴다(사용자 요청).
@@ -17449,6 +17559,7 @@ fn update_storm_episodes(
         crate::process_storm::StormEpisode,
     >,
     next_episode_id: &mut u64,
+    notify_pending: &mut Vec<(runtime::SessionId, usize)>,
     session_usage: &[runtime::SessionResourceUsage],
 ) {
     for usage in session_usage {
@@ -17460,13 +17571,15 @@ fn update_storm_episodes(
             next_episode_id,
         );
         if next.is_some_and(|e| e.confirmed) && !prev.is_some_and(|e| e.confirmed) {
-            // 확정 전이 1회 로그 — 경고 UI(B2) 전까지의 관측 가시성.
+            // 확정 전이 1회 — 로그 + OS 알림 큐 적재(에피소드당 1회).
             tracing::warn!(
                 kind = "resource",
                 phase = "process_storm_confirmed",
                 session = usage.session.0,
                 process_count = usage.process_count,
             );
+            let peak = next.map_or(usage.process_count, |e| e.peak_process_count);
+            notify_pending.push((usage.session, peak));
         }
         match next {
             Some(episode) => {
@@ -19585,15 +19698,39 @@ mod tests {
         };
         let mut episodes = std::collections::HashMap::new();
         let mut next_id = 0;
-        update_storm_episodes(&mut episodes, &mut next_id, &[sample(5_417, 0)]);
+        let mut notify = Vec::new();
+        update_storm_episodes(
+            &mut episodes,
+            &mut next_id,
+            &mut notify,
+            &[sample(5_417, 0)],
+        );
         assert!(episodes.get(&session).is_some_and(|e| !e.confirmed));
-        update_storm_episodes(&mut episodes, &mut next_id, &[sample(5_417, 6_000)]);
+        assert!(notify.is_empty(), "확정 전에는 알림 큐가 비어 있다");
+        update_storm_episodes(
+            &mut episodes,
+            &mut next_id,
+            &mut notify,
+            &[sample(5_417, 6_000)],
+        );
         assert!(episodes.get(&session).is_some_and(|e| e.confirmed));
+        assert_eq!(notify, vec![(session, 5_417)], "확정 전이 1회 알림 적재");
         // 확정 후 임계 미만 — 히스테리시스 창 안에서는 유지, 지속되면 제거.
-        update_storm_episodes(&mut episodes, &mut next_id, &[sample(1, 10_000)]);
+        update_storm_episodes(
+            &mut episodes,
+            &mut next_id,
+            &mut notify,
+            &[sample(1, 10_000)],
+        );
         assert!(episodes.contains_key(&session));
-        update_storm_episodes(&mut episodes, &mut next_id, &[sample(1, 16_000)]);
+        update_storm_episodes(
+            &mut episodes,
+            &mut next_id,
+            &mut notify,
+            &[sample(1, 16_000)],
+        );
         assert!(!episodes.contains_key(&session));
+        assert_eq!(notify.len(), 1, "해소 구간에서는 추가 알림 없음");
     }
 
     #[test]

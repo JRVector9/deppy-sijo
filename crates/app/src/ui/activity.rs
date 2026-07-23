@@ -60,6 +60,8 @@ pub struct ActivitySessionRow {
     pub resource: Option<runtime::SessionResourceUsage>,
     /// 세션별 마지막 입력 backpressure 신호.
     pub pressure: Option<runtime::PtyInputPressure>,
+    /// 자식 프로세스 폭주 확정 (로드맵 B1/B2) — High 뱃지와 구분되는 강조 표시.
+    pub storm: bool,
 }
 
 impl std::fmt::Debug for ActivitySessionRow {
@@ -70,6 +72,7 @@ impl std::fmt::Debug for ActivitySessionRow {
             .field("status_line", &self.status_line.as_ref().map(|_| REDACTED))
             .field("resource", &self.resource)
             .field("pressure", &self.pressure)
+            .field("storm", &self.storm)
             .finish()
     }
 }
@@ -464,7 +467,7 @@ fn workspace_has_warning(row: &ActivityWorkspaceRow) -> bool {
         || row
             .sessions
             .iter()
-            .any(|session| session.pressure.is_some())
+            .any(|session| session.pressure.is_some() || session.storm)
 }
 
 fn activity_hairline(ui: &mut egui::Ui) {
@@ -537,6 +540,14 @@ fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWork
                                 None => String::new(),
                             };
                             ui.label(egui::RichText::new(resources).monospace().size(11.0));
+                            if session.storm {
+                                ui.label(
+                                    egui::RichText::new(catalog.t("activity.resource_storm", &[]))
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(240, 150, 150))
+                                        .size(11.0),
+                                );
+                            }
                             if let Some(pressure) = &session.pressure {
                                 input_pressure_badge(ui, catalog, pressure);
                             }
@@ -735,6 +746,7 @@ mod tests {
             status_line: None,
             resource: None,
             pressure: None,
+            storm: false,
         }
     }
 
@@ -1109,6 +1121,7 @@ mod tests {
                 status_line: Some(Arc::from("private status")),
                 resource: None,
                 pressure: None,
+                storm: false,
             }],
         );
         let row_debug = format!("{row:?}");

@@ -343,6 +343,14 @@ env.project_folder.choose = 选择文件夹
 env.session_cwd.detected = 会话文件夹: {path}
 env.session_cwd.register = 注册为新项目
 env.session_cwd.set_project = 将此文件夹设为项目文件夹
+
+# 프로세스 폭주 경고 (로드맵 B2)
+process_storm.banner.title = 检测到进程激增
+process_storm.banner.detail = {sessions} 个会话 · 最多 {count} 个进程
+process_storm.dismiss = 关闭
+process_storm.notification.title = 检测到进程激增
+process_storm.notification.body = {session}：{count} 个进程 — 该终端会话可能耗尽系统内存
+process_storm.unknown_session = 终端会话
 env.project_folder.clear = 清除
 env.add_var = 添加变量
 env.empty_value_placeholder = 值
@@ -526,6 +534,7 @@ activity.cpu_pending = 等待中
 activity.resource_label = CPU {cpu} / RSS {rss}
 activity.child_resource_label = 子进程 CPU {cpu} / RSS {rss}
 activity.resource_high = 高负载
+activity.resource_storm = 激增
 activity.clear_caches = 清除渲染缓存
 activity.session_count = {count} 个会话
 activity.clear_caches_hint = 清除所有工作区的终端渲染缓存。不影响正在运行的任务、进程和回滚记录。

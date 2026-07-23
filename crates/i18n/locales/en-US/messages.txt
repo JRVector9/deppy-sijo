@@ -343,6 +343,14 @@ env.project_folder.choose = Choose folder
 env.session_cwd.detected = Session folder: {path}
 env.session_cwd.register = Register as new project
 env.session_cwd.set_project = Use this folder as project folder
+
+# 프로세스 폭주 경고 (로드맵 B2)
+process_storm.banner.title = Process storm detected
+process_storm.banner.detail = {sessions} session(s) · up to {count} processes
+process_storm.dismiss = Dismiss
+process_storm.notification.title = Process storm detected
+process_storm.notification.body = {session}: {count} processes — the terminal session may exhaust system memory
+process_storm.unknown_session = a terminal session
 env.project_folder.clear = Clear
 env.add_var = Add variable
 env.empty_value_placeholder = Value
@@ -526,6 +534,7 @@ activity.cpu_pending = pending
 activity.resource_label = CPU {cpu} / RSS {rss}
 activity.child_resource_label = Child CPU {cpu} / RSS {rss}
 activity.resource_high = High
+activity.resource_storm = Storm
 activity.clear_caches = Clear render caches
 activity.session_count = {count} sessions
 activity.clear_caches_hint = Clears terminal render caches for all workspaces. Running tasks, processes, and scrollback are unaffected.

@@ -343,6 +343,14 @@ env.project_folder.choose = フォルダを選択
 env.session_cwd.detected = セッションフォルダ: {path}
 env.session_cwd.register = 新しいプロジェクトとして登録
 env.session_cwd.set_project = このフォルダをプロジェクトフォルダに設定
+
+# 프로세스 폭주 경고 (로드맵 B2)
+process_storm.banner.title = プロセス急増を検知
+process_storm.banner.detail = {sessions}件のセッション · 最大{count}プロセス
+process_storm.dismiss = 閉じる
+process_storm.notification.title = プロセス急増を検知
+process_storm.notification.body = {session}: {count}プロセス — ターミナルセッションがシステムメモリを枯渇させる恐れがあります
+process_storm.unknown_session = ターミナルセッション
 env.project_folder.clear = 解除
 env.add_var = 変数追加
 env.empty_value_placeholder = 値
@@ -526,6 +534,7 @@ activity.cpu_pending = 待機中
 activity.resource_label = CPU {cpu} / RSS {rss}
 activity.child_resource_label = 子プロセス CPU {cpu} / RSS {rss}
 activity.resource_high = 高負荷
+activity.resource_storm = 急増
 activity.clear_caches = レンダーキャッシュをクリア
 activity.session_count = セッション {count} 個
 activity.clear_caches_hint = 全ワークスペースの端末レンダーキャッシュをクリアします。実行中の作業・プロセス・スクロール履歴には影響しません。

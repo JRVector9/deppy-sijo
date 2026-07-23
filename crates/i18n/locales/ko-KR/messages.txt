@@ -343,6 +343,14 @@ env.project_folder.choose = 폴더 선택
 env.session_cwd.detected = 세션 폴더: {path}
 env.session_cwd.register = 새 프로젝트로 등록
 env.session_cwd.set_project = 이 폴더를 프로젝트 폴더로 지정
+
+# 프로세스 폭주 경고 (로드맵 B2)
+process_storm.banner.title = 프로세스 폭주 감지
+process_storm.banner.detail = 세션 {sessions}개 · 최대 {count}개 프로세스
+process_storm.dismiss = 닫기
+process_storm.notification.title = 프로세스 폭주 감지
+process_storm.notification.body = {session}: 프로세스 {count}개 — 터미널 세션이 시스템 메모리를 고갈시킬 수 있습니다
+process_storm.unknown_session = 터미널 세션
 env.project_folder.clear = 해제
 env.add_var = 변수 추가
 env.empty_value_placeholder = 값
@@ -526,6 +534,7 @@ activity.cpu_pending = 대기 중
 activity.resource_label = CPU {cpu} / RSS {rss}
 activity.child_resource_label = 자식 CPU {cpu} / RSS {rss}
 activity.resource_high = 높음
+activity.resource_storm = 폭주
 activity.clear_caches = 렌더 캐시 비우기
 activity.session_count = 세션 {count}개
 activity.clear_caches_hint = 모든 워크스페이스의 터미널 렌더 캐시를 비웁니다. 실행 중인 작업·프로세스·스크롤 기록에는 영향이 없습니다.

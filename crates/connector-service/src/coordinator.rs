@@ -7073,10 +7073,14 @@ mod tests {
         }
     }
 
-    fn wait_for_quiescent_checkpoint(fixture: &Fixture) -> QuiescentCheckpoint {
-        wait_until(|| {
+    fn wait_for_quiescent_checkpoint(
+        fixture: &Fixture,
+        cycle: Option<usize>,
+    ) -> QuiescentCheckpoint {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
             let checkpoint = quiescent_checkpoint(fixture);
-            checkpoint.command_queue_depth == 0
+            if checkpoint.command_queue_depth == 0
                 && checkpoint.active_mcp_operations == 0
                 && checkpoint.active_oauth_flows == 0
                 && checkpoint.host_backlog == 0
@@ -7086,7 +7090,15 @@ mod tests {
                 && checkpoint.mcp_leases == 0
                 && checkpoint.cancellation_entries == 0
                 && checkpoint.operation_entries == 0
-        });
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancel soak quiescence timed out at cycle {cycle:?}: {checkpoint:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let checkpoint = quiescent_checkpoint(fixture);
         assert_eq!(checkpoint.command_queue_depth, 0);
         assert_eq!(checkpoint.active_mcp_operations, 0);
@@ -7110,6 +7122,26 @@ mod tests {
         checkpoint
     }
 
+    fn wait_for_cancel_soak_discover(fixture: &Fixture, cycle: usize) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let metrics = fixture.coordinator.metrics();
+            let operations = fixture.coordinator.current_snapshot().operations.len();
+            if metrics.active_mcp_operations == 1 && operations != 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancel soak discover timed out at cycle {cycle}: active_mcp_operations={}, command_queue_depth={}, operation_entries={operations}, worker_alive={}, generation_entries={}",
+                metrics.active_mcp_operations,
+                metrics.command_queue_depth,
+                metrics.worker_alive,
+                metrics.generation_entries,
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn run_cancel_soak(cycles: usize) -> SoakCheckpoints {
         assert!(cycles > 0);
         let mcp_gate = Arc::new(Gate::closed());
@@ -7126,18 +7158,15 @@ mod tests {
             .coordinator
             .dispatch(ConnectorIntent::Activate)
             .unwrap();
-        checkpoints.push(wait_for_quiescent_checkpoint(&fixture));
+        checkpoints.push(wait_for_quiescent_checkpoint(&fixture, None));
 
-        for _ in 0..cycles {
+        for cycle in 0..cycles {
             mcp_gate.close();
             fixture
                 .coordinator
                 .dispatch(ConnectorIntent::Discover(ServerId::new("server-1")))
                 .unwrap();
-            wait_until(|| {
-                fixture.coordinator.metrics().active_mcp_operations == 1
-                    && !fixture.coordinator.current_snapshot().operations.is_empty()
-            });
+            wait_for_cancel_soak_discover(&fixture, cycle);
             let operation_id = fixture.coordinator.current_snapshot().operations[0]
                 .id
                 .clone();
@@ -7145,7 +7174,7 @@ mod tests {
                 .coordinator
                 .dispatch(ConnectorIntent::Cancel(operation_id))
                 .unwrap();
-            checkpoints.push(wait_for_quiescent_checkpoint(&fixture));
+            checkpoints.push(wait_for_quiescent_checkpoint(&fixture, Some(cycle)));
         }
 
         assert_eq!(checkpoints.total, cycles + 2);

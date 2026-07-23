@@ -10,6 +10,8 @@ use crate::index::{Column, Line, Point};
 use crate::term::cell::{Flags, ResetDiscriminant};
 use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
+// deppy-sijo 옵션 D: 스크롤백 라인 압축(codec은 여기, 저장 연결은 후속 PR).
+mod compressed;
 pub mod resize;
 mod row;
 mod storage;

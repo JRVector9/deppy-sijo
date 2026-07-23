@@ -388,3 +388,89 @@ fn wrap_cell(c: char) -> Cell {
     cell.flags.insert(Flags::WRAPLINE);
     cell
 }
+
+// ── deppy-sijo 옵션 D: 스크롤백 라인 압축 ───────────────────────────────────
+
+/// 가시 1줄·`cols`폭 그리드에 `rows`개의 서로 다른 줄을 스크롤아웃시켜 history를
+/// 만든다. Line(-1)=마지막, Line(-rows)=처음 쓴 줄.
+fn grid_with_history(rows: usize, cols: usize) -> Grid<Cell> {
+    let mut grid = Grid::<Cell>::new(1, cols, rows + 5);
+    for r in 0..rows {
+        let ch = char::from(b'A' + (r % 26) as u8);
+        for c in 0..cols {
+            grid[Line(0)][Column(c)] = cell(ch);
+        }
+        grid.scroll_up::<crate::vte::ansi::Color>(&(Line(0)..Line(1)), 1);
+    }
+    grid
+}
+
+fn assert_line_eq(grid: &Grid<Cell>, line: Line, expected: &Row<Cell>, cols: usize) {
+    let mut scratch = Row::<Cell>::new(cols);
+    let got = grid.read_line(line, &mut scratch);
+    for c in 0..cols {
+        assert_eq!(got[Column(c)], expected[Column(c)], "{line:?} col {c} 불일치");
+    }
+    assert_eq!(got.occ, expected.occ, "{line:?} occ 불일치");
+}
+
+#[test]
+fn deppy_compress_history_roundtrip_and_frees_heap() {
+    let (rows, cols) = (6, 4);
+    let mut grid = grid_with_history(rows, cols);
+    assert_eq!(grid.history_size(), rows);
+
+    // 압축 전 스냅샷.
+    let snap: Vec<Row<Cell>> = (1..=rows).map(|d| grid[Line(-(d as i32))].clone()).collect();
+
+    // hot_lines=0 → history 전체 압축.
+    let freed = grid.compress_history(0, rows);
+    assert!(freed > 0, "회수 바이트가 0");
+    assert!(grid.compressed_heap_bytes() > 0, "압축 곁가지가 비어 있음");
+
+    // read_line 왕복 = 원본과 완전히 동일.
+    for (i, expected) in snap.iter().enumerate() {
+        assert_line_eq(&grid, Line(-((i + 1) as i32)), expected, cols);
+    }
+
+    // 재호출은 idempotent(이미 압축된 것은 0 회수).
+    assert_eq!(grid.compress_history(0, rows), 0, "재압축이 추가 회수");
+}
+
+#[test]
+fn deppy_compress_history_respects_hot_lines() {
+    let (rows, cols) = (6, 4);
+    let mut grid = grid_with_history(rows, cols);
+    let snap: Vec<Row<Cell>> = (1..=rows).map(|d| grid[Line(-(d as i32))].clone()).collect();
+
+    // hot_lines >= history → 아무것도 압축 안 함.
+    assert_eq!(grid.compress_history(rows, rows), 0);
+    assert_eq!(grid.compressed_heap_bytes(), 0);
+
+    // hot_lines=2 → 오래된 rows-2줄만 압축. 그래도 모든 줄 read_line은 원본과 동일.
+    let freed = grid.compress_history(2, rows);
+    assert!(freed > 0);
+    for (i, expected) in snap.iter().enumerate() {
+        assert_line_eq(&grid, Line(-((i + 1) as i32)), expected, cols);
+    }
+}
+
+/// 압축된 그리드도 truncate(가장 오래된 history 제거) 후 남은 줄이 온전한지 —
+/// 곁가지 truncate 동기화 검증.
+#[test]
+fn deppy_compress_survives_history_shrink() {
+    let (rows, cols) = (8, 4);
+    let mut grid = grid_with_history(rows, cols);
+    let snap: Vec<Row<Cell>> = (1..=rows).map(|d| grid[Line(-(d as i32))].clone()).collect();
+
+    grid.compress_history(0, rows);
+
+    // 스크롤백을 3줄로 줄인다(가장 오래된 rows-3줄 제거).
+    grid.update_history(3);
+    assert_eq!(grid.history_size(), 3);
+
+    // 남은 최근 3줄(Line(-1..=-3))은 여전히 원본과 동일하게 읽혀야 한다.
+    for d in 1..=3 {
+        assert_line_eq(&grid, Line(-(d as i32)), &snap[d - 1], cols);
+    }
+}

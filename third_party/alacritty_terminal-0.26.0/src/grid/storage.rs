@@ -7,7 +7,9 @@ use std::ops::{Index, IndexMut};
 use serde::{Deserialize, Serialize};
 
 use super::Row;
+use super::compressed::CompressedRow;
 use crate::index::Line;
+use crate::term::cell::Cell;
 
 /// Maximum number of buffered lines outside of the grid for performance optimization.
 const MAX_CACHE_SIZE: usize = 1_000;
@@ -50,6 +52,18 @@ pub struct Storage<T> {
     /// As long as `len` is bigger than `inner`, it is also possible to grow the scrollback buffer
     /// without any additional insertions.
     len: usize,
+
+    /// deppy-sijo 옵션 D: 스크롤아웃된 행의 압축 표현 곁가지 배열.
+    ///
+    /// `inner`와 물리 슬롯을 1:1로 공유한다(같은 `zero`/`compute_index` 사용). 규약:
+    /// 비어 있으면(len 0) "압축 없음"이고, 하나라도 압축되면 `inner.len()`과 길이가
+    /// 같아진다. 슬롯 `i`가 `Some`이면 `inner[i]`는 빈 placeholder(힙 0)이고 실제
+    /// 내용은 여기 압축돼 있다. 구조 변경(swap/rezero/truncate/initialize)마다
+    /// `(inner[i], compressed[i])`를 **쌍으로** 이동시켜 정합성을 유지한다.
+    ///
+    /// serde에서는 건너뛴다(ref-test JSON 불변 + 역직렬화 시 빈 채로 시작 = 압축 없음).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    compressed: Vec<Option<CompressedRow>>,
 }
 
 impl<T: PartialEq> PartialEq for Storage<T> {
@@ -72,7 +86,8 @@ impl<T> Storage<T> {
         let mut inner = Vec::with_capacity(visible_lines);
         inner.resize_with(visible_lines, || Row::new(columns));
 
-        Storage { inner, zero: 0, visible_lines, len: visible_lines }
+        // compressed는 lazy: 첫 압축 전까지 빈 채로 둔다(오버헤드 0).
+        Storage { inner, zero: 0, visible_lines, len: visible_lines, compressed: Vec::new() }
     }
 
     /// Increase the number of lines in the buffer.
@@ -119,6 +134,10 @@ impl<T> Storage<T> {
         self.rezero();
 
         self.inner.truncate(self.len);
+        // 곁가지도 같은 꼬리 슬롯(가장 오래된 history)을 버린다.
+        if !self.compressed.is_empty() {
+            self.compressed.truncate(self.len);
+        }
     }
 
     /// Dynamically grow the storage buffer at runtime.
@@ -132,6 +151,10 @@ impl<T> Storage<T> {
 
             let realloc_size = self.inner.len() + max(additional_rows, MAX_CACHE_SIZE);
             self.inner.resize_with(realloc_size, || Row::new(columns));
+            // 곁가지도 같은 길이로: 새로 추가된(가장 최근) 슬롯은 None(비압축).
+            if !self.compressed.is_empty() {
+                self.compressed.resize_with(realloc_size, || None);
+            }
         }
 
         self.len += additional_rows;
@@ -173,6 +196,11 @@ impl<T> Storage<T> {
                 *b_ptr.offset(i) = tmp;
             }
         }
+
+        // (inner[i], compressed[i])는 항상 쌍으로 움직인다.
+        if !self.compressed.is_empty() {
+            self.compressed.swap(a, b);
+        }
     }
 
     /// Rotate the grid, moving all lines up/down in history.
@@ -200,6 +228,8 @@ impl<T> Storage<T> {
         self.len = vec.len();
         self.inner = vec;
         self.zero = 0;
+        // 새 inner는 압축 이력이 없다(resize/reflow는 복원된 행을 넘겨준다).
+        self.compressed.clear();
     }
 
     /// Remove all rows from storage.
@@ -211,6 +241,7 @@ impl<T> Storage<T> {
 
         mem::swap(&mut buffer, &mut self.inner);
         self.len = 0;
+        self.compressed.clear();
 
         buffer
     }
@@ -240,8 +271,69 @@ impl<T> Storage<T> {
             return;
         }
 
+        // 곁가지도 동일하게 회전시켜 물리 슬롯 쌍을 보존한다.
+        if !self.compressed.is_empty() {
+            self.compressed.rotate_left(self.zero);
+        }
         self.inner.rotate_left(self.zero);
         self.zero = 0;
+    }
+}
+
+impl Storage<Cell> {
+    /// `line`을 압축한다. 이미 압축됐거나 빈(placeholder) 행이면 아무것도 안 하고 0
+    /// 반환. 반환값은 회수 추정 힙 바이트(원본 셀 배열 − 압축 표현).
+    ///
+    /// 압축 후 `inner[idx]`는 힙 0인 placeholder가 되고, 실제 내용은 곁가지에 남는다.
+    /// 이후 이 행을 읽으려면 반드시 [`read_line`](Self::read_line)을 거쳐야 한다
+    /// (원시 `Index<Line>`은 placeholder를 돌려준다).
+    pub(crate) fn compress_line(&mut self, line: Line, columns: usize) -> usize {
+        let idx = self.compute_index(line);
+        if self.compressed.get(idx).is_some_and(Option::is_some) {
+            return 0;
+        }
+        let raw_bytes = self.inner[idx].len() * mem::size_of::<Cell>();
+        if raw_bytes == 0 {
+            return 0;
+        }
+        let compressed = CompressedRow::encode(&self.inner[idx], columns);
+        let saved = raw_bytes.saturating_sub(compressed.heap_bytes());
+
+        // 첫 압축에서만 곁가지를 inner와 같은 길이로 실체화(lazy).
+        if self.compressed.is_empty() {
+            self.compressed.resize_with(self.inner.len(), || None);
+        }
+        self.compressed[idx] = Some(compressed);
+        // 셀 배열의 힙을 즉시 반납(용량까지 드롭).
+        self.inner[idx] = Row::from_vec(Vec::new(), 0);
+        saved
+    }
+
+    /// `line`을 읽는다. 압축돼 있으면 `scratch`로 복원해 그 참조를, 아니면 원시
+    /// `inner` 행 참조를 돌려준다. 어느 쪽이든 호출자는 동일한 `&Row<Cell>`을 본다.
+    pub(crate) fn read_line<'a>(
+        &'a self,
+        line: Line,
+        columns: usize,
+        scratch: &'a mut Row<Cell>,
+    ) -> &'a Row<Cell> {
+        let idx = self.compute_index(line);
+        match self.compressed.get(idx).and_then(Option::as_ref) {
+            Some(compressed) => {
+                *scratch = compressed.decode(columns);
+                scratch
+            },
+            None => &self.inner[idx],
+        }
+    }
+
+    /// 현재 압축 곁가지가 점유하는 힙 바이트 추정 — RSS 예산/실측용.
+    pub(crate) fn compressed_heap_bytes(&self) -> usize {
+        self.compressed
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(CompressedRow::heap_bytes)
+            .sum()
     }
 }
 
@@ -354,6 +446,7 @@ mod tests {
             zero: 0,
             visible_lines: 3,
             len: 3,
+            compressed: Vec::new(),
         };
 
         // Grow buffer.
@@ -365,6 +458,7 @@ mod tests {
             zero: 0,
             visible_lines: 4,
             len: 4,
+            compressed: Vec::new(),
         };
         expected.inner.append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
 
@@ -395,6 +489,7 @@ mod tests {
             zero: 1,
             visible_lines: 3,
             len: 3,
+            compressed: Vec::new(),
         };
 
         // Grow buffer.
@@ -406,6 +501,7 @@ mod tests {
             zero: 0,
             visible_lines: 4,
             len: 4,
+            compressed: Vec::new(),
         };
         expected.inner.append(&mut vec![filled_row('\0'); MAX_CACHE_SIZE]);
 
@@ -433,6 +529,7 @@ mod tests {
             zero: 1,
             visible_lines: 3,
             len: 3,
+            compressed: Vec::new(),
         };
 
         // Shrink buffer.
@@ -444,6 +541,7 @@ mod tests {
             zero: 1,
             visible_lines: 2,
             len: 2,
+            compressed: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -469,6 +567,7 @@ mod tests {
             zero: 0,
             visible_lines: 3,
             len: 3,
+            compressed: Vec::new(),
         };
 
         // Shrink buffer.
@@ -480,6 +579,7 @@ mod tests {
             zero: 0,
             visible_lines: 2,
             len: 2,
+            compressed: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -518,6 +618,7 @@ mod tests {
             zero: 2,
             visible_lines: 6,
             len: 6,
+            compressed: Vec::new(),
         };
 
         // Shrink buffer.
@@ -536,6 +637,7 @@ mod tests {
             zero: 2,
             visible_lines: 2,
             len: 2,
+            compressed: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -570,6 +672,7 @@ mod tests {
             zero: 2,
             visible_lines: 1,
             len: 2,
+            compressed: Vec::new(),
         };
 
         // Truncate buffer.
@@ -581,6 +684,7 @@ mod tests {
             zero: 0,
             visible_lines: 1,
             len: 2,
+            compressed: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -605,6 +709,7 @@ mod tests {
             zero: 2,
             visible_lines: 1,
             len: 2,
+            compressed: Vec::new(),
         };
 
         // Truncate buffer.
@@ -616,6 +721,7 @@ mod tests {
             zero: 0,
             visible_lines: 1,
             len: 2,
+            compressed: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -662,6 +768,7 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 6,
+            compressed: Vec::new(),
         };
 
         // Shrink buffer.
@@ -680,6 +787,7 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 3,
+            compressed: Vec::new(),
         };
         assert_eq!(storage.inner, shrinking_expected.inner);
         assert_eq!(storage.zero, shrinking_expected.zero);
@@ -701,6 +809,7 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 4,
+            compressed: Vec::new(),
         };
 
         assert_eq!(storage.inner, growing_expected.inner);
@@ -723,6 +832,7 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 6,
+            compressed: Vec::new(),
         };
 
         // Initialize additional lines.
@@ -740,7 +850,8 @@ mod tests {
         ];
         let expected_init_size = std::cmp::max(init_size, MAX_CACHE_SIZE);
         expected_inner.append(&mut vec![filled_row('\0'); expected_init_size]);
-        let expected_storage = Storage { inner: expected_inner, zero: 0, visible_lines: 0, len: 9 };
+        let expected_storage =
+            Storage { inner: expected_inner, zero: 0, visible_lines: 0, len: 9, compressed: Vec::new() };
 
         assert_eq!(storage.len, expected_storage.len);
         assert_eq!(storage.zero, expected_storage.zero);
@@ -754,6 +865,7 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 3,
+            compressed: Vec::new(),
         };
 
         storage.rotate(2);

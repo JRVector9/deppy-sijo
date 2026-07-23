@@ -6,8 +6,9 @@
 //! 압축한다. `Cell`의 공개 API만 써서 왕복 무손실이며, alacritty 타입(`CellExtra`)의
 //! 프라이버시를 건드리지 않는다.
 //!
-//! 이 파일은 순수 데이터 구조 + codec이다. 실제로 Storage 링버퍼에 앉히는 것은
-//! 후속 작업(PR-3)이며, 아직 아무도 호출하지 않는다.
+//! 이 파일은 순수 데이터 구조 + codec이다. Storage 링버퍼에 이를 앉히는(곁가지
+//! 배열 + compress_line/read_line) 것은 `storage.rs`이며, 트리거(누가 언제 압축을
+//! 호출하는가)는 아직 없다 — 후속 PR에서 연결한다.
 
 #![allow(dead_code)]
 
@@ -18,7 +19,7 @@ use crate::vte::ansi::Color;
 use super::row::Row;
 
 /// 연속된 셀이 공유하는 색/플래그 구간.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct AttrRun {
     len: u16,
     fg: Color,
@@ -27,7 +28,7 @@ struct AttrRun {
 }
 
 /// 드물게만 존재하는 셀 부가 정보(alacritty의 `CellExtra`에 대응).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ExtraData {
     zerowidth: Box<[char]>,
     underline_color: Option<Color>,
@@ -36,7 +37,7 @@ struct ExtraData {
 
 /// 압축된 한 행. content_len(마지막 non-default 셀 + 1)까지만 저장하고, 그 뒤는
 /// 복원 시 `Cell::default()`로 채운다(뒤쪽 공백 압축의 핵심).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct CompressedRow {
     /// content 범위 각 셀의 문자. 길이(char 수) == content_len.
     text: Box<str>,

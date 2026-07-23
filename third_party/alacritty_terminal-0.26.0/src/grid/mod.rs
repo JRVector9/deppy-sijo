@@ -442,6 +442,51 @@ impl<T> Grid<T> {
     }
 }
 
+/// deppy-sijo 옵션 D: 스크롤백 라인 압축(Cell 전용).
+impl Grid<crate::term::cell::Cell> {
+    /// `hot_lines`보다 오래된 스크롤백 history 행을 압축한다. 한 번 호출당 최대
+    /// `max_compress`행만 실제로 압축(feed 버스트 지연 방지). 반환: 회수 추정 바이트.
+    ///
+    /// 오래된 행(depth 큰 쪽)부터 훑고 이미 압축된 슬롯은 건너뛴다. 트리거(누가 언제
+    /// 호출하는가)는 아직 없다 — 후속 PR에서 연결한다.
+    pub fn compress_history(&mut self, hot_lines: usize, max_compress: usize) -> usize {
+        let history = self.history_size();
+        if history <= hot_lines || max_compress == 0 {
+            return 0;
+        }
+
+        let columns = self.columns;
+        let mut freed = 0;
+        let mut compressed = 0;
+        // depth: 1 = 가장 최근 history, history = 가장 오래된 것. 오래된 쪽부터.
+        let mut depth = history;
+        while depth > hot_lines && compressed < max_compress {
+            let saved = self.raw.compress_line(Line(-(depth as i32)), columns);
+            if saved > 0 {
+                freed += saved;
+                compressed += 1;
+            }
+            depth -= 1;
+        }
+        freed
+    }
+
+    /// `line`을 읽는다. 압축돼 있으면 `scratch`로 복원해 그 참조를, 아니면 원시 행
+    /// 참조를 돌려준다. 압축된 스크롤백을 안전하게 읽는 유일한 경로다.
+    pub fn read_line<'a>(
+        &'a self,
+        line: Line,
+        scratch: &'a mut Row<crate::term::cell::Cell>,
+    ) -> &'a Row<crate::term::cell::Cell> {
+        self.raw.read_line(line, self.columns, scratch)
+    }
+
+    /// 현재 압축 곁가지가 점유하는 힙 바이트 추정 — RSS 실측용.
+    pub fn compressed_heap_bytes(&self) -> usize {
+        self.raw.compressed_heap_bytes()
+    }
+}
+
 impl<T: PartialEq> PartialEq for Grid<T> {
     fn eq(&self, other: &Self) -> bool {
         // Compare struct fields and check result of grid comparison.

@@ -243,6 +243,15 @@ pub trait PtySession: Send {
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()>;
     fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>>;
     fn kill(&mut self) -> anyhow::Result<()>;
+    /// 프로세스 그룹 일시정지(SIGSTOP)/재개(SIGCONT) — 폭주 세션 동결 (로드맵 B3).
+    /// 자동 해제하지 않는다(정책: 사용자 조치만). Windows 등 미지원 백엔드는
+    /// 기본 구현이 명시적으로 실패한다.
+    fn freeze(&self) -> anyhow::Result<()> {
+        anyhow::bail!("freeze unsupported on this platform")
+    }
+    fn resume(&self) -> anyhow::Result<()> {
+        anyhow::bail!("resume unsupported on this platform")
+    }
 }
 
 pub struct PortablePtyBackend;
@@ -1436,6 +1445,27 @@ impl PtySession for PortablePtySession {
             self.child.kill().context("프로세스 kill 실패")
         }
     }
+
+    #[cfg(unix)]
+    fn freeze(&self) -> anyhow::Result<()> {
+        // 프로세스 그룹 전체 정지 — grandchild job(예: next dev의 워커들)까지 멈춘다.
+        anyhow::ensure!(
+            self.process_group.is_some(),
+            "process group 없음 — 동결 불가"
+        );
+        self.signal_process_group(libc::SIGSTOP);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn resume(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.process_group.is_some(),
+            "process group 없음 — 재개 불가"
+        );
+        self.signal_process_group(libc::SIGCONT);
+        Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2038,6 +2068,56 @@ mod tests {
     fn kill로_종료() {
         let mut session = spawn("/bin/cat", &[]);
         let _rx = session.take_output().unwrap();
+        session.kill().unwrap();
+        assert!(wait_exit(&mut session, Duration::from_secs(5)).is_some());
+    }
+
+    #[test]
+    fn freeze는_프로세스를_정지시키고_resume이_되살린다() {
+        // sleep 자식을 동결하면 ps 상태가 T(stopped)가 되고, 재개하면 다시 S/R.
+        let mut session = spawn("/bin/sleep", &["30"]);
+        let _rx = session.take_output().unwrap();
+        let pid = session.process_identity().pid.expect("pid");
+
+        let state = |pid: u32| -> String {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        session.freeze().unwrap();
+        // SIGSTOP 반영까지 짧게 폴링 — state 첫 글자가 T면 stopped.
+        let stopped = {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if state(pid).starts_with('T') {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        };
+        assert!(stopped, "freeze 후 T(stopped) 상태가 아님: {}", state(pid));
+
+        session.resume().unwrap();
+        let resumed = {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if !state(pid).starts_with('T') {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        };
+        assert!(resumed, "resume 후에도 정지 상태: {}", state(pid));
+
         session.kill().unwrap();
         assert!(wait_exit(&mut session, Duration::from_secs(5)).is_some());
     }

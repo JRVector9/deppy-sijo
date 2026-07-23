@@ -1734,6 +1734,23 @@ impl Worker {
                     trace_runtime_failure("emergency_persist_flush", "persist_flush_failed", error);
                 }
             }
+            RuntimeCommand::FreezeSession { session } => {
+                // 폭주 세션 동결 (로드맵 B3) — 결과를 명시 회신해 낙관적 상태 대신
+                // 실제 프로세스 상태를 UI가 반영한다. 종료/부재 세션은 무해히 무시.
+                if let Some(active) = self.sessions.get(&session) {
+                    let frozen = active.freeze();
+                    self.emit(RuntimeEvent::SessionFreezeChanged { session, frozen });
+                }
+            }
+            RuntimeCommand::ResumeSession { session } => {
+                if let Some(active) = self.sessions.get(&session) {
+                    let resumed = active.resume();
+                    self.emit(RuntimeEvent::SessionFreezeChanged {
+                        session,
+                        frozen: !resumed,
+                    });
+                }
+            }
             RuntimeCommand::SearchScrollback {
                 session,
                 query,
@@ -4436,6 +4453,56 @@ mod tests {
         });
         assert_eq!(exited, session);
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn freeze_resume는_결과_이벤트를_회신한다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("freeze"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::FreezeSession { session })
+            .unwrap();
+        // Probe.seen은 누적되므로 각 대기는 기대 frozen 값을 정확히 매칭한다.
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionFreezeChanged {
+                session: s,
+                frozen: true,
+            } if *s == session => Some(()),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::ResumeSession { session })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionFreezeChanged {
+                session: s,
+                frozen: false,
+            } if *s == session => Some(()),
+            _ => None,
+        });
+        // 이미 종료된/부재 세션에 보내면 무해히 무시된다(이벤트 없음) — kill로 정리.
+        client
+            .send_command(RuntimeCommand::KillSession { session })
+            .unwrap();
     }
 
     #[test]

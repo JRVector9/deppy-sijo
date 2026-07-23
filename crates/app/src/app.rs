@@ -5308,6 +5308,9 @@ struct WorkspaceRuntime {
     /// 폭주 확정 전이 시 (세션, peak 프로세스 수)를 쌓는 알림 큐 (B2). logic()이
     /// drain해 OS 알림을 1회 발화한다 — 에피소드당 확정 1회만 쌓인다.
     storm_notify_pending: Vec<(runtime::SessionId, usize)>,
+    /// 사용자가 동결(SIGSTOP)한 세션 (로드맵 B3). SessionFreezeChanged로 갱신,
+    /// exit 시 제거 — live 세션 수로 유계.
+    frozen_sessions: std::collections::HashSet<runtime::SessionId>,
     /// 마지막 PTY input pressure signal(+관측 시각). 회복 이벤트가 없어(QueueFull은
     /// writer drain으로 조용히 해소) 표시 시 TTL로 stale 뱃지를 걸러낸다(codex 2026-07-08).
     input_pressure: Option<(runtime::PtyInputPressure, std::time::Instant)>,
@@ -5713,6 +5716,9 @@ pub struct App {
     /// 폭주 경고 배너를 닫음 (로드맵 B2). 현재 폭주가 모두 해소되면 리셋돼 다음
     /// 폭주에 다시 뜬다 — 에피소드별 상태를 안 들고도 유계.
     storm_banner_dismissed: bool,
+    /// 배너 버튼이 요청한 폭주 대응 (로드맵 B3). ui()는 렌더 경로라 명령을 못 보내므로
+    /// 여기 담고 logic()에서 소비한다.
+    pending_storm_action: Option<StormAction>,
     env_project_rows_worker: EnvProjectRowsWorker,
     env_project_rows_generation: u64,
     /// Exact generation currently owned by the capacity-one worker. Invalidation advances the
@@ -8286,6 +8292,7 @@ impl App {
             env_api_projects_cache: None,
             env_session_banner: None,
             storm_banner_dismissed: false,
+            pending_storm_action: None,
             env_project_rows_worker,
             env_project_rows_generation: 0,
             env_project_rows_in_flight: None,
@@ -8554,6 +8561,7 @@ impl App {
             storm_episodes: std::collections::HashMap::new(),
             storm_next_episode_id: 0,
             storm_notify_pending: Vec::new(),
+            frozen_sessions: std::collections::HashSet::new(),
             input_pressure: None,
             session_input_pressure: std::collections::HashMap::new(),
             session_dotenv_states: std::collections::HashMap::new(),
@@ -13644,6 +13652,55 @@ impl App {
         (count > 0).then_some((count, peak))
     }
 
+    /// 확정 폭주 세션 중 하나라도 동결 상태인가 (배너 [재개]/[동결] 라벨 선택용).
+    fn any_storm_session_frozen(&self) -> bool {
+        std::iter::once(&self.active)
+            .chain(self.warm.values())
+            .any(|workspace| {
+                workspace.storm_episodes.iter().any(|(session, episode)| {
+                    episode.confirmed && workspace.frozen_sessions.contains(session)
+                })
+            })
+    }
+
+    /// 배너 버튼이 요청한 폭주 대응을 실행한다 (로드맵 B3). logic()에서만 호출 —
+    /// 확정 폭주 세션(재개는 동결된 세션) 전체에 명령을 보낸다. 종료는 기존
+    /// KillSession(SIGHUP→SIGTERM→SIGKILL 에스컬레이션) 재사용.
+    fn dispatch_storm_action(&mut self, action: StormAction) {
+        for workspace in std::iter::once(&mut self.active).chain(self.warm.values_mut()) {
+            let targets: Vec<runtime::SessionId> = workspace
+                .storm_episodes
+                .iter()
+                .filter(|(session, episode)| {
+                    if !episode.confirmed {
+                        return false;
+                    }
+                    match action {
+                        StormAction::Resume => workspace.frozen_sessions.contains(session),
+                        StormAction::Freeze | StormAction::Kill => true,
+                    }
+                })
+                .map(|(session, _)| *session)
+                .collect();
+            for session in targets {
+                let command = match action {
+                    StormAction::Freeze => runtime::RuntimeCommand::FreezeSession { session },
+                    StormAction::Resume => runtime::RuntimeCommand::ResumeSession { session },
+                    StormAction::Kill => runtime::RuntimeCommand::KillSession { session },
+                };
+                if let Err(error) = workspace.runtime.send_command(command) {
+                    tracing::warn!(
+                        kind = "resource",
+                        phase = "storm_action_send_failed",
+                        action = ?action,
+                        workspace = %workspace.id,
+                        error = %error,
+                    );
+                }
+            }
+        }
+    }
+
     /// 최신 feed를 읽음 기준과 대조해 Home 배지 수를 갱신한다. Home이 선택된 동안에는
     /// 현재 목록을 곧바로 읽음 처리한다. 디스크 쓰기는 기준이 실제로 달라질 때만 한다.
     fn sync_home_notice_badge(&mut self, mark_read: bool, ctx: &egui::Context) {
@@ -14160,11 +14217,20 @@ impl App {
                 rt.session_input_pressure.remove(session);
                 rt.session_dotenv_states.remove(session);
                 rt.storm_episodes.remove(session);
+                rt.frozen_sessions.remove(session);
                 rt.input_pressure = rt
                     .session_input_pressure
                     .values()
                     .max_by_key(|(_, at)| *at)
                     .cloned();
+            }
+            // 동결/재개 결과 반영 (B3) — 실제 프로세스 상태를 낙관적 상태 대신 추적.
+            if let runtime::RuntimeEvent::SessionFreezeChanged { session, frozen } = event {
+                if *frozen {
+                    rt.frozen_sessions.insert(*session);
+                } else {
+                    rt.frozen_sessions.remove(session);
+                }
             }
             // live 세션 추적 (suspend 보호)
             rt.live.observe(event);
@@ -15428,6 +15494,9 @@ impl eframe::App for App {
             platform::notify(intent.summary(), intent.body());
         }
         self.dispatch_storm_notifications();
+        if let Some(action) = self.pending_storm_action.take() {
+            self.dispatch_storm_action(action);
+        }
 
         // 폰 대시보드가 볼 워크스페이스 스냅샷(전체 + 해석된 세션 이름) 동기화.
         // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
@@ -15556,11 +15625,28 @@ impl eframe::App for App {
                                 ))
                                 .color(egui::Color32::from_rgb(240, 220, 220)),
                             );
+                            let any_frozen = self.any_storm_session_frozen();
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui.button(text.t("process_storm.dismiss", &[])).clicked() {
                                         self.storm_banner_dismissed = true;
+                                    }
+                                    // 종료(되돌릴 수 없음) → 재개/동결 순. 정책상 자동 개입
+                                    // 없음 — 모두 사용자 클릭이다.
+                                    if ui.button(text.t("process_storm.kill", &[])).clicked() {
+                                        self.pending_storm_action = Some(StormAction::Kill);
+                                    }
+                                    if any_frozen {
+                                        if ui.button(text.t("process_storm.resume", &[])).clicked()
+                                        {
+                                            self.pending_storm_action = Some(StormAction::Resume);
+                                        }
+                                    } else if ui
+                                        .button(text.t("process_storm.freeze", &[]))
+                                        .clicked()
+                                    {
+                                        self.pending_storm_action = Some(StormAction::Freeze);
                                     }
                                 },
                             );
@@ -17780,6 +17866,14 @@ struct EnvSessionCwdBanner {
     cwd: std::path::PathBuf,
     /// cwd가 기존 워크스페이스 path와 일치하거나 그 하위 폴더인가.
     registered: bool,
+}
+
+/// 폭주 배너 버튼이 요청하는 대응 (로드맵 B3) — 확정된 폭주 세션 전체에 적용된다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StormAction {
+    Freeze,
+    Resume,
+    Kill,
 }
 
 /// T1: cwd가 워크스페이스 path 중 하나와 일치하거나 그 하위 폴더인지 판정

@@ -3116,6 +3116,7 @@ mod tests {
             RuntimeEvent::ScrollbackSearchResult { .. } => "ScrollbackSearchResult",
             RuntimeEvent::LastOutputExtracted { .. } => "LastOutputExtracted",
             RuntimeEvent::AgentSpawnResolved { .. } => "AgentSpawnResolved",
+            RuntimeEvent::SessionFreezeChanged { .. } => "SessionFreezeChanged",
         }
     }
 

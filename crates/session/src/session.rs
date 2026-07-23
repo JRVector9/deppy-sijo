@@ -215,6 +215,16 @@ impl Session {
         self.lifecycle
     }
 
+    /// 폭주 세션 동결(SIGSTOP)/재개(SIGCONT) — PtySession에 위임 (로드맵 B3).
+    /// PTY가 이미 정리된(종료된) 세션은 false.
+    pub fn freeze(&self) -> bool {
+        self.pty.as_ref().is_some_and(|pty| pty.freeze().is_ok())
+    }
+
+    pub fn resume(&self) -> bool {
+        self.pty.as_ref().is_some_and(|pty| pty.resume().is_ok())
+    }
+
     /// PTY 출력을 terminal backend에 반영한다. 출력 wake 또는 fallback tick마다 호출.
     /// `on_output`은 raw chunk마다 불린다 — 로그/status detector는
     /// backend 내부가 아니라 이 output stream 기반이다 (설계문서 4.1).

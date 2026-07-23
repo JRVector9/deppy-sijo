@@ -442,7 +442,9 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::ScrollToBottom { .. }
         | RuntimeCommand::ScrollToPrompt { .. }
         | RuntimeCommand::ExtractLastOutput { .. }
-        | RuntimeCommand::EmergencyPersistFlush => {}
+        | RuntimeCommand::EmergencyPersistFlush
+        | RuntimeCommand::FreezeSession { .. }
+        | RuntimeCommand::ResumeSession { .. } => {}
     }
     Ok(total)
 }
@@ -552,7 +554,9 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::ScrollToBottom { .. }
         | RuntimeCommand::ScrollToPrompt { .. }
         | RuntimeCommand::ExtractLastOutput { .. }
-        | RuntimeCommand::EmergencyPersistFlush => {}
+        | RuntimeCommand::EmergencyPersistFlush
+        | RuntimeCommand::FreezeSession { .. }
+        | RuntimeCommand::ResumeSession { .. } => {}
     }
 }
 
@@ -718,7 +722,9 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         | RuntimeCommand::ScrollToBottom { .. }
         | RuntimeCommand::ScrollToPrompt { .. }
         | RuntimeCommand::ExtractLastOutput { .. }
-        | RuntimeCommand::EmergencyPersistFlush => {}
+        | RuntimeCommand::EmergencyPersistFlush
+        | RuntimeCommand::FreezeSession { .. }
+        | RuntimeCommand::ResumeSession { .. } => {}
     }
     Ok(())
 }
@@ -904,6 +910,16 @@ pub enum RuntimeCommand {
     /// 않으므로 압박 신호 시점의 이 명령이 유일한 사전 안전망이다.
     /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
     EmergencyPersistFlush,
+    /// 폭주 세션 프로세스 그룹 동결(SIGSTOP) — 사용자 조치 (로드맵 B3). 자동 해제
+    /// 없음. 결과는 `RuntimeEvent::SessionFreezeChanged`로 회신한다.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    FreezeSession {
+        session: SessionId,
+    },
+    /// 동결된 세션 재개(SIGCONT) — 사용자 조치 (로드맵 B3).
+    ResumeSession {
+        session: SessionId,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1006,6 +1022,14 @@ impl std::fmt::Debug for RuntimeCommand {
             RuntimeCommand::EmergencyPersistFlush => {
                 f.debug_struct("EmergencyPersistFlush").finish()
             }
+            RuntimeCommand::FreezeSession { session } => f
+                .debug_struct("FreezeSession")
+                .field("session", session)
+                .finish(),
+            RuntimeCommand::ResumeSession { session } => f
+                .debug_struct("ResumeSession")
+                .field("session", session)
+                .finish(),
             RuntimeCommand::KillSession { session } => f
                 .debug_struct("KillSession")
                 .field("session", session)
@@ -1795,6 +1819,8 @@ mod tests {
                 "ScrollToPrompt",
                 "ExtractLastOutput",
                 "EmergencyPersistFlush",
+                "FreezeSession",
+                "ResumeSession",
             ]
         );
     }

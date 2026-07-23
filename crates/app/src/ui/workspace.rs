@@ -2005,6 +2005,8 @@ impl WorkspaceUi {
                 // same batch here, so the workspace leaf intentionally performs no action.
                 RuntimeEvent::AgentSpawned { .. } | RuntimeEvent::AgentSpawnResolved { .. } => {}
                 RuntimeEvent::ResourceUsage { .. } => {}
+                // 동결/재개 상태는 App(WorkspaceRuntime)에서 추적한다 — 이 뷰 캐시는 무관.
+                RuntimeEvent::SessionFreezeChanged { .. } => {}
                 RuntimeEvent::ScrollbackSearchResult {
                     session,
                     query,

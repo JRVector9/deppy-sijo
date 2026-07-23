@@ -178,6 +178,13 @@ pub enum RuntimeEvent {
         agent_config_id: AgentConfigCorrelationId,
         session: Option<SessionId>,
     },
+    /// 세션 동결/재개 결과 (로드맵 B3) — 낙관적 클라이언트 상태 대신 실제 결과를
+    /// 회신해 배너·활동 뷰·원격 뷰어가 같은 진실을 본다.
+    /// **variant는 enum 끝에만 추가** (postcard discriminant — wire 호환).
+    SessionFreezeChanged {
+        session: SessionId,
+        frozen: bool,
+    },
 }
 
 /// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의

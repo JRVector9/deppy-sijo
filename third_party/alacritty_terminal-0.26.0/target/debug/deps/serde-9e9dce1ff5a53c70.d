@@ -1,0 +1,14 @@
+/Users/jr/Desktop/projects/deppy-sijo/third_party/alacritty_terminal-0.26.0/target/debug/deps/serde-9e9dce1ff5a53c70.d: /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/jr/Desktop/projects/deppy-sijo/third_party/alacritty_terminal-0.26.0/target/debug/build/serde-58ea0ee887cc2602/out/private.rs
+
+/Users/jr/Desktop/projects/deppy-sijo/third_party/alacritty_terminal-0.26.0/target/debug/deps/libserde-9e9dce1ff5a53c70.rlib: /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/jr/Desktop/projects/deppy-sijo/third_party/alacritty_terminal-0.26.0/target/debug/build/serde-58ea0ee887cc2602/out/private.rs
+
+/Users/jr/Desktop/projects/deppy-sijo/third_party/alacritty_terminal-0.26.0/target/debug/deps/libserde-9e9dce1ff5a53c70.rmeta: /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/jr/Desktop/projects/deppy-sijo/third_party/alacritty_terminal-0.26.0/target/debug/build/serde-58ea0ee887cc2602/out/private.rs
+
+/Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/jr/Desktop/projects/deppy-sijo/third_party/alacritty_terminal-0.26.0/target/debug/build/serde-58ea0ee887cc2602/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/jr/Desktop/projects/deppy-sijo/third_party/alacritty_terminal-0.26.0/target/debug/build/serde-58ea0ee887cc2602/out

@@ -26,6 +26,9 @@ members = [
     "crates/web-remote",
     "xtask",
 ]
+# vendored fork는 워크스페이스 멤버가 아니다(patch로만 주입). exclude가 있어야 그
+# 크레이트를 --manifest-path로 독립 테스트할 수 있다(자체 alacritty 테스트 스위트 실행용).
+exclude = ["third_party/alacritty_terminal-0.26.0"]
 
 [workspace.package]
 version = "0.1.0"
@@ -88,3 +91,6 @@ tungstenite = { version = "0.29", default-features = false }
 # DEPPY_BACKPORT.md for the upstream commit and removal criteria.
 [patch.crates-io]
 winit = { path = "third_party/winit-0.30.13" }
+# 스크롤백 라인 압축(옵션 D) 구현을 위해 vendor. 코덱/저장은 이 포크 내부에만 두고
+# alacritty 타입은 crates/terminal 밖으로 노출하지 않는다. third_party/.../DEPPY_VENDOR.md 참조.
+alacritty_terminal = { path = "third_party/alacritty_terminal-0.26.0" }

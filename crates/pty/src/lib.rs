@@ -953,6 +953,70 @@ fn wait_for_fd_or_cancel(fd: RawFd, events: libc::c_short, cancel: RawFd) -> std
     }
 }
 
+/// 코얼레싱 대기 — EAGAIN(지금 당장은 더 없음) 시 이만큼만 더 기다려 프로듀서가
+/// 다음 1KB를 쓸 여유를 준다. macOS pty가 1KB씩 트리클하고 우리 read 루프가 그보다
+/// 빨라 read 사이에 즉시 EAGAIN이 뜨므로, 이 짧은 대기 없이는 합쳐지지 않는다.
+/// 프레임 예산(16ms) 대비 무시할 수준이라 상호작용 지연은 체감되지 않는다.
+#[cfg(unix)]
+const PTY_COALESCE_WAIT_MS: libc::c_int = 2;
+
+/// reader fd에 timeout_ms 안에 읽을 데이터가 생기는지 — cancel 신호면 즉시 false.
+#[cfg(unix)]
+fn reader_ready_within(fd: RawFd, cancel: RawFd, timeout_ms: libc::c_int) -> bool {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: cancel,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout_ms) };
+    if result <= 0 {
+        return false; // timeout 또는 error → 더 기다리지 말고 flush
+    }
+    if descriptors[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    {
+        return false; // cancel → 코얼레싱 중단
+    }
+    descriptors[1].revents & libc::POLLIN != 0
+}
+
+/// 단일 read 버퍼. macOS 커널은 PTY read를 ~1KB로 캡하지만, Linux 등에서는 한 번에
+/// 더 많이 줄 수 있으므로 여유 있게 잡는다.
+#[cfg(unix)]
+const PTY_READ_CHUNK_BYTES: usize = 64 * 1024;
+/// 한 번 깨어났을 때 합쳐 보내는 상한 — 다운스트림 FEED_PER_PUMP_CAP(256KiB)보다 작게
+/// 두어 큐 메모리(용량 64청크)를 유계로 유지한다.
+#[cfg(unix)]
+const PTY_COALESCE_CAP_BYTES: usize = 128 * 1024;
+
+/// 누적분을 채널로 보내고 깨운다. 수신자가 사라졌으면 false.
+#[cfg(unix)]
+fn flush_pty_chunk(
+    output: &PtyOutputSender,
+    output_wake: &Option<PtyOutputWake>,
+    chunk: Vec<u8>,
+) -> bool {
+    if chunk.is_empty() {
+        return true;
+    }
+    match output.send(chunk) {
+        Ok(true) => {
+            if let Some(wake) = output_wake {
+                wake();
+            }
+            true
+        }
+        Ok(false) => true,
+        Err(_) => false,
+    }
+}
+
 #[cfg(unix)]
 fn unix_reader_loop(
     reader: OwnedFd,
@@ -960,33 +1024,60 @@ fn unix_reader_loop(
     output: PtyOutputSender,
     output_wake: Option<PtyOutputWake>,
 ) {
-    let mut buf = [0u8; 8192];
-    while let Ok(true) = wait_for_fd_or_cancel(reader.as_raw_fd(), libc::POLLIN, cancel.as_raw_fd())
+    // reader fd는 non-blocking(duplicate_nonblocking_fd). macOS는 PTY read를 ~1KB로
+    // 캡하므로, poll로 한 번 깨어나면 EAGAIN까지 드레인해 한 청크로 합쳐 보낸다 —
+    // 대량 출력에서 채널 send / wake / 다운스트림 VTE 파싱·스냅샷 왕복을 수십 배 줄인다.
+    // 블로킹으로 더 기다리지는 않아(상호작용 지연 없음) EAGAIN이면 즉시 flush 후 다음
+    // poll을 기다린다 — idle이면 poll(-1)에서 블로킹해 0 CPU.
+    let mut buf = vec![0u8; PTY_READ_CHUNK_BYTES];
+    'wait: while let Ok(true) =
+        wait_for_fd_or_cancel(reader.as_raw_fd(), libc::POLLIN, cancel.as_raw_fd())
     {
-        let count = unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if count > 0 {
-            match output.send(buf[..count as usize].to_vec()) {
-                Ok(true) => {
-                    if let Some(wake) = &output_wake {
-                        wake();
-                    }
+        let mut acc: Vec<u8> = Vec::new();
+        loop {
+            let count =
+                unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if count > 0 {
+                acc.extend_from_slice(&buf[..count as usize]);
+                if acc.len() >= PTY_COALESCE_CAP_BYTES {
+                    break; // 상한 — flush 후 다음 poll(즉시 반환)에서 이어 읽는다
                 }
-                Ok(false) => {}
-                Err(_) => break,
+                continue;
             }
-            continue;
+            if count == 0 {
+                // EOF — 누적분 flush 후 종료
+                flush_pty_chunk(&output, &output_wake, std::mem::take(&mut acc));
+                break 'wait;
+            }
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => {
+                    // 지금 당장은 더 없다. 이미 모은 게 있고 상한 미만이면 아주 짧게만
+                    // 더 기다려 트리클을 합친다(체감 불가 수준). 새 데이터가 오면 계속,
+                    // 대기 안에 안 오면 flush. (PTY_NO_COALESCE는 측정용 baseline 토글.)
+                    if !acc.is_empty()
+                        && acc.len() < PTY_COALESCE_CAP_BYTES
+                        && std::env::var_os("PTY_NO_COALESCE").is_none()
+                        && reader_ready_within(
+                            reader.as_raw_fd(),
+                            cancel.as_raw_fd(),
+                            PTY_COALESCE_WAIT_MS,
+                        )
+                    {
+                        continue;
+                    }
+                    break; // 드레인 완료 — flush
+                }
+                _ => {
+                    flush_pty_chunk(&output, &output_wake, std::mem::take(&mut acc));
+                    break 'wait;
+                }
+            }
         }
-        if count == 0 {
-            break;
+        if !flush_pty_chunk(&output, &output_wake, acc) {
+            break; // 수신자 종료
         }
-        let error = std::io::Error::last_os_error();
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-        ) {
-            continue;
-        }
-        break;
     }
 }
 
@@ -2062,6 +2153,56 @@ mod tests {
         let _rx = session.take_output().unwrap();
         session.write_input(b"\x03").unwrap(); // PTY line discipline이 SIGINT로 변환
         assert!(wait_exit(&mut session, Duration::from_secs(5)).is_some());
+    }
+
+    /// 대량 출력 처리량 벤치 (수동 실행). read 버퍼 크기 변경 전/후를 비교한다:
+    /// `cargo test -p pty bench_bulk_read_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "throughput benchmark — run manually with --nocapture"]
+    fn bench_bulk_read_throughput() {
+        const TARGET: usize = 64 * 1024 * 1024; // 64 MiB
+        // /dev/zero 64MiB를 'x'로 바꿔 PTY로 쏟아낸다 — 코얼레싱/버퍼 크기 효과가 드러난다.
+        let mut session = spawn(
+            "/bin/sh",
+            &["-c", "head -c 67108864 /dev/zero | tr '\\0' x"],
+        );
+        let rx = session.take_output().unwrap();
+        let cpu0 = process_cpu_seconds();
+        let start = Instant::now();
+        let (mut total, mut chunks) = (0usize, 0usize);
+        while total < TARGET {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(chunk) => {
+                    total += chunk.len();
+                    chunks += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        let dt = start.elapsed();
+        let cpu = process_cpu_seconds() - cpu0;
+        let _ = session.kill();
+        let mib = total as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "PTY-BENCH bytes={:.1}MiB chunks={} avg_chunk={}B time={:.3}s throughput={:.1}MiB/s cpu={:.3}s",
+            mib,
+            chunks,
+            total / chunks.max(1),
+            dt.as_secs_f64(),
+            mib / dt.as_secs_f64(),
+            cpu,
+        );
+    }
+
+    /// 프로세스 누적 CPU 초(user+sys, 전 스레드). 벤치 전/후 차이로 CPU 소모를 잰다.
+    #[cfg(test)]
+    fn process_cpu_seconds() -> f64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return 0.0;
+        }
+        let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
+        tv(usage.ru_utime) + tv(usage.ru_stime)
     }
 
     #[test]

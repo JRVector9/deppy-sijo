@@ -1167,7 +1167,9 @@ mod tests {
                     }
                     Err(error) => panic!("HTTP mock accept failed: {error}"),
                 };
-                let request = read_http_json(&mut stream).unwrap();
+                let Some(request) = read_http_json(&mut stream) else {
+                    continue;
+                };
                 let method = request
                     .get("method")
                     .and_then(Value::as_str)

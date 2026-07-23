@@ -759,6 +759,71 @@ mod tests {
     use super::*;
     use crate::backend::TerminalBackend;
 
+    /// 스크롤백 메모리 산정 근거 — Cell/Row 크기와 라인당 바이트를 출력한다(수동).
+    /// `cargo test -p terminal size_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "size probe — run manually with --nocapture"]
+    fn size_probe() {
+        eprintln!(
+            "SIZE-PROBE Cell={}B Flags={}B Row<Cell>(header)={}B  200열/line={}B  10000줄={:.1}MB",
+            std::mem::size_of::<AlacrittyCell>(),
+            std::mem::size_of::<Flags>(),
+            std::mem::size_of::<Row<AlacrittyCell>>(),
+            200 * std::mem::size_of::<AlacrittyCell>(),
+            (10_000.0 * 200.0 * std::mem::size_of::<AlacrittyCell>() as f64) / (1024.0 * 1024.0),
+        );
+    }
+
+    /// 실제 스크롤백 RSS 실측(수동) — 20,000줄을 먹인 뒤 Visible에서의 실제 phys_footprint,
+    /// 그리고 Hidden으로 트리밍했을 때의 감소를 잰다.
+    /// `cargo test -p terminal --release rss_probe -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "RSS probe — run manually with --nocapture"]
+    fn rss_probe() {
+        use crate::backend::TerminalCacheClass;
+        fn footprint_mb() -> f64 {
+            let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+            let rc = unsafe {
+                libc::proc_pid_rusage(
+                    std::process::id() as libc::c_int,
+                    libc::RUSAGE_INFO_V4,
+                    info.as_mut_ptr().cast(),
+                )
+            };
+            if rc != 0 {
+                return 0.0;
+            }
+            let info = unsafe { info.assume_init() };
+            info.ri_phys_footprint as f64 / (1024.0 * 1024.0)
+        }
+        let base = footprint_mb();
+        // Visible 클래스(10,000줄 / 16MB 예산), 200열. 20,000줄을 먹여 캡을 넘긴다.
+        let mut backend = AlacrittyBackend::new(200, 40, 10_000);
+        backend.set_cache_class(TerminalCacheClass::Visible);
+        let line: Vec<u8> = std::iter::repeat(b'x').take(200).chain([b'\r', b'\n']).collect();
+        for _ in 0..20_000 {
+            let _ = backend.feed(&line);
+        }
+        let visible = footprint_mb();
+        // Hidden으로 전이 → 트리밍
+        backend.set_cache_class(TerminalCacheClass::Hidden);
+        // alacritty가 shrink를 반영하도록 소량 추가 feed(트림은 set_options 시점에 적용).
+        let _ = backend.feed(&line);
+        let hidden = footprint_mb();
+        let fp = backend.cache_footprint();
+        eprintln!(
+            "RSS-PROBE base={:.1}MB  visible(20k줄 입력)={:.1}MB (Δ{:.1}MB)  hidden트림후={:.1}MB (Δ{:.1}MB)  history_lines={} limit={}",
+            base,
+            visible,
+            visible - base,
+            hidden,
+            hidden - base,
+            fp.history_lines,
+            fp.scrollback_limit_lines,
+        );
+    }
+
     fn feed(backend: &mut AlacrittyBackend, bytes: &[u8]) -> TerminalChangeSet {
         backend.feed(bytes).unwrap()
     }

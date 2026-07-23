@@ -17,3 +17,6 @@ libghostty-vt = { version = "0.1", optional = true }
 
 [features]
 ghostty-backend = ["dep:libghostty-vt"]
+
+[dev-dependencies]
+libc = { workspace = true }

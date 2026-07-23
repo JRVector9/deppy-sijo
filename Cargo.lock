@@ -5119,6 +5119,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "egui",
+ "libc",
  "libghostty-vt",
  "serde",
  "unicode-normalization",

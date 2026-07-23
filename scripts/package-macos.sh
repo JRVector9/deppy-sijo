@@ -57,6 +57,11 @@ cp "target/release/$BIN_NAME" "$BUNDLE/Contents/MacOS/$BIN_NAME"
 # 옆에서 찾으므로, 권한계층 경유 스폰이 프록시를 확실히 찾게 한다 (codex).
 cp "target/release/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy"
 
+# 배포 바이너리에서만 심볼 테이블을 제거해 용량을 줄인다. target/release의 원본은
+# 그대로 두어 디버깅(lldb 스택 트레이스 등)에는 계속 심볼 있는 바이너리를 쓸 수 있다.
+strip -x "$BUNDLE/Contents/MacOS/$BIN_NAME"
+strip -x "$BUNDLE/Contents/MacOS/deppy-mcp-proxy"
+
 cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

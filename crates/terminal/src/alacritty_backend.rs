@@ -170,10 +170,39 @@ fn effective_scrollback_limit(
         .min(history_lines_for_byte_budget(cols, rows, budget.max_bytes))
 }
 
+/// 바이트 예산이 담을 수 있는 **히스토리 줄 수**를 압축 인지로 역산한다.
+///
+/// 예산 배분: 화면 rows + HOT 히스토리 창은 **비압축 전액**(`bytes_per_line`)으로 두고,
+/// 그보다 오래된(식은) 히스토리는 라인당 `ceil(bytes_per_line / SCROLLBACK_COMPRESSION_DIVISOR)`
+/// 만 든다고 본다. feed()가 언제나 최근 HOT 창을 비압축으로 유지(compress_history(HOT))
+/// 하므로 어떤 캐시 클래스에서도 비압축 상한은 HOT 줄이다 — 이 함수가 가정하는 배분과
+/// 실제 grid 배치가 일치한다.
+///
+/// 보수성: `div_ceil`로 라인당 압축 비용을 올려 담을 줄 수를 **작게** 잡는다. 반환값이
+/// 곧 히스토리 캡이고, `effective_scrollback_limit`이 `max_scrollback_lines`로 다시
+/// 클램프하므로 절대 상한은 유지된다. 이 값을 그대로 채웠을 때의 보수적 추정 바이트는
+/// 정의상 `max_bytes`를 넘지 않는다(테스트 `최악_압축_추정은_예산_이내` 참고).
 fn history_lines_for_byte_budget(cols: usize, rows: usize, max_bytes: usize) -> usize {
     let bytes_per_line = estimated_bytes_per_line(cols.max(1));
-    let total_lines = max_bytes / bytes_per_line;
-    total_lines.saturating_sub(rows.max(1))
+    let rows = rows.max(1);
+    let screen_bytes = rows.saturating_mul(bytes_per_line);
+    // 화면 rows조차 예산을 넘으면 히스토리를 담을 여유가 없다.
+    let Some(mut remaining) = max_bytes.checked_sub(screen_bytes) else {
+        return 0;
+    };
+    // (1) HOT 히스토리 창 — feed가 비압축으로 유지하므로 전액으로 채운다.
+    let hot_uncompressed = (remaining / bytes_per_line).min(HOT_SCROLLBACK_LINES);
+    remaining -= hot_uncompressed * bytes_per_line;
+    if hot_uncompressed < HOT_SCROLLBACK_LINES {
+        // 예산이 HOT 창조차 다 못 채운다 — 압축 히스토리를 위한 여지 없음.
+        return hot_uncompressed;
+    }
+    // (2) 남은 예산은 식은(압축된) 히스토리를 보수적 비율로 커버한다.
+    let compressed_bytes_per_line = bytes_per_line
+        .div_ceil(SCROLLBACK_COMPRESSION_DIVISOR)
+        .max(1);
+    let cold_lines = remaining / compressed_bytes_per_line;
+    hot_uncompressed.saturating_add(cold_lines)
 }
 
 fn estimated_bytes_per_line(cols: usize) -> usize {
@@ -181,9 +210,22 @@ fn estimated_bytes_per_line(cols: usize) -> usize {
         .saturating_add(cols.saturating_mul(std::mem::size_of::<AlacrittyCell>()))
 }
 
-fn estimated_terminal_bytes(cols: usize, rows: usize, history_lines: usize) -> usize {
-    rows.saturating_add(history_lines)
+/// 백엔드가 실제로 점유하는 스크롤백 바이트 추정. 부풀린 전량-비압축 추정 대신
+/// (화면 rows + **비압축** 히스토리 행)은 셀 배열 전액으로, 압축된 히스토리는 grid의
+/// **실제** 압축 곁가지 바이트(`compressed_heap_bytes`)로 계산한다. 이래야 전역 128MB
+/// 강제가 부풀린 추정이 아니라 진짜(작은) 메모리를 본다.
+///
+/// `uncompressed_history_lines`는 호출자(`cache_footprint`)가 클래스별 압축 정책으로
+/// 산정한다 — 압축된 행을 raw로 이중 계상하지 않도록.
+fn estimated_terminal_bytes(
+    cols: usize,
+    rows: usize,
+    uncompressed_history_lines: usize,
+    compressed_heap_bytes: usize,
+) -> usize {
+    rows.saturating_add(uncompressed_history_lines)
         .saturating_mul(estimated_bytes_per_line(cols.max(1)))
+        .saturating_add(compressed_heap_bytes)
 }
 
 /// grid의 `idx` 행 마지막 열이 WRAPLINE(soft wrap)인지 판정한다. 압축된 히스토리 행은
@@ -205,6 +247,22 @@ fn line_soft_wrapped(
 /// 그보다 더 과거로 스크롤할 때만 렌더가 행을 복원한다. 값이 클수록 스크롤 반응은 좋지만
 /// RSS 절감은 줄어든다 — 몇 화면 분량으로 잡는다.
 const HOT_SCROLLBACK_LINES: usize = 256;
+
+/// 압축 인지 예산이 **식은(HOT 밖) 히스토리 줄**에 가정하는 보수적 압축비.
+///
+/// 예산 역산(`history_lines_for_byte_budget`)은 화면 rows + HOT 창은 비압축 전액으로,
+/// 그보다 오래된 히스토리는 라인당 `bytes_per_line / 이 값`만큼만 든다고 보고 담을 줄
+/// 수를 늘린다. 실측(`compression_rss_probe`)의 현실 로그류 압축비는 ~30배지만, 색이
+/// 자주 바뀌어 run-length가 잘 안 되는 콘텐츠는 그보다 훨씬 덜 압축된다. 그래서 최선의
+/// 30배가 아니라 **4배**만 가정한다 — 실측 대비 7배 이상의 안전 여유를 남기면서도, 색이
+/// 섞인(수 배로만 압축되는) 출력에서도 예산을 지키는 값이다.
+///
+/// 안전성 한계: 압축 행의 `AttrRun`(12B)이 `Cell`(24B)의 절반이라, 셀마다 색이 다른
+/// **극단적** 콘텐츠는 run당 텍스트까지 더해도 겨우 ~1.5–1.9배로만 압축된다. 그런 병리적
+/// 입력은 어떤 유용한 divisor로도 라인당 비용을 다 못 덮으므로, 최종 방어선은 (a) 절대
+/// 상한인 `TerminalCacheBudget::max_scrollback_lines`(줄 수 캡)과 (b) `cache_footprint`가
+/// **실제** 압축 곁가지 바이트를 보고해 전역 128MB 강제가 진짜 메모리에 반응하는 것이다.
+const SCROLLBACK_COMPRESSION_DIVISOR: usize = 4;
 
 impl TerminalBackend for AlacrittyBackend {
     fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<TerminalChangeSet> {
@@ -424,6 +482,22 @@ impl TerminalBackend for AlacrittyBackend {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
         let history_lines = self.term.history_size();
+        // 압축된(HOT 밖) 히스토리는 grid의 실제 곁가지 힙 바이트로 계상한다.
+        let compressed_heap_bytes = self.term.grid().compressed_heap_bytes();
+        // 비압축(raw) 히스토리 행 수를 클래스별 압축 정책으로 모델링한다 — 압축된 행을
+        // raw 셀 배열로 이중 계상하지 않기 위함:
+        //  - Visible: feed가 최근 HOT 창을 비압축으로 유지(compress_history(HOT))하므로
+        //    min(history, HOT). Visible은 히스토리 전체를 압축한 적이 없어 정확하다.
+        //  - Hidden/Exited: apply_cache_class가 compress_history(0)로 히스토리 전체를
+        //    압축했으므로 0. 이래야 전이 시 HOT 창 압축분이 footprint 감소로 나타난다
+        //    (trim event의 freed_estimated_bytes > 0). Hidden이 이후 feed로 HOT 창을
+        //    다시 raw화하면 최대 HOT*bytes_per_line만큼 과소 계상될 수 있으나(유계),
+        //    이는 예전 전량-비압축 추정보다 훨씬 정확하다. Exited는 더 이상 feed되지
+        //    않아 항상 0으로 정확하다.
+        let uncompressed_history = match self.cache_class {
+            TerminalCacheClass::Visible => history_lines.min(HOT_SCROLLBACK_LINES),
+            TerminalCacheClass::Hidden | TerminalCacheClass::Exited => 0,
+        };
         TerminalCacheFootprint {
             class: self.cache_class,
             scrollback_limit_lines: self.active_scrollback_limit,
@@ -431,7 +505,12 @@ impl TerminalBackend for AlacrittyBackend {
             screen_lines: rows,
             columns: cols,
             bytes_per_line: estimated_bytes_per_line(cols),
-            estimated_bytes: estimated_terminal_bytes(cols, rows, history_lines),
+            estimated_bytes: estimated_terminal_bytes(
+                cols,
+                rows,
+                uncompressed_history,
+                compressed_heap_bytes,
+            ),
         }
     }
 
@@ -1041,6 +1120,113 @@ mod tests {
         assert!(event.freed_estimated_bytes() > 0);
         assert_eq!(event.after.scrollback_limit_lines, hidden_limit);
         assert!(event.after.estimated_bytes <= TerminalCacheBudget::HIDDEN.max_bytes);
+    }
+
+    // ── 압축 인지 스크롤백 예산 ──────────────────────────────────────────────
+
+    /// 대표 열 수/클래스에서 압축 인지 예산이 이전(전량-비압축) 캡보다 더 많은
+    /// 히스토리 줄을 담는다. 절대 상한(max_scrollback_lines)은 넘지 않는다.
+    #[test]
+    fn 압축_인지_예산은_비압축_추정보다_많은_줄을_담는다() {
+        let rows = 24usize;
+        for (class, cols) in [
+            (TerminalCacheClass::Visible, 80usize),
+            (TerminalCacheClass::Visible, 200usize),
+            (TerminalCacheClass::Hidden, 200usize),
+        ] {
+            let budget = TerminalCacheBudget::for_class(class);
+            let bpl = estimated_bytes_per_line(cols);
+            // 이전 공식: (max_bytes / bpl - rows), 그 뒤 line cap으로 클램프.
+            let old_cap = (budget.max_bytes / bpl)
+                .saturating_sub(rows)
+                .min(budget.max_scrollback_lines);
+            let new_cap = effective_scrollback_limit(usize::MAX, cols, rows, class);
+            assert!(
+                new_cap > old_cap,
+                "{class:?} cols={cols}: 새 캡 {new_cap} 이 이전 {old_cap} 보다 커야 함",
+            );
+            assert!(
+                new_cap <= budget.max_scrollback_lines,
+                "{class:?} cols={cols}: 새 캡 {new_cap} 이 라인 상한 {} 를 넘음",
+                budget.max_scrollback_lines,
+            );
+        }
+    }
+
+    /// 안전성: 역산한 캡을 최악(비압축에 가까운, 보수적 divisor 압축만 되는) 콘텐츠로
+    /// 가득 채워도 그 추정 바이트가 예산을 넘지 않는다 — 예산 초과 불가 증명.
+    #[test]
+    fn 최악_압축_추정은_예산_이내() {
+        let rows = 24usize;
+        for (class, cols) in [
+            (TerminalCacheClass::Visible, 80usize),
+            (TerminalCacheClass::Visible, 200usize),
+            (TerminalCacheClass::Hidden, 200usize),
+            (TerminalCacheClass::Exited, 200usize),
+        ] {
+            let budget = TerminalCacheBudget::for_class(class);
+            let cap = effective_scrollback_limit(usize::MAX, cols, rows, class);
+            let bpl = estimated_bytes_per_line(cols);
+            // footprint 회계와 동일 구조: 화면+HOT은 전액, 나머지는 ceil(bpl/divisor).
+            let hot = cap.min(HOT_SCROLLBACK_LINES);
+            let cold = cap.saturating_sub(HOT_SCROLLBACK_LINES);
+            let compressed_bpl = bpl.div_ceil(SCROLLBACK_COMPRESSION_DIVISOR).max(1);
+            let worst = (rows + hot) * bpl + cold * compressed_bpl;
+            assert!(
+                worst <= budget.max_bytes,
+                "{class:?} cols={cols}: 최악추정 {worst} > 예산 {}",
+                budget.max_bytes,
+            );
+        }
+    }
+
+    /// HOT 창을 넘게 feed하면 cache_footprint가 실제 압축을 반영해 전량-비압축
+    /// 추정보다 작게(그러나 비압축 baseline 이상으로) 보고한다.
+    #[test]
+    fn cache_footprint는_압축을_반영한다() {
+        let cols = 200usize;
+        let rows = 40usize;
+        let mut b = AlacrittyBackend::new(cols as u16, rows as u16, 10_000);
+        // HOT(256)을 크게 넘기는 현실적 로그류(줄마다 내용 + 가끔 SGR 색).
+        for i in 0..4_000u32 {
+            let line = format!(
+                "\x1b[32m2026-07-24T12:00:{:02}\x1b[0m INFO worker[{}] req={} status=200 \
+                 path=/api/v1/items/{} latency={}ms\r\n",
+                i % 60,
+                i % 8,
+                i,
+                (i * 7) % 100_000,
+                i % 500,
+            );
+            feed(&mut b, line.as_bytes());
+        }
+        let fp = b.cache_footprint();
+        assert!(
+            fp.history_lines > HOT_SCROLLBACK_LINES,
+            "압축 대상 히스토리가 부족: {}",
+            fp.history_lines,
+        );
+        assert!(
+            b.term.grid().compressed_heap_bytes() > 0,
+            "HOT 밖 히스토리가 압축되지 않았다",
+        );
+        // 전량-비압축 추정보다 작아야 압축이 반영된 것.
+        let all_uncompressed = (rows + fp.history_lines) * estimated_bytes_per_line(cols);
+        assert!(
+            fp.estimated_bytes < all_uncompressed,
+            "footprint {} 이 비압축 추정 {} 보다 작아야 함",
+            fp.estimated_bytes,
+            all_uncompressed,
+        );
+        // 비압축 baseline(화면 + HOT 히스토리) 이상은 되어야 한다(과소보고 아님).
+        let baseline =
+            (rows + fp.history_lines.min(HOT_SCROLLBACK_LINES)) * estimated_bytes_per_line(cols);
+        assert!(
+            fp.estimated_bytes >= baseline,
+            "footprint {} 이 baseline {} 보다 작으면 과소보고",
+            fp.estimated_bytes,
+            baseline,
+        );
     }
 
     #[test]

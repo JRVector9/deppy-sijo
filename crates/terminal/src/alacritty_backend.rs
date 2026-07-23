@@ -862,6 +862,73 @@ mod tests {
         );
     }
 
+    /// 옵션 D 스크롤백 압축의 실제 RSS 절감 실측(수동). 현실적 로그류 2만 줄을 먹인 뒤:
+    /// (1) 결정론적 압축비 = 원시 셀배열 추정 바이트 ÷ 압축 곁가지 힙 바이트,
+    /// (2) phys_footprint(압축 상태) vs inflate_all(전부 복원) 델타 = 실제 RSS 차이.
+    /// 실행: `cargo test -p terminal compression_rss_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn compression_rss_probe() {
+        fn footprint_mb() -> f64 {
+            let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+            let rc = unsafe {
+                libc::proc_pid_rusage(
+                    std::process::id() as libc::c_int,
+                    libc::RUSAGE_INFO_V4,
+                    info.as_mut_ptr().cast(),
+                )
+            };
+            if rc != 0 {
+                return 0.0;
+            }
+            unsafe { info.assume_init() }.ri_phys_footprint as f64 / (1024.0 * 1024.0)
+        }
+
+        let base = footprint_mb();
+        let mut backend = AlacrittyBackend::new(200, 40, 10_000);
+        // 줄마다 다른 내용 + 가끔 SGR 색 — 합성 반복 문자보다 현실적인 압축률을 본다.
+        for i in 0..20_000u32 {
+            let line = format!(
+                "\x1b[32m2026-07-24T12:00:{:02}\x1b[0m INFO worker[{}] req={} status=200 \
+                 path=/api/v1/items/{} latency={}ms bytes={}\r\n",
+                i % 60,
+                i % 8,
+                i,
+                (i * 7) % 100_000,
+                i % 500,
+                (i * 131) % 65_536,
+            );
+            let _ = backend.feed(line.as_bytes());
+        }
+
+        let compressed_fp = footprint_mb();
+        let history = backend.term.history_size();
+        let cols = backend.term.columns();
+        let compressed_heap = backend.term.grid().compressed_heap_bytes();
+        let compressed_lines = history.saturating_sub(HOT_SCROLLBACK_LINES);
+        let raw_estimate = compressed_lines * estimated_bytes_per_line(cols);
+
+        backend.term.grid_mut().inflate_all();
+        let inflated_fp = footprint_mb();
+
+        eprintln!(
+            "COMPRESS-RSS base={:.1}MB  compressed={:.1}MB(Δ{:.1})  inflated={:.1}MB(Δ{:.1})\n\
+             history={} lines, 압축대상≈{} lines | 곁가지 힙: 압축={:.2}MB  원시추정={:.2}MB  압축비={:.1}x\n\
+             실제 RSS 절감(inflated−compressed)={:.1}MB",
+            base,
+            compressed_fp,
+            compressed_fp - base,
+            inflated_fp,
+            inflated_fp - base,
+            history,
+            compressed_lines,
+            compressed_heap as f64 / 1e6,
+            raw_estimate as f64 / 1e6,
+            raw_estimate as f64 / compressed_heap.max(1) as f64,
+            inflated_fp - compressed_fp,
+        );
+    }
+
     fn feed(backend: &mut AlacrittyBackend, bytes: &[u8]) -> TerminalChangeSet {
         backend.feed(bytes).unwrap()
     }

@@ -119,6 +119,13 @@ impl AlacrittyBackend {
             });
             self.active_scrollback_limit = target;
         }
+        // deppy-sijo(D): 보이지 않는 세션은 스크롤 반응성이 필요 없으므로 HOT 창까지
+        // 포함해 히스토리 전체를 압축한다(feed 트리거의 HOT=256 비압축분도 회수).
+        // 다시 Visible이 되면 이후 feed가 최근 창을 그대로 두고, 그 전 스크롤은 read_line
+        // 이 복원한다. Visible은 feed의 HOT 창 유지 정책(compress_history(HOT))을 따른다.
+        if matches!(class, TerminalCacheClass::Hidden | TerminalCacheClass::Exited) {
+            self.term.grid_mut().compress_history(0);
+        }
         let after = self.cache_footprint();
         let limit_reduced = target < before.scrollback_limit_lines;
         let history_trimmed = after.history_lines < before.history_lines;
@@ -901,31 +908,41 @@ mod tests {
             let _ = backend.feed(line.as_bytes());
         }
 
-        let compressed_fp = footprint_mb();
+        // Visible 상태(feed 트리거: HOT 창 비압축).
+        let visible_fp = footprint_mb();
         let history = backend.term.history_size();
         let cols = backend.term.columns();
-        let compressed_heap = backend.term.grid().compressed_heap_bytes();
-        let compressed_lines = history.saturating_sub(HOT_SCROLLBACK_LINES);
-        let raw_estimate = compressed_lines * estimated_bytes_per_line(cols);
+        let visible_heap = backend.term.grid().compressed_heap_bytes();
 
+        // Hidden 전환: HOT 창까지 전체 압축(안 보이는 세션의 최대 RSS 회수).
+        backend.set_cache_class(crate::backend::TerminalCacheClass::Hidden);
+        let hidden_fp = footprint_mb();
+        let hidden_hist = backend.term.history_size();
+        let hidden_heap = backend.term.grid().compressed_heap_bytes();
+        let hidden_raw_estimate = hidden_hist * estimated_bytes_per_line(cols);
+
+        // 비압축 기준선: 전부 복원.
         backend.term.grid_mut().inflate_all();
         let inflated_fp = footprint_mb();
 
+        // 신뢰 지표는 결정론적 live-heap 회계(곁가지 vs 원시추정)다. phys_footprint는
+        // 프로세스 전역이라 테스트의 format! churn·할당자 free-list 잔류에 오염되므로
+        // 참고용으로만 본다(해제된 셀 배열을 macOS malloc이 OS에 즉시 반환하지 않는다).
         eprintln!(
-            "COMPRESS-RSS base={:.1}MB  compressed={:.1}MB(Δ{:.1})  inflated={:.1}MB(Δ{:.1})\n\
-             history={} lines, 압축대상≈{} lines | 곁가지 힙: 압축={:.2}MB  원시추정={:.2}MB  압축비={:.1}x\n\
-             실제 RSS 절감(inflated−compressed)={:.1}MB",
-            base,
-            compressed_fp,
-            compressed_fp - base,
-            inflated_fp,
-            inflated_fp - base,
+            "COMPRESS-RSS (결정론적 live-heap)\n\
+             visible: history={}줄, HOT 밖 압축 곁가지={:.2}MB\n\
+             hidden : history={}줄 전체압축, 곁가지={:.3}MB vs 원시추정={:.2}MB → 압축비={:.1}x\n\
+             [참고] phys_footprint base={:.1} visible={:.1} hidden={:.1} inflated={:.1}MB (노이즈 큼)",
             history,
-            compressed_lines,
-            compressed_heap as f64 / 1e6,
-            raw_estimate as f64 / 1e6,
-            raw_estimate as f64 / compressed_heap.max(1) as f64,
-            inflated_fp - compressed_fp,
+            visible_heap as f64 / 1e6,
+            hidden_hist,
+            hidden_heap as f64 / 1e6,
+            hidden_raw_estimate as f64 / 1e6,
+            hidden_raw_estimate as f64 / hidden_heap.max(1) as f64,
+            base,
+            visible_fp,
+            hidden_fp,
+            inflated_fp,
         );
     }
 
@@ -1387,6 +1404,31 @@ mod tests {
             compressed_snap.visible_cells, inflated_snap.visible_cells,
             "압축/비압축 뷰포트 셀 불일치"
         );
+    }
+
+    /// Hidden 전환 시 HOT 창까지 포함해 히스토리 전체가 압축되고(RSS 최대 회수),
+    /// 읽기는 여전히 비압축과 동일하다.
+    #[test]
+    fn deppy_hidden_전환은_hot_창까지_압축() {
+        use crate::backend::TerminalCacheClass;
+        let mut a = backend_with_compressed_history(); // 400줄, Visible(HOT=256 밖만 압축)
+        let visible_compressed = a.term.grid().compressed_heap_bytes();
+        let visible_dump = a.serialize_scrollback().unwrap();
+
+        a.set_cache_class(TerminalCacheClass::Hidden);
+        let hidden_compressed = a.term.grid().compressed_heap_bytes();
+        assert!(
+            hidden_compressed > visible_compressed,
+            "hidden이 HOT 창을 압축하지 않음 (visible={visible_compressed} hidden={hidden_compressed})"
+        );
+
+        // Hidden 예산(1000줄)이 400줄을 트림하지 않으므로 내용은 불변.
+        let hidden_dump = a.serialize_scrollback().unwrap();
+        assert_eq!(visible_dump, hidden_dump, "hidden 전환이 스크롤백 내용을 바꿈");
+
+        // 전부 복원 후 재직렬화와도 동일(압축/비압축 등가).
+        a.term.grid_mut().inflate_all();
+        assert_eq!(hidden_dump, a.serialize_scrollback().unwrap());
     }
 
     /// 압축 세션이 계속 출력을 받아 스크롤백이 가득 차고 가장 오래된 압축 슬롯이

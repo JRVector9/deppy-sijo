@@ -50,3 +50,32 @@ A2 (보류 — A1 배포 후 재판단)
    spawn 원칙). 무손실 = 레이아웃/세션 메타/출력 로그의 마지막 순간까지 복원.
 8. **앱 자체 메모리 폭식 경로는 기존 바운드로 차단 확인**: 스크롤백 10,000줄
    (비가시 1,000줄), ANSI 로그 16MiB tail-bounded.
+
+## C4 — OOM 복구 보장/비보장 범위 (구현 완료 기준)
+
+무손실의 의미와 한계를 명시한다(기획 오해 방지).
+
+**보장**
+- SQLite로 이미 `tx.commit()`된 데이터는 WAL 모드라 SIGKILL(=OOM-kill)에도
+  안전하다. WAL checkpoint는 crash-safety 수단이 아니라 파일 크기 관리용이라
+  비상 플러시 대상이 아니다.
+- 유일한 유실 창이던 `DbWriteWorker`의 50ms debounce 배치(세션 status /
+  last_log_offset)는 C2의 `EmergencyPersistFlush → flush_async_writes()`가 압박
+  격상 시 즉시 커밋한다. `Drop`은 SIGKILL에서 실행되지 않으므로 이 경로가
+  Drop-독립적 내구성을 만든다 — `비상_플러시는_drop_없이_배치를_커밋한다`
+  테스트가 실증(대조군: flush 전 미반영 → flush 후 커밋).
+- 창 레이아웃 / 세션 spawn 행은 각 변경 시 동기 auto-commit이라 원래 내구적.
+- 재시작 시 `reconcile_orphan_sessions` + `validate_log_offset`이 orphan 세션을
+  exited로 정리하고 partial-write offset을 마지막 완전한 줄로 되돌린다.
+
+**비보장 (문서화된 한계 — 이번 범위에서 고치지 않음)**
+- 복원은 항상 fresh 셸만 spawn한다(기존 안전 원칙). **폭주하던 프로세스 자체는
+  재개되지 않는다.** 무손실 = 레이아웃/세션 메타/출력 로그의 마지막 순간까지
+  복원이지, 죽어가던 프로세스의 재개가 아니다.
+- 압박 warning부터 실제 SIGKILL까지가 매우 짧으면(수십 ms) non-blocking 커맨드가
+  워커에 도달·커밋되기 전에 죽을 수 있다. "무손실"이 아니라 "손실 창을 50ms
+  배치 주기에서 신호~커밋 지연으로 좁히는" 완화다.
+- `send_command`가 큐 포화로 `try_send` 실패하면 그 플러시는 유실된다(재시도
+  없음 — 압박 상황에 부하를 더하지 않기 위한 의도적 선택).
+- audit / mcp-store 등 다른 쓰기 경로는 즉시 커밋이라 이 배치 유실 창에
+  해당하지 않음(C4 확인 항목).

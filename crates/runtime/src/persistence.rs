@@ -398,6 +398,65 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 로드맵 C4: 메모리 압박 비상 플러시(EmergencyPersistFlush →
+    /// flush_async_writes)가 **drop 없이** 배치를 커밋한다. OOM-kill은 Drop을
+    /// 실행하지 않으므로, 이 경로가 커밋을 보장해야 재시작 시 무손실이다. drop-flush
+    /// 테스트가 증명하지 못하는 "Drop 없는 내구성"을 정확히 메운다.
+    #[test]
+    fn 비상_플러시는_drop_없이_배치를_커밋한다() {
+        let (dir, db_path) = temp_db("emergency-flush");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("runtime").unwrap();
+        drop(db);
+
+        let config = PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id,
+        };
+        // 타이머 flush(50ms)를 배제 — status/offset이 커밋됐다면 그건 명시 flush의 효과다.
+        let mut pipe = PersistPipe::open_with_worker_config(
+            &config,
+            DbWriteWorkerConfig {
+                flush_interval: std::time::Duration::from_secs(3600),
+                ..DbWriteWorkerConfig::default()
+            },
+        )
+        .unwrap();
+        let session = SessionId(1);
+        // spawn은 동기 커밋(후속 read 의존), status/log_offset은 debounce 배치.
+        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[], "/tmp");
+        pipe.session_status(session, session::SessionStatus::Done);
+        pipe.session_log_offset(session, 128);
+
+        let read = || -> (String, i64) {
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row("SELECT status, last_log_offset FROM sessions", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+        };
+
+        // 대조군: flush 전에는 배치가 아직 반영 안 됨 — 이 순간 SIGKILL이면 유실될 상태.
+        let (status_before, offset_before) = read();
+        assert_eq!(status_before, "running", "배치 status는 flush 전 미반영");
+        assert_eq!(offset_before, 0, "배치 offset은 flush 전 미반영");
+
+        // 실험군: 비상 플러시 핸들러가 부르는 flush_async_writes를 호출하면, drop 없이도
+        // 값이 커밋되어 별도 커넥션에서 읽힌다.
+        pipe.flush_async_writes().unwrap();
+        let (status_after, offset_after) = read();
+        assert_eq!(status_after, "done");
+        assert_eq!(
+            offset_after, 128,
+            "비상 플러시가 drop 없이 최신 offset을 커밋한다"
+        );
+
+        // SIGKILL 모사 — Drop을 실행하지 않아도 위 값은 이미 내구적이다.
+        std::mem::forget(pipe);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// crash-recovery 불변식: 명시적 flush 없이 pipe가 drop돼도(앱 종료 경로)
     /// 배치 버퍼에 남은 write가 유실되면 안 된다.
     #[test]

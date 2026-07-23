@@ -57,6 +57,53 @@ mod macos {
         )
     }
 
+    /// mimalloc이 **명시적 purge 없이** 자동으로(purge_delay 후) 해제 페이지를 OS로
+    /// 반환하는지 실측한다 — idle hidden 세션의 메모리가 저절로 빠지는지 판정.
+    /// 명시적 mi_collect은 부르지 않고, 짧은 busy-wait + 소량 alloc churn으로
+    /// deferred purge를 유도한 뒤 측정한다.
+    #[test]
+    #[ignore = "mimalloc 자동 반환 실측 — macOS에서 --release --ignored로만 실행"]
+    fn mimalloc은_명시_purge_없이도_자동_반환하는가() {
+        use std::time::{Duration, Instant};
+        unsafe { libmimalloc_sys::mi_collect(true) };
+        let baseline = phys_footprint();
+
+        const CHUNK: usize = 4832;
+        const COUNT: usize = (200 * 1024 * 1024) / CHUNK;
+        let mut chunks: Vec<Vec<u8>> = (0..COUNT).map(|i| vec![(i & 0xff) as u8; CHUNK]).collect();
+        std::hint::black_box(&chunks);
+        let peak = phys_footprint();
+
+        // 전부 해제 — 명시적 mi_collect은 부르지 않는다.
+        chunks.clear();
+        chunks.shrink_to_fit();
+        drop(chunks);
+
+        // ~500ms busy-wait + 주기적 소량 alloc으로 deferred purge/background 스레드에
+        // 기회를 준다(sleep은 CI 환경 제약 회피 위해 busy-wait).
+        let start = Instant::now();
+        let mut sink: u64 = 0;
+        while start.elapsed() < Duration::from_millis(500) {
+            let tiny: Vec<u8> = vec![7u8; 64];
+            sink = sink.wrapping_add(tiny[0] as u64);
+            std::hint::black_box(&tiny);
+        }
+        std::hint::black_box(sink);
+        let after_auto = phys_footprint();
+
+        let auto_released = peak.saturating_sub(after_auto);
+        eprintln!(
+            "[auto] baseline={:.1}MB peak={:.1}MB after_auto(500ms, no mi_collect)={:.1}MB \
+             → 자동 반환={:.1}MB",
+            mb(baseline),
+            mb(peak),
+            mb(after_auto),
+            mb(auto_released),
+        );
+        // 진단용 — 자동 반환이 되는지 그냥 보고만 한다(임계 assert 없음).
+        assert!(peak.saturating_sub(baseline) >= 150 * MB, "peak 미달 — 측정 무효");
+    }
+
     /// 무거운 스크롤백 세션 여러 개 → Hidden 전이(전체 압축) → mimalloc purge →
     /// phys_footprint가 실질적으로 하락함을 증명한다.
     #[test]

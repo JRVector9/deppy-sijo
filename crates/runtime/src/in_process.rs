@@ -2807,6 +2807,11 @@ impl Worker {
                     && let Some(event) = active.set_cache_class(class)
                 {
                     trace_terminal_cache_event(active.id(), event);
+                    // Exited 전환은 스크롤백을 전체 압축·트림해 셀 배열을 해제한다 —
+                    // 해제 페이지를 OS로 돌려주도록 purge 훅을 부른다.
+                    if class == TerminalCacheClass::Exited {
+                        crate::signal_memory_released();
+                    }
                 }
                 if class != TerminalCacheClass::Hidden {
                     self.hidden_scrollback.remove(&active.id());
@@ -2936,6 +2941,9 @@ impl Worker {
         // remote_viewed_sessions가 하고, 여기서는 현재 map을 그대로 신뢰한다.
         visible.extend(self.remote_viewing.keys().copied());
         let sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
+        // hidden/exited 전환이 스크롤백을 해제하면(트림/압축) 그 페이지를 OS로 돌려주도록
+        // purge 훅을 부른다. 여러 세션이 한 번에 숨겨져도 pass당 1회로 합친다.
+        let mut freed_memory = false;
         for id in sessions {
             let Some(session) = self.sessions.get_mut(&id) else {
                 continue;
@@ -2956,7 +2964,13 @@ impl Worker {
                 && let Some(event) = session.set_cache_class(class)
             {
                 trace_terminal_cache_event(id, event);
+                if matches!(class, TerminalCacheClass::Hidden | TerminalCacheClass::Exited) {
+                    freed_memory = true;
+                }
             }
+        }
+        if freed_memory {
+            crate::signal_memory_released();
         }
     }
 

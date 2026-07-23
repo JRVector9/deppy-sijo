@@ -42,6 +42,10 @@ fn main() -> anyhow::Result<()> {
     // Install before paths, logging, config, or any worker can panic. Payloads may contain user
     // data; early static diagnostics can be dropped before tracing is ready, but never exposed.
     panic_policy::install_sanitized_panic_hook();
+    // 스크롤백 해제(hidden/exited 전환) 시 mimalloc이 붙잡은 페이지를 OS로 반환하도록
+    // runtime에 purge 훅을 건다. worker 스레드가 스크롤백을 해제한 직후 이 훅을 부른다
+    // (mimalloc은 명시적 purge 없이는 자동 반환하지 않음 — 실측). worker보다 먼저 등록.
+    runtime::set_memory_release_hook(alloc::purge);
     // 렌더러 A/B 실측(B1) — env 미설정이면 bench_log는 None이고 아래 경로는 전부 무시된다.
     // `start` 스테이지 RSS는 이 시점(창/렌더러 생성 전)에 이미 찍힌다.
     let bench_log = bench::init_log();

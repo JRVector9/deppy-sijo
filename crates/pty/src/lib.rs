@@ -960,6 +960,12 @@ fn wait_for_fd_or_cancel(fd: RawFd, events: libc::c_short, cancel: RawFd) -> std
 #[cfg(unix)]
 const PTY_COALESCE_WAIT_MS: libc::c_int = 2;
 
+/// 한 배치를 코얼레싱하며 기다리는 **누적** 상한(ms). 2ms 미만 간격으로 끊임없이
+/// 트리클하는 흐름(cap도 못 채우는)이 무한정 버퍼링되지 않도록, 첫 바이트 이후 이
+/// 시간이 지나면 상한/gap 없이도 flush한다(B-L1). 프레임 예산(16ms)보다 작아 체감 없음.
+#[cfg(unix)]
+const PTY_COALESCE_MAX_MS: u64 = 8;
+
 /// reader fd에 timeout_ms 안에 읽을 데이터가 생기는지 — cancel 신호면 즉시 false.
 #[cfg(unix)]
 fn reader_ready_within(fd: RawFd, cancel: RawFd, timeout_ms: libc::c_int) -> bool {
@@ -1030,14 +1036,30 @@ fn unix_reader_loop(
     // 블로킹으로 더 기다리지는 않아(상호작용 지연 없음) EAGAIN이면 즉시 flush 후 다음
     // poll을 기다린다 — idle이면 poll(-1)에서 블로킹해 0 CPU.
     let mut buf = vec![0u8; PTY_READ_CHUNK_BYTES];
+    // 측정용 baseline 토글은 프로세스 수명 내내 불변이라 한 번만 읽는다(EAGAIN마다
+    // env 조회하던 비용 제거 — B-L2). 켜지면 코얼레싱을 **완전히** 끄고 read당 즉시
+    // flush해 진짜 "read당 1송신" baseline을 만든다.
+    let no_coalesce = std::env::var_os("PTY_NO_COALESCE").is_some();
     'wait: while let Ok(true) =
         wait_for_fd_or_cancel(reader.as_raw_fd(), libc::POLLIN, cancel.as_raw_fd())
     {
         let mut acc: Vec<u8> = Vec::new();
+        // 이 배치의 첫 바이트를 모은 시각 — 누적 대기 상한(B-L1) 계산용.
+        let mut batch_start: Option<std::time::Instant> = None;
         loop {
             let count =
                 unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if count > 0 {
+                if no_coalesce {
+                    // baseline: 합치지 않고 read당 즉시 flush.
+                    if !flush_pty_chunk(&output, &output_wake, buf[..count as usize].to_vec()) {
+                        break 'wait; // 수신자 종료
+                    }
+                    continue;
+                }
+                if batch_start.is_none() {
+                    batch_start = Some(std::time::Instant::now());
+                }
                 acc.extend_from_slice(&buf[..count as usize]);
                 if acc.len() >= PTY_COALESCE_CAP_BYTES {
                     break; // 상한 — flush 후 다음 poll(즉시 반환)에서 이어 읽는다
@@ -1053,12 +1075,15 @@ fn unix_reader_loop(
             match error.kind() {
                 std::io::ErrorKind::Interrupted => continue,
                 std::io::ErrorKind::WouldBlock => {
-                    // 지금 당장은 더 없다. 이미 모은 게 있고 상한 미만이면 아주 짧게만
-                    // 더 기다려 트리클을 합친다(체감 불가 수준). 새 데이터가 오면 계속,
-                    // 대기 안에 안 오면 flush. (PTY_NO_COALESCE는 측정용 baseline 토글.)
+                    // 지금 당장은 더 없다. 이미 모은 게 있고 상한 미만이며 배치 시작 이후
+                    // 누적 대기 상한 이내이면 아주 짧게만 더 기다려 트리클을 합친다.
+                    // 누적 상한을 넘으면(지속 트리클) 여기서 flush해 무한 버퍼링을 막는다.
+                    let within_window = batch_start.is_some_and(|start| {
+                        start.elapsed() < std::time::Duration::from_millis(PTY_COALESCE_MAX_MS)
+                    });
                     if !acc.is_empty()
                         && acc.len() < PTY_COALESCE_CAP_BYTES
-                        && std::env::var_os("PTY_NO_COALESCE").is_none()
+                        && within_window
                         && reader_ready_within(
                             reader.as_raw_fd(),
                             cancel.as_raw_fd(),
@@ -1067,7 +1092,7 @@ fn unix_reader_loop(
                     {
                         continue;
                     }
-                    break; // 드레인 완료 — flush
+                    break; // 드레인 완료(또는 누적 상한) — flush
                 }
                 _ => {
                     flush_pty_chunk(&output, &output_wake, std::mem::take(&mut acc));

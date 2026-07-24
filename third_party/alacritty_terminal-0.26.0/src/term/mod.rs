@@ -651,6 +651,12 @@ impl<T> Term<T> {
         &mut self.grid
     }
 
+    /// deppy-sijo: 비활성(alt↔primary) 그리드 접근. alt-screen 활성 시 실제 스크롤백은
+    /// 여기(primary)에 있어, 캐시 footprint를 정확히 합산하려면 이쪽 히스토리도 봐야 한다.
+    pub fn inactive_grid(&self) -> &Grid<Cell> {
+        &self.inactive_grid
+    }
+
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
         let old_cols = self.columns();

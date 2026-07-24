@@ -1078,12 +1078,15 @@ fn unix_reader_loop(
                     // 지금 당장은 더 없다. 이미 모은 게 있고 상한 미만이며 배치 시작 이후
                     // 누적 대기 상한 이내이면 아주 짧게만 더 기다려 트리클을 합친다.
                     // 누적 상한을 넘으면(지속 트리클) 여기서 flush해 무한 버퍼링을 막는다.
-                    let within_window = batch_start.is_some_and(|start| {
-                        start.elapsed() < std::time::Duration::from_millis(PTY_COALESCE_MAX_MS)
-                    });
+                    // (실효 상한은 마지막 대기 1회 때문에 ~PTY_COALESCE_MAX_MS + WAIT_MS —
+                    //  프레임 예산 16ms보다 작아 체감 없음.) within_window 판정은 앞선
+                    // acc 가드가 통과할 때만 평가되도록 && 체인에 접는다.
                     if !acc.is_empty()
                         && acc.len() < PTY_COALESCE_CAP_BYTES
-                        && within_window
+                        && batch_start.is_some_and(|start| {
+                            start.elapsed()
+                                < std::time::Duration::from_millis(PTY_COALESCE_MAX_MS)
+                        })
                         && reader_ready_within(
                             reader.as_raw_fd(),
                             cancel.as_raw_fd(),

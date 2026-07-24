@@ -286,6 +286,7 @@ impl InProcessRuntimeClient {
                     exited_order: std::collections::VecDeque::new(),
                     max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                     cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
+                    scrollback_recover_ticks: 0,
                     archived: std::collections::HashMap::new(),
                     archived_order: std::collections::VecDeque::new(),
                     archived_on_disk: std::collections::HashSet::new(),
@@ -538,6 +539,11 @@ const MAX_RUNTIME_CACHE_BUDGET_BYTES: usize = 2048 * 1024 * 1024;
 /// 이 밑으로는 안 줄인다(사용성 보호) — 모든 세션이 여기 도달하면 트림을 멈춘다.
 const LIVE_TRIM_FLOOR_LINES: usize = 200;
 
+/// 트림된 스크롤백을 회복하기 전, 예산 여유(3/4 아래)가 연속 유지돼야 하는 pump tick 수.
+/// 활발히 재성장하는 세션은 이 창 안에 다시 3/4를 넘겨 회복되지 않고(계속 트림 유지),
+/// 진짜 잠잠해진 세션만 회복된다 — 트림 직후 회복으로 인한 오실레이션 방지(리뷰 A-H1).
+const SCROLLBACK_RECOVER_TICKS: u32 = 30;
+
 fn clamp_runtime_cache_budget_bytes(bytes: usize) -> usize {
     bytes.clamp(
         MIN_RUNTIME_CACHE_BUDGET_BYTES,
@@ -699,6 +705,9 @@ struct Worker {
     max_exited_backends: usize,
     /// 이 runtime에 배정된 프로세스 전역 터미널 캐시 바이트 예산의 share.
     cache_budget_bytes: usize,
+    /// 예산 여유(3/4 아래)가 연속 유지된 pump tick 수 — 이 값이 임계 이상이어야 트림된
+    /// 스크롤백을 회복한다(트림↔회복 오실레이션 debounce, 리뷰 A-H1). 여유가 없어지면 0.
+    scrollback_recover_ticks: u32,
     /// 압축 아카이브 — 백엔드를 내린 exited 세션의 zlib(ANSI) 덤프. pane이 다시
     /// 보이면 복원(inflate)한다 (§14.3 확장, 2026-07-11).
     archived: std::collections::HashMap<SessionId, ArchivedScrollback>,
@@ -3078,6 +3087,20 @@ impl Worker {
         {
             crate::signal_memory_released();
         }
+        // 압박 해소 시 트림됐던 세션의 스크롤백 상한을 회복한다. 여유(예산의 3/4 아래)가
+        // SCROLLBACK_RECOVER_TICKS 연속 유지된 뒤에만 회복해, 트림 직후 회복으로 인한
+        // 오실레이션을 막는다(리뷰 A-H1). 상한만 올려 즉시 메모리는 안 늘어 purge 불필요.
+        if self.terminal_cache_bytes() < self.cache_budget_bytes / 4 * 3 {
+            self.scrollback_recover_ticks = self.scrollback_recover_ticks.saturating_add(1);
+            if self.scrollback_recover_ticks >= SCROLLBACK_RECOVER_TICKS {
+                for session in self.sessions.values_mut() {
+                    session.clear_pressure_trim();
+                }
+                self.scrollback_recover_ticks = 0;
+            }
+        } else {
+            self.scrollback_recover_ticks = 0; // 여유 없음 → debounce 리셋
+        }
     }
 
     /// exited 아카이브 후에도 전역 예산을 초과하면 live 세션의 스크롤백을 트림해 예산
@@ -3088,8 +3111,12 @@ impl Worker {
     fn trim_live_over_budget(&mut self, visible: &[SessionId]) -> bool {
         let budget = self.cache_budget_bytes;
         let mut trimmed_any = false;
+        // 트림을 못 하는(불변식이 깨진) 세션은 제외하고 다른 세션 계속 — 한 세션 때문에
+        // 전체를 포기하지 않는다(리뷰 A-L1). 실무상 도달 불가하나 방어적.
+        let mut cannot_trim: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
         loop {
-            // 현재 세션들의 (id, 추정바이트, 히스토리, 가시성) 스냅샷.
+            // 현재 세션들의 (id, 추정바이트, 히스토리, 가시성) 스냅샷. cache_bytes는 전
+            // 세션 합(제외 세션 포함)이어야 예산 판정이 정확하다 — 후보만 제외한다.
             let footprints: Vec<LiveTrimEntry> = self
                 .sessions
                 .iter()
@@ -3104,7 +3131,11 @@ impl Worker {
                 })
                 .collect();
             let cache_bytes: usize = footprints.iter().map(|e| e.estimated_bytes).sum();
-            let Some((id, target)) = select_next_live_trim(&footprints, cache_bytes, budget) else {
+            let candidates: Vec<LiveTrimEntry> = footprints
+                .into_iter()
+                .filter(|e| !cannot_trim.contains(&e.id))
+                .collect();
+            let Some((id, target)) = select_next_live_trim(&candidates, cache_bytes, budget) else {
                 if cache_bytes > budget {
                     tracing::warn!(
                         budget,
@@ -3117,10 +3148,12 @@ impl Worker {
             let over_bytes = cache_bytes.saturating_sub(budget);
             let was_visible = visible.contains(&id);
             let Some(session) = self.sessions.get_mut(&id) else {
-                return trimmed_any;
+                cannot_trim.insert(id);
+                continue;
             };
             if session.trim_scrollback(target).is_none() {
-                return trimmed_any; // 더 못 줄임 → 무한루프 방지
+                cannot_trim.insert(id); // 이 세션은 못 줄임 — 제외하고 다른 세션 계속
+                continue;
             }
             trimmed_any = true;
             tracing::warn!(
@@ -3920,6 +3953,7 @@ mod tests {
                 exited_order: std::collections::VecDeque::new(),
                 max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                 cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
+                scrollback_recover_ticks: 0,
                 archived: std::collections::HashMap::new(),
                 archived_order: std::collections::VecDeque::new(),
                 archived_on_disk: std::collections::HashSet::new(),

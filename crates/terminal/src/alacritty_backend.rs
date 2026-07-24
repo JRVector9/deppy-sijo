@@ -85,6 +85,11 @@ pub struct AlacrittyBackend {
     scrollback_lines: usize,
     cache_class: TerminalCacheClass,
     active_scrollback_limit: usize,
+    /// 메모리 압박 하 강제 트림이 씌운 스크롤백 상한(줄). Some이면 apply_cache_class가
+    /// 클래스 예산을 이 값으로 클램프해, resize/가시성 전이의 클래스 재적용이 트림을
+    /// 되돌리지 못하게 한다(리뷰 A-H1의 flip-flop 방지). 압박 해소 시 runtime이
+    /// clear_pressure_trim으로 해제해 스크롤백을 회복한다.
+    pressure_trim_floor: Option<usize>,
 }
 
 impl AlacrittyBackend {
@@ -100,17 +105,21 @@ impl AlacrittyBackend {
             scrollback_lines,
             cache_class,
             active_scrollback_limit,
+            pressure_trim_floor: None,
         }
     }
 
     fn apply_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
         let before = self.cache_footprint();
-        let target = effective_scrollback_limit(
+        let budget_target = effective_scrollback_limit(
             self.scrollback_lines,
             self.term.columns(),
             self.term.screen_lines(),
             class,
         );
+        // 압박 트림이 씌운 상한이 있으면 클래스 예산을 그 이하로 클램프한다 — 이래야
+        // resize/전이의 클래스 재적용이 트림을 되돌리지 않는다(A-H1 flip-flop 방지).
+        let target = budget_target.min(self.pressure_trim_floor.unwrap_or(usize::MAX));
         self.cache_class = class;
         if target != self.active_scrollback_limit {
             self.term.set_options(Config {
@@ -491,6 +500,10 @@ impl TerminalBackend for AlacrittyBackend {
             ..Config::default()
         });
         self.active_scrollback_limit = target;
+        // 트림 상한을 영속화한다 — 이후 클래스 재적용(resize/전이)이 이 값을 존중해
+        // 스크롤백을 도로 늘리지 못한다(A-H1). 이미 더 낮은 floor가 있으면 유지.
+        self.pressure_trim_floor =
+            Some(target.min(self.pressure_trim_floor.unwrap_or(usize::MAX)));
         // 남은 히스토리를 HOT 창까지 전부 압축해 최대한 회수한다(압박 하 최후 수단).
         self.term.grid_mut().compress_history(0);
         let after = self.cache_footprint();
@@ -505,6 +518,17 @@ impl TerminalBackend for AlacrittyBackend {
             })
     }
 
+    fn clear_pressure_trim(&mut self) -> bool {
+        if self.pressure_trim_floor.is_none() {
+            return false;
+        }
+        self.pressure_trim_floor = None;
+        // floor 해제 후 현재 클래스를 재적용해 스크롤백 상한을 예산 전액으로 회복한다
+        // (상한만 올리므로 즉시 메모리가 늘진 않고, 이후 feed로 채워진다).
+        self.apply_cache_class(self.cache_class);
+        true
+    }
+
     fn cache_class(&self) -> TerminalCacheClass {
         self.cache_class
     }
@@ -512,14 +536,21 @@ impl TerminalBackend for AlacrittyBackend {
     fn cache_footprint(&self) -> TerminalCacheFootprint {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
-        let history_lines = self.term.history_size();
+        // 활성 + 비활성(alt↔primary) 두 그리드의 스크롤백을 모두 합산한다. alt-screen
+        // (vim/less/htop) 활성 시 실제 스크롤백은 inactive(primary)에 있어, 활성 그리드만
+        // 보면 히스토리를 ~0으로 오판해 예산·트림 사각지대가 된다(리뷰 A-M2). 한쪽은 늘
+        // 스크롤백이 없어(alt=0) 합산해도 실제 총량과 같다.
+        let active = self.term.grid();
+        let inactive = self.term.inactive_grid();
+        let history_lines = active.history_size() + inactive.history_size();
         // 압축된(HOT 밖) 히스토리는 grid의 실제 곁가지 힙 바이트로 계상한다.
-        let compressed_heap_bytes = self.term.grid().compressed_heap_bytes();
+        let compressed_heap_bytes =
+            active.compressed_heap_bytes() + inactive.compressed_heap_bytes();
         // 비압축(raw) 히스토리 행 수를 **실제 grid 상태**로 산정한다: 전체 히스토리에서
         // 실제 압축된 슬롯 수를 뺀다. 클래스 모델(예전: Hidden=0)은 배경 feed를 받는
         // hidden 세션이 HOT 창을 raw로 남기는 것을 놓쳐 ~HOT*bpl 과소계상했다(리뷰 B-M2).
         // 실측 기반이라 클래스와 무관하게 정확하고 이중계상도 없다(압축 행은 raw로 안 셈).
-        let compressed_rows = self.term.grid().compressed_row_count();
+        let compressed_rows = active.compressed_row_count() + inactive.compressed_row_count();
         let uncompressed_history = history_lines.saturating_sub(compressed_rows);
         TerminalCacheFootprint {
             class: self.cache_class,
@@ -1645,6 +1676,41 @@ mod tests {
         // 이미 그 이하: 재트림·상향은 no-op.
         assert!(a.trim_scrollback(200).is_none(), "재트림이 이벤트를 냄");
         assert!(a.trim_scrollback(10_000).is_none(), "상향 요청은 no-op이어야");
+    }
+
+    /// (A-H1) 트림 상한은 클래스 재적용(resize/전이)에 영속하고, clear_pressure_trim으로
+    /// 회복된다. 이게 없으면 재적용이 트림을 되돌려 flip-flop이 난다.
+    #[test]
+    fn deppy_트림은_클래스_재적용에_영속하고_clear로_회복된다() {
+        let mut a = AlacrittyBackend::new(200, 40, 10_000);
+        for i in 0..2000 {
+            feed(&mut a, format!("line{i}\r\n").as_bytes());
+        }
+        a.trim_scrollback(200);
+        let floor = 200 + a.term.screen_lines();
+
+        // 같은 클래스 재적용(resize/전이가 하는 것) — 트림을 되돌리면 안 된다.
+        a.set_cache_class(TerminalCacheClass::Visible);
+        for i in 2000..2600 {
+            feed(&mut a, format!("line{i}\r\n").as_bytes());
+        }
+        assert!(
+            a.cache_footprint().history_lines <= floor,
+            "클래스 재적용이 트림을 되돌림: {}",
+            a.cache_footprint().history_lines
+        );
+
+        // clear_pressure_trim → 상한 회복 → 재feed로 200 넘게 자란다.
+        assert!(a.clear_pressure_trim(), "트림 상태인데 clear가 false");
+        for i in 2600..4000 {
+            feed(&mut a, format!("line{i}\r\n").as_bytes());
+        }
+        assert!(
+            a.cache_footprint().history_lines > floor,
+            "clear 후에도 스크롤백이 회복 안 됨: {}",
+            a.cache_footprint().history_lines
+        );
+        assert!(!a.clear_pressure_trim(), "이미 회복인데 clear가 true");
     }
 
     /// (B-M2) 배경 feed를 계속 받는 hidden 세션은 feed의 compress_history(HOT)로 최근

@@ -187,9 +187,16 @@ pub trait TerminalBackend {
     /// 메모리 압박 하에서 스크롤백을 클래스 예산 **아래로** 강제 축소한다 — 가장 오래된
     /// 히스토리를 `max_lines`까지 드롭하고 남은 것을 전부 압축한다. 전역 예산이 exited
     /// 아카이브만으로 안 맞을 때 live 세션을 예산 안으로 넣는 경로. 이미 `max_lines`
-    /// 이하면 `None`. 기본 구현은 no-op(미지원 백엔드).
+    /// 이하면 `None`. 트림 상한은 영속화되어 클래스 재적용이 되돌리지 못한다. 기본
+    /// 구현은 no-op(미지원 백엔드).
     fn trim_scrollback(&mut self, _max_lines: usize) -> Option<TerminalCacheEvent> {
         None
+    }
+
+    /// 압박 트림 상한을 해제하고 스크롤백을 클래스 예산으로 회복한다(압박 해소 시).
+    /// 트림 상태였으면 `true`. 기본 구현은 no-op → `false`.
+    fn clear_pressure_trim(&mut self) -> bool {
+        false
     }
 
     fn cache_class(&self) -> TerminalCacheClass;

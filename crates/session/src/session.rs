@@ -525,6 +525,11 @@ impl Session {
         self.backend.trim_scrollback(max_lines)
     }
 
+    /// 압박 트림 상한을 해제하고 스크롤백을 클래스 예산으로 회복한다(압박 해소 시).
+    pub fn clear_pressure_trim(&mut self) -> bool {
+        self.backend.clear_pressure_trim()
+    }
+
     pub fn cache_class(&self) -> TerminalCacheClass {
         self.cache_class
     }

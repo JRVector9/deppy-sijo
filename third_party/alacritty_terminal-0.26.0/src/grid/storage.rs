@@ -311,12 +311,17 @@ impl<T> Storage<T> {
 impl Storage<Cell> {
     /// `line`을 압축한다. 이미 압축됐거나 빈(placeholder) 행이면 `None`(=이 슬롯은
     /// 압축 frontier), 새로 압축했으면 `Some(회수 추정 힙 바이트)`. 회수량이 0이어도
-    /// (거의 꽉 찬 incompressible 행) 상태는 바뀌었으므로 `Some(0)`이지 `None`이 아니다
-    /// — 호출자(compress_history)의 frontier 판정이 어긋나지 않게 하기 위함.
+    /// (거의 꽉 찬 행) 상태는 바뀌어 저장되므로 `Some(0)`이지 `None`이 아니다 — 이래야
+    /// 다음 호출에서 `None`(이미 압축)으로 frontier break가 걸려 **한 번만 encode**된다.
     ///
     /// 압축 후 `inner[idx]`는 힙 0인 placeholder가 되고, 실제 내용은 곁가지에 남는다.
     /// 이후 이 행을 읽으려면 반드시 [`read_line`](Self::read_line)을 거쳐야 한다
     /// (원시 `Index<Line>`은 placeholder를 돌려준다).
+    ///
+    /// 참고: 셀마다 extra(하이퍼링크 등)가 붙은 극히 드문 행은 압축 표현이 원시보다 클
+    /// 수 있다(그 행 한정 RSS 소폭 증가). 그래도 **항상 저장**한다 — 저장 안 하고 raw로
+    /// 남기면 매 호출 재-encode되는 CPU 회귀가 더 크기 때문(리뷰 B-M1). heap_bytes가
+    /// 정직히 커진 크기를 보고하므로 예산 계산은 오도되지 않는다.
     pub(crate) fn compress_line(&mut self, line: Line, columns: usize) -> Option<usize> {
         let idx = self.compute_index(line);
         if self.compressed.get(idx).is_some_and(Option::is_some) {
@@ -327,15 +332,7 @@ impl Storage<Cell> {
             return None;
         }
         let compressed = CompressedRow::encode(&self.inner[idx], columns);
-        // 압축 표현이 원시 셀 배열보다 크거나 같으면(모든 셀에 extra가 있는 극히 드문
-        // 행 — A-L2) 저장하지 않고 원시를 유지한다. 저장하면 오히려 RSS가 늘기 때문.
-        // frontier가 끊기지 않도록 "검사했으니 계속"만 신호한다(Some(0)) — 이 행은 raw로
-        // 남아 다음 호출에 재검사되나, 그런 행은 드물고 pathological 세션은 live-트림이
-        // 상한을 씌운다.
-        if compressed.heap_bytes() >= raw_bytes {
-            return Some(0);
-        }
-        let saved = raw_bytes - compressed.heap_bytes();
+        let saved = raw_bytes.saturating_sub(compressed.heap_bytes());
 
         // 첫 압축에서만 곁가지를 inner와 같은 길이로 실체화(lazy).
         if self.compressed.is_empty() {
@@ -374,10 +371,29 @@ impl Storage<Cell> {
             .sum()
     }
 
-    /// 현재 압축된(placeholder) 슬롯 수. footprint에서 raw 히스토리 행 수를
-    /// `history - 이 값`으로 정확히 산정하는 데 쓴다(클래스 모델의 과소/이중계상 제거).
+    /// 현재 **논리 버퍼(`len`) 안에서** 압축된 슬롯 수. footprint에서 raw 히스토리 행
+    /// 수를 `history - 이 값`으로 산정하는 데 쓴다(클래스 모델의 과소/이중계상 제거).
+    ///
+    /// 곁가지 벡터 전체가 아니라 논리 범위 `positive ∈ [0, len)`만 센다 — `shrink_lines`가
+    /// `truncate` 없이 `len`만 줄이면 캐시 영역 `[len, inner.len())`에 stale `Some`가
+    /// 남는데(리뷰 A-M1/B-L1), 그걸 세면 `history - count`가 raw를 과소계상(예산 강제에
+    /// 위험한 방향)한다. 논리 범위로 한정해 그 오차를 없앤다. stale 슬롯의 힙 자체는
+    /// [`compressed_heap_bytes`]가 여전히 합산한다(그 메모리는 실제로 상주하므로 맞다).
     pub(crate) fn compressed_row_count(&self) -> usize {
-        self.compressed.iter().filter(|slot| slot.is_some()).count()
+        if self.compressed.is_empty() {
+            return 0;
+        }
+        let n = self.inner.len();
+        (0..self.len)
+            .filter(|&positive| {
+                let idx = if self.zero + positive >= n {
+                    self.zero + positive - n
+                } else {
+                    self.zero + positive
+                };
+                self.compressed[idx].is_some()
+            })
+            .count()
     }
 
     /// 모든 압축 슬롯을 복원해 stock 상태로 되돌린다(곁가지 비움). resize/reflow처럼

@@ -297,9 +297,11 @@ mod tests {
     }
 
     #[test]
-    fn extras_heavy_행은_압축이_원시보다_커서_저장_안함_조건을_탄다() {
+    fn extras_heavy_행은_압축이_원시보다_크지만_왕복_무손실이다() {
         // 모든 셀에 서로 다른 하이퍼링크 → extras가 셀마다 붙어 압축 표현이 원시(24B/셀)
-        // 를 넘는다(A-L2). compress_line은 이 조건에서 저장하지 않고 원시를 유지한다.
+        // 를 넘을 수 있다(그 행 한정 소폭 증가). 그래도 항상 저장하며(재-encode 회귀
+        // 회피, 리뷰 B-M1), 왕복은 무손실이어야 한다. heap_bytes는 커진 크기를 정직히
+        // 보고한다.
         let mut cells = blank_row();
         for i in 0..columns() {
             cells[i].c = 'x';

@@ -14504,7 +14504,9 @@ impl App {
                 })
                 .inner
         };
-        if open_palette {
+        // 이미 열려 있으면 재초기화하지 않는다 — 파라미터 입력 중 재클릭으로 작업이
+        // 날아가지 않게(PR-2 리뷰 Low).
+        if open_palette && !self.prompt_palette.is_open() {
             self.prompt_palette.open();
         }
         // 팔레트는 떠 있는 Window라 도크와 독립적으로 그린다. intent를 받으면 App이

@@ -84,7 +84,7 @@ rustls-pki-types = "1"
 # 모바일 PWA (v3.3 P1): QR 페어링 — 설정 UI가 접속 URL을 egui 텍스처로 렌더 (image 기능 불필요)
 qrcode = { version = "0.14", default-features = false }
 # 모바일 PWA WS API (v3.3 P2 예정) — sync tungstenite. P1은 워크스페이스 등록만, 실사용 없음
-tungstenite = { version = "0.29", default-features = false }
+tungstenite = { version = "0.30", default-features = false }
 # 글로벌 할당자 — scrollback 압축이 해제한 셀 배열 페이지를 OS로 실제 반환해
 # macOS phys_footprint(활성 상태 보기 메모리)를 떨어뜨린다. jemalloc은 Windows/MSVC
 # 미지원이라 배제, mimalloc은 macOS+Windows/MSVC 크로스플랫폼. libmimalloc-sys는

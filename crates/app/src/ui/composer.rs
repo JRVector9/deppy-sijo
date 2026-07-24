@@ -358,6 +358,15 @@ impl ComposerUi {
         }
     }
 
+    /// 활성 워크스페이스의 현재 컴포저 입력(없으면 빈 문자열). 프롬프트 라이브러리의
+    /// "현재 내용 저장" 프리필용 읽기 전용 접근자.
+    pub fn current_text(&self, active_workspace: &str) -> &str {
+        self.buffers
+            .get(active_workspace)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
     /// 프롬프트 라이브러리 팔레트가 고른 텍스트를 활성 워크스페이스의 컴포저 버퍼에
     /// 삽입한다(끝에 경계 공백 보정). 실제 전송은 기존 Send 경로(사용자 검토 후)가 한다.
     pub fn insert_text(&mut self, active_workspace: &str, text: &str) {

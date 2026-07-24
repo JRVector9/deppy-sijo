@@ -5854,6 +5854,13 @@ pub struct App {
     /// 하단 도크 프롬프트 컴포저 (2026-07-17) — 워크스페이스별 드래프트 + 영속 히스토리.
     composer: ui::composer::ComposerUi,
     composer_history_path: PathBuf,
+    /// 프롬프트 라이브러리 (기능2) — 저장된 에이전트 프롬프트 팔레트. 파레트에서 고른
+    /// 프롬프트는 파라미터를 채워 활성 세션의 컴포저 버퍼에 삽입된다.
+    prompt_palette: ui::prompt_palette::PromptPaletteUi,
+    prompt_library: crate::prompt_library::PromptLibrary,
+    /// 저장 경로 — PR-3(프롬프트 저장/편집)에서 읽는다.
+    #[allow(dead_code)]
+    prompt_library_path: PathBuf,
     /// agent-proxy 승인 팝업 (option 1.5). proxy가 DB에 쓴 pending 행을 폴링해 표시한다.
     approvals_ui: ui::approvals::ApprovalsUi,
     /// 이미 알림을 발화한 pending 승인 id — 폴링마다 재발화하지 않기 위한 기억.
@@ -8218,6 +8225,21 @@ impl App {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("composer_history.jsonl");
+        // 프롬프트 라이브러리 (기능2) — 없으면 예시 프롬프트로 씨드해 팔레트가 비지 않게 한다.
+        let prompt_library_path = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("prompt_library.json");
+        let mut prompt_library = crate::prompt_library::PromptLibrary::load(&prompt_library_path);
+        if prompt_library.prompts.is_empty() {
+            prompt_library = crate::prompt_library::PromptLibrary::default_seed();
+            if let Err(error) = prompt_library.save(&prompt_library_path) {
+                tracing::warn!(
+                    path = %prompt_library_path.display(),
+                    "프롬프트 라이브러리 씨드 저장 실패: {error:#}"
+                );
+            }
+        }
         let notice_translation_cache =
             match crate::notice_translate::TranslationCache::load(&notice_translation_cache_path) {
                 Ok(cache) => cache,
@@ -8380,6 +8402,9 @@ impl App {
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
             composer: ui::composer::ComposerUi::new(composer_history_path.clone()),
             composer_history_path,
+            prompt_palette: ui::prompt_palette::PromptPaletteUi::default(),
+            prompt_library,
+            prompt_library_path,
             approvals_ui: ui::approvals::ApprovalsUi::new(),
             approval_notified: std::collections::HashSet::new(),
             _pending_approval_owner: pending_approval_owner,
@@ -14425,6 +14450,9 @@ impl App {
             .and_then(|session| self.active.workspace_ui.agent_provider_for(session));
         let composer_root = self.agent_workspace_cwd.as_deref().map(PathBuf::from);
         let composer_workspace_id = self.active.id.clone();
+        // 프롬프트 라이브러리(기능2) 열기 요청 — 아래 도크 클로저에서 self.composer를
+        // 이미 빌린 상태라 로컬 플래그로 모았다가 블록 뒤에서 연다(빌림 충돌 회피).
+        let mut open_palette = false;
         let composer_action = {
             // 도크 배경은 패널색(테마 파생) — 카드가 살짝 떠 보이도록 여백을 준다.
             let dock_frame =
@@ -14450,9 +14478,33 @@ impl App {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(dock_frame)
-                .show(ui, |ui| composer.render(ui, text, &composer_ctx))
+                .show(ui, |ui| {
+                    // 프롬프트 라이브러리 열기 — Ctrl+K가 컴포저 접기로 리바인드되어
+                    // 단축키 대신 버튼으로 연다. 툴바 스타일(small_button "/model")과 맞춘다.
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("/prompt")
+                            .on_hover_text("저장된 프롬프트 라이브러리 — 파라미터 채워 컴포저에 삽입")
+                            .clicked()
+                        {
+                            open_palette = true;
+                        }
+                    });
+                    composer.render(ui, text, &composer_ctx)
+                })
                 .inner
         };
+        if open_palette {
+            self.prompt_palette.open();
+        }
+        // 팔레트는 떠 있는 Window라 도크와 독립적으로 그린다. 삽입 intent를 받으면
+        // App이 활성 워크스페이스 컴포저 버퍼에 실제로 쓴다(leaf+intent+host I/O 경계).
+        if let Some(ui::prompt_palette::PromptPaletteAction::Insert(prompt_text)) =
+            self.prompt_palette.render(ui.ctx(), &self.prompt_library)
+        {
+            self.composer
+                .insert_text(&composer_workspace_id, &prompt_text);
+        }
         match composer_action {
             Some(ui::composer::ComposerAction::Send(submission)) => {
                 let (prompt, history) = submission.into_parts();

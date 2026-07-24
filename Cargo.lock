@@ -1193,6 +1193,7 @@ dependencies = [
  "uuid",
  "web-remote",
  "windows-sys 0.61.2",
+ "winit",
 ]
 
 [[package]]

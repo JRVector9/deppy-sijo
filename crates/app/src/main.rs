@@ -122,6 +122,14 @@ fn main() -> anyhow::Result<()> {
                 &config.terminal.mono_weight,
             );
             install_macos_menu();
+            // 커스텀 상단바(TOP_BAR_HEIGHT)가 macOS 기본 타이틀바(~28pt)보다 높아
+            // 신호등이 위로 치우쳐 보였다 — 상단바 높이 기준으로 수직 중앙 재배치
+            // (2026-07-25 사용자, winit 신규 API — third_party/winit-0.30.13 patch).
+            #[cfg(target_os = "macos")]
+            if let Some(window) = cc.winit_window() {
+                use winit::platform::macos::WindowExtMacOS as _;
+                window.set_traffic_light_titlebar_height(app::TOP_BAR_HEIGHT as f64);
+            }
             native_key_monitor::install();
             // 메모리 압박 감지 (로드맵 C1) — 신호만 설치, 소비는 logic()에서.
             mem_pressure_monitor::install(cc.egui_ctx.clone());

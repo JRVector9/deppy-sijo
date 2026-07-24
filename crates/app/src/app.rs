@@ -14720,6 +14720,55 @@ impl App {
         }
     }
 
+    /// 브로드캐스트(기능2×1): 특정 (workspace, session)에 프롬프트를 컴포저 Send와 동일한
+    /// 경로로 주입한다. active/warm 런타임을 라우팅하고, suspended/사라진 워크스페이스는
+    /// runtime이 없어 자연히 no-op(inject_waiting_answer와 같은 관례).
+    fn broadcast_prompt_to(
+        &mut self,
+        workspace_id: &str,
+        session: runtime::SessionId,
+        prompt: &str,
+    ) {
+        if workspace_id == self.active.id {
+            Self::write_prompt_to_session(
+                &mut self.active.workspace_ui,
+                &self.active.runtime,
+                session,
+                prompt,
+            );
+        } else if let Some(rt) = self.warm.get_mut(workspace_id) {
+            Self::write_prompt_to_session(&mut rt.workspace_ui, &rt.runtime, session, prompt);
+        }
+    }
+
+    /// 한 세션에 프롬프트를 주입한다 — send_composer_prompt와 동일한 bracketed-paste + CR
+    /// 계획을 쓰되 대상 세션을 인자로 받아 active/warm 어디든 보낸다.
+    fn write_prompt_to_session(
+        workspace_ui: &mut ui::workspace::WorkspaceUi,
+        runtime: &InProcessRuntimeClient,
+        session: runtime::SessionId,
+        prompt: &str,
+    ) {
+        let bracketed = workspace_ui.session_bracketed_paste(session);
+        let provider = workspace_ui.agent_provider_for(session);
+        workspace_ui.clear_selection(session);
+        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider) else {
+            return;
+        };
+        let writes = match plan {
+            ui::composer::ComposerInputPlan::Single(bytes) => vec![bytes],
+            ui::composer::ComposerInputPlan::BracketedPaste { body, submit } => vec![body, submit],
+        };
+        for bytes in writes {
+            if let Err(e) =
+                runtime.send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
+            {
+                tracing::warn!("브로드캐스트 전송 실패: {e:#}");
+                return;
+            }
+        }
+    }
+
     /// 인박스 표면(벨 팝오버·작업함 페이지)이 공유하는 워크스페이스 표시명 맵 —
     /// 승인 카드·알림 행의 "어느 워크스페이스인가" 컨텍스트.
     fn inbox_workspace_names(&self) -> std::collections::HashMap<String, String> {
@@ -16438,7 +16487,13 @@ impl eframe::App for App {
                 } else if inbox_visible {
                     inbox_page_click = self.render_inbox_page(ui, &text);
                 } else if fleet_visible {
-                    fleet_action = self.fleet_ui.render(ui, &fleet_sessions, fleet_summary, &text);
+                    fleet_action = self.fleet_ui.render(
+                        ui,
+                        &fleet_sessions,
+                        fleet_summary,
+                        &text,
+                        &self.prompt_library,
+                    );
                 } else {
                     self.active
                         .workspace_ui
@@ -16471,6 +16526,13 @@ impl eframe::App for App {
                 // 에이전트 패널을 연다(fleet에 세션을 추가하는 진입점). 패널은 떠 있는
                 // 창이라 fleet 뷰 위에서 바로 쓸 수 있다.
                 self.agent_sessions_ui.open();
+            }
+            Some(ui::fleet::FleetAction::Broadcast { prompt, targets }) => {
+                // 저장된 프롬프트를 선택된 각 실행 중 에이전트에 컴포저 Send와 동일 경로로
+                // 주입한다(사용자가 대상·프롬프트를 명시적으로 고른 뒤에만 발행됨).
+                for (workspace_id, session) in targets {
+                    self.broadcast_prompt_to(&workspace_id, session, &prompt);
+                }
             }
             None => {}
         }

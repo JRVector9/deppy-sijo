@@ -5,8 +5,11 @@
 //! FocusSession 경로로 수행한다(leaf+intent+host I/O 경계). 상태 색은 앱 공용 팔레트
 //! (`agent_visuals::status_color`)를 재사용한다.
 
+use std::collections::{BTreeMap, HashSet};
+
 use crate::agent_surface::AgentVisualState;
 use crate::fleet::{FleetSession, FleetSummary};
+use crate::prompt_library::PromptLibrary;
 use crate::ui::agent_visuals::status_color;
 
 /// fleet 그리드가 App에 돌려주는 액션.
@@ -19,10 +22,29 @@ pub enum FleetAction {
     },
     /// 새 에이전트 시작 — App이 에이전트 패널을 연다(fleet에 세션을 추가하는 진입점).
     LaunchAgent,
+    /// 저장된 프롬프트를 여러 실행 중 에이전트에 브로드캐스트. App이 각 대상 세션에
+    /// 컴포저 Send와 동일 경로로 주입한다(사용자 검토 후 전송이 아니라 즉시 전송이므로
+    /// 대상·프롬프트를 사용자가 명시적으로 고른 뒤에만 발행된다).
+    Broadcast {
+        prompt: String,
+        targets: Vec<(String, runtime::SessionId)>,
+    },
+}
+
+/// 브로드캐스트 패널 상태 — 프롬프트 선택 + 파라미터 + 대상 체크.
+#[derive(Default)]
+struct BroadcastState {
+    prompt_id: Option<String>,
+    params: BTreeMap<String, String>,
+    /// 체크된 대상 (workspace_id, session).
+    targets: HashSet<(String, runtime::SessionId)>,
 }
 
 #[derive(Default)]
-pub struct FleetUi {}
+pub struct FleetUi {
+    /// Some이면 브로드캐스트 패널이 열려 있다.
+    broadcast: Option<BroadcastState>,
+}
 
 impl FleetUi {
     /// fleet 페이지를 그린다. 세션이 없으면 안내 문구만 보인다.
@@ -32,13 +54,27 @@ impl FleetUi {
         sessions: &[FleetSession],
         summary: FleetSummary,
         catalog: &i18n::Catalog,
+        library: &PromptLibrary,
     ) -> Option<FleetAction> {
         let mut action = None;
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::symmetric(16, 14))
             .show(ui, |ui| {
-                if header(ui, summary, catalog) {
-                    action = Some(FleetAction::LaunchAgent);
+                match header(ui, summary, catalog, !sessions.is_empty()) {
+                    Some(HeaderClick::Launch) => action = Some(FleetAction::LaunchAgent),
+                    Some(HeaderClick::Broadcast) => {
+                        // 대상 기본값 = 작업 중이 아닌 세션(진행 중 에이전트는 방해하지 않음).
+                        self.broadcast = Some(BroadcastState {
+                            prompt_id: library.prompts.first().map(|p| p.id.clone()),
+                            params: BTreeMap::new(),
+                            targets: sessions
+                                .iter()
+                                .filter(|s| s.state != AgentVisualState::Active)
+                                .map(|s| (s.workspace_id.clone(), s.session))
+                                .collect(),
+                        });
+                    }
+                    None => {}
                 }
                 ui.add_space(12.0);
                 if sessions.is_empty() {
@@ -74,13 +110,166 @@ impl FleetUi {
                         });
                     });
             });
+        // 브로드캐스트 창은 떠 있는 Window라 중앙 패널과 독립적으로 그린다.
+        if let Some(sent) = self.broadcast_window(ui.ctx(), sessions, catalog, library) {
+            action = Some(sent);
+        }
         action
+    }
+
+    /// 브로드캐스트 창 — 프롬프트 선택 + 파라미터 + 대상 체크 + 전송. 닫혀 있으면 아무것도
+    /// 그리지 않는다. 전송/닫기 시 상태를 제거한다.
+    fn broadcast_window(
+        &mut self,
+        ctx: &egui::Context,
+        sessions: &[FleetSession],
+        catalog: &i18n::Catalog,
+        library: &PromptLibrary,
+    ) -> Option<FleetAction> {
+        // 닫혀 있으면(Some 아님) 창을 그리지 않는다.
+        self.broadcast.as_ref()?;
+        let mut action = None;
+        let mut open = true;
+        egui::Window::new(catalog.t("fleet.broadcast.title", &[]))
+            .id(egui::Id::new("fleet_broadcast"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                action = self.broadcast_body(ui, sessions, catalog, library);
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        // 전송했거나(action Some) 닫으면 패널 상태를 버린다.
+        if !open || action.is_some() {
+            self.broadcast = None;
+        }
+        action
+    }
+
+    fn broadcast_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        sessions: &[FleetSession],
+        catalog: &i18n::Catalog,
+        library: &PromptLibrary,
+    ) -> Option<FleetAction> {
+        let state = self.broadcast.as_mut()?;
+        if library.prompts.is_empty() {
+            ui.weak(catalog.t("fleet.broadcast.no_prompts", &[]));
+            return None;
+        }
+        // ① 프롬프트 선택.
+        let selected_title = state
+            .prompt_id
+            .as_ref()
+            .and_then(|id| library.get(id))
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| catalog.t("fleet.broadcast.pick_prompt", &[]));
+        egui::ComboBox::from_id_salt("fleet_bc_prompt")
+            .selected_text(selected_title)
+            .width(300.0)
+            .show_ui(ui, |ui| {
+                for prompt in &library.prompts {
+                    let picked = state.prompt_id.as_deref() == Some(prompt.id.as_str());
+                    if ui.selectable_label(picked, &prompt.title).clicked() {
+                        state.prompt_id = Some(prompt.id.clone());
+                        state.params.clear();
+                    }
+                }
+            });
+        // ② 파라미터 + 미리보기.
+        let prompt = state.prompt_id.as_ref().and_then(|id| library.get(id));
+        let ready_prompt = if let Some(prompt) = prompt {
+            let names = prompt.params();
+            if !names.is_empty() {
+                egui::Grid::new("fleet_bc_params").num_columns(2).show(ui, |ui| {
+                    for name in &names {
+                        ui.monospace(format!("{{{{{name}}}}}"));
+                        ui.text_edit_singleline(state.params.entry(name.clone()).or_default());
+                        ui.end_row();
+                    }
+                });
+            }
+            let rendered = crate::prompt_library::render(&prompt.body, &state.params);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&rendered).monospace()).wrap());
+            });
+            let filled = names
+                .iter()
+                .all(|n| state.params.get(n).is_some_and(|v| !v.trim().is_empty()));
+            filled.then_some(rendered)
+        } else {
+            None
+        };
+        ui.add_space(6.0);
+        ui.separator();
+        // ③ 대상 체크박스.
+        ui.label(catalog.t("fleet.broadcast.targets", &[]));
+        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+            for session in sessions {
+                let key = (session.workspace_id.clone(), session.session);
+                let mut checked = state.targets.contains(&key);
+                let label = format!(
+                    "{} · {}  ({})",
+                    session.title,
+                    session.workspace_name,
+                    state_label(session.state, catalog)
+                );
+                if ui.checkbox(&mut checked, label).changed() {
+                    if checked {
+                        state.targets.insert(key);
+                    } else {
+                        state.targets.remove(&key);
+                    }
+                }
+            }
+        });
+        // ④ 전송.
+        ui.add_space(6.0);
+        let count = state.targets.len();
+        let can_send = ready_prompt.is_some() && count > 0;
+        let mut out = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    can_send,
+                    egui::Button::new(
+                        catalog.t("fleet.broadcast.send", &[("count", &count.to_string())]),
+                    ),
+                )
+                .clicked()
+                && let Some(prompt_text) = ready_prompt
+            {
+                out = Some(FleetAction::Broadcast {
+                    prompt: prompt_text,
+                    targets: state.targets.iter().cloned().collect(),
+                });
+            }
+            if !can_send {
+                ui.weak(catalog.t("fleet.broadcast.fill", &[]));
+            }
+        });
+        out
     }
 }
 
-/// 상단 헤더: 제목 + 총계 + (우측) 새 에이전트 버튼 + 상태별 칩. 버튼 클릭 시 true.
-fn header(ui: &mut egui::Ui, summary: FleetSummary, catalog: &i18n::Catalog) -> bool {
-    let mut launch = false;
+/// 헤더 우측 버튼 클릭.
+enum HeaderClick {
+    Launch,
+    Broadcast,
+}
+
+/// 상단 헤더: 제목 + 총계 + (우측) 브로드캐스트·새 에이전트 버튼 + 상태별 칩.
+fn header(
+    ui: &mut egui::Ui,
+    summary: FleetSummary,
+    catalog: &i18n::Catalog,
+    has_agents: bool,
+) -> Option<HeaderClick> {
+    let mut click = None;
     ui.horizontal(|ui| {
         ui.heading(catalog.t("fleet.title", &[]));
         ui.add_space(8.0);
@@ -92,7 +281,11 @@ fn header(ui: &mut egui::Ui, summary: FleetSummary, catalog: &i18n::Catalog) -> 
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button(catalog.t("fleet.new_agent", &[])).clicked() {
-                launch = true;
+                click = Some(HeaderClick::Launch);
+            }
+            // 브로드캐스트는 실행 중 에이전트가 있을 때만.
+            if has_agents && ui.button(catalog.t("fleet.broadcast", &[])).clicked() {
+                click = Some(HeaderClick::Broadcast);
             }
         });
     });
@@ -104,7 +297,7 @@ fn header(ui: &mut egui::Ui, summary: FleetSummary, catalog: &i18n::Catalog) -> 
         chip(ui, AgentVisualState::Active, summary.working, catalog);
         chip(ui, AgentVisualState::Idle, summary.idle, catalog);
     });
-    launch
+    click
 }
 
 /// 상태별 칩 — 색 점 + "라벨 n". 0이면 흐리게(회색) 표시.

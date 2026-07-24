@@ -14546,7 +14546,9 @@ impl App {
         let composer_workspace_id = self.active.id.clone();
         // 프롬프트 라이브러리(기능2) 열기 요청 — 아래 도크 클로저에서 self.composer를
         // 이미 빌린 상태라 로컬 플래그로 모았다가 블록 뒤에서 연다(빌림 충돌 회피).
+        // enabled 여부도 미리 복사한다(클로저 안에서 self.config를 못 읽음).
         let mut open_palette = false;
+        let prompt_library_enabled = self.config.ui.prompt_library_enabled;
         let composer_action = {
             // 도크 배경은 패널색(테마 파생) — 카드가 살짝 떠 보이도록 여백을 준다.
             let dock_frame =
@@ -14575,48 +14577,56 @@ impl App {
                 .show(ui, |ui| {
                     // 프롬프트 라이브러리 열기 — Ctrl+K가 컴포저 접기로 리바인드되어
                     // 단축키 대신 버튼으로 연다. 툴바 스타일(small_button "/model")과 맞춘다.
-                    ui.horizontal(|ui| {
-                        if ui
-                            .small_button("/prompt")
-                            .on_hover_text("저장된 프롬프트 라이브러리 — 파라미터 채워 컴포저에 삽입")
-                            .clicked()
-                        {
-                            open_palette = true;
-                        }
-                    });
+                    // 설정에서 끄면(PR-7) 버튼을 숨긴다.
+                    if prompt_library_enabled {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button("/prompt")
+                                .on_hover_text("저장된 프롬프트 라이브러리 — 파라미터 채워 컴포저에 삽입")
+                                .clicked()
+                            {
+                                open_palette = true;
+                            }
+                        });
+                    }
                     composer.render(ui, text, &composer_ctx)
                 })
                 .inner
         };
-        // 이미 열려 있으면 재초기화하지 않는다 — 파라미터 입력 중 재클릭으로 작업이
-        // 날아가지 않게(PR-2 리뷰 Low).
-        if open_palette && !self.prompt_palette.is_open() {
-            self.prompt_palette.open();
-        }
-        // 팔레트는 떠 있는 Window라 도크와 독립적으로 그린다. intent를 받으면 App이
-        // 실제 부수효과를 수행한다(leaf+intent+host I/O 경계): 삽입=컴포저 버퍼 쓰기,
-        // 저장/삭제=라이브러리 변경 + 파일 영속화. composer_draft는 "현재 내용 저장" 프리필용.
-        let composer_draft = self
-            .composer
-            .current_text(&composer_workspace_id)
-            .to_owned();
-        match self
-            .prompt_palette
-            .render(ui.ctx(), &self.prompt_library, &composer_draft)
-        {
-            Some(ui::prompt_palette::PromptPaletteAction::Insert(prompt_text)) => {
-                self.composer
-                    .insert_text(&composer_workspace_id, &prompt_text);
+        // 설정에서 꺼져 있으면(PR-7) 팔레트를 그리지 않는다. 켜져 있던 중 끄면 닫는다.
+        if prompt_library_enabled {
+            // 이미 열려 있으면 재초기화하지 않는다 — 파라미터 입력 중 재클릭으로 작업이
+            // 날아가지 않게(PR-2 리뷰 Low).
+            if open_palette && !self.prompt_palette.is_open() {
+                self.prompt_palette.open();
             }
-            Some(ui::prompt_palette::PromptPaletteAction::Upsert(prompt)) => {
-                self.prompt_library.upsert(prompt);
-                self.persist_prompt_library();
+            // 팔레트는 떠 있는 Window라 도크와 독립적으로 그린다. intent를 받으면 App이
+            // 실제 부수효과를 수행한다(leaf+intent+host I/O 경계): 삽입=컴포저 버퍼 쓰기,
+            // 저장/삭제=라이브러리 변경 + 파일 영속화. composer_draft는 "현재 내용 저장" 프리필용.
+            let composer_draft = self
+                .composer
+                .current_text(&composer_workspace_id)
+                .to_owned();
+            match self
+                .prompt_palette
+                .render(ui.ctx(), &self.prompt_library, &composer_draft)
+            {
+                Some(ui::prompt_palette::PromptPaletteAction::Insert(prompt_text)) => {
+                    self.composer
+                        .insert_text(&composer_workspace_id, &prompt_text);
+                }
+                Some(ui::prompt_palette::PromptPaletteAction::Upsert(prompt)) => {
+                    self.prompt_library.upsert(prompt);
+                    self.persist_prompt_library();
+                }
+                Some(ui::prompt_palette::PromptPaletteAction::Delete(id)) => {
+                    self.prompt_library.delete(&id);
+                    self.persist_prompt_library();
+                }
+                None => {}
             }
-            Some(ui::prompt_palette::PromptPaletteAction::Delete(id)) => {
-                self.prompt_library.delete(&id);
-                self.persist_prompt_library();
-            }
-            None => {}
+        } else if self.prompt_palette.is_open() {
+            self.prompt_palette.close();
         }
         match composer_action {
             Some(ui::composer::ComposerAction::Send(submission)) => {

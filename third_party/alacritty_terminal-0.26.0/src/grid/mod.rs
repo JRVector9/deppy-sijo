@@ -490,6 +490,11 @@ impl Grid<crate::term::cell::Cell> {
         self.raw.compressed_heap_bytes()
     }
 
+    /// 현재 압축된 슬롯 수 — footprint의 raw 히스토리 행 수 산정용.
+    pub fn compressed_row_count(&self) -> usize {
+        self.raw.compressed_row_count()
+    }
+
     /// 모든 압축 스크롤백을 복원해 stock 상태로 되돌린다. resize처럼 히스토리 전체를
     /// 원시 인덱싱으로 훑는 연산 직전에 호출해야 한다(그렇지 않으면 압축 placeholder를
     /// 읽어 깨진다).

@@ -489,20 +489,12 @@ impl TerminalBackend for AlacrittyBackend {
         let history_lines = self.term.history_size();
         // 압축된(HOT 밖) 히스토리는 grid의 실제 곁가지 힙 바이트로 계상한다.
         let compressed_heap_bytes = self.term.grid().compressed_heap_bytes();
-        // 비압축(raw) 히스토리 행 수를 클래스별 압축 정책으로 모델링한다 — 압축된 행을
-        // raw 셀 배열로 이중 계상하지 않기 위함:
-        //  - Visible: feed가 최근 HOT 창을 비압축으로 유지(compress_history(HOT))하므로
-        //    min(history, HOT). Visible은 히스토리 전체를 압축한 적이 없어 정확하다.
-        //  - Hidden/Exited: apply_cache_class가 compress_history(0)로 히스토리 전체를
-        //    압축했으므로 0. 이래야 전이 시 HOT 창 압축분이 footprint 감소로 나타난다
-        //    (trim event의 freed_estimated_bytes > 0). Hidden이 이후 feed로 HOT 창을
-        //    다시 raw화하면 최대 HOT*bytes_per_line만큼 과소 계상될 수 있으나(유계),
-        //    이는 예전 전량-비압축 추정보다 훨씬 정확하다. Exited는 더 이상 feed되지
-        //    않아 항상 0으로 정확하다.
-        let uncompressed_history = match self.cache_class {
-            TerminalCacheClass::Visible => history_lines.min(HOT_SCROLLBACK_LINES),
-            TerminalCacheClass::Hidden | TerminalCacheClass::Exited => 0,
-        };
+        // 비압축(raw) 히스토리 행 수를 **실제 grid 상태**로 산정한다: 전체 히스토리에서
+        // 실제 압축된 슬롯 수를 뺀다. 클래스 모델(예전: Hidden=0)은 배경 feed를 받는
+        // hidden 세션이 HOT 창을 raw로 남기는 것을 놓쳐 ~HOT*bpl 과소계상했다(리뷰 B-M2).
+        // 실측 기반이라 클래스와 무관하게 정확하고 이중계상도 없다(압축 행은 raw로 안 셈).
+        let compressed_rows = self.term.grid().compressed_row_count();
+        let uncompressed_history = history_lines.saturating_sub(compressed_rows);
         TerminalCacheFootprint {
             class: self.cache_class,
             scrollback_limit_lines: self.active_scrollback_limit,
@@ -1594,6 +1586,42 @@ mod tests {
         assert_eq!(
             compressed_snap.visible_cells, inflated_snap.visible_cells,
             "압축/비압축 뷰포트 셀 불일치"
+        );
+    }
+
+    /// (B-M2) 배경 feed를 계속 받는 hidden 세션은 feed의 compress_history(HOT)로 최근
+    /// HOT 창을 raw로 남긴다 — footprint가 이를 0으로 과소계상하지 않고 실측으로 계상한다.
+    #[test]
+    fn deppy_활성_hidden_footprint는_hot_raw창을_계상한다() {
+        let mut a = AlacrittyBackend::new(40, 5, 1000);
+        for i in 0..400 {
+            feed(&mut a, format!("line{i}\r\n").as_bytes());
+        }
+        a.set_cache_class(TerminalCacheClass::Hidden); // 전체 압축(compress_history(0))
+        // 배경 feed 지속 — feed의 compress_history(HOT)가 최근 HOT행을 raw로 남긴다.
+        for i in 400..700 {
+            feed(&mut a, format!("line{i}\r\n").as_bytes());
+        }
+
+        let history = a.term.history_size();
+        let raw_history = history.saturating_sub(a.term.grid().compressed_row_count());
+        // 활성 hidden은 HOT 창만큼(±) raw 행을 갖는다 — 0이 아니다(예전 Hidden=0 과소계상).
+        assert!(raw_history > 0, "활성 hidden이 raw HOT 창을 안 남김: raw={raw_history}");
+        assert!(
+            raw_history <= HOT_SCROLLBACK_LINES + 5,
+            "raw가 HOT 창보다 과함: {raw_history}"
+        );
+
+        // footprint가 그 raw 창을 계상한다(0으로 과소계상하던 예전과 대비).
+        let fp = a.cache_footprint();
+        let bpl = estimated_bytes_per_line(a.term.columns());
+        let floor = a.term.screen_lines() * bpl
+            + a.term.grid().compressed_heap_bytes()
+            + raw_history * bpl;
+        assert!(
+            fp.estimated_bytes >= floor,
+            "footprint가 raw HOT 창을 미계상: est={} floor={floor}",
+            fp.estimated_bytes
         );
     }
 

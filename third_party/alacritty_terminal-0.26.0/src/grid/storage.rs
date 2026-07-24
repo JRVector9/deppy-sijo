@@ -366,6 +366,12 @@ impl Storage<Cell> {
             .sum()
     }
 
+    /// 현재 압축된(placeholder) 슬롯 수. footprint에서 raw 히스토리 행 수를
+    /// `history - 이 값`으로 정확히 산정하는 데 쓴다(클래스 모델의 과소/이중계상 제거).
+    pub(crate) fn compressed_row_count(&self) -> usize {
+        self.compressed.iter().filter(|slot| slot.is_some()).count()
+    }
+
     /// 모든 압축 슬롯을 복원해 stock 상태로 되돌린다(곁가지 비움). resize/reflow처럼
     /// 히스토리 전체를 원시 인덱싱으로 훑는 연산 직전에 호출한다.
     pub(crate) fn inflate_all(&mut self, columns: usize) {

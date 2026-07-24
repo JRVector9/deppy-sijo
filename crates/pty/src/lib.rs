@@ -381,6 +381,13 @@ impl PortablePtyBackend {
         }
         builder.env_remove("NO_COLOR");
         #[cfg(target_os = "macos")]
+        // Xcode/Instruments·leaks 같은 진단 도구가 붙였던 MallocStackLogging이 앱을
+        // 띄운 셸을 거쳐 상속되면, 임베디드 셸과 그 자식 프로세스마다 libmalloc이
+        // "can't turn off malloc stack logging because it was not enabled"를 stderr로
+        // 찍어 화면을 덮는다. 진단은 켠 쪽 프로세스에서 할 일이지 사용자 셸이 물려받을
+        // 상태가 아니므로, capability를 고정하는 것과 같은 이유로 여기서 끊는다.
+        builder.env_remove("MallocStackLogging");
+        #[cfg(target_os = "macos")]
         if command_env_is_empty(cmd, "LANG") {
             // Finder/LaunchServices에서 .app을 열면 LANG가 없는 것이 정상이다. 그대로
             // 셸/에이전트를 띄우면 macOS locale이 US-ASCII가 되어 한글을 렌더러에
@@ -2018,6 +2025,33 @@ mod tests {
         assert!(text.contains("TERM_PROGRAM=deppy-sijo"));
         assert!(text.contains("CLICOLOR=1"));
         assert!(text.contains("NO_COLOR=unset"));
+        assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn embedded_pty는_malloc_stack_logging을_제거한다() {
+        let mut session = PortablePtyBackend
+            .spawn(
+                &CommandSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "printf 'MSL=%s\\n' \"${MallocStackLogging-unset}\"".into(),
+                    ],
+                    env: vec![("MallocStackLogging".into(), "0".into())],
+                    cwd: None,
+                },
+                80,
+                24,
+            )
+            .unwrap();
+        let rx = session.take_output().unwrap();
+        let output = collect_output(&rx, Duration::from_secs(5));
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("MSL=unset"));
+        // libmalloc 경고 자체가 stderr로 새어나오지 않아야 한다.
+        assert!(!text.contains("MallocStackLogging:"));
         assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));
     }
 

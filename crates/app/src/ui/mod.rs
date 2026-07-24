@@ -11,6 +11,7 @@ pub mod diff_panel;
 pub mod env_profiles;
 pub mod env_project_list;
 pub mod file_tree;
+pub mod fleet;
 pub mod inbox_approvals;
 pub mod inbox_waiting;
 pub mod notifications;

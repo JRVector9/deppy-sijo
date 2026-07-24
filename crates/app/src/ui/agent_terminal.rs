@@ -7,6 +7,9 @@ pub enum AgentTerminalView {
     /// 「작업함」 전체 페이지 — 벨 팝오버와 같은 대기 카드 + 전체 알림 목록
     /// (2026-07-18 사용자 확정 디자인, 사이드바 하단 nav로 진입).
     Inbox,
+    /// 멀티에이전트 fleet 그리드 — active/warm 워크스페이스의 에이전트 세션을 한 화면에
+    /// 모아 상태별로 보여준다(기능1, 사이드바 하단 nav로 진입).
+    Fleet,
     #[default]
     Terminal,
 }
@@ -234,6 +237,7 @@ impl AgentTerminalUi {
                     ui.weak(match self.view {
                         AgentTerminalView::Home => catalog.t("status_bar.view.home", &[]),
                         AgentTerminalView::Inbox => catalog.t("status_bar.view.inbox", &[]),
+                        AgentTerminalView::Fleet => catalog.t("status_bar.view.fleet", &[]),
                         AgentTerminalView::Terminal => catalog.t("status_bar.view.terminal", &[]),
                     });
                 });

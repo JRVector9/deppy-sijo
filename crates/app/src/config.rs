@@ -209,6 +209,10 @@ pub struct UiConfig {
     /// Enter 전송이면 Shift+Enter=개행, ⌘/Ctrl+Enter 전송이면 Enter=개행.
     #[serde(default)]
     pub composer_send_key: ComposerSendKey,
+    /// 프롬프트 라이브러리 표시 (기능2, 기본 ON). OFF면 컴포저 도크의 "/prompt" 버튼과
+    /// 팔레트를 숨긴다 — 저장된 프롬프트 데이터(prompt_library.json)는 보존한다.
+    #[serde(default = "default_true")]
+    pub prompt_library_enabled: bool,
 }
 
 /// 컴포저 전송 키 — "프롬프트가 길면 실수로 Enter를 누를 가능성"(사용자) 대응 옵션.
@@ -260,6 +264,7 @@ impl Default for UiConfig {
             ui_scale: 1.0,
             composer_enabled: true,
             composer_send_key: ComposerSendKey::default(),
+            prompt_library_enabled: true,
         }
     }
 }
@@ -605,6 +610,19 @@ mod tests {
         config.ui.composer_enabled = false;
         let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert!(!reloaded.ui.composer_enabled);
+    }
+
+    /// 프롬프트 라이브러리 토글(기능2 PR-7): 기본 켜짐 + 키 없는 기존 config 하위호환 +
+    /// 명시 off 라운드트립. composer_enabled와 동일한 default_true 규약.
+    #[test]
+    fn prompt_library_enabled_기본_켜짐이고_off는_라운드트립된다() {
+        assert!(UiConfig::default().prompt_library_enabled);
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.ui.prompt_library_enabled);
+        let mut config = Config::default();
+        config.ui.prompt_library_enabled = false;
+        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(!reloaded.ui.prompt_library_enabled);
     }
 
     #[test]

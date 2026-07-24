@@ -1615,6 +1615,18 @@ fn general_page(
             }
         },
     );
+    // 프롬프트 라이브러리 표시 (기능2 PR-7) — OFF면 컴포저 "/prompt" 버튼·팔레트를 숨긴다
+    // (저장된 프롬프트 데이터는 보존).
+    row(
+        ui,
+        &catalog.t("settings.prompt_library", &[]),
+        Some(&catalog.t("settings.prompt_library.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut config.ui.prompt_library_enabled) {
+                *changed = true;
+            }
+        },
+    );
     agent_send_presets_section(ui, config, changed, catalog);
 }
 

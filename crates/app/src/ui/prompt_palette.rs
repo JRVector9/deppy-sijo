@@ -60,6 +60,11 @@ impl PromptPaletteUi {
         self.open
     }
 
+    /// 팔레트를 닫는다(설정에서 기능을 끌 때 호출).
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
     /// 팔레트를 그린다. 닫혀 있으면 아무것도 안 그리고 None. `composer_draft`는 "현재 컴포저
     /// 내용 저장"을 프리필하기 위한 활성 워크스페이스의 컴포저 입력이다. 삽입(Insert)은
     /// 팔레트를 닫고 컴포저로 돌아가지만, 저장/삭제(Upsert/Delete)는 계속 관리하도록

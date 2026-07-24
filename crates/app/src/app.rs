@@ -5814,6 +5814,11 @@ pub struct App {
     agent_terminal_ui: ui::agent_terminal::AgentTerminalUi,
     /// 멀티에이전트 fleet 그리드 (기능1) — Fleet 뷰에서 그린다.
     fleet_ui: ui::fleet::FleetUi,
+    /// 브로드캐스트 직후 대상 세션을 잠깐 "작업 중"으로 낙관적 표시하기 위한 타임스탬프
+    /// ((workspace_id, session) → 전송 시각). 전송했으니 지금 작업을 시작했다는 걸 아는데
+    /// transcript 감지에는 지연이 있어(warm은 아예 활동 추적 안 됨) 그 공백을 메운다.
+    /// BROADCAST_WORKING_WINDOW 안에서 감지 상태가 Idle/Off일 때만 Active로 덮는다.
+    broadcast_working: std::collections::HashMap<(String, runtime::SessionId), std::time::Instant>,
     /// 상태바·홈이 쓰는 activity_rows 500ms 캐시 — 매 프레임(타이핑 중 60~120fps)
     /// 전 워크스페이스 × 세션의 String/Vec 재조립을 피한다. 리소스 샘플 주기(2s)보다
     /// 짧아 표시 신선도는 유지된다.
@@ -8383,6 +8388,7 @@ impl App {
             activity_ui: ui::activity::ActivityUi::new(),
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             fleet_ui: ui::fleet::FleetUi::default(),
+            broadcast_working: std::collections::HashMap::new(),
             activity_rows_cache: None,
             status_feed_rx: status_feed_rx_channel.0,
             status_feed_refresh: status_feed_rx_channel.1,
@@ -14345,6 +14351,9 @@ impl App {
     /// (agent_activity/needs_input/turn_done)은 active에만 쓰고, warm은 workspace
     /// namespace가 있는 global_waiting에서 needs_input을 뽑아 넣는다(SessionId 재사용 안전).
     fn build_fleet_sessions(&self, text: &i18n::Catalog) -> Vec<crate::fleet::FleetSession> {
+        // 브로드캐스트 직후 낙관적 "작업 중" 윈도우. 감지가 따라잡거나 지나면 실제 상태로.
+        const BROADCAST_WORKING_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+        let now = std::time::Instant::now();
         let empty_activity: std::collections::HashMap<
             runtime::SessionId,
             crate::agent_transcript::AgentActivity,
@@ -14400,6 +14409,20 @@ impl App {
                     .iter()
                     .find(|(ws, s, _)| ws == &workspace.id && *s == session)
                     .and_then(|(_, _, message)| message.clone());
+                // 감지 상태. 브로드캐스트 직후 아직 Idle/Off로 보이면(감지 지연/​warm 미추적)
+                // 윈도우 안에서 Active로 덮는다 — Waiting/Done/Error 등 확정 상태는 그대로 둔다.
+                use crate::agent_surface::AgentVisualState;
+                let detected = AgentVisualState::from_pty(entry.status);
+                let optimistic = matches!(detected, AgentVisualState::Idle | AgentVisualState::Off)
+                    && self
+                        .broadcast_working
+                        .get(&(workspace.id.clone(), session))
+                        .is_some_and(|sent| now.duration_since(*sent) < BROADCAST_WORKING_WINDOW);
+                let state = if optimistic {
+                    AgentVisualState::Active
+                } else {
+                    detected
+                };
                 out.push(crate::fleet::FleetSession {
                     workspace_id: workspace.id.clone(),
                     workspace_name: workspace_name.clone(),
@@ -14407,7 +14430,7 @@ impl App {
                     tab: entry.tab,
                     pane: entry.pane,
                     title: entry.title,
-                    state: crate::agent_surface::AgentVisualState::from_pty(entry.status),
+                    state,
                     agent_line: entry.agent_line,
                     waiting_message,
                     active_workspace: active,
@@ -16530,8 +16553,14 @@ impl eframe::App for App {
             Some(ui::fleet::FleetAction::Broadcast { prompt, targets }) => {
                 // 저장된 프롬프트를 선택된 각 실행 중 에이전트에 컴포저 Send와 동일 경로로
                 // 주입한다(사용자가 대상·프롬프트를 명시적으로 고른 뒤에만 발행됨).
+                let now = std::time::Instant::now();
+                // 만료된 낙관적 마커 정리(윈도우보다 넉넉히 — 맵을 작게 유지).
+                self.broadcast_working
+                    .retain(|_, sent| now.duration_since(*sent) < std::time::Duration::from_secs(30));
                 for (workspace_id, session) in targets {
                     self.broadcast_prompt_to(&workspace_id, session, &prompt);
+                    // 방금 프롬프트를 보냈으니 잠깐 "작업 중"으로 낙관적 표시(감지 지연 메움).
+                    self.broadcast_working.insert((workspace_id, session), now);
                 }
             }
             None => {}

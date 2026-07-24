@@ -7,9 +7,17 @@
 //! 프라이버시를 건드리지 않는다.
 //!
 //! 이 파일은 순수 데이터 구조 + codec이다. Storage 링버퍼에 이를 앉히는(곁가지
-//! 배열 + compress_line/read_line) 것은 `storage.rs`이며, 트리거(누가 언제 압축을
-//! 호출하는가)는 아직 없다 — 후속 PR에서 연결한다.
+//! 배열 + compress_line/read_line) 것은 `storage.rs`이고, 트리거(feed 후
+//! compress_history, hidden/exited 전환 시 전체 압축)는 `crates/terminal`이 건다.
+//!
+//! **접근 계약(load-bearing)**: 압축된 슬롯의 `inner[idx]`는 길이 0 placeholder라,
+//! 원시 `Index<Line>`(및 이를 쓰는 상류 `Term::bounds_to_string`/`Term::search`/
+//! selection-to-string)로 접근하면 OOB 패닉한다. 압축 히스토리는 반드시 `read_line`
+//! (읽기)·`reset_row`/`inflate_all`(변경 전 복원)로만 접근해야 한다. 현재 앱은
+//! 스크롤백을 전적으로 `read_line`으로 순회하고 resize 전 `inflate_all`하므로 안전하다.
 
+// 대부분의 codec 표면이 crates/terminal 경로에서 쓰이지만, vendored 포크를 독립
+// (`--manifest-path`) 빌드할 때는 일부가 미사용으로 보여 경고가 난다.
 #![allow(dead_code)]
 
 use crate::index::Column;

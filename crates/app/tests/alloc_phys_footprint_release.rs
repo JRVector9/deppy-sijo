@@ -6,15 +6,13 @@
 //!   -- --ignored --nocapture
 //! ```
 //!
-//! ## 왜 통합 테스트인가
-//! deppy-sijo bin의 unittest 타깃(`src/main.rs`)은 `--release`에서 컴파일되지
-//! 않는다 — `src/ui/file_tree.rs`의 한 테스트가 egui `Style::debug` 필드를
-//! `#[cfg(debug_assertions)]` 가드 없이 접근하는데, 그 필드는 egui 쪽에서
-//! `debug_assertions`로 게이트돼 release egui에는 없기 때문이다(이 할당자 작업과
-//! 무관한 기존 이슈). alloc 모듈의 unit test는 그래서 debug로만 돌릴 수 있다.
-//! 이 통합 테스트는 별도 크레이트라 file_tree.rs를 끌어오지 않아 release에서 그대로
-//! 빌드되며, 앱이 설치하는 것과 **동일한** `mimalloc::MiMalloc`를 글로벌 할당자로
-//! 선언해 release 조건의 반환 수치를 확보한다.
+//! ## 왜 별도 통합 테스트 크레이트인가
+//! 별도 test 크레이트라 앱이 설치하는 것과 **동일한** `mimalloc::MiMalloc`를 자기
+//! 글로벌 할당자로 선언해, bin unittest와 독립적으로 release 조건의 반환 수치를
+//! 격리 측정한다. (참고: 예전에는 `file_tree.rs`의 한 테스트가 egui `Style::debug`를
+//! `#[cfg(debug_assertions)]` 가드 없이 접근해 bin unittest가 release에서 컴파일되지
+//! 않았으나, 지금은 그 테스트가 가드돼 해소됐다. 그래도 이 격리 크레이트가 할당자
+//! 측정에는 더 깔끔하다.)
 
 // 앱(crates/app/src/alloc.rs)이 설치하는 것과 같은 타입. 통합 테스트는 별도 바이너리라
 // 자체 #[global_allocator] 선언이 필요하다(앱 main.rs의 선언과 충돌하지 않는다).

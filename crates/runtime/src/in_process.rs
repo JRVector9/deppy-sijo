@@ -1692,7 +1692,16 @@ impl Worker {
                     if let Some(event) = active.resize(cols, rows) {
                         trace_terminal_cache_event(session, event);
                     }
+                    // hidden/exited 세션 resize는 cache class 재적용(compress_history(0))으로
+                    // reflow가 만든 raw 셀을 해제한다 — 그 페이지를 OS로 반환하도록 신호.
+                    let freed_scrollback = matches!(
+                        active.cache_class(),
+                        TerminalCacheClass::Hidden | TerminalCacheClass::Exited
+                    );
                     self.save_terminal_size(session, cols, rows);
+                    if freed_scrollback {
+                        crate::signal_memory_released();
+                    }
                 }
             }
             RuntimeCommand::Scroll { session, delta } => {
@@ -2803,12 +2812,12 @@ impl Worker {
                     } else {
                         TerminalCacheClass::Exited
                     };
-                if active.cache_class() != class
-                    && let Some(event) = active.set_cache_class(class)
-                {
-                    trace_terminal_cache_event(active.id(), event);
+                if active.cache_class() != class {
+                    if let Some(event) = active.set_cache_class(class) {
+                        trace_terminal_cache_event(active.id(), event);
+                    }
                     // Exited 전환은 스크롤백을 전체 압축·트림해 셀 배열을 해제한다 —
-                    // 해제 페이지를 OS로 돌려주도록 purge 훅을 부른다.
+                    // 트림 이벤트 유무와 무관하게 해제 페이지를 OS로 돌려주도록 신호한다.
                     if class == TerminalCacheClass::Exited {
                         crate::signal_memory_released();
                     }
@@ -2960,10 +2969,13 @@ impl Worker {
             } else {
                 self.hidden_scrollback.remove(&id);
             }
-            if session.cache_class() != class
-                && let Some(event) = session.set_cache_class(class)
-            {
-                trace_terminal_cache_event(id, event);
+            if session.cache_class() != class {
+                if let Some(event) = session.set_cache_class(class) {
+                    trace_terminal_cache_event(id, event);
+                }
+                // Hidden/Exited 전환은 compress_history(0)로 HOT 창까지 셀 배열을
+                // 해제한다 — 트림 이벤트 유무와 무관하게(작은 스크롤백은 이벤트 없이도
+                // 해제됨) 신호한다.
                 if matches!(class, TerminalCacheClass::Hidden | TerminalCacheClass::Exited) {
                     freed_memory = true;
                 }
@@ -2980,6 +2992,11 @@ impl Worker {
     /// 복원한다. 직렬화 미지원 백엔드만 기존대로 drop + pane detach
     /// ("연결 중…" 갇힘 방지 — codex 리뷰의 detach 사유는 복원 훅이 대신한다).
     fn archive_over_cap(&mut self) {
+        // 아카이브는 백엔드를 통째로 드롭해(그리드+히스토리 전체) 압축 경로보다 훨씬
+        // 많은 셀 배열을 해제한다. mimalloc은 명시적 purge 없이는 그 페이지를 OS로
+        // 반환하지 않으므로(실측), 세션이 하나라도 제거됐으면 끝에서 purge를 신호한다.
+        // archive_over_cap은 세션을 제거만 하고 추가하지 않으므로 len 감소 = 아카이브.
+        let sessions_before = self.sessions.len();
         // 현재 보이는(active tab의) pane 세션은 archive하지 않는다 — split이면
         // 비포커스 pane도 화면에 있어 사용자가 그 scrollback을 보는 중일 수 있다
         // (codex 리뷰: focused 하나만 제외하면 부족). watched = visible.
@@ -3045,6 +3062,10 @@ impl Worker {
         }
         if detached_any {
             self.emit_mux_snapshot();
+        }
+        // 세션이 하나라도 아카이브(제거)됐으면 해제된 백엔드 페이지를 OS로 반환한다.
+        if self.sessions.len() < sessions_before {
+            crate::signal_memory_released();
         }
     }
 

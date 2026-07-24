@@ -253,16 +253,21 @@ const HOT_SCROLLBACK_LINES: usize = 256;
 /// 예산 역산(`history_lines_for_byte_budget`)은 화면 rows + HOT 창은 비압축 전액으로,
 /// 그보다 오래된 히스토리는 라인당 `bytes_per_line / 이 값`만큼만 든다고 보고 담을 줄
 /// 수를 늘린다. 실측(`compression_rss_probe`)의 현실 로그류 압축비는 ~30배지만, 색이
-/// 자주 바뀌어 run-length가 잘 안 되는 콘텐츠는 그보다 훨씬 덜 압축된다. 그래서 최선의
-/// 30배가 아니라 **4배**만 가정한다 — 실측 대비 7배 이상의 안전 여유를 남기면서도, 색이
-/// 섞인(수 배로만 압축되는) 출력에서도 예산을 지키는 값이다.
+/// 자주 바뀌어 run-length가 잘 안 되는 콘텐츠는 그보다 훨씬 덜 압축된다.
 ///
-/// 안전성 한계: 압축 행의 `AttrRun`(12B)이 `Cell`(24B)의 절반이라, 셀마다 색이 다른
-/// **극단적** 콘텐츠는 run당 텍스트까지 더해도 겨우 ~1.5–1.9배로만 압축된다. 그런 병리적
-/// 입력은 어떤 유용한 divisor로도 라인당 비용을 다 못 덮으므로, 최종 방어선은 (a) 절대
-/// 상한인 `TerminalCacheBudget::max_scrollback_lines`(줄 수 캡)과 (b) `cache_footprint`가
-/// **실제** 압축 곁가지 바이트를 보고해 전역 128MB 강제가 진짜 메모리에 반응하는 것이다.
-const SCROLLBACK_COMPRESSION_DIVISOR: usize = 4;
+/// 안전성 한계(정직히): 압축 행의 `AttrRun`(12B) + 텍스트(1B/셀)라, **셀마다 색이 다른**
+/// 병리적 콘텐츠는 라인당 ~13B/셀 → `Cell`(24B) 대비 겨우 **~1.86배**로만 압축된다. 즉
+/// 어떤 divisor>1도 그런 콘텐츠로 캡을 가득 채우면 per-session 바이트 예산을 넘는다.
+/// **2**로 잡아(4에서 하향) 그 최악을 완화한다 — 200열 Visible 기준 캡을 이전 ~3,448줄
+/// 대비 ~6,600줄로 늘리면서(현실 콘텐츠엔 순기능), 병리적 최악은 예산의 ~1.66배(divisor 4)
+/// 에서 ~1.1배로 줄인다. 현실 로그류(~30배)에선 여유가 넘친다.
+///
+/// 최종 방어선: (a) 절대 상한 `TerminalCacheBudget::max_scrollback_lines`(줄 수 캡), (b)
+/// `cache_footprint`가 **실제** 압축 곁가지 바이트를 정확히 보고. 단, 전역 128MB 강제는
+/// 현재 **exited 세션만** 아카이브해 회수하므로(`exited_to_archive_for_budget`), live
+/// visible/hidden 세션은 이 강제로 회수되지 않는다 — 병리적 live 세션을 실제로 bound하려면
+/// live 세션 scrollback trim 경로가 필요하다(runaway 보호 로드맵 후속 과제).
+const SCROLLBACK_COMPRESSION_DIVISOR: usize = 2;
 
 impl TerminalBackend for AlacrittyBackend {
     fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<TerminalChangeSet> {

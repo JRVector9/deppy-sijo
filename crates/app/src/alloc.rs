@@ -15,11 +15,14 @@
 //! 앱은 macOS + Windows/MSVC를 모두 타깃한다. jemalloc(tikv-jemallocator)은
 //! Windows/MSVC를 지원하지 않으므로 배제했다. mimalloc은 두 플랫폼 모두 지원한다.
 //!
-//! ## 설정 정책 — 보수적
+//! ## 설정 정책 — 보수적 + 명시적 purge 필수
 //! mimalloc 기본값을 그대로 쓴다(`purge_delay=10ms`, `purge_decommits=1`,
-//! `arena_purge_mult=10`). 자동 백그라운드 반환은 이 지연을 따르고(steady-state
-//! 스래싱 회피), **즉시** 반환이 필요한 순간(메모리 압박 격상)에는 [`purge`]로
-//! `mi_collect(true)`를 호출해 지연을 무시하고 강제 decommit한다.
+//! `arena_purge_mult=10`). **중요(실측)**: `purge_delay` 기반 자동 백그라운드 반환은
+//! idle 프리(더는 alloc/free 활동이 없는 해제)에는 신뢰할 수 없다 — 200MB 해제 후
+//! 500ms busy-wait + 소량 alloc churn에도 반환 0MB였다(`scrollback_rss_end_to_end`의
+//! `mimalloc은_명시_purge_없이도_자동_반환하는가` 진단). 따라서 스크롤백을 해제하는
+//! 순간(hidden/exited 전환·아카이브·압박 격상)마다 [`purge`]로 `mi_collect(true)`를
+//! 명시 호출해 지연을 무시하고 강제 decommit한다 — 이게 실제 반환 경로다.
 //! 자동 반환을 더 공격적으로 하려면 프로세스 시작 전 환경변수
 //! `MIMALLOC_PURGE_DELAY=0`을 설정하면 된다(코드에 하드코딩하지 않는다 —
 //! purge_delay의 enum 인덱스가 mimalloc v2/v3 간 다르고 libmimalloc-sys 0.1.49의

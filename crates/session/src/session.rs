@@ -519,6 +519,12 @@ impl Session {
         self.backend.set_cache_class(class)
     }
 
+    /// 메모리 압박 하에서 스크롤백을 클래스 예산 아래로 강제 축소한다(전역 예산이
+    /// exited 아카이브만으로 안 맞을 때 live 세션 트림용). 이미 그 이하면 None.
+    pub fn trim_scrollback(&mut self, max_lines: usize) -> Option<TerminalCacheEvent> {
+        self.backend.trim_scrollback(max_lines)
+    }
+
     pub fn cache_class(&self) -> TerminalCacheClass {
         self.cache_class
     }

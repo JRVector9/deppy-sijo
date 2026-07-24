@@ -184,6 +184,14 @@ pub trait TerminalBackend {
 
     fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent>;
 
+    /// 메모리 압박 하에서 스크롤백을 클래스 예산 **아래로** 강제 축소한다 — 가장 오래된
+    /// 히스토리를 `max_lines`까지 드롭하고 남은 것을 전부 압축한다. 전역 예산이 exited
+    /// 아카이브만으로 안 맞을 때 live 세션을 예산 안으로 넣는 경로. 이미 `max_lines`
+    /// 이하면 `None`. 기본 구현은 no-op(미지원 백엔드).
+    fn trim_scrollback(&mut self, _max_lines: usize) -> Option<TerminalCacheEvent> {
+        None
+    }
+
     fn cache_class(&self) -> TerminalCacheClass;
 
     fn cache_footprint(&self) -> TerminalCacheFootprint;

@@ -479,6 +479,32 @@ impl TerminalBackend for AlacrittyBackend {
         self.apply_cache_class(class)
     }
 
+    fn trim_scrollback(&mut self, max_lines: usize) -> Option<TerminalCacheEvent> {
+        let target = self.active_scrollback_limit.min(max_lines);
+        if target >= self.active_scrollback_limit {
+            return None; // 이미 그 이하 — 더 줄일 것 없음
+        }
+        let before = self.cache_footprint();
+        // 스크롤백 상한을 낮춰 가장 오래된 히스토리를 드롭한다.
+        self.term.set_options(Config {
+            scrolling_history: target,
+            ..Config::default()
+        });
+        self.active_scrollback_limit = target;
+        // 남은 히스토리를 HOT 창까지 전부 압축해 최대한 회수한다(압박 하 최후 수단).
+        self.term.grid_mut().compress_history(0);
+        let after = self.cache_footprint();
+        (after.estimated_bytes < before.estimated_bytes
+            || after.history_lines < before.history_lines)
+            .then_some(TerminalCacheEvent {
+                kind: TerminalCacheEventKind::ScrollbackLimitApplied,
+                class: self.cache_class,
+                budget: TerminalCacheBudget::for_class(self.cache_class),
+                before,
+                after,
+            })
+    }
+
     fn cache_class(&self) -> TerminalCacheClass {
         self.cache_class
     }
@@ -1587,6 +1613,38 @@ mod tests {
             compressed_snap.visible_cells, inflated_snap.visible_cells,
             "압축/비압축 뷰포트 셀 불일치"
         );
+    }
+
+    /// (PR-2) trim_scrollback은 스크롤백을 클래스 예산 아래로 줄이고 메모리를 회수하며,
+    /// 이미 그 이하면 no-op이다.
+    #[test]
+    fn deppy_trim_scrollback는_스크롤백을_줄이고_회수한다() {
+        let mut a = AlacrittyBackend::new(200, 40, 10_000);
+        for i in 0..2000 {
+            feed(&mut a, format!("line{i}\r\n").as_bytes());
+        }
+        let before = a.cache_footprint();
+        assert!(before.history_lines > 1000, "사전 조건: 충분한 히스토리");
+
+        // 200줄로 강제 트림.
+        let event = a.trim_scrollback(200);
+        assert!(event.is_some(), "트림 이벤트가 나와야 함");
+        let after = a.cache_footprint();
+        assert!(
+            after.history_lines <= 200 + a.term.screen_lines(),
+            "히스토리가 안 줄음: {}",
+            after.history_lines
+        );
+        assert!(
+            after.estimated_bytes < before.estimated_bytes,
+            "메모리 회수 안 됨: {} -> {}",
+            before.estimated_bytes,
+            after.estimated_bytes
+        );
+
+        // 이미 그 이하: 재트림·상향은 no-op.
+        assert!(a.trim_scrollback(200).is_none(), "재트림이 이벤트를 냄");
+        assert!(a.trim_scrollback(10_000).is_none(), "상향 요청은 no-op이어야");
     }
 
     /// (B-M2) 배경 feed를 계속 받는 hidden 세션은 feed의 compress_history(HOT)로 최근

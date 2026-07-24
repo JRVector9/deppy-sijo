@@ -74,20 +74,21 @@ impl PromptPaletteUi {
         ctx: &egui::Context,
         library: &PromptLibrary,
         composer_draft: &str,
+        catalog: &i18n::Catalog,
     ) -> Option<PromptPaletteAction> {
         if !self.open {
             return None;
         }
         let mut action = None;
         let mut open = true;
-        egui::Window::new("프롬프트 라이브러리")
+        egui::Window::new(catalog.t("prompt.title", &[]))
             .id(egui::Id::new("prompt_palette"))
             .collapsible(false)
             .resizable(true)
             .default_width(560.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                action = self.body(ui, library, composer_draft);
+                action = self.body(ui, library, composer_draft, catalog);
             });
         // Esc: 편집 중이면 폼만 닫고(목록/상세로 복귀), 아니면 팔레트를 닫는다.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -108,29 +109,36 @@ impl PromptPaletteUi {
         ui: &mut egui::Ui,
         library: &PromptLibrary,
         composer_draft: &str,
+        catalog: &i18n::Catalog,
     ) -> Option<PromptPaletteAction> {
         if self.editing.is_some() {
-            return self.edit_form(ui, library);
+            return self.edit_form(ui, library, catalog);
         }
         match self.selected.clone().and_then(|id| library.get(&id)) {
-            Some(prompt) => self.detail_view(ui, prompt),
+            Some(prompt) => self.detail_view(ui, prompt, catalog),
             None => {
-                self.list_view(ui, library, composer_draft);
+                self.list_view(ui, library, composer_draft, catalog);
                 None
             }
         }
     }
 
     /// 목록: 상단 액션(새 프롬프트/컴포저 내용 저장) + 검색 + 선택.
-    fn list_view(&mut self, ui: &mut egui::Ui, library: &PromptLibrary, composer_draft: &str) {
+    fn list_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &PromptLibrary,
+        composer_draft: &str,
+        catalog: &i18n::Catalog,
+    ) {
         ui.horizontal(|ui| {
-            if ui.button("+ 새 프롬프트").clicked() {
+            if ui.button(catalog.t("prompt.new", &[])).clicked() {
                 self.editing = Some(PromptDraft::default());
             }
             if !composer_draft.trim().is_empty()
                 && ui
-                    .button("+ 컴포저 내용 저장")
-                    .on_hover_text("현재 컴포저 입력을 새 프롬프트로 저장")
+                    .button(catalog.t("prompt.save_from_composer", &[]))
+                    .on_hover_text(catalog.t("prompt.save_from_composer.hint", &[]))
                     .clicked()
             {
                 self.editing = Some(PromptDraft {
@@ -144,7 +152,7 @@ impl PromptPaletteUi {
         ui.separator();
         let search = ui.add(
             egui::TextEdit::singleline(&mut self.query)
-                .hint_text("프롬프트 검색…")
+                .hint_text(catalog.t("prompt.search", &[]))
                 .desired_width(f32::INFINITY),
         );
         if self.focus_search {
@@ -154,7 +162,7 @@ impl PromptPaletteUi {
         ui.add_space(4.0);
         let matches = library.search(&self.query);
         if matches.is_empty() {
-            ui.weak("일치하는 프롬프트가 없습니다.");
+            ui.weak(catalog.t("prompt.no_match", &[]));
         } else {
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                 for prompt in matches {
@@ -178,10 +186,15 @@ impl PromptPaletteUi {
     }
 
     /// 상세: 파라미터 채우기 + 미리보기 + 삽입/편집/삭제.
-    fn detail_view(&mut self, ui: &mut egui::Ui, prompt: &Prompt) -> Option<PromptPaletteAction> {
+    fn detail_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        prompt: &Prompt,
+        catalog: &i18n::Catalog,
+    ) -> Option<PromptPaletteAction> {
         let mut action = None;
         ui.horizontal(|ui| {
-            if ui.button("← 목록").clicked() {
+            if ui.button(catalog.t("prompt.back", &[])).clicked() {
                 self.selected = None;
                 self.confirm_delete = false;
                 self.focus_search = true; // 목록 복귀 시 검색창 재포커스(PR-2 리뷰 Low).
@@ -191,7 +204,7 @@ impl PromptPaletteUi {
         ui.separator();
         let names = prompt.params();
         if names.is_empty() {
-            ui.weak("파라미터 없음");
+            ui.weak(catalog.t("prompt.no_params", &[]));
         } else {
             egui::Grid::new("prompt_params").num_columns(2).show(ui, |ui| {
                 for name in &names {
@@ -202,7 +215,7 @@ impl PromptPaletteUi {
             });
         }
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("미리보기").small().weak());
+        ui.label(egui::RichText::new(catalog.t("prompt.preview", &[])).small().weak());
         let rendered = crate::prompt_library::render(&prompt.body, &self.params);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.add(egui::Label::new(egui::RichText::new(&rendered).monospace()).wrap());
@@ -213,12 +226,12 @@ impl PromptPaletteUi {
             .all(|n| self.params.get(n).is_some_and(|v| !v.trim().is_empty()));
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(ready, egui::Button::new("컴포저에 삽입 ↵"))
+                .add_enabled(ready, egui::Button::new(catalog.t("prompt.insert", &[])))
                 .clicked()
             {
                 action = Some(PromptPaletteAction::Insert(rendered.clone()));
             }
-            if ui.button("편집").clicked() {
+            if ui.button(catalog.t("prompt.edit", &[])).clicked() {
                 self.editing = Some(PromptDraft {
                     id: Some(prompt.id.clone()),
                     title: prompt.title.clone(),
@@ -227,25 +240,25 @@ impl PromptPaletteUi {
                 });
                 self.confirm_delete = false;
             }
-            if !self.confirm_delete && ui.button("삭제").clicked() {
+            if !self.confirm_delete && ui.button(catalog.t("prompt.delete", &[])).clicked() {
                 self.confirm_delete = true;
             }
         });
         if self.confirm_delete {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().warn_fg_color, "삭제할까요?");
-                if ui.button("확정 삭제").clicked() {
+                ui.colored_label(ui.visuals().warn_fg_color, catalog.t("prompt.delete_confirm", &[]));
+                if ui.button(catalog.t("prompt.delete_yes", &[])).clicked() {
                     action = Some(PromptPaletteAction::Delete(prompt.id.clone()));
                     self.selected = None;
                     self.confirm_delete = false;
                 }
-                if ui.button("취소").clicked() {
+                if ui.button(catalog.t("prompt.cancel", &[])).clicked() {
                     self.confirm_delete = false;
                 }
             });
         } else if !ready {
-            ui.weak("삽입하려면 모든 파라미터를 채우세요");
+            ui.weak(catalog.t("prompt.fill_params", &[]));
         }
         action
     }
@@ -255,19 +268,20 @@ impl PromptPaletteUi {
         &mut self,
         ui: &mut egui::Ui,
         library: &PromptLibrary,
+        catalog: &i18n::Catalog,
     ) -> Option<PromptPaletteAction> {
         let mut save = false;
         let mut cancel = false;
         {
             let draft = self.editing.as_mut().expect("editing.is_some() checked");
             ui.horizontal(|ui| {
-                if ui.button("← 취소").clicked() {
+                if ui.button(catalog.t("prompt.form.cancel", &[])).clicked() {
                     cancel = true;
                 }
                 ui.strong(if draft.id.is_some() {
-                    "프롬프트 편집"
+                    catalog.t("prompt.form.edit_title", &[])
                 } else {
-                    "새 프롬프트"
+                    catalog.t("prompt.form.new_title", &[])
                 });
             });
             ui.separator();
@@ -275,46 +289,51 @@ impl PromptPaletteUi {
                 .num_columns(2)
                 .spacing([8.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("제목");
+                    ui.label(catalog.t("prompt.form.title", &[]));
                     ui.add(
                         egui::TextEdit::singleline(&mut draft.title)
                             .desired_width(f32::INFINITY)
-                            .hint_text("예: PR 리뷰"),
+                            .hint_text(catalog.t("prompt.form.title_hint", &[])),
                     );
                     ui.end_row();
-                    ui.label("태그");
+                    ui.label(catalog.t("prompt.form.tags", &[]));
                     ui.add(
                         egui::TextEdit::singleline(&mut draft.tags)
                             .desired_width(f32::INFINITY)
-                            .hint_text("공백/쉼표 구분 (예: git review)"),
+                            .hint_text(catalog.t("prompt.form.tags_hint", &[])),
                     );
                     ui.end_row();
                 });
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("본문 — {{param}} 으로 파라미터 지정").small().weak());
+            ui.label(egui::RichText::new(catalog.t("prompt.form.body", &[])).small().weak());
             ui.add(
                 egui::TextEdit::multiline(&mut draft.body)
                     .desired_rows(7)
                     .desired_width(f32::INFINITY)
                     .code_editor()
-                    .hint_text("이 브랜치의 변경을 리뷰해줘. 특히 {{focus}} …"),
+                    .hint_text(catalog.t("prompt.form.body_hint", &[])),
             );
             let names = crate::prompt_library::param_names(&draft.body);
             if !names.is_empty() {
                 ui.label(
-                    egui::RichText::new(format!("파라미터: {}", names.join(", ")))
-                        .small()
-                        .weak(),
+                    egui::RichText::new(
+                        catalog.t("prompt.form.params", &[("names", &names.join(", "))]),
+                    )
+                    .small()
+                    .weak(),
                 );
             }
             ui.add_space(8.0);
             let can_save = !draft.title.trim().is_empty() && !draft.body.trim().is_empty();
             ui.horizontal(|ui| {
-                if ui.add_enabled(can_save, egui::Button::new("저장")).clicked() {
+                if ui
+                    .add_enabled(can_save, egui::Button::new(catalog.t("prompt.form.save", &[])))
+                    .clicked()
+                {
                     save = true;
                 }
                 if !can_save {
-                    ui.weak("제목과 본문을 채우세요");
+                    ui.weak(catalog.t("prompt.form.fill", &[]));
                 }
             });
         }

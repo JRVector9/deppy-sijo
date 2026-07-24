@@ -227,9 +227,15 @@ impl FleetUi {
                 }
             }
         });
-        // ④ 전송.
+        // ④ 전송 — 현재 세션과 교집합만 보낸다. 패널 연 뒤 종료된 stale 대상을 제외해
+        // 카운트가 실제 전송 수와 일치하게 한다(세션 순회 순서라 결정적).
         ui.add_space(6.0);
-        let count = state.targets.len();
+        let effective_targets: Vec<(String, runtime::SessionId)> = sessions
+            .iter()
+            .map(|s| (s.workspace_id.clone(), s.session))
+            .filter(|key| state.targets.contains(key))
+            .collect();
+        let count = effective_targets.len();
         let can_send = ready_prompt.is_some() && count > 0;
         let mut out = None;
         ui.horizontal(|ui| {
@@ -245,7 +251,7 @@ impl FleetUi {
             {
                 out = Some(FleetAction::Broadcast {
                     prompt: prompt_text,
-                    targets: state.targets.iter().cloned().collect(),
+                    targets: effective_targets,
                 });
             }
             if !can_send {

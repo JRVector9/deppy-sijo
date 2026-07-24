@@ -15,6 +15,7 @@ mod config;
 mod dotenv_sync;
 mod env;
 mod env_reload;
+mod fleet;
 mod fonts;
 mod git_cli;
 mod lazy_worker;

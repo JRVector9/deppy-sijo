@@ -13,7 +13,7 @@ unicode-normalization = { workspace = true }
 egui = { workspace = true }
 # LibGhosttyBackend (v1.x experimental, A/B 실측용) — 빌드에 Zig 툴체인 필요해 opt-in.
 # macOS 26.4 SDK에서는 zig 0.15.2 우회 필요 (scripts/… fake xcrun) — 기본 빌드 무관.
-libghostty-vt = { version = "0.1", optional = true }
+libghostty-vt = { version = "0.2", optional = true }
 
 [features]
 ghostty-backend = ["dep:libghostty-vt"]

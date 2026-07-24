@@ -75,6 +75,44 @@ impl PromptLibrary {
     pub fn get(&self, id: &str) -> Option<&Prompt> {
         self.prompts.iter().find(|p| p.id == id)
     }
+
+    /// 첫 실행(저장 파일 없음)에서 팔레트가 비지 않도록 채우는 예시 프롬프트들.
+    pub fn default_seed() -> Self {
+        let p = |id: &str, title: &str, body: &str, tags: &[&str]| Prompt {
+            id: id.into(),
+            title: title.into(),
+            body: body.into(),
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+        };
+        Self {
+            prompts: vec![
+                p(
+                    "review-branch",
+                    "브랜치 리뷰",
+                    "이 브랜치의 변경을 리뷰해줘. 특히 {{focus}}를 중점으로 보고 버그·엣지케이스·테스트 누락을 짚어줘.",
+                    &["review", "git"],
+                ),
+                p(
+                    "add-tests",
+                    "테스트 추가",
+                    "{{module}}에 대한 단위 테스트를 추가해줘. 경계값과 실패 경로를 포함하고 기존 테스트 스타일을 따라줘.",
+                    &["test"],
+                ),
+                p(
+                    "explain-error",
+                    "에러 설명",
+                    "방금 출력된 에러의 원인을 설명하고 최소 수정안을 제안해줘.",
+                    &["debug"],
+                ),
+                p(
+                    "commit-msg",
+                    "커밋 메시지",
+                    "지금 staged 변경에 대한 한국어 커밋 메시지를 conventional commits 형식으로 써줘.",
+                    &["git"],
+                ),
+            ],
+        }
+    }
 }
 
 /// `body`의 `{{name}}` 파라미터 이름을 등장 순서로, 중복 없이 뽑는다. name은

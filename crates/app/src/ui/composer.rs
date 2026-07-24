@@ -358,6 +358,14 @@ impl ComposerUi {
         }
     }
 
+    /// 프롬프트 라이브러리 팔레트가 고른 텍스트를 활성 워크스페이스의 컴포저 버퍼에
+    /// 삽입한다(끝에 경계 공백 보정). 실제 전송은 기존 Send 경로(사용자 검토 후)가 한다.
+    pub fn insert_text(&mut self, active_workspace: &str, text: &str) {
+        let buffer = self.buffers.entry(active_workspace.to_owned()).or_default();
+        let _ = insert_snippet(buffer, None, text);
+        self.request_focus();
+    }
+
     /// App host가 clipboard/image 변환을 완료한 뒤 bounded path 결과를 돌려준다.
     /// 현재 latest request와 정확히 일치하지 않는 늦은 결과는 path materialization 전에
     /// 버린다. 취소/실패/limit 초과는 placeholder 제거로 fail-closed 처리한다.

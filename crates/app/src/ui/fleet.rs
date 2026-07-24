@@ -17,6 +17,8 @@ pub enum FleetAction {
         tab: runtime::MuxTabId,
         pane: runtime::MuxPaneId,
     },
+    /// 새 에이전트 시작 — App이 에이전트 패널을 연다(fleet에 세션을 추가하는 진입점).
+    LaunchAgent,
 }
 
 #[derive(Default)]
@@ -34,7 +36,9 @@ impl FleetUi {
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::symmetric(16, 14))
             .show(ui, |ui| {
-                header(ui, summary);
+                if header(ui, summary) {
+                    action = Some(FleetAction::LaunchAgent);
+                }
                 ui.add_space(12.0);
                 if sessions.is_empty() {
                     ui.add_space(48.0);
@@ -48,6 +52,10 @@ impl FleetUi {
                             .weak()
                             .small(),
                         );
+                        ui.add_space(12.0);
+                        if ui.button("+ 새 에이전트").clicked() {
+                            action = Some(FleetAction::LaunchAgent);
+                        }
                     });
                     return;
                 }
@@ -71,12 +79,18 @@ impl FleetUi {
     }
 }
 
-/// 상단 헤더: 제목 + 총계 + 상태별 칩.
-fn header(ui: &mut egui::Ui, summary: FleetSummary) {
+/// 상단 헤더: 제목 + 총계 + (우측) 새 에이전트 버튼 + 상태별 칩. 버튼 클릭 시 true.
+fn header(ui: &mut egui::Ui, summary: FleetSummary) -> bool {
+    let mut launch = false;
     ui.horizontal(|ui| {
         ui.heading("에이전트 Fleet");
         ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("{}개 세션", summary.total)).weak());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("+ 새 에이전트").clicked() {
+                launch = true;
+            }
+        });
     });
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
@@ -86,6 +100,7 @@ fn header(ui: &mut egui::Ui, summary: FleetSummary) {
         chip(ui, AgentVisualState::Active, "작업 중", summary.working);
         chip(ui, AgentVisualState::Idle, "유휴", summary.idle);
     });
+    launch
 }
 
 /// 상태별 칩 — 색 점 + "라벨 n". 0이면 흐리게(회색) 표시.

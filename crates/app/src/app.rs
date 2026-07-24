@@ -16441,20 +16441,28 @@ impl eframe::App for App {
             self.agent_terminal_ui
                 .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
         }
-        // fleet 카드 클릭 → 터미널로 복귀 후 해당 세션 포커스(사이드바 FocusSession과 동일).
-        if let Some(ui::fleet::FleetAction::Focus {
-            workspace_id,
-            tab,
-            pane,
-        }) = fleet_action
-        {
-            self.agent_terminal_ui
-                .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-            self.stage_workspace_controller_action(WorkspaceControllerAction::FocusSession {
+        // fleet 액션 처리 — 카드 클릭은 세션 포커스, 새 에이전트는 에이전트 패널 열기.
+        match fleet_action {
+            Some(ui::fleet::FleetAction::Focus {
                 workspace_id,
                 tab,
                 pane,
-            });
+            }) => {
+                // 터미널로 복귀 후 해당 세션 포커스(사이드바 FocusSession과 동일).
+                self.agent_terminal_ui
+                    .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                self.stage_workspace_controller_action(WorkspaceControllerAction::FocusSession {
+                    workspace_id,
+                    tab,
+                    pane,
+                });
+            }
+            Some(ui::fleet::FleetAction::LaunchAgent) => {
+                // 에이전트 패널을 연다(fleet에 세션을 추가하는 진입점). 패널은 떠 있는
+                // 창이라 fleet 뷰 위에서 바로 쓸 수 있다.
+                self.agent_sessions_ui.open();
+            }
+            None => {}
         }
         // take/put-back 마무리 — 위 take에서 꺼낸 rows를 타임스탬프 그대로 되돌린다.
         self.activity_rows_cache = Some((activity_rows_stamp, activity_rows));

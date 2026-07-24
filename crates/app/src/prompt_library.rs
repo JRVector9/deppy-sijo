@@ -8,10 +8,6 @@
 //! 이 데이터로 UI를 그리고, `app.rs`가 치환 결과를 composer/WriteInput 경로로 주입한다
 //! — 기존 leaf+intent+host I/O 경계와 동일하다.
 
-// PR-1은 데이터 모델·로직만이다. 팔레트/composer 배선(실사용)은 PR-2에서 붙는다 —
-// 그전까지 미사용 항목이 있어 경고를 억제한다(compressed.rs 선례와 동일 정책).
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -74,6 +70,42 @@ impl PromptLibrary {
 
     pub fn get(&self, id: &str) -> Option<&Prompt> {
         self.prompts.iter().find(|p| p.id == id)
+    }
+
+    /// 새 프롬프트에 부여할 라이브러리 내 유일한 id를 title 슬러그로 만든다. 슬러그가
+    /// 비면(예: 한글 전용 제목) `prompt`를 쓰고, 충돌 시 `-2`, `-3`…을 붙인다. id는
+    /// 내부 식별자일 뿐 화면에는 title이 나온다.
+    pub fn fresh_id(&self, title: &str) -> String {
+        let base = slugify(title);
+        let base = if base.is_empty() {
+            "prompt".to_owned()
+        } else {
+            base
+        };
+        if self.get(&base).is_none() {
+            return base;
+        }
+        let mut n = 2;
+        loop {
+            let candidate = format!("{base}-{n}");
+            if self.get(&candidate).is_none() {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// id가 같은 프롬프트가 있으면 교체(편집), 없으면 추가(신규)한다.
+    pub fn upsert(&mut self, prompt: Prompt) {
+        match self.prompts.iter_mut().find(|p| p.id == prompt.id) {
+            Some(existing) => *existing = prompt,
+            None => self.prompts.push(prompt),
+        }
+    }
+
+    /// id로 프롬프트를 삭제한다(없으면 무시).
+    pub fn delete(&mut self, id: &str) {
+        self.prompts.retain(|p| p.id != id);
     }
 
     /// 첫 실행(저장 파일 없음)에서 팔레트가 비지 않도록 채우는 예시 프롬프트들.
@@ -166,6 +198,36 @@ fn is_param_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// title → id 슬러그. ASCII 영숫자는 소문자로 남기고 나머지는 `-`로 접은 뒤 앞뒤·중복
+/// `-`를 정리한다. 비-ASCII만 있는 제목은 빈 슬러그가 되며 호출부가 fallback을 쓴다.
+fn slugify(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut prev_dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
+
+/// 편집 폼의 태그 입력(공백·쉼표 구분)을 정규화한다. 트림·빈값 제거·중복 제거하고
+/// 입력 순서를 보존한다.
+pub fn parse_tags(input: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in input.split([',', ' ', '\t', '\n']) {
+        let tag = tag.trim();
+        if !tag.is_empty() && !out.iter().any(|t| t == tag) {
+            out.push(tag.to_owned());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +295,53 @@ mod tests {
         assert_eq!(lib.search("TEST").len(), 1); // 제목 "Add tests"
         assert_eq!(lib.search("git").len(), 1); // 태그
         assert_eq!(lib.search("").len(), 2); // 빈 쿼리 = 전체
+    }
+
+    #[test]
+    fn fresh_id_슬러그화와_충돌회피() {
+        let mut lib = PromptLibrary::default();
+        assert_eq!(lib.fresh_id("Review PR"), "review-pr");
+        // 한글 전용 제목 → 빈 슬러그 → fallback "prompt"
+        assert_eq!(lib.fresh_id("브랜치 리뷰"), "prompt");
+        lib.prompts.push(Prompt {
+            id: "review-pr".into(),
+            title: "x".into(),
+            body: "b".into(),
+            tags: vec![],
+        });
+        assert_eq!(lib.fresh_id("Review  PR!!"), "review-pr-2");
+    }
+
+    #[test]
+    fn upsert_는_교체_또는_추가하고_delete는_제거() {
+        let mut lib = PromptLibrary::default();
+        let mk = |id: &str, title: &str| Prompt {
+            id: id.into(),
+            title: title.into(),
+            body: "b".into(),
+            tags: vec![],
+        };
+        lib.upsert(mk("a", "first"));
+        lib.upsert(mk("b", "second"));
+        assert_eq!(lib.prompts.len(), 2);
+        // 같은 id → 교체(추가 아님)
+        lib.upsert(mk("a", "first-edited"));
+        assert_eq!(lib.prompts.len(), 2);
+        assert_eq!(lib.get("a").unwrap().title, "first-edited");
+        lib.delete("a");
+        assert_eq!(lib.prompts.len(), 1);
+        assert!(lib.get("a").is_none());
+        lib.delete("nope"); // 없는 id는 무시
+        assert_eq!(lib.prompts.len(), 1);
+    }
+
+    #[test]
+    fn parse_tags_트림_빈값제거_중복제거_순서보존() {
+        assert_eq!(
+            parse_tags(" git, review  review,,test "),
+            vec!["git", "review", "test"]
+        );
+        assert_eq!(parse_tags("   "), Vec::<String>::new());
     }
 
     #[test]

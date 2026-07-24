@@ -5858,8 +5858,7 @@ pub struct App {
     /// 프롬프트는 파라미터를 채워 활성 세션의 컴포저 버퍼에 삽입된다.
     prompt_palette: ui::prompt_palette::PromptPaletteUi,
     prompt_library: crate::prompt_library::PromptLibrary,
-    /// 저장 경로 — PR-3(프롬프트 저장/편집)에서 읽는다.
-    #[allow(dead_code)]
+    /// 저장/삭제 영속화 경로 (persist_prompt_library).
     prompt_library_path: PathBuf,
     /// agent-proxy 승인 팝업 (option 1.5). proxy가 DB에 쓴 pending 행을 폴링해 표시한다.
     approvals_ui: ui::approvals::ApprovalsUi,
@@ -14444,6 +14443,17 @@ impl App {
     /// 영역이 자동으로 줄어든다(통합 도크 — 팝업/오버레이 금지 사양). 설정 OFF면
     /// 호출측이 아예 부르지 않는다(Panel 미생성 — 리소스 0).
     /// MCP 목록은 Connector의 bounded immutable overview/단일 tool page만 읽는다.
+    /// 프롬프트 라이브러리를 파일에 저장한다(저장/편집/삭제 후). 실패는 경고만 남기고
+    /// 앱을 막지 않는다 — 사용자 데이터라 다음 저장에서 복구된다.
+    fn persist_prompt_library(&self) {
+        if let Err(error) = self.prompt_library.save(&self.prompt_library_path) {
+            tracing::warn!(
+                path = %self.prompt_library_path.display(),
+                "프롬프트 라이브러리 저장 실패: {error:#}"
+            );
+        }
+    }
+
     fn render_composer_dock(&mut self, ui: &mut egui::Ui, text: &i18n::Catalog) {
         let composer_session = self.active.workspace_ui.focused_session();
         let composer_agent = composer_session
@@ -14497,13 +14507,30 @@ impl App {
         if open_palette {
             self.prompt_palette.open();
         }
-        // 팔레트는 떠 있는 Window라 도크와 독립적으로 그린다. 삽입 intent를 받으면
-        // App이 활성 워크스페이스 컴포저 버퍼에 실제로 쓴다(leaf+intent+host I/O 경계).
-        if let Some(ui::prompt_palette::PromptPaletteAction::Insert(prompt_text)) =
-            self.prompt_palette.render(ui.ctx(), &self.prompt_library)
+        // 팔레트는 떠 있는 Window라 도크와 독립적으로 그린다. intent를 받으면 App이
+        // 실제 부수효과를 수행한다(leaf+intent+host I/O 경계): 삽입=컴포저 버퍼 쓰기,
+        // 저장/삭제=라이브러리 변경 + 파일 영속화. composer_draft는 "현재 내용 저장" 프리필용.
+        let composer_draft = self
+            .composer
+            .current_text(&composer_workspace_id)
+            .to_owned();
+        match self
+            .prompt_palette
+            .render(ui.ctx(), &self.prompt_library, &composer_draft)
         {
-            self.composer
-                .insert_text(&composer_workspace_id, &prompt_text);
+            Some(ui::prompt_palette::PromptPaletteAction::Insert(prompt_text)) => {
+                self.composer
+                    .insert_text(&composer_workspace_id, &prompt_text);
+            }
+            Some(ui::prompt_palette::PromptPaletteAction::Upsert(prompt)) => {
+                self.prompt_library.upsert(prompt);
+                self.persist_prompt_library();
+            }
+            Some(ui::prompt_palette::PromptPaletteAction::Delete(id)) => {
+                self.prompt_library.delete(&id);
+                self.persist_prompt_library();
+            }
+            None => {}
         }
         match composer_action {
             Some(ui::composer::ComposerAction::Send(submission)) => {

@@ -74,6 +74,10 @@ libc = { workspace = true }
 # 메모리 압박 감지 (로드맵 C1) — rfd가 이미 쓰는 crate라 추가 빌드 비용 없음.
 dispatch2 = "0.3"
 muda = "0.19.3"
+# 상단바 신호등(닫기/최소화/전체화면) 수직 재배치 — eframe이 이미 쓰는 winit을
+# 직접 참조해 CreationContext::winit_window()에 WindowExtMacOS를 쓴다
+# (third_party/winit-0.30.13 patch, 2026-07-25).
+winit = "0.30"
 # 클립보드 PNG 바이트 직행(디코드/재인코딩 없이 파일로 — cmux 방식, 2026-07-08).
 # eframe/winit이 이미 쓰는 crate라 추가 빌드 비용 미미.
 objc2-app-kit = { version = "0.3", default-features = false, features = [

@@ -10,6 +10,10 @@ use crate::ui;
 use secret::KeyringSecretStore;
 use storage::Db;
 
+/// 커스텀 상단 타이틀바 높이 — macOS 신호등(닫기/최소화/전체화면) 수직 중앙 정렬에도
+/// 쓰인다(main.rs의 `set_traffic_light_titlebar_height`). 값이 바뀌면 신호등도 다시
+/// 어긋나므로 두 곳이 이 상수 하나만 본다.
+pub(crate) const TOP_BAR_HEIGHT: f32 = 38.0;
 const APPROVAL_WAKE_MARKER: u8 = 1;
 const APPROVAL_CONTROL_MARKER: u8 = 2;
 const APPROVAL_COMMAND_CAP: usize = 8;
@@ -15788,7 +15792,7 @@ impl eframe::App for App {
         // 타이틀바 통합 바: 패널 기본 inner_margin(8)을 없애 상단 경계에 붙이고 좌측
         // 여백을 제거한다(#67 사용자). 항목은 신호등과 38pt 브랜드 바 안에서
         // 맞춰 세로 중앙 정렬.
-        let bar_h = 38.0;
+        let bar_h = TOP_BAR_HEIGHT;
         let top_frame =
             egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin::ZERO);
         egui::Panel::top("top_bar")
@@ -15813,11 +15817,24 @@ impl eframe::App for App {
                     egui::vec2(ui.available_width(), bar_h),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS.
+                        // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS. 브랜드
+                        // 텍스트("Deppy Sijo"/"AI Agent Workspace")는 제거(2026-07-25
+                        // 사용자) — 신호등 3개만 이 자리에서 수직 중앙 정렬로 보인다
+                        // (실제 재배치는 main.rs의 set_traffic_light_titlebar_height).
                         #[cfg(target_os = "macos")]
                         ui.add_space(76.0);
-                        ui.label(egui::RichText::new("Deppy Sijo").strong().size(14.0));
-                        ui.weak(egui::RichText::new("AI Agent Workspace").size(11.0));
+                        // 신호등 옆 "+" — 워크스페이스 추가(폴더 선택), 사이드바의
+                        // CreateWorkspaceFromPicker와 동일 경로(2026-07-25 사용자).
+                        if tbtn_response(ui, "+".to_owned(), false)
+                            .on_hover_text(text.t("sidebar.empty.start_workspace", &[]))
+                            .clicked()
+                            && self.pending_app_host_action.is_none()
+                        {
+                            self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
+                                FolderPickerPurpose::SwitchWorkspace,
+                            ));
+                            ui.ctx().request_repaint();
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(10.0);
                             // 우측: 로케일. 중앙에는 검색/워크스페이스 선택기를 두지

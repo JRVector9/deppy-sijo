@@ -56,6 +56,10 @@ pub struct PlatformSpecificWindowAttributes {
     pub tabbing_identifier: Option<String>,
     pub option_as_alt: OptionAsAlt,
     pub borderless_game: bool,
+    /// `fullsize_content_view`용 커스텀 타이틀바 높이(pt) — Some이면 신호등 3개(닫기·
+    /// 축소·확대)를 이 높이 안에서 수직 중앙으로 재배치한다. macOS 기본 위치는 표준
+    /// 타이틀바(~28pt) 기준이라, 그보다 높은 커스텀 바에선 위로 치우쳐 보인다.
+    pub traffic_light_titlebar_height: Option<f64>,
 }
 
 impl Default for PlatformSpecificWindowAttributes {
@@ -74,6 +78,7 @@ impl Default for PlatformSpecificWindowAttributes {
             tabbing_identifier: None,
             option_as_alt: Default::default(),
             borderless_game: false,
+            traffic_light_titlebar_height: None,
         }
     }
 }
@@ -123,6 +128,9 @@ pub(crate) struct State {
     is_simple_fullscreen: Cell<bool>,
     saved_style: Cell<Option<NSWindowStyleMask>>,
     is_borderless_game: Cell<bool>,
+    /// `traffic_light_titlebar_height`가 설정됐을 때만 Some — `windowDidResize:`마다
+    /// 신호등을 다시 이 높이로 재배치한다(리사이즈 시 AppKit이 기본 위치로 되돌림).
+    traffic_light_titlebar_height: Cell<Option<f64>>,
 }
 
 declare_class!(
@@ -165,6 +173,11 @@ declare_class!(
             trace_scope!("windowDidResize:");
             // NOTE: WindowEvent::Resized is reported in frameDidChange.
             self.emit_move_event();
+            // AppKit resets the standard window buttons to their default position on
+            // every resize — re-center them in the custom titlebar if configured.
+            if let Some(height) = self.ivars().traffic_light_titlebar_height.get() {
+                reposition_traffic_lights(self.window(), height);
+            }
         }
 
         #[method(windowWillStartLiveResize:)]
@@ -616,6 +629,9 @@ fn new_window(
         if attrs.platform_specific.movable_by_window_background {
             window.setMovableByWindowBackground(true);
         }
+        if let Some(height) = attrs.platform_specific.traffic_light_titlebar_height {
+            reposition_traffic_lights(&window, height);
+        }
 
         if !attrs.enabled_buttons.contains(WindowButtons::MAXIMIZE) {
             if let Some(button) = window.standardWindowButton(NSWindowButton::NSWindowZoomButton) {
@@ -735,6 +751,9 @@ impl WindowDelegate {
             is_simple_fullscreen: Cell::new(false),
             saved_style: Cell::new(None),
             is_borderless_game: Cell::new(attrs.platform_specific.borderless_game),
+            traffic_light_titlebar_height: Cell::new(
+                attrs.platform_specific.traffic_light_titlebar_height,
+            ),
         });
         let delegate: Retained<WindowDelegate> = unsafe { msg_send_id![super(delegate), init] };
 
@@ -1864,6 +1883,11 @@ impl WindowExtMacOS for WindowDelegate {
         self.ivars().is_borderless_game.set(borderless_game);
     }
 
+    fn set_traffic_light_titlebar_height(&self, height: f64) {
+        self.ivars().traffic_light_titlebar_height.set(Some(height));
+        reposition_traffic_lights(self.window(), height);
+    }
+
     fn is_borderless_game(&self) -> bool {
         self.ivars().is_borderless_game.get()
     }
@@ -1906,5 +1930,35 @@ fn theme_to_appearance(theme: Option<Theme>) -> Option<Retained<NSAppearance>> {
         warn!(?theme, "could not find appearance for theme");
         // Assume system appearance in this case
         None
+    }
+}
+
+/// Vertically re-centers the three standard window buttons (close/miniaturize/zoom)
+/// inside a custom `fullsize_content_view` titlebar of the given height (points,
+/// measured from the top of the window). Only `frame.origin.y` is touched — the
+/// horizontal spacing AppKit already applied between the three buttons is left as-is.
+///
+/// Needed because AppKit positions these buttons for the *standard* titlebar height
+/// (~28pt); a taller custom titlebar bar leaves them looking pinned to the top edge
+/// instead of centered.
+fn reposition_traffic_lights(window: &WinitWindow, titlebar_height: f64) {
+    for kind in [
+        NSWindowButton::NSWindowCloseButton,
+        NSWindowButton::NSWindowMiniaturizeButton,
+        NSWindowButton::NSWindowZoomButton,
+    ] {
+        let Some(button) = window.standardWindowButton(kind) else {
+            continue;
+        };
+        // `frame` is relative to the button's superview, which spans the full window
+        // height in AppKit's bottom-left-origin coordinates — so "distance from the
+        // window's top edge" is `superview_height - y`, not `y` itself.
+        let Some(superview) = (unsafe { button.superview() }) else {
+            continue;
+        };
+        let mut frame = button.frame();
+        let container_height = superview.frame().size.height;
+        frame.origin.y = (container_height - (titlebar_height + frame.size.height) / 2.0).round();
+        unsafe { button.setFrameOrigin(frame.origin) };
     }
 }

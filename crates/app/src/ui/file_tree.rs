@@ -3245,15 +3245,20 @@ fn workspace_row(
     // (클릭 판정은 full_rect라 가장자리도 눌린다).
     let rect = full_rect.shrink2(egui::vec2(8.0, 0.0));
     let highlight_rect = workspace_highlight_rect(full_rect);
+    // hover에서만 밝아지던 배경(widgets.hovered.bg_fill)을 걷어내고, 같은 톤
+    // (#2a2a33)을 hover 여부와 무관하게 모든 워크스페이스 행에 상시 유지한다
+    // (2026-07-25 사용자). 활성 행은 그 위에 액센트 틴트를 덧칠해 구분한다.
+    ui.painter().rect_filled(
+        highlight_rect,
+        1.0,
+        egui::Color32::from_rgb(0x2a, 0x2a, 0x33),
+    );
     if active {
         ui.painter().rect_filled(
             highlight_rect,
             1.0,
             ui.visuals().selection.bg_fill.gamma_multiply(0.12),
         );
-    } else if response.hovered() {
-        ui.painter()
-            .rect_filled(highlight_rect, 1.0, ui.visuals().widgets.hovered.bg_fill);
     }
     // 선택/실행 상태와 무관한 프로젝트 고유색. 목록 전체에서 같은 계열이 겹치지 않게
     // 미리 배정된 색을 받아 비활성 행과 40pt 아이콘 레일에서도 그대로 유지한다.
@@ -3280,15 +3285,15 @@ fn workspace_row(
     let summary_mode = workspace_summary_mode(rect.width());
     let show_summary = summary_mode != WorkspaceSummaryMode::IconOnly;
     let show_disclosure = expanded.is_some() && rect.width() >= 56.0;
+    let total_sessions = workspace_total_sessions(workspace.summary);
+    let (_, badge_color) = workspace_primary_summary_segment(workspace.summary, catalog);
     if rect.width() >= 64.0 {
         // 요약 배지 자리를 **실제 폭**만큼만 예약한다 — 고정 198px는 "유휴 5"처럼
         // 짧은 요약에도 이름을 훨씬 일찍 잘라 옆 여백이 남았다(2026-07-18 사용자).
         // 우측 여백 8 + 이름/요약 간격 16 + disclosure 폭(있으면 14)을 더한다.
         let reserved_right = if show_summary {
             let disclosure = if show_disclosure { 14.0 } else { 0.0 };
-            workspace_summary_width(ui, workspace.summary, summary_mode, catalog)
-                + 20.4
-                + disclosure
+            workspace_status_badge_width(ui, total_sessions) + 20.4 + disclosure
         } else {
             6.8
         };
@@ -3310,28 +3315,24 @@ fn workspace_row(
         }
     }
     if show_summary {
+        // 텍스트 요약("유휴"/"비활성" 등) 대신 상태색 dot + 세션 수 배지 — 활성/닫힌
+        // 행 공용(2026-07-25 사용자: "비활성" 문구 제거, 색으로 상태 표기).
+        // chevron과의 간격 22→14(너무 붙음)→16으로 재조정(2026-07-25 사용자:
+        // 숫자·화살표 사이 여백 2 추가).
         let right = if show_disclosure {
-            rect.right() - 22.0
+            rect.right() - 16.0
         } else {
             rect.right() - 8.0
         };
-        paint_workspace_summary(
-            ui,
-            right,
-            rect.center().y,
-            workspace.summary,
-            summary_mode,
-            catalog,
-        );
+        paint_workspace_status_badge(ui, right, rect.center().y, badge_color, total_sessions);
     } else {
-        // 40pt 아이콘 레일까지 줄였을 때는 상태 문구 자리가 없으므로 아바타 우하단의
+        // 40pt 아이콘 레일까지 줄였을 때는 배지 자리가 없으므로 아바타 우하단의
         // 작은 점으로 primary state를 계속 표시한다. 이름이 보이는 폭부터는 반드시
-        // 위의 텍스트 요약으로 바뀐다.
-        let (_, color) = workspace_primary_summary_segment(workspace.summary, catalog);
+        // 위의 dot+카운트 배지로 바뀐다.
         ui.painter().circle_filled(
             egui::pos2(avatar.right() - 2.5, avatar.bottom() - 2.5),
             2.5,
-            color,
+            badge_color,
         );
     }
     if show_disclosure && let Some(expanded) = expanded {
@@ -3346,9 +3347,11 @@ fn workspace_row(
 }
 
 fn workspace_highlight_rect(full_rect: egui::Rect) -> egui::Rect {
+    // 우측(화살표 쪽) 인셋을 8→6으로 줄여 배경(#2a2a33)이 화살표 옆으로 2px 더
+    // 넓게 채워지게 한다(2026-07-25 사용자) — 좌우 비대칭은 의도된 변경.
     egui::Rect::from_min_max(
         egui::pos2(full_rect.left() + 8.0, full_rect.top()),
-        egui::pos2(full_rect.right() - 8.0, full_rect.bottom()),
+        egui::pos2(full_rect.right() - 6.0, full_rect.bottom()),
     )
 }
 
@@ -3467,50 +3470,62 @@ fn workspace_summary_mode(width: f32) -> WorkspaceSummaryMode {
     }
 }
 
-fn workspace_summary_width(
-    ui: &egui::Ui,
-    summary: SidebarSessionSummary,
-    mode: WorkspaceSummaryMode,
-    catalog: &i18n::Catalog,
-) -> f32 {
-    let weak = ui.visuals().weak_text_color();
-    let font = crate::fonts::sidebar_font(11.0);
-    workspace_summary_segments_for_mode(summary, weak, mode, catalog)
-        .iter()
-        .map(|(text, color)| {
-            ui.painter()
-                .layout_no_wrap(text.clone(), font.clone(), *color)
-                .size()
-                .x
-        })
-        .sum()
+/// 접힌/펼친 워크스페이스 행 공용 총 세션 수(우측 dot+카운트 배지에 쓴다,
+/// 2026-07-25 사용자: 텍스트 요약 대신 색+숫자로 상태 표기).
+fn workspace_total_sessions(summary: SidebarSessionSummary) -> usize {
+    summary.running + summary.waiting + summary.done + summary.error + summary.idle + summary.inactive
 }
 
-fn paint_workspace_summary(
+// 8.0 → 5% 축소(2026-07-25 사용자).
+const WORKSPACE_STATUS_DOT_DIAMETER: f32 = 7.6;
+// dot↔숫자 간격 — 6→4(너무 넓음)→5→6으로 재조정(2026-07-25 사용자: 여백 1 추가).
+const WORKSPACE_STATUS_DOT_GAP: f32 = 6.0;
+
+/// 세션 수 자리의 고정 슬롯 폭(dot+간격+숫자 전체) — 실제 글리프 폭(자릿수마다
+/// 다름)으로 dot 위치를 정하면 0→1→10처럼 자릿수가 바뀔 때마다 dot이 옆으로
+/// 밀린다(2026-07-25 사용자: 버튼 정렬 안 맞음). 두 자리(예 "99")까지 넉넉한
+/// 고정폭이라 dot의 x 위치가 행마다 항상 같다.
+const WORKSPACE_STATUS_COUNT_SLOT_WIDTH: f32 = 26.0;
+
+/// 상태색 dot + 세션 수 배지의 그리기 폭 — 이름 자리 예약 계산에 쓴다.
+fn workspace_status_badge_width(_ui: &egui::Ui, _count: usize) -> f32 {
+    WORKSPACE_STATUS_COUNT_SLOT_WIDTH
+}
+
+/// 상태색 dot + 세션 수 — `right`를 오른쪽 끝으로 왼쪽으로 그린다. dot은 고정
+/// 슬롯의 좌측 경계에 앵커링해 자릿수가 바뀌어도 흔들리지 않고, 숫자는 dot
+/// 바로 옆(고정 간격)에 좌측 정렬해 실제 자폭과 무관하게 여백이 일정하다.
+fn paint_workspace_status_badge(
     ui: &egui::Ui,
     right: f32,
     center_y: f32,
-    summary: SidebarSessionSummary,
-    mode: WorkspaceSummaryMode,
-    catalog: &i18n::Catalog,
+    color: egui::Color32,
+    count: usize,
 ) {
-    let weak = ui.visuals().weak_text_color();
-    let values = workspace_summary_segments_for_mode(summary, weak, mode, catalog);
-    let font = crate::fonts::sidebar_font(11.0);
-    let mut cursor = right;
-    for (text, color) in values.iter().rev() {
-        let galley = ui
-            .painter()
-            .layout_no_wrap(text.clone(), font.clone(), *color);
-        cursor -= galley.size().x;
-        ui.painter().galley(
-            egui::pos2(cursor, center_y - galley.size().y / 2.0),
-            galley,
-            *color,
-        );
-    }
+    let dot_x = right - WORKSPACE_STATUS_COUNT_SLOT_WIDTH + WORKSPACE_STATUS_DOT_DIAMETER / 2.0;
+    ui.painter().circle_filled(
+        egui::pos2(dot_x, center_y),
+        WORKSPACE_STATUS_DOT_DIAMETER / 2.0,
+        color,
+    );
+    let text_x = dot_x + WORKSPACE_STATUS_DOT_DIAMETER / 2.0 + WORKSPACE_STATUS_DOT_GAP;
+    // Align2::LEFT_CENTER — 아바타 이니셜(CENTER_CENTER)과 같은 방식으로 egui가
+    // 직접 세로 중앙을 잡게 한다. 수동으로 size().y/2를 빼는 방식은 폰트 라인하이트
+    // 여백 때문에 dot과 시각적으로 어긋나 보였다(2026-07-25 사용자). +1px는 그
+    // 위에 얹은 미세 보정(2026-07-25 사용자: 숫자를 아래로 1).
+    ui.painter().text(
+        egui::pos2(text_x, center_y + 1.0),
+        egui::Align2::LEFT_CENTER,
+        count.to_string(),
+        crate::fonts::sidebar_font(12.0),
+        ui.visuals().text_color(),
+    );
 }
 
+// workspace_row는 이제 상태색 dot + 세션 수 배지만 그려 이 세그먼트 목록을 쓰지
+// 않지만(2026-07-25 사용자), 세그먼트별 텍스트·색 우선순위 로직은 테스트가 여전히
+// 검증한다 — 프로덕션 미사용이라 cfg(test)로 경고만 제거한다.
+#[cfg(test)]
 fn workspace_summary_segments_for_mode(
     summary: SidebarSessionSummary,
     weak: egui::Color32,
@@ -3599,6 +3614,7 @@ fn workspace_primary_summary_segment(
     )
 }
 
+#[cfg(test)]
 fn workspace_summary_segments(
     summary: SidebarSessionSummary,
     weak: egui::Color32,
@@ -5263,14 +5279,16 @@ mod tests {
     }
 
     #[test]
-    fn 워크스페이스_하이라이트는_좌우_여백이_같다() {
+    fn 워크스페이스_하이라이트는_우측_인셋이_2px_더_좁다() {
+        // 2026-07-25 사용자: 화살표 옆 배경(#2a2a33)을 2px 더 넓히려고 우측 인셋만
+        // 8→6으로 줄임 — 좌우 비대칭은 의도된 변경(과거엔 대칭이었다).
         let full = egui::Rect::from_min_max(egui::pos2(0.0, 10.0), egui::pos2(500.0, 49.1));
         let highlight = workspace_highlight_rect(full);
         assert_eq!(highlight.left(), 8.0, "워크스페이스 왼쪽 인셋은 유지");
         assert_eq!(
             highlight.right(),
-            full.right() - 8.0,
-            "오른쪽에도 왼쪽과 같은 인셋 유지"
+            full.right() - 6.0,
+            "오른쪽 인셋은 6px로 좁아져 배경이 화살표 쪽으로 더 넓게 퍼진다"
         );
         assert_eq!(highlight.top(), full.top());
         assert_eq!(highlight.bottom(), full.bottom());

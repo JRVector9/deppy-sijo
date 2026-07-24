@@ -170,6 +170,13 @@ pub trait WindowExtMacOS {
 
     /// Getter for the [`WindowExtMacOS::set_borderless_game`].
     fn is_borderless_game(&self) -> bool;
+
+    /// Runtime counterpart to
+    /// [`WindowAttributesExtMacOS::with_traffic_light_titlebar_height`] — re-centers
+    /// the standard window buttons now, and keeps re-centering them on every resize.
+    /// Use this when the window was created through a framework (e.g. eframe) that
+    /// builds its own `WindowAttributes` and doesn't expose that builder method.
+    fn set_traffic_light_titlebar_height(&self, height: f64);
 }
 
 impl WindowExtMacOS for Window {
@@ -244,6 +251,11 @@ impl WindowExtMacOS for Window {
     }
 
     #[inline]
+    fn set_traffic_light_titlebar_height(&self, height: f64) {
+        self.window.maybe_queue_on_main(move |w| w.set_traffic_light_titlebar_height(height))
+    }
+
+    #[inline]
     fn set_borderless_game(&self, borderless_game: bool) {
         self.window.maybe_wait_on_main(|w| w.set_borderless_game(borderless_game))
     }
@@ -304,6 +316,10 @@ pub trait WindowAttributesExtMacOS {
     fn with_option_as_alt(self, option_as_alt: OptionAsAlt) -> Self;
     /// See [`WindowExtMacOS::set_borderless_game`] for details on what this means if set.
     fn with_borderless_game(self, borderless_game: bool) -> Self;
+    /// Re-centers the standard window buttons (close/miniaturize/zoom) vertically
+    /// inside a custom `fullsize_content_view` titlebar of this height (points).
+    /// Only meaningful together with `with_fullsize_content_view(true)`.
+    fn with_traffic_light_titlebar_height(self, height: f64) -> Self;
 }
 
 impl WindowAttributesExtMacOS for WindowAttributes {
@@ -364,6 +380,12 @@ impl WindowAttributesExtMacOS for WindowAttributes {
     #[inline]
     fn with_tabbing_identifier(mut self, tabbing_identifier: &str) -> Self {
         self.platform_specific.tabbing_identifier.replace(tabbing_identifier.to_string());
+        self
+    }
+
+    #[inline]
+    fn with_traffic_light_titlebar_height(mut self, height: f64) -> Self {
+        self.platform_specific.traffic_light_titlebar_height = Some(height);
         self
     }
 

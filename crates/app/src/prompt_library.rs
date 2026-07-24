@@ -227,7 +227,9 @@ pub fn parse_tags(input: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for tag in input.split([',', ' ', '\t', '\n']) {
         let tag = tag.trim();
-        if !tag.is_empty() && !out.iter().any(|t| t == tag) {
+        // 대소문자 무시 중복제거(검색이 대소문자 무시라 "Git"/"git"이 같은 태그로
+        // 매칭됨 — 저장도 같게 취급해 근접 중복을 막는다). 첫 등장 표기를 보존한다.
+        if !tag.is_empty() && !out.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
             out.push(tag.to_owned());
         }
     }
@@ -348,6 +350,39 @@ mod tests {
             vec!["git", "review", "test"]
         );
         assert_eq!(parse_tags("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_tags_대소문자_무시_중복제거_첫표기_보존() {
+        // "Git"과 "git"은 같은 태그 — 첫 등장 표기("Git")를 남긴다(검색이 대소문자 무시).
+        assert_eq!(parse_tags("Git git GIT review"), vec!["Git", "review"]);
+    }
+
+    #[test]
+    fn render_닫히지_않은_중괄호는_원문_유지() {
+        // param_names뿐 아니라 사용자 출력을 만드는 render도 unclosed를 안전 처리한다.
+        assert_eq!(render("prefix {{oops", &vals(&[])), "prefix {{oops");
+    }
+
+    #[test]
+    fn 중첩_빈_중괄호는_파라미터_아님_render_불변() {
+        // {{{{x}}}}의 첫 쌍이 잡는 이름은 "{{x" → is_param_name 실패 → 통째로 리터럴.
+        assert_eq!(param_names("{{{{x}}}}"), Vec::<String>::new());
+        assert_eq!(render("{{{{x}}}}", &vals(&[("x", "V")])), "{{{{x}}}}");
+        // 빈 이름({{}})도 파라미터 아님.
+        assert_eq!(param_names("{{}}"), Vec::<String>::new());
+        assert_eq!(render("{{}}", &vals(&[])), "{{}}");
+    }
+
+    #[test]
+    fn load_손상_json은_빈_라이브러리로_폴백() {
+        // "missing/corrupt → default" 계약의 corrupt 절반을 테스트로 고정한다.
+        let dir = std::env::temp_dir().join("deppy_prompt_lib_corrupt_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("corrupt.json");
+        std::fs::write(&path, "{ not valid json ").unwrap();
+        assert_eq!(PromptLibrary::load(&path), PromptLibrary::default());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

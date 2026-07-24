@@ -38,7 +38,8 @@ pub struct PromptLibrary {
 
 impl PromptLibrary {
     /// 파일에서 로드한다. 파일이 없거나 파싱 실패면 빈 라이브러리(사용자 데이터이므로
-    /// 손상 시 앱을 막지 않는다 — 로드 실패는 호출자가 로깅한다).
+    /// 손상 시 앱을 막지 않는다). 없음/손상/정상-빈 파일을 구분하지 않으므로 호출자가
+    /// 오류를 로깅할 방법은 없다 — 파괴적 손상을 막는 책임은 save의 원자성에 있다.
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
@@ -46,10 +47,15 @@ impl PromptLibrary {
         }
     }
 
-    /// 파일에 저장한다. 부모 디렉터리는 있다고 가정한다(AppPaths가 생성).
+    /// 파일에 원자적으로 저장한다. 부모 디렉터리는 있다고 가정한다(AppPaths가 생성).
+    /// 임시 파일에 쓴 뒤 rename으로 교체한다 — 저장이 매 편집/삭제마다 일어나므로,
+    /// 쓰기 도중 크래시로 파일이 잘려 load()가 빈 라이브러리로 되돌아가는(=전량 손실)
+    /// 걸 막는다(PR-3 리뷰 Low). 같은 디렉터리 rename은 Unix에서 원자적이다.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 

@@ -14582,7 +14582,7 @@ impl App {
                         ui.horizontal(|ui| {
                             if ui
                                 .small_button("/prompt")
-                                .on_hover_text("저장된 프롬프트 라이브러리 — 파라미터 채워 컴포저에 삽입")
+                                .on_hover_text(text.t("composer.prompt_hint", &[]))
                                 .clicked()
                             {
                                 open_palette = true;
@@ -14609,7 +14609,7 @@ impl App {
                 .to_owned();
             match self
                 .prompt_palette
-                .render(ui.ctx(), &self.prompt_library, &composer_draft)
+                .render(ui.ctx(), &self.prompt_library, &composer_draft, text)
             {
                 Some(ui::prompt_palette::PromptPaletteAction::Insert(prompt_text)) => {
                     self.composer
@@ -16438,7 +16438,7 @@ impl eframe::App for App {
                 } else if inbox_visible {
                     inbox_page_click = self.render_inbox_page(ui, &text);
                 } else if fleet_visible {
-                    fleet_action = self.fleet_ui.render(ui, &fleet_sessions, fleet_summary);
+                    fleet_action = self.fleet_ui.render(ui, &fleet_sessions, fleet_summary, &text);
                 } else {
                     self.active
                         .workspace_ui

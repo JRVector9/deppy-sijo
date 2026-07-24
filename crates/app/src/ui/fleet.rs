@@ -31,29 +31,28 @@ impl FleetUi {
         ui: &mut egui::Ui,
         sessions: &[FleetSession],
         summary: FleetSummary,
+        catalog: &i18n::Catalog,
     ) -> Option<FleetAction> {
         let mut action = None;
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::symmetric(16, 14))
             .show(ui, |ui| {
-                if header(ui, summary) {
+                if header(ui, summary, catalog) {
                     action = Some(FleetAction::LaunchAgent);
                 }
                 ui.add_space(12.0);
                 if sessions.is_empty() {
                     ui.add_space(48.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("실행 중인 에이전트 세션이 없습니다.").weak());
+                        ui.label(egui::RichText::new(catalog.t("fleet.empty", &[])).weak());
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new(
-                                "워크스페이스에서 에이전트를 시작하면 여기에 모입니다.",
-                            )
-                            .weak()
-                            .small(),
+                            egui::RichText::new(catalog.t("fleet.empty.hint", &[]))
+                                .weak()
+                                .small(),
                         );
                         ui.add_space(12.0);
-                        if ui.button("+ 새 에이전트").clicked() {
+                        if ui.button(catalog.t("fleet.new_agent", &[])).clicked() {
                             action = Some(FleetAction::LaunchAgent);
                         }
                     });
@@ -64,7 +63,7 @@ impl FleetUi {
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             for session in sessions {
-                                if card(ui, session) {
+                                if card(ui, session, catalog) {
                                     action = Some(FleetAction::Focus {
                                         workspace_id: session.workspace_id.clone(),
                                         tab: session.tab.clone(),
@@ -80,31 +79,36 @@ impl FleetUi {
 }
 
 /// 상단 헤더: 제목 + 총계 + (우측) 새 에이전트 버튼 + 상태별 칩. 버튼 클릭 시 true.
-fn header(ui: &mut egui::Ui, summary: FleetSummary) -> bool {
+fn header(ui: &mut egui::Ui, summary: FleetSummary, catalog: &i18n::Catalog) -> bool {
     let mut launch = false;
     ui.horizontal(|ui| {
-        ui.heading("에이전트 Fleet");
+        ui.heading(catalog.t("fleet.title", &[]));
         ui.add_space(8.0);
-        ui.label(egui::RichText::new(format!("{}개 세션", summary.total)).weak());
+        ui.label(
+            egui::RichText::new(
+                catalog.t("fleet.session_count", &[("count", &summary.total.to_string())]),
+            )
+            .weak(),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("+ 새 에이전트").clicked() {
+            if ui.button(catalog.t("fleet.new_agent", &[])).clicked() {
                 launch = true;
             }
         });
     });
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
-        chip(ui, AgentVisualState::Waiting, "대기", summary.waiting);
-        chip(ui, AgentVisualState::Error, "오류", summary.error);
-        chip(ui, AgentVisualState::Complete, "완료", summary.done);
-        chip(ui, AgentVisualState::Active, "작업 중", summary.working);
-        chip(ui, AgentVisualState::Idle, "유휴", summary.idle);
+        chip(ui, AgentVisualState::Waiting, summary.waiting, catalog);
+        chip(ui, AgentVisualState::Error, summary.error, catalog);
+        chip(ui, AgentVisualState::Complete, summary.done, catalog);
+        chip(ui, AgentVisualState::Active, summary.working, catalog);
+        chip(ui, AgentVisualState::Idle, summary.idle, catalog);
     });
     launch
 }
 
 /// 상태별 칩 — 색 점 + "라벨 n". 0이면 흐리게(회색) 표시.
-fn chip(ui: &mut egui::Ui, state: AgentVisualState, label: &str, count: usize) {
+fn chip(ui: &mut egui::Ui, state: AgentVisualState, count: usize, catalog: &i18n::Catalog) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(88.0, 22.0), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
@@ -120,6 +124,7 @@ fn chip(ui: &mut egui::Ui, state: AgentVisualState, label: &str, count: usize) {
     } else {
         ui.visuals().text_color()
     };
+    let label = state_label(state, catalog);
     let p = ui.painter();
     p.circle_filled(egui::pos2(rect.left() + 6.0, rect.center().y), 4.0, dot_color);
     p.text(
@@ -132,7 +137,7 @@ fn chip(ui: &mut egui::Ui, state: AgentVisualState, label: &str, count: usize) {
 }
 
 /// 세션 카드 하나 — 좌측 상태 바 + 제목/상태/워크스페이스/보조 줄. 클릭 시 true.
-fn card(ui: &mut egui::Ui, session: &FleetSession) -> bool {
+fn card(ui: &mut egui::Ui, session: &FleetSession, catalog: &i18n::Catalog) -> bool {
     let size = egui::vec2(252.0, 96.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -174,7 +179,7 @@ fn card(ui: &mut egui::Ui, session: &FleetSession) -> bool {
     // 2행: 상태 라벨(색) + 워크스페이스 + active/warm.
     content.horizontal(|ui| {
         ui.label(
-            egui::RichText::new(state_label(session.state))
+            egui::RichText::new(state_label(session.state, catalog))
                 .small()
                 .color(state_color),
         );
@@ -183,7 +188,7 @@ fn card(ui: &mut egui::Ui, session: &FleetSession) -> bool {
             egui::Label::new(egui::RichText::new(&session.workspace_name).small().weak()).truncate(),
         );
         if !session.active_workspace {
-            ui.label(egui::RichText::new("warm").small().weak());
+            ui.label(egui::RichText::new(catalog.t("fleet.warm", &[])).small().weak());
         }
     });
     // 3행: 대기 사유 우선, 없으면 에이전트 라인("Codex · gpt-5.5 · xhigh").
@@ -200,14 +205,15 @@ fn card(ui: &mut egui::Ui, session: &FleetSession) -> bool {
     response.clicked()
 }
 
-/// 상태별 한국어 라벨.
-fn state_label(state: AgentVisualState) -> &'static str {
-    match state {
-        AgentVisualState::Waiting => "대기",
-        AgentVisualState::Error => "오류",
-        AgentVisualState::Complete => "완료",
-        AgentVisualState::Active => "작업 중",
-        AgentVisualState::Idle => "유휴",
-        AgentVisualState::Off => "off",
-    }
+/// 상태별 라벨(i18n).
+fn state_label(state: AgentVisualState, catalog: &i18n::Catalog) -> String {
+    let key = match state {
+        AgentVisualState::Waiting => "fleet.state.waiting",
+        AgentVisualState::Error => "fleet.state.error",
+        AgentVisualState::Complete => "fleet.state.done",
+        AgentVisualState::Active => "fleet.state.working",
+        AgentVisualState::Idle => "fleet.state.idle",
+        AgentVisualState::Off => "fleet.state.off",
+    };
+    catalog.t(key, &[])
 }

@@ -657,6 +657,12 @@ impl<T> Term<T> {
         &self.inactive_grid
     }
 
+    /// deppy-sijo: 비활성 그리드 가변 접근 — 압박 트림이 alt-screen 세션의 primary
+    /// 스크롤백(inactive)도 압축해 회수하도록.
+    pub fn inactive_grid_mut(&mut self) -> &mut Grid<Cell> {
+        &mut self.inactive_grid
+    }
+
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
         let old_cols = self.columns();

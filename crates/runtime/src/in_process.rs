@@ -286,7 +286,6 @@ impl InProcessRuntimeClient {
                     exited_order: std::collections::VecDeque::new(),
                     max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                     cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
-                    scrollback_recover_ticks: 0,
                     archived: std::collections::HashMap::new(),
                     archived_order: std::collections::VecDeque::new(),
                     archived_on_disk: std::collections::HashSet::new(),
@@ -539,11 +538,6 @@ const MAX_RUNTIME_CACHE_BUDGET_BYTES: usize = 2048 * 1024 * 1024;
 /// 이 밑으로는 안 줄인다(사용성 보호) — 모든 세션이 여기 도달하면 트림을 멈춘다.
 const LIVE_TRIM_FLOOR_LINES: usize = 200;
 
-/// 트림된 스크롤백을 회복하기 전, 예산 여유(3/4 아래)가 연속 유지돼야 하는 pump tick 수.
-/// 활발히 재성장하는 세션은 이 창 안에 다시 3/4를 넘겨 회복되지 않고(계속 트림 유지),
-/// 진짜 잠잠해진 세션만 회복된다 — 트림 직후 회복으로 인한 오실레이션 방지(리뷰 A-H1).
-const SCROLLBACK_RECOVER_TICKS: u32 = 30;
-
 fn clamp_runtime_cache_budget_bytes(bytes: usize) -> usize {
     bytes.clamp(
         MIN_RUNTIME_CACHE_BUDGET_BYTES,
@@ -705,9 +699,6 @@ struct Worker {
     max_exited_backends: usize,
     /// 이 runtime에 배정된 프로세스 전역 터미널 캐시 바이트 예산의 share.
     cache_budget_bytes: usize,
-    /// 예산 여유(3/4 아래)가 연속 유지된 pump tick 수 — 이 값이 임계 이상이어야 트림된
-    /// 스크롤백을 회복한다(트림↔회복 오실레이션 debounce, 리뷰 A-H1). 여유가 없어지면 0.
-    scrollback_recover_ticks: u32,
     /// 압축 아카이브 — 백엔드를 내린 exited 세션의 zlib(ANSI) 덤프. pane이 다시
     /// 보이면 복원(inflate)한다 (§14.3 확장, 2026-07-11).
     archived: std::collections::HashMap<SessionId, ArchivedScrollback>,
@@ -2985,11 +2976,20 @@ impl Worker {
                 if let Some(event) = session.set_cache_class(class) {
                     trace_terminal_cache_event(id, event);
                 }
-                // Hidden/Exited 전환은 compress_history(0)로 HOT 창까지 셀 배열을
-                // 해제한다 — 트림 이벤트 유무와 무관하게(작은 스크롤백은 이벤트 없이도
-                // 해제됨) 신호한다.
-                if matches!(class, TerminalCacheClass::Hidden | TerminalCacheClass::Exited) {
-                    freed_memory = true;
+                match class {
+                    // Hidden/Exited 전환은 compress_history(0)로 HOT 창까지 셀 배열을
+                    // 해제한다 — 트림 이벤트 유무와 무관하게(작은 스크롤백은 이벤트
+                    // 없이도 해제됨) purge를 신호한다.
+                    TerminalCacheClass::Hidden | TerminalCacheClass::Exited => {
+                        freed_memory = true;
+                    }
+                    // 사용자가 세션을 열었다 — 압박 트림됐던 스크롤백 상한을 회복한다
+                    // (가시성 기반 회복, 리뷰 A-H1). 상한만 올려 즉시 메모리는 안 늘고
+                    // 이후 feed로 채워진다. 여전히 예산 초과면 다음 tick이 hidden부터
+                    // 다시 트림하므로 이 세션은 보호된다.
+                    TerminalCacheClass::Visible => {
+                        session.clear_pressure_trim();
+                    }
                 }
             }
         }
@@ -3087,20 +3087,11 @@ impl Worker {
         {
             crate::signal_memory_released();
         }
-        // 압박 해소 시 트림됐던 세션의 스크롤백 상한을 회복한다. 여유(예산의 3/4 아래)가
-        // SCROLLBACK_RECOVER_TICKS 연속 유지된 뒤에만 회복해, 트림 직후 회복으로 인한
-        // 오실레이션을 막는다(리뷰 A-H1). 상한만 올려 즉시 메모리는 안 늘어 purge 불필요.
-        if self.terminal_cache_bytes() < self.cache_budget_bytes / 4 * 3 {
-            self.scrollback_recover_ticks = self.scrollback_recover_ticks.saturating_add(1);
-            if self.scrollback_recover_ticks >= SCROLLBACK_RECOVER_TICKS {
-                for session in self.sessions.values_mut() {
-                    session.clear_pressure_trim();
-                }
-                self.scrollback_recover_ticks = 0;
-            }
-        } else {
-            self.scrollback_recover_ticks = 0; // 여유 없음 → debounce 리셋
-        }
+        // 트림 회복은 총량 기반이 아니라 **가시성 기반**이다(reconcile_visibility). 총량
+        // 기반은 트림된 세션이 스스로 잠잠해 보이게 만들어(floor가 신호를 억눌러) 균형
+        // 워크로드에선 영영 회복 안 되거나(M1) 지속 runaway에선 진동(M2)했다. 대신
+        // 사용자가 세션을 열(Visible 전이) 때 그 세션 floor만 해제한다 — hidden 세션은
+        // 안 보이므로 트림 유지, 열면 회복(리뷰 A-H1 재설계).
     }
 
     /// exited 아카이브 후에도 전역 예산을 초과하면 live 세션의 스크롤백을 트림해 예산
@@ -3953,7 +3944,6 @@ mod tests {
                 exited_order: std::collections::VecDeque::new(),
                 max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                 cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
-                scrollback_recover_ticks: 0,
                 archived: std::collections::HashMap::new(),
                 archived_order: std::collections::VecDeque::new(),
                 archived_on_disk: std::collections::HashSet::new(),

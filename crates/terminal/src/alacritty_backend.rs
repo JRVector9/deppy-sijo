@@ -505,7 +505,10 @@ impl TerminalBackend for AlacrittyBackend {
         self.pressure_trim_floor =
             Some(target.min(self.pressure_trim_floor.unwrap_or(usize::MAX)));
         // 남은 히스토리를 HOT 창까지 전부 압축해 최대한 회수한다(압박 하 최후 수단).
+        // 두 그리드 모두 압축한다 — alt-screen 세션은 스크롤백이 inactive(primary)에
+        // 있어 active(alt)만 압축하면 회수가 불완전하다(리뷰 L3). 스크롤백 없는 쪽은 no-op.
         self.term.grid_mut().compress_history(0);
+        self.term.inactive_grid_mut().compress_history(0);
         let after = self.cache_footprint();
         (after.estimated_bytes < before.estimated_bytes
             || after.history_lines < before.history_lines)

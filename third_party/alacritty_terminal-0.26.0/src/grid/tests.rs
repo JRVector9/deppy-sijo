@@ -545,6 +545,30 @@ fn deppy_resize_on_compressed_trips_assert() {
 }
 
 /// 압축된 그리드도 truncate(가장 오래된 history 제거) 후 남은 줄이 온전한지 —
+/// compressed_row_count는 논리 히스토리 범위만 세고, shrink 후 남는 stale 캐시 슬롯
+/// (truncate 전)은 세지 않는다 — 회전(zero!=0) 상태에서 검증(리뷰 A-M1/B-L1 회귀).
+#[test]
+fn deppy_compressed_row_count는_stale_슬롯을_안_센다() {
+    let (rows, cols) = (30, 4);
+    let mut grid = grid_with_history(rows, cols); // scroll_up으로 zero 회전됨
+    grid.compress_history(0); // 히스토리 전체 압축
+    // 논리 히스토리(rows)만 세고 가시행은 제외.
+    assert_eq!(grid.compressed_row_count(), rows, "히스토리 전부가 압축으로 세져야");
+
+    // 스크롤백을 절반으로 축소 — shrinkage < MAX_CACHE_SIZE(1000)라 truncate 안 됨 →
+    // 드롭된 오래된 압축 슬롯이 캐시 영역에 stale Some로 남는다.
+    grid.update_history(rows / 2);
+    assert_eq!(grid.history_size(), rows / 2);
+    // 논리 범위 밖 stale은 안 센다 → count가 논리 히스토리를 넘지 않는다(넘으면
+    // history-count가 raw를 과소계상해 예산 강제에 위험).
+    assert!(
+        grid.compressed_row_count() <= grid.history_size(),
+        "stale 슬롯을 셈: count={} history={}",
+        grid.compressed_row_count(),
+        grid.history_size()
+    );
+}
+
 /// 곁가지 truncate 동기화 검증.
 #[test]
 fn deppy_compress_survives_history_shrink() {

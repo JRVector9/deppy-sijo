@@ -5812,6 +5812,8 @@ pub struct App {
     activity_ui: ui::activity::ActivityUi,
     /// 목업 기반 홈/터미널 전환과 전체 워크스페이스 대시보드 상태.
     agent_terminal_ui: ui::agent_terminal::AgentTerminalUi,
+    /// 멀티에이전트 fleet 그리드 (기능1) — Fleet 뷰에서 그린다.
+    fleet_ui: ui::fleet::FleetUi,
     /// 상태바·홈이 쓰는 activity_rows 500ms 캐시 — 매 프레임(타이핑 중 60~120fps)
     /// 전 워크스페이스 × 세션의 String/Vec 재조립을 피한다. 리소스 샘플 주기(2s)보다
     /// 짧아 표시 신선도는 유지된다.
@@ -8380,6 +8382,7 @@ impl App {
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             activity_ui: ui::activity::ActivityUi::new(),
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
+            fleet_ui: ui::fleet::FleetUi::default(),
             activity_rows_cache: None,
             status_feed_rx: status_feed_rx_channel.0,
             status_feed_refresh: status_feed_rx_channel.1,
@@ -14334,6 +14337,87 @@ impl App {
     /// [N3] 전역 PTY 대기 카드 데이터 조립 — 팝오버가 열렸을 때만 호출된다(호출부 게이트,
     /// idle 비용 0). suspended/사라진 워크스페이스는 카드에서 제외한다(I1 "모르는/사라진
     /// 세션이면 명령 미생성" 원칙 — 이동 외엔 아무것도 할 수 없는 죽은 카드를 안 보인다).
+    /// fleet 뷰모델 행을 active+warm 런타임을 가로질러 조립한다(읽기전용, 기능1 PR-5).
+    /// idle 워크스페이스(런타임 없음)는 라이브 세션이 없어 제외하고, 에이전트 세션만
+    /// 담는다(셸은 status·agent_line 모두 없음). 정렬은 fleet 모듈이 주목도 순으로 한다.
+    ///
+    /// build_waiting_cards와 같은 active+warm 유니온 패턴. active 전용 map
+    /// (agent_activity/needs_input/turn_done)은 active에만 쓰고, warm은 workspace
+    /// namespace가 있는 global_waiting에서 needs_input을 뽑아 넣는다(SessionId 재사용 안전).
+    fn build_fleet_sessions(&self, text: &i18n::Catalog) -> Vec<crate::fleet::FleetSession> {
+        let empty_activity: std::collections::HashMap<
+            runtime::SessionId,
+            crate::agent_transcript::AgentActivity,
+        > = std::collections::HashMap::new();
+        let empty_turn: std::collections::HashMap<runtime::SessionId, i64> =
+            std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for workspace in &self.workspaces {
+            if !workspace_visible_after_close(&self.closed_workspaces, &workspace.id) {
+                continue;
+            }
+            let active = workspace.id == self.active.id;
+            let runtime = if active {
+                Some(&self.active)
+            } else {
+                self.warm.get(&workspace.id)
+            };
+            let Some(runtime) = runtime else {
+                continue; // idle 워크스페이스 — 라이브 세션 없음.
+            };
+            let needs_input: std::collections::HashSet<runtime::SessionId> = self
+                .global_waiting
+                .iter()
+                .filter(|(ws, _, _)| ws == &workspace.id)
+                .map(|(_, session, _)| *session)
+                .collect();
+            let entries = if active {
+                runtime.workspace_ui.session_entries(
+                    text,
+                    &self.agent_activity,
+                    &self.agent_needs_input,
+                    &self.agent_turn_done,
+                )
+            } else {
+                runtime.workspace_ui.session_entries(
+                    text,
+                    &empty_activity,
+                    &needs_input,
+                    &empty_turn,
+                )
+            };
+            let workspace_name = Self::workspace_display_name(workspace);
+            for entry in entries {
+                // 에이전트만 — 셸은 status/agent_line 둘 다 None.
+                if entry.agent_line.is_none() && entry.status.is_none() {
+                    continue;
+                }
+                let Some(session) = entry.session else {
+                    continue;
+                };
+                let waiting_message = self
+                    .global_waiting
+                    .iter()
+                    .find(|(ws, s, _)| ws == &workspace.id && *s == session)
+                    .and_then(|(_, _, message)| message.clone());
+                out.push(crate::fleet::FleetSession {
+                    workspace_id: workspace.id.clone(),
+                    workspace_name: workspace_name.clone(),
+                    session,
+                    tab: entry.tab,
+                    pane: entry.pane,
+                    title: entry.title,
+                    state: crate::agent_surface::AgentVisualState::from_pty(entry.status),
+                    agent_line: entry.agent_line,
+                    waiting_message,
+                    active_workspace: active,
+                });
+            }
+        }
+        crate::fleet::sort_sessions(&mut out);
+        out
+    }
+
     fn build_waiting_cards(&mut self) -> Vec<ui::inbox_waiting::WaitingCard> {
         let global_waiting = self.global_waiting.clone();
         let mut cards = Vec::with_capacity(global_waiting.len());
@@ -15930,6 +16014,9 @@ impl eframe::App for App {
             view: self.agent_terminal_ui.view(),
             home_notice_count: self.home_notice_unread,
             inbox_count,
+            // fleet 배지 = 주목 필요한 에이전트 수. global_waiting(needs-input, 전 워크스페이스)
+            // 을 싼 프록시로 쓴다 — 매 프레임 build_fleet_sessions를 돌리지 않는다.
+            fleet_count: self.global_waiting.len(),
             agents_open: self.agent_sessions_ui.is_open(),
         };
 
@@ -16029,6 +16116,18 @@ impl eframe::App for App {
                             ui::agent_terminal::AgentTerminalView::Terminal
                         } else {
                             ui::agent_terminal::AgentTerminalView::Inbox
+                        },
+                    );
+                }
+                Some(ui::file_tree::SidebarAction::ShowFleet) => {
+                    // fleet 그리드 — 재클릭 토글 규칙은 홈/작업함과 동일.
+                    self.agent_terminal_ui.set_view(
+                        if self.agent_terminal_ui.view()
+                            == ui::agent_terminal::AgentTerminalView::Fleet
+                        {
+                            ui::agent_terminal::AgentTerminalView::Terminal
+                        } else {
+                            ui::agent_terminal::AgentTerminalView::Fleet
                         },
                     );
                 }
@@ -16280,15 +16379,25 @@ impl eframe::App for App {
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
         let inbox_visible = central_view == ui::agent_terminal::AgentTerminalView::Inbox;
-        // 홈/작업함이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
-        if home_visible || inbox_visible {
+        let fleet_visible = central_view == ui::agent_terminal::AgentTerminalView::Fleet;
+        // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
+        if home_visible || inbox_visible || fleet_visible {
             self.active
                 .workspace_ui
                 .update_hidden(ui.ctx(), &events, &text);
         }
+        // fleet 뷰모델은 Fleet 뷰일 때만 조립한다(active+warm 순회 비용 회피).
+        let (fleet_sessions, fleet_summary) = if fleet_visible {
+            let sessions = self.build_fleet_sessions(&text);
+            let summary =
+                crate::fleet::FleetSummary::from_states(sessions.iter().map(|s| s.state));
+            (sessions, summary)
+        } else {
+            (Vec::new(), crate::fleet::FleetSummary::default())
+        };
 
-        // 컴포저는 터미널 표면에만 붙는다. 홈/작업함은 전체 폭 페이지가 중앙 영역을 쓴다.
-        if !home_visible && !inbox_visible && self.config.ui.composer_enabled {
+        // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
+        if !home_visible && !inbox_visible && !fleet_visible && self.config.ui.composer_enabled {
             self.render_composer_dock(ui, &text);
         }
 
@@ -16301,6 +16410,7 @@ impl eframe::App for App {
             .fill(egui::Color32::from_rgb(0x17, 0x17, 0x1c));
         let mut home_action = None;
         let mut inbox_page_click = None;
+        let mut fleet_action = None;
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
@@ -16317,6 +16427,8 @@ impl eframe::App for App {
                     );
                 } else if inbox_visible {
                     inbox_page_click = self.render_inbox_page(ui, &text);
+                } else if fleet_visible {
+                    fleet_action = self.fleet_ui.render(ui, &fleet_sessions, fleet_summary);
                 } else {
                     self.active
                         .workspace_ui
@@ -16328,6 +16440,21 @@ impl eframe::App for App {
         if inbox_page_click.is_some() {
             self.agent_terminal_ui
                 .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+        }
+        // fleet 카드 클릭 → 터미널로 복귀 후 해당 세션 포커스(사이드바 FocusSession과 동일).
+        if let Some(ui::fleet::FleetAction::Focus {
+            workspace_id,
+            tab,
+            pane,
+        }) = fleet_action
+        {
+            self.agent_terminal_ui
+                .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+            self.stage_workspace_controller_action(WorkspaceControllerAction::FocusSession {
+                workspace_id,
+                tab,
+                pane,
+            });
         }
         // take/put-back 마무리 — 위 take에서 꺼낸 rows를 타임스탬프 그대로 되돌린다.
         self.activity_rows_cache = Some((activity_rows_stamp, activity_rows));

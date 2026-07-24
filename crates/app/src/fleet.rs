@@ -9,10 +9,6 @@
 //! 단일 진실원 유지(agent_surface). needs-input 사유·활동·모델 등은 App이 기존
 //! 소스(global_waiting, session_entries)에서 뽑아 넣는다.
 
-// PR-4는 뷰모델 타입·로직만이다. App 프로젝션·그리드 UI(실사용)는 PR-5에서 붙는다 —
-// 그전까지 미사용 항목이 있어 경고를 억제한다(prompt_library PR-1 선례와 동일 정책).
-#![allow(dead_code)]
-
 use crate::agent_surface::AgentVisualState;
 
 /// fleet 그리드의 세션 행 하나. App이 active/warm 런타임의 여러 필드에서 조립한
@@ -71,11 +67,6 @@ impl FleetSummary {
         }
         s
     }
-
-    /// 주목이 필요한 세션 수(대기 + 오류) — nav 배지용.
-    pub fn attention(&self) -> usize {
-        self.waiting + self.error
-    }
 }
 
 /// 정렬 우선순위. 값이 클수록 그리드 앞(주목 필요 순). 대기 > 오류 > 완료 > 작업중 >
@@ -119,14 +110,12 @@ mod tests {
         assert_eq!(s.working, 1);
         assert_eq!(s.idle, 1);
         assert_eq!(s.off, 1);
-        assert_eq!(s.attention(), 3); // waiting 2 + error 1
     }
 
     #[test]
     fn summary_빈입력() {
         let s = FleetSummary::from_states([]);
         assert_eq!(s, FleetSummary::default());
-        assert_eq!(s.attention(), 0);
     }
 
     #[test]

@@ -102,6 +102,8 @@ pub struct SidebarSnapshot<'a> {
     /// 마지막 Home 열람 뒤 새로 도착한 공지 수 — Home 행에 작업함과 같은 배지로 표시.
     pub home_notice_count: usize,
     pub inbox_count: usize,
+    /// fleet nav 배지 — 주목 필요한 에이전트 수(대기+오류). 0이면 숨김.
+    pub fleet_count: usize,
     /// Agents 창 열림 여부 — 하단 nav 「에이전트」 행의 선택 상태 (2026-07-18).
     pub agents_open: bool,
 }
@@ -110,6 +112,8 @@ pub struct SidebarSnapshot<'a> {
 pub enum SidebarAction {
     SwitchWorkspace(String),
     ShowHome,
+    /// 멀티에이전트 fleet 그리드로 전환(하단 nav). 재클릭 토글은 App이 현재 view로 결정.
+    ShowFleet,
     /// 「작업함」 전체 페이지로 전환 (하단 nav, 2026-07-18). 재클릭 토글(터미널 복귀)은
     /// App이 현재 view를 보고 결정한다 — 이 모듈은 view를 바꾸지 않는다.
     ShowInbox,
@@ -2791,6 +2795,17 @@ impl FileTreeUi {
         }
         if nav_row(
             ui,
+            NavIcon::Fleet,
+            &catalog.t("sidebar.nav.fleet", &[]),
+            sidebar.view == super::agent_terminal::AgentTerminalView::Fleet,
+            nav_badge_text(sidebar.fleet_count).as_deref(),
+        )
+        .clicked()
+        {
+            action = Some(SidebarAction::ShowFleet);
+        }
+        if nav_row(
+            ui,
             NavIcon::Agents,
             &catalog.t("sidebar.nav.agents", &[]),
             sidebar.agents_open,
@@ -4255,6 +4270,7 @@ fn paint_file(
 enum NavIcon {
     Home,
     Inbox,
+    Fleet,
     Agents,
 }
 
@@ -4366,6 +4382,16 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
                 ],
                 stroke,
             );
+        }
+        // fleet — 2×2 격자(여러 에이전트를 한 화면에).
+        NavIcon::Fleet => {
+            for (dx, dy) in [(-3.0, -3.0), (3.0, -3.0), (-3.0, 3.0), (3.0, 3.0)] {
+                let cell = egui::Rect::from_center_size(
+                    egui::pos2(c.x + dx, c.y + dy),
+                    egui::vec2(5.0, 5.0),
+                );
+                p.rect_stroke(cell, 1.0, stroke, egui::StrokeKind::Inside);
+            }
         }
         // 봇 — 머리(사각) + 눈 2점 + 안테나.
         NavIcon::Agents => {
@@ -5971,6 +5997,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         inbox_count: 0,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     if matches!(
@@ -6145,6 +6172,7 @@ mod tests {
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
             home_notice_count: 0,
             inbox_count: 0,
+            fleet_count: 0,
             agents_open: false,
         };
         let ctx = egui::Context::default();
@@ -6558,6 +6586,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         inbox_count: 0,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     state.0.panel(ui, &sessions, &snapshot, &catalog);
@@ -6711,6 +6740,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         inbox_count: 0,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     match state.tree.panel(ui, &sessions, &snapshot, &catalog) {
@@ -6829,6 +6859,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         inbox_count: 0,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     state
@@ -6897,6 +6928,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         inbox_count: 0,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     if let Some(a) =
@@ -7015,6 +7047,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         inbox_count: 0,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     if let Some(a) =
@@ -7202,6 +7235,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         inbox_count: 0,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     if let Some(a) =
@@ -7260,6 +7294,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 4,
                         inbox_count: 2,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     if let Some(a) =
@@ -7418,6 +7453,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         inbox_count: 0,
+                        fleet_count: 0,
                         agents_open: false,
                     };
                     if let Some(a) =

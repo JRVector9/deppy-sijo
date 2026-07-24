@@ -792,6 +792,10 @@ pub struct FileTreeUi {
     consumed_paste_shortcut: bool,
     /// 이번 프레임 트리가 ⌘C를 소비했는지 — App이 터미널 선택 복사의 덮어쓰기를 누른다.
     consumed_copy_shortcut: bool,
+    /// 사이드바 내 "워크스페이스·세션" 블록 높이(px) — 하단 폴더 트리와의 경계선을
+    /// 드래그해 사용자가 직접 조절한다(2026-07-24 사용자 요청). 매 프레임 가용 높이
+    /// 기준으로 재클램프하므로 창 크기가 바뀌어도 두 섹션 모두 최소 높이를 유지한다.
+    workspace_section_height: f32,
 }
 
 /// 디렉터리 listing worker 결과. 큰 디렉터리 apply 비용도 쪼개기 위해 chunk로 전달한다.
@@ -853,6 +857,7 @@ impl FileTreeUi {
             last_external_paste: None,
             consumed_paste_shortcut: false,
             consumed_copy_shortcut: false,
+            workspace_section_height: 270.0,
         }
     }
 
@@ -1439,6 +1444,35 @@ impl FileTreeUi {
             .inner
     }
 
+    /// 「워크스페이스·세션」 블록과 폴더 트리 사이 경계선 — 위아래로 끌면
+    /// `workspace_section_height`가 바뀌어 두 섹션의 높이 비중을 조절한다
+    /// (터미널 pane split 핸들과 동일한 hover/drag 스타일, workspace.rs 참고).
+    /// 반환값 = 이번 프레임에 드래그 중인지 — 드래그로 아래 폴더 트리 행이 밀려
+    /// 포인터 밑에 오면 hover 판정만으로 클릭 가능한 것처럼 보이는 오작동을
+    /// 막기 위해 호출측이 행 상호작용을 잠시 꺼야 한다(2026-07-24 사용자 보고).
+    fn workspace_split_handle(&mut self, ui: &mut egui::Ui) -> bool {
+        let gap = 6.0;
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), gap), egui::Sense::hover());
+        let hit_rect = rect.expand2(egui::vec2(0.0, 2.0));
+        let id = ui.id().with("file_tree_workspace_split_handle");
+        let resp = ui
+            .interact(hit_rect, id, egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        if resp.dragged() {
+            self.workspace_section_height += resp.drag_delta().y;
+        }
+        let color = if resp.hovered() || resp.dragged() {
+            ui.visuals().selection.bg_fill
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        let painter = ui.painter();
+        let y = painter.round_to_pixel_center(rect.center().y);
+        painter.hline(ui.clip_rect().x_range(), y, egui::Stroke::new(1.0, color));
+        resp.dragged()
+    }
+
     fn contents(
         &mut self,
         ui: &mut egui::Ui,
@@ -1528,8 +1562,13 @@ impl FileTreeUi {
             } else {
                 0.0
             };
-            let list_max_h =
-                (ui.available_height() * 0.34).clamp(118.0, 232.0) + 39.1 + session_block_h;
+            // 사용자가 아래 경계선(workspace_split_handle)을 드래그해 조절한 높이 —
+            // 창 크기가 바뀌어도 안전하도록 매 프레임 가용 높이 기준으로 재클램프한다.
+            let min_list_h = 118.0_f32;
+            let max_list_h = (ui.available_height() - 160.0).max(min_list_h);
+            self.workspace_section_height =
+                self.workspace_section_height.clamp(min_list_h, max_list_h);
+            let list_max_h = self.workspace_section_height + session_block_h;
             egui::ScrollArea::vertical()
                 .id_salt("workspace_list_scroll")
                 .max_height(list_max_h)
@@ -1856,7 +1895,7 @@ impl FileTreeUi {
                 });
         }
         ui.add_space(4.0);
-        crate::ui::hairline_full(ui);
+        let resizing_workspace_split = self.workspace_split_handle(ui);
 
         // 독립 「파일」 제목행은 제거하고 현재 경로와 핵심 도구를 한 행에 합친다.
         // 패널이 극단적으로 좁아지면 검색 → 새 폴더 → 숨김 순으로 도구를 남겨
@@ -2259,7 +2298,10 @@ impl FileTreeUi {
                         egui::pos2(ui.max_rect().left(), row_top),
                         egui::pos2(ui.max_rect().right(), row_top + row_height),
                     );
-                    if ui.rect_contains_pointer(hover_rect) {
+                    // 워크스페이스·폴더 트리 경계선 드래그 중엔 hover 판정을 끈다 —
+                    // 리사이즈로 행이 포인터 밑에 밀려 들어오면 클릭 가능한 것처럼
+                    // 하이라이트되어 오클릭처럼 보였다(2026-07-24 사용자 보고).
+                    if !resizing_workspace_split && ui.rect_contains_pointer(hover_rect) {
                         ui.painter().rect_filled(
                             hover_rect,
                             1.0,
@@ -2377,8 +2419,14 @@ impl FileTreeUi {
                         egui::pos2(ui.max_rect().left(), response.rect.min.y),
                         egui::pos2(ui.max_rect().right(), response.rect.max.y),
                     );
-                    let row_resp =
-                        ui.interact(row_rect, drag_id.with("row"), egui::Sense::click_and_drag());
+                    // 경계선 리사이즈 중엔 행 전체를 hover만 받게 낮춰 클릭/드래그를
+                    // 아예 못 일으키게 한다(위 hover 판정 차단과 같은 이유).
+                    let row_sense = if resizing_workspace_split {
+                        egui::Sense::hover()
+                    } else {
+                        egui::Sense::click_and_drag()
+                    };
+                    let row_resp = ui.interact(row_rect, drag_id.with("row"), row_sense);
                     let row_resp = if inaccessible {
                         row_resp.on_hover_text(catalog.t("file_tree.macos_access_denied", &[]))
                     } else {

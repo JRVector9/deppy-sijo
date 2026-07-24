@@ -534,6 +534,9 @@ const REMOTE_VIEWING_TTL_CAP: Duration = Duration::from_secs(300);
 const DEFAULT_MAX_EXITED_BACKENDS: usize = 64;
 const MIN_RUNTIME_CACHE_BUDGET_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_CACHE_BUDGET_BYTES: usize = 2048 * 1024 * 1024;
+/// 전역 예산 초과 시 live 세션을 트림해도 세션마다 최소 유지하는 스크롤백 줄 수.
+/// 이 밑으로는 안 줄인다(사용성 보호) — 모든 세션이 여기 도달하면 트림을 멈춘다.
+const LIVE_TRIM_FLOOR_LINES: usize = 200;
 
 fn clamp_runtime_cache_budget_bytes(bytes: usize) -> usize {
     bytes.clamp(
@@ -3067,6 +3070,67 @@ impl Worker {
         if self.sessions.len() < sessions_before {
             crate::signal_memory_released();
         }
+        // exited 아카이브만으로 예산을 못 맞추면 live 세션 스크롤백을 트림한다 — 전역
+        // 강제가 exited 세션만 회수하던 구멍(리뷰 B-M1)을 메운다. hidden 먼저, visible은
+        // 최후수단. 트림이 셀 배열을 해제하므로 성공 시 해제 페이지를 OS로 반환.
+        if self.terminal_cache_bytes() > self.cache_budget_bytes
+            && self.trim_live_over_budget(&visible)
+        {
+            crate::signal_memory_released();
+        }
+    }
+
+    /// exited 아카이브 후에도 전역 예산을 초과하면 live 세션의 스크롤백을 트림해 예산
+    /// 안으로 넣는다. 안 보이는(hidden/원격시청 아님) 세션을 무거운 순으로 먼저 줄이고,
+    /// 그래도 초과하면 최후수단으로 보이는 세션을 줄인다. 각 세션은 히스토리를 절반씩
+    /// (FLOOR까지) 줄여 수렴시키고, 모두 FLOOR면 멈춘다(무한루프 없음). 하나라도 줄였으면
+    /// true. 트림은 사용자가 보던 스크롤백을 줄일 수 있어 warn 로그를 남긴다.
+    fn trim_live_over_budget(&mut self, visible: &[SessionId]) -> bool {
+        let budget = self.cache_budget_bytes;
+        let mut trimmed_any = false;
+        loop {
+            // 현재 세션들의 (id, 추정바이트, 히스토리, 가시성) 스냅샷.
+            let footprints: Vec<LiveTrimEntry> = self
+                .sessions
+                .iter()
+                .map(|(id, session)| {
+                    let fp = session.cache_footprint();
+                    LiveTrimEntry {
+                        id: *id,
+                        estimated_bytes: fp.estimated_bytes,
+                        history_lines: fp.history_lines,
+                        visible: visible.contains(id),
+                    }
+                })
+                .collect();
+            let cache_bytes: usize = footprints.iter().map(|e| e.estimated_bytes).sum();
+            let Some((id, target)) = select_next_live_trim(&footprints, cache_bytes, budget) else {
+                if cache_bytes > budget {
+                    tracing::warn!(
+                        budget,
+                        actual = cache_bytes,
+                        "모든 세션을 최소 스크롤백까지 줄였으나 전역 예산 초과 지속"
+                    );
+                }
+                return trimmed_any;
+            };
+            let over_bytes = cache_bytes.saturating_sub(budget);
+            let was_visible = visible.contains(&id);
+            let Some(session) = self.sessions.get_mut(&id) else {
+                return trimmed_any;
+            };
+            if session.trim_scrollback(target).is_none() {
+                return trimmed_any; // 더 못 줄임 → 무한루프 방지
+            }
+            trimmed_any = true;
+            tracing::warn!(
+                session = id.0,
+                target,
+                over_bytes,
+                visible = was_visible,
+                "전역 터미널 캐시 예산 초과 — live 세션 스크롤백 트림"
+            );
+        }
     }
 
     /// exited 세션의 scrollback을 zlib 압축 아카이브 항목으로 만든다.
@@ -3482,6 +3546,40 @@ fn seek_ansi_replay_tail(
     }
     std::io::Seek::seek(file, std::io::SeekFrom::Start(start))?;
     Ok(start)
+}
+
+/// live-트림 후보 한 세션의 스냅샷 (pure 선택 로직용).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LiveTrimEntry {
+    id: SessionId,
+    estimated_bytes: usize,
+    history_lines: usize,
+    visible: bool,
+}
+
+/// 전역 예산 초과 시 다음에 트림할 세션과 목표 줄 수를 고른다(순수 함수 — 단위 테스트
+/// 대상). 안 보이는 세션을 무거운(estimated_bytes) 순으로 먼저, 그래도 초과면 보이는
+/// 세션을 최후수단으로. `LIVE_TRIM_FLOOR_LINES` 초과인 세션만 후보이고, 목표는 히스토리
+/// 절반(FLOOR 하한). 예산 이내이거나 더 줄일 세션이 없으면 None(호출 루프가 종료).
+fn select_next_live_trim(
+    entries: &[LiveTrimEntry],
+    cache_bytes: usize,
+    budget: usize,
+) -> Option<(SessionId, usize)> {
+    if cache_bytes <= budget {
+        return None;
+    }
+    for visible_pass in [false, true] {
+        if let Some(entry) = entries
+            .iter()
+            .filter(|e| e.visible == visible_pass && e.history_lines > LIVE_TRIM_FLOOR_LINES)
+            .max_by_key(|e| e.estimated_bytes)
+        {
+            let target = (entry.history_lines / 2).max(LIVE_TRIM_FLOOR_LINES);
+            return Some((entry.id, target));
+        }
+    }
+    None
 }
 
 /// exit 순서(오래된 것이 앞)에서 cap 초과분을 archive(backend drop) 대상으로 돌려준다
@@ -7273,6 +7371,66 @@ mod tests {
         assert!(
             !renewal_push,
             "lease 갱신이 스냅샷을 재push함 (P5 리뷰 P3 회귀)"
+        );
+    }
+
+    fn live_entry(id: u64, bytes: usize, history: usize, visible: bool) -> super::LiveTrimEntry {
+        super::LiveTrimEntry {
+            id: SessionId(id),
+            estimated_bytes: bytes,
+            history_lines: history,
+            visible,
+        }
+    }
+
+    #[test]
+    fn select_next_live_trim은_hidden을_heaviest순으로_먼저_고른다() {
+        let entries = [
+            live_entry(1, 50, 1000, true),  // visible, 무거움 — 최후수단이라 나중
+            live_entry(2, 40, 1000, false), // hidden, heaviest → 먼저
+            live_entry(3, 30, 1000, false), // hidden, 더 가벼움
+        ];
+        assert_eq!(
+            super::select_next_live_trim(&entries, 120, 100),
+            Some((SessionId(2), 500)) // 1000/2
+        );
+    }
+
+    #[test]
+    fn select_next_live_trim은_hidden이_전부_floor면_visible을_최후수단으로() {
+        let entries = [
+            live_entry(1, 50, 1000, true),
+            live_entry(2, 40, super::LIVE_TRIM_FLOOR_LINES, false), // 이미 FLOOR
+        ];
+        assert_eq!(
+            super::select_next_live_trim(&entries, 120, 100),
+            Some((SessionId(1), 500))
+        );
+    }
+
+    #[test]
+    fn select_next_live_trim은_예산이내면_none() {
+        let entries = [live_entry(1, 50, 1000, false)];
+        assert_eq!(super::select_next_live_trim(&entries, 50, 100), None);
+        assert_eq!(super::select_next_live_trim(&entries, 100, 100), None); // 경계 ==
+    }
+
+    #[test]
+    fn select_next_live_trim은_전부_floor면_초과여도_none() {
+        let entries = [
+            live_entry(1, 50, super::LIVE_TRIM_FLOOR_LINES, false),
+            live_entry(2, 50, super::LIVE_TRIM_FLOOR_LINES, true),
+        ];
+        assert_eq!(super::select_next_live_trim(&entries, 200, 100), None);
+    }
+
+    #[test]
+    fn select_next_live_trim_target은_floor아래로_안내려간다() {
+        // history = FLOOR+10 → /2는 FLOOR 미만 → FLOOR로 클램프
+        let entries = [live_entry(1, 50, super::LIVE_TRIM_FLOOR_LINES + 10, false)];
+        assert_eq!(
+            super::select_next_live_trim(&entries, 120, 100),
+            Some((SessionId(1), super::LIVE_TRIM_FLOOR_LINES))
         );
     }
 

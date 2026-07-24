@@ -35,25 +35,6 @@ pub(crate) fn signal_memory_released() {
     }
 }
 
-#[cfg(test)]
-mod memory_release_hook_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    fn hook() {
-        CALLS.fetch_add(1, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn 등록된_훅이_signal마다_호출된다() {
-        super::set_memory_release_hook(hook);
-        let before = CALLS.load(Ordering::SeqCst);
-        super::signal_memory_released();
-        super::signal_memory_released();
-        assert_eq!(CALLS.load(Ordering::SeqCst), before + 2, "훅이 signal마다 불려야 함");
-    }
-}
-
 pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 pub use command::{
     MuxPaneId, MuxTabId, RuntimeCommand, RuntimeCommandPreparationErrorCode,
@@ -86,3 +67,22 @@ pub use terminal::{
 pub use session::{
     SessionStatus, SessionStatusView, StatusConfidence, StatusSource, UserStatusOverride,
 };
+
+#[cfg(test)]
+mod memory_release_hook_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn hook() {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn 등록된_훅이_signal마다_호출된다() {
+        super::set_memory_release_hook(hook);
+        let before = CALLS.load(Ordering::SeqCst);
+        super::signal_memory_released();
+        super::signal_memory_released();
+        assert_eq!(CALLS.load(Ordering::SeqCst), before + 2, "훅이 signal마다 불려야 함");
+    }
+}

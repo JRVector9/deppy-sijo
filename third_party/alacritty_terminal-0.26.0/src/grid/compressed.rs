@@ -102,17 +102,25 @@ impl CompressedRow {
                 }),
             }
             if cell.extra.is_some() {
-                extras.push((
-                    col as u16,
-                    ExtraData {
-                        zerowidth: cell
-                            .zerowidth()
-                            .map(|z| z.to_vec().into_boxed_slice())
-                            .unwrap_or_default(),
-                        underline_color: cell.underline_color(),
-                        hyperlink: cell.hyperlink(),
-                    },
-                ));
+                let zerowidth = cell
+                    .zerowidth()
+                    .map(|z| z.to_vec().into_boxed_slice())
+                    .unwrap_or_default();
+                let underline_color = cell.underline_color();
+                let hyperlink = cell.hyperlink();
+                // Some(빈 CellExtra)(clear_wide 등)는 실질 내용이 없어 decode 시 None으로
+                // 복원된다 — 빈 ExtraData를 저장할 필요 없다(공간 낭비 제거). 실질 내용이
+                // 있을 때만 기록한다(A-L1).
+                if !zerowidth.is_empty() || underline_color.is_some() || hyperlink.is_some() {
+                    extras.push((
+                        col as u16,
+                        ExtraData {
+                            zerowidth,
+                            underline_color,
+                            hyperlink,
+                        },
+                    ));
+                }
             }
         }
 
@@ -120,6 +128,8 @@ impl CompressedRow {
             text: text.into_boxed_str(),
             runs: runs.into_boxed_slice(),
             extras: extras.into_boxed_slice(),
+            // occ는 폭 이하 → 폭 65535 이하 터미널에서는 u16으로 무손실(A-L5). 폭이
+            // 65535를 넘는 건 현실 터미널에서 불가능하므로 clamp는 이론적 안전장치다.
             occ: row.occ.min(u16::MAX as usize) as u16,
         }
     }
@@ -284,5 +294,33 @@ mod tests {
             compressed.heap_bytes(),
             raw
         );
+    }
+
+    #[test]
+    fn extras_heavy_행은_압축이_원시보다_커서_저장_안함_조건을_탄다() {
+        // 모든 셀에 서로 다른 하이퍼링크 → extras가 셀마다 붙어 압축 표현이 원시(24B/셀)
+        // 를 넘는다(A-L2). compress_line은 이 조건에서 저장하지 않고 원시를 유지한다.
+        let mut cells = blank_row();
+        for i in 0..columns() {
+            cells[i].c = 'x';
+            cells[i].set_hyperlink(Some(Hyperlink::new(
+                Some(format!("id{i}")),
+                format!("https://example.com/{i}"),
+            )));
+        }
+        let row = Row::from_vec(cells, columns());
+        let compressed = CompressedRow::encode(&row, columns());
+        let raw = columns() * std::mem::size_of::<Cell>();
+        assert!(
+            compressed.heap_bytes() >= raw,
+            "extras-heavy인데 압축이 더 작음: compressed {} < raw {}",
+            compressed.heap_bytes(),
+            raw
+        );
+        // 그래도 (저장한다면) 왕복은 무손실이어야 한다.
+        let restored = compressed.decode(columns());
+        for col in 0..columns() {
+            assert_eq!(row[Column(col)], restored[Column(col)], "col {col} 왕복 불일치");
+        }
     }
 }

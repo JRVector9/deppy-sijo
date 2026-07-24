@@ -327,7 +327,15 @@ impl Storage<Cell> {
             return None;
         }
         let compressed = CompressedRow::encode(&self.inner[idx], columns);
-        let saved = raw_bytes.saturating_sub(compressed.heap_bytes());
+        // 압축 표현이 원시 셀 배열보다 크거나 같으면(모든 셀에 extra가 있는 극히 드문
+        // 행 — A-L2) 저장하지 않고 원시를 유지한다. 저장하면 오히려 RSS가 늘기 때문.
+        // frontier가 끊기지 않도록 "검사했으니 계속"만 신호한다(Some(0)) — 이 행은 raw로
+        // 남아 다음 호출에 재검사되나, 그런 행은 드물고 pathological 세션은 live-트림이
+        // 상한을 씌운다.
+        if compressed.heap_bytes() >= raw_bytes {
+            return Some(0);
+        }
+        let saved = raw_bytes - compressed.heap_bytes();
 
         // 첫 압축에서만 곁가지를 inner와 같은 길이로 실체화(lazy).
         if self.compressed.is_empty() {

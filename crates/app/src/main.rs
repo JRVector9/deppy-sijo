@@ -27,6 +27,7 @@ mod native_key_monitor;
 mod notice_translate;
 mod panic_policy;
 mod paths;
+mod prompt_library;
 mod perf;
 mod process_storm;
 mod shortcuts;

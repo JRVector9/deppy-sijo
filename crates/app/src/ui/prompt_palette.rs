@@ -56,6 +56,10 @@ impl PromptPaletteUi {
         self.confirm_delete = false;
     }
 
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
     /// 팔레트를 그린다. 닫혀 있으면 아무것도 안 그리고 None. `composer_draft`는 "현재 컴포저
     /// 내용 저장"을 프리필하기 위한 활성 워크스페이스의 컴포저 입력이다. 삽입(Insert)은
     /// 팔레트를 닫고 컴포저로 돌아가지만, 저장/삭제(Upsert/Delete)는 계속 관리하도록
@@ -175,6 +179,7 @@ impl PromptPaletteUi {
             if ui.button("← 목록").clicked() {
                 self.selected = None;
                 self.confirm_delete = false;
+                self.focus_search = true; // 목록 복귀 시 검색창 재포커스(PR-2 리뷰 Low).
             }
             ui.strong(&prompt.title);
         });

@@ -371,7 +371,11 @@ impl ComposerUi {
     /// 삽입한다(끝에 경계 공백 보정). 실제 전송은 기존 Send 경로(사용자 검토 후)가 한다.
     pub fn insert_text(&mut self, active_workspace: &str, text: &str) {
         let buffer = self.buffers.entry(active_workspace.to_owned()).or_default();
-        let _ = insert_snippet(buffer, None, text);
+        let inserted = insert_snippet(buffer, None, text);
+        // 삽입 조각 끝으로 캐럿을 예약한다(post-show 경로 — 툴바 삽입과 동일 규칙).
+        // 안 하면 egui TextEditState 캐럿이 이전 위치에 남아, 이어 입력이 엉뚱한 곳에
+        // 들어간다(PR-2 리뷰 High).
+        self.pending_cursor = Some(inserted.cursor);
         self.request_focus();
     }
 

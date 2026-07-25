@@ -1172,6 +1172,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "persist",
  "platform",
+ "pty",
  "qrcode",
  "quick-xml",
  "regex",

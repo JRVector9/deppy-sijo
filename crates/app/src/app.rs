@@ -14430,9 +14430,11 @@ impl App {
                 out.push(crate::fleet::FleetSession {
                     workspace_id: workspace.id.clone(),
                     workspace_name: workspace_name.clone(),
-                    session,
-                    tab: entry.tab,
-                    pane: entry.pane,
+                    target: crate::fleet::FleetTarget::Pty {
+                        session,
+                        tab: entry.tab,
+                        pane: entry.pane,
+                    },
                     title: entry.title,
                     state,
                     agent_line: entry.agent_line,
@@ -14440,6 +14442,44 @@ impl App {
                     active_workspace: active,
                 });
             }
+        }
+        // 구조화(App Server) 에이전트 — 워크스페이스 런타임과 독립이라 agent_sessions_ui에서
+        // 직접 나열한다(관찰 + 열기 전용, 브로드캐스트 대상 아님). 상태는 from_structured.
+        for row in self.agent_sessions_ui.fleet_rows() {
+            // 닫은 워크스페이스의 구조화 세션은 fleet에서도 숨긴다 — PTY 카드와 일관되게
+            // (병렬 리뷰 Low). workspace_id가 없으면 필터할 수 없어 그대로 표시한다.
+            if let Some(ws) = &row.workspace_id
+                && !workspace_visible_after_close(&self.closed_workspaces, ws)
+            {
+                continue;
+            }
+            // workspace_id 없으면 빈 문자열(표시용 fallback). 구조화 카드의 라우팅은
+            // OpenStructured가 session_id로만 하므로 이 값이 실제 id가 아니어도 안전하다.
+            let workspace_id = row.workspace_id.clone().unwrap_or_default();
+            let workspace_name = self
+                .workspaces
+                .iter()
+                .find(|w| Some(&w.id) == row.workspace_id.as_ref())
+                .map(Self::workspace_display_name)
+                .unwrap_or_else(|| "—".to_owned());
+            // badge는 AgentTransport 상수 재사용(드리프트 방지 — 병렬 리뷰 Low).
+            let badge = crate::agent_surface::AgentTransport::AppServer.badge();
+            let agent_line = Some(match &row.model {
+                Some(model) => format!("[{badge}] Codex · {model}"),
+                None => format!("[{badge}] Codex"),
+            });
+            out.push(crate::fleet::FleetSession {
+                active_workspace: row.workspace_id.as_deref() == Some(self.active.id.as_str()),
+                workspace_id,
+                workspace_name,
+                target: crate::fleet::FleetTarget::Structured {
+                    session_id: row.session_id,
+                },
+                title: row.title,
+                state: row.state,
+                agent_line,
+                waiting_message: None,
+            });
         }
         crate::fleet::sort_sessions(&mut out);
         out
@@ -16566,6 +16606,13 @@ impl eframe::App for App {
                 // 에이전트 패널을 연다(fleet에 세션을 추가하는 진입점). 패널은 떠 있는
                 // 창이라 fleet 뷰 위에서 바로 쓸 수 있다.
                 self.agent_sessions_ui.open();
+            }
+            Some(ui::fleet::FleetAction::OpenStructured { session_id }) => {
+                // 구조화 세션 카드 클릭 → 에이전트 패널에서 해당 세션을 연다. 세션이
+                // 사라졌으면(open_session=false) 엉뚱한 이전 선택을 띄우지 않는다(리뷰 Low).
+                if self.agent_sessions_ui.open_session(&session_id) {
+                    self.agent_sessions_ui.open();
+                }
             }
             Some(ui::fleet::FleetAction::Broadcast { prompt, targets }) => {
                 // 저장된 프롬프트를 선택된 각 실행 중 에이전트에 컴포저 Send와 동일 경로로

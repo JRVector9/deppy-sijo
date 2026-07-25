@@ -245,6 +245,17 @@ pub struct AgentSessionStatusNotice {
     pub status: AgentSessionStatus,
 }
 
+/// fleet 뷰가 구조화(App Server) 세션을 카드로 그리기 위한 읽기전용 요약.
+/// App이 fleet_rows()로 받아 FleetSession으로 투영한다(관찰 + 열기 전용).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FleetStructuredRow {
+    pub session_id: AgentSessionId,
+    pub workspace_id: Option<String>,
+    pub title: String,
+    pub state: crate::agent_surface::AgentVisualState,
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSessionsRequest {
     RevealWorkspace(String),
@@ -798,6 +809,29 @@ impl AgentSessionsUi {
         self.sessions
             .iter()
             .map(|session| session.id.clone())
+            .collect()
+    }
+
+    /// fleet 뷰용 라이브 구조화(App Server) 세션 요약. Off(중단/종료)는 제외해 "지금
+    /// 살아있는" 에이전트만 담는다. 관찰 + 열기 전용(브로드캐스트 대상 아님).
+    pub fn fleet_rows(&self) -> Vec<FleetStructuredRow> {
+        self.sessions
+            .iter()
+            .filter_map(|session| {
+                let state = crate::agent_surface::AgentVisualState::from_structured(session.status);
+                if state == crate::agent_surface::AgentVisualState::Off {
+                    return None;
+                }
+                Some(FleetStructuredRow {
+                    session_id: session.id.clone(),
+                    workspace_id: session.workspace_id.clone(),
+                    // 기존 catalog-aware 헬퍼 재사용(빈 프롬프트 fallback도 i18n 처리 —
+                    // agent_sessions.default_task). 병렬 리뷰 Medium 반영.
+                    title: one_line_title(&session.prompt, &self.catalog),
+                    state,
+                    model: session.model.clone(),
+                })
+            })
             .collect()
     }
 

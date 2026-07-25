@@ -17,21 +17,43 @@ use crate::agent_surface::AgentVisualState;
 pub struct FleetSession {
     pub workspace_id: String,
     pub workspace_name: String,
-    /// 세션 id. `runtime::SessionId`는 워크스페이스마다 재사용될 수 있어 fleet 맵의
-    /// 키는 항상 `(workspace_id, session)` 쌍이어야 한다(단독 사용 금지).
-    pub session: runtime::SessionId,
-    /// 포커스 라우팅용 tab/pane(그리드 카드 클릭 → 해당 세션으로 전환).
-    pub tab: runtime::MuxTabId,
-    pub pane: runtime::MuxPaneId,
+    /// 포커스 라우팅 + 종류(PTY vs 구조화). 브로드캐스트는 PTY만 대상이다.
+    pub target: FleetTarget,
     pub title: String,
     /// 정규화된 시각 상태(agent_surface). needs-input/승인/오류/완료/작업중/유휴/off.
     pub state: AgentVisualState,
-    /// 에이전트 2행 "Codex · gpt-5.5 · xhigh"(에이전트일 때만 Some).
+    /// 에이전트 2행 "Codex · gpt-5.5 · xhigh" 또는 "[APP] Codex · …".
     pub agent_line: Option<String>,
     /// hook이 보고한 대기 사유(needs-input 메시지). Waiting 상태에서만 대개 Some.
     pub waiting_message: Option<String>,
     /// active 워크스페이스의 세션인지(그 외는 warm — 물러났지만 워커는 실행 중).
     pub active_workspace: bool,
+}
+
+/// fleet 카드의 종류별 포커스 대상. PTY는 tab/pane으로 포커스하고 WriteInput
+/// 브로드캐스트가 가능하지만, 구조화(App Server) 세션은 세션 id로 열고 브로드캐스트는
+/// steer 경로라 대상이 아니다.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FleetTarget {
+    /// PTY 세션. `runtime::SessionId`는 워크스페이스마다 재사용될 수 있어 브로드캐스트
+    /// 키는 항상 `(workspace_id, session)` 쌍이어야 한다(단독 사용 금지).
+    Pty {
+        session: runtime::SessionId,
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+    },
+    /// 구조화(App Server) 세션 — 관찰 + 열기만.
+    Structured { session_id: String },
+}
+
+impl FleetSession {
+    /// 브로드캐스트 대상 키 — PTY만 Some(구조화는 steer라 제외).
+    pub fn broadcast_key(&self) -> Option<(String, runtime::SessionId)> {
+        match &self.target {
+            FleetTarget::Pty { session, .. } => Some((self.workspace_id.clone(), *session)),
+            FleetTarget::Structured { .. } => None,
+        }
+    }
 }
 
 /// fleet 상태별 세션 수 총합. 상단 요약 스트립·배지에 쓴다.
@@ -126,5 +148,24 @@ mod tests {
         assert!(fleet_urgency(Complete) > fleet_urgency(Active));
         assert!(fleet_urgency(Active) > fleet_urgency(Idle));
         assert!(fleet_urgency(Idle) > fleet_urgency(Off));
+    }
+
+    /// 안전 불변식: 구조화 세션은 브로드캐스트 키를 절대 내지 않는다(steer 경로라
+    /// WriteInput 대상 불가). FleetTarget/match를 미래에 바꿔도 이 회귀를 잡는다(리뷰 Low).
+    #[test]
+    fn 구조화_세션은_브로드캐스트_대상이_아니다() {
+        let structured = FleetSession {
+            workspace_id: "ws".into(),
+            workspace_name: "ws".into(),
+            target: FleetTarget::Structured {
+                session_id: "s1".into(),
+            },
+            title: "t".into(),
+            state: AgentVisualState::Idle,
+            agent_line: None,
+            waiting_message: None,
+            active_workspace: false,
+        };
+        assert_eq!(structured.broadcast_key(), None);
     }
 }

@@ -14528,6 +14528,10 @@ impl App {
             let workspace_name = Self::workspace_display_name(workspace);
             for entry in entries {
                 // 에이전트만 — 셸은 status/agent_line 둘 다 None.
+                // 주의(의도된 비대칭, 2026-07-25 판정): PTY의 status=None(회색 off 카드)은
+                // 스폰 직후 첫 상태 감지 전(~10초)의 "미분류지만 살아있는" 상태라 일부러
+                // 표시한다 — 구조화 쪽 Off 필터(agent_sessions.rs fleet_rows: DB placeholder
+                // 홍수 방지)와 대칭으로 숨기지 말 것.
                 if entry.agent_line.is_none() && entry.status.is_none() {
                     continue;
                 }

@@ -814,6 +814,12 @@ impl AgentSessionsUi {
 
     /// fleet 뷰용 라이브 구조화(App Server) 세션 요약. Off(중단/종료)는 제외해 "지금
     /// 살아있는" 에이전트만 담는다. 관찰 + 열기 전용(브로드캐스트 대상 아님).
+    ///
+    /// 주의 — PTY 카드와 "off" 의미가 다르다(의도된 비대칭, 2026-07-25 판정): 여기의
+    /// Off(Stopped)는 **DB 복원 placeholder 전부**(import/replace_persisted_threads가
+    /// Stopped로 하드코딩)를 포함하는 "확실히 죽음/보관"이라, 필터하지 않으면 재시작마다
+    /// 죽은 스레드가 fleet를 뒤덮는다. PTY의 Off(status=None)는 스폰 직후 미분류(살아있음)
+    /// 라 반대로 표시가 맞다 — 대칭으로 "고치지" 말 것(app.rs build_fleet_sessions 참고).
     pub fn fleet_rows(&self) -> Vec<FleetStructuredRow> {
         self.sessions
             .iter()

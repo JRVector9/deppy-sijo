@@ -5956,6 +5956,11 @@ pub struct App {
     /// SessionId가 워크스페이스마다 재사용될 수 있어 global은 (workspace, session) 쌍.
     agent_working: std::collections::HashSet<runtime::SessionId>,
     global_working: std::collections::HashSet<(String, runtime::SessionId)>,
+    /// v3.9 N3의 global_waiting/global_working과 같은 패턴 — turn_done이 storage에서
+    /// 전역(prefix 없음) 스코프가 되어(warm turn_done 격차, 감사 발견) warm 워크스페이스도
+    /// "완료" 표시가 가능해졌다. agent_turn_done(활성 전용)과 달리 워크스페이스별로 갈라
+    /// fleet/사이드바 warm 경로에 넘긴다.
+    global_turn_done: std::collections::HashMap<(String, runtime::SessionId), i64>,
     /// 완료/입력대기 주목(attention) 추적 — 미확인이면 레일 6px, 포커스 확인 시 해제.
     session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
     /// 세션별 현재 작업 폴더(감지 워커 lsof) — 행 1행 폴더명 + 워크스페이스명.
@@ -8461,6 +8466,7 @@ impl App {
             agent_turn_done: std::collections::HashMap::new(),
             agent_working: std::collections::HashSet::new(),
             global_working: std::collections::HashSet::new(),
+            global_turn_done: std::collections::HashMap::new(),
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
@@ -9094,6 +9100,19 @@ impl App {
         )
     }
 
+    /// 전역 attention 세션(global_waiting/global_working/global_turn_done)의 liveness 필터
+    /// — 활성 워크스페이스면 active.session_titles, 아니면 warm runtime의
+    /// session_titles로 살아있는 세션인지 확인한다(세 곳에 복붙되던 판정을 한 곳으로).
+    fn attention_session_alive(&self, workspace_id: &str, session: runtime::SessionId) -> bool {
+        if workspace_id == self.active.id {
+            self.active.session_titles.contains_key(&session)
+        } else {
+            self.warm
+                .get(workspace_id)
+                .is_some_and(|runtime| runtime.session_titles.contains_key(&session))
+        }
+    }
+
     fn apply_agent_state_storage_projection(
         &mut self,
         section: crate::agent_state_worker::AgentStateSection,
@@ -9139,20 +9158,26 @@ impl App {
                     .iter()
                     .filter_map(|(key, message)| {
                         let (workspace_id, session) = ui::inbox_waiting::parse_session_key(key)?;
-                        let alive = if workspace_id == self.active.id {
-                            self.active.session_titles.contains_key(&session)
-                        } else {
-                            self.warm.get(&workspace_id).is_some_and(|runtime| {
-                                runtime.session_titles.contains_key(&session)
-                            })
-                        };
-                        alive.then(|| (workspace_id, session, message.clone()))
+                        self.attention_session_alive(&workspace_id, session)
+                            .then(|| (workspace_id, session, message.clone()))
                     })
                     .collect();
                 self.agent_turn_done = snapshot
                     .turn_done_sessions
                     .iter()
                     .filter_map(|(key, at)| Some((session_id(key)?, *at)))
+                    .collect();
+                // turn_done 전역화(warm turn_done 격차, 감사 발견) — global_waiting/
+                // global_working과 동일 규칙(liveness 필터, 살아있는 세션만). 값(updated_at)은
+                // 워크스페이스별 subset 소비 시 조건부 clear의 세대 기준으로 그대로 쓴다.
+                self.global_turn_done = snapshot
+                    .turn_done_sessions
+                    .iter()
+                    .filter_map(|(key, at)| {
+                        let (workspace_id, session) = ui::inbox_waiting::parse_session_key(key)?;
+                        self.attention_session_alive(&workspace_id, session)
+                            .then_some(((workspace_id, session), *at))
+                    })
                     .collect();
                 // hook 기반 "작업 중"(v32) — 활성 전용 set + 전 워크스페이스(liveness 필터,
                 // global_waiting과 동일 규칙: 살아있는 세션만).
@@ -9166,14 +9191,8 @@ impl App {
                     .iter()
                     .filter_map(|key| {
                         let (workspace_id, session) = ui::inbox_waiting::parse_session_key(key)?;
-                        let alive = if workspace_id == self.active.id {
-                            self.active.session_titles.contains_key(&session)
-                        } else {
-                            self.warm.get(&workspace_id).is_some_and(|runtime| {
-                                runtime.session_titles.contains_key(&session)
-                            })
-                        };
-                        alive.then_some((workspace_id, session))
+                        self.attention_session_alive(&workspace_id, session)
+                            .then_some((workspace_id, session))
                     })
                     .collect();
             }
@@ -14395,8 +14414,6 @@ impl App {
             runtime::SessionId,
             crate::agent_transcript::AgentActivity,
         > = std::collections::HashMap::new();
-        let empty_turn: std::collections::HashMap<runtime::SessionId, i64> =
-            std::collections::HashMap::new();
         let mut out = Vec::new();
         for workspace in &self.workspaces {
             if !workspace_visible_after_close(&self.closed_workspaces, &workspace.id) {
@@ -14425,6 +14442,14 @@ impl App {
                 .filter(|(ws, _)| ws == &workspace.id)
                 .map(|(_, session)| *session)
                 .collect();
+            // turn_done 전역화(warm turn_done 격차, 감사 발견) — global_turn_done에서
+            // 이 워크스페이스 몫만. warm도 "완료(바이올렛)" 표시가 가능해진다.
+            let turn_done: std::collections::HashMap<runtime::SessionId, i64> = self
+                .global_turn_done
+                .iter()
+                .filter(|((ws, _), _)| ws == &workspace.id)
+                .map(|((_, session), at)| (*session, *at))
+                .collect();
             let entries = if active {
                 runtime.workspace_ui.session_entries(
                     text,
@@ -14438,7 +14463,7 @@ impl App {
                     text,
                     &empty_activity,
                     &needs_input,
-                    &empty_turn,
+                    &turn_done,
                     &working,
                 )
             };
@@ -16146,8 +16171,6 @@ impl eframe::App for App {
             runtime::SessionId,
             crate::agent_transcript::AgentActivity,
         > = std::collections::HashMap::new();
-        let no_turn_done: std::collections::HashMap<runtime::SessionId, i64> =
-            std::collections::HashMap::new();
         let mut sidebar_sessions: std::collections::HashMap<
             String,
             Vec<ui::file_tree::SessionEntry>,
@@ -16172,11 +16195,19 @@ impl eframe::App for App {
                 .filter(|(workspace_id, _)| workspace_id == &workspace.id)
                 .map(|(_, session)| *session)
                 .collect();
+            // turn_done 전역화(warm turn_done 격차, 감사 발견) — warm 워크스페이스도
+            // 사이드바에서 "완료"를 보인다.
+            let turn_done: std::collections::HashMap<_, _> = self
+                .global_turn_done
+                .iter()
+                .filter(|((workspace_id, _), _)| workspace_id == &workspace.id)
+                .map(|((_, session), at)| (*session, *at))
+                .collect();
             let mut entries = warm_runtime.workspace_ui.session_entries(
                 &text,
                 &no_activity,
                 &needs_input,
-                &no_turn_done,
+                &turn_done,
                 &working,
             );
             for entry in &mut entries {

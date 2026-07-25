@@ -11,6 +11,7 @@ mod alloc;
 mod app;
 mod bench;
 mod codex_app_server;
+mod claude_usage;
 mod config;
 mod dotenv_sync;
 mod env;

@@ -1101,3 +1101,7 @@
 - Built and launched the Developer ID-signed app bundle; the running process is PID 90868.
 - Commit gates passed: `cargo test -p deppy-sijo --bins file_tree`, `cargo clippy -p deppy-sijo --bin deppy-sijo -p mcp-proxy --bin deppy-mcp-proxy -- -D warnings`, and `cargo test -p i18n`.
 - The delivery plan is two stacked PRs: usage/repository integration first, followed by the isolated active-session and compact-header visual change.
+## 2026-07-26 stacked PR delivery
+
+- PR #37 (`workspaceDesign-usage` -> `workspaceDesign`): repository context and Codex/Claude usage, including the hidden Claude `/usage` PTY fallback.
+- PR #38 (`workspaceDesign-active-session` -> `workspaceDesign-usage`): active session rail `#c84d4d` and 10% smaller workspace header/avatar.

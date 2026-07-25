@@ -1579,197 +1579,235 @@ impl FileTreeUi {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for workspace in before_active {
-                        let color = workspace_accent(sidebar.workspaces, &workspace.id);
-                        let expanded = self
-                            .workspace_sessions_expanded
-                            .get(&workspace.id)
-                            .copied()
-                            .unwrap_or(false);
-                        let resp =
-                            workspace_row(ui, workspace, color, false, Some(expanded), catalog);
-                        workspace_context_menu(&resp, workspace, catalog, &mut action);
-                        if resp.clicked() {
-                            self.workspace_sessions_expanded
-                                .insert(workspace.id.clone(), true);
-                            action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
-                        }
-                        if expanded
-                            && let Some(sessions) = sessions_by_workspace.get(&workspace.id)
-                            && let Some(session_action) = inactive_workspace_sessions(
-                                ui,
-                                &workspace.id,
-                                sessions,
-                                session_max_h,
-                            )
-                        {
-                            action = Some(session_action);
-                        }
+                        // 워크스페이스 헤더 + 그 세션 목록을 한 카드(#0f171d 배경·
+                        // #131c23 테두리)로 묶는다 — paint_workspace_group_wrap 주석 참고.
+                        // 세션 구간만 살짝 다른 톤(#121a20)을 더 얹는다(inset_reserve) —
+                        // paint_workspace_session_inset 참고.
+                        let reserve = ui.painter().add(egui::Shape::Noop);
+                        let inset_reserve = ui.painter().add(egui::Shape::Noop);
+                        let inner = ui.scope(|ui| {
+                            let color = workspace_accent(sidebar.workspaces, &workspace.id);
+                            let expanded = self
+                                .workspace_sessions_expanded
+                                .get(&workspace.id)
+                                .copied()
+                                .unwrap_or(false);
+                            let resp =
+                                workspace_row(ui, workspace, color, false, Some(expanded), catalog);
+                            let header_bottom = resp.rect.bottom();
+                            workspace_context_menu(&resp, workspace, catalog, &mut action);
+                            if resp.clicked() {
+                                self.workspace_sessions_expanded
+                                    .insert(workspace.id.clone(), true);
+                                action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+                            }
+                            let mut last_row_rect = None;
+                            if expanded
+                                && let Some(sessions) = sessions_by_workspace.get(&workspace.id)
+                            {
+                                let (session_action, rect) = inactive_workspace_sessions(
+                                    ui,
+                                    &workspace.id,
+                                    sessions,
+                                    session_max_h,
+                                );
+                                if let Some(session_action) = session_action {
+                                    action = Some(session_action);
+                                }
+                                last_row_rect = rect;
+                            }
+                            (header_bottom, last_row_rect)
+                        });
+                        let group_rect = inner.response.rect;
+                        let (header_bottom, last_row_rect) = inner.inner;
+                        paint_workspace_group_wrap(ui, reserve, group_rect);
+                        paint_workspace_session_inset(
+                            ui,
+                            inset_reserve,
+                            group_rect,
+                            header_bottom,
+                            last_row_rect,
+                        );
                     }
-                    if let Some(active) = active {
-                        let color = workspace_accent(sidebar.workspaces, &active.id);
-                        let expanded = self
-                            .workspace_sessions_expanded
-                            .get(&active.id)
-                            .copied()
-                            .unwrap_or(true);
-                        let resp = workspace_row(ui, active, color, true, Some(expanded), catalog);
-                        workspace_context_menu(&resp, active, catalog, &mut action);
-                        if resp.clicked() {
-                            self.workspace_sessions_expanded
-                                .insert(active.id.clone(), !expanded);
-                            // Home/Inbox/Agents에서 현재 활성 워크스페이스를 다시 눌러도
-                            // App dispatch가 Terminal view로 복귀할 수 있게 명시적 전환을
-                            // 방출한다. 같은 id의 runtime 전환은 App에서 no-op이다.
-                            action = Some(SidebarAction::SwitchWorkspace(active.id.clone()));
+                    // 활성 워크스페이스 헤더 + 그 세션 목록을 하나의 카드 배경(#0f171d)·
+                    // 테두리(#131c23)로 묶는다(2026-07-25 사용자). 배경 자리를 먼저
+                    // 예약(add)해 두고, 아래 두 블록을 ui.scope로 감싸 실제 점유 rect를
+                    // 얻은 뒤 그 자리에 칠한다(paint_workspace_group_wrap 참고) — 두
+                    // 블록의 기존 조건(if let Some(active)/if active_sessions_visible)은
+                    // 그대로 두어 동작을 바꾸지 않는다.
+                    let active_group_reserve = ui.painter().add(egui::Shape::Noop);
+                    let active_inset_reserve = ui.painter().add(egui::Shape::Noop);
+                    let active_inner = ui.scope(|ui| {
+                        let mut header_bottom = None;
+                        if let Some(active) = active {
+                            let color = workspace_accent(sidebar.workspaces, &active.id);
+                            let expanded = self
+                                .workspace_sessions_expanded
+                                .get(&active.id)
+                                .copied()
+                                .unwrap_or(true);
+                            let resp =
+                                workspace_row(ui, active, color, true, Some(expanded), catalog);
+                            header_bottom = Some(resp.rect.bottom());
+                            workspace_context_menu(&resp, active, catalog, &mut action);
+                            if resp.clicked() {
+                                self.workspace_sessions_expanded
+                                    .insert(active.id.clone(), !expanded);
+                                // Home/Inbox/Agents에서 현재 활성 워크스페이스를 다시 눌러도
+                                // App dispatch가 Terminal view로 복귀할 수 있게 명시적 전환을
+                                // 방출한다. 같은 id의 runtime 전환은 App에서 no-op이다.
+                                action = Some(SidebarAction::SwitchWorkspace(active.id.clone()));
+                            }
                         }
-                    }
 
-                    // 현재 workspace의 셸/에이전트를 활성 워크스페이스 아래에 들여써 나열한다.
-                    let active_sessions_visible = self
-                        .workspace_sessions_expanded
-                        .get(sidebar.active_workspace_id)
-                        .copied()
-                        .unwrap_or(true)
-                        && !active_sessions.is_empty();
-                    if active_sessions_visible {
-                        // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05
-                        // 사용자 보고). 세션 목록은 자기 상한 안에서만 스크롤하고, 나머지는
-                        // 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
-                        egui::ScrollArea::vertical()
-                            .id_salt("session_list_scroll")
-                            .max_height(session_max_h)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.add_space(2.0);
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                for entry in active_sessions {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(20.0);
-                                        ui.vertical(|ui| {
-                                            let editing = matches!(
-                                                &self.session_name_edit,
-                                                Some((p, _)) if *p == entry.pane
-                                            );
-                                            if editing {
-                                                // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
-                                                // 행(레일/상태줄) 레이아웃은 유지하고 제목 자리만 편집기로.
-                                                let buf =
-                                                    &mut self.session_name_edit.as_mut().unwrap().1;
-                                                session_row_editing(ui, entry, buf);
-                                                let (enter, esc) = ui.input(|i| {
-                                                    (
-                                                        i.key_pressed(egui::Key::Enter),
-                                                        i.key_pressed(egui::Key::Escape),
-                                                    )
-                                                });
-                                                if enter {
-                                                    if let Some((pane, title)) =
-                                                        self.session_name_edit.take()
-                                                    {
-                                                        let title = title.trim().to_owned();
-                                                        if !title.is_empty() {
-                                                            action = Some(
-                                                                SidebarAction::RenameSession {
-                                                                    pane,
-                                                                    title,
-                                                                },
-                                                            );
+                        // 현재 workspace의 셸/에이전트를 활성 워크스페이스 아래에 들여써 나열한다.
+                        let mut last_row_rect = None;
+                        let active_sessions_visible = self
+                            .workspace_sessions_expanded
+                            .get(sidebar.active_workspace_id)
+                            .copied()
+                            .unwrap_or(true)
+                            && !active_sessions.is_empty();
+                        if active_sessions_visible {
+                            // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05
+                            // 사용자 보고). 세션 목록은 자기 상한 안에서만 스크롤하고, 나머지는
+                            // 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
+                            egui::ScrollArea::vertical()
+                                .id_salt("session_list_scroll")
+                                .max_height(session_max_h)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    // 헤더-세션 사이 여백 없음(2026-07-25 사용자) — 첫 행이
+                                    // 인셋 상단에 바로 붙는다.
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    for (index, entry) in active_sessions.iter().enumerate() {
+                                        let is_last = index + 1 == active_sessions.len();
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(20.0);
+                                            ui.vertical(|ui| {
+                                                let editing = matches!(
+                                                    &self.session_name_edit,
+                                                    Some((p, _)) if *p == entry.pane
+                                                );
+                                                if editing {
+                                                    // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
+                                                    // 행(레일/상태줄) 레이아웃은 유지하고 제목 자리만 편집기로.
+                                                    let buf = &mut self
+                                                        .session_name_edit
+                                                        .as_mut()
+                                                        .unwrap()
+                                                        .1;
+                                                    let resp = session_row_editing(
+                                                        ui, entry, buf, is_last,
+                                                    );
+                                                    last_row_rect = Some(resp.rect);
+                                                    let (enter, esc) = ui.input(|i| {
+                                                        (
+                                                            i.key_pressed(egui::Key::Enter),
+                                                            i.key_pressed(egui::Key::Escape),
+                                                        )
+                                                    });
+                                                    if enter {
+                                                        if let Some((pane, title)) =
+                                                            self.session_name_edit.take()
+                                                        {
+                                                            let title = title.trim().to_owned();
+                                                            if !title.is_empty() {
+                                                                action = Some(
+                                                                    SidebarAction::RenameSession {
+                                                                        pane,
+                                                                        title,
+                                                                    },
+                                                                );
+                                                            }
                                                         }
+                                                    } else if esc {
+                                                        self.session_name_edit = None;
                                                     }
-                                                } else if esc {
-                                                    self.session_name_edit = None;
-                                                }
-                                            } else {
-                                                // 세션 행 자체에는 hover tooltip을 띄우지 않는다.
-                                                // 상태 감지 출처/신뢰도 같은 내부 진단과 이름 변경
-                                                // 안내가 터미널 위를 가리는 문제(2026-07-19 사용자).
-                                                let resp = session_row(ui, entry);
-                                                // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
-                                                // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
-                                                // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
-                                                if let Some(session) = entry.session {
-                                                    resp.context_menu(|ui| {
-                                                        if ui
-                                                            .button(
-                                                                catalog.t(
+                                                } else {
+                                                    // 세션 행 자체에는 hover tooltip을 띄우지 않는다.
+                                                    // 상태 감지 출처/신뢰도 같은 내부 진단과 이름 변경
+                                                    // 안내가 터미널 위를 가리는 문제(2026-07-19 사용자).
+                                                    let resp = session_row(ui, entry, is_last);
+                                                    last_row_rect = Some(resp.rect);
+                                                    // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
+                                                    // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
+                                                    // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
+                                                    if let Some(session) = entry.session {
+                                                        resp.context_menu(|ui| {
+                                                            if ui
+                                                                .button(catalog.t(
                                                                     "workspace.rename_menu",
                                                                     &[],
-                                                                ),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            self.session_name_edit = Some((
-                                                                entry.pane.clone(),
-                                                                entry.title.clone(),
-                                                            ));
-                                                            ui.close();
-                                                        }
-                                                        ui.separator();
-                                                        if ui
-                                                            .button(
-                                                                catalog.t(
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                self.session_name_edit = Some((
+                                                                    entry.pane.clone(),
+                                                                    entry.title.clone(),
+                                                                ));
+                                                                ui.close();
+                                                            }
+                                                            ui.separator();
+                                                            if ui
+                                                                .button(catalog.t(
                                                                     "sidebar.menu.open_folder",
                                                                     &[],
-                                                                ),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            action = Some(
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                action = Some(
                                                                 SidebarAction::OpenSessionFolder {
                                                                     session,
                                                                 },
                                                             );
-                                                            ui.close();
-                                                        }
-                                                        if ui
-                                                            .button(
-                                                                catalog.t(
+                                                                ui.close();
+                                                            }
+                                                            if ui
+                                                                .button(catalog.t(
                                                                     "sidebar.menu.copy_path",
                                                                     &[],
-                                                                ),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            action = Some(
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                action = Some(
                                                                 SidebarAction::CopySessionPath {
                                                                     session,
                                                                 },
                                                             );
-                                                            ui.close();
-                                                        }
-                                                        if ui
-                                                            .button(catalog.t(
-                                                                "sidebar.menu.new_shell_here",
-                                                                &[],
-                                                            ))
-                                                            .clicked()
-                                                        {
-                                                            action = Some(
+                                                                ui.close();
+                                                            }
+                                                            if ui
+                                                                .button(catalog.t(
+                                                                    "sidebar.menu.new_shell_here",
+                                                                    &[],
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                action = Some(
                                                                 SidebarAction::NewShellSameFolder {
                                                                     session,
                                                                 },
                                                             );
-                                                            ui.close();
-                                                        }
-                                                        // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
-                                                        if ui
-                                                            .button(
-                                                                catalog.t(
+                                                                ui.close();
+                                                            }
+                                                            // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
+                                                            if ui
+                                                                .button(catalog.t(
                                                                     "sidebar.menu.show_diff",
                                                                     &[],
-                                                                ),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            action =
-                                                                Some(SidebarAction::ShowDiff {
-                                                                    session,
-                                                                });
-                                                            ui.close();
-                                                        }
-                                                        // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
-                                                        // dispatch의 백그라운드 repo_root가 한다, PR-W).
-                                                        if entry.has_cwd
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                action =
+                                                                    Some(SidebarAction::ShowDiff {
+                                                                        session,
+                                                                    });
+                                                                ui.close();
+                                                            }
+                                                            // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
+                                                            // dispatch의 백그라운드 repo_root가 한다, PR-W).
+                                                            if entry.has_cwd
                                                         && ui
                                                             .button(catalog.t(
                                                                 "sidebar.menu.new_worktree_cell",
@@ -1783,9 +1821,9 @@ impl FileTreeUi {
                                                             });
                                                         ui.close();
                                                     }
-                                                        // 워크트리 삭제 — 이 세션 cwd가 `.deppy/worktrees/`
-                                                        // 하위일 때만 노출(2026-07-18 사용자 제안).
-                                                        if entry.in_worktree
+                                                            // 워크트리 삭제 — 이 세션 cwd가 `.deppy/worktrees/`
+                                                            // 하위일 때만 노출(2026-07-18 사용자 제안).
+                                                            if entry.in_worktree
                                                             && ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.remove_worktree",
@@ -1800,86 +1838,122 @@ impl FileTreeUi {
                                                             );
                                                             ui.close();
                                                         }
-                                                        if entry.resumable
-                                                            && ui
+                                                            if entry.resumable
+                                                                && ui
+                                                                    .button(catalog.t(
+                                                                        "sidebar.menu.resume_agent",
+                                                                        &[],
+                                                                    ))
+                                                                    .clicked()
+                                                            {
+                                                                action = Some(
+                                                                    SidebarAction::ResumeAgent {
+                                                                        pane: entry.pane.clone(),
+                                                                        session,
+                                                                        title: entry.title.clone(),
+                                                                    },
+                                                                );
+                                                                ui.close();
+                                                            }
+                                                            ui.separator();
+                                                            if ui
                                                                 .button(catalog.t(
-                                                                    "sidebar.menu.resume_agent",
+                                                                    "sidebar.menu.close_pane",
                                                                     &[],
                                                                 ))
                                                                 .clicked()
-                                                        {
-                                                            action =
-                                                                Some(SidebarAction::ResumeAgent {
-                                                                    pane: entry.pane.clone(),
-                                                                    session,
-                                                                    title: entry.title.clone(),
-                                                                });
-                                                            ui.close();
-                                                        }
-                                                        ui.separator();
-                                                        if ui
-                                                            .button(
-                                                                catalog.t(
-                                                                    "sidebar.menu.close_pane",
-                                                                    &[],
-                                                                ),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            action =
-                                                                Some(SidebarAction::ClosePane {
-                                                                    pane: entry.pane.clone(),
-                                                                });
-                                                            ui.close();
-                                                        }
-                                                    });
+                                                            {
+                                                                action = Some(
+                                                                    SidebarAction::ClosePane {
+                                                                        pane: entry.pane.clone(),
+                                                                    },
+                                                                );
+                                                                ui.close();
+                                                            }
+                                                        });
+                                                    }
+                                                    if resp.double_clicked() {
+                                                        self.session_name_edit = Some((
+                                                            entry.pane.clone(),
+                                                            entry.title.clone(),
+                                                        ));
+                                                    } else if resp.clicked() && !entry.focused {
+                                                        action =
+                                                            Some(SidebarAction::FocusSession {
+                                                                workspace_id: sidebar
+                                                                    .active_workspace_id
+                                                                    .to_owned(),
+                                                                tab: entry.tab.clone(),
+                                                                pane: entry.pane.clone(),
+                                                            });
+                                                    }
                                                 }
-                                                if resp.double_clicked() {
-                                                    self.session_name_edit = Some((
-                                                        entry.pane.clone(),
-                                                        entry.title.clone(),
-                                                    ));
-                                                } else if resp.clicked() && !entry.focused {
-                                                    action = Some(SidebarAction::FocusSession {
-                                                        workspace_id: sidebar
-                                                            .active_workspace_id
-                                                            .to_owned(),
-                                                        tab: entry.tab.clone(),
-                                                        pane: entry.pane.clone(),
-                                                    });
-                                                }
-                                            }
+                                            });
                                         });
-                                    });
-                                }
-                            });
-                    }
+                                    }
+                                });
+                        }
+                        (header_bottom, last_row_rect)
+                    });
+                    let active_group_rect = active_inner.response.rect;
+                    let (active_header_bottom, active_last_row_rect) = active_inner.inner;
+                    paint_workspace_group_wrap(ui, active_group_reserve, active_group_rect);
+                    // 헤더가 없으면(활성 workspace를 못 찾은 예외적 상태) 카드 전체를
+                    // 세션 구간으로 본다.
+                    paint_workspace_session_inset(
+                        ui,
+                        active_inset_reserve,
+                        active_group_rect,
+                        active_header_bottom.unwrap_or(active_group_rect.top()),
+                        active_last_row_rect,
+                    );
                     for workspace in after_active {
-                        let color = workspace_accent(sidebar.workspaces, &workspace.id);
-                        let expanded = self
-                            .workspace_sessions_expanded
-                            .get(&workspace.id)
-                            .copied()
-                            .unwrap_or(false);
-                        let resp =
-                            workspace_row(ui, workspace, color, false, Some(expanded), catalog);
-                        workspace_context_menu(&resp, workspace, catalog, &mut action);
-                        if resp.clicked() {
-                            self.workspace_sessions_expanded
-                                .insert(workspace.id.clone(), true);
-                            action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
-                        }
-                        if expanded
-                            && let Some(sessions) = sessions_by_workspace.get(&workspace.id)
-                            && let Some(session_action) = inactive_workspace_sessions(
-                                ui,
-                                &workspace.id,
-                                sessions,
-                                session_max_h,
-                            )
-                        {
-                            action = Some(session_action);
-                        }
+                        // before_active와 동일한 카드 배경/테두리 + 세션 인셋 묶음.
+                        let reserve = ui.painter().add(egui::Shape::Noop);
+                        let inset_reserve = ui.painter().add(egui::Shape::Noop);
+                        let inner = ui.scope(|ui| {
+                            let color = workspace_accent(sidebar.workspaces, &workspace.id);
+                            let expanded = self
+                                .workspace_sessions_expanded
+                                .get(&workspace.id)
+                                .copied()
+                                .unwrap_or(false);
+                            let resp =
+                                workspace_row(ui, workspace, color, false, Some(expanded), catalog);
+                            let header_bottom = resp.rect.bottom();
+                            workspace_context_menu(&resp, workspace, catalog, &mut action);
+                            if resp.clicked() {
+                                self.workspace_sessions_expanded
+                                    .insert(workspace.id.clone(), true);
+                                action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+                            }
+                            let mut last_row_rect = None;
+                            if expanded
+                                && let Some(sessions) = sessions_by_workspace.get(&workspace.id)
+                            {
+                                let (session_action, rect) = inactive_workspace_sessions(
+                                    ui,
+                                    &workspace.id,
+                                    sessions,
+                                    session_max_h,
+                                );
+                                if let Some(session_action) = session_action {
+                                    action = Some(session_action);
+                                }
+                                last_row_rect = rect;
+                            }
+                            (header_bottom, last_row_rect)
+                        });
+                        let group_rect = inner.response.rect;
+                        let (header_bottom, last_row_rect) = inner.inner;
+                        paint_workspace_group_wrap(ui, reserve, group_rect);
+                        paint_workspace_session_inset(
+                            ui,
+                            inset_reserve,
+                            group_rect,
+                            header_bottom,
+                            last_row_rect,
+                        );
                     }
                 });
         }
@@ -1984,7 +2058,13 @@ impl FileTreeUi {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| root.display().to_string());
                 let label = format!("{name}  {}", compact_root_path(root));
-                let galley = clipped_line(ui, &label, crate::fonts::sidebar_font(11.5), text_width);
+                let galley = clipped_line(
+                    ui,
+                    &label,
+                    crate::fonts::sidebar_font(11.5),
+                    text_width,
+                    None,
+                );
                 ui.painter().galley(
                     egui::pos2(text_left, header_rect.center().y - galley.size().y / 2.0),
                     galley,
@@ -3229,22 +3309,12 @@ fn workspace_row(
     // 붙었다. 그리기 rect만 좌우 8px 안으로 들여 pill·내용에 숨 공간을 준다
     // (클릭 판정은 full_rect라 가장자리도 눌린다).
     let rect = full_rect.shrink2(egui::vec2(8.0, 0.0));
-    let highlight_rect = workspace_highlight_rect(full_rect);
-    // hover에서만 밝아지던 배경(widgets.hovered.bg_fill)을 걷어내고, 같은 톤
-    // (#2a2a33)을 hover 여부와 무관하게 모든 워크스페이스 행에 상시 유지한다
-    // (2026-07-25 사용자). 활성 행은 그 위에 액센트 틴트를 덧칠해 구분한다.
-    ui.painter().rect_filled(
-        highlight_rect,
-        1.0,
-        egui::Color32::from_rgb(0x2a, 0x2a, 0x33),
-    );
-    if active {
-        ui.painter().rect_filled(
-            highlight_rect,
-            1.0,
-            ui.visuals().selection.bg_fill.gamma_multiply(0.12),
-        );
-    }
+    // 행 자체의 상시 배경(구 #2a2a33)과 활성 행 액센트 틴트(구
+    // selection.bg_fill*0.12)는 걷어냈다 — 워크스페이스+세션을 한 카드로 감싸는
+    // 배경(paint_workspace_group_wrap, #0f171d)이 호출부에서 먼저 깔린다
+    // (2026-07-25 사용자: 여백 없이 이어지는 카드). 틴트를 남기면 헤더만 카드보다
+    // 밝게 떠서 "이어진 카드" 느낌이 깨졌다(2026-07-25 사용자 스샷). 활성 표시는
+    // 아바타 밝기 차이(아래 gamma_multiply 0.48/0.36)로도 이미 구분된다.
     // 선택/실행 상태와 무관한 프로젝트 고유색. 목록 전체에서 같은 계열이 겹치지 않게
     // 미리 배정된 색을 받아 비활성 행과 40pt 아이콘 레일에서도 그대로 유지한다.
     let avatar = egui::Rect::from_center_size(
@@ -3291,6 +3361,7 @@ fn workspace_row(
                 // 원래 대소문자와 자연스러운 자폭을 보존한다.
                 crate::fonts::sidebar_font(14.0),
                 name_width,
+                None,
             );
             ui.painter().galley(
                 egui::pos2(avatar.right() + 7.65, rect.center().y - name.size().y / 2.0),
@@ -3331,13 +3402,96 @@ fn workspace_row(
     response
 }
 
-fn workspace_highlight_rect(full_rect: egui::Rect) -> egui::Rect {
-    // 우측(화살표 쪽) 인셋을 8→6으로 줄여 배경(#2a2a33)이 화살표 옆으로 2px 더
-    // 넓게 채워지게 한다(2026-07-25 사용자) — 좌우 비대칭은 의도된 변경.
-    egui::Rect::from_min_max(
-        egui::pos2(full_rect.left() + 8.0, full_rect.top()),
-        egui::pos2(full_rect.right() - 6.0, full_rect.bottom()),
-    )
+const WORKSPACE_GROUP_FILL: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x17, 0x1d);
+const WORKSPACE_GROUP_BORDER: egui::Color32 = egui::Color32::from_rgb(0x13, 0x1c, 0x23);
+
+/// 워크스페이스 헤더 + (펼쳐졌으면) 그 세션 목록을 배경(#0f171d)·테두리(#131c23)로
+/// 하나의 카드처럼 묶어 그린다(2026-07-25 사용자: 여백 없이 이어지는 카드).
+///
+/// 실제 행 크기는 렌더 전에 알 수 없으므로(에이전트 유무로 세션 행 높이가
+/// 38/52px로 갈리고, 세션 목록 자체도 자기 상한 안에서 스크롤될 수 있다) 배경을
+/// 먼저 계산하지 않는다. 대신 `ui.painter().add(Shape::Noop)`로 그리기 순서상의
+/// 자리만 예약해 두고(`reserve`), 실제 행들을 `ui.scope`로 감싸 그 결과 rect(=
+/// 스크롤 클리핑까지 반영된 실제 점유 영역)를 얻은 뒤 `set`으로 그 자리에 채워
+/// 넣는다 — 순서는 예약 시점 그대로라 배경이 행 콘텐츠보다 항상 아래에 그려진다.
+fn paint_workspace_group_wrap(ui: &egui::Ui, reserve: egui::layers::ShapeIdx, rect: egui::Rect) {
+    if rect.height() <= 0.0 || rect.width() <= 0.0 {
+        return;
+    }
+    let rounding = 6.0;
+    ui.painter().set(
+        reserve,
+        egui::Shape::Vec(vec![
+            egui::Shape::rect_filled(rect, rounding, WORKSPACE_GROUP_FILL),
+            egui::Shape::rect_stroke(
+                rect,
+                rounding,
+                egui::Stroke::new(1.0, WORKSPACE_GROUP_BORDER),
+                egui::StrokeKind::Inside,
+            ),
+        ]),
+    );
+}
+
+const WORKSPACE_SESSION_INSET_FILL: egui::Color32 = egui::Color32::from_rgb(0x12, 0x1a, 0x20);
+const WORKSPACE_SESSION_INSET_BORDER: egui::Color32 = egui::Color32::from_rgb(0x19, 0x22, 0x2a);
+/// 세션 행 hover/편집 배경 — 카드 팔레트(0f171d→121a20→131c23→19222a)와 같은
+/// 계열로 한 단계 더 밝힌 톤(2026-07-25 사용자: 기본 테마 gray(70) hover가
+/// 너무 밝아 튀어 보였다).
+const SESSION_HOVER_FILL: egui::Color32 = egui::Color32::from_rgb(0x1c, 0x28, 0x30);
+
+// 좌측 인셋 8px = 세션 행 자체의 hover 좌측 경계와 같은 값(20px 들여쓰기 -
+// SESSION_HIGHLIGHT_LEFT_EXTEND 12px, 아래 session_highlight_rect 참고) —
+// workspace_row의 아바타 영역과도 같은 여백 관례라 우연히 같은 8이다.
+const WORKSPACE_SESSION_INSET_LEFT: f32 = 8.0;
+
+/// 카드 안에서 세션 목록 구간만 살짝 다른 톤(#121a20 채우기 + #19222a 테두리)을
+/// 얹어 헤더와 분리해 보이게 한다(2026-07-25 사용자) — group_rect(헤더+세션 전체)
+/// 에서 헤더가 이미 차지한 위쪽을 뺀 나머지에만 칠한다. 헤더와 맞닿는 위쪽까지
+/// 포함해 네 모서리 모두 1px로 통일한다(2026-07-25 사용자: "위쪽도 1px만").
+///
+/// 우측/하단은 group_rect가 아니라 **마지막 세션 행의 실제 rect**로 계산한다
+/// (2026-07-25 사용자: "인셋이 hover보다 커서 빈 공간 생기는거"). group_rect의
+/// 우측은 세션 ScrollArea 밖에 있는 헤더 full_rect까지 합친 값이라, 세션 행이
+/// (스크롤바 유무 등으로) 헤더보다 좁아지면 인셋이 hover 영역보다 넓게 그려져
+/// 오른쪽에 빈 공간이 남았다. `session_highlight_rect`(hover가 쓰는 것과 동일한
+/// 함수)를 마지막 행에 직접 적용해 우측 경계를 정확히 맞추고, 하단도 hover와
+/// 같은 -1px 트림을 그 행 기준으로 적용한다. 좌측은 헤더 폭에 영향받지 않아
+/// group_rect 그대로 쓴다.
+fn paint_workspace_session_inset(
+    ui: &egui::Ui,
+    reserve: egui::layers::ShapeIdx,
+    group_rect: egui::Rect,
+    header_bottom: f32,
+    last_row_rect: Option<egui::Rect>,
+) {
+    let Some(last_row_rect) = last_row_rect else {
+        return;
+    };
+    let last_row_highlight = session_highlight_rect(last_row_rect);
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(
+            group_rect.left() + WORKSPACE_SESSION_INSET_LEFT,
+            header_bottom,
+        ),
+        egui::pos2(last_row_highlight.right(), last_row_rect.bottom() - 1.0),
+    );
+    if rect.height() <= 0.0 || rect.width() <= 0.0 {
+        return;
+    }
+    let rounding = 1.0;
+    ui.painter().set(
+        reserve,
+        egui::Shape::Vec(vec![
+            egui::Shape::rect_filled(rect, rounding, WORKSPACE_SESSION_INSET_FILL),
+            egui::Shape::rect_stroke(
+                rect,
+                rounding,
+                egui::Stroke::new(1.0, WORKSPACE_SESSION_INSET_BORDER),
+                egui::StrokeKind::Inside,
+            ),
+        ]),
+    );
 }
 
 fn workspace_initial(name: &str) -> char {
@@ -3706,28 +3860,37 @@ fn workspace_summary_segments(
 
 /// 비활성(warm) workspace의 마지막 세션 스냅샷. 편집/컨텍스트 작업은 활성 runtime을
 /// 전제로 하므로 노출하지 않고, 클릭만 workspace 전환 + 정확한 tab/pane focus로 보낸다.
+/// 반환값 두 번째 필드는 마지막 세션 행의 rect — 인셋 배경의 우측/하단 경계를
+/// 이걸로 맞춰야 hover 영역과 정확히 일치한다(아래 paint_workspace_session_inset
+/// 참고, 2026-07-25 사용자: "인셋이 hover보다 커서 빈 공간 생기는거"). 헤더의
+/// full_rect는 세션 ScrollArea 밖이라 스크롤바 유무로 폭이 안 흔들리지만, 세션
+/// 행은 ScrollArea 안이라 실제 폭이 다를 수 있어 group_rect로 대체할 수 없다.
 fn inactive_workspace_sessions(
     ui: &mut egui::Ui,
     workspace_id: &str,
     sessions: &[SessionEntry],
     max_height: f32,
-) -> Option<SidebarAction> {
+) -> (Option<SidebarAction>, Option<egui::Rect>) {
     if sessions.is_empty() {
-        return None;
+        return (None, None);
     }
     let mut action = None;
+    let mut last_row_rect = None;
     egui::ScrollArea::vertical()
         .id_salt(("inactive_session_list_scroll", workspace_id))
         .max_height(max_height)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.add_space(2.0);
+            // 헤더-세션 사이 여백 없음(2026-07-25 사용자) — 첫 행이 인셋 상단에
+            // 바로 붙는다.
             ui.spacing_mut().item_spacing.y = 0.0;
-            for entry in sessions {
+            for (index, entry) in sessions.iter().enumerate() {
+                let is_last = index + 1 == sessions.len();
                 ui.horizontal(|ui| {
                     ui.add_space(20.0);
                     ui.vertical(|ui| {
-                        let response = session_row(ui, entry);
+                        let response = session_row(ui, entry, is_last);
+                        last_row_rect = Some(response.rect);
                         if response.clicked() {
                             action = Some(SidebarAction::FocusSession {
                                 workspace_id: workspace_id.to_owned(),
@@ -3739,28 +3902,49 @@ fn inactive_workspace_sessions(
                 });
             }
         });
-    action
+    (action, last_row_rect)
 }
 
-fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
-    session_row_impl(ui, entry, None)
+fn session_row(ui: &mut egui::Ui, entry: &SessionEntry, is_last: bool) -> egui::Response {
+    session_row_impl(ui, entry, None, is_last)
 }
 
 /// 이름 인라인 편집 중인 행 — 레일/보조 행(2·3행)은 그대로 유지하고 **제목 자리만**
 /// TextEdit로 바꾼다. 행 전체를 편집기로 대체하면 편집 중 레이아웃이 무너진다
 /// (2026-07-16 사용자).
-fn session_row_editing(ui: &mut egui::Ui, entry: &SessionEntry, buf: &mut String) {
-    session_row_impl(ui, entry, Some(buf));
+fn session_row_editing(
+    ui: &mut egui::Ui,
+    entry: &SessionEntry,
+    buf: &mut String,
+    is_last: bool,
+) -> egui::Response {
+    session_row_impl(ui, entry, Some(buf), is_last)
 }
 
-const SESSION_HIGHLIGHT_RIGHT_INSET: f32 = 8.0;
+// 워크스페이스 헤더의 우측 인셋(workspace_row 내부 rect = full_rect.shrink2((8,0)))
+// 과 같은 6px — 8px일 땐 세션 카드 배경이 위 워크스페이스 카드보다 우측 여백이
+// 2px 더 넓어 보였다(2026-07-25 사용자).
+const SESSION_HIGHLIGHT_RIGHT_INSET: f32 = 6.0;
 /// 최대 6px 레일 뒤 여백을 기존 약 10px에서 약 5px로 줄인 텍스트 시작점.
 const SESSION_TEXT_INSET: f32 = 11.0;
+// 폰트 기본 줄높이(CJK 포함이라 여유 있게 잡힘) 대신 폰트 크기에 곱하는 비율로
+// 세션 행을 촘촘히 쌓는다(2026-07-25 사용자: "텍스트 행간 간격을 줄여서 해결해").
+// 절대 px(예전엔 15.0/12.0 고정값)는 폰트 크기가 바뀌면 그대로 깨진다 —
+// cmux/Warp 조사 후 Warp의 DEFAULT_UI_LINE_HEIGHT_RATIO 패턴을 따라 비율로
+// 바꿨다(2026-07-25 사용자). 호출부는 자기 폰트 크기 × 이 비율을 쓴다.
+const SESSION_LINE_HEIGHT_RATIO: f32 = 1.15;
 const SESSION_CONTENT_RIGHT_INSET: f32 = 16.0;
+/// 세션 행은 호출부(session_list_scroll/inactive_workspace_sessions)가
+/// `ui.add_space(20.0)`으로 들여쓰는데, 워크스페이스 헤더는 같은 원점 기준 8px만
+/// 들여쓴다(위 SESSION_HIGHLIGHT_RIGHT_INSET 주석 참고). 배경을 그대로
+/// rect.left()에서 시작하면 워크스페이스 카드보다 12px(20-8) 더 안쪽에서
+/// 시작해 레일 왼쪽에 배경이 안 칠해진 틈이 생긴다(2026-07-25 사용자) — 그만큼
+/// 왼쪽으로 더 그린다.
+const SESSION_HIGHLIGHT_LEFT_EXTEND: f32 = 12.0;
 
 fn session_highlight_rect(rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
-        rect.left_top(),
+        egui::pos2(rect.left() - SESSION_HIGHLIGHT_LEFT_EXTEND, rect.top()),
         egui::pos2(
             (rect.right() - SESSION_HIGHLIGHT_RIGHT_INSET).max(rect.left()),
             rect.bottom(),
@@ -3778,9 +3962,12 @@ fn session_title_lines(
     std::sync::Arc<egui::Galley>,
     Option<std::sync::Arc<egui::Galley>>,
 ) {
-    let title_font_id = crate::fonts::sidebar_font(13.0);
+    let title_size = 13.0;
+    let title_font_id = crate::fonts::sidebar_font(title_size);
     // 제목보다 상태를 1pt 작게 두어 `폴더명 · 상태`의 시각적 위계를 분리한다.
-    let status_font_id = crate::fonts::sidebar_font(12.0);
+    let status_size = 12.0;
+    let status_font_id = crate::fonts::sidebar_font(status_size);
+    let status_line_height = status_size * SESSION_LINE_HEIGHT_RATIO;
     let status_galley = entry
         .status_label
         .as_deref()
@@ -3793,6 +3980,7 @@ fn session_title_lines(
                 egui::TextFormat {
                     font_id: status_font_id.clone(),
                     color: separator_color,
+                    line_height: Some(status_line_height),
                     ..Default::default()
                 },
             );
@@ -3802,6 +3990,7 @@ fn session_title_lines(
                 egui::TextFormat {
                     font_id: status_font_id,
                     color: status_color,
+                    line_height: Some(status_line_height),
                     ..Default::default()
                 },
             );
@@ -3809,7 +3998,13 @@ fn session_title_lines(
         });
     let status_width = status_galley.as_ref().map_or(0.0, |galley| galley.size().x);
     let title_width = (max_width - status_width).max(10.0);
-    let title_galley = clipped_line(ui, &entry.title, title_font_id, title_width);
+    let title_galley = clipped_line(
+        ui,
+        &entry.title,
+        title_font_id,
+        title_width,
+        Some(title_size * SESSION_LINE_HEIGHT_RATIO),
+    );
     (title_galley, status_galley)
 }
 
@@ -3817,6 +4012,7 @@ fn session_row_impl(
     ui: &mut egui::Ui,
     entry: &SessionEntry,
     edit_buf: Option<&mut String>,
+    is_last: bool,
 ) -> egui::Response {
     // 에이전트면 3줄(제목/에이전트·모델·effort/상태·ctx%), 아니면 2줄(제목/요약).
     // 요약이 없어도(유휴/시작 직후) 2행에 '~'를 표시해 행 높이를 유지한다(2026-07-07).
@@ -3826,7 +4022,17 @@ fn session_row_impl(
     } else {
         &entry.summary
     };
-    let row_h = if agent { 52.0 } else { 38.0 };
+    // 46/34에서 레일·텍스트가 바닥 밖으로 삐져나와 51/39로 5px씩 늘렸다(2026-07-25
+    // 사용자 스샷). row_h는 여전히 고정값이라 폰트/언어별 실제 렌더 높이가 이 값을
+    // 넘으면 같은 문제가 재발할 수 있다 — 근본 해결은 행 높이를 실측 갤리 높이로
+    // 동적 계산하는 것이지만, 그러려면 지금 화면 밖 행에서 건너뛰는 텍스트
+    // 레이아웃(is_rect_visible 조기 리턴, 위 참고)을 모든 행에서 항상 해야 해서
+    // 스크롤 목록 성능과 맞바꿔야 한다(사용자 확인 대기).
+    // 줄 사이 간격을 1px씩 더 좁혀서(아래 gap 계산) 남는 줄 수만큼 그대로
+    // 줄인다(2026-07-25 사용자: "행간 간격을 1px 줄여도 돼") — 안 그러면 위/아래
+    // 여백 대칭(SESSION_TEXT_MARGIN)이 깨진다.
+    let line_count = if agent { 3.0 } else { 2.0 };
+    let row_h = (if agent { 51.0 } else { 39.0 }) - (line_count - 1.0);
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_h),
         egui::Sense::click(),
@@ -3846,7 +4052,10 @@ fn session_row_impl(
     // 색을 먼저 복사(Copy)해 visuals 차용을 끝낸 뒤 ui.fonts로 galley를 만든다.
     let accent = ui.visuals().selection.bg_fill;
     let dot = session_entry_status_color(entry);
-    let hover_bg = ui.visuals().widgets.hovered.bg_fill;
+    // 기본 테마의 hovered.bg_fill(gray(70), #464646)은 카드 팔레트(#0f171d~#19222a)
+    // 보다 훨씬 밝아 hover 중인 행만 완전히 다른 색의 별도 박스처럼 튀어 보였다
+    // (2026-07-25 사용자 스샷). 인셋(#121a20)보다 한 단계만 밝은 톤으로 대체한다.
+    let hover_bg = SESSION_HOVER_FILL;
     // 2·3행(보조 정보): 다크는 기존 weak 톤, 라이트는 weak가 패널 위에서 너무 옅어
     // textSecondary(#444444) 수준으로 진하게 (라이트 테마 회색 흐림, 2026-07-10).
     let sub_color = if ui.visuals().dark_mode {
@@ -3869,18 +4078,53 @@ fn session_row_impl(
     } else {
         (Some(summary_text), None)
     };
-    let line2_galley = line2.map(|t| clipped_line(ui, t, crate::fonts::sidebar_font(10.5), max_w));
-    let line3_galley = line3.map(|t| clipped_line(ui, t, crate::fonts::sidebar_font(10.5), max_w));
+    let subline_size = 10.5;
+    let subline_line_height = Some(subline_size * SESSION_LINE_HEIGHT_RATIO);
+    let line2_galley = line2.map(|t| {
+        clipped_line(
+            ui,
+            t,
+            crate::fonts::sidebar_font(subline_size),
+            max_w,
+            subline_line_height,
+        )
+    });
+    let line3_galley = line3.map(|t| {
+        clipped_line(
+            ui,
+            t,
+            crate::fonts::sidebar_font(subline_size),
+            max_w,
+            subline_line_height,
+        )
+    });
 
     let painter = ui.painter();
     let highlight_rect = session_highlight_rect(rect);
-    // 선택/hover 배경 — 편집 중에는 hover 톤으로 상시 칠해 편집 상태를 표시.
-    if edit_buf.is_some() {
-        painter.rect_filled(highlight_rect, 1.0, hover_bg);
-    } else if entry.focused {
-        painter.rect_filled(highlight_rect, 1.0, accent.gamma_multiply(0.18));
-    } else if resp.hovered() {
-        painter.rect_filled(highlight_rect, 1.0, hover_bg);
+    // 행 자체의 상시 배경(구 #2a2a33)은 걷어냈다 — 워크스페이스 헤더와 한 카드로
+    // 감싸는 배경(paint_workspace_group_wrap, #0f171d)이 호출부에서 먼저 깔린다.
+    // focus의 별도 배경 틴트(구 accent*0.18)는 제거했다 — 카드 배경이 항상 깔리는
+    // 지금은 좌측 레일+파란 제목만으로 포커스가 충분히 구분되고, 틴트를 얹으면
+    // 카드 안에서 그 행만 색이 크게 튀어 보였다(2026-07-25 사용자). hover/편집
+    // 중의 일시적 배경만 그 위에 겹쳐 칠한다.
+    if edit_buf.is_some() || resp.hovered() {
+        // 바닥은 1px 줄여 구분선(아래)과 안 겹치게(2026-07-25 사용자: "hover 시
+        // 선택되는 영역을 1 줄여"), 위는 1px 늘려(2026-07-25 사용자: "인셋 hover
+        // 할때 영역 위로 1칸 추가해서 키워") 위 행과의 경계에 조금 더 걸치게 한다.
+        let hover_rect = egui::Rect::from_min_max(
+            egui::pos2(highlight_rect.left(), highlight_rect.top() - 1.0),
+            egui::pos2(highlight_rect.right(), highlight_rect.bottom() - 1.0),
+        );
+        painter.rect_filled(hover_rect, 1.0, hover_bg);
+    }
+    // 세션이 둘 이상일 때 행 사이를 구분선으로 나눈다(2026-07-25 사용자) — 마지막
+    // 행은 그리지 않는다(카드/인셋 바닥과 겹쳐 이중선으로 보이는 것 방지).
+    if !is_last {
+        painter.hline(
+            highlight_rect.x_range(),
+            highlight_rect.bottom(),
+            egui::Stroke::new(1.0, WORKSPACE_SESSION_INSET_BORDER),
+        );
     }
     // 좌측 상태 레일 — 항상 표시, 상태 색으로 세로로 훑어 파악 (목업 §세션).
     // 폭 = 두 번째 채널(2026-07-07): 평시 3px, 미확인 완료/입력대기(attention)는 6px로
@@ -3893,57 +4137,86 @@ fn session_row_impl(
     } else {
         (3.0, dot)
     };
+    // 레일은 텍스트 블록과 같은 상하 2px 여백을 써서 텍스트 세로 범위와 맞춘다
+    // (2026-07-25 사용자: "컬러레일도 위로 올려야하고" — 안 그러면 레일만
+    // 아래로 처져 텍스트와 어긋나 보인다).
     let rail = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), rect.top() + 4.0),
-        egui::vec2(rail_w, row_h - 8.0),
+        egui::pos2(rect.left(), rect.top() + SESSION_TEXT_MARGIN),
+        egui::vec2(rail_w, row_h - 2.0 * SESSION_TEXT_MARGIN),
     );
     painter.rect_filled(rail, 0.0, rail_color);
     // 제목(1행) + 2행 + 3행 — 세로 위치는 행 수에 맞춰.
+    // 위/아래 여백을 2px로 대칭 맞춘다(2026-07-25 사용자: 텍스트 내리고, 아래
+    // 여백 2, 위아래 대칭). 실제 렌더된 줄 높이(galley.size().y)로 계산해야
+    // 고정 오프셋(9/23/37 등)처럼 가정한 줄 높이가 틀려서 어긋나는 일이 없다.
+    // 남는 공간은 줄 사이에 균등 배분한다.
+    const SESSION_TEXT_MARGIN: f32 = 2.0;
+    let line_heights = [
+        Some(title_galley.size().y),
+        line2_galley.as_ref().map(|g| g.size().y),
+        line3_galley.as_ref().map(|g| g.size().y),
+    ];
+    let heights: Vec<f32> = line_heights.into_iter().flatten().collect();
+    let content_h: f32 = heights.iter().sum();
+    let available = (row_h - 2.0 * SESSION_TEXT_MARGIN).max(0.0);
+    let gap = if heights.len() > 1 {
+        ((available - content_h) / (heights.len() as f32 - 1.0)).max(0.0)
+    } else {
+        0.0
+    };
+    let mut y = rect.top() + SESSION_TEXT_MARGIN;
+    let title_center = y + title_galley.size().y / 2.0;
+    y += title_galley.size().y + gap;
+    let line2_center = line2_galley.as_ref().map(|g| {
+        let c = y + g.size().y / 2.0;
+        y += g.size().y + gap;
+        c
+    });
+    let line3_center = line3_galley.as_ref().map(|g| y + g.size().y / 2.0);
+
     // 편집 중에는 제목 갤리 대신 같은 자리에 TextEdit를 얹는다 (아래 edit_buf 분기).
     if edit_buf.is_none() {
         let title_pos = egui::pos2(
             rect.left() + SESSION_TEXT_INSET,
-            rect.top() + 13.0 - title_galley.size().y / 2.0,
+            title_center - title_galley.size().y / 2.0,
         );
         painter.galley(title_pos, title_galley.clone(), title_color);
         if let Some(status_galley) = status_galley {
             painter.galley(
                 egui::pos2(
                     title_pos.x + title_galley.size().x,
-                    rect.top() + 13.0 - status_galley.size().y / 2.0,
+                    title_center - status_galley.size().y / 2.0,
                 ),
                 status_galley,
                 egui::Color32::WHITE,
             );
         }
     }
-    if let Some(g) = line2_galley {
+    // line2_center/line3_center는 line2_galley/line3_galley와 같은 Option에서
+    // 나왔으므로(위 계산부) 항상 함께 Some/None이다 — 튜플 매치로 그 관계를 드러낸다.
+    if let (Some(g), Some(center)) = (line2_galley, line2_center) {
         painter.galley(
-            egui::pos2(
-                rect.left() + SESSION_TEXT_INSET,
-                rect.top() + 27.0 - g.size().y / 2.0,
-            ),
+            egui::pos2(rect.left() + SESSION_TEXT_INSET, center - g.size().y / 2.0),
             g,
             sub_color,
         );
     }
-    if let Some(g) = line3_galley {
+    if let (Some(g), Some(center)) = (line3_galley, line3_center) {
         painter.galley(
-            egui::pos2(
-                rect.left() + SESSION_TEXT_INSET,
-                rect.top() + 41.0 - g.size().y / 2.0,
-            ),
+            egui::pos2(rect.left() + SESSION_TEXT_INSET, center - g.size().y / 2.0),
             g,
             sub_color,
         );
     }
     if let Some(buf) = edit_buf {
         // 제목 1행 자리에 프레임 없는 TextEdit — 글꼴/x 위치를 제목 갤리와 맞춘다.
+        // 세로는 title_center를 감싸는 title_galley 높이만큼의 박스로.
+        let half_h = title_galley.size().y / 2.0;
         let title_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + SESSION_TEXT_INSET, rect.top() + 4.0),
+            egui::pos2(rect.left() + SESSION_TEXT_INSET, title_center - half_h),
             egui::pos2(
                 rect.right() - SESSION_CONTENT_RIGHT_INSET,
-                rect.top() + 22.0,
+                title_center + half_h,
             ),
         );
         let edit_resp = ui.put(
@@ -3960,11 +4233,14 @@ fn session_row_impl(
 }
 
 /// 한 줄 텍스트를 max_width 안으로 잘라 '…'로 끝내는 galley (박스 밖 삐짐 방지, #91).
+/// `line_height`를 주면 폰트 기본 줄높이 대신 그 값을 쓴다 — 세션 행처럼 여러 줄을
+/// 촘촘히 쌓아야 할 때만 좁혀 쓰고, 나머지 호출부는 None으로 기존 그대로 둔다.
 fn clipped_line(
     ui: &egui::Ui,
     text: &str,
     font_id: egui::FontId,
     max_width: f32,
+    line_height: Option<f32>,
 ) -> std::sync::Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::single_section(
         text.to_owned(),
@@ -3973,6 +4249,7 @@ fn clipped_line(
             // PLACEHOLDER여야 painter.galley의 fallback 색이 적용된다 — 기본값
             // Color32::GRAY는 fallback을 무시하고 항상 회색으로 그려졌다(라이트 흐림 원인).
             color: egui::Color32::PLACEHOLDER,
+            line_height,
             ..Default::default()
         },
     );
@@ -5275,27 +5552,13 @@ mod tests {
     }
 
     #[test]
-    fn 워크스페이스_하이라이트는_우측_인셋이_2px_더_좁다() {
-        // 2026-07-25 사용자: 화살표 옆 배경(#2a2a33)을 2px 더 넓히려고 우측 인셋만
-        // 8→6으로 줄임 — 좌우 비대칭은 의도된 변경(과거엔 대칭이었다).
-        let full = egui::Rect::from_min_max(egui::pos2(0.0, 10.0), egui::pos2(500.0, 49.1));
-        let highlight = workspace_highlight_rect(full);
-        assert_eq!(highlight.left(), 8.0, "워크스페이스 왼쪽 인셋은 유지");
-        assert_eq!(
-            highlight.right(),
-            full.right() - 6.0,
-            "오른쪽 인셋은 6px로 좁아져 배경이 화살표 쪽으로 더 넓게 퍼진다"
-        );
-        assert_eq!(highlight.top(), full.top());
-        assert_eq!(highlight.bottom(), full.bottom());
-    }
-
-    #[test]
-    fn 세션_하이라이트는_오른쪽_여백을_두고_레일텍스트간격은_절반이다() {
+    fn 세션_하이라이트는_좌측으로_확장되고_우측_여백을_두며_레일텍스트간격은_절반이다() {
         let full = egui::Rect::from_min_max(egui::pos2(20.0, 10.0), egui::pos2(500.0, 62.0));
         let highlight = session_highlight_rect(full);
-        assert_eq!(highlight.left(), full.left());
-        assert_eq!(highlight.right(), full.right() - 8.0);
+        // 좌측은 호출부의 20px 들여쓰기를 걷어내 워크스페이스 헤더와 같은 8px
+        // 인셋으로 맞춘다(SESSION_HIGHLIGHT_LEFT_EXTEND 주석 참고).
+        assert_eq!(highlight.left(), full.left() - SESSION_HIGHLIGHT_LEFT_EXTEND);
+        assert_eq!(highlight.right(), full.right() - SESSION_HIGHLIGHT_RIGHT_INSET);
         assert_eq!(
             SESSION_TEXT_INSET - 6.0,
             5.0,

@@ -40,6 +40,8 @@ struct BroadcastState {
     params: BTreeMap<String, String>,
     /// 체크된 대상 (workspace_id, session).
     targets: HashSet<(String, runtime::SessionId)>,
+    /// 대상 3개 이상 전송의 2단계 확인 단계(리뷰 Low). 프롬프트·대상이 바뀌면 초기화한다.
+    confirm_send: bool,
 }
 
 #[derive(Default)]
@@ -77,6 +79,7 @@ impl FleetUi {
                                 .filter(|s| s.state != AgentVisualState::Active)
                                 .filter_map(|s| s.broadcast_key())
                                 .collect(),
+                            confirm_send: false,
                         });
                     }
                     None => {}
@@ -189,6 +192,7 @@ impl FleetUi {
                     if ui.selectable_label(picked, &prompt.title).clicked() {
                         state.prompt_id = Some(prompt.id.clone());
                         state.params.clear();
+                        state.confirm_send = false;
                     }
                 }
             });
@@ -238,6 +242,7 @@ impl FleetUi {
                     } else {
                         state.targets.remove(&key);
                     }
+                    state.confirm_send = false;
                 }
             }
         });
@@ -251,6 +256,9 @@ impl FleetUi {
             .collect();
         let count = effective_targets.len();
         let can_send = ready_prompt.is_some() && count > 0;
+        // 대상 3개 이상은 한 번의 실수로 다수 에이전트를 건드릴 수 있어(리뷰 Low) 2단계
+        // 확인을 거친다. 1~2개는 되돌리기 부담이 작아 기존처럼 클릭 한 번으로 보낸다.
+        const CONFIRM_THRESHOLD: usize = 3;
         let mut out = None;
         ui.horizontal(|ui| {
             if ui
@@ -261,17 +269,41 @@ impl FleetUi {
                     ),
                 )
                 .clicked()
-                && let Some(prompt_text) = ready_prompt
             {
-                out = Some(FleetAction::Broadcast {
-                    prompt: prompt_text,
-                    targets: effective_targets,
-                });
+                if count >= CONFIRM_THRESHOLD {
+                    state.confirm_send = true;
+                } else if let Some(prompt_text) = ready_prompt.clone() {
+                    out = Some(FleetAction::Broadcast {
+                        prompt: prompt_text,
+                        targets: effective_targets.clone(),
+                    });
+                }
             }
             if !can_send {
                 ui.weak(catalog.t("fleet.broadcast.fill", &[]));
             }
         });
+        if state.confirm_send {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    catalog.t("fleet.broadcast.confirm", &[("count", &count.to_string())]),
+                );
+                if ui.button(catalog.t("fleet.broadcast.confirm_yes", &[])).clicked()
+                    && let Some(prompt_text) = ready_prompt
+                {
+                    out = Some(FleetAction::Broadcast {
+                        prompt: prompt_text,
+                        targets: effective_targets,
+                    });
+                    state.confirm_send = false;
+                }
+                if ui.button(catalog.t("fleet.broadcast.confirm_no", &[])).clicked() {
+                    state.confirm_send = false;
+                }
+            });
+        }
         out
     }
 }

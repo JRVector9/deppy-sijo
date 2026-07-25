@@ -6111,6 +6111,25 @@ fn workspace_visible_after_close(
     !closed.contains_key(workspace_id)
 }
 
+/// hook 상태에서 "새 턴 시작"으로 볼 전이만 고른다 — 직전에 막혀 있던(대기 또는 완료)
+/// 세션이 작업 중으로 바뀐 것.
+///
+/// working 재진입 자체는 턴 경계가 아니다: working의 stale 창은 2분인데 하트비트는 툴
+/// 호출(PreToolUse)마다라, 한 턴 안에서 툴 사이가 2분을 넘으면 같은 턴이 working에서
+/// 빠졌다 다시 들어온다. 그걸 턴 시작으로 오인하면 진행 중인 턴의 진짜 Error latch를
+/// 지우게 된다(병렬 리뷰 medium).
+fn turn_start_transitions(
+    working_now: &std::collections::HashSet<(String, runtime::SessionId)>,
+    working_before: &std::collections::HashSet<(String, runtime::SessionId)>,
+    blocked_before: &std::collections::HashSet<(String, runtime::SessionId)>,
+) -> Vec<(String, runtime::SessionId)> {
+    working_now
+        .difference(working_before)
+        .filter(|key| blocked_before.contains(*key))
+        .cloned()
+        .collect()
+}
+
 /// 설정 창의 workspace context만 결정한다. DB 목록 존재 여부만 보며 sidebar의
 /// `closed_workspaces`나 active runtime은 입력조차 받지 않아 선택만으로 재노출/전환할 수 없다.
 fn resolve_settings_workspace_id(
@@ -9198,6 +9217,29 @@ impl App {
         }
     }
 
+    /// hook이 보고한 턴 시작을 해당 워크스페이스 런타임의 status detector에 전달한다.
+    /// regex 결과 상태(Error/Done)는 latch라 해제 경로가 on_input(=그 pane에 직접 타이핑)
+    /// 하나뿐이었고, 그래서 error regex 오탐 한 번이 무기한 남았다. 턴 경계는 입력과
+    /// 동등한 리셋 신호다. warm 워크스페이스도 자기 런타임 핸들로 그대로 전달한다.
+    ///
+    /// 호출부는 "대기(waiting)/완료(turn_done)였다가 작업 중(working)이 된" 전이만
+    /// 넘긴다 — working 재진입 자체는 턴 경계가 아니다(2분 stale 창 만료 후의 하트비트
+    /// 재개일 수 있다). Stop hook이 유실된 턴(Ctrl-C 등)은 이 전이를 못 만들어 latch가
+    /// 남지만, 그건 종전과 같은 상태라 회귀는 아니다.
+    fn note_turn_starts(&self, sessions: &[(String, runtime::SessionId)]) {
+        for (workspace_id, session) in sessions {
+            let runtime = if workspace_id == &self.active.id {
+                Some(&self.active.runtime)
+            } else {
+                self.warm.get(workspace_id).map(|warm| &warm.runtime)
+            };
+            if let Some(runtime) = runtime {
+                let _ = runtime
+                    .send_command(runtime::RuntimeCommand::NoteTurnStart { session: *session });
+            }
+        }
+    }
+
     fn apply_agent_state_storage_projection(
         &mut self,
         section: crate::agent_state_worker::AgentStateSection,
@@ -9233,6 +9275,14 @@ impl App {
                 self.push_agent_display();
             }
             crate::agent_state_worker::AgentStateSection::Attention => {
+                // 턴 경계 판정용 직전 스냅샷 — "대기/완료였다가 작업 중"만 새 턴으로 본다
+                // (note_turn_starts 주석 참조). 아래에서 덮어쓰기 전에 떠 둔다.
+                let was_blocked: std::collections::HashSet<(String, runtime::SessionId)> = self
+                    .global_waiting
+                    .iter()
+                    .map(|(workspace_id, session, _)| (workspace_id.clone(), *session))
+                    .chain(self.global_turn_done.keys().cloned())
+                    .collect();
                 self.agent_needs_input = snapshot
                     .waiting_sessions
                     .iter()
@@ -9271,7 +9321,7 @@ impl App {
                     .iter()
                     .filter_map(|key| session_id(key))
                     .collect();
-                self.global_working = snapshot
+                let working_now: std::collections::HashSet<(String, runtime::SessionId)> = snapshot
                     .working_sessions
                     .iter()
                     .filter_map(|key| {
@@ -9280,6 +9330,10 @@ impl App {
                             .then_some((workspace_id, session))
                     })
                     .collect();
+                let turn_started =
+                    turn_start_transitions(&working_now, &self.global_working, &was_blocked);
+                self.global_working = working_now;
+                self.note_turn_starts(&turn_started);
             }
             crate::agent_state_worker::AgentStateSection::Restore => {
                 let rows = snapshot
@@ -14924,8 +14978,7 @@ impl App {
         let bracketed = self.active.workspace_ui.session_bracketed_paste(session);
         let provider = self.active.workspace_ui.agent_provider_for(session);
         self.active.workspace_ui.clear_selection(session);
-        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider)
-        else {
+        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider) else {
             return;
         };
         let writes = match plan {
@@ -14976,7 +15029,8 @@ impl App {
         let bracketed = workspace_ui.session_bracketed_paste(session);
         let provider = workspace_ui.agent_provider_for(session);
         workspace_ui.clear_selection(session);
-        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider) else {
+        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider)
+        else {
             return;
         };
         let writes = match plan {
@@ -18537,6 +18591,29 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    /// 턴 시작 판정 — 막혀 있던(대기/완료) 세션이 작업 중으로 바뀐 것만 새 턴이다.
+    /// working 재진입(2분 stale 창 만료 뒤 하트비트 재개)을 턴 시작으로 오인하면
+    /// 진행 중인 턴의 진짜 Error latch를 지운다(병렬 리뷰 medium).
+    #[test]
+    fn 턴_시작은_막혀있던_세션의_작업_재개만_센다() {
+        let key = |name: &str, id: u64| (name.to_owned(), runtime::SessionId(id));
+        let set = |keys: &[(String, runtime::SessionId)]| {
+            keys.iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let resumed = key("ws", 1); // 완료/대기 뒤 재개 = 새 턴
+        let heartbeat = key("ws", 2); // stale 만료 뒤 하트비트 재개 = 같은 턴
+        let steady = key("ws", 3); // 계속 작업 중
+
+        let started = turn_start_transitions(
+            &set(&[resumed.clone(), heartbeat, steady.clone()]),
+            &set(&[steady]),
+            &set(&[resumed.clone()]),
+        );
+        assert_eq!(started, vec![resumed]);
+    }
 
     #[test]
     fn bounded_projection_failure_keeps_last_complete_snapshot() {

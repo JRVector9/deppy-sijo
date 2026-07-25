@@ -1763,6 +1763,13 @@ impl Worker {
                     });
                 }
             }
+            RuntimeCommand::NoteTurnStart { session } => {
+                // hook 턴 경계 = 입력과 동등한 리셋 신호 (WriteInput의 on_input과 같은 처리).
+                // 변화는 다음 tick의 evaluate()가 SessionStatusChanged로 알린다.
+                if let Some(detector) = self.detectors.get_mut(&session) {
+                    detector.on_turn_start();
+                }
+            }
             RuntimeCommand::SearchScrollback {
                 session,
                 query,
@@ -6096,6 +6103,61 @@ mod tests {
         assert_eq!(view.detected_status, session::SessionStatus::Running);
         assert_eq!(view.source, session::StatusSource::UserOverride);
         assert_eq!(view.user_override, Some(session::SessionStatus::Done));
+    }
+
+    /// hook이 보고한 턴 시작은 입력과 동등한 리셋 신호다 — latch된 결과 상태(여기선
+    /// error regex 오탐)가 그 pane에 직접 타이핑할 때까지 남던 문제(백로그 2).
+    #[test]
+    #[cfg(unix)]
+    fn note_turn_start는_latch된_error를_해제한다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("status-turn-start"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        // FATAL 뒤에 무매치 라인을 화면 꼬리만큼 밀어 넣어 화면 재매치를 배제한다 —
+        // 남는 Error는 stream latch뿐이다.
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "echo FATAL; for i in 1 2 3 4 5 6; do echo line$i; done; sleep 30".into(),
+                ],
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: Some("FATAL".into()),
+                done_regex: None,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SessionStatusChanged {
+                session,
+                status: session::SessionStatus::Error,
+            } => Some(*session),
+            _ => None,
+        });
+        probe.seen.clear();
+        client
+            .send_command(RuntimeCommand::NoteTurnStart { session })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SessionStatusChanged {
+                session: changed,
+                status: session::SessionStatus::Running,
+            } if *changed == session => Some(()),
+            _ => None,
+        });
     }
 
     #[test]

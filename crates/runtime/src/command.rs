@@ -444,7 +444,8 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::ExtractLastOutput { .. }
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
-        | RuntimeCommand::ResumeSession { .. } => {}
+        | RuntimeCommand::ResumeSession { .. }
+        | RuntimeCommand::NoteTurnStart { .. } => {}
     }
     Ok(total)
 }
@@ -556,7 +557,8 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::ExtractLastOutput { .. }
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
-        | RuntimeCommand::ResumeSession { .. } => {}
+        | RuntimeCommand::ResumeSession { .. }
+        | RuntimeCommand::NoteTurnStart { .. } => {}
     }
 }
 
@@ -724,7 +726,8 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         | RuntimeCommand::ExtractLastOutput { .. }
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
-        | RuntimeCommand::ResumeSession { .. } => {}
+        | RuntimeCommand::ResumeSession { .. }
+        | RuntimeCommand::NoteTurnStart { .. } => {}
     }
     Ok(())
 }
@@ -920,6 +923,14 @@ pub enum RuntimeCommand {
     ResumeSession {
         session: SessionId,
     },
+    /// hook이 보고한 새 턴 시작(UserPromptSubmit/PreToolUse) — status detector에
+    /// 사용자 입력과 동일한 리셋을 건다. regex 결과 상태(Error/Done)는 latch라 해제가
+    /// on_input(=pane에 직접 타이핑)뿐이었고, 그래서 오탐 한 번이 그 pane에 무기한
+    /// 남았다. 턴 경계는 latch를 끝낼 정당한 신호다.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    NoteTurnStart {
+        session: SessionId,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1028,6 +1039,10 @@ impl std::fmt::Debug for RuntimeCommand {
                 .finish(),
             RuntimeCommand::ResumeSession { session } => f
                 .debug_struct("ResumeSession")
+                .field("session", session)
+                .finish(),
+            RuntimeCommand::NoteTurnStart { session } => f
+                .debug_struct("NoteTurnStart")
                 .field("session", session)
                 .finish(),
             RuntimeCommand::KillSession { session } => f
@@ -1821,6 +1836,7 @@ mod tests {
                 "EmergencyPersistFlush",
                 "FreezeSession",
                 "ResumeSession",
+                "NoteTurnStart",
             ]
         );
     }

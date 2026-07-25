@@ -8,18 +8,20 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::agent_surface::AgentVisualState;
-use crate::fleet::{FleetSession, FleetSummary};
+use crate::fleet::{FleetSession, FleetSummary, FleetTarget};
 use crate::prompt_library::PromptLibrary;
 use crate::ui::agent_visuals::status_color;
 
 /// fleet 그리드가 App에 돌려주는 액션.
 pub enum FleetAction {
-    /// 이 세션으로 포커스(그리드 → 터미널 전환). App이 FocusSession 경로로 라우팅한다.
+    /// PTY 세션으로 포커스(그리드 → 터미널 전환). App이 FocusSession 경로로 라우팅한다.
     Focus {
         workspace_id: String,
         tab: runtime::MuxTabId,
         pane: runtime::MuxPaneId,
     },
+    /// 구조화(App Server) 세션 열기 — App이 에이전트 패널에서 해당 세션을 연다.
+    OpenStructured { session_id: String },
     /// 새 에이전트 시작 — App이 에이전트 패널을 연다(fleet에 세션을 추가하는 진입점).
     LaunchAgent,
     /// 저장된 프롬프트를 여러 실행 중 에이전트에 브로드캐스트. App이 각 대상 세션에
@@ -60,7 +62,10 @@ impl FleetUi {
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::symmetric(16, 14))
             .show(ui, |ui| {
-                match header(ui, summary, catalog, !sessions.is_empty()) {
+                // 브로드캐스트 버튼은 브로드캐스트 가능한 세션(PTY)이 있을 때만 — 구조화만
+                // 있는 fleet에서 눌러도 대상이 비는 막다른 버튼이 되지 않게(리뷰 Medium).
+                let has_broadcast_target = sessions.iter().any(|s| s.broadcast_key().is_some());
+                match header(ui, summary, catalog, has_broadcast_target) {
                     Some(HeaderClick::Launch) => action = Some(FleetAction::LaunchAgent),
                     Some(HeaderClick::Broadcast) => {
                         // 대상 기본값 = 작업 중이 아닌 세션(진행 중 에이전트는 방해하지 않음).
@@ -70,7 +75,7 @@ impl FleetUi {
                             targets: sessions
                                 .iter()
                                 .filter(|s| s.state != AgentVisualState::Active)
-                                .map(|s| (s.workspace_id.clone(), s.session))
+                                .filter_map(|s| s.broadcast_key())
                                 .collect(),
                         });
                     }
@@ -100,10 +105,17 @@ impl FleetUi {
                         ui.horizontal_wrapped(|ui| {
                             for session in sessions {
                                 if card(ui, session, catalog) {
-                                    action = Some(FleetAction::Focus {
-                                        workspace_id: session.workspace_id.clone(),
-                                        tab: session.tab.clone(),
-                                        pane: session.pane.clone(),
+                                    action = Some(match &session.target {
+                                        FleetTarget::Pty { tab, pane, .. } => FleetAction::Focus {
+                                            workspace_id: session.workspace_id.clone(),
+                                            tab: tab.clone(),
+                                            pane: pane.clone(),
+                                        },
+                                        FleetTarget::Structured { session_id } => {
+                                            FleetAction::OpenStructured {
+                                                session_id: session_id.clone(),
+                                            }
+                                        }
                                     });
                                 }
                             }
@@ -206,11 +218,13 @@ impl FleetUi {
         };
         ui.add_space(6.0);
         ui.separator();
-        // ③ 대상 체크박스.
+        // ③ 대상 체크박스 — PTY 세션만(구조화는 steer 경로라 브로드캐스트 대상 아님).
         ui.label(catalog.t("fleet.broadcast.targets", &[]));
         egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
             for session in sessions {
-                let key = (session.workspace_id.clone(), session.session);
+                let Some(key) = session.broadcast_key() else {
+                    continue;
+                };
                 let mut checked = state.targets.contains(&key);
                 let label = format!(
                     "{} · {}  ({})",
@@ -227,12 +241,12 @@ impl FleetUi {
                 }
             }
         });
-        // ④ 전송 — 현재 세션과 교집합만 보낸다. 패널 연 뒤 종료된 stale 대상을 제외해
+        // ④ 전송 — 현재 PTY 세션과 교집합만 보낸다. 패널 연 뒤 종료된 stale 대상을 제외해
         // 카운트가 실제 전송 수와 일치하게 한다(세션 순회 순서라 결정적).
         ui.add_space(6.0);
         let effective_targets: Vec<(String, runtime::SessionId)> = sessions
             .iter()
-            .map(|s| (s.workspace_id.clone(), s.session))
+            .filter_map(|s| s.broadcast_key())
             .filter(|key| state.targets.contains(key))
             .collect();
         let count = effective_targets.len();
@@ -273,7 +287,7 @@ fn header(
     ui: &mut egui::Ui,
     summary: FleetSummary,
     catalog: &i18n::Catalog,
-    has_agents: bool,
+    has_broadcast_target: bool,
 ) -> Option<HeaderClick> {
     let mut click = None;
     ui.horizontal(|ui| {
@@ -290,7 +304,7 @@ fn header(
                 click = Some(HeaderClick::Launch);
             }
             // 브로드캐스트는 실행 중 에이전트가 있을 때만.
-            if has_agents && ui.button(catalog.t("fleet.broadcast", &[])).clicked() {
+            if has_broadcast_target && ui.button(catalog.t("fleet.broadcast", &[])).clicked() {
                 click = Some(HeaderClick::Broadcast);
             }
         });

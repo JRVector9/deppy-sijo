@@ -3313,8 +3313,9 @@ fn workspace_row(
     expanded: Option<bool>,
     catalog: &i18n::Catalog,
 ) -> egui::Response {
+    // 2026-07-26 사용자: 워크스페이스 헤더와 아바타를 다시 10% 축소한다.
     let has_repo = workspace.repo.as_deref().is_some_and(|repo| !repo.is_empty());
-    let row_height = if has_repo { 48.0 } else { 39.1 };
+    let row_height = if has_repo { 43.2 } else { 35.19 };
     let (full_rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_height),
         egui::Sense::click(),
@@ -3352,8 +3353,8 @@ fn workspace_row(
     // 선택/실행 상태와 무관한 프로젝트 고유색. 목록 전체에서 같은 계열이 겹치지 않게
     // 미리 배정된 색을 받아 비활성 행과 40pt 아이콘 레일에서도 그대로 유지한다.
     let avatar = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 6.8 + 12.0, rect.center().y),
-        egui::vec2(24.0, 24.0),
+        egui::pos2(rect.left() + 6.8 + 10.8, rect.center().y),
+        egui::vec2(21.6, 21.6),
     );
     // 워크스페이스 마크는 별도 테두리 없이 상태색을 채운다(HTML 목업과 같은 규칙).
     ui.painter().rect_filled(
@@ -3368,7 +3369,7 @@ fn workspace_row(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
         initial,
-        crate::fonts::sidebar_font(12.0),
+        crate::fonts::sidebar_font(10.8),
         egui::Color32::WHITE,
     );
     let summary_mode = workspace_summary_mode(rect.width());
@@ -3399,7 +3400,7 @@ fn workspace_row(
             );
             let text_x = avatar.right() + 7.65;
             let name_center_y = if has_repo {
-                rect.center().y - 8.0
+                rect.center().y - 7.2
             } else {
                 rect.center().y
             };
@@ -3417,7 +3418,7 @@ fn workspace_row(
                     None,
                 );
                 ui.painter().galley(
-                    egui::pos2(text_x, rect.center().y + 2.0),
+                    egui::pos2(text_x, rect.center().y + 1.8),
                     repo,
                     ui.visuals().weak_text_color(),
                 );
@@ -4819,7 +4820,11 @@ pub(crate) fn session_entry_status_color(entry: &SessionEntry) -> egui::Color32 
         entry.status,
         entry.agent_line.is_some(),
     );
-    crate::ui::agent_visuals::status_color(state)
+    if state == crate::agent_surface::AgentVisualState::Active {
+        egui::Color32::from_rgb(0xc8, 0x4d, 0x4d)
+    } else {
+        crate::ui::agent_visuals::status_color(state)
+    }
 }
 
 /// 현재 플랫폼/환경에서 새 shell session이 사용할 것으로 예상되는 기본 shell kind.

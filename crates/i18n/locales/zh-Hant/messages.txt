@@ -819,3 +819,6 @@ fleet.broadcast.no_prompts = 沒有已儲存的提示詞。
 fleet.broadcast.targets = 目標代理（執行中）
 fleet.broadcast.send = 傳送給 {count} 個
 fleet.broadcast.fill = 請選擇提示詞和目標
+fleet.broadcast.confirm = 確定要傳送給全部 {count} 個代理嗎？
+fleet.broadcast.confirm_yes = 確認傳送
+fleet.broadcast.confirm_no = 取消

@@ -819,3 +819,6 @@ fleet.broadcast.no_prompts = 保存済みプロンプトがありません。
 fleet.broadcast.targets = 対象エージェント（実行中）
 fleet.broadcast.send = {count} 件に送信
 fleet.broadcast.fill = プロンプトと対象を選択してください
+fleet.broadcast.confirm = {count}件のエージェント全員に送信しますか？
+fleet.broadcast.confirm_yes = 送信を確定
+fleet.broadcast.confirm_no = キャンセル

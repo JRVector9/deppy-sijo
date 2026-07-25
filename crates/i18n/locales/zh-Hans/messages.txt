@@ -819,3 +819,6 @@ fleet.broadcast.no_prompts = 没有已保存的提示词。
 fleet.broadcast.targets = 目标智能体（运行中）
 fleet.broadcast.send = 发送给 {count} 个
 fleet.broadcast.fill = 请选择提示词和目标
+fleet.broadcast.confirm = 确定要发送给全部 {count} 个代理吗？
+fleet.broadcast.confirm_yes = 确认发送
+fleet.broadcast.confirm_no = 取消

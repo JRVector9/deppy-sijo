@@ -15827,6 +15827,12 @@ impl eframe::App for App {
                     &agent_providers,
                     &self.i18n,
                 );
+                // 표시 상태(mux 구조·세션 status·종료 결과)는 warm에서도 지금 반영한다 —
+                // 안 하면 fleet/사이드바가 warm 진입 시점 스냅샷에 얼어붙어 종료된 pane이
+                // 계속 실행 중으로, 새 pane은 없는 것으로 보인다. 렌더 상태는 그대로
+                // pending에 남겨 재활성 replay가 처리한다(둘 다 last-write-wins라 중복
+                // 적용이 안전하다).
+                rt.workspace_ui.apply_warm_events(&events);
                 rt.pending_events.extend(events.into_iter().filter(|event| {
                     !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
                 }));

@@ -2092,6 +2092,69 @@ impl WorkspaceUi {
         self.flush_command_repaint(ctx);
     }
 
+    /// warm(비활성) 워크스페이스의 상태 선반영 — 렌더는 하지 않는다.
+    ///
+    /// warm은 RuntimeEvent를 pending_events에 쌓아두고 재활성 시 한 번에 replay하므로
+    /// regex status와 mux 구조가 warm 진입 시점에 얼어붙었다(hook 기반 신호만 DB를 거쳐
+    /// 계속 갱신). 그 사이 fleet 카드·사이드바는 warm workspace_ui를 그대로 읽으므로
+    /// 종료된 pane이 계속 실행 중으로, 새로 생긴 pane은 아예 없는 것으로 보였다.
+    ///
+    /// 여기서는 "표시 상태" 세 종류만 즉시 반영한다 — mux 스냅샷, 세션 status,
+    /// 종료 결과. 나머지(뷰포트 스냅샷·렌더 캐시·선택/검색 정리 등 렌더 상태)는
+    /// 재활성 시 replay가 담당한다. 세 종류 모두 last-write-wins라 replay가 같은
+    /// 이벤트를 다시 적용해도 결과가 같다.
+    ///
+    /// 상태 변화 플래시(note_status_flash)는 일부러 걸지 않는다. 여기서 걸면 보이지도
+    /// 않는 워크스페이스에서 타이머가 소진되고, 여기서 status를 이미 반영했으므로
+    /// 재활성 replay의 `prev != new` 판정도 거짓이 되어 결국 플래시는 뜨지 않는다 —
+    /// 즉 warm 중 일어난 전이의 플래시는 사라진다(병렬 리뷰 medium). 플래시는 "방금
+    /// 일어난 일"의 주의 신호라 몇 분~몇 시간 전 전이를 재활성 시점에 몰아 띄우는 건
+    /// 노이즈고, warm 워크스페이스의 그 사건들은 이미 알림 센터가 받아 둔다
+    /// (process_ws_notifications는 warm에서도 돈다).
+    pub fn apply_warm_events(&mut self, events: &[RuntimeEvent]) {
+        for event in events {
+            match event {
+                RuntimeEvent::MuxUpdated { snapshot } => {
+                    let alive = mux_sessions(snapshot);
+                    self.sessions.retain(|id, _| alive.contains(id));
+                    self.mux = Some(Arc::clone(snapshot));
+                }
+                RuntimeEvent::SessionStatusChanged { session, status } => {
+                    if self.session_alive(*session) {
+                        self.sessions.entry(*session).or_default().status = Some(*status);
+                    }
+                }
+                RuntimeEvent::SessionStatusViewChanged { session, view } => {
+                    if self.session_alive(*session) {
+                        let entry = self.sessions.entry(*session).or_default();
+                        entry.status = Some(view.status);
+                        entry.status_view = Some(view.clone());
+                    }
+                }
+                RuntimeEvent::SessionExited { session, exit_code }
+                | RuntimeEvent::SessionRestored { session, exit_code }
+                    if self.session_alive(*session) =>
+                {
+                    let view = self.sessions.entry(*session).or_default();
+                    view.exit_code = Some(*exit_code);
+                    // handle_events와 같은 규칙 — 결과 상태(✅/❌)는 유지하고
+                    // 없을 때만 exit code로 채운다.
+                    if !matches!(
+                        view.status,
+                        Some(SessionStatus::Done) | Some(SessionStatus::Error)
+                    ) {
+                        view.status = Some(if *exit_code == Some(0) {
+                            SessionStatus::Done
+                        } else {
+                            SessionStatus::Error
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -5041,6 +5104,68 @@ mod tests {
 
     fn catalog() -> i18n::Catalog {
         i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
+
+    /// warm 워크스페이스는 이벤트를 replay용으로만 쌓아 regex status와 mux 구조가
+    /// warm 진입 시점에 얼어붙었다 — 표시 상태 3종(mux/status/종료 결과)은 즉시
+    /// 반영해야 fleet 카드와 사이드바가 warm을 정확히 보여준다(백로그 4).
+    #[test]
+    fn warm_이벤트는_mux와_status와_종료결과를_즉시_반영한다() {
+        let mut ui = WorkspaceUi::new();
+        let both = mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(1)), pane("pb", SessionId(2))],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        );
+        ui.apply_warm_events(&[
+            RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&both),
+            },
+            RuntimeEvent::SessionStatusChanged {
+                session: SessionId(1),
+                status: SessionStatus::Running,
+            },
+            RuntimeEvent::SessionExited {
+                session: SessionId(2),
+                exit_code: Some(1),
+            },
+        ]);
+        assert_eq!(
+            ui.last_session_status(SessionId(1)),
+            Some(SessionStatus::Running)
+        );
+        assert_eq!(
+            ui.last_session_status(SessionId(2)),
+            Some(SessionStatus::Error)
+        );
+
+        // mux에 없는 세션은 무시한다 — handle_events와 같은 liveness 규칙.
+        ui.apply_warm_events(&[RuntimeEvent::SessionStatusChanged {
+            session: SessionId(9),
+            status: SessionStatus::Running,
+        }]);
+        assert_eq!(ui.last_session_status(SessionId(9)), None);
+
+        // 사라진 pane의 상태는 다음 mux 스냅샷에서 정리된다.
+        let only_pa = mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(1))],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        );
+        ui.apply_warm_events(&[RuntimeEvent::MuxUpdated { snapshot: only_pa }]);
+        assert_eq!(ui.last_session_status(SessionId(2)), None);
+        assert_eq!(
+            ui.last_session_status(SessionId(1)),
+            Some(SessionStatus::Running)
+        );
     }
 
     #[test]

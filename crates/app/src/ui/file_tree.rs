@@ -1881,21 +1881,6 @@ impl FileTreeUi {
                             action = Some(session_action);
                         }
                     }
-                    // 워크스페이스 추가(+) — 헤더에서 옮겨온 폴더 선택 진입점. 목록
-                    // 마지막에 얇게 붙여 첫 워크스페이스 상단 밀착을 해치지 않는다.
-                    ui.add_space(2.0);
-                    if ui
-                        .add_sized(
-                            egui::vec2(ui.available_width(), 26.0),
-                            egui::Button::new(
-                                egui::RichText::new(catalog.t("sidebar.add_workspace", &[])).weak(),
-                            )
-                            .frame(false),
-                        )
-                        .clicked()
-                    {
-                        action = Some(SidebarAction::CreateWorkspaceFromPicker);
-                    }
                 });
         }
         ui.add_space(4.0);

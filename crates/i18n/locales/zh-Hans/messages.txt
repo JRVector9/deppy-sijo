@@ -34,7 +34,6 @@ sidebar.menu.close_pane = 关闭会话
 sidebar.menu.close_workspace = 关闭工作区会话
 sidebar.menu.rename_workspace = 重命名
 sidebar.empty.start_workspace = 开始一个工作区
-sidebar.add_workspace = + 添加工作区
 sidebar.nav.home = 主页
 sidebar.nav.inbox = 收件箱
 sidebar.nav.fleet = 舰队

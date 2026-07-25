@@ -34,7 +34,6 @@ sidebar.menu.close_pane = 세션 닫기
 sidebar.menu.close_workspace = 워크스페이스 종료
 sidebar.menu.rename_workspace = 이름 바꾸기
 sidebar.empty.start_workspace = 워크스페이스를 시작하세요
-sidebar.add_workspace = + 워크스페이스 추가
 sidebar.nav.home = 홈
 sidebar.nav.inbox = 작업함
 sidebar.nav.fleet = 플릿

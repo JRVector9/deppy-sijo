@@ -34,7 +34,6 @@ sidebar.menu.close_pane = セッションを閉じる
 sidebar.menu.close_workspace = ワークスペースのセッションを終了
 sidebar.menu.rename_workspace = 名前を変更
 sidebar.empty.start_workspace = ワークスペースを始めましょう
-sidebar.add_workspace = + ワークスペースを追加
 sidebar.nav.home = ホーム
 sidebar.nav.inbox = インボックス
 sidebar.nav.fleet = フリート

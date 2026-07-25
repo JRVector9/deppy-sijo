@@ -34,7 +34,6 @@ sidebar.menu.close_pane = Close session
 sidebar.menu.close_workspace = Close workspace sessions
 sidebar.menu.rename_workspace = Rename workspace
 sidebar.empty.start_workspace = Start a workspace
-sidebar.add_workspace = + Add workspace
 sidebar.nav.home = Home
 sidebar.nav.inbox = Inbox
 sidebar.nav.fleet = Fleet

@@ -650,6 +650,9 @@ pub struct AgentSessionsUi {
     selected_skill_paths: HashSet<String>,
     pending_model_catalog: Option<CodexModelCatalogReply>,
     pending_skill_catalog: Option<CodexSkillCatalogReply>,
+    pending_rate_limits: Option<CodexAppServerReply>,
+    codex_usage: Option<(u8, u8)>,
+    last_rate_limits_request: Option<std::time::Instant>,
     catalog_error: Option<CatalogMessage>,
     text_input_ids: Vec<egui::Id>,
     /// config에서 동기화한 LLM 프로바이더 오버라이드 (PR-L2) — ensure_client가 spawn 시
@@ -710,6 +713,9 @@ impl AgentSessionsUi {
             selected_skill_paths: HashSet::new(),
             pending_model_catalog: None,
             pending_skill_catalog: None,
+            pending_rate_limits: None,
+            codex_usage: None,
+            last_rate_limits_request: None,
             catalog_error: None,
             text_input_ids: Vec::new(),
             llm_override: Ok(None),
@@ -1522,6 +1528,74 @@ impl AgentSessionsUi {
         Ok(())
     }
 
+    pub fn refresh_rate_limits(&mut self, ctx: &egui::Context) {
+        if self.pending_rate_limits.is_some()
+            || self.last_rate_limits_request.is_some_and(|last| {
+                last.elapsed() < std::time::Duration::from_secs(60)
+            })
+        {
+            return;
+        }
+        self.last_rate_limits_request = Some(std::time::Instant::now());
+        if self.ensure_client(ctx).is_err() {
+            return;
+        }
+        self.pending_rate_limits = self
+            .client
+            .as_ref()
+            .and_then(|client| client.read_rate_limits().ok());
+    }
+
+    pub fn codex_usage(&self) -> Option<(u8, u8)> {
+        self.codex_usage
+    }
+
+    fn poll_rate_limits_reply(&mut self) {
+        let Some(reply) = self.pending_rate_limits.as_ref() else {
+            return;
+        };
+        let result = match reply.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(
+                "Codex rate-limit reply disconnected"
+            ))),
+        };
+        let Some(result) = result else { return };
+        self.pending_rate_limits = None;
+        let Ok(snapshot) = result else { return };
+        // Codex wraps the windows in `result.rateLimits`. Keep the direct-object
+        // fallback for older app-server builds that returned the windows at the root.
+        let limits = snapshot.get("rateLimits").unwrap_or(&snapshot);
+        let window = |name: &str| {
+            limits
+                .get(name)
+                .and_then(|window| window.get("usedPercent"))
+                .and_then(serde_json::Value::as_f64)
+                .filter(|percent| percent.is_finite())
+                .map(|percent| percent.clamp(0.0, 100.0).round() as u8)
+        };
+        let window_by_duration = |expected_minutes: f64| {
+            ["primary", "secondary"].into_iter().find_map(|name| {
+                let value = limits.get(name)?;
+                let duration = value.get("windowDurationMins")?.as_f64()?;
+                if (duration - expected_minutes).abs() > 1.0 {
+                    return None;
+                }
+                value
+                    .get("usedPercent")?
+                    .as_f64()
+                    .filter(|percent| percent.is_finite())
+                    .map(|percent| percent.clamp(0.0, 100.0).round() as u8)
+            })
+        };
+        let five_hour = window_by_duration(300.0).or_else(|| window("primary"));
+        let weekly = window_by_duration(10_080.0).or_else(|| window("secondary"));
+        if let (Some(five_hour), Some(weekly)) = (five_hour, weekly) {
+            self.codex_usage = Some((five_hour, weekly));
+        }
+    }
+
     /// config → LLM 프로바이더 오버라이드 동기화 (매 프레임, PR-L2). 프로바이더는
     /// 프로세스 argv라 살아 있는 app-server에는 적용되지 않는다 — 진행 중 작업이
     /// 전혀 없으면 기존 shutdown 경로로 client를 내려 다음 실행부터 새 설정을 쓴다.
@@ -1967,6 +2041,7 @@ impl AgentSessionsUi {
         // so a stale snapshot can never erase a newer streamed item update.
         self.poll_thread_replies();
         self.poll_catalog_replies();
+        self.poll_rate_limits_reply();
         let mut connection_stopped = false;
         let events = self
             .client

@@ -27,6 +27,36 @@
 
 ## Status
 
+- 2026-07-26 workspace/세션 하단 및 텍스트 여백 조정: workspace ScrollArea 끝에 중복 추가했던 4px 공간을 제거해 기존 section 하단 4px만 남겼다. 세션 텍스트 시작점을 11→12px로 옮겨 최대 6px rail 뒤 간격을 5→6px로 맞췄다. before-active/active/after-active 세 렌더 경로에서 세션이 존재할 때 마지막 세션 인셋 뒤에 카드 내부 4px 공간을 추가했다. debug 빌드 성공 후 고정 Developer ID bundle을 LaunchServices로 PID 21883에 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 workspace 목록/세션 인셋 조정: workspace 목록 viewport의 최상단·최하단에 각각 4px 공간을 추가하고 카드 좌우 시각 inset을 4→6px로 변경했다. 세션 인셋은 workspace 기준 좌우 16px로 더 안쪽에 배치하고 `#0e181e` fill + `#1c2a32` 1px inside stroke를 사용하며 corner radius는 0으로 바꿨다. focus fill과 행 separator의 좌우 경계도 같은 16px에 맞췄다. debug 빌드 성공 후 고정 Developer ID bundle을 LaunchServices로 PID 6857에 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 sidebar 전체 배경/카드 여백 조정: workspace 카드 좌우 시각 inset을 10→4px로 줄였다. workspace 목록 viewport에만 적용하던 `#171717`을 공용 `SIDEBAR_BACKGROUND` 토큰으로 만들고 `FileTreeUi`의 SidePanel frame fill에도 적용해 파일 트리·workspace 목록·하단 nav 전체 배경을 같은 `#171717`로 통일했다. debug 빌드 성공 후 고정 Developer ID bundle을 LaunchServices로 PID 96103에 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 workspace 카드 외부 여백/사이드 배경 조정: 카드 좌우 시각 inset을 14→10px로 줄였고, workspace 목록 배경 gradient의 상·하단을 모두 `#171717`로 맞춰 단색 사이드 배경으로 변경했다. 카드 내부 padding은 유지된다. debug 빌드 성공 후 고정 Developer ID bundle을 LaunchServices로 PID 85328에 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 workspace 카드 색상 사용자 조정: 카드 gradient 상·하단을 모두 `#19222a`로 맞춰 단색 배경으로 만들고, 세션 인셋 배경은 `#0e181e`로 변경했다. 테두리·그림자·간격·radius는 유지했다. debug 빌드 성공 후 고정 Developer ID bundle을 LaunchServices로 PID 67593에 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 닫힌 workspace 카드 밀도/내부 여백 조정: workspace 간 `item_spacing.y`를 8→3px로 줄였다. 카드 배경의 좌우 14px 시각 inset은 유지하고, `workspace_row` 콘텐츠 rect를 `WORKSPACE_CARD_HORIZONTAL_INSET + 8px`만큼 안쪽으로 이동해 아바타·제목·상태 badge·chevron이 카드 양끝에 붙지 않도록 했다. 색상·radius·세션 선택 동작은 변경하지 않았다. debug 빌드 성공 후 고정 Developer ID bundle을 LaunchServices로 PID 53890에 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 workspace 레퍼런스 스타일 low 항목 적용: focused 세션 배경을 `#172831`로 낮추고 focused 제목의 cyan 전환을 제거해 모든 제목을 기본 흰색으로 유지했다. 상태 rail은 기존 상태색을 유지한다. workspace 목록 viewport에는 `#0d171d→#081015` 청흑색 세로 mesh gradient를 추가했고 카드 gradient는 공용 helper로 정리했다. debug 빌드 성공 후 고정 Developer ID bundle을 LaunchServices로 PID 23920에 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 workspace 카드 레퍼런스 스타일 1차 적용: 사용자 의도에 따라 radius 6px는 유지했다. 카드 시각 rect에 좌우 14px inset과 목록 간 8px 간격을 적용하고, 쿨톤 `#121d24→#0e181e` mesh gradient, `#1c2a33` 1px border, 얕은 shadow를 추가했다. 세션 인셋 외곽 stroke는 제거하고 행 separator만 유지했으며 card/focus/inset 좌우 경계를 동일한 14px 기준으로 맞췄다. 우측 상태는 dot 7.6→6px, gap 6→4.5px, count slot 26→22px, font 12→11.5px/muted, chevron 크기와 대비를 축소했다. debug 빌드 성공 후 고정 Developer ID bundle을 LaunchServices로 PID 11825에 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 세션 선택 뒤 인셋의 비선택 행 배경이 달라지던 원인 수정: 비활성 workspace 세션 경로는 모든 row rect를 합집합으로 누적했지만, 활성 workspace 렌더의 일반/편집 두 분기는 `session_rows_rect`를 현재 row로 덮어써 최종적으로 마지막 행만 인셋 배경 범위가 됐다. 두 분기 모두 합집합 누적으로 고쳐 선택 전후에 인셋 전체 배경이 유지되고 focused row fill만 겹치도록 했다. debug 빌드 성공 후 고정 Developer ID로 app/helper/bundle을 서명해 LaunchServices로 PID 62353을 실행했다. 테스트·clippy·i18n은 아직 실행하지 않았다.
+
+- 2026-07-26 개발 앱 유지 실행 방식 정정: `nohup scripts/dev-run.sh`의 직접 바이너리 프로세스가 명령 세션 종료 뒤 함께 정리되는 현상이 있어, `scripts/dev-run.sh`로 Developer ID 고정 서명된 debug 바이너리를 만든 뒤 `target/bundle/Deppy Sijo.app`에 넣고 app/helper/bundle을 같은 Developer ID로 재서명한 후 LaunchServices `open -n`으로 실행했다. 현재 PID 31653이 bundle 경로에서 독립 실행 중이다. 이후 UI 재실행도 ad-hoc/직접 nohup 대신 이 고정 서명 `.app` 실행 경로를 사용한다.
+
+- 2026-07-26 두 번째 세션 포커스 시 첫 번째 세션 하단 색이 변하던 문제 수정: 포커스 fill이 인셋용 rect helper를 공유하면서 row top을 1px 위로 확장해 이전 행을 침범한 것이 원인이었다. `session_inset_fill_rect`는 그룹 인셋 정렬을 위해 기존 `top - 1px`을 유지하고, 새 `session_focus_fill_rect`는 실제 row top에서 시작해 bottom만 1px 줄인다. 좌표 회귀 assertion을 추가했고, 테스트는 아직 실행하지 않았다. 고정 Developer ID의 `scripts/dev-run.sh`로 빌드·재실행했으며 PID는 24134다.
+
+- 2026-07-26 개발 재실행의 키체인 반복 승인 원인을 정정했다. 임시 `.app`에 debug 바이너리를 넣고 ad-hoc 서명하던 방식은 빌드마다 designated requirement가 바뀌어 `app.vector9.deppy-sijo` keyring 접근 암호 창을 반복 발생시킨다. 해당 앱을 종료하고 프로젝트 표준 `scripts/dev-run.sh`로 재실행했으며, 로그에서 `Developer ID Application: VectorNine INC (ZDTU5LS35K)`와 고정 identifier `app.vector9.deppy-sijo` 적용을 확인했다. 현재 PID는 12085다. 이후 개발 재실행은 임시 ad-hoc 번들을 만들지 말고 이 스크립트만 사용한다.
+
+- 2026-07-26 workspace 세션 배경 정책 변경: 세션 행 배경은 더 이상 hover/편집 상태에 반응하지 않고 `entry.focused`인 실제 작업 세션에만 `#1c2830`을 그린다. 포커스 제목/레일 accent는 유지하며, 인셋과 포커스 fill은 공통 `session_row_fill_rect` 좌표를 사용한다. debug 빌드 성공 후 키체인을 사용하지 않는 새 ad-hoc 임시 앱 번들로 PID 86038을 실행했다. 사용자 UI 확인 대기이며 테스트·clippy·i18n 게이트는 아직 실행하지 않았다.
+
+- 2026-07-26 workspace 세션 목록 표시 후속: 활성/비활성 workspace의 중첩 `ScrollArea`에서 `max_height` 제한을 제거해 세션 전체가 펼쳐지고 바깥 workspace 목록만 스크롤하도록 변경했다. `cargo build -p deppy-sijo --bin deppy-sijo`가 성공했고, debug 바이너리를 임시 `.app`에 넣어 ad-hoc 서명(`codesign -s -`, 키체인 미사용) 후 PID 28645로 실행했다. UI 확인 대기이며 테스트·clippy·i18n 게이트는 아직 실행하지 않았다.
+
+- 2026-07-26 `workspaceDesign` 세션 인셋/hover 수직 경계 수정: `file_tree.rs`가 각 workspace의 마지막 세션 rect만 보관하던 대신 모든 세션 행의 합집합 rect를 누적하고, 인셋과 행 hover가 공통 `session_hover_rect` 좌표를 사용하도록 변경했다. 이로써 인셋 상단은 첫 hover의 `top - 1px`, 하단은 마지막 hover의 `bottom - 1px`와 일치한다. 기존 지침대로 회귀 테스트 없이 `scripts/dev-run.sh`로 빌드·재기동했으며 PID 68627이 실행 중이다. 사용자 화면 확인 대기이며 clippy/i18n/file_tree 회귀 게이트는 커밋 직전에만 실행한다.
+
 - 2026-07-23 runaway-protection program (A1, B1-B3, C1-C4) landed on branch `fix/child-rss-footprint`, 8 commits. Policy: warn-only, all freeze/kill actions are user-triggered. A1 `1ae9f6c`: session child RSS via per-pid `proc_pid_rusage` phys_footprint (memoized, ps-RSS fallback, never zero) — fixes the 263GiB shared-page double-count; same-uid other-pid lookup empirically verified without privileges. B1 `e96cbd7`: pure `process_storm` state machine (≥300 procs sustained 6s, hysteresis; CPU excluded to avoid build false-positives) + runtime "empty ps capture ≠ resolved" fix (retains last emitted). C1 `61cda08`: `dispatch2` `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` subscription (no polling). C2 `e61deb3`: `EmergencyPersistFlush` command → `flush_async_writes()` on pressure escalation (closes the only OOM loss window — DbWriteWorker's 50ms debounce batch, since Drop never runs on SIGKILL). B2 `1281f10`: storm banner + Activity badge + one-shot OS notification via `platform::notify` (NOT notify-rust — 2026-07-05 abort precedent). C3 `8f8f827`: heaviest-session pressure notification. B3 `8b47d67`: freeze(SIGSTOP)/resume(SIGCONT)/kill(reuses KillSession) buttons; `FreezeSession`/`ResumeSession` commands + `SessionFreezeChanged` event appended to wire tails (postcard-compatible, order C2→B3). C4: `비상_플러시는_drop_없이_배치를_커밋한다` proves Drop-independent durability; guarantee/non-guarantee scope documented. All commits pass fmt/clippy/check-boundary/check-deps/i18n-check; pty freeze test needs `--test-threads=1` (parallel run exhausts ptys — env limit, not a logic failure). Roadmap: `docs/runaway-protection-roadmap.md`. NOT yet merged to main; `scripts/package-macos.sh` has an uncommitted local strip-on-package tweak (size reduction) still pending a decision.
 - 2026-07-23 user-authorized merge completed as a non-force fast-forward: remote `main` advanced from `ef4abf01996a5261b91f475d0f740b0d50a4cc26` to `3b61e23dfe207c3629e8f8b76c8f1fc4b4618fc4`, identical to `codex/connector-refactor`. The merge base was exactly the prior main, main-only commit count and three-way overlap candidates were both zero, and no merge commit/conflict resolution/force push was required. User-owned `.claude/` remains untracked and unstaged.
 - 2026-07-23 user-requested branch build/run completed from shadow-worktree `codex-integration@298f66ed7c205f4bd60e1cca80d8b687df74bd94`, which is the remote `codex/connector-refactor` head at the time of execution. The trusted release package command completed successfully again (Developer ID, hardened runtime, timestamp, nested/deep/archive/hash verification). `open -n 'target/bundle/Deppy Sijo.app'` then launched the exact signed bundle; after four seconds `pgrep` confirmed PID 52209 executing `/Users/jr/Desktop/Projects/deppy-sijo/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. No prior app process was terminated, no source file changed, and no OAuth/account action was performed.
@@ -1001,3 +1031,73 @@
 - 2026-07-19: Removed gitignore-based filtering from the file tree (`crates/app/src/ui/file_tree.rs`). `FileTreeUi` no longer owns `GitIgnoreCache`; listing and watcher now behave like Finder and ignore only the hard-coded generated-dir list (`.git`, `node_modules`, `target`, `dist`, `build`, `.next`, `.turbo`, `vendor`, `logs`, `.cache`, `.DS_Store`). Deleted `GitIgnoreCache`, `IgnoreRule`, and related helpers. Merged `watch_events_for_path_with_ignore` into `watch_events_for_path` as the production function. Updated two tests to assert gitignored entries are visible and generated dirs remain hidden. `cargo check -p deppy-sijo` and `cargo test -p deppy-sijo file_tree` pass (54/54).
 
 - 2026-07-19: Removed the hard-coded generated-directory filter from the file tree (`crates/app/src/ui/file_tree.rs`). `read_children_guarded`, `watch_events_for_path`, and `sync_watches` no longer call `has_default_watch_ignore_component`, so `.git`, `node_modules`, `target`, `dist`, `build`, `.next`, `.turbo`, `vendor`, `logs`, `.cache`, and `.DS_Store` are now listed and watched like Finder. Deleted `has_default_watch_ignore_component` and `default_watch_ignore_name`. Caller-provided `watch_ignore` prefixes remain unchanged for app data/log self-loop prevention. Updated tests: `watcher_generated_경로도_이제_이벤트를_생성한다` asserts generated paths produce events, `gitignore_규칙은_listing에서_더_이상_적용되지_않는다` now asserts `node_modules` is visible, and `watcher_gitignore_rules는_dirty_event를_더_이상_버리지_않는다` now asserts `node_modules` events are kept. `cargo check -p deppy-sijo`, `cargo test -p deppy-sijo file_tree` (54/54), and `cargo clippy -p deppy-sijo --all-targets` all pass.
+- 2026-07-26 참고 세션 카드 밀도 적용: 직각 인셋과 기존 색상은 유지하고 세션 인셋 좌우를 16→24px, 최대 6px 상태 레일 뒤 텍스트 간격을 28px, 우측 콘텐츠 패딩을 24px로 확대했다. 세션 줄 높이 비율을 1.15→1.35로 조정해 행 높이와 정보 간격을 넓혔으며 관련 좌표 테스트 기대값도 함께 갱신했다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 참고 세션 카드 밀도 적용 실행 확인: `cargo build -p deppy-sijo --bin deppy-sijo` 성공. 고정 Developer ID로 메인 실행 파일과 앱 번들을 재서명한 뒤 LaunchServices로 PID 44415에 실행하고 전면 표시했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 워크스페이스 카드 색상 조정: 카드 상단/하단 배경을 모두 `#19222a`에서 `#151111`로 변경해 평면 색상을 유지했다. 세션 인셋 `#0e181e`와 사이드 배경 `#171717`은 유지했다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 워크스페이스 카드 `#151111` 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 54567에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 카드/세션 팔레트 재조정: 워크스페이스 카드 상단·하단 배경을 `#2a2a33`, 세션 인셋 배경을 `#151515`로 변경했다. 카드 외곽선과 세션 인셋 테두리도 모두 `#2a2a33`으로 통일했다. 사이드 배경은 `#171717`을 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 카드/세션 팔레트 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 66620에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 세션 행 3상태 배경 적용: 기본 세션 인셋은 `#151515`, hover 행은 `#454545`, focused/selected 행은 `#00a3d1`로 분리했다. selected가 hover보다 우선하며 기존 흰색 텍스트와 직각 행 배경을 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 세션 행 3상태 배경 적용: 기본 세션 인셋은 `#151515`, hover 행은 `#454545`, focused/selected 행은 `#00a3d1`로 분리했다. selected가 hover보다 우선하며 두 상태가 동일한 행 사각형을 사용한다. 첫 자동 치환은 색상 상수만 반영되고 실제 배경 호출 형태가 달라 중단됐으며, 해당 블록을 확인해 `resp.hovered()` 기반으로 정확히 수정했다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 세션 행 3상태 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 85294에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 사이드/인셋 배경 통일: 세션 인셋 기본 배경을 `#151515`에서 `#171717`로 변경해 기존 워크스페이스 사이드 배경 `#171717`과 통일했다. hover `#454545`, selected `#00a3d1`, 카드 `#2a2a33`은 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 사이드/인셋 `#171717` 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 99391에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 워크스페이스 카드 배경 통일 보정: 이전 변경은 세션 인셋만 `#171717`로 바꿔 카드의 `#2a2a33`이 남아 있었다. 워크스페이스 카드 상단·하단 배경도 모두 `#171717`로 변경해 사이드 및 세션 인셋과 동일하게 맞췄다. 테두리 `#2a2a33`, hover `#454545`, selected `#00a3d1`은 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 워크스페이스 카드 `#171717` 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 10184에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 워크스페이스/세션 테두리 통일: 워크스페이스 카드 외곽선과 세션 인셋 테두리를 `#2a2a33`에서 `#171717`로 변경해 배경과 동일하게 맞췄다. hover `#454545`, selected `#00a3d1`은 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 워크스페이스/세션 테두리 `#171717` 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 22968에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 워크스페이스/세션 좌표 조정: 워크스페이스 카드와 헤더 콘텐츠의 왼쪽 바깥 여백만 6px 줄이고 오른쪽 여백은 유지했다. 아바타를 30→24px, 이니셜 글자를 15→12px로 20% 축소했다. selected 세션 배경을 `#151b23`으로 바꾸고, 상태 레일을 행 왼쪽에서 4px 들인 뒤 최대 6px 레일과 텍스트 사이가 2px가 되도록 `SESSION_TEXT_INSET`을 계산식으로 변경했다. 관련 좌표 테스트 기대값도 함께 갱신했다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 워크스페이스/세션 좌표 변경 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 52452에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 세션 포커스/세로 여백 조정: focused/selected 세션 배경을 `#151b23`에서 `#0f1116`으로 변경하고, 세션 텍스트 블록의 상·하 내부 여백을 각각 2→1px로 줄였다. hover `#454545`와 레일/텍스트 좌표는 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 세션 포커스/세로 여백 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 75684에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 워크스페이스 헤더/세션 우측 정렬: 워크스페이스 헤더 콘텐츠의 좌측·우측 내부 패딩을 8→5px로 줄여 아바타를 왼쪽으로 3px, 상태/chevron을 오른쪽으로 3px 이동했다. 세션 인셋 및 행 상태 배경의 우측 인셋을 24px에서 카드 우측 바깥 여백과 같은 6px로 바꿔 워크스페이스 카드 우측 경계까지 확장했다. 세션 텍스트 줄 간격 계산은 기존 `SESSION_LINE_HEIGHT_RATIO=1.35`, 상·하 1px 방식을 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 워크스페이스 헤더/세션 우측 정렬 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 12774에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 세션 줄 높이/워크스페이스 화살표 간격 조정: 세션 `SESSION_LINE_HEIGHT_RATIO`를 1.35→1.0으로 변경했다. 워크스페이스 헤더 우측 패딩을 5→3px로 줄이고, 펼침 화살표가 있는 상태 배지의 right 오프셋 및 이름 예약 폭을 18→20px로 조정해 숫자는 기존 위치를 유지하면서 화살표만 오른쪽으로 2px 이동시켰다. 이에 따라 숫자-화살표 간격은 2px 늘고 화살표 우측 여백은 2px 줄었다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 세션 줄 높이/상태 간격 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 30322에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 세션 행간/화살표 간격 추가 조정: `SESSION_LINE_HEIGHT_RATIO`를 1.0→0.85로 낮췄다. 워크스페이스 헤더 우측 패딩을 3→1px, disclosure가 있는 상태 배지 오프셋과 이름 예약 폭을 20→22px로 조정해 숫자는 그대로 두고 화살표만 다시 오른쪽으로 2px 이동했다. 숫자-화살표 간격은 추가 2px 증가하고 화살표 우측 여백은 추가 2px 감소한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 세션 행간/화살표 추가 조정 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 50113에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 세션 행간 추가 축소: `SESSION_LINE_HEIGHT_RATIO`를 0.85→0.75로 변경했다. 다른 세션 여백과 워크스페이스 상태 배치는 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 세션 줄 높이 0.75 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 69007에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 세션 줄 높이 실험: 사용자가 비율을 낮출수록 시각적 줄 간격이 커지는 현상을 확인해 달라고 요청하여 `SESSION_LINE_HEIGHT_RATIO`를 0.75→2.0으로 변경했다. 현재 레이아웃은 남는 행 공간을 줄 사이에 재분배하므로 비율과 실제 glyph 간격이 단순 비례하지 않을 수 있다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 세션 줄 높이 2.0 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 90461에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 세션 줄 높이 극단값 실험: `SESSION_LINE_HEIGHT_RATIO`를 2.0→0.1로 변경해 실제 glyph 간격 변화를 비교한다. 다른 레이아웃 값은 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 세션 줄 높이 0.1 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 98102에 전면 실행했다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+- 2026-07-26 세션 줄 높이 비율 복원: 0.1에서 텍스트 영역이 글리프 높이보다 작아 두 번째 줄이 영역 밖으로 밀리는 결과를 확인해 `SESSION_LINE_HEIGHT_RATIO`를 1.0으로 복원했다. 다른 레이아웃 값은 유지한다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 워크스페이스 Git 헤더/상단 사용량 줄 구현: `SidebarWorkspaceEntry`에 선택적 `repo` 레이블을 추가했다. 워크스페이스 루트의 `.git/HEAD` 또는 worktree `.git` 포인터를 읽어 `저장소 · 브랜치`를 만들고 2초 캐시로 프레임별 파일 I/O를 피한다. Git 레이블이 있으면 워크스페이스 헤더를 48px 2행으로 렌더하고, 인셋 세션 정보는 변경하지 않았다. 타이틀바 알림 버튼 옆에는 Claude/Codex의 compact bar와 `— 5h · — wk`를 한 줄로 배치했다. 앱에는 아직 계정 한도 데이터 소스가 없어 수치는 `—`이며 위젯을 독립 함수로 만들어 후속 조회 결과 연결이 가능하다. 테스트 fixture의 새 `repo` 필드는 `None`으로 보정했다. 빌드·재실행 전이며 테스트·clippy·i18n은 실행하지 않았다.
+- 2026-07-26 Git 헤더/상단 사용량 UI 실행 확인: debug 빌드 성공 후 고정 Developer ID로 앱을 재서명하고 PID 87868에 전면 실행했다. 사용량 UI 수치는 데이터 소스 연결 전이라 `—`로 표시된다. 프로젝트 규칙에 따라 회귀테스트·clippy·i18n은 아직 실행하지 않았다.
+
+## 2026-07-26 Codex usage data connection
+
+- Connected the top-bar Codex usage display to the official app-server `account/rateLimits/read` RPC.
+- Added 60-second rate-limit refresh and mapped primary/secondary windows to the `5h`/`wk` percentages and progress bar.
+- Claude usage remains unavailable because the installed Claude CLI exposes no supported subscription-usage query source; its placeholder is retained.
+- `cargo build -p deppy-sijo --bin deppy-sijo` completed successfully.
+- Re-signed and launched `target/bundle/Deppy Sijo.app` with the configured Developer ID; running PID was `53476`.
+- Tests, clippy, and i18n gates were not run because no commit was requested.
+
+## 2026-07-26 Orca-compatible provider usage
+
+- Root cause for the empty Codex usage display: `account/rateLimits/read` returns `{ rateLimits: { primary, secondary } }`, while the first parser expected the windows at the result root and accepted integers only.
+- Codex now unwraps `rateLimits`, accepts floating-point `usedPercent`, and classifies 5-hour/weekly windows using `windowDurationMins` with the primary/secondary fallback retained.
+- Claude now reuses the existing Deppy status-line proxy. Claude Code `rate_limits.five_hour` and `rate_limits.seven_day` percentages are written as a non-secret local snapshot after a live response and read by the top bar with a two-second cache. No Claude Keychain credential read was added.
+- Reference: `stablyai/orca` `codex-fetcher.ts` and `claude-statusline-rate-limits.ts`.
+- The first combined build command failed only because the proxy package is named `mcp-proxy`, not `deppy-mcp-proxy`. The corrected app+proxy build completed successfully.
+- Replaced and Developer-ID-signed both binaries in `target/bundle/Deppy Sijo.app`; launched PID `78159`.
+- Tests, clippy, and i18n gates were not run because no commit was requested.
+
+## 2026-07-26 Claude PTY fallback and compact workspace header
+
+- Added `crates/app/src/claude_usage.rs`: when no live status-line snapshot exists, a bounded background PTY starts the real Claude CLI, sends `/usage`, parses current-session and weekly percentages, and refreshes every 60 seconds.
+- The probe uses the existing `pty` abstraction, a 25-second timeout, a 100 KB output cap, a 2-second startup delay, and a 2-second render-settle window. Deppy does not read Claude Keychain credentials directly.
+- Fixed the parser to continue scanning up to 12 lines after each usage heading instead of returning on the first non-percent line.
+- Sidebar active-session status color is now `#c84d4d`.
+- Workspace header heights changed from `48.0/39.1` to `43.2/35.19`; avatar and initial font changed from `24/12` to `21.6/10.8`.
+- App and proxy debug build succeeded. Developer-ID-signed bundle launched as PID `90868`.
+- User requested the usage and latest sidebar UI changes be separated into PRs; commit/PR gates and branch split remain.
+## 2026-07-26 Claude usage fallback and compact active-session styling
+
+- Added a hidden Claude PTY `/usage` fallback so the top bar can obtain current-session and weekly usage without reading macOS Keychain credentials directly. The live statusline snapshot remains the primary source.
+- Added the active session rail color `#c84d4d`, reduced workspace header height by 10%, and reduced the workspace avatar by 10%.
+- Built and launched the Developer ID-signed app bundle; the running process is PID 90868.
+- Commit gates passed: `cargo test -p deppy-sijo --bins file_tree`, `cargo clippy -p deppy-sijo --bin deppy-sijo -p mcp-proxy --bin deppy-mcp-proxy -- -D warnings`, and `cargo test -p i18n`.
+- The delivery plan is two stacked PRs: usage/repository integration first, followed by the isolated active-session and compact-header visual change.

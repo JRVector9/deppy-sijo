@@ -5379,6 +5379,149 @@ struct WorkspaceRuntime {
     event_resync_pending: bool,
 }
 
+#[derive(Clone)]
+struct WorkspaceGitLabelCacheEntry {
+    checked_at: std::time::Instant,
+    label: Option<String>,
+}
+
+fn workspace_git_label(path: &str) -> Option<String> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, WorkspaceGitLabelCacheEntry>,
+        >,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(entries) = cache.lock()
+        && let Some(entry) = entries.get(path)
+        && entry.checked_at.elapsed() < std::time::Duration::from_secs(2)
+    {
+        return entry.label.clone();
+    }
+
+    let root = std::path::Path::new(path);
+    let dot_git = root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        Some(dot_git)
+    } else {
+        std::fs::read_to_string(&dot_git).ok().and_then(|contents| {
+            let relative = contents.trim().strip_prefix("gitdir:")?.trim();
+            let candidate = std::path::PathBuf::from(relative);
+            Some(if candidate.is_absolute() {
+                candidate
+            } else {
+                root.join(candidate)
+            })
+        })
+    };
+    let label = git_dir.and_then(|git_dir| {
+        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+        let head = head.trim();
+        let branch = head
+            .strip_prefix("ref: refs/heads/")
+            .map(str::to_owned)
+            .unwrap_or_else(|| head.chars().take(7).collect());
+        let repo = root.file_name()?.to_string_lossy();
+        Some(format!("{repo} · {branch}"))
+    });
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(
+            path.to_owned(),
+            WorkspaceGitLabelCacheEntry {
+                checked_at: std::time::Instant::now(),
+                label: label.clone(),
+            },
+        );
+    }
+    label
+}
+
+fn claude_usage_snapshot() -> Option<(u8, u8)> {
+    type Cache = Option<(std::time::Instant, Option<(u8, u8)>)>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut cache = cache.lock().ok()?;
+    if let Some((checked_at, usage)) = *cache
+        && checked_at.elapsed() < std::time::Duration::from_secs(2)
+    {
+        return usage;
+    }
+    let usage = (|| {
+        let path = crate::paths::home_dir()?
+            .join(".deppy-sijo")
+            .join("claude-usage.json");
+        if std::fs::metadata(&path).ok()?.len() > 4 * 1024 {
+            return None;
+        }
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        let percent = |name: &str| {
+            snapshot
+                .get(name)
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 100.0).round() as u8)
+        };
+        Some((percent("five_hour")?, percent("seven_day")?))
+    })();
+    *cache = Some((std::time::Instant::now(), usage));
+    usage
+}
+
+fn top_provider_usage(
+    ui: &mut egui::Ui,
+    claude_usage: Option<(u8, u8)>,
+    codex_usage: Option<(u8, u8)>,
+) {
+    fn provider(
+        ui: &mut egui::Ui,
+        name: &str,
+        accent: egui::Color32,
+        usage: Option<(u8, u8)>,
+    ) {
+        ui.label(
+            egui::RichText::new(name)
+                .size(10.5)
+                .color(accent),
+        );
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(40.0, 6.0), egui::Sense::hover());
+        ui.painter().rect_filled(bar, 3.0, egui::Color32::from_gray(42));
+        if let Some((five_hour, weekly)) = usage {
+            let filled = egui::Rect::from_min_max(
+                bar.min,
+                egui::pos2(
+                    bar.left() + bar.width() * f32::from(five_hour) / 100.0,
+                    bar.bottom(),
+                ),
+            );
+            ui.painter().rect_filled(filled, 3.0, accent);
+            ui.label(
+                egui::RichText::new(format!("{five_hour}% 5h · {weekly}% wk"))
+                    .size(10.5)
+                    .weak(),
+            );
+        } else {
+            ui.label(egui::RichText::new("— 5h · — wk").size(10.5).weak());
+        }
+    }
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(260.0, 20.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            provider(
+                ui,
+                "Claude",
+                egui::Color32::from_rgb(0xd9, 0x77, 0x57),
+                claude_usage,
+            );
+            ui.add_space(4.0);
+            provider(ui, "Codex", ui.visuals().weak_text_color(), codex_usage);
+        },
+    );
+}
+
 impl WorkspaceRuntime {
     /// 아직 종료(Exited)되지 않은 세션이 pane에 하나라도 있으면 true — 셸이든
     /// 에이전트든 떠 있는 것 자체가 실행 중이다. 이런 workspace는 Suspended(워커
@@ -15707,6 +15850,9 @@ impl eframe::App for App {
             }
         }
         // 창이 숨겨져도 App Server JSON-RPC 이벤트를 드레인해 structured session 상태를 최신화한다.
+        self.agent_sessions_ui
+            .sync_controller_config(&self.config.agents);
+        self.agent_sessions_ui.refresh_rate_limits(ctx);
         self.agent_sessions_ui.poll();
         self.stage_structured_agent_state(true);
         for notice in self.agent_sessions_ui.drain_status_notices() {
@@ -16130,9 +16276,16 @@ impl eframe::App for App {
                             };
                             let bell_open =
                                 egui::Popup::is_id_open(ui.ctx(), Self::inbox_popup_id());
-                            let bell = tbtn_response(ui, bell_label, bell_open)
-                                .on_hover_text(text.t("top.notifications", &[]));
-                            inbox_click = self.inbox_popup(&bell, &text);
+                              let bell = tbtn_response(ui, bell_label, bell_open)
+                                  .on_hover_text(text.t("top.notifications", &[]));
+                              inbox_click = self.inbox_popup(&bell, &text);
+                              let claude_usage = claude_usage_snapshot()
+                                  .or_else(|| crate::claude_usage::current(ui.ctx()));
+                              top_provider_usage(
+                                  ui,
+                                  claude_usage,
+                                  self.agent_sessions_ui.codex_usage(),
+                              );
                             // Agents 진입은 사이드바 하단 nav가 담당한다 — 상단바 버튼은
                             // 삭제(2026-07-18 사용자 확정). 단축키·기타 진입점은 유지.
                         });
@@ -16308,12 +16461,13 @@ impl eframe::App for App {
                         ),
                     )
                 };
-                ui::file_tree::SidebarWorkspaceEntry {
-                    id: workspace.id.clone(),
-                    name: Self::workspace_display_name(workspace),
-                    state,
-                    summary,
-                }
+                  ui::file_tree::SidebarWorkspaceEntry {
+                      id: workspace.id.clone(),
+                      name: Self::workspace_display_name(workspace),
+                      repo: workspace_git_label(&workspace.path),
+                      state,
+                      summary,
+                  }
             })
             .collect();
         // 사이드바 펼침은 활성 선택과 독립적이다. 활성 세션뿐 아니라 warm runtime의

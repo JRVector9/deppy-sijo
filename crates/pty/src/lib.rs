@@ -386,7 +386,11 @@ impl PortablePtyBackend {
         // "can't turn off malloc stack logging because it was not enabled"를 stderr로
         // 찍어 화면을 덮는다. 진단은 켠 쪽 프로세스에서 할 일이지 사용자 셸이 물려받을
         // 상태가 아니므로, capability를 고정하는 것과 같은 이유로 여기서 끊는다.
+        // NoCompact는 단독으로 있어도 MSL을 켜 같은 노이즈를 내므로 함께 지운다(실측).
+        // spawn env만 손대므로 셸 안에서 export/명령 프리픽스로 켜는 건 그대로 동작한다.
         builder.env_remove("MallocStackLogging");
+        #[cfg(target_os = "macos")]
+        builder.env_remove("MallocStackLoggingNoCompact");
         #[cfg(target_os = "macos")]
         if command_env_is_empty(cmd, "LANG") {
             // Finder/LaunchServices에서 .app을 열면 LANG가 없는 것이 정상이다. 그대로
@@ -2037,9 +2041,17 @@ mod tests {
                     program: "/bin/sh".into(),
                     args: vec![
                         "-c".into(),
-                        "printf 'MSL=%s\\n' \"${MallocStackLogging-unset}\"".into(),
+                        concat!(
+                            "printf 'MSL=%s\\nNOCOMPACT=%s\\n' ",
+                            "\"${MallocStackLogging-unset}\" ",
+                            "\"${MallocStackLoggingNoCompact-unset}\""
+                        )
+                        .into(),
                     ],
-                    env: vec![("MallocStackLogging".into(), "0".into())],
+                    env: vec![
+                        ("MallocStackLogging".into(), "0".into()),
+                        ("MallocStackLoggingNoCompact".into(), "1".into()),
+                    ],
                     cwd: None,
                 },
                 80,
@@ -2050,6 +2062,7 @@ mod tests {
         let output = collect_output(&rx, Duration::from_secs(5));
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("MSL=unset"));
+        assert!(text.contains("NOCOMPACT=unset"));
         // libmalloc 경고 자체가 stderr로 새어나오지 않아야 한다.
         assert!(!text.contains("MallocStackLogging:"));
         assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));

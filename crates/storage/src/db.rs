@@ -1469,6 +1469,27 @@ const WAITING_SESSIONS_SELECT: &str = "SELECT session_key, message FROM agent_ne
     WHERE waiting = 1 AND updated_at > ?3 - 3600
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
 
+// 턴 완료(Stop) 세션 — 전역 스코프(warm turn_done 격차, 감사 발견). 기존
+// TURN_DONE_PREFIX_*는 워크스페이스 prefix로 좁혀 warm(비활성) 워크스페이스의 완료를
+// 놓쳤다 — waiting/working처럼 prefix 없이 전체에서 뽑아야 fleet·사이드바가 warm
+// 에이전트의 "완료"도 보인다. stale 창은 기존과 동일하게 1시간.
+const TURN_DONE_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_needs_input
+     WHERE turn_done = 1 AND updated_at > ?4 - 3600
+     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
+), sized AS MATERIALIZED (
+    SELECT state.*, length(CAST(state.session_key AS BLOB)) AS row_bytes
+      FROM selected JOIN agent_needs_input state ON state.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(session_key) != 'text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(updated_at) != 'integer' OR typeof(turn_done) != 'integer' OR turn_done != 1
+    OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const TURN_DONE_SESSIONS_SELECT: &str = "SELECT session_key, updated_at FROM agent_needs_input
+    WHERE turn_done = 1 AND updated_at > ?3 - 3600
+    ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
+
 // hook 기반 "작업 중"(v32). stale 창은 2분 — Stop이 유실되면(Ctrl-C 등 훅 미발화)
 // hook_working이 PTY IdleHeuristic까지 눌러 고착 표시가 되므로(병렬 리뷰 H1) 창으로
 // 상한을 짧게 건다. 실제 작업 중엔 PreToolUse가 툴 호출마다 updated_at을 갱신해
@@ -6772,8 +6793,6 @@ impl Db {
                 snapshot_epoch.ok_or_else(|| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
             let waiting_sql_limit =
                 bounded_limit_plus_one(WAITING_SESSION_ROWS_MAX, WAITING_SESSION_ROWS_MAX)?;
-            let turn_sql_limit =
-                bounded_limit_plus_one(HOOK_PREFIX_ROWS_MAX, HOOK_PREFIX_ROWS_MAX)?;
             let waiting = bounded_read_preflight(
                 &tx,
                 WAITING_SESSIONS_PREFLIGHT,
@@ -6786,17 +6805,18 @@ impl Db {
                 ],
                 WAITING_SESSION_ROWS_MAX,
             )?;
+            // turn_done 전역화(warm turn_done 격차, 감사 발견) — waiting과 동일한 전역
+            // 상한/스코프를 쓴다(prefix 없음).
             let turn = bounded_read_preflight(
                 &tx,
-                TURN_DONE_PREFIX_PREFLIGHT,
+                TURN_DONE_SESSIONS_PREFLIGHT,
                 rusqlite::params![
-                    workspace_prefix,
-                    turn_sql_limit,
+                    waiting_sql_limit,
                     BOUNDED_ID_BYTES_MAX as i64,
                     BOUNDED_ROW_BYTES_MAX as i64,
                     snapshot_epoch,
                 ],
-                HOOK_PREFIX_ROWS_MAX,
+                WAITING_SESSION_ROWS_MAX,
             )?;
             // hook working(v32) — waiting과 동일한 전역 상한/스코프를 쓴다.
             let working = bounded_read_preflight(
@@ -6810,14 +6830,7 @@ impl Db {
                 ],
                 WAITING_SESSION_ROWS_MAX,
             )?;
-            Some((
-                waiting,
-                turn,
-                working,
-                waiting_sql_limit,
-                turn_sql_limit,
-                snapshot_epoch,
-            ))
+            Some((waiting, turn, working, waiting_sql_limit, snapshot_epoch))
         } else {
             None
         };
@@ -6907,13 +6920,13 @@ impl Db {
                 .map_or(0, |(_, probe, _, _)| probe.retained_bytes),
             attention_probes
                 .as_ref()
-                .map_or(0, |(probe, _, _, _, _, _)| probe.retained_bytes),
+                .map_or(0, |(probe, _, _, _, _)| probe.retained_bytes),
             attention_probes
                 .as_ref()
-                .map_or(0, |(_, probe, _, _, _, _)| probe.retained_bytes),
+                .map_or(0, |(_, probe, _, _, _)| probe.retained_bytes),
             attention_probes
                 .as_ref()
-                .map_or(0, |(_, _, probe, _, _, _)| probe.retained_bytes),
+                .map_or(0, |(_, _, probe, _, _)| probe.retained_bytes),
             agent_probe
                 .as_ref()
                 .map_or(0, |(probe, _)| probe.retained_bytes),
@@ -7011,7 +7024,7 @@ impl Db {
         } else {
             Vec::new()
         };
-        let waiting_sessions = if let Some((waiting_probe, _, _, sql_limit, _, snapshot_epoch)) =
+        let waiting_sessions = if let Some((waiting_probe, _, _, sql_limit, snapshot_epoch)) =
             &attention_probes
         {
             let mut result = Vec::with_capacity(waiting_probe.count);
@@ -7039,14 +7052,13 @@ impl Db {
             Vec::new()
         };
         let turn_done_sessions =
-            if let Some((_, turn_probe, _, _, sql_limit, snapshot_epoch)) = &attention_probes {
+            if let Some((_, turn_probe, _, sql_limit, snapshot_epoch)) = &attention_probes {
                 let mut result = Vec::with_capacity(turn_probe.count);
                 let mut stmt = tx
-                    .prepare(TURN_DONE_PREFIX_SELECT)
+                    .prepare(TURN_DONE_SESSIONS_SELECT)
                     .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
                 let mut rows = stmt
                     .query(rusqlite::params![
-                        workspace_prefix,
                         sql_limit,
                         BOUNDED_ID_BYTES_MAX as i64,
                         snapshot_epoch,
@@ -7065,7 +7077,7 @@ impl Db {
             } else {
                 Vec::new()
             };
-        let working_sessions = if let Some((_, _, working_probe, sql_limit, _, snapshot_epoch)) =
+        let working_sessions = if let Some((_, _, working_probe, sql_limit, snapshot_epoch)) =
             &attention_probes
         {
             let mut result = Vec::with_capacity(working_probe.count);
@@ -12322,6 +12334,25 @@ mod tests {
             db.list_waiting_sessions().unwrap(),
             vec![("workspace:pane-2".to_string(), None)]
         );
+    }
+
+    /// warm turn_done 격차(감사 발견) — turn_done_sessions는 이제 waiting/working과 같은
+    /// 전역 스코프라, job이 요청한(활성) workspace와 다른 warm workspace의 완료 세션도
+    /// 스냅샷에 나타나야 한다(prefix 스코프였다면 누락됐을 것).
+    #[test]
+    fn turn_done_sessions는_요청_workspace가_아닌_warm_세션도_전역으로_반환한다() {
+        let db = Db::open_in_memory().unwrap();
+        let active = db.create_workspace("active-ws").unwrap();
+        let warm = db.create_workspace("warm-ws").unwrap();
+        let warm_key = format!("{warm}:1");
+        db.set_agent_turn_done(&warm_key).unwrap();
+
+        // job은 active workspace를 요청하지만 turn_done은 warm workspace 세션의 것이다.
+        let job = AgentStateJob::projection(&active);
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+
+        assert_eq!(snapshot.turn_done_sessions.len(), 1);
+        assert_eq!(snapshot.turn_done_sessions[0].0, warm_key);
     }
 
     #[test]

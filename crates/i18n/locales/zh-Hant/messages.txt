@@ -830,3 +830,6 @@ fleet.batch.pick_agent = 選擇代理…
 fleet.batch.no_agents = 還沒有已註冊的代理設定。請先在 設定 > 代理 中註冊。
 fleet.batch.count = 數量
 fleet.batch.start = 啟動 {count} 個
+fleet.batch.prompt = 提示詞（選填）
+fleet.batch.prompt_none = （無）
+fleet.batch.fill_params = 請填寫所有參數

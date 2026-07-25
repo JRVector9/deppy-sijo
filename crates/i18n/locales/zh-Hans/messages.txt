@@ -830,3 +830,6 @@ fleet.batch.pick_agent = 选择智能体…
 fleet.batch.no_agents = 还没有已注册的智能体配置。请先在 设置 > 智能体 中注册。
 fleet.batch.count = 数量
 fleet.batch.start = 启动 {count} 个
+fleet.batch.prompt = 提示词（可选）
+fleet.batch.prompt_none = （无）
+fleet.batch.fill_params = 请填写所有参数

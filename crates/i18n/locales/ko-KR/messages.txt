@@ -830,3 +830,6 @@ fleet.batch.pick_agent = 에이전트 선택…
 fleet.batch.no_agents = 등록된 에이전트 설정이 없습니다. 설정 > 에이전트에서 먼저 등록하세요.
 fleet.batch.count = 개수
 fleet.batch.start = {count}개 시작
+fleet.batch.prompt = 프롬프트 (선택)
+fleet.batch.prompt_none = (없음)
+fleet.batch.fill_params = 모든 파라미터를 입력하세요

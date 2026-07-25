@@ -1295,6 +1295,12 @@ struct SettingsJob {
     action: SettingsJobAction,
 }
 
+/// fleet 배치 스폰 프롬프트(PR-S2) 바이트 상한 — FleetAction 핸들러에서 방어적으로
+/// 재검증한다. prepare_agent_launch의 args-byte 상한(64KiB, 설정 args 포함)과는 별개로,
+/// 패널이 비정상적으로 큰 값을 보내는 경우를 조기에 거부해 settings 잡 큐까지 가지
+/// 않게 한다.
+const FLEET_BATCH_SPAWN_PROMPT_MAX_BYTES: usize = 16 * 1024;
+
 /// fleet 배치 스폰(PR-S1) 대기 상태 — settings 잡 큐가 단일 슬롯이라 프레임에 걸쳐
 /// PrepareAgentLaunch를 하나씩 큐잉한다(`pump_batch_spawn`).
 struct PendingBatchSpawn {
@@ -1304,6 +1310,9 @@ struct PendingBatchSpawn {
     /// staging(버튼 클릭) 시점의 활성 workspace. 펌프 도중 활성 workspace가 바뀌면
     /// 엉뚱한 workspace로 이어 스폰되는 걸 막기 위해 남은 스폰을 전부 취소한다.
     staged_workspace_id: String,
+    /// 선택된 저장 프롬프트의 렌더 결과(PR-S2) — Some이면 각 스폰마다 초기 argv
+    /// 프롬프트로 전달된다. None이면 빈 세션(PR-S1과 동일).
+    prompt: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1339,6 +1348,9 @@ enum SettingsJobAction {
         agent_id: String,
         profile_id: Option<String>,
         runtime_workspace_id: String,
+        /// fleet 배치 스폰(PR-S2)의 렌더된 프롬프트 — 설정 args 뒤에 위치 인자로
+        /// 덧붙는다. 일반 AgentsIntent::Run 경로는 항상 None.
+        extra_arg: Option<String>,
     },
     FinalizeProxyAgentLaunch {
         prepared: Box<PreparedAgentLaunch>,
@@ -1900,14 +1912,18 @@ fn prepare_agent_launch(
     agent_id: &str,
     profile_id: Option<&str>,
     runtime_workspace_id: String,
+    extra_arg: Option<String>,
 ) -> anyhow::Result<PreparedAgentLaunch> {
     let rows = db.settings_agent_launch_rows(workspace_id, agent_id, profile_id)?;
     let agent = rows.agent.context("settings_agent_missing")?;
+    // extra_arg(배치 스폰 렌더된 프롬프트, PR-S2)도 같은 바이트 상한에 포함시켜, 설정
+    // args만으로 초과할 때와 동일하게 실패하게 한다.
+    let extra_bytes = extra_arg.as_deref().map_or(0usize, str::len);
     let arg_bytes = agent
         .args
         .iter()
         .map(String::len)
-        .try_fold(0usize, usize::checked_add)
+        .try_fold(extra_bytes, usize::checked_add)
         .context("settings_agent_args_byte_overflow")?;
     anyhow::ensure!(
         agent.args.len() <= ui::agents::AGENT_ARGS_MAX_ITEMS
@@ -1952,11 +1968,18 @@ fn prepare_agent_launch(
         None
     };
 
+    // extra_arg(있으면)는 설정 args 뒤에 위치 인자로 덧붙인다 — `claude "<prompt>"` /
+    // `codex "<prompt>"`와 동일한 형태로 각 CLI가 초기 프롬프트로 즉시 받는다(PR-S2).
+    let mut args = agent.args;
+    if let Some(extra) = extra_arg {
+        args.push(extra);
+    }
+
     Ok(PreparedAgentLaunch {
         runtime_workspace_id,
         agent_config_id: agent.id,
         command: agent.command,
-        args: agent.args,
+        args,
         env_plain,
         env_secrets,
         waiting_regex: agent.waiting_regex,
@@ -2403,6 +2426,7 @@ fn execute_settings_job(
             agent_id,
             profile_id,
             runtime_workspace_id,
+            extra_arg,
         } => SettingsOutcomeKind::AgentLaunchPrepared(
             prepare_agent_launch(
                 db,
@@ -2410,6 +2434,7 @@ fn execute_settings_job(
                 &agent_id,
                 profile_id.as_deref(),
                 runtime_workspace_id,
+                extra_arg,
             )
             .map_err(|_| SettingsErrorCode::Launch),
         ),
@@ -8741,6 +8766,7 @@ impl App {
         // 아래 request_settings_snapshot_if_needed/queue_settings_action이 &mut self를
         // 요구하므로 pending의 값은 먼저 복제해 빌림을 끝낸다.
         let agent_id = pending.agent_id.clone();
+        let prompt = pending.prompt.clone();
         let workspace_id = self.active.id.clone();
         // 설정/에이전트 창을 한 번도 안 열었으면 agents_snapshot이 비어 있을 수 있다 —
         // Run 핸들러와 동일하게 project_root는 workspace_tree_root에서 유도한다.
@@ -8753,6 +8779,7 @@ impl App {
                 agent_id,
                 profile_id: None,
                 runtime_workspace_id: workspace_id.clone(),
+                extra_arg: prompt,
             },
         );
         if queued && let Some(pending) = &mut self.pending_batch_spawn {
@@ -16788,17 +16815,31 @@ impl eframe::App for App {
                     self.broadcast_working.insert((workspace_id, session), now);
                 }
             }
-            Some(ui::fleet::FleetAction::BatchSpawn { agent_id, count }) => {
+            Some(ui::fleet::FleetAction::BatchSpawn {
+                agent_id,
+                count,
+                prompt,
+            }) => {
                 // 실제 launch는 다음 logic tick부터 pump_batch_spawn이 settings 잡 큐
-                // 1슬롯을 통해 순차로 큐잉한다(PR-S1, 빈 세션만 — 프롬프트 주입은 PR-S2).
+                // 1슬롯을 통해 순차로 큐잉한다(PR-S1 빈 세션 / PR-S2 프롬프트 argv 전달).
                 // count는 패널이 이미 1..=cap으로 그렸지만 방어적으로 다시 클램프한다.
-                let cap = self.config.ui.fleet_batch_spawn_max.max(1);
-                self.pending_batch_spawn = Some(PendingBatchSpawn {
-                    agent_id,
-                    remaining: count.clamp(1, cap),
-                    staged_workspace_id: self.active.id.clone(),
-                });
-                ui.ctx().request_repaint();
+                let prompt_bytes = prompt.as_deref().map_or(0, str::len);
+                if prompt_bytes > FLEET_BATCH_SPAWN_PROMPT_MAX_BYTES {
+                    // prepare_agent_launch의 args-byte 상한(64KiB)과는 별개로, 패널이
+                    // 비정상적으로 큰 프롬프트를 보내면 settings 잡 큐까지 보내지 않고
+                    // 조기에 거부한다(스폰 자체를 하지 않음).
+                    self.agents_ui
+                        .report_error(ui::agents::AgentsUiErrorCode::TooManyArguments);
+                } else {
+                    let cap = self.config.ui.fleet_batch_spawn_max.max(1);
+                    self.pending_batch_spawn = Some(PendingBatchSpawn {
+                        agent_id,
+                        remaining: count.clamp(1, cap),
+                        staged_workspace_id: self.active.id.clone(),
+                        prompt,
+                    });
+                    ui.ctx().request_repaint();
+                }
             }
             None => {}
         }
@@ -17741,6 +17782,7 @@ impl eframe::App for App {
                     agent_id,
                     profile_id,
                     runtime_workspace_id: self.active.id.clone(),
+                    extra_arg: None,
                 }),
                 _ => {
                     self.agents_ui.report_error(if registration_intent {

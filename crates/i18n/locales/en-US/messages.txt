@@ -830,3 +830,6 @@ fleet.batch.pick_agent = Select an agent…
 fleet.batch.no_agents = No agent configs yet. Register one in Settings > Agents first.
 fleet.batch.count = Count
 fleet.batch.start = Start {count}
+fleet.batch.prompt = Prompt (optional)
+fleet.batch.prompt_none = (None)
+fleet.batch.fill_params = Fill in all parameters

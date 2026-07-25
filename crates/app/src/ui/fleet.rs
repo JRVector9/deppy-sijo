@@ -32,9 +32,16 @@ pub enum FleetAction {
         prompt: String,
         targets: Vec<(String, runtime::SessionId)>,
     },
-    /// 등록된 에이전트 설정으로 N개 세션을 한 번에 시작(빈 세션 — 프롬프트 주입은
-    /// PR-S2 범위). App이 fleet_batch_spawn_max로 count를 방어적으로 재클램프한다.
-    BatchSpawn { agent_id: String, count: u32 },
+    /// 등록된 에이전트 설정으로 N개 세션을 한 번에 시작. `prompt`가 Some이면 렌더된
+    /// 프롬프트 텍스트를 각 에이전트의 초기 argv(위치 인자)로 전달해 즉시 작업을
+    /// 시작한다(PR-S2) — `claude "<prompt>"` / `codex "<prompt>"`와 동일한 형태라
+    /// 주입 타이밍 문제가 없다. None이면 빈 세션(PR-S1과 동일). App이
+    /// fleet_batch_spawn_max로 count를, 바이트 상한으로 prompt를 방어적으로 재검증한다.
+    BatchSpawn {
+        agent_id: String,
+        count: u32,
+        prompt: Option<String>,
+    },
 }
 
 /// 브로드캐스트 패널 상태 — 프롬프트 선택 + 파라미터 + 대상 체크.
@@ -48,10 +55,13 @@ struct BroadcastState {
     confirm_send: bool,
 }
 
-/// 배치 스폰 패널 상태 — 에이전트 선택 + 개수. 패널을 열 때마다 초기화한다.
+/// 배치 스폰 패널 상태 — 에이전트 선택 + 개수 + (선택) 프롬프트. 패널을 열 때마다
+/// 초기화한다. `prompt_id`가 None이면 빈 세션(PR-S1과 동일 — "없음" 선택).
 struct BatchSpawnState {
     agent_id: Option<String>,
     count: u32,
+    prompt_id: Option<String>,
+    params: BTreeMap<String, String>,
 }
 
 /// 배치 스폰 패널에 필요한 App 투영 — 슬림 (id, name) 목록 + 설정 상한. `render`의
@@ -107,10 +117,13 @@ impl FleetUi {
                         });
                     }
                     Some(HeaderClick::BatchSpawn) => {
-                        // 패널을 열 때마다 초기화 — 기본 선택 = 첫 에이전트, 개수 1.
+                        // 패널을 열 때마다 초기화 — 기본 선택 = 첫 에이전트, 개수 1,
+                        // 프롬프트 없음(빈 세션, PR-S1 동작 유지).
                         self.batch_spawn = Some(BatchSpawnState {
                             agent_id: agents.first().map(|(id, _)| id.to_string()),
                             count: 1,
+                            prompt_id: None,
+                            params: BTreeMap::new(),
                         });
                     }
                     None => {}
@@ -161,7 +174,9 @@ impl FleetUi {
             action = Some(sent);
         }
         // 배치 스폰 창도 동일하게 독립 Window.
-        if let Some(sent) = self.batch_spawn_window(ui.ctx(), agents, batch_spawn_max, catalog) {
+        if let Some(sent) =
+            self.batch_spawn_window(ui.ctx(), agents, batch_spawn_max, catalog, library)
+        {
             action = Some(sent);
         }
         action
@@ -350,6 +365,7 @@ impl FleetUi {
         agents: &[(Arc<str>, Arc<str>)],
         max: u32,
         catalog: &i18n::Catalog,
+        library: &PromptLibrary,
     ) -> Option<FleetAction> {
         // 닫혀 있으면(Some 아님) 창을 그리지 않는다.
         self.batch_spawn.as_ref()?;
@@ -362,7 +378,7 @@ impl FleetUi {
             .default_width(360.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                action = self.batch_spawn_body(ui, agents, max, catalog);
+                action = self.batch_spawn_body(ui, agents, max, catalog, library);
             });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             open = false;
@@ -380,6 +396,7 @@ impl FleetUi {
         agents: &[(Arc<str>, Arc<str>)],
         max: u32,
         catalog: &i18n::Catalog,
+        library: &PromptLibrary,
     ) -> Option<FleetAction> {
         let state = self.batch_spawn.as_mut()?;
         // 등록된 에이전트가 없으면 콤보/개수/시작 버튼 없이 안내만(broadcast의 no_prompts와
@@ -413,24 +430,94 @@ impl FleetUi {
             ui.add(egui::DragValue::new(&mut state.count).range(1..=max.max(1)));
         });
         ui.add_space(10.0);
-        // ③ 시작.
-        let mut out = None;
-        let can_start = state.agent_id.is_some();
-        if ui
-            .add_enabled(
-                can_start,
-                egui::Button::new(
-                    catalog.t("fleet.batch.start", &[("count", &state.count.to_string())]),
-                ),
-            )
-            .clicked()
-            && let Some(agent_id) = state.agent_id.clone()
-        {
-            out = Some(FleetAction::BatchSpawn {
-                agent_id,
-                count: state.count,
+        ui.separator();
+        ui.add_space(6.0);
+        // ③ 프롬프트(선택) — broadcast_body와 동일 idiom. "없음"이면 빈 세션(PR-S1과
+        // 동일), 프롬프트를 고르면 파라미터를 채운 뒤 렌더된 텍스트가 각 에이전트의
+        // 초기 argv 프롬프트로 전달된다(PR-S2). prompt_library_enabled 토글과 무관하게
+        // 항상 노출한다(broadcast와 동일 결정, A안).
+        ui.label(catalog.t("fleet.batch.prompt", &[]));
+        let selected_title = state
+            .prompt_id
+            .as_ref()
+            .and_then(|id| library.get(id))
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| catalog.t("fleet.batch.prompt_none", &[]));
+        egui::ComboBox::from_id_salt("fleet_batch_prompt")
+            .selected_text(selected_title)
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(
+                        state.prompt_id.is_none(),
+                        catalog.t("fleet.batch.prompt_none", &[]),
+                    )
+                    .clicked()
+                {
+                    state.prompt_id = None;
+                    state.params.clear();
+                }
+                for prompt in &library.prompts {
+                    let picked = state.prompt_id.as_deref() == Some(prompt.id.as_str());
+                    if ui.selectable_label(picked, &prompt.title).clicked() {
+                        state.prompt_id = Some(prompt.id.clone());
+                        state.params.clear();
+                    }
+                }
             });
-        }
+        let selected_prompt = state.prompt_id.as_ref().and_then(|id| library.get(id));
+        // ready: 바깥 None이면 시작 불가(파라미터 미입력), Some(None)이면 빈 세션,
+        // Some(Some(text))면 렌더된 프롬프트로 시작.
+        let ready: Option<Option<String>> = if let Some(prompt) = selected_prompt {
+            let names = prompt.params();
+            if !names.is_empty() {
+                egui::Grid::new("fleet_batch_params").num_columns(2).show(ui, |ui| {
+                    for name in &names {
+                        ui.monospace(format!("{{{{{name}}}}}"));
+                        ui.text_edit_singleline(state.params.entry(name.clone()).or_default());
+                        ui.end_row();
+                    }
+                });
+            }
+            let rendered = crate::prompt_library::render(&prompt.body, &state.params);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&rendered).monospace()).wrap());
+            });
+            let filled = names
+                .iter()
+                .all(|n| state.params.get(n).is_some_and(|v| !v.trim().is_empty()));
+            if filled { Some(Some(rendered)) } else { None }
+        } else {
+            Some(None)
+        };
+        ui.add_space(10.0);
+        // ④ 시작.
+        let mut out = None;
+        let can_start = state.agent_id.is_some() && ready.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    can_start,
+                    egui::Button::new(
+                        catalog.t("fleet.batch.start", &[("count", &state.count.to_string())]),
+                    ),
+                )
+                .clicked()
+                && let Some(agent_id) = state.agent_id.clone()
+                && let Some(prompt) = ready.clone()
+            {
+                out = Some(FleetAction::BatchSpawn {
+                    agent_id,
+                    count: state.count,
+                    prompt,
+                });
+            }
+            // 프롬프트를 골랐지만 파라미터가 안 채워졌을 때만 힌트(broadcast의 fill과
+            // 동일 idiom) — 프롬프트 없음은 항상 시작 가능이라 힌트가 필요 없다.
+            if selected_prompt.is_some() && ready.is_none() {
+                ui.weak(catalog.t("fleet.batch.fill_params", &[]));
+            }
+        });
         out
     }
 }

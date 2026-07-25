@@ -830,3 +830,6 @@ fleet.batch.pick_agent = エージェントを選択…
 fleet.batch.no_agents = 登録済みのエージェント設定がありません。設定 > エージェントで先に登録してください。
 fleet.batch.count = 個数
 fleet.batch.start = {count}件開始
+fleet.batch.prompt = プロンプト（任意）
+fleet.batch.prompt_none = （なし）
+fleet.batch.fill_params = すべてのパラメータを入力してください

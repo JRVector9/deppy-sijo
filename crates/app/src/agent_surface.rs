@@ -80,6 +80,30 @@ impl AgentVisualState {
         }
     }
 
+    /// 에이전트 감지 여부까지 반영한 PTY 상태 — `agent_present`(감지 워커의 ps 스캔이
+    /// 그 pane에서 claude/codex를 찾았는지)가 거짓이면 그 pane에서 도는 에이전트가 없다.
+    /// 이때 남은 Idle은 셸의 idle heuristic이 남긴 유령이다: 에이전트 자식 프로세스만
+    /// 죽으면 셸(PTY)은 살아 있어 SessionExited가 오지 않고, status는 래치라 None으로
+    /// 돌아가지 않아 "에이전트 없는 유휴" 표시가 남는다. status=None과 같은 off(회색)로
+    /// 낮춘다 — 항목 자체는 계속 보여야 pane으로 들어갈 수 있고, off 표시는 의도된
+    /// 동작이다(2026-07-25 판정).
+    ///
+    /// 진행형/결과 상태(Running/Waiting/Done/Error)는 그대로 둔다 — 감지가 한 tick
+    /// 흔들렸을 때 살아있는 에이전트의 상태까지 지우지 않기 위해서다.
+    ///
+    /// 한계: 감지는 활성 워크스페이스에서만 돌고 warm은 마지막 감지값을 유지하므로
+    /// (`WorkspaceUi::agent_line_for` 주석), warm으로 내려간 뒤 죽은 에이전트는 여기서
+    /// 걸러지지 않는다.
+    pub const fn from_pty_with_agent(
+        status: Option<runtime::SessionStatus>,
+        agent_present: bool,
+    ) -> Self {
+        match (agent_present, status) {
+            (false, Some(runtime::SessionStatus::Idle)) => Self::Off,
+            _ => Self::from_pty(status),
+        }
+    }
+
     /// Project the local structured-session lifecycle. Authoritative App Server
     /// `thread/status/changed` values are normalized into this lifecycle by the
     /// transport before reaching UI code.
@@ -196,6 +220,32 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(AgentVisualState::from_pty(input), expected);
+        }
+    }
+
+    /// 에이전트 프로세스가 죽으면 agent_line은 사라지지만(ps 스캔) status는 래치라
+    /// Idle로 정착한다 — fleet 카드와 사이드바 점에 "에이전트 없는 유휴"가 남던
+    /// 유령(백로그 3). 두 표면이 같은 규칙을 쓴다.
+    #[test]
+    fn 에이전트_없는_idle은_off로_낮춘다() {
+        use runtime::SessionStatus as Status;
+        let card = AgentVisualState::from_pty_with_agent;
+        assert_eq!(card(Some(Status::Idle), false), AgentVisualState::Off);
+        assert_eq!(card(Some(Status::Idle), true), AgentVisualState::Idle);
+        // 미분류(스폰 직후)는 원래도 off — 그대로.
+        assert_eq!(card(None, false), AgentVisualState::Off);
+        // 진행형/결과 상태는 감지가 흔들려도 유지한다.
+        for status in [
+            Status::Running,
+            Status::Waiting,
+            Status::NeedsApproval,
+            Status::Done,
+            Status::Error,
+        ] {
+            assert_eq!(
+                card(Some(status), false),
+                AgentVisualState::from_pty(Some(status))
+            );
         }
     }
 

@@ -14608,7 +14608,9 @@ impl App {
             };
             let workspace_name = Self::workspace_display_name(workspace);
             for entry in entries {
-                // 에이전트만 — 셸은 status/agent_line 둘 다 None.
+                // agent_line도 status도 없는 pane만 제외한다(셸도 idle heuristic으로
+                // status를 받으므로 "셸 = 둘 다 None"은 성립하지 않는다 — 그런 pane은
+                // 아래 from_pty_with_agent가 off로 낮춘다).
                 // 주의(의도된 비대칭, 2026-07-25 판정): PTY의 status=None(회색 off 카드)은
                 // 스폰 직후 첫 상태 감지 전(~10초)의 "미분류지만 살아있는" 상태라 일부러
                 // 표시한다 — 구조화 쪽 Off 필터(agent_sessions.rs fleet_rows: DB placeholder
@@ -14627,7 +14629,8 @@ impl App {
                 // 감지 상태. 브로드캐스트 직후 아직 Idle/Off로 보이면(감지 지연/​warm 미추적)
                 // 윈도우 안에서 Active로 덮는다 — Waiting/Done/Error 등 확정 상태는 그대로 둔다.
                 use crate::agent_surface::AgentVisualState;
-                let detected = AgentVisualState::from_pty(entry.status);
+                let detected =
+                    AgentVisualState::from_pty_with_agent(entry.status, entry.agent_line.is_some());
                 let optimistic = matches!(detected, AgentVisualState::Idle | AgentVisualState::Off)
                     && self
                         .broadcast_working

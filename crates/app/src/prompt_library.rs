@@ -153,22 +153,78 @@ impl PromptLibrary {
     }
 }
 
+/// `{{...}}` 스캔이 내놓는 조각 하나. param_names와 render가 이 이터레이터 하나를
+/// 공유해서 find("{{") → find("}}") → trim → is_param_name 브레이스 파싱 로직이 두
+/// 함수에서 따로 갈라지는 걸 막는다(PR-1 리뷰 M2: 한쪽만 고치면 파라미터 판정이
+/// 조용히 어긋날 수 있었음).
+enum Segment<'a> {
+    /// 일반 텍스트, 또는 파라미터가 아닌 것으로 판정된 `{{...}}` 원문(중괄호 포함
+    /// 그대로) — render는 이걸 그대로 출력에 이어붙이면 된다.
+    Literal(&'a str),
+    /// 유효한 파라미터로 판정된 `{{ name }}` 블록의 트림된 이름.
+    Param(&'a str),
+}
+
+/// `body`를 앞에서부터 스캔해 Literal/Param 조각을 등장 순서대로 내놓는다. `{{`를 찾고
+/// 짝이 되는 `}}`를 찾아 안쪽을 트림한 뒤 `is_param_name`으로 파라미터 여부를 판정한다
+/// — 판정 로직이 이 한 곳에만 있어서 param_names와 render가 절대 어긋나지 않는다.
+fn scan_braces(body: &str) -> impl Iterator<Item = Segment<'_>> {
+    struct Scanner<'a> {
+        rest: &'a str,
+    }
+
+    impl<'a> Iterator for Scanner<'a> {
+        type Item = Segment<'a>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.rest.is_empty() {
+                return None;
+            }
+            let Some(open) = self.rest.find("{{") else {
+                // 더 이상 "{{" 없음 — 남은 전부 리터럴
+                let lit = self.rest;
+                self.rest = "";
+                return Some(Segment::Literal(lit));
+            };
+            if open > 0 {
+                // "{{" 앞의 일반 텍스트를 먼저 리터럴로 내놓는다
+                let lit = &self.rest[..open];
+                self.rest = &self.rest[open..];
+                return Some(Segment::Literal(lit));
+            }
+            let after = &self.rest[2..];
+            let Some(close) = after.find("}}") else {
+                // 닫힘 없음 — 남은 전부 리터럴
+                let lit = self.rest;
+                self.rest = "";
+                return Some(Segment::Literal(lit));
+            };
+            let raw = &self.rest[..2 + close + 2];
+            let name = after[..close].trim();
+            self.rest = &after[close + 2..];
+            if is_param_name(name) {
+                Some(Segment::Param(name))
+            } else {
+                // 파라미터 아님 — `{{...}}` 원문을 리터럴로 보존
+                Some(Segment::Literal(raw))
+            }
+        }
+    }
+
+    Scanner { rest: body }
+}
+
 /// `body`의 `{{name}}` 파라미터 이름을 등장 순서로, 중복 없이 뽑는다. name은
 /// `[A-Za-z0-9_]+`(양옆 공백 허용: `{{ name }}`)만 파라미터로 본다 — 그 밖의 `{{...}}`는
 /// 프롬프트 본문의 리터럴로 두고 무시한다(예: JSON 예시 안의 중괄호).
 pub fn param_names(body: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut rest = body;
-    while let Some(open) = rest.find("{{") {
-        let after = &rest[open + 2..];
-        let Some(close) = after.find("}}") else {
-            break; // 닫힘 없음 — 끝
-        };
-        let name = after[..close].trim();
-        if is_param_name(name) && !out.iter().any(|n| n == name) {
+    for seg in scan_braces(body) {
+        if let Segment::Param(name) = seg
+            && !out.iter().any(|n| n == name)
+        {
             out.push(name.to_string());
         }
-        rest = &after[close + 2..];
     }
     out
 }
@@ -178,25 +234,14 @@ pub fn param_names(body: &str) -> Vec<String> {
 /// 아닌 `{{...}}`(리터럴 중괄호)는 원문 그대로 남긴다.
 pub fn render(body: &str, values: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(body.len());
-    let mut rest = body;
-    while let Some(open) = rest.find("{{") {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 2..];
-        let Some(close) = after.find("}}") else {
-            // 닫힘 없음 — 남은 전부 리터럴
-            out.push_str(&rest[open..]);
-            return out;
-        };
-        let name = after[..close].trim();
-        if is_param_name(name) {
-            out.push_str(values.get(name).map(String::as_str).unwrap_or(""));
-        } else {
-            // 파라미터 아님 — `{{...}}` 원문 유지
-            out.push_str(&rest[open..open + 2 + close + 2]);
+    for seg in scan_braces(body) {
+        match seg {
+            Segment::Literal(s) => out.push_str(s),
+            Segment::Param(name) => {
+                out.push_str(values.get(name).map(String::as_str).unwrap_or(""));
+            }
         }
-        rest = &after[close + 2..];
     }
-    out.push_str(rest);
     out
 }
 

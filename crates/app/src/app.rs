@@ -18619,7 +18619,7 @@ mod tests {
         let started = turn_start_transitions(
             &set(&[resumed.clone(), heartbeat, steady.clone()]),
             &set(&[steady]),
-            &set(&[resumed.clone()]),
+            &set(std::slice::from_ref(&resumed)),
         );
         assert_eq!(started, vec![resumed]);
     }

@@ -5950,6 +5950,12 @@ pub struct App {
     /// hook이 보고한 턴 완료(Stop) 세션 → updated_at — 레일 '완료(바이올렛)' 트랜지언트
     /// 소스. 값(updated_at)은 소비 시 조건부 clear의 세대 기준(레이스 방지, codex 리뷰).
     agent_turn_done: std::collections::HashMap<runtime::SessionId, i64>,
+    /// hook이 보고한 "작업 중"(v32, cmux식 턴 경계) — UserPromptSubmit/PreToolUse가 기록.
+    /// transcript 폴링(지연·활성 전용)과 달리 즉시·전 워크스페이스. 활성 전용 set은
+    /// session_entries 경로용, global은 warm 워크스페이스(fleet/사이드바)용 —
+    /// SessionId가 워크스페이스마다 재사용될 수 있어 global은 (workspace, session) 쌍.
+    agent_working: std::collections::HashSet<runtime::SessionId>,
+    global_working: std::collections::HashSet<(String, runtime::SessionId)>,
     /// 완료/입력대기 주목(attention) 추적 — 미확인이면 레일 6px, 포커스 확인 시 해제.
     session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
     /// 세션별 현재 작업 폴더(감지 워커 lsof) — 행 1행 폴더명 + 워크스페이스명.
@@ -8453,6 +8459,8 @@ impl App {
             agent_needs_input: std::collections::HashSet::new(),
             global_waiting: Vec::new(),
             agent_turn_done: std::collections::HashMap::new(),
+            agent_working: std::collections::HashSet::new(),
+            global_working: std::collections::HashSet::new(),
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
@@ -9145,6 +9153,28 @@ impl App {
                     .turn_done_sessions
                     .iter()
                     .filter_map(|(key, at)| Some((session_id(key)?, *at)))
+                    .collect();
+                // hook 기반 "작업 중"(v32) — 활성 전용 set + 전 워크스페이스(liveness 필터,
+                // global_waiting과 동일 규칙: 살아있는 세션만).
+                self.agent_working = snapshot
+                    .working_sessions
+                    .iter()
+                    .filter_map(|key| session_id(key))
+                    .collect();
+                self.global_working = snapshot
+                    .working_sessions
+                    .iter()
+                    .filter_map(|key| {
+                        let (workspace_id, session) = ui::inbox_waiting::parse_session_key(key)?;
+                        let alive = if workspace_id == self.active.id {
+                            self.active.session_titles.contains_key(&session)
+                        } else {
+                            self.warm.get(&workspace_id).is_some_and(|runtime| {
+                                runtime.session_titles.contains_key(&session)
+                            })
+                        };
+                        alive.then_some((workspace_id, session))
+                    })
                     .collect();
             }
             crate::agent_state_worker::AgentStateSection::Restore => {
@@ -10143,6 +10173,7 @@ impl App {
         let empty_activity = std::collections::HashMap::new();
         let empty_needs_input = std::collections::HashSet::new();
         let empty_turn_done = std::collections::HashMap::new();
+        let empty_working = std::collections::HashSet::new();
         self.workspaces
             .iter()
             .filter(|ws| workspace_visible_after_close(&self.closed_workspaces, &ws.id))
@@ -10156,6 +10187,7 @@ impl App {
                             &empty_activity,
                             &empty_needs_input,
                             &empty_turn_done,
+                            &empty_working,
                         )
                         .into_iter()
                         .filter_map(|entry| {
@@ -13930,6 +13962,7 @@ impl App {
                         &self.agent_activity,
                         &self.agent_needs_input,
                         &self.agent_turn_done,
+                        &self.agent_working,
                     );
                     let sessions = entries
                         .iter()
@@ -14384,12 +14417,21 @@ impl App {
                 .filter(|(ws, _, _)| ws == &workspace.id)
                 .map(|(_, session, _)| *session)
                 .collect();
+            // hook "작업 중"(v32) — global_working에서 이 워크스페이스 몫만. warm도
+            // 훅 신호로 작업 중을 정확히 보인다(transcript는 활성 전용이라 불가능했음).
+            let working: std::collections::HashSet<runtime::SessionId> = self
+                .global_working
+                .iter()
+                .filter(|(ws, _)| ws == &workspace.id)
+                .map(|(_, session)| *session)
+                .collect();
             let entries = if active {
                 runtime.workspace_ui.session_entries(
                     text,
                     &self.agent_activity,
                     &self.agent_needs_input,
                     &self.agent_turn_done,
+                    &self.agent_working,
                 )
             } else {
                 runtime.workspace_ui.session_entries(
@@ -14397,6 +14439,7 @@ impl App {
                     &empty_activity,
                     &needs_input,
                     &empty_turn,
+                    &working,
                 )
             };
             let workspace_name = Self::workspace_display_name(workspace);
@@ -16007,6 +16050,7 @@ impl eframe::App for App {
             &self.agent_activity,
             &self.agent_needs_input,
             &self.agent_turn_done,
+            &self.agent_working,
         );
         // 저장된 에이전트가 있고 지금 실행 중이 아닌 pane — 컨텍스트 메뉴 '이어가기' 노출.
         for entry in &mut terminal_sessions {
@@ -16121,11 +16165,19 @@ impl eframe::App for App {
                 .filter(|(workspace_id, _, _)| workspace_id == &workspace.id)
                 .map(|(_, session, _)| *session)
                 .collect();
+            // hook "작업 중"(v32) — warm 워크스페이스도 사이드바에서 작업 중을 보인다.
+            let working: std::collections::HashSet<_> = self
+                .global_working
+                .iter()
+                .filter(|(workspace_id, _)| workspace_id == &workspace.id)
+                .map(|(_, session)| *session)
+                .collect();
             let mut entries = warm_runtime.workspace_ui.session_entries(
                 &text,
                 &no_activity,
                 &needs_input,
                 &no_turn_done,
+                &working,
             );
             for entry in &mut entries {
                 // workspace가 warm이면 그 안의 과거 focused_pane은 전역 포커스가 아니다.

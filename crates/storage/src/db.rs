@@ -206,6 +206,7 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 /// 29: exact pending-approval session cleanup index (event-driven session exit).
 /// 30: durable exact cleanup obligations for legacy logical keyring sources (PR-SC01).
 /// 31: bounded finalized-audit retention ordering index (PR-AU02 hardening).
+/// 32: agent_needs_input.working — hook 기반 "작업 중" 신호(cmux식 턴 경계).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -671,6 +672,12 @@ END;
     // an unbounded legacy table inside a lifecycle transaction. The partial expression index makes
     // the fixed policy-window + batch + sentinel scan an indexed walk.
     audit::MIGRATION_AUDIT_RETENTION,
+    // v32: hook 기반 "작업 중" 신호(cmux식). UserPromptSubmit/PreToolUse의 clear 이벤트가
+    // working=1을 기록하고 Stop(turn-done)/Notification(needs-input)이 0으로 되돌린다 —
+    // transcript 폴링 지연·warm 미추적을 훅 신호로 대체한다.
+    "
+ALTER TABLE agent_needs_input ADD COLUMN working INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -932,6 +939,9 @@ pub struct AgentStateSnapshot {
     pub statuslines: Vec<StatuslineRow>,
     pub waiting_sessions: Vec<(String, Option<String>)>,
     pub turn_done_sessions: Vec<(String, i64)>,
+    /// hook 기반 "작업 중" 세션 키(v32) — clear 이벤트(UserPromptSubmit/PreToolUse)가
+    /// 기록. waiting처럼 전역(모든 워크스페이스)이며 2분 stale 창으로 자기치유된다.
+    pub working_sessions: Vec<String>,
     pub agent_sessions: Vec<AgentSessionRow>,
     pub structured_threads: Vec<StructuredThreadRow>,
     /// Complete bounded `(workspace_id, title, cwd)` activity catalog when requested; otherwise
@@ -947,6 +957,7 @@ impl std::fmt::Debug for AgentStateSnapshot {
             .field("statusline_count", &self.statuslines.len())
             .field("waiting_session_count", &self.waiting_sessions.len())
             .field("turn_done_session_count", &self.turn_done_sessions.len())
+            .field("working_session_count", &self.working_sessions.len())
             .field("agent_session_count", &self.agent_sessions.len())
             .field("structured_thread_count", &self.structured_threads.len())
             .field("activity_pane_count", &self.activity_panes.len())
@@ -1458,6 +1469,29 @@ const WAITING_SESSIONS_SELECT: &str = "SELECT session_key, message FROM agent_ne
     WHERE waiting = 1 AND updated_at > ?3 - 3600
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
 
+// hook 기반 "작업 중"(v32). stale 창은 2분 — Stop이 유실되면(Ctrl-C 등 훅 미발화)
+// hook_working이 PTY IdleHeuristic까지 눌러 고착 표시가 되므로(병렬 리뷰 H1) 창으로
+// 상한을 짧게 건다. 실제 작업 중엔 PreToolUse가 툴 호출마다 updated_at을 갱신해
+// (하트비트) 창이 계속 연장되고, 활성 워크스페이스는 만료 후에도 transcript activity가
+// 폴백이라 유실 영향이 없다. waiting과 달리 전역(prefix 없음) — warm 워크스페이스
+// 세션도 fleet에서 작업 중을 보여야 한다.
+const WORKING_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_needs_input
+     WHERE working = 1 AND updated_at > ?4 - 120
+     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
+), sized AS MATERIALIZED (
+    SELECT state.*, length(CAST(state.session_key AS BLOB)) AS row_bytes
+      FROM selected JOIN agent_needs_input state ON state.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(session_key) != 'text' OR length(CAST(session_key AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(updated_at) != 'integer' OR typeof(working) != 'integer' OR working != 1
+    OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const WORKING_SESSIONS_SELECT: &str = "SELECT session_key FROM agent_needs_input
+    WHERE working = 1 AND updated_at > ?3 - 120
+    ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
+
 const AGENT_SESSIONS_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_sessions WHERE workspace_id = ?1
      ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2
@@ -1910,6 +1944,10 @@ fn agent_state_snapshot_retained_bytes(
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.turn_done_sessions)?;
     for (session_key, _) in &snapshot.turn_done_sessions {
+        checked_agent_state_string_capacity(&mut total, session_key)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.working_sessions)?;
+    for session_key in &snapshot.working_sessions {
         checked_agent_state_string_capacity(&mut total, session_key)?;
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.agent_sessions)?;
@@ -6109,11 +6147,20 @@ impl Db {
         bounded_input_row_bytes(&[session_key, message.unwrap_or_default()])?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
+        // working = !waiting (v32, cmux식 턴 경계): clear 이벤트(UserPromptSubmit=턴 시작,
+        // PreToolUse=툴 호출 직전)는 에이전트가 턴 안에서 실제로 작업 중이라는 뜻이라
+        // working=1을 함께 기록한다. needs-input(승인 대기)은 작업이 막힌 상태라 0.
+        // Stop(set_agent_turn_done)은 working 컬럼을 나열하지 않아 DEFAULT 0으로 리셋된다.
         tx.execute(
             "INSERT OR REPLACE INTO agent_needs_input
-                     (session_key, waiting, updated_at, message)
-                 VALUES (?1, ?2, CAST(strftime('%s','now') AS INTEGER), ?3)",
-            (session_key, waiting as i64, message.filter(|_| waiting)),
+                     (session_key, waiting, working, updated_at, message)
+                 VALUES (?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER), ?4)",
+            (
+                session_key,
+                waiting as i64,
+                !waiting as i64,
+                message.filter(|_| waiting),
+            ),
         )
         .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         evict_hook_state_prefix_overflow(
@@ -6126,6 +6173,19 @@ impl Db {
         tx.commit()
             .map_err(|_| anyhow::anyhow!(BOUNDED_WRITE_FAILED))?;
         Ok(())
+    }
+
+    /// hook 기반 "작업 중"(v32) 세션 키. stale(2분 초과)은 제외 — Stop 유실(Ctrl-C 등)
+    /// 시 자기치유(병렬 리뷰 H1: 창이 길면 IdleHeuristic을 눌러 고착 표시). 실제 작업
+    /// 중엔 PreToolUse가 툴 호출마다 updated_at을 갱신한다.
+    pub fn list_working_sessions(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_key FROM agent_needs_input
+             WHERE working = 1
+               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 120",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// 현재 입력 대기(waiting) 중인 세션 키 + hook이 보고한 사유 문구. stale(1시간 초과)은
@@ -6738,9 +6798,22 @@ impl Db {
                 ],
                 HOOK_PREFIX_ROWS_MAX,
             )?;
+            // hook working(v32) — waiting과 동일한 전역 상한/스코프를 쓴다.
+            let working = bounded_read_preflight(
+                &tx,
+                WORKING_SESSIONS_PREFLIGHT,
+                rusqlite::params![
+                    waiting_sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_ROW_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ],
+                WAITING_SESSION_ROWS_MAX,
+            )?;
             Some((
                 waiting,
                 turn,
+                working,
                 waiting_sql_limit,
                 turn_sql_limit,
                 snapshot_epoch,
@@ -6834,10 +6907,13 @@ impl Db {
                 .map_or(0, |(_, probe, _, _)| probe.retained_bytes),
             attention_probes
                 .as_ref()
-                .map_or(0, |(probe, _, _, _, _)| probe.retained_bytes),
+                .map_or(0, |(probe, _, _, _, _, _)| probe.retained_bytes),
             attention_probes
                 .as_ref()
-                .map_or(0, |(_, probe, _, _, _)| probe.retained_bytes),
+                .map_or(0, |(_, probe, _, _, _, _)| probe.retained_bytes),
+            attention_probes
+                .as_ref()
+                .map_or(0, |(_, _, probe, _, _, _)| probe.retained_bytes),
             agent_probe
                 .as_ref()
                 .map_or(0, |(probe, _)| probe.retained_bytes),
@@ -6935,7 +7011,7 @@ impl Db {
         } else {
             Vec::new()
         };
-        let waiting_sessions = if let Some((waiting_probe, _, sql_limit, _, snapshot_epoch)) =
+        let waiting_sessions = if let Some((waiting_probe, _, _, sql_limit, _, snapshot_epoch)) =
             &attention_probes
         {
             let mut result = Vec::with_capacity(waiting_probe.count);
@@ -6963,7 +7039,7 @@ impl Db {
             Vec::new()
         };
         let turn_done_sessions =
-            if let Some((_, turn_probe, _, sql_limit, snapshot_epoch)) = &attention_probes {
+            if let Some((_, turn_probe, _, _, sql_limit, snapshot_epoch)) = &attention_probes {
                 let mut result = Vec::with_capacity(turn_probe.count);
                 let mut stmt = tx
                     .prepare(TURN_DONE_PREFIX_SELECT)
@@ -6989,6 +7065,32 @@ impl Db {
             } else {
                 Vec::new()
             };
+        let working_sessions = if let Some((_, _, working_probe, sql_limit, _, snapshot_epoch)) =
+            &attention_probes
+        {
+            let mut result = Vec::with_capacity(working_probe.count);
+            let mut stmt = tx
+                .prepare(WORKING_SESSIONS_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(
+                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                );
+            }
+            result
+        } else {
+            Vec::new()
+        };
         let agent_sessions = if let Some((agent_probe, sql_limit)) = &agent_probe {
             let mut result = Vec::with_capacity(agent_probe.count);
             let mut stmt = tx
@@ -7142,6 +7244,7 @@ impl Db {
             statuslines,
             waiting_sessions,
             turn_done_sessions,
+            working_sessions,
             agent_sessions,
             structured_threads,
             activity_panes,
@@ -10857,6 +10960,27 @@ mod tests {
                 .to_string(),
             BOUNDED_READ_ROW_INVALID
         );
+
+        // working=1 코럽트 행(v32)도 waiting/turn과 같은 preflight 검증을 거친다.
+        db.conn
+            .execute("DELETE FROM agent_needs_input", [])
+            .unwrap();
+        let working_key = format!("{ws}:working");
+        db.conn
+            .execute(
+                "INSERT INTO agent_needs_input
+                    (session_key, waiting, updated_at, turn_done, message, working)
+                 VALUES (CAST(?1 AS BLOB), 0, CAST(strftime('%s','now') AS INTEGER), 0, NULL, 1)",
+                [&working_key],
+            )
+            .unwrap();
+        assert!(db.apply_agent_state_job(&omitted).is_ok());
+        assert_eq!(
+            db.apply_agent_state_job(&requested)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
     }
 
     #[test]
@@ -11845,6 +11969,7 @@ mod tests {
             }],
             waiting_sessions: vec![(marker.to_owned(), Some(marker.to_owned()))],
             turn_done_sessions: vec![(marker.to_owned(), i64::MAX)],
+            working_sessions: vec![marker.to_owned()],
             agent_sessions: reconcile.desired_bindings.clone(),
             structured_threads: vec![structured],
             activity_panes: vec![(marker.to_owned(), marker.to_owned(), marker.to_owned())],
@@ -12141,6 +12266,33 @@ mod tests {
             db.list_waiting_sessions().unwrap(),
             vec![("workspace:pane-1".to_string(), None)]
         );
+    }
+
+    /// hook "작업 중"(v32) 라이프사이클: clear(UserPromptSubmit/PreToolUse)=working,
+    /// needs-input(승인 대기)=중단, Stop(turn-done)=중단.
+    #[test]
+    fn agent_working_은_clear가_켜고_needs_input과_turn_done이_끈다() {
+        let db = Db::open_in_memory().unwrap();
+        // 턴 시작(clear) → working
+        db.set_agent_needs_input("workspace:pane-1", false, None)
+            .unwrap();
+        assert_eq!(
+            db.list_working_sessions().unwrap(),
+            vec!["workspace:pane-1".to_string()]
+        );
+        // 승인 대기 → working 중단(작업이 막힘)
+        db.set_agent_needs_input("workspace:pane-1", true, None)
+            .unwrap();
+        assert!(db.list_working_sessions().unwrap().is_empty());
+        // 승인 후 PreToolUse(clear) → 다시 working
+        db.set_agent_needs_input("workspace:pane-1", false, None)
+            .unwrap();
+        assert_eq!(db.list_working_sessions().unwrap().len(), 1);
+        // Stop(턴 완료) → working 중단 (turn_done SQL이 working 컬럼을 나열하지 않아
+        // INSERT OR REPLACE가 DEFAULT 0으로 리셋)
+        db.set_agent_turn_done("workspace:pane-1").unwrap();
+        assert!(db.list_working_sessions().unwrap().is_empty());
+        assert_eq!(db.list_turn_done_sessions().unwrap().len(), 1);
     }
 
     #[test]

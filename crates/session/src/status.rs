@@ -360,6 +360,14 @@ impl StatusDetector {
         self.last_output = Instant::now();
     }
 
+    /// hook이 보고한 새 턴 시작(UserPromptSubmit/PreToolUse) — 입력과 동일한 리셋이다.
+    /// 턴이 시작됐다는 건 이전 턴의 프롬프트가 응답됐고 결과 상태도 지난 턴의 것이라는
+    /// 뜻이다. 이 경로가 없으면 latch된 결과 상태(특히 error regex 오탐)는 사용자가 그
+    /// pane에 직접 타이핑할 때까지 무기한 남는다.
+    pub fn on_turn_start(&mut self) {
+        self.on_input();
+    }
+
     /// output chunk 수신 — stream line regex 단계.
     ///
     /// regex로 잡힌 상태는 **latch**된다: 뒤따르는 무매치 출력(스택트레이스 등)이
@@ -580,6 +588,17 @@ mod tests {
         assert_eq!(d.evaluate(None), Some(SessionStatus::Error));
         // 사용자 입력이 상태를 해제한다
         d.on_input();
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Running));
+    }
+
+    /// error regex 오탐이 그 pane에 타이핑할 때까지 무기한 남던 문제 — hook이 보고한
+    /// 턴 시작도 입력과 동등한 해제 신호다(RuntimeCommand::NoteTurnStart).
+    #[test]
+    fn latch된_결과_상태는_턴_시작으로도_해제된다() {
+        let mut d = StatusDetector::new(patterns());
+        d.on_output(b"Error: failed\n");
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Error));
+        d.on_turn_start();
         assert_eq!(d.evaluate(None), Some(SessionStatus::Running));
     }
 

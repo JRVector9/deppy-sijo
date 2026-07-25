@@ -3845,7 +3845,7 @@ fn session_row_impl(
     }
     // 색을 먼저 복사(Copy)해 visuals 차용을 끝낸 뒤 ui.fonts로 galley를 만든다.
     let accent = ui.visuals().selection.bg_fill;
-    let dot = session_status_color(entry.status, ui.visuals());
+    let dot = session_entry_status_color(entry);
     let hover_bg = ui.visuals().widgets.hovered.bg_fill;
     // 2·3행(보조 정보): 다크는 기존 weak 톤, 라이트는 weak가 패널 위에서 너무 옅어
     // textSecondary(#444444) 수준으로 진하게 (라이트 테마 회색 흐림, 2026-07-10).
@@ -4420,6 +4420,17 @@ pub(crate) fn session_status_color(
     _visuals: &egui::Visuals,
 ) -> egui::Color32 {
     crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::from_pty(status))
+}
+
+/// 세션 행의 상태 점 색 — 에이전트 감지 여부까지 반영한다(from_pty_with_agent).
+/// fleet 카드와 같은 규칙을 써야 같은 세션이 두 표면에서 다른 색으로 보이지 않는다.
+pub(crate) fn session_entry_status_color(entry: &SessionEntry) -> egui::Color32 {
+    crate::ui::agent_visuals::status_color(
+        crate::agent_surface::AgentVisualState::from_pty_with_agent(
+            entry.status,
+            entry.agent_line.is_some(),
+        ),
+    )
 }
 
 /// 현재 플랫폼/환경에서 새 shell session이 사용할 것으로 예상되는 기본 shell kind.

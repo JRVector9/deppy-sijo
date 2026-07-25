@@ -3678,6 +3678,7 @@ impl WorkspaceUi {
         >,
         needs_input: &std::collections::HashSet<runtime::SessionId>,
         turn_done: &std::collections::HashMap<runtime::SessionId, i64>,
+        hook_working: &std::collections::HashSet<runtime::SessionId>,
     ) -> Vec<crate::ui::file_tree::SessionEntry> {
         let Some(mux) = &self.mux else {
             return Vec::new();
@@ -3698,7 +3699,9 @@ impl WorkspaceUi {
                 // hook이 보고한 needsInput = 가장 신뢰도 높은 승인 신호(최우선).
                 let waiting = pane.session_id.is_some_and(|s| needs_input.contains(&s));
                 let done = pane.session_id.is_some_and(|s| turn_done.contains_key(&s));
-                let merged = merge_agent_status(regex_status, activity, waiting, done);
+                // hook이 보고한 "작업 중"(v32) — transcript보다 즉시·정확(턴 경계).
+                let working = pane.session_id.is_some_and(|s| hook_working.contains(&s));
+                let merged = merge_agent_status(regex_status, activity, waiting, done, working);
                 // U17b: 수동 오버라이드가 있으면 최우선(status view의 user_override).
                 let view = pane
                     .session_id
@@ -4313,6 +4316,7 @@ fn merge_agent_status(
     activity: Option<crate::agent_transcript::AgentActivity>,
     needs_input: bool,
     turn_done: bool,
+    hook_working: bool,
 ) -> Option<runtime::SessionStatus> {
     use crate::agent_transcript::AgentActivity;
     use runtime::SessionStatus as S;
@@ -4336,6 +4340,12 @@ fn merge_agent_status(
         Some(S::Waiting) => return Some(S::NeedsApproval),
         Some(S::NeedsApproval | S::Done) => return regex,
         _ => {}
+    }
+    // hook "작업 중"(v32, cmux식): UserPromptSubmit/PreToolUse가 턴 경계에서 즉시 기록 —
+    // transcript(1.5s 폴링 + 활성 전용)보다 빠르고 warm에서도 동작한다. 화면 regex의
+    // 대기/승인(위)은 hook이 놓치는 프롬프트를 잡는 fallback이라 여전히 우선한다.
+    if hook_working {
+        return Some(S::Running);
     }
     match activity {
         Some(AgentActivity::Working) => Some(S::Running),
@@ -4573,6 +4583,45 @@ mod tests {
     use super::*;
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    /// hook "작업 중"(v32) 병합 우선순위: 확정 상태(승인대기/오류/완료/화면 대기)가
+    /// 이기고, 그 외엔 hook working이 transcript(지연·활성 전용)보다 우선한다.
+    #[test]
+    fn merge_agent_status_hook_working_우선순위() {
+        use crate::agent_transcript::AgentActivity;
+        use runtime::SessionStatus as S;
+        // hook working 단독 → Running (transcript 없음/유휴여도)
+        assert_eq!(
+            merge_agent_status(None, None, false, false, true),
+            Some(S::Running)
+        );
+        assert_eq!(
+            merge_agent_status(None, Some(AgentActivity::Idle), false, false, true),
+            Some(S::Running)
+        );
+        // 확정 상태가 우선: needs_input / regex Error / turn_done / 화면 대기(regex)
+        assert_eq!(
+            merge_agent_status(None, None, true, false, true),
+            Some(S::NeedsApproval)
+        );
+        assert_eq!(
+            merge_agent_status(Some(S::Error), None, false, false, true),
+            Some(S::Error)
+        );
+        assert_eq!(
+            merge_agent_status(None, None, false, true, true),
+            Some(S::Done)
+        );
+        assert_eq!(
+            merge_agent_status(Some(S::Waiting), None, false, false, true),
+            Some(S::NeedsApproval)
+        );
+        // hook working 없으면 기존과 동일(transcript 폴백)
+        assert_eq!(
+            merge_agent_status(None, Some(AgentActivity::Idle), false, false, false),
+            Some(S::Idle)
+        );
+    }
 
     fn drain_protocol(ui: &mut WorkspaceUi) -> Vec<RuntimeCommand> {
         let mut commands = Vec::new();

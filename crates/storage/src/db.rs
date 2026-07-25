@@ -1430,9 +1430,16 @@ const STATUSLINES_PREFIX_SELECT: &str = "SELECT session_key, effort, model, cont
       AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2";
 
+// waiting/turn_done의 stale 창은 24시간 — working(120초)과 달리 하트비트가 없다.
+// Notification(needs-input)과 Stop(turn-done)은 상태가 바뀌는 순간에만 한 번 발화하므로
+// updated_at은 그 시각에 멈춘다. 창이 1시간이면 밤새 승인을 기다린 에이전트나 오래 전
+// 끝난 턴이 실제로는 그 상태 그대로인데 배지만 조용히 사라졌다(false negative).
+// 죽은 hook의 잔여는 창이 아니라 App의 liveness 필터(attention_session_alive — 세션이
+// 아직 살아있는 워크스페이스에 있는지)가 걷어내고, 행 자체는 prune_agent_hook_state(7일)와
+// HOOK_STATE_ROWS_MAX eviction이 정리한다. 창은 그 뒤의 마지막 상한일 뿐이다.
 const TURN_DONE_PREFIX_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_needs_input
-     WHERE turn_done = 1 AND updated_at > ?5 - 3600
+     WHERE turn_done = 1 AND updated_at > ?5 - 86400
        AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
      ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2
 ), sized AS MATERIALIZED (
@@ -1445,13 +1452,13 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const TURN_DONE_PREFIX_SELECT: &str = "SELECT session_key, updated_at FROM agent_needs_input
-    WHERE turn_done = 1 AND updated_at > ?4 - 3600
+    WHERE turn_done = 1 AND updated_at > ?4 - 86400
       AND substr(CAST(session_key AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?3), rowid LIMIT ?2";
 
 const WAITING_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_needs_input
-     WHERE waiting = 1 AND updated_at > ?5 - 3600
+     WHERE waiting = 1 AND updated_at > ?5 - 86400
      ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
 ), sized AS MATERIALIZED (
     SELECT state.*, length(CAST(state.session_key AS BLOB))
@@ -1466,16 +1473,16 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const WAITING_SESSIONS_SELECT: &str = "SELECT session_key, message FROM agent_needs_input
-    WHERE waiting = 1 AND updated_at > ?3 - 3600
+    WHERE waiting = 1 AND updated_at > ?3 - 86400
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
 
 // 턴 완료(Stop) 세션 — 전역 스코프(warm turn_done 격차, 감사 발견). 기존
 // TURN_DONE_PREFIX_*는 워크스페이스 prefix로 좁혀 warm(비활성) 워크스페이스의 완료를
 // 놓쳤다 — waiting/working처럼 prefix 없이 전체에서 뽑아야 fleet·사이드바가 warm
-// 에이전트의 "완료"도 보인다. stale 창은 기존과 동일하게 1시간.
+// 에이전트의 "완료"도 보인다. stale 창은 waiting과 동일하게 24시간(위 주석).
 const TURN_DONE_SESSIONS_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_needs_input
-     WHERE turn_done = 1 AND updated_at > ?4 - 3600
+     WHERE turn_done = 1 AND updated_at > ?4 - 86400
      ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1
 ), sized AS MATERIALIZED (
     SELECT state.*, length(CAST(state.session_key AS BLOB)) AS row_bytes
@@ -1487,7 +1494,7 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
 const TURN_DONE_SESSIONS_SELECT: &str = "SELECT session_key, updated_at FROM agent_needs_input
-    WHERE turn_done = 1 AND updated_at > ?3 - 3600
+    WHERE turn_done = 1 AND updated_at > ?3 - 86400
     ORDER BY updated_at DESC, substr(CAST(session_key AS BLOB), 1, ?2), rowid LIMIT ?1";
 
 // hook 기반 "작업 중"(v32). stale 창은 2분 — Stop이 유실되면(Ctrl-C 등 훅 미발화)
@@ -6209,13 +6216,14 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// 현재 입력 대기(waiting) 중인 세션 키 + hook이 보고한 사유 문구. stale(1시간 초과)은
-    /// 제외해 죽은 hook의 잔여가 영원히 주황으로 남지 않게 한다.
+    /// 현재 입력 대기(waiting) 중인 세션 키 + hook이 보고한 사유 문구. stale(24시간 초과)은
+    /// 제외한다 — 대기는 하트비트가 없어 창을 짧게 잡으면 실제로 기다리는 중인 에이전트의
+    /// 배지가 사라진다(WAITING_SESSIONS_PREFLIGHT 위 주석).
     pub fn list_waiting_sessions(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_key, message FROM agent_needs_input
              WHERE waiting = 1
-               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 3600",
+               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 86400",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -6436,13 +6444,13 @@ impl Db {
         Ok(result)
     }
 
-    /// 턴 완료(미확인) 세션 (key, updated_at) 목록. waiting과 같은 1시간 stale 컷오프.
+    /// 턴 완료(미확인) 세션 (key, updated_at) 목록. waiting과 같은 24시간 stale 컷오프.
     /// updated_at은 소비 시 조건부 clear의 세대 기준으로 쓴다.
     pub fn list_turn_done_sessions(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_key, updated_at FROM agent_needs_input
              WHERE turn_done = 1
-               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 3600",
+               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 86400",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -12334,6 +12342,47 @@ mod tests {
             db.list_waiting_sessions().unwrap(),
             vec![("workspace:pane-2".to_string(), None)]
         );
+    }
+
+    /// agent_needs_input의 모든 행을 `seconds`초 전으로 되돌린다 — stale 창 검증용.
+    fn backdate_agent_needs_input(db: &Db, seconds: i64) {
+        db.conn
+            .execute(
+                "UPDATE agent_needs_input
+                    SET updated_at = CAST(strftime('%s','now') AS INTEGER) - ?1",
+                [seconds],
+            )
+            .unwrap();
+    }
+
+    /// waiting/turn_done은 working과 달리 하트비트가 없다(상태 전이 때 한 번만 기록) —
+    /// 1시간 창이던 시절엔 실제로는 계속 승인을 기다리는 에이전트의 배지가 조용히
+    /// 사라졌다(false negative). 24시간 창은 넘기고, 그 뒤에는 여전히 잘린다.
+    #[test]
+    fn waiting과_turn_done은_1시간이_지나도_24시간_안이면_유지된다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("ws").unwrap();
+        db.set_agent_needs_input(&format!("{ws}:1"), true, Some("승인 필요"))
+            .unwrap();
+        db.set_agent_turn_done(&format!("{ws}:2")).unwrap();
+
+        backdate_agent_needs_input(&db, 2 * 3600);
+        assert_eq!(db.list_waiting_sessions().unwrap().len(), 1);
+        assert_eq!(db.list_turn_done_sessions().unwrap().len(), 1);
+        let snapshot = db
+            .apply_agent_state_job(&AgentStateJob::projection(&ws))
+            .unwrap();
+        assert_eq!(snapshot.waiting_sessions.len(), 1);
+        assert_eq!(snapshot.turn_done_sessions.len(), 1);
+
+        backdate_agent_needs_input(&db, 25 * 3600);
+        assert!(db.list_waiting_sessions().unwrap().is_empty());
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        let snapshot = db
+            .apply_agent_state_job(&AgentStateJob::projection(&ws))
+            .unwrap();
+        assert!(snapshot.waiting_sessions.is_empty());
+        assert!(snapshot.turn_done_sessions.is_empty());
     }
 
     /// warm turn_done 격차(감사 발견) — turn_done_sessions는 이제 waiting/working과 같은
@@ -18363,8 +18412,21 @@ mod tests {
                 STATUSLINES_PREFIX_SELECT,
                 "3600",
             ),
-            (TURN_DONE_PREFIX_PREFLIGHT, TURN_DONE_PREFIX_SELECT, "3600"),
-            (WAITING_SESSIONS_PREFLIGHT, WAITING_SESSIONS_SELECT, "3600"),
+            (
+                TURN_DONE_PREFIX_PREFLIGHT,
+                TURN_DONE_PREFIX_SELECT,
+                "86400",
+            ),
+            (
+                WAITING_SESSIONS_PREFLIGHT,
+                WAITING_SESSIONS_SELECT,
+                "86400",
+            ),
+            (
+                TURN_DONE_SESSIONS_PREFLIGHT,
+                TURN_DONE_SESSIONS_SELECT,
+                "86400",
+            ),
         ] {
             assert!(!preflight.contains("strftime"));
             assert!(!projection.contains("strftime"));

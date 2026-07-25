@@ -76,6 +76,12 @@ impl AgentListItem {
         &self.command
     }
 
+    /// (id, name) 쌍 — Arc 클론이라 재할당 없이 저비용(fleet 배치 스폰 패널처럼 매 프레임
+    /// 슬림 목록을 만드는 소비자용, PR-S1).
+    pub fn id_name(&self) -> (Arc<str>, Arc<str>) {
+        (Arc::clone(&self.id), Arc::clone(&self.name))
+    }
+
     pub fn args_summary(&self) -> &str {
         self.args_summary.as_str()
     }

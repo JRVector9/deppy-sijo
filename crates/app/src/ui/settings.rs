@@ -1627,6 +1627,20 @@ fn general_page(
             }
         },
     );
+    // fleet 배치 스폰 한 번에 시작할 수 있는 최대 세션 수(PR-S1). max_live_warm 스타일의
+    // stepper — 위젯 범위(1~16)는 config::normalize의 클램프와 동일하다.
+    row(
+        ui,
+        &catalog.t("settings.fleet_batch_spawn_max", &[]),
+        Some(&catalog.t("settings.fleet_batch_spawn_max.hint", &[])),
+        |ui| {
+            let mut v = config.ui.fleet_batch_spawn_max as i64;
+            if stepper(ui, &mut v, 1, 1, 16, "") {
+                config.ui.fleet_batch_spawn_max = v as u32;
+                *changed = true;
+            }
+        },
+    );
     agent_send_presets_section(ui, config, changed, catalog);
 }
 

@@ -213,6 +213,9 @@ pub struct UiConfig {
     /// 팔레트를 숨긴다 — 저장된 프롬프트 데이터(prompt_library.json)는 보존한다.
     #[serde(default = "default_true")]
     pub prompt_library_enabled: bool,
+    /// fleet 배치 스폰 한 번에 시작할 수 있는 최대 세션 수(PR-S1). 기본 6, 1~16 클램프.
+    #[serde(default = "default_fleet_batch_spawn_max")]
+    pub fleet_batch_spawn_max: u32,
 }
 
 /// 컴포저 전송 키 — "프롬프트가 길면 실수로 Enter를 누를 가능성"(사용자) 대응 옵션.
@@ -247,6 +250,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_fleet_batch_spawn_max() -> u32 {
+    6
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -265,6 +272,7 @@ impl Default for UiConfig {
             composer_enabled: true,
             composer_send_key: ComposerSendKey::default(),
             prompt_library_enabled: true,
+            fleet_batch_spawn_max: default_fleet_batch_spawn_max(),
         }
     }
 }
@@ -484,6 +492,7 @@ impl Config {
             .clamp(MIN_OUTPUT_BATCH_MS, 1_000);
         self.performance.max_warm = self.performance.max_warm.clamp(0, 8);
         self.performance.max_live_warm = self.performance.max_live_warm.clamp(1, 12);
+        self.ui.fleet_batch_spawn_max = self.ui.fleet_batch_spawn_max.clamp(1, 16);
         self.i18n.locale = i18n::normalize_locale(&self.i18n.locale);
         // TOML을 손으로 고친 미지 프로바이더는 기본(None)으로 — spawn 경계의 검증과 별개로
         // UI 콤보가 미지값을 표시할 수 없어 로드 경계에서 정규화한다.
@@ -623,6 +632,31 @@ mod tests {
         config.ui.prompt_library_enabled = false;
         let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert!(!reloaded.ui.prompt_library_enabled);
+    }
+
+    /// fleet 배치 스폰 상한(PR-S1): 기본 6 + 키 없는 기존 config 하위호환 + 변경값 라운드트립.
+    /// prompt_library_enabled와 동일한 default fn 규약.
+    #[test]
+    fn fleet_batch_spawn_max_기본값은_6이고_변경값은_라운드트립된다() {
+        assert_eq!(UiConfig::default().fleet_batch_spawn_max, 6);
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.ui.fleet_batch_spawn_max, 6);
+        let mut config = Config::default();
+        config.ui.fleet_batch_spawn_max = 10;
+        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reloaded.ui.fleet_batch_spawn_max, 10);
+    }
+
+    #[test]
+    fn fleet_batch_spawn_max_범위밖_값은_정규화에서_1에서_16으로_클램프() {
+        let mut config = Config::default();
+        config.ui.fleet_batch_spawn_max = 0;
+        config.normalize();
+        assert_eq!(config.ui.fleet_batch_spawn_max, 1);
+
+        config.ui.fleet_batch_spawn_max = 999;
+        config.normalize();
+        assert_eq!(config.ui.fleet_batch_spawn_max, 16);
     }
 
     #[test]

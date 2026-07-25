@@ -1295,6 +1295,17 @@ struct SettingsJob {
     action: SettingsJobAction,
 }
 
+/// fleet 배치 스폰(PR-S1) 대기 상태 — settings 잡 큐가 단일 슬롯이라 프레임에 걸쳐
+/// PrepareAgentLaunch를 하나씩 큐잉한다(`pump_batch_spawn`).
+struct PendingBatchSpawn {
+    agent_id: String,
+    /// 남은 스폰 횟수 — 큐잉 성공마다 감소, 0이면 pending 상태를 지운다.
+    remaining: u32,
+    /// staging(버튼 클릭) 시점의 활성 workspace. 펌프 도중 활성 workspace가 바뀌면
+    /// 엉뚱한 workspace로 이어 스폰되는 걸 막기 위해 남은 스폰을 전부 취소한다.
+    staged_workspace_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspaceMutationPurpose {
     SelectInSettings,
@@ -5818,6 +5829,9 @@ pub struct App {
     agent_terminal_ui: ui::agent_terminal::AgentTerminalUi,
     /// 멀티에이전트 fleet 그리드 (기능1) — Fleet 뷰에서 그린다.
     fleet_ui: ui::fleet::FleetUi,
+    /// fleet 배치 스폰(PR-S1) 대기 — Some이면 매 logic tick `pump_batch_spawn`이 settings
+    /// 잡 큐 1슬롯이 빌 때마다 하나씩 launch를 큐잉한다.
+    pending_batch_spawn: Option<PendingBatchSpawn>,
     /// 브로드캐스트 직후 대상 세션을 잠깐 "작업 중"으로 낙관적 표시하기 위한 타임스탬프
     /// ((workspace_id, session) → 전송 시각). 전송했으니 지금 작업을 시작했다는 걸 아는데
     /// transcript 감지에는 지연이 있어(warm은 아예 활동 추적 안 됨) 그 공백을 메운다.
@@ -8403,6 +8417,7 @@ impl App {
             activity_ui: ui::activity::ActivityUi::new(),
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             fleet_ui: ui::fleet::FleetUi::default(),
+            pending_batch_spawn: None,
             broadcast_working: std::collections::HashMap::new(),
             activity_rows_cache: None,
             status_feed_rx: status_feed_rx_channel.0,
@@ -8706,6 +8721,49 @@ impl App {
                 error_code = "backpressure",
                 "performance harness launch failed closed"
             );
+        }
+    }
+
+    /// fleet 배치 스폰(PR-S1) 펌프 — settings 잡 큐는 동시 1개만 허용해(단일 슬롯) 매
+    /// logic tick 빈 슬롯이면 PrepareAgentLaunch를 하나씩 큐잉한다. AgentsIntent::Run
+    /// 핸들러와 같은 launch 파이프라인을 재사용하되 N개를 여러 프레임에 걸쳐 순차 발사한다.
+    fn pump_batch_spawn(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_batch_spawn else {
+            return;
+        };
+        // staging(버튼 클릭) 이후 활성 workspace가 바뀌면 남은 스폰을 전부 취소한다 —
+        // 그러지 않으면 사용자가 다른 workspace로 전환한 사이에도 스폰이 이어져 엉뚱한
+        // workspace에 세션이 쌓인다(배치 스폰은 클릭 시점의 workspace에만 적용).
+        if pending.staged_workspace_id != self.active.id {
+            self.pending_batch_spawn = None;
+            return;
+        }
+        // 아래 request_settings_snapshot_if_needed/queue_settings_action이 &mut self를
+        // 요구하므로 pending의 값은 먼저 복제해 빌림을 끝낸다.
+        let agent_id = pending.agent_id.clone();
+        let workspace_id = self.active.id.clone();
+        // 설정/에이전트 창을 한 번도 안 열었으면 agents_snapshot이 비어 있을 수 있다 —
+        // Run 핸들러와 동일하게 project_root는 workspace_tree_root에서 유도한다.
+        let project_root = self.workspace_tree_root(&workspace_id);
+        self.request_settings_snapshot_if_needed(&workspace_id, project_root);
+        let queued = self.queue_settings_action(
+            &workspace_id,
+            None,
+            SettingsJobAction::PrepareAgentLaunch {
+                agent_id,
+                profile_id: None,
+                runtime_workspace_id: workspace_id.clone(),
+            },
+        );
+        if queued && let Some(pending) = &mut self.pending_batch_spawn {
+            pending.remaining -= 1;
+            if pending.remaining == 0 {
+                self.pending_batch_spawn = None;
+            }
+        }
+        // 남은 스폰이 있으면 다음 프레임에 즉시 재시도 — 사용자 입력 없이도 큐가 드레인된다.
+        if self.pending_batch_spawn.is_some() {
+            ctx.request_repaint();
         }
     }
 
@@ -15534,6 +15592,7 @@ impl eframe::App for App {
         self.poll_dotenv_sync();
         self.poll_agent_state_worker();
         self.pump_perf_harness();
+        self.pump_batch_spawn(ctx);
         if let Some((intent, subject)) = self.pending_connector_dispatch.take() {
             let result = match subject {
                 Some(subject) => self
@@ -16617,6 +16676,17 @@ impl eframe::App for App {
         } else {
             (Vec::new(), crate::fleet::FleetSummary::default())
         };
+        // 배치 스폰 패널용 슬림 (id, name) 목록 — leaf가 AgentsSnapshot 내부를 직접 몰라도
+        // 되게 App이 매 프레임(Fleet 뷰일 때만) 투영한다. Arc 클론이라 재할당 없음.
+        let fleet_batch_spawn_agents: Vec<(Arc<str>, Arc<str>)> = if fleet_visible {
+            self.agents_snapshot
+                .agents()
+                .iter()
+                .map(ui::agents::AgentListItem::id_name)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
         if !home_visible && !inbox_visible && !fleet_visible && self.config.ui.composer_enabled {
@@ -16656,6 +16726,10 @@ impl eframe::App for App {
                         fleet_summary,
                         &text,
                         &self.prompt_library,
+                        ui::fleet::BatchSpawnInput {
+                            agents: &fleet_batch_spawn_agents,
+                            max: self.config.ui.fleet_batch_spawn_max,
+                        },
                     );
                 } else {
                     self.active
@@ -16709,6 +16783,18 @@ impl eframe::App for App {
                     // 방금 프롬프트를 보냈으니 잠깐 "작업 중"으로 낙관적 표시(감지 지연 메움).
                     self.broadcast_working.insert((workspace_id, session), now);
                 }
+            }
+            Some(ui::fleet::FleetAction::BatchSpawn { agent_id, count }) => {
+                // 실제 launch는 다음 logic tick부터 pump_batch_spawn이 settings 잡 큐
+                // 1슬롯을 통해 순차로 큐잉한다(PR-S1, 빈 세션만 — 프롬프트 주입은 PR-S2).
+                // count는 패널이 이미 1..=cap으로 그렸지만 방어적으로 다시 클램프한다.
+                let cap = self.config.ui.fleet_batch_spawn_max.max(1);
+                self.pending_batch_spawn = Some(PendingBatchSpawn {
+                    agent_id,
+                    remaining: count.clamp(1, cap),
+                    staged_workspace_id: self.active.id.clone(),
+                });
+                ui.ctx().request_repaint();
             }
             None => {}
         }

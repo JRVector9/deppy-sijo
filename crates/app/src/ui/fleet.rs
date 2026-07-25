@@ -6,6 +6,7 @@
 //! (`agent_visuals::status_color`)를 재사용한다.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use crate::agent_surface::AgentVisualState;
 use crate::fleet::{FleetSession, FleetSummary, FleetTarget};
@@ -31,6 +32,9 @@ pub enum FleetAction {
         prompt: String,
         targets: Vec<(String, runtime::SessionId)>,
     },
+    /// 등록된 에이전트 설정으로 N개 세션을 한 번에 시작(빈 세션 — 프롬프트 주입은
+    /// PR-S2 범위). App이 fleet_batch_spawn_max로 count를 방어적으로 재클램프한다.
+    BatchSpawn { agent_id: String, count: u32 },
 }
 
 /// 브로드캐스트 패널 상태 — 프롬프트 선택 + 파라미터 + 대상 체크.
@@ -44,10 +48,25 @@ struct BroadcastState {
     confirm_send: bool,
 }
 
+/// 배치 스폰 패널 상태 — 에이전트 선택 + 개수. 패널을 열 때마다 초기화한다.
+struct BatchSpawnState {
+    agent_id: Option<String>,
+    count: u32,
+}
+
+/// 배치 스폰 패널에 필요한 App 투영 — 슬림 (id, name) 목록 + 설정 상한. `render`의
+/// 인자 수를 clippy::too_many_arguments 문턱 아래로 묶어 둔다.
+pub struct BatchSpawnInput<'a> {
+    pub agents: &'a [(Arc<str>, Arc<str>)],
+    pub max: u32,
+}
+
 #[derive(Default)]
 pub struct FleetUi {
     /// Some이면 브로드캐스트 패널이 열려 있다.
     broadcast: Option<BroadcastState>,
+    /// Some이면 배치 스폰 패널이 열려 있다.
+    batch_spawn: Option<BatchSpawnState>,
 }
 
 impl FleetUi {
@@ -59,7 +78,12 @@ impl FleetUi {
         summary: FleetSummary,
         catalog: &i18n::Catalog,
         library: &PromptLibrary,
+        batch_spawn_input: BatchSpawnInput<'_>,
     ) -> Option<FleetAction> {
+        let BatchSpawnInput {
+            agents,
+            max: batch_spawn_max,
+        } = batch_spawn_input;
         let mut action = None;
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::symmetric(16, 14))
@@ -80,6 +104,13 @@ impl FleetUi {
                                 .filter_map(|s| s.broadcast_key())
                                 .collect(),
                             confirm_send: false,
+                        });
+                    }
+                    Some(HeaderClick::BatchSpawn) => {
+                        // 패널을 열 때마다 초기화 — 기본 선택 = 첫 에이전트, 개수 1.
+                        self.batch_spawn = Some(BatchSpawnState {
+                            agent_id: agents.first().map(|(id, _)| id.to_string()),
+                            count: 1,
                         });
                     }
                     None => {}
@@ -127,6 +158,10 @@ impl FleetUi {
             });
         // 브로드캐스트 창은 떠 있는 Window라 중앙 패널과 독립적으로 그린다.
         if let Some(sent) = self.broadcast_window(ui.ctx(), sessions, catalog, library) {
+            action = Some(sent);
+        }
+        // 배치 스폰 창도 동일하게 독립 Window.
+        if let Some(sent) = self.batch_spawn_window(ui.ctx(), agents, batch_spawn_max, catalog) {
             action = Some(sent);
         }
         action
@@ -306,15 +341,108 @@ impl FleetUi {
         }
         out
     }
+
+    /// 배치 스폰 창 — 에이전트 선택 + 개수 + 시작. 닫혀 있으면 아무것도 그리지 않는다.
+    /// 시작/닫기 시 상태를 제거한다(broadcast_window와 동일 idiom).
+    fn batch_spawn_window(
+        &mut self,
+        ctx: &egui::Context,
+        agents: &[(Arc<str>, Arc<str>)],
+        max: u32,
+        catalog: &i18n::Catalog,
+    ) -> Option<FleetAction> {
+        // 닫혀 있으면(Some 아님) 창을 그리지 않는다.
+        self.batch_spawn.as_ref()?;
+        let mut action = None;
+        let mut open = true;
+        egui::Window::new(catalog.t("fleet.batch.title", &[]))
+            .id(egui::Id::new("fleet_batch_spawn"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                action = self.batch_spawn_body(ui, agents, max, catalog);
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        // 시작했거나(action Some) 닫으면 패널 상태를 버린다.
+        if !open || action.is_some() {
+            self.batch_spawn = None;
+        }
+        action
+    }
+
+    fn batch_spawn_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        agents: &[(Arc<str>, Arc<str>)],
+        max: u32,
+        catalog: &i18n::Catalog,
+    ) -> Option<FleetAction> {
+        let state = self.batch_spawn.as_mut()?;
+        // 등록된 에이전트가 없으면 콤보/개수/시작 버튼 없이 안내만(broadcast의 no_prompts와
+        // 동일 idiom) — 사용자는 설정 > 에이전트에서 먼저 등록해야 한다.
+        if agents.is_empty() {
+            ui.weak(catalog.t("fleet.batch.no_agents", &[]));
+            return None;
+        }
+        // ① 에이전트 선택.
+        let selected_name = state
+            .agent_id
+            .as_deref()
+            .and_then(|id| agents.iter().find(|(aid, _)| aid.as_ref() == id))
+            .map(|(_, name)| name.to_string())
+            .unwrap_or_else(|| catalog.t("fleet.batch.pick_agent", &[]));
+        egui::ComboBox::from_id_salt("fleet_batch_agent")
+            .selected_text(selected_name)
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                for (id, name) in agents {
+                    let picked = state.agent_id.as_deref() == Some(id.as_ref());
+                    if ui.selectable_label(picked, name.as_ref()).clicked() {
+                        state.agent_id = Some(id.to_string());
+                    }
+                }
+            });
+        ui.add_space(8.0);
+        // ② 개수 — 1..=max(설정 「fleet_batch_spawn_max」에서 온 상한).
+        ui.horizontal(|ui| {
+            ui.label(catalog.t("fleet.batch.count", &[]));
+            ui.add(egui::DragValue::new(&mut state.count).range(1..=max.max(1)));
+        });
+        ui.add_space(10.0);
+        // ③ 시작.
+        let mut out = None;
+        let can_start = state.agent_id.is_some();
+        if ui
+            .add_enabled(
+                can_start,
+                egui::Button::new(
+                    catalog.t("fleet.batch.start", &[("count", &state.count.to_string())]),
+                ),
+            )
+            .clicked()
+            && let Some(agent_id) = state.agent_id.clone()
+        {
+            out = Some(FleetAction::BatchSpawn {
+                agent_id,
+                count: state.count,
+            });
+        }
+        out
+    }
 }
 
 /// 헤더 우측 버튼 클릭.
 enum HeaderClick {
     Launch,
     Broadcast,
+    BatchSpawn,
 }
 
-/// 상단 헤더: 제목 + 총계 + (우측) 브로드캐스트·새 에이전트 버튼 + 상태별 칩.
+/// 상단 헤더: 제목 + 총계 + (우측) 배치 스폰·브로드캐스트·새 에이전트 버튼 + 상태별 칩.
 fn header(
     ui: &mut egui::Ui,
     summary: FleetSummary,
@@ -338,6 +466,10 @@ fn header(
             // 브로드캐스트는 실행 중 에이전트가 있을 때만.
             if has_broadcast_target && ui.button(catalog.t("fleet.broadcast", &[])).clicked() {
                 click = Some(HeaderClick::Broadcast);
+            }
+            // 배치 스폰은 등록된 에이전트가 없어도 열 수 있다(패널 안에서 안내, PR-S1).
+            if ui.button(catalog.t("fleet.batch", &[])).clicked() {
+                click = Some(HeaderClick::BatchSpawn);
             }
         });
     });

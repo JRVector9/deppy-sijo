@@ -2821,7 +2821,7 @@ impl WorkspaceUi {
                 // URL은 cwd 해석이 필요 없는 문자열 판정이라 폴더보다 먼저 본다.
                 if let Some(url) = extract_url(&word) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    if output.response.clicked() && focused {
+                    if terminal_primary_pointer_clicked(&output.response) && focused {
                         // 더블클릭이 clicked를 두 번 발화 — 같은 URL 연속 열기를 막는다
                         // (last_dir_click과 동일 관례).
                         let duplicate = self.last_url_click.as_ref().is_some_and(|(u, at)| {
@@ -2840,7 +2840,7 @@ impl WorkspaceUi {
                     // 포커스된 pane에서만 cd — 비포커스 pane을 포커스하려는 클릭이
                     // cd까지 주입하면 안 된다 (codex 리뷰 MEDIUM). 첫 클릭은 포커스만,
                     // 포커스된 뒤의 클릭이 이동한다.
-                    if output.response.clicked() && focused {
+                    if terminal_primary_pointer_clicked(&output.response) && focused {
                         // 실제 경로 판정은 App host가 완료한 immutable cache만 사용한다.
                         // cwd가 바뀌면 set_session_cwds가 pending/cache를 무효화한다.
                         if let Some(PathClick::Dir(path)) = self.resolve_path_cached(session, &word)
@@ -2956,7 +2956,7 @@ impl WorkspaceUi {
                 } else {
                     self.drag_autoscroll_residual = 0.0;
                 }
-            } else if output.response.clicked() {
+            } else if terminal_primary_pointer_clicked(&output.response) {
                 self.selection = None; // 단순 클릭은 선택 해제 (더블클릭 아님)
             }
         }
@@ -2972,7 +2972,7 @@ impl WorkspaceUi {
             self.pending_focus = None;
             request_terminal_focus(&output.response);
         }
-        if output.response.clicked() {
+        if terminal_primary_pointer_clicked(&output.response) {
             self.terminal_focus_claimed = true;
             request_terminal_focus(&output.response);
             // 이미 runtime focus인 pane을 다시 클릭해도 stale TextEdit focus를 누르고
@@ -4244,6 +4244,10 @@ fn request_terminal_focus(response: &egui::Response) {
     response.ctx.memory_mut(|memory| {
         memory.set_focus_lock_filter(response.id, renderer_egui::terminal_focus_lock_filter());
     });
+}
+
+fn terminal_primary_pointer_clicked(response: &egui::Response) -> bool {
+    response.clicked_by(egui::PointerButton::Primary)
 }
 
 fn clipboard_terminal_paste_bytes(
@@ -6255,6 +6259,41 @@ https://example.test/login \
         assert!(terminal_keyboard_input_allowed(true, false, false, true));
         assert!(!terminal_keyboard_input_allowed(true, true, false, true));
         assert!(!terminal_keyboard_input_allowed(true, false, true, true));
+    }
+
+    #[test]
+    fn 터미널_enter_합성클릭은_hover_path를_활성화하지_않는다() {
+        let ctx = egui::Context::default();
+        let mut response_id = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (_, response) =
+                ui.allocate_exact_size(egui::vec2(120.0, 40.0), egui::Sense::click_and_drag());
+            response.request_focus();
+            response_id = Some(response.id);
+        });
+        assert!(ctx.memory(|memory| memory.has_focus(response_id.unwrap())));
+
+        let mut activation = None;
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            let (_, response) =
+                ui.allocate_exact_size(egui::vec2(120.0, 40.0), egui::Sense::click_and_drag());
+            activation = Some((
+                response.clicked(),
+                terminal_primary_pointer_clicked(&response),
+            ));
+        });
+
+        assert_eq!(activation, Some((true, false)));
     }
 
     #[test]

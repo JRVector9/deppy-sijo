@@ -2026,9 +2026,9 @@ fn prepare_quick_agent_launch(
     spec: crate::agent_launcher::LaunchSpec,
     runtime_workspace_id: String,
 ) -> anyhow::Result<PreparedAgentLaunch> {
-    let (kind, command, args, env_plain) = spec.into_parts();
-    Db::validate_agent_args_for_persistence(&args)?;
-    db.upsert_builtin_agent_config(kind.stable_config_id(), kind.label(), &command)?;
+    let (kind, agent_command, agent_args, env_plain) = spec.into_parts();
+    Db::validate_agent_args_for_persistence(&agent_args)?;
+    db.upsert_builtin_agent_config(kind.stable_config_id(), kind.label(), &agent_command)?;
     let mut prepared = prepare_agent_launch(
         db,
         workspace_id,
@@ -2037,6 +2037,9 @@ fn prepare_quick_agent_launch(
         runtime_workspace_id,
         None,
     )?;
+    let (command, args) = crate::agent_launcher::wrap_agent_then_shell(agent_command, agent_args);
+    Db::validate_agent_args_for_persistence(&args)?;
+    prepared.command = command;
     prepared.args = args;
     prepared.env_plain = env_plain;
     Ok(prepared)
@@ -20224,7 +20227,7 @@ mod tests {
                 .find(crate::agent_launcher::AgentKind::Codex)
                 .unwrap(),
             crate::agent_launcher::LaunchOptions {
-                model: "gpt-test".to_owned(),
+                model: "gpt-5.4".to_owned(),
                 effort: Some(crate::agent_launcher::ReasoningEffort::XHigh),
                 yolo: true,
             },
@@ -20236,17 +20239,37 @@ mod tests {
             prepare_quick_agent_launch(&db, &workspace_id, spec, workspace_id.clone()).unwrap();
         assert_eq!(prepared.runtime_workspace_id, workspace_id);
         assert_eq!(prepared.agent_config_id, "deppy-builtin-codex");
-        assert_eq!(prepared.command, "/tmp/deppy/shims/codex");
-        assert_eq!(
-            prepared.args,
-            [
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--model",
-                "gpt-test",
-                "--config",
-                "model_reasoning_effort=\"xhigh\"",
-            ]
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(prepared.command, "/bin/sh");
+            assert_eq!(prepared.args[0], "-c");
+            assert_eq!(prepared.args[2], "deppy-agent-session");
+            assert_eq!(prepared.args[3], "/tmp/deppy/shims/codex");
+            assert_eq!(
+                prepared.args[4..],
+                [
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--model",
+                    "gpt-5.4",
+                    "--config",
+                    "model_reasoning_effort=\"xhigh\"",
+                ]
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(prepared.command, "/tmp/deppy/shims/codex");
+            assert_eq!(
+                prepared.args,
+                [
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--model",
+                    "gpt-5.4",
+                    "--config",
+                    "model_reasoning_effort=\"xhigh\"",
+                ]
+            );
+        }
         assert_eq!(
             prepared.env_plain,
             [(

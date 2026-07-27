@@ -1,7 +1,5 @@
 use crate::agent_launcher::{AgentKind, DetectionSnapshot, LaunchOptions, ReasoningEffort};
 
-const MODEL_INPUT_MAX_BYTES: usize = 256;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LauncherErrorCode {
     DetectionFailed,
@@ -103,7 +101,6 @@ impl AgentLauncherUi {
             return None;
         }
         self.reconcile_selection(snapshot);
-        truncate_utf8(&mut self.model, MODEL_INPUT_MAX_BYTES);
 
         let mut intent = None;
         let response = egui::Modal::new(egui::Id::new("agent-launcher-modal")).show(ctx, |ui| {
@@ -231,25 +228,62 @@ impl AgentLauncherUi {
     }
 
     fn render_options(&mut self, ui: &mut egui::Ui, kind: AgentKind, catalog: &i18n::Catalog) {
-        if kind.supports_model() {
+        let models = kind.supported_models();
+        if !models.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(catalog.t("agent_launcher.model", &[]));
-                ui.add_enabled(
-                    !self.launch_pending,
-                    egui::TextEdit::singleline(&mut self.model)
-                        .hint_text(catalog.t("agent_launcher.model_hint", &[]))
-                        .desired_width(360.0),
-                );
+                let selected = models
+                    .iter()
+                    .find(|choice| choice.value() == self.model)
+                    .map_or_else(
+                        || catalog.t("agent_launcher.model_hint", &[]),
+                        |choice| choice.label().to_owned(),
+                    );
+                ui.add_enabled_ui(!self.launch_pending, |ui| {
+                    egui::ComboBox::from_id_salt(("agent-launcher-model", kind.id()))
+                        .selected_text(selected)
+                        .width(360.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    self.model.is_empty(),
+                                    catalog.t("agent_launcher.model_hint", &[]),
+                                )
+                                .clicked()
+                            {
+                                self.model.clear();
+                                self.reconcile_effort(kind);
+                            }
+                            for choice in models {
+                                if ui
+                                    .selectable_label(self.model == choice.value(), choice.label())
+                                    .clicked()
+                                {
+                                    self.model = choice.value().to_owned();
+                                    self.reconcile_effort(kind);
+                                }
+                            }
+                        });
+                });
             });
-            truncate_utf8(&mut self.model, MODEL_INPUT_MAX_BYTES);
         }
 
-        let efforts = kind.supported_efforts();
+        let efforts = kind.supported_efforts(&self.model);
         if !efforts.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(catalog.t("agent_launcher.effort", &[]));
-                let selected = self.effort.map_or_else(
+                let default_label = kind.default_effort(&self.model).map_or_else(
                     || catalog.t("agent_launcher.effort.default", &[]),
+                    |effort| {
+                        let effort = catalog.t(effort_message_key(effort), &[]);
+                        catalog.t(
+                            "agent_launcher.effort.default_value",
+                            &[("effort", effort.as_str())],
+                        )
+                    },
+                );
+                let selected = self.effort.map_or_else(
+                    || default_label.clone(),
                     |effort| catalog.t(effort_message_key(effort), &[]),
                 );
                 ui.add_enabled_ui(!self.launch_pending, |ui| {
@@ -257,10 +291,7 @@ impl AgentLauncherUi {
                         .selected_text(selected)
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(
-                                    self.effort.is_none(),
-                                    catalog.t("agent_launcher.effort.default", &[]),
-                                )
+                                .selectable_label(self.effort.is_none(), default_label)
                                 .clicked()
                             {
                                 self.effort = None;
@@ -306,6 +337,7 @@ impl AgentLauncherUi {
         let Some(snapshot) = snapshot else {
             return;
         };
+        let previous_selected = self.selected;
         if self
             .selected
             .is_some_and(|selected| snapshot.find(selected).is_none())
@@ -315,16 +347,12 @@ impl AgentLauncherUi {
         if self.selected.is_none() {
             self.selected = snapshot.agents().first().map(|agent| agent.kind());
         }
+        if self.selected != previous_selected {
+            self.model.clear();
+        }
         if let Some(kind) = self.selected {
-            if !kind.supports_model() {
-                self.model.clear();
-            }
-            if self
-                .effort
-                .is_some_and(|effort| !kind.supported_efforts().contains(&effort))
-            {
-                self.effort = None;
-            }
+            self.reconcile_model(kind);
+            self.reconcile_effort(kind);
             if !kind.supports_yolo() {
                 self.yolo = false;
             }
@@ -332,19 +360,35 @@ impl AgentLauncherUi {
     }
 
     fn select(&mut self, kind: AgentKind) {
-        self.selected = Some(kind);
-        self.error = None;
-        if !kind.supports_model() {
+        if self.selected != Some(kind) {
             self.model.clear();
         }
-        if self
-            .effort
-            .is_some_and(|effort| !kind.supported_efforts().contains(&effort))
-        {
-            self.effort = None;
-        }
+        self.selected = Some(kind);
+        self.error = None;
+        self.reconcile_model(kind);
+        self.reconcile_effort(kind);
         if !kind.supports_yolo() {
             self.yolo = false;
+        }
+    }
+
+    fn reconcile_model(&mut self, kind: AgentKind) {
+        if !self.model.is_empty()
+            && !kind
+                .supported_models()
+                .iter()
+                .any(|choice| choice.value() == self.model)
+        {
+            self.model.clear();
+        }
+    }
+
+    fn reconcile_effort(&mut self, kind: AgentKind) {
+        if self
+            .effort
+            .is_some_and(|effort| !kind.supported_efforts(&self.model).contains(&effort))
+        {
+            self.effort = None;
         }
     }
 }
@@ -408,24 +452,13 @@ fn agent_card(ui: &mut egui::Ui, kind: AgentKind, selected: bool) -> egui::Respo
 
 const fn effort_message_key(effort: ReasoningEffort) -> &'static str {
     match effort {
-        ReasoningEffort::Minimal => "agent_launcher.effort.minimal",
         ReasoningEffort::Low => "agent_launcher.effort.low",
         ReasoningEffort::Medium => "agent_launcher.effort.medium",
         ReasoningEffort::High => "agent_launcher.effort.high",
         ReasoningEffort::XHigh => "agent_launcher.effort.xhigh",
         ReasoningEffort::Max => "agent_launcher.effort.max",
+        ReasoningEffort::Ultra => "agent_launcher.effort.ultra",
     }
-}
-
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut boundary = max_bytes;
-    while boundary > 0 && !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
 }
 
 #[cfg(test)]
@@ -467,5 +500,37 @@ mod tests {
         ui.reconcile_selection(Some(&second));
         assert_eq!(ui.selected, Some(AgentKind::OpenCode));
         assert!(!ui.yolo);
+    }
+
+    #[test]
+    fn changing_provider_clears_an_incompatible_model_choice() {
+        let mut ui = AgentLauncherUi::new();
+        ui.select(AgentKind::Claude);
+        ui.model = "sonnet".to_owned();
+        ui.select(AgentKind::Codex);
+        assert!(ui.model.is_empty());
+
+        ui.model = "gpt-5.6-sol".to_owned();
+        ui.select(AgentKind::Codex);
+        assert_eq!(ui.model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn changing_codex_model_clears_an_unsupported_reasoning_effort() {
+        let mut ui = AgentLauncherUi::new();
+        ui.select(AgentKind::Codex);
+        ui.model = "gpt-5.6-sol".to_owned();
+        ui.effort = Some(ReasoningEffort::Ultra);
+        ui.reconcile_effort(AgentKind::Codex);
+        assert_eq!(ui.effort, Some(ReasoningEffort::Ultra));
+
+        ui.model = "gpt-5.6-luna".to_owned();
+        ui.reconcile_effort(AgentKind::Codex);
+        assert!(ui.effort.is_none());
+
+        ui.model = "gpt-5.6-luna".to_owned();
+        ui.effort = Some(ReasoningEffort::Max);
+        ui.reconcile_effort(AgentKind::Codex);
+        assert_eq!(ui.effort, Some(ReasoningEffort::Max));
     }
 }

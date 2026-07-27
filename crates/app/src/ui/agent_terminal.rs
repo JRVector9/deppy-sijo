@@ -29,7 +29,8 @@ const ANNOUNCEMENT_VISIBLE_ROWS: usize = 5;
 const ANNOUNCEMENT_ROW_HEIGHT: f32 = 44.8;
 const ANNOUNCEMENT_DATE_WIDTH: f32 = 82.0;
 const ANNOUNCEMENT_LINK_WIDTH: f32 = 30.0;
-const ANNOUNCEMENT_LOGO_SIZE: f32 = 22.0;
+const ANNOUNCEMENT_LOGO_SIZE: f32 = 20.0;
+const ANNOUNCEMENT_LOGO_BASE_SIZE: f32 = 22.0;
 const ANNOUNCEMENT_LOGO_LEFT_GAP: f32 = 2.4;
 const ANNOUNCEMENT_TITLE_GAP: f32 = 8.0;
 const ANNOUNCEMENT_RIGHT_INSET: f32 = 8.0;
@@ -53,7 +54,6 @@ pub struct NoticeTranslations<'a> {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct WorkspaceTotals {
-    workspaces: usize,
     active: usize,
     warm: usize,
     idle: usize,
@@ -144,9 +144,12 @@ impl AgentTerminalUi {
         action
     }
 
+    #[allow(clippy::too_many_arguments)] // 하단 상태바가 provider usage까지 함께 그린다.
     pub fn status_bar(
         &self,
         ui: &mut egui::Ui,
+        claude_usage: Option<(u8, u8)>,
+        codex_usage: Option<(u8, u8)>,
         rows: &[ActivityWorkspaceRow],
         waiting: usize,
         mcp_count: usize,
@@ -164,18 +167,7 @@ impl AgentTerminalUi {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
-                // 서비스 연결/건강 집계 — 이전엔 항상 켜진 장식용 초록불이었으나
-                // 실제 상태를 반영하도록 바꿨다(2026-07-23 사용자). 폴링 전엔 회색,
-                // 정상=초록, 일부 이상=주황, 장애=빨강.
-                let (conn_color, conn_key) = connection_health(ui, feed);
-                status_dot(ui, conn_color);
-                ui.weak(catalog.t(conn_key, &[]))
-                    .on_hover_text(catalog.t("status_bar.connection_hover", &[]));
-                ui.separator();
-                ui.weak(catalog.t(
-                    "status_bar.workspaces",
-                    &[("count", &totals.workspaces.to_string())],
-                ));
+                crate::app::top_provider_usage(ui, claude_usage, codex_usage);
                 ui.separator();
                 ui.weak(catalog.t(
                     "status_bar.sessions",
@@ -609,7 +601,11 @@ fn announcement_columns(row_rect: egui::Rect) -> AnnouncementColumns {
 
 /// 외부 이미지 없이 작은 크기에 맞춰 그리는 provider mark. 공급자명은 화면에서 제거하되
 /// hover/accessibility에는 남겨 로고만으로 구분하기 어려운 사용자도 확인할 수 있게 한다.
-fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Rect, source: &str) {
+pub(crate) fn paint_announcement_provider_logo(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    source: &str,
+) {
     let label = format!("{} logo", announcement_source_label(source));
     let response = ui
         .interact(
@@ -627,16 +623,23 @@ fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Rect, source:
     });
     let painter = ui.painter();
     let center = rect.center();
+    let scale = rect.width().min(rect.height()) / ANNOUNCEMENT_LOGO_BASE_SIZE;
     match source {
         "Claude" => {
             let color = egui::Color32::from_rgb(0xe7, 0x9a, 0x3b);
-            let stroke = egui::Stroke::new(1.8, color);
+            let stroke = egui::Stroke::new(1.8 * scale, color);
             for index in 0..8 {
                 let angle = index as f32 * std::f32::consts::TAU / 8.0;
                 let direction = egui::vec2(angle.cos(), angle.sin());
-                painter.line_segment([center + direction * 2.8, center + direction * 8.0], stroke);
+                painter.line_segment(
+                    [
+                        center + direction * (2.8 * scale),
+                        center + direction * (8.0 * scale),
+                    ],
+                    stroke,
+                );
             }
-            painter.circle_filled(center, 2.2, color);
+            painter.circle_filled(center, 2.2 * scale, color);
         }
         "Grok" => {
             let color = egui::Color32::from_rgb(0xa5, 0x70, 0xff);
@@ -679,13 +682,14 @@ fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Rect, source:
         _ => {
             // OpenAI knot를 작은 크기에서 읽히는 여섯 개의 연결 루프로 단순화한다.
             let color = ui.visuals().hyperlink_color;
-            let stroke = egui::Stroke::new(1.35, color);
+            let stroke = egui::Stroke::new(1.35 * scale, color);
             for index in 0..6 {
                 let angle = index as f32 * std::f32::consts::TAU / 6.0;
-                let loop_center = center + egui::vec2(angle.cos(), angle.sin()) * 4.2;
-                painter.circle_stroke(loop_center, 3.4, stroke);
+                let loop_center =
+                    center + egui::vec2(angle.cos(), angle.sin()) * (4.2 * scale);
+                painter.circle_stroke(loop_center, 3.4 * scale, stroke);
             }
-            painter.circle_stroke(center, 2.2, stroke);
+            painter.circle_stroke(center, 2.2 * scale, stroke);
         }
     }
 }
@@ -832,10 +836,7 @@ fn memory_label(catalog: &i18n::Catalog, app_rss: u64, session_rss: u64, compact
 }
 
 fn workspace_totals(rows: &[ActivityWorkspaceRow]) -> WorkspaceTotals {
-    let mut totals = WorkspaceTotals {
-        workspaces: rows.len(),
-        ..WorkspaceTotals::default()
-    };
+    let mut totals = WorkspaceTotals::default();
     // 앱 스냅샷은 pid별 **최신 샘플**을 고른다 — 워크스페이스 워커마다 2초 주기
     // 샘플 시점이 제각각이라, 먼저 만난 행을 쓰면 다른 표시(구 상단 표시·설정)와
     // 수 MB 어긋났다(2026-07-18 사용자 보고 — 표시 수치 불일치의 원인).
@@ -897,48 +898,6 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
-/// 하단 "연결" 점등 — 상태페이지가 있는 provider(Claude/OpenAI/GitHub/Grok)를 집계한다.
-/// 아직 아무 응답도 없으면(오프라인/폴링 전) 회색 "확인 중", 하나라도 응답이 있으면
-/// 그중 가장 나쁜 상태로 정상(초록)/일부 이상(주황)/장애(빨강)를 표시한다.
-fn connection_health(ui: &egui::Ui, feed: &StatusFeedSnapshot) -> (egui::Color32, &'static str) {
-    let indicators: Vec<ServiceIndicator> = [
-        feed.claude.as_ref(),
-        feed.openai.as_ref(),
-        feed.github.as_ref(),
-        feed.grok.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|p| p.indicator)
-    .collect();
-    if indicators.is_empty() {
-        return (
-            ui.visuals().weak_text_color(),
-            "status_bar.connection.checking",
-        );
-    }
-    let severity = |indicator: &ServiceIndicator| match indicator {
-        ServiceIndicator::Operational => 0u8,
-        ServiceIndicator::Unknown => 1,
-        ServiceIndicator::Minor => 2,
-        ServiceIndicator::Major | ServiceIndicator::Critical => 3,
-    };
-    match indicators.iter().max_by_key(|i| severity(i)).map(severity) {
-        Some(3) => (
-            egui::Color32::from_rgb(0xed, 0x5b, 0x61),
-            "status_bar.connection.outage",
-        ),
-        Some(2) => (
-            egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-            "status_bar.connection.degraded",
-        ),
-        _ => (
-            egui::Color32::from_rgb(0x55, 0xc8, 0x79),
-            "status_bar.connection.ok",
-        ),
-    }
-}
-
 /// indicator → 점등 색. 미조회(None)/미지 값은 회색.
 fn indicator_color(ui: &egui::Ui, provider: Option<&ProviderStatus>) -> egui::Color32 {
     match provider.map(|p| p.indicator) {
@@ -985,7 +944,6 @@ mod tests {
     #[test]
     fn empty_totals_are_stable() {
         let totals = workspace_totals(&[]);
-        assert_eq!(totals.workspaces, 0);
         assert_eq!(totals.sessions, 0);
         assert!(!totals.cpu_seen);
     }
@@ -1051,7 +1009,7 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let feed = StatusFeedSnapshot::default();
         let mut harness = egui_kittest::Harness::new_ui(move |ui| {
-            AgentTerminalUi::new().status_bar(ui, &[], 0, 0, &feed, &catalog);
+            AgentTerminalUi::new().status_bar(ui, None, None, &[], 0, 0, &feed, &catalog);
         });
         harness.run();
 

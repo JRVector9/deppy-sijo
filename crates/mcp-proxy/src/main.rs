@@ -373,11 +373,20 @@ fn run_statusline(args: &[String]) -> anyhow::Result<()> {
     let ctx = json
         .pointer("/context_window/remaining_percentage")
         .and_then(serde_json::Value::as_i64);
+    let usage = claude_statusline_usage(&json);
     let sig = format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         effort.unwrap_or(""),
         model.unwrap_or(""),
-        ctx.map(|c| c.to_string()).unwrap_or_default()
+        ctx.map(|c| c.to_string()).unwrap_or_default(),
+        usage
+            .and_then(|(five_hour, _)| five_hour)
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        usage
+            .and_then(|(_, weekly)| weekly)
+            .map(|value| value.to_string())
+            .unwrap_or_default()
     );
     // sig 파일로 렌더마다의 DB write를 막는다 — 값이 바뀐 렌더에서만 DB에 쓴다.
     let sig_path = statusline_sig_path(&session_key);
@@ -394,8 +403,57 @@ fn run_statusline(args: &[String]) -> anyhow::Result<()> {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(&sig_path, sig);
+        if let Some((five_hour, weekly)) = usage {
+            write_claude_usage_snapshot(five_hour, weekly);
+        }
     }
     Ok(())
+}
+
+fn claude_statusline_usage(json: &serde_json::Value) -> Option<(Option<u8>, Option<u8>)> {
+    let percent = |path: &str| {
+        let window = json.pointer(path)?;
+        window
+            .get("used_percentage")
+            .or_else(|| window.get("utilization"))?
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 100.0).round() as u8)
+    };
+    let five_hour = percent("/rate_limits/five_hour");
+    let weekly = percent("/rate_limits/seven_day");
+    (five_hour.is_some() || weekly.is_some()).then_some((five_hour, weekly))
+}
+
+fn write_claude_usage_snapshot(five_hour: Option<u8>, weekly: Option<u8>) {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let dir = home.join(".deppy-sijo");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("claude-usage.json");
+    let temporary = dir.join(format!("claude-usage.{}.tmp", std::process::id()));
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "five_hour": five_hour,
+        "seven_day": weekly,
+        "updated_at": updated_at,
+    });
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    if std::fs::write(&temporary, bytes).is_err() {
+        return;
+    }
+    if std::fs::rename(&temporary, &path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
 }
 
 /// 세션별 statusLine 시그니처 캐시 경로(`~/.deppy-sijo/statusline/<sanitized-key>.sig`).

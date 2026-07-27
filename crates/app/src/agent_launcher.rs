@@ -6,6 +6,37 @@ const EXECUTABLE_PATH_MAX_BYTES: usize = 4 * 1024;
 const MODEL_MAX_BYTES: usize = 256;
 const DETECTION_PATH_ITEMS_MAX: usize = 96;
 const DETECTION_LAUNCH_PATH_MAX_BYTES: usize = 32 * 1024;
+const CODEX_EFFORTS_XHIGH: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+];
+const CODEX_EFFORTS_MAX: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+];
+const CODEX_EFFORTS_ULTRA: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+    ReasoningEffort::Ultra,
+];
+const CLAUDE_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+];
+
+#[cfg(unix)]
+const AGENT_THEN_SHELL_SCRIPT: &str = r#""$@"; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${SHELL:-/bin/sh}""#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AgentKind {
@@ -20,6 +51,32 @@ pub(crate) enum AgentKind {
     QwenCode,
     Cursor,
     Copilot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelChoice {
+    value: &'static str,
+    label: &'static str,
+    efforts: &'static [ReasoningEffort],
+    default_effort: Option<ReasoningEffort>,
+}
+
+impl ModelChoice {
+    pub(crate) const fn value(self) -> &'static str {
+        self.value
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        self.label
+    }
+
+    pub(crate) const fn efforts(self) -> &'static [ReasoningEffort] {
+        self.efforts
+    }
+
+    pub(crate) const fn default_effort(self) -> Option<ReasoningEffort> {
+        self.default_effort
+    }
 }
 
 impl AgentKind {
@@ -137,6 +194,102 @@ impl AgentKind {
         matches!(self, Self::Claude | Self::Codex | Self::Kimi)
     }
 
+    pub(crate) const fn supported_models(self) -> &'static [ModelChoice] {
+        match self {
+            Self::Claude => &[
+                ModelChoice {
+                    value: "sonnet",
+                    label: "Sonnet",
+                    efforts: CLAUDE_EFFORTS,
+                    default_effort: None,
+                },
+                ModelChoice {
+                    value: "opus",
+                    label: "Opus",
+                    efforts: CLAUDE_EFFORTS,
+                    default_effort: None,
+                },
+                ModelChoice {
+                    value: "fable",
+                    label: "Fable",
+                    efforts: CLAUDE_EFFORTS,
+                    default_effort: None,
+                },
+            ],
+            Self::Codex => &[
+                ModelChoice {
+                    value: "gpt-5.6-sol",
+                    label: "GPT-5.6-Sol",
+                    efforts: CODEX_EFFORTS_ULTRA,
+                    default_effort: Some(ReasoningEffort::Low),
+                },
+                ModelChoice {
+                    value: "gpt-5.6-terra",
+                    label: "GPT-5.6-Terra",
+                    efforts: CODEX_EFFORTS_ULTRA,
+                    default_effort: Some(ReasoningEffort::Medium),
+                },
+                ModelChoice {
+                    value: "gpt-5.6-luna",
+                    label: "GPT-5.6-Luna",
+                    efforts: CODEX_EFFORTS_MAX,
+                    default_effort: Some(ReasoningEffort::Medium),
+                },
+                ModelChoice {
+                    value: "gpt-5.5",
+                    label: "GPT-5.5",
+                    efforts: CODEX_EFFORTS_XHIGH,
+                    default_effort: Some(ReasoningEffort::Medium),
+                },
+                ModelChoice {
+                    value: "gpt-5.4",
+                    label: "GPT-5.4",
+                    efforts: CODEX_EFFORTS_XHIGH,
+                    default_effort: Some(ReasoningEffort::Medium),
+                },
+                ModelChoice {
+                    value: "gpt-5.4-mini",
+                    label: "GPT-5.4-Mini",
+                    efforts: CODEX_EFFORTS_XHIGH,
+                    default_effort: Some(ReasoningEffort::Medium),
+                },
+                ModelChoice {
+                    value: "gpt-5.3-codex-spark",
+                    label: "GPT-5.3-Codex-Spark",
+                    efforts: CODEX_EFFORTS_XHIGH,
+                    default_effort: Some(ReasoningEffort::High),
+                },
+            ],
+            Self::Kimi => &[
+                ModelChoice {
+                    value: "kimi-code/kimi-for-coding",
+                    label: "K2.7 Coding",
+                    efforts: &[],
+                    default_effort: None,
+                },
+                ModelChoice {
+                    value: "kimi-code/kimi-for-coding-highspeed",
+                    label: "K2.7 Coding Highspeed",
+                    efforts: &[],
+                    default_effort: None,
+                },
+                ModelChoice {
+                    value: "kimi-code/k3",
+                    label: "K3",
+                    efforts: &[],
+                    default_effort: None,
+                },
+                ModelChoice {
+                    value: "kimi-code/k3-256k",
+                    label: "K3-256k",
+                    efforts: &[],
+                    default_effort: None,
+                },
+            ],
+            _ => &[],
+        }
+    }
+
     pub(crate) const fn supports_yolo(self) -> bool {
         !matches!(self, Self::OpenCode)
     }
@@ -145,24 +298,25 @@ impl AgentKind {
         matches!(self, Self::Claude | Self::Codex)
     }
 
-    pub(crate) const fn supported_efforts(self) -> &'static [ReasoningEffort] {
-        match self {
-            Self::Codex => &[
-                ReasoningEffort::Minimal,
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::XHigh,
-            ],
-            Self::Claude => &[
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::XHigh,
-                ReasoningEffort::Max,
-            ],
-            _ => &[],
-        }
+    pub(crate) fn supported_efforts(self, model: &str) -> &'static [ReasoningEffort] {
+        self.supported_models()
+            .iter()
+            .find(|choice| choice.value() == model)
+            .map_or_else(
+                || match self {
+                    Self::Codex => CODEX_EFFORTS_XHIGH,
+                    Self::Claude => CLAUDE_EFFORTS,
+                    _ => &[],
+                },
+                |choice| choice.efforts(),
+            )
+    }
+
+    pub(crate) fn default_effort(self, model: &str) -> Option<ReasoningEffort> {
+        self.supported_models()
+            .iter()
+            .find(|choice| choice.value() == model)
+            .and_then(|choice| choice.default_effort())
     }
 }
 
@@ -174,23 +328,23 @@ pub(crate) fn is_builtin_config_id(id: &str) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReasoningEffort {
-    Minimal,
     Low,
     Medium,
     High,
     XHigh,
     Max,
+    Ultra,
 }
 
 impl ReasoningEffort {
     pub(crate) const fn value(self) -> &'static str {
         match self {
-            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 }
@@ -284,6 +438,22 @@ impl LaunchSpec {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn wrap_agent_then_shell(command: String, args: Vec<String>) -> (String, Vec<String>) {
+    let mut wrapped_args = Vec::with_capacity(args.len() + 4);
+    wrapped_args.push("-c".to_owned());
+    wrapped_args.push(AGENT_THEN_SHELL_SCRIPT.to_owned());
+    wrapped_args.push("deppy-agent-session".to_owned());
+    wrapped_args.push(command);
+    wrapped_args.extend(args);
+    ("/bin/sh".to_owned(), wrapped_args)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn wrap_agent_then_shell(command: String, args: Vec<String>) -> (String, Vec<String>) {
+    (command, args)
+}
+
 pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> DetectionSnapshot {
     let paths = detection_paths(excluded_directory);
     let launch_path = launch_search_path(&paths);
@@ -314,12 +484,19 @@ pub(crate) fn build_launch_spec(
     if model.len() > MODEL_MAX_BYTES || model.bytes().any(|byte| byte.is_ascii_control()) {
         return Err(LaunchSpecErrorCode::InvalidModel);
     }
-    if !model.is_empty() && !agent.kind.supports_model() {
+    if !model.is_empty()
+        && (!agent.kind.supports_model()
+            || !agent
+                .kind
+                .supported_models()
+                .iter()
+                .any(|choice| choice.value() == model))
+    {
         return Err(LaunchSpecErrorCode::UnsupportedModel);
     }
     if options
         .effort
-        .is_some_and(|effort| !agent.kind.supported_efforts().contains(&effort))
+        .is_some_and(|effort| !agent.kind.supported_efforts(model).contains(&effort))
     {
         return Err(LaunchSpecErrorCode::UnsupportedEffort);
     }
@@ -567,7 +744,7 @@ mod tests {
         let spec = build_launch_spec(
             &detected(AgentKind::Codex),
             LaunchOptions {
-                model: "gpt-test".to_owned(),
+                model: "gpt-5.4".to_owned(),
                 effort: Some(ReasoningEffort::XHigh),
                 yolo: true,
             },
@@ -581,7 +758,7 @@ mod tests {
             [
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--model",
-                "gpt-test",
+                "gpt-5.4",
                 "--config",
                 "model_reasoning_effort=\"xhigh\"",
             ]
@@ -626,7 +803,7 @@ mod tests {
         let spec = build_launch_spec(
             &detected(AgentKind::Kimi),
             LaunchOptions {
-                model: "kimi-k2.5".to_owned(),
+                model: "kimi-code/k3".to_owned(),
                 effort: None,
                 yolo: false,
             },
@@ -634,7 +811,104 @@ mod tests {
         )
         .unwrap();
         let (_, _, args, _) = spec.into_parts();
-        assert_eq!(args, ["--model", "kimi-k2.5"]);
+        assert_eq!(args, ["--model", "kimi-code/k3"]);
+    }
+
+    #[test]
+    fn model_capabilities_expose_bounded_unique_selectable_values() {
+        for kind in AgentKind::ALL {
+            let choices = kind.supported_models();
+            assert_eq!(kind.supports_model(), !choices.is_empty(), "{}", kind.id());
+            assert!(choices.len() <= 16, "{}", kind.id());
+            let mut values = HashSet::new();
+            for choice in choices {
+                assert!(!choice.value().is_empty(), "{}", kind.id());
+                assert!(choice.value().len() <= MODEL_MAX_BYTES, "{}", kind.id());
+                assert!(
+                    !choice.value().bytes().any(|byte| byte.is_ascii_control()),
+                    "{}",
+                    kind.id()
+                );
+                assert!(!choice.label().is_empty(), "{}", kind.id());
+                assert!(
+                    choice
+                        .default_effort()
+                        .is_none_or(|effort| choice.efforts().contains(&effort)),
+                    "{}:{}",
+                    kind.id(),
+                    choice.value()
+                );
+                for (index, effort) in choice.efforts().iter().enumerate() {
+                    assert!(
+                        !choice.efforts()[..index].contains(effort),
+                        "{}:{}",
+                        kind.id(),
+                        choice.value()
+                    );
+                }
+                assert!(values.insert(choice.value()), "{}", kind.id());
+            }
+        }
+    }
+
+    #[test]
+    fn codex_reasoning_capabilities_follow_the_selected_model() {
+        assert_eq!(
+            AgentKind::Codex.supported_efforts("gpt-5.6-sol"),
+            CODEX_EFFORTS_ULTRA
+        );
+        assert_eq!(
+            AgentKind::Codex.default_effort("gpt-5.6-sol"),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            AgentKind::Codex.supported_efforts("gpt-5.6-luna"),
+            CODEX_EFFORTS_MAX
+        );
+        assert_eq!(
+            AgentKind::Codex.supported_efforts("gpt-5.4"),
+            CODEX_EFFORTS_XHIGH
+        );
+        assert_eq!(
+            AgentKind::Codex.default_effort("gpt-5.3-codex-spark"),
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn codex_launch_rejects_an_effort_the_selected_model_does_not_support() {
+        assert!(matches!(
+            build_launch_spec(
+                &detected(AgentKind::Codex),
+                LaunchOptions {
+                    model: "gpt-5.6-luna".to_owned(),
+                    effort: Some(ReasoningEffort::Ultra),
+                    yolo: false,
+                },
+                None,
+            ),
+            Err(LaunchSpecErrorCode::UnsupportedEffort)
+        ));
+        let spec = build_launch_spec(
+            &detected(AgentKind::Codex),
+            LaunchOptions {
+                model: "gpt-5.6-sol".to_owned(),
+                effort: Some(ReasoningEffort::Ultra),
+                yolo: false,
+            },
+            None,
+        )
+        .unwrap();
+        let (_, _, args, _) = spec.into_parts();
+        assert_eq!(
+            args,
+            [
+                "--model",
+                "gpt-5.6-sol",
+                "--config",
+                "model_reasoning_effort=\"ultra\""
+            ]
+        );
     }
 
     #[test]
@@ -688,6 +962,56 @@ mod tests {
             ),
             Err(LaunchSpecErrorCode::UnsupportedModel)
         ));
+        assert!(matches!(
+            build_launch_spec(
+                &detected(AgentKind::Codex),
+                LaunchOptions {
+                    model: "unknown-codex-model".to_owned(),
+                    effort: None,
+                    yolo: false,
+                },
+                None,
+            ),
+            Err(LaunchSpecErrorCode::UnsupportedModel)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_exit_returns_to_an_interactive_shell_without_requoting_arguments() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let (command, args) = wrap_agent_then_shell(
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), "printf 'agent-done\\n'".to_owned()],
+        );
+        assert_eq!(command, "/bin/sh");
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[1], AGENT_THEN_SHELL_SCRIPT);
+        assert_eq!(args[2], "deppy-agent-session");
+        assert_eq!(args[3], "/bin/sh");
+        assert_eq!(args[4..], ["-c", "printf 'agent-done\\n'"]);
+
+        let mut child = Command::new(command)
+            .args(args)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"printf 'shell-ready\\n'\nexit\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("agent-done\n"), "{stdout:?}");
+        assert!(stdout.contains("shell-ready\n"), "{stdout:?}");
     }
 
     #[cfg(unix)]

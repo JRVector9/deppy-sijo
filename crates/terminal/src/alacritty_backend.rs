@@ -49,10 +49,16 @@ fn composed_char(base: char, zerowidth: Option<&[char]>) -> char {
 /// ColorRequest는 팔레트 참조가 필요해 feed()에서 해석한다.
 type ColorFormatter = std::sync::Arc<dyn Fn(Rgb) -> String + Sync + Send + 'static>;
 
+enum PtyResponseEvent {
+    Bytes(String),
+    ColorRequest(usize, ColorFormatter),
+}
+
 #[derive(Clone, Default)]
 struct CollectingListener {
-    pty_responses: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    color_requests: std::sync::Arc<std::sync::Mutex<Vec<(usize, ColorFormatter)>>>,
+    /// 응답 종류별 버퍼를 따로 두면 `OSC 11` 뒤의 `CSI 6n`처럼 한 feed에 들어온
+    /// 질의의 응답 순서가 뒤집힌다. 자식이 요청한 순서 그대로 한 큐에 보관한다.
+    pty_response_events: std::sync::Arc<std::sync::Mutex<Vec<PtyResponseEvent>>>,
     /// OSC 0/2로 프로그램이 설정한 터미널 제목(현재 값). 세션 이름 동적 표시에 쓴다.
     title: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
@@ -61,15 +67,15 @@ impl EventListener for CollectingListener {
     fn send_event(&self, event: Event) {
         match event {
             Event::PtyWrite(text) => self
-                .pty_responses
+                .pty_response_events
                 .lock()
-                .expect("pty_responses lock")
-                .extend_from_slice(text.as_bytes()),
+                .expect("pty response events lock")
+                .push(PtyResponseEvent::Bytes(text)),
             Event::ColorRequest(index, formatter) => self
-                .color_requests
+                .pty_response_events
                 .lock()
-                .expect("color_requests lock")
-                .push((index, formatter)),
+                .expect("pty response events lock")
+                .push(PtyResponseEvent::ColorRequest(index, formatter)),
             // OSC 0/2 제목 — 최신 값 보관, 리셋이면 비운다.
             Event::Title(t) => *self.title.lock().expect("title lock") = Some(t),
             Event::ResetTitle => *self.title.lock().expect("title lock") = None,
@@ -308,30 +314,32 @@ impl TerminalBackend for AlacrittyBackend {
         }
         self.term.reset_damage();
 
-        let mut pty_responses = std::mem::take(
+        let response_events = std::mem::take(
             &mut *self
                 .listener
-                .pty_responses
+                .pty_response_events
                 .lock()
-                .expect("pty_responses lock"),
+                .expect("pty response events lock"),
         );
-        // OSC 색상 질의(ESC]10;? / ESC]4;n;? 등) — 현재 팔레트(재정의 반영) 기준으로 응답
-        let color_requests = std::mem::take(
-            &mut *self
-                .listener
-                .color_requests
-                .lock()
-                .expect("color_requests lock"),
-        );
-        for (index, formatter) in color_requests {
-            // 자식 프로세스 출력은 임의 데이터 — 범위 밖 인덱스는 무시 (panic 금지)
-            if index >= alacritty_terminal::term::color::COUNT {
-                continue;
+        let mut pty_responses = Vec::new();
+        for event in response_events {
+            match event {
+                PtyResponseEvent::Bytes(text) => {
+                    pty_responses.extend_from_slice(text.as_bytes());
+                }
+                // OSC 색상 질의(ESC]10;? / ESC]4;n;? 등) — 현재 팔레트(재정의
+                // 반영) 기준으로 응답하되 다른 질의와의 원래 순서를 보존한다.
+                PtyResponseEvent::ColorRequest(index, formatter) => {
+                    // 자식 프로세스 출력은 임의 데이터 — 범위 밖 인덱스는 무시 (panic 금지)
+                    if index >= alacritty_terminal::term::color::COUNT {
+                        continue;
+                    }
+                    let [r, g, b] = self.term.colors()[index]
+                        .map(rgb_to_arr)
+                        .unwrap_or_else(|| palette_default(index));
+                    pty_responses.extend_from_slice(formatter(Rgb { r, g, b }).as_bytes());
+                }
             }
-            let [r, g, b] = self.term.colors()[index]
-                .map(rgb_to_arr)
-                .unwrap_or_else(|| palette_default(index));
-            pty_responses.extend_from_slice(formatter(Rgb { r, g, b }).as_bytes());
         }
         Ok(TerminalChangeSet {
             dirty_rows,
@@ -1382,6 +1390,29 @@ mod tests {
         let text = String::from_utf8_lossy(&changes.pty_responses).into_owned();
         assert!(text.contains("]10;"), "응답 없음: {text:?}");
         assert!(text.contains("rgb:"), "rgb 형식 아님: {text:?}");
+    }
+
+    #[test]
+    fn osc_색상과_커서_질의_응답은_요청_순서를_지킨다() {
+        let mut backend = AlacrittyBackend::new(80, 24, 100);
+        // termenv(gh가 터미널 테마 감지에 사용)는 OSC 11 다음 DSR을 보내고,
+        // 같은 순서로 응답을 읽는다. 순서가 뒤집히면 OSC 응답이 셸 입력에 남는다.
+        let changes = feed(&mut backend, b"\x1b]11;?\x1b\\\x1b[6n");
+        assert!(
+            changes.pty_responses.starts_with(b"\x1b]11;rgb:"),
+            "OSC 11보다 다른 응답이 먼저 나옴: {:?}",
+            String::from_utf8_lossy(&changes.pty_responses)
+        );
+        let osc_end = changes
+            .pty_responses
+            .windows(2)
+            .position(|window| window == b"\x1b\\")
+            .expect("OSC response terminator");
+        assert!(
+            changes.pty_responses[osc_end + 2..].starts_with(b"\x1b["),
+            "OSC 11 뒤에 DSR 응답이 없음: {:?}",
+            String::from_utf8_lossy(&changes.pty_responses)
+        );
     }
 
     #[test]

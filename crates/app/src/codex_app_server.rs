@@ -626,6 +626,12 @@ impl CodexAppServerClient {
         Ok(receiver)
     }
 
+    pub fn read_rate_limits(&self) -> anyhow::Result<CodexAppServerReply> {
+        let (reply, receiver) = mpsc::sync_channel(REPLY_QUEUE_CAPACITY);
+        self.send(ClientCommand::ReadRateLimits { reply })?;
+        Ok(receiver)
+    }
+
     /// Interrupt only the selected thread/turn. The shared App Server process
     /// remains available for other sessions.
     pub fn interrupt(&self, session_id: AgentSessionId) -> anyhow::Result<()> {
@@ -898,6 +904,9 @@ enum ClientCommand {
         force_reload: bool,
         reply: SyncSender<anyhow::Result<Vec<CodexSkillInfo>>>,
     },
+    ReadRateLimits {
+        reply: SyncSender<anyhow::Result<Value>>,
+    },
 }
 
 fn command_retained_bytes(command: &ClientCommand) -> usize {
@@ -968,6 +977,7 @@ fn command_retained_bytes(command: &ClientCommand) -> usize {
         ClientCommand::ListSkills { cwds, .. } => cwds
             .iter()
             .fold(0usize, |bytes, cwd| bytes.saturating_add(cwd.len())),
+        ClientCommand::ReadRateLimits { .. } => 0,
     }
 }
 
@@ -1005,7 +1015,8 @@ fn command_identifiers_are_valid(command: &ClientCommand) -> bool {
         } => valid_identifier(session_id) && valid_identifier(thread_id),
         ClientCommand::ListThreads { .. }
         | ClientCommand::ListModels { .. }
-        | ClientCommand::ListSkills { .. } => true,
+        | ClientCommand::ListSkills { .. }
+        | ClientCommand::ReadRateLimits { .. } => true,
     }
 }
 
@@ -1087,6 +1098,9 @@ enum PendingRequest {
     },
     ListSkills {
         reply: SyncSender<anyhow::Result<Vec<CodexSkillInfo>>>,
+    },
+    ReadRateLimits {
+        reply: SyncSender<anyhow::Result<Value>>,
     },
 }
 
@@ -1459,13 +1473,15 @@ fn handle_client_command(
         | ClientCommand::ReadThread { .. }
         | ClientCommand::ArchiveThread { .. }
         | ClientCommand::ListModels { .. }
-        | ClientCommand::ListSkills { .. } => None,
+        | ClientCommand::ListSkills { .. }
+        | ClientCommand::ReadRateLimits { .. } => None,
     };
     let rpc_reply = match &command {
         ClientCommand::ListThreads { reply, .. }
         | ClientCommand::ReadThread { reply, .. }
         | ClientCommand::ResumeThread { reply, .. }
-        | ClientCommand::ArchiveThread { reply, .. } => {
+        | ClientCommand::ArchiveThread { reply, .. }
+        | ClientCommand::ReadRateLimits { reply } => {
             Some(ClientCommandReply::Json(reply.clone()))
         }
         ClientCommand::ListModels { reply, .. } => Some(ClientCommandReply::Models(reply.clone())),
@@ -1475,13 +1491,14 @@ fn handle_client_command(
     let queues_before_initialize = !state.initialized
         && matches!(
             &command,
-            ClientCommand::StartSession { .. }
-                | ClientCommand::ListThreads { .. }
-                | ClientCommand::ReadThread { .. }
-                | ClientCommand::ResumeThread { .. }
-                | ClientCommand::ArchiveThread { .. }
-                | ClientCommand::ListModels { .. }
-                | ClientCommand::ListSkills { .. }
+                ClientCommand::StartSession { .. }
+                    | ClientCommand::ListThreads { .. }
+                    | ClientCommand::ReadThread { .. }
+                    | ClientCommand::ResumeThread { .. }
+                    | ClientCommand::ArchiveThread { .. }
+                    | ClientCommand::ListModels { .. }
+                    | ClientCommand::ListSkills { .. }
+                    | ClientCommand::ReadRateLimits { .. }
         );
     if queues_before_initialize
         && preinitialize_backlog_len(state) >= PREINITIALIZE_BACKLOG_CAPACITY
@@ -1505,6 +1522,7 @@ fn handle_client_command(
                 | ClientCommand::ArchiveThread { .. }
                 | ClientCommand::ListModels { .. }
                 | ClientCommand::ListSkills { .. }
+                | ClientCommand::ReadRateLimits { .. }
         )
     {
         state.queued_rpc_commands.push(command);
@@ -1629,6 +1647,7 @@ fn handle_client_command(
             force_reload,
             reply,
         } => request_skills_list(stdin, state, cwds, force_reload, reply),
+        ClientCommand::ReadRateLimits { reply } => request_rate_limits(stdin, state, reply),
     };
 
     if result.is_err() {
@@ -2070,6 +2089,28 @@ fn request_skills_list(
     Ok(())
 }
 
+fn request_rate_limits(
+    stdin: &mut ChildStdin,
+    state: &mut WorkerState,
+    reply: SyncSender<anyhow::Result<Value>>,
+) -> anyhow::Result<()> {
+    let id = state.request_id();
+    let key = rpc_key(&id);
+    state
+        .pending
+        .insert(key.clone(), PendingRequest::ReadRateLimits { reply });
+    let frame = json!({
+        "method": "account/rateLimits/read",
+        "id": id,
+        "params": null,
+    });
+    if let Err(error) = write_message(stdin, &frame) {
+        state.pending.remove(&key);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn model_list_params(cursor: Option<String>, limit: Option<u32>, include_hidden: bool) -> Value {
     let mut params = serde_json::Map::new();
     if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
@@ -2197,7 +2238,8 @@ fn handle_response(
             }
             PendingRequest::ListThreads { reply }
             | PendingRequest::ReadThread { reply, .. }
-            | PendingRequest::ArchiveThread { reply, .. } => {
+            | PendingRequest::ArchiveThread { reply, .. }
+            | PendingRequest::ReadRateLimits { reply } => {
                 send_rpc_reply(reply, repaint, Err(anyhow::anyhow!(text)));
             }
             PendingRequest::ListModels { reply } => {
@@ -2397,6 +2439,14 @@ fn handle_response(
         PendingRequest::Interrupt { .. } => {}
         PendingRequest::ListThreads { reply } => {
             let response = validate_thread_list_result(&result).map(|()| result);
+            send_rpc_reply(reply, repaint, response);
+        }
+        PendingRequest::ReadRateLimits { reply } => {
+            let response = if result.is_object() {
+                Ok(result)
+            } else {
+                Err(anyhow::anyhow!("account/rateLimits/read 응답이 객체가 아닙니다"))
+            };
             send_rpc_reply(reply, repaint, response);
         }
         PendingRequest::ReadThread { thread_id, reply } => {

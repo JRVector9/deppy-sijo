@@ -3606,9 +3606,6 @@ fn paint_workspace_group_wrap(ui: &egui::Ui, reserve: egui::layers::ShapeIdx, re
 
 const WORKSPACE_SESSION_INSET_FILL: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
 const WORKSPACE_SESSION_INSET_BORDER: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
-/// 세션 행 상태 배경: focused/selected는 청록, hover는 중간 회색.
-const SESSION_FOCUS_FILL: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x11, 0x16);
-const SESSION_HOVER_FILL: egui::Color32 = egui::Color32::from_rgb(0x45, 0x45, 0x45);
 
 // 좌측 인셋 8px = 세션 행 자체의 hover 좌측 경계와 같은 값(20px 들여쓰기 -
 // SESSION_HIGHLIGHT_LEFT_EXTEND 12px, 아래 session_highlight_rect 참고) —

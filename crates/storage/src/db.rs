@@ -9968,6 +9968,75 @@ impl Db {
         Ok(id)
     }
 
+    pub fn upsert_builtin_agent_config(
+        &self,
+        id: &str,
+        name: &str,
+        command: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !id.is_empty() && id.len() <= 128 && !id.bytes().any(|byte| byte.is_ascii_control()),
+            "builtin_agent_id_invalid"
+        );
+        anyhow::ensure!(
+            !name.is_empty()
+                && name.len() <= 256
+                && !name.bytes().any(|byte| byte.is_ascii_control()),
+            "builtin_agent_name_invalid"
+        );
+        anyhow::ensure!(
+            !command.is_empty()
+                && command.len() <= 4 * 1024
+                && !command.bytes().any(|byte| byte.is_ascii_control()),
+            "builtin_agent_command_invalid"
+        );
+        let args_json = "[]";
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        settings_agent_write_admission(
+            &tx,
+            &SettingsAgentWriteCandidate {
+                id,
+                name,
+                command,
+                args_json,
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+                mcp_proxy_server_id: None,
+                mcp_config_flag: None,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO agent_configs
+                 (id, name, command, args_json,
+                  waiting_regex, approval_regex, error_regex, done_regex,
+                  mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag,
+                  created_at, updated_at, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, 0, NULL, NULL,
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 command = excluded.command,
+                 args_json = excluded.args_json,
+                 waiting_regex = NULL,
+                 approval_regex = NULL,
+                 error_regex = NULL,
+                 done_regex = NULL,
+                 mcp_proxy_enabled = 0,
+                 mcp_proxy_server_id = NULL,
+                 mcp_config_flag = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                 deleted_at = NULL",
+            (id, name, command, args_json),
+        )
+        .context("builtin agent config upsert failed")?;
+        tx.commit()
+            .context("builtin agent config upsert transaction commit failed")?;
+        Ok(())
+    }
+
     pub fn validate_agent_args_for_persistence(args: &[String]) -> anyhow::Result<()> {
         validate_args_for_persistence(args, "agent args")
     }
@@ -17212,6 +17281,37 @@ mod tests {
         assert_eq!(listed[0].mcp_config_flag, None);
         db.delete_agent_config(&id).unwrap();
         assert!(db.list_agent_configs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn builtin_agent_config_upsert는_고정_id를_갱신하고_soft_delete를_복구한다() {
+        let db = Db::open_in_memory().unwrap();
+        let id = "deppy-builtin-codex";
+        db.upsert_builtin_agent_config(id, "Codex", "/usr/local/bin/codex")
+            .unwrap();
+        db.upsert_builtin_agent_config(id, "Codex CLI", "/opt/homebrew/bin/codex")
+            .unwrap();
+
+        let listed = db.list_agent_configs().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].name, "Codex CLI");
+        assert_eq!(listed[0].command, "/opt/homebrew/bin/codex");
+        assert!(listed[0].args.is_empty());
+
+        db.delete_agent_config(id).unwrap();
+        assert!(db.list_agent_configs().unwrap().is_empty());
+        db.upsert_builtin_agent_config(id, "Codex", "/usr/bin/codex")
+            .unwrap();
+        let revived = db.list_agent_configs().unwrap();
+        assert_eq!(revived.len(), 1);
+        assert_eq!(revived[0].id, id);
+        assert_eq!(revived[0].command, "/usr/bin/codex");
+        let total: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_configs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 1);
     }
 
     #[test]

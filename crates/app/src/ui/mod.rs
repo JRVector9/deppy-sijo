@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod agent_launcher;
 pub mod agent_sessions;
 pub mod agent_terminal;
 pub mod agent_visuals;

@@ -671,6 +671,7 @@ pub struct WorkspaceUi {
     /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
     /// 설정 창을 Environment 카테고리로 연다.
     open_environment_requested: bool,
+    new_session_requested: bool,
     /// pane 우클릭 → 세션 폴더 요청(파일 트리 이동/Finder 열기, 2026-07-18). cwd
     /// 해석(lsof 폴백 포함)과 트리·Finder 라우팅은 App 몫이라 요청만 쌓는다 — E4 ⑥
     /// take_open_environment와 같은 프레임 소비 패턴.
@@ -1043,6 +1044,7 @@ impl WorkspaceUi {
             pending_spawn_cd: None,
             agent_send_presets: Vec::new(),
             open_environment_requested: false,
+            new_session_requested: false,
             session_folder_request: None,
             selection: None,
             project_name: None,
@@ -2478,11 +2480,7 @@ impl WorkspaceUi {
                     self.open_search_for_session(session);
                 }
             }
-            TerminalToolbarIcon::NewTerminal => self.send(RuntimeCommand::SpawnShell {
-                cols: 80,
-                rows: 24,
-                scrollback_lines: config.scrollback_lines as usize,
-            }),
+            TerminalToolbarIcon::NewTerminal => self.new_session_requested = true,
             TerminalToolbarIcon::SplitColumns => self.send(RuntimeCommand::SplitPane {
                 pane: pane.clone(),
                 direction: SplitDirection::Horizontal,
@@ -2823,7 +2821,7 @@ impl WorkspaceUi {
                 // URL은 cwd 해석이 필요 없는 문자열 판정이라 폴더보다 먼저 본다.
                 if let Some(url) = extract_url(&word) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    if output.response.clicked() && focused {
+                    if terminal_primary_pointer_clicked(&output.response) && focused {
                         // 더블클릭이 clicked를 두 번 발화 — 같은 URL 연속 열기를 막는다
                         // (last_dir_click과 동일 관례).
                         let duplicate = self.last_url_click.as_ref().is_some_and(|(u, at)| {
@@ -2842,7 +2840,7 @@ impl WorkspaceUi {
                     // 포커스된 pane에서만 cd — 비포커스 pane을 포커스하려는 클릭이
                     // cd까지 주입하면 안 된다 (codex 리뷰 MEDIUM). 첫 클릭은 포커스만,
                     // 포커스된 뒤의 클릭이 이동한다.
-                    if output.response.clicked() && focused {
+                    if terminal_primary_pointer_clicked(&output.response) && focused {
                         // 실제 경로 판정은 App host가 완료한 immutable cache만 사용한다.
                         // cwd가 바뀌면 set_session_cwds가 pending/cache를 무효화한다.
                         if let Some(PathClick::Dir(path)) = self.resolve_path_cached(session, &word)
@@ -2958,7 +2956,7 @@ impl WorkspaceUi {
                 } else {
                     self.drag_autoscroll_residual = 0.0;
                 }
-            } else if output.response.clicked() {
+            } else if terminal_primary_pointer_clicked(&output.response) {
                 self.selection = None; // 단순 클릭은 선택 해제 (더블클릭 아님)
             }
         }
@@ -2974,7 +2972,7 @@ impl WorkspaceUi {
             self.pending_focus = None;
             request_terminal_focus(&output.response);
         }
-        if output.response.clicked() {
+        if terminal_primary_pointer_clicked(&output.response) {
             self.terminal_focus_claimed = true;
             request_terminal_focus(&output.response);
             // 이미 runtime focus인 pane을 다시 클릭해도 stale TextEdit focus를 누르고
@@ -3691,6 +3689,10 @@ impl WorkspaceUi {
         std::mem::take(&mut self.open_environment_requested)
     }
 
+    pub fn take_new_session_requested(&mut self) -> bool {
+        std::mem::take(&mut self.new_session_requested)
+    }
+
     /// pane 우클릭의 세션 폴더 요청(트리 이동/Finder)을 소비한다 — App이 프레임마다
     /// 확인해 cwd 해석 후 라우팅한다(2026-07-18).
     pub fn take_session_folder_request(&mut self) -> Option<SessionFolderRequest> {
@@ -4242,6 +4244,10 @@ fn request_terminal_focus(response: &egui::Response) {
     response.ctx.memory_mut(|memory| {
         memory.set_focus_lock_filter(response.id, renderer_egui::terminal_focus_lock_filter());
     });
+}
+
+fn terminal_primary_pointer_clicked(response: &egui::Response) -> bool {
+    response.clicked_by(egui::PointerButton::Primary)
 }
 
 fn clipboard_terminal_paste_bytes(
@@ -4887,13 +4893,13 @@ mod tests {
             Some(SessionId(7))
         );
         ui.activate_terminal_toolbar(TerminalToolbarIcon::NewTerminal, &target, &config);
+        assert!(ui.take_new_session_requested());
         ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitColumns, &target, &config);
         ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitRows, &target, &config);
 
         let commands = drain_protocol(&mut ui);
-        assert!(matches!(commands[0], RuntimeCommand::SpawnShell { .. }));
         assert!(matches!(
-            &commands[1],
+            &commands[0],
             RuntimeCommand::SplitPane {
                 pane,
                 direction: SplitDirection::Horizontal,
@@ -4901,7 +4907,7 @@ mod tests {
             } if pane == &target
         ));
         assert!(matches!(
-            &commands[2],
+            &commands[1],
             RuntimeCommand::SplitPane {
                 pane,
                 direction: SplitDirection::Vertical,
@@ -6253,6 +6259,41 @@ https://example.test/login \
         assert!(terminal_keyboard_input_allowed(true, false, false, true));
         assert!(!terminal_keyboard_input_allowed(true, true, false, true));
         assert!(!terminal_keyboard_input_allowed(true, false, true, true));
+    }
+
+    #[test]
+    fn 터미널_enter_합성클릭은_hover_path를_활성화하지_않는다() {
+        let ctx = egui::Context::default();
+        let mut response_id = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (_, response) =
+                ui.allocate_exact_size(egui::vec2(120.0, 40.0), egui::Sense::click_and_drag());
+            response.request_focus();
+            response_id = Some(response.id);
+        });
+        assert!(ctx.memory(|memory| memory.has_focus(response_id.unwrap())));
+
+        let mut activation = None;
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            let (_, response) =
+                ui.allocate_exact_size(egui::vec2(120.0, 40.0), egui::Sense::click_and_drag());
+            activation = Some((
+                response.clicked(),
+                terminal_primary_pointer_clicked(&response),
+            ));
+        });
+
+        assert_eq!(activation, Some((true, false)));
     }
 
     #[test]

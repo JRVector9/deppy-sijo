@@ -1206,6 +1206,7 @@ enum PendingDotenvContinuation {
     AgentLaunch {
         command: runtime::RuntimeCommand,
         approval_ticket: Option<u64>,
+        launcher_request_id: Option<u64>,
     },
 }
 
@@ -1352,6 +1353,11 @@ enum SettingsJobAction {
         /// 덧붙는다. 일반 AgentsIntent::Run 경로는 항상 None.
         extra_arg: Option<String>,
     },
+    PrepareQuickAgentLaunch {
+        request_id: u64,
+        spec: crate::agent_launcher::LaunchSpec,
+        runtime_workspace_id: String,
+    },
     FinalizeProxyAgentLaunch {
         prepared: Box<PreparedAgentLaunch>,
         approval_notify_socket: PathBuf,
@@ -1436,6 +1442,10 @@ enum SettingsOutcomeKind {
     AgentRegistered(Result<(), SettingsErrorCode>),
     AgentDeleted(Result<(), SettingsErrorCode>),
     AgentLaunchPrepared(Result<PreparedAgentLaunch, SettingsErrorCode>),
+    QuickAgentLaunchPrepared {
+        request_id: u64,
+        result: Result<PreparedAgentLaunch, SettingsErrorCode>,
+    },
     AgentLaunchFinalized {
         ticket_id: Option<u64>,
         result: Result<PreparedAgentLaunch, SettingsErrorCode>,
@@ -1496,6 +1506,24 @@ struct PreparedAgentLaunch {
     done_regex: Option<String>,
     proxy: Option<PreparedProxyLaunch>,
     approval_ticket: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingAgentLauncherLaunch {
+    request_id: u64,
+    workspace_id: String,
+    agent_config_id: String,
+}
+
+fn take_matching_agent_launcher_launch(
+    pending: &mut Option<PendingAgentLauncherLaunch>,
+    workspace_id: &str,
+    agent_config_id: &str,
+) -> Option<PendingAgentLauncherLaunch> {
+    let matches = pending.as_ref().is_some_and(|launch| {
+        launch.workspace_id == workspace_id && launch.agent_config_id == agent_config_id
+    });
+    matches.then(|| pending.take()).flatten()
 }
 
 struct PreparedProxyLaunch {
@@ -1712,6 +1740,7 @@ fn load_agents_snapshot(db: &Db, revision: u64, workspace_id: &str) -> ui::agent
         let agents = rows
             .agents
             .into_iter()
+            .filter(|row| !crate::agent_launcher::is_builtin_config_id(&row.id))
             .map(|row| {
                 let summary = settings_agent_args_summary(&row.args);
                 ui::agents::AgentListItem::new(row.id, row.name, row.command, summary)
@@ -1989,6 +2018,31 @@ fn prepare_agent_launch(
         proxy,
         approval_ticket: None,
     })
+}
+
+fn prepare_quick_agent_launch(
+    db: &Db,
+    workspace_id: &str,
+    spec: crate::agent_launcher::LaunchSpec,
+    runtime_workspace_id: String,
+) -> anyhow::Result<PreparedAgentLaunch> {
+    let (kind, agent_command, agent_args, env_plain) = spec.into_parts();
+    Db::validate_agent_args_for_persistence(&agent_args)?;
+    db.upsert_builtin_agent_config(kind.stable_config_id(), kind.label(), &agent_command)?;
+    let mut prepared = prepare_agent_launch(
+        db,
+        workspace_id,
+        kind.stable_config_id(),
+        None,
+        runtime_workspace_id,
+        None,
+    )?;
+    let (command, args) = crate::agent_launcher::wrap_agent_then_shell(agent_command, agent_args);
+    Db::validate_agent_args_for_persistence(&args)?;
+    prepared.command = command;
+    prepared.args = args;
+    prepared.env_plain = env_plain;
+    Ok(prepared)
 }
 
 fn finalize_proxy_agent_launch(
@@ -2438,6 +2492,16 @@ fn execute_settings_job(
             )
             .map_err(|_| SettingsErrorCode::Launch),
         ),
+        SettingsJobAction::PrepareQuickAgentLaunch {
+            request_id,
+            spec,
+            runtime_workspace_id,
+        } => {
+            let result = prepare_quick_agent_launch(db, &workspace_id, spec, runtime_workspace_id)
+                .map_err(|_| SettingsErrorCode::Launch);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::QuickAgentLaunchPrepared { request_id, result }
+        }
         SettingsJobAction::FinalizeProxyAgentLaunch {
             prepared,
             approval_notify_socket,
@@ -2643,6 +2707,12 @@ fn settings_open_failed_outcome(job: SettingsJob) -> SettingsOutcome {
         }
         SettingsJobAction::PrepareAgentLaunch { .. } => {
             SettingsOutcomeKind::AgentLaunchPrepared(Err(SettingsErrorCode::Launch))
+        }
+        SettingsJobAction::PrepareQuickAgentLaunch { request_id, .. } => {
+            SettingsOutcomeKind::QuickAgentLaunchPrepared {
+                request_id,
+                result: Err(SettingsErrorCode::Launch),
+            }
         }
         SettingsJobAction::FinalizeProxyAgentLaunch { prepared, .. } => {
             SettingsOutcomeKind::AgentLaunchFinalized {
@@ -5968,6 +6038,16 @@ pub struct App {
     db: Db,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
+    agent_launcher_ui: ui::agent_launcher::AgentLauncherUi,
+    agent_launcher_worker:
+        crate::lazy_worker::LazyBoundedWorker<(), crate::agent_launcher::DetectionSnapshot>,
+    agent_launcher_snapshot: Option<crate::agent_launcher::DetectionSnapshot>,
+    agent_launcher_detection_requested: bool,
+    agent_launcher_detection_in_flight: bool,
+    pending_agent_launcher_intent: Option<ui::agent_launcher::AgentLauncherIntent>,
+    next_agent_launcher_request_id: u64,
+    pending_agent_launcher_launch: Option<PendingAgentLauncherLaunch>,
+    agent_launcher_seen_workspaces: std::collections::HashSet<String>,
     /// PTY와 분리된 Codex App Server structured session controller.
     agent_sessions_ui: ui::agent_sessions::AgentSessionsUi,
     /// Render가 반환한 controller action 한 건. 다음 logic tick에서만 실행해 process와
@@ -6556,6 +6636,7 @@ enum AppControllerAction {
 /// protocol, persistence, process/session lifecycle, and transcript filesystem work execute only
 /// when `logic` drains this slot on the next tick.
 enum WorkspaceControllerAction {
+    OpenAgentLauncher,
     SwitchWorkspace(String),
     FocusSession {
         workspace_id: String,
@@ -8456,6 +8537,19 @@ impl App {
             new_env_secret_reveal_worker(db_path.clone(), egui_ctx.clone());
         let settings_snapshot_worker =
             SettingsSnapshotWorker::new(db_path.clone(), redaction.clone(), egui_ctx.clone());
+        let launcher_ctx = egui_ctx.clone();
+        let launcher_excluded_directory = crate::agent_shim::shim_path();
+        let agent_launcher_worker = crate::lazy_worker::LazyBoundedWorker::new(
+            "agent-launch-detect",
+            std::time::Duration::from_secs(30),
+            move || {
+                let excluded_directory = launcher_excluded_directory.clone();
+                move |_| {
+                    crate::agent_launcher::detect_installed_agents(excluded_directory.as_deref())
+                }
+            },
+            move || launcher_ctx.request_repaint(),
+        );
         let dotenv_sync_worker =
             new_dotenv_sync_worker(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let initial_agent_state_scope = Arc::new(
@@ -8603,6 +8697,15 @@ impl App {
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
+            agent_launcher_ui: ui::agent_launcher::AgentLauncherUi::new(),
+            agent_launcher_worker,
+            agent_launcher_snapshot: None,
+            agent_launcher_detection_requested: false,
+            agent_launcher_detection_in_flight: false,
+            pending_agent_launcher_intent: None,
+            next_agent_launcher_request_id: 0,
+            pending_agent_launcher_launch: None,
+            agent_launcher_seen_workspaces: std::collections::HashSet::new(),
             agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new()
                 .with_catalog(&i18n)
                 .with_app_server_host(Arc::new(AppCodexAppServerHost {
@@ -8757,13 +8860,15 @@ impl App {
         app.sync_agent_hooks();
         // The first process-capable restore is an exact dotenv continuation. Construction alone
         // does not bypass source/keyring verification or fall back to an empty environment.
-        if app
+        let persisted_restore_exists = app
             .persisted_activity_panes
             .get(&app.active.id)
-            .is_some_and(|panes| !panes.is_empty())
-        {
+            .is_some_and(|panes| !panes.is_empty());
+        if persisted_restore_exists {
             let initial_runtime_instance = app.active.runtime_instance;
             app.stage_runtime_restore(initial_runtime_instance);
+        } else if app.bench.is_none() && app.perf_harness_next.is_none() {
+            app.offer_agent_launcher_for_active();
         }
         // 시작 시 config가 remote를 켜 뒀으면 best-effort로 기동한다 (실패는 log + settings 표시,
         // config는 그대로 두어 다음 실행에 재시도). 자동 시작은 config 저장을 유발하지 않는다.
@@ -10753,6 +10858,9 @@ impl App {
             return;
         };
         match action {
+            WorkspaceControllerAction::OpenAgentLauncher => {
+                self.open_agent_launcher_for_active();
+            }
             WorkspaceControllerAction::SwitchWorkspace(workspace_id) => {
                 self.switch_workspace(&workspace_id);
             }
@@ -11583,6 +11691,10 @@ impl App {
         }
         self.egui_ctx.request_repaint();
 
+        if !persisted_restore_exists && self.bench.is_none() && self.perf_harness_next.is_none() {
+            self.offer_agent_launcher_for_active();
+        }
+
         self.evict_warm();
         // 새 runtime 생성 또는 warm 축출로 resident 수가 바뀌었을 수 있다. 설정의
         // 전역 예산을 현재 active+warm 전체에 다시 나눠 각 워커에 반영한다.
@@ -11715,12 +11827,7 @@ impl App {
                 self.refresh_workspaces();
             }
             A::OpenAgents => self.handle_agent_shortcut(action, ctx),
-            A::NewShell => {
-                self.reveal_active_workspace_for_new_session();
-                self.active
-                    .workspace_ui
-                    .spawn_shell(self.config.terminal.scrollback_lines as usize);
-            }
+            A::NewShell => self.open_agent_launcher_for_active(),
             A::ClosePane => self.active.workspace_ui.close_focused_pane(),
             A::ScrollToBottom => self.active.workspace_ui.scroll_focused_to_bottom(),
             A::PromptJumpPrev => self.active.workspace_ui.scroll_focused_to_prompt(-1),
@@ -12406,6 +12513,13 @@ impl App {
             } => *approval_ticket,
             _ => None,
         };
+        let launcher_request_id = match &pending.continuation {
+            PendingDotenvContinuation::AgentLaunch {
+                launcher_request_id,
+                ..
+            } => *launcher_request_id,
+            _ => None,
+        };
         let Some(outcome) = outcome else {
             if let PendingDotenvContinuation::WorkspaceProtocol {
                 operation,
@@ -12429,6 +12543,9 @@ impl App {
                 self.agents_ui
                     .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
             }
+            if let Some(request_id) = launcher_request_id {
+                self.fail_agent_launcher_request(request_id);
+            }
             tracing::warn!(
                 kind = "dotenv",
                 phase = "continuation",
@@ -12446,6 +12563,9 @@ impl App {
         {
             self.agents_ui
                 .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            if let Some(request_id) = launcher_request_id {
+                self.fail_agent_launcher_request(request_id);
+            }
             tracing::warn!(
                 kind = "agent",
                 phase = "spawn_admission",
@@ -12482,6 +12602,9 @@ impl App {
             if is_agent_launch {
                 self.agents_ui
                     .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            }
+            if let Some(request_id) = launcher_request_id {
+                self.fail_agent_launcher_request(request_id);
             }
             tracing::warn!(
                 kind = "dotenv",
@@ -12543,6 +12666,9 @@ impl App {
             if is_agent_launch {
                 self.agents_ui
                     .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            }
+            if let Some(request_id) = launcher_request_id {
+                self.fail_agent_launcher_request(request_id);
             }
             tracing::warn!(
                 kind = "dotenv",
@@ -12862,6 +12988,190 @@ impl App {
         }
     }
 
+    fn active_workspace_display_name(&self) -> String {
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.active.id)
+            .map(Self::workspace_display_name)
+            .unwrap_or_else(|| self.active.id.clone())
+    }
+
+    fn open_agent_launcher_for_active(&mut self) {
+        if self.pending_agent_launcher_launch.is_some() {
+            return;
+        }
+        self.agent_launcher_seen_workspaces
+            .insert(self.active.id.clone());
+        self.agent_launcher_ui
+            .open_for(self.active.id.clone(), self.active_workspace_display_name());
+        if self.agent_launcher_snapshot.is_none() {
+            self.agent_launcher_detection_requested = true;
+        }
+        self.egui_ctx.request_repaint();
+    }
+
+    fn offer_agent_launcher_for_active(&mut self) {
+        if self.pending_agent_launcher_launch.is_some() {
+            return;
+        }
+        if self
+            .agent_launcher_seen_workspaces
+            .insert(self.active.id.clone())
+        {
+            self.agent_launcher_ui
+                .open_for(self.active.id.clone(), self.active_workspace_display_name());
+            if self.agent_launcher_snapshot.is_none() {
+                self.agent_launcher_detection_requested = true;
+            }
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    fn poll_agent_launcher_detection(&mut self) {
+        while let Some(outcome) = self.agent_launcher_worker.try_recv() {
+            self.agent_launcher_detection_in_flight = false;
+            match outcome.into_result() {
+                Ok(snapshot) => {
+                    self.agent_launcher_snapshot = Some(snapshot);
+                    self.agent_launcher_ui.detection_succeeded();
+                }
+                Err(_) if self.agent_launcher_ui.is_open() => self
+                    .agent_launcher_ui
+                    .report_error(ui::agent_launcher::LauncherErrorCode::DetectionFailed),
+                Err(_) => {}
+            }
+        }
+        if !self.agent_launcher_detection_requested || self.agent_launcher_detection_in_flight {
+            return;
+        }
+        match self.agent_launcher_worker.try_request(()) {
+            Ok(()) => {
+                self.agent_launcher_detection_requested = false;
+                self.agent_launcher_detection_in_flight = true;
+            }
+            Err(crate::lazy_worker::LazyWorkerSubmitError::Full(())) => {}
+            Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { .. }) => {
+                self.agent_launcher_detection_requested = false;
+                if self.agent_launcher_ui.is_open() {
+                    self.agent_launcher_ui
+                        .report_error(ui::agent_launcher::LauncherErrorCode::DetectionFailed);
+                }
+            }
+        }
+    }
+
+    fn handle_agent_launcher_intent(&mut self, intent: ui::agent_launcher::AgentLauncherIntent) {
+        match intent {
+            ui::agent_launcher::AgentLauncherIntent::Refresh => {
+                self.agent_launcher_detection_requested = true;
+            }
+            ui::agent_launcher::AgentLauncherIntent::BlankTerminal { workspace_id } => {
+                if workspace_id == self.active.id {
+                    self.reveal_active_workspace_for_new_session();
+                    self.active
+                        .workspace_ui
+                        .spawn_shell(self.config.terminal.scrollback_lines as usize);
+                }
+            }
+            ui::agent_launcher::AgentLauncherIntent::Launch {
+                workspace_id,
+                kind,
+                options,
+            } => {
+                if self.pending_agent_launcher_launch.is_some() {
+                    self.agent_launcher_ui
+                        .report_error(ui::agent_launcher::LauncherErrorCode::LaunchBusy);
+                    return;
+                }
+                if workspace_id != self.active.id {
+                    self.agent_launcher_ui
+                        .report_error(ui::agent_launcher::LauncherErrorCode::AgentUnavailable);
+                    return;
+                }
+                let shim = (self.config.ui.agent_status_hooks && kind.supports_deppy_shim())
+                    .then(crate::agent_shim::shim_dir)
+                    .flatten()
+                    .map(|directory| directory.join(kind.id()));
+                let spec = self
+                    .agent_launcher_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.find(kind))
+                    .ok_or(())
+                    .and_then(|agent| {
+                        crate::agent_launcher::build_launch_spec(agent, options, shim.as_deref())
+                            .map_err(|_| ())
+                    });
+                let Ok(spec) = spec else {
+                    self.agent_launcher_ui
+                        .report_error(ui::agent_launcher::LauncherErrorCode::AgentUnavailable);
+                    return;
+                };
+                self.next_agent_launcher_request_id =
+                    self.next_agent_launcher_request_id.wrapping_add(1).max(1);
+                let request_id = self.next_agent_launcher_request_id;
+                let queued = self.queue_global_settings_action(
+                    &workspace_id,
+                    SettingsJobAction::PrepareQuickAgentLaunch {
+                        request_id,
+                        spec,
+                        runtime_workspace_id: workspace_id.clone(),
+                    },
+                );
+                if queued {
+                    self.pending_agent_launcher_launch = Some(PendingAgentLauncherLaunch {
+                        request_id,
+                        workspace_id,
+                        agent_config_id: kind.stable_config_id().to_owned(),
+                    });
+                } else {
+                    self.agent_launcher_ui
+                        .report_error(ui::agent_launcher::LauncherErrorCode::LaunchBusy);
+                }
+            }
+        }
+    }
+
+    fn fail_agent_launcher_request(&mut self, request_id: u64) {
+        if self
+            .pending_agent_launcher_launch
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_agent_launcher_launch = None;
+            self.agent_launcher_ui
+                .report_error(ui::agent_launcher::LauncherErrorCode::LaunchFailed);
+        }
+    }
+
+    fn observe_agent_launcher_runtime_events(
+        &mut self,
+        workspace_id: &str,
+        events: &[runtime::RuntimeEvent],
+    ) {
+        for event in events {
+            let runtime::RuntimeEvent::AgentSpawnResolved {
+                agent_config_id,
+                session,
+            } = event
+            else {
+                continue;
+            };
+            let Some(_) = take_matching_agent_launcher_launch(
+                &mut self.pending_agent_launcher_launch,
+                workspace_id,
+                agent_config_id.as_str(),
+            ) else {
+                continue;
+            };
+            if session.is_some() {
+                self.agent_launcher_ui.launch_succeeded();
+            } else {
+                self.agent_launcher_ui
+                    .report_error(ui::agent_launcher::LauncherErrorCode::LaunchFailed);
+            }
+        }
+    }
+
     fn upsert_workspace_projection(&mut self, row: storage::SettingsWorkspaceProjectionRow) {
         let anchor = row.folder_anchor;
         let workspace = storage::WorkspaceRow {
@@ -13079,15 +13389,34 @@ impl App {
         }
     }
 
-    fn send_prepared_agent_launch(&mut self, prepared: PreparedAgentLaunch) {
+    fn send_prepared_agent_launch(
+        &mut self,
+        prepared: PreparedAgentLaunch,
+        launcher_request_id: Option<u64>,
+    ) -> bool {
         let ticket_id = prepared.approval_ticket;
+        let launcher_request_is_current = launcher_request_id.is_none_or(|request_id| {
+            self.pending_agent_launcher_launch
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.request_id == request_id
+                        && pending.workspace_id == prepared.runtime_workspace_id
+                        && pending.agent_config_id == prepared.agent_config_id
+                })
+        });
+        if !launcher_request_is_current {
+            return false;
+        }
         if prepared.runtime_workspace_id != self.active.id || prepared.proxy.is_some() {
             if let Some(ticket_id) = ticket_id {
                 self.approval_launch_tracker.cancel(ticket_id);
             }
             self.agents_ui
                 .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
-            return;
+            if let Some(request_id) = launcher_request_id {
+                self.fail_agent_launcher_request(request_id);
+            }
+            return false;
         }
         let command = runtime::RuntimeCommand::SpawnAgent {
             agent_config_id: Some(prepared.agent_config_id),
@@ -13110,6 +13439,7 @@ impl App {
                 PendingDotenvContinuation::AgentLaunch {
                     command,
                     approval_ticket: ticket_id,
+                    launcher_request_id,
                 },
             )
             .is_err()
@@ -13119,7 +13449,12 @@ impl App {
             }
             self.agents_ui
                 .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            if let Some(request_id) = launcher_request_id {
+                self.fail_agent_launcher_request(request_id);
+            }
+            return false;
         }
+        true
     }
 
     fn stage_prepared_proxy_launch(
@@ -13547,15 +13882,25 @@ impl App {
                                 prepared,
                             );
                         } else {
-                            self.send_prepared_agent_launch(prepared);
+                            self.send_prepared_agent_launch(prepared, None);
                         }
                     }
                     Err(_) => self
                         .agents_ui
                         .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed),
                 },
+                SettingsOutcomeKind::QuickAgentLaunchPrepared { request_id, result } => {
+                    match result {
+                        Ok(prepared) => {
+                            self.send_prepared_agent_launch(prepared, Some(request_id));
+                        }
+                        Err(_) => self.fail_agent_launcher_request(request_id),
+                    }
+                }
                 SettingsOutcomeKind::AgentLaunchFinalized { ticket_id, result } => match result {
-                    Ok(prepared) => self.send_prepared_agent_launch(prepared),
+                    Ok(prepared) => {
+                        self.send_prepared_agent_launch(prepared, None);
+                    }
                     Err(_) => {
                         if let Some(ticket_id) = ticket_id {
                             self.approval_launch_tracker.cancel(ticket_id);
@@ -15856,6 +16201,10 @@ impl eframe::App for App {
         // Shortcut handling may persist config, switch runtimes, or start protocol/process work.
         // Consume egui input here so none of those effects are reachable from the render pass.
         self.handle_configured_shortcut(ctx);
+        if let Some(intent) = self.pending_agent_launcher_intent.take() {
+            self.handle_agent_launcher_intent(intent);
+        }
+        self.poll_agent_launcher_detection();
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
         self.poll_agent_state_worker();
@@ -16090,6 +16439,7 @@ impl eframe::App for App {
             }
         }
         for (workspace_id, event) in approval_runtime_events {
+            self.observe_agent_launcher_runtime_events(&workspace_id, std::slice::from_ref(&event));
             self.observe_approval_runtime_events(&workspace_id, std::slice::from_ref(&event));
         }
         self.runtime_stream_warning |= runtime_stream_overflowed;
@@ -16114,6 +16464,7 @@ impl eframe::App for App {
                 }
             }
             let active_id = self.active.id.clone();
+            self.observe_agent_launcher_runtime_events(&active_id, &new_events);
             self.observe_approval_runtime_events(&active_id, &new_events);
             let agent_providers = self.active.workspace_ui.agent_providers();
             Self::process_ws_notifications(
@@ -17017,6 +17368,9 @@ impl eframe::App for App {
                         .show(ui, &self.config.terminal, &events, &text);
                 }
             });
+        if self.active.workspace_ui.take_new_session_requested() {
+            self.stage_workspace_controller_action(WorkspaceControllerAction::OpenAgentLauncher);
+        }
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
         // (아래 notif_click 합류 지점)에 태운다(사이드바 FocusSession과 같은 규칙).
         if inbox_page_click.is_some() {
@@ -17056,8 +17410,9 @@ impl eframe::App for App {
                 // 주입한다(사용자가 대상·프롬프트를 명시적으로 고른 뒤에만 발행됨).
                 let now = std::time::Instant::now();
                 // 만료된 낙관적 마커 정리(윈도우보다 넉넉히 — 맵을 작게 유지).
-                self.broadcast_working
-                    .retain(|_, sent| now.duration_since(*sent) < std::time::Duration::from_secs(30));
+                self.broadcast_working.retain(|_, sent| {
+                    now.duration_since(*sent) < std::time::Duration::from_secs(30)
+                });
                 for (workspace_id, session) in targets {
                     self.broadcast_prompt_to(&workspace_id, session, &prompt);
                     // 방금 프롬프트를 보냈으니 잠깐 "작업 중"으로 낙관적 표시(감지 지연 메움).
@@ -18335,6 +18690,17 @@ impl eframe::App for App {
             self.remote_reveal_token = false;
             self.web_reveal_url = false;
             self.web_qr = None;
+        }
+        if self.pending_agent_launcher_intent.is_none()
+            && let Some(intent) = self.agent_launcher_ui.show(
+                ui.ctx(),
+                self.agent_launcher_snapshot.as_ref(),
+                self.agent_launcher_detection_in_flight,
+                &text,
+            )
+        {
+            self.pending_agent_launcher_intent = Some(intent);
+            ui.ctx().request_repaint();
         }
         self.frame_stats.end();
         // B1: 이번 프레임에 그린 터미널 렌더 카운터를 프레임 이벤트에 실어 보낸다.
@@ -20031,6 +20397,107 @@ mod tests {
         let ctx = egui::Context::default();
         let worker = SettingsSnapshotWorker::new(path, secret::RedactionService::new(), ctx);
         assert!(worker.slot.is_none());
+    }
+
+    #[test]
+    fn quick_agent_launch는_고정_config와_선택옵션을_준비한다() {
+        let path = temp_db_path("quick-agent-launch");
+        let db = Db::open(&path).unwrap();
+        let workspace_id = db.create_workspace("quick-launch").unwrap();
+        let snapshot = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
+            crate::agent_launcher::AgentKind::Codex,
+            PathBuf::from("/usr/local/bin/codex"),
+        )]);
+        let spec = crate::agent_launcher::build_launch_spec(
+            snapshot
+                .find(crate::agent_launcher::AgentKind::Codex)
+                .unwrap(),
+            crate::agent_launcher::LaunchOptions {
+                model: "gpt-5.4".to_owned(),
+                effort: Some(crate::agent_launcher::ReasoningEffort::XHigh),
+                yolo: true,
+            },
+            Some(Path::new("/tmp/deppy/shims/codex")),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_quick_agent_launch(&db, &workspace_id, spec, workspace_id.clone()).unwrap();
+        assert_eq!(prepared.runtime_workspace_id, workspace_id);
+        assert_eq!(prepared.agent_config_id, "deppy-builtin-codex");
+        #[cfg(unix)]
+        {
+            assert_eq!(prepared.command, "/bin/sh");
+            assert_eq!(prepared.args[0], "-c");
+            assert_eq!(prepared.args[2], "deppy-agent-session");
+            assert_eq!(prepared.args[3], "/tmp/deppy/shims/codex");
+            assert_eq!(
+                prepared.args[4..],
+                [
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--model",
+                    "gpt-5.4",
+                    "--config",
+                    "model_reasoning_effort=\"xhigh\"",
+                ]
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(prepared.command, "/tmp/deppy/shims/codex");
+            assert_eq!(
+                prepared.args,
+                [
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--model",
+                    "gpt-5.4",
+                    "--config",
+                    "model_reasoning_effort=\"xhigh\"",
+                ]
+            );
+        }
+        assert_eq!(
+            prepared.env_plain,
+            [(
+                "DEPPY_AGENT_EXECUTABLE".to_owned(),
+                "/usr/local/bin/codex".to_owned()
+            )]
+        );
+        let configs = db.list_agent_configs().unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].id, "deppy-builtin-codex");
+        let agents = load_agents_snapshot(&db, 1, &workspace_id);
+        assert!(agents.agents().is_empty());
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn launcher_spawn_correlation은_workspace와_config가_모두_맞을때만_소비한다() {
+        let mut pending = Some(PendingAgentLauncherLaunch {
+            request_id: 7,
+            workspace_id: "workspace-a".to_owned(),
+            agent_config_id: "deppy-builtin-codex".to_owned(),
+        });
+        assert!(
+            take_matching_agent_launcher_launch(&mut pending, "workspace-b", "deppy-builtin-codex")
+                .is_none()
+        );
+        assert!(pending.is_some());
+        assert!(
+            take_matching_agent_launcher_launch(
+                &mut pending,
+                "workspace-a",
+                "deppy-builtin-claude"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            take_matching_agent_launcher_launch(&mut pending, "workspace-a", "deppy-builtin-codex")
+                .map(|launch| launch.request_id),
+            Some(7)
+        );
+        assert!(pending.is_none());
     }
 
     #[test]

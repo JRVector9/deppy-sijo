@@ -29,20 +29,6 @@ pub fn hairline(ui: &mut egui::Ui) {
     hairline_colored(ui, color);
 }
 
-/// 패널 안 여백을 무시하고 패널 전체 폭(클립 영역)으로 긋는 헤어라인 — 사이드바
-/// 구분선처럼 경계까지 이어져야 하는 라인용 (#68: 여백 탓에 끊겨 보임).
-pub fn hairline_full(ui: &mut egui::Ui) {
-    let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let space = 6.0;
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), space),
-        egui::Sense::hover(),
-    );
-    let painter = ui.painter();
-    let y = painter.round_to_pixel_center(rect.center().y);
-    painter.hline(ui.clip_rect().x_range(), y, egui::Stroke::new(1.0, color));
-}
-
 /// 색 지정 버전.
 pub fn hairline_colored(ui: &mut egui::Ui, color: egui::Color32) {
     // 기본 `ui.separator()`와 동일한 세로 공간을 차지한다(레이아웃 밀림 방지) —

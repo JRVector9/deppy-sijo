@@ -18,8 +18,13 @@ fn root() -> Option<PathBuf> {
 
 /// shim 디렉터리 경로 — 셸 PATH 맨 앞에 주입할 값. 설치 후에만 Some.
 pub fn shim_dir() -> Option<PathBuf> {
-    let d = root()?.join("shims");
+    let d = shim_path()?;
     d.is_dir().then_some(d)
+}
+
+/// 설치 여부와 무관한 shim 경로 — detector가 자기 자신을 실제 CLI로 오인하지 않게 한다.
+pub fn shim_path() -> Option<PathBuf> {
+    Some(root()?.join("shims"))
 }
 
 #[cfg(unix)]
@@ -95,7 +100,7 @@ export DEPPY_SHIM_GUARD=1
 
     // claude shim
     let claude_shim = format!(
-        "{strip}exec claude --settings '{}' \"$@\"\n",
+        "{strip}REAL_AGENT=\"${{DEPPY_AGENT_EXECUTABLE:-claude}}\"\nunset DEPPY_AGENT_EXECUTABLE\nexec \"$REAL_AGENT\" --settings '{}' \"$@\"\n",
         settings_path.display()
     );
     write_executable(&shims.join("claude"), &claude_shim)?;
@@ -116,7 +121,9 @@ export DEPPY_SHIM_GUARD=1
             hook(name)
         ));
     }
-    let codex_shim = format!("{strip}exec codex {codex_args} \"$@\"\n");
+    let codex_shim = format!(
+        "{strip}REAL_AGENT=\"${{DEPPY_AGENT_EXECUTABLE:-codex}}\"\nunset DEPPY_AGENT_EXECUTABLE\nexec \"$REAL_AGENT\" {codex_args} \"$@\"\n"
+    );
     write_executable(&shims.join("codex"), &codex_shim)?;
     Ok(())
 }

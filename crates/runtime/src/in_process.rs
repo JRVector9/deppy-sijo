@@ -658,7 +658,7 @@ struct Worker {
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     batch: Duration,
     shell: CommandSpec,
-    /// 워크스페이스 기본 env(.env 자동 주입 — 2026-07-07). 이후 SpawnShell에 적용된다.
+    /// 워크스페이스 기본 env(.env 자동 주입). 이후 SpawnShell/SpawnAgent에 적용된다.
     /// secret은 (key, credential_id)로 들고 spawn 직전에만 resolve한다(6.3).
     default_env_plain: Vec<(String, String)>,
     default_env_secrets: Vec<(String, String)>,
@@ -1033,6 +1033,28 @@ impl Worker {
             .map(|(key, value)| (key, value.into_string()))
             .collect();
         Ok((env, lease.into_iter().collect()))
+    }
+
+    fn prepare_agent_env(
+        &self,
+        launch_plain: Vec<(String, String)>,
+        launch_secrets: Vec<(String, String)>,
+    ) -> anyhow::Result<PreparedSecretEnv> {
+        let default_secret_count = self.default_env_secrets.len();
+        let mut all_secrets = self.default_env_secrets.clone();
+        all_secrets.extend(launch_secrets);
+        crate::command::validate_env_entries_with_base(
+            &self.default_env_plain,
+            &launch_plain,
+            &all_secrets,
+        )?;
+        let (mut resolved_secrets, leases) = self.resolve_secret_env(all_secrets)?;
+        let launch_secret_env = resolved_secrets.split_off(default_secret_count);
+        let mut env = self.default_env_plain.clone();
+        env.extend(resolved_secrets);
+        env.extend(launch_plain);
+        env.extend(launch_secret_env);
+        Ok((env, leases))
     }
 
     /// Restored dotenv values are already plaintext, but secret-like keys still participate in a
@@ -1499,22 +1521,21 @@ impl Worker {
                     self.reject_session_capacity(SpawnKind::Agent, correlation_id);
                     return;
                 }
-                let mut env = env_plain;
                 // Resolve the complete set and acquire one checked redaction lease before any
-                // plaintext reaches the process environment. Adapter/keyring coordinates never
-                // cross into events or diagnostics on failure.
-                let (secret_env, redaction_leases) = match self.resolve_secret_env(env_secrets) {
-                    Ok(prepared) => prepared,
-                    Err(_) => {
-                        self.emit(RuntimeEvent::SpawnFailed {
-                            kind: SpawnKind::Agent,
-                            message: MessagePayload::new("runtime.spawn_failed.agent_secret"),
-                        });
-                        self.emit_agent_spawn_resolved(correlation_id, None);
-                        return;
-                    }
-                };
-                env.extend(secret_env);
+                // plaintext reaches the process environment. Workspace defaults are lower
+                // precedence than per-launch values, so launcher PATH/YOLO settings remain exact.
+                let (mut env, redaction_leases) =
+                    match self.prepare_agent_env(env_plain, env_secrets) {
+                        Ok(prepared) => prepared,
+                        Err(_) => {
+                            self.emit(RuntimeEvent::SpawnFailed {
+                                kind: SpawnKind::Agent,
+                                message: MessagePayload::new("runtime.spawn_failed.agent_secret"),
+                            });
+                            self.emit_agent_spawn_resolved(correlation_id, None);
+                            return;
+                        }
+                    };
                 let id = SessionId(self.next_id);
                 self.next_id += 1;
                 // 앱이 직접 띄운 에이전트에도 needsInput hook 키를 주입한다(셸과 동일 —
@@ -1588,7 +1609,7 @@ impl Worker {
                 env_plain,
                 env_secrets,
             } => {
-                // 이후 SpawnShell부터 적용 — 기존 세션은 건드리지 않는다(.env 자동 주입).
+                // 이후 SpawnShell/SpawnAgent부터 적용 — 기존 세션은 건드리지 않는다.
                 self.default_env_plain = env_plain;
                 self.default_env_secrets = env_secrets;
             }
@@ -5343,6 +5364,53 @@ mod tests {
         probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::Viewport { snapshot, .. }
                 if snapshot_text(snapshot, 0).contains("P=plain-v S=s3cret-value") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_agent는_workspace_기본_env를_병합하고_launch값을_우선한다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("agent-default-env"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SetSessionDefaultEnv {
+                env_plain: vec![
+                    ("WORKSPACE_ONLY".into(), "workspace".into()),
+                    ("ENV_PRIORITY".into(), "workspace".into()),
+                ],
+                env_secrets: Vec::new(),
+            })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: Some("agent-default-env".into()),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo W=$WORKSPACE_ONLY P=$ENV_PRIORITY".into()],
+                env_plain: vec![("ENV_PRIORITY".into(), "launch".into())],
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("W=workspace P=launch") =>
             {
                 Some(())
             }

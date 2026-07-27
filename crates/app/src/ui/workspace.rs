@@ -671,6 +671,7 @@ pub struct WorkspaceUi {
     /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
     /// 설정 창을 Environment 카테고리로 연다.
     open_environment_requested: bool,
+    new_session_requested: bool,
     /// pane 우클릭 → 세션 폴더 요청(파일 트리 이동/Finder 열기, 2026-07-18). cwd
     /// 해석(lsof 폴백 포함)과 트리·Finder 라우팅은 App 몫이라 요청만 쌓는다 — E4 ⑥
     /// take_open_environment와 같은 프레임 소비 패턴.
@@ -1043,6 +1044,7 @@ impl WorkspaceUi {
             pending_spawn_cd: None,
             agent_send_presets: Vec::new(),
             open_environment_requested: false,
+            new_session_requested: false,
             session_folder_request: None,
             selection: None,
             project_name: None,
@@ -2478,11 +2480,7 @@ impl WorkspaceUi {
                     self.open_search_for_session(session);
                 }
             }
-            TerminalToolbarIcon::NewTerminal => self.send(RuntimeCommand::SpawnShell {
-                cols: 80,
-                rows: 24,
-                scrollback_lines: config.scrollback_lines as usize,
-            }),
+            TerminalToolbarIcon::NewTerminal => self.new_session_requested = true,
             TerminalToolbarIcon::SplitColumns => self.send(RuntimeCommand::SplitPane {
                 pane: pane.clone(),
                 direction: SplitDirection::Horizontal,
@@ -3691,6 +3689,10 @@ impl WorkspaceUi {
         std::mem::take(&mut self.open_environment_requested)
     }
 
+    pub fn take_new_session_requested(&mut self) -> bool {
+        std::mem::take(&mut self.new_session_requested)
+    }
+
     /// pane 우클릭의 세션 폴더 요청(트리 이동/Finder)을 소비한다 — App이 프레임마다
     /// 확인해 cwd 해석 후 라우팅한다(2026-07-18).
     pub fn take_session_folder_request(&mut self) -> Option<SessionFolderRequest> {
@@ -4887,13 +4889,13 @@ mod tests {
             Some(SessionId(7))
         );
         ui.activate_terminal_toolbar(TerminalToolbarIcon::NewTerminal, &target, &config);
+        assert!(ui.take_new_session_requested());
         ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitColumns, &target, &config);
         ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitRows, &target, &config);
 
         let commands = drain_protocol(&mut ui);
-        assert!(matches!(commands[0], RuntimeCommand::SpawnShell { .. }));
         assert!(matches!(
-            &commands[1],
+            &commands[0],
             RuntimeCommand::SplitPane {
                 pane,
                 direction: SplitDirection::Horizontal,
@@ -4901,7 +4903,7 @@ mod tests {
             } if pane == &target
         ));
         assert!(matches!(
-            &commands[2],
+            &commands[1],
             RuntimeCommand::SplitPane {
                 pane,
                 direction: SplitDirection::Vertical,

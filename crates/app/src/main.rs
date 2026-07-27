@@ -2,6 +2,7 @@ mod agent_actions;
 mod agent_detect;
 mod agent_detect_worker;
 mod agent_hooks;
+mod agent_launcher;
 mod agent_session;
 mod agent_shim;
 mod agent_state_worker;

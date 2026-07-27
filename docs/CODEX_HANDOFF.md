@@ -1105,3 +1105,45 @@
 
 - PR #37 (`workspaceDesign-usage` -> `workspaceDesign`): repository context and Codex/Claude usage, including the hidden Claude `/usage` PTY fallback.
 - PR #38 (`workspaceDesign-active-session` -> `workspaceDesign-usage`): active session rail `#c84d4d` and 10% smaller workspace header/avatar.
+## 2026-07-26 workspace accent interaction follow-up
+
+- Restored session rails to the shared agent-state color palette; removed the fixed active `#c84d4d` override.
+- Inset session hover and focused backgrounds now derive from the parent workspace avatar accent (`0.16` hover, `0.24` focused); workspace headers remain untinted.
+- Next: build/relaunch first, then directly inspect whether the Claude usage probe renders in the top bar.
+## 2026-07-26 Claude usage direct verification
+
+- Direct PTY `/usage` verification succeeded: Claude returned `Current session 7% used` and `Current week (all models) 13% used`.
+- The app still renders `— 5h · — wk`; this is not an authentication or Keychain failure.
+- Root cause: Claude's TUI positions text with ANSI cursor movement, and the current stripper collapses labels to `Currentsession` / `Currentweek`, while the parser expects whitespace-separated labels.
+- Required follow-up: normalize labels for matching (for example, compare lowercase alphanumeric-only forms) while retaining percentage extraction from following lines.
+- Fixed Claude usage label matching by comparing lowercase alphanumeric-only forms, which accepts TUI-collapsed `Currentsession` and `Currentweek` labels.
+- Reduced workspace header height by another 6px (`43.2 -> 37.2` with repository subtitle, `35.19 -> 29.19` without).
+- Provider progress bars now fill from the larger of 5h/week usage so a nonzero weekly value remains visible when 5h is zero.
+- Claude usage parsing now prefers the last TUI redraw instead of an initial temporary 0% frame.
+- Reduced inset-session rail left padding from 4px to 0px.
+- Reduced the fixed top-provider usage allocation by 30px (`260 -> 230`).
+- The Claude probe now stops sending automatic Enter once the usage panel is detected, allowing the initial 0% frame to update to the stable account value before parsing.
+- Moved Claude/Codex usage from the top bar to the left side of the bottom status bar.
+- Removed the bottom status bar's connection-health label and workspace-count label; session/MCP/service/memory indicators remain.
+- Disabled the SidePanel's full-height separator and repainted it only above the 26px bottom status bar, so the bottom usage/status region remains visually continuous across the window.
+- Replaced the bottom usage provider text labels with compact vector Claude/Codex marks.
+- Codex usage now uses OpenAI green `#10a37f` for both its mark and progress fill instead of the weak gray text color.
+- Matched the supplied provider marks: cyan three-ellipse Codex knot and orange eight-ray Claude starburst.
+- Provider usage now reuses `paint_announcement_provider_logo` from the Home announcement list instead of maintaining a second icon implementation; Codex progress uses the same theme hyperlink color as the Home knot.
+- Reduced the bottom status-bar Claude/Codex logo allocation and actual vector geometry by 30% (`18px -> 12.6px`) while preserving the Home announcement logos at 22px.
+- Git workspace subtitles now show only the branch because the former "repository" segment was derived from and always duplicated the workspace folder name; non-Git workspaces remain one-line folder names.
+- Set bottom provider logos to 13.5px and Home announcement logos to an actual scaled 20px.
+- Moved inset-session rails another 2px left (`0 -> -2`) and added a foreground mask that removes the built-in SidePanel resize line from the bottom status bar while restoring its horizontal top border.
+- Corrected the inset-session alignment: restored the rail-local inset to `0` and reduced the whole session-row outer indent from `20px` to `18px`, so only the space left of the rail shrinks while the rail-to-text gap remains unchanged.
+- Increased bottom Claude/Codex provider icons from `13.5px` to `14.5px`; Home announcement icons remain `20px`.
+- Removed the foreground separator mask and disabled egui's built-in full-height SidePanel resizer. Sidebar width is now controlled by a custom 6px drag handle whose interaction and separator both end at the top of the 26px bottom status bar.
+- Created branch `colorRail` with the existing workspace-design changes intact. Replaced the inset session's full-height status rail with a centered fixed `4x4px` square marker while retaining the existing status/pulse color rule and a fixed 2px marker-to-text gap.
+- Removed the uncommitted `colorRail` branch and returned to `workspaceDesign`; the 4x4 marker experiment was reverted to the existing full-height status rail. Reduced non-agent two-line session rows from `38px` to `34px` and moved both active/inactive session rows left by reducing their outer indent from `18px` to `16px`.
+- Refined the workspace/session dimensions: Git two-line workspace headers are now `34px`, their visual left inset is `4px`, avatars are `21px`, and the pre-avatar inset is `5.8px`. Non-agent two-line session rows are `36px`; `2.25px` vertical text margins yield an `8px` computed inter-line gap. Session rails are fixed `36px` high and use `2px` normal / `4.5px` attention widths with a matching `2..4.5px` pulse.
+- Reduced fixed session rail height from `36px` to `35px`, removed the explicit `2px` maximum-rail-to-text gap, and reduced the post-session external bottom spacing from `4px` to `2.5px` for active and inactive workspace groups.
+- Added a vector Git-branch icon before workspace branch subtitles. Session text now starts after the rail's actual current width, eliminating the residual gap left by reserving the 4.5px attention width for normal 2px rails.
+- Rebuilt bottom provider usage as icon, colored 5h percentage, 5h progress, `5h`, separator, `이번 주`, and colored weekly percentage; added a provider separator and normalized bottom status text styles and explicit usage labels to 13px.
+- Restored inset-session text to the fixed maximum-rail alignment so pulse/attention width changes do not move text. Focus/hover fill now starts immediately after the rail's actual current width, and the workspace Git-branch icon was reduced by 30% (`10.5px -> 7.35px`).
+- Workspace headers now show an avatar-accent hover fill at `0.16` opacity whether their session list is collapsed or expanded; the effect is limited to the header response and does not tint the inset-session area.
+- Replaced the workspace branch line icon with a fixed square `4x4px` marker. Extended only the workspace hover fill by `1px` on the right, leaving status-count and disclosure geometry unchanged.
+- Reduced the workspace branch marker to `3x3px` and vertically centered it against the second-line branch galley instead of aligning it to the line's top edge.

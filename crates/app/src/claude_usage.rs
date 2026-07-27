@@ -120,7 +120,7 @@ fn fetch_claude_usage() -> anyhow::Result<Option<(u8, u8)>> {
         if settle_at.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
-        if Instant::now() >= next_enter {
+        if settle_at.is_none() && Instant::now() >= next_enter {
             let _ = session.write_input(b"\r");
             next_enter = Instant::now() + ENTER_INTERVAL;
         }
@@ -149,37 +149,43 @@ fn resolve_claude_command() -> String {
 }
 
 fn usage_panel_rendered(lower: &str) -> bool {
+    let compact = compact_label(lower);
     [
-        "current week (all models)",
-        "current week (opus)",
-        "current week (sonnet",
-        "weekly limits",
-        "weekly limit",
-        "weekly usage",
-        "7-day",
-        "current session",
-        "failed to load usage data",
+        "currentweekallmodels",
+        "currentweekopus",
+        "currentweeksonnet",
+        "weeklylimits",
+        "weeklylimit",
+        "weeklyusage",
+        "7day",
+        "currentsession",
+        "failedtoloadusagedata",
     ]
     .into_iter()
-    .any(|needle| lower.contains(needle))
+    .any(|needle| compact.contains(needle))
 }
 
 fn parse_usage(output: &str) -> Option<(u8, u8)> {
     let lines = output.split(['\r', '\n']).collect::<Vec<_>>();
-    let session = extract_percent_after_label(&lines, |line| {
-        line.to_ascii_lowercase().contains("current session")
-    })?;
+    let session =
+        extract_percent_after_label(&lines, |line| compact_label(line).contains("currentsession"))?;
     let weekly = extract_percent_after_label(&lines, |line| {
-        let line = line.to_ascii_lowercase();
+        let line = compact_label(line);
         !line.contains("fable")
-            && (line.contains("current week")
-                || line.contains("weekly limit")
-                || line.contains("weekly usage")
-                || line.contains("weekly rate limit")
-                || line.contains("7-day")
-                || line.contains("7 day"))
+            && (line.contains("currentweek")
+                || line.contains("weeklylimit")
+                || line.contains("weeklyusage")
+                || line.contains("weeklyratelimit")
+                || line.contains("7day"))
     })?;
     Some((session, weekly))
+}
+
+fn compact_label(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 fn extract_percent_after_label(
@@ -193,7 +199,9 @@ fn extract_percent_after_label(
         )
         .expect("static Claude usage regex")
     });
-    for (index, line) in lines.iter().enumerate() {
+    // Claude TUI는 같은 패널을 여러 번 다시 그린다. 첫 프레임의 임시 0%가 아니라
+    // 가장 마지막으로 그려진 안정된 값을 사용한다.
+    for (index, line) in lines.iter().enumerate().rev() {
         if !matches_label(line) {
             continue;
         }

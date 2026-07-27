@@ -5421,8 +5421,7 @@ fn workspace_git_label(path: &str) -> Option<String> {
             .strip_prefix("ref: refs/heads/")
             .map(str::to_owned)
             .unwrap_or_else(|| head.chars().take(7).collect());
-        let repo = root.file_name()?.to_string_lossy();
-        Some(format!("{repo} · {branch}"))
+        Some(branch)
     });
     if let Ok(mut entries) = cache.lock() {
         entries.insert(
@@ -5468,25 +5467,54 @@ fn claude_usage_snapshot() -> Option<(u8, u8)> {
     usage
 }
 
-fn top_provider_usage(
+pub(crate) fn top_provider_usage(
     ui: &mut egui::Ui,
     claude_usage: Option<(u8, u8)>,
     codex_usage: Option<(u8, u8)>,
 ) {
+    for text_style in [
+        egui::TextStyle::Body,
+        egui::TextStyle::Button,
+        egui::TextStyle::Small,
+    ] {
+        ui.style_mut()
+            .text_styles
+            .insert(text_style, crate::fonts::sidebar_font(13.0));
+    }
+
+    fn separator(ui: &mut egui::Ui, height: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, height), egui::Sense::hover());
+        ui.painter().vline(
+            rect.center().x,
+            rect.y_range(),
+            egui::Stroke::new(1.0, ui.visuals().weak_text_color().gamma_multiply(0.55)),
+        );
+    }
+
     fn provider(
         ui: &mut egui::Ui,
         name: &str,
         accent: egui::Color32,
         usage: Option<(u8, u8)>,
     ) {
+        let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
+        crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, name);
+
+        let five_hour = usage.map(|value| value.0);
+        let weekly = usage.map(|value| value.1);
+        let five_hour_label =
+            five_hour.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
+        let weekly_label = weekly.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
         ui.label(
-            egui::RichText::new(name)
-                .size(10.5)
-                .color(accent),
+            egui::RichText::new(five_hour_label)
+                .size(13.0)
+                .color(accent)
+                .strong(),
         );
-        let (bar, _) = ui.allocate_exact_size(egui::vec2(40.0, 6.0), egui::Sense::hover());
+
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(42.0, 6.0), egui::Sense::hover());
         ui.painter().rect_filled(bar, 3.0, egui::Color32::from_gray(42));
-        if let Some((five_hour, weekly)) = usage {
+        if let Some(five_hour) = five_hour {
             let filled = egui::Rect::from_min_max(
                 bar.min,
                 egui::pos2(
@@ -5495,31 +5523,40 @@ fn top_provider_usage(
                 ),
             );
             ui.painter().rect_filled(filled, 3.0, accent);
-            ui.label(
-                egui::RichText::new(format!("{five_hour}% 5h · {weekly}% wk"))
-                    .size(10.5)
-                    .weak(),
-            );
-        } else {
-            ui.label(egui::RichText::new("— 5h · — wk").size(10.5).weak());
         }
+        ui.label(egui::RichText::new("5h").size(13.0).weak());
+        separator(ui, 14.0);
+        ui.label(egui::RichText::new("이번 주").size(13.0).weak());
+        ui.label(
+            egui::RichText::new(weekly_label)
+                .size(13.0)
+                .color(accent)
+                .strong(),
+        );
     }
 
     ui.allocate_ui_with_layout(
-        egui::vec2(260.0, 20.0),
+        egui::vec2(430.0, 20.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().item_spacing.x = 5.0;
             provider(
-                ui,
-                "Claude",
-                egui::Color32::from_rgb(0xd9, 0x77, 0x57),
-                claude_usage,
-            );
-            ui.add_space(4.0);
-            provider(ui, "Codex", ui.visuals().weak_text_color(), codex_usage);
-        },
-    );
+                  ui,
+                  "Claude",
+                  egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+                  claude_usage,
+              );
+              ui.add_space(4.0);
+              separator(ui, 18.0);
+              ui.add_space(4.0);
+              provider(
+                  ui,
+                  "Codex",
+                  ui.visuals().hyperlink_color,
+                  codex_usage,
+              );
+          },
+      );
 }
 
 impl WorkspaceRuntime {
@@ -16279,13 +16316,6 @@ impl eframe::App for App {
                               let bell = tbtn_response(ui, bell_label, bell_open)
                                   .on_hover_text(text.t("top.notifications", &[]));
                               inbox_click = self.inbox_popup(&bell, &text);
-                              let claude_usage = claude_usage_snapshot()
-                                  .or_else(|| crate::claude_usage::current(ui.ctx()));
-                              top_provider_usage(
-                                  ui,
-                                  claude_usage,
-                                  self.agent_sessions_ui.codex_usage(),
-                              );
                             // Agents 진입은 사이드바 하단 nav가 담당한다 — 상단바 버튼은
                             // 삭제(2026-07-18 사용자 확정). 단축키·기타 진입점은 유지.
                         });
@@ -16578,6 +16608,8 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 self.agent_terminal_ui.status_bar(
                     ui,
+                    claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx())),
+                    self.agent_sessions_ui.codex_usage(),
                     activity_rows.rows(),
                     waiting_count,
                     mcp_count,

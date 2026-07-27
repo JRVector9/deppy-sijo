@@ -2182,19 +2182,7 @@ impl WorkspaceUi {
         }
 
         let Some(mux) = self.mux.clone() else {
-            ui.centered_and_justified(|ui| {
-                if ui
-                    .button(catalog.t("workspace.new_shell", &[]))
-                    .on_hover_text(catalog.t("workspace.start_shell_prompt", &[]))
-                    .clicked()
-                {
-                    self.send(RuntimeCommand::SpawnShell {
-                        cols: 80,
-                        rows: 24,
-                        scrollback_lines: config.scrollback_lines as usize,
-                    });
-                }
-            });
+            self.show_new_session_prompt(ui, catalog);
             self.flush_command_repaint(ui.ctx());
             return;
         };
@@ -2230,19 +2218,7 @@ impl WorkspaceUi {
             .as_ref()
             .and_then(|id| mux.tabs.iter().find(|tab| &tab.id == id))
         else {
-            ui.centered_and_justified(|ui| {
-                if ui
-                    .button(catalog.t("workspace.new_shell", &[]))
-                    .on_hover_text(catalog.t("workspace.start_shell_prompt", &[]))
-                    .clicked()
-                {
-                    self.send(RuntimeCommand::SpawnShell {
-                        cols: 80,
-                        rows: 24,
-                        scrollback_lines: config.scrollback_lines as usize,
-                    });
-                }
-            });
+            self.show_new_session_prompt(ui, catalog);
             self.flush_command_repaint(ui.ctx());
             return;
         };
@@ -2272,6 +2248,18 @@ impl WorkspaceUi {
 
         // 응답(MuxUpdated/Viewport)을 다음 프레임에서 수신하도록 보장
         self.flush_command_repaint(ui.ctx());
+    }
+
+    fn show_new_session_prompt(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
+        ui.centered_and_justified(|ui| {
+            if ui
+                .button(catalog.t("workspace.new_shell", &[]))
+                .on_hover_text(catalog.t("workspace.start_shell_prompt", &[]))
+                .clicked()
+            {
+                self.new_session_requested = true;
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4870,6 +4858,27 @@ mod tests {
 
     fn pane_id(name: &str) -> MuxPaneId {
         MuxPaneId(name.to_owned())
+    }
+
+    #[test]
+    fn kittest_빈_workspace의_새세션은_agent_launcher만_요청한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let button_label = catalog.t("workspace.new_shell", &[]);
+        let config = TerminalConfig::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show(ui, &config, &[], &catalog);
+            },
+            WorkspaceUi::new(),
+        );
+        harness.run();
+        harness.get_by_label(&button_label).click();
+        harness.run();
+
+        assert!(harness.state_mut().take_new_session_requested());
+        assert!(drain_protocol(harness.state_mut()).is_empty());
     }
 
     #[test]

@@ -120,6 +120,9 @@ pub enum SidebarAction {
     OpenAgents,
     OpenSettings,
     OpenHelp,
+    ShowFocusedDiff,
+    ShowTerminal,
+    OpenConnectors,
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
     OpenMacosFileAccessSettings,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
@@ -185,6 +188,24 @@ pub enum SidebarAction {
     /// 워크스페이스를 만들어 전환한다. rfd 다이얼로그는 UI leaf가 아니라 App이 연다
     /// (기존 ws_create 관례, 2026-07-18).
     CreateWorkspaceFromPicker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarTool {
+    Files,
+    Search,
+    Git,
+    Terminal,
+    Mcp,
+}
+
+fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
+    match tool {
+        SidebarTool::Files | SidebarTool::Search => None,
+        SidebarTool::Git => Some(SidebarAction::ShowFocusedDiff),
+        SidebarTool::Terminal => Some(SidebarAction::ShowTerminal),
+        SidebarTool::Mcp => Some(SidebarAction::OpenConnectors),
+    }
 }
 
 const FILE_TREE_IO_QUEUE_CAP: usize = 1;
@@ -2126,16 +2147,37 @@ impl FileTreeUi {
         ui.painter()
             .rect_filled(folder_background_rect, 0.0, folder_background);
 
-        // 독립 「파일」 제목행은 제거하고 현재 경로와 핵심 도구를 한 행에 합친다.
-        // 패널이 극단적으로 좁아지면 검색 → 새 폴더 → 숨김 순으로 도구를 남겨
-        // 40pt까지 실제로 축소할 수 있게 한다.
         let mut create_folder = false;
         let mut create_file = false;
         let (header_rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
-        let visible_tools = (((header_rect.width() - 4.0).max(0.0) / 20.0).floor() as usize).min(4);
+        let tabs = [
+            (SidebarTool::Files, catalog.t("sidebar.tool.files", &[])),
+            (SidebarTool::Search, catalog.t("sidebar.tool.search", &[])),
+            (SidebarTool::Git, catalog.t("sidebar.tool.git", &[])),
+            (
+                SidebarTool::Terminal,
+                catalog.t("sidebar.tool.terminal", &[]),
+            ),
+            (SidebarTool::Mcp, catalog.t("sidebar.tool.mcp", &[])),
+        ];
+        let tab_widths = tabs
+            .iter()
+            .map(|(_, label)| {
+                let galley = ui.painter().layout_no_wrap(
+                    label.clone(),
+                    crate::fonts::sidebar_font(11.5),
+                    ui.visuals().text_color(),
+                );
+                (galley.size().x + 12.0).max(34.0)
+            })
+            .collect::<Vec<_>>();
+        let all_tabs_width = tab_widths.iter().sum::<f32>();
+        let visible_tools = (((header_rect.width() - all_tabs_width - 8.0).max(0.0) / 20.0).floor()
+            as usize)
+            .min(4);
         let mut tool_right = header_rect.right() - 4.0;
-        if visible_tools >= 2 {
+        if visible_tools >= 1 {
             let rect = egui::Rect::from_min_size(
                 egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
                 egui::vec2(20.0, 20.0),
@@ -2146,24 +2188,16 @@ impl FileTreeUi {
                     .clicked();
             tool_right -= 20.0;
         }
-        if visible_tools >= 1 {
+        if visible_tools >= 2 {
             let rect = egui::Rect::from_min_size(
                 egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
                 egui::vec2(20.0, 20.0),
             );
-            let search = file_toolbar_icon_at(
-                ui,
-                rect,
-                "search",
-                FileToolbarIcon::Search,
-                self.file_search_open,
-            )
-            .on_hover_text(catalog.t("file_tree.search", &[]));
-            if search.clicked() {
-                self.file_search_open = !self.file_search_open;
-                if !self.file_search_open {
-                    self.file_search.clear();
-                }
+            if file_toolbar_icon_at(ui, rect, "refresh", FileToolbarIcon::Refresh, false)
+                .on_hover_text(catalog.t("sidebar.tool.refresh", &[]))
+                .clicked()
+            {
+                self.refresh();
             }
             tool_right -= 20.0;
         }
@@ -2190,8 +2224,6 @@ impl FileTreeUi {
             }
             tool_right -= 20.0;
         }
-        // 새 파일 — 툴바 리팩토링(2026-07-18)에서 빠졌던 버튼 복원. EditState::NewFile
-        // 소비 흐름(인라인 편집·커밋)은 그대로 살아 있어 생성 지점만 다시 잇는다.
         if visible_tools >= 4 {
             let rect = egui::Rect::from_min_size(
                 egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
@@ -2203,41 +2235,38 @@ impl FileTreeUi {
             tool_right -= 20.0;
         }
 
-        let path_left = header_rect.left() + 10.0;
-        if tool_right - path_left >= 20.0 {
-            let icon_center = egui::pos2(path_left + 8.0, header_rect.center().y);
-            // 최상단은 "현재 열린 폴더" 헤더 — 트리의 닫힌 폴더와 구분해 열린 폴더로
-            // (고정 앵커 아님, 2026-07-19 사용자).
-            paint_folder_open(
-                ui.painter(),
-                icon_center,
-                ui.visuals().text_color(),
-                egui::vec2(12.825, 11.875),
-            );
-            let text_left = path_left + 27.0;
-            let text_width = (tool_right - text_left - 5.0).max(0.0);
-            if text_width > 8.0
-                && let Some(root) = &self.root
-            {
-                let name = root
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| root.display().to_string());
-                let label = format!("{name}  {}", compact_root_path(root));
-                let galley = clipped_line(
-                    ui,
-                    &label,
-                    crate::fonts::sidebar_font(11.5),
-                    text_width,
-                    None,
-                );
-                ui.painter().galley(
-                    egui::pos2(text_left, header_rect.center().y - galley.size().y / 2.0),
-                    galley,
-                    ui.visuals().text_color(),
-                );
+        let tab_right = tool_right - 2.0;
+        let mut tab_left = header_rect.left() + 4.0;
+        for ((tool, label), width) in tabs.iter().zip(tab_widths) {
+            if tab_left + width > tab_right {
+                break;
             }
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(tab_left, header_rect.top()),
+                egui::vec2(width, header_rect.height()),
+            );
+            let active = matches!(tool, SidebarTool::Files) && !self.file_search_open
+                || matches!(tool, SidebarTool::Search) && self.file_search_open;
+            if sidebar_tool_tab_at(ui, rect, label, active).clicked() {
+                match tool {
+                    SidebarTool::Files => {
+                        self.file_search_open = false;
+                        self.file_search.clear();
+                    }
+                    SidebarTool::Search => self.file_search_open = true,
+                    SidebarTool::Git | SidebarTool::Terminal | SidebarTool::Mcp => {
+                        action = sidebar_tool_action(*tool);
+                    }
+                }
+            }
+            tab_left += width;
         }
+        let separator_y = ui.painter().round_to_pixel_center(header_rect.bottom());
+        ui.painter().hline(
+            header_rect.x_range(),
+            separator_y,
+            crate::ui::designall::separator_stroke(ui.visuals()),
+        );
 
         if self.file_search_open {
             let response = ui.add(
@@ -4458,7 +4487,44 @@ enum FileToolbarIcon {
     Hidden,
     Folder,
     File,
-    Search,
+    Refresh,
+}
+
+fn sidebar_tool_tab_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    active: bool,
+) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("sidebar_tool_tab", label)),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let tokens = crate::ui::designall::tokens(ui.visuals());
+    let color = if active || response.hovered() {
+        tokens.text
+    } else {
+        tokens.muted_text
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        crate::fonts::sidebar_font(11.5),
+        color,
+    );
+    if active {
+        let line = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0),
+            egui::pos2(rect.right() - 4.0, rect.bottom()),
+        );
+        ui.painter().rect_filled(line, 0.0, tokens.accent);
+    }
+    response
 }
 
 fn file_toolbar_icon_at(
@@ -4520,64 +4586,24 @@ fn file_toolbar_icon_at(
             // 원본 11×14의 23% 축소 (툴바 파일만 추가 10%, 2026-07-18 사용자).
             egui::vec2(8.4645, 10.773),
         ),
-        FileToolbarIcon::Search => {
-            // 터미널 pane 헤더 검색(workspace.rs paint_terminal_toolbar_icon)과 동일
-            // 디자인 — 렌즈 r3.2·얇은 스트로크·짧은 핸들. 크기만 툴바에 맞춰 1.3배
-            // (스트로크는 헤더의 1.25 유지, 2026-07-18 사용자).
-            let lens = rect.center() + egui::vec2(-1.17, -1.17);
+        FileToolbarIcon::Refresh => {
+            let center = rect.center();
             let stroke = egui::Stroke::new(1.25, color);
-            ui.painter().circle_stroke(lens, 4.16, stroke);
-            ui.painter().line_segment(
-                [lens + egui::vec2(2.99, 2.99), lens + egui::vec2(5.85, 5.85)],
-                stroke,
-            );
+            let points = (0..=14)
+                .map(|index| {
+                    let angle = -0.7 + index as f32 * 5.2 / 14.0;
+                    center + egui::vec2(angle.cos(), angle.sin()) * 4.5
+                })
+                .collect::<Vec<_>>();
+            ui.painter().add(egui::Shape::line(points, stroke));
+            let tip = center + egui::vec2(4.5 * (-0.7_f32).cos(), 4.5 * (-0.7_f32).sin());
+            ui.painter()
+                .line_segment([tip, tip + egui::vec2(-0.4, 3.2)], stroke);
+            ui.painter()
+                .line_segment([tip, tip + egui::vec2(-3.0, 0.9)], stroke);
         }
     }
     response
-}
-
-/// 현재 위치(파일 도크 루트) 표식 — 열린 폴더. 아래 트리의 닫힌 폴더와 구분해
-/// "지금 이 폴더가 열려 있다"를 나타낸다(고정 앵커 아님 — `..`로 자유 이동,
-/// 2026-07-19 사용자). `size`는 전체 (폭, 높이).
-fn paint_folder_open(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, size: egui::Vec2) {
-    let w = size.x;
-    let stroke = egui::Stroke::new(1.2, col);
-    let rise = (size.y * 0.24).round().max(2.0);
-    // 뒤판(탭 달린 몸통) — paint_folder와 같은 비율.
-    let body = egui::Rect::from_min_size(
-        egui::pos2(c.x - w / 2.0, c.y - size.y / 2.0 + rise),
-        egui::vec2(w, size.y - rise),
-    );
-    let tab = egui::Rect::from_min_size(
-        egui::pos2(body.left(), body.top() - rise),
-        egui::vec2(w * 0.45, rise + 1.0),
-    );
-    p.rect_stroke(tab, 1.0, stroke, egui::StrokeKind::Inside);
-    p.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Inside);
-    // 앞면(열린 덮개) — 몸통 안쪽에서 오른쪽으로 벌어진 사다리꼴로 "열림"을 표현.
-    let inset = 1.5;
-    let flap = vec![
-        egui::pos2(body.left() + inset, body.bottom() - inset),
-        egui::pos2(body.right() - inset, body.bottom() - inset),
-        egui::pos2(
-            body.right() - inset - w * 0.14,
-            body.top() + body.height() * 0.42,
-        ),
-        egui::pos2(
-            body.left() + inset + w * 0.14,
-            body.top() + body.height() * 0.42,
-        ),
-    ];
-    p.add(egui::Shape::closed_line(flap, stroke));
-}
-
-fn compact_root_path(root: &Path) -> String {
-    if let Some(home) = crate::paths::home_dir()
-        && let Ok(relative) = root.strip_prefix(home)
-    {
-        return format!("~/{}", relative.display());
-    }
-    root.display().to_string()
 }
 
 /// 파일 트리와 셸 `LS_COLORS`가 공유하는 어두운 배경용 유형 팔레트.
@@ -5759,6 +5785,23 @@ mod tests {
         assert_eq!(project_file_section_heights(700.0, 900.0), (644.0, 50.0));
         assert_eq!(project_file_section_heights(700.0, 270.0), (270.0, 424.0));
         assert_eq!(project_file_section_heights(140.0, 0.0), (84.0, 50.0));
+    }
+
+    #[test]
+    fn designall_사이드바도구는_기존기능으로만_연결된다() {
+        assert!(sidebar_tool_action(SidebarTool::Files).is_none());
+        assert!(matches!(
+            sidebar_tool_action(SidebarTool::Git),
+            Some(SidebarAction::ShowFocusedDiff)
+        ));
+        assert!(matches!(
+            sidebar_tool_action(SidebarTool::Terminal),
+            Some(SidebarAction::ShowTerminal)
+        ));
+        assert!(matches!(
+            sidebar_tool_action(SidebarTool::Mcp),
+            Some(SidebarAction::OpenConnectors)
+        ));
     }
 
     #[test]

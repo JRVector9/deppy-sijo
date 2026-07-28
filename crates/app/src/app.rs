@@ -10312,6 +10312,24 @@ impl App {
         self.session_cwds.get(&session).cloned()
     }
 
+    fn open_session_diff(&mut self, ctx: &egui::Context, session: runtime::SessionId) {
+        let cwd = self.cached_session_cwd(session);
+        let workspace_name = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.active.id)
+            .map(Self::workspace_display_name);
+        let session_label = self.inbox_session_label(&self.active.id, session);
+        let title = match (workspace_name, session_label) {
+            (Some(workspace), Some(session)) => format!("{workspace} · {session}"),
+            (Some(workspace), None) => workspace,
+            (None, Some(session)) => session,
+            (None, None) => String::new(),
+        };
+        self.diff_panel_ui
+            .open_for(ctx, self.active.id.clone(), session, cwd, title);
+    }
+
     /// shim PATH env — hook 토글 ON이고 shim이 설치돼 있으면 셸 PATH 앞에 주입한다.
     fn shim_shell_env(config: &Config) -> Vec<(String, String)> {
         // .env 라이브 반영(E5 ⑨): zsh ZDOTDIR 훅 — 래퍼는 항상 주입(passthrough,
@@ -17003,6 +17021,19 @@ impl eframe::App for App {
                         "https://github.com/JRVector9/deppy-sijo",
                     ));
                 }
+                Some(ui::file_tree::SidebarAction::ShowFocusedDiff) => {
+                    if let Some(session) = self.active.workspace_ui.focused_session() {
+                        self.open_session_diff(ui.ctx(), session);
+                    }
+                }
+                Some(ui::file_tree::SidebarAction::ShowTerminal) => {
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                }
+                Some(ui::file_tree::SidebarAction::OpenConnectors) => {
+                    self.settings_category = ui::settings::Category::Connectors;
+                    self.settings_open = true;
+                }
                 Some(ui::file_tree::SidebarAction::OpenMacosFileAccessSettings) => {
                     if self.pending_app_controller_action.is_none() {
                         self.pending_app_controller_action =
@@ -17111,26 +17142,7 @@ impl eframe::App for App {
                 // 제목은 인박스와 같은 관례로 해석 — "세션 #2"보다 "SKRT · Claude"가
                 // 무엇의 변경분인지 바로 판단된다(2026-07-18 사용자: 가독성 개선 요청).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
-                    let cwd = self.cached_session_cwd(session);
-                    let ws_name = self
-                        .workspaces
-                        .iter()
-                        .find(|w| w.id == self.active.id)
-                        .map(Self::workspace_display_name);
-                    let session_label = self.inbox_session_label(&self.active.id, session);
-                    let title = match (ws_name, session_label) {
-                        (Some(ws), Some(s)) => format!("{ws} · {s}"),
-                        (Some(ws), None) => ws,
-                        (None, Some(s)) => s,
-                        (None, None) => String::new(),
-                    };
-                    self.diff_panel_ui.open_for(
-                        ui.ctx(),
-                        self.active.id.clone(),
-                        session,
-                        cwd,
-                        title,
-                    );
+                    self.open_session_diff(ui.ctx(), session);
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
                 // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.

@@ -1,13 +1,15 @@
 # SF06 Final Stability Gate
 
 작성일: 2026-07-28
-검증 커밋: `3cb6f38187465123f82ad648395e1b3e25aae9d1`
+검증 커밋: `ff8e486c44fd0bfc9e29df0ef718ae930b0a34e0`
 
 ## Verdict
 
-Release verdict: **Not approved**
+Deterministic verdict: **Approved**
 
-SF01-SF05 focused integration tests, workspace check, dependency/boundary gates, performance smoke, and changed-package strict Clippy pass. The frozen workspace Clippy and BG01 commands remain red on pre-existing repository baseline findings, and the required 30-minute release measurement was not run. SF06 must not be reported as passed and SSH00 must not start yet.
+Release hardware verdict: **Pending**
+
+SF01-SF05 focused integration tests and every frozen deterministic command pass at the validation commit. The required 30-minute release measurement was not run because a user-owned Deppy instance remained active, so physical resource stability is not yet approved. The deterministic prerequisite for design-only SSH00 is satisfied.
 
 ## Environment
 
@@ -24,13 +26,18 @@ SF01-SF05 focused integration tests, workspace check, dependency/boundary gates,
 | Gate | Result | Evidence |
 |---|---|---|
 | Workspace check | Pass | `cargo check --workspace --all-targets --locked` exit 0 |
-| Workspace strict Clippy | Fail | Existing terminal test lint at `crates/terminal/src/alacritty_backend.rs:993`; reproduced on `main` |
-| Changed-package strict Clippy | Pass | `deppy-sijo`, `web-remote`, `persist`, `runtime`, `storage` exit 0 |
+| Workspace strict Clippy | Pass | `cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0 |
 | Dependency gate | Pass | `cargo run -p xtask --locked -- check-deps` exit 0 |
 | Boundary gate | Pass | `cargo run -p xtask --locked -- check-boundary` exit 0 |
-| Performance smoke | Pass | `cargo run -p xtask --locked -- perf-smoke` exit 0 |
-| BG01 deterministic gate | Fail | Existing repo-wide rustfmt drift; `cargo fmt --all -- --check` also fails on `main` |
+| Performance smoke | Pass | `cargo run -p xtask --locked -- perf-smoke`: 16 exact smoke tests |
+| BG01 deterministic gate | Pass | Structural, security, failure, performance smoke, workspace regressions and doc-tests |
 | Diff check | Pass | `git diff --check` exit 0 |
+
+## Gate Remediation Evidence
+
+- `e00967d`: applied the repository's exact rustfmt output and replaced the terminal test's manual repeat/take sequence with `std::iter::repeat_n`.
+- `c39daae`: initialized the named sidebar font before the kittest assertion frame. Installing fonts after `Harness::new_ui` or inside its first-frame closure both failed because that frame had already resolved fonts.
+- `ff8e486`: prevented dashboard shutdown wake loss by mutating the stop predicate while holding the condvar mutex. The original full BG01 attempt was interrupted only after a process sample proved `JoinHandle::join` waiting on a worker parked in `Condvar::wait`; the exact regression test then passed 100/100 and `web-remote` passed 153/153.
 
 ## Focused Results
 
@@ -69,4 +76,4 @@ USE_HARNESS=1 SECS=1800 SAMPLE_INTERVAL=60 scripts/render-bench.sh run wgpu swit
 
 Then record RSS, child RSS, threads, fd/socket counts, pending replay count, push job count, and post-shutdown return-to-baseline. If an existing measurement surface cannot expose a metric, leave that metric Pending rather than inferring it.
 
-Before SSH00, rerun and pass the exact deterministic commands listed in the SF06 design specification without suppressions or waivers.
+The exact deterministic commands are green without suppressions or waivers. Only the release hardware procedure remains.

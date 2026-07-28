@@ -2,7 +2,7 @@
 
 작성일: 2026-07-28
 통합 브랜치: `codex/sf06-integration-evidence`
-검증 커밋: `3cb6f38187465123f82ad648395e1b3e25aae9d1`
+검증 커밋: `ff8e486c44fd0bfc9e29df0ef718ae930b0a34e0`
 
 ## 1. Input Findings
 
@@ -16,7 +16,7 @@
 
 - 동일 base `c99c2cc0e4b1705b23e1ed71f36e0ac983d322aa`에서 시작한 SF01-SF05를 격리 브랜치에서 검토하고 통합했다.
 - 고정 순서 SF03 -> SF05 -> SF04 -> SF02 -> SF01을 사용했다.
-- SF06 자체 production 변경은 없으며 이 요약과 최신 performance evidence만 소유한다.
+- SF06은 게이트 기준선 복구와 검증 중 재현된 web-remote 종료 알림 유실 수정, 이 요약과 최신 performance evidence를 소유한다.
 - reconnectable SSH relay, wire-format 변경, migration, schema 변경은 포함하지 않는다.
 
 ## 3. Changes
@@ -27,6 +27,9 @@
 - SF04: 30초 connect timeout, 45초 liveness deadline, partial-frame-aware plain/TLS reader polling을 추가한다.
 - SF05: log/archive scan에 4,096 aggregate entry 상한과 mutation 전 two-phase discovery를 추가한다.
 - 독립 리뷰에서 발견한 SF01 hidden-active state loss, SF02 committed/in-flight duplicate races, SF03 stale marker, SF04 partial-frame sleep 문제를 각 owner branch에서 수정하고 재리뷰했다.
+- 유지보수 커밋 `e00967d`가 workspace rustfmt 기준선과 terminal `manual_repeat_n` lint를 복구했다.
+- 유지보수 커밋 `c39daae`가 첫 프레임 전에 sidebar 테스트 폰트를 준비하도록 kittest 상태 전이를 수정했다.
+- 커밋 `ff8e486`이 dashboard `stop` predicate 변경과 condvar 알림을 같은 mutex 임계구역으로 묶어 shutdown wake 유실을 막았다.
 
 ## 4. Tests
 
@@ -42,21 +45,22 @@
 | `cargo test -p runtime --locked remote -- --test-threads=1` | Pass: 60 passed, 0 failed |
 | `cargo test -p storage --locked logs -- --test-threads=1` | Pass: 25 passed, 0 failed |
 | `cargo test -p storage --locked scrollback_archive -- --test-threads=1` | Pass: 11 passed, 0 failed |
+| `cargo test -p web-remote --locked -- --test-threads=1` | Pass: 153 passed, 0 failed |
+| web-remote shutdown race test binary, exact test 100회 | Pass: 100/100 |
 
 ### Deterministic gates
 
 | Command | Result | Notes |
 |---|---|---|
 | `cargo check --workspace --all-targets --locked` | Pass | Final integration HEAD rerun |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Fail | Pre-existing `crates/terminal/src/alacritty_backend.rs:993` `clippy::manual_repeat_n`; same terminal command fails on `main` |
-| `cargo clippy -p deppy-sijo -p web-remote -p persist -p runtime -p storage --all-targets --locked -- -D warnings` | Pass | All changed packages |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Pass | Final integration HEAD rerun |
 | `cargo run -p xtask --locked -- check-deps` | Pass | Exit 0 |
 | `cargo run -p xtask --locked -- check-boundary` | Pass | Exit 0 |
-| `cargo run -p xtask --locked -- perf-smoke` | Pass | Exit 0 |
-| `cargo run -p xtask --locked -- bg01-deterministic-gate` | Fail | Existing repo-wide `cargo fmt --all -- --check` drift; main fails the same format baseline |
+| `cargo run -p xtask --locked -- perf-smoke` | Pass | 16 exact smoke tests |
+| `cargo run -p xtask --locked -- bg01-deterministic-gate` | Pass | Structural, security, failure, performance smoke, workspace regression and doc-test gate |
 | `git diff --check` | Pass | Final integration HEAD rerun |
 
-The exact SF06 deterministic gate is therefore **not approved**. Changed-package validation is green but does not replace the frozen workspace commands.
+The exact SF06 deterministic gate is therefore **approved**. The first full BG01 attempt exposed a pre-existing dashboard shutdown race rather than a formatting failure; a process sample showed the test waiting in `JoinHandle::join` while the worker was parked on the condvar. The mutex-coupled stop fix passed the exact test 100/100 times before the complete gate rerun.
 
 ### Release evidence
 
@@ -70,11 +74,11 @@ The exact SF06 deterministic gate is therefore **not approved**. Changed-package
 - [x] Five implementation PRs started from the same frozen base with disjoint production ownership.
 - [x] Two unbounded queues and two filesystem/process-lifetime retention paths now have explicit caps/deadlines.
 - [x] Archived restore does not consume its runtime marker before validation and rebind success.
-- [x] Focused integration tests and changed-package strict Clippy pass.
-- [ ] Exact workspace strict Clippy passes.
-- [ ] Exact BG01 deterministic gate passes.
+- [x] Focused integration tests and exact workspace strict Clippy pass.
+- [x] Exact workspace strict Clippy passes.
+- [x] Exact BG01 deterministic gate passes.
 - [ ] Thirty-minute release hidden/warm lifecycle measurement is complete.
-- [ ] SF06 is eligible to start SSH00.
+- [x] SF06 deterministic approval makes design-only SSH00 eligible to start.
 
 ## 6. Regression Risks
 
@@ -82,6 +86,7 @@ The exact SF06 deterministic gate is therefore **not approved**. Changed-package
 - Push delivery is bounded and race-tested, but real network-provider latency and long slow-consumer behavior remain unmeasured.
 - Remote liveness surfaces failure after a bounded deadline but does not reconnect or preserve remote PTYs.
 - Scan entry-limit failures are fail-closed and non-mutating, so extremely large log directories may require operator cleanup before GC can resume.
+- Physical memory release and long-run socket/thread return-to-baseline remain unproven until the release soak is run.
 
 ## 7. Resource Impact
 
@@ -105,12 +110,11 @@ The exact SF06 deterministic gate is therefore **not approved**. Changed-package
 ## 10. Rollback Plan
 
 - Revert SF01, SF02, SF03, SF04, or SF05 independently using their owner-branch commits and summaries.
+- Revert `ff8e486` independently to remove the dashboard shutdown synchronization change; doing so reintroduces the observed lost-wake risk.
 - No schema, migration, wire-format, or disk-format rollback is required.
-- Do not merge `codex/sf06-integration-evidence` into `main` while the frozen deterministic gate is red.
+- The integration branch is deterministic-gate clean but remains unmerged until explicitly approved.
 
 ## 11. Follow-up
 
-1. Resolve the pre-existing workspace format and terminal all-target Clippy baseline in a separately owned maintenance change.
-2. Rerun every exact deterministic command without waivers.
-3. Stop all other Deppy instances and run the existing 30-minute release benchmark procedure, then record all observable resource slopes; unavailable internal queue metrics remain Pending until an existing approved measurement surface exposes them.
-4. Start design-only SSH00 only after deterministic SF06 approval.
+1. Stop all other Deppy instances and run the existing 30-minute release benchmark procedure, then record all observable resource slopes; unavailable internal queue metrics remain Pending until an existing approved measurement surface exposes them.
+2. Start design-only SSH00 when requested; its deterministic SF06 prerequisite is satisfied.

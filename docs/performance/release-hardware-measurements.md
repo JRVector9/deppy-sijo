@@ -1,7 +1,7 @@
 # Release Hardware Measurements
 
 작성일: 2026-07-28
-대상 커밋: `3cb6f38187465123f82ad648395e1b3e25aae9d1`
+대상 커밋: `ff8e486c44fd0bfc9e29df0ef718ae930b0a34e0`
 
 ## Scope
 
@@ -53,8 +53,8 @@ No number in this matrix is inferred from unit tests, allocator behavior, or ear
 ## Automated Context
 
 - Focused SF01-SF05 integration tests: 150 passed, 0 failed across the eight recorded commands.
-- Workspace check, changed-package strict Clippy, dependency gate, boundary gate, performance smoke, and diff check passed.
-- Exact workspace strict Clippy and BG01 deterministic gate did not pass because of reproduced pre-existing lint/format baseline failures.
+- Exact workspace check, workspace strict Clippy, dependency gate, boundary gate, performance smoke, BG01 deterministic gate, and diff check passed.
+- Web-remote passed 153 tests, and the dashboard shutdown regression passed 100/100 stress repetitions.
 - These results establish deterministic bounded behavior only; they do not establish physical memory release or long-run socket/thread stability.
 
 ## Required Procedure
@@ -70,4 +70,4 @@ Use the benchmark CSV/JSONL plus host process tools to record one-minute samples
 
 ## Verdict
 
-Release hardware approval is **Pending**. No 30-minute run was executed, and SF06 deterministic approval is also blocked until the exact workspace gates pass.
+Release hardware approval is **Pending** because no 30-minute run was executed. SF06 deterministic approval is complete.

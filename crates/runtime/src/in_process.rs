@@ -2381,13 +2381,6 @@ impl Worker {
     ) -> bool {
         let id = SessionId(self.next_id);
         self.next_id += 1;
-        // 재결속 먼저 — save_layout이 rows에서 UUID를 찾으므로 이게 빠지면
-        // 다음 저장에서 pane↔세션 연결이 영구 유실된다 (계획 문서 §1 함정)
-        if let Some(pipe) = &mut self.persist
-            && !pipe.session_rebound_archived(id, persistent_id)
-        {
-            return false;
-        }
         // 아카이브는 스트리밍으로 backend에 직접 feed — dump(≤32MB)를 통째로 올리면
         // 시작 복원이 pane 수만큼 순간 메모리 스파이크를 만든다 (2026-07-16).
         let archived = match storage::scrollback_archive::open(&self.logs_root, persistent_id) {
@@ -2439,6 +2432,11 @@ impl Worker {
                 session
             }
         };
+        if let Some(pipe) = &mut self.persist
+            && !pipe.session_rebound_archived(id, persistent_id)
+        {
+            return false;
+        }
         self.sessions.insert(id, restored);
         self.exited_order.push_back(id);
         let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
@@ -4219,6 +4217,122 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("deppy-rt-logs-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-rt-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn create_persist_db(db_path: &std::path::Path, workspace_id: &str) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                 created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+             CREATE TABLE agent_configs (id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO workspaces (id) VALUES (?1)", [workspace_id])
+            .unwrap();
+        conn.execute("INSERT INTO agent_configs (id) VALUES ('cfg-sf03')", [])
+            .unwrap();
+        conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+    }
+
+    fn persisted_single_pane_window(
+        session_id: &str,
+        title: &str,
+        cwd: Option<String>,
+    ) -> persist::WindowState {
+        let pane_id = MuxPaneId::new();
+        let tab_id = MuxTabId::new();
+        persist::WindowState {
+            id: deppy_core::MuxWindowId::new(),
+            title: Some("restore".to_owned()),
+            active_tab: Some(tab_id.clone()),
+            tabs: vec![persist::TabState {
+                id: tab_id,
+                title: "restore".to_owned(),
+                layout: mux::LayoutNode::Pane(pane_id.clone()),
+                active_pane: Some(pane_id.clone()),
+                panes: vec![persist::PaneState {
+                    id: pane_id,
+                    session_id: Some(session_id.to_owned()),
+                    title: title.to_owned(),
+                    pane_kind: mux::PaneKind::Terminal,
+                    cwd,
+                }],
+            }],
+        }
+    }
+
+    fn seed_persisted_session_pane(
+        db_path: &std::path::Path,
+        workspace_id: &str,
+        session_id: &str,
+        session_kind: &str,
+        agent_id: Option<&str>,
+        status: &str,
+        cwd: &str,
+    ) {
+        let mut conn = rusqlite::Connection::open(db_path).unwrap();
+        let row = persist::SessionRow {
+            id: session_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            session_kind: session_kind.to_owned(),
+            agent_id: agent_id.map(str::to_owned),
+            title: "restored".to_owned(),
+            command: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "echo restored".to_owned()],
+            cwd: cwd.to_owned(),
+            status: status.to_owned(),
+            last_log_offset: 0,
+        };
+        persist::upsert_session(&conn, &row).unwrap();
+        let window = persisted_single_pane_window(session_id, "restored", Some(cwd.to_owned()));
+        persist::save_window_layout(&mut conn, workspace_id, &window).unwrap();
+    }
+
+    fn restore_workspace_from_fixture(
+        db_path: &std::path::Path,
+        logs_root: &std::path::Path,
+        workspace_id: &str,
+        shell: CommandSpec,
+    ) -> Arc<MuxSnapshot> {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.to_path_buf(),
+            RedactionService::new(),
+            shell,
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.to_path_buf(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let mux = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter())
+                    .any(|pane| pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        drop(client);
+        mux
     }
 
     /// mock keyring store는 test only (설계문서 1.4). 프로세스 전역 1회만 등록 —
@@ -6601,6 +6715,124 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn archived_restore_invalid_metadata_preserves_persistent_row_for_fallback() {
+        init_mock_store();
+        let dir = unique_test_dir("sf03-invalid-archive");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-sf03-invalid";
+        let persistent_id = "persisted-agent-invalid";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "agent",
+            Some("cfg-sf03"),
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        storage::scrollback_archive::write(
+            &logs_root,
+            persistent_id,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 500,
+                rows: 500,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            b"invalid dimensions should fall back without consuming row",
+        )
+        .unwrap();
+
+        restore_workspace_from_fixture(&db_path, &logs_root, workspace_id, spec("/bin/cat", &[]));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let pane_session: String = conn
+            .query_row("SELECT session_id FROM mux_panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "fallback must not create a second session row");
+        assert_eq!(pane_session, persistent_id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archived_restore_truncated_stream_preserves_persistent_row_for_fallback() {
+        init_mock_store();
+        let dir = unique_test_dir("sf03-truncated-archive");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-sf03-truncated";
+        let persistent_id = "persisted-agent-truncated";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "agent",
+            Some("cfg-sf03"),
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        storage::scrollback_archive::write(
+            &logs_root,
+            persistent_id,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            &vec![b'x'; 4096],
+        )
+        .unwrap();
+        let archive = storage::scrollback_archive::archive_path(&logs_root, persistent_id).unwrap();
+        let truncated_len = archive.metadata().unwrap().len().saturating_sub(4);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_len(truncated_len)
+            .unwrap();
+
+        let mux = restore_workspace_from_fixture(
+            &db_path,
+            &logs_root,
+            workspace_id,
+            spec("/bin/cat", &[]),
+        );
+
+        let restored_sessions: Vec<SessionId> = mux
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|pane| pane.session_id)
+            .collect();
+        assert_eq!(
+            restored_sessions.len(),
+            1,
+            "fallback must expose exactly one restored runtime session"
+        );
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let pane_session: String = conn
+            .query_row("SELECT session_id FROM mux_panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "fallback must not create a second session row");
+        assert_eq!(pane_session, persistent_id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 복원 UX (PR-14, 설계문서 §11.1~11.5·§14): 첫 worker가 만든 셸 2개 + split
     /// 1개(tab 2개/pane 3개) 구조가 종료 후 새 worker 시작 시 fresh 셸로 복원되는지
     /// 확인한다. 임시 파일 DB(WAL) — worker 자체 연결의 다중 프로세스 재시작 시나리오를
@@ -6738,6 +6970,61 @@ mod tests {
         }
 
         drop(client2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_cwd_uses_persisted_session_cwd_for_shell_spawn() {
+        init_mock_store();
+        let dir = unique_test_dir("sf03-restore-cwd");
+        let cwd = dir.join("cwd-target");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-sf03-cwd";
+        let persistent_id = "persisted-shell-cwd";
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "shell",
+            None,
+            persist::SESSION_STATUS_RUNNING,
+            &cwd_text,
+        );
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root,
+            RedactionService::new(),
+            spec("/bin/pwd", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let text = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport { snapshot, .. } => {
+                let text = snapshot
+                    .visible_cells
+                    .iter()
+                    .filter(|cell| !cell.wide_spacer)
+                    .map(|cell| cell.c)
+                    .collect::<String>();
+                text.contains(&cwd_text).then_some(text)
+            }
+            _ => None,
+        });
+        assert!(text.contains(&cwd_text), "{text}");
+        drop(client);
         std::fs::remove_dir_all(&dir).ok();
     }
 

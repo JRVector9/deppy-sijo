@@ -3507,7 +3507,7 @@ fn workspace_row_style(
 ) -> WorkspaceRowStyle {
     WorkspaceRowStyle {
         fill: crate::ui::designall::row_fill(tokens, selected, hovered),
-        accent: selected.then_some(tokens.accent),
+        accent: None,
     }
 }
 
@@ -5762,7 +5762,7 @@ mod tests {
     }
 
     #[test]
-    fn designall_워크스페이스행은_상태가_없으면_구조배경이_없다() {
+    fn designall_선택워크스페이스는_배경만쓰고_좌측레일이_없다() {
         let tokens = crate::ui::designall::DARK;
         assert_eq!(
             workspace_row_style(tokens, false, false),
@@ -5775,7 +5775,7 @@ mod tests {
             workspace_row_style(tokens, true, false),
             WorkspaceRowStyle {
                 fill: Some(tokens.selected_background),
-                accent: Some(tokens.accent),
+                accent: None,
             }
         );
     }

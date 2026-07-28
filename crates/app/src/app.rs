@@ -14,6 +14,7 @@ use storage::Db;
 /// 쓰인다(main.rs의 `set_traffic_light_titlebar_height`). 값이 바뀌면 신호등도 다시
 /// 어긋나므로 두 곳이 이 상수 하나만 본다.
 pub(crate) const TOP_BAR_HEIGHT: f32 = 38.0;
+const DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE: bool = false;
 const APPROVAL_WAKE_MARKER: u8 = 1;
 const APPROVAL_CONTROL_MARKER: u8 = 2;
 const APPROVAL_COMMAND_CAP: usize = 8;
@@ -16567,6 +16568,7 @@ impl eframe::App for App {
             egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin::ZERO);
         egui::Panel::top("top_bar")
             .resizable(false)
+            .show_separator_line(DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE)
             .frame(top_frame)
             .show(ui, |ui| {
                 // 빈 곳을 잡으면 창을 드래그로 옮긴다. auto-sized Panel의 max_rect는
@@ -20796,6 +20798,11 @@ mod tests {
         assert!(!ui_body.contains("env_api_project_rows_cached"));
         assert!(!source.contains(&["ENV_API_", "PROJECTS_TTL"].concat()));
         assert!(!source.contains(&["from_millis", "(25)"].concat()));
+    }
+
+    #[test]
+    fn designall_top_bar는_본문위에_추가선을_그리지_않는다() {
+        assert!(!DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE);
     }
 
     #[test]

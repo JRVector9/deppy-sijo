@@ -170,9 +170,7 @@ impl SessionLogWriter {
     /// 프로세스 재시작마다 다시 1부터 시작하므로, 재시작 복원 대상은 이 API를 써야
     /// 이전 ANSI 로그와 같은 파일에 계속 append할 수 있다.
     pub fn open_key(logs_root: &Path, session_key: &str) -> anyhow::Result<Self> {
-        let dir = Self::session_dir_key(logs_root, session_key)?;
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()))?;
+        let dir = ensure_session_directory(logs_root, session_key)?;
         Ok(Self {
             ansi: BoundedLogFile::open(
                 &dir.join(ANSI_LOG_FILE),
@@ -255,9 +253,7 @@ impl SessionLogWriter {
     ) -> anyhow::Result<()> {
         anyhow::ensure!((1..=500).contains(&cols), "터미널 열 수 범위 초과");
         anyhow::ensure!((1..=500).contains(&rows), "터미널 행 수 범위 초과");
-        let dir = Self::session_dir_key(logs_root, session_key)?;
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()))?;
+        let dir = ensure_session_directory(logs_root, session_key)?;
         let path = dir.join("terminal.size");
         deppy_core::fs::atomic_write(&path, format!("{cols} {rows}\n").as_bytes())
             .map_err(|_| anyhow::anyhow!("terminal_size_write_failed"))
@@ -304,6 +300,39 @@ impl SessionLogWriter {
         self.plain.flush();
         self.events.flush();
     }
+}
+
+pub(crate) fn existing_session_directory(
+    logs_root: &Path,
+    session_key: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let dir = SessionLogWriter::session_dir_key(logs_root, session_key)?;
+    match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(dir)),
+        Ok(_) => anyhow::bail!("session_log_directory_not_regular"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("세션 로그 디렉터리 metadata 실패: {}", dir.display())),
+    }
+}
+
+pub(crate) fn ensure_session_directory(
+    logs_root: &Path,
+    session_key: &str,
+) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(logs_root)
+        .with_context(|| format!("로그 루트 생성 실패: {}", logs_root.display()))?;
+    let dir = SessionLogWriter::session_dir_key(logs_root, session_key)?;
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()));
+        }
+    }
+    existing_session_directory(logs_root, session_key)?
+        .ok_or_else(|| anyhow::anyhow!("session_log_directory_missing"))
 }
 
 fn read_terminal_size_bounded(path: &Path) -> anyhow::Result<Option<String>> {
@@ -652,7 +681,7 @@ fn gc_session_logs_with_limit_impl(
     let scan = scan_session_log_candidates_with_limit(logs_root, entry_limit)?;
     let bundles = bundle_session_log_candidates(scan.candidates, scan.complete)?;
     if !scan.complete {
-        remove_session_log_bundles(bundles, 0, true);
+        remove_session_log_bundles(bundles, 0, true)?;
         remove_empty_directories(scan.directories, logs_root);
         anyhow::bail!("{}", SESSION_LOG_SCAN_LIMIT_ERROR);
     }
@@ -663,7 +692,7 @@ fn gc_session_log_bundles(
     bundles: Vec<SessionLogBundle>,
     budget_bytes: u64,
 ) -> anyhow::Result<u64> {
-    let total = remove_session_log_bundles(bundles, budget_bytes, false);
+    let total = remove_session_log_bundles(bundles, budget_bytes, false)?;
     if total > budget_bytes {
         anyhow::bail!("session_log_gc_budget_unmet");
     }
@@ -674,10 +703,14 @@ fn remove_session_log_bundles(
     mut bundles: Vec<SessionLogBundle>,
     budget_bytes: u64,
     force_all: bool,
-) -> u64 {
-    let mut total = bundles.iter().map(|bundle| bundle.bytes).sum::<u64>();
+) -> anyhow::Result<u64> {
+    let mut total = bundles.iter().try_fold(0u64, |total, bundle| {
+        total
+            .checked_add(bundle.bytes)
+            .context("session log byte total overflow")
+    })?;
     if !force_all && total <= budget_bytes {
-        return total;
+        return Ok(total);
     }
     bundles.sort_by_key(|bundle| bundle.modified);
     for bundle in bundles {
@@ -701,11 +734,13 @@ fn remove_session_log_bundles(
             tracing::info!(bytes = removed, "오래된 세션 로그 GC — 전체 예산 초과 제거");
         }
     }
-    total
+    Ok(total)
 }
 
-fn path_len_or_zero(path: &Path) -> u64 {
-    path.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+fn path_len(path: &Path) -> anyhow::Result<u64> {
+    path.metadata()
+        .map(|metadata| metadata.len())
+        .with_context(|| format!("세션 로그 길이 조회 실패: {}", path.display()))
 }
 
 #[cfg(test)]
@@ -736,10 +771,13 @@ fn bundle_session_log_candidates(
                 )
             })?;
         }
-        let len = path_len_or_zero(&candidate.path);
+        let len = path_len(&candidate.path)?;
         let bundle = by_dir.entry(candidate.dir).or_default();
         bundle.paths.push((candidate.path, len));
-        bundle.bytes = bundle.bytes.saturating_add(len);
+        bundle.bytes = bundle
+            .bytes
+            .checked_add(len)
+            .context("session log bundle byte total overflow")?;
         bundle.modified = bundle.modified.max(candidate.modified);
     }
     Ok(by_dir.into_values().collect())
@@ -791,12 +829,15 @@ fn scan_session_log_directory(
         }
     };
     for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+        let entry = entry.with_context(|| format!("로그 항목 조회 실패: {}", dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("로그 항목 유형 조회 실패: {}", entry.path().display()))?;
+        anyhow::ensure!(
+            !file_type.is_symlink(),
+            "session_log_subtree_not_regular: {}",
+            entry.path().display()
+        );
         if file_type.is_dir() && depth < 4 {
             scan_session_log_directory(&entry.path(), depth + 1, entry_limit, scan)?;
             if !scan.complete {
@@ -817,7 +858,7 @@ fn collect_known_session_logs(
         let path = dir.join(name);
         let metadata = match path.symlink_metadata() {
             Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => continue,
+            Ok(_) => anyhow::bail!("session_log_file_not_regular: {}", path.display()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(error)
@@ -831,11 +872,14 @@ fn collect_known_session_logs(
             scan.complete = false;
             return Ok(());
         }
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("세션 로그 수정시각 조회 실패: {}", path.display()))?;
         scan.candidates.push(SessionLogCandidate {
             dir: dir.to_path_buf(),
             path,
             original_len: metadata.len(),
-            modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            modified,
             max_bytes,
             retain_bytes,
             tail_boundary,
@@ -1085,6 +1129,23 @@ mod tests {
             assert!(SessionLogWriter::session_dir_key(&root, invalid).is_err());
         }
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_and_terminal_writes_reject_symlinked_session_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("symlinked-session-directory");
+        let outside = temp_root("symlinked-session-directory-outside");
+        symlink(&outside, root.join("session")).unwrap();
+
+        assert!(SessionLogWriter::open_key(&root, "session").is_err());
+        assert!(SessionLogWriter::save_terminal_size(&root, "session", 80, 24).is_err());
+        assert!(!outside.join(ANSI_LOG_FILE).exists());
+        assert!(!outside.join("terminal.size").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
@@ -1481,6 +1542,39 @@ mod tests {
 
         assert_eq!(bundles.len(), 1);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_log_scan_fails_closed_for_nonregular_subtree() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("scan-nonregular-subtree");
+        let outside = temp_root("scan-nonregular-subtree-outside");
+        std::fs::write(outside.join(PLAIN_LOG_FILE), b"log").unwrap();
+        symlink(&outside, root.join("linked-session")).unwrap();
+
+        assert!(gc_session_logs(&root, 0).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn session_log_total_overflow_is_explicit() {
+        let bundles = vec![
+            SessionLogBundle {
+                paths: Vec::new(),
+                bytes: u64::MAX,
+                modified: std::time::UNIX_EPOCH,
+            },
+            SessionLogBundle {
+                paths: Vec::new(),
+                bytes: 1,
+                modified: std::time::UNIX_EPOCH,
+            },
+        ];
+
+        assert!(gc_session_log_bundles(bundles, u64::MAX).is_err());
     }
 
     #[test]

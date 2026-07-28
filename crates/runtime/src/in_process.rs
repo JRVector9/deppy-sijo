@@ -3268,6 +3268,9 @@ impl Worker {
         let Some(dump) = live.serialize_scrollback() else {
             return; // 직렬화 미지원 백엔드 (experimental ghostty)
         };
+        if dump.len() > storage::scrollback_archive::MAX_UNCOMPRESSED_BYTES as usize {
+            return;
+        }
         let mut redactor = self.redaction.stream_redactor();
         let mut redacted = redactor.redact_chunk(&dump);
         redacted.extend(redactor.flush());
@@ -6604,6 +6607,22 @@ mod tests {
             worker.archive_disk_bytes,
             storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN
         );
+    }
+
+    #[test]
+    fn oversized_archive_dump_is_rejected_before_redaction() {
+        let production = include_str!("in_process.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let length_check = production
+            .find("dump.len() > storage::scrollback_archive::MAX_UNCOMPRESSED_BYTES")
+            .expect("archive dump length must be checked before redaction");
+        let redaction = production
+            .find("let mut redactor = self.redaction.stream_redactor()")
+            .unwrap();
+
+        assert!(length_check < redaction);
     }
 
     #[cfg(unix)]

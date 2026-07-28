@@ -601,11 +601,7 @@ fn announcement_columns(row_rect: egui::Rect) -> AnnouncementColumns {
 
 /// 외부 이미지 없이 작은 크기에 맞춰 그리는 provider mark. 공급자명은 화면에서 제거하되
 /// hover/accessibility에는 남겨 로고만으로 구분하기 어려운 사용자도 확인할 수 있게 한다.
-pub(crate) fn paint_announcement_provider_logo(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    source: &str,
-) {
+pub(crate) fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Rect, source: &str) {
     let label = format!("{} logo", announcement_source_label(source));
     let response = ui
         .interact(
@@ -685,8 +681,7 @@ pub(crate) fn paint_announcement_provider_logo(
             let stroke = egui::Stroke::new(1.35 * scale, color);
             for index in 0..6 {
                 let angle = index as f32 * std::f32::consts::TAU / 6.0;
-                let loop_center =
-                    center + egui::vec2(angle.cos(), angle.sin()) * (4.2 * scale);
+                let loop_center = center + egui::vec2(angle.cos(), angle.sin()) * (4.2 * scale);
                 painter.circle_stroke(loop_center, 3.4 * scale, stroke);
             }
             painter.circle_stroke(center, 2.2 * scale, stroke);

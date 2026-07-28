@@ -7085,32 +7085,31 @@ impl Db {
             } else {
                 Vec::new()
             };
-        let working_sessions = if let Some((_, _, working_probe, sql_limit, snapshot_epoch)) =
-            &attention_probes
-        {
-            let mut result = Vec::with_capacity(working_probe.count);
-            let mut stmt = tx
-                .prepare(WORKING_SESSIONS_SELECT)
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
-            let mut rows = stmt
-                .query(rusqlite::params![
-                    sql_limit,
-                    BOUNDED_ID_BYTES_MAX as i64,
-                    snapshot_epoch,
-                ])
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
-            while let Some(row) = rows
-                .next()
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
-            {
-                result.push(
-                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
-                );
-            }
-            result
-        } else {
-            Vec::new()
-        };
+        let working_sessions =
+            if let Some((_, _, working_probe, sql_limit, snapshot_epoch)) = &attention_probes {
+                let mut result = Vec::with_capacity(working_probe.count);
+                let mut stmt = tx
+                    .prepare(WORKING_SESSIONS_SELECT)
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                let mut rows = stmt
+                    .query(rusqlite::params![
+                        sql_limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                        snapshot_epoch,
+                    ])
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+                {
+                    result.push(
+                        bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                    );
+                }
+                result
+            } else {
+                Vec::new()
+            };
         let agent_sessions = if let Some((agent_probe, sql_limit)) = &agent_probe {
             let mut result = Vec::with_capacity(agent_probe.count);
             let mut stmt = tx
@@ -18512,16 +18511,8 @@ mod tests {
                 STATUSLINES_PREFIX_SELECT,
                 "3600",
             ),
-            (
-                TURN_DONE_PREFIX_PREFLIGHT,
-                TURN_DONE_PREFIX_SELECT,
-                "86400",
-            ),
-            (
-                WAITING_SESSIONS_PREFLIGHT,
-                WAITING_SESSIONS_SELECT,
-                "86400",
-            ),
+            (TURN_DONE_PREFIX_PREFLIGHT, TURN_DONE_PREFIX_SELECT, "86400"),
+            (WAITING_SESSIONS_PREFLIGHT, WAITING_SESSIONS_SELECT, "86400"),
             (
                 TURN_DONE_SESSIONS_PREFLIGHT,
                 TURN_DONE_SESSIONS_SELECT,

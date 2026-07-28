@@ -321,7 +321,10 @@ mod tests {
     #[test]
     fn render_반복_파라미터와_리터럴_보존() {
         assert_eq!(
-            render("{{x}} then {{x}}; keep {{ not param }}", &vals(&[("x", "A")])),
+            render(
+                "{{x}} then {{x}}; keep {{ not param }}",
+                &vals(&[("x", "A")])
+            ),
             "A then A; keep {{ not param }}"
         );
     }

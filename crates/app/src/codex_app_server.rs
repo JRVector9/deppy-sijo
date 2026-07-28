@@ -1481,9 +1481,7 @@ fn handle_client_command(
         | ClientCommand::ReadThread { reply, .. }
         | ClientCommand::ResumeThread { reply, .. }
         | ClientCommand::ArchiveThread { reply, .. }
-        | ClientCommand::ReadRateLimits { reply } => {
-            Some(ClientCommandReply::Json(reply.clone()))
-        }
+        | ClientCommand::ReadRateLimits { reply } => Some(ClientCommandReply::Json(reply.clone())),
         ClientCommand::ListModels { reply, .. } => Some(ClientCommandReply::Models(reply.clone())),
         ClientCommand::ListSkills { reply, .. } => Some(ClientCommandReply::Skills(reply.clone())),
         _ => None,
@@ -1491,14 +1489,14 @@ fn handle_client_command(
     let queues_before_initialize = !state.initialized
         && matches!(
             &command,
-                ClientCommand::StartSession { .. }
-                    | ClientCommand::ListThreads { .. }
-                    | ClientCommand::ReadThread { .. }
-                    | ClientCommand::ResumeThread { .. }
-                    | ClientCommand::ArchiveThread { .. }
-                    | ClientCommand::ListModels { .. }
-                    | ClientCommand::ListSkills { .. }
-                    | ClientCommand::ReadRateLimits { .. }
+            ClientCommand::StartSession { .. }
+                | ClientCommand::ListThreads { .. }
+                | ClientCommand::ReadThread { .. }
+                | ClientCommand::ResumeThread { .. }
+                | ClientCommand::ArchiveThread { .. }
+                | ClientCommand::ListModels { .. }
+                | ClientCommand::ListSkills { .. }
+                | ClientCommand::ReadRateLimits { .. }
         );
     if queues_before_initialize
         && preinitialize_backlog_len(state) >= PREINITIALIZE_BACKLOG_CAPACITY
@@ -2445,7 +2443,9 @@ fn handle_response(
             let response = if result.is_object() {
                 Ok(result)
             } else {
-                Err(anyhow::anyhow!("account/rateLimits/read 응답이 객체가 아닙니다"))
+                Err(anyhow::anyhow!(
+                    "account/rateLimits/read 응답이 객체가 아닙니다"
+                ))
             };
             send_rpc_reply(reply, repaint, response);
         }

@@ -251,13 +251,15 @@ impl FleetUi {
         let ready_prompt = if let Some(prompt) = prompt {
             let names = prompt.params();
             if !names.is_empty() {
-                egui::Grid::new("fleet_bc_params").num_columns(2).show(ui, |ui| {
-                    for name in &names {
-                        ui.monospace(format!("{{{{{name}}}}}"));
-                        ui.text_edit_singleline(state.params.entry(name.clone()).or_default());
-                        ui.end_row();
-                    }
-                });
+                egui::Grid::new("fleet_bc_params")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for name in &names {
+                            ui.monospace(format!("{{{{{name}}}}}"));
+                            ui.text_edit_singleline(state.params.entry(name.clone()).or_default());
+                            ui.end_row();
+                        }
+                    });
             }
             let rendered = crate::prompt_library::render(&prompt.body, &state.params);
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -274,28 +276,30 @@ impl FleetUi {
         ui.separator();
         // ③ 대상 체크박스 — PTY 세션만(구조화는 steer 경로라 브로드캐스트 대상 아님).
         ui.label(catalog.t("fleet.broadcast.targets", &[]));
-        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-            for session in sessions {
-                let Some(key) = session.broadcast_key() else {
-                    continue;
-                };
-                let mut checked = state.targets.contains(&key);
-                let label = format!(
-                    "{} · {}  ({})",
-                    session.title,
-                    session.workspace_name,
-                    state_label(session.state, catalog)
-                );
-                if ui.checkbox(&mut checked, label).changed() {
-                    if checked {
-                        state.targets.insert(key);
-                    } else {
-                        state.targets.remove(&key);
+        egui::ScrollArea::vertical()
+            .max_height(180.0)
+            .show(ui, |ui| {
+                for session in sessions {
+                    let Some(key) = session.broadcast_key() else {
+                        continue;
+                    };
+                    let mut checked = state.targets.contains(&key);
+                    let label = format!(
+                        "{} · {}  ({})",
+                        session.title,
+                        session.workspace_name,
+                        state_label(session.state, catalog)
+                    );
+                    if ui.checkbox(&mut checked, label).changed() {
+                        if checked {
+                            state.targets.insert(key);
+                        } else {
+                            state.targets.remove(&key);
+                        }
+                        state.confirm_send = false;
                     }
-                    state.confirm_send = false;
                 }
-            }
-        });
+            });
         // ④ 전송 — 현재 PTY 세션과 교집합만 보낸다. 패널 연 뒤 종료된 stale 대상을 제외해
         // 카운트가 실제 전송 수와 일치하게 한다(세션 순회 순서라 결정적).
         ui.add_space(6.0);
@@ -340,7 +344,9 @@ impl FleetUi {
                     ui.visuals().warn_fg_color,
                     catalog.t("fleet.broadcast.confirm", &[("count", &count.to_string())]),
                 );
-                if ui.button(catalog.t("fleet.broadcast.confirm_yes", &[])).clicked()
+                if ui
+                    .button(catalog.t("fleet.broadcast.confirm_yes", &[]))
+                    .clicked()
                     && let Some(prompt_text) = ready_prompt
                 {
                     out = Some(FleetAction::Broadcast {
@@ -349,7 +355,10 @@ impl FleetUi {
                     });
                     state.confirm_send = false;
                 }
-                if ui.button(catalog.t("fleet.broadcast.confirm_no", &[])).clicked() {
+                if ui
+                    .button(catalog.t("fleet.broadcast.confirm_no", &[]))
+                    .clicked()
+                {
                     state.confirm_send = false;
                 }
             });
@@ -471,13 +480,15 @@ impl FleetUi {
         let ready: Option<Option<String>> = if let Some(prompt) = selected_prompt {
             let names = prompt.params();
             if !names.is_empty() {
-                egui::Grid::new("fleet_batch_params").num_columns(2).show(ui, |ui| {
-                    for name in &names {
-                        ui.monospace(format!("{{{{{name}}}}}"));
-                        ui.text_edit_singleline(state.params.entry(name.clone()).or_default());
-                        ui.end_row();
-                    }
-                });
+                egui::Grid::new("fleet_batch_params")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for name in &names {
+                            ui.monospace(format!("{{{{{name}}}}}"));
+                            ui.text_edit_singleline(state.params.entry(name.clone()).or_default());
+                            ui.end_row();
+                        }
+                    });
             }
             let rendered = crate::prompt_library::render(&prompt.body, &state.params);
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -541,9 +552,10 @@ fn header(
         ui.heading(catalog.t("fleet.title", &[]));
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new(
-                catalog.t("fleet.session_count", &[("count", &summary.total.to_string())]),
-            )
+            egui::RichText::new(catalog.t(
+                "fleet.session_count",
+                &[("count", &summary.total.to_string())],
+            ))
             .weak(),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -590,7 +602,11 @@ fn chip(ui: &mut egui::Ui, state: AgentVisualState, count: usize, catalog: &i18n
     };
     let label = state_label(state, catalog);
     let p = ui.painter();
-    p.circle_filled(egui::pos2(rect.left() + 6.0, rect.center().y), 4.0, dot_color);
+    p.circle_filled(
+        egui::pos2(rect.left() + 6.0, rect.center().y),
+        4.0,
+        dot_color,
+    );
     p.text(
         egui::pos2(rect.left() + 16.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -649,10 +665,15 @@ fn card(ui: &mut egui::Ui, session: &FleetSession, catalog: &i18n::Catalog) -> b
         );
         ui.label(egui::RichText::new("·").small().weak());
         ui.add(
-            egui::Label::new(egui::RichText::new(&session.workspace_name).small().weak()).truncate(),
+            egui::Label::new(egui::RichText::new(&session.workspace_name).small().weak())
+                .truncate(),
         );
         if !session.active_workspace {
-            ui.label(egui::RichText::new(catalog.t("fleet.warm", &[])).small().weak());
+            ui.label(
+                egui::RichText::new(catalog.t("fleet.warm", &[]))
+                    .small()
+                    .weak(),
+            );
         }
     });
     // 3행: 대기 사유 우선, 없으면 에이전트 라인("Codex · gpt-5.5 · xhigh").
@@ -661,9 +682,8 @@ fn card(ui: &mut egui::Ui, session: &FleetSession, catalog: &i18n::Catalog) -> b
             egui::Label::new(egui::RichText::new(message).small().color(state_color)).truncate(),
         );
     } else if let Some(line) = &session.agent_line {
-        content.add(
-            egui::Label::new(egui::RichText::new(line).small().weak().monospace()).truncate(),
-        );
+        content
+            .add(egui::Label::new(egui::RichText::new(line).small().weak().monospace()).truncate());
     }
 
     response.clicked()

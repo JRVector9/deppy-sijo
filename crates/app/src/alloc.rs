@@ -111,7 +111,9 @@ mod tests {
         // 최적화로 사라지지 않도록 실제로 읽는다.
         let mut acc: u64 = 0;
         for c in &chunks {
-            acc = acc.wrapping_add(c[0] as u64).wrapping_add(c[CHUNK - 1] as u64);
+            acc = acc
+                .wrapping_add(c[0] as u64)
+                .wrapping_add(c[CHUNK - 1] as u64);
         }
         black_box(acc);
         let peak = phys_footprint();

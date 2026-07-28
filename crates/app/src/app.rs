@@ -5607,19 +5607,13 @@ pub(crate) fn top_provider_usage(
         );
     }
 
-    fn provider(
-        ui: &mut egui::Ui,
-        name: &str,
-        accent: egui::Color32,
-        usage: Option<(u8, u8)>,
-    ) {
+    fn provider(ui: &mut egui::Ui, name: &str, accent: egui::Color32, usage: Option<(u8, u8)>) {
         let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
         crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, name);
 
         let five_hour = usage.map(|value| value.0);
         let weekly = usage.map(|value| value.1);
-        let five_hour_label =
-            five_hour.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
+        let five_hour_label = five_hour.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
         let weekly_label = weekly.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
         ui.label(
             egui::RichText::new(five_hour_label)
@@ -5629,7 +5623,8 @@ pub(crate) fn top_provider_usage(
         );
 
         let (bar, _) = ui.allocate_exact_size(egui::vec2(42.0, 6.0), egui::Sense::hover());
-        ui.painter().rect_filled(bar, 3.0, egui::Color32::from_gray(42));
+        ui.painter()
+            .rect_filled(bar, 3.0, egui::Color32::from_gray(42));
         if let Some(five_hour) = five_hour {
             let filled = egui::Rect::from_min_max(
                 bar.min,
@@ -5657,22 +5652,17 @@ pub(crate) fn top_provider_usage(
         |ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
             provider(
-                  ui,
-                  "Claude",
-                  egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-                  claude_usage,
-              );
-              ui.add_space(4.0);
-              separator(ui, 18.0);
-              ui.add_space(4.0);
-              provider(
-                  ui,
-                  "Codex",
-                  ui.visuals().hyperlink_color,
-                  codex_usage,
-              );
-          },
-      );
+                ui,
+                "Claude",
+                egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+                claude_usage,
+            );
+            ui.add_space(4.0);
+            separator(ui, 18.0);
+            ui.add_space(4.0);
+            provider(ui, "Codex", ui.visuals().hyperlink_color, codex_usage);
+        },
+    );
 }
 
 impl WorkspaceRuntime {
@@ -15559,7 +15549,8 @@ impl App {
         let bracketed = self.active.workspace_ui.session_bracketed_paste(session);
         let provider = self.active.workspace_ui.agent_provider_for(session);
         self.active.workspace_ui.clear_selection(session);
-        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider) else {
+        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider)
+        else {
             return;
         };
         let writes = match plan {
@@ -16731,9 +16722,9 @@ impl eframe::App for App {
                             };
                             let bell_open =
                                 egui::Popup::is_id_open(ui.ctx(), Self::inbox_popup_id());
-                              let bell = tbtn_response(ui, bell_label, bell_open)
-                                  .on_hover_text(text.t("top.notifications", &[]));
-                              inbox_click = self.inbox_popup(&bell, &text);
+                            let bell = tbtn_response(ui, bell_label, bell_open)
+                                .on_hover_text(text.t("top.notifications", &[]));
+                            inbox_click = self.inbox_popup(&bell, &text);
                             // Agents 진입은 사이드바 하단 nav가 담당한다 — 상단바 버튼은
                             // 삭제(2026-07-18 사용자 확정). 단축키·기타 진입점은 유지.
                         });
@@ -16909,13 +16900,13 @@ impl eframe::App for App {
                         ),
                     )
                 };
-                  ui::file_tree::SidebarWorkspaceEntry {
-                      id: workspace.id.clone(),
-                      name: Self::workspace_display_name(workspace),
-                      repo: workspace_git_label(&workspace.path),
-                      state,
-                      summary,
-                  }
+                ui::file_tree::SidebarWorkspaceEntry {
+                    id: workspace.id.clone(),
+                    name: Self::workspace_display_name(workspace),
+                    repo: workspace_git_label(&workspace.path),
+                    state,
+                    summary,
+                }
             })
             .collect();
         // 사이드바 펼침은 활성 선택과 독립적이다. 활성 세션뿐 아니라 warm runtime의
@@ -17368,8 +17359,7 @@ impl eframe::App for App {
         // fleet 뷰모델은 Fleet 뷰일 때만 조립한다(active+warm 순회 비용 회피).
         let (fleet_sessions, fleet_summary) = if fleet_visible {
             let sessions = self.build_fleet_sessions(&text);
-            let summary =
-                crate::fleet::FleetSummary::from_states(sessions.iter().map(|s| s.state));
+            let summary = crate::fleet::FleetSummary::from_states(sessions.iter().map(|s| s.state));
             (sessions, summary)
         } else {
             (Vec::new(), crate::fleet::FleetSummary::default())

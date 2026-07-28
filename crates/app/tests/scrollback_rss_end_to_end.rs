@@ -101,7 +101,10 @@ mod macos {
             mb(auto_released),
         );
         // 진단용 — 자동 반환이 되는지 그냥 보고만 한다(임계 assert 없음).
-        assert!(peak.saturating_sub(baseline) >= 150 * MB, "peak 미달 — 측정 무효");
+        assert!(
+            peak.saturating_sub(baseline) >= 150 * MB,
+            "peak 미달 — 측정 무효"
+        );
     }
 
     /// 무거운 스크롤백 세션 여러 개 → Hidden 전이(전체 압축) → mimalloc purge →

@@ -1530,9 +1530,9 @@ impl AgentSessionsUi {
 
     pub fn refresh_rate_limits(&mut self, ctx: &egui::Context) {
         if self.pending_rate_limits.is_some()
-            || self.last_rate_limits_request.is_some_and(|last| {
-                last.elapsed() < std::time::Duration::from_secs(60)
-            })
+            || self
+                .last_rate_limits_request
+                .is_some_and(|last| last.elapsed() < std::time::Duration::from_secs(60))
         {
             return;
         }
@@ -1557,9 +1557,9 @@ impl AgentSessionsUi {
         let result = match reply.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(
-                "Codex rate-limit reply disconnected"
-            ))),
+            Err(TryRecvError::Disconnected) => {
+                Some(Err(anyhow::anyhow!("Codex rate-limit reply disconnected")))
+            }
         };
         let Some(result) = result else { return };
         self.pending_rate_limits = None;

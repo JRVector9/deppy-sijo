@@ -83,6 +83,10 @@ mod memory_release_hook_tests {
         let before = CALLS.load(Ordering::SeqCst);
         super::signal_memory_released();
         super::signal_memory_released();
-        assert_eq!(CALLS.load(Ordering::SeqCst), before + 2, "훅이 signal마다 불려야 함");
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            before + 2,
+            "훅이 signal마다 불려야 함"
+        );
     }
 }

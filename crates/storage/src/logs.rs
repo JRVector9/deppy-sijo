@@ -696,12 +696,8 @@ fn collect_session_log_bundles_with_limit(
     for candidate in candidates {
         if candidate.original_len > candidate.max_bytes {
             let mut file = open_regular_log_file(&candidate.path, false)?;
-            compact_open_file_to_tail(
-                &mut file,
-                candidate.retain_bytes,
-                candidate.tail_boundary,
-            )
-            .with_context(|| {
+            compact_open_file_to_tail(&mut file, candidate.retain_bytes, candidate.tail_boundary)
+                .with_context(|| {
                 format!(
                     "기존 세션 로그 상한 적용 실패: {}",
                     candidate.path.display()

@@ -318,7 +318,9 @@ fn gc_with_limit(logs_root: &Path, budget_bytes: u64, entry_limit: usize) -> any
                 total = total.saturating_sub(archive.bytes);
                 tracing::info!(path = %archive.path.display(), "scrollback 아카이브 GC — 예산 초과 제거");
             }
-            Err(e) => tracing::warn!(path = %archive.path.display(), "아카이브 GC 삭제 실패: {e:#}"),
+            Err(e) => {
+                tracing::warn!(path = %archive.path.display(), "아카이브 GC 삭제 실패: {e:#}")
+            }
         }
     }
     Ok(total)
@@ -487,7 +489,11 @@ mod tests {
         };
 
         assert_eq!(err.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
-        assert_eq!(scan_total(&root), 0, "scan_total must fail closed on scan errors");
+        assert_eq!(
+            scan_total(&root),
+            0,
+            "scan_total must fail closed on scan errors"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -501,7 +507,11 @@ mod tests {
         let err = gc(&root, 0).unwrap_err();
 
         assert_eq!(err.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
-        assert_eq!(scan_total(&root), 0, "scan_total must fail closed on scan errors");
+        assert_eq!(
+            scan_total(&root),
+            0,
+            "scan_total must fail closed on scan errors"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

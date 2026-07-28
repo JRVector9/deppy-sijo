@@ -4,6 +4,7 @@
 
 - Warm/hidden `pending_events` retained replay-only lifecycle events without a hard cap.
 - `workspace_git_label` used a process-global cache with 2s freshness but no path-count bound.
+- Accepted independent review follow-up: when `active.render_active == false`, newly drained active runtime events were appended and capped without first applying warm-style state to `workspace_ui`. If cap compaction later dropped required status/exit replay, returning to visible mode could leave stale status/exit UI after only mux/viewport snapshots were emitted.
 
 ## Scope
 
@@ -18,6 +19,8 @@
 - Changed `coalesce_mux_updated` to return overflow state, keep the latest mux first, drop stale session events absent from the latest mux, and cap replay events by dropping transient spawn acknowledgements before required state.
 - Added `pending_replay_resync` to `WorkspaceRuntime`; warm/hidden compaction sets it on overflow, and successful Warm to Active delivery clears it.
 - Replaced the raw global Git-label `HashMap` with `WorkspaceGitLabelCache`, including `last_accessed` refresh and oldest-access eviction at 256 entries.
+- Added `admit_hidden_active_replay_events`, which applies hidden-active events to `workspace_ui` via the existing `apply_warm_events` path before appending replay events and running cap compaction.
+- Routed only the `active.render_active == false` path through that helper after notification processing, preserving notification ordering and avoiding duplicate visible-side effects while the active workspace is visible.
 
 ## Tests
 
@@ -42,14 +45,27 @@
 - Gate: `cargo test -p deppy-sijo coalesce_mux_updated --locked -- --test-threads=1`
   - Result: passed, 2 passed, 0 failed, 919 filtered out.
 - Gate: `cargo test -p deppy-sijo pending_replay --locked -- --test-threads=1`
-  - Result: passed, 3 passed, 0 failed, 918 filtered out.
+  - Result before review follow-up: passed, 3 passed, 0 failed, 918 filtered out.
+- Review RED: `cargo test -p deppy-sijo pending_replay_hidden_active_applies_required_state_before_cap_discards_replay --locked -- --test-threads=1`
+  - Result: failed to compile as expected.
+  - Evidence: 1 `E0425` error because `admit_hidden_active_replay_events` did not exist.
+- Review GREEN: `cargo test -p deppy-sijo pending_replay_hidden_active_applies_required_state_before_cap_discards_replay --locked -- --test-threads=1`
+  - Result: passed, 1 passed, 0 failed, 921 filtered out.
+- Review Gate: `cargo test -p deppy-sijo coalesce_ --locked -- --test-threads=1`
+  - Result: passed, 10 passed, 0 failed, 912 filtered out.
+- Review Gate: `cargo test -p deppy-sijo pending_replay --locked -- --test-threads=1`
+  - Result: passed, 4 passed, 0 failed, 918 filtered out.
 - Gate: `cargo test -p deppy-sijo coalesce_ --locked -- --test-threads=1`
-  - Result: passed, 10 passed, 0 failed, 911 filtered out.
+  - Result before review follow-up: passed, 10 passed, 0 failed, 911 filtered out.
 - Gate: `cargo test -p deppy-sijo workspace_git_label --locked -- --test-threads=1`
   - Result: passed, 1 passed, 0 failed, 920 filtered out.
 - Gate: `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`
+  - Result: passed before review follow-up.
+- Review Gate: `cargo clippy -p deppy-sijo --all-targets --locked -- -D warnings`
   - Result: passed.
 - Gate: `git diff --check`
+  - Result: passed before review follow-up.
+- Review Gate: `git diff --check`
   - Result: passed.
 
 ## Non-Gate Commands
@@ -66,6 +82,7 @@
 - [x] Overflow sets a replay-resync flag instead of silently relying on partial replay.
 - [x] Hidden overflow does not set `event_resync_pending` or reactivate rendering.
 - [x] Successful activation clears replay-resync state.
+- [x] Hidden-active runtime events apply status/exit state to `workspace_ui` before replay cap compaction can discard required replay entries.
 - [x] Git-label cache retains at most 256 paths and evicts the oldest accessed entry.
 - [x] Existing 2s Git-label freshness is preserved.
 
@@ -76,6 +93,7 @@
 ## Regression Risks
 
 - If a replay overflow drops required non-transient events after the transient pass, the overflow flag relies on the next successful Warm to Active transition for the full runtime snapshot refresh.
+- Hidden-active status/exit state now reaches `workspace_ui` before replay compaction, but fresh mux/viewport resync is still required after overflow for terminal content snapshots.
 - `cargo fmt --check` remains red for pre-existing out-of-scope formatting differences.
 
 ## Rollback Plan

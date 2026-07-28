@@ -16535,17 +16535,23 @@ impl eframe::App for App {
                 &agent_providers,
                 &self.i18n,
             );
-            self.active
-                .pending_events
-                .extend(new_events.into_iter().filter(|event| {
-                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
-                }));
             // 창이 숨겨져(render_active=false) ui()가 스킵되면 active의 pending도 warm처럼
-            // 무한 누적된다 — 동일하게 coalesce로 유계화한다. 보일 때는 ui()가 매 프레임
-            // take()로 소비해 자라지 않으므로 coalesce가 불필요하다.
+            // 무한 누적된다. 이때 표시 상태도 warm과 같은 경로로 먼저 반영한 뒤 replay를
+            // 유계화한다. 보일 때는 ui()가 매 프레임 take()로 소비해 자라지 않으므로
+            // coalesce가 불필요하다.
             if !self.active.render_active {
-                let compacted = coalesce_mux_updated(&mut self.active.pending_events);
+                let compacted = admit_hidden_active_replay_events(
+                    &mut self.active.workspace_ui,
+                    &mut self.active.pending_events,
+                    new_events,
+                );
                 self.active.pending_replay_resync |= compacted.overflowed;
+            } else {
+                self.active
+                    .pending_events
+                    .extend(new_events.into_iter().filter(|event| {
+                        !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                    }));
             }
             // 여기서 리페인트를 재요청하지 않는다 — 이벤트를 여기까지 실어나른 모든 경로
             // (emit_gated의 Viewport/InputPressure/ResourceUsage slot + enqueue_durable_event)가
@@ -19104,6 +19110,20 @@ fn clear_pending_replay_resync_after_activation(
     }
 }
 
+fn admit_hidden_active_replay_events(
+    workspace_ui: &mut ui::workspace::WorkspaceUi,
+    pending_events: &mut Vec<runtime::RuntimeEvent>,
+    events: Vec<runtime::RuntimeEvent>,
+) -> ReplayCompaction {
+    workspace_ui.apply_warm_events(&events);
+    pending_events.extend(
+        events
+            .into_iter()
+            .filter(|event| !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })),
+    );
+    coalesce_mux_updated(pending_events)
+}
+
 fn mux_live_sessions(
     mux: &runtime::MuxSnapshot,
 ) -> std::collections::HashSet<runtime::SessionId> {
@@ -21144,6 +21164,39 @@ mod tests {
         clear_pending_replay_resync_after_activation(&mut pending_replay_resync, true, true);
         assert!(render_active);
         assert!(!pending_replay_resync);
+    }
+
+    #[test]
+    fn pending_replay_hidden_active_applies_required_state_before_cap_discards_replay() {
+        let session_ids: Vec<u64> = (1..=(PENDING_REPLAY_EVENT_CAP + 1) as u64).collect();
+        let target = runtime::SessionId(session_ids[0]);
+        let mut events = vec![live_mux_event("latest", &session_ids)];
+        events.extend(session_ids.iter().copied().map(|session| {
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(session),
+                exit_code: Some(if session == target.0 { 1 } else { 0 }),
+            }
+        }));
+        let mut workspace_ui = ui::workspace::WorkspaceUi::new();
+        let mut pending_events = Vec::new();
+
+        let result =
+            admit_hidden_active_replay_events(&mut workspace_ui, &mut pending_events, events);
+
+        assert!(result.overflowed);
+        assert_eq!(pending_events.len(), PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&pending_events[0]), Some("latest"));
+        assert_eq!(
+            workspace_ui.last_session_status(target),
+            Some(runtime::SessionStatus::Error)
+        );
+        assert!(
+            !pending_events.iter().any(|event| matches!(
+                event,
+                runtime::RuntimeEvent::SessionExited { session, .. } if *session == target
+            )),
+            "target exit replay should be dropped by the hard cap"
+        );
     }
 
     #[test]

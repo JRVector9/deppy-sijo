@@ -124,6 +124,17 @@ pub(crate) fn peek_clipboard_paste() -> bool {
         .any(|kd| matches!(kd, NativeKeyDown::ClipboardPaste { .. }) && kd.fresh())
 }
 
+/// drain하지 않고 fresh한 Command+C key-down이 있는지만 본다. 파일 트리가 터미널보다
+/// 먼저 복사 소유권을 정할 수 있게 하며, 실제 소비는 WorkspaceUi의 drain에 맡긴다.
+pub(crate) fn peek_clipboard_copy() -> bool {
+    let Ok(key_downs) = queue().lock() else {
+        return false;
+    };
+    key_downs
+        .iter()
+        .any(|kd| matches!(kd, NativeKeyDown::ClipboardCopy { .. }) && kd.fresh())
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn install() {
     use std::ptr::NonNull;
@@ -240,8 +251,11 @@ fn is_clipboard_copy_key(
     if !command || conflicting_modifier {
         return false;
     }
-    characters_ignoring_modifiers.is_some_and(|characters| characters.eq_ignore_ascii_case("c"))
-        || key_code == 0x08
+    match characters_ignoring_modifiers {
+        Some(characters) if characters.eq_ignore_ascii_case("c") => true,
+        Some(characters) if characters.is_ascii() => false,
+        Some(_) | None => key_code == 0x08,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -345,6 +359,7 @@ mod tests {
         assert!(is_clipboard_copy_key(0x30, Some("c"), true, false));
         assert!(is_clipboard_copy_key(0x08, Some("ㅊ"), true, false));
         assert!(is_clipboard_copy_key(0x08, None, true, false));
+        assert!(!is_clipboard_copy_key(0x08, Some("x"), true, false));
         assert!(!is_clipboard_copy_key(0x08, Some("c"), false, false));
         assert!(!is_clipboard_copy_key(0x08, Some("c"), true, true));
         assert!(!is_clipboard_copy_key(0x09, Some("v"), true, false));

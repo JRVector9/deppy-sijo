@@ -5447,26 +5447,78 @@ struct WorkspaceRuntime {
     event_overflow_pending: bool,
     /// active receiver 재구독 뒤 전체 mux/viewport snapshot 재전송 명령이 아직 남아 있다.
     event_resync_pending: bool,
+    /// replay cap overflow 뒤 다음 Warm→Active full snapshot 전환으로 보정해야 한다.
+    pending_replay_resync: bool,
 }
 
 #[derive(Clone)]
 struct WorkspaceGitLabelCacheEntry {
     checked_at: std::time::Instant,
+    last_accessed: std::time::Instant,
     label: Option<String>,
 }
 
+const WORKSPACE_GIT_LABEL_CACHE_CAP: usize = 256;
+const WORKSPACE_GIT_LABEL_CACHE_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Default)]
+struct WorkspaceGitLabelCache {
+    entries: std::collections::HashMap<String, WorkspaceGitLabelCacheEntry>,
+}
+
+impl WorkspaceGitLabelCache {
+    fn get_fresh(&mut self, path: &str, now: std::time::Instant) -> Option<Option<String>> {
+        let entry = self.entries.get_mut(path)?;
+        if now.duration_since(entry.checked_at) >= WORKSPACE_GIT_LABEL_CACHE_FRESHNESS {
+            return None;
+        }
+        entry.last_accessed = now;
+        Some(entry.label.clone())
+    }
+
+    fn insert(&mut self, path: String, label: Option<String>, now: std::time::Instant) {
+        if let Some(entry) = self.entries.get_mut(&path) {
+            entry.checked_at = now;
+            entry.last_accessed = now;
+            entry.label = label;
+            return;
+        }
+        while self.entries.len() >= WORKSPACE_GIT_LABEL_CACHE_CAP {
+            let Some(oldest_path) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_accessed)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest_path);
+        }
+        self.entries.insert(
+            path,
+            WorkspaceGitLabelCacheEntry {
+                checked_at: now,
+                last_accessed: now,
+                label,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 fn workspace_git_label(path: &str) -> Option<String> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<String, WorkspaceGitLabelCacheEntry>,
-        >,
-    > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Ok(entries) = cache.lock()
-        && let Some(entry) = entries.get(path)
-        && entry.checked_at.elapsed() < std::time::Duration::from_secs(2)
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<WorkspaceGitLabelCache>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(WorkspaceGitLabelCache::default()));
+    let now = std::time::Instant::now();
+    if let Ok(mut entries) = cache.lock()
+        && let Some(label) = entries.get_fresh(path, now)
     {
-        return entry.label.clone();
+        return label;
     }
 
     let root = std::path::Path::new(path);
@@ -5494,13 +5546,7 @@ fn workspace_git_label(path: &str) -> Option<String> {
         Some(branch)
     });
     if let Ok(mut entries) = cache.lock() {
-        entries.insert(
-            path.to_owned(),
-            WorkspaceGitLabelCacheEntry {
-                checked_at: std::time::Instant::now(),
-                label: label.clone(),
-            },
-        );
+        entries.insert(path.to_owned(), label.clone(), std::time::Instant::now());
     }
     label
 }
@@ -8970,6 +9016,7 @@ impl App {
             pending_agent_spawns: 0,
             event_overflow_pending: false,
             event_resync_pending: false,
+            pending_replay_resync: false,
         }
     }
 
@@ -11631,11 +11678,17 @@ impl App {
         // 이미 fresh + RestoreWorkspace라 리셋 불필요.)
         new_active.render_active = true;
         new_active.backgrounded_at = None;
-        let _ = new_active
+        let activated = new_active
             .runtime
             .send_command(runtime::RuntimeCommand::SetWorkspaceState(
                 runtime::WorkspaceRuntimeState::Active,
-            ));
+            ))
+            .is_ok();
+        clear_pending_replay_resync_after_activation(
+            &mut new_active.pending_replay_resync,
+            true,
+            activated,
+        );
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
@@ -16353,16 +16406,22 @@ impl eframe::App for App {
         }
 
         if want_active != self.active.render_active {
-            self.active.render_active = want_active;
             let state = if want_active {
                 runtime::WorkspaceRuntimeState::Active
             } else {
                 runtime::WorkspaceRuntimeState::Warm
             };
-            let _ = self
+            let delivered = self
                 .active
                 .runtime
-                .send_command(runtime::RuntimeCommand::SetWorkspaceState(state));
+                .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
+                .is_ok();
+            self.active.render_active = want_active;
+            clear_pending_replay_resync_after_activation(
+                &mut self.active.pending_replay_resync,
+                want_active,
+                delivered,
+            );
             if want_active {
                 // 재개된 Viewport push는 비동기 — 다음 프레임을 예약해 드레인한다.
                 // (안 그러면 hidden 중 종료된 pane이 stale/"연결 중…"에 갇힐 수 있다)
@@ -16429,7 +16488,8 @@ impl eframe::App for App {
                 // chatty한 warm 워커가 pending_events를 무한 누적하지 않도록 최신 하나만
                 // 남기고 합친다 (lifecycle은 순서 보존, Viewport는 세션별 최신본 — replay 정확성).
                 // 새 이벤트가 들어온 이 분기에서만 호출돼 프레임마다 도는 걸 피한다.
-                coalesce_mux_updated(&mut rt.pending_events);
+                let compacted = coalesce_mux_updated(&mut rt.pending_events);
+                rt.pending_replay_resync |= compacted.overflowed;
             }
             if rt.event_overflow_pending && rt.events.durable_backlog_exhausted() {
                 rt.events = Self::subscribe_runtime_events(&rt.runtime, ctx);
@@ -16475,16 +16535,23 @@ impl eframe::App for App {
                 &agent_providers,
                 &self.i18n,
             );
-            self.active
-                .pending_events
-                .extend(new_events.into_iter().filter(|event| {
-                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
-                }));
             // 창이 숨겨져(render_active=false) ui()가 스킵되면 active의 pending도 warm처럼
-            // 무한 누적된다 — 동일하게 coalesce로 유계화한다. 보일 때는 ui()가 매 프레임
-            // take()로 소비해 자라지 않으므로 coalesce가 불필요하다.
+            // 무한 누적된다. 이때 표시 상태도 warm과 같은 경로로 먼저 반영한 뒤 replay를
+            // 유계화한다. 보일 때는 ui()가 매 프레임 take()로 소비해 자라지 않으므로
+            // coalesce가 불필요하다.
             if !self.active.render_active {
-                coalesce_mux_updated(&mut self.active.pending_events);
+                let compacted = admit_hidden_active_replay_events(
+                    &mut self.active.workspace_ui,
+                    &mut self.active.pending_events,
+                    new_events,
+                );
+                self.active.pending_replay_resync |= compacted.overflowed;
+            } else {
+                self.active
+                    .pending_events
+                    .extend(new_events.into_iter().filter(|event| {
+                        !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                    }));
             }
             // 여기서 리페인트를 재요청하지 않는다 — 이벤트를 여기까지 실어나른 모든 경로
             // (emit_gated의 Viewport/InputPressure/ResourceUsage slot + enqueue_durable_event)가
@@ -19026,12 +19093,88 @@ fn expired_warm_workspace_ids(
 ///
 /// 알림은 coalesce 전에 process_ws_notifications가 전량 소비하므로(렌더 replay 전용)
 /// 공격적으로 줄여도 알림엔 영향이 없다.
-fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
+const PENDING_REPLAY_EVENT_CAP: usize = 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayCompaction {
+    overflowed: bool,
+}
+
+fn clear_pending_replay_resync_after_activation(
+    pending_replay_resync: &mut bool,
+    want_active: bool,
+    delivered: bool,
+) {
+    if want_active && delivered {
+        *pending_replay_resync = false;
+    }
+}
+
+fn admit_hidden_active_replay_events(
+    workspace_ui: &mut ui::workspace::WorkspaceUi,
+    pending_events: &mut Vec<runtime::RuntimeEvent>,
+    events: Vec<runtime::RuntimeEvent>,
+) -> ReplayCompaction {
+    workspace_ui.apply_warm_events(&events);
+    pending_events.extend(
+        events
+            .into_iter()
+            .filter(|event| !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })),
+    );
+    coalesce_mux_updated(pending_events)
+}
+
+fn mux_live_sessions(
+    mux: &runtime::MuxSnapshot,
+) -> std::collections::HashSet<runtime::SessionId> {
+    mux.tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .filter_map(|pane| pane.session_id)
+        .collect()
+}
+
+fn event_session(event: &runtime::RuntimeEvent) -> Option<runtime::SessionId> {
+    match event {
+        runtime::RuntimeEvent::ShellSpawned { session }
+        | runtime::RuntimeEvent::AgentSpawned { session }
+        | runtime::RuntimeEvent::Viewport { session, .. }
+        | runtime::RuntimeEvent::SessionExited { session, .. }
+        | runtime::RuntimeEvent::SessionStatusChanged { session, .. }
+        | runtime::RuntimeEvent::PtyInputPressure { session, .. }
+        | runtime::RuntimeEvent::SessionStatusViewChanged { session, .. }
+        | runtime::RuntimeEvent::SessionRestored { session, .. }
+        | runtime::RuntimeEvent::ScrollbackSearchResult { session, .. }
+        | runtime::RuntimeEvent::LastOutputExtracted { session, .. }
+        | runtime::RuntimeEvent::SessionFreezeChanged { session, .. } => Some(*session),
+        runtime::RuntimeEvent::AgentSpawnResolved {
+            session: Some(session),
+            ..
+        } => Some(*session),
+        _ => None,
+    }
+}
+
+fn replay_transient_event(event: &runtime::RuntimeEvent) -> bool {
+    matches!(
+        event,
+        runtime::RuntimeEvent::ShellSpawned { .. }
+            | runtime::RuntimeEvent::AgentSpawned { .. }
+            | runtime::RuntimeEvent::SpawnFailed { .. }
+            | runtime::RuntimeEvent::AgentSpawnResolved { .. }
+    )
+}
+
+fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) -> ReplayCompaction {
     // 남길 최신 MuxUpdated(있으면) — 뽑아서 나중에 맨 앞에 재삽입.
     let latest_mux = events
         .iter()
         .rposition(|e| matches!(e, runtime::RuntimeEvent::MuxUpdated { .. }))
         .map(|i| events[i].clone());
+    let latest_mux_live_sessions = latest_mux.as_ref().and_then(|event| match event {
+        runtime::RuntimeEvent::MuxUpdated { snapshot } => Some(mux_live_sessions(snapshot)),
+        _ => None,
+    });
     let latest_resource_idx = events
         .iter()
         .rposition(|e| matches!(e, runtime::RuntimeEvent::ResourceUsage { .. }));
@@ -19082,6 +19225,10 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
             }
             _ => true,
         };
+        let keep = keep
+            && latest_mux_live_sessions
+                .as_ref()
+                .is_none_or(|live| event_session(e).is_none_or(|session| live.contains(&session)));
         idx += 1;
         keep
     });
@@ -19089,6 +19236,33 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
     if let Some(mux) = latest_mux {
         events.insert(0, mux);
     }
+
+    let mut overflowed = false;
+    if events.len() > PENDING_REPLAY_EVENT_CAP {
+        overflowed = true;
+        let mut drop_remaining = events.len() - PENDING_REPLAY_EVENT_CAP;
+        events.retain(|event| {
+            if drop_remaining > 0 && replay_transient_event(event) {
+                drop_remaining -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    if events.len() > PENDING_REPLAY_EVENT_CAP {
+        overflowed = true;
+        let keep_tail = PENDING_REPLAY_EVENT_CAP.saturating_sub(1);
+        let non_mux_len = events.len().saturating_sub(1);
+        let drop_non_mux = non_mux_len.saturating_sub(keep_tail);
+        if drop_non_mux > 0 {
+            events.drain(1..1 + drop_non_mux);
+        }
+        events.truncate(PENDING_REPLAY_EVENT_CAP);
+    }
+
+    ReplayCompaction { overflowed }
 }
 
 /// T1: pane 우클릭 → 환경설정 진입 시 감지한 focused 세션 폴더 배너 상태.
@@ -19309,6 +19483,46 @@ mod tests {
                 }
             ) if failed_operation == operation_id
         ));
+    }
+
+    #[test]
+    fn workspace_git_label_cache_evicts_oldest_accessed_entry_at_cap() {
+        let now = std::time::Instant::now();
+        let mut cache = WorkspaceGitLabelCache::default();
+        for idx in 0..WORKSPACE_GIT_LABEL_CACHE_CAP {
+            cache.insert(
+                format!("path-{idx}"),
+                Some(format!("branch-{idx}")),
+                now + std::time::Duration::from_nanos(idx as u64),
+            );
+        }
+
+        assert_eq!(
+            cache.get_fresh("path-0", now + std::time::Duration::from_millis(1)),
+            Some(Some("branch-0".to_owned()))
+        );
+        cache.insert(
+            format!("path-{WORKSPACE_GIT_LABEL_CACHE_CAP}"),
+            Some(format!("branch-{WORKSPACE_GIT_LABEL_CACHE_CAP}")),
+            now + std::time::Duration::from_millis(2),
+        );
+
+        assert_eq!(cache.entry_count(), WORKSPACE_GIT_LABEL_CACHE_CAP);
+        assert_eq!(
+            cache.get_fresh("path-0", now + std::time::Duration::from_millis(3)),
+            Some(Some("branch-0".to_owned()))
+        );
+        assert_eq!(
+            cache.get_fresh("path-1", now + std::time::Duration::from_millis(3)),
+            None
+        );
+        assert_eq!(
+            cache.get_fresh(
+                &format!("path-{WORKSPACE_GIT_LABEL_CACHE_CAP}"),
+                now + std::time::Duration::from_millis(3)
+            ),
+            Some(Some(format!("branch-{WORKSPACE_GIT_LABEL_CACHE_CAP}")))
+        );
     }
 
     #[test]
@@ -19806,6 +20020,34 @@ mod tests {
                 tabs: Vec::new(),
                 active_tab: Some(runtime::MuxTabId(tag.to_owned())),
                 focused_pane: None,
+            }),
+        }
+    }
+
+    fn live_mux_event(tag: &str, sessions: &[u64]) -> runtime::RuntimeEvent {
+        runtime::RuntimeEvent::MuxUpdated {
+            snapshot: std::sync::Arc::new(runtime::MuxSnapshot {
+                tabs: vec![runtime::TabSnapshot {
+                    id: runtime::MuxTabId(tag.to_owned()),
+                    title: tag.to_owned(),
+                    layout: runtime::LayoutNode::Pane(runtime::MuxPaneId(format!(
+                        "{tag}-pane-{}",
+                        sessions.first().copied().unwrap_or(0)
+                    ))),
+                    panes: sessions
+                        .iter()
+                        .map(|session| runtime::PaneSnapshot {
+                            id: runtime::MuxPaneId(format!("{tag}-pane-{session}")),
+                            session_id: Some(runtime::SessionId(*session)),
+                            title: format!("session-{session}"),
+                            persistent_session_id: None,
+                        })
+                        .collect(),
+                }],
+                active_tab: Some(runtime::MuxTabId(tag.to_owned())),
+                focused_pane: sessions
+                    .first()
+                    .map(|session| runtime::MuxPaneId(format!("{tag}-pane-{session}"))),
             }),
         }
     }
@@ -20873,19 +21115,174 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_mux_updated_pending_replay_caps_exact_boundary_and_reports_overflow() {
+        let mut exact = vec![mux_event("old")];
+        exact.extend((0..PENDING_REPLAY_EVENT_CAP - 1).map(|idx| {
+            runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Shell,
+                message: runtime::MessagePayload::new(format!("spawn.failed.{idx}")),
+            }
+        }));
+        exact.push(mux_event("latest"));
+
+        let exact_result = coalesce_mux_updated(&mut exact);
+
+        assert!(!exact_result.overflowed);
+        assert_eq!(exact.len(), PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&exact[0]), Some("latest"));
+
+        let mut events = vec![mux_event("old")];
+        events.extend((0..PENDING_REPLAY_EVENT_CAP).map(|idx| {
+            runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Shell,
+                message: runtime::MessagePayload::new(format!("spawn.failed.{idx}")),
+            }
+        }));
+        events.push(mux_event("latest"));
+
+        let result = coalesce_mux_updated(&mut events);
+
+        assert!(result.overflowed);
+        assert!(events.len() <= PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&events[0]), Some("latest"));
+    }
+
+    #[test]
+    fn pending_replay_resync_flag_waits_for_successful_activation() {
+        let mut render_active = false;
+        let mut pending_replay_resync = true;
+
+        clear_pending_replay_resync_after_activation(&mut pending_replay_resync, false, true);
+        assert!(!render_active);
+        assert!(pending_replay_resync);
+
+        render_active = true;
+        clear_pending_replay_resync_after_activation(&mut pending_replay_resync, true, false);
+        assert!(render_active);
+        assert!(pending_replay_resync);
+
+        clear_pending_replay_resync_after_activation(&mut pending_replay_resync, true, true);
+        assert!(render_active);
+        assert!(!pending_replay_resync);
+    }
+
+    #[test]
+    fn pending_replay_hidden_active_applies_required_state_before_cap_discards_replay() {
+        let session_ids: Vec<u64> = (1..=(PENDING_REPLAY_EVENT_CAP + 1) as u64).collect();
+        let target = runtime::SessionId(session_ids[0]);
+        let mut events = vec![live_mux_event("latest", &session_ids)];
+        events.extend(session_ids.iter().copied().map(|session| {
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(session),
+                exit_code: Some(if session == target.0 { 1 } else { 0 }),
+            }
+        }));
+        let mut workspace_ui = ui::workspace::WorkspaceUi::new();
+        let mut pending_events = Vec::new();
+
+        let result =
+            admit_hidden_active_replay_events(&mut workspace_ui, &mut pending_events, events);
+
+        assert!(result.overflowed);
+        assert_eq!(pending_events.len(), PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&pending_events[0]), Some("latest"));
+        assert_eq!(
+            workspace_ui.last_session_status(target),
+            Some(runtime::SessionStatus::Error)
+        );
+        assert!(
+            !pending_events.iter().any(|event| matches!(
+                event,
+                runtime::RuntimeEvent::SessionExited { session, .. } if *session == target
+            )),
+            "target exit replay should be dropped by the hard cap"
+        );
+    }
+
+    #[test]
+    fn coalesce_mux_updated_pending_replay_preserves_latest_live_session_state_after_churn() {
+        let session = runtime::SessionId(7);
+        let stale_session = runtime::SessionId(9);
+        let mut events = vec![live_mux_event("old", &[session.0, stale_session.0])];
+        events.extend((0..PENDING_REPLAY_EVENT_CAP).map(|idx| {
+            runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Agent,
+                message: runtime::MessagePayload::new(format!("agent.failed.{idx}")),
+            }
+        }));
+        events.extend([
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session,
+                status: runtime::SessionStatus::Running,
+            },
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session,
+                status: runtime::SessionStatus::Waiting,
+            },
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: stale_session,
+                status: runtime::SessionStatus::Waiting,
+            },
+            viewport_event(session.0, "final"),
+            viewport_event(stale_session.0, "stale"),
+            runtime::RuntimeEvent::SessionExited {
+                session,
+                exit_code: Some(0),
+            },
+            runtime::RuntimeEvent::SessionExited {
+                session: stale_session,
+                exit_code: Some(1),
+            },
+            live_mux_event("latest", &[session.0]),
+        ]);
+
+        let result = coalesce_mux_updated(&mut events);
+
+        assert!(result.overflowed);
+        assert!(events.len() <= PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&events[0]), Some("latest"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: changed,
+                status: runtime::SessionStatus::Waiting,
+            } if *changed == session
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::Viewport { session: changed, snapshot, .. }
+                if *changed == session && snapshot.title.as_deref() == Some("final")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::SessionExited {
+                session: exited,
+                exit_code: Some(0),
+            } if *exited == session
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::SessionStatusChanged { session, .. }
+                | runtime::RuntimeEvent::Viewport { session, .. }
+                | runtime::RuntimeEvent::SessionExited { session, .. }
+                if *session == stale_session
+        )));
+    }
+
+    #[test]
     fn coalesce_moves_latest_mux_to_front() {
         let mut events = vec![
-            mux_event("a"),
+            live_mux_event("a", &[1]),
             runtime::RuntimeEvent::SessionStatusChanged {
                 session: runtime::SessionId(1),
                 status: runtime::SessionStatus::Running,
             },
-            mux_event("b"),
+            live_mux_event("b", &[1]),
             runtime::RuntimeEvent::SessionExited {
                 session: runtime::SessionId(1),
                 exit_code: None,
             },
-            mux_event("c"),
+            live_mux_event("c", &[1]),
         ];
 
         coalesce_mux_updated(&mut events);
@@ -21081,7 +21478,7 @@ mod tests {
         // [MuxUpdated(세션X 도입), SessionExited(X)] → coalesce 후에도 exit이 mux 뒤에.
         // (mux가 맨 앞으로 가므로 replay 시 X를 먼저 확립하고 exit이 적용됨.)
         let mut events = vec![
-            mux_event("x"),
+            live_mux_event("x", &[9]),
             runtime::RuntimeEvent::SessionExited {
                 session: runtime::SessionId(9),
                 exit_code: Some(0),

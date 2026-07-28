@@ -11666,19 +11666,22 @@ impl App {
         // 이벤트 포함)를 그대로 ui()가 처리해 exit/status 상태를 재구성해야 하고, workspace_ui는
         // 마지막 active 상태 + 아래 Active 재emit(전체 mux 스냅샷)으로 최신화된다. (새 워커는
         // 이미 fresh + RestoreWorkspace라 리셋 불필요.)
-        new_active.render_active = true;
+        new_active.render_active = false;
         new_active.backgrounded_at = None;
-        let activated = new_active
-            .runtime
-            .send_command(runtime::RuntimeCommand::SetWorkspaceState(
-                runtime::WorkspaceRuntimeState::Active,
-            ))
-            .is_ok();
-        clear_pending_replay_resync_after_activation(
+        let runtime = &new_active.runtime;
+        let activated = deliver_workspace_state_transition(
+            &mut new_active.render_active,
             &mut new_active.pending_replay_resync,
             true,
-            activated,
+            |state| {
+                runtime
+                    .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
+                    .is_ok()
+            },
         );
+        if !activated {
+            self.egui_ctx.request_repaint();
+        }
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
@@ -16397,21 +16400,16 @@ impl eframe::App for App {
         }
 
         if want_active != self.active.render_active {
-            let state = if want_active {
-                runtime::WorkspaceRuntimeState::Active
-            } else {
-                runtime::WorkspaceRuntimeState::Warm
-            };
-            let delivered = self
-                .active
-                .runtime
-                .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
-                .is_ok();
-            self.active.render_active = want_active;
-            clear_pending_replay_resync_after_activation(
+            let runtime = &self.active.runtime;
+            deliver_workspace_state_transition(
+                &mut self.active.render_active,
                 &mut self.active.pending_replay_resync,
                 want_active,
-                delivered,
+                |state| {
+                    runtime
+                        .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
+                        .is_ok()
+                },
             );
             if want_active {
                 // 재개된 Viewport push는 비동기 — 다음 프레임을 예약해 드레인한다.
@@ -16466,15 +16464,15 @@ impl eframe::App for App {
                     &agent_providers,
                     &self.i18n,
                 );
-                // 표시 상태(mux 구조·세션 status·종료 결과)는 warm에서도 지금 반영한다 —
+                // 표시 상태(mux 구조·세션 status·종료 결과)와 shell spawn 완료는 warm에서도
+                // 지금 반영한다 —
                 // 안 하면 fleet/사이드바가 warm 진입 시점 스냅샷에 얼어붙어 종료된 pane이
                 // 계속 실행 중으로, 새 pane은 없는 것으로 보인다. 렌더 상태는 그대로
-                // pending에 남겨 재활성 replay가 처리한다(둘 다 last-write-wins라 중복
-                // 적용이 안전하다).
-                rt.workspace_ui.apply_warm_events(&events);
-                rt.pending_events.extend(events.into_iter().filter(|event| {
-                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
-                }));
+                // pending에 남겨 재활성 replay가 처리한다. shell spawn 완료는 pending 수와
+                // cd를 즉시 해소한 뒤 replay에서 제외해 중복 적용하지 않는다.
+                rt.workspace_ui.apply_warm_events(&events, &self.i18n);
+                rt.pending_events
+                    .extend(events.into_iter().filter(warm_replay_event));
                 // MuxUpdated는 매번 전체 스냅샷이라 오래된 건 최신에 완전히 대체된다.
                 // chatty한 warm 워커가 pending_events를 무한 누적하지 않도록 최신 하나만
                 // 남기고 합친다 (lifecycle은 순서 보존, Viewport는 세션별 최신본 — replay 정확성).
@@ -16535,6 +16533,7 @@ impl eframe::App for App {
                     &mut self.active.workspace_ui,
                     &mut self.active.pending_events,
                     new_events,
+                    &self.i18n,
                 );
                 self.active.pending_replay_resync |= compacted.overflowed;
             } else {
@@ -19100,18 +19099,56 @@ fn clear_pending_replay_resync_after_activation(
     }
 }
 
+fn commit_workspace_state_transition(
+    render_active: &mut bool,
+    pending_replay_resync: &mut bool,
+    want_active: bool,
+    delivered: bool,
+) {
+    if !delivered {
+        return;
+    }
+    *render_active = want_active;
+    clear_pending_replay_resync_after_activation(pending_replay_resync, want_active, delivered);
+}
+
+fn deliver_workspace_state_transition(
+    render_active: &mut bool,
+    pending_replay_resync: &mut bool,
+    want_active: bool,
+    deliver: impl FnOnce(runtime::WorkspaceRuntimeState) -> bool,
+) -> bool {
+    let state = if want_active {
+        runtime::WorkspaceRuntimeState::Active
+    } else {
+        runtime::WorkspaceRuntimeState::Warm
+    };
+    let delivered = deliver(state);
+    commit_workspace_state_transition(render_active, pending_replay_resync, want_active, delivered);
+    delivered
+}
+
 fn admit_hidden_active_replay_events(
     workspace_ui: &mut ui::workspace::WorkspaceUi,
     pending_events: &mut Vec<runtime::RuntimeEvent>,
     events: Vec<runtime::RuntimeEvent>,
+    catalog: &i18n::Catalog,
 ) -> ReplayCompaction {
-    workspace_ui.apply_warm_events(&events);
-    pending_events.extend(
-        events
-            .into_iter()
-            .filter(|event| !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })),
-    );
+    workspace_ui.apply_warm_events(&events, catalog);
+    pending_events.extend(events.into_iter().filter(warm_replay_event));
     coalesce_mux_updated(pending_events)
+}
+
+fn warm_replay_event(event: &runtime::RuntimeEvent) -> bool {
+    !matches!(
+        event,
+        runtime::RuntimeEvent::AgentSpawnResolved { .. }
+            | runtime::RuntimeEvent::ShellSpawned { .. }
+            | runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Shell,
+                ..
+            }
+    )
 }
 
 fn mux_live_sessions(mux: &runtime::MuxSnapshot) -> std::collections::HashSet<runtime::SessionId> {
@@ -20047,6 +20084,46 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    fn workspace_with_pending_shell(cwd: &str) -> ui::workspace::WorkspaceUi {
+        let mut workspace_ui = ui::workspace::WorkspaceUi::new();
+        workspace_ui.spawn_shell_at(1_000, Some(cwd.to_owned()));
+        let intent = workspace_ui.take_protocol_intent().unwrap();
+        let operation = intent.operation();
+        let generation = intent.generation();
+        workspace_ui.complete_protocol(ui::workspace::WorkspaceProtocolCompletion {
+            operation,
+            generation,
+            result: Ok(()),
+        });
+        assert_eq!(workspace_ui.pending_spawns(), 1);
+        workspace_ui
+    }
+
+    fn overflow_spawn_replay(
+        completion: runtime::RuntimeEvent,
+    ) -> (
+        ui::workspace::WorkspaceUi,
+        Vec<runtime::RuntimeEvent>,
+        ReplayCompaction,
+    ) {
+        let mut workspace_ui = workspace_with_pending_shell("/tmp/deppy-spawn");
+        let mut events = vec![completion];
+        events.extend((0..=PENDING_REPLAY_EVENT_CAP).map(|idx| {
+            runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Agent,
+                message: runtime::MessagePayload::new(format!("agent.failed.{idx}")),
+            }
+        }));
+        let mut pending_events = Vec::new();
+        let compacted = admit_hidden_active_replay_events(
+            &mut workspace_ui,
+            &mut pending_events,
+            events,
+            &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+        );
+        (workspace_ui, pending_events, compacted)
     }
 
     fn resource_event(sampled_at_ms: u64) -> runtime::RuntimeEvent {
@@ -21136,22 +21213,60 @@ mod tests {
     }
 
     #[test]
-    fn pending_replay_resync_flag_waits_for_successful_activation() {
+    fn workspace_state_transition_retries_after_failed_delivery() {
         let mut render_active = false;
         let mut pending_replay_resync = true;
 
-        clear_pending_replay_resync_after_activation(&mut pending_replay_resync, false, true);
+        commit_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            false,
+        );
         assert!(!render_active);
         assert!(pending_replay_resync);
 
-        render_active = true;
-        clear_pending_replay_resync_after_activation(&mut pending_replay_resync, true, false);
-        assert!(render_active);
-        assert!(pending_replay_resync);
-
-        clear_pending_replay_resync_after_activation(&mut pending_replay_resync, true, true);
+        commit_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            true,
+        );
         assert!(render_active);
         assert!(!pending_replay_resync);
+    }
+
+    #[test]
+    fn switched_warm_activation_failure_remains_retryable() {
+        let mut render_active = false;
+        let mut pending_replay_resync = true;
+        let mut deliveries = std::collections::VecDeque::from([false, true]);
+
+        deliver_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            |state| {
+                assert_eq!(state, runtime::WorkspaceRuntimeState::Active);
+                deliveries.pop_front().unwrap()
+            },
+        );
+        assert!(!render_active);
+        assert!(pending_replay_resync);
+        assert!(!render_active, "next frame must retry activation");
+
+        deliver_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            |state| {
+                assert_eq!(state, runtime::WorkspaceRuntimeState::Active);
+                deliveries.pop_front().unwrap()
+            },
+        );
+        assert!(render_active);
+        assert!(!pending_replay_resync);
+        assert!(deliveries.is_empty());
     }
 
     #[test]
@@ -21168,8 +21283,12 @@ mod tests {
         let mut workspace_ui = ui::workspace::WorkspaceUi::new();
         let mut pending_events = Vec::new();
 
-        let result =
-            admit_hidden_active_replay_events(&mut workspace_ui, &mut pending_events, events);
+        let result = admit_hidden_active_replay_events(
+            &mut workspace_ui,
+            &mut pending_events,
+            events,
+            &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+        );
 
         assert!(result.overflowed);
         assert_eq!(pending_events.len(), PENDING_REPLAY_EVENT_CAP);
@@ -21185,6 +21304,38 @@ mod tests {
             )),
             "target exit replay should be dropped by the hard cap"
         );
+    }
+
+    #[test]
+    fn warm_spawn_completion_success_survives_replay_overflow() {
+        let session = runtime::SessionId(77);
+        let (workspace_ui, pending_events, compacted) =
+            overflow_spawn_replay(runtime::RuntimeEvent::ShellSpawned { session });
+
+        assert!(compacted.overflowed);
+        assert_eq!(workspace_ui.pending_spawns(), 0);
+        assert!(!pending_events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::ShellSpawned { session: spawned } if *spawned == session
+        )));
+    }
+
+    #[test]
+    fn warm_spawn_completion_failure_survives_replay_overflow() {
+        let message_id = "shell.failed.target";
+        let (workspace_ui, pending_events, compacted) =
+            overflow_spawn_replay(runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Shell,
+                message: runtime::MessagePayload::new(message_id),
+            });
+
+        assert!(compacted.overflowed);
+        assert_eq!(workspace_ui.pending_spawns(), 0);
+        assert!(!pending_events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::SpawnFailed { message, .. }
+                if message.message_id == message_id
+        )));
     }
 
     #[test]

@@ -3299,9 +3299,7 @@ impl Worker {
         if accounted && storage::scrollback_archive::exists(&self.logs_root, key) {
             self.archived_on_disk.insert(session);
         } else if !accounted
-            && let Ok(path) = storage::scrollback_archive::archive_path(&self.logs_root, key)
-            && let Err(error) = std::fs::remove_file(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
+            && let Err(error) = storage::scrollback_archive::remove(&self.logs_root, key)
         {
             trace_runtime_failure(
                 "scrollback_archive_rollback",

@@ -28,6 +28,8 @@ pub const ARCHIVE_DISK_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 const ARCHIVE_FILE: &str = "scrollback.zlib";
 const ARCHIVE_SCAN_ENTRY_LIMIT: usize = 4_096;
 const ARCHIVE_SCAN_LIMIT_ERROR: &str = "scrollback_archive_scan_entry_limit";
+#[cfg(unix)]
+const ARCHIVE_TEMP_ATTEMPTS: usize = 16;
 /// 전체 사용량을 안전하게 확정할 수 없음을 나타내는 증분 캐시 값.
 pub const ARCHIVE_DISK_USAGE_UNKNOWN: u64 = u64::MAX;
 
@@ -54,9 +56,46 @@ pub fn archive_path(logs_root: &Path, session_key: &str) -> anyhow::Result<PathB
 
 /// 이미 기록된 아카이브가 있는가 (exited grid는 불변 — 있으면 재기록하지 않는다).
 pub fn exists(logs_root: &Path, session_key: &str) -> bool {
-    archive_path(logs_root, session_key)
-        .map(|path| path.exists())
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        let Ok(Some(directory)) = pin_session_directory(logs_root, session_key, false) else {
+            return false;
+        };
+        regular_entry_exists_at(&directory, ARCHIVE_FILE).unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (logs_root, session_key);
+        false
+    }
+}
+
+pub fn remove(logs_root: &Path, session_key: &str) -> anyhow::Result<bool> {
+    remove_with_session_hook(logs_root, session_key, || {})
+}
+
+fn remove_with_session_hook(
+    logs_root: &Path,
+    session_key: &str,
+    after_session_pin: impl FnOnce(),
+) -> anyhow::Result<bool> {
+    #[cfg(unix)]
+    {
+        let Some(directory) = pin_session_directory(logs_root, session_key, false)? else {
+            return Ok(false);
+        };
+        after_session_pin();
+        match unlink_archive_at(&directory) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).context("scrollback archive remove failed"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (logs_root, session_key, after_session_pin);
+        anyhow::bail!("scrollback_archive_descriptor_io_unsupported")
+    }
 }
 
 /// redaction이 끝난 ANSI 덤프를 압축해 원자적으로 기록한다 (tmp+rename).
@@ -67,6 +106,16 @@ pub fn write(
     session_key: &str,
     meta: &ArchiveMeta,
     redacted_ansi: &[u8],
+) -> anyhow::Result<u64> {
+    write_with_session_hook(logs_root, session_key, meta, redacted_ansi, || {})
+}
+
+fn write_with_session_hook(
+    logs_root: &Path,
+    session_key: &str,
+    meta: &ArchiveMeta,
+    redacted_ansi: &[u8],
+    after_session_pin: impl FnOnce(),
 ) -> anyhow::Result<u64> {
     anyhow::ensure!(
         redacted_ansi.len() <= MAX_UNCOMPRESSED_BYTES as usize,
@@ -84,8 +133,6 @@ pub fn write(
         meta.cols,
         meta.rows
     );
-    let dir = crate::logs::ensure_session_directory(logs_root, session_key)?;
-    let path = dir.join(ARCHIVE_FILE);
 
     let mut buf = Vec::with_capacity(HEADER_LEN + redacted_ansi.len() / 4);
     buf.extend_from_slice(MAGIC);
@@ -103,10 +150,24 @@ pub fn write(
         .context("scrollback 압축 실패")?;
     let bytes = encoder.finish().context("scrollback 압축 마감 실패")?;
 
-    // 원자 기록 — 부분 파일이 노출되지 않는다 (프로젝트 관례: tmp+rename)
-    deppy_core::fs::atomic_write(&path, &bytes)
-        .with_context(|| format!("아카이브 원자 기록 실패: {}", path.display()))?;
-    Ok(bytes.len() as u64)
+    #[cfg(unix)]
+    {
+        let directory = pin_session_directory(logs_root, session_key, true)?
+            .context("session archive directory missing after creation")?;
+        after_session_pin();
+        atomic_write_archive_at(&directory, &bytes).with_context(|| {
+            format!(
+                "아카이브 원자 기록 실패: {}",
+                directory.path.join(ARCHIVE_FILE).display()
+            )
+        })?;
+        Ok(bytes.len() as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (logs_root, session_key, after_session_pin);
+        anyhow::bail!("scrollback_archive_descriptor_io_unsupported")
+    }
 }
 
 /// 아카이브를 읽어 (메타, redacted ANSI 덤프)를 돌려준다.
@@ -133,80 +194,268 @@ pub fn read(logs_root: &Path, session_key: &str) -> anyhow::Result<Option<(Archi
 /// (복원 시 순간 메모리 스파이크 방지, 2026-07-16). 파일 없음 → Ok(None),
 /// 헤더 손상 → 파일 삭제 후 Ok(None) — [`read`]와 동일 규약.
 pub fn open(logs_root: &Path, session_key: &str) -> anyhow::Result<Option<ArchiveStream>> {
-    let Some(dir) = crate::logs::existing_session_directory(logs_root, session_key)? else {
-        return Ok(None);
+    open_with_session_hook(logs_root, session_key, || {})
+}
+
+fn open_with_session_hook(
+    logs_root: &Path,
+    session_key: &str,
+    after_session_pin: impl FnOnce(),
+) -> anyhow::Result<Option<ArchiveStream>> {
+    #[cfg(not(unix))]
+    {
+        let _ = (logs_root, session_key, after_session_pin);
+        anyhow::bail!("scrollback_archive_descriptor_io_unsupported")
+    }
+    #[cfg(unix)]
+    {
+        let Some(directory) = pin_session_directory(logs_root, session_key, false)? else {
+            return Ok(None);
+        };
+        let path = directory.path.join(ARCHIVE_FILE);
+        after_session_pin();
+        let file = match open_regular_archive_at(&directory) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("아카이브 열기 실패: {}", path.display()));
+            }
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let mut header = [0u8; HEADER_LEN];
+        let parsed = reader
+            .read_exact(&mut header)
+            .ok()
+            .and_then(|()| parse_header(&header));
+        let Some((meta, uncompressed_len)) = parsed else {
+            tracing::warn!(path = %path.display(), "scrollback 아카이브 손상 — 폐기");
+            let _ = unlink_archive_at(&directory);
+            return Ok(None);
+        };
+        // take로 선언 길이 초과 해제를 차단 (압축 폭탄/오염 방어) — 정확 길이 검증은 finish
+        let decoder = flate2::read::ZlibDecoder::new(reader).take(u64::from(uncompressed_len) + 1);
+        Ok(Some(ArchiveStream {
+            meta,
+            decoder,
+            expected_len: uncompressed_len,
+            fed: 0,
+            saw_error: false,
+            path,
+            directory,
+        }))
+    }
+}
+
+#[cfg(unix)]
+struct PinnedSessionDirectory {
+    fd: std::os::fd::OwnedFd,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+fn pin_session_directory(
+    logs_root: &Path,
+    session_key: &str,
+    create: bool,
+) -> anyhow::Result<Option<PinnedSessionDirectory>> {
+    let path = SessionLogWriter::session_dir_key(logs_root, session_key)?;
+    let session_name = path
+        .file_name()
+        .context("session archive directory name missing")?;
+    pin_session_directory_entry(logs_root, session_name, create)
+}
+
+#[cfg(unix)]
+fn pin_session_directory_entry(
+    logs_root: &Path,
+    session_name: &std::ffi::OsStr,
+    create: bool,
+) -> anyhow::Result<Option<PinnedSessionDirectory>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = logs_root.join(session_name);
+    if create {
+        std::fs::create_dir_all(logs_root)
+            .with_context(|| format!("로그 루트 생성 실패: {}", logs_root.display()))?;
+    }
+    let root_name = std::ffi::CString::new(logs_root.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("logs_root_contains_nul"))?;
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
     };
-    let path = dir.join(ARCHIVE_FILE);
-    let file = match open_regular_archive_file(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("아카이브 열기 실패: {}", path.display()));
+    if root_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if !create && error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
         }
+        return Err(error).context("logs_root directory open failed");
+    }
+    let root_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_fd) };
+    let session_name = std::ffi::CString::new(session_name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("session_key_contains_nul"))?;
+    if create {
+        let created = unsafe { libc::mkdirat(root_fd.as_raw_fd(), session_name.as_ptr(), 0o755) };
+        if created != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error).context("session archive directory create failed");
+            }
+        }
+    }
+    let session_fd = unsafe {
+        libc::openat(
+            root_fd.as_raw_fd(),
+            session_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
     };
-    let mut reader = std::io::BufReader::new(file);
-    let mut header = [0u8; HEADER_LEN];
-    let parsed = reader
-        .read_exact(&mut header)
-        .ok()
-        .and_then(|()| parse_header(&header));
-    let Some((meta, uncompressed_len)) = parsed else {
-        tracing::warn!(path = %path.display(), "scrollback 아카이브 손상 — 폐기");
-        let _ = std::fs::remove_file(&path);
-        return Ok(None);
-    };
-    // take로 선언 길이 초과 해제를 차단 (압축 폭탄/오염 방어) — 정확 길이 검증은 finish
-    let decoder = flate2::read::ZlibDecoder::new(reader).take(u64::from(uncompressed_len) + 1);
-    Ok(Some(ArchiveStream {
-        meta,
-        decoder,
-        expected_len: uncompressed_len,
-        fed: 0,
-        saw_error: false,
+    if session_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if !create && error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error).context("session archive directory open failed");
+    }
+    Ok(Some(PinnedSessionDirectory {
+        fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(session_fd) },
         path,
     }))
 }
 
-fn open_regular_archive_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let before = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => metadata,
-        Ok(_) => return Err(std::io::Error::other("archive_file_not_regular")),
-        Err(error) => return Err(error),
+#[cfg(unix)]
+fn open_regular_archive_at(directory: &PinnedSessionDirectory) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = std::ffi::CString::new(ARCHIVE_FILE).expect("archive file is static ASCII");
+    let fd = unsafe {
+        libc::openat(
+            directory.fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
     };
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path)?;
-    let opened = file.metadata()?;
-    if !opened.file_type().is_file() {
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::other("archive_file_not_regular"));
     }
-    let path_after = std::fs::symlink_metadata(path)?;
-    if !path_after.file_type().is_file() {
-        return Err(std::io::Error::other("archive_file_replaced"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if before.dev() != opened.dev()
-            || before.ino() != opened.ino()
-            || opened.dev() != path_after.dev()
-            || opened.ino() != path_after.ino()
-        {
-            return Err(std::io::Error::other("archive_file_replaced"));
-        }
-    }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn regular_entry_exists_at(
+    directory: &PinnedSessionDirectory,
+    name: &str,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let name = std::ffi::CString::new(name).expect("archive entry name is static ASCII");
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.fd.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+}
+
+#[cfg(unix)]
+fn atomic_write_archive_at(
+    directory: &PinnedSessionDirectory,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let final_name = std::ffi::CString::new(ARCHIVE_FILE).expect("archive file is static ASCII");
+    for attempt in 0..ARCHIVE_TEMP_ATTEMPTS {
+        let temp_name = if attempt == 0 {
+            format!("{ARCHIVE_FILE}.deppytmp")
+        } else {
+            format!(
+                ".{ARCHIVE_FILE}.deppytmp.{}.{}.{}",
+                std::process::id(),
+                sequence,
+                attempt
+            )
+        };
+        let temp_name = std::ffi::CString::new(temp_name).expect("generated temp name has no NUL");
+        let fd = unsafe {
+            libc::openat(
+                directory.fd.as_raw_fd(),
+                temp_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+            if !regular_entry_exists_at(directory, temp_name.to_str().unwrap_or_default())? {
+                return Err(std::io::Error::other("archive_temp_not_regular"));
+            }
+            continue;
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let result = (|| {
+            file.write_all(bytes)?;
+            drop(file);
+            let renamed = unsafe {
+                libc::renameat(
+                    directory.fd.as_raw_fd(),
+                    temp_name.as_ptr(),
+                    directory.fd.as_raw_fd(),
+                    final_name.as_ptr(),
+                )
+            };
+            if renamed != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = unsafe { libc::unlinkat(directory.fd.as_raw_fd(), temp_name.as_ptr(), 0) };
+        }
+        return result;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "archive_temp_collision_limit",
+    ))
+}
+
+#[cfg(unix)]
+fn unlink_archive_at(directory: &PinnedSessionDirectory) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let name = std::ffi::CString::new(ARCHIVE_FILE).expect("archive file is static ASCII");
+    let result = unsafe { libc::unlinkat(directory.fd.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// [`open`]이 돌려주는 스트리밍 핸들. [`Read`]로 해제 바이트를 내보내며, 소비가 끝나면
@@ -218,6 +467,8 @@ pub struct ArchiveStream {
     fed: u64,
     saw_error: bool,
     path: PathBuf,
+    #[cfg(unix)]
+    directory: PinnedSessionDirectory,
 }
 
 impl Read for ArchiveStream {
@@ -258,7 +509,8 @@ impl ArchiveStream {
     /// 손상 확정 — 경고 후 파일 삭제 (graceful skip 규약).
     fn discard(self) {
         tracing::warn!(path = %self.path.display(), "scrollback 아카이브 손상 — 폐기");
-        let _ = std::fs::remove_file(&self.path);
+        #[cfg(unix)]
+        let _ = unlink_archive_at(&self.directory);
     }
 }
 
@@ -442,7 +694,7 @@ fn gc_with_limit(logs_root: &Path, budget_bytes: u64, entry_limit: usize) -> any
         anyhow::bail!("scrollback_archive_byte_total_overflow");
     }
     if !scan.complete {
-        remove_archives_until_budget(&mut total, archives, 0, true);
+        remove_archives_until_budget(logs_root, &mut total, archives, 0, true);
         for directory in scan.directories {
             let _ = std::fs::remove_dir(directory);
         }
@@ -452,7 +704,7 @@ fn gc_with_limit(logs_root: &Path, budget_bytes: u64, entry_limit: usize) -> any
         return Ok(total);
     }
     archives.sort_by_key(|archive| archive.modified);
-    remove_archives_until_budget(&mut total, archives, budget_bytes, false);
+    remove_archives_until_budget(logs_root, &mut total, archives, budget_bytes, false);
     if total > budget_bytes {
         anyhow::bail!("scrollback_archive_gc_budget_unmet");
     }
@@ -467,6 +719,7 @@ fn archive_total(archives: &[ArchiveRecord]) -> u64 {
 }
 
 fn remove_archives_until_budget(
+    logs_root: &Path,
     total: &mut u64,
     archives: Vec<ArchiveRecord>,
     budget_bytes: u64,
@@ -476,12 +729,31 @@ fn remove_archives_until_budget(
         if !force_all && *total <= budget_bytes {
             break;
         }
-        match std::fs::remove_file(&archive.path) {
-            Ok(()) => {
+        let Some(session_name) = archive.path.parent().and_then(Path::file_name) else {
+            tracing::warn!(path = %archive.path.display(), "아카이브 GC 세션 경로 없음");
+            continue;
+        };
+        #[cfg(unix)]
+        let removal = pin_session_directory_entry(logs_root, session_name, false).and_then(|dir| {
+            let Some(dir) = dir else {
+                return Ok(false);
+            };
+            match unlink_archive_at(&dir) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error).context("scrollback archive GC remove failed"),
+            }
+        });
+        #[cfg(not(unix))]
+        let removal: anyhow::Result<bool> = Err(anyhow::anyhow!(
+            "scrollback_archive_descriptor_io_unsupported"
+        ));
+        match removal {
+            Ok(true) => {
                 *total = total.saturating_sub(archive.bytes);
                 tracing::info!(path = %archive.path.display(), "scrollback 아카이브 GC — 예산 초과 제거");
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(false) => {
                 *total = total.saturating_sub(archive.bytes);
             }
             Err(e) => {
@@ -702,6 +974,147 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!outside.join(ARCHIVE_FILE).exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_write_rejects_planted_atomic_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = temp_root();
+        let outside_target = outside.join("target");
+        std::fs::write(&outside_target, b"outside-safe").unwrap();
+        let session_dir = root.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        symlink(
+            &outside_target,
+            session_dir.join(format!("{ARCHIVE_FILE}.deppytmp")),
+        )
+        .unwrap();
+
+        let result = write(&root, "session", &meta(), b"archive");
+
+        assert!(result.is_err(), "a planted temp symlink must fail closed");
+        assert_eq!(std::fs::read(&outside_target).unwrap(), b"outside-safe");
+        assert!(
+            archive_path(&root, "session")
+                .unwrap()
+                .symlink_metadata()
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exists_rejects_symlink_dangling_and_nonregular_archive_paths() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let target = root.join("target");
+        std::fs::write(&target, b"target").unwrap();
+
+        for session in ["linked", "dangling", "directory", "fifo"] {
+            std::fs::create_dir_all(root.join(session)).unwrap();
+        }
+        symlink(&target, root.join("linked").join(ARCHIVE_FILE)).unwrap();
+        symlink("missing", root.join("dangling").join(ARCHIVE_FILE)).unwrap();
+        std::fs::create_dir(root.join("directory").join(ARCHIVE_FILE)).unwrap();
+        let fifo = root.join("fifo").join(ARCHIVE_FILE);
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        assert!(!exists(&root, "linked"));
+        assert!(!exists(&root, "dangling"));
+        assert!(!exists(&root, "directory"));
+        assert!(!exists(&root, "fifo"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_session_directory_prevents_parent_swap_from_redirecting_write() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = temp_root();
+        let session_dir = root.join("session");
+        let pinned_dir = root.join("pinned-session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        write_with_session_hook(&root, "session", &meta(), b"pinned", || {
+            std::fs::rename(&session_dir, &pinned_dir).unwrap();
+            symlink(&outside, &session_dir).unwrap();
+        })
+        .unwrap();
+
+        assert!(pinned_dir.join(ARCHIVE_FILE).is_file());
+        assert!(!outside.join(ARCHIVE_FILE).exists());
+        std::fs::remove_file(&session_dir).unwrap();
+        std::fs::rename(&pinned_dir, &session_dir).unwrap();
+        assert_eq!(read(&root, "session").unwrap().unwrap().1, b"pinned");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_session_directory_prevents_parent_swap_from_redirecting_read() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = temp_root();
+        write(&root, "session", &meta(), b"inside").unwrap();
+        write(&outside, "session", &meta(), b"outside").unwrap();
+        let session_dir = root.join("session");
+        let pinned_dir = root.join("pinned-session");
+
+        let mut stream = open_with_session_hook(&root, "session", || {
+            std::fs::rename(&session_dir, &pinned_dir).unwrap();
+            symlink(outside.join("session"), &session_dir).unwrap();
+        })
+        .unwrap()
+        .unwrap();
+        let mut dump = Vec::new();
+        stream.read_to_end(&mut dump).unwrap();
+
+        assert!(stream.finish());
+        assert_eq!(dump, b"inside");
+        std::fs::remove_file(&session_dir).unwrap();
+        std::fs::remove_dir_all(pinned_dir).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_session_directory_prevents_parent_swap_from_redirecting_remove() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = temp_root();
+        write(&root, "session", &meta(), b"inside").unwrap();
+        write(&outside, "session", &meta(), b"outside").unwrap();
+        let session_dir = root.join("session");
+        let pinned_dir = root.join("pinned-session");
+
+        assert!(
+            remove_with_session_hook(&root, "session", || {
+                std::fs::rename(&session_dir, &pinned_dir).unwrap();
+                symlink(outside.join("session"), &session_dir).unwrap();
+            })
+            .unwrap()
+        );
+
+        assert!(!pinned_dir.join(ARCHIVE_FILE).exists());
+        assert!(outside.join("session").join(ARCHIVE_FILE).is_file());
+        std::fs::remove_file(&session_dir).unwrap();
+        std::fs::remove_dir_all(pinned_dir).unwrap();
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
     }

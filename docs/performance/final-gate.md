@@ -1,122 +1,72 @@
-# PR-U20 Final Performance Gate
+# SF06 Final Stability Gate
 
-작성일: 2026-07-05
-작성 범위: PR-U20b Scenario A-E release-gate report, PR-U20c baseline/final
-automated gate update
+작성일: 2026-07-28
+검증 커밋: `3cb6f38187465123f82ad648395e1b3e25aae9d1`
 
 ## Verdict
 
-Release verdict: **Not approved yet**
+Release verdict: **Not approved**
 
-Reason: automated security, performance smoke, and i18n gates pass after
-PR-U12c, PR-U18b, PR-U15c, and PR-U17b, but this Codex sandbox did not run the
-GUI/remote soak measurements required to claim final RSS/CPU/frame-p95 approval
-for Scenarios A-E.
+SF01-SF05 focused integration tests, workspace check, dependency/boundary gates, performance smoke, and changed-package strict Clippy pass. The frozen workspace Clippy and BG01 commands remain red on pre-existing repository baseline findings, and the required 30-minute release measurement was not run. SF06 must not be reported as passed and SSH00 must not start yet.
 
 ## Environment
 
-- Repository: `/Users/jr/Desktop/Projects/deppy-sijo`
-- Baseline commit under test: `52f1cd1 Document remaining parallel PR contracts`
-- Final implementation commit under test:
-  `8d18295 Add status confidence and user override flow`
-- PR-U20c baseline adds measurement documentation only; no runtime behavior was
-  changed by the baseline measurement commit.
-- OS: macOS 26.4.1 build 25E253
-- Kernel: Darwin 25.4.0 arm64
-- Hardware details: `sysctl` hardware queries were denied in the sandbox.
-- Build profile used for automated smoke: Cargo test/dev profile.
+- Repository: `/Users/jr/Desktop/projects/deppy-sijo`
+- Integration worktree: `/tmp/deppy-sf06-integration`
+- Branch: `codex/sf06-integration-evidence`
+- OS: macOS 26.5.2 build 25F84
+- Kernel: Darwin 25.5.0 arm64
+- Automated profile: Cargo test/dev profile
+- Release measurement profile: Not run
 
-## Automated Evidence
+## Deterministic Evidence
 
-Latest final automated run:
+| Gate | Result | Evidence |
+|---|---|---|
+| Workspace check | Pass | `cargo check --workspace --all-targets --locked` exit 0 |
+| Workspace strict Clippy | Fail | Existing terminal test lint at `crates/terminal/src/alacritty_backend.rs:993`; reproduced on `main` |
+| Changed-package strict Clippy | Pass | `deppy-sijo`, `web-remote`, `persist`, `runtime`, `storage` exit 0 |
+| Dependency gate | Pass | `cargo run -p xtask --locked -- check-deps` exit 0 |
+| Boundary gate | Pass | `cargo run -p xtask --locked -- check-boundary` exit 0 |
+| Performance smoke | Pass | `cargo run -p xtask --locked -- perf-smoke` exit 0 |
+| BG01 deterministic gate | Fail | Existing repo-wide rustfmt drift; `cargo fmt --all -- --check` also fails on `main` |
+| Diff check | Pass | `git diff --check` exit 0 |
 
-- `cargo run -p xtask -- security-scan` - pass
-- `cargo run -p xtask -- perf-smoke` - pass
-- `cargo run -p xtask -- i18n-check` - pass
+## Focused Results
 
-The smoke/gate commands covered:
+| Area | Result |
+|---|---|
+| App replay and Git-label retention | Pass: 3 tests total, 0 failed |
+| Web-push admission/retry/in-flight behavior | Pass: 42 tests, 0 failed |
+| Persisted restore cwd projection | Pass: 1 test, 0 failed |
+| Runtime restore atomicity | Pass: 8 tests, 0 failed |
+| Remote protocol/deadline/liveness | Pass: 60 tests, 0 failed |
+| Session log scan/GC | Pass: 25 tests, 0 failed |
+| Scrollback archive scan/GC | Pass: 11 tests, 0 failed |
 
-- UI boundary, dependency, secret-redaction, MCP audit/permission, and security
-  unit gates
-- app performance harness unit tests
-- runtime backpressure-filtered tests
-- hidden-session status detector smoke
-- required locale completeness, CJK path paste fixture, and message-id
-  notification gates
+## Release Scenario Matrix
 
-Related gates from the same working set:
-
-- `cargo fmt --check` - pass
-- `cargo clippy --workspace --all-targets` - pass
-- `cargo check --workspace --all-targets` - pass
-- `cargo test --workspace --no-run` - pass
-
-## Scenario Results
-
-| Scenario | Requirement | Automated Evidence | Measured Result | Gate |
+| Scenario | Requirement | Automated Evidence | Physical Measurement | Gate |
 |---|---|---|---|---|
-| A | Empty app idle RSS/CPU and idle repaint | Automated gates pass; no GUI idle run | Not measured in this sandbox | Pending |
-| B | 5 workspaces, 20 panes, 10 sessions, 2 visible panes | Current mux/runtime tests compile; no full GUI load run | Not measured in this sandbox | Pending |
-| C | 10 hidden sessions, 3 high-output sessions | `perf-smoke` validates hidden-session harness shape and hidden snapshot smoke | RSS/CPU/frame p95 not measured | Pending |
-| D | Folder tree 100k files | Existing file-tree tests and PR-U05b ignore/listing hardening exist | 100k-file GUI/folder-tree run not measured | Pending |
-| E | Remote slow consumer | `perf-smoke` exercises runtime backpressure tests | Long slow-client soak not measured | Pending |
+| A Empty app idle | RSS/CPU, idle repaint, frame p95 | Existing perf smoke only | Not run | Pending |
+| B Multi-workspace load | 5 workspaces, 20 panes, 10 sessions | Workspace/replay focused tests | Not run | Pending |
+| C Hidden high-output | Hidden/warm churn, queue caps, RSS slope | Replay cap and perf harness smoke | 30-minute run not started | Pending |
+| D Folder tree 100k | UI latency, watcher pressure, RSS/CPU | No SF06 production change | Not run | Pending |
+| E Remote slow consumer | Queue pressure, disconnect, local responsiveness | 60 remote tests and perf smoke | Long slow-consumer run not run | Pending |
 
-Detailed baseline notes are recorded in
-`docs/performance/release-hardware-measurements.md`.
+## Why Release Measurement Is Pending
 
-## Required Manual Measurement Procedure
+The existing benchmark procedure rejects concurrent Deppy instances. A user-owned debug `deppy-sijo` process was active when SF06 reached the measurement step, so the agent did not stop it or launch a competing release instance. No release build, 30-minute lifecycle run, or physical resource sample was claimed.
 
-Run these on the release target machine, preferably with a release build and no
-debugger attached.
+## Required Next Commands
 
-1. Build release binary:
-   `cargo build --release -p deppy-sijo`
+Run only after other Deppy instances are closed:
 
-2. Enable frame stats:
-   `DEPPY_FRAME_STATS=1 target/release/deppy-sijo`
+```bash
+scripts/render-bench.sh build
+USE_HARNESS=1 SECS=1800 SAMPLE_INTERVAL=60 scripts/render-bench.sh run wgpu switch 5
+```
 
-3. Scenario A:
-   Start with an empty/default workspace and leave idle for 60 seconds. Record
-   RSS, CPU, and whether frame stats continue appearing while idle.
+Then record RSS, child RSS, threads, fd/socket counts, pending replay count, push job count, and post-shutdown return-to-baseline. If an existing measurement surface cannot expose a metric, leave that metric Pending rather than inferring it.
 
-4. Scenario B:
-   Create or restore 5 workspaces, 20 panes, 10 sessions, with 2 visible panes.
-   Interact for 60 seconds. Record RSS, CPU, and frame p95 logs.
-
-5. Scenario C:
-   Start with `DEPPY_PERF_HARNESS=1 DEPPY_FRAME_STATS=1` and run for at least
-   120 seconds. Record RSS, CPU, frame p95, and whether hidden panes create
-   viewport snapshots.
-
-6. Scenario D:
-   Open a generated workspace containing 100k files and exercise folder expand,
-   collapse, refresh, and drag path insert. Record UI stalls, RSS, CPU, and
-   watcher queue behavior.
-
-7. Scenario E:
-   Connect a remote client that intentionally stops or slows reads. Record
-   server RSS/CPU, outbound queue behavior, disconnect/degraded behavior, and
-   local runtime responsiveness.
-
-## Acceptance Criteria
-
-- RSS/CPU targets are explicitly recorded for the release machine.
-- Idle app has no recurring repaint loop.
-- Active pane frame time p95 satisfies the release target.
-- Hidden panes do not create viewport snapshots.
-- Output/remote queues do not grow without bound.
-- Slow remote client cannot stall local runtime.
-- CJK path DnD and terminal copy/paste remain covered by existing gates.
-
-## Current Release Blockers
-
-- Scenario A-E RSS/CPU/frame-p95 numbers are not captured in this environment.
-- Scenario D still needs an actual 100k-file workspace run.
-- Scenario E still needs a slow-client soak run.
-
-## Follow-up
-
-- Add an automated `xtask perf-report` harness when GUI scenario setup can be
-  controlled headlessly.
-- Re-run this document on release hardware and replace Pending rows with measured
-  Pass/Fail values.
+Before SSH00, rerun and pass the exact deterministic commands listed in the SF06 design specification without suppressions or waivers.

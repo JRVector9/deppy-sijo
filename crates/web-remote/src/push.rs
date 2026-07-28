@@ -69,6 +69,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// 세션 상태 알림의 총 발송 시도 횟수(첫 시도 + 재시도). 승인은 DB 폴링이 스스로 재수렴하지만
 /// 세션 전이는 (session,kind)가 생애 1회라 재시도 큐가 없으면 일시 장애 = 영구 유실이다.
 const SESSION_SEND_ATTEMPTS: u32 = 3;
+/// fresh + retry 큐를 합친 세션 상태 알림 작업 상한.
+const MAX_SESSION_JOBS: usize = 256;
 /// `notified_status` 상한 — 초과 시 오래된(사전순 낮은) 키부터 버린다. UUID라 단조성은
 /// 없지만 상한 유지가 목적이다. 원문:
 /// 세션 id는 런타임에서 단조 증가(next_id)하므로 초과 시 가장 낮은
@@ -442,7 +444,7 @@ impl Notification {
 }
 
 /// 대시보드 브리지가 넘기는 세션 상태 알림(입력대기/완료). 승인은 DB 폴링이 담당하므로 여기 없다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SessionKind {
     Done,
     Waiting,
@@ -462,6 +464,12 @@ struct SessionJob {
     attempts: u32,
 }
 
+#[derive(Clone, Copy)]
+enum SessionJobQueue {
+    Fresh,
+    Retry,
+}
+
 struct PushInner {
     /// 즉시 1회 재평가 강제(구독 등록 직후).
     force: bool,
@@ -471,10 +479,120 @@ struct PushInner {
     /// 않는 것이 핵심 — 넣으면 실패 즉시 같은 발송이 반복돼 폭주한다. 구독>0이면 어차피 폴링
     /// 주기마다 깨므로 그때 jobs와 함께 처리된다(구독 0이면 보낼 곳이 없어 처리하지 않는다).
     retry_jobs: VecDeque<SessionJob>,
+    /// 락 밖에서 발송 중인 세션 상태. drain된 배치 전체를 같은 락 구간에서 마킹해, 발송 결과
+    /// 커밋 전까지 exact duplicate가 큐 상한 eviction을 일으키지 못하게 한다.
+    in_flight_status: HashSet<(String, SessionKind)>,
     /// 이미 푸시한 pending 승인 id — 중복 발송 방지. pending에서 사라지면 정리(유계).
     notified_approvals: HashSet<String>,
     /// 세션별 마지막으로 알린 상태 — 같은 전이 반복 발송 방지. MAX_NOTIFIED_SESSIONS로 유계.
     notified_status: HashMap<String, SessionKind>,
+}
+
+fn session_status_key(session: &str, kind: SessionKind) -> (String, SessionKind) {
+    (session.to_owned(), kind)
+}
+
+fn session_job_key(job: &SessionJob) -> (String, SessionKind) {
+    session_status_key(&job.session, job.kind)
+}
+
+fn remove_in_flight_session_job(inner: &mut PushInner, job: &SessionJob) {
+    inner.in_flight_status.remove(&session_job_key(job));
+}
+
+fn remove_session_jobs(queue: &mut VecDeque<SessionJob>, session: &str) -> Option<SessionJob> {
+    let mut removed = None;
+    let mut i = 0;
+    while i < queue.len() {
+        if queue[i].session == session {
+            if let Some(job) = queue.remove(i)
+                && (job.kind == SessionKind::Done
+                    || removed
+                        .as_ref()
+                        .is_none_or(|old: &SessionJob| old.kind != SessionKind::Done))
+            {
+                removed = Some(job);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    removed
+}
+
+fn enqueue_session_job(
+    inner: &mut PushInner,
+    mut job: SessionJob,
+    destination: SessionJobQueue,
+) -> bool {
+    if inner.notified_status.get(&job.session) == Some(&job.kind) {
+        return false;
+    }
+    if inner.in_flight_status.contains(&session_job_key(&job)) {
+        return false;
+    }
+    if job.kind == SessionKind::Waiting
+        && inner
+            .in_flight_status
+            .contains(&session_status_key(&job.session, SessionKind::Done))
+    {
+        return false;
+    }
+
+    let old_fresh = remove_session_jobs(&mut inner.jobs, &job.session);
+    let old_retry = remove_session_jobs(&mut inner.retry_jobs, &job.session);
+    let final_kind = if job.kind == SessionKind::Done
+        || old_fresh
+            .as_ref()
+            .is_some_and(|old| old.kind == SessionKind::Done)
+        || old_retry
+            .as_ref()
+            .is_some_and(|old| old.kind == SessionKind::Done)
+    {
+        SessionKind::Done
+    } else {
+        job.kind
+    };
+    let same_kind_attempts = [old_fresh.as_ref(), old_retry.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|old| old.kind == final_kind)
+        .map(|old| old.attempts)
+        .max();
+    job.kind = final_kind;
+    job.attempts = match destination {
+        SessionJobQueue::Fresh => same_kind_attempts.unwrap_or(0),
+        SessionJobQueue::Retry => {
+            same_kind_attempts.map_or(job.attempts, |old| old.max(job.attempts))
+        }
+    };
+
+    let mut evicted = false;
+    while inner.jobs.len() + inner.retry_jobs.len() >= MAX_SESSION_JOBS {
+        if inner.jobs.pop_front().is_some() || inner.retry_jobs.pop_front().is_some() {
+            evicted = true;
+        } else {
+            break;
+        }
+    }
+
+    match destination {
+        SessionJobQueue::Fresh => inner.jobs.push_back(job),
+        SessionJobQueue::Retry => inner.retry_jobs.push_back(job),
+    }
+    evicted
+}
+
+fn warn_session_job_eviction(destination: SessionJobQueue) {
+    let queue = match destination {
+        SessionJobQueue::Fresh => "fresh",
+        SessionJobQueue::Retry => "retry",
+    };
+    tracing::warn!(
+        limit = MAX_SESSION_JOBS,
+        queue,
+        "웹푸시 세션 알림 큐 상한 초과 — 오래된 상태 알림 제거"
+    );
 }
 
 struct PushShared {
@@ -563,6 +681,7 @@ impl PushManager {
                 force: false,
                 jobs: VecDeque::new(),
                 retry_jobs: VecDeque::new(),
+                in_flight_status: HashSet::new(),
                 notified_approvals: HashSet::new(),
                 notified_status: HashMap::new(),
             }),
@@ -658,13 +777,20 @@ impl PushHandle {
             runtime::SessionStatus::Waiting => SessionKind::Waiting,
             _ => return,
         };
-        {
+        let evicted = {
             let mut inner = self.shared.inner.lock().expect("push inner lock");
-            inner.jobs.push_back(SessionJob {
-                session,
-                kind,
-                attempts: 0,
-            });
+            enqueue_session_job(
+                &mut inner,
+                SessionJob {
+                    session,
+                    kind,
+                    attempts: 0,
+                },
+                SessionJobQueue::Fresh,
+            )
+        };
+        if evicted {
+            warn_session_job_eviction(SessionJobQueue::Fresh);
         }
         self.shared.cvar.notify_all();
     }
@@ -710,6 +836,10 @@ fn run(shared: &Arc<PushShared>) {
             // 락 밖에서 처리한다(구독 0이면 아래에서 skip).
             let mut batch = std::mem::take(&mut inner.retry_jobs);
             batch.extend(inner.jobs.drain(..));
+            for job in &batch {
+                inner.in_flight_status.insert(session_job_key(job));
+            }
+            debug_assert!(inner.in_flight_status.len() <= MAX_SESSION_JOBS);
             jobs = batch;
             do_poll = subs > 0;
             inner.force = false;
@@ -720,11 +850,17 @@ fn run(shared: &Arc<PushShared>) {
         // 넣는다. 세션 전이는 생애 1회라 여기서 버리면 영구 유실이다.
         for job in jobs {
             if shared.sub_count.load(Ordering::SeqCst) == 0 {
+                let mut inner = shared.inner.lock().expect("push inner lock");
+                remove_in_flight_session_job(&mut inner, &job);
                 continue;
             }
             let already = {
-                let inner = shared.inner.lock().expect("push inner lock");
-                inner.notified_status.get(&job.session) == Some(&job.kind)
+                let mut inner = shared.inner.lock().expect("push inner lock");
+                let already = inner.notified_status.get(&job.session) == Some(&job.kind);
+                if already {
+                    remove_in_flight_session_job(&mut inner, &job);
+                }
+                already
             };
             if already {
                 continue;
@@ -742,17 +878,30 @@ fn run(shared: &Arc<PushShared>) {
             if outcome.should_commit() {
                 let mut inner = shared.inner.lock().expect("push inner lock");
                 remember_status(&mut inner.notified_status, &job.session, job.kind);
+                remove_in_flight_session_job(&mut inner, &job);
             } else if attempts < SESSION_SEND_ATTEMPTS {
-                let mut inner = shared.inner.lock().expect("push inner lock");
-                inner.retry_jobs.push_back(SessionJob {
-                    attempts,
-                    ..job.clone()
-                });
+                let evicted = {
+                    let mut inner = shared.inner.lock().expect("push inner lock");
+                    remove_in_flight_session_job(&mut inner, &job);
+                    enqueue_session_job(
+                        &mut inner,
+                        SessionJob {
+                            attempts,
+                            ..job.clone()
+                        },
+                        SessionJobQueue::Retry,
+                    )
+                };
+                if evicted {
+                    warn_session_job_eviction(SessionJobQueue::Retry);
+                }
             } else {
                 tracing::warn!(
                     attempts,
                     "웹푸시 세션 알림 재시도 상한 초과 — 포기(구독 측 지속 장애)"
                 );
+                let mut inner = shared.inner.lock().expect("push inner lock");
+                remove_in_flight_session_job(&mut inner, &job);
             }
         }
 
@@ -1161,7 +1310,7 @@ fn random_p256_scalar() -> [u8; 32] {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
 
     // ── RFC 8291 부록 A 고정 벡터 ────────────────────────────────────────────
     const RFC_AS_PRIVATE: &str = "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw";
@@ -1555,6 +1704,57 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct StallingState {
+        calls: usize,
+        first_blocked: bool,
+        release: bool,
+    }
+
+    #[derive(Default)]
+    struct StallingTransport {
+        state: StdMutex<StallingState>,
+        cvar: StdCondvar,
+    }
+
+    impl StallingTransport {
+        fn call_count(&self) -> usize {
+            self.state.lock().unwrap().calls
+        }
+
+        fn first_blocked(&self) -> bool {
+            self.state.lock().unwrap().first_blocked
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.release = true;
+            self.cvar.notify_all();
+        }
+    }
+
+    impl PushTransport for StallingTransport {
+        fn post(
+            &self,
+            _endpoint: &str,
+            _t: u32,
+            _u: &str,
+            _a: &str,
+            _b: &[u8],
+        ) -> Result<u16, TransportError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls += 1;
+            if state.calls == 1 {
+                state.first_blocked = true;
+                self.cvar.notify_all();
+                while !state.release {
+                    state = self.cvar.wait(state).unwrap();
+                }
+            }
+            Ok(500)
+        }
+    }
+
+    #[derive(Default)]
     struct MemStore(StdMutex<HashMap<String, String>>);
     impl SecretStore for MemStore {
         fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
@@ -1610,8 +1810,12 @@ mod tests {
             .unwrap();
     }
 
-    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    fn wait_until(cond: impl FnMut() -> bool) -> bool {
+        wait_until_for(Duration::from_secs(3), cond)
+    }
+
+    fn wait_until_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
             if cond() {
                 return true;
@@ -1619,6 +1823,294 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         cond()
+    }
+
+    fn empty_push_inner() -> PushInner {
+        PushInner {
+            force: false,
+            jobs: VecDeque::new(),
+            retry_jobs: VecDeque::new(),
+            in_flight_status: HashSet::new(),
+            notified_approvals: HashSet::new(),
+            notified_status: HashMap::new(),
+        }
+    }
+
+    fn session_job(session: impl Into<String>, kind: SessionKind, attempts: u32) -> SessionJob {
+        SessionJob {
+            session: session.into(),
+            kind,
+            attempts,
+        }
+    }
+
+    fn queued_session_job<'a>(inner: &'a PushInner, session: &str) -> Option<&'a SessionJob> {
+        inner
+            .jobs
+            .iter()
+            .chain(inner.retry_jobs.iter())
+            .find(|job| job.session == session)
+    }
+
+    #[test]
+    fn session_job_admission_coalesces_identical_session_to_one_job() {
+        let mut inner = empty_push_inner();
+
+        for _ in 0..1_000 {
+            enqueue_session_job(
+                &mut inner,
+                session_job("same", SessionKind::Waiting, 99),
+                SessionJobQueue::Fresh,
+            );
+        }
+
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), 1);
+        let job = queued_session_job(&inner, "same").expect("same session job");
+        assert_eq!(job.kind, SessionKind::Waiting);
+        assert_eq!(job.attempts, 0, "fresh admission resets attempts");
+    }
+
+    #[test]
+    fn session_job_admission_done_wins_over_waiting() {
+        let mut inner = empty_push_inner();
+
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Waiting, 0),
+            SessionJobQueue::Fresh,
+        );
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Done, 0),
+            SessionJobQueue::Fresh,
+        );
+
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), 1);
+        assert_eq!(
+            queued_session_job(&inner, "same").map(|job| job.kind),
+            Some(SessionKind::Done)
+        );
+    }
+
+    #[test]
+    fn session_job_admission_retry_replaces_fresh_and_preserves_attempts() {
+        let mut inner = empty_push_inner();
+
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Waiting, 0),
+            SessionJobQueue::Fresh,
+        );
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Waiting, 2),
+            SessionJobQueue::Retry,
+        );
+
+        assert!(inner.jobs.is_empty(), "fresh duplicate should be removed");
+        assert_eq!(inner.retry_jobs.len(), 1);
+        let job = inner.retry_jobs.front().expect("retry job");
+        assert_eq!(job.session, "same");
+        assert_eq!(job.kind, SessionKind::Waiting);
+        assert_eq!(job.attempts, 2, "retry admission preserves attempts");
+    }
+
+    #[test]
+    fn session_job_admission_bounds_unique_sessions_at_limit() {
+        let mut inner = empty_push_inner();
+        let mut evicted = false;
+
+        for i in 0..=MAX_SESSION_JOBS {
+            evicted |= enqueue_session_job(
+                &mut inner,
+                session_job(format!("session-{i:03}"), SessionKind::Waiting, 0),
+                SessionJobQueue::Fresh,
+            );
+        }
+
+        assert!(evicted, "257th unique session should evict one old job");
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), MAX_SESSION_JOBS);
+        assert!(
+            queued_session_job(&inner, "session-000").is_none(),
+            "oldest best-effort session job should be evicted"
+        );
+        assert!(
+            queued_session_job(&inner, "session-256").is_some(),
+            "newest session job should be retained"
+        );
+    }
+
+    #[test]
+    fn session_job_admission_rejects_committed_duplicate_without_eviction() {
+        let mut inner = empty_push_inner();
+
+        for i in 0..MAX_SESSION_JOBS {
+            enqueue_session_job(
+                &mut inner,
+                session_job(format!("session-{i:03}"), SessionKind::Waiting, 0),
+                SessionJobQueue::Fresh,
+            );
+        }
+        remember_status(
+            &mut inner.notified_status,
+            "already-committed",
+            SessionKind::Done,
+        );
+
+        let evicted = enqueue_session_job(
+            &mut inner,
+            session_job("already-committed", SessionKind::Done, 0),
+            SessionJobQueue::Fresh,
+        );
+
+        assert!(!evicted, "committed duplicate should be rejected");
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), MAX_SESSION_JOBS);
+        assert!(
+            queued_session_job(&inner, "already-committed").is_none(),
+            "committed duplicate should not be queued"
+        );
+        assert!(
+            queued_session_job(&inner, "session-000").is_some(),
+            "committed duplicate should not evict an unsent session"
+        );
+    }
+
+    #[test]
+    fn session_job_admission_rejects_in_flight_duplicate_without_eviction() {
+        let mut inner = empty_push_inner();
+
+        for i in 0..MAX_SESSION_JOBS {
+            enqueue_session_job(
+                &mut inner,
+                session_job(format!("session-{i:03}"), SessionKind::Waiting, 0),
+                SessionJobQueue::Fresh,
+            );
+        }
+        inner
+            .in_flight_status
+            .insert(("in-flight".to_owned(), SessionKind::Done));
+
+        let evicted = enqueue_session_job(
+            &mut inner,
+            session_job("in-flight", SessionKind::Done, 0),
+            SessionJobQueue::Fresh,
+        );
+
+        assert!(!evicted, "in-flight duplicate should be rejected");
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), MAX_SESSION_JOBS);
+        assert!(
+            queued_session_job(&inner, "in-flight").is_none(),
+            "in-flight duplicate should not be queued"
+        );
+        assert!(
+            queued_session_job(&inner, "session-000").is_some(),
+            "in-flight duplicate should not evict an unsent session"
+        );
+    }
+
+    #[test]
+    fn session_job_admission_fresh_duplicate_done_preserves_retry_attempts() {
+        let mut inner = empty_push_inner();
+
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Done, 2),
+            SessionJobQueue::Retry,
+        );
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Done, 0),
+            SessionJobQueue::Fresh,
+        );
+
+        assert!(
+            inner.retry_jobs.is_empty(),
+            "retry duplicate should move fresh"
+        );
+        assert_eq!(inner.jobs.len(), 1);
+        let job = inner.jobs.front().expect("fresh job");
+        assert_eq!(job.session, "same");
+        assert_eq!(job.kind, SessionKind::Done);
+        assert_eq!(
+            job.attempts, 2,
+            "fresh duplicate of same final state should preserve retry attempts"
+        );
+    }
+
+    #[test]
+    fn push_stalled_failure_bounds_session_jobs_and_stops_after_retry_cap() {
+        let db_path = temp_db();
+        let endpoint = "https://push.example/stalled-session";
+        let transport = Arc::new(StallingTransport::default());
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedStallingTransport(Arc::clone(&transport))),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(endpoint, RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+        wait_until(|| handle.poll_count() >= 1);
+
+        handle.notify_session("session-000".to_owned(), runtime::SessionStatus::Done);
+        assert!(
+            wait_until(|| transport.first_blocked()),
+            "first session send did not stall"
+        );
+
+        for i in 1..=MAX_SESSION_JOBS + 1 {
+            handle.notify_session(format!("session-{i:03}"), runtime::SessionStatus::Done);
+        }
+
+        {
+            let inner = handle.shared.inner.lock().expect("push inner lock");
+            assert_eq!(
+                inner.jobs.len() + inner.retry_jobs.len(),
+                MAX_SESSION_JOBS,
+                "stalled delivery let retained session jobs exceed the cap"
+            );
+            assert!(
+                queued_session_job(&inner, "session-001").is_none(),
+                "oldest queued best-effort session should be evicted"
+            );
+            assert!(
+                queued_session_job(&inner, "session-257").is_some(),
+                "newest queued session should be retained"
+            );
+        }
+
+        transport.release();
+
+        let expected_posts = MAX_SESSION_JOBS * SESSION_SEND_ATTEMPTS as usize * 2;
+        assert!(
+            wait_until_for(Duration::from_secs(30), || transport.call_count()
+                >= expected_posts),
+            "failed session jobs did not reach the retry cap"
+        );
+        assert!(
+            wait_until_for(Duration::from_secs(5), || {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.jobs.is_empty() && inner.retry_jobs.is_empty()
+            }),
+            "session queues did not drain after retry cap"
+        );
+        let settled = transport.call_count();
+        std::thread::sleep(FAST_POLL * 4);
+        assert_eq!(
+            transport.call_count(),
+            settled,
+            "failed session jobs kept sending after retry cap"
+        );
+        assert_eq!(
+            settled, expected_posts,
+            "unexpected number of post attempts for retained failed jobs"
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]
@@ -1918,6 +2410,204 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 
+    #[test]
+    fn in_flight_session_job_clears_after_successful_commit() {
+        let db_path = temp_db();
+        let transport = Arc::new(FakeTransport::default());
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedTransport(Arc::clone(&transport))),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(
+                "https://push.example/session-commit",
+                RFC_UA_PUBLIC,
+                RFC_AUTH,
+            )
+            .unwrap();
+        wait_until(|| handle.poll_count() >= 1);
+
+        handle.notify_session("commit".to_owned(), runtime::SessionStatus::Done);
+        assert!(
+            wait_until(|| {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.notified_status.get("commit") == Some(&SessionKind::Done)
+                    && inner.in_flight_status.is_empty()
+            }),
+            "committed session job left in-flight state behind"
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn in_flight_session_job_clears_before_retry_requeue() {
+        let db_path = temp_db();
+        let endpoint = "https://push.example/session-retry-clear";
+        let transport = Arc::new(StallingTransport::default());
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedStallingTransport(Arc::clone(&transport))),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(endpoint, RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+        wait_until(|| handle.poll_count() >= 1);
+
+        handle.notify_session("retry-clear".to_owned(), runtime::SessionStatus::Done);
+        assert!(
+            wait_until(|| transport.first_blocked()),
+            "session send did not stall"
+        );
+        transport.release();
+
+        assert!(
+            wait_until(|| {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.in_flight_status.is_empty()
+                    && inner.jobs.is_empty()
+                    && inner
+                        .retry_jobs
+                        .iter()
+                        .any(|job| job.session == "retry-clear" && job.attempts == 1)
+            }),
+            "retry requeue did not clear in-flight state"
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn in_flight_session_job_clears_after_zero_subscription_skip() {
+        let db_path = temp_db();
+        let _ = storage::Db::open(&db_path).unwrap();
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(FakeTransport::default()),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+
+        handle.notify_session("zero-subs".to_owned(), runtime::SessionStatus::Done);
+
+        assert!(
+            wait_until(|| {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.in_flight_status.is_empty()
+                    && inner.jobs.is_empty()
+                    && inner.retry_jobs.is_empty()
+            }),
+            "zero-subscription skip left in-flight state behind"
+        );
+        assert_eq!(handle.sent_count(), 0, "zero-subscription job was sent");
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn in_flight_session_job_clears_after_already_notified_skip() {
+        let db_path = temp_db();
+        let transport = Arc::new(FakeTransport::default());
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedTransport(Arc::clone(&transport))),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(
+                "https://push.example/already-notified",
+                RFC_UA_PUBLIC,
+                RFC_AUTH,
+            )
+            .unwrap();
+        wait_until(|| handle.poll_count() >= 1);
+        let base = handle.sent_count();
+        {
+            let mut inner = handle.shared.inner.lock().expect("push inner lock");
+            remember_status(&mut inner.notified_status, "already", SessionKind::Done);
+            inner
+                .jobs
+                .push_back(session_job("already", SessionKind::Done, 0));
+        }
+        handle.shared.cvar.notify_all();
+
+        assert!(
+            wait_until(|| {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.in_flight_status.is_empty()
+                    && inner.jobs.is_empty()
+                    && inner.retry_jobs.is_empty()
+            }),
+            "already-notified skip left in-flight state behind"
+        );
+        assert_eq!(handle.sent_count(), base, "already-notified job was sent");
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn in_flight_session_job_clears_after_retry_exhaustion() {
+        let db_path = temp_db();
+        let endpoint = "https://push.example/session-exhaustion-clear";
+        let transport = Arc::new(FakeTransport::with(HashMap::from([(
+            endpoint.to_owned(),
+            Reply::Status(500),
+        )])));
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedTransport(Arc::clone(&transport))),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(endpoint, RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+        wait_until(|| handle.poll_count() >= 1);
+
+        {
+            let mut inner = handle.shared.inner.lock().expect("push inner lock");
+            inner.jobs.push_back(session_job(
+                "exhausted",
+                SessionKind::Done,
+                SESSION_SEND_ATTEMPTS - 1,
+            ));
+        }
+        handle.shared.cvar.notify_all();
+
+        assert!(
+            wait_until(|| {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.in_flight_status.is_empty()
+                    && inner.jobs.is_empty()
+                    && inner.retry_jobs.is_empty()
+                    && transport.call_count() >= 2
+            }),
+            "retry exhaustion left in-flight state behind"
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
     // ── P3-1: notified_status 유계화 ────────────────────────────────────────
 
     #[test]
@@ -1949,6 +2639,13 @@ mod tests {
     /// Arc<FakeTransport>를 Box<dyn PushTransport>로 넘기기 위한 래퍼(테스트가 관찰을 공유).
     struct SharedTransport(Arc<FakeTransport>);
     impl PushTransport for SharedTransport {
+        fn post(&self, e: &str, t: u32, u: &str, a: &str, b: &[u8]) -> Result<u16, TransportError> {
+            self.0.post(e, t, u, a, b)
+        }
+    }
+
+    struct SharedStallingTransport(Arc<StallingTransport>);
+    impl PushTransport for SharedStallingTransport {
         fn post(&self, e: &str, t: u32, u: &str, a: &str, b: &[u8]) -> Result<u16, TransportError> {
             self.0.post(e, t, u, a, b)
         }

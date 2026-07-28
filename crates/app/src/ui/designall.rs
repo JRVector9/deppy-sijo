@@ -26,7 +26,7 @@ pub const SEPARATOR_WIDTH: f32 = 1.0;
 pub const DARK: Tokens = Tokens {
     app_background: egui::Color32::from_rgb(0x0b, 0x10, 0x15),
     workspace_background: egui::Color32::from_rgb(0x10, 0x16, 0x1c),
-    folder_tree_background: egui::Color32::from_rgb(0x08, 0x0f, 0x16),
+    folder_tree_background: egui::Color32::from_rgb(0x10, 0x16, 0x1c),
     input_background: egui::Color32::from_rgb(0x11, 0x18, 0x20),
     separator: egui::Color32::from_rgb(0x26, 0x30, 0x3a),
     text: egui::Color32::from_rgb(0xd8, 0xde, 0xe6),
@@ -42,7 +42,7 @@ pub const DARK: Tokens = Tokens {
 pub const LIGHT: Tokens = Tokens {
     app_background: egui::Color32::from_rgb(0xfb, 0xfc, 0xfd),
     workspace_background: egui::Color32::from_rgb(0xf5, 0xf7, 0xf9),
-    folder_tree_background: egui::Color32::from_rgb(0xee, 0xf2, 0xf5),
+    folder_tree_background: egui::Color32::from_rgb(0xf5, 0xf7, 0xf9),
     input_background: egui::Color32::from_rgb(0xf1, 0xf3, 0xf5),
     separator: egui::Color32::from_rgb(0xd5, 0xd9, 0xdf),
     text: egui::Color32::from_rgb(0x23, 0x26, 0x2c),
@@ -107,10 +107,7 @@ mod tests {
             DARK.input_background,
             egui::Color32::from_rgb(0x11, 0x18, 0x20)
         );
-        assert_eq!(
-            DARK.separator,
-            egui::Color32::from_rgb(0x26, 0x30, 0x3a)
-        );
+        assert_eq!(DARK.separator, egui::Color32::from_rgb(0x26, 0x30, 0x3a));
         assert_eq!(DARK.accent, egui::Color32::from_rgb(0x39, 0xb8, 0xe8));
         assert_eq!(STRUCTURAL_CORNER_RADIUS, 0);
         assert_eq!(NAV_RAIL_WIDTH, 88.0);
@@ -119,13 +116,7 @@ mod tests {
     #[test]
     fn inactive_structure_has_no_fill_but_interactions_may_have_one() {
         assert_eq!(row_fill(DARK, false, false), None);
-        assert_eq!(
-            row_fill(DARK, true, false),
-            Some(DARK.selected_background)
-        );
-        assert_eq!(
-            row_fill(DARK, false, true),
-            Some(DARK.hover_background)
-        );
+        assert_eq!(row_fill(DARK, true, false), Some(DARK.selected_background));
+        assert_eq!(row_fill(DARK, false, true), Some(DARK.hover_background));
     }
 }

@@ -262,13 +262,17 @@ pub fn draw(
     );
     // click_and_drag: 클릭=포커스, 드래그=선택 (2026-07-05 복사 지원)
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-    // egui 0.35에서 커스텀 입력 위젯은 `Memory::owns_ime_events`가 참일 때만 IME를
-    // 출력·소비해야 한다. `request_focus`는 즉시 focus id를 바꾸고 기존 조합 중단도
-    // egui에 알리므로, 논리적 터미널 소유권이 넘어온 프레임 안에 공식 소유자가 된다.
-    if ime_active && !ui.memory(|memory| memory.owns_ime_events(response.id)) {
+    // 조합이 없을 때만 공식 소유권을 즉시 되찾는다. egui의 request_focus는 현재 조합을
+    // interrupt하므로, 진행 중 preedit 동안 비-TextEdit 포커스가 한 프레임 튀었다고
+    // 호출하면 macOS가 자모를 강제 commit한다. 진행 중 조합은 아래 IME output을 유지한
+    // 채 호출측이 논리적 입력 소유권으로 계속 소비하고, commit 뒤 다음 프레임에 복귀한다.
+    let continues_preedit = ime_active && preedit.is_some_and(|preedit| !preedit.is_empty());
+    if ime_active && !continues_preedit && !ui.memory(|memory| memory.owns_ime_events(response.id))
+    {
         response.request_focus();
     }
     let owns_ime_events = ime_active && ui.memory(|memory| memory.owns_ime_events(response.id));
+    let maintains_ime_composition = owns_ime_events || continues_preedit;
     if response.has_focus() {
         ui.memory_mut(|memory| {
             memory.set_focus_lock_filter(response.id, terminal_focus_lock_filter());
@@ -359,7 +363,7 @@ pub fn draw(
     // 비우면 set_ime_allowed(false)로 macOS가 진행 중인 한글 조합을 강제 커밋한다.
     // TUI(claude 등)는 리드로우마다 커서를 숨겼다 켜므로(?25l/?25h) 커서 가시성에
     // 묶으면 조합이 자모 단위로 끊긴다 (2026-07-14 사용자: "ㄹㅗ" 분리).
-    if owns_ime_events {
+    if maintains_ime_composition {
         // 조합 중 텍스트를 커서 위치에 표시
         if let Some(preedit) = preedit.filter(|p| !p.is_empty()) {
             // 조합 텍스트도 글자이므로 셀 안 세로 중앙 정렬을 따른다.
@@ -910,6 +914,41 @@ mod tests {
             );
         });
         assert!(full.platform_output.ime.is_none());
+    }
+
+    #[test]
+    fn 조합중_비textedit_포커스전이는_ime를_중단하지_않는다() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let snapshot = snap(4, 1, &["test"]);
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let transient = ui.button("transient focus");
+            transient.request_focus();
+        });
+        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            let _ = ui.button("transient focus");
+            draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                Some("ㄱ"),
+                true,
+                None,
+                next_gen(),
+            );
+        });
+
+        let ime = full
+            .platform_output
+            .ime
+            .expect("진행 중 조합은 IME allowance를 유지해야 한다");
+        assert!(
+            !ime.should_interrupt_composition,
+            "조합 중 request_focus는 egui가 IME 강제 중단으로 바꾼다"
+        );
     }
 
     #[test]

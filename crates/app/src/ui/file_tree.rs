@@ -799,6 +799,9 @@ pub struct FileTreeUi {
     /// 마지막 외부 파일 붙여넣기(⌘V) 처리 시각 — 같은 제스처의 press(native)와
     /// release(egui fallback)가 두 번 복사하는 것을 막는다(터미널 PASTE_GESTURE 관례).
     last_external_paste: Option<std::time::Instant>,
+    /// 마지막 외부 파일 복사(⌘C) 처리 시각 — native key-down 뒤 늦게 도착한
+    /// Event::Copy가 같은 파일 URL 쓰기를 중복하지 않게 한다.
+    last_external_copy: Option<std::time::Instant>,
     /// 이번 프레임 트리가 ⌘V를 소비했는지 — App이 터미널의 같은 제스처 붙여넣기를 누른다.
     consumed_paste_shortcut: bool,
     /// 이번 프레임 트리가 ⌘C를 소비했는지 — App이 터미널 선택 복사의 덮어쓰기를 누른다.
@@ -868,6 +871,7 @@ impl FileTreeUi {
             workspace_sessions_expanded: HashMap::new(),
             last_sidebar_active_workspace: None,
             last_external_paste: None,
+            last_external_copy: None,
             consumed_paste_shortcut: false,
             consumed_copy_shortcut: false,
             workspace_section_height: 270.0,
@@ -3088,12 +3092,11 @@ impl FileTreeUi {
             return;
         }
         // ⌘C(③): 포인터 밑 행을 파일 URL로 pasteboard에 — Finder에서 ⌘V 가능.
-        if let Some(path) = row_path
-            && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
-        {
-            self.consumed_copy_shortcut = true;
-            self.copy_files_to_clipboard(std::slice::from_ref(&path));
-        }
+        // AppKit native key-down을 먼저 peek해 비-Latin 배열에서 Event::Copy가 빠져도
+        // WorkspaceUi drain 전에 트리가 소유권을 확정한다.
+        let egui_copy = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        let native_copy = crate::native_key_monitor::peek_clipboard_copy();
+        self.handle_copy_shortcut_signal(row_path, native_copy, egui_copy);
         // ⌘V(②): 클립보드 파일 목록을 대상 폴더로 복사. macOS는 press가 native
         // key-down(peek)으로, 텍스트 표현이 있으면 Event::Paste로, release가 V key-up
         // fallback으로 온다(터미널 관례) — 어느 쪽이든 한 제스처는 한 번만 처리한다.
@@ -3121,6 +3124,29 @@ impl FileTreeUi {
         }
         self.consumed_paste_shortcut = true;
         self.last_external_paste = Some(std::time::Instant::now());
+    }
+
+    fn handle_copy_shortcut_signal(
+        &mut self,
+        row_path: Option<PathBuf>,
+        native_copy: bool,
+        egui_copy: bool,
+    ) {
+        let Some(path) = row_path else {
+            return;
+        };
+        if !native_copy && !egui_copy {
+            return;
+        }
+        self.consumed_copy_shortcut = true;
+        if self
+            .last_external_copy
+            .is_some_and(|at| at.elapsed() < EXTERNAL_COPY_GESTURE_WINDOW)
+        {
+            return;
+        }
+        self.last_external_copy = Some(std::time::Instant::now());
+        self.copy_files_to_clipboard(std::slice::from_ref(&path));
     }
 
     /// 파일 URL pasteboard 쓰기 — 실패는 하단 에러 라벨로 표면화(조용한 실패 금지).
@@ -5283,6 +5309,7 @@ fn row_target_dir(row: &FlatRow, root: Option<&Path>) -> PathBuf {
 
 /// 같은 ⌘V 제스처(press+release) 이중 처리 방지 창 — 터미널 PASTE_GESTURE_WINDOW 관례.
 const EXTERNAL_PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+const EXTERNAL_COPY_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// 트리 ⌘V 신호(egui 이벤트 기반). macOS는 press가 Event::Paste(클립보드에 텍스트
 /// 표현이 있을 때만)로 오고 파일-only pasteboard면 press 이벤트가 없다 — release
@@ -5537,6 +5564,57 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_only_copy는_유효한_트리_행이_소유한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let path = PathBuf::from("/tmp/native-copy.txt");
+
+        tree.handle_copy_shortcut_signal(Some(path.clone()), true, false);
+
+        let intent = tree.take_io_intent().expect("native copy intent");
+        match intent.request {
+            FileTreeIoRequest::CopyFileUrls { paths } => {
+                assert_eq!(paths.into_paths(), vec![path]);
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+        let (paste_consumed, copy_consumed) = tree.take_clipboard_shortcut_consumption();
+        assert!(!paste_consumed);
+        assert!(
+            copy_consumed,
+            "App이 터미널 선택 복사로 파일 URL을 덮어쓰지 않도록 해야 한다"
+        );
+    }
+
+    #[test]
+    fn native_copy뒤_늦은_egui_copy는_소유권만_유지하고_중복하지_않는다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let path = PathBuf::from("/tmp/deduplicated-copy.txt");
+
+        tree.handle_copy_shortcut_signal(Some(path.clone()), true, false);
+        assert!(
+            tree.take_io_intent().is_some(),
+            "첫 신호는 파일 URL을 복사한다"
+        );
+        assert_eq!(tree.take_clipboard_shortcut_consumption(), (false, true));
+
+        tree.handle_copy_shortcut_signal(Some(path), false, true);
+
+        assert!(
+            tree.take_io_intent().is_none(),
+            "후속 신호는 intent를 중복하지 않는다"
+        );
+        assert_eq!(
+            tree.take_clipboard_shortcut_consumption(),
+            (false, true),
+            "후속 신호도 터미널 복사는 계속 억제한다"
+        );
+        assert!(
+            tree.error.is_none(),
+            "중복 신호가 busy 오류를 만들면 안 된다"
+        );
+    }
 
     #[test]
     fn maintenance_constructor는_thread_channel_watcher와_intent가_없다() {

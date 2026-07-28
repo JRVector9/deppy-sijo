@@ -605,6 +605,9 @@ pub struct WorkspaceUi {
     /// egui-winit이 이미지-only clipboard에서 Event::Paste 없이 소비하는 macOS Command+V
     /// 원본 key-down. 터미널 입력 소유권을 확인한 pane에서만 1회 소비한다.
     native_clipboard_paste_requested: bool,
+    /// egui가 고수준 Copy를 생략하거나 한 프레임 늦게 보낼 때의 macOS Command+C
+    /// 원본 key-down. 선택과 터미널 입력 소유권이 모두 확인된 경우에만 복사한다.
+    native_clipboard_copy_requested: bool,
     /// 파일 트리가 이번 프레임 ⌘V/⌘C를 소비 — 같은 제스처의 터미널 붙여넣기/선택 복사
     /// 이중 처리를 누른다(App이 사이드바 렌더 직후 설정, prepare_frame이 프레임
     /// 플래그로 옮긴다. 파일 트리 §과제②③ 충돌 금지).
@@ -1032,6 +1035,7 @@ impl WorkspaceUi {
             preedit: String::new(),
             native_printable_key_downs: Vec::new(),
             native_clipboard_paste_requested: false,
+            native_clipboard_copy_requested: false,
             suppress_paste_request: false,
             suppress_copy_request: false,
             paste_suppressed: false,
@@ -2111,6 +2115,7 @@ impl WorkspaceUi {
         let native_key_downs = crate::native_key_monitor::drain();
         self.native_printable_key_downs = native_key_downs.printable;
         self.native_clipboard_paste_requested = native_key_downs.clipboard_paste;
+        self.native_clipboard_copy_requested = native_key_downs.clipboard_copy;
         // 파일 트리 ⌘V/⌘C 소비 프레임 — 요청을 이번 프레임 확정값으로 옮긴다(이월 없음).
         self.paste_suppressed = std::mem::take(&mut self.suppress_paste_request);
         self.copy_suppressed = std::mem::take(&mut self.suppress_copy_request);
@@ -3116,11 +3121,48 @@ impl WorkspaceUi {
 
         // 검색 TextEdit/팝업 같은 overlay가 renderer 뒤에서 포커스를 가져갈 수도 있으므로
         // 이벤트를 소비하는 바로 이 시점에 egui의 공식 IME 소유권을 다시 확인한다.
-        let terminal_owns_ime_events = terminal_keyboard_active
-            && ui
-                .ctx()
-                .memory(|memory| memory.owns_ime_events(output.response.id));
-        if terminal_owns_ime_events {
+        let terminal_owns_ime_events = ui
+            .ctx()
+            .memory(|memory| memory.owns_ime_events(output.response.id));
+        let any_blocking_window_visible = ui.ctx().memory(|mem| {
+            mem.areas()
+                .visible_layer_ids()
+                .iter()
+                .any(is_blocking_terminal_window)
+        });
+        let terminal_accepts_ime_events = terminal_accepts_ime_events(
+            terminal_keyboard_active,
+            terminal_owns_ime_events,
+            !self.preedit.is_empty(),
+            ui.ctx().text_edit_focused(),
+            ui.ctx().any_popup_open(),
+            any_blocking_window_visible,
+        );
+        let native_clipboard_copy_requested = if terminal_input_owner {
+            std::mem::take(&mut self.native_clipboard_copy_requested)
+        } else {
+            false
+        };
+        let copy_selection = self
+            .selection
+            .filter(|(selection_session, _, _)| *selection_session == session);
+        let should_copy_selection = ui.input(|input| {
+            terminal_should_copy_selection(
+                native_clipboard_copy_requested,
+                &input.raw.events,
+                terminal_keyboard_active,
+                self.copy_suppressed,
+                copy_selection.is_some(),
+            )
+        });
+        if should_copy_selection && let Some((_, start, end)) = copy_selection {
+            ui.ctx().copy_text(renderer_egui::selection_text(
+                &snapshot,
+                start.min(end),
+                start.max(end),
+            ));
+        }
+        if terminal_accepts_ime_events {
             let mut pending: Vec<u8> = Vec::new();
             // macOS/winit은 한 번의 IME 종료 키를 `Ime::Commit`과 일반 `Text` 양쪽으로
             // 전달하거나, 반대로 `Text`를 생략할 수 있다. AppKit/egui에서 관찰한 실제
@@ -3137,7 +3179,6 @@ impl WorkspaceUi {
                     preedit_active_before_input,
                 )
             });
-            let mut copy_text: Option<String> = None;
             let mut image_paste_trigger = (native_clipboard_paste_requested
                 && !self.paste_suppressed)
                 .then_some(ClipboardPasteTrigger::NativeKeyDown);
@@ -3166,17 +3207,9 @@ impl WorkspaceUi {
                     }
                     // Cmd+C(macOS)/Ctrl+C(그 외)의 Copy 이벤트: 선택이 있으면 복사가
                     // 우선 — 이벤트를 소비해 ^C 전송(비macOS 매핑)을 막는다 (2026-07-05)
-                    if matches!(event, egui::Event::Copy)
-                        && let Some((sel_session, a, b)) = self.selection
-                        && sel_session == session
-                    {
-                        // 파일 트리가 이번 ⌘C를 소비 — 프레임 끝 copy_text가 트리의
-                        // pasteboard 파일 URL을 덮어쓰지 않게 선택 복사를 스킵한다.
-                        if self.copy_suppressed {
-                            continue;
-                        }
-                        copy_text =
-                            Some(renderer_egui::selection_text(&snapshot, a.min(b), a.max(b)));
+                    if matches!(event, egui::Event::Copy) && copy_selection.is_some() {
+                        // 선택이 있으면 Copy는 PTY 제어 바이트가 아니다. 실제 clipboard
+                        // 쓰기는 네이티브/지연 이벤트를 합친 위 단일 경로에서 수행한다.
                         continue;
                     }
                     if is_clipboard_paste_shortcut(event) {
@@ -3261,9 +3294,6 @@ impl WorkspaceUi {
                 }
             });
             pending.extend(&ime_reconciliation.fallback_bytes);
-            if let Some(text) = copy_text {
-                ui.ctx().copy_text(text);
-            }
             if let Some(paste_trigger) = image_paste_trigger {
                 if should_skip_paste_task(
                     paste_trigger,
@@ -4537,6 +4567,37 @@ fn terminal_keyboard_input_allowed(
     // TextEditState는 widget이 사라진 뒤 한 프레임 더 memory에 남을 수 있다. terminal
     // refocus가 명시적으로 대기 중이면 그 stale 상태는 무시해야 첫 글자가 빠지지 않는다.
     !popup_open && !top_window_open && (terminal_refocus_pending || !text_edit_focused)
+}
+
+fn terminal_accepts_ime_events(
+    terminal_keyboard_active: bool,
+    owns_ime_events: bool,
+    preedit_active: bool,
+    text_edit_focused: bool,
+    popup_open: bool,
+    blocking_window_open: bool,
+) -> bool {
+    terminal_keyboard_active
+        && !text_edit_focused
+        && !popup_open
+        && !blocking_window_open
+        && (owns_ime_events || preedit_active)
+}
+
+fn terminal_should_copy_selection(
+    native_copy_requested: bool,
+    events: &[egui::Event],
+    terminal_keyboard_active: bool,
+    copy_suppressed: bool,
+    has_selection: bool,
+) -> bool {
+    terminal_keyboard_active
+        && !copy_suppressed
+        && has_selection
+        && (native_copy_requested
+            || events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy)))
 }
 
 /// Agents and the diff review panel are floating but non-modal. A terminal
@@ -6586,6 +6647,51 @@ https://example.test/login \
         assert!(terminal_keyboard_input_allowed(true, false, false, true));
         assert!(!terminal_keyboard_input_allowed(true, true, false, true));
         assert!(!terminal_keyboard_input_allowed(true, false, true, true));
+    }
+
+    #[test]
+    fn 진행중_ime는_일시적_비textedit_포커스에서도_이벤트를_계속_받는다() {
+        assert!(terminal_accepts_ime_events(
+            true, false, true, false, false, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, true, true, false, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, true, false, true, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, true, false, false, true
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, true, true, true, false, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, true, true, false, true, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, true, true, false, false, true
+        ));
+    }
+
+    #[test]
+    fn 네이티브_command_c는_copy_event가_없거나_늦어도_터미널_선택을_복사한다() {
+        assert!(terminal_should_copy_selection(true, &[], true, false, true,));
+        assert!(terminal_should_copy_selection(
+            false,
+            &[egui::Event::Copy],
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_should_copy_selection(true, &[], true, true, true,));
+        assert!(!terminal_should_copy_selection(
+            true,
+            &[],
+            false,
+            false,
+            true,
+        ));
     }
 
     #[test]

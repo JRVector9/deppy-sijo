@@ -2409,11 +2409,8 @@ impl Worker {
             }
             _ => None,
         };
-        let restored = match archived {
-            Some(session) => {
-                self.archived_on_disk.insert(id);
-                session
-            }
+        let (restored, restored_from_disk) = match archived {
+            Some(session) => (session, true),
             None => {
                 // 폴백: 아카이브 부재(레거시/GC/손상) — redacted.ansi.log tail을
                 // 열람 전용 세션에 재생 (VS Code revive/reconnection 2계층 차용)
@@ -2429,7 +2426,7 @@ impl Worker {
                 );
                 // 열람 전용 — 모드 경계 리셋 생략(alt-screen 화면 보존, codex 리뷰 P2)
                 Self::replay_saved_ansi_ext(&self.logs_root, persistent_id, &mut session, false);
-                session
+                (session, false)
             }
         };
         if let Some(pipe) = &mut self.persist
@@ -2438,6 +2435,9 @@ impl Worker {
             return false;
         }
         self.sessions.insert(id, restored);
+        if restored_from_disk {
+            self.archived_on_disk.insert(id);
+        }
         self.exited_order.push_back(id);
         let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
         pane.session_id = Some(id);
@@ -6830,6 +6830,81 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "fallback must not create a second session row");
         assert_eq!(pane_session, persistent_id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archived_restore_failed_rebind_leaves_no_runtime_marker() {
+        let dir = unique_test_dir("sf03-rebind-fail-marker");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-sf03-rebind-fail";
+        let persistent_id = "persisted-agent-rebind-fail";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "agent",
+            Some("cfg-sf03"),
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        storage::scrollback_archive::write(
+            &logs_root,
+            persistent_id,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            b"valid archive prepared before failed rebind",
+        )
+        .unwrap();
+
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "sf03-rebind-fail-marker",
+        );
+        worker.logs_root = logs_root.clone();
+        worker.persist = Some(
+            crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            })
+            .unwrap(),
+        );
+        assert!(
+            worker
+                .persist
+                .as_mut()
+                .unwrap()
+                .session_rebound_archived(SessionId(99), persistent_id),
+            "test setup must consume the restored persistence row"
+        );
+        let pane_state = persist::PaneState {
+            id: MuxPaneId::new(),
+            session_id: Some(persistent_id.to_owned()),
+            title: "restored".to_owned(),
+            pane_kind: mux::PaneKind::Terminal,
+            cwd: Some("/tmp".to_owned()),
+        };
+
+        assert!(!worker.restore_archived_pane(&pane_state, persistent_id));
+        let failed_session = SessionId(1);
+        assert!(!worker.sessions.contains_key(&failed_session));
+        assert!(!worker.exited_order.contains(&failed_session));
+        assert!(!worker.mux.panes.contains_key(&pane_state.id));
+        assert!(
+            !worker.archived_on_disk.contains(&failed_session),
+            "failed rebind must not leave a disk archive marker without a session"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

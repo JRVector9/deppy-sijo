@@ -19124,9 +19124,7 @@ fn admit_hidden_active_replay_events(
     coalesce_mux_updated(pending_events)
 }
 
-fn mux_live_sessions(
-    mux: &runtime::MuxSnapshot,
-) -> std::collections::HashSet<runtime::SessionId> {
+fn mux_live_sessions(mux: &runtime::MuxSnapshot) -> std::collections::HashSet<runtime::SessionId> {
     mux.tabs
         .iter()
         .flat_map(|tab| &tab.panes)

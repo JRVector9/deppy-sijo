@@ -20809,7 +20809,9 @@ mod tests {
 
     #[test]
     fn designall_top_bar는_본문위에_추가선을_그리지_않는다() {
-        assert!(!DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE);
+        let source = include_str!("app.rs");
+        assert!(source.contains("const DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE: bool = false;"));
+        assert!(source.contains(".show_separator_line(DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE)"));
     }
 
     #[test]

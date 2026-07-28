@@ -931,6 +931,20 @@ fn service_status_light(
 mod tests {
     use super::*;
 
+    fn install_sidebar_test_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        fonts.families.insert(
+            egui::FontFamily::Name(crate::fonts::SIDEBAR_FONT_FAMILY.into()),
+            fallback,
+        );
+        ctx.set_fonts(fonts);
+    }
+
     #[test]
     fn view_defaults_to_terminal() {
         assert_eq!(AgentTerminalUi::new().view(), AgentTerminalView::Terminal);
@@ -1003,9 +1017,17 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let feed = StatusFeedSnapshot::default();
-        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
-            AgentTerminalUi::new().status_bar(ui, None, None, &[], 0, 0, &feed, &catalog);
-        });
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, fonts_ready| {
+                if !*fonts_ready {
+                    return;
+                }
+                AgentTerminalUi::new().status_bar(ui, None, None, &[], 0, 0, &feed, &catalog);
+            },
+            false,
+        );
+        install_sidebar_test_fonts(&harness.ctx);
+        *harness.state_mut() = true;
         harness.run();
 
         harness.get_by_label("Claude");

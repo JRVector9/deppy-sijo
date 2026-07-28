@@ -50,6 +50,8 @@ use crate::protocol::{
 };
 use crate::tls_identity::TlsIdentity;
 
+mod liveness;
+
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
 const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 /// heartbeat 주기 — 이 시간 동안 보낼 이벤트가 없으면 길이 0 프레임(keepalive)을
@@ -62,6 +64,8 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCROLLBACK_LINES: usize = 100_000;
 /// 인증 프레임 대기 상한 — 접속만 열고 침묵하는 peer가 서버를 잡아두지 못하게.
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 클라이언트 최초 TCP connect 상한 — OS 기본 connect timeout에 의존하지 않는다.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// TLS 접속당 단일 I/O 루프가 아무 진전이 없을 때 다음 tick 전 짧게 재운다 —
 /// busy-spin(CPU 100%) 방지. 1~5ms 범위(설계 §2.4). read/write 어느 쪽도 블록하지 않는다.
 const TLS_IDLE_SLEEP: Duration = Duration::from_millis(2);
@@ -124,6 +128,25 @@ fn read_frame(reader: &mut impl Read) -> Option<Vec<u8>> {
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).ok()?;
     Some(payload)
+}
+
+fn connect_with(
+    addr: SocketAddr,
+    connect: impl FnOnce(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+) -> std::io::Result<TcpStream> {
+    connect(&addr, CONNECT_TIMEOUT)
+}
+
+fn observe_client_frame_for_liveness(
+    tracker: &mut liveness::LivenessTracker,
+    _frame: &[u8],
+    now: Instant,
+) {
+    tracker.observe_frame(now);
+}
+
+fn client_liveness_expired(tracker: &liveness::LivenessTracker, now: Instant) -> bool {
+    tracker.expired(now)
 }
 
 /// 상수 시간 비교 — 토큰 길이/내용의 타이밍 누설 방지.
@@ -209,9 +232,16 @@ impl FrameDecoder {
                             self.payload = vec![0u8; len];
                             self.payload_filled = 0;
                             self.need = Some(len);
+                            if len == 0 {
+                                continue;
+                            }
                         }
+                        return FramePoll::Pending;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
                         return FramePoll::Pending;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -228,8 +258,16 @@ impl FrameDecoder {
                     }
                     match r.read(&mut self.payload[self.payload_filled..need]) {
                         Ok(0) => return FramePoll::Closed, // EOF (부분 프레임 중 단절)
-                        Ok(n) => self.payload_filled += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        Ok(n) => {
+                            self.payload_filled += n;
+                            if self.payload_filled < need {
+                                return FramePoll::Pending;
+                            }
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
                             return FramePoll::Pending;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1489,8 +1527,8 @@ impl RemoteRuntimeClient {
         if !addr.ip().is_loopback() {
             bail!("remote attach는 localhost만 허용합니다 (public remote는 v1+): {addr}");
         }
-        let mut stream =
-            TcpStream::connect(addr).with_context(|| format!("remote 서버 연결 실패: {addr}"))?;
+        let mut stream = connect_with(addr, TcpStream::connect_timeout)
+            .with_context(|| format!("remote 서버 연결 실패: {addr}"))?;
         // 핸드셰이크 v2 (§3.1): ClientHello 송신 → ServerHello 대기. 토큰은 hello 안에 실린다.
         let hello = ClientHello {
             magic: PROTO_MAGIC,
@@ -1537,10 +1575,18 @@ impl RemoteRuntimeClient {
             .expect("remote writer lock")
             .try_clone()
             .context("remote stream clone 실패")?;
+        reader_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .context("remote plain reader timeout 설정 실패")?;
         let reader_thread = std::thread::Builder::new()
             .name("remote-events".into())
             .spawn(move || {
-                let mut reader = BufReader::new(reader_stream);
+                let mut reader = reader_stream;
+                let mut decoder = FrameDecoder::new();
+                let mut liveness = liveness::LivenessTracker::new(
+                    Instant::now(),
+                    liveness::CLIENT_LIVENESS_TIMEOUT,
+                );
                 // 접속별 재구성 상태 (§4.3): 세션마다 (마지막 적용 seq, 현재 재구성본).
                 // reader가 TCP를 UI 소비와 무관하게 완전히 드레인하므로 delta는 여기서 유실되지 않고,
                 // slot에는 항상 "재구성된 전체 스냅샷"만 담긴다 — UI 계약(전체 Viewport)은 불변.
@@ -1549,28 +1595,44 @@ impl RemoteRuntimeClient {
                 // seq gap으로 keyframe을 이미 요청한 세션 — keyframe 도착 전까지 delta를 조용히 버려
                 // RequestKeyframe 폭주를 막는다.
                 let mut pending_keyframe: HashSet<SessionId> = HashSet::new();
-                while let Some(frame) = read_frame(&mut reader) {
-                    if frame.is_empty() {
-                        continue; // heartbeat(길이 0 프레임) — decode 전에 소비
+                loop {
+                    match decoder.advance(&mut reader) {
+                        FramePoll::Frame(frame) => {
+                            observe_client_frame_for_liveness(
+                                &mut liveness,
+                                &frame,
+                                Instant::now(),
+                            );
+                            if !frame.is_empty() {
+                                // 접속 코덱으로 디코딩. Plain은 postcard(RuntimeEvent)와 바이트 동일.
+                                let Ok(decoded) = codec.decode_event(&frame) else {
+                                    tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
+                                    break;
+                                };
+                                if !handle_decoded_event(
+                                    decoded,
+                                    &reader_subscribers,
+                                    &reader_writer,
+                                    &mut recon,
+                                    &mut pending_keyframe,
+                                ) {
+                                    break;
+                                }
+                            }
+                        }
+                        FramePoll::Pending => {}
+                        FramePoll::Closed => break,
                     }
-                    // 접속 코덱으로 디코딩. Plain은 postcard(RuntimeEvent)와 바이트 동일.
-                    let Ok(decoded) = codec.decode_event(&frame) else {
-                        tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
-                        break;
-                    };
-                    if !handle_decoded_event(
-                        decoded,
-                        &reader_subscribers,
-                        &reader_writer,
-                        &mut recon,
-                        &mut pending_keyframe,
-                    ) {
+                    if client_liveness_expired(&liveness, Instant::now()) {
+                        tracing::warn!(
+                            "remote client liveness timeout — no frames received, 접속 종료"
+                        );
                         break;
                     }
                 }
                 // 수신이 죽은 클라이언트가 명령 전송만 성공하는 반쪽 상태 방지 —
                 // 소켓을 양방향으로 닫아 이후 send_command도 실패하게 한다 (codex 리뷰)
-                let _ = reader.into_inner().shutdown(Shutdown::Both);
+                let _ = reader.shutdown(Shutdown::Both);
             })
             .context("remote reader thread 생성 실패")?;
 
@@ -1641,8 +1703,8 @@ impl RemoteRuntimeClient {
             .context("rustls ClientConnection 생성 실패")?
             .into();
         conn.set_buffer_limit(None);
-        let mut sock =
-            TcpStream::connect(addr).with_context(|| format!("remote TLS 연결 실패: {addr}"))?;
+        let mut sock = connect_with(addr, TcpStream::connect_timeout)
+            .with_context(|| format!("remote TLS 연결 실패: {addr}"))?;
         sock.set_nonblocking(true)
             .context("remote TLS non-blocking 설정 실패")?;
 
@@ -1845,6 +1907,8 @@ fn client_tls_io_loop(
     let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
     let mut pending_keyframe: HashSet<SessionId> = HashSet::new();
     let mut out: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut liveness =
+        liveness::LivenessTracker::new(Instant::now(), liveness::CLIENT_LIVENESS_TIMEOUT);
 
     'main: loop {
         let mut progressed = false;
@@ -1861,6 +1925,7 @@ fn client_tls_io_loop(
                 match dec.advance(&mut conn.reader()) {
                     FramePoll::Frame(frame) => {
                         progressed = true;
+                        observe_client_frame_for_liveness(&mut liveness, &frame, Instant::now());
                         if frame.is_empty() {
                             continue; // heartbeat 소비
                         }
@@ -1884,7 +1949,15 @@ fn client_tls_io_loop(
                             }
                         }
                     }
-                    FramePoll::Pending => break,
+                    FramePoll::Pending => {
+                        if client_liveness_expired(&liveness, Instant::now()) {
+                            tracing::warn!(
+                                "remote client liveness timeout — no frames received, 접속 종료"
+                            );
+                            break 'main;
+                        }
+                        break;
+                    }
                     FramePoll::Closed => break 'main,
                 }
             }
@@ -1905,6 +1978,11 @@ fn client_tls_io_loop(
                 }
                 Err(_) => break 'main,
             }
+        }
+
+        if client_liveness_expired(&liveness, Instant::now()) {
+            tracing::warn!("remote client liveness timeout — no frames received, 접속 종료");
+            break 'main;
         }
 
         // (2) 송신 명령 흡수 — 서버 outbound와 같은 원칙(codex HIGH): 직전 배치를 소켓에 다
@@ -2343,6 +2421,101 @@ mod tests {
         assert!(format!("{e:#}").contains("localhost"));
     }
 
+    #[test]
+    fn connect_timeout_is_applied_by_connector_helper() {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let err = connect_with(addr, |_addr, timeout| {
+            assert_eq!(timeout, Duration::from_secs(30));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "fake deadline",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn client_liveness_observes_empty_heartbeat_frame() {
+        let start = Instant::now();
+        let observed = start + Duration::from_secs(44);
+        let mut tracker = liveness::LivenessTracker::new(start, liveness::CLIENT_LIVENESS_TIMEOUT);
+
+        observe_client_frame_for_liveness(&mut tracker, &[], observed);
+
+        assert!(!client_liveness_expired(
+            &tracker,
+            observed + liveness::CLIENT_LIVENESS_TIMEOUT - Duration::from_nanos(1),
+        ));
+    }
+
+    #[test]
+    fn client_liveness_observes_ordinary_event_frame() {
+        let start = Instant::now();
+        let observed = start + Duration::from_secs(44);
+        let mut tracker = liveness::LivenessTracker::new(start, liveness::CLIENT_LIVENESS_TIMEOUT);
+
+        observe_client_frame_for_liveness(&mut tracker, &[1, 2, 3], observed);
+
+        assert!(!client_liveness_expired(
+            &tracker,
+            observed + liveness::CLIENT_LIVENESS_TIMEOUT - Duration::from_nanos(1),
+        ));
+    }
+
+    #[test]
+    fn client_liveness_idle_poll_at_deadline_requests_disconnect() {
+        let start = Instant::now();
+        let tracker = liveness::LivenessTracker::new(start, liveness::CLIENT_LIVENESS_TIMEOUT);
+
+        assert!(client_liveness_expired(
+            &tracker,
+            start + liveness::CLIENT_LIVENESS_TIMEOUT,
+        ));
+    }
+
+    #[test]
+    fn frame_decoder_treats_timed_out_like_pending() {
+        struct TimedOutReader;
+        impl Read for TimedOutReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "fake timeout",
+                ))
+            }
+        }
+
+        let mut decoder = FrameDecoder::new();
+
+        assert!(matches!(
+            decoder.advance(&mut TimedOutReader),
+            FramePoll::Pending
+        ));
+    }
+
+    #[test]
+    fn frame_decoder_yields_pending_after_incomplete_successful_read() {
+        struct OneByteReader {
+            used: bool,
+        }
+        impl Read for OneByteReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(!self.used, "decoder must return after one partial read");
+                self.used = true;
+                buf[0] = 1;
+                Ok(1)
+            }
+        }
+
+        let mut decoder = FrameDecoder::new();
+        let mut reader = OneByteReader { used: false };
+
+        assert!(matches!(decoder.advance(&mut reader), FramePoll::Pending));
+    }
+
     /// 완료 기준: InProcess와 같은 명령/이벤트 모델로 localhost attach.
     /// SpawnShell 명령이 TCP를 건너 worker에 닿고, ShellSpawned/MuxUpdated/
     /// Viewport 이벤트가 되돌아온다.
@@ -2628,6 +2801,27 @@ mod tests {
         }
         handle.join().unwrap();
         drop(client);
+    }
+
+    #[test]
+    fn plain_client_drop_joins_reader_liveness_thread() {
+        let server = RemoteRuntimeServer::serve(test_backend("plain-client-drop"), 0).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            drop(client);
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "plain client drop did not join");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        handle.join().unwrap();
+        server.shutdown();
     }
 
     /// 동시 접속: 두 클라이언트가 같은 runtime에 함께 attach해 있고, 한쪽이
@@ -4094,6 +4288,36 @@ mod tests {
                 > first
         });
         drop(client);
+        server.shutdown();
+    }
+
+    #[test]
+    fn tls_client_drop_joins_io_liveness_thread() {
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-client-drop"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+            false,
+        )
+        .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            drop(client);
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "TLS client drop did not join");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        handle.join().unwrap();
         server.shutdown();
     }
 

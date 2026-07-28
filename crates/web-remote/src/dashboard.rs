@@ -939,6 +939,7 @@ impl DashboardHandle {
 
     /// 브리지 스레드에 종료를 알린다(서버 shutdown이 join 전에 호출).
     pub fn stop(&self) {
+        let _inner = self.shared.inner.lock().expect("dashboard inner lock");
         self.shared.stop.store(true, Ordering::SeqCst);
         self.shared.cvar.notify_all();
     }

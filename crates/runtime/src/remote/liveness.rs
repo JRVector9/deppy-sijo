@@ -7,6 +7,11 @@ pub(super) struct LivenessTracker {
     timeout: Duration,
 }
 
+pub(super) struct OutboundHeartbeatTracker {
+    last_sent: Instant,
+    interval: Duration,
+}
+
 impl LivenessTracker {
     pub(super) fn new(now: Instant, timeout: Duration) -> Self {
         Self {
@@ -21,6 +26,23 @@ impl LivenessTracker {
 
     pub(super) fn expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.last_received) >= self.timeout
+    }
+}
+
+impl OutboundHeartbeatTracker {
+    pub(super) fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            last_sent: now,
+            interval,
+        }
+    }
+
+    pub(super) fn observe_frame(&mut self, now: Instant) {
+        self.last_sent = now;
+    }
+
+    pub(super) fn due(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_sent) >= self.interval
     }
 }
 
@@ -62,5 +84,13 @@ mod tests {
             CLIENT_LIVENESS_TIMEOUT,
             super::super::HEARTBEAT_INTERVAL * 3
         );
+    }
+
+    #[test]
+    fn outbound_heartbeat_is_due_despite_inbound_only_progress() {
+        let start = Instant::now();
+        let tracker = OutboundHeartbeatTracker::new(start, Duration::from_secs(15));
+
+        assert!(tracker.due(start + Duration::from_secs(15)));
     }
 }

@@ -15321,9 +15321,8 @@ impl App {
         let mut open_palette = false;
         let prompt_library_enabled = self.config.ui.prompt_library_enabled;
         let composer_action = {
-            // 도크 배경은 패널색(테마 파생) — 카드가 살짝 떠 보이도록 여백을 준다.
             let dock_frame =
-                egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin {
+                ui::designall::structural_frame(ui.visuals()).inner_margin(egui::Margin {
                     left: 10,
                     right: 10,
                     top: 8,
@@ -15341,7 +15340,7 @@ impl App {
                 collapse_shortcut: composer_collapse_shortcut(&self.config.shortcuts),
                 connector_snapshot: self.connector_snapshot_reader.snapshot(),
             };
-            egui::Panel::bottom("composer_dock")
+            let dock_response = egui::Panel::bottom("composer_dock")
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(dock_frame)
@@ -15361,8 +15360,16 @@ impl App {
                         });
                     }
                     composer.render(ui, text, &composer_ctx)
-                })
-                .inner
+                });
+            let separator_y = ui
+                .painter()
+                .round_to_pixel_center(dock_response.response.rect.top());
+            ui.painter().hline(
+                dock_response.response.rect.x_range(),
+                separator_y,
+                ui::designall::separator_stroke(ui.visuals()),
+            );
+            dock_response.inner
         };
         // 설정에서 꺼져 있으면(PR-7) 팔레트를 그리지 않는다. 켜져 있던 중 끄면 닫는다.
         if prompt_library_enabled {

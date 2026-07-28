@@ -1,7 +1,7 @@
 # SF06 Final Stability Gate
 
 작성일: 2026-07-28
-검증 커밋: `ff8e486c44fd0bfc9e29df0ef718ae930b0a34e0`
+검증 source 커밋: `fe221cb67e1a2bb17e169aa99940b9bf2ca6ad99`
 
 ## Verdict
 
@@ -9,7 +9,7 @@ Deterministic verdict: **Approved**
 
 Release hardware verdict: **Pending**
 
-SF01-SF05 focused integration tests and every frozen deterministic command pass at the validation commit. The required 30-minute release measurement was not run because a user-owned Deppy instance remained active, so physical resource stability is not yet approved. The deterministic prerequisite for design-only SSH00 is satisfied.
+SF01-SF05 and all five post-gate repair branches pass their post-merge package suites and every frozen deterministic command at the validation source commit. The required 30-minute release measurement was not run because a user-owned Deppy instance remained active, so physical resource stability is not yet approved. The deterministic prerequisite for design-only SSH00 is satisfied.
 
 ## Environment
 
@@ -31,6 +31,7 @@ SF01-SF05 focused integration tests and every frozen deterministic command pass 
 | Boundary gate | Pass | `cargo run -p xtask --locked -- check-boundary` exit 0 |
 | Performance smoke | Pass | `cargo run -p xtask --locked -- perf-smoke`: 16 exact smoke tests |
 | BG01 deterministic gate | Pass | Structural, security, failure, performance smoke, workspace regressions and doc-tests |
+| Format check | Pass | `cargo fmt --all -- --check` exit 0 |
 | Diff check | Pass | `git diff --check` exit 0 |
 
 ## Gate Remediation Evidence
@@ -51,15 +52,27 @@ SF01-SF05 focused integration tests and every frozen deterministic command pass 
 | Session log scan/GC | Pass: 25 tests, 0 failed |
 | Scrollback archive scan/GC | Pass: 11 tests, 0 failed |
 
+## Post-Repair Package Results
+
+| Package | Result |
+|---|---|
+| storage | 284 passed, 0 failed |
+| runtime | 237 passed, 0 failed |
+| web-remote | 154 passed, 0 failed |
+| terminal | 76 passed, 0 failed, 3 ignored |
+| deppy-sijo | Main suite 929 passed, 0 failed, 7 ignored; auxiliary suites green or explicitly ignored |
+
+The storage, remote, push, app replay, and macOS terminal input branches were independently reviewed before integration. Post-merge `workspace.rs` auto-merged without conflict markers.
+
 ## Release Scenario Matrix
 
 | Scenario | Requirement | Automated Evidence | Physical Measurement | Gate |
 |---|---|---|---|---|
 | A Empty app idle | RSS/CPU, idle repaint, frame p95 | Existing perf smoke only | Not run | Pending |
 | B Multi-workspace load | 5 workspaces, 20 panes, 10 sessions | Workspace/replay focused tests | Not run | Pending |
-| C Hidden high-output | Hidden/warm churn, queue caps, RSS slope | Replay cap and perf harness smoke | 30-minute run not started | Pending |
+| C Hidden high-output | Hidden/warm churn, queue caps, RSS slope | Replay retry/cap regressions and perf harness smoke | 30-minute run not started | Pending |
 | D Folder tree 100k | UI latency, watcher pressure, RSS/CPU | No SF06 production change | Not run | Pending |
-| E Remote slow consumer | Queue pressure, disconnect, local responsiveness | 60 remote tests and perf smoke | Long slow-consumer run not run | Pending |
+| E Remote slow consumer | Queue pressure, disconnect, local responsiveness | Integrated runtime 237 tests, remote liveness regressions and perf smoke | Long slow-consumer run not run | Pending |
 
 ## Why Release Measurement Is Pending
 

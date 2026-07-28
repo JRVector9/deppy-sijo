@@ -2,7 +2,7 @@
 
 작성일: 2026-07-28
 통합 브랜치: `codex/sf06-integration-evidence`
-검증 커밋: `ff8e486c44fd0bfc9e29df0ef718ae930b0a34e0`
+검증 source 커밋: `fe221cb67e1a2bb17e169aa99940b9bf2ca6ad99`
 
 ## 1. Input Findings
 
@@ -17,6 +17,7 @@
 - 동일 base `c99c2cc0e4b1705b23e1ed71f36e0ac983d322aa`에서 시작한 SF01-SF05를 격리 브랜치에서 검토하고 통합했다.
 - 고정 순서 SF03 -> SF05 -> SF04 -> SF02 -> SF01을 사용했다.
 - SF06은 게이트 기준선 복구와 검증 중 재현된 web-remote 종료 알림 유실 수정, 이 요약과 최신 performance evidence를 소유한다.
+- SF07/SF08 후속 repair는 storage fail-closed GC/회계, remote disconnect/liveness, push retry state, app replay delivery, macOS terminal copy/IME를 격리 브랜치에서 수정하고 독립 승인 후 순서대로 통합했다.
 - reconnectable SSH relay, wire-format 변경, migration, schema 변경은 포함하지 않는다.
 
 ## 3. Changes
@@ -30,6 +31,10 @@
 - 유지보수 커밋 `e00967d`가 workspace rustfmt 기준선과 terminal `manual_repeat_n` lint를 복구했다.
 - 유지보수 커밋 `c39daae`가 첫 프레임 전에 sidebar 테스트 폰트를 준비하도록 kittest 상태 전이를 수정했다.
 - 커밋 `ff8e486`이 dashboard `stop` predicate 변경과 condvar 알림을 같은 mutex 임계구역으로 묶어 shutdown wake 유실을 막았다.
+- storage는 capacity-16 root별 cursor, fresh full-pass 회계, dev/inode 검증, receipt-owned rollback FD, no-replace rename, root-bound runtime byte cache를 사용한다.
+- remote는 outbound heartbeat와 subscriber disconnect 관측을 복구하고, push retry attempt를 상태별로 격리한다.
+- app은 실패한 workspace transition과 spawn/cwd 후속 전달을 bounded FIFO에서 재시도한다.
+- macOS terminal 입력은 native Cmd+C 소유권과 중복 억제를 보강하고 IME preedit 중 focus 재요청을 막는다.
 
 ## 4. Tests
 
@@ -48,6 +53,16 @@
 | `cargo test -p web-remote --locked -- --test-threads=1` | Pass: 153 passed, 0 failed |
 | web-remote shutdown race test binary, exact test 100회 | Pass: 100/100 |
 
+### Post-repair package suites
+
+| Command | Result |
+|---|---|
+| `cargo test -p storage --lib --locked -- --test-threads=1` | Pass: 284 passed |
+| `cargo test -p runtime --lib --locked -- --test-threads=1` | Pass: 237 passed |
+| `cargo test -p web-remote --locked` | Pass: 154 passed |
+| `cargo test -p terminal --locked` | Pass: 76 passed, 3 ignored |
+| `cargo test -p deppy-sijo --locked -- --test-threads=1` | Pass: main 929 passed/7 ignored; all auxiliary suites passed or explicitly ignored |
+
 ### Deterministic gates
 
 | Command | Result | Notes |
@@ -58,6 +73,7 @@
 | `cargo run -p xtask --locked -- check-boundary` | Pass | Exit 0 |
 | `cargo run -p xtask --locked -- perf-smoke` | Pass | 16 exact smoke tests |
 | `cargo run -p xtask --locked -- bg01-deterministic-gate` | Pass | Structural, security, failure, performance smoke, workspace regression and doc-test gate |
+| `cargo fmt --all -- --check` | Pass | Final integration HEAD rerun |
 | `git diff --check` | Pass | Final integration HEAD rerun |
 
 The exact SF06 deterministic gate is therefore **approved**. The first full BG01 attempt exposed a pre-existing dashboard shutdown race rather than a formatting failure; a process sample showed the test waiting in `JoinHandle::join` while the worker was parked on the condvar. The mutex-coupled stop fix passed the exact test 100/100 times before the complete gate rerun.
@@ -77,6 +93,7 @@ The exact SF06 deterministic gate is therefore **approved**. The first full BG01
 - [x] Focused integration tests and exact workspace strict Clippy pass.
 - [x] Exact workspace strict Clippy passes.
 - [x] Exact BG01 deterministic gate passes.
+- [x] Five post-gate repair branches passed independent review and post-merge package suites.
 - [ ] Thirty-minute release hidden/warm lifecycle measurement is complete.
 - [x] SF06 deterministic approval makes design-only SSH00 eligible to start.
 
@@ -85,7 +102,8 @@ The exact SF06 deterministic gate is therefore **approved**. The first full BG01
 - Replay overflow intentionally requires a later full snapshot resync; focused tests cover cap and hidden-state correctness, not a 30-minute GUI lifecycle run.
 - Push delivery is bounded and race-tested, but real network-provider latency and long slow-consumer behavior remain unmeasured.
 - Remote liveness surfaces failure after a bounded deadline but does not reconnect or preserve remote PTYs.
-- Scan entry-limit failures are fail-closed and non-mutating, so extremely large log directories may require operator cleanup before GC can resume.
+- Bounded scans can make deletion progress, but usage remains unknown until a fresh complete pass; noise-only trees over the cap remain fail-closed.
+- Cmd+C and Korean IME have deterministic ownership/preedit regressions, but still require physical macOS input smoke testing.
 - Physical memory release and long-run socket/thread return-to-baseline remain unproven until the release soak is run.
 
 ## 7. Resource Impact
@@ -93,7 +111,7 @@ The exact SF06 deterministic gate is therefore **approved**. The first full BG01
 - Warm/hidden replay: at most 1,024 retained events per workspace.
 - Git-label cache: at most 256 paths.
 - Web-push jobs: at most 256 fresh+retry jobs plus bounded in-flight status keys.
-- Session log and archive scans: at most 4,096 entries per scan.
+- Session log and archive scans: at most 4,096 entries per call and 16 retained root cursor slots; distinct roots do not share the scan-operation lock.
 - Remote client: 30-second connect and 45-second silent-peer deadlines.
 - Physical RSS, child RSS, thread, fd, socket, and queue slopes remain Pending because the release soak was not run.
 
@@ -105,16 +123,19 @@ The exact SF06 deterministic gate is therefore **approved**. The first full BG01
 
 ## 9. I18n/CJK Impact
 
-- No locale catalog, user-facing translation, IME, CJK path, or terminal text rendering behavior changed.
+- Korean IME preedit ownership changed: terminal rendering preserves composition across non-TextEdit focus transitions and emits IME output only while the terminal owns composition.
+- Locale catalogs and translated strings are unchanged.
 
 ## 10. Rollback Plan
 
 - Revert SF01, SF02, SF03, SF04, or SF05 independently using their owner-branch commits and summaries.
 - Revert `ff8e486` independently to remove the dashboard shutdown synchronization change; doing so reintroduces the observed lost-wake risk.
+- Revert integration merge commits `fba6f82`, `053ef0a`, `217cdc0`, `bc2c6cb`, or `fe221cb` independently for storage, remote, push, app replay, or terminal input rollback.
 - No schema, migration, wire-format, or disk-format rollback is required.
 - The integration branch is deterministic-gate clean but remains unmerged until explicitly approved.
 
 ## 11. Follow-up
 
 1. Stop all other Deppy instances and run the existing 30-minute release benchmark procedure, then record all observable resource slopes; unavailable internal queue metrics remain Pending until an existing approved measurement surface exposes them.
-2. Start design-only SSH00 when requested; its deterministic SF06 prerequisite is satisfied.
+2. Physically smoke-test selected-text Cmd+C and continuous Korean composition in the macOS agent terminal.
+3. Start design-only SSH00 when requested; its deterministic SF06 prerequisite is satisfied.

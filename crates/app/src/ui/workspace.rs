@@ -658,16 +658,15 @@ pub struct WorkspaceUi {
     /// 이 프레임에 사용자가 터미널을 직접 클릭해 키보드 소유권을 요청했다. App이
     /// 뒤이어 렌더하는 Agents TextEdit의 지연 autofocus를 취소하는 one-shot 신호다.
     terminal_focus_claimed: bool,
-    /// 응답(Spawned/Failed)을 아직 못 받은 셸 spawn 수 — 0이 될 때까지 계속 폴링
-    pending_spawns: u32,
+    /// 성공 전달됐지만 응답(Spawned/Failed)을 아직 못 받은 셸 spawn 순서.
+    /// None은 일반 spawn, Some은 완료된 세션에 1회 주입할 cwd다.
+    pending_spawn_cwds: VecDeque<Option<String>>,
     /// split 경계 드래그 중 로컬 미리보기 (path, ratio). 드래그 동안은 명령을 보내지
     /// 않고(매 프레임 DB 저장 방지) 릴리즈 시 1회 ResizeSplit을 보낸다.
     split_drag: Option<(Vec<u8>, f32)>,
     /// 닫기 확인 대기 중인 pane — 실행 중 세션이 있는 pane 닫기는 확인을 거친다
     /// (2026-07-05 사용자 보고: 닫기 실수로 셸 전체 즉사 방지).
     confirm_close: Option<runtime::MuxPaneId>,
-    /// '같은 폴더에서 새 셀'(사이드바) 요청의 pending spawn 내 상대 위치와 cd 폴더.
-    pending_spawn_cd: Option<(u32, String)>,
     /// 「에이전트로 보내기」 프리셋 프롬프트 (설정 미러 — App이 매 프레임 갱신).
     agent_send_presets: Vec<String>,
     /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
@@ -1040,10 +1039,9 @@ impl WorkspaceUi {
             session_flash: HashMap::new(),
             pending_focus: None,
             terminal_focus_claimed: false,
-            pending_spawns: 0,
+            pending_spawn_cwds: VecDeque::with_capacity(WORKSPACE_PROTOCOL_CAP),
             split_drag: None,
             confirm_close: None,
-            pending_spawn_cd: None,
             agent_send_presets: Vec::new(),
             open_environment_requested: false,
             new_session_requested: false,
@@ -1154,6 +1152,37 @@ impl WorkspaceUi {
     ) -> Result<(), WorkspaceProtocolErrorCode> {
         workspace_protocol_command_is_valid(&command)?;
 
+        let spawn = matches!(
+            &command,
+            RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }
+        );
+        if spawn
+            && self
+                .pending_spawn_cwds
+                .len()
+                .saturating_add(
+                    self.protocol_intents
+                        .iter()
+                        .filter(|intent| {
+                            matches!(
+                                &intent.command,
+                                RuntimeCommand::SpawnShell { .. }
+                                    | RuntimeCommand::SplitPane { .. }
+                            )
+                        })
+                        .count(),
+                )
+                .saturating_add(
+                    self.protocol_inflight
+                        .values()
+                        .filter(|pending| pending.spawn)
+                        .count(),
+                )
+                >= WORKSPACE_PROTOCOL_CAP
+        {
+            return Err(WorkspaceProtocolErrorCode::Busy);
+        }
+
         if let RuntimeCommand::WriteInput {
             session: next_session,
             bytes: next_bytes,
@@ -1230,10 +1259,8 @@ impl WorkspaceUi {
         match completion.result {
             Ok(()) => {
                 if pending.spawn {
-                    if let Some(cwd) = pending.spawn_cwd {
-                        self.pending_spawn_cd = Some((self.pending_spawns, cwd));
-                    }
-                    self.pending_spawns = self.pending_spawns.saturating_add(1);
+                    debug_assert!(self.pending_spawn_cwds.len() < WORKSPACE_PROTOCOL_CAP);
+                    self.pending_spawn_cwds.push_back(pending.spawn_cwd);
                 }
             }
             Err(_) => {
@@ -2192,17 +2219,10 @@ impl WorkspaceUi {
     }
 
     fn resolve_pending_shell_spawn(&mut self, succeeded: bool) -> Option<String> {
-        if self.pending_spawns == 0 {
-            return None;
-        }
-        self.pending_spawns -= 1;
-        let (position, _) = self.pending_spawn_cd.as_mut()?;
-        if *position > 0 {
-            *position -= 1;
-            return None;
-        }
-        let (_, cwd) = self.pending_spawn_cd.take()?;
-        succeeded.then_some(cwd)
+        self.pending_spawn_cwds
+            .pop_front()
+            .flatten()
+            .filter(|_| succeeded)
     }
 
     pub fn show(
@@ -3855,7 +3875,7 @@ impl WorkspaceUi {
     /// 응답(Spawned/Failed)을 아직 못 받은 셸 spawn 수 — App의 suspend 보호가
     /// "spawn 진행 중 = live"로 판정하는 데 쓴다 (codex High race).
     pub fn pending_spawns(&self) -> u32 {
-        self.pending_spawns
+        self.pending_spawn_cwds.len() as u32
     }
 
     pub fn spawn_shell(&mut self, scrollback_lines: usize) {
@@ -5893,7 +5913,7 @@ mod tests {
         );
 
         assert_eq!(ui.pending_spawns(), 0);
-        assert!(ui.pending_spawn_cd.is_none());
+        assert!(ui.pending_spawn_cwds.is_empty());
         assert!(matches!(
             drain_protocol(&mut ui).as_slice(),
             [RuntimeCommand::WriteInput {
@@ -5922,7 +5942,7 @@ mod tests {
         );
 
         assert_eq!(ui.pending_spawns(), 0);
-        assert!(ui.pending_spawn_cd.is_none());
+        assert!(ui.pending_spawn_cwds.is_empty());
         assert!(drain_protocol(&mut ui).is_empty());
     }
 
@@ -5942,7 +5962,10 @@ mod tests {
             &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
         );
         assert_eq!(ui.pending_spawns(), 1);
-        assert!(ui.pending_spawn_cd.is_some());
+        assert_eq!(
+            ui.pending_spawn_cwds.front(),
+            Some(&Some("/tmp/deppy-spawn".to_owned()))
+        );
 
         ui.apply_warm_events(
             &[RuntimeEvent::ShellSpawned {
@@ -5957,6 +5980,63 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn warm_multiple_cwd_spawns_preserve_order_across_normal_failure() {
+        let mut ui = WorkspaceUi::new();
+        ui.spawn_shell_at(1_000, Some("/tmp/deppy-first".to_owned()));
+        ui.spawn_shell(1_000);
+        ui.spawn_shell_at(1_000, Some("/tmp/deppy-second".to_owned()));
+        assert_eq!(drain_protocol(&mut ui).len(), 3);
+        assert_eq!(ui.pending_spawns(), 3);
+
+        ui.apply_warm_events(
+            &[
+                RuntimeEvent::ShellSpawned {
+                    session: SessionId(7),
+                },
+                RuntimeEvent::SpawnFailed {
+                    kind: SpawnKind::Shell,
+                    message: runtime::MessagePayload::new("shell.failed"),
+                },
+                RuntimeEvent::ShellSpawned {
+                    session: SessionId(9),
+                },
+            ],
+            &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+        );
+
+        assert_eq!(ui.pending_spawns(), 0);
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[0],
+            RuntimeCommand::WriteInput { session, bytes }
+                if *session == SessionId(7)
+                    && String::from_utf8_lossy(bytes).contains("/tmp/deppy-first")
+        ));
+        assert!(matches!(
+            &commands[1],
+            RuntimeCommand::WriteInput { session, bytes }
+                if *session == SessionId(9)
+                    && String::from_utf8_lossy(bytes).contains("/tmp/deppy-second")
+        ));
+    }
+
+    #[test]
+    fn unresolved_spawn_tracking_is_bounded_by_protocol_cap() {
+        let mut ui = WorkspaceUi::new();
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            ui.spawn_shell_at(1_000, Some(format!("/tmp/deppy-{index}")));
+            assert_eq!(drain_protocol(&mut ui).len(), 1);
+        }
+        assert_eq!(ui.pending_spawns(), WORKSPACE_PROTOCOL_CAP as u32);
+
+        ui.spawn_shell_at(1_000, Some("/tmp/deppy-overflow".to_owned()));
+
+        assert!(drain_protocol(&mut ui).is_empty());
+        assert_eq!(ui.pending_spawns(), WORKSPACE_PROTOCOL_CAP as u32);
     }
 
     /// 「마지막 출력 복사」만 남고 제거된 agent 전송 항목은 다시 나타나지 않는다.

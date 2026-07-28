@@ -11666,19 +11666,22 @@ impl App {
         // 이벤트 포함)를 그대로 ui()가 처리해 exit/status 상태를 재구성해야 하고, workspace_ui는
         // 마지막 active 상태 + 아래 Active 재emit(전체 mux 스냅샷)으로 최신화된다. (새 워커는
         // 이미 fresh + RestoreWorkspace라 리셋 불필요.)
-        new_active.render_active = true;
+        new_active.render_active = false;
         new_active.backgrounded_at = None;
-        let activated = new_active
-            .runtime
-            .send_command(runtime::RuntimeCommand::SetWorkspaceState(
-                runtime::WorkspaceRuntimeState::Active,
-            ))
-            .is_ok();
-        clear_pending_replay_resync_after_activation(
+        let runtime = &new_active.runtime;
+        let activated = deliver_workspace_state_transition(
+            &mut new_active.render_active,
             &mut new_active.pending_replay_resync,
             true,
-            activated,
+            |state| {
+                runtime
+                    .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
+                    .is_ok()
+            },
         );
+        if !activated {
+            self.egui_ctx.request_repaint();
+        }
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
@@ -16397,21 +16400,16 @@ impl eframe::App for App {
         }
 
         if want_active != self.active.render_active {
-            let state = if want_active {
-                runtime::WorkspaceRuntimeState::Active
-            } else {
-                runtime::WorkspaceRuntimeState::Warm
-            };
-            let delivered = self
-                .active
-                .runtime
-                .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
-                .is_ok();
-            commit_workspace_state_transition(
+            let runtime = &self.active.runtime;
+            deliver_workspace_state_transition(
                 &mut self.active.render_active,
                 &mut self.active.pending_replay_resync,
                 want_active,
-                delivered,
+                |state| {
+                    runtime
+                        .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
+                        .is_ok()
+                },
             );
             if want_active {
                 // 재개된 Viewport push는 비동기 — 다음 프레임을 예약해 드레인한다.
@@ -19114,6 +19112,22 @@ fn commit_workspace_state_transition(
     clear_pending_replay_resync_after_activation(pending_replay_resync, want_active, delivered);
 }
 
+fn deliver_workspace_state_transition(
+    render_active: &mut bool,
+    pending_replay_resync: &mut bool,
+    want_active: bool,
+    deliver: impl FnOnce(runtime::WorkspaceRuntimeState) -> bool,
+) -> bool {
+    let state = if want_active {
+        runtime::WorkspaceRuntimeState::Active
+    } else {
+        runtime::WorkspaceRuntimeState::Warm
+    };
+    let delivered = deliver(state);
+    commit_workspace_state_transition(render_active, pending_replay_resync, want_active, delivered);
+    delivered
+}
+
 fn admit_hidden_active_replay_events(
     workspace_ui: &mut ui::workspace::WorkspaceUi,
     pending_events: &mut Vec<runtime::RuntimeEvent>,
@@ -21220,6 +21234,39 @@ mod tests {
         );
         assert!(render_active);
         assert!(!pending_replay_resync);
+    }
+
+    #[test]
+    fn switched_warm_activation_failure_remains_retryable() {
+        let mut render_active = false;
+        let mut pending_replay_resync = true;
+        let mut deliveries = std::collections::VecDeque::from([false, true]);
+
+        deliver_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            |state| {
+                assert_eq!(state, runtime::WorkspaceRuntimeState::Active);
+                deliveries.pop_front().unwrap()
+            },
+        );
+        assert!(!render_active);
+        assert!(pending_replay_resync);
+        assert!(!render_active, "next frame must retry activation");
+
+        deliver_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            |state| {
+                assert_eq!(state, runtime::WorkspaceRuntimeState::Active);
+                deliveries.pop_front().unwrap()
+            },
+        );
+        assert!(render_active);
+        assert!(!pending_replay_resync);
+        assert!(deliveries.is_empty());
     }
 
     #[test]

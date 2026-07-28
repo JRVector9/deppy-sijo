@@ -69,6 +69,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// 세션 상태 알림의 총 발송 시도 횟수(첫 시도 + 재시도). 승인은 DB 폴링이 스스로 재수렴하지만
 /// 세션 전이는 (session,kind)가 생애 1회라 재시도 큐가 없으면 일시 장애 = 영구 유실이다.
 const SESSION_SEND_ATTEMPTS: u32 = 3;
+/// fresh + retry 큐를 합친 세션 상태 알림 작업 상한.
+const MAX_SESSION_JOBS: usize = 256;
 /// `notified_status` 상한 — 초과 시 오래된(사전순 낮은) 키부터 버린다. UUID라 단조성은
 /// 없지만 상한 유지가 목적이다. 원문:
 /// 세션 id는 런타임에서 단조 증가(next_id)하므로 초과 시 가장 낮은
@@ -462,6 +464,12 @@ struct SessionJob {
     attempts: u32,
 }
 
+#[derive(Clone, Copy)]
+enum SessionJobQueue {
+    Fresh,
+    Retry,
+}
+
 struct PushInner {
     /// 즉시 1회 재평가 강제(구독 등록 직후).
     force: bool,
@@ -475,6 +483,74 @@ struct PushInner {
     notified_approvals: HashSet<String>,
     /// 세션별 마지막으로 알린 상태 — 같은 전이 반복 발송 방지. MAX_NOTIFIED_SESSIONS로 유계.
     notified_status: HashMap<String, SessionKind>,
+}
+
+fn remove_session_jobs(queue: &mut VecDeque<SessionJob>, session: &str) -> Option<SessionJob> {
+    let mut removed = None;
+    let mut i = 0;
+    while i < queue.len() {
+        if queue[i].session == session {
+            if let Some(job) = queue.remove(i)
+                && (job.kind == SessionKind::Done
+                    || removed
+                        .as_ref()
+                        .is_none_or(|old: &SessionJob| old.kind != SessionKind::Done))
+            {
+                removed = Some(job);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    removed
+}
+
+fn enqueue_session_job(
+    inner: &mut PushInner,
+    mut job: SessionJob,
+    destination: SessionJobQueue,
+) -> bool {
+    let old_fresh = remove_session_jobs(&mut inner.jobs, &job.session);
+    let old_retry = remove_session_jobs(&mut inner.retry_jobs, &job.session);
+    if old_fresh
+        .as_ref()
+        .is_some_and(|old| old.kind == SessionKind::Done)
+        || old_retry
+            .as_ref()
+            .is_some_and(|old| old.kind == SessionKind::Done)
+    {
+        job.kind = SessionKind::Done;
+    }
+    if matches!(destination, SessionJobQueue::Fresh) {
+        job.attempts = 0;
+    }
+
+    let mut evicted = false;
+    while inner.jobs.len() + inner.retry_jobs.len() >= MAX_SESSION_JOBS {
+        if inner.jobs.pop_front().is_some() || inner.retry_jobs.pop_front().is_some() {
+            evicted = true;
+        } else {
+            break;
+        }
+    }
+
+    match destination {
+        SessionJobQueue::Fresh => inner.jobs.push_back(job),
+        SessionJobQueue::Retry => inner.retry_jobs.push_back(job),
+    }
+    evicted
+}
+
+fn warn_session_job_eviction(destination: SessionJobQueue) {
+    let queue = match destination {
+        SessionJobQueue::Fresh => "fresh",
+        SessionJobQueue::Retry => "retry",
+    };
+    tracing::warn!(
+        limit = MAX_SESSION_JOBS,
+        queue,
+        "웹푸시 세션 알림 큐 상한 초과 — 오래된 상태 알림 제거"
+    );
 }
 
 struct PushShared {
@@ -658,13 +734,20 @@ impl PushHandle {
             runtime::SessionStatus::Waiting => SessionKind::Waiting,
             _ => return,
         };
-        {
+        let evicted = {
             let mut inner = self.shared.inner.lock().expect("push inner lock");
-            inner.jobs.push_back(SessionJob {
-                session,
-                kind,
-                attempts: 0,
-            });
+            enqueue_session_job(
+                &mut inner,
+                SessionJob {
+                    session,
+                    kind,
+                    attempts: 0,
+                },
+                SessionJobQueue::Fresh,
+            )
+        };
+        if evicted {
+            warn_session_job_eviction(SessionJobQueue::Fresh);
         }
         self.shared.cvar.notify_all();
     }
@@ -743,11 +826,20 @@ fn run(shared: &Arc<PushShared>) {
                 let mut inner = shared.inner.lock().expect("push inner lock");
                 remember_status(&mut inner.notified_status, &job.session, job.kind);
             } else if attempts < SESSION_SEND_ATTEMPTS {
-                let mut inner = shared.inner.lock().expect("push inner lock");
-                inner.retry_jobs.push_back(SessionJob {
-                    attempts,
-                    ..job.clone()
-                });
+                let evicted = {
+                    let mut inner = shared.inner.lock().expect("push inner lock");
+                    enqueue_session_job(
+                        &mut inner,
+                        SessionJob {
+                            attempts,
+                            ..job.clone()
+                        },
+                        SessionJobQueue::Retry,
+                    )
+                };
+                if evicted {
+                    warn_session_job_eviction(SessionJobQueue::Retry);
+                }
             } else {
                 tracing::warn!(
                     attempts,
@@ -1161,7 +1253,7 @@ fn random_p256_scalar() -> [u8; 32] {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
 
     // ── RFC 8291 부록 A 고정 벡터 ────────────────────────────────────────────
     const RFC_AS_PRIVATE: &str = "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw";
@@ -1555,6 +1647,57 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct StallingState {
+        calls: usize,
+        first_blocked: bool,
+        release: bool,
+    }
+
+    #[derive(Default)]
+    struct StallingTransport {
+        state: StdMutex<StallingState>,
+        cvar: StdCondvar,
+    }
+
+    impl StallingTransport {
+        fn call_count(&self) -> usize {
+            self.state.lock().unwrap().calls
+        }
+
+        fn first_blocked(&self) -> bool {
+            self.state.lock().unwrap().first_blocked
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.release = true;
+            self.cvar.notify_all();
+        }
+    }
+
+    impl PushTransport for StallingTransport {
+        fn post(
+            &self,
+            _endpoint: &str,
+            _t: u32,
+            _u: &str,
+            _a: &str,
+            _b: &[u8],
+        ) -> Result<u16, TransportError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls += 1;
+            if state.calls == 1 {
+                state.first_blocked = true;
+                self.cvar.notify_all();
+                while !state.release {
+                    state = self.cvar.wait(state).unwrap();
+                }
+            }
+            Ok(500)
+        }
+    }
+
+    #[derive(Default)]
     struct MemStore(StdMutex<HashMap<String, String>>);
     impl SecretStore for MemStore {
         fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
@@ -1610,8 +1753,12 @@ mod tests {
             .unwrap();
     }
 
-    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    fn wait_until(cond: impl FnMut() -> bool) -> bool {
+        wait_until_for(Duration::from_secs(3), cond)
+    }
+
+    fn wait_until_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
             if cond() {
                 return true;
@@ -1619,6 +1766,198 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         cond()
+    }
+
+    fn empty_push_inner() -> PushInner {
+        PushInner {
+            force: false,
+            jobs: VecDeque::new(),
+            retry_jobs: VecDeque::new(),
+            notified_approvals: HashSet::new(),
+            notified_status: HashMap::new(),
+        }
+    }
+
+    fn session_job(session: impl Into<String>, kind: SessionKind, attempts: u32) -> SessionJob {
+        SessionJob {
+            session: session.into(),
+            kind,
+            attempts,
+        }
+    }
+
+    fn queued_session_job<'a>(inner: &'a PushInner, session: &str) -> Option<&'a SessionJob> {
+        inner
+            .jobs
+            .iter()
+            .chain(inner.retry_jobs.iter())
+            .find(|job| job.session == session)
+    }
+
+    #[test]
+    fn session_job_admission_coalesces_identical_session_to_one_job() {
+        let mut inner = empty_push_inner();
+
+        for _ in 0..1_000 {
+            enqueue_session_job(
+                &mut inner,
+                session_job("same", SessionKind::Waiting, 99),
+                SessionJobQueue::Fresh,
+            );
+        }
+
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), 1);
+        let job = queued_session_job(&inner, "same").expect("same session job");
+        assert_eq!(job.kind, SessionKind::Waiting);
+        assert_eq!(job.attempts, 0, "fresh admission resets attempts");
+    }
+
+    #[test]
+    fn session_job_admission_done_wins_over_waiting() {
+        let mut inner = empty_push_inner();
+
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Waiting, 0),
+            SessionJobQueue::Fresh,
+        );
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Done, 0),
+            SessionJobQueue::Fresh,
+        );
+
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), 1);
+        assert_eq!(
+            queued_session_job(&inner, "same").map(|job| job.kind),
+            Some(SessionKind::Done)
+        );
+    }
+
+    #[test]
+    fn session_job_admission_retry_replaces_fresh_and_preserves_attempts() {
+        let mut inner = empty_push_inner();
+
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Waiting, 0),
+            SessionJobQueue::Fresh,
+        );
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Waiting, 2),
+            SessionJobQueue::Retry,
+        );
+
+        assert!(inner.jobs.is_empty(), "fresh duplicate should be removed");
+        assert_eq!(inner.retry_jobs.len(), 1);
+        let job = inner.retry_jobs.front().expect("retry job");
+        assert_eq!(job.session, "same");
+        assert_eq!(job.kind, SessionKind::Waiting);
+        assert_eq!(job.attempts, 2, "retry admission preserves attempts");
+    }
+
+    #[test]
+    fn session_job_admission_bounds_unique_sessions_at_limit() {
+        let mut inner = empty_push_inner();
+        let mut evicted = false;
+
+        for i in 0..=MAX_SESSION_JOBS {
+            evicted |= enqueue_session_job(
+                &mut inner,
+                session_job(format!("session-{i:03}"), SessionKind::Waiting, 0),
+                SessionJobQueue::Fresh,
+            );
+        }
+
+        assert!(evicted, "257th unique session should evict one old job");
+        assert_eq!(
+            inner.jobs.len() + inner.retry_jobs.len(),
+            MAX_SESSION_JOBS
+        );
+        assert!(
+            queued_session_job(&inner, "session-000").is_none(),
+            "oldest best-effort session job should be evicted"
+        );
+        assert!(
+            queued_session_job(&inner, "session-256").is_some(),
+            "newest session job should be retained"
+        );
+    }
+
+    #[test]
+    fn push_stalled_failure_bounds_session_jobs_and_stops_after_retry_cap() {
+        let db_path = temp_db();
+        let endpoint = "https://push.example/stalled-session";
+        let transport = Arc::new(StallingTransport::default());
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedStallingTransport(Arc::clone(&transport))),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(endpoint, RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+        wait_until(|| handle.poll_count() >= 1);
+
+        handle.notify_session("session-000".to_owned(), runtime::SessionStatus::Done);
+        assert!(
+            wait_until(|| transport.first_blocked()),
+            "first session send did not stall"
+        );
+
+        for i in 1..=MAX_SESSION_JOBS + 1 {
+            handle.notify_session(format!("session-{i:03}"), runtime::SessionStatus::Done);
+        }
+
+        {
+            let inner = handle.shared.inner.lock().expect("push inner lock");
+            assert_eq!(
+                inner.jobs.len() + inner.retry_jobs.len(),
+                MAX_SESSION_JOBS,
+                "stalled delivery let retained session jobs exceed the cap"
+            );
+            assert!(
+                queued_session_job(&inner, "session-001").is_none(),
+                "oldest queued best-effort session should be evicted"
+            );
+            assert!(
+                queued_session_job(&inner, "session-257").is_some(),
+                "newest queued session should be retained"
+            );
+        }
+
+        transport.release();
+
+        let expected_posts = MAX_SESSION_JOBS * SESSION_SEND_ATTEMPTS as usize * 2;
+        assert!(
+            wait_until_for(Duration::from_secs(30), || transport.call_count() >= expected_posts),
+            "failed session jobs did not reach the retry cap"
+        );
+        assert!(
+            wait_until_for(Duration::from_secs(5), || {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.jobs.is_empty() && inner.retry_jobs.is_empty()
+            }),
+            "session queues did not drain after retry cap"
+        );
+        let settled = transport.call_count();
+        std::thread::sleep(FAST_POLL * 4);
+        assert_eq!(
+            transport.call_count(),
+            settled,
+            "failed session jobs kept sending after retry cap"
+        );
+        assert_eq!(
+            settled, expected_posts,
+            "unexpected number of post attempts for retained failed jobs"
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]
@@ -1949,6 +2288,13 @@ mod tests {
     /// Arc<FakeTransport>를 Box<dyn PushTransport>로 넘기기 위한 래퍼(테스트가 관찰을 공유).
     struct SharedTransport(Arc<FakeTransport>);
     impl PushTransport for SharedTransport {
+        fn post(&self, e: &str, t: u32, u: &str, a: &str, b: &[u8]) -> Result<u16, TransportError> {
+            self.0.post(e, t, u, a, b)
+        }
+    }
+
+    struct SharedStallingTransport(Arc<StallingTransport>);
+    impl PushTransport for SharedStallingTransport {
         fn post(&self, e: &str, t: u32, u: &str, a: &str, b: &[u8]) -> Result<u16, TransportError> {
             self.0.post(e, t, u, a, b)
         }

@@ -118,6 +118,7 @@ pub enum SidebarAction {
     /// App이 현재 view를 보고 결정한다 — 이 모듈은 view를 바꾸지 않는다.
     ShowInbox,
     OpenAgents,
+    OpenSettings,
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
     OpenMacosFileAccessSettings,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
@@ -1429,11 +1430,40 @@ impl FileTreeUi {
             .show(ui, |ui| {
                 crate::ui::designall::apply_workspace_visuals(ui);
                 crate::fonts::apply_sidebar_text_styles(ui);
-                egui::ScrollArea::vertical()
-                    .id_salt("designall_navigation_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.navigation(ui, sidebar, catalog))
-                    .inner
+                let width = ui.available_width();
+                let settings_height = SIDEBAR_NAV_ROW_HEIGHT;
+                let navigation_height = (ui.available_height() - settings_height).max(0.0);
+                let navigation_action = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(width, navigation_height),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("designall_navigation_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.navigation(ui, sidebar, catalog))
+                                .inner
+                        },
+                    )
+                    .inner;
+                let settings_action = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(width, settings_height),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            nav_row(
+                                ui,
+                                NavIcon::Settings,
+                                &catalog.t("settings.title", &[]),
+                                false,
+                                None,
+                            )
+                            .clicked()
+                            .then_some(SidebarAction::OpenSettings)
+                        },
+                    )
+                    .inner;
+                settings_action.or(navigation_action)
             });
         paint_sidebar_separator(
             ui,
@@ -3552,8 +3582,8 @@ fn workspace_row(
     response
 }
 
-const SIDEBAR_NAV_ROW_HEIGHT: f32 = 24.0;
-const SIDEBAR_NAV_ITEM_SPACING: f32 = 0.8;
+const SIDEBAR_NAV_ROW_HEIGHT: f32 = 58.0;
+const SIDEBAR_NAV_ITEM_SPACING: f32 = 2.0;
 const SIDEBAR_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
 const WORKSPACE_CARD_HORIZONTAL_INSET: f32 = 6.0;
 const WORKSPACE_LIST_BACKGROUND_TOP: egui::Color32 = SIDEBAR_BACKGROUND;
@@ -4781,12 +4811,13 @@ fn paint_file(
     ));
 }
 
-/// 하단 nav 아이콘 종류 (2026-07-18 확정 디자인).
+/// 내비게이션 레일 아이콘 종류.
 enum NavIcon {
     Home,
     Inbox,
     Fleet,
     Agents,
+    Settings,
 }
 
 /// 작업함 배지 문구 — 0이면 숨김(None).
@@ -4800,6 +4831,26 @@ fn paint_sidebar_separator(ui: &egui::Ui, rect: egui::Rect, stroke: egui::Stroke
     if bottom > rect.top() {
         ui.painter()
             .vline(rect.right(), egui::Rangef::new(rect.top(), bottom), stroke);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NavRowLayout {
+    icon_center: egui::Pos2,
+    label_anchor: egui::Pos2,
+}
+
+fn nav_row_layout(row: egui::Rect, show_label: bool) -> NavRowLayout {
+    if show_label {
+        NavRowLayout {
+            icon_center: egui::pos2(row.center().x, row.center().y - 9.0),
+            label_anchor: egui::pos2(row.center().x, row.center().y + 15.0),
+        }
+    } else {
+        NavRowLayout {
+            icon_center: row.center(),
+            label_anchor: row.center(),
+        }
     }
 }
 
@@ -4841,20 +4892,15 @@ fn nav_row(
     } else {
         tokens.muted_text
     };
-    // 아이콘 레일(좁은 폭)에서는 아이콘만 중앙에 — workspace_row의 폭 단계 규칙과 동일.
     let show_label = rect.width() >= 64.0;
-    let icon_center = if show_label {
-        egui::pos2(row.left() + 16.0, rect.center().y)
-    } else {
-        egui::pos2(rect.center().x, rect.center().y)
-    };
-    paint_nav_icon(ui.painter(), icon_center, icon, color);
+    let layout = nav_row_layout(row, show_label);
+    paint_nav_icon(ui.painter(), layout.icon_center, icon, color);
     if show_label {
         ui.painter().text(
-            egui::pos2(row.left() + 32.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
+            layout.label_anchor,
+            egui::Align2::CENTER_CENTER,
             label,
-            crate::fonts::sidebar_font(13.0),
+            crate::fonts::sidebar_font(12.0),
             color,
         );
         if let Some(badge) = badge {
@@ -4864,8 +4910,8 @@ fn nav_row(
     response
 }
 
-/// 작업함 카운트 배지 — 빨간 원형(두 자리부터는 알약꼴), 흰 숫자.
-fn paint_nav_badge(ui: &egui::Ui, pill: egui::Rect, text: &str) {
+/// 작업 카운트 배지 — 빨간 원형(두 자리부터는 알약꼴), 흰 숫자.
+fn paint_nav_badge(ui: &egui::Ui, row: egui::Rect, text: &str) {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
         crate::fonts::sidebar_font(10.0),
@@ -4873,7 +4919,7 @@ fn paint_nav_badge(ui: &egui::Ui, pill: egui::Rect, text: &str) {
     );
     let h = 16.0;
     let w = (galley.size().x + 8.0).max(h);
-    let center = egui::pos2(pill.right() - 8.0 - w / 2.0, pill.center().y);
+    let center = egui::pos2(row.right() - 6.0 - w / 2.0, row.top() + 10.0);
     let rect = egui::Rect::from_center_size(center, egui::vec2(w, h));
     ui.painter()
         .rect_filled(rect, h / 2.0, egui::Color32::from_rgb(0xed, 0x5b, 0x61));
@@ -4881,7 +4927,7 @@ fn paint_nav_badge(ui: &egui::Ui, pill: egui::Rect, text: &str) {
         .galley(center - galley.size() / 2.0, galley, egui::Color32::WHITE);
 }
 
-/// 하단 nav 아이콘 — 이모지는 폰트 글리프가 없어 □로 깨진다(레포 관례: painter 직접
+/// 레일 아이콘 — 이모지는 폰트 글리프가 없어 □로 깨진다(레포 관례: painter 직접
 /// 드로잉 — paint_folder/file_toolbar_icon_at 참고). 1.3px 스트로크로 기존 톤과 맞춘다.
 fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Color32) {
     let stroke = egui::Stroke::new(1.3, col);
@@ -4937,6 +4983,15 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
             p.circle_filled(egui::pos2(c.x, head.top() - 3.5), 1.2, col);
             p.circle_filled(egui::pos2(c.x - 2.5, c.y + 1.0), 1.2, col);
             p.circle_filled(egui::pos2(c.x + 2.5, c.y + 1.0), 1.2, col);
+        }
+        NavIcon::Settings => {
+            p.circle_stroke(c, 5.0, stroke);
+            p.circle_stroke(c, 1.8, stroke);
+            for index in 0..8 {
+                let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                p.line_segment([c + direction * 5.5, c + direction * 7.0], stroke);
+            }
         }
     }
 }
@@ -7877,6 +7932,75 @@ mod tests {
     }
 
     #[test]
+    fn designall_nav행은_아이콘위_텍스트아래_중앙정렬한다() {
+        let row = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 58.0));
+        let layout = nav_row_layout(row, true);
+
+        assert_eq!(layout.icon_center.x, row.center().x);
+        assert_eq!(layout.label_anchor.x, row.center().x);
+        assert!(layout.icon_center.y < layout.label_anchor.y);
+    }
+
+    #[test]
+    fn 한국어_레일문구는_작업과_ai를_사용한다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        assert_eq!(catalog.t("sidebar.nav.inbox", &[]), "작업");
+        assert_eq!(catalog.t("sidebar.nav.agents", &[]), "AI");
+    }
+
+    #[test]
+    fn kittest_설정은_레일하단에_고정되고_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut fonts_ready = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(520.0, 700.0))
+            .build_ui_state(
+                move |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    if !fonts_ready {
+                        install_sidebar_test_fonts(ui.ctx());
+                        fonts_ready = true;
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        inbox_count: 0,
+                        fleet_count: 0,
+                        agents_open: false,
+                    };
+                    if let Some(action) =
+                        state
+                            .0
+                            .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog)
+                    {
+                        state.1.push(action);
+                    }
+                },
+                (FileTreeUi::new(egui::Context::default()), Vec::new()),
+            );
+        harness.run();
+
+        let settings_rect = harness.get_by_label("Settings").rect();
+        let rail = egui::PanelState::load(
+            &harness.ctx,
+            egui::Id::new("designall_navigation_rail"),
+        )
+        .unwrap();
+        assert!((settings_rect.bottom() - rail.outer_rect.bottom()).abs() < 4.0);
+
+        harness.get_by_label("Settings").click();
+        harness.run();
+        assert!(matches!(
+            harness.state().1.as_slice(),
+            [SidebarAction::OpenSettings]
+        ));
+    }
+
+    #[test]
     fn kittest_designall은_내비게이션레일과_프로젝트패널을_분리한다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let snapshot = SidebarSnapshot {
@@ -7955,11 +8079,11 @@ mod tests {
         harness.run();
         harness.get_by_label("Home").click();
         harness.run();
-        harness.get_by_label("Inbox").click();
+        harness.get_by_label("Work").click();
         harness.run();
         harness.get_by_label("Fleet").click();
         harness.run();
-        harness.get_by_label("Agents").click();
+        harness.get_by_label("AI").click();
         harness.run();
         let kinds: Vec<&'static str> = harness
             .state()

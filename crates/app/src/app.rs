@@ -16601,13 +16601,6 @@ impl eframe::App for App {
                                 .next()
                                 .unwrap_or(&self.config.i18n.locale);
                             ui.weak(locale_short.to_owned());
-                            let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
-                                tbtn_response(ui, label, selected).clicked()
-                            };
-                            let sel = self.settings_open;
-                            if tbtn(ui, text.t("top.settings", &[]), sel) {
-                                self.settings_open = !sel;
-                            }
                             let unread = self.notifications_ui.unread();
                             unread_before = unread;
                             let waiting =
@@ -17001,6 +16994,9 @@ impl eframe::App for App {
                 }
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
                     self.agent_sessions_ui.open();
+                }
+                Some(ui::file_tree::SidebarAction::OpenSettings) => {
+                    self.settings_open = true;
                 }
                 Some(ui::file_tree::SidebarAction::OpenMacosFileAccessSettings) => {
                     if self.pending_app_controller_action.is_none() {

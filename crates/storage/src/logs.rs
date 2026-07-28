@@ -3,7 +3,9 @@
 //! 호출측(runtime worker)이 redaction을 끝낸 바이트만 넘긴다 —
 //! 이 모듈은 평문 secret을 받지 않는 것이 계약이다.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(any(test, not(unix)))]
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,7 +15,10 @@ use deppy_core::SessionId;
 const ANSI_LOG_FILE: &str = "redacted.ansi.log";
 const PLAIN_LOG_FILE: &str = "redacted.plain.txt";
 const EVENTS_LOG_FILE: &str = "events.redacted.jsonl";
+const TERMINAL_SIZE_FILE: &str = "terminal.size";
 const TERMINAL_SIZE_BYTES_MAX: usize = 64;
+#[cfg(unix)]
+const LOG_TEMP_ATTEMPTS: usize = 16;
 
 /// 런타임 복원이 읽는 ANSI tail 상한과 동일하다. 이보다 오래된 출력은 재시작 때도
 /// 사용되지 않으므로 디스크에 무기한 중복 보관하지 않는다.
@@ -47,12 +52,33 @@ enum TailBoundary {
 }
 
 impl BoundedLogFile {
+    #[cfg(any(test, not(unix)))]
     fn open(path: &Path, max_bytes: u64, tail_boundary: TailBoundary) -> anyhow::Result<Self> {
         let file = open_regular_log_file(path, true)
             .with_context(|| format!("로그 파일 열기 실패: {}", path.display()))?;
         let mut bounded = Self {
             file,
             path: path.to_path_buf(),
+            max_bytes,
+            tail_boundary,
+        };
+        bounded.compact_if_oversized(max_bytes / 2)?;
+        Ok(bounded)
+    }
+
+    #[cfg(unix)]
+    fn open_at(
+        directory: &PinnedLogDirectory,
+        name: &str,
+        max_bytes: u64,
+        tail_boundary: TailBoundary,
+    ) -> anyhow::Result<Self> {
+        let path = directory.path.join(name);
+        let file = open_regular_log_at(directory, std::ffi::OsStr::new(name), true)
+            .with_context(|| format!("로그 파일 열기 실패: {}", path.display()))?;
+        let mut bounded = Self {
+            file,
+            path,
             max_bytes,
             tail_boundary,
         };
@@ -108,6 +134,7 @@ impl BoundedLogFile {
     }
 }
 
+#[cfg(any(test, not(unix)))]
 fn open_regular_log_file(path: &Path, create: bool) -> std::io::Result<File> {
     let before = match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
@@ -152,6 +179,324 @@ fn open_regular_log_file(path: &Path, create: bool) -> std::io::Result<File> {
     Ok(file)
 }
 
+#[cfg(unix)]
+struct PinnedLogDirectory {
+    fd: std::os::fd::OwnedFd,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn pinned_log_directory_identity(directory: &PinnedLogDirectory) -> std::io::Result<FileIdentity> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(directory.fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    #[cfg(target_vendor = "apple")]
+    let device = u64::try_from(stat.st_dev)
+        .map_err(|_| std::io::Error::other("session_log_device_invalid"))?;
+    #[cfg(not(target_vendor = "apple"))]
+    let device = stat.st_dev;
+    Ok(FileIdentity {
+        device,
+        inode: stat.st_ino,
+    })
+}
+
+#[cfg(unix)]
+fn metadata_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(unix)]
+fn pin_log_directory(
+    logs_root: &Path,
+    directory: &Path,
+    create_leaf: bool,
+) -> anyhow::Result<Option<PinnedLogDirectory>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let relative = directory
+        .strip_prefix(logs_root)
+        .context("session log directory escaped logs_root")?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name.to_os_string()),
+            _ => anyhow::bail!("session log directory component invalid"),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !create_leaf || components.len() == 1,
+        "session log create path must be one component"
+    );
+    if create_leaf {
+        std::fs::create_dir_all(logs_root)
+            .with_context(|| format!("로그 루트 생성 실패: {}", logs_root.display()))?;
+    }
+    let root_name = std::ffi::CString::new(logs_root.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("logs_root_contains_nul"))?;
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if !create_leaf && error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error).context("logs_root directory open failed");
+    }
+    let mut current = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_fd) };
+    for (index, component) in components.iter().enumerate() {
+        let component = std::ffi::CString::new(component.as_bytes())
+            .map_err(|_| anyhow::anyhow!("session_log_component_contains_nul"))?;
+        if create_leaf && index + 1 == components.len() {
+            let created = unsafe { libc::mkdirat(current.as_raw_fd(), component.as_ptr(), 0o755) };
+            if created != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error).context("session log directory create failed");
+                }
+            }
+        }
+        let next = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if next < 0 {
+            let error = std::io::Error::last_os_error();
+            if !create_leaf && error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error).context("session log directory open failed");
+        }
+        current = unsafe { std::os::fd::OwnedFd::from_raw_fd(next) };
+    }
+    Ok(Some(PinnedLogDirectory {
+        fd: current,
+        path: directory.to_path_buf(),
+    }))
+}
+
+#[cfg(unix)]
+fn open_regular_log_at(
+    directory: &PinnedLogDirectory,
+    name: &std::ffi::OsStr,
+    create: bool,
+) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::other("log_name_contains_nul"))?;
+    let mut flags =
+        libc::O_RDWR | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    if create {
+        flags |= libc::O_CREAT;
+    }
+    let fd = unsafe { libc::openat(directory.fd.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other("log_file_not_regular"));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_readonly_log_at(
+    directory: &PinnedLogDirectory,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::other("log_name_contains_nul"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other("log_file_not_regular"));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn regular_log_entry_exists_at(
+    directory: &PinnedLogDirectory,
+    name: &std::ffi::CStr,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.fd.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+}
+
+#[cfg(unix)]
+fn atomic_write_log_at(
+    directory: &PinnedLogDirectory,
+    target: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let final_name = std::ffi::CString::new(target).expect("log target names are static ASCII");
+    for attempt in 0..LOG_TEMP_ATTEMPTS {
+        let temp_name = if attempt == 0 {
+            format!("{target}.deppytmp")
+        } else {
+            format!(
+                ".{target}.deppytmp.{}.{}.{}",
+                std::process::id(),
+                sequence,
+                attempt
+            )
+        };
+        let temp_name = std::ffi::CString::new(temp_name).expect("generated temp name has no NUL");
+        let fd = unsafe {
+            libc::openat(
+                directory.fd.as_raw_fd(),
+                temp_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+            if !regular_log_entry_exists_at(directory, &temp_name)? {
+                return Err(std::io::Error::other("log_temp_not_regular"));
+            }
+            continue;
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let result = (|| {
+            file.write_all(bytes)?;
+            drop(file);
+            let renamed = unsafe {
+                libc::renameat(
+                    directory.fd.as_raw_fd(),
+                    temp_name.as_ptr(),
+                    directory.fd.as_raw_fd(),
+                    final_name.as_ptr(),
+                )
+            };
+            if renamed != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = unsafe { libc::unlinkat(directory.fd.as_raw_fd(), temp_name.as_ptr(), 0) };
+        }
+        return result;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "log_temp_collision_limit",
+    ))
+}
+
+#[cfg(unix)]
+fn unlink_log_at(
+    directory: &PinnedLogDirectory,
+    name: &std::ffi::OsStr,
+    expected: FileIdentity,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::other("log_name_contains_nul"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let status = unsafe {
+        libc::fstatat(
+            directory.fd.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    let stat = unsafe { stat.assume_init() };
+    #[cfg(target_vendor = "apple")]
+    let device = u64::try_from(stat.st_dev)
+        .map_err(|_| std::io::Error::other("session_log_device_invalid"))?;
+    #[cfg(not(target_vendor = "apple"))]
+    let device = stat.st_dev;
+    let inode = stat.st_ino;
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || device != expected.device
+        || inode != expected.inode
+    {
+        return Err(std::io::Error::other("session_log_file_replaced"));
+    }
+    let result = unsafe { libc::unlinkat(directory.fd.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(true)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 pub struct SessionLogWriter {
     ansi: BoundedLogFile,
     plain: BoundedLogFile,
@@ -170,25 +515,47 @@ impl SessionLogWriter {
     /// 프로세스 재시작마다 다시 1부터 시작하므로, 재시작 복원 대상은 이 API를 써야
     /// 이전 ANSI 로그와 같은 파일에 계속 append할 수 있다.
     pub fn open_key(logs_root: &Path, session_key: &str) -> anyhow::Result<Self> {
-        let dir = ensure_session_directory(logs_root, session_key)?;
-        Ok(Self {
-            ansi: BoundedLogFile::open(
-                &dir.join(ANSI_LOG_FILE),
-                ANSI_LOG_MAX_BYTES,
-                TailBoundary::Ansi,
-            )?,
-            plain: BoundedLogFile::open(
-                &dir.join(PLAIN_LOG_FILE),
-                PLAIN_LOG_MAX_BYTES,
-                TailBoundary::NextNewlineIfPresent,
-            )?,
-            events: BoundedLogFile::open(
-                &dir.join(EVENTS_LOG_FILE),
-                EVENTS_LOG_MAX_BYTES,
-                TailBoundary::NextNewlineIfPresent,
-            )?,
-            strip_state: StripState::default(),
-        })
+        Self::open_key_with_session_hook(logs_root, session_key, || {})
+    }
+
+    fn open_key_with_session_hook(
+        logs_root: &Path,
+        session_key: &str,
+        after_session_pin: impl FnOnce(),
+    ) -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            let dir = Self::session_dir_key(logs_root, session_key)?;
+            let directory = pin_log_directory(logs_root, &dir, true)?
+                .context("session log directory missing after creation")?;
+            after_session_pin();
+            Ok(Self {
+                ansi: BoundedLogFile::open_at(
+                    &directory,
+                    ANSI_LOG_FILE,
+                    ANSI_LOG_MAX_BYTES,
+                    TailBoundary::Ansi,
+                )?,
+                plain: BoundedLogFile::open_at(
+                    &directory,
+                    PLAIN_LOG_FILE,
+                    PLAIN_LOG_MAX_BYTES,
+                    TailBoundary::NextNewlineIfPresent,
+                )?,
+                events: BoundedLogFile::open_at(
+                    &directory,
+                    EVENTS_LOG_FILE,
+                    EVENTS_LOG_MAX_BYTES,
+                    TailBoundary::NextNewlineIfPresent,
+                )?,
+                strip_state: StripState::default(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (logs_root, session_key, after_session_pin);
+            anyhow::bail!("session_log_descriptor_io_unsupported")
+        }
     }
 
     pub fn session_dir(logs_root: &Path, session: SessionId) -> PathBuf {
@@ -222,8 +589,7 @@ impl SessionLogWriter {
         logs_root: &Path,
         session_key: &str,
     ) -> anyhow::Result<Option<(u16, u16)>> {
-        let path = Self::terminal_size_path(logs_root, session_key)?;
-        let Some(raw) = read_terminal_size_bounded(&path)? else {
+        let Some(raw) = load_terminal_size_raw(logs_root, session_key)? else {
             return Ok(None);
         };
         let mut fields = raw.split_whitespace();
@@ -251,12 +617,36 @@ impl SessionLogWriter {
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<()> {
+        Self::save_terminal_size_with_session_hook(logs_root, session_key, cols, rows, || {})
+    }
+
+    fn save_terminal_size_with_session_hook(
+        logs_root: &Path,
+        session_key: &str,
+        cols: u16,
+        rows: u16,
+        after_session_pin: impl FnOnce(),
+    ) -> anyhow::Result<()> {
         anyhow::ensure!((1..=500).contains(&cols), "터미널 열 수 범위 초과");
         anyhow::ensure!((1..=500).contains(&rows), "터미널 행 수 범위 초과");
-        let dir = ensure_session_directory(logs_root, session_key)?;
-        let path = dir.join("terminal.size");
-        deppy_core::fs::atomic_write(&path, format!("{cols} {rows}\n").as_bytes())
+        #[cfg(unix)]
+        {
+            let dir = Self::session_dir_key(logs_root, session_key)?;
+            let directory = pin_log_directory(logs_root, &dir, true)?
+                .context("session log directory missing after creation")?;
+            after_session_pin();
+            atomic_write_log_at(
+                &directory,
+                TERMINAL_SIZE_FILE,
+                format!("{cols} {rows}\n").as_bytes(),
+            )
             .map_err(|_| anyhow::anyhow!("terminal_size_write_failed"))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (logs_root, session_key, after_session_pin);
+            anyhow::bail!("session_log_descriptor_io_unsupported")
+        }
     }
 
     /// append 재개 시 offset을 기존 파일 길이부터 이어가기 위한 길이 조회.
@@ -302,43 +692,68 @@ impl SessionLogWriter {
     }
 }
 
-pub(crate) fn existing_session_directory(
-    logs_root: &Path,
-    session_key: &str,
-) -> anyhow::Result<Option<PathBuf>> {
-    let dir = SessionLogWriter::session_dir_key(logs_root, session_key)?;
-    match std::fs::symlink_metadata(&dir) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(dir)),
-        Ok(_) => anyhow::bail!("session_log_directory_not_regular"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("세션 로그 디렉터리 metadata 실패: {}", dir.display())),
+fn load_terminal_size_raw(logs_root: &Path, session_key: &str) -> anyhow::Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        let dir = SessionLogWriter::session_dir_key(logs_root, session_key)?;
+        let Some(directory) = pin_log_directory(logs_root, &dir, false)? else {
+            return Ok(None);
+        };
+        let file = match open_readonly_log_at(&directory, std::ffi::OsStr::new(TERMINAL_SIZE_FILE))
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => anyhow::bail!("terminal_size_open_failed"),
+        };
+        read_terminal_size_open_file(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (logs_root, session_key);
+        anyhow::bail!("session_log_descriptor_io_unsupported")
     }
 }
 
-pub(crate) fn ensure_session_directory(
-    logs_root: &Path,
-    session_key: &str,
-) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(logs_root)
-        .with_context(|| format!("로그 루트 생성 실패: {}", logs_root.display()))?;
-    let dir = SessionLogWriter::session_dir_key(logs_root, session_key)?;
-    match std::fs::create_dir(&dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()));
-        }
-    }
-    existing_session_directory(logs_root, session_key)?
-        .ok_or_else(|| anyhow::anyhow!("session_log_directory_missing"))
+#[cfg(unix)]
+fn read_terminal_size_open_file(mut file: File) -> anyhow::Result<Option<String>> {
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("terminal_size_metadata_failed"))?;
+    anyhow::ensure!(opened.file_type().is_file(), "terminal_size_not_regular");
+    anyhow::ensure!(
+        opened.len() <= TERMINAL_SIZE_BYTES_MAX as u64,
+        "terminal_size_bytes_exceeded"
+    );
+    let declared_len = usize::try_from(opened.len())
+        .map_err(|_| anyhow::anyhow!("terminal_size_bytes_exceeded"))?;
+    let mut bytes = vec![0_u8; declared_len];
+    file.read_exact(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("terminal_size_changed"))?;
+    let mut overflow = [0_u8; 1];
+    anyhow::ensure!(
+        file.read(&mut overflow)
+            .map_err(|_| anyhow::anyhow!("terminal_size_read_failed"))?
+            == 0,
+        "terminal_size_changed"
+    );
+    anyhow::ensure!(
+        file.metadata()
+            .map_err(|_| anyhow::anyhow!("terminal_size_metadata_failed"))?
+            .len()
+            == opened.len(),
+        "terminal_size_changed"
+    );
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("terminal_size_utf8_invalid"))
 }
 
+#[cfg(any(test, not(unix)))]
 fn read_terminal_size_bounded(path: &Path) -> anyhow::Result<Option<String>> {
     read_terminal_size_bounded_with_hook(path, || {})
 }
 
+#[cfg(any(test, not(unix)))]
 fn read_terminal_size_bounded_with_hook(
     path: &Path,
     after_snapshot: impl FnOnce(),
@@ -632,9 +1047,18 @@ pub fn seek_ansi_tail_boundary_snapshot(
 }
 
 struct SessionLogBundle {
-    paths: Vec<(PathBuf, u64)>,
+    paths: Vec<SessionLogPath>,
     bytes: u64,
     modified: std::time::SystemTime,
+    #[cfg(unix)]
+    directory_identity: Option<FileIdentity>,
+}
+
+struct SessionLogPath {
+    path: PathBuf,
+    len: u64,
+    #[cfg(unix)]
+    identity: FileIdentity,
 }
 
 struct SessionLogCandidate {
@@ -645,6 +1069,10 @@ struct SessionLogCandidate {
     max_bytes: u64,
     retain_bytes: u64,
     tail_boundary: TailBoundary,
+    #[cfg(unix)]
+    identity: FileIdentity,
+    #[cfg(unix)]
+    directory_identity: FileIdentity,
 }
 
 impl Default for SessionLogBundle {
@@ -653,6 +1081,8 @@ impl Default for SessionLogBundle {
             paths: Vec::new(),
             bytes: 0,
             modified: std::time::UNIX_EPOCH,
+            #[cfg(unix)]
+            directory_identity: None,
         }
     }
 }
@@ -678,21 +1108,103 @@ fn gc_session_logs_with_limit_impl(
     budget_bytes: u64,
     entry_limit: usize,
 ) -> anyhow::Result<u64> {
-    let scan = scan_session_log_candidates_with_limit(logs_root, entry_limit)?;
-    let bundles = bundle_session_log_candidates(scan.candidates, scan.complete)?;
-    if !scan.complete {
-        remove_session_log_bundles(bundles, 0, true)?;
+    gc_session_logs_with_limit_and_hook(logs_root, budget_bytes, entry_limit, |_| {})
+}
+
+fn gc_session_logs_with_limit_and_hook(
+    logs_root: &Path,
+    budget_bytes: u64,
+    entry_limit: usize,
+    mut after_directory_pin: impl FnMut(&Path),
+) -> anyhow::Result<u64> {
+    gc_session_logs_with_limit_and_hooks(
+        logs_root,
+        budget_bytes,
+        entry_limit,
+        |_| {},
+        &mut after_directory_pin,
+    )
+}
+
+fn gc_session_logs_with_limit_and_hooks(
+    logs_root: &Path,
+    budget_bytes: u64,
+    entry_limit: usize,
+    mut before_directory_pin: impl FnMut(&Path),
+    mut after_directory_pin: impl FnMut(&Path),
+) -> anyhow::Result<u64> {
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            logs_root,
+            budget_bytes,
+            entry_limit,
+            &mut before_directory_pin,
+            &mut after_directory_pin,
+        );
+        anyhow::bail!("session_log_descriptor_io_unsupported");
+    }
+    let slot = session_log_scan_slot(logs_root)?;
+    let _operation = slot
+        .operation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let scan = scan_session_log_batch_with_limit(&slot, logs_root, entry_limit)?;
+    let scan_complete = scan.complete;
+    let bundles = match bundle_session_log_candidates(logs_root, scan.candidates, scan_complete) {
+        Ok(bundles) => bundles,
+        Err(error) => {
+            if !scan_complete {
+                reset_session_log_scan_cursor(&slot);
+            }
+            return Err(error);
+        }
+    };
+    if !scan_complete {
+        let remaining = match remove_session_log_bundles(
+            logs_root,
+            bundles,
+            0,
+            true,
+            &mut before_directory_pin,
+            &mut after_directory_pin,
+        ) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                reset_session_log_scan_cursor(&slot);
+                return Err(error);
+            }
+        };
+        if remaining > 0 {
+            reset_session_log_scan_cursor(&slot);
+        }
         remove_empty_directories(scan.directories, logs_root);
         anyhow::bail!("{}", SESSION_LOG_SCAN_LIMIT_ERROR);
     }
-    gc_session_log_bundles(bundles, budget_bytes)
+    gc_session_log_bundles(
+        logs_root,
+        bundles,
+        budget_bytes,
+        &mut before_directory_pin,
+        &mut after_directory_pin,
+    )
 }
 
 fn gc_session_log_bundles(
+    logs_root: &Path,
     bundles: Vec<SessionLogBundle>,
     budget_bytes: u64,
+    before_directory_pin: &mut impl FnMut(&Path),
+    after_directory_pin: &mut impl FnMut(&Path),
 ) -> anyhow::Result<u64> {
-    let total = remove_session_log_bundles(bundles, budget_bytes, false)?;
+    let total = remove_session_log_bundles(
+        logs_root,
+        bundles,
+        budget_bytes,
+        false,
+        before_directory_pin,
+        after_directory_pin,
+    )?;
     if total > budget_bytes {
         anyhow::bail!("session_log_gc_budget_unmet");
     }
@@ -700,9 +1212,12 @@ fn gc_session_log_bundles(
 }
 
 fn remove_session_log_bundles(
+    logs_root: &Path,
     mut bundles: Vec<SessionLogBundle>,
     budget_bytes: u64,
     force_all: bool,
+    before_directory_pin: &mut impl FnMut(&Path),
+    after_directory_pin: &mut impl FnMut(&Path),
 ) -> anyhow::Result<u64> {
     let mut total = bundles.iter().try_fold(0u64, |total, bundle| {
         total
@@ -718,14 +1233,44 @@ fn remove_session_log_bundles(
             break;
         }
         let mut removed = 0u64;
-        for (path, len) in bundle.paths {
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed = removed.saturating_add(len),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    removed = removed.saturating_add(len);
+        #[cfg(unix)]
+        {
+            let directory_path = bundle_dir(&bundle);
+            before_directory_pin(&directory_path);
+            let Some(directory) = pin_log_directory(logs_root, &directory_path, false)? else {
+                tracing::warn!(path = %directory_path.display(), "세션 로그 GC 디렉터리 사라짐");
+                continue;
+            };
+            anyhow::ensure!(
+                bundle.directory_identity == Some(pinned_log_directory_identity(&directory)?),
+                "session_log_directory_replaced"
+            );
+            after_directory_pin(&directory.path);
+            for path in bundle.paths {
+                let Some(name) = path.path.file_name() else {
+                    tracing::warn!(path = %path.path.display(), "세션 로그 GC 파일명 없음");
+                    continue;
+                };
+                match unlink_log_at(&directory, name, path.identity) {
+                    Ok(true) | Ok(false) => removed = removed.saturating_add(path.len),
+                    Err(error) => {
+                        tracing::warn!(path = %path.path.display(), "세션 로그 GC 삭제 실패: {error:#}")
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), "세션 로그 GC 삭제 실패: {error:#}")
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            before_directory_pin(&bundle_dir(&bundle));
+            for path in bundle.paths {
+                match std::fs::remove_file(&path.path) {
+                    Ok(()) => removed = removed.saturating_add(path.len),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        removed = removed.saturating_add(path.len);
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %path.path.display(), "세션 로그 GC 삭제 실패: {error:#}")
+                    }
                 }
             }
         }
@@ -737,6 +1282,16 @@ fn remove_session_log_bundles(
     Ok(total)
 }
 
+fn bundle_dir(bundle: &SessionLogBundle) -> PathBuf {
+    bundle
+        .paths
+        .first()
+        .and_then(|path| path.path.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+#[cfg(not(unix))]
 fn path_len(path: &Path) -> anyhow::Result<u64> {
     path.metadata()
         .map(|metadata| metadata.len())
@@ -752,28 +1307,87 @@ fn collect_session_log_bundles_with_limit(
     if !scan.complete {
         anyhow::bail!("{}", SESSION_LOG_SCAN_LIMIT_ERROR);
     }
-    bundle_session_log_candidates(scan.candidates, true)
+    bundle_session_log_candidates(logs_root, scan.candidates, true)
 }
 
 fn bundle_session_log_candidates(
+    logs_root: &Path,
     candidates: Vec<SessionLogCandidate>,
     compact_oversized: bool,
 ) -> anyhow::Result<Vec<SessionLogBundle>> {
     let mut by_dir = std::collections::HashMap::<PathBuf, SessionLogBundle>::new();
     for candidate in candidates {
-        if compact_oversized && candidate.original_len > candidate.max_bytes {
-            let mut file = open_regular_log_file(&candidate.path, false)?;
-            compact_open_file_to_tail(&mut file, candidate.retain_bytes, candidate.tail_boundary)
-                .with_context(|| {
-                format!(
-                    "기존 세션 로그 상한 적용 실패: {}",
-                    candidate.path.display()
+        #[cfg(unix)]
+        let len = {
+            let directory = pin_log_directory(logs_root, &candidate.dir, false)?
+                .context("session log directory disappeared during scan")?;
+            anyhow::ensure!(
+                pinned_log_directory_identity(&directory)? == candidate.directory_identity,
+                "session_log_directory_replaced"
+            );
+            let name = candidate
+                .path
+                .file_name()
+                .context("session log file name missing")?;
+            let mut file = open_regular_log_at(&directory, name, false)?;
+            let opened = file.metadata()?;
+            let identity = metadata_identity(&opened);
+            anyhow::ensure!(
+                identity.device == candidate.identity.device
+                    && identity.inode == candidate.identity.inode,
+                "session_log_file_replaced"
+            );
+            if compact_oversized && candidate.original_len > candidate.max_bytes {
+                compact_open_file_to_tail(
+                    &mut file,
+                    candidate.retain_bytes,
+                    candidate.tail_boundary,
                 )
-            })?;
-        }
-        let len = path_len(&candidate.path)?;
+                .with_context(|| {
+                    format!(
+                        "기존 세션 로그 상한 적용 실패: {}",
+                        candidate.path.display()
+                    )
+                })?;
+            }
+            file.metadata()?.len()
+        };
+        #[cfg(not(unix))]
+        let len = {
+            if compact_oversized && candidate.original_len > candidate.max_bytes {
+                let mut file = open_regular_log_file(&candidate.path, false)?;
+                compact_open_file_to_tail(
+                    &mut file,
+                    candidate.retain_bytes,
+                    candidate.tail_boundary,
+                )
+                .with_context(|| {
+                    format!(
+                        "기존 세션 로그 상한 적용 실패: {}",
+                        candidate.path.display()
+                    )
+                })?;
+            }
+            path_len(&candidate.path)?
+        };
         let bundle = by_dir.entry(candidate.dir).or_default();
-        bundle.paths.push((candidate.path, len));
+        #[cfg(unix)]
+        {
+            if let Some(identity) = bundle.directory_identity {
+                anyhow::ensure!(
+                    identity == candidate.directory_identity,
+                    "session_log_directory_replaced"
+                );
+            } else {
+                bundle.directory_identity = Some(candidate.directory_identity);
+            }
+        }
+        bundle.paths.push(SessionLogPath {
+            path: candidate.path,
+            len,
+            #[cfg(unix)]
+            identity: candidate.identity,
+        });
         bundle.bytes = bundle
             .bytes
             .checked_add(len)
@@ -790,6 +1404,279 @@ struct SessionLogScan {
     complete: bool,
 }
 
+struct SessionLogScanFrame {
+    path: PathBuf,
+    depth: usize,
+    entries: std::fs::ReadDir,
+    #[cfg(unix)]
+    directory_identity: FileIdentity,
+}
+
+struct SessionLogScanCursor {
+    stack: Vec<SessionLogScanFrame>,
+    pending: Option<std::fs::DirEntry>,
+    continued: bool,
+    #[cfg(unix)]
+    root_identity: FileIdentity,
+}
+
+const SESSION_LOG_SCAN_CURSOR_CAP: usize = 16;
+
+struct SessionLogScanSlot {
+    operation: std::sync::Mutex<()>,
+    cursor: std::sync::Mutex<Option<SessionLogScanCursor>>,
+}
+
+type SessionLogScanSlots =
+    std::sync::Mutex<std::collections::VecDeque<(PathBuf, std::sync::Arc<SessionLogScanSlot>)>>;
+
+fn session_log_scan_slots() -> &'static SessionLogScanSlots {
+    static CURSORS: std::sync::OnceLock<SessionLogScanSlots> = std::sync::OnceLock::new();
+    CURSORS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn session_log_scan_slot(logs_root: &Path) -> anyhow::Result<std::sync::Arc<SessionLogScanSlot>> {
+    let mut slots = session_log_scan_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(position) = slots.iter().position(|(root, _)| root == logs_root) {
+        let (_, slot) = slots
+            .remove(position)
+            .context("session log scan slot disappeared")?;
+        let result = std::sync::Arc::clone(&slot);
+        slots.push_back((logs_root.to_path_buf(), slot));
+        return Ok(result);
+    }
+    if slots.len() >= SESSION_LOG_SCAN_CURSOR_CAP {
+        let Some(position) = slots
+            .iter()
+            .position(|(_, slot)| std::sync::Arc::strong_count(slot) == 1)
+        else {
+            anyhow::bail!("session_log_scan_cursor_capacity");
+        };
+        slots.remove(position);
+    }
+    let slot = std::sync::Arc::new(SessionLogScanSlot {
+        operation: std::sync::Mutex::new(()),
+        cursor: std::sync::Mutex::new(None),
+    });
+    slots.push_back((logs_root.to_path_buf(), std::sync::Arc::clone(&slot)));
+    Ok(slot)
+}
+
+fn reset_session_log_scan_cursor(slot: &SessionLogScanSlot) {
+    *slot
+        .cursor
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn create_session_log_scan_cursor(
+    logs_root: &Path,
+) -> anyhow::Result<Option<SessionLogScanCursor>> {
+    let before = match std::fs::symlink_metadata(logs_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("로그 루트 metadata 실패"),
+    };
+    anyhow::ensure!(
+        before.file_type().is_dir(),
+        "session_log_directory_not_regular"
+    );
+    let entries = std::fs::read_dir(logs_root).context("로그 디렉터리 나열 실패")?;
+    let after = std::fs::symlink_metadata(logs_root).context("로그 루트 metadata 재조회 실패")?;
+    anyhow::ensure!(
+        after.file_type().is_dir(),
+        "session_log_directory_not_regular"
+    );
+    #[cfg(unix)]
+    anyhow::ensure!(
+        metadata_identity(&before) == metadata_identity(&after),
+        "session_log_root_replaced"
+    );
+    Ok(Some(SessionLogScanCursor {
+        stack: vec![SessionLogScanFrame {
+            path: logs_root.to_path_buf(),
+            depth: 0,
+            entries,
+            #[cfg(unix)]
+            directory_identity: metadata_identity(&after),
+        }],
+        pending: None,
+        continued: false,
+        #[cfg(unix)]
+        root_identity: metadata_identity(&after),
+    }))
+}
+
+#[cfg(unix)]
+fn session_log_scan_root_matches(
+    cursor: &SessionLogScanCursor,
+    logs_root: &Path,
+) -> anyhow::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(logs_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("로그 루트 metadata 실패"),
+    };
+    Ok(metadata.file_type().is_dir() && metadata_identity(&metadata) == cursor.root_identity)
+}
+
+fn scan_session_log_batch_with_limit(
+    slot: &SessionLogScanSlot,
+    logs_root: &Path,
+    entry_limit: usize,
+) -> anyhow::Result<SessionLogScan> {
+    let mut cursor = slot
+        .cursor
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(unix)]
+    if let Some(active) = cursor.as_ref()
+        && !session_log_scan_root_matches(active, logs_root)?
+    {
+        *cursor = None;
+    }
+    if cursor.is_none() {
+        let Some(created) = create_session_log_scan_cursor(logs_root)? else {
+            return Ok(SessionLogScan {
+                candidates: Vec::new(),
+                directories: Vec::new(),
+                entries_seen: 0,
+                complete: true,
+            });
+        };
+        *cursor = Some(created);
+    }
+    let active = cursor.as_mut().context("session log scan cursor missing")?;
+    let result = scan_session_log_cursor(active, entry_limit);
+    let mut scan = match result {
+        Ok(scan) => scan,
+        Err(error) => {
+            *cursor = None;
+            return Err(error);
+        }
+    };
+    #[cfg(unix)]
+    if !session_log_scan_root_matches(active, logs_root)? {
+        *cursor = None;
+        anyhow::bail!("session_log_root_replaced");
+    }
+    if scan.complete && active.continued {
+        scan.complete = false;
+        *cursor = None;
+    } else if scan.complete {
+        *cursor = None;
+    } else {
+        active.continued = true;
+    }
+    Ok(scan)
+}
+
+fn scan_session_log_cursor(
+    cursor: &mut SessionLogScanCursor,
+    entry_limit: usize,
+) -> anyhow::Result<SessionLogScan> {
+    let mut scan = SessionLogScan {
+        candidates: Vec::new(),
+        directories: Vec::new(),
+        entries_seen: 0,
+        complete: true,
+    };
+    while let Some(frame) = cursor.stack.last_mut() {
+        let entry = match cursor.pending.take() {
+            Some(entry) => Some(Ok(entry)),
+            None => frame.entries.next(),
+        };
+        let Some(entry) = entry else {
+            cursor.stack.pop();
+            continue;
+        };
+        let entry =
+            entry.with_context(|| format!("로그 항목 조회 실패: {}", frame.path.display()))?;
+        scan.entries_seen = scan.entries_seen.saturating_add(1);
+        if scan.entries_seen > entry_limit {
+            cursor.pending = Some(entry);
+            scan.complete = false;
+            break;
+        }
+        let parent = frame.path.clone();
+        let depth = frame.depth;
+        #[cfg(unix)]
+        let directory_identity = frame.directory_identity;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("로그 항목 유형 조회 실패: {}", entry.path().display()))?;
+        anyhow::ensure!(
+            !file_type.is_symlink(),
+            "session_log_subtree_not_regular: {}",
+            entry.path().display()
+        );
+        if file_type.is_dir() && depth < 4 {
+            let path = entry.path();
+            let entries = std::fs::read_dir(&path)
+                .with_context(|| format!("로그 디렉터리 나열 실패: {}", path.display()))?;
+            #[cfg(unix)]
+            let child_identity = {
+                let metadata = path
+                    .symlink_metadata()
+                    .with_context(|| format!("로그 디렉터리 metadata 실패: {}", path.display()))?;
+                anyhow::ensure!(
+                    metadata.file_type().is_dir(),
+                    "session_log_directory_not_regular"
+                );
+                metadata_identity(&metadata)
+            };
+            scan.directories.push(path.clone());
+            cursor.stack.push(SessionLogScanFrame {
+                path,
+                depth: depth + 1,
+                entries,
+                #[cfg(unix)]
+                directory_identity: child_identity,
+            });
+            continue;
+        }
+        let Some((max_bytes, retain_bytes, tail_boundary)) =
+            log_limits_for_name(&entry.file_name())
+        else {
+            continue;
+        };
+        let path = entry.path();
+        anyhow::ensure!(
+            file_type.is_file(),
+            "session_log_file_not_regular: {}",
+            path.display()
+        );
+        let metadata = path
+            .symlink_metadata()
+            .with_context(|| format!("세션 로그 metadata 실패: {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "session_log_file_not_regular: {}",
+            path.display()
+        );
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("세션 로그 수정시각 조회 실패: {}", path.display()))?;
+        scan.candidates.push(SessionLogCandidate {
+            dir: parent,
+            path,
+            original_len: metadata.len(),
+            modified,
+            max_bytes,
+            retain_bytes,
+            tail_boundary,
+            #[cfg(unix)]
+            identity: metadata_identity(&metadata),
+            #[cfg(unix)]
+            directory_identity,
+        });
+    }
+    Ok(scan)
+}
+
+#[cfg(test)]
 fn scan_session_log_candidates_with_limit(
     logs_root: &Path,
     entry_limit: usize,
@@ -804,6 +1691,7 @@ fn scan_session_log_candidates_with_limit(
     Ok(scan)
 }
 
+#[cfg(test)]
 fn scan_session_log_directory(
     dir: &Path,
     depth: usize,
@@ -816,10 +1704,6 @@ fn scan_session_log_directory(
     if depth > 0 {
         scan.directories.push(dir.to_path_buf());
     }
-    collect_known_session_logs(dir, entry_limit, scan)?;
-    if !scan.complete {
-        return Ok(());
-    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -828,8 +1712,24 @@ fn scan_session_log_directory(
                 .with_context(|| format!("로그 디렉터리 나열 실패: {}", dir.display()));
         }
     };
+    #[cfg(unix)]
+    let directory_identity = {
+        let metadata = dir
+            .symlink_metadata()
+            .with_context(|| format!("로그 디렉터리 metadata 실패: {}", dir.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "session_log_directory_not_regular"
+        );
+        metadata_identity(&metadata)
+    };
     for entry in entries {
         let entry = entry.with_context(|| format!("로그 항목 조회 실패: {}", dir.display()))?;
+        scan.entries_seen = scan.entries_seen.saturating_add(1);
+        if scan.entries_seen > entry_limit {
+            scan.complete = false;
+            return Ok(());
+        }
         let file_type = entry
             .file_type()
             .with_context(|| format!("로그 항목 유형 조회 실패: {}", entry.path().display()))?;
@@ -845,33 +1745,25 @@ fn scan_session_log_directory(
             }
             continue;
         }
-    }
-    Ok(())
-}
-
-fn collect_known_session_logs(
-    dir: &Path,
-    entry_limit: usize,
-    scan: &mut SessionLogScan,
-) -> anyhow::Result<()> {
-    for name in [ANSI_LOG_FILE, PLAIN_LOG_FILE, EVENTS_LOG_FILE] {
-        let path = dir.join(name);
-        let metadata = match path.symlink_metadata() {
-            Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => anyhow::bail!("session_log_file_not_regular: {}", path.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("세션 로그 metadata 실패: {}", path.display()));
-            }
+        let Some((max_bytes, retain_bytes, tail_boundary)) =
+            log_limits_for_name(&entry.file_name())
+        else {
+            continue;
         };
-        let (max_bytes, retain_bytes, tail_boundary) =
-            log_limits_for_name(std::ffi::OsStr::new(name)).expect("known log name");
-        scan.entries_seen = scan.entries_seen.saturating_add(1);
-        if scan.entries_seen > entry_limit {
-            scan.complete = false;
-            return Ok(());
-        }
+        let path = entry.path();
+        anyhow::ensure!(
+            file_type.is_file(),
+            "session_log_file_not_regular: {}",
+            path.display()
+        );
+        let metadata = path
+            .symlink_metadata()
+            .with_context(|| format!("세션 로그 metadata 실패: {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "session_log_file_not_regular: {}",
+            path.display()
+        );
         let modified = metadata
             .modified()
             .with_context(|| format!("세션 로그 수정시각 조회 실패: {}", path.display()))?;
@@ -883,6 +1775,10 @@ fn collect_known_session_logs(
             max_bytes,
             retain_bytes,
             tail_boundary,
+            #[cfg(unix)]
+            identity: metadata_identity(&metadata),
+            #[cfg(unix)]
+            directory_identity,
         });
     }
     Ok(())
@@ -1146,6 +2042,61 @@ mod tests {
         assert!(!outside.join("terminal.size").exists());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_and_terminal_writes_stay_in_pinned_directory_after_parent_swap() {
+        use std::os::unix::fs::symlink;
+
+        let log_root = temp_root("pinned-log-parent-swap");
+        let log_session = log_root.join("session");
+        let pinned_log_session = log_root.join("pinned-session");
+        let log_outside = temp_root("pinned-log-parent-swap-outside");
+        std::fs::create_dir_all(&log_session).unwrap();
+        let mut writer = SessionLogWriter::open_key_with_session_hook(&log_root, "session", || {
+            std::fs::rename(&log_session, &pinned_log_session).unwrap();
+            symlink(&log_outside, &log_session).unwrap();
+        })
+        .unwrap();
+        writer.append_output(b"safe").unwrap();
+        writer.flush();
+        assert_eq!(
+            std::fs::read(pinned_log_session.join(ANSI_LOG_FILE)).unwrap(),
+            b"safe"
+        );
+        assert!(!log_outside.join(ANSI_LOG_FILE).exists());
+
+        let size_root = temp_root("pinned-size-parent-swap");
+        let size_session = size_root.join("session");
+        let pinned_size_session = size_root.join("pinned-session");
+        let size_outside = temp_root("pinned-size-parent-swap-outside");
+        std::fs::create_dir_all(&size_session).unwrap();
+        SessionLogWriter::save_terminal_size_with_session_hook(
+            &size_root,
+            "session",
+            80,
+            24,
+            || {
+                std::fs::rename(&size_session, &pinned_size_session).unwrap();
+                symlink(&size_outside, &size_session).unwrap();
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pinned_size_session.join("terminal.size")).unwrap(),
+            "80 24\n"
+        );
+        assert!(!size_outside.join("terminal.size").exists());
+
+        std::fs::remove_file(log_session).unwrap();
+        std::fs::remove_dir_all(pinned_log_session).unwrap();
+        std::fs::remove_dir_all(log_root).unwrap();
+        std::fs::remove_dir_all(log_outside).unwrap();
+        std::fs::remove_file(size_session).unwrap();
+        std::fs::remove_dir_all(pinned_size_session).unwrap();
+        std::fs::remove_dir_all(size_root).unwrap();
+        std::fs::remove_dir_all(size_outside).unwrap();
     }
 
     #[test]
@@ -1450,7 +2401,7 @@ mod tests {
     #[test]
     fn scan_entry_limit_exact_boundary_succeeds() {
         let root = temp_root("scan-entry-limit-exact");
-        for index in 0..4 {
+        for index in 0..2 {
             let dir = root.join(format!("session-{index}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(PLAIN_LOG_FILE), b"log").unwrap();
@@ -1458,14 +2409,14 @@ mod tests {
 
         let bundles = collect_session_log_bundles_with_limit(&root, 4).unwrap();
 
-        assert_eq!(bundles.len(), 4);
+        assert_eq!(bundles.len(), 2);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn scan_entry_limit_default_exact_boundary_succeeds() {
         let root = temp_root("scan-entry-limit-default-exact");
-        for index in 0..SESSION_LOG_SCAN_ENTRY_LIMIT {
+        for index in 0..SESSION_LOG_SCAN_ENTRY_LIMIT / 2 {
             let dir = root.join(format!("session-{index}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(PLAIN_LOG_FILE), b"").unwrap();
@@ -1480,7 +2431,7 @@ mod tests {
     #[test]
     fn scan_entry_limit_rejects_limit_plus_one() {
         let root = temp_root("scan-entry-limit-plus-one");
-        for index in 0..5 {
+        for index in 0..3 {
             let dir = root.join(format!("session-{index}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(PLAIN_LOG_FILE), b"log").unwrap();
@@ -1498,11 +2449,12 @@ mod tests {
     #[test]
     fn scan_entry_limit_default_rejects_limit_plus_one() {
         let root = temp_root("scan-entry-limit-default-plus-one");
-        for index in 0..=SESSION_LOG_SCAN_ENTRY_LIMIT {
+        for index in 0..SESSION_LOG_SCAN_ENTRY_LIMIT / 2 {
             let dir = root.join(format!("session-{index}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(PLAIN_LOG_FILE), b"").unwrap();
         }
+        std::fs::write(root.join("one-entry-over-limit"), b"noise").unwrap();
 
         let err = gc_session_logs(&root, 0).unwrap_err();
 
@@ -1529,19 +2481,141 @@ mod tests {
     }
 
     #[test]
-    fn non_log_entries_do_not_starve_bounded_scan() {
+    fn non_log_entries_consume_bounded_scan_budget() {
         let root = temp_root("scan-entry-limit-noise");
-        for index in 0..=SESSION_LOG_SCAN_ENTRY_LIMIT {
+        for index in 0..5 {
             std::fs::write(root.join(format!("noise-{index}")), b"ignored").unwrap();
         }
-        let session_dir = root.join("session");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join(PLAIN_LOG_FILE), b"log").unwrap();
 
-        let bundles = collect_session_log_bundles_with_limit(&root, 1).unwrap();
+        let error = match collect_session_log_bundles_with_limit(&root, 4) {
+            Ok(_) => panic!("expected scan entry limit error"),
+            Err(error) => error,
+        };
 
-        assert_eq!(bundles.len(), 1);
+        assert_eq!(error.to_string(), SESSION_LOG_SCAN_LIMIT_ERROR);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn repeated_gc_advances_past_non_log_batches() {
+        let root = temp_root("scan-entry-noise-progress");
+        for index in 0..5 {
+            std::fs::write(root.join(format!("noise-{index}")), b"ignored").unwrap();
+        }
+        let session = root.join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join(PLAIN_LOG_FILE), b"remove-me").unwrap();
+
+        let mut reported_success = false;
+        for _ in 0..16 {
+            if matches!(gc_session_logs_with_limit(&root, 0, 2), Ok(0)) {
+                reported_success = true;
+                break;
+            }
+        }
+
+        assert!(!session.join(PLAIN_LOG_FILE).exists());
+        assert!(
+            !reported_success,
+            "an over-limit noise tree cannot produce a complete usage snapshot"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_gc_discards_cursor_after_logs_root_replacement() {
+        let root = temp_root("scan-root-replacement");
+        for index in 0..3 {
+            std::fs::write(root.join(format!("noise-{index}")), b"ignored").unwrap();
+        }
+        assert!(gc_session_logs_with_limit(&root, 0, 2).is_err());
+        let old_root = root.with_extension("old");
+        std::fs::rename(&root, &old_root).unwrap();
+        let session = root.join("replacement-session");
+        std::fs::create_dir_all(&session).unwrap();
+        let replacement_log = session.join(PLAIN_LOG_FILE);
+        std::fs::write(&replacement_log, b"remove-me").unwrap();
+
+        let result = gc_session_logs_with_limit(&root, 0, 2);
+
+        assert_eq!(result.unwrap(), 0);
+        assert!(
+            !replacement_log.exists(),
+            "a stale cursor must not publish usage for a replacement root"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(old_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_unlinks_from_pinned_directory_after_parent_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("gc-pinned-parent-swap");
+        let session = root.join("session");
+        let pinned_session = root.join("pinned-session");
+        let outside = temp_root("gc-pinned-parent-swap-outside");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join(PLAIN_LOG_FILE), b"remove-me").unwrap();
+        std::fs::write(outside.join(PLAIN_LOG_FILE), b"keep-me").unwrap();
+        let mut swapped = false;
+
+        let total = gc_session_logs_with_limit_and_hook(&root, 0, 16, |directory| {
+            if !swapped && directory == session {
+                std::fs::rename(&session, &pinned_session).unwrap();
+                symlink(&outside, &session).unwrap();
+                swapped = true;
+            }
+        })
+        .unwrap();
+
+        assert_eq!(total, 0);
+        assert!(!pinned_session.join(PLAIN_LOG_FILE).exists());
+        assert_eq!(
+            std::fs::read(outside.join(PLAIN_LOG_FILE)).unwrap(),
+            b"keep-me"
+        );
+        std::fs::remove_file(session).unwrap();
+        std::fs::remove_dir_all(pinned_session).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_rejects_session_directory_replacement_before_repin() {
+        let root = temp_root("gc-parent-replaced-before-repin");
+        let session = root.join("session");
+        let moved_session = root.join("moved-session");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join(PLAIN_LOG_FILE), b"original").unwrap();
+
+        let result = gc_session_logs_with_limit_and_hooks(
+            &root,
+            0,
+            16,
+            |directory| {
+                if directory == session {
+                    std::fs::rename(&session, &moved_session).unwrap();
+                    std::fs::create_dir_all(&session).unwrap();
+                    std::fs::write(session.join(PLAIN_LOG_FILE), b"replacement").unwrap();
+                }
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err(), "replaced parent identity must fail closed");
+        assert_eq!(
+            std::fs::read(moved_session.join(PLAIN_LOG_FILE)).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(session.join(PLAIN_LOG_FILE)).unwrap(),
+            b"replacement"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -1566,15 +2640,22 @@ mod tests {
                 paths: Vec::new(),
                 bytes: u64::MAX,
                 modified: std::time::UNIX_EPOCH,
+                #[cfg(unix)]
+                directory_identity: None,
             },
             SessionLogBundle {
                 paths: Vec::new(),
                 bytes: 1,
                 modified: std::time::UNIX_EPOCH,
+                #[cfg(unix)]
+                directory_identity: None,
             },
         ];
 
-        assert!(gc_session_log_bundles(bundles, u64::MAX).is_err());
+        assert!(
+            gc_session_log_bundles(Path::new("."), bundles, u64::MAX, &mut |_| {}, &mut |_| {},)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1609,6 +2690,52 @@ mod tests {
             "repeated bounded passes must eventually recover"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_gc_restarts_after_failed_batch_cleanup() {
+        let root = temp_root("scan-entry-limit-failed-cleanup");
+        let mut log_paths = Vec::new();
+        for index in 0..3 {
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(PLAIN_LOG_FILE);
+            std::fs::write(&path, b"log").unwrap();
+            log_paths.push(path);
+        }
+        let mut swapped = None;
+
+        let first = gc_session_logs_with_limit_and_hooks(
+            &root,
+            0,
+            2,
+            |directory| {
+                if swapped.is_none() {
+                    let moved = root.join("moved-session");
+                    std::fs::rename(directory, &moved).unwrap();
+                    std::fs::create_dir_all(directory).unwrap();
+                    std::fs::write(directory.join(PLAIN_LOG_FILE), b"replacement").unwrap();
+                    swapped = Some((directory.to_path_buf(), moved));
+                }
+            },
+            |_| {},
+        );
+
+        assert!(first.is_err());
+        let (session, moved) = swapped.expect("cleanup hook must replace one session");
+        std::fs::remove_dir_all(&session).unwrap();
+        std::fs::rename(moved, session).unwrap();
+        for _ in 0..8 {
+            if matches!(gc_session_logs_with_limit(&root, 0, 2), Ok(0)) {
+                break;
+            }
+        }
+        assert!(
+            log_paths.iter().all(|path| !path.exists()),
+            "a failed incomplete batch must be rescanned before GC reports success"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

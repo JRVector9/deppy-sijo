@@ -48,6 +48,73 @@ struct ArchiveRecord {
     modified: std::time::SystemTime,
     bytes: u64,
     path: PathBuf,
+    #[cfg(unix)]
+    file_identity: ArchiveIdentity,
+    #[cfg(unix)]
+    directory_identity: ArchiveIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchiveIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveRootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+pub struct ArchiveWriteReceipt {
+    bytes: u64,
+    #[cfg(unix)]
+    file_identity: ArchiveIdentity,
+    #[cfg(unix)]
+    directory_identity: ArchiveIdentity,
+    #[cfg(unix)]
+    root_identity: ArchiveRootIdentity,
+    #[cfg(unix)]
+    directory: PinnedSessionDirectory,
+}
+
+impl ArchiveWriteReceipt {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn root_identity(&self) -> ArchiveRootIdentity {
+        #[cfg(unix)]
+        {
+            self.root_identity
+        }
+        #[cfg(not(unix))]
+        {
+            unreachable!("archive receipts are unsupported on non-Unix targets")
+        }
+    }
+}
+
+pub fn root_identity(logs_root: &Path) -> anyhow::Result<Option<ArchiveRootIdentity>> {
+    #[cfg(unix)]
+    {
+        let metadata = match std::fs::symlink_metadata(logs_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("logs_root metadata failed"),
+        };
+        anyhow::ensure!(metadata.file_type().is_dir(), "logs_root_not_regular");
+        Ok(Some(ArchiveRootIdentity {
+            device: archive_metadata_identity(&metadata).device,
+            inode: archive_metadata_identity(&metadata).inode,
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = logs_root;
+        anyhow::bail!("scrollback_archive_descriptor_io_unsupported")
+    }
 }
 
 pub fn archive_path(logs_root: &Path, session_key: &str) -> anyhow::Result<PathBuf> {
@@ -84,12 +151,11 @@ fn remove_with_session_hook(
         let Some(directory) = pin_session_directory(logs_root, session_key, false)? else {
             return Ok(false);
         };
+        let Some(identity) = archive_identity_at(&directory)? else {
+            return Ok(false);
+        };
         after_session_pin();
-        match unlink_archive_at(&directory) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error).context("scrollback archive remove failed"),
-        }
+        unlink_archive_at(&directory, identity).context("scrollback archive remove failed")
     }
     #[cfg(not(unix))]
     {
@@ -107,9 +173,19 @@ pub fn write(
     meta: &ArchiveMeta,
     redacted_ansi: &[u8],
 ) -> anyhow::Result<u64> {
-    write_with_session_hook(logs_root, session_key, meta, redacted_ansi, || {})
+    write_receipt(logs_root, session_key, meta, redacted_ansi).map(|receipt| receipt.bytes())
 }
 
+pub fn write_receipt(
+    logs_root: &Path,
+    session_key: &str,
+    meta: &ArchiveMeta,
+    redacted_ansi: &[u8],
+) -> anyhow::Result<ArchiveWriteReceipt> {
+    write_receipt_with_session_hook(logs_root, session_key, meta, redacted_ansi, || {})
+}
+
+#[cfg(test)]
 fn write_with_session_hook(
     logs_root: &Path,
     session_key: &str,
@@ -117,6 +193,23 @@ fn write_with_session_hook(
     redacted_ansi: &[u8],
     after_session_pin: impl FnOnce(),
 ) -> anyhow::Result<u64> {
+    write_receipt_with_session_hook(
+        logs_root,
+        session_key,
+        meta,
+        redacted_ansi,
+        after_session_pin,
+    )
+    .map(|receipt| receipt.bytes())
+}
+
+fn write_receipt_with_session_hook(
+    logs_root: &Path,
+    session_key: &str,
+    meta: &ArchiveMeta,
+    redacted_ansi: &[u8],
+    after_session_pin: impl FnOnce(),
+) -> anyhow::Result<ArchiveWriteReceipt> {
     anyhow::ensure!(
         redacted_ansi.len() <= MAX_UNCOMPRESSED_BYTES as usize,
         "scrollback 아카이브 크기 초과: {} bytes",
@@ -134,38 +227,114 @@ fn write_with_session_hook(
         meta.rows
     );
 
-    let mut buf = Vec::with_capacity(HEADER_LEN + redacted_ansi.len() / 4);
-    buf.extend_from_slice(MAGIC);
-    buf.push(VERSION);
-    buf.push(meta.kind);
-    buf.extend_from_slice(&meta.cols.to_le_bytes());
-    buf.extend_from_slice(&meta.rows.to_le_bytes());
-    buf.extend_from_slice(&meta.scrollback_lines.to_le_bytes());
-    buf.push(meta.exit_code.is_some() as u8);
-    buf.extend_from_slice(&meta.exit_code.unwrap_or(0).to_le_bytes());
-    buf.extend_from_slice(&(redacted_ansi.len() as u32).to_le_bytes());
-    let mut encoder = flate2::write::ZlibEncoder::new(buf, flate2::Compression::default());
-    encoder
-        .write_all(redacted_ansi)
-        .context("scrollback 압축 실패")?;
-    let bytes = encoder.finish().context("scrollback 압축 마감 실패")?;
-
+    #[cfg(not(unix))]
+    {
+        let _ = (logs_root, session_key, after_session_pin);
+        anyhow::bail!("scrollback_archive_descriptor_io_unsupported")
+    }
     #[cfg(unix)]
     {
+        let mut buf = Vec::with_capacity(HEADER_LEN + redacted_ansi.len() / 4);
+        buf.extend_from_slice(MAGIC);
+        buf.push(VERSION);
+        buf.push(meta.kind);
+        buf.extend_from_slice(&meta.cols.to_le_bytes());
+        buf.extend_from_slice(&meta.rows.to_le_bytes());
+        buf.extend_from_slice(&meta.scrollback_lines.to_le_bytes());
+        buf.push(meta.exit_code.is_some() as u8);
+        buf.extend_from_slice(&meta.exit_code.unwrap_or(0).to_le_bytes());
+        buf.extend_from_slice(&(redacted_ansi.len() as u32).to_le_bytes());
+        let mut encoder = flate2::write::ZlibEncoder::new(buf, flate2::Compression::default());
+        encoder
+            .write_all(redacted_ansi)
+            .context("scrollback 압축 실패")?;
+        let bytes = encoder.finish().context("scrollback 압축 마감 실패")?;
         let directory = pin_session_directory(logs_root, session_key, true)?
             .context("session archive directory missing after creation")?;
+        let directory_identity = pinned_session_directory_identity(&directory)?;
         after_session_pin();
-        atomic_write_archive_at(&directory, &bytes).with_context(|| {
+        let file_identity = atomic_write_archive_at(&directory, &bytes).with_context(|| {
             format!(
                 "아카이브 원자 기록 실패: {}",
                 directory.path.join(ARCHIVE_FILE).display()
             )
         })?;
-        Ok(bytes.len() as u64)
+        let expected_root_identity = directory.root_identity;
+        let current_directory = match pin_session_directory(logs_root, session_key, false) {
+            Ok(directory) => directory,
+            Err(error) => {
+                let removed = unlink_archive_at(&directory, file_identity)
+                    .context("scrollback archive stale-session cleanup failed")?;
+                anyhow::ensure!(removed, "scrollback_archive_stale_session_cleanup_missing");
+                return Err(error).context("scrollback archive session revalidation failed");
+            }
+        };
+        let current_matches = match current_directory {
+            Some(current) => {
+                current.root_identity == expected_root_identity
+                    && pinned_session_directory_identity(&current)? == directory_identity
+            }
+            None => false,
+        };
+        if root_identity(logs_root)? != Some(expected_root_identity) || !current_matches {
+            let removed = unlink_archive_at(&directory, file_identity)
+                .context("scrollback archive stale-root cleanup failed")?;
+            anyhow::ensure!(removed, "scrollback_archive_stale_root_cleanup_missing");
+            anyhow::bail!("scrollback_archive_root_replaced");
+        }
+        Ok(ArchiveWriteReceipt {
+            bytes: bytes.len() as u64,
+            file_identity,
+            directory_identity,
+            root_identity: expected_root_identity,
+            directory,
+        })
+    }
+}
+
+pub fn remove_written(
+    logs_root: &Path,
+    session_key: &str,
+    receipt: ArchiveWriteReceipt,
+) -> anyhow::Result<bool> {
+    #[cfg(unix)]
+    {
+        let _ = (logs_root, session_key);
+        anyhow::ensure!(
+            pinned_session_directory_identity(&receipt.directory)? == receipt.directory_identity,
+            "scrollback_archive_directory_replaced"
+        );
+        unlink_archive_at(&receipt.directory, receipt.file_identity)
+            .context("scrollback archive written-file remove failed")
     }
     #[cfg(not(unix))]
     {
-        let _ = (logs_root, session_key, after_session_pin);
+        let _ = (logs_root, session_key, receipt);
+        anyhow::bail!("scrollback_archive_descriptor_io_unsupported")
+    }
+}
+
+pub fn written_is_current(
+    logs_root: &Path,
+    session_key: &str,
+    receipt: &ArchiveWriteReceipt,
+) -> anyhow::Result<bool> {
+    #[cfg(unix)]
+    {
+        if root_identity(logs_root)? != Some(receipt.root_identity) {
+            return Ok(false);
+        }
+        let Some(directory) = pin_session_directory(logs_root, session_key, false)? else {
+            return Ok(false);
+        };
+        if pinned_session_directory_identity(&directory)? != receipt.directory_identity {
+            return Ok(false);
+        }
+        Ok(archive_identity_at(&directory)? == Some(receipt.file_identity))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (logs_root, session_key, receipt);
         anyhow::bail!("scrollback_archive_descriptor_io_unsupported")
     }
 }
@@ -222,6 +391,7 @@ fn open_with_session_hook(
                     .with_context(|| format!("아카이브 열기 실패: {}", path.display()));
             }
         };
+        let file_identity = archive_metadata_identity(&file.metadata()?);
         let mut reader = std::io::BufReader::new(file);
         let mut header = [0u8; HEADER_LEN];
         let parsed = reader
@@ -230,7 +400,7 @@ fn open_with_session_hook(
             .and_then(|()| parse_header(&header));
         let Some((meta, uncompressed_len)) = parsed else {
             tracing::warn!(path = %path.display(), "scrollback 아카이브 손상 — 폐기");
-            let _ = unlink_archive_at(&directory);
+            let _ = unlink_archive_at(&directory, file_identity);
             return Ok(None);
         };
         // take로 선언 길이 초과 해제를 차단 (압축 폭탄/오염 방어) — 정확 길이 검증은 finish
@@ -243,6 +413,7 @@ fn open_with_session_hook(
             saw_error: false,
             path,
             directory,
+            file_identity,
         }))
     }
 }
@@ -251,6 +422,99 @@ fn open_with_session_hook(
 struct PinnedSessionDirectory {
     fd: std::os::fd::OwnedFd,
     path: PathBuf,
+    root_identity: ArchiveRootIdentity,
+}
+
+#[cfg(unix)]
+fn archive_metadata_identity(metadata: &std::fs::Metadata) -> ArchiveIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    ArchiveIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(unix)]
+fn archive_root_identity_from_fd(
+    fd: &std::os::fd::OwnedFd,
+) -> std::io::Result<ArchiveRootIdentity> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    #[cfg(target_vendor = "apple")]
+    let device = u64::try_from(stat.st_dev)
+        .map_err(|_| std::io::Error::other("archive_root_device_invalid"))?;
+    #[cfg(not(target_vendor = "apple"))]
+    let device = stat.st_dev;
+    Ok(ArchiveRootIdentity {
+        device,
+        inode: stat.st_ino,
+    })
+}
+
+#[cfg(unix)]
+fn pinned_session_directory_identity(
+    directory: &PinnedSessionDirectory,
+) -> std::io::Result<ArchiveIdentity> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(directory.fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    #[cfg(target_vendor = "apple")]
+    let device =
+        u64::try_from(stat.st_dev).map_err(|_| std::io::Error::other("archive_device_invalid"))?;
+    #[cfg(not(target_vendor = "apple"))]
+    let device = stat.st_dev;
+    Ok(ArchiveIdentity {
+        device,
+        inode: stat.st_ino,
+    })
+}
+
+#[cfg(unix)]
+fn archive_identity_at(
+    directory: &PinnedSessionDirectory,
+) -> std::io::Result<Option<ArchiveIdentity>> {
+    use std::os::fd::AsRawFd as _;
+
+    let name = std::ffi::CString::new(ARCHIVE_FILE).expect("archive file is static ASCII");
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.fd.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let stat = unsafe { stat.assume_init() };
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(std::io::Error::other("archive_file_not_regular"));
+    }
+    #[cfg(target_vendor = "apple")]
+    let device =
+        u64::try_from(stat.st_dev).map_err(|_| std::io::Error::other("archive_device_invalid"))?;
+    #[cfg(not(target_vendor = "apple"))]
+    let device = stat.st_dev;
+    Ok(Some(ArchiveIdentity {
+        device,
+        inode: stat.st_ino,
+    }))
 }
 
 #[cfg(unix)]
@@ -296,6 +560,7 @@ fn pin_session_directory_entry(
         return Err(error).context("logs_root directory open failed");
     }
     let root_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_fd) };
+    let root_identity = archive_root_identity_from_fd(&root_fd)?;
     let session_name = std::ffi::CString::new(session_name.as_bytes())
         .map_err(|_| anyhow::anyhow!("session_key_contains_nul"))?;
     if create {
@@ -324,6 +589,7 @@ fn pin_session_directory_entry(
     Ok(Some(PinnedSessionDirectory {
         fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(session_fd) },
         path,
+        root_identity,
     }))
 }
 
@@ -381,7 +647,7 @@ fn regular_entry_exists_at(
 fn atomic_write_archive_at(
     directory: &PinnedSessionDirectory,
     bytes: &[u8],
-) -> std::io::Result<()> {
+) -> std::io::Result<ArchiveIdentity> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -420,19 +686,10 @@ fn atomic_write_archive_at(
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let result = (|| {
             file.write_all(bytes)?;
+            let identity = archive_metadata_identity(&file.metadata()?);
             drop(file);
-            let renamed = unsafe {
-                libc::renameat(
-                    directory.fd.as_raw_fd(),
-                    temp_name.as_ptr(),
-                    directory.fd.as_raw_fd(),
-                    final_name.as_ptr(),
-                )
-            };
-            if renamed != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
+            rename_archive_no_replace_at(directory, &temp_name, &final_name)?;
+            Ok(identity)
         })();
         if result.is_err() {
             let _ = unsafe { libc::unlinkat(directory.fd.as_raw_fd(), temp_name.as_ptr(), 0) };
@@ -446,13 +703,68 @@ fn atomic_write_archive_at(
 }
 
 #[cfg(unix)]
-fn unlink_archive_at(directory: &PinnedSessionDirectory) -> std::io::Result<()> {
+fn rename_archive_no_replace_at(
+    directory: &PinnedSessionDirectory,
+    temp_name: &std::ffi::CStr,
+    final_name: &std::ffi::CStr,
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
+    #[cfg(target_vendor = "apple")]
+    let result = unsafe {
+        libc::renameatx_np(
+            directory.fd.as_raw_fd(),
+            temp_name.as_ptr(),
+            directory.fd.as_raw_fd(),
+            final_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe {
+        libc::renameat2(
+            directory.fd.as_raw_fd(),
+            temp_name.as_ptr(),
+            directory.fd.as_raw_fd(),
+            final_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    let result = -1;
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    let unsupported = true;
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    let unsupported = false;
+
+    if unsupported {
+        return Err(std::io::Error::other(
+            "scrollback_archive_noreplace_rename_unsupported",
+        ));
+    }
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlink_archive_at(
+    directory: &PinnedSessionDirectory,
+    expected: ArchiveIdentity,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let Some(identity) = archive_identity_at(directory)? else {
+        return Ok(false);
+    };
+    if identity != expected {
+        return Err(std::io::Error::other("scrollback_archive_file_replaced"));
+    }
     let name = std::ffi::CString::new(ARCHIVE_FILE).expect("archive file is static ASCII");
     let result = unsafe { libc::unlinkat(directory.fd.as_raw_fd(), name.as_ptr(), 0) };
     if result == 0 {
-        Ok(())
+        Ok(true)
     } else {
         Err(std::io::Error::last_os_error())
     }
@@ -469,6 +781,8 @@ pub struct ArchiveStream {
     path: PathBuf,
     #[cfg(unix)]
     directory: PinnedSessionDirectory,
+    #[cfg(unix)]
+    file_identity: ArchiveIdentity,
 }
 
 impl Read for ArchiveStream {
@@ -510,7 +824,7 @@ impl ArchiveStream {
     fn discard(self) {
         tracing::warn!(path = %self.path.display(), "scrollback 아카이브 손상 — 폐기");
         #[cfg(unix)]
-        let _ = unlink_archive_at(&self.directory);
+        let _ = unlink_archive_at(&self.directory, self.file_identity);
     }
 }
 
@@ -557,8 +871,13 @@ fn collect_archives_with_limit(
         Err(error) => return Err(error).context("logs_root 나열 실패"),
     };
     let mut archives = Vec::new();
+    let mut entries_seen = 0usize;
     for entry in entries {
         let entry = entry.context("logs_root 항목 조회 실패")?;
+        entries_seen = entries_seen.saturating_add(1);
+        if entries_seen > entry_limit {
+            anyhow::bail!("{}", ARCHIVE_SCAN_LIMIT_ERROR);
+        }
         let file_type = entry
             .file_type()
             .with_context(|| format!("세션 디렉터리 유형 조회 실패: {}", entry.path().display()))?;
@@ -570,9 +889,6 @@ fn collect_archives_with_limit(
             continue;
         }
         if let Some(archive) = archive_record(&entry.path())? {
-            if archives.len() >= entry_limit {
-                anyhow::bail!("{}", ARCHIVE_SCAN_LIMIT_ERROR);
-            }
             archives.push(archive);
         }
     }
@@ -585,28 +901,175 @@ struct ArchiveScan {
     complete: bool,
 }
 
+struct ArchiveScanCursor {
+    entries: std::fs::ReadDir,
+    pending: Option<std::fs::DirEntry>,
+    continued: bool,
+    #[cfg(unix)]
+    root_identity: ArchiveIdentity,
+}
+
+const ARCHIVE_SCAN_CURSOR_CAP: usize = 16;
+
+struct ArchiveScanSlot {
+    operation: std::sync::Mutex<()>,
+    cursor: std::sync::Mutex<Option<ArchiveScanCursor>>,
+}
+
+type ArchiveScanSlots =
+    std::sync::Mutex<std::collections::VecDeque<(PathBuf, std::sync::Arc<ArchiveScanSlot>)>>;
+
+fn archive_scan_slots() -> &'static ArchiveScanSlots {
+    static CURSORS: std::sync::OnceLock<ArchiveScanSlots> = std::sync::OnceLock::new();
+    CURSORS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn archive_scan_slot(logs_root: &Path) -> anyhow::Result<std::sync::Arc<ArchiveScanSlot>> {
+    let mut slots = archive_scan_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(position) = slots.iter().position(|(root, _)| root == logs_root) {
+        let (_, slot) = slots
+            .remove(position)
+            .context("archive scan slot disappeared")?;
+        let result = std::sync::Arc::clone(&slot);
+        slots.push_back((logs_root.to_path_buf(), slot));
+        return Ok(result);
+    }
+    if slots.len() >= ARCHIVE_SCAN_CURSOR_CAP {
+        let Some(position) = slots
+            .iter()
+            .position(|(_, slot)| std::sync::Arc::strong_count(slot) == 1)
+        else {
+            anyhow::bail!("scrollback_archive_scan_cursor_capacity");
+        };
+        slots.remove(position);
+    }
+    let slot = std::sync::Arc::new(ArchiveScanSlot {
+        operation: std::sync::Mutex::new(()),
+        cursor: std::sync::Mutex::new(None),
+    });
+    slots.push_back((logs_root.to_path_buf(), std::sync::Arc::clone(&slot)));
+    Ok(slot)
+}
+
+fn reset_archive_scan_cursor(slot: &ArchiveScanSlot) {
+    *slot
+        .cursor
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn create_archive_scan_cursor(logs_root: &Path) -> anyhow::Result<Option<ArchiveScanCursor>> {
+    let before = match std::fs::symlink_metadata(logs_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("logs_root metadata 실패"),
+    };
+    anyhow::ensure!(before.file_type().is_dir(), "logs_root_not_regular");
+    let entries = std::fs::read_dir(logs_root).context("logs_root 나열 실패")?;
+    let after = std::fs::symlink_metadata(logs_root).context("logs_root metadata 재조회 실패")?;
+    anyhow::ensure!(after.file_type().is_dir(), "logs_root_not_regular");
+    #[cfg(unix)]
+    anyhow::ensure!(
+        archive_metadata_identity(&before) == archive_metadata_identity(&after),
+        "logs_root_replaced"
+    );
+    Ok(Some(ArchiveScanCursor {
+        entries,
+        pending: None,
+        continued: false,
+        #[cfg(unix)]
+        root_identity: archive_metadata_identity(&after),
+    }))
+}
+
+#[cfg(unix)]
+fn archive_scan_root_matches(cursor: &ArchiveScanCursor, logs_root: &Path) -> anyhow::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(logs_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("logs_root metadata 실패"),
+    };
+    Ok(metadata.file_type().is_dir()
+        && archive_metadata_identity(&metadata) == cursor.root_identity)
+}
+
 fn scan_archive_batch_with_limit(
+    slot: &ArchiveScanSlot,
     logs_root: &Path,
     entry_limit: usize,
 ) -> anyhow::Result<ArchiveScan> {
-    let entries = match std::fs::read_dir(logs_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let mut cursor = slot
+        .cursor
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(unix)]
+    if let Some(active) = cursor.as_ref()
+        && !archive_scan_root_matches(active, logs_root)?
+    {
+        *cursor = None;
+    }
+    if cursor.is_none() {
+        let Some(created) = create_archive_scan_cursor(logs_root)? else {
             return Ok(ArchiveScan {
                 archives: Vec::new(),
                 directories: Vec::new(),
                 complete: true,
             });
+        };
+        *cursor = Some(created);
+    }
+    let active = cursor.as_mut().context("archive scan cursor missing")?;
+    let result = scan_archive_cursor(active, entry_limit);
+    let mut scan = match result {
+        Ok(scan) => scan,
+        Err(error) => {
+            *cursor = None;
+            return Err(error);
         }
-        Err(error) => return Err(error).context("logs_root 나열 실패"),
     };
+    #[cfg(unix)]
+    if !archive_scan_root_matches(active, logs_root)? {
+        *cursor = None;
+        anyhow::bail!("logs_root_replaced");
+    }
+    if scan.complete && active.continued {
+        scan.complete = false;
+        *cursor = None;
+    } else if scan.complete {
+        *cursor = None;
+    } else {
+        active.continued = true;
+    }
+    Ok(scan)
+}
+
+fn scan_archive_cursor(
+    cursor: &mut ArchiveScanCursor,
+    entry_limit: usize,
+) -> anyhow::Result<ArchiveScan> {
     let mut scan = ArchiveScan {
         archives: Vec::new(),
         directories: Vec::new(),
         complete: true,
     };
-    for entry in entries {
+    let mut entries_seen = 0usize;
+    loop {
+        let entry = match cursor.pending.take() {
+            Some(entry) => Some(Ok(entry)),
+            None => cursor.entries.next(),
+        };
+        let Some(entry) = entry else {
+            break;
+        };
         let entry = entry.context("logs_root 항목 조회 실패")?;
+        entries_seen = entries_seen.saturating_add(1);
+        if entries_seen > entry_limit {
+            cursor.pending = Some(entry);
+            scan.complete = false;
+            break;
+        }
         let file_type = entry
             .file_type()
             .with_context(|| format!("세션 디렉터리 유형 조회 실패: {}", entry.path().display()))?;
@@ -619,10 +1082,6 @@ fn scan_archive_batch_with_limit(
         }
         let directory = entry.path();
         if let Some(archive) = archive_record(&directory)? {
-            if scan.archives.len() >= entry_limit {
-                scan.complete = false;
-                break;
-            }
             scan.archives.push(archive);
             scan.directories.push(directory);
         }
@@ -657,6 +1116,10 @@ fn archive_record(directory: &Path) -> anyhow::Result<Option<ArchiveRecord>> {
             .with_context(|| format!("아카이브 수정시각 조회 실패: {}", path.display()))?,
         bytes: metadata.len(),
         path,
+        #[cfg(unix)]
+        file_identity: archive_metadata_identity(&metadata),
+        #[cfg(unix)]
+        directory_identity: archive_metadata_identity(&directory_metadata),
     }))
 }
 
@@ -687,14 +1150,39 @@ pub fn gc(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<u64> {
 }
 
 fn gc_with_limit(logs_root: &Path, budget_bytes: u64, entry_limit: usize) -> anyhow::Result<u64> {
-    let scan = scan_archive_batch_with_limit(logs_root, entry_limit)?;
+    gc_with_limit_and_hook(logs_root, budget_bytes, entry_limit, |_| {})
+}
+
+fn gc_with_limit_and_hook(
+    logs_root: &Path,
+    budget_bytes: u64,
+    entry_limit: usize,
+    mut before_directory_pin: impl FnMut(&Path),
+) -> anyhow::Result<u64> {
+    let slot = archive_scan_slot(logs_root)?;
+    let _operation = slot
+        .operation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let scan = scan_archive_batch_with_limit(&slot, logs_root, entry_limit)?;
     let mut archives = scan.archives;
     let mut total = archive_total(&archives);
     if total == ARCHIVE_DISK_USAGE_UNKNOWN {
+        reset_archive_scan_cursor(&slot);
         anyhow::bail!("scrollback_archive_byte_total_overflow");
     }
     if !scan.complete {
-        remove_archives_until_budget(logs_root, &mut total, archives, 0, true);
+        remove_archives_until_budget_with_hook(
+            logs_root,
+            &mut total,
+            archives,
+            0,
+            true,
+            &mut before_directory_pin,
+        );
+        if total > 0 {
+            reset_archive_scan_cursor(&slot);
+        }
         for directory in scan.directories {
             let _ = std::fs::remove_dir(directory);
         }
@@ -704,7 +1192,14 @@ fn gc_with_limit(logs_root: &Path, budget_bytes: u64, entry_limit: usize) -> any
         return Ok(total);
     }
     archives.sort_by_key(|archive| archive.modified);
-    remove_archives_until_budget(logs_root, &mut total, archives, budget_bytes, false);
+    remove_archives_until_budget_with_hook(
+        logs_root,
+        &mut total,
+        archives,
+        budget_bytes,
+        false,
+        &mut before_directory_pin,
+    );
     if total > budget_bytes {
         anyhow::bail!("scrollback_archive_gc_budget_unmet");
     }
@@ -718,12 +1213,13 @@ fn archive_total(archives: &[ArchiveRecord]) -> u64 {
         .unwrap_or(ARCHIVE_DISK_USAGE_UNKNOWN)
 }
 
-fn remove_archives_until_budget(
+fn remove_archives_until_budget_with_hook(
     logs_root: &Path,
     total: &mut u64,
     archives: Vec<ArchiveRecord>,
     budget_bytes: u64,
     force_all: bool,
+    mut before_directory_pin: impl FnMut(&Path),
 ) {
     for archive in archives {
         if !force_all && *total <= budget_bytes {
@@ -733,16 +1229,23 @@ fn remove_archives_until_budget(
             tracing::warn!(path = %archive.path.display(), "아카이브 GC 세션 경로 없음");
             continue;
         };
+        let directory_path = archive
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        before_directory_pin(&directory_path);
         #[cfg(unix)]
         let removal = pin_session_directory_entry(logs_root, session_name, false).and_then(|dir| {
             let Some(dir) = dir else {
                 return Ok(false);
             };
-            match unlink_archive_at(&dir) {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(error).context("scrollback archive GC remove failed"),
-            }
+            anyhow::ensure!(
+                pinned_session_directory_identity(&dir)? == archive.directory_identity,
+                "scrollback_archive_directory_replaced"
+            );
+            unlink_archive_at(&dir, archive.file_identity)
+                .context("scrollback archive GC remove failed")
         });
         #[cfg(not(unix))]
         let removal: anyhow::Result<bool> = Err(anyhow::anyhow!(
@@ -755,6 +1258,7 @@ fn remove_archives_until_budget(
             }
             Ok(false) => {
                 *total = total.saturating_sub(archive.bytes);
+                tracing::info!(path = %archive.path.display(), "아카이브 GC 대상 사라짐 — 회계 제거");
             }
             Err(e) => {
                 tracing::warn!(path = %archive.path.display(), "아카이브 GC 삭제 실패: {e:#}")
@@ -1047,19 +1551,35 @@ mod tests {
         let pinned_dir = root.join("pinned-session");
         std::fs::create_dir_all(&session_dir).unwrap();
 
-        write_with_session_hook(&root, "session", &meta(), b"pinned", || {
+        let result = write_with_session_hook(&root, "session", &meta(), b"pinned", || {
             std::fs::rename(&session_dir, &pinned_dir).unwrap();
             symlink(&outside, &session_dir).unwrap();
-        })
-        .unwrap();
+        });
 
-        assert!(pinned_dir.join(ARCHIVE_FILE).is_file());
+        assert!(result.is_err(), "a replaced logs root must fail the write");
+        assert!(!pinned_dir.join(ARCHIVE_FILE).exists());
         assert!(!outside.join(ARCHIVE_FILE).exists());
         std::fs::remove_file(&session_dir).unwrap();
         std::fs::rename(&pinned_dir, &session_dir).unwrap();
-        assert_eq!(read(&root, "session").unwrap().unwrap().1, b"pinned");
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_receipt_rolls_back_original_inode_after_root_replacement() {
+        let root = temp_root();
+        let receipt = write_receipt(&root, "session", &meta(), b"archive").unwrap();
+        let old_root = root.with_extension("old");
+        std::fs::rename(&root, &old_root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let removed = remove_written(&root, "session", receipt).unwrap();
+
+        assert!(removed);
+        assert!(!old_root.join("session").join(ARCHIVE_FILE).exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(old_root).unwrap();
     }
 
     #[cfg(unix)]
@@ -1117,6 +1637,76 @@ mod tests {
         std::fs::remove_dir_all(pinned_dir).unwrap();
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_write_does_not_replace_existing_archive() {
+        let root = temp_root();
+        let first = vec![b'a'; 1024];
+        write(&root, "session", &meta(), &first).unwrap();
+        let path = archive_path(&root, "session").unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let result = write(&root, "session", &meta(), b"replacement");
+
+        assert!(
+            result.is_err(),
+            "immutable archive publish must not replace"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_stream_discard_does_not_remove_replacement_archive() {
+        let root = temp_root();
+        let path = archive_path(&root, "session").unwrap();
+        write(&root, "session", &meta(), &vec![b'x'; 4096]).unwrap();
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged.truncate(HEADER_LEN + 2);
+        std::fs::write(&path, damaged).unwrap();
+        let stream = open(&root, "session").unwrap().unwrap();
+        let moved = root.join("session").join("damaged-original");
+        std::fs::rename(&path, &moved).unwrap();
+        write(&root, "session", &meta(), b"replacement").unwrap();
+        let replacement = std::fs::read(&path).unwrap();
+
+        assert!(!stream.finish());
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        assert!(moved.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_gc_rejects_session_directory_replacement_before_repin() {
+        let root = temp_root();
+        let original_bytes = write(&root, "session", &meta(), b"original").unwrap();
+        let mut records = collect_archives_with_limit(&root, 16).unwrap();
+        let session = root.join("session");
+        let moved_session = root.join("moved-session");
+        let mut total = archive_total(&records);
+
+        remove_archives_until_budget_with_hook(
+            &root,
+            &mut total,
+            std::mem::take(&mut records),
+            0,
+            true,
+            |directory| {
+                if directory == session {
+                    std::fs::rename(&session, &moved_session).unwrap();
+                    write(&root, "session", &meta(), b"replacement").unwrap();
+                }
+            },
+        );
+
+        assert_eq!(total, original_bytes);
+        assert!(moved_session.join(ARCHIVE_FILE).exists());
+        assert!(session.join(ARCHIVE_FILE).exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1226,21 +1816,73 @@ mod tests {
     }
 
     #[test]
-    fn non_archive_directories_do_not_starve_bounded_scan() {
+    fn non_archive_directories_consume_bounded_scan_budget() {
         let root = temp_root();
-        for index in 0..=ARCHIVE_SCAN_ENTRY_LIMIT {
+        for index in 0..5 {
             let dir = root.join(format!("noise-{index}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("redacted.plain.txt"), b"ignored").unwrap();
         }
-        let archive_dir = root.join("session");
-        std::fs::create_dir_all(&archive_dir).unwrap();
-        std::fs::write(archive_dir.join(ARCHIVE_FILE), b"archive").unwrap();
 
-        let archives = collect_archives_with_limit(&root, 1).unwrap();
+        let error = match collect_archives_with_limit(&root, 4) {
+            Ok(_) => panic!("expected scan entry limit error"),
+            Err(error) => error,
+        };
 
-        assert_eq!(archives.len(), 1);
+        assert_eq!(error.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
+        assert_eq!(scan_total_with_limit(&root, 4), ARCHIVE_DISK_USAGE_UNKNOWN);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_gc_advances_past_non_archive_batches() {
+        let root = temp_root();
+        for index in 0..5 {
+            let directory = root.join(format!("noise-{index}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("redacted.plain.txt"), b"ignored").unwrap();
+        }
+        write(&root, "session", &meta(), b"remove-me").unwrap();
+        let archive = archive_path(&root, "session").unwrap();
+
+        let mut reported_success = false;
+        for _ in 0..16 {
+            if matches!(gc_with_limit(&root, 0, 2), Ok(0)) {
+                reported_success = true;
+                break;
+            }
+        }
+
+        assert!(!archive.exists());
+        assert!(
+            !reported_success,
+            "an over-limit noise tree cannot produce a complete usage snapshot"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_gc_discards_cursor_after_logs_root_replacement() {
+        let root = temp_root();
+        for index in 0..3 {
+            std::fs::create_dir_all(root.join(format!("noise-{index}"))).unwrap();
+        }
+        assert!(gc_with_limit(&root, 0, 2).is_err());
+        let old_root = root.with_extension("old");
+        std::fs::rename(&root, &old_root).unwrap();
+        write(&root, "replacement-session", &meta(), b"remove-me").unwrap();
+        let replacement_archive = archive_path(&root, "replacement-session").unwrap();
+
+        let result = gc_with_limit(&root, 0, 2);
+
+        assert_eq!(result.unwrap(), 0);
+        assert!(
+            !replacement_archive.exists(),
+            "a stale cursor must not publish usage for a replacement root"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(old_root).unwrap();
     }
 
     #[test]
@@ -1272,6 +1914,65 @@ mod tests {
             paths.iter().all(|path| !path.exists()),
             "repeated bounded passes must eventually recover"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_gc_restarts_after_failed_batch_cleanup() {
+        let root = temp_root();
+        let mut paths = Vec::new();
+        for index in 0..3 {
+            write(&root, &format!("session-{index}"), &meta(), b"archive").unwrap();
+            paths.push(archive_path(&root, &format!("session-{index}")).unwrap());
+        }
+        let mut swapped = None;
+
+        let first = gc_with_limit_and_hook(&root, 0, 2, |directory| {
+            if swapped.is_none() {
+                let session = directory
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap()
+                    .to_owned();
+                let moved = root.join("moved-session");
+                std::fs::rename(directory, &moved).unwrap();
+                write(&root, &session, &meta(), b"replacement").unwrap();
+                swapped = Some((directory.to_path_buf(), moved));
+            }
+        });
+
+        assert!(first.is_err());
+        let (session, moved) = swapped.expect("cleanup hook must replace one session");
+        std::fs::remove_dir_all(&session).unwrap();
+        std::fs::rename(moved, session).unwrap();
+        for _ in 0..8 {
+            if matches!(gc_with_limit(&root, 0, 2), Ok(0)) {
+                break;
+            }
+        }
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "a failed incomplete batch must be rescanned before GC reports success"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_subtracts_archive_that_disappears_before_unlink() {
+        let root = temp_root();
+        let bytes = write(&root, "session", &meta(), b"archive").unwrap();
+        let records = collect_archives_with_limit(&root, 16).unwrap();
+        let path = archive_path(&root, "session").unwrap();
+        let mut total = archive_total(&records);
+
+        remove_archives_until_budget_with_hook(&root, &mut total, records, 0, false, |_| {
+            std::fs::remove_file(&path).unwrap()
+        });
+
+        assert_eq!(total, 0, "a disappeared archive no longer consumes budget");
+        assert!(bytes > 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1343,11 +2044,31 @@ mod tests {
                 modified: std::time::UNIX_EPOCH,
                 bytes: u64::MAX,
                 path: PathBuf::from("first"),
+                #[cfg(unix)]
+                file_identity: ArchiveIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+                #[cfg(unix)]
+                directory_identity: ArchiveIdentity {
+                    device: 0,
+                    inode: 0,
+                },
             },
             ArchiveRecord {
                 modified: std::time::UNIX_EPOCH,
                 bytes: 1,
                 path: PathBuf::from("second"),
+                #[cfg(unix)]
+                file_identity: ArchiveIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+                #[cfg(unix)]
+                directory_identity: ArchiveIdentity {
+                    device: 0,
+                    inode: 0,
+                },
             },
         ];
 

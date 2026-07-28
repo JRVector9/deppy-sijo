@@ -255,7 +255,8 @@ impl InProcessRuntimeClient {
                 // 증분 예산 캐시 시드 — 이전 실행/재시작이 남긴 디스크 아카이브 총량을
                 // 워커당 1회 읽기 전용 스캔으로 복원한다 (A1 리뷰 P2). 이후 exit는
                 // 이 캐시에 증분만 더하고 예산 초과 시에만 전체 스캔(gc)한다.
-                let archive_disk_bytes = storage::scrollback_archive::scan_total(&logs_root);
+                let (archive_disk_bytes, archive_root_identity) =
+                    scan_archive_usage_snapshot(&logs_root);
                 Worker {
                     command_rx,
                     subscribers: worker_subscribers,
@@ -290,6 +291,7 @@ impl InProcessRuntimeClient {
                     archived_order: std::collections::VecDeque::new(),
                     archived_on_disk: std::collections::HashSet::new(),
                     archive_disk_bytes,
+                    archive_root_identity,
                     hidden_scrollback: std::collections::HashSet::new(),
                     render_active: true,
                     suspended: false,
@@ -711,6 +713,9 @@ struct Worker {
     /// 시드하고, 기록 성공마다 그 파일 크기만 더한다. 예산 초과가 확정될 때만 gc를
     /// 호출(그때만 전체 디렉터리 스캔+제거)해 매 exit 전체 스캔 비용을 없앤다.
     archive_disk_bytes: u64,
+    /// `archive_disk_bytes`를 측정한 logs_root의 dev/inode. root가 교체되면 증분값을
+    /// 폐기하고 fresh GC 스캔이 성공하기 전까지 신규 기록을 회계하지 않는다.
+    archive_root_identity: Option<storage::scrollback_archive::ArchiveRootIdentity>,
     /// 현재 hidden scrollback cap이 적용된 running 세션들 (§14.3) — 전이 감지용.
     hidden_scrollback: std::collections::HashSet<SessionId>,
     /// Active면 visible pane snapshot 생성, false(Warm 등)면 중단 (§14.1). 세션은 유지.
@@ -758,6 +763,49 @@ fn archive_kind_from_u8(byte: u8) -> session::SessionKind {
 /// 단위 테스트로 "스캔 없이 정확히 감지"를 검증한다.
 fn archive_cache_needs_gc(cached_bytes: u64, written_len: u64, budget: u64) -> bool {
     cached_bytes.saturating_add(written_len) > budget
+}
+
+fn scan_archive_usage_snapshot(
+    logs_root: &std::path::Path,
+) -> (
+    u64,
+    Option<storage::scrollback_archive::ArchiveRootIdentity>,
+) {
+    let Ok(before) = storage::scrollback_archive::root_identity(logs_root) else {
+        return (
+            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN,
+            None,
+        );
+    };
+    let total = storage::scrollback_archive::scan_total(logs_root);
+    let Ok(after) = storage::scrollback_archive::root_identity(logs_root) else {
+        return (
+            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN,
+            None,
+        );
+    };
+    if before == after {
+        (total, after)
+    } else {
+        (
+            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN,
+            after,
+        )
+    }
+}
+
+fn gc_archive_usage_snapshot(
+    logs_root: &std::path::Path,
+    budget: u64,
+) -> anyhow::Result<(
+    u64,
+    Option<storage::scrollback_archive::ArchiveRootIdentity>,
+)> {
+    let before = storage::scrollback_archive::root_identity(logs_root)?;
+    let total = storage::scrollback_archive::gc(logs_root, budget)?;
+    let after = storage::scrollback_archive::root_identity(logs_root)?;
+    anyhow::ensure!(before == after, "scrollback_archive_root_replaced");
+    Ok((total, after))
 }
 
 /// 압축 아카이브 항목 — 백엔드를 내린 exited 세션의 복원 재료 (§14.3 확장).
@@ -3237,21 +3285,15 @@ impl Worker {
         else {
             return; // 비영속 세션 — 메모리 아카이브만
         };
-        if self.archive_disk_bytes == storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN {
-            match storage::scrollback_archive::gc(
-                &self.logs_root,
+        if !self.refresh_archive_root_identity() {
+            return;
+        }
+        if self.archive_disk_bytes == storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN
+            && !self.reconcile_archive_disk_usage(
                 storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES,
-            ) {
-                Ok(total) => self.archive_disk_bytes = total,
-                Err(error) => {
-                    trace_runtime_failure(
-                        "scrollback_archive_gc",
-                        "scrollback_archive_gc_failed",
-                        error,
-                    );
-                    return;
-                }
-            }
+            )
+        {
+            return;
         }
         if storage::scrollback_archive::exists(&self.logs_root, &key) {
             self.archived_on_disk.insert(session);
@@ -3284,8 +3326,8 @@ impl Worker {
                 session::SessionLifecycle::Running => None,
             },
         };
-        match storage::scrollback_archive::write(&self.logs_root, &key, &meta, &redacted) {
-            Ok(written_len) => self.finish_archive_write(session, &key, written_len),
+        match storage::scrollback_archive::write_receipt(&self.logs_root, &key, &meta, &redacted) {
+            Ok(receipt) => self.finish_archive_write(session, &key, receipt),
             Err(error) => trace_runtime_failure(
                 "scrollback_archive_write",
                 "scrollback_archive_write_failed",
@@ -3294,18 +3336,85 @@ impl Worker {
         }
     }
 
-    fn finish_archive_write(&mut self, session: SessionId, key: &str, written_len: u64) {
-        let accounted = self.account_archive_write(written_len);
-        if accounted && storage::scrollback_archive::exists(&self.logs_root, key) {
+    fn finish_archive_write(
+        &mut self,
+        session: SessionId,
+        key: &str,
+        receipt: storage::scrollback_archive::ArchiveWriteReceipt,
+    ) {
+        let accounted = self.account_archive_write(receipt.bytes());
+        let current =
+            match storage::scrollback_archive::written_is_current(&self.logs_root, key, &receipt) {
+                Ok(current) => current,
+                Err(error) => {
+                    trace_runtime_failure(
+                        "scrollback_archive_revalidate",
+                        "scrollback_archive_revalidate_failed",
+                        error,
+                    );
+                    false
+                }
+            };
+        if accounted && current {
             self.archived_on_disk.insert(session);
-        } else if !accounted
-            && let Err(error) = storage::scrollback_archive::remove(&self.logs_root, key)
-        {
-            trace_runtime_failure(
-                "scrollback_archive_rollback",
-                "scrollback_archive_rollback_failed",
-                error,
-            );
+        } else {
+            if !current {
+                self.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                self.archive_root_identity =
+                    storage::scrollback_archive::root_identity(&self.logs_root)
+                        .ok()
+                        .flatten();
+            }
+            if let Err(error) =
+                storage::scrollback_archive::remove_written(&self.logs_root, key, receipt)
+            {
+                trace_runtime_failure(
+                    "scrollback_archive_rollback",
+                    "scrollback_archive_rollback_failed",
+                    error,
+                );
+            }
+        }
+    }
+
+    fn refresh_archive_root_identity(&mut self) -> bool {
+        match storage::scrollback_archive::root_identity(&self.logs_root) {
+            Ok(current) => {
+                if current != self.archive_root_identity {
+                    self.archive_root_identity = current;
+                    self.archive_disk_bytes =
+                        storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                }
+                true
+            }
+            Err(error) => {
+                trace_runtime_failure(
+                    "scrollback_archive_root_identity",
+                    "scrollback_archive_root_identity_failed",
+                    error,
+                );
+                self.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                false
+            }
+        }
+    }
+
+    fn reconcile_archive_disk_usage(&mut self, budget: u64) -> bool {
+        match gc_archive_usage_snapshot(&self.logs_root, budget) {
+            Ok((total, identity)) => {
+                self.archive_disk_bytes = total;
+                self.archive_root_identity = identity;
+                true
+            }
+            Err(error) => {
+                trace_runtime_failure(
+                    "scrollback_archive_gc",
+                    "scrollback_archive_gc_failed",
+                    error,
+                );
+                self.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                false
+            }
         }
     }
 
@@ -3315,23 +3424,11 @@ impl Worker {
     /// "지금까지 존재한 세션 수"에 비례하는 문제를 없앤다.
     fn account_archive_write(&mut self, written_len: u64) -> bool {
         let budget = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
+        if !self.refresh_archive_root_identity() {
+            return false;
+        }
         if archive_cache_needs_gc(self.archive_disk_bytes, written_len, budget) {
-            match storage::scrollback_archive::gc(&self.logs_root, budget) {
-                Ok(total) => {
-                    self.archive_disk_bytes = total;
-                    true
-                }
-                Err(error) => {
-                    trace_runtime_failure(
-                        "scrollback_archive_gc",
-                        "scrollback_archive_gc_failed",
-                        error,
-                    );
-                    self.archive_disk_bytes =
-                        storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
-                    false
-                }
-            }
+            self.reconcile_archive_disk_usage(budget)
         } else {
             self.archive_disk_bytes = self.archive_disk_bytes.saturating_add(written_len);
             true
@@ -3981,6 +4078,9 @@ mod tests {
             render_bound: false,
         }]));
         let logs_root = test_logs_root(name);
+        let archive_root_identity = storage::scrollback_archive::root_identity(&logs_root)
+            .ok()
+            .flatten();
         (
             Worker {
                 command_rx,
@@ -4011,6 +4111,7 @@ mod tests {
                 archived_order: std::collections::VecDeque::new(),
                 archived_on_disk: std::collections::HashSet::new(),
                 archive_disk_bytes: 0,
+                archive_root_identity,
                 hidden_scrollback: std::collections::HashSet::new(),
                 render_active: true,
                 suspended: false,
@@ -6607,6 +6708,64 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn archive_cache_revalidates_replaced_logs_root_before_incrementing() {
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "archive-root-cache-replacement",
+        );
+        worker.archive_disk_bytes = 0;
+        worker.archive_root_identity =
+            storage::scrollback_archive::root_identity(&worker.logs_root).unwrap();
+        let old_root = worker.logs_root.with_extension("old");
+        std::fs::rename(&worker.logs_root, &old_root).unwrap();
+        let seeded = worker.logs_root.join("seed").join("scrollback.zlib");
+        std::fs::create_dir_all(seeded.parent().unwrap()).unwrap();
+        let seeded_file = std::fs::File::create(&seeded).unwrap();
+        seeded_file
+            .set_len(storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES)
+            .unwrap();
+        seeded_file
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+        let key = "trigger";
+        let receipt = storage::scrollback_archive::write_receipt(
+            &worker.logs_root,
+            key,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            b"new archive",
+        )
+        .unwrap();
+        let written = receipt.bytes();
+        let session = SessionId(100);
+
+        worker.finish_archive_write(session, key, receipt);
+
+        assert!(
+            !seeded.exists(),
+            "fresh GC must account the replacement root"
+        );
+        assert!(storage::scrollback_archive::exists(&worker.logs_root, key));
+        assert!(worker.archived_on_disk.contains(&session));
+        assert_eq!(worker.archive_disk_bytes, written);
+        assert_eq!(
+            worker.archive_root_identity,
+            storage::scrollback_archive::root_identity(&worker.logs_root).unwrap()
+        );
+        std::fs::remove_dir_all(&worker.logs_root).unwrap();
+        std::fs::remove_dir_all(old_root).unwrap();
+    }
+
     #[test]
     fn oversized_archive_dump_is_rejected_before_redaction() {
         let production = include_str!("in_process.rs")
@@ -6651,7 +6810,7 @@ mod tests {
         )
         .unwrap();
         let key = "new";
-        let written_len = storage::scrollback_archive::write(
+        let receipt = storage::scrollback_archive::write_receipt(
             &worker.logs_root,
             key,
             &storage::scrollback_archive::ArchiveMeta {
@@ -6667,7 +6826,7 @@ mod tests {
         worker.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
         let session = SessionId(99);
 
-        worker.finish_archive_write(session, key, written_len);
+        worker.finish_archive_write(session, key, receipt);
 
         std::fs::set_permissions(
             old_path.parent().unwrap(),

@@ -5451,106 +5451,6 @@ struct WorkspaceRuntime {
     pending_replay_resync: bool,
 }
 
-#[derive(Clone)]
-struct WorkspaceGitLabelCacheEntry {
-    checked_at: std::time::Instant,
-    last_accessed: std::time::Instant,
-    label: Option<String>,
-}
-
-const WORKSPACE_GIT_LABEL_CACHE_CAP: usize = 256;
-const WORKSPACE_GIT_LABEL_CACHE_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(2);
-
-#[derive(Default)]
-struct WorkspaceGitLabelCache {
-    entries: std::collections::HashMap<String, WorkspaceGitLabelCacheEntry>,
-}
-
-impl WorkspaceGitLabelCache {
-    fn get_fresh(&mut self, path: &str, now: std::time::Instant) -> Option<Option<String>> {
-        let entry = self.entries.get_mut(path)?;
-        if now.duration_since(entry.checked_at) >= WORKSPACE_GIT_LABEL_CACHE_FRESHNESS {
-            return None;
-        }
-        entry.last_accessed = now;
-        Some(entry.label.clone())
-    }
-
-    fn insert(&mut self, path: String, label: Option<String>, now: std::time::Instant) {
-        if let Some(entry) = self.entries.get_mut(&path) {
-            entry.checked_at = now;
-            entry.last_accessed = now;
-            entry.label = label;
-            return;
-        }
-        while self.entries.len() >= WORKSPACE_GIT_LABEL_CACHE_CAP {
-            let Some(oldest_path) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_accessed)
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            self.entries.remove(&oldest_path);
-        }
-        self.entries.insert(
-            path,
-            WorkspaceGitLabelCacheEntry {
-                checked_at: now,
-                last_accessed: now,
-                label,
-            },
-        );
-    }
-
-    #[cfg(test)]
-    fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-fn workspace_git_label(path: &str) -> Option<String> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<WorkspaceGitLabelCache>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(WorkspaceGitLabelCache::default()));
-    let now = std::time::Instant::now();
-    if let Ok(mut entries) = cache.lock()
-        && let Some(label) = entries.get_fresh(path, now)
-    {
-        return label;
-    }
-
-    let root = std::path::Path::new(path);
-    let dot_git = root.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        Some(dot_git)
-    } else {
-        std::fs::read_to_string(&dot_git).ok().and_then(|contents| {
-            let relative = contents.trim().strip_prefix("gitdir:")?.trim();
-            let candidate = std::path::PathBuf::from(relative);
-            Some(if candidate.is_absolute() {
-                candidate
-            } else {
-                root.join(candidate)
-            })
-        })
-    };
-    let label = git_dir.and_then(|git_dir| {
-        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-        let head = head.trim();
-        let branch = head
-            .strip_prefix("ref: refs/heads/")
-            .map(str::to_owned)
-            .unwrap_or_else(|| head.chars().take(7).collect());
-        Some(branch)
-    });
-    if let Ok(mut entries) = cache.lock() {
-        entries.insert(path.to_owned(), label.clone(), std::time::Instant::now());
-    }
-    label
-}
-
 fn claude_usage_snapshot() -> Option<(u8, u8)> {
     type Cache = Option<(std::time::Instant, Option<(u8, u8)>)>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
@@ -16902,7 +16802,6 @@ impl eframe::App for App {
                 ui::file_tree::SidebarWorkspaceEntry {
                     id: workspace.id.clone(),
                     name: Self::workspace_display_name(workspace),
-                    repo: workspace_git_label(&workspace.path),
                     state,
                     summary,
                 }
@@ -19508,46 +19407,6 @@ mod tests {
                 }
             ) if failed_operation == operation_id
         ));
-    }
-
-    #[test]
-    fn workspace_git_label_cache_evicts_oldest_accessed_entry_at_cap() {
-        let now = std::time::Instant::now();
-        let mut cache = WorkspaceGitLabelCache::default();
-        for idx in 0..WORKSPACE_GIT_LABEL_CACHE_CAP {
-            cache.insert(
-                format!("path-{idx}"),
-                Some(format!("branch-{idx}")),
-                now + std::time::Duration::from_nanos(idx as u64),
-            );
-        }
-
-        assert_eq!(
-            cache.get_fresh("path-0", now + std::time::Duration::from_millis(1)),
-            Some(Some("branch-0".to_owned()))
-        );
-        cache.insert(
-            format!("path-{WORKSPACE_GIT_LABEL_CACHE_CAP}"),
-            Some(format!("branch-{WORKSPACE_GIT_LABEL_CACHE_CAP}")),
-            now + std::time::Duration::from_millis(2),
-        );
-
-        assert_eq!(cache.entry_count(), WORKSPACE_GIT_LABEL_CACHE_CAP);
-        assert_eq!(
-            cache.get_fresh("path-0", now + std::time::Duration::from_millis(3)),
-            Some(Some("branch-0".to_owned()))
-        );
-        assert_eq!(
-            cache.get_fresh("path-1", now + std::time::Duration::from_millis(3)),
-            None
-        );
-        assert_eq!(
-            cache.get_fresh(
-                &format!("path-{WORKSPACE_GIT_LABEL_CACHE_CAP}"),
-                now + std::time::Duration::from_millis(3)
-            ),
-            Some(Some(format!("branch-{WORKSPACE_GIT_LABEL_CACHE_CAP}")))
-        );
     }
 
     #[test]

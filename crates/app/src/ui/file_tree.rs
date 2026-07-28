@@ -52,7 +52,6 @@ pub enum SidebarWorkspaceState {
 pub struct SidebarWorkspaceEntry {
     pub id: String,
     pub name: String,
-    pub repo: Option<String>,
     pub state: SidebarWorkspaceState,
     pub summary: SidebarSessionSummary,
 }
@@ -3442,10 +3441,6 @@ pub enum ShellKind {
     Cmd,
 }
 
-fn paint_git_branch_icon(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
-    ui.painter().rect_filled(rect, 0.0, color);
-}
-
 /// 세션 행을 painter로 직접 그린다 (2026-07-06 목업 반영). 상태를 이모지 글리프로
 /// 쓰면 폰트(AppleGothic)에 ⏳/✋/▸/◆ 글리프가 없어 □(두부)로 깨진다 — 색 점·삼각형·
 /// 마름모를 도형으로 그려 회피한다. 선택 시 액센트 배경 + 좌측 레일, agent는 레일 표시,
@@ -3459,11 +3454,7 @@ fn workspace_row(
     catalog: &i18n::Catalog,
 ) -> egui::Response {
     // 2026-07-26 사용자: 워크스페이스 헤더와 아바타를 다시 10% 축소한다.
-    let has_repo = workspace
-        .repo
-        .as_deref()
-        .is_some_and(|repo| !repo.is_empty());
-    let row_height = if has_repo { 34.0 } else { 29.19 };
+    let row_height = 29.19;
     let (full_rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_height),
         egui::Sense::click(),
@@ -3551,43 +3542,11 @@ fn workspace_row(
                 None,
             );
             let text_x = avatar.right() + 7.65;
-            let name_center_y = if has_repo {
-                rect.center().y - 7.2
-            } else {
-                rect.center().y
-            };
             ui.painter().galley(
-                egui::pos2(text_x, name_center_y - name.size().y / 2.0),
+                egui::pos2(text_x, rect.center().y - name.size().y / 2.0),
                 name,
                 ui.visuals().text_color(),
             );
-            if let Some(repo) = workspace.repo.as_deref().filter(|repo| !repo.is_empty()) {
-                let branch_icon_size = 3.0;
-                let branch_gap = 3.0;
-                let branch_text_x = text_x + branch_icon_size + branch_gap;
-                let repo = clipped_line(
-                    ui,
-                    repo,
-                    crate::fonts::sidebar_font(10.5),
-                    (name_width - branch_icon_size - branch_gap).max(4.0),
-                    None,
-                );
-                let repo_y = rect.center().y + 1.8;
-                let branch_icon_center_y = repo_y + repo.size().y / 2.0;
-                paint_git_branch_icon(
-                    ui,
-                    egui::Rect::from_center_size(
-                        egui::pos2(text_x + branch_icon_size / 2.0, branch_icon_center_y),
-                        egui::vec2(branch_icon_size, branch_icon_size),
-                    ),
-                    ui.visuals().weak_text_color(),
-                );
-                ui.painter().galley(
-                    egui::pos2(branch_text_x, repo_y),
-                    repo,
-                    ui.visuals().weak_text_color(),
-                );
-            }
         }
     }
     if show_summary {
@@ -5774,7 +5733,6 @@ mod tests {
             .map(|index| SidebarWorkspaceEntry {
                 id: format!("stable-id-{index}"),
                 name: format!("same-{index}"),
-                repo: None,
                 state: SidebarWorkspaceState::Idle,
                 summary: SidebarSessionSummary::default(),
             })
@@ -5816,7 +5774,6 @@ mod tests {
         let workspaces = ["first", "second", "third"].map(|id| SidebarWorkspaceEntry {
             id: id.to_owned(),
             name: id.to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Idle,
             summary: SidebarSessionSummary::default(),
         });
@@ -6647,7 +6604,6 @@ mod tests {
         let workspaces = vec![SidebarWorkspaceEntry {
             id: "workspace-a".to_owned(),
             name: "Workspace A".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Active,
             summary: SidebarSessionSummary::default(),
         }];
@@ -7219,7 +7175,6 @@ mod tests {
             .map(|i| SidebarWorkspaceEntry {
                 id: format!("ws-{i}"),
                 name: format!("workspace-{i}"),
-                repo: None,
                 state: SidebarWorkspaceState::Idle,
                 summary: SidebarSessionSummary::default(),
             })
@@ -7373,14 +7328,12 @@ mod tests {
             SidebarWorkspaceEntry {
                 id: "workspace-a".to_owned(),
                 name: "Workspace A".to_owned(),
-                repo: None,
                 state: SidebarWorkspaceState::Active,
                 summary: SidebarSessionSummary::default(),
             },
             SidebarWorkspaceEntry {
                 id: "workspace-b".to_owned(),
                 name: "Workspace B".to_owned(),
-                repo: None,
                 state: SidebarWorkspaceState::Warm,
                 summary: SidebarSessionSummary::default(),
             },
@@ -7521,7 +7474,6 @@ mod tests {
             .map(|i| SidebarWorkspaceEntry {
                 id: format!("ws-{i}"),
                 name: format!("workspace-{i}"),
-                repo: None,
                 state: SidebarWorkspaceState::Idle,
                 summary: SidebarSessionSummary::default(),
             })
@@ -7763,7 +7715,6 @@ mod tests {
         let workspaces = vec![SidebarWorkspaceEntry {
             id: "ws-close".to_owned(),
             name: "closer".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Active,
             summary: SidebarSessionSummary::default(),
         }];
@@ -7782,7 +7733,6 @@ mod tests {
         let workspace = SidebarWorkspaceEntry {
             id: "ws-close".to_owned(),
             name: "closer".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Warm,
             summary: SidebarSessionSummary::default(),
         };
@@ -7813,7 +7763,6 @@ mod tests {
         let workspace = SidebarWorkspaceEntry {
             id: "ws-rename".to_owned(),
             name: "sleeper".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Idle,
             summary: SidebarSessionSummary::inactive(0),
         };
@@ -7843,7 +7792,6 @@ mod tests {
         let workspaces = vec![SidebarWorkspaceEntry {
             id: "ws-idle".to_owned(),
             name: "sleeper".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Idle,
             summary: SidebarSessionSummary::inactive(0),
         }];
@@ -7870,7 +7818,6 @@ mod tests {
         let workspace = SidebarWorkspaceEntry {
             id: "ws-narrow".to_owned(),
             name: "narrow".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Active,
             summary: SidebarSessionSummary::default(),
         };

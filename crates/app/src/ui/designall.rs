@@ -14,6 +14,7 @@ pub struct Tokens {
 }
 
 pub const STRUCTURAL_CORNER_RADIUS: u8 = 0;
+#[allow(dead_code)]
 pub const INTERACTION_CORNER_RADIUS: u8 = 4;
 pub const NAV_RAIL_WIDTH: f32 = 88.0;
 pub const SEPARATOR_WIDTH: f32 = 1.0;
@@ -71,11 +72,14 @@ pub fn apply_workspace_visuals(ui: &mut egui::Ui) {
     let tokens = tokens(ui.visuals());
     let visuals = ui.visuals_mut();
     visuals.override_text_color = Some(tokens.text);
+    visuals.weak_text_color = Some(tokens.muted_text);
     visuals.panel_fill = tokens.app_background;
     visuals.window_fill = tokens.app_background;
     visuals.extreme_bg_color = tokens.input_background;
     visuals.faint_bg_color = tokens.hover_background;
     visuals.hyperlink_color = tokens.accent;
+    visuals.warn_fg_color = tokens.warning;
+    visuals.error_fg_color = tokens.error;
     visuals.selection.bg_fill = tokens.accent;
     visuals.selection.stroke = egui::Stroke::new(1.0, tokens.accent);
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, tokens.separator);

@@ -217,7 +217,11 @@ git commit -m "feat(ui): add DesignALL presentation tokens"
 
 - [ ] **Step 1: Replace obsolete lower-navigation tests with a failing shell test**
 
-Delete tests tied to `navigation_section_height` and add a harness that records the remaining width after `tree.panel(...)`. Assert that it consumes at least `designall::NAV_RAIL_WIDTH + 40.0`, while the existing four-action navigation test remains unchanged.
+Delete tests tied to `navigation_section_height` and add a harness that reads egui's persisted
+`PanelState` for the two required panel IDs. Assert that the dedicated navigation panel is exactly
+`designall::NAV_RAIL_WIDTH` and that the project/file panel remains at least 40px wide, while the
+existing four-action navigation test remains unchanged. A total consumed-width assertion is not
+sufficient because the old single 360px panel also satisfies it.
 
 ```rust
 #[test]
@@ -235,21 +239,28 @@ fn kittest_designall은_내비게이션레일과_프로젝트패널을_분리한
     let ctx = egui::Context::default();
     install_sidebar_test_fonts(&ctx);
     let mut tree = FileTreeUi::new(ctx.clone());
-    let consumed = ctx.run_ui(egui::RawInput::default(), |ctx| {
-        egui::CentralPanel::default()
-            .show(ctx, |ui| {
-                let before = ui.available_width();
-                let _ = tree.panel(
-                    ui,
-                    &std::collections::HashMap::new(),
-                    &snapshot,
-                    &catalog,
-                );
-                before - ui.available_width()
-            })
-            .inner
+    let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = tree.panel(
+                ui,
+                &std::collections::HashMap::new(),
+                &snapshot,
+                &catalog,
+            );
+        });
     });
-    assert!(consumed.inner >= crate::ui::designall::NAV_RAIL_WIDTH + 40.0);
+    let navigation = egui::PanelState::load(
+        &ctx,
+        egui::Id::new("designall_navigation_rail"),
+    )
+    .expect("DesignALL navigation rail must be a separate panel");
+    let project = egui::PanelState::load(
+        &ctx,
+        egui::Id::new("designall_project_file_panel"),
+    )
+    .expect("DesignALL project/file area must be a separate panel");
+    assert!((navigation.size().x - crate::ui::designall::NAV_RAIL_WIDTH).abs() < 0.1);
+    assert!(project.size().x >= 40.0);
 }
 ```
 
@@ -259,7 +270,8 @@ fn kittest_designall은_내비게이션레일과_프로젝트패널을_분리한
 cargo test -p deppy-sijo kittest_designall은_내비게이션레일과_프로젝트패널을_분리한다 --locked -- --test-threads=1
 ```
 
-Expected: FAIL because navigation is still inside one panel.
+Expected: FAIL because neither required DesignALL panel ID exists while navigation is still inside
+the legacy `file_tree_panel`.
 
 - [ ] **Step 3: Remove lower-navigation height state**
 

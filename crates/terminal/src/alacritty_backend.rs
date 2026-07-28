@@ -138,7 +138,10 @@ impl AlacrittyBackend {
         // 포함해 히스토리 전체를 압축한다(feed 트리거의 HOT=256 비압축분도 회수).
         // 다시 Visible이 되면 이후 feed가 최근 창을 그대로 두고, 그 전 스크롤은 read_line
         // 이 복원한다. Visible은 feed의 HOT 창 유지 정책(compress_history(HOT))을 따른다.
-        if matches!(class, TerminalCacheClass::Hidden | TerminalCacheClass::Exited) {
+        if matches!(
+            class,
+            TerminalCacheClass::Hidden | TerminalCacheClass::Exited
+        ) {
             self.term.grid_mut().compress_history(0);
         }
         let after = self.cache_footprint();
@@ -253,8 +256,8 @@ fn line_soft_wrapped(
 ) -> bool {
     grid.read_line(alacritty_terminal::index::Line(idx), scratch)
         [alacritty_terminal::index::Column(cols - 1)]
-        .flags
-        .contains(Flags::WRAPLINE)
+    .flags
+    .contains(Flags::WRAPLINE)
 }
 
 /// deppy-sijo(D) 스크롤백 라인 압축: 이 줄 수만큼의 **최근** 스크롤아웃 히스토리는
@@ -374,7 +377,11 @@ impl TerminalBackend for AlacrittyBackend {
         // 즉시 놓는다. 셀은 아래에서 grid.read_line으로 직접 순회한다.
         let (display_offset, cursor_point, cursor_shape) = {
             let content = self.term.renderable_content();
-            (content.display_offset, content.cursor.point, content.cursor.shape)
+            (
+                content.display_offset,
+                content.cursor.point,
+                content.cursor.shape,
+            )
         };
 
         // deppy-sijo(D): display_iter 대신 read_line으로 직접 순회한다 — 스크롤이 압축
@@ -510,8 +517,7 @@ impl TerminalBackend for AlacrittyBackend {
         self.active_scrollback_limit = target;
         // 트림 상한을 영속화한다 — 이후 클래스 재적용(resize/전이)이 이 값을 존중해
         // 스크롤백을 도로 늘리지 못한다(A-H1). 이미 더 낮은 floor가 있으면 유지.
-        self.pressure_trim_floor =
-            Some(target.min(self.pressure_trim_floor.unwrap_or(usize::MAX)));
+        self.pressure_trim_floor = Some(target.min(self.pressure_trim_floor.unwrap_or(usize::MAX)));
         // 남은 히스토리를 HOT 창까지 전부 압축해 최대한 회수한다(압박 하 최후 수단).
         // 두 그리드 모두 압축한다 — alt-screen 세션은 스크롤백이 inactive(primary)에
         // 있어 active(alt)만 압축하면 회수가 불완전하다(리뷰 L3). 스크롤백 없는 쪽은 no-op.
@@ -990,7 +996,9 @@ mod tests {
         // Visible 클래스(10,000줄 / 16MB 예산), 200열. 20,000줄을 먹여 캡을 넘긴다.
         let mut backend = AlacrittyBackend::new(200, 40, 10_000);
         backend.set_cache_class(TerminalCacheClass::Visible);
-        let line: Vec<u8> = std::iter::repeat(b'x').take(200).chain([b'\r', b'\n']).collect();
+        let line: Vec<u8> = std::iter::repeat_n(b'x', 200)
+            .chain([b'\r', b'\n'])
+            .collect();
         for _ in 0..20_000 {
             let _ = backend.feed(&line);
         }
@@ -1709,7 +1717,10 @@ mod tests {
 
         // 이미 그 이하: 재트림·상향은 no-op.
         assert!(a.trim_scrollback(200).is_none(), "재트림이 이벤트를 냄");
-        assert!(a.trim_scrollback(10_000).is_none(), "상향 요청은 no-op이어야");
+        assert!(
+            a.trim_scrollback(10_000).is_none(),
+            "상향 요청은 no-op이어야"
+        );
     }
 
     /// (A-H1) 트림 상한은 클래스 재적용(resize/전이)에 영속하고, clear_pressure_trim으로
@@ -1764,7 +1775,10 @@ mod tests {
         let history = a.term.history_size();
         let raw_history = history.saturating_sub(a.term.grid().compressed_row_count());
         // 활성 hidden은 HOT 창만큼(±) raw 행을 갖는다 — 0이 아니다(예전 Hidden=0 과소계상).
-        assert!(raw_history > 0, "활성 hidden이 raw HOT 창을 안 남김: raw={raw_history}");
+        assert!(
+            raw_history > 0,
+            "활성 hidden이 raw HOT 창을 안 남김: raw={raw_history}"
+        );
         assert!(
             raw_history <= HOT_SCROLLBACK_LINES + 5,
             "raw가 HOT 창보다 과함: {raw_history}"
@@ -1773,9 +1787,8 @@ mod tests {
         // footprint가 그 raw 창을 계상한다(0으로 과소계상하던 예전과 대비).
         let fp = a.cache_footprint();
         let bpl = estimated_bytes_per_line(a.term.columns());
-        let floor = a.term.screen_lines() * bpl
-            + a.term.grid().compressed_heap_bytes()
-            + raw_history * bpl;
+        let floor =
+            a.term.screen_lines() * bpl + a.term.grid().compressed_heap_bytes() + raw_history * bpl;
         assert!(
             fp.estimated_bytes >= floor,
             "footprint가 raw HOT 창을 미계상: est={} floor={floor}",
@@ -1801,7 +1814,10 @@ mod tests {
 
         // Hidden 예산(1000줄)이 400줄을 트림하지 않으므로 내용은 불변.
         let hidden_dump = a.serialize_scrollback().unwrap();
-        assert_eq!(visible_dump, hidden_dump, "hidden 전환이 스크롤백 내용을 바꿈");
+        assert_eq!(
+            visible_dump, hidden_dump,
+            "hidden 전환이 스크롤백 내용을 바꿈"
+        );
 
         // 전부 복원 후 재직렬화와도 동일(압축/비압축 등가).
         a.term.grid_mut().inflate_all();

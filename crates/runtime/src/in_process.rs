@@ -3132,7 +3132,8 @@ impl Worker {
         let mut trimmed_any = false;
         // 트림을 못 하는(불변식이 깨진) 세션은 제외하고 다른 세션 계속 — 한 세션 때문에
         // 전체를 포기하지 않는다(리뷰 A-L1). 실무상 도달 불가하나 방어적.
-        let mut cannot_trim: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
+        let mut cannot_trim: std::collections::HashSet<SessionId> =
+            std::collections::HashSet::new();
         loop {
             // 현재 세션들의 (id, 추정바이트, 히스토리, 가시성) 스냅샷. cache_bytes는 전
             // 세션 합(제외 세션 포함)이어야 예산 판정이 정확하다 — 후보만 제외한다.

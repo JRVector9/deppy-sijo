@@ -28,6 +28,8 @@ pub const ARCHIVE_DISK_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 const ARCHIVE_FILE: &str = "scrollback.zlib";
 const ARCHIVE_SCAN_ENTRY_LIMIT: usize = 4_096;
 const ARCHIVE_SCAN_LIMIT_ERROR: &str = "scrollback_archive_scan_entry_limit";
+/// 전체 사용량을 안전하게 확정할 수 없음을 나타내는 증분 캐시 값.
+pub const ARCHIVE_DISK_USAGE_UNKNOWN: u64 = u64::MAX;
 
 /// 복원에 필요한 세션 메타 — 파일 헤더에 자급한다 (sidecar 의존 없음).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,10 +252,6 @@ fn parse_header(bytes: &[u8; HEADER_LEN]) -> Option<(ArchiveMeta, u32)> {
 
 /// logs_root 아래 각 세션 디렉터리의 scrollback.zlib를 (mtime, len, path)로 모은다.
 /// logs_root 부재는 빈 목록으로 취급한다 (scan_total·gc 공용 스캔).
-fn collect_archives(logs_root: &Path) -> anyhow::Result<Vec<ArchiveRecord>> {
-    collect_archives_with_limit(logs_root, ARCHIVE_SCAN_ENTRY_LIMIT)
-}
-
 fn collect_archives_with_limit(
     logs_root: &Path,
     entry_limit: usize,
@@ -264,35 +262,105 @@ fn collect_archives_with_limit(
         Err(error) => return Err(error).context("logs_root 나열 실패"),
     };
     let mut archives = Vec::new();
-    let mut entries_seen = 0usize;
     for entry in entries {
-        entries_seen = entries_seen.saturating_add(1);
-        if entries_seen > entry_limit {
-            anyhow::bail!("{}", ARCHIVE_SCAN_LIMIT_ERROR);
-        }
         let Ok(entry) = entry else {
             continue;
         };
-        let path = entry.path().join(ARCHIVE_FILE);
-        if let Ok(meta) = path.metadata() {
-            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            archives.push(ArchiveRecord {
-                modified: mtime,
-                bytes: meta.len(),
-                path,
-            });
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if let Some(archive) = archive_record(&entry.path()) {
+            if archives.len() >= entry_limit {
+                anyhow::bail!("{}", ARCHIVE_SCAN_LIMIT_ERROR);
+            }
+            archives.push(archive);
         }
     }
     Ok(archives)
 }
 
+struct ArchiveScan {
+    archives: Vec<ArchiveRecord>,
+    directories: Vec<PathBuf>,
+    complete: bool,
+}
+
+fn scan_archive_batch_with_limit(
+    logs_root: &Path,
+    entry_limit: usize,
+) -> anyhow::Result<ArchiveScan> {
+    let entries = match std::fs::read_dir(logs_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ArchiveScan {
+                archives: Vec::new(),
+                directories: Vec::new(),
+                complete: true,
+            });
+        }
+        Err(error) => return Err(error).context("logs_root 나열 실패"),
+    };
+    let mut scan = ArchiveScan {
+        archives: Vec::new(),
+        directories: Vec::new(),
+        complete: true,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let directory = entry.path();
+        if let Some(archive) = archive_record(&directory) {
+            if scan.archives.len() >= entry_limit {
+                scan.complete = false;
+                break;
+            }
+            scan.archives.push(archive);
+            scan.directories.push(directory);
+        }
+    }
+    Ok(scan)
+}
+
+fn archive_record(directory: &Path) -> Option<ArchiveRecord> {
+    let path = directory.join(ARCHIVE_FILE);
+    let metadata = path.symlink_metadata().ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    Some(ArchiveRecord {
+        modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        bytes: metadata.len(),
+        path,
+    })
+}
+
 /// logs_root 아래 아카이브 총 바이트를 센다 (읽기 전용 — 삭제하지 않는다).
-/// 워커 시작 시 증분 예산 캐시를 1회 시드하는 용도 (A1 리뷰 P2). 나열 실패는 0으로
-/// 간주한다 — 이후 예산 초과 확정 시 gc의 실제 스캔이 캐시를 보정한다.
+/// 워커 시작 시 증분 예산 캐시를 1회 시드하는 용도 (A1 리뷰 P2). 나열 실패나 합산
+/// overflow는 `ARCHIVE_DISK_USAGE_UNKNOWN`으로 반환해 신규 기록을 fail closed한다.
 pub fn scan_total(logs_root: &Path) -> u64 {
-    collect_archives(logs_root)
-        .map(|archives| archives.iter().map(|archive| archive.bytes).sum())
-        .unwrap_or(0)
+    scan_total_with_limit(logs_root, ARCHIVE_SCAN_ENTRY_LIMIT)
+}
+
+fn scan_total_with_limit(logs_root: &Path, entry_limit: usize) -> u64 {
+    collect_archives_with_limit(logs_root, entry_limit)
+        .and_then(|archives| {
+            archives.iter().try_fold(0u64, |total, archive| {
+                total
+                    .checked_add(archive.bytes)
+                    .context("scrollback archive byte total overflow")
+            })
+        })
+        .unwrap_or(ARCHIVE_DISK_USAGE_UNKNOWN)
 }
 
 /// logs_root 아래 아카이브 총량이 예산을 넘으면 mtime 오래된 것부터 삭제한다.
@@ -303,27 +371,60 @@ pub fn gc(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<u64> {
 }
 
 fn gc_with_limit(logs_root: &Path, budget_bytes: u64, entry_limit: usize) -> anyhow::Result<u64> {
-    let mut archives = collect_archives_with_limit(logs_root, entry_limit)?;
-    let mut total: u64 = archives.iter().map(|archive| archive.bytes).sum();
+    let scan = scan_archive_batch_with_limit(logs_root, entry_limit)?;
+    let mut archives = scan.archives;
+    let mut total = archive_total(&archives);
+    if total == ARCHIVE_DISK_USAGE_UNKNOWN {
+        anyhow::bail!("scrollback_archive_byte_total_overflow");
+    }
+    if !scan.complete {
+        remove_archives_until_budget(&mut total, archives, 0, true);
+        for directory in scan.directories {
+            let _ = std::fs::remove_dir(directory);
+        }
+        anyhow::bail!("{}", ARCHIVE_SCAN_LIMIT_ERROR);
+    }
     if total <= budget_bytes {
         return Ok(total);
     }
     archives.sort_by_key(|archive| archive.modified);
+    remove_archives_until_budget(&mut total, archives, budget_bytes, false);
+    if total > budget_bytes {
+        anyhow::bail!("scrollback_archive_gc_budget_unmet");
+    }
+    Ok(total)
+}
+
+fn archive_total(archives: &[ArchiveRecord]) -> u64 {
+    archives
+        .iter()
+        .try_fold(0u64, |total, archive| total.checked_add(archive.bytes))
+        .unwrap_or(ARCHIVE_DISK_USAGE_UNKNOWN)
+}
+
+fn remove_archives_until_budget(
+    total: &mut u64,
+    archives: Vec<ArchiveRecord>,
+    budget_bytes: u64,
+    force_all: bool,
+) {
     for archive in archives {
-        if total <= budget_bytes {
+        if !force_all && *total <= budget_bytes {
             break;
         }
         match std::fs::remove_file(&archive.path) {
             Ok(()) => {
-                total = total.saturating_sub(archive.bytes);
+                *total = total.saturating_sub(archive.bytes);
                 tracing::info!(path = %archive.path.display(), "scrollback 아카이브 GC — 예산 초과 제거");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                *total = total.saturating_sub(archive.bytes);
             }
             Err(e) => {
                 tracing::warn!(path = %archive.path.display(), "아카이브 GC 삭제 실패: {e:#}")
             }
         }
     }
-    Ok(total)
 }
 
 #[cfg(test)]
@@ -454,12 +555,14 @@ mod tests {
     fn scan_entry_limit_exact_boundary_succeeds() {
         let root = temp_root();
         for index in 0..4 {
-            std::fs::create_dir_all(root.join(format!("session-{index}"))).unwrap();
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(ARCHIVE_FILE), b"").unwrap();
         }
 
         let archives = collect_archives_with_limit(&root, 4).unwrap();
 
-        assert!(archives.is_empty());
+        assert_eq!(archives.len(), 4);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -467,7 +570,9 @@ mod tests {
     fn scan_entry_limit_default_exact_boundary_succeeds() {
         let root = temp_root();
         for index in 0..ARCHIVE_SCAN_ENTRY_LIMIT {
-            std::fs::create_dir_all(root.join(format!("session-{index}"))).unwrap();
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(ARCHIVE_FILE), b"").unwrap();
         }
 
         let total = gc(&root, 0).unwrap();
@@ -480,7 +585,9 @@ mod tests {
     fn scan_entry_limit_rejects_limit_plus_one() {
         let root = temp_root();
         for index in 0..5 {
-            std::fs::create_dir_all(root.join(format!("session-{index}"))).unwrap();
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(ARCHIVE_FILE), b"").unwrap();
         }
 
         let err = match collect_archives_with_limit(&root, 4) {
@@ -490,9 +597,9 @@ mod tests {
 
         assert_eq!(err.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
         assert_eq!(
-            scan_total(&root),
-            0,
-            "scan_total must fail closed on scan errors"
+            scan_total_with_limit(&root, 4),
+            u64::MAX,
+            "scan_total must expose unknown usage on scan errors"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -501,22 +608,24 @@ mod tests {
     fn scan_entry_limit_default_rejects_limit_plus_one() {
         let root = temp_root();
         for index in 0..=ARCHIVE_SCAN_ENTRY_LIMIT {
-            std::fs::create_dir_all(root.join(format!("session-{index}"))).unwrap();
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(ARCHIVE_FILE), b"").unwrap();
         }
 
+        assert_eq!(
+            scan_total(&root),
+            u64::MAX,
+            "scan_total must expose unknown usage on scan errors"
+        );
         let err = gc(&root, 0).unwrap_err();
 
         assert_eq!(err.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
-        assert_eq!(
-            scan_total(&root),
-            0,
-            "scan_total must fail closed on scan errors"
-        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn scan_entry_limit_returns_before_partial_deletion() {
+    fn scan_entry_limit_reports_incomplete_after_bounded_progress() {
         let root = temp_root();
         let payload = vec![b'x'; 4096];
         let old_bytes = write(&root, "old", &meta(), &payload).unwrap();
@@ -529,17 +638,151 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
         )
         .unwrap();
-        for index in 0..4 {
-            std::fs::create_dir_all(root.join(format!("noise-{index}"))).unwrap();
+        let mut paths = vec![old_path];
+        for index in 0..2 {
+            let dir = root.join(format!("archive-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(ARCHIVE_FILE);
+            std::fs::write(&path, b"").unwrap();
+            paths.push(path);
         }
 
         let err = gc_with_limit(&root, old_bytes.saturating_sub(1), 2).unwrap_err();
 
         assert_eq!(err.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
         assert!(
-            old_path.exists(),
-            "over-limit archive scan must not delete partial GC candidates"
+            paths.iter().any(|path| !path.exists()),
+            "over-limit archive scan must remove a bounded candidate batch"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_archive_directories_do_not_starve_bounded_scan() {
+        let root = temp_root();
+        for index in 0..=ARCHIVE_SCAN_ENTRY_LIMIT {
+            let dir = root.join(format!("noise-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("redacted.plain.txt"), b"ignored").unwrap();
+        }
+        let archive_dir = root.join("session");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join(ARCHIVE_FILE), b"archive").unwrap();
+
+        let archives = collect_archives_with_limit(&root, 1).unwrap();
+
+        assert_eq!(archives.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn over_limit_gc_makes_bounded_progress_until_recovered() {
+        let root = temp_root();
+        let payload = vec![b'x'; 4096];
+        let mut paths = Vec::new();
+        for index in 0..5 {
+            write(&root, &format!("session-{index}"), &meta(), &payload).unwrap();
+            paths.push(archive_path(&root, &format!("session-{index}")).unwrap());
+        }
+
+        let first = gc_with_limit(&root, 0, 4);
+
+        assert!(
+            first.is_err(),
+            "incomplete bounded scan must remain explicit"
+        );
+        assert!(
+            paths.iter().filter(|path| path.exists()).count() < paths.len(),
+            "an over-limit pass must delete at least one bounded batch"
+        );
+        for _ in 0..5 {
+            if matches!(gc_with_limit(&root, 0, 4), Ok(0)) {
+                break;
+            }
+        }
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "repeated bounded passes must eventually recover"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn over_limit_gc_removes_zero_byte_archive_candidates() {
+        let root = temp_root();
+        let mut paths = Vec::new();
+        for index in 0..5 {
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(ARCHIVE_FILE);
+            std::fs::write(&path, b"").unwrap();
+            paths.push(path);
+        }
+
+        let _ = gc_with_limit(&root, 0, 4);
+
+        assert!(paths.iter().any(|path| !path.exists()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn over_limit_gc_does_not_follow_symlinked_session_directories() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = temp_root();
+        let outside_archive = outside.join(ARCHIVE_FILE);
+        std::fs::write(&outside_archive, b"outside").unwrap();
+        for index in 0..5 {
+            symlink(&outside, root.join(format!("linked-{index}"))).unwrap();
+        }
+
+        let _ = gc_with_limit(&root, 0, 4);
+
+        assert!(
+            outside_archive.exists(),
+            "bounded recovery must not delete through a symlinked session directory"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_errors_when_delete_failure_leaves_total_over_budget() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root();
+        write(&root, "locked", &meta(), b"archive").unwrap();
+        let session_dir = root.join("locked");
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = gc(&root, 0);
+
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "GC must not report success while retained bytes exceed the budget"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_total_overflow_is_explicit() {
+        let archives = vec![
+            ArchiveRecord {
+                modified: std::time::UNIX_EPOCH,
+                bytes: u64::MAX,
+                path: PathBuf::from("first"),
+            },
+            ArchiveRecord {
+                modified: std::time::UNIX_EPOCH,
+                bytes: 1,
+                path: PathBuf::from("second"),
+            },
+        ];
+
+        assert_eq!(archive_total(&archives), ARCHIVE_DISK_USAGE_UNKNOWN);
     }
 }

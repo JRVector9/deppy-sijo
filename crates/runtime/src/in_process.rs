@@ -3237,6 +3237,22 @@ impl Worker {
         else {
             return; // 비영속 세션 — 메모리 아카이브만
         };
+        if self.archive_disk_bytes == storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN {
+            match storage::scrollback_archive::gc(
+                &self.logs_root,
+                storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES,
+            ) {
+                Ok(total) => self.archive_disk_bytes = total,
+                Err(error) => {
+                    trace_runtime_failure(
+                        "scrollback_archive_gc",
+                        "scrollback_archive_gc_failed",
+                        error,
+                    );
+                    return;
+                }
+            }
+        }
         if storage::scrollback_archive::exists(&self.logs_root, &key) {
             self.archived_on_disk.insert(session);
             return;
@@ -3266,10 +3282,7 @@ impl Worker {
             },
         };
         match storage::scrollback_archive::write(&self.logs_root, &key, &meta, &redacted) {
-            Ok(written_len) => {
-                self.archived_on_disk.insert(session);
-                self.account_archive_write(written_len);
-            }
+            Ok(written_len) => self.finish_archive_write(session, &key, written_len),
             Err(error) => trace_runtime_failure(
                 "scrollback_archive_write",
                 "scrollback_archive_write_failed",
@@ -3278,27 +3291,49 @@ impl Worker {
         }
     }
 
+    fn finish_archive_write(&mut self, session: SessionId, key: &str, written_len: u64) {
+        let accounted = self.account_archive_write(written_len);
+        if accounted && storage::scrollback_archive::exists(&self.logs_root, key) {
+            self.archived_on_disk.insert(session);
+        } else if !accounted
+            && let Ok(path) = storage::scrollback_archive::archive_path(&self.logs_root, key)
+            && let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            trace_runtime_failure(
+                "scrollback_archive_rollback",
+                "scrollback_archive_rollback_failed",
+                error,
+            );
+        }
+    }
+
     /// 디스크 아카이브 기록 후 증분 예산 캐시를 갱신한다 (A1 리뷰 P2). 예산 내면
     /// 전체 스캔 없이 크기만 더하고, 초과가 확정될 때만 gc(전체 스캔+오래된 것부터
     /// 제거)를 호출해 캐시를 실제 총량으로 재동기화한다. 이로써 매 exit의 GC 비용이
     /// "지금까지 존재한 세션 수"에 비례하는 문제를 없앤다.
-    fn account_archive_write(&mut self, written_len: u64) {
+    fn account_archive_write(&mut self, written_len: u64) -> bool {
         let budget = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
         if archive_cache_needs_gc(self.archive_disk_bytes, written_len, budget) {
             match storage::scrollback_archive::gc(&self.logs_root, budget) {
-                Ok(total) => self.archive_disk_bytes = total,
+                Ok(total) => {
+                    self.archive_disk_bytes = total;
+                    true
+                }
                 Err(error) => {
-                    // 스캔 실패 — 기록한 만큼은 반영해 undercount를 막는다 (다음 기록에서 재시도).
                     trace_runtime_failure(
                         "scrollback_archive_gc",
                         "scrollback_archive_gc_failed",
                         error,
                     );
-                    self.archive_disk_bytes = self.archive_disk_bytes.saturating_add(written_len);
+                    self.archive_disk_bytes =
+                        storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                    false
                 }
             }
         } else {
             self.archive_disk_bytes = self.archive_disk_bytes.saturating_add(written_len);
+            true
         }
     }
 
@@ -6548,6 +6583,87 @@ mod tests {
         assert!(archive_cache_needs_gc(u64::MAX, 1, budget));
     }
 
+    #[test]
+    fn archive_gc_failure_marks_cached_usage_unknown() {
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "archive-gc-failure",
+        );
+        let invalid_root = worker.logs_root.join("not-a-directory");
+        std::fs::create_dir_all(&worker.logs_root).unwrap();
+        std::fs::write(&invalid_root, b"file").unwrap();
+        worker.logs_root = invalid_root;
+        worker.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
+
+        assert!(!worker.account_archive_write(1));
+
+        assert_eq!(
+            worker.archive_disk_bytes,
+            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_evicted_triggering_archive_does_not_leave_disk_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "archive-trigger-evicted",
+        );
+        std::fs::create_dir_all(&worker.logs_root).unwrap();
+        let old_path = worker.logs_root.join("old").join("scrollback.zlib");
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        let old_file = std::fs::File::create(&old_path).unwrap();
+        old_file
+            .set_len(storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES)
+            .unwrap();
+        old_file
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+        std::fs::set_permissions(
+            old_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let key = "new";
+        let written_len = storage::scrollback_archive::write(
+            &worker.logs_root,
+            key,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            b"new archive",
+        )
+        .unwrap();
+        worker.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
+        let session = SessionId(99);
+
+        worker.finish_archive_write(session, key, written_len);
+
+        std::fs::set_permissions(
+            old_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(!storage::scrollback_archive::exists(&worker.logs_root, key));
+        assert!(
+            !worker.archived_on_disk.contains(&session),
+            "a GC-evicted triggering archive must not leave a false disk marker"
+        );
+    }
+
     /// PR-A1: 세션 exit 시 최종 grid가 디스크 아카이브(scrollback.zlib)로 기록되고,
     /// 메타·내용이 라운드트립된다 (suspend/재시작 생존의 원천).
     #[cfg(unix)]
@@ -6603,6 +6719,130 @@ mod tests {
         let text = String::from_utf8_lossy(&dump);
         assert!(text.contains("archive-roundtrip-marker"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_archive_usage_blocks_new_writes_and_makes_gc_progress() {
+        init_mock_store();
+        let dir = unique_test_dir("archive-scan-over-limit");
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-archive-limit');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let logs_root = dir.join("logs");
+        std::fs::create_dir_all(&logs_root).unwrap();
+        for index in 0..=4_096 {
+            let session_dir = logs_root.join(format!("noise-{index}"));
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(session_dir.join("scrollback.zlib"), b"").unwrap();
+        }
+        let entries_before = std::fs::read_dir(&logs_root).unwrap().count();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: "ws-archive-limit".into(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd("echo blocked-archive", None, None))
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SessionExited { .. } => Some(()),
+            _ => None,
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let uuid: String = conn
+            .query_row("SELECT id FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            !storage::scrollback_archive::exists(&logs_root, &uuid),
+            "unknown disk usage must fail closed before writing"
+        );
+        assert!(
+            std::fs::read_dir(&logs_root).unwrap().count() < entries_before,
+            "failed admission must still make bounded GC progress"
+        );
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_over_limit_archive_scan_rolls_back_the_triggering_write() {
+        init_mock_store();
+        let dir = unique_test_dir("archive-scan-growth-over-limit");
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-archive-growth');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let logs_root = dir.join("logs");
+        let seeded_archive = logs_root.join("seed").join("scrollback.zlib");
+        std::fs::create_dir_all(seeded_archive.parent().unwrap()).unwrap();
+        std::fs::File::create(&seeded_archive)
+            .unwrap()
+            .set_len(storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES)
+            .unwrap();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: "ws-archive-growth".into(),
+            }),
+        );
+        for index in 0..=4_096 {
+            let session_dir = logs_root.join(format!("noise-{index}"));
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(session_dir.join("scrollback.zlib"), b"").unwrap();
+        }
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd("echo rollback-archive", None, None))
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SessionExited { .. } => Some(()),
+            _ => None,
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let uuid: String = conn
+            .query_row("SELECT id FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            !storage::scrollback_archive::exists(&logs_root, &uuid),
+            "failed post-write GC must roll back the triggering archive"
+        );
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// PR-A2: agent pane은 재시작 후 respawn 대신 열람 전용 복원된다 —

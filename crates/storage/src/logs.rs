@@ -632,8 +632,7 @@ impl Default for SessionLogBundle {
 /// 세션의 redacted 로그 3종을 오래된 묶음부터 제거한다. 앱 자체 `app.log`, provider
 /// transcript, terminal.size, scrollback.zlib은 이름이 다르므로 건드리지 않는다.
 pub fn gc_session_logs(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<u64> {
-    let bundles = collect_session_log_bundles(logs_root)?;
-    gc_session_log_bundles(bundles, budget_bytes)
+    gc_session_logs_with_limit_impl(logs_root, budget_bytes, SESSION_LOG_SCAN_ENTRY_LIMIT)
 }
 
 #[cfg(test)]
@@ -642,21 +641,47 @@ fn gc_session_logs_with_limit(
     budget_bytes: u64,
     entry_limit: usize,
 ) -> anyhow::Result<u64> {
-    let bundles = collect_session_log_bundles_with_limit(logs_root, entry_limit)?;
+    gc_session_logs_with_limit_impl(logs_root, budget_bytes, entry_limit)
+}
+
+fn gc_session_logs_with_limit_impl(
+    logs_root: &Path,
+    budget_bytes: u64,
+    entry_limit: usize,
+) -> anyhow::Result<u64> {
+    let scan = scan_session_log_candidates_with_limit(logs_root, entry_limit)?;
+    let bundles = bundle_session_log_candidates(scan.candidates, scan.complete)?;
+    if !scan.complete {
+        remove_session_log_bundles(bundles, 0, true);
+        remove_empty_directories(scan.directories, logs_root);
+        anyhow::bail!("{}", SESSION_LOG_SCAN_LIMIT_ERROR);
+    }
     gc_session_log_bundles(bundles, budget_bytes)
 }
 
 fn gc_session_log_bundles(
-    mut bundles: Vec<SessionLogBundle>,
+    bundles: Vec<SessionLogBundle>,
     budget_bytes: u64,
 ) -> anyhow::Result<u64> {
+    let total = remove_session_log_bundles(bundles, budget_bytes, false);
+    if total > budget_bytes {
+        anyhow::bail!("session_log_gc_budget_unmet");
+    }
+    Ok(total)
+}
+
+fn remove_session_log_bundles(
+    mut bundles: Vec<SessionLogBundle>,
+    budget_bytes: u64,
+    force_all: bool,
+) -> u64 {
     let mut total = bundles.iter().map(|bundle| bundle.bytes).sum::<u64>();
-    if total <= budget_bytes {
-        return Ok(total);
+    if !force_all && total <= budget_bytes {
+        return total;
     }
     bundles.sort_by_key(|bundle| bundle.modified);
     for bundle in bundles {
-        if total <= budget_bytes {
+        if !force_all && total <= budget_bytes {
             break;
         }
         let mut removed = 0u64;
@@ -676,25 +701,32 @@ fn gc_session_log_bundles(
             tracing::info!(bytes = removed, "오래된 세션 로그 GC — 전체 예산 초과 제거");
         }
     }
-    Ok(total)
+    total
 }
 
 fn path_len_or_zero(path: &Path) -> u64 {
     path.metadata().map(|metadata| metadata.len()).unwrap_or(0)
 }
 
-fn collect_session_log_bundles(logs_root: &Path) -> anyhow::Result<Vec<SessionLogBundle>> {
-    collect_session_log_bundles_with_limit(logs_root, SESSION_LOG_SCAN_ENTRY_LIMIT)
-}
-
+#[cfg(test)]
 fn collect_session_log_bundles_with_limit(
     logs_root: &Path,
     entry_limit: usize,
 ) -> anyhow::Result<Vec<SessionLogBundle>> {
-    let candidates = collect_session_log_candidates_with_limit(logs_root, entry_limit)?;
+    let scan = scan_session_log_candidates_with_limit(logs_root, entry_limit)?;
+    if !scan.complete {
+        anyhow::bail!("{}", SESSION_LOG_SCAN_LIMIT_ERROR);
+    }
+    bundle_session_log_candidates(scan.candidates, true)
+}
+
+fn bundle_session_log_candidates(
+    candidates: Vec<SessionLogCandidate>,
+    compact_oversized: bool,
+) -> anyhow::Result<Vec<SessionLogBundle>> {
     let mut by_dir = std::collections::HashMap::<PathBuf, SessionLogBundle>::new();
     for candidate in candidates {
-        if candidate.original_len > candidate.max_bytes {
+        if compact_oversized && candidate.original_len > candidate.max_bytes {
             let mut file = open_regular_log_file(&candidate.path, false)?;
             compact_open_file_to_tail(&mut file, candidate.retain_bytes, candidate.tail_boundary)
                 .with_context(|| {
@@ -713,60 +745,113 @@ fn collect_session_log_bundles_with_limit(
     Ok(by_dir.into_values().collect())
 }
 
-fn collect_session_log_candidates_with_limit(
+struct SessionLogScan {
+    candidates: Vec<SessionLogCandidate>,
+    directories: Vec<PathBuf>,
+    entries_seen: usize,
+    complete: bool,
+}
+
+fn scan_session_log_candidates_with_limit(
     logs_root: &Path,
     entry_limit: usize,
-) -> anyhow::Result<Vec<SessionLogCandidate>> {
-    let mut candidates = Vec::new();
-    let mut entries_seen = 0usize;
-    let mut stack = vec![(logs_root.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
+) -> anyhow::Result<SessionLogScan> {
+    let mut scan = SessionLogScan {
+        candidates: Vec::new(),
+        directories: Vec::new(),
+        entries_seen: 0,
+        complete: true,
+    };
+    scan_session_log_directory(logs_root, 0, entry_limit, &mut scan)?;
+    Ok(scan)
+}
+
+fn scan_session_log_directory(
+    dir: &Path,
+    depth: usize,
+    entry_limit: usize,
+    scan: &mut SessionLogScan,
+) -> anyhow::Result<()> {
+    if !scan.complete {
+        return Ok(());
+    }
+    if depth > 0 {
+        scan.directories.push(dir.to_path_buf());
+    }
+    collect_known_session_logs(dir, entry_limit, scan)?;
+    if !scan.complete {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("로그 디렉터리 나열 실패: {}", dir.display()));
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && depth < 4 {
+            scan_session_log_directory(&entry.path(), depth + 1, entry_limit, scan)?;
+            if !scan.complete {
+                return Ok(());
+            }
+            continue;
+        }
+    }
+    Ok(())
+}
+
+fn collect_known_session_logs(
+    dir: &Path,
+    entry_limit: usize,
+    scan: &mut SessionLogScan,
+) -> anyhow::Result<()> {
+    for name in [ANSI_LOG_FILE, PLAIN_LOG_FILE, EVENTS_LOG_FILE] {
+        let path = dir.join(name);
+        let metadata = match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("로그 디렉터리 나열 실패: {}", dir.display()));
+                    .with_context(|| format!("세션 로그 metadata 실패: {}", path.display()));
             }
         };
-        for entry in entries {
-            entries_seen = entries_seen.saturating_add(1);
-            if entries_seen > entry_limit {
-                anyhow::bail!("{}", SESSION_LOG_SCAN_LIMIT_ERROR);
-            }
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() && depth < 4 {
-                stack.push((entry.path(), depth + 1));
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some((max_bytes, retain_bytes, tail_boundary)) = log_limits_for_name(&name) else {
-                continue;
-            };
-            let path = entry.path();
-            let original = path
-                .metadata()
-                .with_context(|| format!("세션 로그 metadata 실패: {}", path.display()))?;
-            candidates.push(SessionLogCandidate {
-                dir: dir.clone(),
-                path,
-                original_len: original.len(),
-                modified: original.modified().unwrap_or(std::time::UNIX_EPOCH),
-                max_bytes,
-                retain_bytes,
-                tail_boundary,
-            });
+        let (max_bytes, retain_bytes, tail_boundary) =
+            log_limits_for_name(std::ffi::OsStr::new(name)).expect("known log name");
+        scan.entries_seen = scan.entries_seen.saturating_add(1);
+        if scan.entries_seen > entry_limit {
+            scan.complete = false;
+            return Ok(());
+        }
+        scan.candidates.push(SessionLogCandidate {
+            dir: dir.to_path_buf(),
+            path,
+            original_len: metadata.len(),
+            modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            max_bytes,
+            retain_bytes,
+            tail_boundary,
+        });
+    }
+    Ok(())
+}
+
+fn remove_empty_directories(mut directories: Vec<PathBuf>, logs_root: &Path) {
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    directories.dedup();
+    for directory in directories {
+        if directory != logs_root {
+            let _ = std::fs::remove_dir(directory);
         }
     }
-    Ok(candidates)
 }
 
 fn log_limits_for_name(name: &std::ffi::OsStr) -> Option<(u64, u64, TailBoundary)> {
@@ -1305,12 +1390,14 @@ mod tests {
     fn scan_entry_limit_exact_boundary_succeeds() {
         let root = temp_root("scan-entry-limit-exact");
         for index in 0..4 {
-            std::fs::write(root.join(format!("noise-{index}")), b"ignored").unwrap();
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(PLAIN_LOG_FILE), b"log").unwrap();
         }
 
         let bundles = collect_session_log_bundles_with_limit(&root, 4).unwrap();
 
-        assert!(bundles.is_empty());
+        assert_eq!(bundles.len(), 4);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1318,7 +1405,9 @@ mod tests {
     fn scan_entry_limit_default_exact_boundary_succeeds() {
         let root = temp_root("scan-entry-limit-default-exact");
         for index in 0..SESSION_LOG_SCAN_ENTRY_LIMIT {
-            std::fs::write(root.join(format!("noise-{index}")), b"ignored").unwrap();
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(PLAIN_LOG_FILE), b"").unwrap();
         }
 
         let total = gc_session_logs(&root, 0).unwrap();
@@ -1331,7 +1420,9 @@ mod tests {
     fn scan_entry_limit_rejects_limit_plus_one() {
         let root = temp_root("scan-entry-limit-plus-one");
         for index in 0..5 {
-            std::fs::write(root.join(format!("noise-{index}")), b"ignored").unwrap();
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(PLAIN_LOG_FILE), b"log").unwrap();
         }
 
         let err = match collect_session_log_bundles_with_limit(&root, 4) {
@@ -1347,7 +1438,9 @@ mod tests {
     fn scan_entry_limit_default_rejects_limit_plus_one() {
         let root = temp_root("scan-entry-limit-default-plus-one");
         for index in 0..=SESSION_LOG_SCAN_ENTRY_LIMIT {
-            std::fs::write(root.join(format!("noise-{index}")), b"ignored").unwrap();
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(PLAIN_LOG_FILE), b"").unwrap();
         }
 
         let err = gc_session_logs(&root, 0).unwrap_err();
@@ -1357,30 +1450,124 @@ mod tests {
     }
 
     #[test]
-    fn scan_entry_limit_returns_before_partial_mutation() {
+    fn scan_entry_limit_reports_incomplete_after_bounded_progress() {
         let root = temp_root("scan-entry-limit-no-mutation");
         let session_dir = root.join("session");
         std::fs::create_dir_all(&session_dir).unwrap();
         let oversized_log = session_dir.join(ANSI_LOG_FILE);
         let original = vec![b'x'; (ANSI_LOG_MAX_BYTES + 1) as usize];
         std::fs::write(&oversized_log, &original).unwrap();
-        for index in 0..4 {
-            std::fs::write(session_dir.join(format!("noise-{index}")), b"ignored").unwrap();
-        }
+        std::fs::write(session_dir.join(PLAIN_LOG_FILE), b"plain").unwrap();
+        std::fs::write(session_dir.join(EVENTS_LOG_FILE), b"event").unwrap();
 
         let err = gc_session_logs_with_limit(&root, 0, 2).unwrap_err();
 
         assert_eq!(err.to_string(), SESSION_LOG_SCAN_LIMIT_ERROR);
-        assert_eq!(
-            oversized_log.metadata().unwrap().len(),
-            original.len() as u64,
-            "over-limit scan must not compact oversized logs"
+        assert!(!oversized_log.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn non_log_entries_do_not_starve_bounded_scan() {
+        let root = temp_root("scan-entry-limit-noise");
+        for index in 0..=SESSION_LOG_SCAN_ENTRY_LIMIT {
+            std::fs::write(root.join(format!("noise-{index}")), b"ignored").unwrap();
+        }
+        let session_dir = root.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(PLAIN_LOG_FILE), b"log").unwrap();
+
+        let bundles = collect_session_log_bundles_with_limit(&root, 1).unwrap();
+
+        assert_eq!(bundles.len(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn over_limit_gc_makes_bounded_progress_until_recovered() {
+        let root = temp_root("scan-entry-limit-progress");
+        let mut log_paths = Vec::new();
+        for index in 0..5 {
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(PLAIN_LOG_FILE);
+            std::fs::write(&path, b"log").unwrap();
+            log_paths.push(path);
+        }
+
+        let first = gc_session_logs_with_limit(&root, 0, 4);
+
+        assert!(
+            first.is_err(),
+            "incomplete bounded scan must remain explicit"
         );
         assert!(
-            oversized_log.exists(),
-            "over-limit scan must not delete partial GC candidates"
+            log_paths.iter().filter(|path| path.exists()).count() < log_paths.len(),
+            "an over-limit pass must delete at least one bounded batch"
+        );
+        for _ in 0..5 {
+            if matches!(gc_session_logs_with_limit(&root, 0, 4), Ok(0)) {
+                break;
+            }
+        }
+        assert!(
+            log_paths.iter().all(|path| !path.exists()),
+            "repeated bounded passes must eventually recover"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn over_limit_gc_removes_zero_byte_log_candidates() {
+        let root = temp_root("scan-entry-limit-zero-byte");
+        let mut log_paths = Vec::new();
+        for index in 0..5 {
+            let dir = root.join(format!("session-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(PLAIN_LOG_FILE);
+            std::fs::write(&path, b"").unwrap();
+            log_paths.push(path);
+        }
+
+        let _ = gc_session_logs_with_limit(&root, 0, 4);
+
+        assert!(log_paths.iter().any(|path| !path.exists()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_errors_when_delete_failure_leaves_logs_over_budget() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("global-gc-delete-failure");
+        let session_dir = root.join("locked");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(PLAIN_LOG_FILE), b"log").unwrap();
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = gc_session_logs(&root, 0);
+
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "GC must not report success while retained logs exceed the budget"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_gc_scan_compacts_oversized_logs_before_budget_check() {
+        let root = temp_root("global-gc-oversized-file");
+        let session_dir = root.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join(PLAIN_LOG_FILE);
+        std::fs::write(&path, vec![b'x'; (PLAIN_LOG_MAX_BYTES + 1) as usize]).unwrap();
+
+        gc_session_logs(&root, SESSION_LOG_DISK_BUDGET_BYTES).unwrap();
+
+        assert!(path.metadata().unwrap().len() <= PLAIN_LOG_MAX_BYTES / 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 2026-07-17 실측 회귀: claude는 정렬에 공백이 아니라 커서 이동을 쓴다

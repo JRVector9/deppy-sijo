@@ -1338,6 +1338,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn load_workspace_restore_bounded는_session_cwd를_pane_state에_join한다() {
+        let mut conn = test_conn();
+        let cwd = std::env::temp_dir().join(format!("deppy-persist-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.to_string_lossy().into_owned();
+        let mut session = sample_session("sess-1", SESSION_STATUS_RUNNING);
+        session.cwd = cwd.clone();
+        upsert_session(&conn, &session).unwrap();
+        let window = sample_window();
+        save_window_layout(&mut conn, "ws-1", &window).unwrap();
+
+        let restored = load_workspace_restore_bounded(&conn, "ws-1").unwrap();
+
+        let window = restored.window.unwrap();
+        let restored_pane = window.tabs[0]
+            .panes
+            .iter()
+            .find(|pane| pane.session_id.as_deref() == Some("sess-1"))
+            .expect("session-backed pane must restore");
+        assert_eq!(restored_pane.cwd.as_deref(), Some(cwd.as_str()));
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
     fn bounded_restore는_created_at기준_canonical_window만_복원한다() {
         let mut conn = test_conn();
         let first = bounded_window(1, 1);

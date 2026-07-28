@@ -26,6 +26,8 @@ const MAX_GRID_DIM: u16 = 500;
 pub const ARCHIVE_DISK_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 const ARCHIVE_FILE: &str = "scrollback.zlib";
+const ARCHIVE_SCAN_ENTRY_LIMIT: usize = 4_096;
+const ARCHIVE_SCAN_LIMIT_ERROR: &str = "scrollback_archive_scan_entry_limit";
 
 /// 복원에 필요한 세션 메타 — 파일 헤더에 자급한다 (sidecar 의존 없음).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +38,12 @@ pub struct ArchiveMeta {
     pub rows: u16,
     pub scrollback_lines: u32,
     pub exit_code: Option<u32>,
+}
+
+struct ArchiveRecord {
+    modified: std::time::SystemTime,
+    bytes: u64,
+    path: PathBuf,
 }
 
 pub fn archive_path(logs_root: &Path, session_key: &str) -> anyhow::Result<PathBuf> {
@@ -242,20 +250,37 @@ fn parse_header(bytes: &[u8; HEADER_LEN]) -> Option<(ArchiveMeta, u32)> {
 
 /// logs_root 아래 각 세션 디렉터리의 scrollback.zlib를 (mtime, len, path)로 모은다.
 /// logs_root 부재는 빈 목록으로 취급한다 (scan_total·gc 공용 스캔).
-fn collect_archives(
+fn collect_archives(logs_root: &Path) -> anyhow::Result<Vec<ArchiveRecord>> {
+    collect_archives_with_limit(logs_root, ARCHIVE_SCAN_ENTRY_LIMIT)
+}
+
+fn collect_archives_with_limit(
     logs_root: &Path,
-) -> anyhow::Result<Vec<(std::time::SystemTime, u64, PathBuf)>> {
+    entry_limit: usize,
+) -> anyhow::Result<Vec<ArchiveRecord>> {
     let entries = match std::fs::read_dir(logs_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).context("logs_root 나열 실패"),
     };
-    let mut archives: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
+    let mut archives = Vec::new();
+    let mut entries_seen = 0usize;
+    for entry in entries {
+        entries_seen = entries_seen.saturating_add(1);
+        if entries_seen > entry_limit {
+            anyhow::bail!("{}", ARCHIVE_SCAN_LIMIT_ERROR);
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path().join(ARCHIVE_FILE);
         if let Ok(meta) = path.metadata() {
             let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            archives.push((mtime, meta.len(), path));
+            archives.push(ArchiveRecord {
+                modified: mtime,
+                bytes: meta.len(),
+                path,
+            });
         }
     }
     Ok(archives)
@@ -266,7 +291,7 @@ fn collect_archives(
 /// 간주한다 — 이후 예산 초과 확정 시 gc의 실제 스캔이 캐시를 보정한다.
 pub fn scan_total(logs_root: &Path) -> u64 {
     collect_archives(logs_root)
-        .map(|archives| archives.iter().map(|(_, len, _)| *len).sum())
+        .map(|archives| archives.iter().map(|archive| archive.bytes).sum())
         .unwrap_or(0)
 }
 
@@ -274,22 +299,26 @@ pub fn scan_total(logs_root: &Path) -> u64 {
 /// 로그 3종(redacted.*)은 건드리지 않는다 — 대상은 scrollback.zlib뿐.
 /// 반환: 정리 후 현재 아카이브 총 바이트 — 호출측 증분 예산 캐시 재동기화용 (A1 리뷰 P2).
 pub fn gc(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<u64> {
-    let mut archives = collect_archives(logs_root)?;
-    let mut total: u64 = archives.iter().map(|(_, len, _)| *len).sum();
+    gc_with_limit(logs_root, budget_bytes, ARCHIVE_SCAN_ENTRY_LIMIT)
+}
+
+fn gc_with_limit(logs_root: &Path, budget_bytes: u64, entry_limit: usize) -> anyhow::Result<u64> {
+    let mut archives = collect_archives_with_limit(logs_root, entry_limit)?;
+    let mut total: u64 = archives.iter().map(|archive| archive.bytes).sum();
     if total <= budget_bytes {
         return Ok(total);
     }
-    archives.sort_by_key(|(mtime, _, _)| *mtime);
-    for (_, len, path) in archives {
+    archives.sort_by_key(|archive| archive.modified);
+    for archive in archives {
         if total <= budget_bytes {
             break;
         }
-        match std::fs::remove_file(&path) {
+        match std::fs::remove_file(&archive.path) {
             Ok(()) => {
-                total -= len;
-                tracing::info!(path = %path.display(), "scrollback 아카이브 GC — 예산 초과 제거");
+                total = total.saturating_sub(archive.bytes);
+                tracing::info!(path = %archive.path.display(), "scrollback 아카이브 GC — 예산 초과 제거");
             }
-            Err(e) => tracing::warn!(path = %path.display(), "아카이브 GC 삭제 실패: {e:#}"),
+            Err(e) => tracing::warn!(path = %archive.path.display(), "아카이브 GC 삭제 실패: {e:#}"),
         }
     }
     Ok(total)
@@ -417,5 +446,90 @@ mod tests {
         std::fs::write(root.join("s1").join("redacted.ansi.log"), b"log noise").unwrap();
         // 재시드: 이미 존재하는 아카이브 총량을 정확히 복원한다 (워커 재생성 시드 경로).
         assert_eq!(scan_total(&root), a + b);
+    }
+
+    #[test]
+    fn scan_entry_limit_exact_boundary_succeeds() {
+        let root = temp_root();
+        for index in 0..4 {
+            std::fs::create_dir_all(root.join(format!("session-{index}"))).unwrap();
+        }
+
+        let archives = collect_archives_with_limit(&root, 4).unwrap();
+
+        assert!(archives.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_entry_limit_default_exact_boundary_succeeds() {
+        let root = temp_root();
+        for index in 0..ARCHIVE_SCAN_ENTRY_LIMIT {
+            std::fs::create_dir_all(root.join(format!("session-{index}"))).unwrap();
+        }
+
+        let total = gc(&root, 0).unwrap();
+
+        assert_eq!(total, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_entry_limit_rejects_limit_plus_one() {
+        let root = temp_root();
+        for index in 0..5 {
+            std::fs::create_dir_all(root.join(format!("session-{index}"))).unwrap();
+        }
+
+        let err = match collect_archives_with_limit(&root, 4) {
+            Ok(_) => panic!("expected scan entry limit error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(err.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
+        assert_eq!(scan_total(&root), 0, "scan_total must fail closed on scan errors");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_entry_limit_default_rejects_limit_plus_one() {
+        let root = temp_root();
+        for index in 0..=ARCHIVE_SCAN_ENTRY_LIMIT {
+            std::fs::create_dir_all(root.join(format!("session-{index}"))).unwrap();
+        }
+
+        let err = gc(&root, 0).unwrap_err();
+
+        assert_eq!(err.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
+        assert_eq!(scan_total(&root), 0, "scan_total must fail closed on scan errors");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_entry_limit_returns_before_partial_deletion() {
+        let root = temp_root();
+        let payload = vec![b'x'; 4096];
+        let old_bytes = write(&root, "old", &meta(), &payload).unwrap();
+        let old_path = archive_path(&root, "old").unwrap();
+        let file = std::fs::File::options()
+            .append(true)
+            .open(&old_path)
+            .unwrap();
+        file.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        )
+        .unwrap();
+        for index in 0..4 {
+            std::fs::create_dir_all(root.join(format!("noise-{index}"))).unwrap();
+        }
+
+        let err = gc_with_limit(&root, old_bytes.saturating_sub(1), 2).unwrap_err();
+
+        assert_eq!(err.to_string(), ARCHIVE_SCAN_LIMIT_ERROR);
+        assert!(
+            old_path.exists(),
+            "over-limit archive scan must not delete partial GC candidates"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

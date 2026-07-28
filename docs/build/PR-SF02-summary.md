@@ -20,8 +20,16 @@ cannot let fresh and retry session queues grow without limit.
 - Removed queued duplicates for the same session from both queues before
   insertion.
 - Rejected an already-committed exact `(session, kind)` duplicate while holding
-  the `PushInner` lock before admission or eviction, so a full queue cannot lose
-  an unsent different session to a job the worker would later drop.
+  the `PushInner` lock before admission or eviction.
+- Added bounded `PushInner::in_flight_status` tracking for drained session jobs
+  keyed by `(session, kind)`.
+- Marked the whole drained session batch under the same `PushInner` lock before
+  releasing it for network sends.
+- Rejected exact in-flight duplicates before queued job removal or queue-cap
+  eviction, so a full queue cannot lose an unsent different session to a job the
+  worker is already sending.
+- Removed in-flight keys on every worker exit path: zero subscriptions,
+  already-notified skip, successful commit, retry requeue, and retry exhaustion.
 - Preserved latest-state semantics with `Done` taking precedence over
   `Waiting`.
 - Preserved the maximum old attempt count when replacing the same final session
@@ -50,12 +58,21 @@ cannot let fresh and retry session queues grow without limit.
   eviction and fresh duplicate `Done` reset attempts from 2 to 0.
 - Review-fix green result after helper correction: 6 passed, 0 failed, 141
   filtered.
+- SF02 re-review red test command:
+  `cargo test -p web-remote --locked session_job_admission -- --test-threads=1`
+- SF02 re-review red result: failed as expected with 7 compile errors because
+  `PushInner::in_flight_status` did not exist (`E0560`, `E0609`).
+- SF02 re-review first green result after in-flight tracking: 7 passed, 0
+  failed, 146 filtered.
 
 ## Final Gate Results
 
+- `cargo test -p web-remote --locked session_job_admission -- --test-threads=1`
+  - PASS
+  - 7 passed, 0 failed, 0 ignored, 146 filtered
 - `cargo test -p web-remote --locked push -- --test-threads=1`
   - PASS
-  - 36 passed, 0 failed, 0 ignored, 111 filtered
+  - 42 passed, 0 failed, 0 ignored, 111 filtered
 - `cargo clippy -p web-remote --all-targets --locked -- -D warnings`
   - PASS
 - `git diff --check`
@@ -80,10 +97,14 @@ cannot let fresh and retry session queues grow without limit.
 - 257 unique queued session admissions retain exactly 256 jobs.
 - A full queue plus an already-committed duplicate is rejected without evicting
   an unsent session.
+- A full queue plus an exact in-flight duplicate is rejected without evicting an
+  unsent session.
 - A retry `Done` job at attempts=2 replaced by a fresh duplicate `Done`
   preserves attempts=2.
 - A stalled/failing transport keeps retained jobs bounded at 256, drains after
   the existing 3 total send attempts, and does not prevent `stop_and_join`.
+- In-flight state is cleared after successful commit, retry requeue, retry
+  exhaustion, zero-subscription skip, and already-notified skip.
 
 ## Residual Risks
 

@@ -187,10 +187,16 @@ fn token_matches(expected: &str, provided: &[u8]) -> bool {
 enum FramePoll {
     /// 완성된 프레임 하나(길이 0 = heartbeat 포함).
     Frame(Vec<u8>),
-    /// 지금은 더 읽을 게 없다(WouldBlock/부분 프레임) — 다음 tick에 이어 읽는다.
+    /// 성공적으로 바이트를 소비했지만 아직 프레임이 완성되지 않았다.
+    Partial,
+    /// 지금은 더 읽을 게 없다(WouldBlock/TimedOut) — 다음 tick에 이어 읽는다.
     Pending,
     /// EOF 또는 프로토콜 위반(상한 초과) — 접속 종료.
     Closed,
+}
+
+fn tls_idle_sleep_needed(progressed: bool) -> bool {
+    !progressed
 }
 
 /// `[u32 LE len][payload]` 프레임을 **부분 진척을 tick 간 보존**하며 디코드한다.
@@ -215,8 +221,9 @@ impl FrameDecoder {
         }
     }
 
-    /// 준비된 만큼 읽어 프레임 하나가 완성되면 반환한다. WouldBlock이면 `Pending`(상태 보존),
-    /// EOF/상한 초과면 `Closed`. `r`은 WouldBlock을 돌려주는 non-blocking Read여야 한다.
+    /// 준비된 만큼 읽어 프레임 하나가 완성되면 반환한다. 성공적으로 일부 바이트만 읽었으면
+    /// `Partial`(상태 보존 + IO 진척), WouldBlock/TimedOut이면 `Pending`(true idle),
+    /// EOF/상한 초과면 `Closed`.
     fn advance(&mut self, r: &mut impl Read) -> FramePoll {
         loop {
             match self.need {
@@ -236,7 +243,7 @@ impl FrameDecoder {
                                 continue;
                             }
                         }
-                        return FramePoll::Pending;
+                        return FramePoll::Partial;
                     }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
@@ -261,7 +268,7 @@ impl FrameDecoder {
                         Ok(n) => {
                             self.payload_filled += n;
                             if self.payload_filled < need {
-                                return FramePoll::Pending;
+                                return FramePoll::Partial;
                             }
                         }
                         Err(e)
@@ -1200,6 +1207,10 @@ fn serve_connection_tls(
                             }
                         }
                     }
+                    FramePoll::Partial => {
+                        progressed = true;
+                        continue;
+                    }
                     FramePoll::Pending => break,
                     FramePoll::Closed => break 'main,
                 }
@@ -1291,7 +1302,7 @@ fn serve_connection_tls(
         if eof {
             break;
         }
-        if !progressed {
+        if tls_idle_sleep_needed(progressed) {
             std::thread::sleep(TLS_IDLE_SLEEP);
         }
     }
@@ -1326,6 +1337,7 @@ fn tls_server_handshake(
         match dec.advance(&mut conn.reader()) {
             FramePoll::Frame(frame) if !frame.is_empty() => break frame,
             FramePoll::Frame(_) => {} // 길이 0(있을 리 없지만) 무시
+            FramePoll::Partial => {}
             FramePoll::Pending => std::thread::sleep(TLS_IDLE_SLEEP),
             FramePoll::Closed => return None,
         }
@@ -1620,6 +1632,7 @@ impl RemoteRuntimeClient {
                                 }
                             }
                         }
+                        FramePoll::Partial => {}
                         FramePoll::Pending => {}
                         FramePoll::Closed => break,
                     }
@@ -1887,6 +1900,7 @@ fn tls_client_handshake(
                 }
                 return Ok(Codec::from_features(server_hello.features));
             }
+            FramePoll::Partial => {}
             FramePoll::Pending => std::thread::sleep(TLS_IDLE_SLEEP),
             FramePoll::Closed => bail!("remote TLS 인증 거부 — 접속 종료"),
         }
@@ -1948,6 +1962,16 @@ fn client_tls_io_loop(
                                 Err(e) => tracing::warn!("remote RequestKeyframe 직렬화 실패: {e}"),
                             }
                         }
+                    }
+                    FramePoll::Partial => {
+                        progressed = true;
+                        if client_liveness_expired(&liveness, Instant::now()) {
+                            tracing::warn!(
+                                "remote client liveness timeout — no frames received, 접속 종료"
+                            );
+                            break 'main;
+                        }
+                        continue;
                     }
                     FramePoll::Pending => {
                         if client_liveness_expired(&liveness, Instant::now()) {
@@ -2021,7 +2045,7 @@ fn client_tls_io_loop(
         if eof {
             break;
         }
-        if !progressed {
+        if tls_idle_sleep_needed(progressed) {
             std::thread::sleep(TLS_IDLE_SLEEP);
         }
     }
@@ -2497,7 +2521,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_decoder_yields_pending_after_incomplete_successful_read() {
+    fn frame_decoder_yields_partial_after_incomplete_successful_read() {
         struct OneByteReader {
             used: bool,
         }
@@ -2513,7 +2537,41 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let mut reader = OneByteReader { used: false };
 
+        assert!(matches!(decoder.advance(&mut reader), FramePoll::Partial));
+    }
+
+    #[test]
+    fn frame_decoder_reports_idle_after_partial_progress_is_exhausted() {
+        struct SplitThenTimeout {
+            reads: usize,
+        }
+        impl Read for SplitThenTimeout {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                match self.reads {
+                    1 => {
+                        buf[..2].copy_from_slice(&[5, 0]);
+                        Ok(2)
+                    }
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "fake timeout",
+                    )),
+                }
+            }
+        }
+
+        let mut decoder = FrameDecoder::new();
+        let mut reader = SplitThenTimeout { reads: 0 };
+
+        assert!(matches!(decoder.advance(&mut reader), FramePoll::Partial));
         assert!(matches!(decoder.advance(&mut reader), FramePoll::Pending));
+    }
+
+    #[test]
+    fn tls_idle_sleep_is_skipped_after_partial_frame_progress() {
+        assert!(!tls_idle_sleep_needed(true));
+        assert!(tls_idle_sleep_needed(false));
     }
 
     /// 완료 기준: InProcess와 같은 명령/이벤트 모델로 localhost attach.

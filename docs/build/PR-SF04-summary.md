@@ -6,6 +6,7 @@
 - Bounded plain and TLS initial TCP connect with a 30 second `TcpStream::connect_timeout` deadline.
 - Converted the plain client reader from blocking `read_frame` to timed `FrameDecoder` polling.
 - Added client liveness checks to plain and TLS receive loops. Empty heartbeat frames and ordinary frames both refresh `last_received`.
+- Accepted independent review fix: split decoder partial progress from true transport idle so partial length/payload reads preserve decoder state, do not refresh frame liveness, do mark IO progress, and skip TLS idle sleep/backoff until a true idle poll occurs.
 - Preserved existing public wrappers: `attach`, `attach_tls`, and `attach_tls_tofu`.
 
 ## Scope exclusions
@@ -54,17 +55,35 @@
    - Result: PASSED.
    - Count: 58 passed; 0 failed; 162 filtered out.
 
+9. `cargo test -p runtime --locked frame_decoder -- --test-threads=1`
+   - Result: FAILED as expected.
+   - Count: 0 passed; compile failed before running tests.
+   - Failure: `E0599` unresolved `FramePoll::Partial` and `E0425` unresolved `tls_idle_sleep_needed`.
+   - Correction: added explicit `FramePoll::Partial`, updated decoder callers, and routed TLS idle backoff through the progress predicate.
+
+10. `cargo test -p runtime --locked frame_decoder -- --test-threads=1`
+    - Result: PASSED.
+    - Count: 3 passed; 0 failed; 219 filtered out.
+
+11. `cargo test -p runtime --locked tls_idle_sleep_is_skipped_after_partial_frame_progress -- --test-threads=1`
+    - Result: PASSED.
+    - Count: 1 passed; 0 failed; 221 filtered out.
+
 ## Required gates
 
 1. `cargo test -p runtime --locked remote -- --test-threads=1`
    - Result: PASSED.
-   - Count: 58 passed; 0 failed; 162 filtered out.
+   - Count: 60 passed; 0 failed; 162 filtered out.
 
 2. `cargo clippy -p runtime --all-targets --locked -- -D warnings`
    - Result: PASSED.
    - Count: command completed successfully with no warnings.
 
-3. `git diff --check`
+3. `rustfmt --edition 2024 --check crates/runtime/src/remote.rs crates/runtime/src/remote/liveness.rs`
+   - Result: PASSED.
+   - Count: command completed successfully with no formatting diff.
+
+4. `git diff --check`
    - Result: PASSED.
    - Count: command completed successfully with no whitespace errors.
 
@@ -83,6 +102,11 @@
 3. `rustfmt --edition 2024 --check crates/runtime/src/remote.rs crates/runtime/src/remote/liveness.rs`
    - Result: PASSED.
    - Count: command completed successfully with no formatting diff.
+
+4. `cargo test -p runtime --locked frame_decoder_reports_idle_after_partial_progress_is_exhausted tls_idle_sleep_is_skipped_after_partial_frame_progress -- --test-threads=1`
+   - Result: FAILED.
+   - Failure: invalid command shape; Cargo accepts only one test-name filter before `--`.
+   - Correction: reran using `frame_decoder` and `tls_idle_sleep_is_skipped_after_partial_frame_progress` as separate filters.
 
 ## Modified files
 

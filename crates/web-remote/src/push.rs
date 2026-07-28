@@ -510,20 +510,37 @@ fn enqueue_session_job(
     mut job: SessionJob,
     destination: SessionJobQueue,
 ) -> bool {
+    if inner.notified_status.get(&job.session) == Some(&job.kind) {
+        return false;
+    }
+
     let old_fresh = remove_session_jobs(&mut inner.jobs, &job.session);
     let old_retry = remove_session_jobs(&mut inner.retry_jobs, &job.session);
-    if old_fresh
-        .as_ref()
-        .is_some_and(|old| old.kind == SessionKind::Done)
+    let final_kind = if job.kind == SessionKind::Done
+        || old_fresh
+            .as_ref()
+            .is_some_and(|old| old.kind == SessionKind::Done)
         || old_retry
             .as_ref()
             .is_some_and(|old| old.kind == SessionKind::Done)
     {
-        job.kind = SessionKind::Done;
-    }
-    if matches!(destination, SessionJobQueue::Fresh) {
-        job.attempts = 0;
-    }
+        SessionKind::Done
+    } else {
+        job.kind
+    };
+    let same_kind_attempts = [old_fresh.as_ref(), old_retry.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|old| old.kind == final_kind)
+        .map(|old| old.attempts)
+        .max();
+    job.kind = final_kind;
+    job.attempts = match destination {
+        SessionJobQueue::Fresh => same_kind_attempts.unwrap_or(0),
+        SessionJobQueue::Retry => {
+            same_kind_attempts.map_or(job.attempts, |old| old.max(job.attempts))
+        }
+    };
 
     let mut evicted = false;
     while inner.jobs.len() + inner.retry_jobs.len() >= MAX_SESSION_JOBS {
@@ -1871,10 +1888,7 @@ mod tests {
         }
 
         assert!(evicted, "257th unique session should evict one old job");
-        assert_eq!(
-            inner.jobs.len() + inner.retry_jobs.len(),
-            MAX_SESSION_JOBS
-        );
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), MAX_SESSION_JOBS);
         assert!(
             queued_session_job(&inner, "session-000").is_none(),
             "oldest best-effort session job should be evicted"
@@ -1882,6 +1896,70 @@ mod tests {
         assert!(
             queued_session_job(&inner, "session-256").is_some(),
             "newest session job should be retained"
+        );
+    }
+
+    #[test]
+    fn session_job_admission_rejects_committed_duplicate_without_eviction() {
+        let mut inner = empty_push_inner();
+
+        for i in 0..MAX_SESSION_JOBS {
+            enqueue_session_job(
+                &mut inner,
+                session_job(format!("session-{i:03}"), SessionKind::Waiting, 0),
+                SessionJobQueue::Fresh,
+            );
+        }
+        remember_status(
+            &mut inner.notified_status,
+            "already-committed",
+            SessionKind::Done,
+        );
+
+        let evicted = enqueue_session_job(
+            &mut inner,
+            session_job("already-committed", SessionKind::Done, 0),
+            SessionJobQueue::Fresh,
+        );
+
+        assert!(!evicted, "committed duplicate should be rejected");
+        assert_eq!(inner.jobs.len() + inner.retry_jobs.len(), MAX_SESSION_JOBS);
+        assert!(
+            queued_session_job(&inner, "already-committed").is_none(),
+            "committed duplicate should not be queued"
+        );
+        assert!(
+            queued_session_job(&inner, "session-000").is_some(),
+            "committed duplicate should not evict an unsent session"
+        );
+    }
+
+    #[test]
+    fn session_job_admission_fresh_duplicate_done_preserves_retry_attempts() {
+        let mut inner = empty_push_inner();
+
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Done, 2),
+            SessionJobQueue::Retry,
+        );
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Done, 0),
+            SessionJobQueue::Fresh,
+        );
+
+        assert!(
+            inner.retry_jobs.is_empty(),
+            "retry duplicate should move fresh"
+        );
+        assert_eq!(inner.jobs.len(), 1);
+        let job = inner.jobs.front().expect("fresh job");
+        assert_eq!(job.session, "same");
+        assert_eq!(job.kind, SessionKind::Done);
+        assert_eq!(
+            job.attempts, 2,
+            "fresh duplicate of same final state should preserve retry attempts"
         );
     }
 
@@ -1934,7 +2012,8 @@ mod tests {
 
         let expected_posts = MAX_SESSION_JOBS * SESSION_SEND_ATTEMPTS as usize * 2;
         assert!(
-            wait_until_for(Duration::from_secs(30), || transport.call_count() >= expected_posts),
+            wait_until_for(Duration::from_secs(30), || transport.call_count()
+                >= expected_posts),
             "failed session jobs did not reach the retry cap"
         );
         assert!(

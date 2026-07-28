@@ -19,10 +19,14 @@ cannot let fresh and retry session queues grow without limit.
 - Centralized session job insertion through `enqueue_session_job`.
 - Removed queued duplicates for the same session from both queues before
   insertion.
+- Rejected an already-committed exact `(session, kind)` duplicate while holding
+  the `PushInner` lock before admission or eviction, so a full queue cannot lose
+  an unsent different session to a job the worker would later drop.
 - Preserved latest-state semantics with `Done` taking precedence over
   `Waiting`.
-- Reset attempts for fresh admissions and preserved incremented attempts for
-  retry admissions.
+- Preserved the maximum old attempt count when replacing the same final session
+  kind, including fresh duplicates of retry jobs, while resetting attempts for
+  genuine state transitions such as `Waiting -> Done`.
 - Evicted oldest fresh jobs first, then oldest retry jobs, before inserting
   when the combined queue is full.
 - Logged a low-cardinality warning when admission evicts an old best-effort
@@ -39,12 +43,19 @@ cannot let fresh and retry session queues grow without limit.
   filtered.
 - After adding the worker-level stalled sender regression, the same focused
   admission command passed again: 4 passed, 0 failed, 141 filtered.
+- Review-fix red test command:
+  `cargo test -p web-remote --locked session_job_admission -- --test-threads=1`
+- Review-fix red result: failed as expected with 4 passed, 2 failed, 141
+  filtered. The failures showed committed duplicate admission still returned
+  eviction and fresh duplicate `Done` reset attempts from 2 to 0.
+- Review-fix green result after helper correction: 6 passed, 0 failed, 141
+  filtered.
 
 ## Final Gate Results
 
 - `cargo test -p web-remote --locked push -- --test-threads=1`
   - PASS
-  - 34 passed, 0 failed, 0 ignored, 111 filtered
+  - 36 passed, 0 failed, 0 ignored, 111 filtered
 - `cargo clippy -p web-remote --all-targets --locked -- -D warnings`
   - PASS
 - `git diff --check`
@@ -57,6 +68,9 @@ cannot let fresh and retry session queues grow without limit.
   `remove_session_jobs`.
 - Corrected the helper shape and reran the final test, Clippy, and diff gates
   successfully.
+- Standalone `rustfmt crates/web-remote/src/push.rs` failed because it did not
+  infer the crate's Rust 2024 edition for an existing let-chain; reran
+  `cargo fmt -p web-remote` successfully.
 
 ## Coverage Added
 
@@ -64,6 +78,10 @@ cannot let fresh and retry session queues grow without limit.
 - `Waiting -> Done` leaves one final `Done` job.
 - Retry admission replaces a fresh duplicate while preserving retry attempts.
 - 257 unique queued session admissions retain exactly 256 jobs.
+- A full queue plus an already-committed duplicate is rejected without evicting
+  an unsent session.
+- A retry `Done` job at attempts=2 replaced by a fresh duplicate `Done`
+  preserves attempts=2.
 - A stalled/failing transport keeps retained jobs bounded at 256, drains after
   the existing 3 total send attempts, and does not prevent `stop_and_join`.
 

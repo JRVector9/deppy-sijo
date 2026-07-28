@@ -69,6 +69,13 @@ pub fn separator_stroke(visuals: &egui::Visuals) -> egui::Stroke {
     egui::Stroke::new(SEPARATOR_WIDTH, tokens(visuals).separator)
 }
 
+pub fn vertical_separator(ui: &mut egui::Ui, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, height), egui::Sense::hover());
+    let x = ui.painter().round_to_pixel_center(rect.center().x);
+    ui.painter()
+        .vline(x, rect.y_range(), separator_stroke(ui.visuals()));
+}
+
 pub fn structural_frame(visuals: &egui::Visuals) -> egui::Frame {
     egui::Frame::NONE
         .fill(tokens(visuals).app_background)

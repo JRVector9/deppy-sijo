@@ -168,18 +168,18 @@ impl AgentTerminalUi {
             |ui| {
                 ui.add_space(10.0);
                 crate::app::top_provider_usage(ui, claude_usage, codex_usage);
-                ui.separator();
+                crate::ui::designall::vertical_separator(ui, 14.0);
                 ui.weak(catalog.t(
                     "status_bar.sessions",
                     &[("count", &totals.sessions.to_string())],
                 ));
-                ui.separator();
+                crate::ui::designall::vertical_separator(ui, 14.0);
                 // 등록·활성화된 MCP 서버 수 (2026-07-18 사용자 요청).
                 ui.weak(catalog.t("status_bar.mcp", &[("count", &mcp_count.to_string())]))
                     .on_hover_text(catalog.t("status_bar.mcp_hover", &[]));
                 // 핵심 서비스 상태 점등 — Claude/OpenAI/GitHub를 5분마다 폴링하고
                 // 클릭하면 각 공식 상태 페이지를 연다.
-                ui.separator();
+                crate::ui::designall::vertical_separator(ui, 14.0);
                 service_status_light(
                     ui,
                     "Claude",
@@ -202,7 +202,7 @@ impl AgentTerminalUi {
                     catalog,
                 );
                 if waiting > 0 {
-                    ui.separator();
+                    crate::ui::designall::vertical_separator(ui, 14.0);
                     ui.colored_label(
                         egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
                         catalog.t("status_bar.waiting", &[("count", &waiting.to_string())]),
@@ -223,9 +223,9 @@ impl AgentTerminalUi {
                         "status_bar.memory_hover",
                         &[("sessions", &super::format_bytes(totals.session_rss_bytes))],
                     ));
-                    ui.separator();
+                    crate::ui::designall::vertical_separator(ui, 14.0);
                     ui.weak(cpu);
-                    ui.separator();
+                    crate::ui::designall::vertical_separator(ui, 14.0);
                     ui.weak(match self.view {
                         AgentTerminalView::Home => catalog.t("status_bar.view.home", &[]),
                         AgentTerminalView::Inbox => catalog.t("status_bar.view.inbox", &[]),
@@ -1022,17 +1022,24 @@ mod tests {
                 if !*fonts_ready {
                     return;
                 }
-                AgentTerminalUi::new().status_bar(ui, None, None, &[], 0, 0, &feed, &catalog);
+                AgentTerminalUi::new().status_bar(ui, None, None, &[], 2, 5, &feed, &catalog);
             },
             false,
         );
+        harness.set_size(egui::vec2(1400.0, 100.0));
         install_sidebar_test_fonts(&harness.ctx);
         *harness.state_mut() = true;
         harness.run();
 
+        harness.get_by_label("Sessions 0");
+        harness.get_by_label("MCP 5");
         harness.get_by_label("Claude");
         harness.get_by_label("OpenAI");
         harness.get_by_label("GitHub");
+        harness.get_by_label("Waiting for input 2");
+        harness.get_by_label("Terminal");
+        harness.get_by_label("CPU —");
+        harness.get_by_label("App 0 B · Sessions 0 B");
     }
 
     #[test]

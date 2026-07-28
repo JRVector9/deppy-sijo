@@ -8,6 +8,7 @@ pub mod approvals;
 pub mod clipboard_image;
 pub mod composer;
 pub mod credentials;
+pub mod designall;
 pub mod diff_panel;
 pub mod env_profiles;
 pub mod env_project_list;

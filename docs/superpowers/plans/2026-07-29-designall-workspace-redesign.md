@@ -87,11 +87,13 @@ mod tests {
 cargo test -p deppy-sijo ui::designall::tests --locked -- --test-threads=1
 ```
 
-Expected: FAIL because `ui::designall` is not exported.
+Expected: FAIL because the exported test-only module references token symbols that have not been
+implemented yet. An unexported Rust source file is not compiled, so exporting the test shell is
+part of the RED setup rather than the GREEN implementation.
 
 - [ ] **Step 3: Implement the minimal token module**
 
-Export it from `ui/mod.rs` with `pub mod designall;`, then implement:
+Keep the `pub mod designall;` export from the RED setup, then implement:
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

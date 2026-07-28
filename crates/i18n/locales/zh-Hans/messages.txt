@@ -38,6 +38,7 @@ sidebar.nav.home = 主页
 sidebar.nav.inbox = 工作
 sidebar.nav.fleet = 舰队
 sidebar.nav.agents = AI
+sidebar.nav.help = 帮助
 worktree.create_failed = 工作树创建失败
 worktree.created_elsewhere = 工作区已切换，未打开 Shell — 工作树已创建
 worktree.remove_failed = 工作树删除失败

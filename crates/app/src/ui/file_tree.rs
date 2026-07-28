@@ -119,6 +119,7 @@ pub enum SidebarAction {
     ShowInbox,
     OpenAgents,
     OpenSettings,
+    OpenHelp,
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
     OpenMacosFileAccessSettings,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
@@ -750,6 +751,7 @@ pub struct FileTreeUi {
     /// 내장 SidePanel 리사이저 대신 사용하는 폭. 내장 리사이저는 드래그 가이드선을
     /// 하단 상태바까지 그리므로, 상태바 위에서 끝나는 전용 핸들로 직접 조절한다.
     sidebar_width: f32,
+    navigation_rail_width: f32,
     /// 마지막 조작 에러 (하단 빨간 라벨, §4).
     error: Option<String>,
     /// macOS/TCC 등에서 나열 권한이 거부된 디렉터리. 전역 오류로 승격하지 않고
@@ -844,6 +846,7 @@ impl FileTreeUi {
             file_search: String::new(),
             collapsed: false,
             sidebar_width: 360.0,
+            navigation_rail_width: crate::ui::designall::NAV_RAIL_WIDTH,
             error: None,
             inaccessible_paths: HashSet::new(),
             io_generation: 1,
@@ -1421,18 +1424,22 @@ impl FileTreeUi {
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
+        self.navigation_rail_width = self.navigation_rail_width.clamp(
+            crate::ui::designall::NAV_RAIL_MIN_WIDTH,
+            crate::ui::designall::NAV_RAIL_MAX_WIDTH,
+        );
         let frame = crate::ui::designall::structural_frame(ui.visuals());
         let panel = egui::Panel::left("designall_navigation_rail")
             .resizable(false)
-            .exact_size(crate::ui::designall::NAV_RAIL_WIDTH)
+            .exact_size(self.navigation_rail_width)
             .show_separator_line(false)
             .frame(frame)
             .show(ui, |ui| {
                 crate::ui::designall::apply_workspace_visuals(ui);
                 crate::fonts::apply_sidebar_text_styles(ui);
                 let width = ui.available_width();
-                let settings_height = SIDEBAR_NAV_ROW_HEIGHT;
-                let navigation_height = (ui.available_height() - settings_height).max(0.0);
+                let utility_height = nav_utility_height(width);
+                let navigation_height = (ui.available_height() - utility_height).max(0.0);
                 let navigation_action = ui
                     .allocate_ui_with_layout(
                         egui::vec2(width, navigation_height),
@@ -1446,29 +1453,49 @@ impl FileTreeUi {
                         },
                     )
                     .inner;
-                let settings_action = ui
+                let utility_action = ui
                     .allocate_ui_with_layout(
-                        egui::vec2(width, settings_height),
+                        egui::vec2(width, utility_height),
                         egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            nav_row(
-                                ui,
-                                NavIcon::Settings,
-                                &catalog.t("settings.title", &[]),
-                                false,
-                                None,
-                            )
-                            .clicked()
-                            .then_some(SidebarAction::OpenSettings)
-                        },
+                        |ui| nav_utilities(ui, catalog),
                     )
                     .inner;
-                settings_action.or(navigation_action)
+                utility_action.or(navigation_action)
             });
+        let panel_rect = panel.response.rect;
+        let resize_bottom = panel_rect
+            .bottom()
+            .min(ui.ctx().content_rect().bottom() - 26.0);
+        let resize_rect = egui::Rect::from_min_max(
+            egui::pos2(panel_rect.right() - 3.0, panel_rect.top()),
+            egui::pos2(panel_rect.right() + 3.0, resize_bottom),
+        );
+        let resize_response = ui
+            .interact(
+                resize_rect,
+                egui::Id::new("designall_navigation_rail_resize"),
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if resize_response.dragged() {
+            let delta_x = ui.input(|input| input.pointer.delta().x);
+            self.navigation_rail_width = (self.navigation_rail_width + delta_x).clamp(
+                crate::ui::designall::NAV_RAIL_MIN_WIDTH,
+                crate::ui::designall::NAV_RAIL_MAX_WIDTH,
+            );
+            ui.ctx().request_repaint();
+        }
+        let separator_stroke = if resize_response.dragged() {
+            ui.visuals().widgets.active.bg_stroke
+        } else if resize_response.hovered() {
+            ui.visuals().widgets.hovered.bg_stroke
+        } else {
+            crate::ui::designall::separator_stroke(ui.visuals())
+        };
         paint_sidebar_separator(
             ui,
-            panel.response.rect,
-            crate::ui::designall::separator_stroke(ui.visuals()),
+            panel_rect,
+            separator_stroke,
         );
         panel.inner
     }
@@ -1554,16 +1581,17 @@ impl FileTreeUi {
     /// 포인터 밑에 오면 hover 판정만으로 클릭 가능한 것처럼 보이는 오작동을
     /// 막기 위해 호출측이 행 상호작용을 잠시 꺼야 한다(2026-07-24 사용자 보고).
     fn workspace_split_handle(&mut self, ui: &mut egui::Ui) -> bool {
-        let gap = 6.0;
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), gap), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), WORKSPACE_SPLIT_HANDLE_HEIGHT),
+            egui::Sense::hover(),
+        );
         let hit_rect = rect.expand2(egui::vec2(0.0, 2.0));
         let id = ui.id().with("file_tree_workspace_split_handle");
         let resp = ui
             .interact(hit_rect, id, egui::Sense::drag())
             .on_hover_cursor(egui::CursorIcon::ResizeVertical);
         if resp.dragged() {
-            self.workspace_section_height += resp.drag_delta().y;
+            self.workspace_section_height += ui.input(|input| input.pointer.delta().y);
         }
         let color = if resp.hovered() || resp.dragged() {
             ui.visuals().selection.bg_fill
@@ -1585,6 +1613,24 @@ impl FileTreeUi {
     ) -> Option<SidebarAction> {
         // (워처/백그라운드 채널 수거는 panel()이 접힘 여부와 무관하게 이미 수행했다)
         let mut action: Option<SidebarAction> = None;
+        let available_height = ui.available_height();
+        let max_workspace_height =
+            (available_height - WORKSPACE_SPLIT_HANDLE_HEIGHT - FOLDER_TREE_SECTION_MIN_HEIGHT)
+                .max(0.0);
+        let min_workspace_height = WORKSPACE_SECTION_MIN_HEIGHT.min(max_workspace_height);
+        self.workspace_section_height = self
+            .workspace_section_height
+            .clamp(min_workspace_height, max_workspace_height);
+        let workspace_width = ui.available_width();
+        let workspace_height = self.workspace_section_height;
+        let workspace_background =
+            crate::ui::designall::tokens(ui.visuals()).workspace_background;
+        let _ = ui.allocate_ui_with_layout(
+            egui::vec2(workspace_width, workspace_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.painter()
+                    .rect_filled(ui.max_rect(), 0.0, workspace_background);
 
         // ── 통합 워크스페이스·세션 계층 ──
         let compact_sidebar = ui.available_width() < 120.0;
@@ -1645,40 +1691,16 @@ impl FileTreeUi {
                 .get(sidebar.active_workspace_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let any_sessions_visible = sidebar.workspaces.iter().any(|workspace| {
-                self.workspace_sessions_expanded
-                    .get(&workspace.id)
-                    .copied()
-                    .unwrap_or(false)
-                    && sessions_by_workspace
-                        .get(&workspace.id)
-                        .is_some_and(|sessions| !sessions.is_empty())
-            });
             // 활성 워크스페이스가 생성순 뒤쪽이면 before_active 행들이 스크롤 밖에 그려져
             // 46px씩 사이드바 고정 높이를 잠식했다 (codex P2 — 세션·파일 트리가 클립 밖으로
             // 밀리는데 스크롤할 방법이 없었다). 전체 순서 목록(before + 활성 + 세션 + after)을
             // 하나의 bounded 스크롤 영역이 공유한다. 상한은 기존 워크스페이스 목록 예산에
             // 활성 행(46px)과 세션 블록 예산을 더한 값 — before가 없던 기존 화면과 동일한
             // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
-            let session_block_h = if any_sessions_visible {
-                session_max_h
-            } else {
-                0.0
-            };
-            // 사용자가 아래 경계선(workspace_split_handle)을 드래그해 조절한 높이 —
-            // 창 크기가 바뀌어도 안전하도록 매 프레임 가용 높이 기준으로 재클램프한다.
-            let min_list_h = 118.0_f32;
-            let max_list_h = (ui.available_height() - 160.0).max(min_list_h);
-            self.workspace_section_height =
-                self.workspace_section_height.clamp(min_list_h, max_list_h);
-            let list_max_h = self.workspace_section_height + session_block_h;
             egui::ScrollArea::vertical()
                 .id_salt("workspace_list_scroll")
-                .max_height(list_max_h)
-                .auto_shrink([false, true])
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.painter()
-                        .add(workspace_list_background_gradient(ui.clip_rect()));
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.add_space(4.0);
                     for workspace in before_active {
@@ -2104,8 +2126,17 @@ impl FileTreeUi {
                     }
                 });
         }
-        ui.add_space(4.0);
+            },
+        );
         let resizing_workspace_split = self.workspace_split_handle(ui);
+        let folder_background =
+            crate::ui::designall::tokens(ui.visuals()).folder_tree_background;
+        let folder_background_rect = egui::Rect::from_min_max(
+            egui::pos2(ui.max_rect().left(), ui.cursor().min.y),
+            ui.max_rect().right_bottom(),
+        );
+        ui.painter()
+            .rect_filled(folder_background_rect, 0.0, folder_background);
 
         // 독립 「파일」 제목행은 제거하고 현재 경로와 핵심 도구를 한 행에 합친다.
         // 패널이 극단적으로 좁아지면 검색 → 새 폴더 → 숨김 순으로 도구를 남겨
@@ -3584,10 +3615,10 @@ fn workspace_row(
 
 const SIDEBAR_NAV_ROW_HEIGHT: f32 = 58.0;
 const SIDEBAR_NAV_ITEM_SPACING: f32 = 2.0;
-const SIDEBAR_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
+const WORKSPACE_SECTION_MIN_HEIGHT: f32 = 118.0;
+const FOLDER_TREE_SECTION_MIN_HEIGHT: f32 = 50.0;
+const WORKSPACE_SPLIT_HANDLE_HEIGHT: f32 = 6.0;
 const WORKSPACE_CARD_HORIZONTAL_INSET: f32 = 6.0;
-const WORKSPACE_LIST_BACKGROUND_TOP: egui::Color32 = SIDEBAR_BACKGROUND;
-const WORKSPACE_LIST_BACKGROUND_BOTTOM: egui::Color32 = SIDEBAR_BACKGROUND;
 const WORKSPACE_GROUP_FILL: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
 const WORKSPACE_GROUP_TOP_FILL: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
 const WORKSPACE_GROUP_BORDER: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
@@ -3607,14 +3638,6 @@ fn vertical_gradient_rect(
     mesh.indices
         .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
     egui::Shape::mesh(mesh)
-}
-
-fn workspace_list_background_gradient(rect: egui::Rect) -> egui::Shape {
-    vertical_gradient_rect(
-        rect,
-        WORKSPACE_LIST_BACKGROUND_TOP,
-        WORKSPACE_LIST_BACKGROUND_BOTTOM,
-    )
 }
 
 fn workspace_group_gradient(rect: egui::Rect) -> egui::Shape {
@@ -4818,6 +4841,7 @@ enum NavIcon {
     Fleet,
     Agents,
     Settings,
+    Help,
 }
 
 /// 작업함 배지 문구 — 0이면 숨김(None).
@@ -4832,6 +4856,91 @@ fn paint_sidebar_separator(ui: &egui::Ui, rect: egui::Rect, stroke: egui::Stroke
         ui.painter()
             .vline(rect.right(), egui::Rangef::new(rect.top(), bottom), stroke);
     }
+}
+
+fn nav_utility_height(width: f32) -> f32 {
+    if width < 56.0 { 48.0 } else { 28.0 }
+}
+
+fn nav_utilities(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<SidebarAction> {
+    let mut action = None;
+    let stacked = ui.available_width() < 56.0;
+    if stacked {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.vertical_centered(|ui| {
+            let side = ui.available_width().min(24.0);
+            if nav_utility_button(
+                ui,
+                NavIcon::Settings,
+                &catalog.t("settings.title", &[]),
+                side,
+            )
+            .clicked()
+            {
+                action = Some(SidebarAction::OpenSettings);
+            }
+            if nav_utility_button(
+                ui,
+                NavIcon::Help,
+                &catalog.t("sidebar.nav.help", &[]),
+                side,
+            )
+            .clicked()
+            {
+                action = Some(SidebarAction::OpenHelp);
+            }
+        });
+    } else {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.horizontal_centered(|ui| {
+            if nav_utility_button(
+                ui,
+                NavIcon::Settings,
+                &catalog.t("settings.title", &[]),
+                28.0,
+            )
+            .clicked()
+            {
+                action = Some(SidebarAction::OpenSettings);
+            }
+            if nav_utility_button(
+                ui,
+                NavIcon::Help,
+                &catalog.t("sidebar.nav.help", &[]),
+                28.0,
+            )
+            .clicked()
+            {
+                action = Some(SidebarAction::OpenHelp);
+            }
+        });
+    }
+    action
+}
+
+fn nav_utility_button(
+    ui: &mut egui::Ui,
+    icon: NavIcon,
+    label: &str,
+    side: f32,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if response.hovered() {
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        ui.painter()
+            .rect_filled(rect.shrink(2.0), 0.0, tokens.hover_background);
+    }
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    paint_nav_icon(ui.painter(), rect.center(), icon, color);
+    response.on_hover_text(label)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4992,6 +5101,16 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
                 let direction = egui::vec2(angle.cos(), angle.sin());
                 p.line_segment([c + direction * 5.5, c + direction * 7.0], stroke);
             }
+        }
+        NavIcon::Help => {
+            p.circle_stroke(c, 6.0, stroke);
+            p.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                "?",
+                egui::FontId::monospace(10.0),
+                col,
+            );
         }
     }
 }

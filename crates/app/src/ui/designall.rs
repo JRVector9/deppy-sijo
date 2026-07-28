@@ -1,6 +1,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tokens {
     pub app_background: egui::Color32,
+    pub workspace_background: egui::Color32,
+    pub folder_tree_background: egui::Color32,
     pub input_background: egui::Color32,
     pub separator: egui::Color32,
     pub text: egui::Color32,
@@ -17,10 +19,14 @@ pub const STRUCTURAL_CORNER_RADIUS: u8 = 0;
 #[allow(dead_code)]
 pub const INTERACTION_CORNER_RADIUS: u8 = 4;
 pub const NAV_RAIL_WIDTH: f32 = 88.0;
+pub const NAV_RAIL_MIN_WIDTH: f32 = 20.0;
+pub const NAV_RAIL_MAX_WIDTH: f32 = 180.0;
 pub const SEPARATOR_WIDTH: f32 = 1.0;
 
 pub const DARK: Tokens = Tokens {
     app_background: egui::Color32::from_rgb(0x0b, 0x10, 0x15),
+    workspace_background: egui::Color32::from_rgb(0x10, 0x16, 0x1c),
+    folder_tree_background: egui::Color32::from_rgb(0x08, 0x0f, 0x16),
     input_background: egui::Color32::from_rgb(0x11, 0x18, 0x20),
     separator: egui::Color32::from_rgb(0x26, 0x30, 0x3a),
     text: egui::Color32::from_rgb(0xd8, 0xde, 0xe6),
@@ -35,6 +41,8 @@ pub const DARK: Tokens = Tokens {
 
 pub const LIGHT: Tokens = Tokens {
     app_background: egui::Color32::from_rgb(0xfb, 0xfc, 0xfd),
+    workspace_background: egui::Color32::from_rgb(0xf5, 0xf7, 0xf9),
+    folder_tree_background: egui::Color32::from_rgb(0xee, 0xf2, 0xf5),
     input_background: egui::Color32::from_rgb(0xf1, 0xf3, 0xf5),
     separator: egui::Color32::from_rgb(0xd5, 0xd9, 0xdf),
     text: egui::Color32::from_rgb(0x23, 0x26, 0x2c),

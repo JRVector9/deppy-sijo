@@ -16998,6 +16998,11 @@ impl eframe::App for App {
                 Some(ui::file_tree::SidebarAction::OpenSettings) => {
                     self.settings_open = true;
                 }
+                Some(ui::file_tree::SidebarAction::OpenHelp) => {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/JRVector9/deppy-sijo",
+                    ));
+                }
                 Some(ui::file_tree::SidebarAction::OpenMacosFileAccessSettings) => {
                     if self.pending_app_controller_action.is_none() {
                         self.pending_app_controller_action =

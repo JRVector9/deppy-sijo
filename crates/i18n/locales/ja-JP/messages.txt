@@ -38,6 +38,7 @@ sidebar.nav.home = ホーム
 sidebar.nav.inbox = 作業
 sidebar.nav.fleet = フリート
 sidebar.nav.agents = AI
+sidebar.nav.help = ヘルプ
 worktree.create_failed = ワークツリーの作成に失敗しました
 worktree.created_elsewhere = ワークスペースが切り替わったためシェルは開きませんでした — ワークツリーは作成済み
 worktree.remove_failed = ワークツリーの削除に失敗しました

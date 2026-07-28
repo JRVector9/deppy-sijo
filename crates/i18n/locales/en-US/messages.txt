@@ -38,6 +38,7 @@ sidebar.nav.home = Home
 sidebar.nav.inbox = Work
 sidebar.nav.fleet = Fleet
 sidebar.nav.agents = AI
+sidebar.nav.help = Help
 worktree.create_failed = Worktree creation failed
 worktree.created_elsewhere = Workspace changed — shell not opened; the worktree was created
 worktree.remove_failed = Worktree deletion failed

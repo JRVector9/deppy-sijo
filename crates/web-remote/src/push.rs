@@ -559,12 +559,15 @@ fn enqueue_session_job(
         .filter(|old| old.kind == final_kind)
         .map(|old| old.attempts)
         .max();
+    let incoming_same_kind_attempts = (job.kind == final_kind).then_some(job.attempts);
     job.kind = final_kind;
     job.attempts = match destination {
         SessionJobQueue::Fresh => same_kind_attempts.unwrap_or(0),
-        SessionJobQueue::Retry => {
-            same_kind_attempts.map_or(job.attempts, |old| old.max(job.attempts))
-        }
+        SessionJobQueue::Retry => same_kind_attempts
+            .into_iter()
+            .chain(incoming_same_kind_attempts)
+            .max()
+            .unwrap_or(0),
     };
 
     let mut evicted = false;
@@ -1913,6 +1916,27 @@ mod tests {
         assert_eq!(job.session, "same");
         assert_eq!(job.kind, SessionKind::Waiting);
         assert_eq!(job.attempts, 2, "retry admission preserves attempts");
+    }
+
+    #[test]
+    fn session_job_admission_done_retry_does_not_inherit_waiting_attempts() {
+        let mut inner = empty_push_inner();
+
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Done, 0),
+            SessionJobQueue::Fresh,
+        );
+        enqueue_session_job(
+            &mut inner,
+            session_job("same", SessionKind::Waiting, 2),
+            SessionJobQueue::Retry,
+        );
+
+        assert_eq!(inner.retry_jobs.len(), 1);
+        let job = inner.retry_jobs.front().expect("done retry job");
+        assert_eq!(job.kind, SessionKind::Done);
+        assert_eq!(job.attempts, 0, "done starts its own retry budget");
     }
 
     #[test]

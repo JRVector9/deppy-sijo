@@ -404,6 +404,21 @@ const TERMINAL_STREAM_LEFT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_RIGHT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_VERTICAL_PADDING: f32 = 6.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneHeaderStyle {
+    background: egui::Color32,
+    selection_fill: Option<egui::Color32>,
+    active_line: Option<egui::Color32>,
+}
+
+fn pane_header_style(tokens: crate::ui::designall::Tokens, focused: bool) -> PaneHeaderStyle {
+    PaneHeaderStyle {
+        background: tokens.app_background,
+        selection_fill: None,
+        active_line: focused.then_some(tokens.accent),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalPaneLayout {
     header: egui::Rect,
@@ -444,8 +459,6 @@ struct PaneHeaderButtons {
     /// 표시할 우측 도구 히트박스(왼쪽→오른쪽). 아이콘은 전체 목록의 뒤에서부터
     /// `toolbar.len()`개를 대응시킨다 (왼쪽 도구부터 숨김).
     toolbar: Vec<egui::Rect>,
-    /// 우측 도구 묶음의 왼쪽 경계 (탭 폭 계산용, 도구 0개면 우측 여백 기준).
-    toolbar_left: f32,
 }
 
 /// 헤더 폭·제목 폭으로 닫기(×)와 우측 도구의 히트박스를 계산한다.
@@ -500,11 +513,7 @@ fn pane_header_buttons(
             visible_toolbar -= 1;
             continue;
         }
-        return PaneHeaderButtons {
-            close,
-            toolbar,
-            toolbar_left,
-        };
+        return PaneHeaderButtons { close, toolbar };
     }
 }
 
@@ -2431,23 +2440,26 @@ impl WorkspaceUi {
         let buttons = pane_header_buttons(header, title_width, toolbar_icons.len());
         let center_y = header.center().y;
         let close = buttons.close;
-        let tab_right = (close.right() + 6.0)
-            .min(buttons.toolbar_left - 4.0)
-            .max(header.left());
-        let tab = egui::Rect::from_min_max(header.min, egui::pos2(tab_right, header.bottom()));
-
-        let header_fill = egui::Color32::from_rgb(0x17, 0x17, 0x1c);
-        let active_tab_fill = egui::Color32::from_rgb(0x1b, 0x29, 0x33);
-        let border = egui::Color32::from_rgb(0x2a, 0x2a, 0x33);
-        let status_green = egui::Color32::from_rgb(0x55, 0xc8, 0x79);
-        ui.painter().rect_filled(header, 0.0, header_fill);
-        if focused {
-            ui.painter().rect_filled(tab, 0.0, active_tab_fill);
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        let style = pane_header_style(tokens, focused);
+        ui.painter().rect_filled(header, 0.0, style.background);
+        if let Some(selection_fill) = style.selection_fill {
+            ui.painter().rect_filled(header, 0.0, selection_fill);
+        }
+        if let Some(active_line) = style.active_line {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    header.min,
+                    egui::pos2(header.right(), header.top() + 2.0),
+                ),
+                0.0,
+                active_line,
+            );
         }
         ui.painter().hline(
             header.x_range(),
-            header.bottom() - 0.5,
-            egui::Stroke::new(1.0, border),
+            ui.painter().round_to_pixel_center(header.bottom()),
+            crate::ui::designall::separator_stroke(ui.visuals()),
         );
 
         let header_response = ui.interact(
@@ -2461,9 +2473,9 @@ impl WorkspaceUi {
         self.pane_context_menu(&header_response, &pane.id, config, catalog);
 
         let status_color = if focused {
-            status_green
+            tokens.success
         } else {
-            egui::Color32::from_rgb(0x72, 0x76, 0x80)
+            tokens.muted_text
         };
         ui.painter()
             .circle_filled(egui::pos2(header.left() + 8.0, center_y), 4.0, status_color);
@@ -2474,9 +2486,9 @@ impl WorkspaceUi {
             egui::pos2(title_right, header.bottom()),
         );
         let title_color = if focused {
-            egui::Color32::from_rgb(0xee, 0xef, 0xf1)
+            tokens.text
         } else {
-            egui::Color32::from_rgb(0xa6, 0xaa, 0xb2)
+            tokens.muted_text
         };
         let mut title_job = egui::text::LayoutJob::single_section(
             title,
@@ -2504,9 +2516,9 @@ impl WorkspaceUi {
             egui::Sense::click(),
         );
         let close_color = if close_response.hovered() || close_response.has_focus() {
-            status_green
+            tokens.success
         } else {
-            egui::Color32::from_rgb(0xf2, 0xf2, 0xf2)
+            tokens.text
         };
         let d = 4.0;
         ui.painter().line_segment(
@@ -2701,14 +2713,13 @@ impl WorkspaceUi {
             SplitDirection::Vertical => egui::CursorIcon::ResizeVertical,
         };
         let resp = resp.on_hover_cursor(cursor);
-        // 항상 1px 구분선(다크 헤어라인)을 그린다 — hover/drag 시 accent로 강조.
-        if resp.hovered() || resp.dragged() {
-            ui.painter()
-                .rect_filled(gap_rect, 0.0, ui.visuals().selection.bg_fill);
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        let color = if resp.hovered() || resp.dragged() {
+            tokens.accent
         } else {
-            ui.painter()
-                .rect_filled(gap_rect, 0.0, egui::Color32::from_rgb(0x3a, 0x3a, 0x42));
-        }
+            tokens.separator
+        };
+        ui.painter().rect_filled(gap_rect, 0.0, color);
         if resp.dragged()
             && let Some(pointer) = resp.interact_pointer_pos()
         {
@@ -2750,8 +2761,9 @@ impl WorkspaceUi {
         let focused = mux.focused_pane.as_ref() == Some(pane_id);
         let pane_layout = terminal_pane_layout(ui.max_rect());
         let pane_rect = pane_layout.surface;
+        let tokens = crate::ui::designall::tokens(ui.visuals());
         ui.painter()
-            .rect_filled(pane_rect, 0.0, egui::Color32::from_rgb(0x0f, 0x11, 0x17));
+            .rect_filled(pane_rect, 0.0, tokens.app_background);
         self.render_pane_header(ui, pane_layout.header, pane, focused, config, catalog);
         // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
         // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
@@ -4899,6 +4911,14 @@ mod tests {
             layout.content.bottom(),
             358.0 - TERMINAL_STREAM_VERTICAL_PADDING
         );
+    }
+
+    #[test]
+    fn designall_pane_header는_배경카드없이_활성선만_쓴다() {
+        let style = pane_header_style(crate::ui::designall::DARK, true);
+        assert_eq!(style.background, crate::ui::designall::DARK.app_background);
+        assert_eq!(style.selection_fill, None);
+        assert_eq!(style.active_line, Some(crate::ui::designall::DARK.accent));
     }
 
     #[test]

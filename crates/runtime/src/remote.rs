@@ -1165,8 +1165,7 @@ fn serve_connection_tls(
     let mut exited_sessions = ExitedSessionTombstones::new();
     let mut keyframe_requests: Vec<SessionId> = Vec::new();
     let mut outbound = OutboundEventQueue::new();
-    let mut heartbeat =
-        liveness::OutboundHeartbeatTracker::new(Instant::now(), HEARTBEAT_INTERVAL);
+    let mut heartbeat = liveness::OutboundHeartbeatTracker::new(Instant::now(), HEARTBEAT_INTERVAL);
 
     'main: loop {
         if stop.load(Ordering::SeqCst) {
@@ -1287,10 +1286,7 @@ fn serve_connection_tls(
         }
 
         // (4) heartbeat — 유휴가 HEARTBEAT_INTERVAL 넘고 보낼 것도 없으면 길이 0 프레임.
-        if heartbeat.due(Instant::now())
-            && outbound.is_empty()
-            && !conn.wants_write()
-        {
+        if heartbeat.due(Instant::now()) && outbound.is_empty() && !conn.wants_write() {
             if write_frame(&mut conn.writer(), &[]).is_err()
                 || tls_flush(&mut conn, &mut sock).is_err()
             {
@@ -1649,9 +1645,7 @@ impl RemoteRuntimeClient {
                 // 수신이 죽은 클라이언트가 명령 전송만 성공하는 반쪽 상태 방지 —
                 // 소켓을 양방향으로 닫아 이후 send_command도 실패하게 한다 (codex 리뷰)
                 let _ = reader.shutdown(Shutdown::Both);
-                let mut subscribers = reader_subscribers
-                    .lock()
-                    .expect("remote subscribers lock");
+                let mut subscribers = reader_subscribers.lock().expect("remote subscribers lock");
                 reader_connected.store(false, Ordering::Release);
                 subscribers.clear();
             })
@@ -1744,15 +1738,7 @@ impl RemoteRuntimeClient {
         let reader_thread = std::thread::Builder::new()
             .name("remote-tls-io".into())
             .spawn(move || {
-                client_tls_io_loop(
-                    conn,
-                    sock,
-                    dec,
-                    codec,
-                    io_subscribers,
-                    io_connected,
-                    cmd_rx,
-                );
+                client_tls_io_loop(conn, sock, dec, codec, io_subscribers, io_connected, cmd_rx);
             })
             .context("remote TLS IO thread 생성 실패")?;
 
@@ -2071,12 +2057,20 @@ fn client_tls_io_loop(
         }
     }
 
+    publish_tls_disconnect(commands, subscribers, connected);
+    let _ = conn.write_tls(&mut sock);
+    let _ = sock.shutdown(Shutdown::Both);
+}
+
+fn publish_tls_disconnect(
+    commands: std::sync::mpsc::Receiver<Vec<u8>>,
+    subscribers: Arc<Mutex<Vec<RemoteSubscriber>>>,
+    connected: Arc<AtomicBool>,
+) {
+    drop(commands);
     let mut subscribers = subscribers.lock().expect("remote subscribers lock");
     connected.store(false, Ordering::Release);
     subscribers.clear();
-    drop(subscribers);
-    let _ = conn.write_tls(&mut sock);
-    let _ = sock.shutdown(Shutdown::Both);
 }
 
 /// [`reconstruct_and_dispatch`] 결과 — 접속 종료 여부 + keyframe 재동기화 요청 세션.
@@ -2345,10 +2339,7 @@ impl RuntimeEventStream for RemoteRuntimeClient {
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let overflowed = Arc::new(AtomicBool::new(false));
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .expect("remote subscribers lock");
+        let mut subscribers = self.subscribers.lock().expect("remote subscribers lock");
         if self.connected.load(Ordering::Acquire) {
             subscribers.push(RemoteSubscriber {
                 events: tx,
@@ -2481,8 +2472,7 @@ mod tests {
     #[test]
     fn plain_server_disconnect_closes_event_subscription() {
         let server = RemoteRuntimeServer::serve(test_backend("plain-disconnect"), 0).unwrap();
-        let client =
-            RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
         let receiver = client.subscribe();
 
         server.shutdown();
@@ -2493,8 +2483,7 @@ mod tests {
     #[test]
     fn subscribing_after_plain_disconnect_is_immediately_closed() {
         let server = RemoteRuntimeServer::serve(test_backend("plain-late-subscribe"), 0).unwrap();
-        let client =
-            RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
         let receiver = client.subscribe();
 
         server.shutdown();
@@ -4303,12 +4292,9 @@ mod tests {
             false,
         )
         .unwrap();
-        let client = RemoteRuntimeClient::attach_tls(
-            server.local_addr(),
-            server.auth_token(),
-            &fingerprint,
-        )
-        .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fingerprint)
+                .unwrap();
         let receiver = client.subscribe();
 
         server.shutdown();
@@ -4567,6 +4553,53 @@ mod tests {
             format!("{err:#}").contains("종료"),
             "IO 스레드 종료는 종료 Err여야 한다: {err:#}"
         );
+    }
+
+    #[test]
+    fn tls_event_disconnect_is_published_after_command_channel_closes() {
+        let (client_sock, _server_sock) = socket_pair();
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+        let subscribers = Arc::default();
+        let connected = Arc::new(AtomicBool::new(true));
+        let client = RemoteRuntimeClient {
+            transport: ClientTransport::Tls {
+                commands,
+                shutdown: client_sock,
+            },
+            subscribers: Arc::clone(&subscribers),
+            connected: Arc::clone(&connected),
+            reader_thread: None,
+            codec: Codec::Delta,
+        };
+        let events = client.subscribe();
+        let disconnect = std::thread::spawn(move || {
+            publish_tls_disconnect(command_receiver, subscribers, connected);
+        });
+
+        wait_for_disconnect(&events, Duration::from_secs(5));
+
+        std::thread::scope(|scope| {
+            let start = Arc::new(std::sync::Barrier::new(9));
+            let mut sends = Vec::new();
+            for _ in 0..8 {
+                let start = Arc::clone(&start);
+                let client = &client;
+                sends.push(scope.spawn(move || {
+                    start.wait();
+                    client.send_command(RuntimeCommand::SpawnShell {
+                        cols: 80,
+                        rows: 24,
+                        scrollback_lines: 100,
+                    })
+                }));
+            }
+            start.wait();
+            for send in sends {
+                let err = send.join().unwrap().unwrap_err();
+                assert!(format!("{err:#}").contains("종료"), "{err:#}");
+            }
+        });
+        disconnect.join().unwrap();
     }
 
     /// 명령 폭주 스모크 (codex HIGH): send_command를 대량 호출해 큐를 압박해도(가득참 Err는

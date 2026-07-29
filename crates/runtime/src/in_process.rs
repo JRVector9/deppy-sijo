@@ -284,6 +284,7 @@ impl InProcessRuntimeClient {
                     mux: MuxState::new(),
                     tab_counter: 0,
                     persist: persist_pipe,
+                    lazy_restore: None,
                     exited_order: std::collections::VecDeque::new(),
                     max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                     cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
@@ -655,6 +656,10 @@ fn prepare_queued_command(
     })
 }
 
+struct LazyWorkspaceRestore {
+    pending_panes: Vec<persist::PaneState>,
+}
+
 struct Worker {
     command_rx: Receiver<QueuedRuntimeCommand>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
@@ -695,6 +700,9 @@ struct Worker {
     tab_counter: u64,
     /// 세션/mux 영속 파이프 (설정 시에만 — 실패는 best-effort warn)
     persist: Option<crate::persistence::PersistPipe>,
+    /// 첫 targeted restore가 설치한 bounded pane catalog. worker 명령 직렬화로 한 번에
+    /// 하나만 materialize하며, 비어지거나 full restore가 끝나면 즉시 drop한다.
+    lazy_restore: Option<LazyWorkspaceRestore>,
     /// backend를 유지 중인 exited 세션들 (종료 순서 — 오래된 것이 앞). §14.3 cap.
     exited_order: std::collections::VecDeque<SessionId>,
     /// exited 백엔드 LRU 상한 (SetTerminalCachePolicy로 변경 — 설정 UI).
@@ -1949,8 +1957,13 @@ impl Worker {
                 // "완전히 빈 상태(세션 0)"일 때만 복원한다 — 시작 직후 SpawnShell/
                 // SpawnAgent가 먼저 처리돼 세션이 생겼으면 skip해 hybrid 상태를 막는다.
                 // suspended면 복원하지 않는다 (shutdown 큐 잔여 — 복원 즉시 죽는 것 방지).
-                if !self.suspended && self.sessions.is_empty() {
+                if !self.suspended && (self.sessions.is_empty() || self.lazy_restore.is_some()) {
                     self.restore_saved_layout();
+                }
+            }
+            RuntimeCommand::RestoreWorkspacePane { pane } => {
+                if !self.suspended {
+                    self.restore_saved_pane(&pane);
                 }
             }
             RuntimeCommand::RenamePane { pane, title } => {
@@ -2214,23 +2227,19 @@ impl Worker {
     /// 복원 경로에 없어 app::config::TerminalConfig 기본값(10_000)과 맞춘 상수를 쓴다.
     const RESTORE_SCROLLBACK_LINES: usize = 10_000;
 
-    /// 이전 실행이 저장한 mux layout을 복원한다 (설계문서 §11.1~11.5, §14, PR-14).
-    /// `RestoreWorkspace` 명령 핸들러가 빈 상태(세션 0)를 확인한 뒤 호출한다.
-    /// 저장된 tab이 없으면 아무 것도 하지 않는다(기존 빈 시작 동작 유지).
-    ///
-    /// agent 세션은 재실행하지 않는다 — 저장된 pane의 session_kind와 무관하게
-    /// 항상 fresh 셸만 spawn한다(agent 명령 재실행은 파괴적일 수 있다).
-    fn restore_saved_layout(&mut self) {
+    /// bounded startup snapshot을 정확히 한 번 소비해 tab/layout과 session 없는 pane
+    /// skeleton을 설치한다. PaneState는 최대 256개로 persist loader에서 이미 제한된다.
+    fn prepare_saved_layout_skeleton(&mut self) -> bool {
+        if self.lazy_restore.is_some() {
+            return true;
+        }
         let (tabs, active_tab) = match &mut self.persist {
             Some(pipe) => pipe.take_saved_layout(),
-            None => return,
+            None => return false,
         };
         if tabs.is_empty() {
-            return;
+            return false;
         }
-        // 복원 tab/pane 제목의 "셸 N"/"에이전트 N" 최대 N 이상으로 counter를 전진 —
-        // tabs.len()만으로는 중간 tab을 닫았던 경우(셸 1·3만 남음) 다음 spawn이
-        // 기존 "셸 3"과 충돌한다 (codex 리뷰). id는 유일하지만 제목 정합을 위해.
         let max_suffix = tabs
             .iter()
             .flat_map(|tab| {
@@ -2240,29 +2249,112 @@ impl Worker {
             .filter_map(title_suffix)
             .max()
             .unwrap_or(0);
+        let mut pending_panes = Vec::new();
         for tab in tabs {
-            self.restore_tab(tab);
+            let persist::TabState {
+                id,
+                title,
+                layout,
+                active_pane,
+                panes,
+            } = tab;
+            for pane_state in panes {
+                self.mux.panes.insert(
+                    pane_state.id.clone(),
+                    MuxPane::new(pane_state.id.clone(), pane_state.title.clone()),
+                );
+                pending_panes.push(pane_state);
+            }
+            let restored = MuxTab {
+                id,
+                title,
+                layout,
+                active_pane,
+            };
+            self.mux.window.add_tab(restored.id.clone());
+            self.mux.tabs.insert(restored.id.clone(), restored);
         }
         self.tab_counter = self.tab_counter.max(max_suffix);
         if active_tab.is_some() {
             self.mux.window.active_tab = active_tab;
         }
         self.mux.fix_focus();
+        self.lazy_restore = Some(LazyWorkspaceRestore { pending_panes });
+        true
+    }
+
+    fn restore_saved_pane(&mut self, pane: &MuxPaneId) {
+        if self.lazy_restore.is_none()
+            && (!self.sessions.is_empty() || !self.prepare_saved_layout_skeleton())
+        {
+            return;
+        }
+        if self
+            .mux
+            .panes
+            .get(pane)
+            .is_some_and(|pane| pane.session_id.is_some())
+        {
+            return;
+        }
+        let pane_state = self.lazy_restore.as_mut().and_then(|restore| {
+            restore
+                .pending_panes
+                .iter()
+                .position(|candidate| candidate.id == *pane)
+                .map(|position| (position, restore.pending_panes.remove(position)))
+        });
+        let restored_session = match pane_state {
+            Some((position, pane_state)) => match self.restore_pane(&pane_state) {
+                Some(session) => Some(session),
+                None => {
+                    if let Some(restore) = &mut self.lazy_restore {
+                        restore.pending_panes.insert(position, pane_state);
+                    }
+                    None
+                }
+            },
+            None => None,
+        };
+        if self
+            .lazy_restore
+            .as_ref()
+            .is_some_and(|restore| restore.pending_panes.is_empty())
+        {
+            self.lazy_restore = None;
+        }
         self.emit_mux_and_watched();
-        // PR-A2: 열람 전용으로 복원된 exited 세션을 UI에 알린다. SessionRestored는
-        // 완료 알림을 재발화하지 않으면서(재시작마다 done 알림 중복 방지) UI의 생존
-        // 추적(LiveSessionTracker)·exit_code 부기·상태 배지를 갱신한다. SessionExited를
-        // 그대로 쓰면 알림이 중복되고, 안 쓰면 세션이 "영원히 살아있는 것"으로 취급돼
-        // auto-suspend/warm 축출이 무력화된다 (codex 리뷰 P1).
-        let restored_exited: Vec<(SessionId, Option<u32>)> = self
-            .sessions
+        if let Some(session) = restored_session {
+            self.emit_restored_session(session);
+        }
+    }
+
+    /// 이전 실행이 저장한 mux layout을 완전히 복원한다. targeted restore가 먼저
+    /// 진행됐으면 남은 catalog만 worker에서 순서대로 materialize하고 즉시 drop한다.
+    fn restore_saved_layout(&mut self) {
+        if self.lazy_restore.is_none() && !self.prepare_saved_layout_skeleton() {
+            return;
+        }
+        let pending_panes = self
+            .lazy_restore
+            .take()
+            .map(|restore| restore.pending_panes)
+            .unwrap_or_default();
+        let restored_sessions = pending_panes
             .iter()
-            .filter_map(|(id, live)| match live.lifecycle() {
-                session::SessionLifecycle::Exited { exit_code } => Some((*id, exit_code)),
-                session::SessionLifecycle::Running => None,
-            })
-            .collect();
-        for (session, exit_code) in restored_exited {
+            .filter_map(|pane| self.restore_pane(pane))
+            .collect::<Vec<_>>();
+        self.mux.fix_focus();
+        self.emit_mux_and_watched();
+        for session in restored_sessions {
+            self.emit_restored_session(session);
+        }
+    }
+
+    fn emit_restored_session(&self, session: SessionId) {
+        if let Some(session::SessionLifecycle::Exited { exit_code }) =
+            self.sessions.get(&session).map(Session::lifecycle)
+        {
             let status = if exit_code == Some(0) {
                 session::SessionStatus::Done
             } else {
@@ -2274,22 +2366,6 @@ impl Worker {
             });
             self.emit(RuntimeEvent::SessionRestored { session, exit_code });
         }
-    }
-
-    /// 저장된 tab 하나를 재구성한다 — tab/pane id, layout 구조, active_pane은
-    /// 저장된 그대로 재사용한다(내부 일관성 + 재저장 시 같은 행을 갱신하기 위함).
-    fn restore_tab(&mut self, tab: persist::TabState) {
-        for pane in &tab.panes {
-            self.restore_pane(pane);
-        }
-        let restored = MuxTab {
-            id: tab.id,
-            title: tab.title,
-            layout: tab.layout,
-            active_pane: tab.active_pane,
-        };
-        self.mux.window.add_tab(restored.id.clone());
-        self.mux.tabs.insert(restored.id.clone(), restored);
     }
 
     /// Bounded dotenv projection for restored panes. Any missing/invalid/over-limit input is an
@@ -2306,12 +2382,12 @@ impl Worker {
     /// layout/tab 구조는 살아있게 한다.
     /// agent였던 pane은 respawn 대신 열람 전용 복원(PR-A2) — agent 재실행 금지는
     /// persistence 헤더의 안전 요구사항이고, 결과 화면 보존이 목적이다.
-    fn restore_pane(&mut self, pane_state: &persist::PaneState) {
+    fn restore_pane(&mut self, pane_state: &persist::PaneState) -> Option<SessionId> {
         if !self.session_capacity_available() {
             let pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
             self.mux.panes.insert(pane_state.id.clone(), pane);
             tracing::warn!(error_code = "runtime_session_limit", "복원 세션 상한 도달");
-            return;
+            return None;
         }
         if let Some(persistent_id) = pane_state.session_id.as_deref() {
             let was_agent = self
@@ -2320,7 +2396,11 @@ impl Worker {
                 .and_then(|pipe| pipe.restored_session_kind(persistent_id))
                 .is_some_and(|kind| kind == "agent");
             if was_agent && self.restore_archived_pane(pane_state, persistent_id) {
-                return;
+                return self
+                    .mux
+                    .panes
+                    .get(&pane_state.id)
+                    .and_then(|pane| pane.session_id);
             }
         }
         let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
@@ -2334,7 +2414,7 @@ impl Worker {
             Err(_) => {
                 tracing::warn!(pane_id = %pane_state.id.0, "복원 중 셸 secret 준비 실패");
                 self.mux.panes.insert(pane_state.id.clone(), pane);
-                return;
+                return None;
             }
         };
         let restored_cwd = pane_state
@@ -2352,7 +2432,7 @@ impl Worker {
                 Err(_) => {
                     tracing::warn!(pane_id = %pane_state.id.0, "복원 중 dotenv redaction 준비 실패");
                     self.mux.panes.insert(pane_state.id.clone(), pane);
-                    return;
+                    return None;
                 }
             }
             // 워크스페이스 기본 env보다 뒤에 붙어 pane 폴더 값이 이긴다.
@@ -2364,7 +2444,7 @@ impl Worker {
             .as_deref()
             .map(|persistent_id| Self::restored_terminal_size(&self.logs_root, persistent_id))
             .unwrap_or((DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS));
-        match Self::spawn_session(
+        let restored_session = match Self::spawn_session(
             id,
             session::SessionKind::Shell,
             &spec,
@@ -2411,12 +2491,15 @@ impl Worker {
                     }
                 }
                 self.open_session_log(id);
+                Some(id)
             }
             Err(error) => {
                 trace_runtime_failure("restore_shell_spawn", "pty_spawn_failed", error);
+                None
             }
-        }
+        };
         self.mux.panes.insert(pane_state.id.clone(), pane);
+        restored_session
     }
 
     /// agent pane의 열람 전용 복원 (PR-A2): 디스크 아카이브 1차, 로그 tail 폴백.
@@ -2600,6 +2683,12 @@ impl Worker {
         let Some(tab_id) = self.mux.tab_of_pane(&pane_id) else {
             return;
         };
+        if let Some(restore) = &mut self.lazy_restore {
+            restore.pending_panes.retain(|pane| pane.id != pane_id);
+            if restore.pending_panes.is_empty() {
+                self.lazy_restore = None;
+            }
+        }
         // 세션 kill
         if let Some(session) = self
             .mux
@@ -2636,7 +2725,16 @@ impl Worker {
         let Some(tab) = self.mux.tabs.remove(&tab_id) else {
             return;
         };
-        for pane_id in tab.panes() {
+        let pane_ids = tab.panes();
+        if let Some(restore) = &mut self.lazy_restore {
+            restore
+                .pending_panes
+                .retain(|pane| !pane_ids.contains(&pane.id));
+            if restore.pending_panes.is_empty() {
+                self.lazy_restore = None;
+            }
+        }
+        for pane_id in pane_ids {
             if let Some(pane) = self.mux.panes.remove(&pane_id)
                 && let Some(session) = pane.session_id
             {
@@ -2708,8 +2806,11 @@ impl Worker {
     fn emit_mux_snapshot(&mut self) {
         // mux 구조가 바뀐 지점 — 가시성 전이에 맞춰 scrollback cap 조정 (§14.3)
         self.reconcile_visibility();
-        // 영속 layout도 같은 시점에 저장 (§11.2~11.5)
-        if let Some(pipe) = &mut self.persist {
+        // 부분 복원 중 skeleton의 session_id=None을 원본 영속 layout에 덮지 않는다.
+        // 마지막 pane/full restore에서 catalog가 drop된 뒤 한 번 정상 저장한다.
+        if self.lazy_restore.is_none()
+            && let Some(pipe) = &mut self.persist
+        {
             pipe.save_layout(&self.mux.window, &self.mux.tabs, &self.mux.panes);
         }
         self.emit(RuntimeEvent::MuxUpdated {
@@ -4104,6 +4205,7 @@ mod tests {
                 mux: MuxState::new(),
                 tab_counter: 0,
                 persist: None,
+                lazy_restore: None,
                 exited_order: std::collections::VecDeque::new(),
                 max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                 cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
@@ -4434,6 +4536,433 @@ mod tests {
         persist::upsert_session(&conn, &row).unwrap();
         let window = persisted_single_pane_window(session_id, "restored", Some(cwd.to_owned()));
         persist::save_window_layout(&mut conn, workspace_id, &window).unwrap();
+    }
+
+    fn seed_persisted_two_pane_window(
+        db_path: &std::path::Path,
+        workspace_id: &str,
+        first_kind: &str,
+    ) -> (MuxPaneId, MuxPaneId) {
+        let mut conn = rusqlite::Connection::open(db_path).unwrap();
+        let first_session = "restore-pane-first";
+        let second_session = "restore-pane-second";
+        for (id, kind) in [(first_session, first_kind), (second_session, "shell")] {
+            persist::upsert_session(
+                &conn,
+                &persist::SessionRow {
+                    id: id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                    session_kind: kind.to_owned(),
+                    agent_id: (kind == "agent").then(|| "cfg-sf03".to_owned()),
+                    title: id.to_owned(),
+                    command: "/bin/cat".to_owned(),
+                    args: Vec::new(),
+                    cwd: "/tmp".to_owned(),
+                    status: if kind == "agent" {
+                        persist::SESSION_STATUS_EXITED.to_owned()
+                    } else {
+                        persist::SESSION_STATUS_RUNNING.to_owned()
+                    },
+                    last_log_offset: 0,
+                },
+            )
+            .unwrap();
+        }
+        let first_pane = MuxPaneId("restore-pane-first".to_owned());
+        let second_pane = MuxPaneId("restore-pane-second".to_owned());
+        let first_tab = MuxTabId("restore-tab-first".to_owned());
+        let second_tab = MuxTabId("restore-tab-second".to_owned());
+        let window = persist::WindowState {
+            id: deppy_core::MuxWindowId::new(),
+            title: Some("lazy restore".to_owned()),
+            active_tab: Some(first_tab.clone()),
+            tabs: vec![
+                persist::TabState {
+                    id: first_tab.clone(),
+                    title: "first".to_owned(),
+                    layout: mux::LayoutNode::Pane(first_pane.clone()),
+                    active_pane: Some(first_pane.clone()),
+                    panes: vec![persist::PaneState {
+                        id: first_pane.clone(),
+                        session_id: Some(first_session.to_owned()),
+                        title: "first".to_owned(),
+                        pane_kind: mux::PaneKind::Terminal,
+                        cwd: Some("/tmp".to_owned()),
+                    }],
+                },
+                persist::TabState {
+                    id: second_tab,
+                    title: "second".to_owned(),
+                    layout: mux::LayoutNode::Pane(second_pane.clone()),
+                    active_pane: Some(second_pane.clone()),
+                    panes: vec![persist::PaneState {
+                        id: second_pane.clone(),
+                        session_id: Some(second_session.to_owned()),
+                        title: "second".to_owned(),
+                        pane_kind: mux::PaneKind::Terminal,
+                        cwd: Some("/tmp".to_owned()),
+                    }],
+                },
+            ],
+        };
+        persist::save_window_layout(&mut conn, workspace_id, &window).unwrap();
+        (first_pane, second_pane)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_materializes_only_requested_panes_and_reuses_catalog() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-two-pane");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore";
+        create_persist_db(&db_path, workspace_id);
+        let (first_pane, second_pane) =
+            seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: first_pane.clone(),
+            })
+            .unwrap();
+        let first = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot.tabs.len() == 2
+                    && snapshot
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| &tab.panes)
+                        .any(|pane| pane.id == first_pane && pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            first
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .filter(|pane| pane.session_id.is_some())
+                .count(),
+            1
+        );
+        assert!(first.tabs.iter().any(|tab| {
+            tab.layout.contains(&second_pane)
+                && tab
+                    .panes
+                    .iter()
+                    .any(|pane| pane.id == second_pane && pane.session_id.is_none())
+        }));
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: second_pane.clone(),
+            })
+            .unwrap();
+        let second = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter(|pane| pane.session_id.is_some())
+                    .count()
+                    == 2 =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            second
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|pane| pane.id == second_pane && pane.session_id.is_some())
+        );
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_unknown_target_creates_no_partial_session() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-unknown");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-unknown";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: MuxPaneId("missing-pane".to_owned()),
+            })
+            .unwrap();
+        let snapshot = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .all(|pane| pane.session_id.is_none())
+        );
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_spawn_failure_preserves_persisted_association() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-spawn-failure");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-spawn-failure";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            "persisted-shell",
+            "shell",
+            None,
+            persist::SESSION_STATUS_RUNNING,
+            "/tmp",
+        );
+        let pane_id = MuxPaneId(
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row("SELECT id FROM mux_panes", [], |row| row.get(0))
+                .unwrap(),
+        );
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "lazy-restore-spawn-failure",
+        );
+        worker.shell = spec("/definitely/missing/deppy-shell", &[]);
+        worker.persist = Some(
+            crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            })
+            .unwrap(),
+        );
+
+        worker.handle_command(RuntimeCommand::RestoreWorkspacePane { pane: pane_id });
+        assert!(worker.sessions.is_empty());
+        drop(worker);
+
+        let association: Option<String> = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT session_id FROM mux_panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(association.as_deref(), Some("persisted-shell"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_closed_skeleton_is_not_materialized_by_full_restore() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-close-skeleton");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-close-skeleton";
+        create_persist_db(&db_path, workspace_id);
+        let (first_pane, second_pane) =
+            seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "lazy-restore-close-skeleton",
+        );
+        worker.shell = spec("/bin/cat", &[]);
+        worker.persist = Some(
+            crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            })
+            .unwrap(),
+        );
+
+        worker.handle_command(RuntimeCommand::RestoreWorkspacePane {
+            pane: MuxPaneId("missing-pane".to_owned()),
+        });
+        worker.handle_command(RuntimeCommand::ClosePane {
+            pane: second_pane.clone(),
+        });
+        worker.handle_command(RuntimeCommand::RestoreWorkspace);
+
+        assert_eq!(worker.sessions.len(), 1);
+        assert!(worker.mux.panes.contains_key(&first_pane));
+        assert!(!worker.mux.panes.contains_key(&second_pane));
+        assert!(worker.lazy_restore.is_none());
+        drop(worker);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_then_full_restore_materializes_remaining_once() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-full");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-full";
+        create_persist_db(&db_path, workspace_id);
+        let (first_pane, _) = seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane { pane: first_pane })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter(|pane| pane.session_id.is_some())
+                    .count()
+                    == 1 =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let full = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter(|pane| pane.session_id.is_some())
+                    .count()
+                    == 2 =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            full.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .filter(|pane| pane.session_id.is_some())
+                .count(),
+            2
+        );
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_agent_is_archived_without_agent_start_event() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-agent");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-agent";
+        create_persist_db(&db_path, workspace_id);
+        let (agent_pane, _) = seed_persisted_two_pane_window(&db_path, workspace_id, "agent");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: agent_pane.clone(),
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id == agent_pane && pane.session_id.is_some()) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        probe.seen.extend(probe.rx.drain());
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::AgentSpawned { .. }))
+        );
+        let conn = rusqlite::Connection::open(dir.join("metadata.sqlite3")).unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT session_kind FROM sessions WHERE id = 'restore-pane-first'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "agent");
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn restore_workspace_from_fixture(

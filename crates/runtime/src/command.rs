@@ -402,7 +402,8 @@ pub(crate) fn runtime_command_retained_bytes(
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
-        | RuntimeCommand::FocusPane { pane } => retained_string(&mut total, &pane.0)?,
+        | RuntimeCommand::FocusPane { pane }
+        | RuntimeCommand::RestoreWorkspacePane { pane } => retained_string(&mut total, &pane.0)?,
         RuntimeCommand::CloseTab { tab } | RuntimeCommand::SelectTab { tab } => {
             retained_string(&mut total, &tab.0)?;
         }
@@ -517,7 +518,8 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
-        | RuntimeCommand::FocusPane { pane } => canonicalize_mux_pane_id(pane),
+        | RuntimeCommand::FocusPane { pane }
+        | RuntimeCommand::RestoreWorkspacePane { pane } => canonicalize_mux_pane_id(pane),
         RuntimeCommand::CloseTab { tab } | RuntimeCommand::SelectTab { tab } => {
             canonicalize_mux_tab_id(tab);
         }
@@ -688,7 +690,9 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 return Err(admission_error("runtime_command_pane_title_invalid"));
             }
         }
-        RuntimeCommand::ClosePane { pane } | RuntimeCommand::FocusPane { pane } => {
+        RuntimeCommand::ClosePane { pane }
+        | RuntimeCommand::FocusPane { pane }
+        | RuntimeCommand::RestoreWorkspacePane { pane } => {
             if !mux_pane_id_is_valid(pane) {
                 return Err(admission_error("runtime_command_pane_id_invalid"));
             }
@@ -931,6 +935,12 @@ pub enum RuntimeCommand {
     NoteTurnStart {
         session: SessionId,
     },
+    /// 저장된 canonical pane 하나만 materialize한다. 첫 요청은 bounded restore
+    /// snapshot의 tab/layout/pane skeleton을 설치하고, 지정 pane만 기존 복원 경로로
+    /// 세션을 붙인다. **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    RestoreWorkspacePane {
+        pane: MuxPaneId,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1076,6 +1086,10 @@ impl std::fmt::Debug for RuntimeCommand {
                 f.debug_struct("FocusPane").field("pane", pane).finish()
             }
             RuntimeCommand::RestoreWorkspace => f.write_str("RestoreWorkspace"),
+            RuntimeCommand::RestoreWorkspacePane { pane } => f
+                .debug_struct("RestoreWorkspacePane")
+                .field("pane", pane)
+                .finish(),
             RuntimeCommand::SetWorkspaceState(state) => {
                 f.debug_tuple("SetWorkspaceState").field(state).finish()
             }
@@ -1542,6 +1556,7 @@ mod tests {
             },
             RuntimeCommand::ClosePane { pane: pane() },
             RuntimeCommand::FocusPane { pane: pane() },
+            RuntimeCommand::RestoreWorkspacePane { pane: pane() },
             RuntimeCommand::RenamePane {
                 pane: pane(),
                 title: String::new(),
@@ -1571,6 +1586,18 @@ mod tests {
                 assert!(validate_host_command(&command).is_err(), "{command:?}");
             }
         }
+    }
+
+    #[test]
+    fn restore_workspace_pane_debug_exposes_only_bounded_identifier() {
+        let command = RuntimeCommand::RestoreWorkspacePane {
+            pane: MuxPaneId("pane-safe".to_owned()),
+        };
+
+        assert_eq!(
+            format!("{command:?}"),
+            "RestoreWorkspacePane { pane: MuxPaneId(\"pane-safe\") }"
+        );
     }
 
     fn spare_string(value: &str, capacity: usize) -> String {
@@ -1837,6 +1864,7 @@ mod tests {
                 "FreezeSession",
                 "ResumeSession",
                 "NoteTurnStart",
+                "RestoreWorkspacePane",
             ]
         );
     }

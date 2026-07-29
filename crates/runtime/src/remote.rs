@@ -446,8 +446,8 @@ fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         } if *scrollback_lines > MAX_SCROLLBACK_LINES => {
             return Err("scrollback_lines 상한 초과");
         }
-        RuntimeCommand::CommandBarrier { correlation_id: 0 } => {
-            return Err("command barrier correlation_id는 0일 수 없음");
+        RuntimeCommand::DurableEventBarrier { correlation_id: 0 } => {
+            return Err("durable event barrier correlation_id는 0일 수 없음");
         }
         _ => {}
     }
@@ -479,8 +479,8 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
         } if !agent_config_id.is_valid() => {
             return Err("agent_config_id가 비었거나 상한/NUL 규칙 위반");
         }
-        RuntimeEvent::CommandBarrierReached { correlation_id: 0 } => {
-            return Err("command barrier correlation_id는 0일 수 없음");
+        RuntimeEvent::DurableEventBarrierReached { correlation_id: 0 } => {
+            return Err("durable event barrier correlation_id는 0일 수 없음");
         }
         _ => {}
     }
@@ -2804,9 +2804,9 @@ mod tests {
     }
 
     #[test]
-    fn command_barrier_remote_codecs_roundtrip_and_reject_invalid_payloads() {
-        let command = RuntimeCommand::CommandBarrier { correlation_id: 91 };
-        let event = RuntimeEvent::CommandBarrierReached { correlation_id: 91 };
+    fn durable_event_barrier_remote_codecs_roundtrip_and_reject_invalid_payloads() {
+        let command = RuntimeCommand::DurableEventBarrier { correlation_id: 91 };
+        let event = RuntimeEvent::DurableEventBarrierReached { correlation_id: 91 };
 
         for codec in [Codec::Plain, Codec::Delta] {
             let command_frame = codec.encode_command(&command).unwrap();
@@ -2817,7 +2817,7 @@ mod tests {
             };
             assert!(matches!(
                 decoded_command,
-                RuntimeCommand::CommandBarrier { correlation_id: 91 }
+                RuntimeCommand::DurableEventBarrier { correlation_id: 91 }
             ));
             validate_command(&decoded_command).unwrap();
 
@@ -2828,7 +2828,7 @@ mod tests {
             };
             assert!(matches!(
                 decoded_event,
-                RuntimeEvent::CommandBarrierReached { correlation_id: 91 }
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 91 }
             ));
             validate_event(&decoded_event).unwrap();
 
@@ -2836,27 +2836,30 @@ mod tests {
             assert!(codec.decode_event(&[0xff, 0xff]).is_err());
         }
 
-        assert!(validate_command(&RuntimeCommand::CommandBarrier { correlation_id: 0 }).is_err());
         assert!(
-            validate_event(&RuntimeEvent::CommandBarrierReached { correlation_id: 0 }).is_err()
+            validate_command(&RuntimeCommand::DurableEventBarrier { correlation_id: 0 }).is_err()
+        );
+        assert!(
+            validate_event(&RuntimeEvent::DurableEventBarrierReached { correlation_id: 0 })
+                .is_err()
         );
     }
 
     #[test]
-    fn command_barrier_crosses_remote_runtime_transport() {
-        let server = RemoteRuntimeServer::serve(test_backend("command-barrier"), 0).unwrap();
+    fn durable_event_barrier_crosses_remote_runtime_transport() {
+        let server = RemoteRuntimeServer::serve(test_backend("durable-event-barrier"), 0).unwrap();
         let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
         let receiver = client.subscribe();
 
         client
-            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 92 })
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 92 })
             .unwrap();
         let mut seen = Vec::new();
         wait_for(&receiver, &mut seen, Duration::from_secs(10), |events| {
             events.iter().any(|event| {
                 matches!(
                     event,
-                    RuntimeEvent::CommandBarrierReached { correlation_id: 92 }
+                    RuntimeEvent::DurableEventBarrierReached { correlation_id: 92 }
                 )
             })
         });
@@ -3371,6 +3374,83 @@ mod tests {
     }
 
     #[test]
+    fn remote_outbound_preserves_stale_and_requested_mux_before_durable_event_barrier() {
+        let stale = mux_snapshot("stale", &[("stale", SessionId(1))]);
+        let requested = mux_snapshot(
+            "requested",
+            &[("stale", SessionId(1)), ("requested", SessionId(2))],
+        );
+        let mut queue = OutboundEventQueue::with_caps(3, 2);
+        queue
+            .enqueue(RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&stale),
+            })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&requested),
+            })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::DurableEventBarrierReached { correlation_id: 94 })
+            .unwrap();
+
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::MuxUpdated { snapshot }) if Arc::ptr_eq(&snapshot, &stale)
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::MuxUpdated { snapshot }) if Arc::ptr_eq(&snapshot, &requested)
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::DurableEventBarrierReached { correlation_id: 94 })
+        ));
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn durable_event_barrier_explicitly_does_not_fence_viewport_slots() {
+        let mut queue = OutboundEventQueue::with_caps(2, 1);
+        queue
+            .enqueue(RuntimeEvent::Viewport {
+                session: SessionId(1),
+                snapshot: make_snapshot(8, 2, &["before"], false),
+                bracketed_paste: false,
+            })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::DurableEventBarrierReached { correlation_id: 95 })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::Viewport {
+                session: SessionId(1),
+                snapshot: make_snapshot(8, 2, &["after"], false),
+                bracketed_paste: false,
+            })
+            .unwrap();
+
+        assert_eq!(
+            queue.viewport_len(),
+            1,
+            "viewport remains one bounded latest slot"
+        );
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::DurableEventBarrierReached { correlation_id: 95 })
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::Viewport {
+                session: SessionId(1),
+                ..
+            })
+        ));
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
     fn outbound_queue는_durable_overflow를_silent_drop하지_않는다() {
         let mut queue = OutboundEventQueue::with_caps(2, 8);
         queue
@@ -3493,7 +3573,7 @@ mod tests {
             RuntimeEvent::LastOutputExtracted { .. } => "LastOutputExtracted",
             RuntimeEvent::AgentSpawnResolved { .. } => "AgentSpawnResolved",
             RuntimeEvent::SessionFreezeChanged { .. } => "SessionFreezeChanged",
-            RuntimeEvent::CommandBarrierReached { .. } => "CommandBarrierReached",
+            RuntimeEvent::DurableEventBarrierReached { .. } => "DurableEventBarrierReached",
         }
     }
 

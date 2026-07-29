@@ -1278,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn command_barrier_event_is_not_dashboard_or_session_data() {
+    fn durable_event_barrier_is_not_dashboard_or_session_data() {
         let mut sessions = BTreeMap::new();
         let mut resource = None;
         let mut ids = IdMap::default();
@@ -1287,7 +1287,7 @@ mod tests {
             &mut sessions,
             &mut resource,
             &mut ids,
-            &RuntimeEvent::CommandBarrierReached { correlation_id: 1 },
+            &RuntimeEvent::DurableEventBarrierReached { correlation_id: 1 },
         ));
         assert!(sessions.is_empty());
         assert!(resource.is_none());

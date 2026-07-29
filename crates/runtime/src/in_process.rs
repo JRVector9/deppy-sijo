@@ -1968,8 +1968,8 @@ impl Worker {
                     self.restore_saved_pane(&pane);
                 }
             }
-            RuntimeCommand::CommandBarrier { correlation_id } => {
-                self.emit(RuntimeEvent::CommandBarrierReached { correlation_id });
+            RuntimeCommand::DurableEventBarrier { correlation_id } => {
+                self.emit(RuntimeEvent::DurableEventBarrierReached { correlation_id });
             }
             RuntimeCommand::RenamePane { pane, title } => {
                 if let Some(p) = self.mux.panes.get_mut(&pane) {
@@ -4698,7 +4698,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn lazy_restore_barrier_fixture(
+    fn lazy_restore_durable_event_barrier_fixture(
         name: &str,
     ) -> (InProcessRuntimeClient, Probe, MuxPaneId, MuxPaneId, PathBuf) {
         init_mock_store();
@@ -4725,9 +4725,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restore_workspace_pane_barrier_follows_requested_mux_result() {
+    fn restore_workspace_pane_durable_event_barrier_follows_requested_mux_result() {
         let (client, mut probe, first_pane, _second_pane, dir) =
-            lazy_restore_barrier_fixture("restore-barrier-order");
+            lazy_restore_durable_event_barrier_fixture("restore-durable-barrier-order");
 
         client
             .send_command(RuntimeCommand::RestoreWorkspacePane {
@@ -4735,12 +4735,12 @@ mod tests {
             })
             .unwrap();
         client
-            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 41 })
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 41 })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| {
             matches!(
                 event,
-                RuntimeEvent::CommandBarrierReached { correlation_id: 41 }
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 41 }
             )
             .then_some(())
         });
@@ -4763,7 +4763,7 @@ mod tests {
             .position(|event| {
                 matches!(
                     event,
-                    RuntimeEvent::CommandBarrierReached { correlation_id: 41 }
+                    RuntimeEvent::DurableEventBarrierReached { correlation_id: 41 }
                 )
             })
             .expect("exact barrier");
@@ -4775,20 +4775,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stale_mux_can_precede_restore_while_barrier_stays_after_requested_result() {
+    fn stale_mux_can_precede_restore_while_durable_event_barrier_stays_after_requested_result() {
         let (client, mut probe, first_pane, second_pane, dir) =
-            lazy_restore_barrier_fixture("restore-barrier-stale-mux");
+            lazy_restore_durable_event_barrier_fixture("restore-durable-barrier-stale-mux");
 
         client
             .send_command(RuntimeCommand::RestoreWorkspacePane { pane: first_pane })
             .unwrap();
         client
-            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 50 })
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 50 })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| {
             matches!(
                 event,
-                RuntimeEvent::CommandBarrierReached { correlation_id: 50 }
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 50 }
             )
             .then_some(())
         });
@@ -4797,12 +4797,12 @@ mod tests {
             .send_command(RuntimeCommand::RestoreWorkspacePane { pane: second_pane })
             .unwrap();
         client
-            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 51 })
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 51 })
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| {
             matches!(
                 event,
-                RuntimeEvent::CommandBarrierReached { correlation_id: 51 }
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 51 }
             )
             .then_some(())
         });
@@ -4825,7 +4825,7 @@ mod tests {
             .position(|event| {
                 matches!(
                     event,
-                    RuntimeEvent::CommandBarrierReached { correlation_id: 50 }
+                    RuntimeEvent::DurableEventBarrierReached { correlation_id: 50 }
                 )
             })
             .expect("first barrier");
@@ -4850,7 +4850,7 @@ mod tests {
             .position(|event| {
                 matches!(
                     event,
-                    RuntimeEvent::CommandBarrierReached { correlation_id: 51 }
+                    RuntimeEvent::DurableEventBarrierReached { correlation_id: 51 }
                 )
             })
             .expect("requested barrier");
@@ -4863,7 +4863,7 @@ mod tests {
     }
 
     #[test]
-    fn back_to_back_command_barriers_preserve_fifo_and_exact_ids() {
+    fn back_to_back_durable_event_barriers_preserve_fifo_and_exact_ids() {
         let client = InProcessRuntimeClient::new(
             5,
             test_store(),
@@ -4876,15 +4876,15 @@ mod tests {
         let mut probe = Probe::new(client.subscribe());
 
         client
-            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 70 })
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 70 })
             .unwrap();
         client
-            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 71 })
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 71 })
             .unwrap();
         probe.wait_for(Duration::from_secs(5), |event| {
             matches!(
                 event,
-                RuntimeEvent::CommandBarrierReached { correlation_id: 71 }
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 71 }
             )
             .then_some(())
         });
@@ -4893,7 +4893,9 @@ mod tests {
             .seen
             .iter()
             .filter_map(|event| match event {
-                RuntimeEvent::CommandBarrierReached { correlation_id } => Some(*correlation_id),
+                RuntimeEvent::DurableEventBarrierReached { correlation_id } => {
+                    Some(*correlation_id)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();

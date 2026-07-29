@@ -185,11 +185,13 @@ pub enum RuntimeEvent {
         session: SessionId,
         frozen: bool,
     },
-    /// Exact acknowledgement for a handled `RuntimeCommand::CommandBarrier`.
-    /// Every synchronous event from earlier FIFO commands has already been emitted.
+    /// Exact acknowledgement for a handled `RuntimeCommand::DurableEventBarrier`.
+    /// Durable lifecycle/mux events synchronously emitted by earlier FIFO commands
+    /// have already entered the same bounded FIFO channel. Coalesced Viewport,
+    /// PtyInputPressure, and ResourceUsage slots are explicitly outside this fence.
     /// Correlation ids retain the issuing command's shared-backend uniqueness contract.
     /// **variant는 enum 끝에만 추가** (postcard discriminant — remote wire 호환).
-    CommandBarrierReached {
+    DurableEventBarrierReached {
         correlation_id: u64,
     },
 }
@@ -404,7 +406,7 @@ mod tests {
                 "LastOutputExtracted",
                 "AgentSpawnResolved",
                 "SessionFreezeChanged",
-                "CommandBarrierReached",
+                "DurableEventBarrierReached",
             ]
         );
     }

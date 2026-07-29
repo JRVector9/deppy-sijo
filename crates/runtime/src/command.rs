@@ -447,7 +447,7 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
         | RuntimeCommand::NoteTurnStart { .. }
-        | RuntimeCommand::CommandBarrier { .. } => {}
+        | RuntimeCommand::DurableEventBarrier { .. } => {}
     }
     Ok(total)
 }
@@ -562,7 +562,7 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
         | RuntimeCommand::NoteTurnStart { .. }
-        | RuntimeCommand::CommandBarrier { .. } => {}
+        | RuntimeCommand::DurableEventBarrier { .. } => {}
     }
 }
 
@@ -719,9 +719,9 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 return Err(admission_error("runtime_command_search_invalid"));
             }
         }
-        RuntimeCommand::CommandBarrier { correlation_id } => {
+        RuntimeCommand::DurableEventBarrier { correlation_id } => {
             if *correlation_id == 0 {
-                return Err(admission_error("runtime_command_barrier_invalid"));
+                return Err(admission_error("runtime_durable_event_barrier_invalid"));
             }
         }
         RuntimeCommand::Scroll { .. }
@@ -948,11 +948,13 @@ pub enum RuntimeCommand {
     RestoreWorkspacePane {
         pane: MuxPaneId,
     },
-    /// FIFO marker for proving that every earlier command has been handled and
-    /// its synchronous events emitted. The opaque id is fixed-size and nonzero;
-    /// issuers sharing one runtime backend must keep their outstanding ids unique.
+    /// FIFO marker proving that durable lifecycle/mux events synchronously emitted by
+    /// earlier commands have entered their bounded FIFO channel. Coalesced Viewport,
+    /// PtyInputPressure, and ResourceUsage slots are explicitly outside this fence.
+    /// The opaque id is fixed-size and nonzero; issuers sharing one runtime backend
+    /// must keep their outstanding ids unique.
     /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
-    CommandBarrier {
+    DurableEventBarrier {
         correlation_id: u64,
     },
 }
@@ -1104,8 +1106,8 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("RestoreWorkspacePane")
                 .field("pane", pane)
                 .finish(),
-            RuntimeCommand::CommandBarrier { correlation_id } => f
-                .debug_struct("CommandBarrier")
+            RuntimeCommand::DurableEventBarrier { correlation_id } => f
+                .debug_struct("DurableEventBarrier")
                 .field("correlation_id", correlation_id)
                 .finish(),
             RuntimeCommand::SetWorkspaceState(state) => {
@@ -1883,14 +1885,14 @@ mod tests {
                 "ResumeSession",
                 "NoteTurnStart",
                 "RestoreWorkspacePane",
-                "CommandBarrier",
+                "DurableEventBarrier",
             ]
         );
     }
 
     #[test]
-    fn command_barrier_requires_nonzero_correlation_and_retains_no_heap() {
-        let mut valid = RuntimeCommand::CommandBarrier { correlation_id: 7 };
+    fn durable_event_barrier_requires_nonzero_correlation_and_retains_no_heap() {
+        let mut valid = RuntimeCommand::DurableEventBarrier { correlation_id: 7 };
         assert!(validate_host_command(&valid).is_ok());
         let retained = prepare_runtime_command_for_retention(&mut valid).unwrap();
         assert_eq!(
@@ -1898,8 +1900,11 @@ mod tests {
             std::mem::size_of::<RuntimeCommand>()
         );
 
-        let invalid = RuntimeCommand::CommandBarrier { correlation_id: 0 };
+        let invalid = RuntimeCommand::DurableEventBarrier { correlation_id: 0 };
         assert!(validate_host_command(&invalid).is_err());
-        assert_eq!(format!("{valid:?}"), "CommandBarrier { correlation_id: 7 }");
+        assert_eq!(
+            format!("{valid:?}"),
+            "DurableEventBarrier { correlation_id: 7 }"
+        );
     }
 }

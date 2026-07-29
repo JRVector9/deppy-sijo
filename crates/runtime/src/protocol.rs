@@ -41,8 +41,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// bump를 누락해 이 bump가 두 변경을 함께 커버한다.
 /// **v10 (B00b)**: terminal AgentSpawnResolved correlation event를 enum 끝에 append.
 /// 구버전 피어가 새 variant를 오해독하지 않도록 handshake에서 정확 버전을 거부한다.
-/// **v11**: CommandBarrier 명령과 CommandBarrierReached 이벤트를 enum 끝에 append.
-/// 로컬과 원격 runtime이 같은 FIFO acknowledgement 계약을 쓰도록 정확 버전을 올린다.
+/// **v11**: DurableEventBarrier 명령과 DurableEventBarrierReached 이벤트를 enum 끝에 append.
+/// 로컬과 원격 runtime이 같은 durable FIFO acknowledgement 계약을 쓰도록 정확 버전을 올린다.
 pub(crate) const PROTO_VERSION: u16 = 11;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).

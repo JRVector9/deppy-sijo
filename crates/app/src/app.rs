@@ -17539,6 +17539,8 @@ impl eframe::App for App {
                     &self.cross_workspace_pane,
                     &self.active.id,
                     self.active.runtime_instance,
+                    self.agent_terminal_ui.view()
+                        == ui::agent_terminal::AgentTerminalView::Terminal,
                 );
                 if let Some((workspace_id, runtime_instance)) = target
                     && let Some(runtime) =
@@ -19940,7 +19942,11 @@ fn focused_terminal_runtime_identity(
     state: &ui::cross_workspace::CrossWorkspacePaneState,
     primary_workspace_id: &str,
     primary_runtime_instance: u64,
+    terminal_surface_visible: bool,
 ) -> Option<(String, u64)> {
+    if !terminal_surface_visible {
+        return None;
+    }
     match state.focused_input_target()? {
         ui::cross_workspace::FocusedInputTarget::Primary => {
             Some((primary_workspace_id.to_owned(), primary_runtime_instance))
@@ -20617,13 +20623,23 @@ mod tests {
         );
 
         assert_eq!(
-            focused_terminal_runtime_identity(&state, "workspace-a", 1),
+            focused_terminal_runtime_identity(&state, "workspace-a", 1, true),
             Some(("workspace-b".to_owned(), 9))
+        );
+        assert_eq!(
+            focused_terminal_runtime_identity(&state, "workspace-a", 1, false),
+            None,
+            "a hidden attached pane must not retain deferred suppression"
         );
         state.focus_primary();
         assert_eq!(
-            focused_terminal_runtime_identity(&state, "workspace-a", 1),
+            focused_terminal_runtime_identity(&state, "workspace-a", 1, true),
             Some(("workspace-a".to_owned(), 1))
+        );
+        assert_eq!(
+            focused_terminal_runtime_identity(&state, "workspace-a", 1, false),
+            None,
+            "a hidden primary pane is not an input-owning terminal surface"
         );
         state.focus_attached();
         state.reconcile(
@@ -20633,7 +20649,7 @@ mod tests {
             },
         );
         assert_eq!(
-            focused_terminal_runtime_identity(&state, "workspace-a", 1),
+            focused_terminal_runtime_identity(&state, "workspace-a", 1, true),
             None,
             "an unavailable attached focus must not fall back to A"
         );

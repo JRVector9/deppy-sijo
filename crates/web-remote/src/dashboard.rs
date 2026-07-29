@@ -1277,6 +1277,24 @@ mod tests {
         assert_eq!(sessions[&10].status, SessionStatus::Running);
     }
 
+    #[test]
+    fn command_barrier_event_is_not_dashboard_or_session_data() {
+        let mut sessions = BTreeMap::new();
+        let mut resource = None;
+        let mut ids = IdMap::default();
+
+        assert!(!apply_event(
+            &mut sessions,
+            &mut resource,
+            &mut ids,
+            &RuntimeEvent::CommandBarrierReached { correlation_id: 1 },
+        ));
+        assert!(sessions.is_empty());
+        assert!(resource.is_none());
+        assert!(ids.to_session.is_empty());
+        assert!(ids.to_uuid.is_empty());
+    }
+
     /// 표시명은 앱 스냅샷에서 오고, mux의 raw 제목이 덮지 않는다 (폰에서 사람이 읽는 이름).
     #[test]
     fn 표시명은_앱_스냅샷에서_오고_비활성은_표시전용이다() {

@@ -1968,6 +1968,9 @@ impl Worker {
                     self.restore_saved_pane(&pane);
                 }
             }
+            RuntimeCommand::CommandBarrier { correlation_id } => {
+                self.emit(RuntimeEvent::CommandBarrierReached { correlation_id });
+            }
             RuntimeCommand::RenamePane { pane, title } => {
                 if let Some(p) = self.mux.panes.get_mut(&pane) {
                     p.title = title;
@@ -4692,6 +4695,211 @@ mod tests {
         };
         persist::save_window_layout(&mut conn, workspace_id, &window).unwrap();
         (first_pane, second_pane)
+    }
+
+    #[cfg(unix)]
+    fn lazy_restore_barrier_fixture(
+        name: &str,
+    ) -> (InProcessRuntimeClient, Probe, MuxPaneId, MuxPaneId, PathBuf) {
+        init_mock_store();
+        let dir = unique_test_dir(name);
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = format!("ws-{name}");
+        create_persist_db(&db_path, &workspace_id);
+        let (first_pane, second_pane) =
+            seed_persisted_two_pane_window(&db_path, &workspace_id, "shell");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id,
+            }),
+        );
+        let probe = Probe::new(client.subscribe());
+        (client, probe, first_pane, second_pane, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_barrier_follows_requested_mux_result() {
+        let (client, mut probe, first_pane, _second_pane, dir) =
+            lazy_restore_barrier_fixture("restore-barrier-order");
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: first_pane.clone(),
+            })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 41 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| {
+            matches!(
+                event,
+                RuntimeEvent::CommandBarrierReached { correlation_id: 41 }
+            )
+            .then_some(())
+        });
+
+        let restore_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::MuxUpdated { snapshot }
+                        if snapshot.tabs.iter().flat_map(|tab| &tab.panes).any(|pane|
+                            pane.id == first_pane && pane.session_id.is_some())
+                )
+            })
+            .expect("requested restore mux result");
+        let barrier_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CommandBarrierReached { correlation_id: 41 }
+                )
+            })
+            .expect("exact barrier");
+        assert!(restore_index < barrier_index);
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_mux_can_precede_restore_while_barrier_stays_after_requested_result() {
+        let (client, mut probe, first_pane, second_pane, dir) =
+            lazy_restore_barrier_fixture("restore-barrier-stale-mux");
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane { pane: first_pane })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 50 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| {
+            matches!(
+                event,
+                RuntimeEvent::CommandBarrierReached { correlation_id: 50 }
+            )
+            .then_some(())
+        });
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane { pane: second_pane })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 51 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| {
+            matches!(
+                event,
+                RuntimeEvent::CommandBarrierReached { correlation_id: 51 }
+            )
+            .then_some(())
+        });
+
+        let stale_mux_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::MuxUpdated { snapshot }
+                        if snapshot.tabs.iter().flat_map(|tab| &tab.panes)
+                            .filter(|pane| pane.session_id.is_some()).count() == 1
+                )
+            })
+            .expect("stale mux before requested restore");
+        let first_barrier_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CommandBarrierReached { correlation_id: 50 }
+                )
+            })
+            .expect("first barrier");
+        let requested_mux_index = probe
+            .seen
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                (index > first_barrier_index
+                    && matches!(
+                        event,
+                        RuntimeEvent::MuxUpdated { snapshot }
+                            if snapshot.tabs.iter().flat_map(|tab| &tab.panes)
+                                .filter(|pane| pane.session_id.is_some()).count() == 2
+                    ))
+                .then_some(index)
+            })
+            .expect("requested restore mux result");
+        let requested_barrier_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CommandBarrierReached { correlation_id: 51 }
+                )
+            })
+            .expect("requested barrier");
+        assert!(stale_mux_index < first_barrier_index);
+        assert!(first_barrier_index < requested_mux_index);
+        assert!(requested_mux_index < requested_barrier_index);
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn back_to_back_command_barriers_preserve_fifo_and_exact_ids() {
+        let client = InProcessRuntimeClient::new(
+            5,
+            test_store(),
+            test_logs_root("back-to-back-barriers"),
+            RedactionService::new(),
+            None,
+            None,
+            Vec::new(),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 70 })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 71 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                RuntimeEvent::CommandBarrierReached { correlation_id: 71 }
+            )
+            .then_some(())
+        });
+
+        let ids = probe
+            .seen
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::CommandBarrierReached { correlation_id } => Some(*correlation_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [70, 71]);
+
+        drop(client);
     }
 
     #[cfg(unix)]

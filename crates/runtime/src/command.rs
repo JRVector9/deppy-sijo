@@ -446,7 +446,8 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
-        | RuntimeCommand::NoteTurnStart { .. } => {}
+        | RuntimeCommand::NoteTurnStart { .. }
+        | RuntimeCommand::CommandBarrier { .. } => {}
     }
     Ok(total)
 }
@@ -560,7 +561,8 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
-        | RuntimeCommand::NoteTurnStart { .. } => {}
+        | RuntimeCommand::NoteTurnStart { .. }
+        | RuntimeCommand::CommandBarrier { .. } => {}
     }
 }
 
@@ -715,6 +717,11 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         RuntimeCommand::SearchScrollback { query, .. } => {
             if query.len() > SEARCH_QUERY_BYTES_MAX {
                 return Err(admission_error("runtime_command_search_invalid"));
+            }
+        }
+        RuntimeCommand::CommandBarrier { correlation_id } => {
+            if *correlation_id == 0 {
+                return Err(admission_error("runtime_command_barrier_invalid"));
             }
         }
         RuntimeCommand::Scroll { .. }
@@ -941,6 +948,13 @@ pub enum RuntimeCommand {
     RestoreWorkspacePane {
         pane: MuxPaneId,
     },
+    /// FIFO marker for proving that every earlier command has been handled and
+    /// its synchronous events emitted. The opaque id is fixed-size and nonzero;
+    /// issuers sharing one runtime backend must keep their outstanding ids unique.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    CommandBarrier {
+        correlation_id: u64,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1089,6 +1103,10 @@ impl std::fmt::Debug for RuntimeCommand {
             RuntimeCommand::RestoreWorkspacePane { pane } => f
                 .debug_struct("RestoreWorkspacePane")
                 .field("pane", pane)
+                .finish(),
+            RuntimeCommand::CommandBarrier { correlation_id } => f
+                .debug_struct("CommandBarrier")
+                .field("correlation_id", correlation_id)
                 .finish(),
             RuntimeCommand::SetWorkspaceState(state) => {
                 f.debug_tuple("SetWorkspaceState").field(state).finish()
@@ -1865,7 +1883,23 @@ mod tests {
                 "ResumeSession",
                 "NoteTurnStart",
                 "RestoreWorkspacePane",
+                "CommandBarrier",
             ]
         );
+    }
+
+    #[test]
+    fn command_barrier_requires_nonzero_correlation_and_retains_no_heap() {
+        let mut valid = RuntimeCommand::CommandBarrier { correlation_id: 7 };
+        assert!(validate_host_command(&valid).is_ok());
+        let retained = prepare_runtime_command_for_retention(&mut valid).unwrap();
+        assert_eq!(
+            retained.retained_bytes(),
+            std::mem::size_of::<RuntimeCommand>()
+        );
+
+        let invalid = RuntimeCommand::CommandBarrier { correlation_id: 0 };
+        assert!(validate_host_command(&invalid).is_err());
+        assert_eq!(format!("{valid:?}"), "CommandBarrier { correlation_id: 7 }");
     }
 }

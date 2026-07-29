@@ -185,6 +185,13 @@ pub enum RuntimeEvent {
         session: SessionId,
         frozen: bool,
     },
+    /// Exact acknowledgement for a handled `RuntimeCommand::CommandBarrier`.
+    /// Every synchronous event from earlier FIFO commands has already been emitted.
+    /// Correlation ids retain the issuing command's shared-backend uniqueness contract.
+    /// **variant는 enum 끝에만 추가** (postcard discriminant — remote wire 호환).
+    CommandBarrierReached {
+        correlation_id: u64,
+    },
 }
 
 /// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의
@@ -351,5 +358,54 @@ mod tests {
             }
             _ => panic!("unexpected event"),
         }
+    }
+
+    #[test]
+    fn runtime_event_variant_order_is_source_locked() {
+        let source = include_str!("event.rs");
+        let body = source
+            .split_once("pub enum RuntimeEvent {")
+            .unwrap()
+            .1
+            .split_once("\n}\n\n/// 최신값 슬롯")
+            .unwrap()
+            .0;
+        let actual = body
+            .lines()
+            .filter_map(|line| {
+                let line = line.strip_prefix("    ")?;
+                if line.starts_with([' ', '/']) {
+                    return None;
+                }
+                let name = line
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .next()?;
+                name.chars()
+                    .next()
+                    .is_some_and(char::is_uppercase)
+                    .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                "ShellSpawned",
+                "AgentSpawned",
+                "SpawnFailed",
+                "Viewport",
+                "SessionExited",
+                "MuxUpdated",
+                "SessionStatusChanged",
+                "ResourceUsage",
+                "PtyInputPressure",
+                "SessionStatusViewChanged",
+                "SessionRestored",
+                "ScrollbackSearchResult",
+                "LastOutputExtracted",
+                "AgentSpawnResolved",
+                "SessionFreezeChanged",
+                "CommandBarrierReached",
+            ]
+        );
     }
 }

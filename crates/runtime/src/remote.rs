@@ -446,6 +446,9 @@ fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         } if *scrollback_lines > MAX_SCROLLBACK_LINES => {
             return Err("scrollback_lines 상한 초과");
         }
+        RuntimeCommand::CommandBarrier { correlation_id: 0 } => {
+            return Err("command barrier correlation_id는 0일 수 없음");
+        }
         _ => {}
     }
     Ok(())
@@ -475,6 +478,9 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
             agent_config_id, ..
         } if !agent_config_id.is_valid() => {
             return Err("agent_config_id가 비었거나 상한/NUL 규칙 위반");
+        }
+        RuntimeEvent::CommandBarrierReached { correlation_id: 0 } => {
+            return Err("command barrier correlation_id는 0일 수 없음");
         }
         _ => {}
     }
@@ -2720,14 +2726,14 @@ mod tests {
     }
 
     #[test]
-    fn v9_peer_is_rejected_at_hello_before_event_decode() {
+    fn v10_peer_is_rejected_at_hello_before_event_decode() {
         let old = ClientHello {
             magic: PROTO_MAGIC,
-            proto_version: 9,
+            proto_version: 10,
             features: CLIENT_FEATURES,
             token: b"irrelevant".to_vec(),
         };
-        assert_eq!(PROTO_VERSION, 10);
+        assert_eq!(PROTO_VERSION, 11);
         assert!(!client_hello_matches_protocol(&old));
     }
 
@@ -2795,6 +2801,68 @@ mod tests {
             Codec::Plain.decode_command(&cmd_frame).unwrap(),
             DecodedCommand::Command(RuntimeCommand::SpawnAgent { cols: 80, .. })
         ));
+    }
+
+    #[test]
+    fn command_barrier_remote_codecs_roundtrip_and_reject_invalid_payloads() {
+        let command = RuntimeCommand::CommandBarrier { correlation_id: 91 };
+        let event = RuntimeEvent::CommandBarrierReached { correlation_id: 91 };
+
+        for codec in [Codec::Plain, Codec::Delta] {
+            let command_frame = codec.encode_command(&command).unwrap();
+            let DecodedCommand::Command(decoded_command) =
+                codec.decode_command(&command_frame).unwrap()
+            else {
+                panic!("barrier decoded as keyframe request");
+            };
+            assert!(matches!(
+                decoded_command,
+                RuntimeCommand::CommandBarrier { correlation_id: 91 }
+            ));
+            validate_command(&decoded_command).unwrap();
+
+            let event_frame = codec.encode_event(&event).unwrap();
+            let DecodedEvent::Event(decoded_event) = codec.decode_event(&event_frame).unwrap()
+            else {
+                panic!("barrier decoded as viewport frame");
+            };
+            assert!(matches!(
+                decoded_event,
+                RuntimeEvent::CommandBarrierReached { correlation_id: 91 }
+            ));
+            validate_event(&decoded_event).unwrap();
+
+            assert!(codec.decode_command(&[0xff, 0xff]).is_err());
+            assert!(codec.decode_event(&[0xff, 0xff]).is_err());
+        }
+
+        assert!(validate_command(&RuntimeCommand::CommandBarrier { correlation_id: 0 }).is_err());
+        assert!(
+            validate_event(&RuntimeEvent::CommandBarrierReached { correlation_id: 0 }).is_err()
+        );
+    }
+
+    #[test]
+    fn command_barrier_crosses_remote_runtime_transport() {
+        let server = RemoteRuntimeServer::serve(test_backend("command-barrier"), 0).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let receiver = client.subscribe();
+
+        client
+            .send_command(RuntimeCommand::CommandBarrier { correlation_id: 92 })
+            .unwrap();
+        let mut seen = Vec::new();
+        wait_for(&receiver, &mut seen, Duration::from_secs(10), |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CommandBarrierReached { correlation_id: 92 }
+                )
+            })
+        });
+
+        drop(client);
+        server.shutdown();
     }
 
     /// rogue/버그 서버가 클라이언트가 요청하지 않은 feature를 ack하면 클라이언트는
@@ -3425,6 +3493,7 @@ mod tests {
             RuntimeEvent::LastOutputExtracted { .. } => "LastOutputExtracted",
             RuntimeEvent::AgentSpawnResolved { .. } => "AgentSpawnResolved",
             RuntimeEvent::SessionFreezeChanged { .. } => "SessionFreezeChanged",
+            RuntimeEvent::CommandBarrierReached { .. } => "CommandBarrierReached",
         }
     }
 

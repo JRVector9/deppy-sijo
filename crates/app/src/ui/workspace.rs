@@ -706,13 +706,15 @@ fn find_attached_pane<'a>(
 }
 
 #[allow(dead_code)]
-pub(crate) fn visible_attachment_indices(viewport: egui::Rect, rects: &[egui::Rect]) -> Vec<usize> {
+pub(crate) fn visible_attachment_indices<'a>(
+    viewport: egui::Rect,
+    rects: &'a [egui::Rect],
+) -> impl Iterator<Item = usize> + 'a {
     rects
         .iter()
         .take(crate::ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
         .enumerate()
-        .filter_map(|(index, rect)| viewport.intersect(*rect).is_positive().then_some(index))
-        .collect()
+        .filter_map(move |(index, rect)| viewport.intersect(*rect).is_positive().then_some(index))
 }
 
 fn terminal_toolbar_button(
@@ -807,6 +809,8 @@ pub struct WorkspaceUi {
     /// egui가 고수준 Copy를 생략하거나 한 프레임 늦게 보낼 때의 macOS Command+C
     /// 원본 key-down. 선택과 터미널 입력 소유권이 모두 확인된 경우에만 복사한다.
     native_clipboard_copy_requested: bool,
+    prepared_attached_input_owner: Option<AttachedPaneTarget>,
+    prepared_attached_input_consumed: bool,
     /// 파일 트리가 이번 프레임 ⌘V/⌘C를 소비 — 같은 제스처의 터미널 붙여넣기/선택 복사
     /// 이중 처리를 누른다(App이 사이드바 렌더 직후 설정, prepare_frame이 프레임
     /// 플래그로 옮긴다. 파일 트리 §과제②③ 충돌 금지).
@@ -1235,6 +1239,8 @@ impl WorkspaceUi {
             native_printable_key_downs: Vec::new(),
             native_clipboard_paste_requested: false,
             native_clipboard_copy_requested: false,
+            prepared_attached_input_owner: None,
+            prepared_attached_input_consumed: false,
             suppress_paste_request: false,
             suppress_copy_request: false,
             paste_suppressed: false,
@@ -2373,6 +2379,7 @@ impl WorkspaceUi {
                 catalog,
                 input_enabled,
                 std::slice::from_ref(target),
+                input_enabled.then_some(target),
                 drain_native_input,
             );
         } else {
@@ -2382,11 +2389,13 @@ impl WorkspaceUi {
                 catalog,
                 input_enabled,
                 &[],
+                None,
                 drain_native_input,
             );
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_frame_with_native_input_for_targets(
         &mut self,
         ctx: &egui::Context,
@@ -2394,10 +2403,12 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
         input_enabled: bool,
         attached_targets: &[AttachedPaneTarget],
+        attached_input_owner: Option<&AttachedPaneTarget>,
         drain_native_input: impl FnOnce() -> crate::native_key_monitor::NativeKeyDownBatch,
     ) {
         self.frame_counters = renderer_egui::RenderCounters::default();
         self.terminal_focus_claimed = false;
+        self.set_prepared_attached_input_owner(attached_input_owner);
         // AppKit local monitor는 winit/egui가 IME 처리 중 숨길 수 있는 원본 key-down을
         // 보존한다. 매 프레임 먼저 비워 두어 검색창/설정창에서 친 키가 나중에 터미널로
         // 이월되지 않게 하고, 실제 전송은 terminal_keyboard_active pane만 수행한다.
@@ -2452,15 +2463,35 @@ impl WorkspaceUi {
         let visible_targets = &visible_targets[..visible_targets
             .len()
             .min(crate::ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)];
-        let input_enabled = input_target.is_some_and(|target| visible_targets.contains(target));
+        let input_target = input_target.filter(|target| visible_targets.contains(target));
         self.prepare_frame_with_native_input_for_targets(
             ctx,
             events,
             catalog,
-            input_enabled,
+            input_target.is_some(),
             visible_targets,
+            input_target,
             drain_native_input,
         );
+    }
+
+    fn set_prepared_attached_input_owner(&mut self, owner: Option<&AttachedPaneTarget>) {
+        self.prepared_attached_input_consumed = false;
+        match (self.prepared_attached_input_owner.as_mut(), owner) {
+            (Some(current), Some(owner)) => current.clone_from(owner),
+            (None, Some(owner)) => self.prepared_attached_input_owner = Some(owner.clone()),
+            (_, None) => self.prepared_attached_input_owner = None,
+        }
+    }
+
+    fn take_prepared_attached_input(&mut self, target: &AttachedPaneTarget) -> bool {
+        if self.prepared_attached_input_consumed
+            || self.prepared_attached_input_owner.as_ref() != Some(target)
+        {
+            return false;
+        }
+        self.prepared_attached_input_consumed = true;
+        true
     }
 
     /// 홈 대시보드가 중앙 표면을 차지한 프레임에도 런타임 이벤트와 비동기 붙여넣기
@@ -2773,7 +2804,6 @@ impl WorkspaceUi {
             target,
             external_workspace_label,
             availability,
-            input_enabled,
             None,
         )
         .surface
@@ -2789,7 +2819,6 @@ impl WorkspaceUi {
         target: &AttachedPaneTarget,
         external_workspace_label: &str,
         availability: AttachedPaneAvailability,
-        input_enabled: bool,
         header_context: Option<AttachedPaneHeaderContext>,
     ) -> PreparedAttachedPaneOutput {
         let rect = ui.available_rect_before_wrap();
@@ -2804,6 +2833,9 @@ impl WorkspaceUi {
         let pane = mux
             .as_deref()
             .and_then(|snapshot| find_attached_pane(snapshot, target));
+        let input_enabled = availability == AttachedPaneAvailability::Available
+            && pane.is_some()
+            && self.take_prepared_attached_input(target);
         let pane_title = pane.map(|pane| pane.title.clone());
         let header_height = TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0));
         let header = egui::Rect::from_min_max(
@@ -6277,7 +6309,6 @@ mod tests {
                     &target,
                     "Other",
                     AttachedPaneAvailability::Available,
-                    false,
                     None,
                 );
             },
@@ -6301,7 +6332,222 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(310.0, 0.0), egui::vec2(90.0, 80.0)),
         ];
 
-        assert_eq!(visible_attachment_indices(viewport, &rects), vec![1, 2]);
+        assert_eq!(
+            visible_attachment_indices(viewport, &rects).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn prepared_attached_input_owner는_두_render중_exact_target에만_input을_emit한다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let targets = [
+            AttachedPaneTarget {
+                workspace_id: "workspace-b".to_owned(),
+                tab: tab_id("first-tab"),
+                pane: pane_id("first-pane"),
+                session: SessionId(7),
+            },
+            AttachedPaneTarget {
+                workspace_id: "workspace-b".to_owned(),
+                tab: tab_id("second-tab"),
+                pane: pane_id("second-pane"),
+                session: SessionId(8),
+            },
+        ];
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "first-tab",
+            vec![
+                tab(
+                    "first-tab",
+                    vec![pane("first-pane", SessionId(7))],
+                    LayoutNode::Pane(pane_id("first-pane")),
+                ),
+                tab(
+                    "second-tab",
+                    vec![pane("second-pane", SessionId(8))],
+                    LayoutNode::Pane(pane_id("second-pane")),
+                ),
+            ],
+            "first-pane",
+        ));
+        workspace.sessions.entry(SessionId(7)).or_default().snapshot = Some(snapshot("first"));
+        workspace.sessions.entry(SessionId(8)).or_default().snapshot = Some(snapshot("second"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.prepare_attached_panes(
+                    ui.ctx(),
+                    &[],
+                    &catalog,
+                    &targets,
+                    Some(&targets[0]),
+                );
+                let rect = ui.available_rect_before_wrap();
+                let middle = rect.center().x;
+                for (index, target) in targets.iter().enumerate() {
+                    let pane_rect = if index == 0 {
+                        egui::Rect::from_min_max(rect.min, egui::pos2(middle, rect.bottom()))
+                    } else {
+                        egui::Rect::from_min_max(egui::pos2(middle, rect.top()), rect.max)
+                    };
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(pane_rect));
+                    workspace.show_prepared_attached_pane(
+                        &mut child,
+                        &config,
+                        &catalog,
+                        target,
+                        "Other",
+                        AttachedPaneAvailability::Available,
+                        None,
+                    );
+                }
+            },
+            workspace,
+        );
+        harness.run();
+        drain_protocol(harness.state_mut());
+
+        harness.event(egui::Event::Text("x".to_owned()));
+        harness.run();
+
+        let writes = drain_protocol(harness.state_mut())
+            .into_iter()
+            .filter_map(|command| match command {
+                RuntimeCommand::WriteInput { session, bytes } => Some((session, bytes)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes, vec![(SessionId(7), b"x".to_vec())]);
+    }
+
+    #[test]
+    fn prepared_attached_input_owner와_render_target이_다르면_input을_emit하지_않는다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let owner = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("owner-tab"),
+            pane: pane_id("owner-pane"),
+            session: SessionId(7),
+        };
+        let rendered = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("rendered-tab"),
+            pane: pane_id("rendered-pane"),
+            session: SessionId(8),
+        };
+        let targets = [owner, rendered];
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "owner-tab",
+            vec![
+                tab(
+                    "owner-tab",
+                    vec![pane("owner-pane", SessionId(7))],
+                    LayoutNode::Pane(pane_id("owner-pane")),
+                ),
+                tab(
+                    "rendered-tab",
+                    vec![pane("rendered-pane", SessionId(8))],
+                    LayoutNode::Pane(pane_id("rendered-pane")),
+                ),
+            ],
+            "owner-pane",
+        ));
+        workspace.sessions.entry(SessionId(8)).or_default().snapshot = Some(snapshot("rendered"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.prepare_attached_panes(
+                    ui.ctx(),
+                    &[],
+                    &catalog,
+                    &targets,
+                    Some(&targets[0]),
+                );
+                workspace.show_prepared_attached_pane(
+                    ui,
+                    &config,
+                    &catalog,
+                    &targets[1],
+                    "Other",
+                    AttachedPaneAvailability::Available,
+                    None,
+                );
+            },
+            workspace,
+        );
+        harness.run();
+        drain_protocol(harness.state_mut());
+
+        harness.event(egui::Event::Text("x".to_owned()));
+        harness.run();
+
+        assert!(
+            drain_protocol(harness.state_mut())
+                .into_iter()
+                .all(|command| { !matches!(command, RuntimeCommand::WriteInput { .. }) })
+        );
+    }
+
+    #[test]
+    fn 다음_attached_prepare는_이전_input_owner를_지운다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("pane"),
+            session: SessionId(7),
+        };
+        let owner_enabled = std::rc::Rc::new(std::cell::Cell::new(true));
+        let callback_owner_enabled = std::rc::Rc::clone(&owner_enabled);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "foreign",
+            vec![tab(
+                "foreign",
+                vec![pane("pane", SessionId(7))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        workspace.sessions.entry(SessionId(7)).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                let owner = callback_owner_enabled.get().then_some(&target);
+                workspace.prepare_attached_panes(
+                    ui.ctx(),
+                    &[],
+                    &catalog,
+                    std::slice::from_ref(&target),
+                    owner,
+                );
+                workspace.show_prepared_attached_pane(
+                    ui,
+                    &config,
+                    &catalog,
+                    &target,
+                    "Other",
+                    AttachedPaneAvailability::Available,
+                    None,
+                );
+            },
+            workspace,
+        );
+        harness.run();
+        drain_protocol(harness.state_mut());
+        owner_enabled.set(false);
+
+        harness.event(egui::Event::Text("x".to_owned()));
+        harness.run();
+
+        assert!(
+            drain_protocol(harness.state_mut())
+                .into_iter()
+                .all(|command| { !matches!(command, RuntimeCommand::WriteInput { .. }) })
+        );
     }
 
     #[test]

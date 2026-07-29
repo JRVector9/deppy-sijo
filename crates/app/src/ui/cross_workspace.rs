@@ -2,6 +2,7 @@ use runtime::{MuxPaneId, MuxTabId, SessionId};
 
 const MIN_ATTACHED_RATIO: f32 = 0.10;
 const MAX_ATTACHED_RATIO: f32 = 0.90;
+const DEFAULT_ATTACHED_RATIO: f32 = 0.50;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspacePaneTarget {
@@ -50,11 +51,17 @@ pub(crate) enum AttachedRenderState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiveTargetRelation {
+    Exact,
+    PaneMissing,
+    SessionMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttachedRuntimeState {
     Live {
         runtime_instance: u64,
-        pane_present: bool,
-        session_present: bool,
+        target_relation: LiveTargetRelation,
     },
     Suspended {
         runtime_instance: u64,
@@ -143,7 +150,11 @@ impl CrossWorkspacePaneState {
         self.attachment = Some(AttachedPane {
             primary_workspace_id: primary_workspace_id.into(),
             target,
-            ratio: ratio.clamp(MIN_ATTACHED_RATIO, MAX_ATTACHED_RATIO),
+            ratio: if ratio.is_finite() {
+                ratio.clamp(MIN_ATTACHED_RATIO, MAX_ATTACHED_RATIO)
+            } else {
+                DEFAULT_ATTACHED_RATIO
+            },
             render_state: AttachedRenderState::Live,
         });
         self.focused_surface = TerminalSurfaceFocus::Attached;
@@ -177,14 +188,17 @@ impl CrossWorkspacePaneState {
 
         match runtime {
             AttachedRuntimeState::Live {
-                pane_present: false,
+                target_relation: LiveTargetRelation::PaneMissing,
                 ..
             } => self.detach_for(DetachReason::PaneMissing),
             AttachedRuntimeState::Live {
-                session_present: false,
+                target_relation: LiveTargetRelation::SessionMismatch,
                 ..
             } => self.detach_for(DetachReason::SessionMissing),
-            AttachedRuntimeState::Live { .. } => {
+            AttachedRuntimeState::Live {
+                target_relation: LiveTargetRelation::Exact,
+                ..
+            } => {
                 self.attachment.as_mut().unwrap().render_state = AttachedRenderState::Live;
                 ReconcileDecision::RetainedLive
             }
@@ -202,7 +216,9 @@ impl CrossWorkspacePaneState {
     }
 
     pub(crate) fn set_ratio(&mut self, ratio: f32) {
-        if let Some(attachment) = self.attachment.as_mut() {
+        if ratio.is_finite()
+            && let Some(attachment) = self.attachment.as_mut()
+        {
             attachment.ratio = ratio.clamp(MIN_ATTACHED_RATIO, MAX_ATTACHED_RATIO);
         }
     }
@@ -284,8 +300,7 @@ mod tests {
     fn live(runtime_instance: u64) -> AttachedRuntimeState {
         AttachedRuntimeState::Live {
             runtime_instance,
-            pane_present: true,
-            session_present: true,
+            target_relation: LiveTargetRelation::Exact,
         }
     }
 
@@ -323,6 +338,19 @@ mod tests {
 
         state.set_ratio(0.37);
         assert_eq!(state.attachment().unwrap().ratio(), 0.37);
+    }
+
+    #[test]
+    fn non_finite_ratio_uses_safe_attach_default_and_preserves_last_valid_update() {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut state = CrossWorkspacePaneState::default();
+            state.attach("workspace-a", target("workspace-b", 1), invalid);
+            assert_eq!(state.attachment().unwrap().ratio(), 0.5);
+
+            state.set_ratio(0.37);
+            state.set_ratio(invalid);
+            assert_eq!(state.attachment().unwrap().ratio(), 0.37);
+        }
     }
 
     #[test]
@@ -365,9 +393,12 @@ mod tests {
 
     #[test]
     fn missing_pane_or_session_auto_detaches() {
-        for (pane_present, session_present, expected) in [
-            (false, true, DetachReason::PaneMissing),
-            (true, false, DetachReason::SessionMissing),
+        for (target_relation, expected) in [
+            (LiveTargetRelation::PaneMissing, DetachReason::PaneMissing),
+            (
+                LiveTargetRelation::SessionMismatch,
+                DetachReason::SessionMissing,
+            ),
         ] {
             let mut state = CrossWorkspacePaneState::default();
             state.attach("workspace-a", target("workspace-b", 1), 0.5);
@@ -377,13 +408,35 @@ mod tests {
                     "workspace-a",
                     AttachedRuntimeState::Live {
                         runtime_instance: 1,
-                        pane_present,
-                        session_present,
+                        target_relation,
                     },
                 ),
                 ReconcileDecision::Detached(expected)
             );
         }
+    }
+
+    #[test]
+    fn pane_with_different_session_detaches_and_is_never_routable() {
+        let mut state = CrossWorkspacePaneState::default();
+        state.attach("workspace-a", target("workspace-b", 1), 0.5);
+
+        assert_eq!(
+            state.reconcile(
+                "workspace-a",
+                AttachedRuntimeState::Live {
+                    runtime_instance: 1,
+                    target_relation: LiveTargetRelation::SessionMismatch,
+                },
+            ),
+            ReconcileDecision::Detached(DetachReason::SessionMissing)
+        );
+        assert!(state.attachment().is_none());
+        assert!(!state.protects_runtime("workspace-b", 1));
+        assert_eq!(
+            state.focused_input_target(),
+            Some(FocusedInputTarget::Primary)
+        );
     }
 
     #[test]

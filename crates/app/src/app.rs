@@ -6646,6 +6646,7 @@ enum AppHostIoAction {
     Connector(connector_service::HostAction),
     Workspace {
         workspace_id: String,
+        runtime_instance: u64,
         intent: ui::workspace::WorkspaceIoIntent,
     },
     FileTree(ui::file_tree::FileTreeIoIntent),
@@ -6750,6 +6751,7 @@ enum AppHostIoCompletion {
     Dispatch(connector_contract::ConnectorIntent),
     Workspace {
         workspace_id: String,
+        runtime_instance: u64,
         completion: ui::workspace::WorkspaceIoCompletion,
     },
     FileTree(ui::file_tree::FileTreeIoCompletion),
@@ -6782,11 +6784,13 @@ enum AppHostIoFallback {
     Cancel(connector_contract::OperationId),
     WorkspacePath {
         workspace_id: String,
+        runtime_instance: u64,
         operation: ui::workspace::WorkspaceIoOperation,
         generation: u64,
     },
     WorkspaceClipboard {
         workspace_id: String,
+        runtime_instance: u64,
         operation: ui::workspace::WorkspaceIoOperation,
         generation: u64,
     },
@@ -6832,6 +6836,7 @@ impl AppHostIoFallback {
             }) => Self::None,
             AppHostIoAction::Workspace {
                 workspace_id,
+                runtime_instance,
                 intent:
                     ui::workspace::WorkspaceIoIntent::ResolvePath {
                         operation,
@@ -6840,11 +6845,13 @@ impl AppHostIoFallback {
                     },
             } => Self::WorkspacePath {
                 workspace_id: workspace_id.clone(),
+                runtime_instance: *runtime_instance,
                 operation: *operation,
                 generation: *generation,
             },
             AppHostIoAction::Workspace {
                 workspace_id,
+                runtime_instance,
                 intent:
                     ui::workspace::WorkspaceIoIntent::ReadTerminalClipboard {
                         operation,
@@ -6852,6 +6859,7 @@ impl AppHostIoFallback {
                     },
             } => Self::WorkspaceClipboard {
                 workspace_id: workspace_id.clone(),
+                runtime_instance: *runtime_instance,
                 operation: *operation,
                 generation: *generation,
             },
@@ -6900,10 +6908,12 @@ impl AppHostIoFallback {
             ),
             Self::WorkspacePath {
                 workspace_id,
+                runtime_instance,
                 operation,
                 generation,
             } => AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::PathResolved {
                     operation,
                     generation,
@@ -6912,10 +6922,12 @@ impl AppHostIoFallback {
             },
             Self::WorkspaceClipboard {
                 workspace_id,
+                runtime_instance,
                 operation,
                 generation,
             } => AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::TerminalClipboardRead {
                     operation,
                     generation,
@@ -7854,6 +7866,7 @@ fn run_app_host_io(
     match action {
         AppHostIoAction::Workspace {
             workspace_id,
+            runtime_instance,
             intent:
                 ui::workspace::WorkspaceIoIntent::ResolvePath {
                     operation,
@@ -7869,6 +7882,7 @@ fn run_app_host_io(
                 .or_else(|| pid.and_then(platform::process_cwd));
             AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::PathResolved {
                     operation,
                     generation,
@@ -7878,6 +7892,7 @@ fn run_app_host_io(
         }
         AppHostIoAction::Workspace {
             workspace_id,
+            runtime_instance,
             intent:
                 ui::workspace::WorkspaceIoIntent::ReadTerminalClipboard {
                     operation,
@@ -7891,6 +7906,7 @@ fn run_app_host_io(
             let text = ui::clipboard_image::read_clipboard_text();
             AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::TerminalClipboardRead {
                     operation,
                     generation,
@@ -8160,14 +8176,20 @@ impl App {
             }
             AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion,
             } => {
-                let runtime = if self.active.id == workspace_id {
-                    Some(&mut self.active)
-                } else {
-                    self.warm.get_mut(&workspace_id)
-                };
-                if let Some(runtime) = runtime {
+                if let Some(runtime) =
+                    self.runtime_by_instance_mut(runtime_instance)
+                        .filter(|runtime| {
+                            workspace_runtime_identity_matches(
+                                &runtime.id,
+                                runtime.runtime_instance,
+                                &workspace_id,
+                                runtime_instance,
+                            )
+                        })
+                {
                     runtime.workspace_ui.complete_io(completion);
                 }
             }
@@ -8343,12 +8365,28 @@ impl App {
                 .map(AppHostIoAction::Connector)
                 .or_else(|| self.pending_app_host_action.take())
                 .or_else(|| {
-                    self.active.workspace_ui.take_io_intent().map(|intent| {
-                        AppHostIoAction::Workspace {
-                            workspace_id: self.active.id.clone(),
-                            intent,
-                        }
-                    })
+                    let active = self.active.workspace_ui.take_io_intent().map(|intent| {
+                        (self.active.id.clone(), self.active.runtime_instance, intent)
+                    });
+                    let attached = if active.is_none() {
+                        self.cross_workspace_pane
+                            .attachment()
+                            .map(|attachment| attachment.target().clone())
+                            .and_then(|target| {
+                                self.warm
+                                    .get_mut(&target.workspace_id)
+                                    .filter(|runtime| {
+                                        runtime.runtime_instance == target.runtime_instance
+                                    })
+                                    .and_then(|runtime| runtime.workspace_ui.take_io_intent())
+                                    .map(|intent| {
+                                        (target.workspace_id, target.runtime_instance, intent)
+                                    })
+                            })
+                    } else {
+                        None
+                    };
+                    select_workspace_host_io_action(active, attached)
                 })
                 .or_else(|| {
                     self.file_tree
@@ -17497,9 +17535,27 @@ impl eframe::App for App {
                 .map(|tree| tree.take_clipboard_shortcut_consumption())
                 && (paste_consumed || copy_consumed)
             {
-                self.active
-                    .workspace_ui
-                    .suppress_clipboard_shortcuts_this_frame(paste_consumed, copy_consumed);
+                let target = focused_terminal_runtime_identity(
+                    &self.cross_workspace_pane,
+                    &self.active.id,
+                    self.active.runtime_instance,
+                );
+                if let Some((workspace_id, runtime_instance)) = target
+                    && let Some(runtime) =
+                        self.runtime_by_instance_mut(runtime_instance)
+                            .filter(|runtime| {
+                                workspace_runtime_identity_matches(
+                                    &runtime.id,
+                                    runtime.runtime_instance,
+                                    &workspace_id,
+                                    runtime_instance,
+                                )
+                            })
+                {
+                    runtime
+                        .workspace_ui
+                        .suppress_clipboard_shortcuts_this_frame(paste_consumed, copy_consumed);
+                }
             }
             match sidebar_action {
                 Some(ui::file_tree::SidebarAction::SwitchWorkspace(workspace_id)) => {
@@ -17873,6 +17929,9 @@ impl eframe::App for App {
             .unwrap_or_default();
         let primary_input_enabled = self.cross_workspace_pane.primary_input_enabled();
         let attached_input_enabled = self.cross_workspace_pane.attached_input_enabled();
+        drain_native_input_if_unowned(primary_input_enabled, attached_input_enabled, || {
+            let _ = crate::native_key_monitor::drain();
+        });
         let mut primary_focus_requested = false;
         let mut attached_focus_requested = false;
         let mut attached_detach_requested = false;
@@ -18120,7 +18179,24 @@ impl eframe::App for App {
             }
             None => {}
         }
-        if self.active.workspace_ui.take_terminal_focus_claimed() {
+        let primary_terminal_focus_claimed = self.active.workspace_ui.take_terminal_focus_claimed();
+        let attached_terminal_focus_claimed = attachment
+            .as_ref()
+            .and_then(|(target, _, _)| {
+                self.warm.get_mut(&target.workspace_id).map(|runtime| {
+                    let runtime_id = runtime.id.clone();
+                    let runtime_instance = runtime.runtime_instance;
+                    take_exact_runtime_focus_claim(
+                        &runtime_id,
+                        runtime_instance,
+                        &target.workspace_id,
+                        target.runtime_instance,
+                        || runtime.workspace_ui.take_terminal_focus_claimed(),
+                    )
+                })
+            })
+            .unwrap_or(false);
+        if primary_terminal_focus_claimed || attached_terminal_focus_claimed {
             self.agent_sessions_ui.surrender_text_focus(ui.ctx());
         }
         // logic에서 workspace/path 변경 때만 검증한 immutable cwd projection을 넘긴다.
@@ -19838,6 +19914,68 @@ fn shortcut_targets_primary_terminal(action: crate::shortcuts::ShortcutAction) -
     )
 }
 
+fn select_workspace_host_io_action(
+    active: Option<(String, u64, ui::workspace::WorkspaceIoIntent)>,
+    attached: Option<(String, u64, ui::workspace::WorkspaceIoIntent)>,
+) -> Option<AppHostIoAction> {
+    active.or(attached).map(
+        |(workspace_id, runtime_instance, intent)| AppHostIoAction::Workspace {
+            workspace_id,
+            runtime_instance,
+            intent,
+        },
+    )
+}
+
+fn workspace_runtime_identity_matches(
+    runtime_workspace_id: &str,
+    runtime_instance: u64,
+    target_workspace_id: &str,
+    target_runtime_instance: u64,
+) -> bool {
+    runtime_workspace_id == target_workspace_id && runtime_instance == target_runtime_instance
+}
+
+fn focused_terminal_runtime_identity(
+    state: &ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: &str,
+    primary_runtime_instance: u64,
+) -> Option<(String, u64)> {
+    match state.focused_input_target()? {
+        ui::cross_workspace::FocusedInputTarget::Primary => {
+            Some((primary_workspace_id.to_owned(), primary_runtime_instance))
+        }
+        ui::cross_workspace::FocusedInputTarget::Attached(target) => {
+            Some((target.workspace_id.clone(), target.runtime_instance))
+        }
+    }
+}
+
+fn drain_native_input_if_unowned(
+    primary_input_enabled: bool,
+    attached_input_enabled: bool,
+    drain: impl FnOnce(),
+) {
+    if !primary_input_enabled && !attached_input_enabled {
+        drain();
+    }
+}
+
+fn take_exact_runtime_focus_claim(
+    runtime_workspace_id: &str,
+    runtime_instance: u64,
+    target_workspace_id: &str,
+    target_runtime_instance: u64,
+    take_claim: impl FnOnce() -> bool,
+) -> bool {
+    workspace_runtime_identity_matches(
+        runtime_workspace_id,
+        runtime_instance,
+        target_workspace_id,
+        target_runtime_instance,
+    ) && take_claim()
+}
+
 fn show_app_attached_placeholder(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -20423,6 +20561,123 @@ mod tests {
         ] {
             assert!(!shortcut_targets_primary_terminal(action), "{action:?}");
         }
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_host_io_selection_keeps_runtime_instance() {
+        let attached_intent = ui::workspace::WorkspaceIoIntent::OpenUrl(
+            ui::workspace::WorkspaceUrlPayload::try_new("https://example.com".to_owned()).unwrap(),
+        );
+
+        let action = select_workspace_host_io_action(
+            None,
+            Some(("workspace-b".to_owned(), 9, attached_intent)),
+        )
+        .expect("attached workspace intent");
+
+        assert!(matches!(
+            action,
+            AppHostIoAction::Workspace {
+                workspace_id,
+                runtime_instance: 9,
+                ..
+            } if workspace_id == "workspace-b"
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_workspace_completion_rejects_replaced_runtime_instance() {
+        assert!(workspace_runtime_identity_matches(
+            "workspace-b",
+            9,
+            "workspace-b",
+            9,
+        ));
+        assert!(!workspace_runtime_identity_matches(
+            "workspace-b",
+            10,
+            "workspace-b",
+            9,
+        ));
+        assert!(!workspace_runtime_identity_matches(
+            "workspace-c",
+            9,
+            "workspace-b",
+            9,
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_clipboard_suppression_has_one_live_focus_owner_without_fallback() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        state.attach(
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            0.5,
+        );
+
+        assert_eq!(
+            focused_terminal_runtime_identity(&state, "workspace-a", 1),
+            Some(("workspace-b".to_owned(), 9))
+        );
+        state.focus_primary();
+        assert_eq!(
+            focused_terminal_runtime_identity(&state, "workspace-a", 1),
+            Some(("workspace-a".to_owned(), 1))
+        );
+        state.focus_attached();
+        state.reconcile(
+            "workspace-a",
+            ui::cross_workspace::AttachedRuntimeState::Disconnected {
+                runtime_instance: Some(9),
+            },
+        );
+        assert_eq!(
+            focused_terminal_runtime_identity(&state, "workspace-a", 1),
+            None,
+            "an unavailable attached focus must not fall back to A"
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_unowned_input_drains_once_but_live_attached_does_not() {
+        let drains = std::cell::Cell::new(0);
+        drain_native_input_if_unowned(false, false, || drains.set(drains.get() + 1));
+        assert_eq!(drains.get(), 1);
+
+        drain_native_input_if_unowned(false, true, || drains.set(drains.get() + 1));
+        assert_eq!(
+            drains.get(),
+            1,
+            "B owns native input in the normal split path"
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_focus_claim_uses_exact_runtime_instance() {
+        let calls = std::cell::Cell::new(0);
+        assert!(!take_exact_runtime_focus_claim(
+            "workspace-b",
+            10,
+            "workspace-b",
+            9,
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(calls.get(), 0, "replacement runtime must not be consumed");
+        assert!(take_exact_runtime_focus_claim(
+            "workspace-b",
+            9,
+            "workspace-b",
+            9,
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(calls.get(), 1);
     }
 
     /// 턴 시작 판정 — 막혀 있던(대기/완료) 세션이 작업 중으로 바뀐 것만 새 턴이다.

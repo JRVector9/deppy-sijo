@@ -1731,6 +1731,34 @@ impl CrossWorkspaceRestoreCoordinator {
     }
 }
 
+fn replace_one_pane_live_attachment(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    coordinator: &mut CrossWorkspaceRestoreCoordinator,
+    primary_workspace_id: impl Into<String>,
+    target: ui::cross_workspace::WorkspacePaneTarget,
+) -> Vec<ui::cross_workspace::WorkspacePaneTarget> {
+    let attachment_ids = panes
+        .attachments()
+        .iter()
+        .map(ui::cross_workspace::AttachedPane::id)
+        .collect::<Vec<_>>();
+    let displaced_live = panes
+        .attachments()
+        .iter()
+        .filter_map(ui::cross_workspace::AttachedPane::live_target)
+        .filter(|existing| {
+            existing.workspace_id != target.workspace_id
+                || existing.runtime_instance != target.runtime_instance
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for attachment_id in attachment_ids {
+        let _ = coordinator.cancel_attachment(attachment_id);
+    }
+    panes.attach(primary_workspace_id, target, 0.5);
+    displaced_live
+}
+
 fn cross_workspace_restore_command(pane: runtime::MuxPaneId) -> runtime::RuntimeCommand {
     runtime::RuntimeCommand::RestoreWorkspacePane { pane }
 }
@@ -12106,12 +12134,15 @@ impl App {
                 let Some(target) = target else {
                     return;
                 };
-                let _ = self.cross_workspace_pane.attach_right(
+                let displaced = replace_one_pane_live_attachment(
+                    &mut self.cross_workspace_pane,
+                    &mut self.cross_workspace_restore,
                     self.active.id.clone(),
                     target,
-                    420.0,
-                    limit,
                 );
+                for target in displaced {
+                    self.set_attached_runtime_visible(&target, false);
+                }
                 self.refresh_warm_idle_deadline();
                 self.egui_ctx.request_repaint();
             }
@@ -21346,6 +21377,137 @@ mod tests {
                 | runtime::RuntimeCommand::KillSession { .. }
                 | runtime::RuntimeCommand::ResizeSplit { .. }
         ));
+    }
+
+    #[test]
+    fn cross_workspace_app_second_live_open_replaces_visible_one_pane_target() {
+        let first = cross_workspace_test_target("workspace-b", 9);
+        let second = ui::cross_workspace::WorkspacePaneTarget::new(
+            "workspace-c",
+            10,
+            runtime::MuxTabId("tab-c".to_owned()),
+            runtime::MuxPaneId("pane-c".to_owned()),
+            runtime::SessionId(43),
+        );
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        state.attach("workspace-a", first.clone(), 0.5);
+
+        let displaced = replace_one_pane_live_attachment(
+            &mut state,
+            &mut coordinator,
+            "workspace-a",
+            second.clone(),
+        );
+
+        assert_eq!(displaced, vec![first]);
+        assert_eq!(state.attachments().len(), 1);
+        assert_eq!(state.attachment().unwrap().target(), &second);
+        assert!(matches!(
+            state.focused_input_target(),
+            Some(ui::cross_workspace::FocusedInputTarget::Attached(target)) if target == &second
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_same_runtime_live_replace_keeps_replacement_runtime_visible() {
+        let first = cross_workspace_test_target("workspace-b", 9);
+        let second = ui::cross_workspace::WorkspacePaneTarget::new(
+            "workspace-b",
+            9,
+            runtime::MuxTabId("tab-c".to_owned()),
+            runtime::MuxPaneId("pane-c".to_owned()),
+            runtime::SessionId(43),
+        );
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        state.attach("workspace-a", first, 0.5);
+
+        let displaced = replace_one_pane_live_attachment(
+            &mut state,
+            &mut coordinator,
+            "workspace-a",
+            second.clone(),
+        );
+
+        assert!(displaced.is_empty());
+        assert_eq!(state.attachment().unwrap().target(), &second);
+    }
+
+    #[test]
+    fn cross_workspace_app_live_replace_cancels_displaced_restore_state_coherently() {
+        let now = std::time::Instant::now();
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = state
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let second = state
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", first)));
+        assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", second)));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        let replacement = ui::cross_workspace::WorkspacePaneTarget::new(
+            "workspace-d",
+            12,
+            runtime::MuxTabId("tab-d".to_owned()),
+            runtime::MuxPaneId("pane-d".to_owned()),
+            runtime::SessionId(44),
+        );
+
+        let displaced = replace_one_pane_live_attachment(
+            &mut state,
+            &mut coordinator,
+            "workspace-a",
+            replacement.clone(),
+        );
+
+        assert!(displaced.is_empty());
+        assert_eq!(state.attachments().len(), 1);
+        assert_eq!(state.attachment().unwrap().target(), &replacement);
+        assert_eq!(coordinator.active_request_len(), 0);
+        assert_eq!(coordinator.pending_len(), 0);
+        assert_eq!(coordinator.in_flight_len(), 1);
+        assert!(coordinator.protects_runtime("workspace-b", 11));
+    }
+
+    #[test]
+    fn cross_workspace_app_live_replace_emits_no_destructive_source_command() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn replace_one_pane_live_attachment")
+            .unwrap()
+            .1
+            .split_once("fn cross_workspace_restore_command")
+            .unwrap()
+            .0;
+
+        for forbidden in ["ClosePane", "KillSession", "ResizeSplit"] {
+            assert!(
+                !body.contains(forbidden),
+                "live replacement contains {forbidden}"
+            );
+        }
     }
 
     #[test]

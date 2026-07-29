@@ -3223,6 +3223,7 @@ impl WorkspaceUi {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_pane(
         &mut self,
         ui: &mut egui::Ui,

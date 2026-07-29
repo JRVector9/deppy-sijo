@@ -152,9 +152,8 @@ pub(crate) struct DetachDecision {
 }
 
 impl DetachDecision {
-    pub(crate) fn target(&self) -> &WorkspacePaneTarget {
-        self.live_target()
-            .expect("restoring attachments do not have a live target")
+    pub(crate) fn source(&self) -> &AttachedPaneSource {
+        &self.source
     }
 
     pub(crate) fn live_target(&self) -> Option<&WorkspacePaneTarget> {
@@ -173,9 +172,20 @@ impl DetachDecision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum AttachedPaneSource {
+pub(crate) enum AttachedPaneSource {
     Restoring(PersistedPaneRequest),
     Live(WorkspacePaneTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveDetachDecision {
+    target: WorkspacePaneTarget,
+}
+
+impl LiveDetachDecision {
+    pub(crate) fn target(&self) -> &WorkspacePaneTarget {
+        &self.target
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -193,9 +203,8 @@ impl AttachedPane {
         self.id
     }
 
-    pub(crate) fn target(&self) -> &WorkspacePaneTarget {
-        self.live_target()
-            .expect("restoring attachments do not have a live target")
+    pub(crate) fn source(&self) -> &AttachedPaneSource {
+        &self.source
     }
 
     pub(crate) fn live_target(&self) -> Option<&WorkspacePaneTarget> {
@@ -229,6 +238,22 @@ impl AttachedPane {
 
     pub(crate) fn ratio(&self) -> f32 {
         self.ratio
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LiveAttachedPane<'a> {
+    pane: &'a AttachedPane,
+    target: &'a WorkspacePaneTarget,
+}
+
+impl LiveAttachedPane<'_> {
+    pub(crate) fn target(&self) -> &WorkspacePaneTarget {
+        self.target
+    }
+
+    pub(crate) fn ratio(&self) -> f32 {
+        self.pane.ratio
     }
 }
 
@@ -285,11 +310,23 @@ impl CrossWorkspacePaneState {
         width_px: f32,
         limit: usize,
     ) -> AttachOutcome {
-        if let Some(existing) = self.attachments.iter().find(|attachment| {
-            attachment.matches_canonical_pane(&target.workspace_id, &target.pane)
-        }) {
-            self.focused = FocusedSurface::Attached(existing.id);
-            return AttachOutcome::FocusedExisting(existing.id);
+        if let Some(index) =
+            self.attachments
+                .iter()
+                .position(|attachment| match &attachment.source {
+                    AttachedPaneSource::Restoring(request) => {
+                        request.workspace_id == target.workspace_id && request.pane == target.pane
+                    }
+                    AttachedPaneSource::Live(existing) => existing == &target,
+                })
+        {
+            let attachment = &mut self.attachments[index];
+            if matches!(attachment.source, AttachedPaneSource::Restoring(_)) {
+                attachment.source = AttachedPaneSource::Live(target);
+                attachment.render_state = AttachedRenderState::Live;
+            }
+            self.focused = FocusedSurface::Attached(attachment.id);
+            return AttachOutcome::FocusedExisting(attachment.id);
         }
         if self.attachments.len() >= limit.min(HARD_MAX_CROSS_WORKSPACE_PANES) {
             return AttachOutcome::CapacityReached;
@@ -357,9 +394,18 @@ impl CrossWorkspacePaneState {
         true
     }
 
-    pub(crate) fn detach(&mut self) -> Option<DetachDecision> {
-        let id = self.attachments.last()?.id;
-        self.detach_attachment(id)
+    pub(crate) fn detach(&mut self) -> Option<LiveDetachDecision> {
+        let id = self
+            .attachments
+            .iter()
+            .rev()
+            .find(|attachment| attachment.live_target().is_some())?
+            .id;
+        let decision = self.detach_attachment(id)?;
+        let AttachedPaneSource::Live(target) = decision.source else {
+            return None;
+        };
+        Some(LiveDetachDecision { target })
     }
 
     pub(crate) fn detach_attachment(&mut self, id: AttachmentId) -> Option<DetachDecision> {
@@ -465,8 +511,11 @@ impl CrossWorkspacePaneState {
         }
     }
 
-    pub(crate) fn attachment(&self) -> Option<&AttachedPane> {
-        self.attachments.first()
+    pub(crate) fn attachment(&self) -> Option<LiveAttachedPane<'_>> {
+        self.attachments.iter().find_map(|pane| {
+            pane.live_target()
+                .map(|target| LiveAttachedPane { pane, target })
+        })
     }
 
     pub(crate) fn attachments(&self) -> &[AttachedPane] {
@@ -695,11 +744,9 @@ mod tests {
 
         let decision = state.detach().unwrap();
 
-        assert_eq!(decision.target(), &attached);
         assert!(state.attachment().is_none());
         assert_eq!(state.focused_surface(), TerminalSurfaceFocus::Primary);
-        assert_eq!(decision.live_target(), Some(&attached));
-        assert_eq!(decision.restoring_request(), None);
+        assert_eq!(decision.target(), &attached);
     }
 
     #[test]
@@ -908,7 +955,7 @@ mod tests {
             state
                 .attachments()
                 .iter()
-                .map(AttachedPane::target)
+                .map(|attachment| attachment.live_target().unwrap())
                 .collect::<Vec<_>>(),
             vec![&first, &second]
         );
@@ -998,11 +1045,11 @@ mod tests {
         let detached = state.enforce_capacity(1);
 
         assert_eq!(state.attachments().len(), 1);
-        assert_eq!(state.attachments()[0].target(), &targets[0]);
+        assert_eq!(state.attachments()[0].live_target(), Some(&targets[0]));
         assert_eq!(
             detached
                 .iter()
-                .map(DetachDecision::target)
+                .map(|decision| decision.live_target().unwrap())
                 .collect::<Vec<_>>(),
             vec![&targets[2], &targets[1]]
         );
@@ -1167,13 +1214,13 @@ mod tests {
         );
         assert!(state.promote_restoring(id, exact.clone()));
         assert_eq!(state.attachments()[0].id(), id);
-        assert_eq!(state.attachments()[0].target(), &exact);
+        assert_eq!(state.attachments()[0].live_target(), Some(&exact));
         assert_eq!(state.focused(), FocusedSurface::Attached(id));
         assert!(state.protects_runtime("workspace-b", 7));
     }
 
     #[test]
-    fn canonical_pane_deduplicates_across_live_and_restoring_sources() {
+    fn attach_right_promotes_matching_restoring_slot_to_live() {
         let request = PersistedPaneRequest::new("workspace-b", MuxPaneId("pane-shared".into()));
         let live = WorkspacePaneTarget::new(
             "workspace-b",
@@ -1183,26 +1230,103 @@ mod tests {
             SessionId(77),
         );
 
-        let mut live_first = CrossWorkspacePaneState::default();
-        let live_id = live_first
-            .attach_right("workspace-a", live.clone(), 420.0, 6)
-            .appended_id()
-            .unwrap();
-        assert_eq!(
-            live_first.append_restoring("workspace-a", request.clone(), 420.0, 6),
-            AttachOutcome::FocusedExisting(live_id)
-        );
-        assert_eq!(live_first.attachments().len(), 1);
-
-        let mut restoring_first = CrossWorkspacePaneState::default();
-        let restoring_id = restoring_first
+        let mut state = CrossWorkspacePaneState::default();
+        let restoring_id = state
             .append_restoring("workspace-a", request, 420.0, 6)
             .appended_id()
             .unwrap();
         assert_eq!(
-            restoring_first.attach_right("workspace-a", live, 420.0, 6),
+            state.attach_right("workspace-a", live.clone(), 420.0, 6),
             AttachOutcome::FocusedExisting(restoring_id)
         );
-        assert_eq!(restoring_first.attachments().len(), 1);
+        assert_eq!(state.attachments().len(), 1);
+        assert_eq!(state.attachments()[0].live_target(), Some(&live));
+        assert_eq!(state.attachments()[0].restoring_request(), None);
+        assert_eq!(state.focused(), FocusedSurface::Attached(restoring_id));
+        assert!(state.protects_runtime("workspace-b", 7));
+        assert_eq!(
+            state.focused_input_target(),
+            Some(FocusedInputTarget::Attached(&live))
+        );
+    }
+
+    #[test]
+    fn live_duplicates_require_full_exact_target() {
+        let mut state = CrossWorkspacePaneState::default();
+        let first = WorkspacePaneTarget::new(
+            "workspace-b",
+            7,
+            MuxTabId("tab-shared".into()),
+            MuxPaneId("pane-shared".into()),
+            SessionId(77),
+        );
+        let replacement = WorkspacePaneTarget::new(
+            "workspace-b",
+            8,
+            MuxTabId("tab-shared".into()),
+            MuxPaneId("pane-shared".into()),
+            SessionId(88),
+        );
+        let first_id = state
+            .attach_right("workspace-a", first.clone(), 420.0, 6)
+            .appended_id()
+            .unwrap();
+
+        let AttachOutcome::Appended(replacement_id) =
+            state.attach_right("workspace-a", replacement.clone(), 420.0, 6)
+        else {
+            panic!("different runtime/session target must append");
+        };
+
+        assert_ne!(first_id, replacement_id);
+        assert_eq!(state.attachments().len(), 2);
+        assert_eq!(state.attachments()[0].live_target(), Some(&first));
+        assert_eq!(state.attachments()[1].live_target(), Some(&replacement));
+    }
+
+    #[test]
+    fn capacity_trim_of_restoring_slot_returns_explicit_source() {
+        let mut state = CrossWorkspacePaneState::default();
+        let live = distinct_target("workspace-b", 7, "live");
+        let request = PersistedPaneRequest::new("workspace-c", MuxPaneId("pane-cold".into()));
+        state.attach_right("workspace-a", live.clone(), 420.0, 6);
+        state.append_restoring("workspace-a", request.clone(), 420.0, 6);
+
+        let mut detached = state.enforce_capacity(1);
+        let decision = detached.pop().unwrap();
+
+        assert!(matches!(
+            decision.source(),
+            AttachedPaneSource::Restoring(detached_request) if detached_request == &request
+        ));
+        assert_eq!(decision.live_target(), None);
+        assert_eq!(decision.restoring_request(), Some(&request));
+        assert_eq!(state.attachments().len(), 1);
+        assert_eq!(state.attachments()[0].live_target(), Some(&live));
+        assert!(state.protects_runtime("workspace-b", 7));
+        assert!(!state.protects_runtime("workspace-c", 8));
+    }
+
+    #[test]
+    fn cancel_restoring_slot_returns_explicit_source_without_panicking_legacy_detach() {
+        let mut state = CrossWorkspacePaneState::default();
+        let request = PersistedPaneRequest::new("workspace-b", MuxPaneId("pane-cold".into()));
+        let restoring_id = state
+            .append_restoring("workspace-a", request.clone(), 420.0, 6)
+            .appended_id()
+            .unwrap();
+
+        assert_eq!(state.detach(), None);
+        assert_eq!(state.attachments().len(), 1);
+
+        let decision = state.detach_attachment(restoring_id).unwrap();
+
+        assert!(matches!(
+            decision.source(),
+            AttachedPaneSource::Restoring(detached_request) if detached_request == &request
+        ));
+        assert_eq!(decision.live_target(), None);
+        assert_eq!(decision.restoring_request(), Some(&request));
+        assert!(state.attachments().is_empty());
     }
 }

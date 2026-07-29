@@ -2,18 +2,28 @@
 
 ## Current task
 
-- Implement the user-approved cross-workspace pane MVP on `DesignALL`: while workspace A remains active and owns the sidebar/file tree, right-click a warm workspace B session row and attach that existing pane to the right side of A's screen without switching workspaces or transferring runtime/session ownership.
-- Status: the user-approved cross-workspace Pane MVP is implemented, reviewed, fully gated, Developer-ID signed, running as PID `59638`, and pushed to `origin/DesignALL` through `4bfd1d9`. No required code work remains; only manual GUI interaction of the new right-click attach flow is outside automated coverage.
+- Extend the reviewed one-pane MVP on `DesignALL` into a bounded horizontal multi-pane strip: live and persisted canonical rows support drag, hover `Open beside`, and the retained context-menu action; foreign headers reorder; the maximum is configurable from 1 to 6 with default 2.
+- Status: architecture audit and executable TDD plan are complete. No production Rust file has changed in this extension yet. Implementation must preserve exact source ownership, use one global cold materialization in flight, skip offscreen paint, count attached runtimes in live capacity, and release protection after the last detach.
 
 ## Working area
 
-- Current branch/worktree: `DesignALL` in `/tmp/deppy-sf06-integration`. `origin/DesignALL` contains the complete MVP and gate evidence through `4bfd1d9`; this final handoff entry is the only local follow-up before its own documentation push. The signed final debug app runs from this exact worktree as PID `59638`.
+- Current branch/worktree: `DesignALL` in `/private/tmp/deppy-sf06-integration` at `d65ddcf`. `origin/DesignALL` contains the complete one-pane MVP. The untracked UX mockup predates the new contract and still needs its excluded picker/palette scenarios removed.
 - Confirmed safeguards: PTY output/input queues, runtime command/event queues, terminal scrollback/cache classes, persisted restore size, remote frames, log bytes, exited backends, and shutdown joins are bounded; no Arc cycle or unbounded terminal scrollback leak was found statically.
 - Confirmed gaps after second-pass review: warm/hidden replay retains some lifecycle events without a hard cap; web-push session jobs are admitted without a cap before slow HTTP delivery; archived-row rebinding mutates persistence before archive validation completes; exported `RemoteRuntimeClient` has no bounded TCP connect deadline or missed-heartbeat deadline; the process-global Git label cache never evicts unique paths; session log/archive GC scans have depth/byte but no entry-count budget.
 - Rejected prior finding: valid persisted cwd is restored. `persist::load_workspace_restore_bounded` joins `sessions.cwd` into `PaneState.cwd` before `restore_pane`; the stability wave adds regression evidence only and does not change cwd production behavior unless that exact test fails.
 - Orca's reusable design is architectural rather than a drop-in dependency: per-target generation-fenced connection ownership, bounded reconnect backoff, SSH keepalive plus relay sequence/ACK liveness, sleep/App Nap wake probing, remote relay-owned PTYs, durable leases/incarnation IDs, and explicit detach versus dispose.
 
 ## Plan
+
+1. In progress — freeze and commit the multi-pane design, TDD plan, resource contracts, and file ownership.
+2. Pending — run MWP01 state, MWP02 config, MWP03 storage, and MWP04 runtime in isolated parallel worktrees.
+3. Pending — merge frozen contracts, then run MWP05 sidebar and MWP06 renderer in parallel.
+4. Pending — run serial MWP07 App coordinator integration.
+5. Pending — perform direct Codex reviews, correction loops, focused/full gates, resource measurements, signed rebuild, docs, and push when requested.
+
+## Multi-pane design status
+
+- 2026-07-29: Three read-only audits established the root constraints before implementation. The current state is a single optional attachment; WorkspaceUi drains events/input per pane; App visibility/protection and host I/O are single-target; Idle rows lack exact pane IDs because the bounded activity projection returns only workspace/title/cwd; and `RestoreWorkspace` restores every pane. The approved design uses an ordered hard-capped vector, stable attachment IDs, fixed-left primary pane, append-right foreign panes, foreign-only header reorder, horizontal overflow, identifier-only row drag payloads, a typed persisted pane projection, runtime one-pane lazy materialization, one global cold request in flight, set-based runtime visibility, offscreen render omission, and exact focused input ownership. Historical shell sessions no longer linked to a canonical pane are explicitly not misrepresented as draggable panes. Tests/results: no Cargo command was run during this design phase. Modified files: `docs/superpowers/specs/2026-07-29-multi-cross-workspace-pane-design.md`, `docs/superpowers/plans/2026-07-29-multi-cross-workspace-pane.md`, and this handoff; the pre-existing untracked mockup remains unmodified. Failed approaches rejected before coding: replacing the single pane with several ratio-nested splits, exempting attached runtimes from live capacity, restoring an entire cold workspace for one dropped row, storing terminal snapshots in drag state, auto-restarting an archived agent, and automatic vertical placement. Exact next commands: `git diff --check`; inspect and commit the three design documents; create four disjoint worktrees from that commit; run the RED commands listed in Tasks 1–4.
 
 1. Completed — reran five independent read-only reviews and root verification.
 2. Completed — removed the stale cwd finding and fixed final severities.

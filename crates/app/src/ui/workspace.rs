@@ -546,6 +546,115 @@ enum TerminalToolbarIcon {
     SplitRows,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AttachedPaneTarget {
+    pub workspace_id: String,
+    pub tab: runtime::MuxTabId,
+    pub pane: runtime::MuxPaneId,
+    pub session: runtime::SessionId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum AttachedPaneAvailability {
+    Available,
+    Suspended,
+    Disconnected,
+    Unavailable,
+}
+
+impl AttachedPaneAvailability {
+    #[allow(dead_code)]
+    fn message_key(self) -> Option<&'static str> {
+        match self {
+            Self::Available => None,
+            Self::Suspended => Some("workspace.cross_pane.suspended"),
+            Self::Disconnected => Some("workspace.cross_pane.disconnected"),
+            Self::Unavailable => Some("workspace.cross_pane.input_unavailable"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AttachedPaneOutput {
+    pub focus_requested: bool,
+    pub detach_requested: bool,
+    pub target_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceSurfaceOutput {
+    pub focus_requested: bool,
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum PaneRenderMode<'a> {
+    Local {
+        input_enabled: bool,
+    },
+    Attached {
+        input_enabled: bool,
+        workspace_id: &'a str,
+        session: SessionId,
+    },
+}
+
+impl PaneRenderMode<'_> {
+    fn input_enabled(self) -> bool {
+        match self {
+            Self::Local { input_enabled } | Self::Attached { input_enabled, .. } => input_enabled,
+        }
+    }
+
+    fn is_local(self) -> bool {
+        matches!(self, Self::Local { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PaneRenderOutput {
+    focus_requested: bool,
+}
+
+impl PaneRenderOutput {
+    fn merge(&mut self, other: Self) {
+        self.focus_requested |= other.focus_requested;
+    }
+}
+
+fn pane_interaction_id(
+    mode: PaneRenderMode<'_>,
+    kind: &'static str,
+    pane: &runtime::MuxPaneId,
+) -> egui::Id {
+    match mode {
+        PaneRenderMode::Local { .. } => egui::Id::new((kind, pane)),
+        PaneRenderMode::Attached {
+            workspace_id,
+            session,
+            ..
+        } => egui::Id::new(("attached_pane", workspace_id, session.0, kind, pane)),
+    }
+}
+
+#[allow(dead_code)]
+fn find_attached_pane<'a>(
+    mux: &'a MuxSnapshot,
+    target: &AttachedPaneTarget,
+) -> Option<&'a runtime::PaneSnapshot> {
+    mux.tabs
+        .iter()
+        .find(|tab| tab.id == target.tab)
+        .and_then(|tab| {
+            tab.panes
+                .iter()
+                .find(|pane| pane.id == target.pane && pane.session_id == Some(target.session))
+        })
+}
+
 fn terminal_toolbar_button(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -2136,16 +2245,40 @@ impl WorkspaceUi {
         ctx: &egui::Context,
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
+        input_enabled: bool,
+    ) {
+        self.prepare_frame_with_native_input(
+            ctx,
+            events,
+            catalog,
+            input_enabled,
+            crate::native_key_monitor::drain,
+        );
+    }
+
+    fn prepare_frame_with_native_input(
+        &mut self,
+        ctx: &egui::Context,
+        events: &[RuntimeEvent],
+        catalog: &i18n::Catalog,
+        input_enabled: bool,
+        drain_native_input: impl FnOnce() -> crate::native_key_monitor::NativeKeyDownBatch,
     ) {
         self.frame_counters = renderer_egui::RenderCounters::default();
         self.terminal_focus_claimed = false;
         // AppKit local monitor는 winit/egui가 IME 처리 중 숨길 수 있는 원본 key-down을
         // 보존한다. 매 프레임 먼저 비워 두어 검색창/설정창에서 친 키가 나중에 터미널로
         // 이월되지 않게 하고, 실제 전송은 terminal_keyboard_active pane만 수행한다.
-        let native_key_downs = crate::native_key_monitor::drain();
-        self.native_printable_key_downs = native_key_downs.printable;
-        self.native_clipboard_paste_requested = native_key_downs.clipboard_paste;
-        self.native_clipboard_copy_requested = native_key_downs.clipboard_copy;
+        if input_enabled {
+            let native_key_downs = drain_native_input();
+            self.native_printable_key_downs = native_key_downs.printable;
+            self.native_clipboard_paste_requested = native_key_downs.clipboard_paste;
+            self.native_clipboard_copy_requested = native_key_downs.clipboard_copy;
+        } else {
+            self.native_printable_key_downs.clear();
+            self.native_clipboard_paste_requested = false;
+            self.native_clipboard_copy_requested = false;
+        }
         // 파일 트리 ⌘V/⌘C 소비 프레임 — 요청을 이번 프레임 확정값으로 옮긴다(이월 없음).
         self.paste_suppressed = std::mem::take(&mut self.suppress_paste_request);
         self.copy_suppressed = std::mem::take(&mut self.suppress_copy_request);
@@ -2164,7 +2297,7 @@ impl WorkspaceUi {
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
     ) {
-        self.prepare_frame(ctx, events, catalog);
+        self.prepare_frame(ctx, events, catalog, false);
         self.flush_command_repaint(ctx);
     }
 
@@ -2306,7 +2439,18 @@ impl WorkspaceUi {
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
     ) {
-        self.prepare_frame(ui.ctx(), events, catalog);
+        let _ = self.show_with_input(ui, config, events, catalog, true);
+    }
+
+    pub fn show_with_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &TerminalConfig,
+        events: &[RuntimeEvent],
+        catalog: &i18n::Catalog,
+        input_enabled: bool,
+    ) -> WorkspaceSurfaceOutput {
+        self.prepare_frame(ui.ctx(), events, catalog, input_enabled);
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
@@ -2326,7 +2470,7 @@ impl WorkspaceUi {
         let Some(mux) = self.mux.clone() else {
             self.show_new_session_prompt(ui, catalog);
             self.flush_command_repaint(ui.ctx());
-            return;
+            return WorkspaceSurfaceOutput::default();
         };
         // mux 포커스가 바뀐 프레임: stale 조합/스크롤 잔여분 리셋 (세션 간 이월 방지)
         if self.last_focused_pane != mux.focused_pane {
@@ -2362,7 +2506,7 @@ impl WorkspaceUi {
         else {
             self.show_new_session_prompt(ui, catalog);
             self.flush_command_repaint(ui.ctx());
-            return;
+            return WorkspaceSurfaceOutput::default();
         };
 
         // (출력/상태 폴링 제거 — 2026-07-04 상시 리페인트 원인 조사)
@@ -2378,7 +2522,7 @@ impl WorkspaceUi {
         let embedded_headers = keeps_embedded_pane_header(&layout);
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
-        self.render_node(
+        let pane_output = self.render_node(
             ui,
             rect,
             &layout,
@@ -2388,10 +2532,165 @@ impl WorkspaceUi {
             &mut split_path,
             embedded_headers,
             catalog,
+            PaneRenderMode::Local { input_enabled },
         );
 
         // 응답(MuxUpdated/Viewport)을 다음 프레임에서 수신하도록 보장
         self.flush_command_repaint(ui.ctx());
+        WorkspaceSurfaceOutput {
+            focus_requested: pane_output.focus_requested,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub fn show_attached_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &TerminalConfig,
+        events: &[RuntimeEvent],
+        catalog: &i18n::Catalog,
+        target: &AttachedPaneTarget,
+        external_workspace_label: &str,
+        availability: AttachedPaneAvailability,
+        input_enabled: bool,
+    ) -> AttachedPaneOutput {
+        self.prepare_frame(ui.ctx(), events, catalog, input_enabled);
+
+        let rect = ui.available_rect_before_wrap();
+        let mut attached_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt((
+            "attached_surface",
+            &target.workspace_id,
+            target.session.0,
+        )));
+        attached_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+        let ui = &mut attached_ui;
+        let mux = self.mux.clone();
+        let pane = mux
+            .as_deref()
+            .and_then(|snapshot| find_attached_pane(snapshot, target));
+        let pane_title = pane.map(|pane| pane.title.clone());
+        let header_height = TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0));
+        let header = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.right(), rect.top() + header_height),
+        );
+        let body = egui::Rect::from_min_max(egui::pos2(rect.left(), header.bottom()), rect.max);
+        let detach_requested = self.render_attached_pane_header(
+            ui,
+            header,
+            target,
+            external_workspace_label,
+            pane_title.as_deref(),
+            catalog,
+        );
+        let mut output = AttachedPaneOutput {
+            detach_requested,
+            target_present: pane.is_some(),
+            ..Default::default()
+        };
+
+        if let Some(message_key) = availability.message_key() {
+            self.render_attached_placeholder(
+                ui,
+                body,
+                catalog.t(message_key, &[("workspace", external_workspace_label)]),
+            );
+        } else if let (Some(mux), Some(_)) = (mux.as_deref(), pane) {
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
+            child.set_clip_rect(body.intersect(ui.clip_rect()));
+            output.focus_requested = self
+                .render_pane(
+                    &mut child,
+                    &target.pane,
+                    mux,
+                    config,
+                    false,
+                    catalog,
+                    Some(&target.tab),
+                    PaneRenderMode::Attached {
+                        input_enabled,
+                        workspace_id: &target.workspace_id,
+                        session: target.session,
+                    },
+                )
+                .focus_requested;
+        } else {
+            self.render_attached_placeholder(
+                ui,
+                body,
+                catalog.t(
+                    "workspace.cross_pane.input_unavailable",
+                    &[("workspace", external_workspace_label)],
+                ),
+            );
+        }
+
+        self.flush_command_repaint(ui.ctx());
+        output
+    }
+
+    #[allow(dead_code)]
+    fn render_attached_pane_header(
+        &self,
+        ui: &mut egui::Ui,
+        header: egui::Rect,
+        target: &AttachedPaneTarget,
+        external_workspace_label: &str,
+        pane_title: Option<&str>,
+        catalog: &i18n::Catalog,
+    ) -> bool {
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        ui.painter().rect_filled(header, 0.0, tokens.app_background);
+        ui.painter().hline(
+            header.x_range(),
+            ui.painter().round_to_pixel_center(header.bottom()),
+            crate::ui::designall::separator_stroke(ui.visuals()),
+        );
+
+        let close_rect = egui::Rect::from_center_size(
+            egui::pos2(header.right() - 15.0, header.center().y),
+            egui::vec2(24.0, 24.0),
+        );
+        let detach = ui
+            .put(
+                close_rect,
+                egui::Button::new(egui::RichText::new("×").size(16.0)).frame(false),
+            )
+            .on_hover_text(catalog.t("workspace.cross_pane.detach", &[]))
+            .clicked();
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(header.left() + 8.0, header.top()),
+            egui::pos2(close_rect.left() - 4.0, header.bottom()),
+        );
+        let title = pane_title.unwrap_or(target.pane.0.as_str());
+        let source = catalog.t(
+            "workspace.cross_pane.external_source",
+            &[("workspace", external_workspace_label)],
+        );
+        let marker = format!("{source} · {title}");
+        ui.painter().text(
+            text_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            marker,
+            egui::FontId::proportional(12.0),
+            tokens.muted_text,
+        );
+        detach
+    }
+
+    #[allow(dead_code)]
+    fn render_attached_placeholder(&self, ui: &mut egui::Ui, rect: egui::Rect, message: String) {
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        ui.painter().rect_filled(rect, 0.0, tokens.app_background);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        child.centered_and_justified(|ui| {
+            ui.add_enabled(false, egui::Label::new(message));
+        });
     }
 
     fn show_new_session_prompt(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
@@ -2415,7 +2714,9 @@ impl WorkspaceUi {
         focused: bool,
         config: &TerminalConfig,
         catalog: &i18n::Catalog,
-    ) {
+        input_enabled: bool,
+    ) -> bool {
+        let mut focus_requested = false;
         let osc = self.session_osc_title(pane.session_id);
         let full_title =
             self.resolve_session_title(&pane.title, pane.session_id, osc.as_deref(), catalog);
@@ -2491,10 +2792,16 @@ impl WorkspaceUi {
             egui::Id::new(("terminal_pane_header", &pane.id)),
             egui::Sense::click(),
         );
-        if header_response.clicked() && !focused {
-            self.request_pane_focus(pane.id.clone());
+        if header_response.clicked() {
+            if input_enabled && !focused {
+                self.request_pane_focus(pane.id.clone());
+            } else if !input_enabled {
+                focus_requested = true;
+            }
         }
-        self.pane_context_menu(&header_response, &pane.id, config, catalog);
+        if input_enabled {
+            self.pane_context_menu(&header_response, &pane.id, config, catalog);
+        }
 
         let status_color = if focused {
             tokens.success
@@ -2559,11 +2866,15 @@ impl WorkspaceUi {
             ],
             egui::Stroke::new(1.5, close_color),
         );
-        if close_response
+        let close_clicked = close_response
             .on_hover_text(catalog.t("workspace.close_pane", &[]))
-            .clicked()
-        {
-            self.request_close_pane(pane.id.clone());
+            .clicked();
+        if close_clicked {
+            if input_enabled {
+                self.request_close_pane(pane.id.clone());
+            } else {
+                focus_requested = true;
+            }
         }
 
         let first_toolbar = toolbar_icons.len() - buttons.toolbar.len();
@@ -2586,12 +2897,17 @@ impl WorkspaceUi {
                 TerminalToolbarIcon::SplitRows => catalog.t("workspace.split_vertical", &[]),
             };
             if response.on_hover_text(tooltip).clicked() {
-                if !focused {
-                    self.request_pane_focus(pane.id.clone());
+                if input_enabled {
+                    if !focused {
+                        self.request_pane_focus(pane.id.clone());
+                    }
+                    self.activate_terminal_toolbar(icon, &pane.id, config);
+                } else {
+                    focus_requested = true;
                 }
-                self.activate_terminal_toolbar(icon, &pane.id, config);
             }
         }
+        focus_requested
     }
 
     fn activate_terminal_toolbar(
@@ -2643,14 +2959,24 @@ impl WorkspaceUi {
         path: &mut Vec<u8>,
         embedded_headers: bool,
         catalog: &i18n::Catalog,
-    ) {
+        mode: PaneRenderMode<'_>,
+    ) -> PaneRenderOutput {
         match node {
             LayoutNode::Pane(pane_id) => {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                 // max_rect는 배치만 제한한다 — 이전 크기의 스냅샷이 이웃 pane을
                 // 덮어 그리지 않게 페인터 클립도 pane 영역으로 줄인다
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
-                self.render_pane(&mut child, pane_id, mux, config, embedded_headers, catalog);
+                self.render_pane(
+                    &mut child,
+                    pane_id,
+                    mux,
+                    config,
+                    embedded_headers,
+                    catalog,
+                    None,
+                    mode,
+                )
                 // 포커스 표시는 각 pane 헤더의 accent top line이 담당한다.
             }
             LayoutNode::Split {
@@ -2700,7 +3026,7 @@ impl WorkspaceUi {
                     }
                 };
                 path.push(0);
-                self.render_node(
+                let mut output = self.render_node(
                     ui,
                     first_rect,
                     first,
@@ -2710,10 +3036,11 @@ impl WorkspaceUi {
                     path,
                     embedded_headers,
                     catalog,
+                    mode,
                 );
                 path.pop();
                 path.push(1);
-                self.render_node(
+                output.merge(self.render_node(
                     ui,
                     second_rect,
                     second,
@@ -2723,12 +3050,22 @@ impl WorkspaceUi {
                     path,
                     embedded_headers,
                     catalog,
-                );
+                    mode,
+                ));
                 path.pop();
                 // 핸들은 자식 pane들 **뒤에** 등록 — egui 히트테스트는 나중 등록이
                 // 우선이라, ±2px 확장 히트영역이 터미널 선택 드래그에 밀리지 않는다
                 // (codex 리뷰: 가장자리에서 리사이즈 대신 선택이 잡히는 문제).
-                self.split_handle(ui, rect, gap_rect, *direction, gap, tab_id, path);
+                if mode.input_enabled() {
+                    self.split_handle(ui, rect, gap_rect, *direction, gap, tab_id, path);
+                } else {
+                    ui.painter().rect_filled(
+                        gap_rect,
+                        0.0,
+                        crate::ui::designall::tokens(ui.visuals()).separator,
+                    );
+                }
+                output
             }
         }
     }
@@ -2795,40 +3132,72 @@ impl WorkspaceUi {
         config: &TerminalConfig,
         embedded_header: bool,
         catalog: &i18n::Catalog,
-    ) {
-        let Some(pane) = mux
-            .tabs
-            .iter()
-            .flat_map(|tab| &tab.panes)
-            .find(|pane| &pane.id == pane_id)
-        else {
-            return;
+        tab_scope: Option<&runtime::MuxTabId>,
+        mode: PaneRenderMode<'_>,
+    ) -> PaneRenderOutput {
+        let Some(pane) = mux.tabs.iter().find_map(|tab| {
+            (tab_scope.is_none_or(|tab_id| &tab.id == tab_id))
+                .then(|| {
+                    tab.panes.iter().find(|pane| {
+                        &pane.id == pane_id
+                            && match mode {
+                                PaneRenderMode::Local { .. } => true,
+                                PaneRenderMode::Attached { session, .. } => {
+                                    pane.session_id == Some(session)
+                                }
+                            }
+                    })
+                })
+                .flatten()
+        }) else {
+            return PaneRenderOutput::default();
         };
+        let input_enabled = mode.input_enabled();
+        let mut render_output = PaneRenderOutput::default();
         let focused = mux.focused_pane.as_ref() == Some(pane_id);
+        let surface_focused = if mode.is_local() {
+            focused
+        } else {
+            input_enabled
+        };
         let pane_layout = terminal_pane_layout_with_embedded_header(ui.max_rect(), embedded_header);
         let pane_rect = pane_layout.surface;
         let tokens = crate::ui::designall::tokens(ui.visuals());
         ui.painter()
             .rect_filled(pane_rect, 0.0, tokens.app_background);
-        if embedded_header {
-            self.render_pane_header(ui, pane_layout.header, pane, focused, config, catalog);
+        if embedded_header && mode.is_local() {
+            render_output.focus_requested |= self.render_pane_header(
+                ui,
+                pane_layout.header,
+                pane,
+                focused,
+                config,
+                catalog,
+                input_enabled,
+            );
         }
         // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
         // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
         // (codex P2). 터미널 위에서는 나중에 등록되는 터미널 위젯이 입력을 받는다.
         let pane_resp = ui.interact(
             pane_rect,
-            egui::Id::new(("pane_bg", pane_id)),
+            pane_interaction_id(mode, "pane_bg", pane_id),
             egui::Sense::click(),
         );
-        if pane_resp.clicked() && !focused {
-            self.request_pane_focus(pane_id.clone());
+        if pane_resp.clicked() {
+            if mode.is_local() && input_enabled && !focused {
+                self.request_pane_focus(pane_id.clone());
+            } else if !input_enabled || !mode.is_local() {
+                render_output.focus_requested = true;
+            }
         }
-        self.pane_context_menu(&pane_resp, pane_id, config, catalog);
+        if mode.is_local() && input_enabled {
+            self.pane_context_menu(&pane_resp, pane_id, config, catalog);
+        }
 
         // 제목/닫기/검색/새 셸/분할은 각 leaf의 얇은 헤더에 있고, 본문은 그 아래를
         // 카드 외곽 여백 없이 채운다.
-        if pane.session_id.is_some() {
+        if mode.is_local() && input_enabled && pane.session_id.is_some() {
             if pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()
                 .is_some()
@@ -2871,7 +3240,7 @@ impl WorkspaceUi {
         let ui = &mut terminal_ui;
         let Some(session) = pane.session_id else {
             ui.label(catalog.t("workspace.no_session", &[]));
-            return;
+            return render_output;
         };
 
         // 터미널 폰트는 UI 배율(zoom_factor)로 같이 커지므로 font_size를 배율로 역보정해
@@ -2909,7 +3278,7 @@ impl WorkspaceUi {
             }
             let Some(snapshot) = view.snapshot.clone() else {
                 ui.label(catalog.t("workspace.connecting", &[]));
-                return;
+                return render_output;
             };
             (view.exit_code, view.bracketed_paste, snapshot)
         };
@@ -2917,9 +3286,14 @@ impl WorkspaceUi {
         // 런타임의 focused pane과 현재 native UI의 논리적 키보드 소유 상태를 draw 전에
         // 확정한다. renderer가 이 값을 바탕으로 같은 프레임에 egui 공식 IME 소유권까지
         // 동기화하므로, 기존 egui owner를 “요청할지”의 선행 조건으로 쓰지 않는다.
-        let terminal_refocus_pending = self.pending_focus.as_ref() == Some(pane_id);
-        let terminal_input_owner =
-            terminal_input_owner(pane_id, focused, self.pending_focus.as_ref());
+        let terminal_refocus_pending =
+            mode.is_local() && self.pending_focus.as_ref() == Some(pane_id);
+        let terminal_input_owner = input_enabled
+            && if mode.is_local() {
+                terminal_input_owner(pane_id, focused, self.pending_focus.as_ref())
+            } else {
+                true
+            };
         let any_blocking_window_visible = ui.ctx().memory(|mem| {
             mem.areas()
                 .visible_layer_ids()
@@ -2957,7 +3331,7 @@ impl WorkspaceUi {
 
         // 선택된 텍스트 위에서 시작한 드래그는 terminal-internal DnD payload가 된다.
         // 그 외의 마우스 드래그는 기존 셀 선택 동작을 유지한다.
-        if !egui::DragAndDrop::has_any_payload(ui.ctx()) {
+        if input_enabled && !egui::DragAndDrop::has_any_payload(ui.ctx()) {
             let cell_at = |pos: egui::Pos2| -> usize {
                 let col = ((pos.x - output.origin.x) / output.cell_size.x)
                     .floor()
@@ -2973,7 +3347,8 @@ impl WorkspaceUi {
             // 바꾸고 클릭하면 그 폴더로 cd, URL 위에서는 클릭하면 기본 브라우저로 연다
             // (2026-07-14/2026-07-17 사용자). 파일은 커서를 바꾸지 않는다(복사용 선택과
             // 혼동 방지 — 열기는 우클릭 메뉴). alt screen(TUI)은 cd 주입 금지라 통째로 비활성.
-            if !snapshot.is_alt_screen
+            if mode.is_local()
+                && !snapshot.is_alt_screen
                 && let Some(pos) = output.response.hover_pos()
                 && let Some((s, e)) = word_range_at(&snapshot, cell_at(pos))
             {
@@ -2981,7 +3356,7 @@ impl WorkspaceUi {
                 // URL은 cwd 해석이 필요 없는 문자열 판정이라 폴더보다 먼저 본다.
                 if let Some(url) = extract_url(&word) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    if terminal_primary_pointer_clicked(&output.response) && focused {
+                    if terminal_primary_pointer_clicked(&output.response) && surface_focused {
                         // 더블클릭이 clicked를 두 번 발화 — 같은 URL 연속 열기를 막는다
                         // (last_dir_click과 동일 관례).
                         let duplicate = self.last_url_click.as_ref().is_some_and(|(u, at)| {
@@ -3000,7 +3375,7 @@ impl WorkspaceUi {
                     // 포커스된 pane에서만 cd — 비포커스 pane을 포커스하려는 클릭이
                     // cd까지 주입하면 안 된다 (codex 리뷰 MEDIUM). 첫 클릭은 포커스만,
                     // 포커스된 뒤의 클릭이 이동한다.
-                    if terminal_primary_pointer_clicked(&output.response) && focused {
+                    if terminal_primary_pointer_clicked(&output.response) && surface_focused {
                         // 실제 경로 판정은 App host가 완료한 immutable cache만 사용한다.
                         // cwd가 바뀌면 set_session_cwds가 pending/cache를 무효화한다.
                         if let Some(PathClick::Dir(path)) = self.resolve_path_cached(session, &word)
@@ -3128,56 +3503,72 @@ impl WorkspaceUi {
         // pending 포커스는 pane이 실제로 그려진 이 시점에 1회 소비한다 —
         // 매 프레임 요청은 다른 창 입력을 뺏고, "연결 중" 단계에서 소비하면
         // 요청이 유실된다 (리뷰 반영).
-        if focused && self.pending_focus.as_ref() == Some(pane_id) {
+        if mode.is_local() && focused && self.pending_focus.as_ref() == Some(pane_id) {
             self.pending_focus = None;
             request_terminal_focus(&output.response);
         }
         if terminal_primary_pointer_clicked(&output.response) {
-            self.terminal_focus_claimed = true;
-            request_terminal_focus(&output.response);
-            // 이미 runtime focus인 pane을 다시 클릭해도 stale TextEdit focus를 누르고
-            // 다음 keydown부터 터미널로 받도록 refocus를 예약한다.
-            if !terminal_refocus_pending {
-                self.begin_terminal_refocus(pane_id.clone());
+            if !input_enabled || !mode.is_local() {
+                render_output.focus_requested = true;
             }
-            // pane 배경이 같은 클릭을 먼저 받았다면 이미 FocusPane을 보냈다.
-            if !focused && !terminal_refocus_pending {
-                self.request_pane_focus(pane_id.clone());
+            if input_enabled {
+                self.terminal_focus_claimed = true;
+                request_terminal_focus(&output.response);
+                if mode.is_local() {
+                    // 이미 runtime focus인 pane을 다시 클릭해도 stale TextEdit focus를 누르고
+                    // 다음 keydown부터 터미널로 받도록 refocus를 예약한다.
+                    if !terminal_refocus_pending {
+                        self.begin_terminal_refocus(pane_id.clone());
+                    }
+                    // pane 배경이 같은 클릭을 먼저 받았다면 이미 FocusPane을 보냈다.
+                    if !focused && !terminal_refocus_pending {
+                        self.request_pane_focus(pane_id.clone());
+                    }
+                }
             }
         }
 
         // 파일 트리에서 드래그한 경로를 터미널 위에 드롭 → 입력으로 삽입 (2026-07-05).
         // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
-        if let Some(path) = output.response.dnd_release_payload::<std::path::PathBuf>() {
+        if mode.is_local()
+            && input_enabled
+            && let Some(path) = output.response.dnd_release_payload::<std::path::PathBuf>()
+        {
             let bytes = path_insert_paste_bytes(&path, self.session_shell_kind(session), bracketed);
             self.send(RuntimeCommand::WriteInput { session, bytes });
-            if !focused {
+            if mode.is_local() && !focused {
                 self.request_pane_focus(pane_id.clone());
             }
         }
-        if let Some(text) = output
-            .response
-            .dnd_release_payload::<TerminalTextDragPayload>()
+        if mode.is_local()
+            && input_enabled
+            && let Some(text) = output
+                .response
+                .dnd_release_payload::<TerminalTextDragPayload>()
         {
             let bytes = terminal_text_paste_bytes(&text.text, bracketed);
             self.send(RuntimeCommand::WriteInput { session, bytes });
-            if !focused {
+            if mode.is_local() && !focused {
                 self.request_pane_focus(pane_id.clone());
             }
         }
         // 터미널 위 우클릭도 같은 메뉴 (터미널 위젯이 topmost라 배경 interact가 못 받음)
-        self.pane_context_menu(&output.response, pane_id, config, catalog);
+        if mode.is_local() && input_enabled {
+            self.pane_context_menu(&output.response, pane_id, config, catalog);
+        }
 
         // 터미널 텍스트 검색 (T3): 매치 하이라이트 + 우상단 검색 바 + 스크롤 이동.
-        self.render_terminal_search(
-            ui,
-            session,
-            output.response.rect,
-            output.origin,
-            output.cell_size,
-            &snapshot,
-            catalog,
-        );
+        if mode.is_local() && input_enabled {
+            self.render_terminal_search(
+                ui,
+                session,
+                output.response.rect,
+                output.origin,
+                output.cell_size,
+                &snapshot,
+                catalog,
+            );
+        }
 
         // 검색 TextEdit/팝업 같은 overlay가 renderer 뒤에서 포커스를 가져갈 수도 있으므로
         // 이벤트를 소비하는 바로 이 시점에 egui의 공식 IME 소유권을 다시 확인한다.
@@ -3394,7 +3785,7 @@ impl WorkspaceUi {
 
         // 마우스 휠 → 스크롤백 (focused pane만 — 비활성 pane은 Viewport가
         // push되지 않아(14.4) 스크롤해도 화면이 안 바뀐다)
-        if focused && output.response.hovered() {
+        if input_enabled && surface_focused && output.response.hovered() {
             let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
             self.scroll_residual += scroll_y / cell.y;
             let whole_rows = self.scroll_residual.trunc() as i32;
@@ -3458,6 +3849,7 @@ impl WorkspaceUi {
                 ui.ctx().request_repaint(); // 페이드 애니메이션
             }
         }
+        render_output
     }
 
     /// 실행 중 에이전트 pane 대상 목록 — 감지 워커가 채운 agent_info의 세션들.
@@ -5147,6 +5539,382 @@ mod tests {
     }
 
     #[test]
+    fn attached_target는_지정한_tab의_정확한_pane만_찾는다() {
+        let snapshot = mux(
+            "active",
+            vec![
+                tab(
+                    "active",
+                    vec![pane("same", SessionId(1))],
+                    LayoutNode::Pane(pane_id("same")),
+                ),
+                tab(
+                    "foreign",
+                    vec![pane("other", SessionId(2))],
+                    LayoutNode::Pane(pane_id("other")),
+                ),
+            ],
+            "same",
+        );
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("same"),
+            session: SessionId(1),
+        };
+
+        assert!(find_attached_pane(&snapshot, &target).is_none());
+    }
+
+    #[test]
+    fn attached_target는_reused_pane_id의_다른_session으로_fallback하지_않는다() {
+        let snapshot = mux(
+            "foreign",
+            vec![tab(
+                "foreign",
+                vec![pane("pane", SessionId(9))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        );
+        let stale_target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("pane"),
+            session: SessionId(7),
+        };
+
+        assert!(find_attached_pane(&snapshot, &stale_target).is_none());
+    }
+
+    #[test]
+    fn attached_surface_i18n은_frozen_key와_workspace_인자를_사용한다() {
+        let source = include_str!("workspace.rs");
+        let availability_start = source
+            .find("impl AttachedPaneAvailability")
+            .expect("availability impl");
+        let availability_end = source[availability_start..]
+            .find("\n}\n\n#[derive(Clone, Copy, Debug, Default")
+            .map(|offset| availability_start + offset)
+            .expect("availability impl end");
+        let availability = &source[availability_start..availability_end];
+        assert!(availability.contains("workspace.cross_pane.input_unavailable"));
+        assert!(!availability.contains("workspace.cross_pane.unavailable"));
+
+        let show_start = source
+            .find("    pub fn show_attached_pane(")
+            .expect("show attached pane");
+        let show_end = source[show_start..]
+            .find("\n    fn render_attached_pane_header(")
+            .map(|offset| show_start + offset)
+            .expect("show attached pane end");
+        let show = &source[show_start..show_end];
+        assert!(show.contains("[(\"workspace\", external_workspace_label)]"));
+
+        let header_start = show_end;
+        let header_end = source[header_start..]
+            .find("\n    fn render_attached_placeholder(")
+            .map(|offset| header_start + offset)
+            .expect("attached header end");
+        let header = &source[header_start..header_end];
+        assert!(header.contains("workspace.cross_pane.external_source"));
+        assert!(!header.contains("format!(\"↗ {external_workspace_label}"));
+    }
+
+    #[test]
+    fn input_disabled_frame은_native_input을_drain하지_않는다() {
+        let catalog = catalog();
+        let context = egui::Context::default();
+        let mut workspace = WorkspaceUi::new();
+        workspace.native_printable_key_downs =
+            vec![crate::native_key_monitor::NativePrintableKeyDown::for_test(
+                '.',
+            )];
+        workspace.native_clipboard_paste_requested = true;
+        workspace.native_clipboard_copy_requested = true;
+        let drained = std::cell::Cell::new(false);
+
+        workspace.prepare_frame_with_native_input(&context, &[], &catalog, false, || {
+            drained.set(true);
+            crate::native_key_monitor::NativeKeyDownBatch::default()
+        });
+
+        assert!(!drained.get());
+        assert!(workspace.native_printable_key_downs.is_empty());
+        assert!(!workspace.native_clipboard_paste_requested);
+        assert!(!workspace.native_clipboard_copy_requested);
+        assert!(drain_protocol(&mut workspace).is_empty());
+    }
+
+    #[test]
+    fn input_disabled_attached_surface는_text_event를_emit하지_않는다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let session = SessionId(7);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "foreign",
+            vec![tab(
+                "foreign",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(pane_id("pane"));
+        let view = workspace.sessions.entry(session).or_default();
+        view.snapshot = Some(snapshot("ready"));
+        view.snapshot_gen = 1;
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("pane"),
+            session,
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_attached_pane(
+                    ui,
+                    &config,
+                    &[],
+                    &catalog,
+                    &target,
+                    "Other",
+                    AttachedPaneAvailability::Available,
+                    false,
+                );
+            },
+            workspace,
+        );
+        harness.run();
+        harness.event(egui::Event::Text("x".to_owned()));
+        harness.run();
+
+        assert!(
+            !drain_protocol(harness.state_mut())
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::WriteInput { .. }))
+        );
+    }
+
+    #[test]
+    fn attached_detach는_close나_kill없이_output만_반환한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = catalog();
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("pane"),
+            session: SessionId(7),
+        };
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "foreign",
+            vec![tab(
+                "foreign",
+                vec![pane("pane", SessionId(7))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        let config = TerminalConfig::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, AttachedPaneOutput)| {
+                let frame = state.0.show_attached_pane(
+                    ui,
+                    &config,
+                    &[],
+                    &catalog,
+                    &target,
+                    "Other",
+                    AttachedPaneAvailability::Available,
+                    false,
+                );
+                state.1.focus_requested |= frame.focus_requested;
+                state.1.detach_requested |= frame.detach_requested;
+                state.1.target_present |= frame.target_present;
+            },
+            (workspace, AttachedPaneOutput::default()),
+        );
+        harness.run();
+        harness.get_by_label("×").click();
+        harness.run();
+
+        assert!(harness.state().1.detach_requested);
+        assert!(
+            !drain_protocol(&mut harness.state_mut().0)
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ClosePane { .. }))
+        );
+    }
+
+    #[test]
+    fn attached_absolute_ids는_workspace와_session으로_namespace된다() {
+        let pane = pane_id("same");
+        let a = PaneRenderMode::Attached {
+            input_enabled: false,
+            workspace_id: "workspace-a",
+            session: SessionId(7),
+        };
+        let b = PaneRenderMode::Attached {
+            input_enabled: false,
+            workspace_id: "workspace-b",
+            session: SessionId(7),
+        };
+        let reused_session = PaneRenderMode::Attached {
+            input_enabled: false,
+            workspace_id: "workspace-b",
+            session: SessionId(9),
+        };
+
+        assert_ne!(
+            pane_interaction_id(a, "pane_bg", &pane),
+            pane_interaction_id(b, "pane_bg", &pane)
+        );
+        assert_ne!(
+            pane_interaction_id(b, "pane_bg", &pane),
+            pane_interaction_id(reused_session, "pane_bg", &pane)
+        );
+    }
+
+    #[test]
+    fn input_disabled_attached_terminal_click은_pure_focus만_요청한다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let session = SessionId(7);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "foreign",
+            vec![tab(
+                "foreign",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        let view = workspace.sessions.entry(session).or_default();
+        view.snapshot = Some(snapshot("ready"));
+        view.snapshot_gen = 1;
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("pane"),
+            session,
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, AttachedPaneOutput)| {
+                let frame = state.0.show_attached_pane(
+                    ui,
+                    &config,
+                    &[],
+                    &catalog,
+                    &target,
+                    "Other",
+                    AttachedPaneAvailability::Available,
+                    false,
+                );
+                state.1.focus_requested |= frame.focus_requested;
+                state.1.detach_requested |= frame.detach_requested;
+                state.1.target_present |= frame.target_present;
+            },
+            (workspace, AttachedPaneOutput::default()),
+        );
+        harness.run();
+        let terminal_point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        harness.input_mut().events.extend([
+            egui::Event::PointerMoved(terminal_point),
+            egui::Event::PointerButton {
+                pos: terminal_point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: terminal_point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run();
+
+        assert!(harness.state().1.focus_requested);
+        let commands = drain_protocol(&mut harness.state_mut().0);
+        assert!(
+            commands
+                .iter()
+                .all(|command| matches!(command, RuntimeCommand::Resize { .. }))
+        );
+    }
+
+    #[test]
+    fn input_disabled_primary_terminal_click은_primary_focus만_요청한다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let session = SessionId(7);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(pane_id("pane"));
+        let view = workspace.sessions.entry(session).or_default();
+        view.snapshot = Some(snapshot("ready"));
+        view.snapshot_gen = 1;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, WorkspaceSurfaceOutput)| {
+                let frame = state.0.show_with_input(ui, &config, &[], &catalog, false);
+                state.1.focus_requested |= frame.focus_requested;
+            },
+            (workspace, WorkspaceSurfaceOutput::default()),
+        );
+        harness.run();
+        let terminal_point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        harness.input_mut().events.extend([
+            egui::Event::PointerMoved(terminal_point),
+            egui::Event::PointerButton {
+                pos: terminal_point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: terminal_point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run();
+
+        assert!(harness.state().1.focus_requested);
+        let commands = drain_protocol(&mut harness.state_mut().0);
+        assert!(
+            commands
+                .iter()
+                .all(|command| matches!(command, RuntimeCommand::Resize { .. }))
+        );
+    }
+
+    #[test]
+    fn 기존_close_now는_여전히_runtime_close_pane을_보낸다() {
+        let target = pane_id("pane");
+        let mut workspace = WorkspaceUi::new();
+
+        workspace.close_pane_now(target.clone());
+
+        assert!(drain_protocol(&mut workspace).iter().any(
+            |command| matches!(command, RuntimeCommand::ClosePane { pane } if pane == &target)
+        ));
+    }
+
+    #[test]
     fn kittest_빈_workspace의_새세션은_agent_launcher만_요청한다() {
         use egui_kittest::kittest::Queryable;
 
@@ -6408,7 +7176,7 @@ mod tests {
         let snapshot = pane("p", SessionId(7));
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, ws: &mut WorkspaceUi| {
-                ws.render_pane_header(ui, header, &snapshot, true, &config, &catalog);
+                ws.render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
             },
             ws,
         );

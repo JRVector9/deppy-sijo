@@ -274,6 +274,7 @@ workspace.new_shell = + 새 세션
 workspace.menu.scroll_bottom = 맨 아래로 스크롤
 workspace.menu.reveal_in_tree = 파일 트리를 이 폴더로 이동
 workspace.menu.open_in_current_view_right = 현재 화면 오른쪽에 열기
+workspace.menu.open_beside = 옆에 열기
 workspace.cross_pane.external_source = 외부 Pane · {workspace}
 workspace.cross_pane.detach = 분리
 workspace.cross_pane.suspended = {workspace} 일시 중지됨

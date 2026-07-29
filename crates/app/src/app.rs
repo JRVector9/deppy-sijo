@@ -1349,7 +1349,390 @@ fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
             | runtime::RuntimeCommand::SpawnAgent { .. }
             | runtime::RuntimeCommand::SplitPane { .. }
             | runtime::RuntimeCommand::RestoreWorkspace
+    ) || runtime_command_is_targeted_workspace_restore(command)
+}
+
+fn runtime_command_is_targeted_workspace_restore(command: &runtime::RuntimeCommand) -> bool {
+    matches!(
+        command,
+        runtime::RuntimeCommand::RestoreWorkspacePane { .. }
     )
+}
+
+const CROSS_WORKSPACE_RESTORE_QUEUE_CAP: usize = 6;
+const CROSS_WORKSPACE_RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrossWorkspaceRestoreRequest {
+    workspace_id: String,
+    pane: runtime::MuxPaneId,
+    attachment_id: ui::cross_workspace::AttachmentId,
+}
+
+impl CrossWorkspaceRestoreRequest {
+    fn new(
+        workspace_id: impl Into<String>,
+        pane: runtime::MuxPaneId,
+        attachment_id: ui::cross_workspace::AttachmentId,
+    ) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            pane,
+            attachment_id,
+        }
+    }
+
+    fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    fn attachment_id(&self) -> ui::cross_workspace::AttachmentId {
+        self.attachment_id
+    }
+
+    fn same_canonical_pane(&self, workspace_id: &str, pane: &runtime::MuxPaneId) -> bool {
+        self.workspace_id == workspace_id && self.pane == *pane
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrossWorkspaceRestoreDispatch {
+    request: CrossWorkspaceRestoreRequest,
+    runtime_instance: u64,
+    deadline: std::time::Instant,
+    command_sent: bool,
+    cancelled: bool,
+}
+
+impl CrossWorkspaceRestoreDispatch {
+    #[cfg(test)]
+    fn request(&self) -> &CrossWorkspaceRestoreRequest {
+        &self.request
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrossWorkspaceRestoreCompletion {
+    attachment_id: ui::cross_workspace::AttachmentId,
+    target: ui::cross_workspace::WorkspacePaneTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RestoreMuxBarrierFact {
+    Restored {
+        workspace_id: String,
+        runtime_instance: u64,
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+        session: runtime::SessionId,
+    },
+    Missing {
+        workspace_id: String,
+        runtime_instance: u64,
+        pane: runtime::MuxPaneId,
+    },
+}
+
+impl RestoreMuxBarrierFact {
+    fn matches_dispatch(&self, dispatch: &CrossWorkspaceRestoreDispatch) -> bool {
+        match self {
+            Self::Restored {
+                workspace_id,
+                runtime_instance,
+                pane,
+                ..
+            }
+            | Self::Missing {
+                workspace_id,
+                runtime_instance,
+                pane,
+            } => {
+                *runtime_instance == dispatch.runtime_instance
+                    && dispatch.request.same_canonical_pane(workspace_id, pane)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RestoreBarrierOutcome {
+    Promote(CrossWorkspaceRestoreCompletion),
+    Failed(CrossWorkspaceRestoreRequest),
+    Ignored(CrossWorkspaceRestoreRequest),
+}
+
+#[derive(Default)]
+struct CrossWorkspaceRestoreCoordinator {
+    pending: std::collections::VecDeque<CrossWorkspaceRestoreRequest>,
+    in_flight: Option<CrossWorkspaceRestoreDispatch>,
+}
+
+impl CrossWorkspaceRestoreCoordinator {
+    fn enqueue(&mut self, request: CrossWorkspaceRestoreRequest) -> bool {
+        if self.in_flight.as_ref().is_some_and(|dispatch| {
+            dispatch
+                .request
+                .same_canonical_pane(&request.workspace_id, &request.pane)
+        }) || self
+            .pending
+            .iter()
+            .any(|pending| pending.same_canonical_pane(&request.workspace_id, &request.pane))
+            || self.pending.len() + usize::from(self.in_flight.is_some())
+                >= CROSS_WORKSPACE_RESTORE_QUEUE_CAP
+        {
+            return false;
+        }
+        self.pending.push_back(request);
+        true
+    }
+
+    fn begin_next(
+        &mut self,
+        runtime_instance: u64,
+        now: std::time::Instant,
+    ) -> Option<CrossWorkspaceRestoreDispatch> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let request = self.pending.pop_front()?;
+        let dispatch = CrossWorkspaceRestoreDispatch {
+            request,
+            runtime_instance,
+            deadline: now + CROSS_WORKSPACE_RESTORE_TIMEOUT,
+            command_sent: false,
+            cancelled: false,
+        };
+        self.in_flight = Some(dispatch.clone());
+        Some(dispatch)
+    }
+
+    fn mark_command_sent(&mut self, runtime_instance: u64, pane: &runtime::MuxPaneId) -> bool {
+        let Some(dispatch) = self.in_flight.as_mut() else {
+            return false;
+        };
+        if dispatch.runtime_instance != runtime_instance || dispatch.request.pane != *pane {
+            return false;
+        }
+        dispatch.command_sent = true;
+        true
+    }
+
+    fn allows_command(&self, runtime_instance: u64, pane: &runtime::MuxPaneId) -> bool {
+        self.in_flight.as_ref().is_some_and(|dispatch| {
+            !dispatch.cancelled
+                && !dispatch.command_sent
+                && dispatch.runtime_instance == runtime_instance
+                && dispatch.request.pane == *pane
+        })
+    }
+
+    fn fail_before_command(
+        &mut self,
+        runtime_instance: u64,
+        pane: &runtime::MuxPaneId,
+    ) -> Option<CrossWorkspaceRestoreRequest> {
+        let dispatch = self.in_flight.as_ref()?;
+        if dispatch.command_sent
+            || dispatch.runtime_instance != runtime_instance
+            || dispatch.request.pane != *pane
+        {
+            return None;
+        }
+        self.in_flight.take().map(|dispatch| dispatch.request)
+    }
+
+    fn settle_mux_barrier(&mut self, fact: RestoreMuxBarrierFact) -> Option<RestoreBarrierOutcome> {
+        let dispatch = self.in_flight.as_ref()?;
+        if !dispatch.command_sent || !fact.matches_dispatch(dispatch) {
+            return None;
+        }
+        let dispatch = self.in_flight.take().unwrap();
+        if dispatch.cancelled {
+            return Some(RestoreBarrierOutcome::Ignored(dispatch.request));
+        }
+        match fact {
+            RestoreMuxBarrierFact::Restored {
+                workspace_id,
+                runtime_instance,
+                tab,
+                pane,
+                session,
+            } => Some(RestoreBarrierOutcome::Promote(
+                CrossWorkspaceRestoreCompletion {
+                    attachment_id: dispatch.request.attachment_id,
+                    target: ui::cross_workspace::WorkspacePaneTarget::new(
+                        workspace_id,
+                        runtime_instance,
+                        tab,
+                        pane,
+                        session,
+                    ),
+                },
+            )),
+            RestoreMuxBarrierFact::Missing { .. } => {
+                Some(RestoreBarrierOutcome::Failed(dispatch.request))
+            }
+        }
+    }
+
+    fn expire(&mut self, now: std::time::Instant) -> Option<CrossWorkspaceRestoreRequest> {
+        let expired = self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.deadline <= now);
+        expired.then(|| self.in_flight.take().unwrap().request)
+    }
+
+    fn cancel_attachment(
+        &mut self,
+        attachment_id: ui::cross_workspace::AttachmentId,
+    ) -> Option<CrossWorkspaceRestoreRequest> {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.request.attachment_id == attachment_id)
+        {
+            let dispatch = self.in_flight.as_mut().unwrap();
+            if dispatch.command_sent {
+                dispatch.cancelled = true;
+                return Some(dispatch.request.clone());
+            }
+            return self.in_flight.take().map(|dispatch| dispatch.request);
+        }
+        let index = self
+            .pending
+            .iter()
+            .position(|request| request.attachment_id == attachment_id)?;
+        self.pending.remove(index)
+    }
+
+    fn retain_attachments(
+        &mut self,
+        retained_ids: &std::collections::HashSet<ui::cross_workspace::AttachmentId>,
+    ) -> Vec<CrossWorkspaceRestoreRequest> {
+        let mut cancelled = Vec::new();
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| !retained_ids.contains(&dispatch.request.attachment_id))
+        {
+            let attachment_id = self.in_flight.as_ref().unwrap().request.attachment_id;
+            if let Some(request) = self.cancel_attachment(attachment_id) {
+                cancelled.push(request);
+            }
+        }
+        let mut retained = std::collections::VecDeque::with_capacity(self.pending.len());
+        while let Some(request) = self.pending.pop_front() {
+            if retained_ids.contains(&request.attachment_id) {
+                retained.push_back(request);
+            } else {
+                cancelled.push(request);
+            }
+        }
+        self.pending = retained;
+        cancelled
+    }
+
+    fn retain_workspaces(
+        &mut self,
+        workspace_ids: &std::collections::HashSet<String>,
+    ) -> Vec<CrossWorkspaceRestoreRequest> {
+        let mut cancelled = Vec::new();
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| !workspace_ids.contains(&dispatch.request.workspace_id))
+        {
+            let attachment_id = self.in_flight.as_ref().unwrap().request.attachment_id;
+            if let Some(request) = self.cancel_attachment(attachment_id) {
+                cancelled.push(request);
+            }
+        }
+        let mut retained = std::collections::VecDeque::with_capacity(self.pending.len());
+        while let Some(request) = self.pending.pop_front() {
+            if workspace_ids.contains(&request.workspace_id) {
+                retained.push_back(request);
+            } else {
+                cancelled.push(request);
+            }
+        }
+        self.pending = retained;
+        cancelled
+    }
+
+    fn cancel_visible_requests(&mut self) -> Vec<CrossWorkspaceRestoreRequest> {
+        let mut cancelled = self.pending.drain(..).collect::<Vec<_>>();
+        if let Some(attachment_id) = self
+            .in_flight
+            .as_ref()
+            .map(|dispatch| dispatch.request.attachment_id)
+            && let Some(request) = self.cancel_attachment(attachment_id)
+        {
+            cancelled.push(request);
+        }
+        cancelled
+    }
+
+    fn force_clear_for_shutdown(&mut self) {
+        self.pending.clear();
+        self.in_flight = None;
+    }
+
+    fn protects_runtime(&self, workspace_id: &str, runtime_instance: u64) -> bool {
+        self.in_flight.as_ref().is_some_and(|dispatch| {
+            dispatch.request.workspace_id == workspace_id
+                && dispatch.runtime_instance == runtime_instance
+        })
+    }
+
+    fn in_flight(&self) -> Option<&CrossWorkspaceRestoreDispatch> {
+        self.in_flight.as_ref()
+    }
+
+    fn next_request(&self) -> Option<&CrossWorkspaceRestoreRequest> {
+        self.pending.front()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.in_flight.is_none()
+    }
+
+    #[cfg(test)]
+    fn total_len(&self) -> usize {
+        self.pending.len() + usize::from(self.in_flight.is_some())
+    }
+
+    #[cfg(test)]
+    fn active_request_len(&self) -> usize {
+        self.pending.len()
+            + usize::from(
+                self.in_flight
+                    .as_ref()
+                    .is_some_and(|dispatch| !dispatch.cancelled),
+            )
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    fn in_flight_len(&self) -> usize {
+        usize::from(self.in_flight.is_some())
+    }
+
+    #[cfg(test)]
+    fn pending_attachment_ids(&self) -> Vec<ui::cross_workspace::AttachmentId> {
+        self.pending
+            .iter()
+            .map(|request| request.attachment_id)
+            .collect()
+    }
+}
+
+fn cross_workspace_restore_command(pane: runtime::MuxPaneId) -> runtime::RuntimeCommand {
+    runtime::RuntimeCommand::RestoreWorkspacePane { pane }
 }
 
 struct AppDotenvResource {
@@ -6251,6 +6634,7 @@ pub struct App {
     /// 현재 활성 workspace가 소유한 화면 오른쪽에 붙인 exact warm pane. 런타임과 mux
     /// 소유권은 이동하지 않으며 이 상태는 메모리에만 존재한다.
     cross_workspace_pane: ui::cross_workspace::CrossWorkspacePaneState,
+    cross_workspace_restore: CrossWorkspaceRestoreCoordinator,
     egui_ctx: egui::Context,
     db_path: PathBuf,
     logs_base: PathBuf,
@@ -6263,7 +6647,8 @@ pub struct App {
     /// refresh_workspaces에서 한 쿼리로 갱신한다.
     /// 워크스페이스별 영속 pane snapshot — (raw 제목, 세션 cwd). cwd는 기본 제목
     /// ("셸 N")을 프로젝트명으로 표시하는 데 쓴다(활성 워크스페이스와 같은 규칙).
-    persisted_activity_panes: std::collections::HashMap<String, Vec<(String, String)>>,
+    persisted_activity_panes:
+        std::collections::HashMap<String, Vec<storage::PersistedActivityPane>>,
     /// 옵션2: 활성 세션별 에이전트 transcript 활동(working/idle) — 레일 상태에 반영.
     agent_activity:
         std::collections::HashMap<runtime::SessionId, crate::agent_transcript::AgentActivity>,
@@ -6688,12 +7073,7 @@ enum AppControllerAction {
 enum WorkspaceControllerAction {
     OpenAgentLauncher,
     SwitchWorkspace(String),
-    AttachWorkspacePaneRight {
-        workspace_id: String,
-        tab: runtime::MuxTabId,
-        pane: runtime::MuxPaneId,
-        session: runtime::SessionId,
-    },
+    OpenSessionBeside(ui::file_tree::SessionRowTarget),
     DetachWorkspacePane,
     FocusSession {
         workspace_id: String,
@@ -8891,6 +9271,7 @@ impl App {
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
             cross_workspace_pane: ui::cross_workspace::CrossWorkspacePaneState::default(),
+            cross_workspace_restore: CrossWorkspaceRestoreCoordinator::default(),
             frame_stats: crate::perf::FrameStats::new(),
             bench,
             perf_harness_next: crate::perf::harness_enabled().then_some(0),
@@ -9569,11 +9950,12 @@ impl App {
                 cwd: cwd.clone(),
             });
         }
-        for (_, cwd) in self
+        for row in self
             .persisted_activity_panes
             .values()
             .flat_map(|panes| panes.iter())
         {
+            let cwd = &row.cwd;
             if rows.len() >= PROJECT_NAME_ITEMS_MAX {
                 break;
             }
@@ -9780,13 +10162,15 @@ impl App {
                         "agent state catalog projection rejected"
                     );
                 }
-                let mut by_workspace: std::collections::HashMap<String, Vec<(String, String)>> =
-                    std::collections::HashMap::new();
-                for (workspace_id, title, cwd) in &snapshot.activity_panes {
+                let mut by_workspace: std::collections::HashMap<
+                    String,
+                    Vec<storage::PersistedActivityPane>,
+                > = std::collections::HashMap::new();
+                for row in &snapshot.activity_panes {
                     by_workspace
-                        .entry(workspace_id.clone())
+                        .entry(row.workspace_id.clone())
                         .or_default()
-                        .push((title.clone(), cwd.clone()));
+                        .push(row.clone());
                 }
                 self.persisted_activity_panes = by_workspace;
                 self.request_project_name_projection();
@@ -10811,9 +11195,9 @@ impl App {
                                 .get(&ws.id)
                                 .into_iter()
                                 .flatten()
-                                .map(|(title, _cwd)| SessionSeed {
+                                .map(|row| SessionSeed {
                                     id: None, // 표시 전용
-                                    title: self.activity_session_name(&ws.id, title),
+                                    title: self.activity_session_name(&ws.id, &row.title),
                                     status: None,
                                     agent: None, // 절전 — 에이전트 죽음
                                     exited: false,
@@ -10949,6 +11333,7 @@ impl App {
         }
         ctx.set_theme(self.config.ui.theme.to_egui());
         self.sync_agent_hooks();
+        self.enforce_cross_workspace_capacity();
         self.broadcast_terminal_cache_policy();
         if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
             self.file_tree = self
@@ -10991,13 +11376,8 @@ impl App {
             WorkspaceControllerAction::SwitchWorkspace(workspace_id) => {
                 self.switch_workspace(&workspace_id);
             }
-            WorkspaceControllerAction::AttachWorkspacePaneRight {
-                workspace_id,
-                tab,
-                pane,
-                session,
-            } => {
-                self.attach_cross_workspace_pane(&workspace_id, tab, pane, session);
+            WorkspaceControllerAction::OpenSessionBeside(target) => {
+                self.open_session_beside(target);
             }
             WorkspaceControllerAction::DetachWorkspacePane => {
                 self.detach_cross_workspace_pane();
@@ -11695,39 +12075,282 @@ impl App {
         }
     }
 
-    fn attach_cross_workspace_pane(
-        &mut self,
-        workspace_id: &str,
-        tab: runtime::MuxTabId,
-        pane: runtime::MuxPaneId,
-        session: runtime::SessionId,
-    ) {
-        let target = self.warm.get(workspace_id).and_then(|runtime| {
-            resolve_exact_warm_pane_target(
-                &self.active.id,
+    fn open_session_beside(&mut self, row_target: ui::file_tree::SessionRowTarget) {
+        if row_target.workspace_id() == self.active.id {
+            return;
+        }
+        let limit = self.config.performance.max_cross_workspace_panes as usize;
+        match row_target {
+            ui::file_tree::SessionRowTarget::Live {
                 workspace_id,
-                Some(runtime.runtime_instance),
-                runtime.workspace_ui.mux().map(AsRef::as_ref),
-                &tab,
-                &pane,
+                runtime_instance,
+                tab,
+                pane,
                 session,
-            )
-        });
-        let Some(target) = target else {
+            } => {
+                let target = self.warm.get(&workspace_id).and_then(|runtime| {
+                    (runtime.runtime_instance == runtime_instance)
+                        .then(|| {
+                            resolve_exact_warm_pane_target(
+                                &self.active.id,
+                                &workspace_id,
+                                Some(runtime.runtime_instance),
+                                runtime.workspace_ui.mux().map(AsRef::as_ref),
+                                &tab,
+                                &pane,
+                                session,
+                            )
+                        })
+                        .flatten()
+                });
+                let Some(target) = target else {
+                    return;
+                };
+                let _ = self.cross_workspace_pane.attach_right(
+                    self.active.id.clone(),
+                    target,
+                    420.0,
+                    limit,
+                );
+                self.refresh_warm_idle_deadline();
+                self.egui_ctx.request_repaint();
+            }
+            ui::file_tree::SessionRowTarget::PersistedPane { workspace_id, pane } => {
+                let canonical = self
+                    .persisted_activity_panes
+                    .get(&workspace_id)
+                    .is_some_and(|rows| rows.iter().any(|row| row.pane_id == pane.0));
+                if !canonical {
+                    return;
+                }
+                let existing_runtime_instance = self
+                    .warm
+                    .get(&workspace_id)
+                    .map(|runtime| runtime.runtime_instance);
+                let live_warm = count_live_warm_runtimes(
+                    self.warm.values().map(WorkspaceRuntime::has_live_sessions),
+                );
+                if cold_restore_runtime_admission(
+                    existing_runtime_instance,
+                    live_warm,
+                    self.config.performance.max_live_warm as usize,
+                ) == ColdRestoreRuntimeAdmission::Denied
+                {
+                    return;
+                }
+                let request = ui::cross_workspace::PersistedPaneRequest::new(
+                    workspace_id.clone(),
+                    pane.clone(),
+                );
+                let ui::cross_workspace::AttachOutcome::Appended(attachment_id) = self
+                    .cross_workspace_pane
+                    .append_restoring(self.active.id.clone(), request, 420.0, limit)
+                else {
+                    return;
+                };
+                if !self
+                    .cross_workspace_restore
+                    .enqueue(CrossWorkspaceRestoreRequest::new(
+                        workspace_id,
+                        pane,
+                        attachment_id,
+                    ))
+                {
+                    let _ = self.cross_workspace_pane.detach_attachment(attachment_id);
+                    return;
+                }
+                self.drive_cross_workspace_restore(std::time::Instant::now());
+                self.refresh_warm_idle_deadline();
+                self.egui_ctx.request_repaint();
+            }
+        }
+    }
+
+    fn drive_cross_workspace_restore(&mut self, now: std::time::Instant) {
+        if self.cross_workspace_restore.is_idle() {
+            return;
+        }
+        let workspace_ids = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let cancelled = self
+            .cross_workspace_restore
+            .retain_workspaces(&workspace_ids);
+        self.detach_cancelled_cross_workspace_restores(cancelled);
+
+        if let Some(expired) = self.cross_workspace_restore.expire(now) {
+            let _ = self
+                .cross_workspace_pane
+                .detach_attachment(expired.attachment_id());
+            self.refresh_warm_idle_deadline();
+        }
+
+        if self.cross_workspace_restore.in_flight().is_some() {
+            return;
+        }
+
+        let Some(next) = self.cross_workspace_restore.next_request().cloned() else {
             return;
         };
-        self.detach_cross_workspace_pane();
-        self.cross_workspace_pane
-            .attach(self.active.id.clone(), target, 0.5);
+        let existing_runtime_instance = self
+            .warm
+            .get(next.workspace_id())
+            .map(|runtime| runtime.runtime_instance);
+        let live_warm =
+            count_live_warm_runtimes(self.warm.values().map(WorkspaceRuntime::has_live_sessions));
+        let runtime_instance = match cold_restore_runtime_admission(
+            existing_runtime_instance,
+            live_warm,
+            self.config.performance.max_live_warm as usize,
+        ) {
+            ColdRestoreRuntimeAdmission::Reuse(runtime_instance) => runtime_instance,
+            ColdRestoreRuntimeAdmission::Denied => {
+                if let Some(cancelled) = self
+                    .cross_workspace_restore
+                    .cancel_attachment(next.attachment_id())
+                {
+                    let _ = self
+                        .cross_workspace_pane
+                        .detach_attachment(cancelled.attachment_id());
+                }
+                return;
+            }
+            ColdRestoreRuntimeAdmission::Create => {
+                self.join_pending_shutdown(next.workspace_id());
+                let runtime_instance = self.next_runtime_instance;
+                self.next_runtime_instance = self.next_runtime_instance.wrapping_add(1).max(1);
+                let mut runtime = Self::make_runtime(
+                    &self.config,
+                    &self.logs_base,
+                    next.workspace_id(),
+                    runtime_instance,
+                    &self.db_path,
+                    self.runtime_host_factory.as_ref(),
+                    &self.db,
+                    &self.egui_ctx,
+                );
+                let delivered = runtime
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                        runtime::WorkspaceRuntimeState::Warm,
+                    ))
+                    .is_ok();
+                runtime.render_active = !delivered;
+                runtime.backgrounded_at = None;
+                self.warm.insert(next.workspace_id().to_owned(), runtime);
+                push_warm_order_unique(&mut self.warm_order, next.workspace_id().to_owned());
+                self.broadcast_terminal_cache_policy();
+                runtime_instance
+            }
+        };
+        let Some(dispatch) = self
+            .cross_workspace_restore
+            .begin_next(runtime_instance, now)
+        else {
+            return;
+        };
+        let command = cross_workspace_restore_command(dispatch.request.pane.clone());
+        if self
+            .stage_dotenv_continuation(
+                runtime_instance,
+                PendingDotenvContinuation::RuntimeCommand(command),
+            )
+            .is_err()
+        {
+            if let Some(cancelled) = self
+                .cross_workspace_restore
+                .fail_before_command(runtime_instance, &dispatch.request.pane)
+            {
+                let _ = self
+                    .cross_workspace_pane
+                    .detach_attachment(cancelled.attachment_id());
+            }
+            self.refresh_warm_idle_deadline();
+            return;
+        }
+        self.egui_ctx
+            .request_repaint_after(CROSS_WORKSPACE_RESTORE_TIMEOUT);
+    }
+
+    fn apply_cross_workspace_restore_barrier(&mut self, outcome: RestoreBarrierOutcome) {
+        match outcome {
+            RestoreBarrierOutcome::Promote(completion) => {
+                let _ = self
+                    .cross_workspace_pane
+                    .promote_restoring(completion.attachment_id, completion.target);
+                self.egui_ctx.request_repaint();
+            }
+            RestoreBarrierOutcome::Failed(request) | RestoreBarrierOutcome::Ignored(request) => {
+                let _ = self
+                    .cross_workspace_pane
+                    .detach_attachment(request.attachment_id());
+            }
+        }
         self.refresh_warm_idle_deadline();
-        self.egui_ctx.request_repaint();
+    }
+
+    fn detach_cancelled_cross_workspace_restores(
+        &mut self,
+        cancelled: Vec<CrossWorkspaceRestoreRequest>,
+    ) {
+        for request in cancelled {
+            let _ = self
+                .cross_workspace_pane
+                .detach_attachment(request.attachment_id());
+        }
+    }
+
+    fn cancel_all_cross_workspace_restores(&mut self) {
+        let cancelled = self.cross_workspace_restore.cancel_visible_requests();
+        self.detach_cancelled_cross_workspace_restores(cancelled);
+        self.refresh_warm_idle_deadline();
+    }
+
+    fn enforce_cross_workspace_capacity(&mut self) {
+        let limit = self.config.performance.max_cross_workspace_panes as usize;
+        let detached = self.cross_workspace_pane.enforce_capacity(limit);
+        for decision in detached {
+            if let Some(target) = decision.live_target() {
+                self.set_attached_runtime_visible(target, false);
+            }
+        }
+        let retained = self
+            .cross_workspace_pane
+            .attachments()
+            .iter()
+            .map(ui::cross_workspace::AttachedPane::id)
+            .collect();
+        let cancelled = self.cross_workspace_restore.retain_attachments(&retained);
+        self.detach_cancelled_cross_workspace_restores(cancelled);
+        self.refresh_warm_idle_deadline();
     }
 
     fn detach_cross_workspace_pane(&mut self) {
-        let Some(detached) = self.cross_workspace_pane.detach() else {
+        let id = match self.cross_workspace_pane.focused() {
+            ui::cross_workspace::FocusedSurface::Attached(id) => Some(id),
+            ui::cross_workspace::FocusedSurface::Primary => self
+                .cross_workspace_pane
+                .attachments()
+                .iter()
+                .rev()
+                .find(|attachment| attachment.live_target().is_some())
+                .map(ui::cross_workspace::AttachedPane::id),
+        };
+        let Some(id) = id else {
             return;
         };
-        self.set_attached_runtime_visible(detached.target(), false);
+        let detached = self.cross_workspace_pane.detach_attachment(id);
+        let Some(detached) = detached else {
+            return;
+        };
+        if let Some(target) = detached.live_target() {
+            self.set_attached_runtime_visible(target, false);
+        }
+        if detached.restoring_request().is_some() {
+            let _ = self.cross_workspace_restore.cancel_attachment(id);
+        }
         self.refresh_warm_idle_deadline();
         self.egui_ctx.request_repaint();
     }
@@ -11844,22 +12467,16 @@ impl App {
         if target_id == self.active.id {
             return;
         }
+        self.cancel_all_cross_workspace_restores();
         let live_warm = self
             .warm
             .values()
-            .filter(|runtime| {
-                !self
-                    .cross_workspace_pane
-                    .protects_runtime(&runtime.id, runtime.runtime_instance)
-            })
             .filter(|runtime| runtime.has_live_sessions())
             .count();
-        let target_is_live_warm = self.warm.get(target_id).is_some_and(|runtime| {
-            !self
-                .cross_workspace_pane
-                .protects_runtime(&runtime.id, runtime.runtime_instance)
-                && runtime.has_live_sessions()
-        });
+        let target_is_live_warm = self
+            .warm
+            .get(target_id)
+            .is_some_and(WorkspaceRuntime::has_live_sessions);
         let projected = projected_live_warm_count(
             live_warm,
             target_is_live_warm,
@@ -12304,6 +12921,9 @@ impl App {
                 self.warm.get(id).is_some_and(|runtime| {
                     self.cross_workspace_pane
                         .protects_runtime(id, runtime.runtime_instance)
+                        || self
+                            .cross_workspace_restore
+                            .protects_runtime(id, runtime.runtime_instance)
                 })
             },
             |id| self.warm.get(id).is_some_and(|rt| rt.has_live_sessions()),
@@ -12330,6 +12950,9 @@ impl App {
                 !self
                     .cross_workspace_pane
                     .protects_runtime(&runtime.id, runtime.runtime_instance)
+                    && !self
+                        .cross_workspace_restore
+                        .protects_runtime(&runtime.id, runtime.runtime_instance)
             })
             .filter(|runtime| {
                 !runtime.has_live_sessions() || runtime.can_auto_suspend_idle_shells()
@@ -12371,6 +12994,9 @@ impl App {
                 self.warm.get(id).is_some_and(|runtime| {
                     self.cross_workspace_pane
                         .protects_runtime(id, runtime.runtime_instance)
+                        || self
+                            .cross_workspace_restore
+                            .protects_runtime(id, runtime.runtime_instance)
                 })
             },
             |id| self.warm.get(id).and_then(|rt| rt.backgrounded_at),
@@ -12817,6 +13443,12 @@ impl App {
         pending: PendingDotenvOperation,
         outcome: Result<DotenvSyncOutcome, crate::dotenv_sync::DotenvWorkerErrorCode>,
     ) {
+        let restore_pane = match &pending.continuation {
+            PendingDotenvContinuation::RuntimeCommand(
+                runtime::RuntimeCommand::RestoreWorkspacePane { pane },
+            ) => Some(pane.clone()),
+            _ => None,
+        };
         let current_root = self.workspace_tree_root(&pending.workspace_id);
         let outcome = outcome.ok().filter(|outcome| {
             outcome.workspace_id == pending.workspace_id
@@ -12874,6 +13506,9 @@ impl App {
                 error_code = "source_unavailable",
                 "dotenv-gated launch failed closed"
             );
+            if let Some(pane) = restore_pane.as_ref() {
+                self.finish_cross_workspace_restore_dotenv(pending.runtime_instance, pane, false);
+            }
             return;
         };
         let baseline = outcome.baseline;
@@ -12917,6 +13552,10 @@ impl App {
                     .push(("DEPPY_PROJECT_ROOT".to_owned(), root.display().to_string()));
             }
         }
+        let restore_command_allowed = restore_pane.as_ref().is_none_or(|pane| {
+            self.cross_workspace_restore
+                .allows_command(pending.runtime_instance, pane)
+        });
         let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) else {
             if let Some(ticket_id) = agent_ticket {
                 self.approval_launch_tracker.cancel(ticket_id);
@@ -12934,6 +13573,9 @@ impl App {
                 error_code = "stale_runtime",
                 "dotenv launch target became stale"
             );
+            if let Some(pane) = restore_pane.as_ref() {
+                self.finish_cross_workspace_restore_dotenv(pending.runtime_instance, pane, false);
+            }
             return;
         };
         let env_delivered = match payload {
@@ -12970,9 +13612,14 @@ impl App {
             }
             PendingDotenvContinuation::RuntimeCommand(command)
             | PendingDotenvContinuation::AgentLaunch { command, .. } => {
-                policy_delivered && runtime.runtime.send_command(command).is_ok()
+                restore_command_allowed
+                    && policy_delivered
+                    && runtime.runtime.send_command(command).is_ok()
             }
         };
+        if let Some(pane) = restore_pane.as_ref() {
+            self.finish_cross_workspace_restore_dotenv(pending.runtime_instance, pane, delivered);
+        }
         if delivered {
             self.invalidate_env_profile_ui();
             self.credentials_ui.invalidate_cache();
@@ -12998,6 +13645,30 @@ impl App {
                 error_code = "delivery_failed",
                 "dotenv-gated launch failed closed"
             );
+        }
+    }
+
+    fn finish_cross_workspace_restore_dotenv(
+        &mut self,
+        runtime_instance: u64,
+        pane: &runtime::MuxPaneId,
+        delivered: bool,
+    ) {
+        if delivered {
+            let _ = self
+                .cross_workspace_restore
+                .mark_command_sent(runtime_instance, pane);
+            return;
+        }
+        if let Some(failed) = self
+            .cross_workspace_restore
+            .fail_before_command(runtime_instance, pane)
+        {
+            let _ = self
+                .cross_workspace_pane
+                .detach_attachment(failed.attachment_id());
+            self.refresh_warm_idle_deadline();
+            self.egui_ctx.request_repaint();
         }
     }
 
@@ -15086,9 +15757,9 @@ impl App {
                     .into_iter()
                     .flatten()
                     .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
-                    .map(|(title, _cwd)| ui::activity::ActivitySessionRow {
+                    .map(|row| ui::activity::ActivitySessionRow {
                         // 유휴 워크스페이스도 프로젝트명으로 표시 (활성/warm과 동일 규칙).
-                        name: self.activity_session_name(&ws.id, title).into(),
+                        name: self.activity_session_name(&ws.id, &row.title).into(),
                         agent_line: None,
                         status_line: None,
                         resource: None,
@@ -16318,6 +16989,8 @@ impl App {
         if let Some(bench) = self.bench.as_mut() {
             bench.finish();
         }
+        self.cancel_all_cross_workspace_restores();
+        self.cross_workspace_restore.force_clear_for_shutdown();
         self.status_feed_rx.shutdown();
         if let Some(task) = self.app_host_io.take() {
             task.cancel
@@ -16781,8 +17454,30 @@ impl eframe::App for App {
         let mut approval_events_overflowed = false;
         let mut approval_runtime_events = Vec::new();
         let mut warm_lifecycle_changed = false;
+        let restore_dispatch = self
+            .cross_workspace_restore
+            .in_flight()
+            .filter(|dispatch| dispatch.command_sent)
+            .cloned();
+        let mut restore_barriers = Vec::with_capacity(1);
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
+            if restore_barriers.len() < CROSS_WORKSPACE_RESTORE_QUEUE_CAP
+                && let Some(dispatch) = restore_dispatch.as_ref()
+                && dispatch.runtime_instance == rt.runtime_instance
+                && dispatch.request.workspace_id() == rt.id
+                && let Some(snapshot) = events.iter().rev().find_map(|event| match event {
+                    runtime::RuntimeEvent::MuxUpdated { snapshot } => Some(snapshot),
+                    _ => None,
+                })
+            {
+                restore_barriers.push(restore_mux_barrier_fact(
+                    &rt.id,
+                    rt.runtime_instance,
+                    &dispatch.request.pane,
+                    snapshot,
+                ));
+            }
             // active와 동일 — 예산 초과 backlog는 wake가 이미 소진돼 직접 예약해야 한다.
             if rt.events.has_backlog() {
                 ctx.request_repaint();
@@ -16867,12 +17562,39 @@ impl eframe::App for App {
         if warm_lifecycle_changed {
             self.refresh_warm_idle_deadline();
         }
+        for barrier in restore_barriers {
+            if let Some(outcome) = self.cross_workspace_restore.settle_mux_barrier(barrier) {
+                self.apply_cross_workspace_restore_barrier(outcome);
+            }
+        }
+        self.drive_cross_workspace_restore(std::time::Instant::now());
         self.maintain_warm_evictions(std::time::Instant::now());
 
         // 이벤트 drain + 알림 생성은 non-render 경로인 여기서 한다 (§14.1 Warm:
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
+        let active_restore_barrier = self
+            .cross_workspace_restore
+            .in_flight()
+            .filter(|dispatch| {
+                dispatch.command_sent
+                    && dispatch.runtime_instance == self.active.runtime_instance
+                    && dispatch.request.workspace_id() == self.active.id
+            })
+            .and_then(|dispatch| {
+                new_events.iter().rev().find_map(|event| match event {
+                    runtime::RuntimeEvent::MuxUpdated { snapshot } => {
+                        Some(restore_mux_barrier_fact(
+                            &self.active.id,
+                            self.active.runtime_instance,
+                            &dispatch.request.pane,
+                            snapshot,
+                        ))
+                    }
+                    _ => None,
+                })
+            });
         if !new_events.is_empty() {
             Self::record_activity_events(&mut self.active, &new_events);
             for event in &new_events {
@@ -16920,6 +17642,12 @@ impl eframe::App for App {
             // 이미 subscribe_runtime_events의 wake로 리페인트를 요청했다. 재요청하면 이번
             // 프레임이 그리는 내용을 위해 프레임을 한 장 더 잡고, egui가 거기에 settle 프레임을
             // 하나 더 붙여 갱신 1회당 3프레임이 된다 (agenttui 실측: 페인트의 70%가 헛 프레임).
+        }
+        if let Some(barrier) = active_restore_barrier
+            && let Some(outcome) = self.cross_workspace_restore.settle_mux_barrier(barrier)
+        {
+            self.apply_cross_workspace_restore_barrier(outcome);
+            self.drive_cross_workspace_restore(std::time::Instant::now());
         }
         // 예외: drain이 durable 예산(256/프레임)을 다 써 backlog를 남겼으면 다음
         // 프레임을 직접 예약한다 — 남은 이벤트의 wake는 이미 coalesce돼 사라졌으므로
@@ -17401,15 +18129,29 @@ impl eframe::App for App {
         > = std::collections::HashMap::new();
         let mut sidebar_sessions: std::collections::HashMap<
             String,
-            Vec<ui::file_tree::SessionEntry>,
+            Vec<ui::file_tree::SidebarSessionRow>,
         > = std::collections::HashMap::new();
         for workspace in &sidebar_workspaces {
             if workspace.id == active_workspace_id {
                 continue;
             }
             let Some(warm_runtime) = self.warm.get(&workspace.id) else {
+                let persisted = self
+                    .persisted_activity_panes
+                    .get(&workspace.id)
+                    .into_iter()
+                    .flatten()
+                    .map(|row| {
+                        ui::file_tree::SidebarSessionRow::from_persisted(
+                            row,
+                            self.activity_session_name(&workspace.id, &row.title),
+                        )
+                    })
+                    .collect();
+                sidebar_sessions.insert(workspace.id.clone(), persisted);
                 continue;
             };
+            let runtime_instance = warm_runtime.runtime_instance;
             let needs_input: std::collections::HashSet<_> = self
                 .global_waiting
                 .iter()
@@ -17447,9 +18189,30 @@ impl eframe::App for App {
                 entry.resumable =
                     entry.agent_line.is_none() && self.restore_agents.contains_key(&entry.pane.0);
             }
+            let entries = entries
+                .into_iter()
+                .map(|entry| {
+                    ui::file_tree::SidebarSessionRow::from_live(
+                        workspace.id.clone(),
+                        runtime_instance,
+                        entry,
+                    )
+                })
+                .collect();
             sidebar_sessions.insert(workspace.id.clone(), entries);
         }
-        sidebar_sessions.insert(active_workspace_id.clone(), terminal_sessions);
+        let active_runtime_instance = self.active.runtime_instance;
+        let active_sidebar_sessions = terminal_sessions
+            .into_iter()
+            .map(|entry| {
+                ui::file_tree::SidebarSessionRow::from_live(
+                    active_workspace_id.clone(),
+                    active_runtime_instance,
+                    entry,
+                )
+            })
+            .collect();
+        sidebar_sessions.insert(active_workspace_id.clone(), active_sidebar_sessions);
         // Home을 보고 있는 동안 도착했거나 이미 표시 중인 공지는 읽음이다. sidebar
         // snapshot을 만들기 전에 반영해 같은 프레임에 Home 배지가 사라지게 한다.
         if self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home {
@@ -17705,21 +18468,11 @@ impl eframe::App for App {
                         },
                     );
                 }
-                Some(ui::file_tree::SidebarAction::OpenSessionInCurrentViewRight {
-                    workspace_id,
-                    tab,
-                    pane,
-                    session,
-                }) => {
+                Some(ui::file_tree::SidebarAction::OpenSessionBeside(target)) => {
                     self.agent_terminal_ui
                         .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
                     self.stage_workspace_controller_action(
-                        WorkspaceControllerAction::AttachWorkspacePaneRight {
-                            workspace_id,
-                            tab,
-                            pane,
-                            session,
-                        },
+                        WorkspaceControllerAction::OpenSessionBeside(target),
                     );
                 }
                 // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)
@@ -17939,9 +18692,18 @@ impl eframe::App for App {
         let mut attached_detach_requested = false;
         let mut attached_target_missing = false;
         let mut next_attached_ratio = None;
+        let mut dropped_session_target = None;
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
+                let drop_surface = ui.interact(
+                    ui.max_rect(),
+                    ui.id().with("cross_workspace_session_drop_surface"),
+                    egui::Sense::hover(),
+                );
+                dropped_session_target = drop_surface
+                    .dnd_release_payload::<ui::file_tree::SessionRowDragPayload>()
+                    .map(|payload| payload.target().clone());
                 if home_visible {
                     home_action = self.agent_terminal_ui.home(
                         ui,
@@ -18076,6 +18838,13 @@ impl eframe::App for App {
                         .show(ui, &self.config.terminal, &events, &text);
                 }
             });
+        if let Some(target) = dropped_session_target {
+            self.agent_terminal_ui
+                .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+            self.stage_workspace_controller_action(WorkspaceControllerAction::OpenSessionBeside(
+                target,
+            ));
+        }
         if let Some(ratio) = next_attached_ratio {
             self.cross_workspace_pane.set_ratio(ratio);
             ui.ctx().request_repaint();
@@ -19610,6 +20379,7 @@ fn load_catalog(locale: &str) -> i18n::Catalog {
 
 /// warm 풀 상한 초과분 중 축출 가능한(live 세션 없는) workspace를 앞(가장 오래됨)에서부터
 /// 고른다. live workspace는 건너뛰며, 그만큼 상한 초과가 허용된다 (작업 보호 우선).
+#[cfg(test)]
 fn warm_eviction_candidates(
     warm_order: &[String],
     max_warm: usize,
@@ -19630,12 +20400,13 @@ fn protected_warm_eviction_candidates(
     is_protected: impl Fn(&str) -> bool,
     has_live: impl Fn(&str) -> bool,
 ) -> Vec<String> {
-    let capacity_order = warm_order
+    let overflow = warm_order.len().saturating_sub(max_warm);
+    warm_order
         .iter()
-        .filter(|id| !is_protected(id))
+        .filter(|id| !is_protected(id) && !has_live(id))
+        .take(overflow)
         .cloned()
-        .collect::<Vec<_>>();
-    warm_eviction_candidates(&capacity_order, max_warm, has_live)
+        .collect()
 }
 
 fn push_warm_order_unique(warm_order: &mut Vec<String>, workspace_id: String) {
@@ -19802,6 +20573,59 @@ fn resolve_exact_warm_pane_target(
             session,
         )
     })
+}
+
+fn restore_mux_barrier_fact(
+    workspace_id: &str,
+    runtime_instance: u64,
+    requested_pane: &runtime::MuxPaneId,
+    mux: &runtime::MuxSnapshot,
+) -> RestoreMuxBarrierFact {
+    mux.tabs
+        .iter()
+        .find_map(|tab| {
+            tab.panes
+                .iter()
+                .find(|pane| pane.id == *requested_pane)
+                .and_then(|pane| {
+                    pane.session_id
+                        .map(|session| RestoreMuxBarrierFact::Restored {
+                            workspace_id: workspace_id.to_owned(),
+                            runtime_instance,
+                            tab: tab.id.clone(),
+                            pane: pane.id.clone(),
+                            session,
+                        })
+                })
+        })
+        .unwrap_or_else(|| RestoreMuxBarrierFact::Missing {
+            workspace_id: workspace_id.to_owned(),
+            runtime_instance,
+            pane: requested_pane.clone(),
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColdRestoreRuntimeAdmission {
+    Reuse(u64),
+    Create,
+    Denied,
+}
+
+fn cold_restore_runtime_admission(
+    existing_runtime_instance: Option<u64>,
+    live_warm_count: usize,
+    max_live_warm: usize,
+) -> ColdRestoreRuntimeAdmission {
+    match existing_runtime_instance {
+        Some(runtime_instance) => ColdRestoreRuntimeAdmission::Reuse(runtime_instance),
+        None if live_warm_count < max_live_warm => ColdRestoreRuntimeAdmission::Create,
+        None => ColdRestoreRuntimeAdmission::Denied,
+    }
+}
+
+fn count_live_warm_runtimes(live: impl IntoIterator<Item = bool>) -> usize {
+    live.into_iter().filter(|is_live| *is_live).count()
 }
 
 fn attached_target_relation(
@@ -20286,11 +21110,11 @@ fn cwd_belongs_to_any(cwd: &std::path::Path, roots: &[std::path::PathBuf]) -> bo
 /// **키는 DB에 저장된 raw 제목**("workspace.spawn.shell 3")이다. 호출측이 i18n 렌더된
 /// 값("셸 3")을 넘기면 항상 miss가 되어 프로젝트명 해석이 조용히 실패한다 —
 /// warm 워크스페이스에서 실제로 그랬다(리뷰 P2-1). session_titles는 raw를 보관한다.
-fn pane_cwd<'a>(panes: &'a [(String, String)], raw_title: &str) -> Option<&'a str> {
+fn pane_cwd<'a>(panes: &'a [storage::PersistedActivityPane], raw_title: &str) -> Option<&'a str> {
     panes
         .iter()
-        .find(|(title, _)| title == raw_title)
-        .map(|(_, cwd)| cwd.as_str())
+        .find(|row| row.title == raw_title)
+        .map(|row| row.cwd.as_str())
         .filter(|cwd| !cwd.is_empty())
 }
 
@@ -20426,13 +21250,14 @@ mod tests {
     }
 
     #[test]
-    fn cross_workspace_app_attached_runtime_is_excluded_from_capacity_and_idle_eviction() {
+    fn cross_workspace_app_attached_runtime_counts_toward_capacity_but_blocks_eviction() {
         let order = vec!["workspace-b".to_owned(), "workspace-d".to_owned()];
         let protected = |workspace_id: &str| workspace_id == "workspace-b";
 
-        assert!(
-            protected_warm_eviction_candidates(&order, 1, protected, |_| false).is_empty(),
-            "the attached runtime must not consume the one warm capacity slot"
+        assert_eq!(
+            protected_warm_eviction_candidates(&order, 1, protected, |_| false),
+            vec!["workspace-d".to_owned()],
+            "protected runtime consumes capacity but is not itself evicted"
         );
 
         let now = std::time::Instant::now();
@@ -21227,10 +22052,12 @@ mod tests {
     fn cwd_조회는_raw_제목을_키로_쓴다() {
         let catalog = load_catalog("ko-KR");
         let raw = "workspace.spawn.shell 3";
-        let panes = vec![(
-            raw.to_owned(),
-            "/Users/jr/Desktop/Projects/deppy-sijo".to_owned(),
-        )];
+        let panes = vec![storage::PersistedActivityPane {
+            workspace_id: "workspace".to_owned(),
+            pane_id: "pane".to_owned(),
+            title: raw.to_owned(),
+            cwd: "/Users/jr/Desktop/Projects/deppy-sijo".to_owned(),
+        }];
         // raw로 조회 → cwd 적중 → 프로젝트명 해석 가능
         assert_eq!(
             pane_cwd(&panes, raw),
@@ -21248,7 +22075,12 @@ mod tests {
             "렌더 값으로 조회가 적중하면 회귀"
         );
         // 빈 cwd는 없는 것으로 취급
-        let empty = vec![(raw.to_owned(), String::new())];
+        let empty = vec![storage::PersistedActivityPane {
+            workspace_id: "workspace".to_owned(),
+            pane_id: "pane".to_owned(),
+            title: raw.to_owned(),
+            cwd: String::new(),
+        }];
         assert_eq!(pane_cwd(&empty, raw), None);
     }
 
@@ -23682,5 +24514,459 @@ mod tests {
         };
         assert!(turn_done_clear_matches_workspace(&current, "workspace-a"));
         assert!(!turn_done_clear_matches_workspace(&stale, "workspace-a"));
+    }
+
+    fn restore_request(
+        workspace_id: &str,
+        pane: &str,
+        attachment_id: ui::cross_workspace::AttachmentId,
+    ) -> CrossWorkspaceRestoreRequest {
+        CrossWorkspaceRestoreRequest::new(
+            workspace_id,
+            runtime::MuxPaneId(pane.to_owned()),
+            attachment_id,
+        )
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_queue_has_one_in_flight() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let second = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", first)));
+        assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", second)));
+
+        let first_dispatch = coordinator.begin_next(11, now).unwrap();
+        assert_eq!(first_dispatch.request().workspace_id(), "workspace-b");
+        assert!(coordinator.begin_next(12, now).is_none());
+        assert_eq!(coordinator.pending_len(), 1);
+        assert_eq!(coordinator.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_queue_deduplicates_workspace_and_pane() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        assert!(!coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        assert_eq!(coordinator.pending_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_cancelled_inflight_blocks_next_until_mux_barrier() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned())));
+        assert!(coordinator.protects_runtime("workspace-b", 11));
+
+        let cancelled = coordinator.cancel_attachment(id).unwrap();
+
+        assert_eq!(cancelled.attachment_id(), id);
+        assert!(coordinator.protects_runtime("workspace-b", 11));
+        assert_eq!(coordinator.in_flight_len(), 1);
+        assert!(coordinator.begin_next(12, now).is_none());
+        assert!(
+            coordinator
+                .settle_mux_barrier(RestoreMuxBarrierFact::Missing {
+                    workspace_id: "workspace-b".to_owned(),
+                    runtime_instance: 11,
+                    pane: runtime::MuxPaneId("pane-b".to_owned()),
+                })
+                .is_some()
+        );
+        assert_eq!(coordinator.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_timeout_releases_all_bookkeeping() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+
+        let expired = coordinator.expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT);
+
+        assert_eq!(expired.unwrap().attachment_id(), id);
+        assert_eq!(coordinator.pending_len(), 0);
+        assert_eq!(coordinator.in_flight_len(), 0);
+        assert!(!coordinator.protects_runtime("workspace-b", 11));
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_queue_hard_cap_is_six() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        for index in 0..6 {
+            let workspace = format!("workspace-{index}");
+            let pane = format!("pane-{index}");
+            let id = panes
+                .append_restoring(
+                    "workspace-a",
+                    ui::cross_workspace::PersistedPaneRequest::new(
+                        workspace.clone(),
+                        runtime::MuxPaneId(pane.clone()),
+                    ),
+                    420.0,
+                    6,
+                )
+                .appended_id()
+                .unwrap();
+            assert!(coordinator.enqueue(restore_request(&workspace, &pane, id)));
+        }
+        assert_eq!(coordinator.total_len(), 6);
+        let seventh = restore_request("workspace-7", "pane-7", panes.attachments()[0].id());
+        assert!(!coordinator.enqueue(seventh));
+        assert_eq!(coordinator.total_len(), 6);
+    }
+
+    #[test]
+    fn cross_workspace_app_missing_pane_mux_barrier_settles_failure() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+
+        let outcome = coordinator.settle_mux_barrier(RestoreMuxBarrierFact::Missing {
+            workspace_id: "workspace-b".to_owned(),
+            runtime_instance: 11,
+            pane: runtime::MuxPaneId("pane-b".to_owned()),
+        });
+
+        assert!(matches!(outcome, Some(RestoreBarrierOutcome::Failed(_))));
+        assert_eq!(coordinator.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_timeout_rejects_late_completion() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        assert!(
+            coordinator
+                .expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT)
+                .is_some()
+        );
+
+        let late = coordinator.settle_mux_barrier(RestoreMuxBarrierFact::Restored {
+            workspace_id: "workspace-b".to_owned(),
+            runtime_instance: 11,
+            tab: runtime::MuxTabId("tab-b".to_owned()),
+            pane: runtime::MuxPaneId("pane-b".to_owned()),
+            session: runtime::SessionId(42),
+        });
+
+        assert!(late.is_none());
+    }
+
+    #[test]
+    fn cross_workspace_app_dotenv_failure_releases_placeholder_and_queue() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+
+        let failed = coordinator
+            .fail_before_command(11, &runtime::MuxPaneId("pane-b".to_owned()))
+            .unwrap();
+        let _ = panes.detach_attachment(failed.attachment_id());
+
+        assert!(panes.attachments().is_empty());
+        assert_eq!(coordinator.total_len(), 0);
+        assert!(!coordinator.protects_runtime("workspace-b", 11));
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_switch_and_shutdown_clear_all_restore_state() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+
+        let cancelled = coordinator.cancel_visible_requests();
+        for request in cancelled {
+            let _ = panes.detach_attachment(request.attachment_id());
+        }
+        assert!(panes.attachments().is_empty());
+        assert_eq!(coordinator.active_request_len(), 0);
+        assert_eq!(
+            coordinator.in_flight_len(),
+            1,
+            "cancelled tombstone blocks overlap"
+        );
+
+        coordinator.force_clear_for_shutdown();
+        assert_eq!(coordinator.total_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_same_workspace_requests_reuse_runtime() {
+        assert_eq!(
+            cold_restore_runtime_admission(Some(11), 6, 6),
+            ColdRestoreRuntimeAdmission::Reuse(11)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_capacity_denial_creates_no_hidden_runtime() {
+        assert_eq!(
+            cold_restore_runtime_admission(None, 2, 2),
+            ColdRestoreRuntimeAdmission::Denied
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_runtimes_still_count_toward_live_budget() {
+        assert_eq!(count_live_warm_runtimes([true, true, false]), 2);
+    }
+
+    #[test]
+    fn cross_workspace_app_exact_workspace_runtime_pane_session_only_promotes() {
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        assert_eq!(
+            restore_mux_barrier_fact(
+                "workspace-b",
+                11,
+                &runtime::MuxPaneId("pane-b".to_owned()),
+                &mux,
+            ),
+            RestoreMuxBarrierFact::Restored {
+                workspace_id: "workspace-b".to_owned(),
+                runtime_instance: 11,
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: runtime::SessionId(42),
+            }
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_cold_restore_never_stages_full_restore_or_agent_resume() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn drive_cross_workspace_restore")
+            .unwrap()
+            .1
+            .split_once("fn detach_cancelled_cross_workspace_restores")
+            .unwrap()
+            .0;
+        for forbidden in [
+            "switch_workspace(",
+            "stage_runtime_restore(",
+            "stage_agent_resume(",
+            "RuntimeCommand::RestoreWorkspace,",
+            "OpenAgentLauncher",
+        ] {
+            assert!(!body.contains(forbidden), "cold path contains {forbidden}");
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_workspace_pane_requires_dotenv() {
+        assert!(runtime_command_requires_dotenv(
+            &runtime::RuntimeCommand::RestoreWorkspacePane {
+                pane: runtime::MuxPaneId("pane-b".to_owned())
+            }
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_archived_agent_is_not_restarted_by_restore_dispatch() {
+        let command = cross_workspace_restore_command(runtime::MuxPaneId("pane-b".to_owned()));
+        assert!(matches!(
+            command,
+            runtime::RuntimeCommand::RestoreWorkspacePane { .. }
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_capacity_reduction_cancels_rightmost_pending() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let workspace_id = format!("workspace-{index}");
+            let pane_id = format!("pane-{index}");
+            let id = panes
+                .append_restoring(
+                    "workspace-a",
+                    ui::cross_workspace::PersistedPaneRequest::new(
+                        workspace_id.clone(),
+                        runtime::MuxPaneId(pane_id.clone()),
+                    ),
+                    420.0,
+                    6,
+                )
+                .appended_id()
+                .unwrap();
+            coordinator.enqueue(restore_request(&workspace_id, &pane_id, id));
+            ids.push(id);
+        }
+
+        let _detached = panes.enforce_capacity(1);
+        let retained = panes
+            .attachments()
+            .iter()
+            .map(ui::cross_workspace::AttachedPane::id)
+            .collect();
+        let cancelled = coordinator.retain_attachments(&retained);
+
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(coordinator.pending_len(), 1);
+        assert_eq!(coordinator.pending_attachment_ids(), vec![ids[0]]);
+    }
+
+    #[test]
+    fn cross_workspace_app_stale_exact_relation_mismatch_does_not_promote() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+
+        let stale = coordinator.settle_mux_barrier(RestoreMuxBarrierFact::Restored {
+            workspace_id: "workspace-b".to_owned(),
+            runtime_instance: 12,
+            tab: runtime::MuxTabId("tab-b".to_owned()),
+            pane: runtime::MuxPaneId("pane-b".to_owned()),
+            session: runtime::SessionId(42),
+        });
+
+        assert!(stale.is_none());
+        assert_eq!(coordinator.in_flight_len(), 1);
+        assert!(panes.attachments()[0].live_target().is_none());
     }
 }

@@ -274,6 +274,7 @@ workspace.new_shell = + New Session
 workspace.menu.scroll_bottom = Scroll to bottom
 workspace.menu.reveal_in_tree = Move file tree to this folder
 workspace.menu.open_in_current_view_right = Open on right in current view
+workspace.menu.open_beside = Open beside
 workspace.cross_pane.external_source = External pane · {workspace}
 workspace.cross_pane.detach = Detach
 workspace.cross_pane.suspended = {workspace} is suspended

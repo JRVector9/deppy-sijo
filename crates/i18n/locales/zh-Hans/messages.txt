@@ -274,6 +274,7 @@ workspace.new_shell = + 新建会话
 workspace.menu.scroll_bottom = 滚动到底部
 workspace.menu.reveal_in_tree = 将文件树移到此文件夹
 workspace.menu.open_in_current_view_right = 在当前视图右侧打开
+workspace.menu.open_beside = 在旁边打开
 workspace.cross_pane.external_source = 外部窗格 · {workspace}
 workspace.cross_pane.detach = 分离
 workspace.cross_pane.suspended = {workspace} 已暂停

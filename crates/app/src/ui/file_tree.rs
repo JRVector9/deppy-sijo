@@ -41,6 +41,171 @@ pub struct SessionEntry {
     pub status_line: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionRowTarget {
+    Live {
+        workspace_id: String,
+        runtime_instance: u64,
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+        session: runtime::SessionId,
+    },
+    PersistedPane {
+        workspace_id: String,
+        pane: runtime::MuxPaneId,
+    },
+}
+
+impl SessionRowTarget {
+    pub(crate) fn live(
+        workspace_id: impl Into<String>,
+        runtime_instance: u64,
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+        session: runtime::SessionId,
+    ) -> Self {
+        Self::Live {
+            workspace_id: workspace_id.into(),
+            runtime_instance,
+            tab,
+            pane,
+            session,
+        }
+    }
+
+    pub(crate) fn from_persisted(row: &storage::PersistedActivityPane) -> Self {
+        Self::PersistedPane {
+            workspace_id: row.workspace_id.clone(),
+            pane: runtime::MuxPaneId(row.pane_id.clone()),
+        }
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        match self {
+            Self::Live { workspace_id, .. } | Self::PersistedPane { workspace_id, .. } => {
+                workspace_id
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_instance(&self) -> Option<u64> {
+        match self {
+            Self::Live {
+                runtime_instance, ..
+            } => Some(*runtime_instance),
+            Self::PersistedPane { .. } => None,
+        }
+    }
+
+    pub(crate) fn pane(&self) -> &runtime::MuxPaneId {
+        match self {
+            Self::Live { pane, .. } | Self::PersistedPane { pane, .. } => pane,
+        }
+    }
+
+    pub(crate) fn session(&self) -> Option<runtime::SessionId> {
+        match self {
+            Self::Live { session, .. } => Some(*session),
+            Self::PersistedPane { .. } => None,
+        }
+    }
+
+    fn live_tab(&self) -> Option<&runtime::MuxTabId> {
+        match self {
+            Self::Live { tab, .. } => Some(tab),
+            Self::PersistedPane { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionRowDragPayload {
+    target: SessionRowTarget,
+}
+
+impl SessionRowDragPayload {
+    fn new(target: SessionRowTarget) -> Self {
+        Self { target }
+    }
+
+    pub(crate) fn target(&self) -> &SessionRowTarget {
+        &self.target
+    }
+}
+
+pub(crate) struct SidebarSessionRow {
+    pub target: SessionRowTarget,
+    pub title: String,
+    pub status: Option<runtime::SessionStatus>,
+    pub summary: String,
+    pub focused: bool,
+    pub attention: bool,
+    pub pulse: Option<(f32, egui::Color32)>,
+    pub agent_line: Option<String>,
+    pub status_label: Option<String>,
+    pub resumable: bool,
+    pub has_cwd: bool,
+    pub in_worktree: bool,
+    pub status_line: Option<String>,
+}
+
+impl SidebarSessionRow {
+    pub(crate) fn from_live(
+        workspace_id: impl Into<String>,
+        runtime_instance: u64,
+        entry: SessionEntry,
+    ) -> Self {
+        let workspace_id = workspace_id.into();
+        let target = match entry.session {
+            Some(session) => SessionRowTarget::live(
+                workspace_id,
+                runtime_instance,
+                entry.tab,
+                entry.pane,
+                session,
+            ),
+            None => SessionRowTarget::PersistedPane {
+                workspace_id,
+                pane: entry.pane,
+            },
+        };
+        Self {
+            target,
+            title: entry.title,
+            status: entry.status,
+            summary: entry.summary,
+            focused: entry.focused,
+            attention: entry.attention,
+            pulse: entry.pulse,
+            agent_line: entry.agent_line,
+            status_label: entry.status_label,
+            resumable: entry.resumable,
+            has_cwd: entry.has_cwd,
+            in_worktree: entry.in_worktree,
+            status_line: entry.status_line,
+        }
+    }
+
+    pub(crate) fn from_persisted(row: &storage::PersistedActivityPane, title: String) -> Self {
+        Self {
+            target: SessionRowTarget::from_persisted(row),
+            title,
+            status: None,
+            summary: row.cwd.clone(),
+            focused: false,
+            attention: false,
+            pulse: None,
+            agent_line: None,
+            status_label: None,
+            resumable: false,
+            has_cwd: !row.cwd.is_empty(),
+            in_worktree: false,
+            status_line: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarWorkspaceState {
     Active,
@@ -135,14 +300,8 @@ pub enum SidebarAction {
         tab: runtime::MuxTabId,
         pane: runtime::MuxPaneId,
     },
-    /// 비활성 warm 워크스페이스의 기존 pane을 현재 화면 오른쪽에 연결한다.
-    /// App이 워크스페이스 전환 없이 namespaced target을 해석한다.
-    OpenSessionInCurrentViewRight {
-        workspace_id: String,
-        tab: runtime::MuxTabId,
-        pane: runtime::MuxPaneId,
-        session: runtime::SessionId,
-    },
+    /// 비활성 workspace의 canonical pane을 현재 화면 오른쪽에 연결한다.
+    OpenSessionBeside(SessionRowTarget),
     /// 세션 이름 변경 — pane 제목을 갱신한다(더블클릭/메뉴 인라인 편집).
     RenameSession {
         pane: runtime::MuxPaneId,
@@ -1454,7 +1613,7 @@ impl FileTreeUi {
     pub fn panel(
         &mut self,
         ui: &mut egui::Ui,
-        sessions_by_workspace: &HashMap<String, Vec<SessionEntry>>,
+        sessions_by_workspace: &HashMap<String, Vec<SidebarSessionRow>>,
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
@@ -1544,7 +1703,7 @@ impl FileTreeUi {
     fn project_file_panel(
         &mut self,
         ui: &mut egui::Ui,
-        sessions_by_workspace: &HashMap<String, Vec<SessionEntry>>,
+        sessions_by_workspace: &HashMap<String, Vec<SidebarSessionRow>>,
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
@@ -1658,7 +1817,7 @@ impl FileTreeUi {
     fn contents(
         &mut self,
         ui: &mut egui::Ui,
-        sessions_by_workspace: &HashMap<String, Vec<SessionEntry>>,
+        sessions_by_workspace: &HashMap<String, Vec<SidebarSessionRow>>,
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
@@ -1864,7 +2023,7 @@ impl FileTreeUi {
                                                     ui.vertical(|ui| {
                                                         let editing = matches!(
                                                             &self.session_name_edit,
-                                                            Some((p, _)) if *p == entry.pane
+                                                            Some((p, _)) if p == entry.target.pane()
                                                         );
                                                         if editing {
                                                             // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
@@ -1940,7 +2099,7 @@ impl FileTreeUi {
                                                             // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
                                                             // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
                                                             // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
-                                                            if let Some(session) = entry.session {
+                                                            if let Some(session) = entry.target.session() {
                                                                 resp.context_menu(|ui| {
                                                                     if ui
                                                                         .button(catalog.t(
@@ -1951,7 +2110,7 @@ impl FileTreeUi {
                                                                     {
                                                                         self.session_name_edit =
                                                                             Some((
-                                                                                entry.pane.clone(),
+                                                                                entry.target.pane().clone(),
                                                                                 entry.title.clone(),
                                                                             ));
                                                                         ui.close();
@@ -2056,7 +2215,7 @@ impl FileTreeUi {
                                                             {
                                                                 action = Some(
                                                                     SidebarAction::ResumeAgent {
-                                                                        pane: entry.pane.clone(),
+                                                                        pane: entry.target.pane().clone(),
                                                                         session,
                                                                         title: entry.title.clone(),
                                                                     },
@@ -2073,7 +2232,7 @@ impl FileTreeUi {
                                                             {
                                                                 action = Some(
                                                                     SidebarAction::ClosePane {
-                                                                        pane: entry.pane.clone(),
+                                                                        pane: entry.target.pane().clone(),
                                                                     },
                                                                 );
                                                                 ui.close();
@@ -2082,19 +2241,20 @@ impl FileTreeUi {
                                                             }
                                                             if resp.double_clicked() {
                                                                 self.session_name_edit = Some((
-                                                                    entry.pane.clone(),
+                                                                    entry.target.pane().clone(),
                                                                     entry.title.clone(),
                                                                 ));
                                                             } else if resp.clicked()
                                                                 && !entry.focused
+                                                                && let Some(tab) = entry.target.live_tab()
                                                             {
                                                                 action = Some(
                                                                     SidebarAction::FocusSession {
                                                                         workspace_id: sidebar
                                                                             .active_workspace_id
                                                                             .to_owned(),
-                                                                        tab: entry.tab.clone(),
-                                                                        pane: entry.pane.clone(),
+                                                                        tab: tab.clone(),
+                                                                        pane: entry.target.pane().clone(),
                                                                     },
                                                                 );
                                                             }
@@ -4095,7 +4255,7 @@ fn inactive_workspace_sessions(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
     active_workspace_id: &str,
-    sessions: &[SessionEntry],
+    sessions: &[SidebarSessionRow],
     _max_height: f32,
     accent_color: egui::Color32,
     catalog: &i18n::Catalog,
@@ -4117,17 +4277,47 @@ fn inactive_workspace_sessions(
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
                     ui.vertical(|ui| {
-                        let response = session_row(ui, entry, is_last, accent_color);
+                        let response = draggable_session_row(ui, entry, is_last, accent_color);
                         session_rows_rect =
                             Some(session_rows_rect.map_or(response.rect, |rect: egui::Rect| {
                                 rect.union(response.rect)
                             }));
-                        if response.clicked() {
-                            action = Some(SidebarAction::FocusSession {
-                                workspace_id: workspace.id.clone(),
-                                tab: entry.tab.clone(),
-                                pane: entry.pane.clone(),
-                            });
+                        if response.drag_started() {
+                            response.dnd_set_drag_payload(SessionRowDragPayload::new(
+                                entry.target.clone(),
+                            ));
+                        }
+                        let drag_happened = response.drag_started()
+                            || response.dragged()
+                            || response.drag_stopped();
+                        if session_row_click_allowed(response.clicked(), drag_happened) {
+                            action = match &entry.target {
+                                SessionRowTarget::Live { tab, pane, .. } => {
+                                    Some(SidebarAction::FocusSession {
+                                        workspace_id: workspace.id.clone(),
+                                        tab: tab.clone(),
+                                        pane: pane.clone(),
+                                    })
+                                }
+                                SessionRowTarget::PersistedPane { .. } => {
+                                    Some(SidebarAction::SwitchWorkspace(workspace.id.clone()))
+                                }
+                            };
+                        }
+                        if response.hovered()
+                            && can_open_session_beside(active_workspace_id, &entry.target)
+                        {
+                            let button_rect = egui::Rect::from_center_size(
+                                egui::pos2(response.rect.right() - 14.0, response.rect.center().y),
+                                egui::vec2(22.0, 22.0),
+                            );
+                            if ui
+                                .put(button_rect, egui::Button::new("↗").frame(false))
+                                .on_hover_text(catalog.t("workspace.menu.open_beside", &[]))
+                                .clicked()
+                            {
+                                action = Some(open_beside_action(entry.target.clone()));
+                            }
                         }
                         response.context_menu(|ui| {
                             inactive_session_context_menu_items(
@@ -4150,37 +4340,58 @@ fn inactive_session_context_menu_items(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
     active_workspace_id: &str,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     catalog: &i18n::Catalog,
     action: &mut Option<SidebarAction>,
 ) {
-    if workspace.state != SidebarWorkspaceState::Warm || workspace.id == active_workspace_id {
+    if !can_open_session_beside(active_workspace_id, &entry.target) {
         return;
     }
-    let Some(session) = entry.session else {
-        return;
-    };
     if ui
-        .button(catalog.t("workspace.menu.open_in_current_view_right", &[]))
+        .button(catalog.t("workspace.menu.open_beside", &[]))
         .clicked()
     {
-        *action = Some(SidebarAction::OpenSessionInCurrentViewRight {
-            workspace_id: workspace.id.clone(),
-            tab: entry.tab.clone(),
-            pane: entry.pane.clone(),
-            session,
-        });
+        debug_assert_eq!(workspace.id, entry.target.workspace_id());
+        *action = Some(open_beside_action(entry.target.clone()));
         ui.close();
     }
 }
 
+fn open_beside_action(target: SessionRowTarget) -> SidebarAction {
+    SidebarAction::OpenSessionBeside(target)
+}
+
+fn can_open_session_beside(active_workspace_id: &str, target: &SessionRowTarget) -> bool {
+    target.workspace_id() != active_workspace_id
+}
+
+fn session_row_click_allowed(clicked: bool, dragged: bool) -> bool {
+    clicked && !dragged
+}
+
 fn session_row(
     ui: &mut egui::Ui,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     is_last: bool,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    session_row_impl(ui, entry, None, is_last, accent_color)
+    session_row_impl(ui, entry, None, is_last, accent_color, egui::Sense::click())
+}
+
+fn draggable_session_row(
+    ui: &mut egui::Ui,
+    entry: &SidebarSessionRow,
+    is_last: bool,
+    accent_color: egui::Color32,
+) -> egui::Response {
+    session_row_impl(
+        ui,
+        entry,
+        None,
+        is_last,
+        accent_color,
+        egui::Sense::click_and_drag(),
+    )
 }
 
 /// 이름 인라인 편집 중인 행 — 레일/보조 행(2·3행)은 그대로 유지하고 **제목 자리만**
@@ -4188,12 +4399,19 @@ fn session_row(
 /// (2026-07-16 사용자).
 fn session_row_editing(
     ui: &mut egui::Ui,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     buf: &mut String,
     is_last: bool,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    session_row_impl(ui, entry, Some(buf), is_last, accent_color)
+    session_row_impl(
+        ui,
+        entry,
+        Some(buf),
+        is_last,
+        accent_color,
+        egui::Sense::click(),
+    )
 }
 
 // 워크스페이스 헤더의 우측 인셋(workspace_row 내부 rect =
@@ -4242,7 +4460,7 @@ fn session_focus_fill_rect(rect: egui::Rect) -> egui::Rect {
 
 fn session_title_lines(
     ui: &egui::Ui,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     status_color: egui::Color32,
     separator_color: egui::Color32,
     max_width: f32,
@@ -4298,10 +4516,11 @@ fn session_title_lines(
 
 fn session_row_impl(
     ui: &mut egui::Ui,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     edit_buf: Option<&mut String>,
     is_last: bool,
     _accent_color: egui::Color32,
+    sense: egui::Sense,
 ) -> egui::Response {
     // 에이전트면 3줄(제목/에이전트·모델·effort/상태·ctx%), 아니면 2줄(제목/요약).
     // 요약이 없어도(유휴/시작 직후) 2행에 '~'를 표시해 행 높이를 유지한다(2026-07-07).
@@ -4326,10 +4545,7 @@ fn session_row_impl(
     } else {
         36.0
     };
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), row_h),
-        egui::Sense::click(),
-    );
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), sense);
     // 제목은 painter galley로 그리므로 별도 접근성 라벨이 없으면 키보드/스크린리더와
     // kittest가 세션 행을 식별할 수 없다. 클릭 행 자체를 제목이 있는 버튼으로 노출한다.
     resp.widget_info(|| {
@@ -5095,7 +5311,7 @@ pub(crate) fn session_status_color(
 
 /// 세션 행의 상태 점 색 — 에이전트 감지 여부까지 반영한다(from_pty_with_agent).
 /// fleet 카드와 같은 규칙을 써야 같은 세션이 두 표면에서 다른 색으로 보이지 않는다.
-pub(crate) fn session_entry_status_color(entry: &SessionEntry) -> egui::Color32 {
+pub(crate) fn session_entry_status_color(entry: &SidebarSessionRow) -> egui::Color32 {
     let state = crate::agent_surface::AgentVisualState::from_pty_with_agent(
         entry.status,
         entry.agent_line.is_some(),
@@ -7336,22 +7552,28 @@ mod tests {
                 summary: SidebarSessionSummary::default(),
             })
             .collect();
-        let make_session = |n: usize, agent: bool| SessionEntry {
-            tab: runtime::MuxTabId(format!("t{n}")),
-            pane: runtime::MuxPaneId(format!("p{n}")),
-            session: Some(runtime::SessionId(n as u64)),
-            title: format!("세션 {n}"),
-            status: agent.then_some(runtime::SessionStatus::Running),
-            summary: "요약".to_owned(),
-            focused: n == 0,
-            attention: false,
-            pulse: None,
-            agent_line: agent.then(|| "Codex · gpt-5.5 · high".to_owned()),
-            status_label: agent.then(|| "실행 중".to_owned()),
-            resumable: agent,
-            has_cwd: true,
-            in_worktree: false,
-            status_line: agent.then(|| "PR #124 코드 리뷰".to_owned()),
+        let make_session = |n: usize, agent: bool| {
+            SidebarSessionRow::from_live(
+                "ws-2",
+                2,
+                SessionEntry {
+                    tab: runtime::MuxTabId(format!("t{n}")),
+                    pane: runtime::MuxPaneId(format!("p{n}")),
+                    session: Some(runtime::SessionId(n as u64)),
+                    title: format!("세션 {n}"),
+                    status: agent.then_some(runtime::SessionStatus::Running),
+                    summary: "요약".to_owned(),
+                    focused: n == 0,
+                    attention: false,
+                    pulse: None,
+                    agent_line: agent.then(|| "Codex · gpt-5.5 · high".to_owned()),
+                    status_label: agent.then(|| "실행 중".to_owned()),
+                    resumable: agent,
+                    has_cwd: true,
+                    in_worktree: false,
+                    status_line: agent.then(|| "PR #124 코드 리뷰".to_owned()),
+                },
+            )
         };
         let sessions = std::collections::HashMap::from([(
             "ws-2".to_owned(),
@@ -7495,22 +7717,28 @@ mod tests {
                 summary: SidebarSessionSummary::default(),
             },
         ];
-        let session = |workspace: &str, title: &str| SessionEntry {
-            tab: runtime::MuxTabId(format!("tab-{workspace}")),
-            pane: runtime::MuxPaneId(format!("pane-{workspace}")),
-            session: Some(runtime::SessionId(1)),
-            title: title.to_owned(),
-            status: None,
-            summary: String::new(),
-            focused: false,
-            attention: false,
-            pulse: None,
-            agent_line: None,
-            status_label: None,
-            resumable: false,
-            has_cwd: false,
-            in_worktree: false,
-            status_line: None,
+        let session = |workspace: &str, title: &str| {
+            SidebarSessionRow::from_live(
+                format!("workspace-{workspace}"),
+                2,
+                SessionEntry {
+                    tab: runtime::MuxTabId(format!("tab-{workspace}")),
+                    pane: runtime::MuxPaneId(format!("pane-{workspace}")),
+                    session: Some(runtime::SessionId(1)),
+                    title: title.to_owned(),
+                    status: None,
+                    summary: String::new(),
+                    focused: false,
+                    attention: false,
+                    pulse: None,
+                    agent_line: None,
+                    status_label: None,
+                    resumable: false,
+                    has_cwd: false,
+                    in_worktree: false,
+                    status_line: None,
+                },
+            )
         };
         let sessions = std::collections::HashMap::from([
             ("workspace-a".to_owned(), vec![session("a", "Session A")]),
@@ -7975,23 +8203,27 @@ mod tests {
             state: SidebarWorkspaceState::Warm,
             summary: SidebarSessionSummary::default(),
         };
-        let entry = SessionEntry {
-            tab: runtime::MuxTabId("tab-b".to_owned()),
-            pane: runtime::MuxPaneId("pane-b".to_owned()),
-            session: Some(runtime::SessionId(42)),
-            title: "Session B".to_owned(),
-            status: None,
-            summary: String::new(),
-            focused: false,
-            attention: false,
-            pulse: None,
-            agent_line: None,
-            status_label: None,
-            resumable: false,
-            has_cwd: false,
-            in_worktree: false,
-            status_line: None,
-        };
+        let entry = SidebarSessionRow::from_live(
+            "workspace-b",
+            7,
+            SessionEntry {
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: Some(runtime::SessionId(42)),
+                title: "Session B".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: false,
+                in_worktree: false,
+                status_line: None,
+            },
+        );
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, action: &mut Option<SidebarAction>| {
                 inactive_session_context_menu_items(
@@ -8007,19 +8239,19 @@ mod tests {
         );
 
         harness.run();
-        harness
-            .get_by_label("Open on right in current view")
-            .click();
+        harness.get_by_label("Open beside").click();
         harness.run();
 
         match harness.state() {
-            Some(SidebarAction::OpenSessionInCurrentViewRight {
+            Some(SidebarAction::OpenSessionBeside(SessionRowTarget::Live {
                 workspace_id,
+                runtime_instance,
                 tab,
                 pane,
                 session,
-            }) => {
+            })) => {
                 assert_eq!(workspace_id, "workspace-b");
+                assert_eq!(*runtime_instance, 7);
                 assert_eq!(tab.0, "tab-b");
                 assert_eq!(pane.0, "pane-b");
                 assert_eq!(*session, runtime::SessionId(42));
@@ -8029,39 +8261,40 @@ mod tests {
     }
 
     #[test]
-    fn kittest_활성_idle_또는_target없는_warm_세션에는_오른쪽열기_메뉴가_없다() {
+    fn kittest_활성_workspace_세션에는_옆에열기_메뉴가_없다() {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        for (state, workspace_id, active_workspace_id) in [
-            (SidebarWorkspaceState::Active, "workspace-a", "workspace-a"),
-            (SidebarWorkspaceState::Warm, "workspace-a", "workspace-a"),
-            (SidebarWorkspaceState::Idle, "workspace-b", "workspace-a"),
-            (SidebarWorkspaceState::Warm, "workspace-b", "workspace-a"),
-        ] {
+        for state in [SidebarWorkspaceState::Active, SidebarWorkspaceState::Warm] {
+            let workspace_id = "workspace-a";
+            let active_workspace_id = "workspace-a";
             let workspace = SidebarWorkspaceEntry {
                 id: workspace_id.to_owned(),
                 name: workspace_id.to_owned(),
                 state,
                 summary: SidebarSessionSummary::default(),
             };
-            let entry = SessionEntry {
-                tab: runtime::MuxTabId("tab".to_owned()),
-                pane: runtime::MuxPaneId("pane".to_owned()),
-                session: None,
-                title: "Session".to_owned(),
-                status: None,
-                summary: String::new(),
-                focused: false,
-                attention: false,
-                pulse: None,
-                agent_line: None,
-                status_label: None,
-                resumable: false,
-                has_cwd: false,
-                in_worktree: false,
-                status_line: None,
-            };
+            let entry = SidebarSessionRow::from_live(
+                workspace_id,
+                7,
+                SessionEntry {
+                    tab: runtime::MuxTabId("tab".to_owned()),
+                    pane: runtime::MuxPaneId("pane".to_owned()),
+                    session: Some(runtime::SessionId(1)),
+                    title: "Session".to_owned(),
+                    status: None,
+                    summary: String::new(),
+                    focused: false,
+                    attention: false,
+                    pulse: None,
+                    agent_line: None,
+                    status_label: None,
+                    resumable: false,
+                    has_cwd: false,
+                    in_worktree: false,
+                    status_line: None,
+                },
+            );
             let mut harness = egui_kittest::Harness::new_ui_state(
                 |ui, action: &mut Option<SidebarAction>| {
                     inactive_session_context_menu_items(
@@ -8078,9 +8311,7 @@ mod tests {
 
             harness.run();
             assert!(
-                harness
-                    .query_by_label("Open on right in current view")
-                    .is_none(),
+                harness.query_by_label("Open beside").is_none(),
                 "state={state:?}, workspace={workspace_id}, active={active_workspace_id}"
             );
             assert!(harness.state().is_none());
@@ -8600,5 +8831,134 @@ mod tests {
             harness.state().0.error
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn typed_persisted_row_carries_exact_pane_id_into_session_target() {
+        let row = storage::PersistedActivityPane {
+            workspace_id: "workspace-b".to_owned(),
+            pane_id: "pane-exact".to_owned(),
+            title: "Saved shell".to_owned(),
+            cwd: "/private/project-b".to_owned(),
+        };
+
+        let target = SessionRowTarget::from_persisted(&row);
+
+        assert_eq!(
+            target,
+            SessionRowTarget::PersistedPane {
+                workspace_id: "workspace-b".to_owned(),
+                pane: runtime::MuxPaneId("pane-exact".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn live_session_target_keeps_all_exact_identifiers() {
+        let target = SessionRowTarget::live(
+            "workspace-b",
+            41,
+            runtime::MuxTabId("tab-b".to_owned()),
+            runtime::MuxPaneId("pane-b".to_owned()),
+            runtime::SessionId(42),
+        );
+
+        assert_eq!(target.workspace_id(), "workspace-b");
+        assert_eq!(target.runtime_instance(), Some(41));
+        assert_eq!(target.pane().0, "pane-b");
+        assert_eq!(target.session(), Some(runtime::SessionId(42)));
+    }
+
+    #[test]
+    fn warm_unmaterialized_pane_keeps_exact_persisted_target() {
+        let row = SidebarSessionRow::from_live(
+            "workspace-b",
+            41,
+            SessionEntry {
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-cold".to_owned()),
+                session: None,
+                title: "Saved shell".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: true,
+                in_worktree: false,
+                status_line: None,
+            },
+        );
+
+        assert_eq!(
+            &row.target,
+            &SessionRowTarget::PersistedPane {
+                workspace_id: "workspace-b".to_owned(),
+                pane: runtime::MuxPaneId("pane-cold".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn session_drag_payload_debug_excludes_presentation_and_terminal_data() {
+        let row = storage::PersistedActivityPane {
+            workspace_id: "workspace-safe".to_owned(),
+            pane_id: "pane-safe".to_owned(),
+            title: "SECRET_TITLE".to_owned(),
+            cwd: "/SECRET/CWD".to_owned(),
+        };
+        let payload = SessionRowDragPayload::new(SessionRowTarget::from_persisted(&row));
+        let debug = format!("{payload:?}");
+
+        assert!(debug.contains("workspace-safe"));
+        assert!(debug.contains("pane-safe"));
+        assert!(!debug.contains("SECRET_TITLE"));
+        assert!(!debug.contains("SECRET/CWD"));
+        assert!(!debug.to_ascii_lowercase().contains("scrollback"));
+    }
+
+    #[test]
+    fn hover_and_context_open_beside_emit_identical_action() {
+        let target = SessionRowTarget::PersistedPane {
+            workspace_id: "workspace-b".to_owned(),
+            pane: runtime::MuxPaneId("pane-b".to_owned()),
+        };
+
+        let hover = open_beside_action(target.clone());
+        let context = open_beside_action(target);
+        assert!(matches!(
+            (hover, context),
+            (
+                SidebarAction::OpenSessionBeside(left),
+                SidebarAction::OpenSessionBeside(right)
+            ) if left == right
+        ));
+    }
+
+    #[test]
+    fn session_row_drag_suppresses_ordinary_click_activation() {
+        assert!(session_row_click_allowed(true, false));
+        assert!(!session_row_click_allowed(true, true));
+    }
+
+    #[test]
+    fn unrelated_dnd_payload_does_not_suppress_session_row_click() {
+        let unrelated_file_payload_is_active = true;
+        assert!(unrelated_file_payload_is_active);
+        assert!(session_row_click_allowed(true, false));
+    }
+
+    #[test]
+    fn active_workspace_target_is_denied_for_cross_workspace_attach() {
+        let target = SessionRowTarget::PersistedPane {
+            workspace_id: "workspace-a".to_owned(),
+            pane: runtime::MuxPaneId("pane-a".to_owned()),
+        };
+
+        assert!(!can_open_session_beside("workspace-a", &target));
+        assert!(can_open_session_beside("workspace-b", &target));
     }
 }

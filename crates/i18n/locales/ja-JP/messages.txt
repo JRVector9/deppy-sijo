@@ -274,6 +274,7 @@ workspace.new_shell = + 新規セッション
 workspace.menu.scroll_bottom = 最下部へスクロール
 workspace.menu.reveal_in_tree = ファイルツリーをこのフォルダへ移動
 workspace.menu.open_in_current_view_right = 現在のビューの右側に開く
+workspace.menu.open_beside = 横に開く
 workspace.cross_pane.external_source = 外部ペイン · {workspace}
 workspace.cross_pane.detach = 切り離す
 workspace.cross_pane.suspended = {workspace} は一時停止中です

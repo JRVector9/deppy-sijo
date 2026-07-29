@@ -274,6 +274,7 @@ workspace.new_shell = + 新增工作階段
 workspace.menu.scroll_bottom = 捲動到底部
 workspace.menu.reveal_in_tree = 將檔案樹移到此資料夾
 workspace.menu.open_in_current_view_right = 在目前檢視右側開啟
+workspace.menu.open_beside = 在旁邊開啟
 workspace.cross_pane.external_source = 外部窗格 · {workspace}
 workspace.cross_pane.detach = 分離
 workspace.cross_pane.suspended = {workspace} 已暫停

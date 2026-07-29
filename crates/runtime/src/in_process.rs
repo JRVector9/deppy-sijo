@@ -703,7 +703,7 @@ struct Worker {
     persist: Option<crate::persistence::PersistPipe>,
     persist_db_path: Option<PathBuf>,
     /// 첫 targeted restore가 설치한 bounded pane catalog. worker 명령 직렬화로 한 번에
-    /// 하나만 materialize하며, 비어지거나 full restore가 끝나면 즉시 drop한다.
+    /// 하나만 materialize하며, 성공한 항목은 제거하고 실패한 항목은 재시도를 위해 남긴다.
     lazy_restore: Option<LazyWorkspaceRestore>,
     /// backend를 유지 중인 exited 세션들 (종료 순서 — 오래된 것이 앞). §14.3 cap.
     exited_order: std::collections::VecDeque<SessionId>,
@@ -2332,7 +2332,8 @@ impl Worker {
     }
 
     /// 이전 실행이 저장한 mux layout을 완전히 복원한다. targeted restore가 먼저
-    /// 진행됐으면 남은 catalog만 worker에서 순서대로 materialize하고 즉시 drop한다.
+    /// 진행됐으면 남은 catalog만 worker에서 순서대로 materialize하고, 실패한 항목은
+    /// 원래 영속 session association을 유지한 채 다음 복원 시도를 위해 보존한다.
     fn restore_saved_layout(&mut self) {
         if self.lazy_restore.is_none() && !self.prepare_saved_layout_skeleton() {
             return;
@@ -2342,10 +2343,19 @@ impl Worker {
             .take()
             .map(|restore| restore.pending_panes)
             .unwrap_or_default();
-        let restored_sessions = pending_panes
-            .iter()
-            .filter_map(|pane| self.restore_pane(pane))
-            .collect::<Vec<_>>();
+        let mut restored_sessions = Vec::new();
+        let mut failed_panes = Vec::new();
+        for pane in pending_panes {
+            match self.restore_pane(&pane) {
+                Some(session) => restored_sessions.push(session),
+                None => failed_panes.push(pane),
+            }
+        }
+        if !failed_panes.is_empty() {
+            self.lazy_restore = Some(LazyWorkspaceRestore {
+                pending_panes: failed_panes,
+            });
+        }
         self.mux.fix_focus();
         self.emit_mux_and_watched();
         for session in restored_sessions {
@@ -5025,6 +5035,92 @@ mod tests {
     #[test]
     fn restore_workspace_pane_pending_tab_close_survives_restart() {
         assert_lazy_restore_close_survives_restart(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_full_failure_preserves_remaining_association_for_restart() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-full-failure-restart");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-full-failure-restart";
+        create_persist_db(&db_path, workspace_id);
+        let (agent_pane, shell_pane) =
+            seed_persisted_two_pane_window(&db_path, workspace_id, "agent");
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "lazy-restore-full-failure-restart",
+        );
+        worker.shell = spec("/definitely/missing/deppy-shell", &[]);
+        worker.persist = Some(
+            crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            })
+            .unwrap(),
+        );
+        worker.persist_db_path = Some(db_path.clone());
+
+        worker.handle_command(RuntimeCommand::RestoreWorkspacePane { pane: agent_pane });
+        worker.handle_command(RuntimeCommand::RestoreWorkspace);
+        assert_eq!(worker.sessions.len(), 1, "remaining shell spawn must fail");
+        drop(worker);
+
+        let association: Option<String> = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT session_id FROM mux_panes WHERE id = ?1",
+                [&shell_pane.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(association.as_deref(), Some("restore-pane-second"));
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs-restart"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let snapshot = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id == shell_pane && pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert!(snapshot.tabs.iter().flat_map(|tab| &tab.panes).any(|pane| {
+            pane.id == shell_pane
+                && pane.persistent_session_id.as_deref() == Some("restore-pane-second")
+        }));
+        drop(client);
+
+        let session_count: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            session_count, 2,
+            "retry must not duplicate persisted sessions"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(unix)]

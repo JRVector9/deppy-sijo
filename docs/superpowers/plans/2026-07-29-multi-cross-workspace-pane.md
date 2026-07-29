@@ -12,12 +12,23 @@
 
 ## File Ownership and Merge Order
 
+### Execution adjustment after wave-one contracts
+
+The typed persisted row is produced in App-owned background projection code,
+while the current sidebar receives only live `SessionEntry` values. A standalone
+MWP05 change would either break the App's exhaustive action match or fabricate
+live IDs for cold rows. To preserve TDD and exact identities, Task 5 is merged
+into the serial Task 7 owner: that worker exclusively owns `app.rs`,
+`file_tree.rs`, and the new entry-action locale keys. Task 6 remains an
+independent renderer worktree and runs in parallel with the final MWP04 review.
+No production requirement is removed; this is an ownership/merge-order change.
+
 1. `MWP01 state`: `crates/app/src/ui/cross_workspace.rs` only.
 2. `MWP02 config`: `crates/app/src/config.rs`, `crates/app/src/ui/settings.rs`, and five `crates/i18n/locales/*/messages.txt` files.
 3. `MWP03 storage`: `crates/storage/src/db.rs` only.
 4. `MWP04 runtime`: `crates/runtime/src/command.rs`, `crates/runtime/src/in_process.rs`, `crates/persist/src/repo.rs`.
-5. After MWP01–04 merge, run `MWP05 sidebar` and `MWP06 renderer` in parallel.
-6. `MWP07 coordinator`: `crates/app/src/app.rs` only, after all contracts merge.
+5. After MWP01/config merge, run `MWP06 renderer`; retain reviewed storage/runtime commits out of the UI base until their App consumer is ready.
+6. `MWP05+MWP07 coordinator`: `crates/app/src/app.rs`, `crates/app/src/ui/file_tree.rs`, and entry-action locale keys, after storage/runtime/renderer contracts merge.
 7. `MWP08 integration`: docs, resource evidence, direct Codex reviews, final gates.
 
 No two simultaneous workers may edit the same file. Each worker uses an
@@ -539,4 +550,3 @@ and real results in the summary and handoff.
 git add docs/CODEX_HANDOFF.md docs/mockups/cross-workspace-pane-entry-scenarios.html docs/build/PR-MWP-summary.md
 git commit -m "docs: record multi-pane delivery evidence"
 ```
-

@@ -3,11 +3,11 @@
 ## Current task
 
 - Extend the reviewed one-pane MVP on `DesignALL` into a bounded horizontal multi-pane strip: live and persisted canonical rows support drag, hover `Open beside`, and the retained context-menu action; foreign headers reorder; the maximum is configurable from 1 to 6 with default 2.
-- Status: architecture audit and executable TDD plan are complete. No production Rust file has changed in this extension yet. Implementation must preserve exact source ownership, use one global cold materialization in flight, skip offscreen paint, count attached runtimes in live capacity, and release protection after the last detach.
+- Status: state and config are integrated; storage, runtime, and renderer lanes are implemented and independently reviewed. The renderer's final review exposed two stale native-input cases, and the orchestrator has completed RED→GREEN fixes plus focused gates in its isolated worktree. Final direct renderer rereview is active before integration.
 
 ## Working area
 
-- Current branch/worktree: `DesignALL` in `/private/tmp/deppy-sf06-integration` at `d65ddcf`. `origin/DesignALL` contains the complete one-pane MVP. The untracked UX mockup predates the new contract and still needs its excluded picker/palette scenarios removed.
+- Current branch/worktree: `DesignALL` in `/private/tmp/deppy-sf06-integration` at `683489d`, ahead of `origin/DesignALL` by eight commits and clean before this handoff edit. The signed running PID `59638` still uses the pre-extension binary and must not be treated as multi-pane evidence.
 - Confirmed safeguards: PTY output/input queues, runtime command/event queues, terminal scrollback/cache classes, persisted restore size, remote frames, log bytes, exited backends, and shutdown joins are bounded; no Arc cycle or unbounded terminal scrollback leak was found statically.
 - Confirmed gaps after second-pass review: warm/hidden replay retains some lifecycle events without a hard cap; web-push session jobs are admitted without a cap before slow HTTP delivery; archived-row rebinding mutates persistence before archive validation completes; exported `RemoteRuntimeClient` has no bounded TCP connect deadline or missed-heartbeat deadline; the process-global Git label cache never evicts unique paths; session log/archive GC scans have depth/byte but no entry-count budget.
 - Rejected prior finding: valid persisted cwd is restored. `persist::load_workspace_restore_bounded` joins `sessions.cwd` into `PaneState.cwd` before `restore_pane`; the stability wave adds regression evidence only and does not change cwd production behavior unless that exact test fails.
@@ -15,13 +15,16 @@
 
 ## Plan
 
-1. In progress — freeze and commit the multi-pane design, TDD plan, resource contracts, and file ownership.
-2. Pending — run MWP01 state, MWP02 config, MWP03 storage, and MWP04 runtime in isolated parallel worktrees.
-3. Pending — merge frozen contracts, then run MWP05 sidebar and MWP06 renderer in parallel.
-4. Pending — run serial MWP07 App coordinator integration.
-5. Pending — perform direct Codex reviews, correction loops, focused/full gates, resource measurements, signed rebuild, docs, and push when requested.
+1. Completed — freeze the design, TDD/resource contracts, and ownership map.
+2. Completed — implement and review state, config, storage, and runtime lanes.
+3. In progress — close the renderer rereview and integrate reviewed lower layers.
+4. Pending — run serial App+sidebar restore coordinator implementation.
+5. Pending — run serial App layout/focus/visibility integration.
+6. Pending — perform direct reviews, full/resource gates, signed rebuild, docs, and push when requested.
 
 ## Multi-pane design status
+
+- 2026-07-29: MWP06 renderer final direct review of `b194b71..ca03d0a` found two accepted stale-input risks: a prepared owner rendered only against a mismatched pane could survive into a later render pass, and an exact pane without a viewport snapshot took ownership before returning the unavailable placeholder. The orchestrator continued directly after the worker's two correction rounds were exhausted. RED evidence: `snapshot없는_attached_input_owner는_drain된_native_batch와_owner를_폐기한다` failed on a retained owner; the render-pass fence test first failed to compile because the pass-aware API did not exist. GREEN commit `bbe138d` records the egui cumulative pass with the exact owner, preserves an owner across mismatched renders only within that pass, discards it and the bounded native printable/copy/paste batch in a later pass, and rejects ownership before rendering when neither a current snapshot nor an eligible pending snapshot exists. One first full workspace-test run correctly exposed an existing no-owner contract regression; the fence was narrowed so ownerless primary/local prepared input is not cleared. Final actual gates: 104/104 WorkspaceUi tests passed, `cargo check -p deppy-sijo --bin deppy-sijo --locked` passed with only expected integration-before-use dead-code warnings, `cargo fmt --all -- --check` passed, and `git diff --check` passed. Direct rereview output is `/tmp/mwp06-direct-final2-review.txt` and is still active. Exact next commands: inspect its conclusion; if clean, cherry-pick storage `f308d59`, runtime `b6f0ee1 f066e2f 36bbcad`, and renderer `35e5fd3 3b54fc0 ca03d0a bbe138d` into this worktree in that order, then create the serial App+sidebar coordinator worktree.
 
 - 2026-07-29: MWP04 runtime is finally frozen at `36bbcad` after the permitted second correction. The second RED proved a failed remaining full materialization changed the persisted association from `Some("restore-pane-second")` to `None`; the fix reinserts only failed `PaneState` records into the bounded lazy catalog. The worker reported ten lazy restore tests, four full-restore regressions, runtime check, strict Clippy, fmt, and diff-check passing. Root final direct review `/tmp/mwp04-direct-final-review.txt` ended `CONCLUSION: OK` using 205,576 tokens, confirming failure retry preservation, no duplicates, merged delete behavior, archived-agent safety, bounded memory, and no polling/thread/timer. MWP06 renderer committed `35e5fd3`; worker and root each ran the 123 WorkspaceUi/state-focused tests successfully, and root diff-check passed. Its direct review `/tmp/mwp06-direct-review.txt` is active. Renderer changed only `workspace.rs` and preserves the one-pane wrapper while adding prepare-once/render-many, visible-target retention, pure prepared render, offscreen filtering, and `AttachmentId` reorder output. Remaining work: close renderer review/corrections, integrate storage/runtime/renderer in order, then start the serial App+sidebar coordinator with the mandatory dotenv gate.
 

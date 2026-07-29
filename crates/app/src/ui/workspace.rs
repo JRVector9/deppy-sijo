@@ -810,6 +810,7 @@ pub struct WorkspaceUi {
     /// 원본 key-down. 선택과 터미널 입력 소유권이 모두 확인된 경우에만 복사한다.
     native_clipboard_copy_requested: bool,
     prepared_attached_input_owner: Option<AttachedPaneTarget>,
+    prepared_attached_input_pass: Option<u64>,
     prepared_attached_input_consumed: bool,
     /// 파일 트리가 이번 프레임 ⌘V/⌘C를 소비 — 같은 제스처의 터미널 붙여넣기/선택 복사
     /// 이중 처리를 누른다(App이 사이드바 렌더 직후 설정, prepare_frame이 프레임
@@ -1240,6 +1241,7 @@ impl WorkspaceUi {
             native_clipboard_paste_requested: false,
             native_clipboard_copy_requested: false,
             prepared_attached_input_owner: None,
+            prepared_attached_input_pass: None,
             prepared_attached_input_consumed: false,
             suppress_paste_request: false,
             suppress_copy_request: false,
@@ -2408,7 +2410,7 @@ impl WorkspaceUi {
     ) {
         self.frame_counters = renderer_egui::RenderCounters::default();
         self.terminal_focus_claimed = false;
-        self.set_prepared_attached_input_owner(attached_input_owner);
+        self.set_prepared_attached_input_owner(attached_input_owner, ctx.cumulative_pass_nr());
         // AppKit local monitor는 winit/egui가 IME 처리 중 숨길 수 있는 원본 key-down을
         // 보존한다. 매 프레임 먼저 비워 두어 검색창/설정창에서 친 키가 나중에 터미널로
         // 이월되지 않게 하고, 실제 전송은 terminal_keyboard_active pane만 수행한다.
@@ -2489,22 +2491,32 @@ impl WorkspaceUi {
         );
     }
 
-    fn set_prepared_attached_input_owner(&mut self, owner: Option<&AttachedPaneTarget>) {
+    fn set_prepared_attached_input_owner(&mut self, owner: Option<&AttachedPaneTarget>, pass: u64) {
         self.prepared_attached_input_consumed = false;
         match (self.prepared_attached_input_owner.as_mut(), owner) {
             (Some(current), Some(owner)) => current.clone_from(owner),
             (None, Some(owner)) => self.prepared_attached_input_owner = Some(owner.clone()),
             (_, None) => self.prepared_attached_input_owner = None,
         }
+        self.prepared_attached_input_pass = owner.map(|_| pass);
     }
 
-    fn take_prepared_attached_input(&mut self, target: &AttachedPaneTarget) -> bool {
+    fn take_prepared_attached_input(&mut self, target: &AttachedPaneTarget, pass: u64) -> bool {
+        if self.prepared_attached_input_owner.is_none() {
+            return false;
+        }
+        if self.prepared_attached_input_pass != Some(pass) {
+            self.discard_prepared_attached_input();
+            return false;
+        }
         if self.prepared_attached_input_consumed
             || self.prepared_attached_input_owner.as_ref() != Some(target)
         {
             return false;
         }
         self.prepared_attached_input_consumed = true;
+        self.prepared_attached_input_owner = None;
+        self.prepared_attached_input_pass = None;
         true
     }
 
@@ -2512,7 +2524,12 @@ impl WorkspaceUi {
         if self.prepared_attached_input_owner.as_ref() != Some(target) {
             return;
         }
+        self.discard_prepared_attached_input();
+    }
+
+    fn discard_prepared_attached_input(&mut self) {
         self.prepared_attached_input_owner = None;
+        self.prepared_attached_input_pass = None;
         self.prepared_attached_input_consumed = false;
         self.native_printable_key_downs.clear();
         self.native_clipboard_paste_requested = false;
@@ -2858,9 +2875,17 @@ impl WorkspaceUi {
         let pane = mux
             .as_deref()
             .and_then(|snapshot| find_attached_pane(snapshot, target));
-        let input_enabled = if availability == AttachedPaneAvailability::Available && pane.is_some()
+        let target_selected = self
+            .selection
+            .is_some_and(|(session, _, _)| session == target.session);
+        let target_has_snapshot = self.sessions.get(&target.session).is_some_and(|view| {
+            view.snapshot.is_some() || (!target_selected && view.pending_snapshot.is_some())
+        });
+        let input_enabled = if availability == AttachedPaneAvailability::Available
+            && pane.is_some()
+            && target_has_snapshot
         {
-            self.take_prepared_attached_input(target)
+            self.take_prepared_attached_input(target, ui.ctx().cumulative_pass_nr())
         } else {
             self.discard_prepared_attached_input_for(target);
             false
@@ -6509,6 +6534,70 @@ mod tests {
     }
 
     #[test]
+    fn snapshot없는_attached_input_owner는_drain된_native_batch와_owner를_폐기한다() {
+        let catalog = catalog();
+        let context = egui::Context::default();
+        let config = TerminalConfig::default();
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("pane"),
+            session: SessionId(7),
+        };
+        let mut workspace = WorkspaceUi::new();
+        workspace.prepare_attached_panes_with_native_input(
+            &context,
+            &[],
+            &catalog,
+            std::slice::from_ref(&target),
+            Some(&target),
+            || crate::native_key_monitor::NativeKeyDownBatch {
+                printable: vec![crate::native_key_monitor::NativePrintableKeyDown::for_test(
+                    '.',
+                )],
+                clipboard_paste: true,
+                clipboard_copy: true,
+            },
+        );
+        workspace.mux = Some(mux(
+            "foreign",
+            vec![tab(
+                "foreign",
+                vec![pane("pane", SessionId(7))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_prepared_attached_pane(
+                    ui,
+                    &config,
+                    &catalog,
+                    &target,
+                    "Other",
+                    AttachedPaneAvailability::Available,
+                    None,
+                );
+            },
+            workspace,
+        );
+
+        harness.run();
+
+        assert!(harness.state().prepared_attached_input_owner.is_none());
+        assert!(harness.state().native_printable_key_downs.is_empty());
+        assert!(!harness.state().native_clipboard_paste_requested);
+        assert!(!harness.state().native_clipboard_copy_requested);
+        assert!(harness.state_mut().take_io_intent().is_none());
+        assert!(
+            drain_protocol(harness.state_mut())
+                .into_iter()
+                .all(|command| { !matches!(command, RuntimeCommand::WriteInput { .. }) })
+        );
+    }
+
+    #[test]
     fn prepared_attached_render는_frame_state와_native_input을_reset하지_않는다() {
         let catalog = catalog();
         let config = TerminalConfig::default();
@@ -6723,6 +6812,43 @@ mod tests {
                 .into_iter()
                 .all(|command| { !matches!(command, RuntimeCommand::WriteInput { .. }) })
         );
+    }
+
+    #[test]
+    fn mismatched_attached_input_owner는_다음_render_pass에서_폐기된다() {
+        let owner = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("owner-tab"),
+            pane: pane_id("owner-pane"),
+            session: SessionId(7),
+        };
+        let rendered = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("rendered-tab"),
+            pane: pane_id("rendered-pane"),
+            session: SessionId(8),
+        };
+        let mut workspace = WorkspaceUi::new();
+        workspace.native_printable_key_downs =
+            vec![crate::native_key_monitor::NativePrintableKeyDown::for_test(
+                '.',
+            )];
+        workspace.native_clipboard_paste_requested = true;
+        workspace.native_clipboard_copy_requested = true;
+        workspace.set_prepared_attached_input_owner(Some(&owner), 41);
+
+        assert!(!workspace.take_prepared_attached_input(&rendered, 41));
+        assert_eq!(
+            workspace.prepared_attached_input_owner.as_ref(),
+            Some(&owner)
+        );
+        assert_eq!(workspace.native_printable_key_downs.len(), 1);
+
+        assert!(!workspace.take_prepared_attached_input(&owner, 42));
+        assert!(workspace.prepared_attached_input_owner.is_none());
+        assert!(workspace.native_printable_key_downs.is_empty());
+        assert!(!workspace.native_clipboard_paste_requested);
+        assert!(!workspace.native_clipboard_copy_requested);
     }
 
     #[test]

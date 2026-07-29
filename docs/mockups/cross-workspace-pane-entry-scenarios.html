@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deppy Sijo · Cross-workspace Pane</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080b10;
+      --surface: #0b1016;
+      --surface-2: #10161e;
+      --surface-3: #151d27;
+      --line: #26313d;
+      --text: #d9e1ea;
+      --muted: #7f8b99;
+      --faint: #52606f;
+      --accent: #48b9e8;
+      --green: #44d68b;
+      --purple: #a78be7;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Pretendard", sans-serif; }
+    button, input { font: inherit; }
+
+    .page { width: min(1500px, calc(100vw - 40px)); margin: 24px auto; }
+    .intro { display: flex; justify-content: space-between; gap: 24px; align-items: end; margin-bottom: 14px; }
+    h1 { margin: 0 0 6px; font-size: 25px; }
+    .intro p { margin: 0; color: var(--muted); font-size: 13px; }
+    .contract { color: #bdeaff; border: 1px solid #28566a; background: #0d202a; padding: 10px 12px; font-size: 12px; }
+
+    .app { height: 760px; border: 1px solid #33404e; background: var(--surface); overflow: hidden; }
+    .titlebar { height: 44px; display: grid; grid-template-columns: 76px 280px minmax(0, 1fr) 130px; border-bottom: 1px solid var(--line); }
+    .traffic, .project, .terminal-top, .account { display: flex; align-items: center; }
+    .traffic { gap: 7px; padding-left: 17px; }
+    .traffic i { width: 10px; height: 10px; border-radius: 50%; background: #46525f; }
+    .project, .terminal-top, .account { border-left: 1px solid var(--line); }
+    .project { justify-content: space-between; padding: 0 14px; font-weight: 650; }
+    .terminal-top { padding: 0 10px; justify-content: space-between; }
+    .top-tab { height: 100%; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-top: 1px solid var(--accent); }
+    .account { justify-content: center; color: var(--muted); }
+
+    .shell { height: calc(100% - 72px); display: grid; grid-template-columns: 76px 280px minmax(0, 1fr); }
+    .rail { border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 10px 7px; }
+    .rail-item { height: 55px; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
+    .rail-item b { font-size: 19px; font-weight: 500; }
+    .rail-item.active { background: #111923; color: var(--text); }
+    .rail-spacer { flex: 1; }
+
+    .sidebar { border-right: 1px solid var(--line); min-width: 0; }
+    .workspace-list { height: 360px; overflow: auto; border-bottom: 1px solid var(--line); padding: 8px; }
+    .workspace { border-bottom: 1px solid #18222c; }
+    .workspace-head { height: 42px; display: flex; align-items: center; gap: 9px; padding: 0 7px; }
+    .workspace-head.active { background: #10202a; }
+    .avatar { width: 21px; height: 21px; display: grid; place-items: center; background: #315e49; font-size: 12px; }
+    .avatar.purple { background: #534475; }
+    .workspace-name { flex: 1; font-size: 13px; }
+    .count { color: var(--muted); font-size: 11px; }
+    .session-row { height: 42px; margin-left: 17px; padding: 0 6px 0 10px; display: flex; align-items: center; gap: 8px; color: #adb8c4; cursor: grab; user-select: none; }
+    .session-row:hover { background: var(--surface-3); }
+    .session-row.dragging { opacity: .55; cursor: grabbing; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+    .dot.stopped { background: var(--faint); }
+    .session-copy { min-width: 0; flex: 1; }
+    .session-title { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-meta { color: var(--faint); font-size: 10px; margin-top: 2px; }
+    .open-beside { display: none; border: 1px solid var(--line); background: #17212b; color: var(--text); width: 27px; height: 27px; cursor: pointer; }
+    .session-row:hover .open-beside { display: block; }
+    .files { padding: 12px; color: var(--muted); font-size: 12px; line-height: 27px; }
+    .files b { color: var(--text); }
+    .folder { color: var(--accent); }
+
+    .main { position: relative; min-width: 0; overflow: hidden; background: #090d13; }
+    .pane-scroll { width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden; }
+    .pane-strip { min-width: 100%; width: max-content; height: 100%; display: flex; }
+    .pane { height: 100%; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: #090d13; }
+    .pane.primary { width: 520px; min-width: 320px; }
+    .pane.foreign { width: 420px; min-width: 320px; max-width: 960px; }
+    .pane.dragging { opacity: .55; }
+    .pane.drop-before { box-shadow: inset 3px 0 0 var(--accent); }
+    .pane-head { height: 40px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 9px; border-bottom: 1px solid var(--line); cursor: default; }
+    .pane.foreign .pane-head { cursor: grab; }
+    .pane.foreign .pane-head:active { cursor: grabbing; }
+    .pane-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .pane-name strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+    .foreign-badge { color: var(--purple); border: 1px solid #55476e; padding: 2px 5px; font-size: 9px; }
+    .pane-tools { color: var(--muted); display: flex; gap: 10px; }
+    .terminal { flex: 1; padding: 17px 18px; font: 12px/1.72 ui-monospace, SFMono-Regular, Menlo, monospace; color: #aeb8c3; }
+    .prompt { color: var(--green); }
+    .accent { color: var(--accent); }
+    .muted { color: var(--faint); }
+    .restoring { display: grid; place-items: center; color: var(--muted); }
+
+    .drop-hint { position: absolute; inset: 0; display: none; place-items: center; background: rgba(5, 10, 15, .72); border: 2px solid var(--accent); color: #c4ecff; pointer-events: none; z-index: 4; }
+    .drop-hint.visible { display: grid; }
+
+    .statusbar { height: 28px; display: flex; align-items: center; gap: 16px; padding: 0 12px; border-top: 1px solid var(--line); color: #6e7b89; font-size: 10px; }
+    .statusbar .push { margin-left: auto; }
+    .statusbar .ok { color: var(--green); }
+
+    .controls { margin-top: 14px; display: grid; grid-template-columns: 1.1fr .9fr; gap: 12px; }
+    .card { border: 1px solid var(--line); background: var(--surface); padding: 13px; }
+    .card h2 { margin: 0 0 9px; font-size: 14px; }
+    .card p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .setting { display: flex; align-items: center; gap: 12px; }
+    .setting label { flex: 1; }
+    .stepper { display: flex; align-items: center; border: 1px solid var(--line); }
+    .stepper button { width: 30px; height: 30px; border: 0; background: var(--surface-2); color: var(--text); cursor: pointer; }
+    .stepper output { width: 38px; text-align: center; font-size: 12px; }
+    .legend { display: flex; gap: 16px; margin-top: 10px; color: var(--muted); font-size: 11px; }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="intro">
+      <div>
+        <h1>Cross-workspace Pane · 최종 UX</h1>
+        <p>A는 고정 왼쪽, 외부 Pane은 오른쪽 추가, 헤더 드래그로 외부 Pane끼리만 재정렬</p>
+      </div>
+      <div class="contract">진입: 세션 행 드래그 · hover 옆에 열기 · 우클릭 유지<br>제외: 명령 팔레트 · Pane 헤더 선택기 · 자동 세로 분할</div>
+    </section>
+
+    <section class="app">
+      <header class="titlebar">
+        <div class="traffic"><i></i><i></i><i></i></div>
+        <div class="project"><span>Project</span><span>−　＋</span></div>
+        <div class="terminal-top"><div class="top-tab"><span class="dot"></span>Serenity ×</div><span>⌕　▥　⋮</span></div>
+        <div class="account">◔　ko</div>
+      </header>
+
+      <div class="shell">
+        <nav class="rail">
+          <div class="rail-item active"><b>⌂</b><span>홈</span></div>
+          <div class="rail-item"><b>▣</b><span>작업</span></div>
+          <div class="rail-item"><b>▦</b><span>플릿</span></div>
+          <div class="rail-item"><b>♙</b><span>AI</span></div>
+          <div class="rail-spacer"></div>
+          <div class="rail-item"><b>?</b></div>
+          <div class="rail-item"><b>⚙</b></div>
+        </nav>
+
+        <aside class="sidebar">
+          <div class="workspace-list">
+            <div class="workspace">
+              <div class="workspace-head active"><span class="avatar">S</span><span class="workspace-name">Serenity</span><span class="count">● 1</span></div>
+              <div class="session-row" draggable="true" data-workspace="Serenity" data-session="Main shell">
+                <span class="dot"></span><div class="session-copy"><div class="session-title">Main shell</div><div class="session-meta">현재 워크스페이스</div></div>
+              </div>
+            </div>
+            <div class="workspace">
+              <div class="workspace-head"><span class="avatar purple">V</span><span class="workspace-name">VisionAI2</span><span class="count">● 2</span></div>
+              <div class="session-row" draggable="true" data-workspace="VisionAI2" data-session="Training">
+                <span class="dot"></span><div class="session-copy"><div class="session-title">Training</div><div class="session-meta">실행 중 · ID만 drag</div></div><button class="open-beside" title="현재 화면 오른쪽에 열기">↗</button>
+              </div>
+              <div class="session-row" draggable="true" data-workspace="VisionAI2" data-session="Archived agent">
+                <span class="dot stopped"></span><div class="session-copy"><div class="session-title">Archived agent</div><div class="session-meta">중지 · 읽기 전용 복원</div></div><button class="open-beside" title="현재 화면 오른쪽에 열기">↗</button>
+              </div>
+            </div>
+            <div class="workspace">
+              <div class="workspace-head"><span class="avatar purple">P</span><span class="workspace-name">PriceAI</span><span class="count">○ 1</span></div>
+              <div class="session-row" draggable="true" data-workspace="PriceAI" data-session="Persisted shell">
+                <span class="dot stopped"></span><div class="session-copy"><div class="session-title">Persisted shell</div><div class="session-meta">cold · 한 번에 하나 복원</div></div><button class="open-beside" title="현재 화면 오른쪽에 열기">↗</button>
+              </div>
+            </div>
+          </div>
+          <div class="files"><b>Serenity　~/Desktop/…</b><br>⌄ <span class="folder">src</span><br>　<span class="folder">components</span><br>　README.md<br>⌄ <span class="folder">docs</span></div>
+        </aside>
+
+        <section class="main" id="dropTarget">
+          <div class="pane-scroll">
+            <div class="pane-strip" id="paneStrip">
+              <article class="pane primary">
+                <header class="pane-head"><div class="pane-name"><span class="dot"></span><strong>Serenity</strong></div><div class="pane-tools">⌕　▥</div></header>
+                <div class="terminal"><span class="prompt">serenity %</span> cargo test<br><span class="muted">996 passed · primary stays fixed left</span></div>
+              </article>
+              <article class="pane foreign" draggable="true" data-pane="VisionAI2 · Training">
+                <header class="pane-head"><div class="pane-name"><span class="dot"></span><strong>Training</strong><span class="foreign-badge">VisionAI2</span></div><div class="pane-tools">⌕　×</div></header>
+                <div class="terminal"><span class="accent">epoch 41/100</span><br>loss 0.0218<br><span class="muted">헤더 drag → 외부 Pane 순서만 변경</span></div>
+              </article>
+              <article class="pane foreign" draggable="true" data-pane="PriceAI · Persisted shell">
+                <header class="pane-head"><div class="pane-name"><span class="dot stopped"></span><strong>Persisted shell</strong><span class="foreign-badge">PriceAI</span></div><div class="pane-tools">⌕　×</div></header>
+                <div class="terminal"><span class="prompt">price-ai %</span> <span class="muted">fresh shell at saved cwd</span><br><br>오른쪽으로 계속 추가되고 폭이 넘으면 가로 스크롤</div>
+              </article>
+            </div>
+          </div>
+          <div class="drop-hint" id="dropHint"><strong>가장 오른쪽에 Pane 추가</strong></div>
+        </section>
+      </div>
+
+      <footer class="statusbar"><span>☀ 4%　5h | 이번 주 8%</span><span>◉ 43%　5h | 이번 주 43%</span><span>세션 5</span><span>MCP 0</span><span class="ok">● Claude　● OpenAI　● GitHub</span><span class="push">CPU 2.1%　메모리 592 MiB</span></footer>
+    </section>
+
+    <section class="controls">
+      <div class="card setting">
+        <label><h2>다른 워크스페이스 Pane 최대 개수</h2><p>기본 2 · 범위 1–6 · 값을 줄이면 오른쪽 초과 뷰만 닫고 원본 세션은 유지</p></label>
+        <div class="stepper"><button id="minus">−</button><output id="limit">2</output><button id="plus">＋</button></div>
+      </div>
+      <div class="card">
+        <h2>리소스 계약</h2>
+        <p>cold 복원 전역 1개 · 화면 밖 Pane paint 생략 · runtime별 event drain 1회 · 마지막 detach 뒤 eviction 보호 해제</p>
+        <div class="legend"><span>● 실행 중</span><span>○ 중지/cold</span><span>보라 배지 = 원본 워크스페이스</span></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const strip = document.getElementById('paneStrip');
+    const target = document.getElementById('dropTarget');
+    const hint = document.getElementById('dropHint');
+    let draggedPane = null;
+
+    document.querySelectorAll('.session-row').forEach((row) => {
+      row.addEventListener('dragstart', (event) => {
+        row.classList.add('dragging');
+        event.dataTransfer.setData('text/session-id', `${row.dataset.workspace}:${row.dataset.session}`);
+      });
+      row.addEventListener('dragend', () => row.classList.remove('dragging'));
+      row.querySelector('.open-beside')?.addEventListener('click', () => appendPane(row.dataset.workspace, row.dataset.session));
+    });
+
+    target.addEventListener('dragover', (event) => {
+      if (event.dataTransfer.types.includes('text/session-id')) {
+        event.preventDefault();
+        hint.classList.add('visible');
+      }
+    });
+    target.addEventListener('dragleave', () => hint.classList.remove('visible'));
+    target.addEventListener('drop', (event) => {
+      const raw = event.dataTransfer.getData('text/session-id');
+      if (!raw) return;
+      event.preventDefault();
+      hint.classList.remove('visible');
+      const [workspace, session] = raw.split(':');
+      appendPane(workspace, session);
+    });
+
+    function bindPane(pane) {
+      pane.addEventListener('dragstart', () => { draggedPane = pane; pane.classList.add('dragging'); });
+      pane.addEventListener('dragend', () => {
+        pane.classList.remove('dragging');
+        document.querySelectorAll('.pane').forEach((item) => item.classList.remove('drop-before'));
+        draggedPane = null;
+      });
+      pane.addEventListener('dragover', (event) => {
+        if (!draggedPane || draggedPane === pane || pane.classList.contains('primary')) return;
+        event.preventDefault();
+        pane.classList.add('drop-before');
+      });
+      pane.addEventListener('dragleave', () => pane.classList.remove('drop-before'));
+      pane.addEventListener('drop', (event) => {
+        if (!draggedPane || pane.classList.contains('primary')) return;
+        event.preventDefault();
+        pane.classList.remove('drop-before');
+        strip.insertBefore(draggedPane, pane);
+      });
+    }
+    document.querySelectorAll('.pane.foreign').forEach(bindPane);
+
+    function appendPane(workspace, session) {
+      const limit = Number(document.getElementById('limit').value);
+      const foreign = strip.querySelectorAll('.pane.foreign');
+      if (foreign.length >= limit) return;
+      const pane = document.createElement('article');
+      pane.className = 'pane foreign';
+      pane.draggable = true;
+      pane.innerHTML = `<header class="pane-head"><div class="pane-name"><span class="dot stopped"></span><strong>${session}</strong><span class="foreign-badge">${workspace}</span></div><div class="pane-tools">⌕　×</div></header><div class="terminal restoring">요청 순서대로 복원 중…</div>`;
+      strip.appendChild(pane);
+      bindPane(pane);
+      pane.scrollIntoView({ behavior: 'smooth', inline: 'end', block: 'nearest' });
+    }
+
+    const output = document.getElementById('limit');
+    document.getElementById('minus').addEventListener('click', () => {
+      output.value = String(Math.max(1, Number(output.value) - 1));
+      while (strip.querySelectorAll('.pane.foreign').length > Number(output.value)) strip.lastElementChild.remove();
+    });
+    document.getElementById('plus').addEventListener('click', () => output.value = String(Math.min(6, Number(output.value) + 1)));
+  </script>
+</body>
+</html>

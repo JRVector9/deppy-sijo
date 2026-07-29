@@ -135,6 +135,14 @@ pub enum SidebarAction {
         tab: runtime::MuxTabId,
         pane: runtime::MuxPaneId,
     },
+    /// 비활성 warm 워크스페이스의 기존 pane을 현재 화면 오른쪽에 연결한다.
+    /// App이 워크스페이스 전환 없이 namespaced target을 해석한다.
+    OpenSessionInCurrentViewRight {
+        workspace_id: String,
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+        session: runtime::SessionId,
+    },
     /// 세션 이름 변경 — pane 제목을 갱신한다(더블클릭/메뉴 인라인 편집).
     RenameSession {
         pane: runtime::MuxPaneId,
@@ -1782,10 +1790,12 @@ impl FileTreeUi {
                                     {
                                         let (session_action, rect) = inactive_workspace_sessions(
                                             ui,
-                                            &workspace.id,
+                                            workspace,
+                                            sidebar.active_workspace_id,
                                             sessions,
                                             session_max_h,
                                             color,
+                                            catalog,
                                         );
                                         if let Some(session_action) = session_action {
                                             action = Some(session_action);
@@ -2130,10 +2140,12 @@ impl FileTreeUi {
                                     {
                                         let (session_action, rect) = inactive_workspace_sessions(
                                             ui,
-                                            &workspace.id,
+                                            workspace,
+                                            sidebar.active_workspace_id,
                                             sessions,
                                             session_max_h,
                                             color,
+                                            catalog,
                                         );
                                         if let Some(session_action) = session_action {
                                             action = Some(session_action);
@@ -4075,15 +4087,18 @@ fn workspace_summary_segments(
     parts
 }
 
-/// 비활성(warm) workspace의 마지막 세션 스냅샷. 편집/컨텍스트 작업은 활성 runtime을
-/// 전제로 하므로 노출하지 않고, 클릭만 workspace 전환 + 정확한 tab/pane focus로 보낸다.
+/// 비활성 workspace의 마지막 세션 스냅샷. 편집/수명주기 작업은 활성 runtime을
+/// 전제로 하므로 노출하지 않는다. 좌클릭은 workspace 전환 + 정확한 tab/pane focus,
+/// warm 세션의 우클릭은 현재 화면 오른쪽 연결 요청만 보낸다.
 /// 반환값 두 번째 필드는 실제로 그려진 세션 행이 있는지 확인하는 합집합 rect다.
 fn inactive_workspace_sessions(
     ui: &mut egui::Ui,
-    workspace_id: &str,
+    workspace: &SidebarWorkspaceEntry,
+    active_workspace_id: &str,
     sessions: &[SessionEntry],
     _max_height: f32,
     accent_color: egui::Color32,
+    catalog: &i18n::Catalog,
 ) -> (Option<SidebarAction>, Option<egui::Rect>) {
     if sessions.is_empty() {
         return (None, None);
@@ -4091,7 +4106,7 @@ fn inactive_workspace_sessions(
     let mut action = None;
     let mut session_rows_rect = None;
     egui::ScrollArea::vertical()
-        .id_salt(("inactive_session_list_scroll", workspace_id))
+        .id_salt(("inactive_session_list_scroll", &workspace.id))
         .auto_shrink([false, true])
         .show(ui, |ui| {
             // 헤더-세션 사이 여백 없음(2026-07-25 사용자) — 첫 행이 인셋 상단에
@@ -4109,16 +4124,54 @@ fn inactive_workspace_sessions(
                             }));
                         if response.clicked() {
                             action = Some(SidebarAction::FocusSession {
-                                workspace_id: workspace_id.to_owned(),
+                                workspace_id: workspace.id.clone(),
                                 tab: entry.tab.clone(),
                                 pane: entry.pane.clone(),
                             });
                         }
+                        response.context_menu(|ui| {
+                            inactive_session_context_menu_items(
+                                ui,
+                                workspace,
+                                active_workspace_id,
+                                entry,
+                                catalog,
+                                &mut action,
+                            );
+                        });
                     });
                 });
             }
         });
     (action, session_rows_rect)
+}
+
+fn inactive_session_context_menu_items(
+    ui: &mut egui::Ui,
+    workspace: &SidebarWorkspaceEntry,
+    active_workspace_id: &str,
+    entry: &SessionEntry,
+    catalog: &i18n::Catalog,
+    action: &mut Option<SidebarAction>,
+) {
+    if workspace.state != SidebarWorkspaceState::Warm || workspace.id == active_workspace_id {
+        return;
+    }
+    let Some(session) = entry.session else {
+        return;
+    };
+    if ui
+        .button(catalog.t("workspace.menu.open_in_current_view_right", &[]))
+        .clicked()
+    {
+        *action = Some(SidebarAction::OpenSessionInCurrentViewRight {
+            workspace_id: workspace.id.clone(),
+            tab: entry.tab.clone(),
+            pane: entry.pane.clone(),
+            session,
+        });
+        ui.close();
+    }
 }
 
 fn session_row(
@@ -7909,6 +7962,129 @@ mod tests {
             "Idle 워크스페이스 행에 종료 메뉴가 떴다"
         );
         assert!(harness.state().1.is_empty(), "Idle 행 우클릭이 액션을 냄");
+    }
+
+    #[test]
+    fn kittest_warm_세션의_오른쪽열기_메뉴가_정확한_대상을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "workspace-b".to_owned(),
+            name: "Workspace B".to_owned(),
+            state: SidebarWorkspaceState::Warm,
+            summary: SidebarSessionSummary::default(),
+        };
+        let entry = SessionEntry {
+            tab: runtime::MuxTabId("tab-b".to_owned()),
+            pane: runtime::MuxPaneId("pane-b".to_owned()),
+            session: Some(runtime::SessionId(42)),
+            title: "Session B".to_owned(),
+            status: None,
+            summary: String::new(),
+            focused: false,
+            attention: false,
+            pulse: None,
+            agent_line: None,
+            status_label: None,
+            resumable: false,
+            has_cwd: false,
+            in_worktree: false,
+            status_line: None,
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, action: &mut Option<SidebarAction>| {
+                inactive_session_context_menu_items(
+                    ui,
+                    &workspace,
+                    "workspace-a",
+                    &entry,
+                    &catalog,
+                    action,
+                );
+            },
+            None,
+        );
+
+        harness.run();
+        harness
+            .get_by_label("Open on right in current view")
+            .click();
+        harness.run();
+
+        match harness.state() {
+            Some(SidebarAction::OpenSessionInCurrentViewRight {
+                workspace_id,
+                tab,
+                pane,
+                session,
+            }) => {
+                assert_eq!(workspace_id, "workspace-b");
+                assert_eq!(tab.0, "tab-b");
+                assert_eq!(pane.0, "pane-b");
+                assert_eq!(*session, runtime::SessionId(42));
+            }
+            _ => panic!("오른쪽 열기 메뉴가 namespaced target 액션을 내지 않음"),
+        }
+    }
+
+    #[test]
+    fn kittest_활성_idle_또는_target없는_warm_세션에는_오른쪽열기_메뉴가_없다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        for (state, workspace_id, active_workspace_id) in [
+            (SidebarWorkspaceState::Active, "workspace-a", "workspace-a"),
+            (SidebarWorkspaceState::Warm, "workspace-a", "workspace-a"),
+            (SidebarWorkspaceState::Idle, "workspace-b", "workspace-a"),
+            (SidebarWorkspaceState::Warm, "workspace-b", "workspace-a"),
+        ] {
+            let workspace = SidebarWorkspaceEntry {
+                id: workspace_id.to_owned(),
+                name: workspace_id.to_owned(),
+                state,
+                summary: SidebarSessionSummary::default(),
+            };
+            let entry = SessionEntry {
+                tab: runtime::MuxTabId("tab".to_owned()),
+                pane: runtime::MuxPaneId("pane".to_owned()),
+                session: None,
+                title: "Session".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: false,
+                in_worktree: false,
+                status_line: None,
+            };
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                |ui, action: &mut Option<SidebarAction>| {
+                    inactive_session_context_menu_items(
+                        ui,
+                        &workspace,
+                        active_workspace_id,
+                        &entry,
+                        &catalog,
+                        action,
+                    );
+                },
+                None,
+            );
+
+            harness.run();
+            assert!(
+                harness
+                    .query_by_label("Open on right in current view")
+                    .is_none(),
+                "state={state:?}, workspace={workspace_id}, active={active_workspace_id}"
+            );
+            assert!(harness.state().is_none());
+        }
     }
 
     /// 좁은 폭에서도 워크스페이스 메뉴 항목은 한 줄로 그려진다 — 이전에는 메뉴가

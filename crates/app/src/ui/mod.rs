@@ -8,6 +8,7 @@ pub mod approvals;
 pub mod clipboard_image;
 pub mod composer;
 pub mod credentials;
+pub(crate) mod cross_workspace;
 pub mod designall;
 pub mod diff_panel;
 pub mod env_profiles;

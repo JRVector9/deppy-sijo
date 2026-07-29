@@ -73,10 +73,10 @@ impl SessionRowTarget {
         }
     }
 
-    pub(crate) fn from_persisted(row: &storage::PersistedActivityPane) -> Self {
+    pub(crate) fn persisted(workspace_id: impl Into<String>, pane: runtime::MuxPaneId) -> Self {
         Self::PersistedPane {
-            workspace_id: row.workspace_id.clone(),
-            pane: runtime::MuxPaneId(row.pane_id.clone()),
+            workspace_id: workspace_id.into(),
+            pane,
         }
     }
 
@@ -165,10 +165,7 @@ impl SidebarSessionRow {
                 entry.pane,
                 session,
             ),
-            None => SessionRowTarget::PersistedPane {
-                workspace_id,
-                pane: entry.pane,
-            },
+            None => SessionRowTarget::persisted(workspace_id, entry.pane),
         };
         Self {
             target,
@@ -187,19 +184,25 @@ impl SidebarSessionRow {
         }
     }
 
-    pub(crate) fn from_persisted(row: &storage::PersistedActivityPane, title: String) -> Self {
+    pub(crate) fn from_persisted_parts(
+        workspace_id: impl Into<String>,
+        pane: runtime::MuxPaneId,
+        title: String,
+        cwd: String,
+    ) -> Self {
+        let has_cwd = !cwd.is_empty();
         Self {
-            target: SessionRowTarget::from_persisted(row),
+            target: SessionRowTarget::persisted(workspace_id, pane),
             title,
             status: None,
-            summary: row.cwd.clone(),
+            summary: cwd,
             focused: false,
             attention: false,
             pulse: None,
             agent_line: None,
             status_label: None,
             resumable: false,
-            has_cwd: !row.cwd.is_empty(),
+            has_cwd,
             in_worktree: false,
             status_line: None,
         }
@@ -8835,14 +8838,8 @@ mod tests {
 
     #[test]
     fn typed_persisted_row_carries_exact_pane_id_into_session_target() {
-        let row = storage::PersistedActivityPane {
-            workspace_id: "workspace-b".to_owned(),
-            pane_id: "pane-exact".to_owned(),
-            title: "Saved shell".to_owned(),
-            cwd: "/private/project-b".to_owned(),
-        };
-
-        let target = SessionRowTarget::from_persisted(&row);
+        let target =
+            SessionRowTarget::persisted("workspace-b", runtime::MuxPaneId("pane-exact".to_owned()));
 
         assert_eq!(
             target,
@@ -8904,13 +8901,10 @@ mod tests {
 
     #[test]
     fn session_drag_payload_debug_excludes_presentation_and_terminal_data() {
-        let row = storage::PersistedActivityPane {
-            workspace_id: "workspace-safe".to_owned(),
-            pane_id: "pane-safe".to_owned(),
-            title: "SECRET_TITLE".to_owned(),
-            cwd: "/SECRET/CWD".to_owned(),
-        };
-        let payload = SessionRowDragPayload::new(SessionRowTarget::from_persisted(&row));
+        let payload = SessionRowDragPayload::new(SessionRowTarget::persisted(
+            "workspace-safe",
+            runtime::MuxPaneId("pane-safe".to_owned()),
+        ));
         let debug = format!("{payload:?}");
 
         assert!(debug.contains("workspace-safe"));
@@ -8918,6 +8912,39 @@ mod tests {
         assert!(!debug.contains("SECRET_TITLE"));
         assert!(!debug.contains("SECRET/CWD"));
         assert!(!debug.to_ascii_lowercase().contains("scrollback"));
+    }
+
+    #[test]
+    fn persisted_sidebar_row_preserves_canonical_fields_and_entry_target() {
+        let row = SidebarSessionRow::from_persisted_parts(
+            "workspace-b",
+            runtime::MuxPaneId("pane-exact".to_owned()),
+            "Saved shell".to_owned(),
+            "/private/project-b".to_owned(),
+        );
+
+        assert_eq!(
+            row.target,
+            SessionRowTarget::PersistedPane {
+                workspace_id: "workspace-b".to_owned(),
+                pane: runtime::MuxPaneId("pane-exact".to_owned()),
+            }
+        );
+        assert_eq!(row.title, "Saved shell");
+        assert_eq!(row.summary, "/private/project-b");
+        assert!(row.has_cwd);
+
+        let hover = open_beside_action(row.target.clone());
+        let context = open_beside_action(row.target.clone());
+        let drag = SessionRowDragPayload::new(row.target.clone());
+        assert!(matches!(
+            (hover, context),
+            (
+                SidebarAction::OpenSessionBeside(left),
+                SidebarAction::OpenSessionBeside(right)
+            ) if left == right
+        ));
+        assert_eq!(drag.target(), &row.target);
     }
 
     #[test]

@@ -18516,9 +18516,11 @@ impl eframe::App for App {
                     .into_iter()
                     .flatten()
                     .map(|row| {
-                        ui::file_tree::SidebarSessionRow::from_persisted(
-                            row,
+                        ui::file_tree::SidebarSessionRow::from_persisted_parts(
+                            row.workspace_id.clone(),
+                            runtime::MuxPaneId(row.pane_id.clone()),
                             self.activity_session_name(&workspace.id, &row.title),
+                            row.cwd.clone(),
                         )
                     })
                     .collect();

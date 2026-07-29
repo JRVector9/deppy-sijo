@@ -2463,7 +2463,21 @@ impl WorkspaceUi {
         let visible_targets = &visible_targets[..visible_targets
             .len()
             .min(crate::ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)];
+        let input_requested = input_target.is_some();
         let input_target = input_target.filter(|target| visible_targets.contains(target));
+        if input_requested && input_target.is_none() {
+            let _ = drain_native_input();
+            self.prepare_frame_with_native_input_for_targets(
+                ctx,
+                events,
+                catalog,
+                false,
+                visible_targets,
+                None,
+                crate::native_key_monitor::NativeKeyDownBatch::default,
+            );
+            return;
+        }
         self.prepare_frame_with_native_input_for_targets(
             ctx,
             events,
@@ -2492,6 +2506,17 @@ impl WorkspaceUi {
         }
         self.prepared_attached_input_consumed = true;
         true
+    }
+
+    fn discard_prepared_attached_input_for(&mut self, target: &AttachedPaneTarget) {
+        if self.prepared_attached_input_owner.as_ref() != Some(target) {
+            return;
+        }
+        self.prepared_attached_input_owner = None;
+        self.prepared_attached_input_consumed = false;
+        self.native_printable_key_downs.clear();
+        self.native_clipboard_paste_requested = false;
+        self.native_clipboard_copy_requested = false;
     }
 
     /// 홈 대시보드가 중앙 표면을 차지한 프레임에도 런타임 이벤트와 비동기 붙여넣기
@@ -2833,9 +2858,13 @@ impl WorkspaceUi {
         let pane = mux
             .as_deref()
             .and_then(|snapshot| find_attached_pane(snapshot, target));
-        let input_enabled = availability == AttachedPaneAvailability::Available
-            && pane.is_some()
-            && self.take_prepared_attached_input(target);
+        let input_enabled = if availability == AttachedPaneAvailability::Available && pane.is_some()
+        {
+            self.take_prepared_attached_input(target)
+        } else {
+            self.discard_prepared_attached_input_for(target);
+            false
+        };
         let pane_title = pane.map(|pane| pane.title.clone());
         let header_height = TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0));
         let header = egui::Rect::from_min_max(
@@ -6272,6 +6301,211 @@ mod tests {
         );
 
         assert_eq!(drains.get(), 1);
+    }
+
+    #[test]
+    fn offscreen_attached_input_owner는_native_batch를_한번_drain하고_폐기한다() {
+        let catalog = catalog();
+        let context = egui::Context::default();
+        let visible = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("visible-tab"),
+            pane: pane_id("visible-pane"),
+            session: SessionId(7),
+        };
+        let offscreen = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("offscreen-tab"),
+            pane: pane_id("offscreen-pane"),
+            session: SessionId(8),
+        };
+        let pending = std::rc::Rc::new(std::cell::RefCell::new(Some(
+            crate::native_key_monitor::NativeKeyDownBatch {
+                printable: vec![crate::native_key_monitor::NativePrintableKeyDown::for_test(
+                    '.',
+                )],
+                clipboard_paste: true,
+                clipboard_copy: true,
+            },
+        )));
+        let drains = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut workspace = WorkspaceUi::new();
+
+        let first_pending = std::rc::Rc::clone(&pending);
+        let first_drains = std::rc::Rc::clone(&drains);
+        workspace.prepare_attached_panes_with_native_input(
+            &context,
+            &[],
+            &catalog,
+            std::slice::from_ref(&visible),
+            Some(&offscreen),
+            move || {
+                first_drains.set(first_drains.get() + 1);
+                first_pending.borrow_mut().take().unwrap_or_default()
+            },
+        );
+
+        assert_eq!(drains.get(), 1);
+        assert!(pending.borrow().is_none());
+        assert!(workspace.prepared_attached_input_owner.is_none());
+        assert!(workspace.native_printable_key_downs.is_empty());
+        assert!(!workspace.native_clipboard_paste_requested);
+        assert!(!workspace.native_clipboard_copy_requested);
+
+        let second_pending = std::rc::Rc::clone(&pending);
+        let second_drains = std::rc::Rc::clone(&drains);
+        workspace.prepare_attached_panes_with_native_input(
+            &context,
+            &[],
+            &catalog,
+            std::slice::from_ref(&offscreen),
+            Some(&offscreen),
+            move || {
+                second_drains.set(second_drains.get() + 1);
+                second_pending.borrow_mut().take().unwrap_or_default()
+            },
+        );
+
+        assert_eq!(drains.get(), 2);
+        assert!(workspace.native_printable_key_downs.is_empty());
+        assert!(!workspace.native_clipboard_paste_requested);
+        assert!(!workspace.native_clipboard_copy_requested);
+
+        workspace.mux = Some(mux(
+            "offscreen-tab",
+            vec![tab(
+                "offscreen-tab",
+                vec![pane("offscreen-pane", SessionId(8))],
+                LayoutNode::Pane(pane_id("offscreen-pane")),
+            )],
+            "offscreen-pane",
+        ));
+        workspace.sessions.entry(SessionId(8)).or_default().snapshot = Some(snapshot("ready"));
+        let config = TerminalConfig::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_prepared_attached_pane(
+                    ui,
+                    &config,
+                    &catalog,
+                    &offscreen,
+                    "Other",
+                    AttachedPaneAvailability::Available,
+                    None,
+                );
+            },
+            workspace,
+        );
+        harness.run();
+
+        assert!(
+            drain_protocol(harness.state_mut())
+                .into_iter()
+                .all(|command| { !matches!(command, RuntimeCommand::WriteInput { .. }) })
+        );
+        assert!(harness.state_mut().take_io_intent().is_none());
+    }
+
+    #[test]
+    fn no_attached_input_owner는_native_monitor를_drain하지_않는다() {
+        let catalog = catalog();
+        let context = egui::Context::default();
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("pane"),
+            session: SessionId(7),
+        };
+        let drains = std::cell::Cell::new(0);
+        let mut workspace = WorkspaceUi::new();
+
+        workspace.prepare_attached_panes_with_native_input(
+            &context,
+            &[],
+            &catalog,
+            std::slice::from_ref(&target),
+            None,
+            || {
+                drains.set(drains.get() + 1);
+                crate::native_key_monitor::NativeKeyDownBatch {
+                    printable: vec![crate::native_key_monitor::NativePrintableKeyDown::for_test(
+                        '.',
+                    )],
+                    clipboard_paste: true,
+                    clipboard_copy: true,
+                }
+            },
+        );
+
+        assert_eq!(drains.get(), 0);
+        assert!(workspace.prepared_attached_input_owner.is_none());
+        assert!(workspace.native_printable_key_downs.is_empty());
+        assert!(!workspace.native_clipboard_paste_requested);
+        assert!(!workspace.native_clipboard_copy_requested);
+    }
+
+    #[test]
+    fn unavailable_attached_input_owner는_drain된_native_batch와_owner를_폐기한다() {
+        let catalog = catalog();
+        let context = egui::Context::default();
+        let config = TerminalConfig::default();
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("pane"),
+            session: SessionId(7),
+        };
+        let mut workspace = WorkspaceUi::new();
+        workspace.prepare_attached_panes_with_native_input(
+            &context,
+            &[],
+            &catalog,
+            std::slice::from_ref(&target),
+            Some(&target),
+            || crate::native_key_monitor::NativeKeyDownBatch {
+                printable: vec![crate::native_key_monitor::NativePrintableKeyDown::for_test(
+                    '.',
+                )],
+                clipboard_paste: true,
+                clipboard_copy: true,
+            },
+        );
+        workspace.mux = Some(mux(
+            "foreign",
+            vec![tab(
+                "foreign",
+                vec![pane("pane", SessionId(7))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        workspace.sessions.entry(SessionId(7)).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_prepared_attached_pane(
+                    ui,
+                    &config,
+                    &catalog,
+                    &target,
+                    "Other",
+                    AttachedPaneAvailability::Unavailable,
+                    None,
+                );
+            },
+            workspace,
+        );
+        harness.run();
+
+        assert!(harness.state().prepared_attached_input_owner.is_none());
+        assert!(harness.state().native_printable_key_downs.is_empty());
+        assert!(!harness.state().native_clipboard_paste_requested);
+        assert!(!harness.state().native_clipboard_copy_requested);
+        assert!(harness.state_mut().take_io_intent().is_none());
+        assert!(
+            drain_protocol(harness.state_mut())
+                .into_iter()
+                .all(|command| { !matches!(command, RuntimeCommand::WriteInput { .. }) })
+        );
     }
 
     #[test]

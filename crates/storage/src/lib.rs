@@ -17,10 +17,11 @@ pub use db::{
     MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX, McpRequestTargetRecord,
     PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX, PENDING_APPROVAL_SESSION_KEY_BYTES_MAX,
     PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX, PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX,
-    PendingApprovalRow, PermissionRuleRow, PhysicalSecretSlotLedgerRow, PhysicalSecretSlotState,
-    SettingsWorkspaceProjectionRow, StatuslineRow, StructuredThreadMutation, StructuredThreadRow,
-    WebPushSubscriptionRow, WorkspaceFindOrCreateResult, WorkspaceFolderAnchor,
-    WorkspaceMovedPathUpdate, WorkspaceRow, prepare_agent_state_job_for_retention,
+    PendingApprovalRow, PermissionRuleRow, PersistedActivityPane, PhysicalSecretSlotLedgerRow,
+    PhysicalSecretSlotState, SettingsWorkspaceProjectionRow, StatuslineRow,
+    StructuredThreadMutation, StructuredThreadRow, WebPushSubscriptionRow,
+    WorkspaceFindOrCreateResult, WorkspaceFolderAnchor, WorkspaceMovedPathUpdate, WorkspaceRow,
+    prepare_agent_state_job_for_retention,
 };
 pub use mcp_store::{
     MCP_PERMISSION_POINT_BYTES_MAX, MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX,
@@ -47,3 +48,18 @@ mod write_worker;
 pub use write_worker::{
     DbWriteHandle, DbWriteQueueError, DbWriteStatsSnapshot, DbWriteWorker, DbWriteWorkerConfig,
 };
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn persisted_activity_pane_is_reexported_from_crate_root() {
+        let row = crate::PersistedActivityPane {
+            workspace_id: "workspace".to_owned(),
+            pane_id: "pane".to_owned(),
+            title: "title".to_owned(),
+            cwd: "/tmp".to_owned(),
+        };
+
+        assert_eq!(row.pane_id, "pane");
+    }
+}

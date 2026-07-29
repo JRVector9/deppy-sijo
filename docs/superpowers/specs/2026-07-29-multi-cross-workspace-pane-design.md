@@ -265,4 +265,3 @@ measurement evidence rather than a brittle absolute unit-test threshold.
 - Reconstructing a historical shell process that no longer has a canonical
   pane.
 - Command palette or pane-header workspace picker.
-

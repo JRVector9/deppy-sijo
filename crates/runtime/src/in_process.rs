@@ -284,6 +284,7 @@ impl InProcessRuntimeClient {
                     mux: MuxState::new(),
                     tab_counter: 0,
                     persist: persist_pipe,
+                    persist_db_path: persist.as_ref().map(|config| config.db_path.clone()),
                     lazy_restore: None,
                     exited_order: std::collections::VecDeque::new(),
                     max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
@@ -700,6 +701,7 @@ struct Worker {
     tab_counter: u64,
     /// 세션/mux 영속 파이프 (설정 시에만 — 실패는 best-effort warn)
     persist: Option<crate::persistence::PersistPipe>,
+    persist_db_path: Option<PathBuf>,
     /// 첫 targeted restore가 설치한 bounded pane catalog. worker 명령 직렬화로 한 번에
     /// 하나만 materialize하며, 비어지거나 full restore가 끝나면 즉시 drop한다.
     lazy_restore: Option<LazyWorkspaceRestore>,
@@ -2799,6 +2801,80 @@ impl Worker {
         self.push_watched_viewports();
     }
 
+    fn save_lazy_merged_layout(&self) {
+        let (Some(restore), Some(db_path), Some(pipe)) = (
+            self.lazy_restore.as_ref(),
+            self.persist_db_path.as_ref(),
+            self.persist.as_ref(),
+        ) else {
+            return;
+        };
+        let saved = (|| -> anyhow::Result<()> {
+            let mut conn = rusqlite::Connection::open(db_path)?;
+            conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+            conn.pragma_update(None, "foreign_keys", true)?;
+            conn.busy_timeout(Duration::from_secs(5))?;
+            let window_id = conn.query_row(
+                "SELECT id FROM mux_windows
+                 WHERE workspace_id = ?1
+                 ORDER BY created_at, id
+                 LIMIT 1",
+                [&self.workspace_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let state = persist::WindowState {
+                id: deppy_core::MuxWindowId(window_id),
+                title: None,
+                active_tab: self.mux.window.active_tab.clone(),
+                tabs: self
+                    .mux
+                    .window
+                    .tabs
+                    .iter()
+                    .filter_map(|tab_id| self.mux.tabs.get(tab_id))
+                    .map(|tab| persist::TabState {
+                        id: tab.id.clone(),
+                        title: tab.title.clone(),
+                        layout: tab.layout.clone(),
+                        active_pane: tab.active_pane.clone(),
+                        panes: tab
+                            .layout
+                            .panes()
+                            .into_iter()
+                            .filter_map(|pane_id| self.mux.panes.get(&pane_id))
+                            .map(|pane| {
+                                let pending = restore
+                                    .pending_panes
+                                    .iter()
+                                    .find(|pending| pending.id == pane.id);
+                                persist::PaneState {
+                                    id: pane.id.clone(),
+                                    session_id: pending
+                                        .and_then(|pending| pending.session_id.clone())
+                                        .or_else(|| {
+                                            pane.session_id.and_then(|session| {
+                                                pipe.session_log_key(session).map(str::to_owned)
+                                            })
+                                        }),
+                                    title: pane.title.clone(),
+                                    pane_kind: pane.pane_kind,
+                                    cwd: pending.and_then(|pending| pending.cwd.clone()),
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
+            persist::save_window_layout(&mut conn, &self.workspace_id, &state)
+        })();
+        if saved.is_err() {
+            tracing::warn!(
+                error_code = "lazy_restore_layout_save_failed",
+                "부분 복원 mux layout 영속 실패"
+            );
+        }
+    }
+
     /// mux 스냅샷만 emit (+ 영속 저장). spawn 경로는 이걸 먼저 부르고
     /// Spawned 이벤트를 보낸 뒤 [`Self::push_watched_viewports`]를 불러야
     /// "slot에 Viewport가 있으면 그 세션의 Spawned가 같은 drain에 포함"이라는
@@ -2806,11 +2882,9 @@ impl Worker {
     fn emit_mux_snapshot(&mut self) {
         // mux 구조가 바뀐 지점 — 가시성 전이에 맞춰 scrollback cap 조정 (§14.3)
         self.reconcile_visibility();
-        // 부분 복원 중 skeleton의 session_id=None을 원본 영속 layout에 덮지 않는다.
-        // 마지막 pane/full restore에서 catalog가 drop된 뒤 한 번 정상 저장한다.
-        if self.lazy_restore.is_none()
-            && let Some(pipe) = &mut self.persist
-        {
+        if self.lazy_restore.is_some() {
+            self.save_lazy_merged_layout();
+        } else if let Some(pipe) = &mut self.persist {
             pipe.save_layout(&self.mux.window, &self.mux.tabs, &self.mux.panes);
         }
         self.emit(RuntimeEvent::MuxUpdated {
@@ -4205,6 +4279,7 @@ mod tests {
                 mux: MuxState::new(),
                 tab_counter: 0,
                 persist: None,
+                persist_db_path: None,
                 lazy_restore: None,
                 exited_order: std::collections::VecDeque::new(),
                 max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
@@ -4834,6 +4909,122 @@ mod tests {
         assert!(worker.lazy_restore.is_none());
         drop(worker);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    fn assert_lazy_restore_close_survives_restart(close_tab: bool) {
+        init_mock_store();
+        let dir = unique_test_dir(if close_tab {
+            "lazy-restore-close-tab-restart"
+        } else {
+            "lazy-restore-close-pane-restart"
+        });
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = if close_tab {
+            "ws-lazy-close-tab-restart"
+        } else {
+            "ws-lazy-close-pane-restart"
+        };
+        create_persist_db(&db_path, workspace_id);
+        let (first_pane, second_pane) =
+            seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        {
+            let client = InProcessRuntimeClient::with_shell(
+                5,
+                test_store(),
+                dir.join("logs-first"),
+                RedactionService::new(),
+                spec("/bin/cat", &[]),
+                Some(crate::persistence::PersistConfig {
+                    db_path: db_path.clone(),
+                    workspace_id: workspace_id.to_owned(),
+                }),
+            );
+            let mut probe = Probe::new(client.subscribe());
+            client
+                .send_command(RuntimeCommand::RestoreWorkspacePane {
+                    pane: MuxPaneId("missing-pane".to_owned()),
+                })
+                .unwrap();
+            probe.wait_for(Duration::from_secs(15), |event| match event {
+                RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => Some(()),
+                _ => None,
+            });
+            let command = if close_tab {
+                RuntimeCommand::CloseTab {
+                    tab: MuxTabId("restore-tab-second".to_owned()),
+                }
+            } else {
+                RuntimeCommand::ClosePane {
+                    pane: second_pane.clone(),
+                }
+            };
+            client.send_command(command).unwrap();
+            probe.wait_for(Duration::from_secs(15), |event| match event {
+                RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 1 => Some(()),
+                _ => None,
+            });
+        }
+
+        let persisted_panes = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .prepare("SELECT id FROM mux_panes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(persisted_panes, vec![first_pane.0.clone()]);
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs-second"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let snapshot = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot.tabs.len() == 1
+                    && snapshot.tabs[0]
+                        .panes
+                        .iter()
+                        .any(|pane| pane.id == first_pane && pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(snapshot.tabs.len(), 1);
+        assert!(
+            !snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|pane| pane.id == second_pane)
+        );
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_pending_close_survives_restart() {
+        assert_lazy_restore_close_survives_restart(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_pending_tab_close_survives_restart() {
+        assert_lazy_restore_close_survives_restart(true);
     }
 
     #[cfg(unix)]

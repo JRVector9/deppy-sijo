@@ -2191,6 +2191,18 @@ fn performance_page(
             }
         },
     );
+    row(
+        ui,
+        &catalog.t("settings.max_cross_workspace_panes", &[]),
+        Some(&catalog.t("settings.max_cross_workspace_panes.hint", &[])),
+        |ui| {
+            let mut v = config.performance.max_cross_workspace_panes as i64;
+            if stepper(ui, &mut v, 1, 1, 6, "") {
+                config.performance.max_cross_workspace_panes = v as u32;
+                *changed = true;
+            }
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -377,6 +377,13 @@ pub struct PerformanceConfig {
     /// 않고 거부한다. 높이면 동시 워커+에이전트가 늘어 메모리↑ (지배 요인은 에이전트).
     /// 기본값은 RAM 유도([`recommended_max_live_warm`]) — 첫 실행 시 1회, 이후 사용자 값.
     pub max_live_warm: u32,
+    /// 활성 워크스페이스 옆에 동시에 표시할 다른 워크스페이스 Pane의 최대 개수.
+    #[serde(default = "default_max_cross_workspace_panes")]
+    pub max_cross_workspace_panes: u32,
+}
+
+fn default_max_cross_workspace_panes() -> u32 {
+    2
 }
 
 impl Default for PerformanceConfig {
@@ -385,6 +392,7 @@ impl Default for PerformanceConfig {
             output_batch_ms: 25,
             max_warm: 2,
             max_live_warm: recommended_max_live_warm(),
+            max_cross_workspace_panes: default_max_cross_workspace_panes(),
         }
     }
 }
@@ -492,6 +500,8 @@ impl Config {
             .clamp(MIN_OUTPUT_BATCH_MS, 1_000);
         self.performance.max_warm = self.performance.max_warm.clamp(0, 8);
         self.performance.max_live_warm = self.performance.max_live_warm.clamp(1, 12);
+        self.performance.max_cross_workspace_panes =
+            self.performance.max_cross_workspace_panes.clamp(1, 6);
         self.ui.fleet_batch_spawn_max = self.ui.fleet_batch_spawn_max.clamp(1, 16);
         self.i18n.locale = i18n::normalize_locale(&self.i18n.locale);
         // TOML을 손으로 고친 미지 프로바이더는 기본(None)으로 — spawn 경계의 검증과 별개로
@@ -752,6 +762,40 @@ mod tests {
         c.normalize();
         assert_eq!(c.performance.max_warm, 8);
         assert_eq!(c.performance.max_live_warm, 1);
+    }
+
+    #[test]
+    fn max_cross_workspace_panes_기본값은_2다() {
+        assert_eq!(PerformanceConfig::default().max_cross_workspace_panes, 2);
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.performance.max_cross_workspace_panes, 2);
+    }
+
+    #[test]
+    fn max_cross_workspace_panes_범위밖_값은_1에서_6으로_정규화된다() {
+        let mut config = Config::default();
+        config.performance.max_cross_workspace_panes = 0;
+        config.normalize();
+        assert_eq!(config.performance.max_cross_workspace_panes, 1);
+
+        config.performance.max_cross_workspace_panes = 7;
+        config.normalize();
+        assert_eq!(config.performance.max_cross_workspace_panes, 6);
+
+        config.performance.max_cross_workspace_panes = u32::MAX;
+        config.normalize();
+        assert_eq!(config.performance.max_cross_workspace_panes, 6);
+    }
+
+    #[test]
+    fn max_cross_workspace_panes_유효값은_toml_라운드트립된다() {
+        for value in [1, 2, 6] {
+            let mut config = Config::default();
+            config.performance.max_cross_workspace_panes = value;
+            let text = toml::to_string(&config).unwrap();
+            let reloaded: Config = toml::from_str(&text).unwrap();
+            assert_eq!(reloaded.performance.max_cross_workspace_panes, value);
+        }
     }
 
     #[test]

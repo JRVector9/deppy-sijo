@@ -1362,6 +1362,46 @@ fn runtime_command_is_targeted_workspace_restore(command: &runtime::RuntimeComma
 const CROSS_WORKSPACE_RESTORE_QUEUE_CAP: usize = 6;
 const CROSS_WORKSPACE_RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+#[derive(Debug, PartialEq, Eq)]
+struct DurableBarrierCorrelationAllocator {
+    next: u64,
+}
+
+impl Default for DurableBarrierCorrelationAllocator {
+    fn default() -> Self {
+        Self { next: 1 }
+    }
+}
+
+impl DurableBarrierCorrelationAllocator {
+    fn allocate(&mut self) -> Option<u64> {
+        let correlation_id = std::num::NonZeroU64::new(self.next)?.get();
+        self.next = self.next.checked_add(1).unwrap_or(0);
+        Some(correlation_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreBarrierDelivery {
+    NotSent,
+    RestoreSentUnarmed,
+    BarrierArmed(u64),
+}
+
+fn send_restore_with_durable_barrier(
+    pane: runtime::MuxPaneId,
+    correlation_id: u64,
+    mut send: impl FnMut(runtime::RuntimeCommand) -> bool,
+) -> RestoreBarrierDelivery {
+    if correlation_id == 0 || !send(runtime::RuntimeCommand::RestoreWorkspacePane { pane }) {
+        return RestoreBarrierDelivery::NotSent;
+    }
+    if !send(runtime::RuntimeCommand::DurableEventBarrier { correlation_id }) {
+        return RestoreBarrierDelivery::RestoreSentUnarmed;
+    }
+    RestoreBarrierDelivery::BarrierArmed(correlation_id)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CrossWorkspaceRestoreRequest {
     workspace_id: String,
@@ -1400,8 +1440,15 @@ struct CrossWorkspaceRestoreDispatch {
     request: CrossWorkspaceRestoreRequest,
     runtime_instance: u64,
     deadline: std::time::Instant,
-    command_sent: bool,
+    state: CrossWorkspaceRestoreDispatchState,
     cancelled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossWorkspaceRestoreDispatchState {
+    Pending,
+    RestoreSentUnarmed,
+    BarrierArmed(u64),
 }
 
 impl CrossWorkspaceRestoreDispatch {
@@ -1415,43 +1462,6 @@ impl CrossWorkspaceRestoreDispatch {
 struct CrossWorkspaceRestoreCompletion {
     attachment_id: ui::cross_workspace::AttachmentId,
     target: ui::cross_workspace::WorkspacePaneTarget,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RestoreMuxBarrierFact {
-    Restored {
-        workspace_id: String,
-        runtime_instance: u64,
-        tab: runtime::MuxTabId,
-        pane: runtime::MuxPaneId,
-        session: runtime::SessionId,
-    },
-    Missing {
-        workspace_id: String,
-        runtime_instance: u64,
-        pane: runtime::MuxPaneId,
-    },
-}
-
-impl RestoreMuxBarrierFact {
-    fn matches_dispatch(&self, dispatch: &CrossWorkspaceRestoreDispatch) -> bool {
-        match self {
-            Self::Restored {
-                workspace_id,
-                runtime_instance,
-                pane,
-                ..
-            }
-            | Self::Missing {
-                workspace_id,
-                runtime_instance,
-                pane,
-            } => {
-                *runtime_instance == dispatch.runtime_instance
-                    && dispatch.request.same_canonical_pane(workspace_id, pane)
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1499,28 +1509,51 @@ impl CrossWorkspaceRestoreCoordinator {
             request,
             runtime_instance,
             deadline: now + CROSS_WORKSPACE_RESTORE_TIMEOUT,
-            command_sent: false,
+            state: CrossWorkspaceRestoreDispatchState::Pending,
             cancelled: false,
         };
         self.in_flight = Some(dispatch.clone());
         Some(dispatch)
     }
 
-    fn mark_command_sent(&mut self, runtime_instance: u64, pane: &runtime::MuxPaneId) -> bool {
+    fn mark_restore_sent(&mut self, runtime_instance: u64, pane: &runtime::MuxPaneId) -> bool {
         let Some(dispatch) = self.in_flight.as_mut() else {
             return false;
         };
-        if dispatch.runtime_instance != runtime_instance || dispatch.request.pane != *pane {
+        if dispatch.runtime_instance != runtime_instance
+            || dispatch.request.pane != *pane
+            || dispatch.state != CrossWorkspaceRestoreDispatchState::Pending
+        {
             return false;
         }
-        dispatch.command_sent = true;
+        dispatch.state = CrossWorkspaceRestoreDispatchState::RestoreSentUnarmed;
+        true
+    }
+
+    fn arm_durable_barrier(
+        &mut self,
+        runtime_instance: u64,
+        pane: &runtime::MuxPaneId,
+        correlation_id: u64,
+    ) -> bool {
+        let Some(dispatch) = self.in_flight.as_mut() else {
+            return false;
+        };
+        if correlation_id == 0
+            || dispatch.runtime_instance != runtime_instance
+            || dispatch.request.pane != *pane
+            || dispatch.state != CrossWorkspaceRestoreDispatchState::RestoreSentUnarmed
+        {
+            return false;
+        }
+        dispatch.state = CrossWorkspaceRestoreDispatchState::BarrierArmed(correlation_id);
         true
     }
 
     fn allows_command(&self, runtime_instance: u64, pane: &runtime::MuxPaneId) -> bool {
         self.in_flight.as_ref().is_some_and(|dispatch| {
             !dispatch.cancelled
-                && !dispatch.command_sent
+                && dispatch.state == CrossWorkspaceRestoreDispatchState::Pending
                 && dispatch.runtime_instance == runtime_instance
                 && dispatch.request.pane == *pane
         })
@@ -1532,7 +1565,7 @@ impl CrossWorkspaceRestoreCoordinator {
         pane: &runtime::MuxPaneId,
     ) -> Option<CrossWorkspaceRestoreRequest> {
         let dispatch = self.in_flight.as_ref()?;
-        if dispatch.command_sent
+        if dispatch.state != CrossWorkspaceRestoreDispatchState::Pending
             || dispatch.runtime_instance != runtime_instance
             || dispatch.request.pane != *pane
         {
@@ -1541,37 +1574,40 @@ impl CrossWorkspaceRestoreCoordinator {
         self.in_flight.take().map(|dispatch| dispatch.request)
     }
 
-    fn settle_mux_barrier(&mut self, fact: RestoreMuxBarrierFact) -> Option<RestoreBarrierOutcome> {
+    fn settle_durable_barrier(
+        &mut self,
+        workspace_id: &str,
+        runtime_instance: u64,
+        correlation_id: u64,
+        mux: Option<&runtime::MuxSnapshot>,
+    ) -> Option<RestoreBarrierOutcome> {
         let dispatch = self.in_flight.as_ref()?;
-        if !dispatch.command_sent || !fact.matches_dispatch(dispatch) {
+        if dispatch.request.workspace_id() != workspace_id
+            || dispatch.runtime_instance != runtime_instance
+            || dispatch.state != CrossWorkspaceRestoreDispatchState::BarrierArmed(correlation_id)
+        {
             return None;
         }
         let dispatch = self.in_flight.take().unwrap();
         if dispatch.cancelled {
             return Some(RestoreBarrierOutcome::Ignored(dispatch.request));
         }
-        match fact {
-            RestoreMuxBarrierFact::Restored {
+        let target = mux.and_then(|mux| {
+            restored_workspace_pane_target(
                 workspace_id,
                 runtime_instance,
-                tab,
-                pane,
-                session,
-            } => Some(RestoreBarrierOutcome::Promote(
+                &dispatch.request.pane,
+                mux,
+            )
+        });
+        match target {
+            Some(target) => Some(RestoreBarrierOutcome::Promote(
                 CrossWorkspaceRestoreCompletion {
                     attachment_id: dispatch.request.attachment_id,
-                    target: ui::cross_workspace::WorkspacePaneTarget::new(
-                        workspace_id,
-                        runtime_instance,
-                        tab,
-                        pane,
-                        session,
-                    ),
+                    target,
                 },
             )),
-            RestoreMuxBarrierFact::Missing { .. } => {
-                Some(RestoreBarrierOutcome::Failed(dispatch.request))
-            }
+            None => Some(RestoreBarrierOutcome::Failed(dispatch.request)),
         }
     }
 
@@ -1593,7 +1629,7 @@ impl CrossWorkspaceRestoreCoordinator {
             .is_some_and(|dispatch| dispatch.request.attachment_id == attachment_id)
         {
             let dispatch = self.in_flight.as_mut().unwrap();
-            if dispatch.command_sent {
+            if dispatch.state != CrossWorkspaceRestoreDispatchState::Pending {
                 dispatch.cancelled = true;
                 return Some(dispatch.request.clone());
             }
@@ -1687,6 +1723,19 @@ impl CrossWorkspaceRestoreCoordinator {
 
     fn in_flight(&self) -> Option<&CrossWorkspaceRestoreDispatch> {
         self.in_flight.as_ref()
+    }
+
+    fn armed_barrier(&self) -> Option<(&str, u64, u64)> {
+        let dispatch = self.in_flight.as_ref()?;
+        let CrossWorkspaceRestoreDispatchState::BarrierArmed(correlation_id) = dispatch.state
+        else {
+            return None;
+        };
+        Some((
+            dispatch.request.workspace_id(),
+            dispatch.runtime_instance,
+            correlation_id,
+        ))
     }
 
     fn next_request(&self) -> Option<&CrossWorkspaceRestoreRequest> {
@@ -6654,6 +6703,7 @@ pub struct App {
     active: WorkspaceRuntime,
     /// Next concrete runtime identity; zero is never issued.
     next_runtime_instance: u64,
+    next_restore_barrier: DurableBarrierCorrelationAllocator,
     /// warm workspace들 (전환으로 물러났지만 워커는 계속 실행 — §14.1 Warm). 이벤트는
     /// drain만 하고(채널 backup 방지) 렌더/알림은 안 한다. 재활성 시 즉시 복귀.
     warm: std::collections::HashMap<String, WorkspaceRuntime>,
@@ -9296,6 +9346,7 @@ impl App {
             startup_positioned: false,
             active,
             next_runtime_instance: 2,
+            next_restore_barrier: DurableBarrierCorrelationAllocator::default(),
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
             cross_workspace_pane: ui::cross_workspace::CrossWorkspacePaneState::default(),
@@ -13538,7 +13589,11 @@ impl App {
                 "dotenv-gated launch failed closed"
             );
             if let Some(pane) = restore_pane.as_ref() {
-                self.finish_cross_workspace_restore_dotenv(pending.runtime_instance, pane, false);
+                self.finish_cross_workspace_restore_dotenv(
+                    pending.runtime_instance,
+                    pane,
+                    RestoreBarrierDelivery::NotSent,
+                );
             }
             return;
         };
@@ -13587,6 +13642,9 @@ impl App {
             self.cross_workspace_restore
                 .allows_command(pending.runtime_instance, pane)
         });
+        let restore_correlation = (restore_pane.is_some() && restore_command_allowed)
+            .then(|| self.next_restore_barrier.allocate())
+            .flatten();
         let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) else {
             if let Some(ticket_id) = agent_ticket {
                 self.approval_launch_tracker.cancel(ticket_id);
@@ -13605,7 +13663,11 @@ impl App {
                 "dotenv launch target became stale"
             );
             if let Some(pane) = restore_pane.as_ref() {
-                self.finish_cross_workspace_restore_dotenv(pending.runtime_instance, pane, false);
+                self.finish_cross_workspace_restore_dotenv(
+                    pending.runtime_instance,
+                    pane,
+                    RestoreBarrierDelivery::NotSent,
+                );
             }
             return;
         };
@@ -13623,7 +13685,7 @@ impl App {
             runtime.dotenv_state = Some(baseline);
         }
         let policy_delivered = env_delivered && runtime.runtime.send_command(cache_policy).is_ok();
-        let delivered = match pending.continuation {
+        let (delivered, restore_delivery) = match pending.continuation {
             PendingDotenvContinuation::WorkspaceProtocol {
                 operation,
                 generation,
@@ -13639,17 +13701,36 @@ impl App {
                             .ok_or(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed),
                     },
                 );
-                delivered
+                (delivered, None)
+            }
+            PendingDotenvContinuation::RuntimeCommand(
+                runtime::RuntimeCommand::RestoreWorkspacePane { pane },
+            ) => {
+                let delivery = match restore_correlation {
+                    Some(correlation_id) if policy_delivered => {
+                        send_restore_with_durable_barrier(pane, correlation_id, |command| {
+                            runtime.runtime.send_command(command).is_ok()
+                        })
+                    }
+                    _ => RestoreBarrierDelivery::NotSent,
+                };
+                (
+                    matches!(delivery, RestoreBarrierDelivery::BarrierArmed(_)),
+                    Some(delivery),
+                )
             }
             PendingDotenvContinuation::RuntimeCommand(command)
-            | PendingDotenvContinuation::AgentLaunch { command, .. } => {
-                restore_command_allowed
-                    && policy_delivered
-                    && runtime.runtime.send_command(command).is_ok()
-            }
+            | PendingDotenvContinuation::AgentLaunch { command, .. } => (
+                policy_delivered && runtime.runtime.send_command(command).is_ok(),
+                None,
+            ),
         };
         if let Some(pane) = restore_pane.as_ref() {
-            self.finish_cross_workspace_restore_dotenv(pending.runtime_instance, pane, delivered);
+            self.finish_cross_workspace_restore_dotenv(
+                pending.runtime_instance,
+                pane,
+                restore_delivery.unwrap_or(RestoreBarrierDelivery::NotSent),
+            );
         }
         if delivered {
             self.invalidate_env_profile_ui();
@@ -13683,13 +13764,29 @@ impl App {
         &mut self,
         runtime_instance: u64,
         pane: &runtime::MuxPaneId,
-        delivered: bool,
+        delivery: RestoreBarrierDelivery,
     ) {
-        if delivered {
-            let _ = self
-                .cross_workspace_restore
-                .mark_command_sent(runtime_instance, pane);
-            return;
+        match delivery {
+            RestoreBarrierDelivery::BarrierArmed(correlation_id) => {
+                if self
+                    .cross_workspace_restore
+                    .mark_restore_sent(runtime_instance, pane)
+                {
+                    let _ = self.cross_workspace_restore.arm_durable_barrier(
+                        runtime_instance,
+                        pane,
+                        correlation_id,
+                    );
+                }
+                return;
+            }
+            RestoreBarrierDelivery::RestoreSentUnarmed => {
+                let _ = self
+                    .cross_workspace_restore
+                    .mark_restore_sent(runtime_instance, pane);
+                return;
+            }
+            RestoreBarrierDelivery::NotSent => {}
         }
         if let Some(failed) = self
             .cross_workspace_restore
@@ -17485,29 +17582,27 @@ impl eframe::App for App {
         let mut approval_events_overflowed = false;
         let mut approval_runtime_events = Vec::new();
         let mut warm_lifecycle_changed = false;
-        let restore_dispatch = self
-            .cross_workspace_restore
-            .in_flight()
-            .filter(|dispatch| dispatch.command_sent)
-            .cloned();
-        let mut restore_barriers = Vec::with_capacity(1);
+        let expected_restore_barrier = self.cross_workspace_restore.armed_barrier().map(
+            |(workspace_id, runtime_instance, correlation_id)| {
+                (workspace_id.to_owned(), runtime_instance, correlation_id)
+            },
+        );
+        let mut warm_restore_outcome = None;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
-            if restore_barriers.len() < CROSS_WORKSPACE_RESTORE_QUEUE_CAP
-                && let Some(dispatch) = restore_dispatch.as_ref()
-                && dispatch.runtime_instance == rt.runtime_instance
-                && dispatch.request.workspace_id() == rt.id
-                && let Some(snapshot) = events.iter().rev().find_map(|event| match event {
-                    runtime::RuntimeEvent::MuxUpdated { snapshot } => Some(snapshot),
-                    _ => None,
-                })
+            if let Some((workspace_id, runtime_instance, correlation_id)) =
+                expected_restore_barrier.as_ref()
+                && *workspace_id == rt.id
+                && *runtime_instance == rt.runtime_instance
+                && let Some(mux) =
+                    runtime_mux_at_durable_barrier(rt.workspace_ui.mux(), &events, *correlation_id)
             {
-                restore_barriers.push(restore_mux_barrier_fact(
-                    &rt.id,
-                    rt.runtime_instance,
-                    &dispatch.request.pane,
-                    snapshot,
-                ));
+                warm_restore_outcome = self.cross_workspace_restore.settle_durable_barrier(
+                    workspace_id,
+                    *runtime_instance,
+                    *correlation_id,
+                    mux.map(Arc::as_ref),
+                );
             }
             // active와 동일 — 예산 초과 backlog는 wake가 이미 소진돼 직접 예약해야 한다.
             if rt.events.has_backlog() {
@@ -17593,10 +17688,8 @@ impl eframe::App for App {
         if warm_lifecycle_changed {
             self.refresh_warm_idle_deadline();
         }
-        for barrier in restore_barriers {
-            if let Some(outcome) = self.cross_workspace_restore.settle_mux_barrier(barrier) {
-                self.apply_cross_workspace_restore_barrier(outcome);
-            }
+        if let Some(outcome) = warm_restore_outcome {
+            self.apply_cross_workspace_restore_barrier(outcome);
         }
         self.drive_cross_workspace_restore(std::time::Instant::now());
         self.maintain_warm_evictions(std::time::Instant::now());
@@ -17607,24 +17700,28 @@ impl eframe::App for App {
         let new_events = self.active.events.drain();
         let active_restore_barrier = self
             .cross_workspace_restore
-            .in_flight()
-            .filter(|dispatch| {
-                dispatch.command_sent
-                    && dispatch.runtime_instance == self.active.runtime_instance
-                    && dispatch.request.workspace_id() == self.active.id
+            .armed_barrier()
+            .map(|(workspace_id, runtime_instance, correlation_id)| {
+                (workspace_id.to_owned(), runtime_instance, correlation_id)
             })
-            .and_then(|dispatch| {
-                new_events.iter().rev().find_map(|event| match event {
-                    runtime::RuntimeEvent::MuxUpdated { snapshot } => {
-                        Some(restore_mux_barrier_fact(
-                            &self.active.id,
-                            self.active.runtime_instance,
-                            &dispatch.request.pane,
-                            snapshot,
-                        ))
-                    }
-                    _ => None,
-                })
+            .and_then(|(workspace_id, runtime_instance, correlation_id)| {
+                (workspace_id == self.active.id && runtime_instance == self.active.runtime_instance)
+                    .then(|| {
+                        runtime_mux_at_durable_barrier(
+                            self.active.workspace_ui.mux(),
+                            &new_events,
+                            correlation_id,
+                        )
+                        .and_then(|mux| {
+                            self.cross_workspace_restore.settle_durable_barrier(
+                                &workspace_id,
+                                runtime_instance,
+                                correlation_id,
+                                mux.map(Arc::as_ref),
+                            )
+                        })
+                    })
+                    .flatten()
             });
         if !new_events.is_empty() {
             Self::record_activity_events(&mut self.active, &new_events);
@@ -17674,9 +17771,7 @@ impl eframe::App for App {
             // 프레임이 그리는 내용을 위해 프레임을 한 장 더 잡고, egui가 거기에 settle 프레임을
             // 하나 더 붙여 갱신 1회당 3프레임이 된다 (agenttui 실측: 페인트의 70%가 헛 프레임).
         }
-        if let Some(barrier) = active_restore_barrier
-            && let Some(outcome) = self.cross_workspace_restore.settle_mux_barrier(barrier)
-        {
+        if let Some(outcome) = active_restore_barrier {
             self.apply_cross_workspace_restore_barrier(outcome);
             self.drive_cross_workspace_restore(std::time::Instant::now());
         }
@@ -20606,34 +20701,28 @@ fn resolve_exact_warm_pane_target(
     })
 }
 
-fn restore_mux_barrier_fact(
+fn restored_workspace_pane_target(
     workspace_id: &str,
     runtime_instance: u64,
     requested_pane: &runtime::MuxPaneId,
     mux: &runtime::MuxSnapshot,
-) -> RestoreMuxBarrierFact {
-    mux.tabs
-        .iter()
-        .find_map(|tab| {
-            tab.panes
-                .iter()
-                .find(|pane| pane.id == *requested_pane)
-                .and_then(|pane| {
-                    pane.session_id
-                        .map(|session| RestoreMuxBarrierFact::Restored {
-                            workspace_id: workspace_id.to_owned(),
-                            runtime_instance,
-                            tab: tab.id.clone(),
-                            pane: pane.id.clone(),
-                            session,
-                        })
+) -> Option<ui::cross_workspace::WorkspacePaneTarget> {
+    mux.tabs.iter().find_map(|tab| {
+        tab.panes
+            .iter()
+            .find(|pane| pane.id == *requested_pane)
+            .and_then(|pane| {
+                pane.session_id.map(|session| {
+                    ui::cross_workspace::WorkspacePaneTarget::new(
+                        workspace_id,
+                        runtime_instance,
+                        tab.id.clone(),
+                        pane.id.clone(),
+                        session,
+                    )
                 })
-        })
-        .unwrap_or_else(|| RestoreMuxBarrierFact::Missing {
-            workspace_id: workspace_id.to_owned(),
-            runtime_instance,
-            pane: requested_pane.clone(),
-        })
+            })
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20972,6 +21061,27 @@ fn warm_replay_event(event: &runtime::RuntimeEvent) -> bool {
                 ..
             }
     )
+}
+
+fn runtime_mux_at_durable_barrier<'a>(
+    current_mux: Option<&'a Arc<runtime::MuxSnapshot>>,
+    events: &'a [runtime::RuntimeEvent],
+    correlation_id: u64,
+) -> Option<Option<&'a Arc<runtime::MuxSnapshot>>> {
+    if correlation_id == 0 {
+        return None;
+    }
+    let mut mux = current_mux;
+    for event in events {
+        match event {
+            runtime::RuntimeEvent::MuxUpdated { snapshot } => mux = Some(snapshot),
+            runtime::RuntimeEvent::DurableEventBarrierReached {
+                correlation_id: reached,
+            } if *reached == correlation_id => return Some(mux),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn mux_live_sessions(mux: &runtime::MuxSnapshot) -> std::collections::HashSet<runtime::SessionId> {
@@ -21466,7 +21576,7 @@ mod tests {
         assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", first)));
         assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", second)));
         coordinator.begin_next(11, now).unwrap();
-        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
         let replacement = ui::cross_workspace::WorkspacePaneTarget::new(
             "workspace-d",
             12,
@@ -24690,6 +24800,24 @@ mod tests {
         )
     }
 
+    fn restoring_attachment_id(
+        workspace_id: &str,
+        pane: &str,
+    ) -> ui::cross_workspace::AttachmentId {
+        ui::cross_workspace::CrossWorkspacePaneState::default()
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    workspace_id,
+                    runtime::MuxPaneId(pane.to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap()
+    }
+
     #[test]
     fn cross_workspace_app_restore_queue_has_one_in_flight() {
         let now = std::time::Instant::now();
@@ -24726,6 +24854,194 @@ mod tests {
         assert_eq!(first_dispatch.request().workspace_id(), "workspace-b");
         assert!(coordinator.begin_next(12, now).is_none());
         assert_eq!(coordinator.pending_len(), 1);
+        assert_eq!(coordinator.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_stale_pre_command_mux_updated_cannot_settle() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        let stale = cross_workspace_test_mux("tab-b", "pane-old", runtime::SessionId(7));
+
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 41, Some(&stale))
+                .is_none()
+        );
+        assert_eq!(coordinator.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_requested_restore_exact_barrier_promotes() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+
+        let outcome = coordinator.settle_durable_barrier("workspace-b", 11, 41, Some(&mux));
+
+        assert!(matches!(outcome, Some(RestoreBarrierOutcome::Promote(_))));
+        assert_eq!(coordinator.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_exact_barrier_uses_mux_at_fifo_boundary() {
+        let restored = Arc::new(cross_workspace_test_mux(
+            "tab-b",
+            "pane-b",
+            runtime::SessionId(42),
+        ));
+        let later = Arc::new(cross_workspace_test_mux(
+            "tab-b",
+            "pane-other",
+            runtime::SessionId(43),
+        ));
+        let events = vec![
+            runtime::RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&restored),
+            },
+            runtime::RuntimeEvent::DurableEventBarrierReached { correlation_id: 41 },
+            runtime::RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&later),
+            },
+        ];
+
+        let mux = runtime_mux_at_durable_barrier(None, &events, 41)
+            .flatten()
+            .unwrap();
+
+        assert!(Arc::ptr_eq(mux, &restored));
+    }
+
+    #[test]
+    fn cross_workspace_app_missing_exact_barrier_fails() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+        let mux = cross_workspace_test_mux("tab-b", "pane-other", runtime::SessionId(42));
+
+        let outcome = coordinator.settle_durable_barrier("workspace-b", 11, 41, Some(&mux));
+
+        assert!(matches!(outcome, Some(RestoreBarrierOutcome::Failed(_))));
+    }
+
+    #[test]
+    fn cross_workspace_app_wrong_correlation_or_runtime_barrier_is_ignored() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 40, Some(&mux))
+                .is_none()
+        );
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 12, 41, Some(&mux))
+                .is_none()
+        );
+        assert_eq!(coordinator.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_cancelled_inflight_blocks_until_exact_barrier() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        let attachment_id = request.attachment_id();
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+        assert!(coordinator.cancel_attachment(attachment_id).is_some());
+        assert!(coordinator.begin_next(12, now).is_none());
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 40, Some(&mux))
+                .is_none()
+        );
+
+        let outcome = coordinator.settle_durable_barrier("workspace-b", 11, 41, Some(&mux));
+
+        assert!(matches!(outcome, Some(RestoreBarrierOutcome::Ignored(_))));
+        assert_eq!(coordinator.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_barrier_ids_are_nonzero_monotonic_across_runtime_replacement() {
+        let mut allocator = DurableBarrierCorrelationAllocator::default();
+        let first = allocator.allocate().unwrap();
+        let _runtime_replaced = 12_u64;
+        let second = allocator.allocate().unwrap();
+
+        assert_ne!(first, 0);
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_second_barrier_send_failure_never_promotes() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        let mut sent = 0;
+        let delivery =
+            send_restore_with_durable_barrier(runtime::MuxPaneId("pane-b".into()), 41, |_| {
+                sent += 1;
+                sent == 1
+            });
+        assert_eq!(delivery, RestoreBarrierDelivery::RestoreSentUnarmed);
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 41, Some(&mux))
+                .is_none()
+        );
         assert_eq!(coordinator.in_flight_len(), 1);
     }
 
@@ -24769,7 +25085,8 @@ mod tests {
         let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
         coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
         coordinator.begin_next(11, now).unwrap();
-        assert!(coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned())));
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".to_owned()), 41,));
         assert!(coordinator.protects_runtime("workspace-b", 11));
 
         let cancelled = coordinator.cancel_attachment(id).unwrap();
@@ -24780,11 +25097,7 @@ mod tests {
         assert!(coordinator.begin_next(12, now).is_none());
         assert!(
             coordinator
-                .settle_mux_barrier(RestoreMuxBarrierFact::Missing {
-                    workspace_id: "workspace-b".to_owned(),
-                    runtime_instance: 11,
-                    pane: runtime::MuxPaneId("pane-b".to_owned()),
-                })
+                .settle_durable_barrier("workspace-b", 11, 41, None)
                 .is_some()
         );
         assert_eq!(coordinator.in_flight_len(), 0);
@@ -24809,7 +25122,7 @@ mod tests {
         let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
         coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
         coordinator.begin_next(11, now).unwrap();
-        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
 
         let expired = coordinator.expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT);
 
@@ -24865,13 +25178,10 @@ mod tests {
         let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
         coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
         coordinator.begin_next(11, now).unwrap();
-        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".to_owned()), 41);
 
-        let outcome = coordinator.settle_mux_barrier(RestoreMuxBarrierFact::Missing {
-            workspace_id: "workspace-b".to_owned(),
-            runtime_instance: 11,
-            pane: runtime::MuxPaneId("pane-b".to_owned()),
-        });
+        let outcome = coordinator.settle_durable_barrier("workspace-b", 11, 41, None);
 
         assert!(matches!(outcome, Some(RestoreBarrierOutcome::Failed(_))));
         assert_eq!(coordinator.in_flight_len(), 0);
@@ -24896,20 +25206,16 @@ mod tests {
         let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
         coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
         coordinator.begin_next(11, now).unwrap();
-        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".to_owned()), 41);
         assert!(
             coordinator
                 .expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT)
                 .is_some()
         );
 
-        let late = coordinator.settle_mux_barrier(RestoreMuxBarrierFact::Restored {
-            workspace_id: "workspace-b".to_owned(),
-            runtime_instance: 11,
-            tab: runtime::MuxTabId("tab-b".to_owned()),
-            pane: runtime::MuxPaneId("pane-b".to_owned()),
-            session: runtime::SessionId(42),
-        });
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        let late = coordinator.settle_durable_barrier("workspace-b", 11, 41, Some(&mux));
 
         assert!(late.is_none());
     }
@@ -24963,7 +25269,7 @@ mod tests {
         let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
         coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
         coordinator.begin_next(11, now).unwrap();
-        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
 
         let cancelled = coordinator.cancel_visible_requests();
         for request in cancelled {
@@ -25006,19 +25312,19 @@ mod tests {
     fn cross_workspace_app_exact_workspace_runtime_pane_session_only_promotes() {
         let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
         assert_eq!(
-            restore_mux_barrier_fact(
+            restored_workspace_pane_target(
                 "workspace-b",
                 11,
                 &runtime::MuxPaneId("pane-b".to_owned()),
                 &mux,
             ),
-            RestoreMuxBarrierFact::Restored {
-                workspace_id: "workspace-b".to_owned(),
-                runtime_instance: 11,
-                tab: runtime::MuxTabId("tab-b".to_owned()),
-                pane: runtime::MuxPaneId("pane-b".to_owned()),
-                session: runtime::SessionId(42),
-            }
+            Some(ui::cross_workspace::WorkspacePaneTarget::new(
+                "workspace-b",
+                11,
+                runtime::MuxTabId("tab-b".to_owned()),
+                runtime::MuxPaneId("pane-b".to_owned()),
+                runtime::SessionId(42),
+            ))
         );
     }
 
@@ -25117,15 +25423,11 @@ mod tests {
         let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
         coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
         coordinator.begin_next(11, now).unwrap();
-        coordinator.mark_command_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".to_owned()), 41);
 
-        let stale = coordinator.settle_mux_barrier(RestoreMuxBarrierFact::Restored {
-            workspace_id: "workspace-b".to_owned(),
-            runtime_instance: 12,
-            tab: runtime::MuxTabId("tab-b".to_owned()),
-            pane: runtime::MuxPaneId("pane-b".to_owned()),
-            session: runtime::SessionId(42),
-        });
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        let stale = coordinator.settle_durable_barrier("workspace-b", 12, 41, Some(&mux));
 
         assert!(stale.is_none());
         assert_eq!(coordinator.in_flight_len(), 1);

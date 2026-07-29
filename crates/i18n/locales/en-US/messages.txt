@@ -680,6 +680,7 @@ connector.error.cancelled = Cancelled
 connector.error.unknown_delivery = Delivery status unknown; not retried
 connector.error.internal = Internal error
 file_tree.expand_sidebar = Expand sidebar
+file_tree.collapse_sidebar = Collapse project and files
 file_tree.set_project_path = Set a project path
 file_tree.edit_workspace_path_hint = Set it in Environment › Project folder
 file_tree.new_folder_label = New folder:

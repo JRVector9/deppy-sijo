@@ -680,6 +680,7 @@ connector.error.cancelled = 취소됨
 connector.error.unknown_delivery = 전송 여부가 불명이라 다시 시도하지 않음
 connector.error.internal = 내부 오류
 file_tree.expand_sidebar = 사이드바 펼치기
+file_tree.collapse_sidebar = 프로젝트 및 파일 접기
 file_tree.set_project_path = 프로젝트 경로를 설정하세요
 file_tree.edit_workspace_path_hint = 환경 메뉴 › 프로젝트 폴더에서 지정
 file_tree.new_folder_label = 새 폴더:

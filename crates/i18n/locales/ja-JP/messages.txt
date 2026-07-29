@@ -680,6 +680,7 @@ connector.error.cancelled = キャンセルされました
 connector.error.unknown_delivery = 配信状況不明のため再試行していません
 connector.error.internal = 内部エラー
 file_tree.expand_sidebar = サイドバーを展開
+file_tree.collapse_sidebar = プロジェクトとファイルを折りたたむ
 file_tree.set_project_path = プロジェクトパスを設定してください
 file_tree.edit_workspace_path_hint = 環境メニュー › プロジェクトフォルダで設定
 file_tree.new_folder_label = 新しいフォルダ:

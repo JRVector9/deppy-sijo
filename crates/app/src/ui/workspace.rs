@@ -404,19 +404,24 @@ const TERMINAL_STREAM_LEFT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_RIGHT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_VERTICAL_PADDING: f32 = 6.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct PaneHeaderStyle {
     background: egui::Color32,
     selection_fill: Option<egui::Color32>,
-    active_line: Option<egui::Color32>,
+    active_stroke: Option<egui::Stroke>,
 }
 
 fn pane_header_style(tokens: crate::ui::designall::Tokens, focused: bool) -> PaneHeaderStyle {
     PaneHeaderStyle {
         background: tokens.app_background,
         selection_fill: None,
-        active_line: focused.then_some(tokens.accent),
+        active_stroke: focused
+            .then_some(egui::Stroke::new(1.0, tokens.accent.gamma_multiply(0.55))),
     }
+}
+
+fn pane_header_active_boundary(header: egui::Rect, close: egui::Rect) -> f32 {
+    (close.right() + 6.0).min(header.right()).max(header.left())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -426,8 +431,20 @@ struct TerminalPaneLayout {
     content: egui::Rect,
 }
 
+#[cfg(test)]
 fn terminal_pane_layout(rect: egui::Rect) -> TerminalPaneLayout {
-    let header_height = TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0) * 0.5);
+    terminal_pane_layout_with_embedded_header(rect, true)
+}
+
+fn terminal_pane_layout_with_embedded_header(
+    rect: egui::Rect,
+    embedded_header: bool,
+) -> TerminalPaneLayout {
+    let header_height = if embedded_header {
+        TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0) * 0.5)
+    } else {
+        0.0
+    };
     let header = egui::Rect::from_min_max(
         rect.min,
         egui::pos2(rect.right(), rect.top() + header_height),
@@ -445,6 +462,10 @@ fn terminal_pane_layout(rect: egui::Rect) -> TerminalPaneLayout {
         surface,
         content,
     }
+}
+
+fn keeps_embedded_pane_header(_layout: &LayoutNode) -> bool {
+    true
 }
 
 /// pane 헤더 우측 도구 버튼 한 변(정사각)과 간격 — pane_header_buttons와
@@ -2354,6 +2375,7 @@ impl WorkspaceUi {
 
         let rect = ui.available_rect_before_wrap();
         let layout = active_tab.layout.clone();
+        let embedded_headers = keeps_embedded_pane_header(&layout);
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
         self.render_node(
@@ -2364,6 +2386,7 @@ impl WorkspaceUi {
             config,
             &tab_id,
             &mut split_path,
+            embedded_headers,
             catalog,
         );
 
@@ -2446,14 +2469,15 @@ impl WorkspaceUi {
         if let Some(selection_fill) = style.selection_fill {
             ui.painter().rect_filled(header, 0.0, selection_fill);
         }
-        if let Some(active_line) = style.active_line {
-            ui.painter().rect_filled(
-                egui::Rect::from_min_max(
-                    header.min,
-                    egui::pos2(header.right(), header.top() + 2.0),
-                ),
-                0.0,
-                active_line,
+        if let Some(active_stroke) = style.active_stroke {
+            let painter = ui.painter();
+            let boundary_x =
+                painter.round_to_pixel_center(pane_header_active_boundary(header, close));
+            let top_y = painter.round_to_pixel_center(header.top() + active_stroke.width * 0.5);
+            painter.hline(
+                egui::Rangef::new(header.left(), boundary_x),
+                top_y,
+                active_stroke,
             );
         }
         ui.painter().hline(
@@ -2617,6 +2641,7 @@ impl WorkspaceUi {
         config: &TerminalConfig,
         tab_id: &runtime::MuxTabId,
         path: &mut Vec<u8>,
+        embedded_headers: bool,
         catalog: &i18n::Catalog,
     ) {
         match node {
@@ -2625,7 +2650,7 @@ impl WorkspaceUi {
                 // max_rect는 배치만 제한한다 — 이전 크기의 스냅샷이 이웃 pane을
                 // 덮어 그리지 않게 페인터 클립도 pane 영역으로 줄인다
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
-                self.render_pane(&mut child, pane_id, mux, config, catalog);
+                self.render_pane(&mut child, pane_id, mux, config, embedded_headers, catalog);
                 // 포커스 표시는 각 pane 헤더의 accent top line이 담당한다.
             }
             LayoutNode::Split {
@@ -2675,10 +2700,30 @@ impl WorkspaceUi {
                     }
                 };
                 path.push(0);
-                self.render_node(ui, first_rect, first, mux, config, tab_id, path, catalog);
+                self.render_node(
+                    ui,
+                    first_rect,
+                    first,
+                    mux,
+                    config,
+                    tab_id,
+                    path,
+                    embedded_headers,
+                    catalog,
+                );
                 path.pop();
                 path.push(1);
-                self.render_node(ui, second_rect, second, mux, config, tab_id, path, catalog);
+                self.render_node(
+                    ui,
+                    second_rect,
+                    second,
+                    mux,
+                    config,
+                    tab_id,
+                    path,
+                    embedded_headers,
+                    catalog,
+                );
                 path.pop();
                 // 핸들은 자식 pane들 **뒤에** 등록 — egui 히트테스트는 나중 등록이
                 // 우선이라, ±2px 확장 히트영역이 터미널 선택 드래그에 밀리지 않는다
@@ -2748,6 +2793,7 @@ impl WorkspaceUi {
         pane_id: &runtime::MuxPaneId,
         mux: &MuxSnapshot,
         config: &TerminalConfig,
+        embedded_header: bool,
         catalog: &i18n::Catalog,
     ) {
         let Some(pane) = mux
@@ -2759,12 +2805,14 @@ impl WorkspaceUi {
             return;
         };
         let focused = mux.focused_pane.as_ref() == Some(pane_id);
-        let pane_layout = terminal_pane_layout(ui.max_rect());
+        let pane_layout = terminal_pane_layout_with_embedded_header(ui.max_rect(), embedded_header);
         let pane_rect = pane_layout.surface;
         let tokens = crate::ui::designall::tokens(ui.visuals());
         ui.painter()
             .rect_filled(pane_rect, 0.0, tokens.app_background);
-        self.render_pane_header(ui, pane_layout.header, pane, focused, config, catalog);
+        if embedded_header {
+            self.render_pane_header(ui, pane_layout.header, pane, focused, config, catalog);
+        }
         // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
         // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
         // (codex P2). 터미널 위에서는 나중에 등록되는 터미널 위젯이 입력을 받는다.
@@ -4914,11 +4962,51 @@ mod tests {
     }
 
     #[test]
-    fn designall_pane_header는_배경카드없이_활성선만_쓴다() {
+    fn designall_단일pane은_본문내부헤더를_유지한다() {
+        let layout_node = LayoutNode::Pane(pane_id("single"));
+        assert!(keeps_embedded_pane_header(&layout_node));
+        let layout = terminal_pane_layout_with_embedded_header(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(589.0, 358.0)),
+            keeps_embedded_pane_header(&layout_node),
+        );
+
+        assert_eq!(layout.header.height(), TERMINAL_PANE_HEADER_HEIGHT);
+        assert_eq!(layout.surface.top(), TERMINAL_PANE_HEADER_HEIGHT);
+        assert_eq!(
+            layout.content.top(),
+            TERMINAL_PANE_HEADER_HEIGHT + TERMINAL_STREAM_VERTICAL_PADDING
+        );
+        assert_eq!(
+            layout.content.bottom(),
+            358.0 - TERMINAL_STREAM_VERTICAL_PADDING
+        );
+    }
+
+    #[test]
+    fn designall_pane_header는_1px탑라인을_close옆에서끝낸다() {
         let style = pane_header_style(crate::ui::designall::DARK, true);
         assert_eq!(style.background, crate::ui::designall::DARK.app_background);
         assert_eq!(style.selection_fill, None);
-        assert_eq!(style.active_line, Some(crate::ui::designall::DARK.accent));
+        assert_eq!(
+            style.active_stroke,
+            Some(egui::Stroke::new(
+                1.0,
+                crate::ui::designall::DARK.accent.gamma_multiply(0.55)
+            ))
+        );
+        let header = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 32.0));
+        let close = egui::Rect::from_min_max(egui::pos2(100.0, 6.0), egui::pos2(120.0, 26.0));
+        let boundary = pane_header_active_boundary(header, close);
+        assert_eq!(boundary, 126.0);
+        assert!(boundary < header.right());
+
+        let source = include_str!("workspace.rs");
+        let start = source.find("    fn render_pane_header(").unwrap();
+        let end = source[start..]
+            .find("\n    fn activate_terminal_toolbar(")
+            .map(|offset| start + offset)
+            .unwrap();
+        assert!(!source[start..end].contains("painter.vline("));
     }
 
     #[test]

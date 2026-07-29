@@ -35,8 +35,8 @@ pub const DARK: Tokens = Tokens {
     success: egui::Color32::from_rgb(0x4a, 0xcb, 0x82),
     warning: egui::Color32::from_rgb(0xe0, 0xa4, 0x3a),
     error: egui::Color32::from_rgb(0xef, 0x66, 0x71),
-    selected_background: egui::Color32::from_rgb(0x10, 0x21, 0x2a),
-    hover_background: egui::Color32::from_rgb(0x10, 0x18, 0x20),
+    selected_background: egui::Color32::from_rgb(0x14, 0x1c, 0x23),
+    hover_background: egui::Color32::from_rgb(0x12, 0x18, 0x1e),
 };
 
 pub const LIGHT: Tokens = Tokens {
@@ -51,8 +51,8 @@ pub const LIGHT: Tokens = Tokens {
     success: egui::Color32::from_rgb(0x27, 0x91, 0x5b),
     warning: egui::Color32::from_rgb(0xb2, 0x70, 0x16),
     error: egui::Color32::from_rgb(0xc8, 0x3d, 0x49),
-    selected_background: egui::Color32::from_rgb(0xe7, 0xf4, 0xf8),
-    hover_background: egui::Color32::from_rgb(0xf1, 0xf5, 0xf7),
+    selected_background: egui::Color32::from_rgb(0xed, 0xf1, 0xf4),
+    hover_background: egui::Color32::from_rgb(0xf3, 0xf5, 0xf6),
 };
 
 pub fn tokens(visuals: &egui::Visuals) -> Tokens {
@@ -116,6 +116,14 @@ mod tests {
         );
         assert_eq!(DARK.separator, egui::Color32::from_rgb(0x26, 0x30, 0x3a));
         assert_eq!(DARK.accent, egui::Color32::from_rgb(0x39, 0xb8, 0xe8));
+        assert_eq!(
+            DARK.selected_background,
+            egui::Color32::from_rgb(0x14, 0x1c, 0x23)
+        );
+        assert_eq!(
+            LIGHT.selected_background,
+            egui::Color32::from_rgb(0xed, 0xf1, 0xf4)
+        );
         assert_eq!(STRUCTURAL_CORNER_RADIUS, 0);
         assert_eq!(NAV_RAIL_WIDTH, 88.0);
     }

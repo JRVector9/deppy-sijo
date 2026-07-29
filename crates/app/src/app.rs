@@ -15,6 +15,115 @@ use storage::Db;
 /// 어긋나므로 두 곳이 이 상수 하나만 본다.
 pub(crate) const TOP_BAR_HEIGHT: f32 = 38.0;
 const DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE: bool = false;
+const TOP_BAR_TEXT_BUTTON_HORIZONTAL_PADDING: f32 = 20.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesignAllTitlebarRegions {
+    traffic: egui::Rect,
+    project: egui::Rect,
+    workspace: egui::Rect,
+    status: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesignAllProjectTitlebarLayout {
+    label_anchor: egui::Pos2,
+    collapse: egui::Rect,
+    add: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesignAllProjectTitlebarControls {
+    collapse: Option<egui::Rect>,
+    add: Option<egui::Rect>,
+}
+
+fn designall_project_titlebar_layout(project: egui::Rect) -> DesignAllProjectTitlebarLayout {
+    let button_size = egui::vec2(24.0, 24.0);
+    let add = egui::Rect::from_center_size(
+        egui::pos2(project.right() - 16.0, project.center().y),
+        button_size,
+    );
+    let collapse = egui::Rect::from_center_size(
+        egui::pos2(add.center().x - 28.0, project.center().y),
+        button_size,
+    );
+    DesignAllProjectTitlebarLayout {
+        label_anchor: egui::pos2(
+            project.left() + crate::ui::file_tree::WORKSPACE_AVATAR_LEFT_INSET - 2.0,
+            project.center().y + 3.0,
+        ),
+        collapse,
+        add,
+    }
+}
+
+fn designall_project_titlebar_controls(
+    project: egui::Rect,
+    has_file_tree: bool,
+) -> DesignAllProjectTitlebarControls {
+    let layout = designall_project_titlebar_layout(project);
+    if !has_file_tree {
+        return DesignAllProjectTitlebarControls {
+            collapse: None,
+            add: Some(layout.add),
+        };
+    }
+    if project.width() < 40.0 {
+        return DesignAllProjectTitlebarControls {
+            collapse: None,
+            add: None,
+        };
+    }
+    if project.width() < 72.0 {
+        return DesignAllProjectTitlebarControls {
+            collapse: Some(layout.add),
+            add: None,
+        };
+    }
+    DesignAllProjectTitlebarControls {
+        collapse: Some(layout.collapse),
+        add: Some(layout.add),
+    }
+}
+
+fn designall_titlebar_status_width(
+    locale_text_width: f32,
+    bell_text_width: f32,
+    item_spacing: f32,
+) -> f32 {
+    (10.0
+        + locale_text_width
+        + item_spacing
+        + bell_text_width
+        + TOP_BAR_TEXT_BUTTON_HORIZONTAL_PADDING)
+        .ceil()
+        .max(96.0)
+}
+
+fn designall_titlebar_regions(
+    bar: egui::Rect,
+    navigation_width: f32,
+    project_width: f32,
+    status_width: f32,
+) -> DesignAllTitlebarRegions {
+    let navigation_right = (bar.left() + navigation_width.max(0.0)).min(bar.right());
+    let project_right = (navigation_right + project_width.max(0.0)).min(bar.right());
+    let status_left = (bar.right() - status_width.max(0.0)).max(project_right);
+    DesignAllTitlebarRegions {
+        traffic: egui::Rect::from_min_max(bar.min, egui::pos2(navigation_right, bar.bottom())),
+        project: egui::Rect::from_min_max(
+            egui::pos2(navigation_right, bar.top()),
+            egui::pos2(project_right, bar.bottom()),
+        ),
+        workspace: egui::Rect::from_min_max(
+            egui::pos2(project_right, bar.top()),
+            egui::pos2(status_left, bar.bottom()),
+        ),
+        status: egui::Rect::from_min_max(egui::pos2(status_left, bar.top()), bar.max),
+    }
+}
+
 const APPROVAL_WAKE_MARKER: u8 = 1;
 const APPROVAL_CONTROL_MARKER: u8 = 2;
 const APPROVAL_COMMAND_CAP: usize = 8;
@@ -16578,12 +16687,67 @@ impl eframe::App for App {
             .show_separator_line(DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE)
             .frame(top_frame)
             .show(ui, |ui| {
-                // 빈 곳을 잡으면 창을 드래그로 옮긴다. auto-sized Panel의 max_rect는
-                // content 측정 전 매우 커질 수 있으므로 실제 titlebar 높이만 hit-test한다.
-                let bar_rect = egui::Rect::from_min_size(
-                    ui.cursor().min,
+                let (bar_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), bar_h),
+                    egui::Sense::hover(),
                 );
+                let tokens = ui::designall::tokens(ui.visuals());
+                let locale_short = self
+                    .config
+                    .i18n
+                    .locale
+                    .split('-')
+                    .next()
+                    .unwrap_or(&self.config.i18n.locale)
+                    .to_owned();
+                let unread = self.notifications_ui.unread();
+                unread_before = unread;
+                let waiting = self.approvals_ui.pending().len() + self.global_waiting.len();
+                let bell_label = if waiting > 0 {
+                    format!("🔔 {waiting}")
+                } else if unread > 0 {
+                    format!("🔔 {unread}")
+                } else {
+                    "🔔".to_owned()
+                };
+                let locale_width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        locale_short.clone(),
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        tokens.muted_text,
+                    )
+                    .size()
+                    .x;
+                let bell_width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        bell_label.clone(),
+                        egui::FontId::proportional(13.0),
+                        tokens.muted_text,
+                    )
+                    .size()
+                    .x;
+                let status_width = designall_titlebar_status_width(
+                    locale_width,
+                    bell_width,
+                    ui.spacing().item_spacing.x,
+                );
+                let has_file_tree = self.file_tree.is_some();
+                let (navigation_width, project_width) = self
+                    .file_tree
+                    .as_ref()
+                    .map(|tree| tree.designall_titlebar_widths())
+                    .unwrap_or((76.0, 40.0));
+                let regions = designall_titlebar_regions(
+                    bar_rect,
+                    navigation_width,
+                    project_width,
+                    status_width,
+                );
+
+                // 빈 곳을 잡으면 창을 드래그로 옮긴다. 버튼과 pane 도구는 이 interact
+                // 뒤에 등록되므로 클릭은 각 도구가 우선하고 나머지 영역만 창을 옮긴다.
                 let drag = ui.interact(
                     bar_rect,
                     egui::Id::new("titlebar_drag"),
@@ -16592,65 +16756,128 @@ impl eframe::App for App {
                 if drag.drag_started_by(egui::PointerButton::Primary) {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), bar_h),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS. 브랜드
-                        // 텍스트("Deppy Sijo"/"AI Agent Workspace")는 제거(2026-07-25
-                        // 사용자) — 신호등 3개만 이 자리에서 수직 중앙 정렬로 보인다
-                        // (실제 재배치는 main.rs의 set_traffic_light_titlebar_height).
-                        #[cfg(target_os = "macos")]
-                        ui.add_space(76.0);
-                        // 신호등 옆 "+" — 워크스페이스 추가(폴더 선택), 사이드바의
-                        // CreateWorkspaceFromPicker와 동일 경로(2026-07-25 사용자).
-                        if tbtn_response(ui, "+".to_owned(), false)
-                            .on_hover_text(text.t("sidebar.empty.start_workspace", &[]))
-                            .clicked()
-                            && self.pending_app_host_action.is_none()
-                        {
-                            self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
-                                FolderPickerPurpose::SwitchWorkspace,
-                            ));
-                            ui.ctx().request_repaint();
+
+                let project_layout = designall_project_titlebar_layout(regions.project);
+                let project_controls =
+                    designall_project_titlebar_controls(regions.project, has_file_tree);
+                if regions.project.width() >= 120.0 {
+                    let label_rect = egui::Rect::from_min_max(
+                        egui::pos2(project_layout.label_anchor.x, regions.project.top() + 3.0),
+                        egui::pos2(
+                            project_layout.collapse.left() - 4.0,
+                            regions.project.bottom() + 3.0,
+                        ),
+                    );
+                    let mut label_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt("designall_project_label")
+                            .max_rect(label_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    label_ui.set_clip_rect(regions.project.intersect(ui.clip_rect()));
+                    label_ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("Project")
+                                .strong()
+                                .size(12.0)
+                                .color(tokens.muted_text),
+                        )
+                        .truncate(),
+                    );
+                }
+                if let Some(collapse_rect) = project_controls.collapse {
+                    let collapse = ui.interact(
+                        collapse_rect,
+                        egui::Id::new("designall_project_panel_collapse"),
+                        egui::Sense::click(),
+                    );
+                    let collapse_color = if collapse.hovered() || collapse.has_focus() {
+                        tokens.text
+                    } else {
+                        tokens.muted_text
+                    };
+                    let icon = egui::Rect::from_center_size(
+                        collapse_rect.center(),
+                        egui::vec2(12.0, 10.0),
+                    );
+                    ui.painter().rect_stroke(
+                        icon,
+                        1.5,
+                        egui::Stroke::new(1.0, collapse_color),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().vline(
+                        icon.left() + 3.5,
+                        icon.y_range(),
+                        egui::Stroke::new(1.0, collapse_color),
+                    );
+                    if collapse
+                        .on_hover_text(text.t("file_tree.collapse_sidebar", &[]))
+                        .clicked()
+                    {
+                        if let Some(tree) = self.file_tree.as_mut() {
+                            tree.collapse_project_file_panel();
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(10.0);
-                            // 우측: 로케일. 중앙에는 검색/워크스페이스 선택기를 두지
-                            // 않아 목업처럼 작업 표면이 비어 있게 한다. 메모리 표시는
-                            // 하단 상태바로 일원화(2026-07-18 사용자 — 상/하단 수치가
-                            // 샘플 시점 차이로 어긋나 보였음).
-                            let locale_short = self
-                                .config
-                                .i18n
-                                .locale
-                                .split('-')
-                                .next()
-                                .unwrap_or(&self.config.i18n.locale);
-                            ui.weak(locale_short.to_owned());
-                            let unread = self.notifications_ui.unread();
-                            unread_before = unread;
-                            let waiting =
-                                self.approvals_ui.pending().len() + self.global_waiting.len();
-                            let bell_label = if waiting > 0 {
-                                format!("🔔 {waiting}")
-                            } else if unread > 0 {
-                                format!("🔔 {unread}")
-                            } else {
-                                "🔔".to_owned()
-                            };
-                            let bell_open =
-                                egui::Popup::is_id_open(ui.ctx(), Self::inbox_popup_id());
-                            let bell = tbtn_response(ui, bell_label, bell_open)
-                                .on_hover_text(text.t("top.notifications", &[]));
-                            inbox_click = self.inbox_popup(&bell, &text);
-                            // Agents 진입은 사이드바 하단 nav가 담당한다 — 상단바 버튼은
-                            // 삭제(2026-07-18 사용자 확정). 단축키·기타 진입점은 유지.
-                        });
-                    },
+                        ui.ctx().request_repaint();
+                    }
+                }
+
+                if let Some(add_rect) = project_controls.add {
+                    let add = ui.interact(
+                        add_rect,
+                        egui::Id::new("designall_project_add"),
+                        egui::Sense::click(),
+                    );
+                    let add_color = if add.hovered() || add.has_focus() {
+                        tokens.text
+                    } else {
+                        tokens.muted_text
+                    };
+                    let center = project_layout.add.center();
+                    let stroke = egui::Stroke::new(1.5, add_color);
+                    ui.painter().hline(
+                        egui::Rangef::new(center.x - 5.0, center.x + 5.0),
+                        center.y,
+                        stroke,
+                    );
+                    ui.painter().vline(
+                        center.x,
+                        egui::Rangef::new(center.y - 5.0, center.y + 5.0),
+                        stroke,
+                    );
+                    if add
+                        .on_hover_text(text.t("sidebar.empty.start_workspace", &[]))
+                        .clicked()
+                        && self.pending_app_host_action.is_none()
+                    {
+                        self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
+                            FolderPickerPurpose::SwitchWorkspace,
+                        ));
+                        ui.ctx().request_repaint();
+                    }
+                }
+
+                let mut status_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(regions.status)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
                 );
-                // 툴바-본문 경계선은 egui Panel::top이 자체로 그린다 — 커스텀 hairline을
-                // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
+                status_ui.set_clip_rect(regions.status.intersect(ui.clip_rect()));
+                status_ui.add_space(10.0);
+                status_ui.weak(locale_short);
+                let bell_open = egui::Popup::is_id_open(status_ui.ctx(), Self::inbox_popup_id());
+                let bell = tbtn_response(&mut status_ui, bell_label, bell_open)
+                    .on_hover_text(text.t("top.notifications", &[]));
+                inbox_click = self.inbox_popup(&bell, &text);
+
+                let separator = ui::designall::separator_stroke(ui.visuals());
+                let painter = ui.painter();
+                let bottom = painter.round_to_pixel_center(bar_rect.bottom());
+                painter.hline(bar_rect.x_range(), bottom, separator);
+                for x in [regions.traffic.right(), regions.project.right()] {
+                    let x = painter.round_to_pixel_center(x);
+                    painter.vline(x, bar_rect.y_range(), separator);
+                }
             });
 
         // 폭주 경고 배너 (로드맵 B2) — 타이틀바 바로 아래, 어떤 탭을 보든 보이게
@@ -18733,7 +18960,7 @@ fn tbtn_response(ui: &mut egui::Ui, label: String, selected: bool) -> egui::Resp
     };
     let font = egui::FontId::proportional(13.0);
     let galley = ui.painter().layout_no_wrap(label, font, col);
-    let w = galley.size().x + 20.0;
+    let w = galley.size().x + TOP_BAR_TEXT_BUTTON_HORIZONTAL_PADDING;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
     if selected {
         ui.painter()
@@ -20812,6 +21039,121 @@ mod tests {
         let source = include_str!("app.rs");
         assert!(source.contains("const DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE: bool = false;"));
         assert!(source.contains(".show_separator_line(DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE)"));
+    }
+
+    #[test]
+    fn designall_titlebar는_신호등_project_terminal_status영역을_한줄에_배치한다() {
+        let regions = designall_titlebar_regions(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_200.0, TOP_BAR_HEIGHT)),
+            88.0,
+            360.0,
+            96.0,
+        );
+
+        assert_eq!(regions.traffic.x_range(), egui::Rangef::new(0.0, 88.0));
+        assert_eq!(regions.project.x_range(), egui::Rangef::new(88.0, 448.0));
+        assert_eq!(
+            regions.workspace.x_range(),
+            egui::Rangef::new(448.0, 1_104.0)
+        );
+        assert_eq!(
+            regions.status.x_range(),
+            egui::Rangef::new(1_104.0, 1_200.0)
+        );
+    }
+
+    #[test]
+    fn designall_titlebar_p2_file_tree가_없어도_workspace_add를_노출한다() {
+        let project =
+            egui::Rect::from_min_size(egui::pos2(76.0, 0.0), egui::vec2(40.0, TOP_BAR_HEIGHT));
+        let controls = designall_project_titlebar_controls(project, false);
+
+        assert!(controls.collapse.is_none());
+        let add = controls.add.expect("workspace add must remain reachable");
+        assert!(project.contains_rect(add));
+    }
+
+    #[test]
+    fn designall_titlebar_p2_좁은_project는_겹치지_않는_collapse만_노출한다() {
+        for width in [40.0, 56.0, 71.0] {
+            let project =
+                egui::Rect::from_min_size(egui::pos2(76.0, 0.0), egui::vec2(width, TOP_BAR_HEIGHT));
+            let controls = designall_project_titlebar_controls(project, true);
+
+            let collapse = controls.collapse.expect("collapse must remain reachable");
+            assert!(project.contains_rect(collapse));
+            assert!(controls.add.is_none());
+        }
+
+        let collapsed =
+            egui::Rect::from_min_size(egui::pos2(76.0, 0.0), egui::vec2(22.0, TOP_BAR_HEIGHT));
+        assert_eq!(
+            designall_project_titlebar_controls(collapsed, true),
+            DesignAllProjectTitlebarControls {
+                collapse: None,
+                add: None,
+            }
+        );
+    }
+
+    #[test]
+    fn designall_titlebar_p2_status폭은_dynamic_count를_수용한다() {
+        let compact = designall_titlebar_status_width(14.0, 18.0, 8.0);
+        let counted = designall_titlebar_status_width(14.0, 128.0, 8.0);
+
+        assert_eq!(compact, 96.0);
+        assert!(counted >= 160.0);
+        assert!(counted > compact);
+    }
+
+    #[test]
+    fn designall_titlebar_p2_render는_fallback과_dynamic_status를_사용한다() {
+        let source = include_str!("app.rs");
+        let start = source.find("        let bar_h = TOP_BAR_HEIGHT;").unwrap();
+        let end = source[start..]
+            .find("\n        // 폭주 경고 배너")
+            .map(|offset| start + offset)
+            .unwrap();
+        let top_bar = &source[start..end];
+
+        assert!(top_bar.contains("unwrap_or((76.0, 40.0))"));
+        assert!(top_bar.contains("designall_project_titlebar_controls("));
+        assert!(top_bar.contains("designall_titlebar_status_width("));
+        assert!(!top_bar.contains("project.width() >= 72.0"));
+        assert!(!top_bar.contains("project_width, 96.0"));
+    }
+
+    #[test]
+    fn designall_project_titlebar는_아바타보다_2px왼쪽이고_글씨를_3px내린다() {
+        let project =
+            egui::Rect::from_min_size(egui::pos2(88.0, 0.0), egui::vec2(200.0, TOP_BAR_HEIGHT));
+        let layout = designall_project_titlebar_layout(project);
+
+        assert!((layout.label_anchor.x - 95.8).abs() < 0.01);
+        assert_eq!(layout.label_anchor.y, project.center().y + 3.0);
+        assert_eq!(layout.collapse.center().y, project.center().y);
+        assert_eq!(layout.add.center().y, project.center().y);
+        assert!(layout.collapse.right() < layout.add.left());
+    }
+
+    #[test]
+    fn designall_top_bar는_bold_project만_렌더하고_terminal_header는_렌더하지_않는다() {
+        let source = include_str!("app.rs");
+        let start = source.find("        let bar_h = TOP_BAR_HEIGHT;").unwrap();
+        let end = source[start..]
+            .find("\n        // 폭주 경고 배너")
+            .map(|offset| start + offset)
+            .unwrap();
+        let top_bar = &source[start..end];
+
+        assert!(top_bar.contains("designall_titlebar_widths()"));
+        assert!(!top_bar.contains("render_titlebar_header("));
+        assert!(top_bar.contains("collapse_project_file_panel()"));
+        assert!(top_bar.contains("file_tree.collapse_sidebar"));
+        assert!(!top_bar.contains(".on_hover_text(text.t(\"action.close\""));
+        assert!(top_bar.contains("egui::RichText::new(\"Project\")"));
+        assert!(top_bar.contains(".strong()"));
+        assert!(!top_bar.contains("\"PROJECT\""));
     }
 
     #[test]

@@ -866,7 +866,7 @@ impl FileTreeUi {
             file_search_open: false,
             file_search: String::new(),
             collapsed: false,
-            sidebar_width: 360.0,
+            sidebar_width: 200.0,
             navigation_rail_width: crate::ui::designall::NAV_RAIL_WIDTH,
             error: None,
             inaccessible_paths: HashSet::new(),
@@ -896,6 +896,23 @@ impl FileTreeUi {
             consumed_copy_shortcut: false,
             workspace_section_height: 270.0,
         }
+    }
+
+    pub fn designall_titlebar_widths(&self) -> (f32, f32) {
+        let navigation = self.navigation_rail_width.clamp(
+            crate::ui::designall::NAV_RAIL_MIN_WIDTH,
+            crate::ui::designall::NAV_RAIL_MAX_WIDTH,
+        );
+        let project = if self.collapsed {
+            22.0
+        } else {
+            self.sidebar_width.clamp(40.0, 680.0)
+        };
+        (navigation, project)
+    }
+
+    pub fn collapse_project_file_panel(&mut self) {
+        self.collapsed = true;
     }
 
     /// 이번 프레임 트리가 소비한 (⌘V, ⌘C). App이 같은 프레임 터미널 이중 처리
@@ -3511,6 +3528,19 @@ fn workspace_row_style(
     }
 }
 
+pub const WORKSPACE_AVATAR_LEFT_INSET: f32 = 9.8;
+const WORKSPACE_AVATAR_SIZE: f32 = 15.0;
+
+fn workspace_avatar_rect(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(
+            row.left() + WORKSPACE_AVATAR_LEFT_INSET + WORKSPACE_AVATAR_SIZE * 0.5,
+            row.center().y,
+        ),
+        egui::vec2(WORKSPACE_AVATAR_SIZE, WORKSPACE_AVATAR_SIZE),
+    )
+}
+
 fn workspace_row(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
@@ -3566,15 +3596,12 @@ fn workspace_row(
     );
     // 선택/실행 상태와 무관한 프로젝트 고유색. 목록 전체에서 같은 계열이 겹치지 않게
     // 미리 배정된 색을 받아 비활성 행과 40pt 아이콘 레일에서도 그대로 유지한다.
-    let avatar = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 5.8 + 10.5, rect.center().y),
-        egui::vec2(21.0, 21.0),
-    );
+    let avatar = workspace_avatar_rect(full_rect);
     // 워크스페이스 마크는 별도 테두리 없이 상태색을 채운다(HTML 목업과 같은 규칙).
     ui.painter().rect_filled(
         avatar,
         1.0,
-        color.gamma_multiply(if active { 0.48 } else { 0.36 }),
+        color.gamma_multiply(if active { 0.42 } else { 0.32 }),
     );
     // 아바타는 빠른 식별용 마크라 첫 글자를 항상 대문자로 고정한다. 반대로 실제
     // 워크스페이스 이름은 사용자가 지정한 대소문자를 그대로 보존한다.
@@ -3583,7 +3610,7 @@ fn workspace_row(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
         initial,
-        crate::fonts::sidebar_font(10.8),
+        crate::fonts::sidebar_font(9.0),
         egui::Color32::WHITE,
     );
     let summary_mode = workspace_summary_mode(rect.width());
@@ -5831,6 +5858,17 @@ mod tests {
     }
 
     #[test]
+    fn designall_워크스페이스_아바타는_15px이고_기존좌측선에_고정된다() {
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 29.19));
+        let avatar = workspace_avatar_rect(row);
+
+        assert!((avatar.width() - 15.0).abs() < 0.01);
+        assert!((avatar.height() - 15.0).abs() < 0.01);
+        assert!((avatar.left() - 9.8).abs() < 0.01);
+        assert!((avatar.center().y - row.center().y).abs() < 0.01);
+    }
+
+    #[test]
     fn 워크스페이스_chevron은_얇은_접힘과_펼침_방향을_가진다() {
         let center = egui::pos2(10.0, 20.0);
         let collapsed = disclosure_chevron_points(center, false);
@@ -8065,6 +8103,19 @@ mod tests {
 
         assert!((navigation.size().x - crate::ui::designall::NAV_RAIL_WIDTH).abs() < 0.1);
         assert!(project.size().x >= 40.0);
+    }
+
+    #[test]
+    fn designall_titlebar는_조절된_레일과_프로젝트폭을_따른다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        assert_eq!(tree.designall_titlebar_widths(), (88.0, 200.0));
+
+        tree.navigation_rail_width = 10.0;
+        tree.sidebar_width = 900.0;
+        assert_eq!(tree.designall_titlebar_widths(), (20.0, 680.0));
+
+        tree.collapse_project_file_panel();
+        assert_eq!(tree.designall_titlebar_widths(), (20.0, 22.0));
     }
 
     /// 하단 nav 4항목 렌더 + 클릭 → 액션 방출. 재클릭 토글은 App 로직이라

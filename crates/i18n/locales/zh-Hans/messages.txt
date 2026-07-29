@@ -680,6 +680,7 @@ connector.error.cancelled = 已取消
 connector.error.unknown_delivery = 传递状态未知；未重试
 connector.error.internal = 内部错误
 file_tree.expand_sidebar = 展开侧边栏
+file_tree.collapse_sidebar = 折叠项目和文件
 file_tree.set_project_path = 请设置项目路径
 file_tree.edit_workspace_path_hint = 在 环境 › 项目文件夹 中设置
 file_tree.new_folder_label = 新建文件夹：

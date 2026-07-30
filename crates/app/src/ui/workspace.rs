@@ -420,6 +420,137 @@ fn pane_header_style(tokens: crate::ui::designall::Tokens, focused: bool) -> Pan
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(dead_code)]
+struct PaneDropFeedbackStyle {
+    outline: egui::Stroke,
+    outline_inset: f32,
+    insertion_width: f32,
+    insertion_color: egui::Color32,
+    label_fill: egui::Color32,
+    label_text: egui::Color32,
+}
+
+#[allow(dead_code)]
+fn pane_drop_feedback_style(tokens: crate::ui::designall::Tokens) -> PaneDropFeedbackStyle {
+    PaneDropFeedbackStyle {
+        outline: egui::Stroke::new(2.0, tokens.accent.gamma_multiply(0.72)),
+        outline_inset: 2.0,
+        insertion_width: 3.0,
+        insertion_color: tokens.accent,
+        label_fill: tokens.selected_background,
+        label_text: tokens.text,
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct PaneDropFeedbackLabelLayout {
+    rect: egui::Rect,
+    galley: Arc<egui::Galley>,
+}
+
+#[allow(dead_code)]
+fn layout_pane_drop_feedback_label(
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
+    label: &str,
+    style: PaneDropFeedbackStyle,
+) -> Option<PaneDropFeedbackLabelLayout> {
+    let margin = 8.0;
+    let padding = egui::vec2(6.0, 3.0);
+    let max_text_width = pane_rect.width() - margin * 2.0 - padding.x * 2.0;
+    if max_text_width <= 0.0 {
+        return None;
+    }
+
+    let mut job = egui::text::LayoutJob::single_section(
+        label.to_owned(),
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: style.label_text,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_text_width,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = painter.layout_job(job);
+    if galley.size().x > max_text_width
+        || galley.size().y + margin * 2.0 + padding.y * 2.0 > pane_rect.height()
+    {
+        return None;
+    }
+
+    let label_size = galley.size() + padding * 2.0;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(
+            pane_rect.right() - margin - label_size.x,
+            pane_rect.top() + margin,
+        ),
+        label_size,
+    );
+    Some(PaneDropFeedbackLabelLayout { rect, galley })
+}
+
+#[allow(dead_code)]
+pub(crate) fn paint_session_pane_drop_feedback(ui: &egui::Ui, rect: egui::Rect, label: &str) {
+    let rect = rect.intersect(ui.clip_rect());
+    if !rect.is_positive() {
+        return;
+    }
+
+    let style = pane_drop_feedback_style(crate::ui::designall::tokens(ui.visuals()));
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_stroke(
+        rect.shrink(style.outline_inset),
+        0.0,
+        style.outline,
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(
+                (rect.right() - style.insertion_width).max(rect.left()),
+                rect.top(),
+            ),
+            rect.max,
+        ),
+        0.0,
+        style.insertion_color,
+    );
+
+    if let Some(label) = layout_pane_drop_feedback_label(&painter, rect, label, style) {
+        painter.rect_filled(label.rect, 3.0, style.label_fill);
+        painter.galley(
+            label.rect.min + egui::vec2(6.0, 3.0),
+            label.galley,
+            style.label_text,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AttachedIdentityStyle {
+    top_line: egui::Stroke,
+    header_fill: egui::Color32,
+    body_fill: egui::Color32,
+}
+
+fn attached_identity_style(
+    tokens: crate::ui::designall::Tokens,
+    identity_color: egui::Color32,
+) -> AttachedIdentityStyle {
+    AttachedIdentityStyle {
+        top_line: egui::Stroke::new(1.0, identity_color),
+        header_fill: tokens.app_background,
+        body_fill: tokens.app_background,
+    }
+}
+
 fn pane_header_active_boundary(header: egui::Rect, close: egui::Rect) -> f32 {
     (close.right() + 6.0).min(header.right()).max(header.left())
 }
@@ -607,6 +738,7 @@ impl AttachedPaneReorder {
 pub(crate) struct AttachedPaneHeaderContext {
     pub(crate) attachment_id: crate::ui::cross_workspace::AttachmentId,
     pub(crate) destination_index: usize,
+    identity_color: egui::Color32,
 }
 
 impl AttachedPaneHeaderContext {
@@ -619,7 +751,14 @@ impl AttachedPaneHeaderContext {
             attachment_id,
             destination_index: destination_index
                 .min(crate::ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES - 1),
+            identity_color: egui::Color32::TRANSPARENT,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_identity_color(mut self, identity_color: egui::Color32) -> Self {
+        self.identity_color = identity_color;
+        self
     }
 }
 
@@ -2847,6 +2986,7 @@ impl WorkspaceUi {
             catalog,
             target,
             external_workspace_label,
+            external_workspace_label,
             availability,
             None,
         )
@@ -2862,6 +3002,7 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
         target: &AttachedPaneTarget,
         external_workspace_label: &str,
+        attached_display_title: &str,
         availability: AttachedPaneAvailability,
         header_context: Option<AttachedPaneHeaderContext>,
     ) -> PreparedAttachedPaneOutput {
@@ -2892,7 +3033,6 @@ impl WorkspaceUi {
             self.discard_prepared_attached_input_for(target);
             false
         };
-        let pane_title = pane.map(|pane| pane.title.clone());
         let header_height = TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0));
         let header = egui::Rect::from_min_max(
             rect.min,
@@ -2904,7 +3044,7 @@ impl WorkspaceUi {
             header,
             target,
             external_workspace_label,
-            pane_title.as_deref(),
+            attached_display_title,
             catalog,
             header_context,
         );
@@ -2964,19 +3104,34 @@ impl WorkspaceUi {
         &self,
         ui: &mut egui::Ui,
         header: egui::Rect,
-        target: &AttachedPaneTarget,
-        external_workspace_label: &str,
-        pane_title: Option<&str>,
+        _target: &AttachedPaneTarget,
+        _external_workspace_label: &str,
+        attached_display_title: &str,
         catalog: &i18n::Catalog,
         header_context: Option<AttachedPaneHeaderContext>,
     ) -> (bool, Option<AttachedPaneReorder>) {
         let tokens = crate::ui::designall::tokens(ui.visuals());
-        ui.painter().rect_filled(header, 0.0, tokens.app_background);
+        let identity_style = attached_identity_style(
+            tokens,
+            header_context
+                .map(|context| context.identity_color)
+                .unwrap_or(egui::Color32::TRANSPARENT),
+        );
+        ui.painter()
+            .rect_filled(header, 0.0, identity_style.header_fill);
         ui.painter().hline(
             header.x_range(),
             ui.painter().round_to_pixel_center(header.bottom()),
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
+        if identity_style.top_line.color != egui::Color32::TRANSPARENT {
+            ui.painter().hline(
+                header.x_range(),
+                ui.painter()
+                    .round_to_pixel_center(header.top() + identity_style.top_line.width * 0.5),
+                identity_style.top_line,
+            );
+        }
 
         let reorder_requested = header_context.and_then(|header_context| {
             let response = ui.interact(
@@ -3009,17 +3164,27 @@ impl WorkspaceUi {
             egui::pos2(header.left() + 8.0, header.top()),
             egui::pos2(close_rect.left() - 4.0, header.bottom()),
         );
-        let title = pane_title.unwrap_or(target.pane.0.as_str());
-        let source = catalog.t(
-            "workspace.cross_pane.external_source",
-            &[("workspace", external_workspace_label)],
+        let mut title_job = egui::text::LayoutJob::single_section(
+            attached_display_title.to_owned(),
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(12.0),
+                color: tokens.muted_text,
+                ..Default::default()
+            },
         );
-        let marker = format!("{source} · {title}");
-        ui.painter().text(
-            text_rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            marker,
-            egui::FontId::proportional(12.0),
+        title_job.wrap = egui::text::TextWrapping {
+            max_width: text_rect.width().max(0.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let title_galley = ui.painter().layout_job(title_job);
+        ui.painter().with_clip_rect(text_rect).galley(
+            egui::pos2(
+                text_rect.left(),
+                text_rect.center().y - title_galley.size().y / 2.0,
+            ),
+            title_galley,
             tokens.muted_text,
         );
         (detach, reorder_requested)
@@ -5910,6 +6075,48 @@ mod tests {
     }
 
     #[test]
+    fn pane_drop_feedback_marks_surface_and_right_insertion_edge() {
+        let style = pane_drop_feedback_style(crate::ui::designall::DARK);
+
+        assert_eq!(style.outline.width, 2.0);
+        assert_eq!(style.outline_inset, 2.0);
+        assert_eq!(style.insertion_width, 3.0);
+    }
+
+    #[test]
+    fn pane_drop_feedback_elides_long_label_inside_narrow_pane() {
+        let context = egui::Context::default();
+        let pane = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(96.0, 64.0));
+        let style = pane_drop_feedback_style(crate::ui::designall::DARK);
+        let mut measured = None;
+
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            measured = layout_pane_drop_feedback_label(
+                ui.painter(),
+                pane,
+                "선택한 세션을 이 Pane의 오른쪽에 연결합니다",
+                style,
+            );
+        });
+
+        let measured = measured.expect("narrow pane still has room for a compact label");
+        assert!(pane.contains_rect(measured.rect));
+        assert_eq!(measured.galley.rows.len(), 1);
+        assert!(measured.galley.elided);
+        assert_eq!(measured.galley.rows[0].text().chars().last(), Some('…'));
+    }
+
+    #[test]
+    fn foreign_identity_color_is_top_line_only() {
+        let identity = egui::Color32::LIGHT_BLUE;
+        let style = attached_identity_style(crate::ui::designall::DARK, identity);
+
+        assert_eq!(style.top_line, egui::Stroke::new(1.0, identity));
+        assert_eq!(style.header_fill, crate::ui::designall::DARK.app_background);
+        assert_eq!(style.body_fill, crate::ui::designall::DARK.app_background);
+    }
+
+    #[test]
     fn attached_target는_지정한_tab의_정확한_pane만_찾는다() {
         let snapshot = mux(
             "active",
@@ -5988,8 +6195,124 @@ mod tests {
             .map(|offset| header_start + offset)
             .expect("attached header end");
         let header = &source[header_start..header_end];
-        assert!(header.contains("workspace.cross_pane.external_source"));
+        assert!(header.contains("attached_display_title"));
+        assert!(!header.contains("workspace.cross_pane.external_source"));
         assert!(!header.contains("format!(\"↗ {external_workspace_label}"));
+    }
+
+    #[test]
+    fn attached_header_uses_only_precomputed_project_workspace_title() {
+        let source = include_str!("workspace.rs");
+        let header = source
+            .split_once("fn render_attached_pane_header(")
+            .expect("attached header")
+            .1
+            .split_once("fn render_attached_placeholder(")
+            .expect("attached header end")
+            .0;
+
+        assert!(header.contains("attached_display_title"));
+        assert!(!header.contains("workspace.cross_pane.external_source"));
+        assert!(!header.contains("pane_title"));
+    }
+
+    #[test]
+    fn attached_header_renders_supplied_title_without_legacy_source_or_pane_title() {
+        let catalog = catalog();
+        let workspace = WorkspaceUi::new();
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("workspace.spawn.shell 1"),
+            session: SessionId(7),
+        };
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let header = egui::Rect::from_min_size(
+                ui.available_rect_before_wrap().min,
+                egui::vec2(360.0, TERMINAL_PANE_HEADER_HEIGHT),
+            );
+            workspace.render_attached_pane_header(
+                ui,
+                header,
+                &target,
+                "Other",
+                "Project (Workspace)",
+                &catalog,
+                None,
+            );
+        });
+        let rendered_text = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let legacy_source = catalog.t(
+            "workspace.cross_pane.external_source",
+            &[("workspace", "Other")],
+        );
+
+        assert!(rendered_text.contains("Project (Workspace)"));
+        assert!(!rendered_text.contains(legacy_source.as_str()));
+        assert!(!rendered_text.contains("workspace.spawn.shell 1"));
+    }
+
+    #[test]
+    fn attached_header_elides_long_title_before_close_action() {
+        let catalog = catalog();
+        let workspace = WorkspaceUi::new();
+        let target = AttachedPaneTarget {
+            workspace_id: "workspace-b".to_owned(),
+            tab: tab_id("foreign"),
+            pane: pane_id("workspace.spawn.shell 1"),
+            session: SessionId(7),
+        };
+        let long_title = "Extremely Long Project Name (Extremely Long Workspace Name)";
+        let header_width = 180.0;
+        let mut title_right = None;
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let header = egui::Rect::from_min_size(
+                ui.available_rect_before_wrap().min,
+                egui::vec2(header_width, TERMINAL_PANE_HEADER_HEIGHT),
+            );
+            title_right = Some(header.right() - 15.0 - 12.0 - 4.0);
+            workspace.render_attached_pane_header(
+                ui, header, &target, "Other", long_title, &catalog, None,
+            );
+        });
+        let clipped_title = output
+            .shapes
+            .iter()
+            .find(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::Shape::Text(text) if text.galley.text() == long_title
+                )
+            })
+            .expect("attached pane title shape");
+        let egui::Shape::Text(title) = &clipped_title.shape else {
+            unreachable!("matched text shape")
+        };
+        let title_right = title_right.expect("title boundary");
+
+        assert!(title.galley.elided);
+        assert_eq!(title.galley.rows.len(), 1);
+        assert_eq!(
+            title
+                .galley
+                .rows
+                .last()
+                .and_then(|row| row.glyphs.last())
+                .map(|glyph| glyph.chr),
+            Some('…')
+        );
+        assert!(clipped_title.clip_rect.right() <= title_right);
+        assert!(title.pos.x + title.galley.size().x <= title_right);
     }
 
     #[test]
@@ -6417,6 +6740,7 @@ mod tests {
                     &catalog,
                     &offscreen,
                     "Other",
+                    "Project (Workspace)",
                     AttachedPaneAvailability::Available,
                     None,
                 );
@@ -6515,6 +6839,7 @@ mod tests {
                     &catalog,
                     &target,
                     "Other",
+                    "Project (Workspace)",
                     AttachedPaneAvailability::Unavailable,
                     None,
                 );
@@ -6578,6 +6903,7 @@ mod tests {
                     &catalog,
                     &target,
                     "Other",
+                    "Project (Workspace)",
                     AttachedPaneAvailability::Available,
                     None,
                 );
@@ -6633,6 +6959,7 @@ mod tests {
                     &catalog,
                     &target,
                     "Other",
+                    "Project (Workspace)",
                     AttachedPaneAvailability::Available,
                     None,
                 );
@@ -6724,6 +7051,7 @@ mod tests {
                         &catalog,
                         target,
                         "Other",
+                        "Project (Workspace)",
                         AttachedPaneAvailability::Available,
                         None,
                     );
@@ -6797,6 +7125,7 @@ mod tests {
                     &catalog,
                     &targets[1],
                     "Other",
+                    "Project (Workspace)",
                     AttachedPaneAvailability::Available,
                     None,
                 );
@@ -6892,6 +7221,7 @@ mod tests {
                     &catalog,
                     &target,
                     "Other",
+                    "Project (Workspace)",
                     AttachedPaneAvailability::Available,
                     None,
                 );

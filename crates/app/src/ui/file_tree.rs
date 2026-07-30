@@ -2104,6 +2104,7 @@ impl FileTreeUi {
                                                             // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
                                                             if let Some(session) = entry.target.session() {
                                                                 resp.context_menu(|ui| {
+                                                                    live_session_context_menu_items(ui, |ui| {
                                                                     if ui
                                                                         .button(catalog.t(
                                                                             "workspace.rename_menu",
@@ -2240,6 +2241,7 @@ impl FileTreeUi {
                                                                 );
                                                                 ui.close();
                                                             }
+                                                                    });
                                                                 });
                                                             }
                                                             if resp.double_clicked() {
@@ -4350,6 +4352,10 @@ fn inactive_session_context_menu_items(
     if !can_open_session_beside(active_workspace_id, &entry.target) {
         return;
     }
+    let menu_style = inactive_session_menu_style();
+    ui.set_min_width(menu_style.min_width);
+    let previous_wrap_mode = ui.style().wrap_mode;
+    ui.style_mut().wrap_mode = Some(menu_style.wrap_mode);
     if ui
         .button(catalog.t("workspace.menu.open_beside", &[]))
         .clicked()
@@ -4358,6 +4364,32 @@ fn inactive_session_context_menu_items(
         *action = Some(open_beside_action(entry.target.clone()));
         ui.close();
     }
+    ui.style_mut().wrap_mode = previous_wrap_mode;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InactiveSessionMenuStyle {
+    min_width: f32,
+    wrap_mode: egui::TextWrapMode,
+}
+
+fn inactive_session_menu_style() -> InactiveSessionMenuStyle {
+    InactiveSessionMenuStyle {
+        min_width: 220.0,
+        wrap_mode: egui::TextWrapMode::Extend,
+    }
+}
+
+fn live_session_context_menu_items<R>(
+    ui: &mut egui::Ui,
+    add_items: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let menu_style = inactive_session_menu_style();
+    ui.scope(|ui| {
+        ui.set_min_width(menu_style.min_width);
+        ui.style_mut().wrap_mode = Some(menu_style.wrap_mode);
+        add_items(ui)
+    })
 }
 
 fn open_beside_action(target: SessionRowTarget) -> SidebarAction {
@@ -4442,6 +4474,42 @@ const SESSION_CONTENT_RIGHT_INSET: f32 = 24.0;
 /// 시작해 레일 왼쪽에 배경이 안 칠해진 틈이 생긴다(2026-07-25 사용자) — 그만큼
 /// 왼쪽으로 더 그린다.
 const SESSION_HIGHLIGHT_LEFT_EXTEND: f32 = 20.0 - WORKSPACE_SESSION_INSET_LEFT;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SessionDragStyle {
+    fill: Option<egui::Color32>,
+    stroke: egui::Stroke,
+    shadow: egui::epaint::Shadow,
+    rail_multiplier: f32,
+}
+
+fn session_drag_style(active: bool, tokens: crate::ui::designall::Tokens) -> SessionDragStyle {
+    if active {
+        SessionDragStyle {
+            fill: Some(tokens.selected_background),
+            stroke: egui::Stroke::new(1.0, tokens.accent),
+            shadow: egui::epaint::Shadow {
+                offset: [0, 2],
+                blur: 8,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(96),
+            },
+            rail_multiplier: 1.2,
+        }
+    } else {
+        SessionDragStyle {
+            fill: None,
+            stroke: egui::Stroke::NONE,
+            shadow: egui::epaint::Shadow::NONE,
+            rail_multiplier: 1.0,
+        }
+    }
+}
+
+fn session_drag_payload_matches(ctx: &egui::Context, target: &SessionRowTarget) -> bool {
+    egui::DragAndDrop::payload::<SessionRowDragPayload>(ctx)
+        .is_some_and(|payload| payload.target() == target)
+}
 
 fn session_highlight_rect(rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
@@ -4615,8 +4683,21 @@ fn session_row_impl(
     let painter = ui.painter();
     let highlight_rect = session_highlight_rect(rect);
     let tokens = crate::ui::designall::tokens(ui.visuals());
-    let state_fill = crate::ui::designall::row_fill(tokens, entry.focused, resp.hovered());
-    if let Some(fill) = state_fill {
+    let drag_style = session_drag_style(
+        session_drag_payload_matches(ui.ctx(), &entry.target),
+        tokens,
+    );
+    if let Some(fill) = drag_style.fill {
+        painter.add(drag_style.shadow.as_shape(highlight_rect, 4.0));
+        painter.rect(
+            highlight_rect,
+            4.0,
+            fill,
+            drag_style.stroke,
+            egui::StrokeKind::Inside,
+        );
+    } else if let Some(fill) = crate::ui::designall::row_fill(tokens, entry.focused, resp.hovered())
+    {
         let focus_rect = session_focus_fill_rect(rect);
         let focus_rect = egui::Rect::from_min_max(
             egui::pos2(
@@ -4627,7 +4708,7 @@ fn session_row_impl(
         );
         painter.rect_filled(focus_rect, 0.0, fill);
     }
-    if !is_last {
+    if !is_last && drag_style.fill.is_none() {
         painter.hline(
             highlight_rect.x_range(),
             highlight_rect.bottom(),
@@ -4645,6 +4726,11 @@ fn session_row_impl(
         ),
         egui::vec2(rail_w, SESSION_RAIL_HEIGHT),
     );
+    let rail_color = if drag_style.rail_multiplier > 1.0 {
+        rail_color.gamma_multiply(drag_style.rail_multiplier)
+    } else {
+        rail_color
+    };
     painter.rect_filled(rail, 0.0, rail_color);
     // 제목(1행) + 2행 + 3행 — 세로 위치는 행 수에 맞춰.
     // 위/아래 여백을 2px로 대칭 맞춘다(2026-07-25 사용자: 텍스트 내리고, 아래
@@ -4972,7 +5058,10 @@ const WORKSPACE_ACCENT_PALETTE: [(u8, u8, u8); 8] = [
 /// 계열은 녹색·주황·보라·빨강·금색·파랑 순으로 의도적으로 떨어뜨렸다. 따라서 선택/
 /// 접힘으로 렌더 순서가 바뀌어도 색은 유지되고, 같은 이니셜도 서로 다른 계열을 갖는다.
 /// 생성순 목록 끝에 새 워크스페이스를 추가해도 기존 배정은 변하지 않는다.
-fn workspace_accent(workspaces: &[SidebarWorkspaceEntry], workspace_id: &str) -> egui::Color32 {
+pub(crate) fn workspace_accent(
+    workspaces: &[SidebarWorkspaceEntry],
+    workspace_id: &str,
+) -> egui::Color32 {
     let slot = workspaces
         .iter()
         .position(|workspace| workspace.id == workspace_id)
@@ -8264,6 +8353,74 @@ mod tests {
     }
 
     #[test]
+    fn kittest_live_session_context_menu_keeps_all_items_on_one_line() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let labels = [
+            catalog.t("workspace.rename_menu", &[]),
+            catalog.t("sidebar.menu.open_folder", &[]),
+            catalog.t("sidebar.menu.copy_path", &[]),
+            catalog.t("sidebar.menu.new_shell_here", &[]),
+            catalog.t("sidebar.menu.show_diff", &[]),
+            catalog.t("sidebar.menu.new_worktree_cell", &[]),
+            catalog.t("sidebar.menu.remove_worktree", &[]),
+            catalog.t("sidebar.menu.resume_agent", &[]),
+            catalog.t("sidebar.menu.close_pane", &[]),
+        ];
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (f32, bool, bool)| {
+                ui.allocate_ui(egui::vec2(100.0, 500.0), |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    let menu = live_session_context_menu_items(ui, |ui| {
+                        let extends = ui.wrap_mode() == egui::TextWrapMode::Extend;
+                        for label in &labels {
+                            let _ = ui.button(label);
+                        }
+                        extends
+                    });
+                    state.0 = menu.response.rect.width();
+                    state.1 = menu.inner;
+                    state.2 = ui.wrap_mode() == egui::TextWrapMode::Wrap;
+                });
+            },
+            (0.0, false, false),
+        );
+
+        harness.run();
+        assert!(harness.state().0 >= 220.0);
+        assert!(harness.state().1, "menu scope did not use Extend wrapping");
+        assert!(
+            harness.state().2,
+            "menu wrap mode leaked into its parent UI"
+        );
+        let baseline_height = harness.get_by_label(&labels[0]).rect().height();
+        for label in &labels {
+            let rect = harness.get_by_label(label).rect();
+            assert!(
+                (rect.height() - baseline_height).abs() < 0.5,
+                "menu item wrapped instead of extending: {label} ({rect:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn live_session_row_context_menu_uses_the_multi_item_renderer() {
+        let source = include_str!("file_tree.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source");
+        let context_menu = production
+            .split("resp.context_menu(|ui| {")
+            .nth(1)
+            .and_then(|tail| tail.split("if resp.double_clicked()").next())
+            .expect("live session context menu");
+
+        assert!(context_menu.contains("live_session_context_menu_items("));
+    }
+
+    #[test]
     fn kittest_활성_workspace_세션에는_옆에열기_메뉴가_없다() {
         use egui_kittest::kittest::Queryable;
 
@@ -8976,6 +9133,54 @@ mod tests {
         let unrelated_file_payload_is_active = true;
         assert!(unrelated_file_payload_is_active);
         assert!(session_row_click_allowed(true, false));
+    }
+
+    #[test]
+    fn inactive_session_menu_keeps_korean_labels_on_one_line() {
+        let style = inactive_session_menu_style();
+
+        assert!(style.min_width >= 220.0);
+        assert_eq!(style.wrap_mode, egui::TextWrapMode::Extend);
+    }
+
+    #[test]
+    fn exact_session_drag_projects_elevated_source_style() {
+        let style = session_drag_style(true, crate::ui::designall::DARK);
+
+        assert!(style.fill.is_some());
+        assert_eq!(style.stroke.width, 1.0);
+        assert!(style.shadow.blur > 0);
+        assert!(style.rail_multiplier > 1.0);
+    }
+
+    #[test]
+    fn inactive_session_drag_style_is_a_visual_noop() {
+        let style = session_drag_style(false, crate::ui::designall::DARK);
+
+        assert!(style.fill.is_none());
+        assert_eq!(style.stroke, egui::Stroke::NONE);
+        assert_eq!(style.shadow, egui::epaint::Shadow::NONE);
+        assert_eq!(style.rail_multiplier, 1.0);
+    }
+
+    #[test]
+    fn session_drag_matches_only_the_exact_active_payload() {
+        let context = egui::Context::default();
+        let exact = SessionRowTarget::persisted(
+            "workspace-exact",
+            runtime::MuxPaneId("pane-exact".to_owned()),
+        );
+        let other = SessionRowTarget::persisted(
+            "workspace-other",
+            runtime::MuxPaneId("pane-other".to_owned()),
+        );
+
+        egui::DragAndDrop::set_payload(&context, SessionRowDragPayload::new(exact.clone()));
+        assert!(session_drag_payload_matches(&context, &exact));
+        assert!(!session_drag_payload_matches(&context, &other));
+
+        egui::DragAndDrop::set_payload(&context, PathBuf::from("/tmp/unrelated"));
+        assert!(!session_drag_payload_matches(&context, &exact));
     }
 
     #[test]

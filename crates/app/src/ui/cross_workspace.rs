@@ -1,7 +1,7 @@
 use runtime::{MuxPaneId, MuxTabId, SessionId};
 
-const MIN_ATTACHED_WIDTH_PX: f32 = 320.0;
-const MAX_ATTACHED_WIDTH_PX: f32 = 960.0;
+pub(crate) const MIN_ATTACHED_WIDTH_PX: f32 = 320.0;
+pub(crate) const MAX_ATTACHED_WIDTH_PX: f32 = 960.0;
 const DEFAULT_ATTACHED_WIDTH_PX: f32 = 420.0;
 
 pub(crate) const HARD_MAX_CROSS_WORKSPACE_PANES: usize = 6;
@@ -57,6 +57,20 @@ pub(crate) enum TerminalSurfaceFocus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AttachmentId(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InsertAnchor {
+    #[allow(dead_code)]
+    Primary,
+    #[allow(dead_code)]
+    Attached(AttachmentId),
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InsertAnchorError {
+    StaleAttachment(AttachmentId),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FocusedSurface {
@@ -243,6 +257,25 @@ impl CrossWorkspacePaneState {
         width_px: f32,
         limit: usize,
     ) -> AttachOutcome {
+        self.attach_at_anchor(
+            primary_workspace_id,
+            target,
+            width_px,
+            limit,
+            InsertAnchor::End,
+        )
+        .expect("end anchor is always valid")
+    }
+
+    pub(crate) fn attach_at_anchor(
+        &mut self,
+        primary_workspace_id: impl Into<String>,
+        target: WorkspacePaneTarget,
+        width_px: f32,
+        limit: usize,
+        anchor: InsertAnchor,
+    ) -> Result<AttachOutcome, InsertAnchorError> {
+        let insertion_index = self.insertion_index(anchor)?;
         if let Some(index) =
             self.attachments
                 .iter()
@@ -259,22 +292,25 @@ impl CrossWorkspacePaneState {
                 attachment.render_state = AttachedRenderState::Live;
             }
             self.focused = FocusedSurface::Attached(attachment.id);
-            return AttachOutcome::FocusedExisting(attachment.id);
+            return Ok(AttachOutcome::FocusedExisting(attachment.id));
         }
         if self.attachments.len() >= limit.min(HARD_MAX_CROSS_WORKSPACE_PANES) {
-            return AttachOutcome::CapacityReached;
+            return Ok(AttachOutcome::CapacityReached);
         }
 
         let id = self.allocate_id();
-        self.attachments.push(AttachedPane {
-            id,
-            primary_workspace_id: primary_workspace_id.into(),
-            source: AttachedPaneSource::Live(target),
-            width_px: normalize_width(width_px),
-            render_state: AttachedRenderState::Live,
-        });
+        self.attachments.insert(
+            insertion_index,
+            AttachedPane {
+                id,
+                primary_workspace_id: primary_workspace_id.into(),
+                source: AttachedPaneSource::Live(target),
+                width_px: normalize_width(width_px),
+                render_state: AttachedRenderState::Live,
+            },
+        );
         self.focused = FocusedSurface::Attached(id);
-        AttachOutcome::Appended(id)
+        Ok(AttachOutcome::Appended(id))
     }
 
     pub(crate) fn append_restoring(
@@ -284,26 +320,48 @@ impl CrossWorkspacePaneState {
         width_px: f32,
         limit: usize,
     ) -> AttachOutcome {
+        self.insert_restoring_at_anchor(
+            primary_workspace_id,
+            request,
+            width_px,
+            limit,
+            InsertAnchor::End,
+        )
+        .expect("end anchor is always valid")
+    }
+
+    pub(crate) fn insert_restoring_at_anchor(
+        &mut self,
+        primary_workspace_id: impl Into<String>,
+        request: PersistedPaneRequest,
+        width_px: f32,
+        limit: usize,
+        anchor: InsertAnchor,
+    ) -> Result<AttachOutcome, InsertAnchorError> {
+        let insertion_index = self.insertion_index(anchor)?;
         if let Some(existing) = self.attachments.iter().find(|attachment| {
             attachment.matches_canonical_pane(&request.workspace_id, &request.pane)
         }) {
             self.focused = FocusedSurface::Attached(existing.id);
-            return AttachOutcome::FocusedExisting(existing.id);
+            return Ok(AttachOutcome::FocusedExisting(existing.id));
         }
         if self.attachments.len() >= limit.min(HARD_MAX_CROSS_WORKSPACE_PANES) {
-            return AttachOutcome::CapacityReached;
+            return Ok(AttachOutcome::CapacityReached);
         }
 
         let id = self.allocate_id();
-        self.attachments.push(AttachedPane {
-            id,
-            primary_workspace_id: primary_workspace_id.into(),
-            source: AttachedPaneSource::Restoring(request),
-            width_px: normalize_width(width_px),
-            render_state: AttachedRenderState::Placeholder(AttachedPlaceholder::Disconnected),
-        });
+        self.attachments.insert(
+            insertion_index,
+            AttachedPane {
+                id,
+                primary_workspace_id: primary_workspace_id.into(),
+                source: AttachedPaneSource::Restoring(request),
+                width_px: normalize_width(width_px),
+                render_state: AttachedRenderState::Placeholder(AttachedPlaceholder::Disconnected),
+            },
+        );
         self.focused = FocusedSurface::Attached(id);
-        AttachOutcome::Appended(id)
+        Ok(AttachOutcome::Appended(id))
     }
 
     pub(crate) fn promote_restoring(
@@ -432,6 +490,43 @@ impl CrossWorkspacePaneState {
         true
     }
 
+    pub(crate) fn resize_adjacent(
+        &mut self,
+        left_id: AttachmentId,
+        right_id: AttachmentId,
+        requested_left_width: f32,
+    ) -> bool {
+        if !requested_left_width.is_finite() {
+            return false;
+        }
+        let Some(left_index) = self
+            .attachments
+            .iter()
+            .position(|attachment| attachment.id == left_id)
+        else {
+            return false;
+        };
+        if self
+            .attachments
+            .get(left_index + 1)
+            .map(|attachment| attachment.id)
+            != Some(right_id)
+        {
+            return false;
+        }
+
+        let (before_right, from_right) = self.attachments.split_at_mut(left_index + 1);
+        let left = &mut before_right[left_index];
+        let right = &mut from_right[0];
+        let pair_width = left.width_px + right.width_px;
+        let minimum_left = MIN_ATTACHED_WIDTH_PX.max(pair_width - MAX_ATTACHED_WIDTH_PX);
+        let maximum_left = MAX_ATTACHED_WIDTH_PX.min(pair_width - MIN_ATTACHED_WIDTH_PX);
+        let next_left = requested_left_width.clamp(minimum_left, maximum_left);
+        left.width_px = next_left;
+        right.width_px = pair_width - next_left;
+        true
+    }
+
     pub(crate) fn focused_surface(&self) -> TerminalSurfaceFocus {
         match self.focused {
             FocusedSurface::Primary => TerminalSurfaceFocus::Primary,
@@ -479,6 +574,19 @@ impl CrossWorkspacePaneState {
         let id = AttachmentId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1).max(1);
         id
+    }
+
+    fn insertion_index(&self, anchor: InsertAnchor) -> Result<usize, InsertAnchorError> {
+        match anchor {
+            InsertAnchor::Primary => Ok(0),
+            InsertAnchor::Attached(id) => self
+                .attachments
+                .iter()
+                .position(|attachment| attachment.id == id)
+                .map(|index| index + 1)
+                .ok_or(InsertAnchorError::StaleAttachment(id)),
+            InsertAnchor::End => Ok(self.attachments.len()),
+        }
     }
 
     fn attachment_mut(&mut self, id: AttachmentId) -> Option<&mut AttachedPane> {
@@ -592,6 +700,212 @@ mod tests {
         );
         assert_eq!(state.attachments().len(), 2);
         assert_eq!(state.focused(), FocusedSurface::Attached(first_id));
+    }
+
+    #[test]
+    fn cross_workspace_insert_anchor_orders_primary_attached_and_end() {
+        let mut state = CrossWorkspacePaneState::default();
+        let targets = [
+            distinct_target("workspace-b", 1, "first"),
+            distinct_target("workspace-c", 2, "second"),
+            distinct_target("workspace-d", 3, "primary"),
+            distinct_target("workspace-e", 4, "middle"),
+            distinct_target("workspace-f", 5, "end"),
+        ];
+        let first_id = state
+            .attach_right("workspace-a", targets[0].clone(), 420.0, 6)
+            .appended_id()
+            .unwrap();
+        state.attach_right("workspace-a", targets[1].clone(), 420.0, 6);
+        state
+            .attach_at_anchor(
+                "workspace-a",
+                targets[2].clone(),
+                420.0,
+                6,
+                InsertAnchor::Primary,
+            )
+            .unwrap();
+        state
+            .attach_at_anchor(
+                "workspace-a",
+                targets[3].clone(),
+                420.0,
+                6,
+                InsertAnchor::Attached(first_id),
+            )
+            .unwrap();
+        state
+            .attach_at_anchor(
+                "workspace-a",
+                targets[4].clone(),
+                420.0,
+                6,
+                InsertAnchor::End,
+            )
+            .unwrap();
+
+        let order = state
+            .attachments()
+            .iter()
+            .map(|attachment| attachment.live_target().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                &targets[2],
+                &targets[0],
+                &targets[3],
+                &targets[1],
+                &targets[4]
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_insert_anchor_rejections_and_duplicates_do_not_reorder() {
+        let mut state = CrossWorkspacePaneState::default();
+        let first = distinct_target("workspace-b", 1, "first");
+        let second = distinct_target("workspace-c", 2, "second");
+        let first_id = state
+            .attach_right("workspace-a", first.clone(), 420.0, 2)
+            .appended_id()
+            .unwrap();
+        let second_id = state
+            .attach_right("workspace-a", second, 420.0, 2)
+            .appended_id()
+            .unwrap();
+        let stale_id = AttachmentId(second_id.0 + 100);
+        state.focus_primary();
+        let attachments = state.attachments().to_vec();
+        let focus = state.focused();
+
+        assert_eq!(
+            state.attach_at_anchor(
+                "workspace-a",
+                distinct_target("workspace-d", 3, "stale"),
+                420.0,
+                2,
+                InsertAnchor::Attached(stale_id),
+            ),
+            Err(InsertAnchorError::StaleAttachment(stale_id))
+        );
+        assert_eq!(state.attachments(), attachments);
+        assert_eq!(state.focused(), focus);
+        assert_eq!(
+            state.attach_at_anchor(
+                "workspace-a",
+                first.clone(),
+                420.0,
+                2,
+                InsertAnchor::Attached(stale_id),
+            ),
+            Err(InsertAnchorError::StaleAttachment(stale_id))
+        );
+        assert_eq!(state.attachments(), attachments);
+        assert_eq!(state.focused(), focus);
+        assert_eq!(
+            state.attach_at_anchor("workspace-a", first, 420.0, 2, InsertAnchor::Primary,),
+            Ok(AttachOutcome::FocusedExisting(first_id))
+        );
+        assert_eq!(state.attachments(), attachments);
+        assert_eq!(state.focused(), FocusedSurface::Attached(first_id));
+        state.focus_primary();
+        assert_eq!(
+            state.attach_at_anchor(
+                "workspace-a",
+                distinct_target("workspace-e", 4, "capacity"),
+                420.0,
+                2,
+                InsertAnchor::Primary,
+            ),
+            Ok(AttachOutcome::CapacityReached)
+        );
+        assert_eq!(state.attachments(), attachments);
+        assert_eq!(state.focused(), focus);
+    }
+
+    #[test]
+    fn cross_workspace_insert_anchor_restoring_inserts_and_fails_closed() {
+        let mut state = CrossWorkspacePaneState::default();
+        let first_id = state
+            .attach_right(
+                "workspace-a",
+                distinct_target("workspace-b", 1, "first"),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        state.attach_right(
+            "workspace-a",
+            distinct_target("workspace-c", 2, "second"),
+            420.0,
+            6,
+        );
+        let middle_request =
+            PersistedPaneRequest::new("workspace-d", MuxPaneId("pane-middle".into()));
+        state
+            .insert_restoring_at_anchor(
+                "workspace-a",
+                middle_request.clone(),
+                420.0,
+                6,
+                InsertAnchor::Attached(first_id),
+            )
+            .unwrap();
+        state
+            .insert_restoring_at_anchor(
+                "workspace-a",
+                PersistedPaneRequest::new("workspace-e", MuxPaneId("pane-end".into())),
+                420.0,
+                6,
+                InsertAnchor::End,
+            )
+            .unwrap();
+        state.focus_primary();
+        let attachments = state.attachments().to_vec();
+        let focus = state.focused();
+        let stale_id = AttachmentId(first_id.0 + 100);
+
+        assert_eq!(
+            state
+                .attachments()
+                .iter()
+                .map(AttachedPane::workspace_id)
+                .collect::<Vec<_>>(),
+            vec!["workspace-b", "workspace-d", "workspace-c", "workspace-e"]
+        );
+        assert_eq!(
+            state.attach_at_anchor(
+                "workspace-a",
+                WorkspacePaneTarget::new(
+                    "workspace-d",
+                    9,
+                    MuxTabId("tab-middle".into()),
+                    MuxPaneId("pane-middle".into()),
+                    SessionId(99),
+                ),
+                420.0,
+                6,
+                InsertAnchor::Attached(stale_id),
+            ),
+            Err(InsertAnchorError::StaleAttachment(stale_id))
+        );
+        assert_eq!(state.attachments(), attachments);
+        assert_eq!(state.focused(), focus);
+        assert_eq!(
+            state.insert_restoring_at_anchor(
+                "workspace-a",
+                middle_request,
+                420.0,
+                6,
+                InsertAnchor::Attached(stale_id),
+            ),
+            Err(InsertAnchorError::StaleAttachment(stale_id))
+        );
+        assert_eq!(state.attachments(), attachments);
+        assert_eq!(state.focused(), focus);
     }
 
     #[test]
@@ -750,6 +1064,119 @@ mod tests {
             assert_eq!(state.attachments()[0].width_px(), 960.0);
             assert!(!state.set_width(id, invalid));
             assert_eq!(state.attachments()[0].width_px(), 960.0);
+        }
+    }
+
+    #[test]
+    fn adjacent_resize_preserves_pair_total_and_bounds() {
+        let mut state = CrossWorkspacePaneState::default();
+        let left = state
+            .attach_right(
+                "workspace-a",
+                distinct_target("workspace-b", 1, "left"),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let right = state
+            .attach_right(
+                "workspace-a",
+                distinct_target("workspace-c", 2, "right"),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+
+        assert!(state.resize_adjacent(left, right, 500.0));
+        assert_eq!(state.attachments()[0].width_px(), 500.0);
+        assert_eq!(state.attachments()[1].width_px(), 340.0);
+
+        assert!(state.resize_adjacent(left, right, 700.0));
+        assert_eq!(state.attachments()[0].width_px(), 520.0);
+        assert_eq!(state.attachments()[1].width_px(), 320.0);
+
+        assert!(state.resize_adjacent(left, right, 100.0));
+        assert_eq!(state.attachments()[0].width_px(), 320.0);
+        assert_eq!(state.attachments()[1].width_px(), 520.0);
+    }
+
+    #[test]
+    fn adjacent_resize_respects_maximum_width_for_both_panes() {
+        let mut state = CrossWorkspacePaneState::default();
+        let left = state
+            .attach_right(
+                "workspace-a",
+                distinct_target("workspace-b", 1, "left"),
+                900.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let right = state
+            .attach_right(
+                "workspace-a",
+                distinct_target("workspace-c", 2, "right"),
+                400.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+
+        assert!(state.resize_adjacent(left, right, 200.0));
+        assert_eq!(state.attachments()[0].width_px(), 340.0);
+        assert_eq!(state.attachments()[1].width_px(), 960.0);
+
+        assert!(state.resize_adjacent(left, right, 1_200.0));
+        assert_eq!(state.attachments()[0].width_px(), 960.0);
+        assert_eq!(state.attachments()[1].width_px(), 340.0);
+    }
+
+    #[test]
+    fn adjacent_resize_rejects_invalid_pairs_without_mutation() {
+        let mut state = CrossWorkspacePaneState::default();
+        let left = state
+            .attach_right(
+                "workspace-a",
+                distinct_target("workspace-b", 1, "left"),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let middle = state
+            .attach_right(
+                "workspace-a",
+                distinct_target("workspace-c", 2, "middle"),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let right = state
+            .attach_right(
+                "workspace-a",
+                distinct_target("workspace-d", 3, "right"),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let unknown = AttachmentId(right.0 + 100);
+        let original = state.attachments().to_vec();
+
+        for (candidate_left, candidate_right, requested_width) in [
+            (unknown, middle, 500.0),
+            (left, unknown, 500.0),
+            (middle, left, 500.0),
+            (left, right, 500.0),
+            (left, middle, f32::NAN),
+            (left, middle, f32::INFINITY),
+            (left, middle, f32::NEG_INFINITY),
+        ] {
+            assert!(!state.resize_adjacent(candidate_left, candidate_right, requested_width));
+            assert_eq!(state.attachments(), original);
         }
     }
 

@@ -1611,12 +1611,19 @@ impl CrossWorkspaceRestoreCoordinator {
         }
     }
 
-    fn expire(&mut self, now: std::time::Instant) -> Option<CrossWorkspaceRestoreRequest> {
+    fn expire(&mut self, now: std::time::Instant) -> Option<RestoreBarrierOutcome> {
         let expired = self
             .in_flight
             .as_ref()
             .is_some_and(|dispatch| dispatch.deadline <= now);
-        expired.then(|| self.in_flight.take().unwrap().request)
+        expired.then(|| {
+            let dispatch = self.in_flight.take().unwrap();
+            if dispatch.cancelled {
+                RestoreBarrierOutcome::Ignored(dispatch.request)
+            } else {
+                RestoreBarrierOutcome::Failed(dispatch.request)
+            }
+        })
     }
 
     fn cancel_attachment(
@@ -1694,6 +1701,23 @@ impl CrossWorkspaceRestoreCoordinator {
         }
         self.pending = retained;
         cancelled
+    }
+
+    fn remove_workspace(&mut self, workspace_id: &str) -> Option<runtime::MuxPaneId> {
+        let sent_restore_pane = if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.request.workspace_id() == workspace_id)
+        {
+            let dispatch = self.in_flight.take().unwrap();
+            (dispatch.state != CrossWorkspaceRestoreDispatchState::Pending)
+                .then_some(dispatch.request.pane)
+        } else {
+            None
+        };
+        self.pending
+            .retain(|request| request.workspace_id() != workspace_id);
+        sent_restore_pane
     }
 
     fn cancel_visible_requests(&mut self) -> Vec<CrossWorkspaceRestoreRequest> {
@@ -1820,6 +1844,47 @@ fn append_live_cross_workspace_pane(
     )
 }
 
+fn remove_workspace_cross_workspace_state(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    visible_ids: &mut Vec<ui::cross_workspace::AttachmentId>,
+    coordinator: &mut CrossWorkspaceRestoreCoordinator,
+    workspace_id: &str,
+) -> Option<runtime::MuxPaneId> {
+    let attachment_ids = panes
+        .attachments()
+        .iter()
+        .filter(|attachment| attachment.workspace_id() == workspace_id)
+        .map(ui::cross_workspace::AttachedPane::id)
+        .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
+        .collect::<Vec<_>>();
+    for attachment_id in attachment_ids {
+        let _ = panes.detach_attachment(attachment_id);
+    }
+    visible_ids.retain(|attachment_id| {
+        panes
+            .attachments()
+            .iter()
+            .any(|attachment| attachment.id() == *attachment_id)
+    });
+    coordinator.remove_workspace(workspace_id)
+}
+
+fn apply_restore_outcome(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    outcome: RestoreBarrierOutcome,
+) -> bool {
+    match outcome {
+        RestoreBarrierOutcome::Promote(completion) => {
+            panes.promote_restoring(completion.attachment_id, completion.target)
+        }
+        RestoreBarrierOutcome::Failed(request) => {
+            let _ = panes.detach_attachment(request.attachment_id());
+            false
+        }
+        RestoreBarrierOutcome::Ignored(_) => false,
+    }
+}
+
 fn attach_cold_cross_workspace_pane(
     panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
     primary_workspace_id: impl Into<String>,
@@ -1916,6 +1981,7 @@ struct CrossWorkspaceRenderPane {
     width_px: f32,
     render_state: ui::cross_workspace::AttachedRenderState,
     workspace_label: String,
+    display_title: String,
     identity_color: egui::Color32,
 }
 
@@ -2014,6 +2080,39 @@ fn frame_terminal_owner(
             })
             .map(|_| FrameTerminalOwner::Attached(id))
             .unwrap_or(FrameTerminalOwner::None),
+    }
+}
+
+fn suppress_terminal_owner_during_pointer_focus(
+    owner: FrameTerminalOwner,
+    pointer_transition: bool,
+    pointer_pos: Option<egui::Pos2>,
+    terminal_rect: egui::Rect,
+) -> FrameTerminalOwner {
+    if pointer_transition_inside_rect(Some(terminal_rect), pointer_transition, pointer_pos) {
+        FrameTerminalOwner::None
+    } else {
+        owner
+    }
+}
+
+fn pointer_transition_inside_rect(
+    rect: Option<egui::Rect>,
+    pointer_transition: bool,
+    pointer_pos: Option<egui::Pos2>,
+) -> bool {
+    pointer_transition
+        && rect.is_some_and(|rect| pointer_pos.is_some_and(|position| rect.contains(position)))
+}
+
+fn runtime_visible_attachment_ids(
+    central_terminal_visible: bool,
+    visible_ids: &[ui::cross_workspace::AttachmentId],
+) -> &[ui::cross_workspace::AttachmentId] {
+    if central_terminal_visible {
+        visible_ids
+    } else {
+        &[]
     }
 }
 
@@ -6976,6 +7075,7 @@ pub struct App {
     cross_workspace_restore: CrossWorkspaceRestoreCoordinator,
     visible_cross_workspace_attachments: Vec<ui::cross_workspace::AttachmentId>,
     frame_terminal_owner: FrameTerminalOwner,
+    last_multi_pane_terminal_rect: Option<egui::Rect>,
     egui_ctx: egui::Context,
     db_path: PathBuf,
     logs_base: PathBuf,
@@ -9632,6 +9732,7 @@ impl App {
                 ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES,
             ),
             frame_terminal_owner: FrameTerminalOwner::None,
+            last_multi_pane_terminal_rect: None,
             frame_stats: crate::perf::FrameStats::new(),
             bench,
             perf_harness_next: crate::perf::harness_enabled().then_some(0),
@@ -12483,6 +12584,12 @@ impl App {
                 if outcome == ui::cross_workspace::AttachOutcome::CapacityReached {
                     return;
                 }
+                if let ui::cross_workspace::AttachOutcome::FocusedExisting(attachment_id) = outcome
+                {
+                    let _ = self
+                        .cross_workspace_restore
+                        .cancel_attachment(attachment_id);
+                }
                 self.refresh_warm_idle_deadline();
                 self.egui_ctx.request_repaint();
             }
@@ -12567,10 +12674,7 @@ impl App {
         self.detach_cancelled_cross_workspace_restores(cancelled);
 
         if let Some(expired) = self.cross_workspace_restore.expire(now) {
-            let _ = self
-                .cross_workspace_pane
-                .detach_attachment(expired.attachment_id());
-            self.refresh_warm_idle_deadline();
+            self.apply_cross_workspace_restore_barrier(expired);
         }
 
         if self.cross_workspace_restore.in_flight().is_some() {
@@ -12661,18 +12765,8 @@ impl App {
     }
 
     fn apply_cross_workspace_restore_barrier(&mut self, outcome: RestoreBarrierOutcome) {
-        match outcome {
-            RestoreBarrierOutcome::Promote(completion) => {
-                let _ = self
-                    .cross_workspace_pane
-                    .promote_restoring(completion.attachment_id, completion.target);
-                self.egui_ctx.request_repaint();
-            }
-            RestoreBarrierOutcome::Failed(request) | RestoreBarrierOutcome::Ignored(request) => {
-                let _ = self
-                    .cross_workspace_pane
-                    .detach_attachment(request.attachment_id());
-            }
+        if apply_restore_outcome(&mut self.cross_workspace_pane, outcome) {
+            self.egui_ctx.request_repaint();
         }
         self.refresh_warm_idle_deadline();
     }
@@ -12848,9 +12942,14 @@ impl App {
     }
 
     fn sync_attached_runtime_visibility(&mut self) {
+        let visible_ids = runtime_visible_attachment_ids(
+            self.active.render_active
+                && self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Terminal,
+            &self.visible_cross_workspace_attachments,
+        );
         let groups = group_visible_cross_workspace_panes(
             &self.cross_workspace_pane,
-            &self.visible_cross_workspace_attachments,
+            visible_ids,
             |target| {
                 self.warm.get(&target.workspace_id).is_some_and(|runtime| {
                     runtime.runtime_instance == target.runtime_instance
@@ -13133,10 +13232,22 @@ impl App {
         else {
             return;
         };
-        if self.cross_workspace_pane.focused_surface()
-            == ui::cross_workspace::TerminalSurfaceFocus::Attached
-            && shortcut_targets_primary_terminal(action)
-        {
+        let attached_focused = self.cross_workspace_pane.focused_surface()
+            == ui::cross_workspace::TerminalSurfaceFocus::Attached;
+        let multi_pane_pointer_transition = !self.cross_workspace_pane.attachments().is_empty()
+            && self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Terminal
+            && ctx.input(|input| {
+                pointer_transition_inside_rect(
+                    self.last_multi_pane_terminal_rect,
+                    input.pointer.primary_pressed() || input.pointer.primary_released(),
+                    input.pointer.interact_pos(),
+                )
+            });
+        if configured_terminal_shortcut_blocked(
+            action,
+            attached_focused,
+            multi_pane_pointer_transition,
+        ) {
             return;
         }
 
@@ -13579,6 +13690,12 @@ impl App {
             // warm 종료는 runtime shutdown까지 동기로 끝난다 — 죽어가는 pane 추적 불필요.
             self.closed_workspaces
                 .insert(workspace_id.to_owned(), ClosedWorkspaceState::Persisted);
+            let sent_restore_pane = remove_workspace_cross_workspace_state(
+                &mut self.cross_workspace_pane,
+                &mut self.visible_cross_workspace_attachments,
+                &mut self.cross_workspace_restore,
+                workspace_id,
+            );
             // warm: 살아 있는 워커에 ClosePane을 모두 보낸 뒤 runtime을 내린다(idle 전환,
             // 프로젝트 삭제의 warm 종료 경로와 같은 순서). worker 루프는 shutdown 판정
             // 전에 큐 명령을 전부 소화하므로 pane 정리(persist layout 갱신)가 종료 전에
@@ -13587,7 +13704,7 @@ impl App {
             // 남아 재활성 시 fresh 셸로만 뜬다.
             self.join_pending_shutdown(workspace_id);
             if let Some(mut rt) = self.warm.remove(workspace_id) {
-                let panes: Vec<runtime::MuxPaneId> = rt
+                let mut panes: Vec<runtime::MuxPaneId> = rt
                     .workspace_ui
                     .mux()
                     .map(|mux| {
@@ -13597,6 +13714,11 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default();
+                if let Some(pane) = sent_restore_pane
+                    && !panes.contains(&pane)
+                {
+                    panes.push(pane);
+                }
                 tracing::info!(
                     workspace = %workspace_id,
                     panes = panes.len(),
@@ -14445,6 +14567,42 @@ impl App {
             (Some(folder), None) => folder,
             (None, None) => "~".to_owned(),
         }
+    }
+
+    fn workspace_project_name(row: &storage::WorkspaceRow) -> String {
+        std::path::Path::new(row.path.trim())
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| Self::workspace_display_name(row))
+    }
+
+    fn attached_workspace_title(row: &storage::WorkspaceRow) -> String {
+        format!(
+            "{} ({})",
+            Self::workspace_project_name(row),
+            Self::workspace_display_name(row)
+        )
+    }
+
+    fn attached_workspace_labels(
+        row: Option<&storage::WorkspaceRow>,
+        workspace_id: &str,
+    ) -> (String, String) {
+        row.map_or_else(
+            || {
+                (
+                    workspace_id.to_owned(),
+                    format!("{workspace_id} ({workspace_id})"),
+                )
+            },
+            |row| {
+                (
+                    Self::workspace_display_name(row),
+                    Self::attached_workspace_title(row),
+                )
+            },
+        )
     }
 
     fn active_workspace_display_name(&self) -> String {
@@ -19112,8 +19270,25 @@ impl eframe::App for App {
             Vec::new()
         };
 
+        let terminal_visible = !home_visible && !inbox_visible && !fleet_visible;
+        if terminal_visible {
+            self.frame_terminal_owner = frame_terminal_owner(
+                &self.cross_workspace_pane,
+                true,
+                &self.visible_cross_workspace_attachments,
+                |target| {
+                    self.warm.get(&target.workspace_id).is_some_and(|runtime| {
+                        runtime.runtime_instance == target.runtime_instance
+                            && runtime.workspace_ui.mux().is_some_and(|mux| {
+                                attached_target_relation(mux, target)
+                                    == ui::cross_workspace::LiveTargetRelation::Exact
+                            })
+                    })
+                },
+            );
+        }
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
-        if !home_visible && !inbox_visible && !fleet_visible && self.config.ui.composer_enabled {
+        if terminal_visible && self.config.ui.composer_enabled {
             self.render_composer_dock(ui, &text);
         }
 
@@ -19123,7 +19298,6 @@ impl eframe::App for App {
         let mut home_action = None;
         let mut inbox_page_click = None;
         let mut fleet_action = None;
-        let terminal_visible = !home_visible && !inbox_visible && !fleet_visible;
         let render_panes = if terminal_visible {
             self.cross_workspace_pane
                 .attachments()
@@ -19131,6 +19305,12 @@ impl eframe::App for App {
                 .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
                 .map(|attachment| {
                     let workspace_id = attachment.workspace_id();
+                    let (workspace_label, display_title) = Self::attached_workspace_labels(
+                        self.workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == workspace_id),
+                        workspace_id,
+                    );
                     CrossWorkspaceRenderPane {
                         id: attachment.id(),
                         target: attachment.live_target().cloned(),
@@ -19141,12 +19321,8 @@ impl eframe::App for App {
                             .unwrap_or(ui::cross_workspace::AttachedRenderState::Placeholder(
                                 ui::cross_workspace::AttachedPlaceholder::Disconnected,
                             )),
-                        workspace_label: self
-                            .workspaces
-                            .iter()
-                            .find(|workspace| workspace.id == workspace_id)
-                            .map(Self::workspace_display_name)
-                            .unwrap_or_else(|| workspace_id.to_owned()),
+                        workspace_label,
+                        display_title,
                         identity_color: ui::file_tree::workspace_accent(
                             &sidebar_workspaces,
                             workspace_id,
@@ -19162,6 +19338,7 @@ impl eframe::App for App {
         let mut attached_detach_requested = None;
         let mut attached_reorder_requested = None;
         let mut attached_width_requested = None;
+        let mut adjacent_width_requested = None;
         let mut visible_attachment_ids =
             Vec::with_capacity(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
         let mut current_owner = FrameTerminalOwner::None;
@@ -19171,6 +19348,7 @@ impl eframe::App for App {
                 ui.ctx(),
             ))
         .then(|| text.t("workspace.menu.open_in_current_view_right", &[]));
+        self.last_multi_pane_terminal_rect = None;
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
@@ -19201,29 +19379,56 @@ impl eframe::App for App {
                     );
                 } else if !render_panes.is_empty() {
                     let rect = ui.available_rect_before_wrap();
-                    let primary_width = (rect.width() * 0.5)
-                        .clamp(320.0, 960.0)
-                        .min((rect.width() - ATTACHED_DIVIDER_WIDTH).max(0.0));
-                    let primary_rect = egui::Rect::from_min_max(
-                        rect.min,
-                        egui::pos2(rect.left() + primary_width, rect.bottom()),
-                    );
-                    let divider_rect = egui::Rect::from_min_max(
-                        egui::pos2(primary_rect.right(), rect.top()),
-                        egui::pos2(
-                            primary_rect.right() + ATTACHED_DIVIDER_WIDTH,
-                            rect.bottom(),
-                        ),
-                    );
-                    let foreign_rect = egui::Rect::from_min_max(
-                        egui::pos2(divider_rect.right(), rect.top()),
-                        rect.max,
-                    );
+                    self.last_multi_pane_terminal_rect = Some(rect);
+                    let widths = render_panes
+                        .iter()
+                        .map(|pane| pane.width_px)
+                        .collect::<Vec<_>>();
+                    let layout = fluid_cross_workspace_layout(rect, &widths);
+                    let primary_rect = layout.primary;
+                    let divider_rect = layout.divider;
+                    let foreign_rect = layout.foreign;
+                    let (pointer_transition, pointer_pos) = ui.ctx().input(|input| {
+                        (
+                            input.pointer.primary_pressed() || input.pointer.primary_released(),
+                            input.pointer.interact_pos(),
+                        )
+                    });
+                    let primary_resize_id = ui.id().with("cross_workspace_primary_width");
+                    let primary_resize = ui
+                        .interact(divider_rect, primary_resize_id, egui::Sense::drag())
+                        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
                     ui.painter().rect_filled(
                         divider_rect,
                         0.0,
                         ui::designall::separator_stroke(ui.visuals()).color,
                     );
+                    let primary_resize_start_id = primary_resize_id.with("drag_start_width");
+                    if primary_resize.drag_started()
+                        && let Some(first) = render_panes.first()
+                    {
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(primary_resize_start_id, first.width_px)
+                        });
+                    }
+                    if primary_resize.dragged()
+                        && let Some(first) = render_panes.first()
+                    {
+                        let start_width = ui
+                            .ctx()
+                            .data(|data| data.get_temp::<f32>(primary_resize_start_id))
+                            .unwrap_or(first.width_px);
+                        if let Some(requested_width) = primary_divider_requested_width(
+                            start_width,
+                            primary_resize.drag_delta().x,
+                        ) {
+                            attached_width_requested = Some((first.id, requested_width));
+                        }
+                    }
+                    if primary_resize.drag_stopped() {
+                        ui.ctx()
+                            .data_mut(|data| data.remove::<f32>(primary_resize_start_id));
+                    }
                     let mut foreign = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(foreign_rect)
@@ -19234,10 +19439,6 @@ impl eframe::App for App {
                         .id_salt("cross_workspace_foreign_scroll")
                         .auto_shrink([false, false])
                         .show_viewport(&mut foreign, |scroll_ui, viewport| {
-                            let widths = render_panes
-                                .iter()
-                                .map(|pane| pane.width_px)
-                                .collect::<Vec<_>>();
                             let relative_rects = foreign_strip_rects(
                                 egui::Pos2::ZERO,
                                 foreign_rect.height(),
@@ -19273,6 +19474,12 @@ impl eframe::App for App {
                                             })
                                     })
                                 },
+                            );
+                            current_owner = suppress_terminal_owner_during_pointer_focus(
+                                current_owner,
+                                pointer_transition,
+                                pointer_pos,
+                                rect,
                             );
                             drain_native_input_if_unowned(
                                 current_owner == FrameTerminalOwner::Primary,
@@ -19383,6 +19590,7 @@ impl eframe::App for App {
                                         &text,
                                         target,
                                         &pane.workspace_label,
+                                        &pane.display_title,
                                         availability,
                                         Some(ui::workspace::AttachedPaneHeaderContext::new(
                                             pane.id,
@@ -19411,20 +19619,10 @@ impl eframe::App for App {
                                 let pane = &render_panes[index];
                                 let pane_rect = relative_rects[index].translate(origin);
                                 if !rendered_ids.contains(&pane.id) {
-                                    let placeholder = match pane.render_state {
-                                        ui::cross_workspace::AttachedRenderState::Placeholder(
-                                            placeholder,
-                                        ) => placeholder,
-                                        ui::cross_workspace::AttachedRenderState::Live => {
-                                            ui::cross_workspace::AttachedPlaceholder::Disconnected
-                                        }
-                                    };
                                     let output = show_app_attached_placeholder(
                                         scroll_ui,
                                         pane_rect,
-                                        &pane.workspace_label,
-                                        pane.identity_color,
-                                        placeholder,
+                                        pane,
                                         &text,
                                     );
                                     if output.focus_requested {
@@ -19434,25 +19632,37 @@ impl eframe::App for App {
                                         attached_detach_requested = Some(pane.id);
                                     }
                                 }
-                                let resize_rect = egui::Rect::from_min_max(
-                                    egui::pos2(pane_rect.right() - 2.0, pane_rect.top()),
-                                    egui::pos2(pane_rect.right() + 2.0, pane_rect.bottom()),
-                                );
-                                let resize = scroll_ui.interact(
-                                    resize_rect,
-                                    scroll_ui.id().with(("attached_width", pane.id)),
-                                    egui::Sense::drag(),
-                                );
-                                scroll_ui.painter().rect_filled(
-                                    resize_rect,
-                                    0.0,
-                                    ui::designall::separator_stroke(scroll_ui.visuals()).color,
-                                );
-                                if resize.dragged()
-                                    && let Some(pointer) = resize.interact_pointer_pos()
-                                {
-                                    attached_width_requested =
-                                        Some((pane.id, pointer.x - pane_rect.left()));
+                                if let Some(next_pane) = render_panes.get(index + 1) {
+                                    let resize_rect = egui::Rect::from_min_max(
+                                        egui::pos2(pane_rect.right(), pane_rect.top()),
+                                        egui::pos2(
+                                            pane_rect.right() + ATTACHED_DIVIDER_WIDTH,
+                                            pane_rect.bottom(),
+                                        ),
+                                    );
+                                    let resize = scroll_ui
+                                        .interact(
+                                            resize_rect,
+                                            scroll_ui.id().with(("attached_width", pane.id)),
+                                            egui::Sense::drag(),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                                    scroll_ui.painter().rect_filled(
+                                        resize_rect,
+                                        0.0,
+                                        ui::designall::separator_stroke(scroll_ui.visuals()).color,
+                                    );
+                                    if resize.dragged()
+                                        && let Some(pointer) = resize.interact_pointer_pos()
+                                    {
+                                        adjacent_width_requested = Some((
+                                            pane.id,
+                                            next_pane.id,
+                                            pointer.x
+                                                - pane_rect.left()
+                                                - ATTACHED_DIVIDER_WIDTH * 0.5,
+                                        ));
+                                    }
                                 }
                                 if let Some(label) = session_drop_label.as_deref()
                                     && dropped_session_open.is_none()
@@ -19534,6 +19744,12 @@ impl eframe::App for App {
         }
         if let Some((attachment_id, width_px)) = attached_width_requested {
             let _ = self.cross_workspace_pane.set_width(attachment_id, width_px);
+            ui.ctx().request_repaint();
+        }
+        if let Some((left_id, right_id, left_width_px)) = adjacent_width_requested {
+            let _ = self
+                .cross_workspace_pane
+                .resize_adjacent(left_id, right_id, left_width_px);
             ui.ctx().request_repaint();
         }
         if let Some(reorder) = attached_reorder_requested {
@@ -21339,6 +21555,61 @@ fn attached_target_relation(
 
 const ATTACHED_DIVIDER_WIDTH: f32 = 4.0;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FluidCrossWorkspaceLayout {
+    primary: egui::Rect,
+    divider: egui::Rect,
+    foreign: egui::Rect,
+}
+
+fn foreign_strip_content_width(widths: &[f32]) -> f32 {
+    let mut content_width = 0.0;
+    for (index, width) in widths
+        .iter()
+        .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
+        .enumerate()
+    {
+        if index > 0 {
+            content_width += ATTACHED_DIVIDER_WIDTH;
+        }
+        content_width += width.max(0.0);
+    }
+    content_width
+}
+
+fn fluid_cross_workspace_layout(
+    rect: egui::Rect,
+    attached_widths: &[f32],
+) -> FluidCrossWorkspaceLayout {
+    let divider_width = ATTACHED_DIVIDER_WIDTH.min(rect.width().max(0.0));
+    let available_after_divider = (rect.width() - divider_width).max(0.0);
+    let primary_min = ui::cross_workspace::MIN_ATTACHED_WIDTH_PX.min(available_after_divider);
+    let content_width = foreign_strip_content_width(attached_widths);
+    let foreign_width = content_width.min((available_after_divider - primary_min).max(0.0));
+    let primary_right = rect.right() - divider_width - foreign_width;
+    let primary = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(primary_right.max(rect.left()), rect.bottom()),
+    );
+    let divider = egui::Rect::from_min_max(
+        egui::pos2(primary.right(), rect.top()),
+        egui::pos2(primary.right() + divider_width, rect.bottom()),
+    );
+    let foreign = egui::Rect::from_min_max(egui::pos2(divider.right(), rect.top()), rect.max);
+    FluidCrossWorkspaceLayout {
+        primary,
+        divider,
+        foreign,
+    }
+}
+
+fn primary_divider_requested_width(start_width: f32, drag_delta_x: f32) -> Option<f32> {
+    if !start_width.is_finite() || !drag_delta_x.is_finite() {
+        return None;
+    }
+    Some((start_width - drag_delta_x).max(0.0))
+}
+
 fn foreign_strip_rects(origin: egui::Pos2, height: f32, widths: &[f32]) -> Vec<egui::Rect> {
     let mut rects = Vec::with_capacity(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
     let mut left = origin.x;
@@ -21395,6 +21666,20 @@ fn shortcut_targets_primary_terminal(action: crate::shortcuts::ShortcutAction) -
             | A::PromptJumpPrev
             | A::PromptJumpNext
     )
+}
+
+fn configured_terminal_shortcut_blocked(
+    action: crate::shortcuts::ShortcutAction,
+    attached_focused: bool,
+    multi_pane_pointer_transition: bool,
+) -> bool {
+    (attached_focused && shortcut_targets_primary_terminal(action))
+        || (multi_pane_pointer_transition && shortcut_depends_on_terminal_owner(action))
+}
+
+fn shortcut_depends_on_terminal_owner(action: crate::shortcuts::ShortcutAction) -> bool {
+    shortcut_targets_primary_terminal(action)
+        || action == crate::shortcuts::ShortcutAction::FocusComposer
 }
 
 fn select_workspace_host_io_action_for_owner(
@@ -21462,51 +21747,103 @@ fn take_exact_runtime_focus_claim(
 fn show_app_attached_placeholder(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    workspace_name: &str,
-    identity_color: egui::Color32,
-    placeholder: ui::cross_workspace::AttachedPlaceholder,
+    pane: &CrossWorkspaceRenderPane,
     catalog: &i18n::Catalog,
 ) -> ui::workspace::AttachedPaneOutput {
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect)
-            .id_salt(("app_attached_placeholder", workspace_name)),
+            .id_salt(app_attached_placeholder_id(pane.id)),
     );
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     let response = child.interact(rect, child.id().with("focus"), egui::Sense::click());
-    let mut detach_requested = false;
-    child.horizontal(|ui| {
-        ui.label(catalog.t(
-            "workspace.cross_pane.external_source",
-            &[("workspace", workspace_name)],
-        ));
-        if ui
-            .small_button("×")
-            .on_hover_text(catalog.t("workspace.cross_pane.detach", &[]))
-            .clicked()
-        {
-            detach_requested = true;
-        }
-    });
-    child.centered_and_justified(|ui| {
-        let key = match placeholder {
-            ui::cross_workspace::AttachedPlaceholder::Suspended => "workspace.cross_pane.suspended",
-            ui::cross_workspace::AttachedPlaceholder::Disconnected => {
-                "workspace.cross_pane.disconnected"
-            }
+    let (header_rect, title_rect, close_rect) = app_attached_placeholder_header_rects(rect);
+    let detach_requested = child
+        .put(
+            close_rect,
+            egui::Button::new(egui::RichText::new("×").size(16.0)).frame(false),
+        )
+        .on_hover_text(catalog.t("workspace.cross_pane.detach", &[]))
+        .clicked();
+    let tokens = ui::designall::tokens(child.visuals());
+    let mut title_job = egui::text::LayoutJob::single_section(
+        pane.display_title.clone(),
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(12.0),
+            color: tokens.muted_text,
+            ..Default::default()
+        },
+    );
+    title_job.wrap = egui::text::TextWrapping {
+        max_width: title_rect.width().max(0.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let title_galley = child.painter().layout_job(title_job);
+    child.painter().with_clip_rect(title_rect).galley(
+        egui::pos2(
+            title_rect.left(),
+            title_rect.center().y - title_galley.size().y / 2.0,
+        ),
+        title_galley,
+        tokens.muted_text,
+    );
+    let body_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.left(), header_rect.bottom()), rect.max);
+    let mut body = child.new_child(
+        egui::UiBuilder::new()
+            .max_rect(body_rect)
+            .id_salt("placeholder_body"),
+    );
+    body.centered_and_justified(|ui| {
+        let key = match pane.render_state {
+            ui::cross_workspace::AttachedRenderState::Placeholder(placeholder) => match placeholder
+            {
+                ui::cross_workspace::AttachedPlaceholder::Suspended => {
+                    "workspace.cross_pane.suspended"
+                }
+                ui::cross_workspace::AttachedPlaceholder::Disconnected => {
+                    "workspace.cross_pane.disconnected"
+                }
+            },
+            ui::cross_workspace::AttachedRenderState::Live => "workspace.cross_pane.disconnected",
         };
-        ui.weak(catalog.t(key, &[("workspace", workspace_name)]));
+        ui.weak(catalog.t(key, &[("workspace", &pane.workspace_label)]));
     });
     child.painter().hline(
         rect.x_range(),
         child.painter().round_to_pixel_center(rect.top() + 0.5),
-        egui::Stroke::new(1.0, identity_color),
+        egui::Stroke::new(1.0, pane.identity_color),
     );
     ui::workspace::AttachedPaneOutput {
         focus_requested: response.clicked(),
         detach_requested,
         target_present: false,
     }
+}
+
+fn app_attached_placeholder_header_rects(rect: egui::Rect) -> (egui::Rect, egui::Rect, egui::Rect) {
+    let header_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(
+            rect.right(),
+            rect.top() + 32.0_f32.min(rect.height().max(0.0)),
+        ),
+    );
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(header_rect.right() - 15.0, header_rect.center().y),
+        egui::vec2(24.0, 24.0),
+    );
+    let title_rect = egui::Rect::from_min_max(
+        egui::pos2(header_rect.left() + 8.0, header_rect.top()),
+        egui::pos2(close_rect.left() - 4.0, header_rect.bottom()),
+    );
+    (header_rect, title_rect, close_rect)
+}
+
+fn app_attached_placeholder_id(attachment_id: ui::cross_workspace::AttachmentId) -> egui::Id {
+    egui::Id::new(("app_attached_placeholder", attachment_id))
 }
 
 /// warm workspace의 pending_events를 합쳐(coalesce) 재활성 replay를 정확+유계로 만든다.
@@ -21876,6 +22213,196 @@ mod tests {
         )
     }
 
+    fn cross_workspace_test_row(id: &str, name: &str, path: &str) -> storage::WorkspaceRow {
+        storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            path: path.to_owned(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_fits_foreign_content_to_right_edge() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_200.0, 700.0));
+        let layout = fluid_cross_workspace_layout(rect, &[420.0]);
+
+        assert_eq!(layout.primary.width(), 776.0);
+        assert_eq!(layout.divider.width(), ATTACHED_DIVIDER_WIDTH);
+        assert_eq!(layout.foreign.width(), 420.0);
+        assert_eq!(layout.foreign.right(), rect.right());
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_overflow_preserves_primary_minimum() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let layout = fluid_cross_workspace_layout(rect, &[420.0, 420.0]);
+
+        assert_eq!(foreign_strip_content_width(&[420.0, 420.0]), 844.0);
+        assert_eq!(layout.primary.width(), 320.0);
+        assert_eq!(layout.foreign.width(), 576.0);
+        assert_eq!(layout.foreign.right(), rect.right());
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_narrow_viewport_prioritizes_primary() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 700.0));
+        let layout = fluid_cross_workspace_layout(rect, &[420.0]);
+
+        assert_eq!(layout.primary.width(), 296.0);
+        assert_eq!(layout.divider.width(), ATTACHED_DIVIDER_WIDTH);
+        assert_eq!(layout.foreign.width(), 0.0);
+        assert_eq!(layout.foreign.right(), rect.right());
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_has_no_fitting_right_gutter() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_200.0, 700.0));
+        let widths = [320.0, 320.0];
+        let layout = fluid_cross_workspace_layout(rect, &widths);
+        let panes = foreign_strip_rects(layout.foreign.min, layout.foreign.height(), &widths);
+
+        assert_eq!(panes.last().unwrap().right(), rect.right());
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_title_uses_project_then_workspace_alias() {
+        let row = cross_workspace_test_row("workspace-b", "Deploy", "/repo/VisionAI2");
+
+        assert_eq!(App::attached_workspace_title(&row), "VisionAI2 (Deploy)");
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_title_falls_back_without_usable_path() {
+        let row = cross_workspace_test_row("workspace-b", "Deploy", "/");
+
+        assert_eq!(App::attached_workspace_title(&row), "Deploy (Deploy)");
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_labels_use_bounded_id_when_row_is_missing() {
+        assert_eq!(
+            App::attached_workspace_labels(None, "workspace-b"),
+            (
+                "workspace-b".to_owned(),
+                "workspace-b (workspace-b)".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_divider_uses_drag_start_width_and_delta() {
+        assert_eq!(primary_divider_requested_width(420.0, 0.0), Some(420.0));
+        assert_eq!(primary_divider_requested_width(420.0, 50.0), Some(370.0));
+        assert_eq!(primary_divider_requested_width(420.0, -50.0), Some(470.0));
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_divider_overflow_does_not_jump_at_drag_start() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let widths = [420.0, 420.0];
+        let layout = fluid_cross_workspace_layout(rect, &widths);
+
+        assert_eq!(layout.foreign.width(), 576.0);
+        assert_eq!(primary_divider_requested_width(widths[0], 0.0), Some(420.0));
+    }
+
+    #[test]
+    fn cross_workspace_app_placeholder_ids_are_unique_within_same_workspace() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let second = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(
+            app_attached_placeholder_id(first),
+            app_attached_placeholder_id(second)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_placeholder_elides_title_before_close_action() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let attachment_id = restoring_attachment_id("workspace-b", "pane-b");
+        let long_title = "Extremely Long Project Name (Extremely Long Workspace Name)";
+        let pane = CrossWorkspaceRenderPane {
+            id: attachment_id,
+            target: None,
+            width_px: 420.0,
+            render_state: ui::cross_workspace::AttachedRenderState::Placeholder(
+                ui::cross_workspace::AttachedPlaceholder::Suspended,
+            ),
+            workspace_label: "Workspace".to_owned(),
+            display_title: long_title.to_owned(),
+            identity_color: egui::Color32::LIGHT_BLUE,
+        };
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180.0, 180.0));
+        let (_, title_rect, close_rect) = app_attached_placeholder_header_rects(rect);
+        let context = egui::Context::default();
+
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            show_app_attached_placeholder(ui, rect, &pane, &catalog);
+        });
+        let clipped_title = output
+            .shapes
+            .iter()
+            .find(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::Shape::Text(text) if text.galley.text() == long_title
+                )
+            })
+            .expect("placeholder title shape");
+        let egui::Shape::Text(title) = &clipped_title.shape else {
+            unreachable!("matched title shape")
+        };
+        let close = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "×" => Some(text),
+                _ => None,
+            })
+            .expect("placeholder close action shape");
+
+        assert!(title.galley.elided);
+        assert_eq!(title.galley.rows.len(), 1);
+        assert_eq!(
+            title
+                .galley
+                .rows
+                .last()
+                .and_then(|row| row.glyphs.last())
+                .map(|glyph| glyph.chr),
+            Some('…')
+        );
+        assert!(clipped_title.clip_rect.right() <= title_rect.right());
+        assert!(clipped_title.clip_rect.right() < close_rect.left());
+        assert!(close.pos.x >= close_rect.left());
+    }
+
     #[test]
     fn cross_workspace_app_drop_anchor_primary_inserts_at_foreign_index_zero() {
         let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
@@ -22073,7 +22600,7 @@ mod tests {
             .split_once("/// warm workspace")
             .unwrap()
             .0;
-        assert!(placeholder.contains("egui::Stroke::new(1.0, identity_color)"));
+        assert!(placeholder.contains("egui::Stroke::new(1.0, pane.identity_color)"));
         assert!(!placeholder.contains("rect_filled"));
     }
 
@@ -22357,6 +22884,15 @@ mod tests {
     }
 
     #[test]
+    fn cross_workspace_app_hidden_or_non_terminal_central_view_hides_attached_runtimes() {
+        let id = restoring_attachment_id("workspace-b", "pane-b");
+        let visible = [id];
+
+        assert_eq!(runtime_visible_attachment_ids(true, &visible), &visible);
+        assert!(runtime_visible_attachment_ids(false, &visible).is_empty());
+    }
+
+    #[test]
     fn cross_workspace_app_last_detach_releases_visibility_and_deadline_path() {
         assert_eq!(
             warm_visibility_transitions([("workspace-b", 9, true)], &[]),
@@ -22447,6 +22983,34 @@ mod tests {
     }
 
     #[test]
+    fn cross_workspace_app_pointer_focus_transition_fails_closed_for_one_frame() {
+        let terminal_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let previous =
+            FrameTerminalOwner::Attached(restoring_attachment_id("workspace-b", "pane-b"));
+
+        let owner = suppress_terminal_owner_during_pointer_focus(
+            previous,
+            true,
+            Some(egui::pos2(100.0, 100.0)),
+            terminal_rect,
+        );
+
+        assert_eq!(owner, FrameTerminalOwner::None);
+        let mut drains = 0;
+        drain_native_input_if_unowned(false, false, || drains += 1);
+        assert_eq!(drains, 1);
+        assert_eq!(
+            suppress_terminal_owner_during_pointer_focus(
+                previous,
+                false,
+                Some(egui::pos2(100.0, 100.0)),
+                terminal_rect,
+            ),
+            previous
+        );
+    }
+
+    #[test]
     fn cross_workspace_app_production_uses_prepared_strip_renderer_only() {
         let source = include_str!("app.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
@@ -22466,6 +23030,25 @@ mod tests {
         for forbidden in ["ClosePane", "KillSession", "ResizeSplit"] {
             assert!(!strip.contains(forbidden), "strip contains {forbidden}");
         }
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_preserves_visibility_owner_and_drop_contracts() {
+        let source = include_str!("app.rs");
+        let strip = source
+            .split_once("let terminal_visible =")
+            .unwrap()
+            .1
+            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .unwrap()
+            .0;
+
+        assert!(strip.contains("fluid_cross_workspace_layout(rect, &widths)"));
+        assert!(strip.contains("visible_attachment_indices"));
+        assert!(strip.contains("frame_terminal_owner"));
+        assert!(strip.contains("InsertAnchor::Attached(pane.id)"));
+        assert!(strip.contains("render_panes.get(index + 1)"));
+        assert!(strip.contains("resize_adjacent(left_id, right_id, left_width_px)"));
     }
 
     #[test]
@@ -22712,6 +23295,39 @@ mod tests {
     }
 
     #[test]
+    fn cross_workspace_app_composer_owner_refreshes_after_pointer_focus_transition() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        state.focus_primary();
+        let stale_owner = FrameTerminalOwner::Primary;
+
+        assert!(state.focus_attachment(attachment_id));
+        let fresh_owner = frame_terminal_owner(&state, true, &[attachment_id], |_| true);
+        let target = focused_composer_target_for_owner(
+            fresh_owner,
+            &state,
+            "workspace-a",
+            1,
+            Some(runtime::SessionId(7)),
+        );
+
+        assert_ne!(fresh_owner, stale_owner);
+        assert_eq!(fresh_owner, FrameTerminalOwner::Attached(attachment_id));
+        assert!(matches!(
+            target,
+            Some(AppTerminalInputTarget::Attached(target))
+                if target == cross_workspace_test_target("workspace-b", 9)
+        ));
+    }
+
+    #[test]
     fn cross_workspace_app_detach_transition_has_no_destructive_runtime_command() {
         let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
         let attachment_id = append_live_cross_workspace_pane(
@@ -22944,9 +23560,59 @@ mod tests {
             A::ClearRenderCaches,
             A::ToggleSidebar,
             A::OpenEnvironment,
+            A::FocusComposer,
         ] {
             assert!(!shortcut_targets_primary_terminal(action), "{action:?}");
         }
+        assert!(shortcut_depends_on_terminal_owner(A::FocusComposer));
+    }
+
+    #[test]
+    fn cross_workspace_app_pointer_transition_blocks_only_terminal_shortcuts() {
+        use crate::shortcuts::ShortcutAction as A;
+        let terminal_rect =
+            egui::Rect::from_min_size(egui::pos2(100.0, 80.0), egui::vec2(900.0, 700.0));
+        let inside = pointer_transition_inside_rect(
+            Some(terminal_rect),
+            true,
+            Some(egui::pos2(400.0, 300.0)),
+        );
+        let outside = pointer_transition_inside_rect(
+            Some(terminal_rect),
+            true,
+            Some(egui::pos2(40.0, 300.0)),
+        );
+
+        assert!(configured_terminal_shortcut_blocked(
+            A::ClosePane,
+            false,
+            inside,
+        ));
+        assert!(configured_terminal_shortcut_blocked(
+            A::FocusComposer,
+            false,
+            inside,
+        ));
+        assert!(configured_terminal_shortcut_blocked(
+            A::TerminalSearch,
+            true,
+            false,
+        ));
+        assert!(!configured_terminal_shortcut_blocked(
+            A::ClosePane,
+            false,
+            outside,
+        ));
+        assert!(!configured_terminal_shortcut_blocked(
+            A::FocusComposer,
+            true,
+            false,
+        ));
+        assert!(!configured_terminal_shortcut_blocked(
+            A::ToggleSidebar,
+            false,
+            inside,
+        ));
     }
 
     #[test]
@@ -26126,6 +26792,228 @@ mod tests {
     }
 
     #[test]
+    fn cross_workspace_app_workspace_close_removes_exact_attachments_and_restores() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let live_b = append_live_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 11, "b-live", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let restoring_b = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b-restore".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let restoring_c = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let pending_b = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b-pending".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request(
+            "workspace-b",
+            "pane-b-restore",
+            restoring_b,
+        )));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(
+            coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b-restore".to_owned()),)
+        );
+        assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", restoring_c,)));
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b-pending", pending_b,)));
+        let mut visible = vec![live_b, restoring_b, restoring_c, pending_b];
+
+        let sent_restore_pane = remove_workspace_cross_workspace_state(
+            &mut panes,
+            &mut visible,
+            &mut coordinator,
+            "workspace-b",
+        );
+
+        assert_eq!(
+            panes
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![restoring_c]
+        );
+        assert_eq!(visible, vec![restoring_c]);
+        assert_eq!(coordinator.in_flight_len(), 0);
+        assert_eq!(coordinator.pending_len(), 1);
+        assert_eq!(
+            sent_restore_pane,
+            Some(runtime::MuxPaneId("pane-b-restore".to_owned()))
+        );
+        assert_eq!(
+            coordinator.next_request().unwrap().workspace_id(),
+            "workspace-c"
+        );
+
+        let source = include_str!("app.rs");
+        let helper = source
+            .split_once("fn remove_workspace_cross_workspace_state")
+            .unwrap()
+            .1
+            .split_once("fn apply_restore_outcome")
+            .unwrap()
+            .0;
+        for forbidden in ["ClosePane", "KillSession", "ResizeSplit"] {
+            assert!(!helper.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_workspace_close_ignores_unsent_restore_pane() {
+        let now = std::time::Instant::now();
+        let id = restoring_attachment_id("workspace-b", "pane-b");
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        coordinator.begin_next(11, now).unwrap();
+
+        assert_eq!(coordinator.remove_workspace("workspace-b"), None);
+        assert_eq!(coordinator.in_flight_len(), 0);
+        assert_eq!(coordinator.pending_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_live_promotion_survives_cancelled_barrier() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+
+        let outcome = append_live_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 11),
+            6,
+        );
+        assert_eq!(
+            outcome,
+            ui::cross_workspace::AttachOutcome::FocusedExisting(id)
+        );
+        assert!(coordinator.cancel_attachment(id).is_some());
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        let ignored = coordinator
+            .settle_durable_barrier("workspace-b", 11, 41, Some(&mux))
+            .unwrap();
+
+        assert!(matches!(ignored, RestoreBarrierOutcome::Ignored(_)));
+        assert!(!apply_restore_outcome(&mut panes, ignored));
+        assert!(panes.attachments()[0].live_target().is_some());
+    }
+
+    #[test]
+    fn cross_workspace_app_live_promotion_survives_cancelled_timeout() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        let outcome = append_live_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 11),
+            6,
+        );
+        assert_eq!(
+            outcome,
+            ui::cross_workspace::AttachOutcome::FocusedExisting(id)
+        );
+        assert!(coordinator.cancel_attachment(id).is_some());
+
+        let ignored = coordinator
+            .expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT)
+            .unwrap();
+
+        assert!(matches!(ignored, RestoreBarrierOutcome::Ignored(_)));
+        assert!(!apply_restore_outcome(&mut panes, ignored));
+        assert!(panes.attachments()[0].live_target().is_some());
+    }
+
+    #[test]
+    fn cross_workspace_app_real_restore_failure_detaches_placeholder() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+
+        assert!(!apply_restore_outcome(
+            &mut panes,
+            RestoreBarrierOutcome::Failed(restore_request("workspace-b", "pane-b", id)),
+        ));
+        assert!(panes.attachments().is_empty());
+    }
+
+    #[test]
     fn cross_workspace_app_restore_queue_has_one_in_flight() {
         let now = std::time::Instant::now();
         let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
@@ -26433,7 +27321,10 @@ mod tests {
 
         let expired = coordinator.expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT);
 
-        assert_eq!(expired.unwrap().attachment_id(), id);
+        assert!(matches!(
+            expired,
+            Some(RestoreBarrierOutcome::Failed(request)) if request.attachment_id() == id
+        ));
         assert_eq!(coordinator.pending_len(), 0);
         assert_eq!(coordinator.in_flight_len(), 0);
         assert!(!coordinator.protects_runtime("workspace-b", 11));

@@ -19411,7 +19411,7 @@ impl eframe::App for App {
                             data.insert_temp(primary_resize_start_id, first.width_px)
                         });
                     }
-                    if primary_resize.dragged()
+                    if let Some(total_drag_delta) = primary_resize.total_drag_delta()
                         && let Some(first) = render_panes.first()
                     {
                         let start_width = ui
@@ -19420,7 +19420,7 @@ impl eframe::App for App {
                             .unwrap_or(first.width_px);
                         if let Some(requested_width) = primary_divider_requested_width(
                             start_width,
-                            primary_resize.drag_delta().x,
+                            total_drag_delta.x,
                         ) {
                             attached_width_requested = Some((first.id, requested_width));
                         }
@@ -21603,11 +21603,11 @@ fn fluid_cross_workspace_layout(
     }
 }
 
-fn primary_divider_requested_width(start_width: f32, drag_delta_x: f32) -> Option<f32> {
-    if !start_width.is_finite() || !drag_delta_x.is_finite() {
+fn primary_divider_requested_width(start_width: f32, total_drag_delta_x: f32) -> Option<f32> {
+    if !start_width.is_finite() || !total_drag_delta_x.is_finite() {
         return None;
     }
-    Some((start_width - drag_delta_x).max(0.0))
+    Some((start_width - total_drag_delta_x).max(0.0))
 }
 
 fn foreign_strip_rects(origin: egui::Pos2, height: f32, widths: &[f32]) -> Vec<egui::Rect> {
@@ -22291,7 +22291,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_workspace_app_primary_divider_uses_drag_start_width_and_delta() {
+    fn cross_workspace_app_primary_divider_uses_drag_start_width_and_total_delta() {
         assert_eq!(primary_divider_requested_width(420.0, 0.0), Some(420.0));
         assert_eq!(primary_divider_requested_width(420.0, 50.0), Some(370.0));
         assert_eq!(primary_divider_requested_width(420.0, -50.0), Some(470.0));
@@ -22305,6 +22305,21 @@ mod tests {
 
         assert_eq!(layout.foreign.width(), 576.0);
         assert_eq!(primary_divider_requested_width(widths[0], 0.0), Some(420.0));
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_divider_uses_total_drag_from_drag_start() {
+        let source = include_str!("app.rs");
+        let divider = source
+            .split_once("let primary_resize_id")
+            .unwrap()
+            .1
+            .split_once("let mut foreign")
+            .unwrap()
+            .0;
+
+        assert!(divider.contains("primary_resize.total_drag_delta()"));
+        assert!(!divider.contains("primary_resize.drag_delta().x"));
     }
 
     #[test]

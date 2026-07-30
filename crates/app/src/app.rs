@@ -1782,6 +1782,30 @@ impl CrossWorkspaceRestoreCoordinator {
 
 const DEFAULT_CROSS_WORKSPACE_PANE_WIDTH: f32 = 420.0;
 
+fn attach_live_cross_workspace_pane(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: impl Into<String>,
+    target: ui::cross_workspace::WorkspacePaneTarget,
+    limit: usize,
+    anchor: ui::cross_workspace::InsertAnchor,
+) -> Result<ui::cross_workspace::AttachOutcome, ui::cross_workspace::InsertAnchorError> {
+    if anchor == ui::cross_workspace::InsertAnchor::End {
+        return Ok(append_live_cross_workspace_pane(
+            panes,
+            primary_workspace_id,
+            target,
+            limit,
+        ));
+    }
+    panes.attach_at_anchor(
+        primary_workspace_id,
+        target,
+        DEFAULT_CROSS_WORKSPACE_PANE_WIDTH,
+        limit,
+        anchor,
+    )
+}
+
 fn append_live_cross_workspace_pane(
     panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
     primary_workspace_id: impl Into<String>,
@@ -1793,6 +1817,30 @@ fn append_live_cross_workspace_pane(
         target,
         DEFAULT_CROSS_WORKSPACE_PANE_WIDTH,
         limit,
+    )
+}
+
+fn attach_cold_cross_workspace_pane(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: impl Into<String>,
+    request: ui::cross_workspace::PersistedPaneRequest,
+    limit: usize,
+    anchor: ui::cross_workspace::InsertAnchor,
+) -> Result<ui::cross_workspace::AttachOutcome, ui::cross_workspace::InsertAnchorError> {
+    if anchor == ui::cross_workspace::InsertAnchor::End {
+        return Ok(append_cold_cross_workspace_pane(
+            panes,
+            primary_workspace_id,
+            request,
+            limit,
+        ));
+    }
+    panes.insert_restoring_at_anchor(
+        primary_workspace_id,
+        request,
+        DEFAULT_CROSS_WORKSPACE_PANE_WIDTH,
+        limit,
+        anchor,
     )
 }
 
@@ -1868,6 +1916,29 @@ struct CrossWorkspaceRenderPane {
     width_px: f32,
     render_state: ui::cross_workspace::AttachedRenderState,
     workspace_label: String,
+    identity_color: egui::Color32,
+}
+
+fn session_pane_drop_interaction(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    anchor: ui::cross_workspace::InsertAnchor,
+    label: &str,
+) -> Option<(
+    ui::file_tree::SessionRowTarget,
+    ui::cross_workspace::InsertAnchor,
+)> {
+    let response = ui.interact(rect, id, egui::Sense::hover());
+    if response
+        .dnd_hover_payload::<ui::file_tree::SessionRowDragPayload>()
+        .is_some()
+    {
+        ui::workspace::paint_session_pane_drop_feedback(ui, rect, label);
+    }
+    response
+        .dnd_release_payload::<ui::file_tree::SessionRowDragPayload>()
+        .map(|payload| (payload.target().clone(), anchor))
 }
 
 fn group_visible_cross_workspace_panes(
@@ -7343,7 +7414,10 @@ enum AppControllerAction {
 enum WorkspaceControllerAction {
     OpenAgentLauncher,
     SwitchWorkspace(String),
-    OpenSessionBeside(ui::file_tree::SessionRowTarget),
+    OpenSessionBeside {
+        target: ui::file_tree::SessionRowTarget,
+        anchor: ui::cross_workspace::InsertAnchor,
+    },
     DetachWorkspacePane(ui::cross_workspace::AttachmentId),
     FocusSession {
         workspace_id: String,
@@ -11662,8 +11736,8 @@ impl App {
             WorkspaceControllerAction::SwitchWorkspace(workspace_id) => {
                 self.switch_workspace(&workspace_id);
             }
-            WorkspaceControllerAction::OpenSessionBeside(target) => {
-                self.open_session_beside(target);
+            WorkspaceControllerAction::OpenSessionBeside { target, anchor } => {
+                self.open_session_beside(target, anchor);
             }
             WorkspaceControllerAction::DetachWorkspacePane(attachment_id) => {
                 self.detach_cross_workspace_pane(attachment_id);
@@ -12361,7 +12435,11 @@ impl App {
         }
     }
 
-    fn open_session_beside(&mut self, row_target: ui::file_tree::SessionRowTarget) {
+    fn open_session_beside(
+        &mut self,
+        row_target: ui::file_tree::SessionRowTarget,
+        anchor: ui::cross_workspace::InsertAnchor,
+    ) {
         if row_target.workspace_id() == self.active.id {
             return;
         }
@@ -12393,12 +12471,15 @@ impl App {
                 };
                 let limit = (self.config.performance.max_cross_workspace_panes as usize)
                     .clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
-                let outcome = append_live_cross_workspace_pane(
+                let Ok(outcome) = attach_live_cross_workspace_pane(
                     &mut self.cross_workspace_pane,
                     self.active.id.clone(),
                     target,
                     limit,
-                );
+                    anchor,
+                ) else {
+                    return;
+                };
                 if outcome == ui::cross_workspace::AttachOutcome::CapacityReached {
                     return;
                 }
@@ -12419,12 +12500,15 @@ impl App {
                 );
                 let limit = (self.config.performance.max_cross_workspace_panes as usize)
                     .clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
-                let outcome = append_cold_cross_workspace_pane(
+                let Ok(outcome) = attach_cold_cross_workspace_pane(
                     &mut self.cross_workspace_pane,
                     self.active.id.clone(),
                     request,
                     limit,
-                );
+                    anchor,
+                ) else {
+                    return;
+                };
                 let ui::cross_workspace::AttachOutcome::Appended(attachment_id) = outcome else {
                     if matches!(
                         outcome,
@@ -18847,7 +18931,10 @@ impl eframe::App for App {
                     self.agent_terminal_ui
                         .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
                     self.stage_workspace_controller_action(
-                        WorkspaceControllerAction::OpenSessionBeside(target),
+                        WorkspaceControllerAction::OpenSessionBeside {
+                            target,
+                            anchor: ui::cross_workspace::InsertAnchor::End,
+                        },
                     );
                 }
                 // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)
@@ -19060,6 +19147,10 @@ impl eframe::App for App {
                             .find(|workspace| workspace.id == workspace_id)
                             .map(Self::workspace_display_name)
                             .unwrap_or_else(|| workspace_id.to_owned()),
+                        identity_color: ui::file_tree::workspace_accent(
+                            &sidebar_workspaces,
+                            workspace_id,
+                        ),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -19074,18 +19165,15 @@ impl eframe::App for App {
         let mut visible_attachment_ids =
             Vec::with_capacity(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
         let mut current_owner = FrameTerminalOwner::None;
-        let mut dropped_session_target = None;
+        let mut dropped_session_open = None;
+        let session_drop_label = (terminal_visible
+            && egui::DragAndDrop::has_payload_of_type::<ui::file_tree::SessionRowDragPayload>(
+                ui.ctx(),
+            ))
+        .then(|| text.t("workspace.menu.open_in_current_view_right", &[]));
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
-                let drop_surface = ui.interact(
-                    ui.max_rect(),
-                    ui.id().with("cross_workspace_session_drop_surface"),
-                    egui::Sense::hover(),
-                );
-                dropped_session_target = drop_surface
-                    .dnd_release_payload::<ui::file_tree::SessionRowDragPayload>()
-                    .map(|payload| payload.target().clone());
                 if home_visible {
                     home_action = self.agent_terminal_ui.home(
                         ui,
@@ -19299,7 +19387,8 @@ impl eframe::App for App {
                                         Some(ui::workspace::AttachedPaneHeaderContext::new(
                                             pane.id,
                                             index,
-                                        )),
+                                        )
+                                        .with_identity_color(pane.identity_color)),
                                     );
                                     if output.surface.focus_requested {
                                         attached_focus_requested = Some(pane.id);
@@ -19334,6 +19423,7 @@ impl eframe::App for App {
                                         scroll_ui,
                                         pane_rect,
                                         &pane.workspace_label,
+                                        pane.identity_color,
                                         placeholder,
                                         &text,
                                     );
@@ -19364,6 +19454,19 @@ impl eframe::App for App {
                                     attached_width_requested =
                                         Some((pane.id, pointer.x - pane_rect.left()));
                                 }
+                                if let Some(label) = session_drop_label.as_deref()
+                                    && dropped_session_open.is_none()
+                                {
+                                    let drop_id =
+                                        scroll_ui.id().with(("session_drop", pane.id));
+                                    dropped_session_open = session_pane_drop_interaction(
+                                        scroll_ui,
+                                        pane_rect,
+                                        drop_id,
+                                        ui::cross_workspace::InsertAnchor::Attached(pane.id),
+                                        label,
+                                    );
+                                }
                             }
                         });
 
@@ -19384,11 +19487,33 @@ impl eframe::App for App {
                             current_owner == FrameTerminalOwner::Primary,
                         )
                         .focus_requested;
+                    if let Some(label) = session_drop_label.as_deref()
+                        && dropped_session_open.is_none()
+                    {
+                        let drop_id = primary.id().with("session_drop");
+                        dropped_session_open = session_pane_drop_interaction(
+                            &mut primary,
+                            primary_rect,
+                            drop_id,
+                            ui::cross_workspace::InsertAnchor::Primary,
+                            label,
+                        );
+                    }
                 } else {
                     current_owner = FrameTerminalOwner::Primary;
+                    let primary_rect = ui.available_rect_before_wrap();
                     self.active
                         .workspace_ui
                         .show(ui, &self.config.terminal, &events, &text);
+                    if let Some(label) = session_drop_label.as_deref() {
+                        dropped_session_open = session_pane_drop_interaction(
+                            ui,
+                            primary_rect,
+                            ui.id().with("cross_workspace_primary_session_drop"),
+                            ui::cross_workspace::InsertAnchor::Primary,
+                            label,
+                        );
+                    }
                 }
             });
         self.visible_cross_workspace_attachments.clear();
@@ -19399,12 +19524,13 @@ impl eframe::App for App {
         );
         self.frame_terminal_owner = current_owner;
         self.sync_attached_runtime_visibility();
-        if let Some(target) = dropped_session_target {
+        if let Some((target, anchor)) = dropped_session_open {
             self.agent_terminal_ui
                 .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-            self.stage_workspace_controller_action(WorkspaceControllerAction::OpenSessionBeside(
+            self.stage_workspace_controller_action(WorkspaceControllerAction::OpenSessionBeside {
                 target,
-            ));
+                anchor,
+            });
         }
         if let Some((attachment_id, width_px)) = attached_width_requested {
             let _ = self.cross_workspace_pane.set_width(attachment_id, width_px);
@@ -21337,6 +21463,7 @@ fn show_app_attached_placeholder(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     workspace_name: &str,
+    identity_color: egui::Color32,
     placeholder: ui::cross_workspace::AttachedPlaceholder,
     catalog: &i18n::Catalog,
 ) -> ui::workspace::AttachedPaneOutput {
@@ -21370,6 +21497,11 @@ fn show_app_attached_placeholder(
         };
         ui.weak(catalog.t(key, &[("workspace", workspace_name)]));
     });
+    child.painter().hline(
+        rect.x_range(),
+        child.painter().round_to_pixel_center(rect.top() + 0.5),
+        egui::Stroke::new(1.0, identity_color),
+    );
     ui::workspace::AttachedPaneOutput {
         focus_requested: response.clicked(),
         detach_requested,
@@ -21742,6 +21874,253 @@ mod tests {
             runtime::MuxPaneId(format!("pane-{suffix}")),
             runtime::SessionId(session),
         )
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_primary_inserts_at_foreign_index_zero() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = cross_workspace_test_target_named("workspace-b", 9, "b1", 41);
+        let inserted = cross_workspace_test_target_named("workspace-c", 10, "c1", 42);
+        let first_id = attach_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            first,
+            6,
+            ui::cross_workspace::InsertAnchor::End,
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+
+        let inserted_id = attach_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            inserted,
+            6,
+            ui::cross_workspace::InsertAnchor::Primary,
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+
+        assert_eq!(
+            state
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![inserted_id, first_id]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_middle_inserts_immediately_after_exact_foreign() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let last_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        let inserted_id = attach_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-d", 11, "d1", 43),
+            6,
+            ui::cross_workspace::InsertAnchor::Attached(first_id),
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+
+        assert_eq!(
+            state
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![first_id, inserted_id, last_id]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_hover_and_context_remain_end_compatible() {
+        let target = ui::file_tree::SessionRowTarget::persisted(
+            "workspace-b",
+            runtime::MuxPaneId("pane-b".to_owned()),
+        );
+        let action = WorkspaceControllerAction::OpenSessionBeside {
+            target: target.clone(),
+            anchor: ui::cross_workspace::InsertAnchor::End,
+        };
+
+        assert!(matches!(
+            action,
+            WorkspaceControllerAction::OpenSessionBeside {
+                target: staged,
+                anchor: ui::cross_workspace::InsertAnchor::End,
+            } if staged == target
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_stale_live_and_cold_fail_without_mutation() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let stale_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let _ = state.detach_attachment(stale_id);
+
+        assert!(
+            attach_live_cross_workspace_pane(
+                &mut state,
+                "workspace-a",
+                cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+                6,
+                ui::cross_workspace::InsertAnchor::Attached(stale_id),
+            )
+            .is_err()
+        );
+        assert!(
+            attach_cold_cross_workspace_pane(
+                &mut state,
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("c1".to_owned()),
+                ),
+                6,
+                ui::cross_workspace::InsertAnchor::Attached(stale_id),
+            )
+            .is_err()
+        );
+        assert!(state.attachments().is_empty());
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_source_has_only_exact_visible_pane_surfaces() {
+        let source = include_str!("app.rs");
+        assert!(!source.contains(&["cross_workspace_session_drop", "_surface",].concat()));
+        let render = source
+            .split_once("egui::CentralPanel::default()")
+            .unwrap()
+            .1
+            .split_once("self.visible_cross_workspace_attachments.clear()")
+            .unwrap()
+            .0;
+        assert!(render.contains("InsertAnchor::Primary"));
+        assert!(render.contains("InsertAnchor::Attached(pane.id)"));
+        assert!(render.contains("for index in visible_indices"));
+        assert!(!render.contains("InsertAnchor::End"));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_has_no_foreign_or_non_terminal_fallback() {
+        let source = include_str!("app.rs");
+        let render = source
+            .split_once("egui::CentralPanel::default()")
+            .unwrap()
+            .1
+            .split_once("self.visible_cross_workspace_attachments.clear()")
+            .unwrap()
+            .0;
+        assert!(render.contains("session_pane_drop_interaction("));
+        assert!(!render.contains("ui.max_rect()"));
+        assert!(!render.contains("home_visible &&"));
+        assert!(!render.contains("inbox_visible &&"));
+        assert!(!render.contains("fleet_visible &&"));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_wires_identity_color_to_live_and_placeholder_headers() {
+        let source = include_str!("app.rs");
+        let render_panes = source
+            .split_once("let render_panes = if terminal_visible")
+            .unwrap()
+            .1
+            .split_once("let mut primary_focus_requested")
+            .unwrap()
+            .0;
+        assert!(render_panes.contains("ui::file_tree::workspace_accent"));
+        let render = source
+            .split_once("show_prepared_attached_pane")
+            .unwrap()
+            .1
+            .split_once("if output.surface.focus_requested")
+            .unwrap()
+            .0;
+        assert!(render.contains("with_identity_color(pane.identity_color)"));
+        let placeholder = source
+            .split_once("fn show_app_attached_placeholder")
+            .unwrap()
+            .1
+            .split_once("/// warm workspace")
+            .unwrap()
+            .0;
+        assert!(placeholder.contains("egui::Stroke::new(1.0, identity_color)"));
+        assert!(!placeholder.contains("rect_filled"));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_cold_restore_rollback_detaches_exact_inserted_pane() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let retained_id = append_live_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let inserted_id = attach_cold_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            ui::cross_workspace::PersistedPaneRequest::new(
+                "workspace-c",
+                runtime::MuxPaneId("c1".to_owned()),
+            ),
+            6,
+            ui::cross_workspace::InsertAnchor::Attached(retained_id),
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-c", "c1", inserted_id)));
+        coordinator.begin_next(11, now).unwrap();
+
+        let failed = coordinator
+            .fail_before_command(11, &runtime::MuxPaneId("c1".to_owned()))
+            .unwrap();
+        let detached = panes.detach_attachment(failed.attachment_id()).unwrap();
+
+        assert_eq!(
+            detached.restoring_request(),
+            Some(&ui::cross_workspace::PersistedPaneRequest::new(
+                "workspace-c",
+                runtime::MuxPaneId("c1".to_owned()),
+            ))
+        );
+        assert_eq!(panes.attachments().len(), 1);
+        assert_eq!(panes.attachments()[0].id(), retained_id);
+        assert_eq!(coordinator.total_len(), 0);
     }
 
     #[test]

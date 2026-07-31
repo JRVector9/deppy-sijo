@@ -3574,6 +3574,34 @@ mod tests {
             RuntimeEvent::AgentSpawnResolved { .. } => "AgentSpawnResolved",
             RuntimeEvent::SessionFreezeChanged { .. } => "SessionFreezeChanged",
             RuntimeEvent::DurableEventBarrierReached { .. } => "DurableEventBarrierReached",
+            RuntimeEvent::UnattachedSessionsInspected { .. } => "UnattachedSessionsInspected",
+            RuntimeEvent::UnattachedSessionsKilled { .. } => "UnattachedSessionsKilled",
+        }
+    }
+
+    #[test]
+    fn unattached_session_event_names_and_remote_codecs_roundtrip() {
+        let events = [
+            (
+                RuntimeEvent::UnattachedSessionsInspected { count: 7 },
+                "UnattachedSessionsInspected",
+            ),
+            (
+                RuntimeEvent::UnattachedSessionsKilled { count: 3 },
+                "UnattachedSessionsKilled",
+            ),
+        ];
+
+        for (event, expected_name) in events {
+            assert_eq!(kind_of(&event), expected_name);
+            for codec in [Codec::Plain, Codec::Delta] {
+                let frame = codec.encode_event(&event).unwrap();
+                let DecodedEvent::Event(decoded) = codec.decode_event(&frame).unwrap() else {
+                    panic!("unattached session event decoded as a viewport frame");
+                };
+                validate_event(&decoded).unwrap();
+                assert_eq!(kind_of(&decoded), expected_name);
+            }
         }
     }
 

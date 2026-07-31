@@ -18,7 +18,9 @@ pub mod fleet;
 pub mod inbox_approvals;
 pub mod inbox_waiting;
 pub mod notifications;
+pub(crate) mod ports;
 pub mod prompt_palette;
+pub(crate) mod resource_manager;
 pub mod settings;
 pub mod workspace;
 

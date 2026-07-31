@@ -2456,6 +2456,10 @@ impl WorkspaceUi {
                 // same batch here, so the workspace leaf intentionally performs no action.
                 RuntimeEvent::AgentSpawned { .. } | RuntimeEvent::AgentSpawnResolved { .. } => {}
                 RuntimeEvent::ResourceUsage { .. } => {}
+                // 유지보수 결과의 count와 후속 UI는 App controller가 소유한다. 터미널
+                // leaf는 세션/mux/오류 상태를 바꾸지 않고 이벤트를 소비만 한다.
+                RuntimeEvent::UnattachedSessionsInspected { .. }
+                | RuntimeEvent::UnattachedSessionsKilled { .. } => {}
                 RuntimeEvent::DurableEventBarrierReached { .. } => {}
                 // 동결/재개 상태는 App(WorkspaceRuntime)에서 추적한다 — 이 뷰 캐시는 무관.
                 RuntimeEvent::SessionFreezeChanged { .. } => {}
@@ -8147,6 +8151,44 @@ mod tests {
         assert_eq!(ui.focused_session(), focused_before);
         assert_eq!(ui.sessions.len(), session_count_before);
         assert_eq!(ui.pending_spawns(), pending_spawns_before);
+        assert!(ui.protocol_intents.is_empty());
+    }
+
+    #[test]
+    fn session_maintenance_events는_workspace_ui에서_상태를_바꾸지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let catalog = catalog();
+        let initial_mux = mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(1))],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        );
+        ui.apply_warm_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&initial_mux),
+            }],
+            &catalog,
+        );
+        ui.error = Some("keep workspace state".to_owned());
+        let mux_before = Arc::clone(ui.mux().unwrap());
+        let focused_before = ui.focused_session();
+        let session_count_before = ui.sessions.len();
+
+        let events = [
+            RuntimeEvent::UnattachedSessionsInspected { count: 7 },
+            RuntimeEvent::UnattachedSessionsKilled { count: 3 },
+        ];
+        ui.handle_events(&events, &catalog);
+        ui.apply_warm_events(&events, &catalog);
+
+        assert!(Arc::ptr_eq(ui.mux().unwrap(), &mux_before));
+        assert_eq!(ui.focused_session(), focused_before);
+        assert_eq!(ui.sessions.len(), session_count_before);
+        assert_eq!(ui.error.as_deref(), Some("keep workspace state"));
         assert!(ui.protocol_intents.is_empty());
     }
 

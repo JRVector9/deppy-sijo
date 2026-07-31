@@ -2736,6 +2736,7 @@ impl Worker {
     }
 
     fn unattached_session_ids(&self) -> Vec<SessionId> {
+        let now = Instant::now();
         let attached = self
             .mux
             .panes
@@ -2746,7 +2747,11 @@ impl Worker {
             .keys()
             .copied()
             .filter(|session| {
-                !attached.contains(session) && !self.remote_viewing.contains_key(session)
+                !attached.contains(session)
+                    && self
+                        .remote_viewing
+                        .get(session)
+                        .is_none_or(|expiry| *expiry <= now)
             })
             .take(RUNTIME_SESSION_CAP)
             .collect()
@@ -4430,13 +4435,25 @@ mod tests {
         }
 
         fn set_remote_viewing(&mut self, session: SessionId, viewing: bool) {
+            self.set_remote_viewing_ttl(session, viewing, 60_000);
+        }
+
+        fn set_remote_viewing_ttl(&mut self, session: SessionId, viewing: bool, ttl_ms: u32) {
             self.worker
                 .handle_command(RuntimeCommand::SetRemoteViewing {
                     session,
                     viewing,
-                    ttl_ms: 60_000,
+                    ttl_ms,
                 });
             let _ = self.events.try_iter().count();
+        }
+
+        fn expire_remote_viewing_without_pump(&mut self, session: SessionId) {
+            *self
+                .worker
+                .remote_viewing
+                .get_mut(&session)
+                .expect("remote viewing lease") = Instant::now();
         }
 
         fn attach_new_pane(&mut self, session: SessionId) {
@@ -4485,6 +4502,30 @@ mod tests {
         assert!(harness.session_exists(attached));
         assert!(harness.session_exists(remote));
         assert!(harness.session_exists(orphan));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inspect_unattached_treats_zero_ttl_remote_lease_as_expired_in_same_burst() {
+        let mut harness = UnattachedHarness::new("inspect-zero-ttl");
+        let candidate = harness.spawn_unattached();
+        harness.set_remote_viewing(candidate, true);
+        harness.set_remote_viewing_ttl(candidate, true, 0);
+
+        assert_eq!(harness.inspect_unattached(), 1);
+        assert!(harness.session_exists(candidate));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_unattached_treats_expired_remote_lease_as_candidate_without_pump() {
+        let mut harness = UnattachedHarness::new("kill-expired-lease");
+        let candidate = harness.spawn_unattached();
+        harness.set_remote_viewing(candidate, true);
+        harness.expire_remote_viewing_without_pump(candidate);
+
+        assert_eq!(harness.kill_unattached(), 1);
+        assert!(!harness.session_exists(candidate));
     }
 
     #[test]

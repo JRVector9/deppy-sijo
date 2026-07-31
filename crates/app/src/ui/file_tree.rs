@@ -2244,7 +2244,20 @@ impl FileTreeUi {
                                                                     });
                                                                 });
                                                             }
-                                                            if resp.double_clicked() {
+                                                            let close_clicked =
+                                                                active_session_close_button(
+                                                                    ui, &resp, catalog,
+                                                                );
+                                                            if close_clicked {
+                                                                action = Some(
+                                                                    SidebarAction::ClosePane {
+                                                                        pane: entry
+                                                                            .target
+                                                                            .pane()
+                                                                            .clone(),
+                                                                    },
+                                                                );
+                                                            } else if resp.double_clicked() {
                                                                 self.session_name_edit = Some((
                                                                     entry.target.pane().clone(),
                                                                     entry.title.clone(),
@@ -2360,17 +2373,47 @@ impl FileTreeUi {
         let all_tabs_width = tab_widths.iter().sum::<f32>();
         let visible_tools = (((header_rect.width() - all_tabs_width - 8.0).max(0.0) / 20.0).floor()
             as usize)
-            .min(4);
+            .min(2);
         let mut tool_right = header_rect.right() - 4.0;
         if visible_tools >= 1 {
             let rect = egui::Rect::from_min_size(
                 egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
                 egui::vec2(20.0, 20.0),
             );
-            create_folder =
-                file_toolbar_icon_at(ui, rect, "new_folder", FileToolbarIcon::Folder, false)
-                    .on_hover_text(catalog.t("file_tree.new_folder_root", &[]))
-                    .clicked();
+            let more_label = catalog.t("sidebar.tool.more", &[]);
+            let more =
+                file_toolbar_more_at(ui, rect, &more_label).on_hover_text(more_label.clone());
+            let mut toggle_hidden = false;
+            egui::Popup::menu(&more).show(|ui| {
+                ui.set_min_width(170.0);
+                if ui
+                    .button(catalog.t("file_tree.new_file_root", &[]))
+                    .clicked()
+                {
+                    create_file = true;
+                    ui.close();
+                }
+                let hidden_label = if self.show_hidden {
+                    catalog.t("file_tree.hide_hidden_files", &[])
+                } else {
+                    catalog.t("file_tree.show_hidden_files", &[])
+                };
+                if ui.button(hidden_label).clicked() {
+                    toggle_hidden = true;
+                    ui.close();
+                }
+                if ui
+                    .button(catalog.t("file_tree.new_folder_root", &[]))
+                    .clicked()
+                {
+                    create_folder = true;
+                    ui.close();
+                }
+            });
+            if toggle_hidden {
+                self.show_hidden = !self.show_hidden;
+                self.rebuild_flat();
+            }
             tool_right -= 20.0;
         }
         if visible_tools >= 2 {
@@ -2378,45 +2421,20 @@ impl FileTreeUi {
                 egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
                 egui::vec2(20.0, 20.0),
             );
-            if file_toolbar_icon_at(ui, rect, "refresh", FileToolbarIcon::Refresh, false)
-                .on_hover_text(catalog.t("sidebar.tool.refresh", &[]))
-                .clicked()
+            let refresh_label = catalog.t("sidebar.tool.refresh", &[]);
+            if file_toolbar_icon_at(
+                ui,
+                rect,
+                "refresh",
+                &refresh_label,
+                FileToolbarIcon::Refresh,
+                false,
+            )
+            .on_hover_text(refresh_label)
+            .clicked()
             {
                 self.refresh();
             }
-            tool_right -= 20.0;
-        }
-        if visible_tools >= 3 {
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
-                egui::vec2(20.0, 20.0),
-            );
-            let hidden = file_toolbar_icon_at(
-                ui,
-                rect,
-                "hidden",
-                FileToolbarIcon::Hidden,
-                self.show_hidden,
-            )
-            .on_hover_text(if self.show_hidden {
-                "숨김 파일 감추기"
-            } else {
-                "숨김 파일 표시"
-            });
-            if hidden.clicked() {
-                self.show_hidden = !self.show_hidden;
-                self.rebuild_flat();
-            }
-            tool_right -= 20.0;
-        }
-        if visible_tools >= 4 {
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
-                egui::vec2(20.0, 20.0),
-            );
-            create_file = file_toolbar_icon_at(ui, rect, "new_file", FileToolbarIcon::File, false)
-                .on_hover_text(catalog.t("file_tree.new_file_root", &[]))
-                .clicked();
             tool_right -= 20.0;
         }
 
@@ -4368,6 +4386,23 @@ fn session_row_click_allowed(clicked: bool, dragged: bool) -> bool {
     clicked && !dragged
 }
 
+fn active_session_close_button(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    catalog: &i18n::Catalog,
+) -> bool {
+    if !ui.rect_contains_pointer(response.rect) {
+        return false;
+    }
+    let button_rect = egui::Rect::from_center_size(
+        egui::pos2(response.rect.right() - 14.0, response.rect.center().y),
+        egui::vec2(22.0, 22.0),
+    );
+    ui.put(button_rect, egui::Button::new("×").frame(false))
+        .on_hover_text(catalog.t("sidebar.menu.close_pane", &[]))
+        .clicked()
+}
+
 fn session_row(
     ui: &mut egui::Ui,
     entry: &SidebarSessionRow,
@@ -4833,10 +4868,35 @@ fn paint_caret(p: &egui::Painter, c: egui::Pos2, expanded: bool, col: egui::Colo
 }
 
 enum FileToolbarIcon {
-    Hidden,
-    Folder,
-    File,
     Refresh,
+}
+
+fn file_toolbar_more_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    accessible_label: &str,
+) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("file_toolbar_icon", "more")),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), accessible_label)
+    });
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.painter().text(
+        rect.center() + egui::vec2(0.0, -2.0),
+        egui::Align2::CENTER_CENTER,
+        "...",
+        crate::fonts::sidebar_font(13.0),
+        color,
+    );
+    response
 }
 
 fn sidebar_tool_tab_at(
@@ -4880,6 +4940,7 @@ fn file_toolbar_icon_at(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     id: &'static str,
+    accessible_label: &str,
     icon: FileToolbarIcon,
     active: bool,
 ) -> egui::Response {
@@ -4888,6 +4949,9 @@ fn file_toolbar_icon_at(
         ui.id().with(("file_toolbar_icon", id)),
         egui::Sense::click(),
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), accessible_label)
+    });
     let color = if active {
         ui.visuals().selection.stroke.color
     } else if response.hovered() {
@@ -4896,45 +4960,6 @@ fn file_toolbar_icon_at(
         ui.visuals().weak_text_color()
     };
     match icon {
-        FileToolbarIcon::Hidden => {
-            let center = rect.center();
-            let stroke = egui::Stroke::new(1.2, color);
-            // 원본(±7, ±4, 동공 r2)의 14.5% 축소 (2026-07-18 사용자).
-            let upper = vec![
-                egui::pos2(center.x - 5.985, center.y),
-                egui::pos2(center.x - 2.9925, center.y - 2.736),
-                egui::pos2(center.x, center.y - 3.42),
-                egui::pos2(center.x + 2.9925, center.y - 2.736),
-                egui::pos2(center.x + 5.985, center.y),
-            ];
-            let lower = vec![
-                egui::pos2(center.x - 5.985, center.y),
-                egui::pos2(center.x - 2.9925, center.y + 2.736),
-                egui::pos2(center.x, center.y + 3.42),
-                egui::pos2(center.x + 2.9925, center.y + 2.736),
-                egui::pos2(center.x + 5.985, center.y),
-            ];
-            ui.painter().add(egui::Shape::line(upper, stroke));
-            ui.painter().add(egui::Shape::line(lower, stroke));
-            ui.painter().circle_filled(center, 1.71, color);
-        }
-        FileToolbarIcon::Folder => {
-            // 원본 15×14의 14.5% 축소 (2026-07-18 사용자).
-            paint_folder(
-                ui.painter(),
-                rect.center(),
-                color,
-                egui::vec2(12.825, 11.875),
-            )
-        }
-        FileToolbarIcon::File => paint_file(
-            ui.painter(),
-            rect.center(),
-            color,
-            ui.visuals().panel_fill,
-            // 원본 11×14의 23% 축소 (툴바 파일만 추가 10%, 2026-07-18 사용자).
-            egui::vec2(8.4645, 10.773),
-        ),
         FileToolbarIcon::Refresh => {
             let center = rect.center();
             let stroke = egui::Stroke::new(1.25, color);
@@ -8341,6 +8366,79 @@ mod tests {
     }
 
     #[test]
+    fn kittest_활성_세션행_hover_닫기가_정확한_pane을_닫는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let sessions = std::collections::HashMap::from([(
+            "workspace-a".to_owned(),
+            vec![SidebarSessionRow::from_live(
+                "workspace-a",
+                7,
+                SessionEntry {
+                    tab: runtime::MuxTabId("tab-a".to_owned()),
+                    pane: runtime::MuxPaneId("pane-a".to_owned()),
+                    session: Some(runtime::SessionId(42)),
+                    title: "Session A".to_owned(),
+                    status: None,
+                    summary: String::new(),
+                    focused: false,
+                    attention: false,
+                    pulse: None,
+                    agent_line: None,
+                    status_label: None,
+                    resumable: false,
+                    has_cwd: false,
+                    in_worktree: false,
+                    status_line: None,
+                },
+            )],
+        )]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>, bool)| {
+                    if !state.2 {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "workspace-a",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        inbox_count: 0,
+                        fleet_count: 0,
+                        agents_open: false,
+                    };
+                    if let Some(action) = state.0.panel(ui, &sessions, &snapshot, &catalog) {
+                        state.1.push(action);
+                    }
+                },
+                (FileTreeUi::new(egui::Context::default()), Vec::new(), false),
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().2 = true;
+
+        harness.run();
+        let row_rect = harness.get_by_label("Session A").rect();
+        harness.hover_at(row_rect.center());
+        harness.run();
+        harness.get_by_label("×").click();
+        harness.run();
+
+        assert!(matches!(
+            harness.state().1.as_slice(),
+            [SidebarAction::ClosePane { pane }] if pane.0 == "pane-a"
+        ));
+    }
+
+    #[test]
     fn kittest_warm_세션행_drag가_정확한_payload를_시작한다() {
         use egui_kittest::kittest::Queryable;
 
@@ -8825,6 +8923,25 @@ mod tests {
         assert!(harness.query_by_label("MCP").is_some());
         assert!(harness.query_by_label("Search").is_none());
         assert!(harness.query_by_label("Terminal").is_none());
+    }
+
+    #[test]
+    fn kittest_파일헤더는_새로고침과_더보기만_노출하고_나머지는_메뉴에_둔다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let tree = FileTreeUi::new(egui::Context::default());
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+
+        assert!(harness.query_by_label("Refresh").is_some());
+        harness.get_by_label("More").click();
+        harness.run();
+
+        assert!(harness.query_by_label("New file (root)").is_some());
+        assert!(harness.query_by_label("Show hidden files").is_some());
+        assert!(harness.query_by_label("New folder (root)").is_some());
     }
 
     #[test]

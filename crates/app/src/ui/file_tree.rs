@@ -3688,7 +3688,7 @@ fn workspace_row_style(
 }
 
 pub const WORKSPACE_AVATAR_LEFT_INSET: f32 = 9.8;
-const WORKSPACE_AVATAR_SIZE: f32 = 15.0;
+const WORKSPACE_AVATAR_SIZE: f32 = 18.0;
 
 fn workspace_avatar_rect(row: egui::Rect) -> egui::Rect {
     egui::Rect::from_center_size(
@@ -3775,7 +3775,6 @@ fn workspace_row(
     let summary_mode = workspace_summary_mode(rect.width());
     let show_summary = summary_mode != WorkspaceSummaryMode::IconOnly;
     let show_disclosure = expanded.is_some() && rect.width() >= 56.0;
-    let total_sessions = workspace_total_sessions(workspace.summary);
     let (_, badge_color) = workspace_primary_summary_segment(workspace.summary, catalog);
     if rect.width() >= 64.0 {
         // 요약 배지 자리를 **실제 폭**만큼만 예약한다 — 고정 198px는 "유휴 5"처럼
@@ -3783,7 +3782,7 @@ fn workspace_row(
         // 우측 여백 8 + 이름/요약 간격 16 + disclosure 폭(있으면 14)을 더한다.
         let reserved_right = if show_summary {
             let disclosure = if show_disclosure { 12.0 } else { 0.0 };
-            workspace_status_badge_width(ui, total_sessions) + 22.0 + disclosure
+            workspace_status_dot_width() + 22.0 + disclosure
         } else {
             6.8
         };
@@ -3807,16 +3806,13 @@ fn workspace_row(
         }
     }
     if show_summary {
-        // 텍스트 요약("유휴"/"비활성" 등) 대신 상태색 dot + 세션 수 배지 — 활성/닫힌
-        // 행 공용(2026-07-25 사용자: "비활성" 문구 제거, 색으로 상태 표기).
-        // chevron과의 간격 22→14(너무 붙음)→16으로 재조정(2026-07-25 사용자:
-        // 숫자·화살표 사이 여백 2 추가).
+        // 텍스트나 세션 수 없이 상태색 점만 표시한다.
         let right = if show_disclosure {
             rect.right() - 22.0
         } else {
             rect.right() - 10.0
         };
-        paint_workspace_status_badge(ui, right, rect.center().y, badge_color, total_sessions);
+        paint_workspace_status_dot(ui, right, rect.center().y, badge_color);
     } else {
         // 40pt 아이콘 레일까지 줄였을 때는 배지 자리가 없으므로 아바타 우하단의
         // 작은 점으로 primary state를 계속 표시한다. 이름이 보이는 폭부터는 반드시
@@ -3981,63 +3977,22 @@ fn workspace_summary_mode(width: f32) -> WorkspaceSummaryMode {
     }
 }
 
-/// 접힌/펼친 워크스페이스 행 공용 총 세션 수(우측 dot+카운트 배지에 쓴다,
-/// 2026-07-25 사용자: 텍스트 요약 대신 색+숫자로 상태 표기).
-fn workspace_total_sessions(summary: SidebarSessionSummary) -> usize {
-    summary.running
-        + summary.waiting
-        + summary.done
-        + summary.error
-        + summary.idle
-        + summary.inactive
-}
-
 const WORKSPACE_STATUS_DOT_DIAMETER: f32 = 6.0;
-// dot↔숫자 간격 — 6→4(너무 넓음)→5→6으로 재조정(2026-07-25 사용자: 여백 1 추가).
-const WORKSPACE_STATUS_DOT_GAP: f32 = 4.5;
+const WORKSPACE_STATUS_SLOT_WIDTH: f32 = WORKSPACE_STATUS_DOT_DIAMETER;
 
-/// 세션 수 자리의 고정 슬롯 폭(dot+간격+숫자 전체) — 실제 글리프 폭(자릿수마다
-/// 다름)으로 dot 위치를 정하면 0→1→10처럼 자릿수가 바뀔 때마다 dot이 옆으로
-/// 밀린다(2026-07-25 사용자: 버튼 정렬 안 맞음). 두 자리(예 "99")까지 넉넉한
-/// 고정폭이라 dot의 x 위치가 행마다 항상 같다.
-const WORKSPACE_STATUS_COUNT_SLOT_WIDTH: f32 = 22.0;
-
-/// 상태색 dot + 세션 수 배지의 그리기 폭 — 이름 자리 예약 계산에 쓴다.
-fn workspace_status_badge_width(_ui: &egui::Ui, _count: usize) -> f32 {
-    WORKSPACE_STATUS_COUNT_SLOT_WIDTH
+fn workspace_status_dot_width() -> f32 {
+    WORKSPACE_STATUS_SLOT_WIDTH
 }
 
-/// 상태색 dot + 세션 수 — `right`를 오른쪽 끝으로 왼쪽으로 그린다. dot은 고정
-/// 슬롯의 좌측 경계에 앵커링해 자릿수가 바뀌어도 흔들리지 않고, 숫자는 dot
-/// 바로 옆(고정 간격)에 좌측 정렬해 실제 자폭과 무관하게 여백이 일정하다.
-fn paint_workspace_status_badge(
-    ui: &egui::Ui,
-    right: f32,
-    center_y: f32,
-    color: egui::Color32,
-    count: usize,
-) {
-    let dot_x = right - WORKSPACE_STATUS_COUNT_SLOT_WIDTH + WORKSPACE_STATUS_DOT_DIAMETER / 2.0;
+fn paint_workspace_status_dot(ui: &egui::Ui, right: f32, center_y: f32, color: egui::Color32) {
     ui.painter().circle_filled(
-        egui::pos2(dot_x, center_y),
+        egui::pos2(right - WORKSPACE_STATUS_DOT_DIAMETER / 2.0, center_y),
         WORKSPACE_STATUS_DOT_DIAMETER / 2.0,
         color,
     );
-    let text_x = dot_x + WORKSPACE_STATUS_DOT_DIAMETER / 2.0 + WORKSPACE_STATUS_DOT_GAP;
-    // Align2::LEFT_CENTER — 아바타 이니셜(CENTER_CENTER)과 같은 방식으로 egui가
-    // 직접 세로 중앙을 잡게 한다. 수동으로 size().y/2를 빼는 방식은 폰트 라인하이트
-    // 여백 때문에 dot과 시각적으로 어긋나 보였다(2026-07-25 사용자). +1px는 그
-    // 위에 얹은 미세 보정(2026-07-25 사용자: 숫자를 아래로 1).
-    ui.painter().text(
-        egui::pos2(text_x, center_y + 1.0),
-        egui::Align2::LEFT_CENTER,
-        count.to_string(),
-        crate::fonts::sidebar_font(11.5),
-        ui.visuals().weak_text_color().gamma_multiply(0.9),
-    );
 }
 
-// workspace_row는 이제 상태색 dot + 세션 수 배지만 그려 이 세그먼트 목록을 쓰지
+// workspace_row는 이제 상태색 점만 그려 이 세그먼트 목록을 쓰지
 // 않지만(2026-07-25 사용자), 세그먼트별 텍스트·색 우선순위 로직은 테스트가 여전히
 // 검증한다 — 프로덕션 미사용이라 cfg(test)로 경고만 제거한다.
 #[cfg(test)]
@@ -6208,14 +6163,67 @@ mod tests {
     }
 
     #[test]
-    fn designall_워크스페이스_아바타는_15px이고_기존좌측선에_고정된다() {
+    fn designall_워크스페이스_아바타는_18px이고_기존좌측선에_고정된다() {
         let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 29.19));
         let avatar = workspace_avatar_rect(row);
 
-        assert!((avatar.width() - 15.0).abs() < 0.01);
-        assert!((avatar.height() - 15.0).abs() < 0.01);
+        assert!((avatar.width() - 18.0).abs() < 0.01);
+        assert!((avatar.height() - 18.0).abs() < 0.01);
         assert!((avatar.left() - 9.8).abs() < 0.01);
         assert!((avatar.center().y - row.center().y).abs() < 0.01);
+    }
+
+    #[test]
+    fn 워크스페이스_행은_상태점만_그리고_세션수는_그리지않는다() {
+        let context = egui::Context::default();
+        install_sidebar_test_fonts(&context);
+        let workspace = SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary {
+                running: 7,
+                ..SidebarSessionSummary::default()
+            },
+        };
+        let catalog = catalog();
+
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_width(220.0);
+            workspace_row(
+                ui,
+                &workspace,
+                egui::Color32::LIGHT_BLUE,
+                true,
+                None,
+                &catalog,
+            );
+        });
+
+        assert!(
+            !output.shapes.iter().any(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::Shape::Text(text) if text.galley.text() == "7"
+                )
+            }),
+            "워크스페이스 행에 세션 수가 남아 있다"
+        );
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .filter(|clipped| {
+                    matches!(
+                        &clipped.shape,
+                        egui::Shape::Circle(circle)
+                            if (circle.radius - WORKSPACE_STATUS_DOT_DIAMETER / 2.0).abs() < 0.01
+                    )
+                })
+                .count(),
+            1,
+            "워크스페이스 상태 점은 하나 유지돼야 한다"
+        );
     }
 
     #[test]

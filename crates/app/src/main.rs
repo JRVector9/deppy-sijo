@@ -31,6 +31,8 @@ mod notice_translate;
 mod panic_policy;
 mod paths;
 mod perf;
+#[allow(dead_code)]
+mod port_inventory;
 mod process_storm;
 mod prompt_library;
 mod shortcuts;

@@ -447,7 +447,9 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
         | RuntimeCommand::NoteTurnStart { .. }
-        | RuntimeCommand::DurableEventBarrier { .. } => {}
+        | RuntimeCommand::DurableEventBarrier { .. }
+        | RuntimeCommand::InspectUnattachedSessions
+        | RuntimeCommand::KillUnattachedSessions => {}
     }
     Ok(total)
 }
@@ -562,7 +564,9 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
         | RuntimeCommand::NoteTurnStart { .. }
-        | RuntimeCommand::DurableEventBarrier { .. } => {}
+        | RuntimeCommand::DurableEventBarrier { .. }
+        | RuntimeCommand::InspectUnattachedSessions
+        | RuntimeCommand::KillUnattachedSessions => {}
     }
 }
 
@@ -738,7 +742,9 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
-        | RuntimeCommand::NoteTurnStart { .. } => {}
+        | RuntimeCommand::NoteTurnStart { .. }
+        | RuntimeCommand::InspectUnattachedSessions
+        | RuntimeCommand::KillUnattachedSessions => {}
     }
     Ok(())
 }
@@ -957,6 +963,12 @@ pub enum RuntimeCommand {
     DurableEventBarrier {
         correlation_id: u64,
     },
+    /// 현재 워커가 소유하지만 mux pane 및 원격 시청 lease에 연결되지 않은 로컬
+    /// 세션 수를 런타임 상태에서 계산한다. **variant는 끝에만 추가** (wire 계약).
+    InspectUnattachedSessions,
+    /// 실행 시점에 unattached 후보를 다시 계산해 런타임 소유 세션만 정리한다.
+    /// UI가 session id를 전달하지 않는다. **variant는 끝에만 추가** (wire 계약).
+    KillUnattachedSessions,
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1110,6 +1122,8 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("DurableEventBarrier")
                 .field("correlation_id", correlation_id)
                 .finish(),
+            RuntimeCommand::InspectUnattachedSessions => f.write_str("InspectUnattachedSessions"),
+            RuntimeCommand::KillUnattachedSessions => f.write_str("KillUnattachedSessions"),
             RuntimeCommand::SetWorkspaceState(state) => {
                 f.debug_tuple("SetWorkspaceState").field(state).finish()
             }
@@ -1886,8 +1900,25 @@ mod tests {
                 "NoteTurnStart",
                 "RestoreWorkspacePane",
                 "DurableEventBarrier",
+                "InspectUnattachedSessions",
+                "KillUnattachedSessions",
             ]
         );
+    }
+
+    #[test]
+    fn unattached_session_commands_retain_no_heap_payload() {
+        for mut command in [
+            RuntimeCommand::InspectUnattachedSessions,
+            RuntimeCommand::KillUnattachedSessions,
+        ] {
+            assert!(validate_host_command(&command).is_ok());
+            let retained = prepare_runtime_command_for_retention(&mut command).unwrap();
+            assert_eq!(
+                retained.retained_bytes(),
+                std::mem::size_of::<RuntimeCommand>()
+            );
+        }
     }
 
     #[test]

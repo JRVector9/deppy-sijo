@@ -1876,25 +1876,7 @@ impl Worker {
                 }
             }
             RuntimeCommand::KillSession { session } => {
-                self.final_drain(session);
-                // Session drop → PtySession Drop이 process group 정리를 보장한다
-                self.remove_session(session);
-                self.exited_order.retain(|s| *s != session);
-                self.hidden_scrollback.remove(&session);
-                self.remote_viewing.remove(&session);
-                self.detectors.remove(&session);
-                self.status_overrides.remove(&session);
-                self.close_session_log(session, "killed", None);
-                if let Some(pipe) = &mut self.persist {
-                    pipe.session_exited(session);
-                }
-                // 세션을 잃은 pane은 attach 해제 (pane/session 분리 — 5.2)
-                for pane in self.mux.panes.values_mut() {
-                    if pane.session_id == Some(session) {
-                        pane.session_id = None;
-                    }
-                }
-                self.emit_mux_and_watched();
+                self.kill_session_owned(session, true);
             }
             RuntimeCommand::SplitPane {
                 pane,
@@ -1970,6 +1952,23 @@ impl Worker {
             }
             RuntimeCommand::DurableEventBarrier { correlation_id } => {
                 self.emit(RuntimeEvent::DurableEventBarrierReached { correlation_id });
+            }
+            RuntimeCommand::InspectUnattachedSessions => {
+                let count = u16::try_from(self.unattached_session_ids().len()).unwrap_or(u16::MAX);
+                self.emit(RuntimeEvent::UnattachedSessionsInspected { count });
+            }
+            RuntimeCommand::KillUnattachedSessions => {
+                let candidates = self.unattached_session_ids();
+                let mut killed = 0_u16;
+                for session in candidates {
+                    killed =
+                        killed.saturating_add(u16::from(self.kill_session_owned(session, false)));
+                }
+                if killed > 0 {
+                    self.emit_mux_and_watched();
+                    crate::signal_memory_released();
+                }
+                self.emit(RuntimeEvent::UnattachedSessionsKilled { count: killed });
             }
             RuntimeCommand::RenamePane { pane, title } => {
                 if let Some(p) = self.mux.panes.get_mut(&pane) {
@@ -2734,6 +2733,49 @@ impl Worker {
         }
         self.mux.fix_focus();
         self.emit_mux_and_watched();
+    }
+
+    fn unattached_session_ids(&self) -> Vec<SessionId> {
+        let attached = self
+            .mux
+            .panes
+            .values()
+            .filter_map(|pane| pane.session_id)
+            .collect::<std::collections::HashSet<_>>();
+        self.sessions
+            .keys()
+            .copied()
+            .filter(|session| {
+                !attached.contains(session) && !self.remote_viewing.contains_key(session)
+            })
+            .take(RUNTIME_SESSION_CAP)
+            .collect()
+    }
+
+    fn kill_session_owned(&mut self, session: SessionId, emit_mux: bool) -> bool {
+        let existed = self.sessions.contains_key(&session);
+        self.final_drain(session);
+        // Session drop → PtySession Drop이 process group 정리를 보장한다.
+        self.remove_session(session);
+        self.exited_order.retain(|candidate| *candidate != session);
+        self.hidden_scrollback.remove(&session);
+        self.remote_viewing.remove(&session);
+        self.detectors.remove(&session);
+        self.status_overrides.remove(&session);
+        self.close_session_log(session, "killed", None);
+        if let Some(pipe) = &mut self.persist {
+            pipe.session_exited(session);
+        }
+        // 세션을 잃은 pane은 attach 해제 (pane/session 분리 — 5.2).
+        for pane in self.mux.panes.values_mut() {
+            if pane.session_id == Some(session) {
+                pane.session_id = None;
+            }
+        }
+        if emit_mux {
+            self.emit_mux_and_watched();
+        }
+        existed
     }
 
     fn close_tab(&mut self, tab_id: MuxTabId) {
@@ -4314,6 +4356,159 @@ mod tests {
             },
             event_rx,
         )
+    }
+
+    struct UnattachedHarness {
+        worker: Worker,
+        events: std::sync::mpsc::Receiver<RuntimeEvent>,
+        _viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+        _input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+        _resource_usage: Arc<Mutex<Option<RuntimeEvent>>>,
+    }
+
+    impl UnattachedHarness {
+        fn new(name: &str) -> Self {
+            init_mock_store();
+            let resolver = Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: Some("runtime-secret-value".to_owned()),
+            });
+            let (mut worker, events) = admission_worker(resolver, name);
+            worker.shell = spec("/bin/cat", &[]);
+            let (viewports, input_pressures, resource_usage) = {
+                let subscribers = worker.subscribers.lock().expect("subscribers lock");
+                let subscriber = subscribers.first().expect("test subscriber");
+                (
+                    Arc::clone(&subscriber.viewports),
+                    Arc::clone(&subscriber.input_pressures),
+                    Arc::clone(&subscriber.resource_usage),
+                )
+            };
+            Self {
+                worker,
+                events,
+                _viewports: viewports,
+                _input_pressures: input_pressures,
+                _resource_usage: resource_usage,
+            }
+        }
+
+        fn spawn_attached(&mut self) -> SessionId {
+            self.worker.handle_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            });
+            let events = self.events.try_iter().collect::<Vec<_>>();
+            if let Some(session) = events.iter().find_map(|event| match event {
+                RuntimeEvent::ShellSpawned { session } => Some(*session),
+                _ => None,
+            }) {
+                return session;
+            }
+            let failure = events.iter().find_map(|event| match event {
+                RuntimeEvent::SpawnFailed { message, .. } => Some(message),
+                _ => None,
+            });
+            panic!(
+                "real worker must emit ShellSpawned; sessions={}, failure={failure:?}",
+                self.worker.sessions.len()
+            );
+        }
+
+        fn spawn_unattached(&mut self) -> SessionId {
+            let session = self.spawn_attached();
+            let pane = self
+                .worker
+                .mux
+                .panes
+                .values_mut()
+                .find(|pane| pane.session_id == Some(session))
+                .expect("spawned session must have a pane");
+            pane.session_id = None;
+            session
+        }
+
+        fn set_remote_viewing(&mut self, session: SessionId, viewing: bool) {
+            self.worker
+                .handle_command(RuntimeCommand::SetRemoteViewing {
+                    session,
+                    viewing,
+                    ttl_ms: 60_000,
+                });
+            let _ = self.events.try_iter().count();
+        }
+
+        fn attach_new_pane(&mut self, session: SessionId) {
+            self.worker.attach_in_new_tab(session, SHELL_TITLE_ID);
+        }
+
+        fn inspect_unattached(&mut self) -> u16 {
+            self.worker
+                .handle_command(RuntimeCommand::InspectUnattachedSessions);
+            self.events
+                .try_iter()
+                .find_map(|event| match event {
+                    RuntimeEvent::UnattachedSessionsInspected { count } => Some(count),
+                    _ => None,
+                })
+                .expect("inspect command must emit a result")
+        }
+
+        fn kill_unattached(&mut self) -> u16 {
+            self.worker
+                .handle_command(RuntimeCommand::KillUnattachedSessions);
+            self.events
+                .try_iter()
+                .find_map(|event| match event {
+                    RuntimeEvent::UnattachedSessionsKilled { count } => Some(count),
+                    _ => None,
+                })
+                .expect("kill command must emit a result")
+        }
+
+        fn session_exists(&self, session: SessionId) -> bool {
+            self.worker.sessions.contains_key(&session)
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inspect_unattached_excludes_mux_and_remote_viewed_sessions() {
+        let mut harness = UnattachedHarness::new("inspect-unattached");
+        let attached = harness.spawn_attached();
+        let remote = harness.spawn_unattached();
+        harness.set_remote_viewing(remote, true);
+        let orphan = harness.spawn_unattached();
+
+        assert_eq!(harness.inspect_unattached(), 1);
+        assert!(harness.session_exists(attached));
+        assert!(harness.session_exists(remote));
+        assert!(harness.session_exists(orphan));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_unattached_recomputes_after_a_session_becomes_attached() {
+        let mut harness = UnattachedHarness::new("reattach-before-kill");
+        let candidate = harness.spawn_unattached();
+        assert_eq!(harness.inspect_unattached(), 1);
+        harness.attach_new_pane(candidate);
+
+        assert_eq!(harness.kill_unattached(), 0);
+        assert!(harness.session_exists(candidate));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_unattached_removes_only_current_local_candidates() {
+        let mut harness = UnattachedHarness::new("kill-unattached");
+        let attached = harness.spawn_attached();
+        let orphan = harness.spawn_unattached();
+
+        assert_eq!(harness.kill_unattached(), 1);
+        assert!(harness.session_exists(attached));
+        assert!(!harness.session_exists(orphan));
     }
 
     fn correlated_agent_command() -> RuntimeCommand {

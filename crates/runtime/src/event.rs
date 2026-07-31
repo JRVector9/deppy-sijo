@@ -194,6 +194,16 @@ pub enum RuntimeEvent {
     DurableEventBarrierReached {
         correlation_id: u64,
     },
+    /// `InspectUnattachedSessions` 결과. 고정 크기 count만 전달하며 후보 id는 런타임
+    /// 경계를 벗어나지 않는다. **variant는 끝에만 추가** (wire 계약).
+    UnattachedSessionsInspected {
+        count: u16,
+    },
+    /// `KillUnattachedSessions`가 실행 시점 재검증 후 실제 정리한 수.
+    /// **variant는 끝에만 추가** (wire 계약).
+    UnattachedSessionsKilled {
+        count: u16,
+    },
 }
 
 /// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의
@@ -407,7 +417,18 @@ mod tests {
                 "AgentSpawnResolved",
                 "SessionFreezeChanged",
                 "DurableEventBarrierReached",
+                "UnattachedSessionsInspected",
+                "UnattachedSessionsKilled",
             ]
         );
+    }
+
+    #[test]
+    fn unattached_session_events_have_only_fixed_count_payloads() {
+        let inspected = RuntimeEvent::UnattachedSessionsInspected { count: 7 };
+        let killed = RuntimeEvent::UnattachedSessionsKilled { count: 3 };
+
+        assert_eq!(postcard::to_allocvec(&inspected).unwrap(), vec![16, 7]);
+        assert_eq!(postcard::to_allocvec(&killed).unwrap(), vec![17, 3]);
     }
 }

@@ -2733,7 +2733,7 @@ mod tests {
             features: CLIENT_FEATURES,
             token: b"irrelevant".to_vec(),
         };
-        assert_eq!(PROTO_VERSION, 11);
+        assert_eq!(PROTO_VERSION, 12);
         assert!(!client_hello_matches_protocol(&old));
     }
 

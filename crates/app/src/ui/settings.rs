@@ -1526,6 +1526,16 @@ fn general_page(
     );
     row(
         ui,
+        &catalog.t("settings.confirm_workspace_close", &[]),
+        Some(&catalog.t("settings.confirm_workspace_close.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut config.ui.confirm_workspace_close) {
+                *changed = true;
+            }
+        },
+    );
+    row(
+        ui,
         &catalog.t("settings.session_name_style", &[]),
         Some(&catalog.t("settings.session_name_style.hint", &[])),
         |ui| {

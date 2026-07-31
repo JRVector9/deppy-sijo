@@ -1805,6 +1805,56 @@ impl CrossWorkspaceRestoreCoordinator {
 }
 
 const DEFAULT_CROSS_WORKSPACE_PANE_WIDTH: f32 = 420.0;
+const MIN_PRIMARY_TERMINAL_WIDTH_PX: f32 = 50.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossWorkspaceOpenWarning {
+    SameWorkspace,
+    StaleTarget,
+    CapacityReached { limit: usize },
+    StaleInsertionAnchor,
+    ColdRuntimeLimit,
+    RestoreQueueBusy,
+}
+
+impl CrossWorkspaceOpenWarning {
+    fn message(self, catalog: &i18n::Catalog) -> String {
+        match self {
+            Self::SameWorkspace => {
+                catalog.t("workspace.cross_pane.open_failed.same_workspace", &[])
+            }
+            Self::StaleTarget => catalog.t("workspace.cross_pane.open_failed.stale_target", &[]),
+            Self::CapacityReached { limit } => catalog.t(
+                "workspace.cross_pane.open_failed.capacity",
+                &[("limit", &limit.to_string())],
+            ),
+            Self::StaleInsertionAnchor => {
+                catalog.t("workspace.cross_pane.open_failed.stale_anchor", &[])
+            }
+            Self::ColdRuntimeLimit => {
+                catalog.t("workspace.cross_pane.open_failed.runtime_limit", &[])
+            }
+            Self::RestoreQueueBusy => {
+                catalog.t("workspace.cross_pane.open_failed.restore_busy", &[])
+            }
+        }
+    }
+}
+
+fn cross_workspace_attach_outcome(
+    outcome: Result<ui::cross_workspace::AttachOutcome, ui::cross_workspace::InsertAnchorError>,
+    limit: usize,
+) -> Result<ui::cross_workspace::AttachOutcome, CrossWorkspaceOpenWarning> {
+    match outcome {
+        Ok(ui::cross_workspace::AttachOutcome::CapacityReached) => {
+            Err(CrossWorkspaceOpenWarning::CapacityReached { limit })
+        }
+        Ok(outcome) => Ok(outcome),
+        Err(ui::cross_workspace::InsertAnchorError::StaleAttachment(_)) => {
+            Err(CrossWorkspaceOpenWarning::StaleInsertionAnchor)
+        }
+    }
+}
 
 fn attach_live_cross_workspace_pane(
     panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
@@ -1844,12 +1894,35 @@ fn append_live_cross_workspace_pane(
     )
 }
 
-fn remove_workspace_cross_workspace_state(
+fn switch_cross_workspace_pane_layout(
+    current_primary_workspace_id: &str,
+    target_primary_workspace_id: &str,
+    active: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    parked: &mut std::collections::HashMap<String, ui::cross_workspace::CrossWorkspacePaneState>,
+    limit: usize,
+) {
+    if current_primary_workspace_id == target_primary_workspace_id {
+        return;
+    }
+    let current = std::mem::take(active);
+    if current.attachments().is_empty() {
+        parked.remove(current_primary_workspace_id);
+    } else {
+        parked.insert(current_primary_workspace_id.to_owned(), current);
+    }
+    *active = parked
+        .remove(target_primary_workspace_id)
+        .unwrap_or_default();
+    let _ = enforce_cross_workspace_capacity_non_destructive(
+        active,
+        limit.clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES),
+    );
+}
+
+fn remove_workspace_attachments(
     panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
-    visible_ids: &mut Vec<ui::cross_workspace::AttachmentId>,
-    coordinator: &mut CrossWorkspaceRestoreCoordinator,
     workspace_id: &str,
-) -> Option<runtime::MuxPaneId> {
+) {
     let attachment_ids = panes
         .attachments()
         .iter()
@@ -1860,6 +1933,15 @@ fn remove_workspace_cross_workspace_state(
     for attachment_id in attachment_ids {
         let _ = panes.detach_attachment(attachment_id);
     }
+}
+
+fn remove_workspace_cross_workspace_state(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    visible_ids: &mut Vec<ui::cross_workspace::AttachmentId>,
+    coordinator: &mut CrossWorkspaceRestoreCoordinator,
+    workspace_id: &str,
+) -> Option<runtime::MuxPaneId> {
+    remove_workspace_attachments(panes, workspace_id);
     visible_ids.retain(|attachment_id| {
         panes
             .attachments()
@@ -1867,6 +1949,34 @@ fn remove_workspace_cross_workspace_state(
             .any(|attachment| attachment.id() == *attachment_id)
     });
     coordinator.remove_workspace(workspace_id)
+}
+
+fn remove_workspace_cross_workspace_layouts(
+    active: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    parked: &mut std::collections::HashMap<String, ui::cross_workspace::CrossWorkspacePaneState>,
+    visible_ids: &mut Vec<ui::cross_workspace::AttachmentId>,
+    coordinator: &mut CrossWorkspaceRestoreCoordinator,
+    workspace_id: &str,
+) -> Option<runtime::MuxPaneId> {
+    let sent_restore_pane =
+        remove_workspace_cross_workspace_state(active, visible_ids, coordinator, workspace_id);
+    parked.remove(workspace_id);
+    for panes in parked.values_mut() {
+        remove_workspace_attachments(panes, workspace_id);
+    }
+    parked.retain(|_, panes| !panes.attachments().is_empty());
+    sent_restore_pane
+}
+
+fn clear_primary_cross_workspace_layout(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    visible_ids: &mut Vec<ui::cross_workspace::AttachmentId>,
+    coordinator: &mut CrossWorkspaceRestoreCoordinator,
+) {
+    let retained = std::collections::HashSet::new();
+    let _ = coordinator.retain_attachments(&retained);
+    let _ = panes.enforce_capacity(0);
+    visible_ids.clear();
 }
 
 fn apply_restore_outcome(
@@ -6845,6 +6955,8 @@ pub struct App {
     runtime_stream_warning: bool,
     /// live warm hard cap을 넘기는 workspace 전환을 거부했을 때 대상 표시명.
     warm_limit_warning: Option<String>,
+    /// 다른 workspace Pane 열기 거부 사유. 마지막 한 건만 보관하는 유계 데스크톱 경고다.
+    cross_workspace_open_warning: Option<CrossWorkspaceOpenWarning>,
     /// 폰(미러 진입 — I1b-2)이 보낸 워크스페이스 전환 요청 큐. 웹 스레드가 push하고 egui
     /// 스레드가 ui() 시작에서 drain해 switch_workspace로 넘긴다(App은 egui 스레드 소유).
     web_switch_queue: Arc<std::sync::Mutex<Vec<String>>>,
@@ -7072,6 +7184,10 @@ pub struct App {
     /// 현재 활성 workspace가 소유한 화면 오른쪽에 붙인 exact warm pane. 런타임과 mux
     /// 소유권은 이동하지 않으며 이 상태는 메모리에만 존재한다.
     cross_workspace_pane: ui::cross_workspace::CrossWorkspacePaneState,
+    /// 비활성 workspace별 화면 분할 구성. 세션/스크롤백을 복제하지 않고 최대 pane 6개의
+    /// 식별자·너비만 보관하며, 해당 workspace 복귀 시 활성 상태와 move-swap한다.
+    parked_cross_workspace_panes:
+        std::collections::HashMap<String, ui::cross_workspace::CrossWorkspacePaneState>,
     cross_workspace_restore: CrossWorkspaceRestoreCoordinator,
     visible_cross_workspace_attachments: Vec<ui::cross_workspace::AttachmentId>,
     frame_terminal_owner: FrameTerminalOwner,
@@ -7244,6 +7360,26 @@ fn workspace_visible_after_close(
     workspace_id: &str,
 ) -> bool {
     !closed.contains_key(workspace_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceCloseDisposition {
+    Ignore,
+    Confirm,
+    CloseNow,
+}
+
+fn workspace_close_disposition(
+    confirmation_enabled: bool,
+    has_closeable_sessions: bool,
+) -> WorkspaceCloseDisposition {
+    if !has_closeable_sessions {
+        WorkspaceCloseDisposition::Ignore
+    } else if confirmation_enabled {
+        WorkspaceCloseDisposition::Confirm
+    } else {
+        WorkspaceCloseDisposition::CloseNow
+    }
 }
 
 /// hook 상태에서 "새 턴 시작"으로 볼 전이만 고른다 — 직전에 막혀 있던(대기 또는 완료)
@@ -9600,6 +9736,7 @@ impl App {
             ws_rename_edit: None,
             runtime_stream_warning: false,
             warm_limit_warning: None,
+            cross_workspace_open_warning: None,
             web_switch_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             web_notice: None,
             dismissed_renames: std::collections::HashSet::new(),
@@ -9727,6 +9864,7 @@ impl App {
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
             cross_workspace_pane: ui::cross_workspace::CrossWorkspacePaneState::default(),
+            parked_cross_workspace_panes: std::collections::HashMap::new(),
             cross_workspace_restore: CrossWorkspaceRestoreCoordinator::default(),
             visible_cross_workspace_attachments: Vec::with_capacity(
                 ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES,
@@ -10149,6 +10287,13 @@ impl App {
             tracing::warn!(workspace = %delete_id, "벤치: 활성 워크스페이스라 삭제 불가");
             return;
         }
+        let _ = remove_workspace_cross_workspace_layouts(
+            &mut self.cross_workspace_pane,
+            &mut self.parked_cross_workspace_panes,
+            &mut self.visible_cross_workspace_attachments,
+            &mut self.cross_workspace_restore,
+            delete_id,
+        );
         self.join_pending_shutdown(delete_id);
         if let Some(mut runtime) = self.warm.remove(delete_id) {
             self.close_approval_workspace(delete_id);
@@ -12541,8 +12686,19 @@ impl App {
         row_target: ui::file_tree::SessionRowTarget,
         anchor: ui::cross_workspace::InsertAnchor,
     ) {
+        if let Err(warning) = self.try_open_session_beside(row_target, anchor) {
+            self.cross_workspace_open_warning = Some(warning);
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    fn try_open_session_beside(
+        &mut self,
+        row_target: ui::file_tree::SessionRowTarget,
+        anchor: ui::cross_workspace::InsertAnchor,
+    ) -> Result<(), CrossWorkspaceOpenWarning> {
         if row_target.workspace_id() == self.active.id {
-            return;
+            return Err(CrossWorkspaceOpenWarning::SameWorkspace);
         }
         match row_target {
             ui::file_tree::SessionRowTarget::Live {
@@ -12567,23 +12723,19 @@ impl App {
                         })
                         .flatten()
                 });
-                let Some(target) = target else {
-                    return;
-                };
+                let target = target.ok_or(CrossWorkspaceOpenWarning::StaleTarget)?;
                 let limit = (self.config.performance.max_cross_workspace_panes as usize)
                     .clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
-                let Ok(outcome) = attach_live_cross_workspace_pane(
-                    &mut self.cross_workspace_pane,
-                    self.active.id.clone(),
-                    target,
+                let outcome = cross_workspace_attach_outcome(
+                    attach_live_cross_workspace_pane(
+                        &mut self.cross_workspace_pane,
+                        self.active.id.clone(),
+                        target,
+                        limit,
+                        anchor,
+                    ),
                     limit,
-                    anchor,
-                ) else {
-                    return;
-                };
-                if outcome == ui::cross_workspace::AttachOutcome::CapacityReached {
-                    return;
-                }
+                )?;
                 if let ui::cross_workspace::AttachOutcome::FocusedExisting(attachment_id) = outcome
                 {
                     let _ = self
@@ -12599,7 +12751,7 @@ impl App {
                     .get(&workspace_id)
                     .is_some_and(|rows| rows.iter().any(|row| row.pane_id == pane.0));
                 if !canonical {
-                    return;
+                    return Err(CrossWorkspaceOpenWarning::StaleTarget);
                 }
                 let request = ui::cross_workspace::PersistedPaneRequest::new(
                     workspace_id.clone(),
@@ -12607,15 +12759,16 @@ impl App {
                 );
                 let limit = (self.config.performance.max_cross_workspace_panes as usize)
                     .clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
-                let Ok(outcome) = attach_cold_cross_workspace_pane(
-                    &mut self.cross_workspace_pane,
-                    self.active.id.clone(),
-                    request,
+                let outcome = cross_workspace_attach_outcome(
+                    attach_cold_cross_workspace_pane(
+                        &mut self.cross_workspace_pane,
+                        self.active.id.clone(),
+                        request,
+                        limit,
+                        anchor,
+                    ),
                     limit,
-                    anchor,
-                ) else {
-                    return;
-                };
+                )?;
                 let ui::cross_workspace::AttachOutcome::Appended(attachment_id) = outcome else {
                     if matches!(
                         outcome,
@@ -12623,7 +12776,7 @@ impl App {
                     ) {
                         self.egui_ctx.request_repaint();
                     }
-                    return;
+                    return Ok(());
                 };
                 let existing_runtime_instance = self
                     .warm
@@ -12639,7 +12792,7 @@ impl App {
                 ) == ColdRestoreRuntimeAdmission::Denied
                 {
                     let _ = self.cross_workspace_pane.detach_attachment(attachment_id);
-                    return;
+                    return Err(CrossWorkspaceOpenWarning::ColdRuntimeLimit);
                 }
                 if !self
                     .cross_workspace_restore
@@ -12650,13 +12803,14 @@ impl App {
                     ))
                 {
                     let _ = self.cross_workspace_pane.detach_attachment(attachment_id);
-                    return;
+                    return Err(CrossWorkspaceOpenWarning::RestoreQueueBusy);
                 }
                 self.drive_cross_workspace_restore(std::time::Instant::now());
                 self.refresh_warm_idle_deadline();
                 self.egui_ctx.request_repaint();
             }
         }
+        Ok(())
     }
 
     fn drive_cross_workspace_restore(&mut self, now: std::time::Instant) {
@@ -13071,6 +13225,16 @@ impl App {
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
+        switch_cross_workspace_pane_layout(
+            &old.id,
+            &self.active.id,
+            &mut self.cross_workspace_pane,
+            &mut self.parked_cross_workspace_panes,
+            self.config.performance.max_cross_workspace_panes as usize,
+        );
+        self.visible_cross_workspace_attachments.clear();
+        self.frame_terminal_owner = FrameTerminalOwner::None;
+        self.last_multi_pane_terminal_rect = None;
         // Retain only the pending scope metadata before any old-scope completion can be applied
         // against the new active runtime. The worker drain barrier installs the new epoch later.
         self.request_agent_state_scope();
@@ -13100,6 +13264,7 @@ impl App {
         self.warm.insert(old_id.clone(), old);
         push_warm_order_unique(&mut self.warm_order, old_id.clone());
         self.reconcile_cross_workspace_pane();
+        self.sync_attached_runtime_visibility();
         self.refresh_warm_idle_deadline();
 
         // pending 상태 정리 (이전 워커 응답 못 받음, 교차-ws 감사 방지).
@@ -13652,7 +13817,22 @@ impl App {
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
     /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
     fn close_workspace_sessions(&mut self, workspace_id: &str) {
+        let sent_restore_pane = remove_workspace_cross_workspace_layouts(
+            &mut self.cross_workspace_pane,
+            &mut self.parked_cross_workspace_panes,
+            &mut self.visible_cross_workspace_attachments,
+            &mut self.cross_workspace_restore,
+            workspace_id,
+        );
         if workspace_id == self.active.id {
+            clear_primary_cross_workspace_layout(
+                &mut self.cross_workspace_pane,
+                &mut self.visible_cross_workspace_attachments,
+                &mut self.cross_workspace_restore,
+            );
+            self.frame_terminal_owner = FrameTerminalOwner::None;
+            self.last_multi_pane_terminal_rect = None;
+            self.sync_attached_runtime_visibility();
             // 활성: 전 pane을 확인 없이 즉시 닫는다(확인은 모달이 이미 했다). 워크스
             // 페이스는 활성인 채 빈 상태로 남는다 — 바로 새 셸을 열 수 있다.
             let panes: Vec<runtime::MuxPaneId> = self
@@ -13690,12 +13870,6 @@ impl App {
             // warm 종료는 runtime shutdown까지 동기로 끝난다 — 죽어가는 pane 추적 불필요.
             self.closed_workspaces
                 .insert(workspace_id.to_owned(), ClosedWorkspaceState::Persisted);
-            let sent_restore_pane = remove_workspace_cross_workspace_state(
-                &mut self.cross_workspace_pane,
-                &mut self.visible_cross_workspace_attachments,
-                &mut self.cross_workspace_restore,
-                workspace_id,
-            );
             // warm: 살아 있는 워커에 ClosePane을 모두 보낸 뒤 runtime을 내린다(idle 전환,
             // 프로젝트 삭제의 warm 종료 경로와 같은 순서). worker 루프는 shutdown 판정
             // 전에 큐 명령을 전부 소화하므로 pane 정리(persist layout 갱신)가 종료 전에
@@ -18999,10 +19173,6 @@ impl eframe::App for App {
                         self.open_session_diff(ui.ctx(), session);
                     }
                 }
-                Some(ui::file_tree::SidebarAction::ShowTerminal) => {
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-                }
                 Some(ui::file_tree::SidebarAction::OpenConnectors) => {
                     self.settings_category = ui::settings::Category::Connectors;
                     self.settings_open = true;
@@ -19191,18 +19361,31 @@ impl eframe::App for App {
                     ));
                 }
                 Some(ui::file_tree::SidebarAction::CloseWorkspace(workspace_id)) => {
-                    // 세션·실행 중 수는 사이드바 행이 그린 것과 같은 원천(summary) —
-                    // 다이얼로그 숫자가 방금 본 행 요약과 어긋나지 않는다.
-                    match sidebar_workspaces.iter().find(|w| w.id == workspace_id) {
-                        Some(entry)
-                            if entry.state != ui::file_tree::SidebarWorkspaceState::Idle =>
-                        {
+                    let entry = sidebar_workspaces
+                        .iter()
+                        .find(|entry| entry.id == workspace_id);
+                    let has_closeable_sessions = entry.is_some_and(|entry| {
+                        entry.state != ui::file_tree::SidebarWorkspaceState::Idle
+                    });
+                    match workspace_close_disposition(
+                        self.config.ui.confirm_workspace_close,
+                        has_closeable_sessions,
+                    ) {
+                        WorkspaceCloseDisposition::Confirm => {
+                            let entry = entry.expect("closeable workspace entry");
+                            // 세션·실행 중 수는 사이드바 행이 그린 것과 같은 원천(summary) —
+                            // 다이얼로그 숫자가 방금 본 행 요약과 어긋나지 않는다.
                             let s = entry.summary;
                             let total = s.running + s.waiting + s.done + s.error + s.idle;
                             self.ws_close_confirm =
                                 Some((workspace_id, entry.name.clone(), total, s.running));
                         }
-                        _ => {
+                        WorkspaceCloseDisposition::CloseNow => {
+                            self.stage_workspace_controller_action(
+                                WorkspaceControllerAction::CloseWorkspace(workspace_id),
+                            );
+                        }
+                        WorkspaceCloseDisposition::Ignore => {
                             // 메뉴는 Idle에 안 붙지만 요청 프레임 사이 상태 변화 방어.
                             tracing::info!(
                                 workspace = %workspace_id,
@@ -20061,8 +20244,25 @@ impl eframe::App for App {
             }
         }
 
-        // 「워크스페이스 종료」 확인 모달 — 실행 중 에이전트를 죽일 수 있어 반드시
-        // 확인을 거친다(pane 닫기 confirm_close와 같은 중앙 egui::Window 관례).
+        if let Some(warning) = self.cross_workspace_open_warning {
+            let mut close = false;
+            egui::Window::new(text.t("workspace.cross_pane.open_failed.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(warning.message(&text));
+                    ui.add_space(8.0);
+                    if ui.button(text.t("action.close", &[])).clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.cross_workspace_open_warning = None;
+            }
+        }
+
+        // 「워크스페이스 종료」 확인 모달 — 설정에서 명시적으로 ON한 경우에만 표시한다.
         if let Some((close_id, close_name, total, running)) = self.ws_close_confirm.clone() {
             let mut decision: Option<bool> = None; // Some(true)=모두 종료, Some(false)=취소
             egui::Window::new(text.t("workspace.close_ws_confirm.title", &[]))
@@ -21583,7 +21783,7 @@ fn fluid_cross_workspace_layout(
 ) -> FluidCrossWorkspaceLayout {
     let divider_width = ATTACHED_DIVIDER_WIDTH.min(rect.width().max(0.0));
     let available_after_divider = (rect.width() - divider_width).max(0.0);
-    let primary_min = ui::cross_workspace::MIN_ATTACHED_WIDTH_PX.min(available_after_divider);
+    let primary_min = MIN_PRIMARY_TERMINAL_WIDTH_PX.min(available_after_divider);
     let content_width = foreign_strip_content_width(attached_widths);
     let foreign_width = content_width.min((available_after_divider - primary_min).max(0.0));
     let primary_right = rect.right() - divider_width - foreign_width;
@@ -22235,12 +22435,12 @@ mod tests {
 
     #[test]
     fn cross_workspace_app_fluid_strip_overflow_preserves_primary_minimum() {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(880.0, 700.0));
         let layout = fluid_cross_workspace_layout(rect, &[420.0, 420.0]);
 
         assert_eq!(foreign_strip_content_width(&[420.0, 420.0]), 844.0);
-        assert_eq!(layout.primary.width(), 320.0);
-        assert_eq!(layout.foreign.width(), 576.0);
+        assert_eq!(layout.primary.width(), 50.0);
+        assert_eq!(layout.foreign.width(), 826.0);
         assert_eq!(layout.foreign.right(), rect.right());
     }
 
@@ -22249,9 +22449,9 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 700.0));
         let layout = fluid_cross_workspace_layout(rect, &[420.0]);
 
-        assert_eq!(layout.primary.width(), 296.0);
+        assert_eq!(layout.primary.width(), 50.0);
         assert_eq!(layout.divider.width(), ATTACHED_DIVIDER_WIDTH);
-        assert_eq!(layout.foreign.width(), 0.0);
+        assert_eq!(layout.foreign.width(), 246.0);
         assert_eq!(layout.foreign.right(), rect.right());
     }
 
@@ -22299,11 +22499,11 @@ mod tests {
 
     #[test]
     fn cross_workspace_app_primary_divider_overflow_does_not_jump_at_drag_start() {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(880.0, 700.0));
         let widths = [420.0, 420.0];
         let layout = fluid_cross_workspace_layout(rect, &widths);
 
-        assert_eq!(layout.foreign.width(), 576.0);
+        assert_eq!(layout.foreign.width(), 826.0);
         assert_eq!(primary_divider_requested_width(widths[0], 0.0), Some(420.0));
     }
 
@@ -22494,6 +22694,140 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first_id, inserted_id, last_id]
         );
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_rightmost_inserts_after_multiple_foreign_panes() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let second_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        let inserted_id = cross_workspace_attach_outcome(
+            attach_live_cross_workspace_pane(
+                &mut state,
+                "workspace-a",
+                cross_workspace_test_target_named("workspace-d", 11, "d1", 43),
+                6,
+                ui::cross_workspace::InsertAnchor::Attached(second_id),
+            ),
+            6,
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+
+        assert_eq!(
+            state
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id, inserted_id]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_attach_rejections_map_to_desktop_warnings() {
+        let mut full = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(
+            &mut full,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            2,
+        );
+        append_live_cross_workspace_pane(
+            &mut full,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+            2,
+        );
+        assert_eq!(
+            cross_workspace_attach_outcome(
+                attach_live_cross_workspace_pane(
+                    &mut full,
+                    "workspace-a",
+                    cross_workspace_test_target_named("workspace-d", 11, "d1", 43),
+                    2,
+                    ui::cross_workspace::InsertAnchor::End,
+                ),
+                2,
+            ),
+            Err(CrossWorkspaceOpenWarning::CapacityReached { limit: 2 })
+        );
+
+        let stale_id = full.attachments()[1].id();
+        let _ = full.detach_attachment(stale_id);
+        assert_eq!(
+            cross_workspace_attach_outcome(
+                attach_live_cross_workspace_pane(
+                    &mut full,
+                    "workspace-a",
+                    cross_workspace_test_target_named("workspace-e", 12, "e1", 44),
+                    2,
+                    ui::cross_workspace::InsertAnchor::Attached(stale_id),
+                ),
+                2,
+            ),
+            Err(CrossWorkspaceOpenWarning::StaleInsertionAnchor)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_open_rejections_have_localized_desktop_messages() {
+        let catalog = load_catalog("ko-KR");
+        let warnings = [
+            CrossWorkspaceOpenWarning::SameWorkspace,
+            CrossWorkspaceOpenWarning::StaleTarget,
+            CrossWorkspaceOpenWarning::CapacityReached { limit: 2 },
+            CrossWorkspaceOpenWarning::StaleInsertionAnchor,
+            CrossWorkspaceOpenWarning::ColdRuntimeLimit,
+            CrossWorkspaceOpenWarning::RestoreQueueBusy,
+        ];
+
+        for warning in warnings {
+            let message = warning.message(&catalog);
+            assert!(!message.is_empty());
+            assert!(!message.starts_with("workspace.cross_pane.open_failed."));
+        }
+        assert!(
+            CrossWorkspaceOpenWarning::CapacityReached { limit: 2 }
+                .message(&catalog)
+                .contains('2')
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_open_session_beside_surfaces_every_rejection_branch() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn open_session_beside(")
+            .unwrap()
+            .1
+            .split_once("fn drive_cross_workspace_restore")
+            .unwrap()
+            .0;
+
+        assert!(body.contains("self.try_open_session_beside(row_target, anchor)"));
+        assert!(body.contains("self.cross_workspace_open_warning = Some(warning)"));
+        assert!(body.contains("CrossWorkspaceOpenWarning::SameWorkspace"));
+        assert!(body.contains("CrossWorkspaceOpenWarning::StaleTarget"));
+        assert!(body.contains("CrossWorkspaceOpenWarning::ColdRuntimeLimit"));
+        assert!(body.contains("CrossWorkspaceOpenWarning::RestoreQueueBusy"));
+        assert!(body.contains("cross_workspace_attach_outcome("));
     }
 
     #[test]
@@ -23221,6 +23555,264 @@ mod tests {
             )
         );
         assert!(state.attachments().is_empty());
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_switch_restores_parked_layout_on_return() {
+        let mut active = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut active,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        assert!(active.set_width(attachment_id, 512.0));
+        let mut parked = std::collections::HashMap::new();
+
+        switch_cross_workspace_pane_layout(
+            "workspace-a",
+            "workspace-c",
+            &mut active,
+            &mut parked,
+            6,
+        );
+
+        assert!(active.attachments().is_empty());
+        assert_eq!(parked["workspace-a"].attachments().len(), 1);
+
+        switch_cross_workspace_pane_layout(
+            "workspace-c",
+            "workspace-a",
+            &mut active,
+            &mut parked,
+            6,
+        );
+
+        assert!(parked.is_empty());
+        assert_eq!(active.attachments().len(), 1);
+        assert_eq!(active.attachments()[0].id(), attachment_id);
+        assert_eq!(active.attachments()[0].workspace_id(), "workspace-b");
+        assert_eq!(active.attachments()[0].width_px(), 512.0);
+    }
+
+    #[test]
+    fn cross_workspace_app_workspace_removal_prunes_active_and_every_parked_layout() {
+        let mut active = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let removed_active = append_live_cross_workspace_pane(
+            &mut active,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "active-b", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let retained_active = append_live_cross_workspace_pane(
+            &mut active,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "active-c", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let mut removed_primary = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(
+            &mut removed_primary,
+            "workspace-b",
+            cross_workspace_test_target_named("workspace-d", 11, "primary-b", 43),
+            6,
+        );
+        let mut retained_primary = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(
+            &mut retained_primary,
+            "workspace-c",
+            cross_workspace_test_target_named("workspace-b", 9, "parked-b", 44),
+            6,
+        );
+        let retained_parked = append_live_cross_workspace_pane(
+            &mut retained_primary,
+            "workspace-c",
+            cross_workspace_test_target_named("workspace-d", 11, "parked-d", 45),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let mut emptied_primary = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(
+            &mut emptied_primary,
+            "workspace-e",
+            cross_workspace_test_target_named("workspace-b", 9, "only-b", 46),
+            6,
+        );
+        let mut parked = std::collections::HashMap::from([
+            ("workspace-b".to_owned(), removed_primary),
+            ("workspace-c".to_owned(), retained_primary),
+            ("workspace-e".to_owned(), emptied_primary),
+        ]);
+        let mut visible = vec![removed_active, retained_active];
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+
+        let sent = remove_workspace_cross_workspace_layouts(
+            &mut active,
+            &mut parked,
+            &mut visible,
+            &mut coordinator,
+            "workspace-b",
+        );
+
+        assert_eq!(sent, None);
+        assert_eq!(
+            active
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![retained_active]
+        );
+        assert_eq!(visible, vec![retained_active]);
+        assert!(!parked.contains_key("workspace-b"));
+        assert!(!parked.contains_key("workspace-e"));
+        assert_eq!(
+            parked["workspace-c"]
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![retained_parked]
+        );
+        assert_eq!(
+            parked["workspace-c"].focused(),
+            ui::cross_workspace::FocusedSurface::Attached(retained_parked)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_active_primary_close_clears_the_entire_layout() {
+        let mut active = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let live = append_live_cross_workspace_pane(
+            &mut active,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "live", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let restoring = active
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut visible = vec![live, restoring];
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", restoring,)));
+
+        clear_primary_cross_workspace_layout(&mut active, &mut visible, &mut coordinator);
+
+        assert!(active.attachments().is_empty());
+        assert!(visible.is_empty());
+        assert!(coordinator.is_idle());
+    }
+
+    #[test]
+    fn cross_workspace_app_parked_restore_reapplies_current_cap_from_the_right() {
+        let mut active = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut restored = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = append_live_cross_workspace_pane(
+            &mut restored,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "first", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let second = append_live_cross_workspace_pane(
+            &mut restored,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "second", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        append_live_cross_workspace_pane(
+            &mut restored,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-d", 11, "third", 43),
+            6,
+        );
+        assert!(restored.focus_attachment(second));
+        let mut parked = std::collections::HashMap::from([("workspace-a".to_owned(), restored)]);
+
+        switch_cross_workspace_pane_layout(
+            "workspace-x",
+            "workspace-a",
+            &mut active,
+            &mut parked,
+            2,
+        );
+
+        assert!(parked.is_empty());
+        assert_eq!(
+            active
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            active.focused(),
+            ui::cross_workspace::FocusedSurface::Attached(second)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_close_and_delete_paths_prune_parked_layouts() {
+        let source = include_str!("app.rs");
+        let close = source
+            .split_once("fn close_workspace_sessions")
+            .unwrap()
+            .1
+            .split_once("fn reveal_closed_workspace")
+            .unwrap()
+            .0;
+        let delete = source
+            .split_once("fn bench_delete_workspace")
+            .unwrap()
+            .1
+            .split_once("fn subscribe_runtime_events")
+            .unwrap()
+            .0;
+
+        assert!(close.contains("remove_workspace_cross_workspace_layouts("));
+        assert!(delete.contains("remove_workspace_cross_workspace_layouts("));
+    }
+
+    #[test]
+    fn cross_workspace_app_production_switches_layout_before_reconcile() {
+        let source = include_str!("app.rs");
+        let switch = source
+            .split_once("fn switch_workspace(&mut self")
+            .unwrap()
+            .1
+            .split_once("fn cycle_workspace")
+            .unwrap()
+            .0;
+        let layout_switch = switch.find("switch_cross_workspace_pane_layout(").unwrap();
+        let reconcile = switch
+            .find("self.reconcile_cross_workspace_pane();")
+            .unwrap();
+
+        assert!(layout_switch < reconcile);
+        assert!(switch.contains("self.visible_cross_workspace_attachments.clear();"));
+        assert!(switch.contains("self.sync_attached_runtime_visibility();"));
     }
 
     #[test]
@@ -26501,6 +27093,22 @@ mod tests {
         assert!(
             !tracker.has_live(),
             "복원된 exited 세션은 live 아님 — auto-suspend 정상 동작"
+        );
+    }
+
+    #[test]
+    fn 워크스페이스_종료확인_policy는_기본즉시종료와_opt_in확인을_구분한다() {
+        assert_eq!(
+            workspace_close_disposition(false, true),
+            WorkspaceCloseDisposition::CloseNow
+        );
+        assert_eq!(
+            workspace_close_disposition(true, true),
+            WorkspaceCloseDisposition::Confirm
+        );
+        assert_eq!(
+            workspace_close_disposition(false, false),
+            WorkspaceCloseDisposition::Ignore
         );
     }
 

@@ -438,7 +438,7 @@ fn pane_drop_feedback_style(tokens: crate::ui::designall::Tokens) -> PaneDropFee
         outline_inset: 2.0,
         insertion_width: 3.0,
         insertion_color: tokens.accent,
-        label_fill: tokens.selected_background,
+        label_fill: egui::Color32::from_rgb(0xed, 0x5b, 0x61),
         label_text: tokens.text,
     }
 }
@@ -467,7 +467,7 @@ fn layout_pane_drop_feedback_label(
     let mut job = egui::text::LayoutJob::single_section(
         label.to_owned(),
         egui::TextFormat {
-            font_id: egui::FontId::proportional(11.0),
+            font_id: egui::FontId::proportional(13.0),
             color: style.label_text,
             ..Default::default()
         },
@@ -486,13 +486,7 @@ fn layout_pane_drop_feedback_label(
     }
 
     let label_size = galley.size() + padding * 2.0;
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(
-            pane_rect.right() - margin - label_size.x,
-            pane_rect.top() + margin,
-        ),
-        label_size,
-    );
+    let rect = egui::Rect::from_center_size(pane_rect.center(), label_size);
     Some(PaneDropFeedbackLabelLayout { rect, galley })
 }
 
@@ -1500,6 +1494,22 @@ impl WorkspaceUi {
         self.queue_protocol_intent_with_spawn_cwd(command, None)
     }
 
+    fn queue_terminal_resize(&mut self, session: SessionId, cols: u16, rows: u16) {
+        if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
+            return;
+        }
+        if self
+            .queue_protocol_intent(RuntimeCommand::Resize {
+                session,
+                cols,
+                rows,
+            })
+            .is_ok()
+        {
+            self.sent_sizes.insert(session, (cols, rows));
+        }
+    }
+
     fn queue_protocol_intent_with_spawn_cwd(
         &mut self,
         command: RuntimeCommand,
@@ -1536,6 +1546,33 @@ impl WorkspaceUi {
                 >= WORKSPACE_PROTOCOL_CAP
         {
             return Err(WorkspaceProtocolErrorCode::Busy);
+        }
+
+        if let RuntimeCommand::Resize {
+            session: next_session,
+            cols: next_cols,
+            rows: next_rows,
+        } = &command
+            && let Some(WorkspaceProtocolIntent {
+                command:
+                    RuntimeCommand::Resize {
+                        session: queued_session,
+                        cols: queued_cols,
+                        rows: queued_rows,
+                    },
+                ..
+            }) = self.protocol_intents.iter_mut().find(|intent| {
+                matches!(
+                    &intent.command,
+                    RuntimeCommand::Resize { session, .. } if session == next_session
+                )
+            })
+        {
+            debug_assert_eq!(queued_session, next_session);
+            *queued_cols = *next_cols;
+            *queued_rows = *next_rows;
+            self.command_sent = true;
+            return Ok(());
         }
 
         if let RuntimeCommand::WriteInput {
@@ -3736,7 +3773,7 @@ impl WorkspaceUi {
                 );
             }
             if let Some(session) = pane.session_id {
-                if let Some(path) = pane_resp.dnd_release_payload::<std::path::PathBuf>() {
+                if let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&pane_resp) {
                     let bytes = path_insert_paste_bytes(
                         &path,
                         self.session_shell_kind(session),
@@ -3744,7 +3781,8 @@ impl WorkspaceUi {
                     );
                     self.send(RuntimeCommand::WriteInput { session, bytes });
                 }
-                if let Some(text) = pane_resp.dnd_release_payload::<TerminalTextDragPayload>() {
+                if let Some(text) = release_typed_dnd_payload::<TerminalTextDragPayload>(&pane_resp)
+                {
                     let bytes = terminal_text_paste_bytes(
                         &text.text,
                         self.session_bracketed_paste(session),
@@ -3780,14 +3818,7 @@ impl WorkspaceUi {
         let cols =
             ((renderer_egui::grid_width_for_available(avail.x) / cell.x) as u16).clamp(10, 500);
         let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y);
-        if self.sent_sizes.get(&session) != Some(&(cols, rows)) {
-            self.sent_sizes.insert(session, (cols, rows));
-            self.send(RuntimeCommand::Resize {
-                session,
-                cols,
-                rows,
-            });
-        }
+        self.queue_terminal_resize(session, cols, rows);
 
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
         let (exit_code, bracketed, snapshot) = {
@@ -4068,7 +4099,7 @@ impl WorkspaceUi {
         // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
         if mode.is_local()
             && input_enabled
-            && let Some(path) = output.response.dnd_release_payload::<std::path::PathBuf>()
+            && let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&output.response)
         {
             let bytes = path_insert_paste_bytes(&path, self.session_shell_kind(session), bracketed);
             self.send(RuntimeCommand::WriteInput { session, bytes });
@@ -4078,9 +4109,8 @@ impl WorkspaceUi {
         }
         if mode.is_local()
             && input_enabled
-            && let Some(text) = output
-                .response
-                .dnd_release_payload::<TerminalTextDragPayload>()
+            && let Some(text) =
+                release_typed_dnd_payload::<TerminalTextDragPayload>(&output.response)
         {
             let bytes = terminal_text_paste_bytes(&text.text, bracketed);
             self.send(RuntimeCommand::WriteInput { session, bytes });
@@ -5236,6 +5266,15 @@ struct TerminalTextDragPayload {
     text: String,
 }
 
+fn release_typed_dnd_payload<Payload>(response: &egui::Response) -> Option<Arc<Payload>>
+where
+    Payload: std::any::Any + Send + Sync,
+{
+    egui::DragAndDrop::has_payload_of_type::<Payload>(&response.ctx)
+        .then(|| response.dnd_release_payload::<Payload>())
+        .flatten()
+}
+
 fn selection_range_contains(start: usize, end: usize, idx: usize) -> bool {
     start <= idx && idx <= end
 }
@@ -6081,6 +6120,7 @@ mod tests {
         assert_eq!(style.outline.width, 2.0);
         assert_eq!(style.outline_inset, 2.0);
         assert_eq!(style.insertion_width, 3.0);
+        assert_eq!(style.label_fill, egui::Color32::from_rgb(0xed, 0x5b, 0x61));
     }
 
     #[test]
@@ -6104,6 +6144,59 @@ mod tests {
         assert_eq!(measured.galley.rows.len(), 1);
         assert!(measured.galley.elided);
         assert_eq!(measured.galley.rows[0].text().chars().last(), Some('…'));
+    }
+
+    #[test]
+    fn pane_drop_feedback_label_is_centered_in_pane() {
+        let context = egui::Context::default();
+        let pane = egui::Rect::from_min_size(egui::pos2(20.0, 40.0), egui::vec2(480.0, 320.0));
+        let style = pane_drop_feedback_style(crate::ui::designall::DARK);
+        let mut measured = None;
+
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            measured = layout_pane_drop_feedback_label(
+                ui.painter(),
+                pane,
+                "현재 화면 오른쪽에 열기",
+                style,
+            );
+        });
+
+        let measured = measured.expect("pane has room for the feedback label");
+        assert!((measured.rect.center().x - pane.center().x).abs() < f32::EPSILON);
+        assert!((measured.rect.center().y - pane.center().y).abs() < f32::EPSILON);
+        assert_eq!(measured.galley.job.sections[0].format.font_id.size, 13.0);
+    }
+
+    #[test]
+    fn typed_drop_release_preserves_unrelated_payload() {
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, preserved: &mut bool| {
+                let response = ui.allocate_response(ui.available_size(), egui::Sense::hover());
+                let _ = release_typed_dnd_payload::<std::path::PathBuf>(&response);
+                if ui.input(|input| input.pointer.any_released()) {
+                    *preserved = egui::DragAndDrop::payload::<String>(ui.ctx())
+                        .is_some_and(|payload| payload.as_str() == "session-payload");
+                }
+            },
+            false,
+        );
+        harness.run();
+        let pointer = egui::pos2(20.0, 20.0);
+        harness.hover_at(pointer);
+        harness.drag_at(pointer);
+        harness.run();
+        egui::DragAndDrop::set_payload(&harness.ctx, "session-payload".to_owned());
+        harness.event(egui::Event::PointerMoved(pointer));
+        harness.event(egui::Event::PointerButton {
+            pos: pointer,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        assert!(harness.state());
     }
 
     #[test]
@@ -8643,6 +8736,72 @@ mod tests {
                 if bytes.len() == WORKSPACE_PROTOCOL_INPUT_MAX_BYTES
                     && bytes.last() == Some(&b'b')
         ));
+    }
+
+    #[test]
+    fn pending_resize_for_same_session_is_latest_only() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(7);
+
+        ui.queue_protocol_intent(RuntimeCommand::Resize {
+            session,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        ui.queue_protocol_intent(RuntimeCommand::Resize {
+            session,
+            cols: 120,
+            rows: 40,
+        })
+        .unwrap();
+
+        assert_eq!(ui.protocol_intents.len(), 1);
+        assert!(matches!(
+            &drain_protocol(&mut ui)[0],
+            RuntimeCommand::Resize {
+                session: queued_session,
+                cols: 120,
+                rows: 40,
+            } if *queued_session == session
+        ));
+    }
+
+    #[test]
+    fn automatic_resize_retries_silently_after_queue_pressure() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(99);
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(index as u64 + 1),
+                delta: 1,
+            })
+            .unwrap();
+        }
+
+        ui.queue_terminal_resize(session, 120, 40);
+
+        assert_eq!(ui.sent_sizes.get(&session), None);
+        assert_eq!(ui.error, None);
+        assert_eq!(ui.protocol_intents.len(), WORKSPACE_PROTOCOL_CAP);
+
+        let completed = ui.take_protocol_intent().expect("one queued command");
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: completed.operation(),
+            generation: completed.generation(),
+            result: Ok(()),
+        });
+        ui.queue_terminal_resize(session, 120, 40);
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(120, 40)));
+        assert!(ui.protocol_intents.iter().any(|intent| matches!(
+            &intent.command,
+            RuntimeCommand::Resize {
+                session: queued_session,
+                cols: 120,
+                rows: 40,
+            } if *queued_session == session
+        )));
     }
 
     #[test]

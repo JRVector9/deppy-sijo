@@ -184,6 +184,10 @@ pub struct UiConfig {
     pub session_name_style: SessionNameStyle,
     /// 다음 실행 때 다시 열 마지막 활성 workspace. 삭제되었거나 없으면 default workspace로 대체.
     pub last_workspace_id: Option<String>,
+    /// 워크스페이스 종료 전 확인 팝업. 기본 OFF라 메뉴 선택 즉시 세션을 종료하며,
+    /// 사용자가 명시적으로 ON한 경우에만 실행 중 세션 수를 보여주는 확인창을 띄운다.
+    #[serde(default)]
+    pub confirm_workspace_close: bool,
     /// 사이드바에서 「워크스페이스 종료」한 프로젝트 ID. 종료는 프로젝트 삭제가 아니므로
     /// DB 행은 보존하고, 사용자가 워크스페이스 선택기로 다시 열 때까지 목록에서 숨긴다.
     #[serde(default)]
@@ -265,6 +269,7 @@ impl Default for UiConfig {
             agent_send_presets: default_agent_send_presets(),
             session_name_style: SessionNameStyle::default(),
             last_workspace_id: None,
+            confirm_workspace_close: false,
             closed_workspace_ids: BTreeSet::new(),
             hidden_env_project_ids: BTreeSet::new(),
             ui_font: None,
@@ -383,7 +388,7 @@ pub struct PerformanceConfig {
 }
 
 fn default_max_cross_workspace_panes() -> u32 {
-    2
+    6
 }
 
 impl Default for PerformanceConfig {
@@ -765,9 +770,19 @@ mod tests {
     }
 
     #[test]
-    fn max_cross_workspace_panes_기본값은_2다() {
-        assert_eq!(PerformanceConfig::default().max_cross_workspace_panes, 2);
+    fn max_cross_workspace_panes_신규_기본값은_6이다() {
+        assert_eq!(PerformanceConfig::default().max_cross_workspace_panes, 6);
         let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.performance.max_cross_workspace_panes, 6);
+    }
+
+    #[test]
+    fn max_cross_workspace_panes_명시적_2_설정은_유지된다() {
+        let mut config: Config =
+            toml::from_str("[performance]\nmax_cross_workspace_panes = 2\n").unwrap();
+
+        config.normalize();
+
         assert_eq!(config.performance.max_cross_workspace_panes, 2);
     }
 
@@ -835,6 +850,17 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert!(!parsed.ui.file_tree_enabled);
+    }
+
+    #[test]
+    fn 워크스페이스_종료확인은_기본_off이고_roundtrip된다() {
+        let mut config = Config::default();
+        assert!(!config.ui.confirm_workspace_close);
+
+        config.ui.confirm_workspace_close = true;
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.ui.confirm_workspace_close);
     }
 
     #[test]

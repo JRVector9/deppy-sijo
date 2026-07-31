@@ -289,7 +289,6 @@ pub enum SidebarAction {
     OpenSettings,
     OpenHelp,
     ShowFocusedDiff,
-    ShowTerminal,
     OpenConnectors,
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
     OpenMacosFileAccessSettings,
@@ -347,8 +346,8 @@ pub enum SidebarAction {
         session: runtime::SessionId,
     },
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 워크스페이스 자체(경로·설정·DB
-    /// 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분). 실행 중 에이전트를 죽일 수
-    /// 있어 App이 확인 다이얼로그를 거친 뒤 수행한다.
+    /// 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분). 확인 다이얼로그 사용 여부는
+    /// App의 사용자 설정이 결정한다.
     CloseWorkspace(String),
     /// 워크스페이스 표시명(별칭) 편집 모달을 연다 — 실제 폴더/경로는 불변.
     /// 편집 자체는 App 소유 모달이 하고(현재 별칭 원본은 App만 안다), 여기서는
@@ -363,17 +362,24 @@ pub enum SidebarAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarTool {
     Files,
-    Search,
     Git,
-    Terminal,
     Mcp,
+}
+
+const SIDEBAR_TOOLS: [SidebarTool; 3] = [SidebarTool::Files, SidebarTool::Git, SidebarTool::Mcp];
+
+fn sidebar_tool_label_key(tool: SidebarTool) -> &'static str {
+    match tool {
+        SidebarTool::Files => "sidebar.tool.files",
+        SidebarTool::Git => "sidebar.tool.git",
+        SidebarTool::Mcp => "sidebar.tool.mcp",
+    }
 }
 
 fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
     match tool {
-        SidebarTool::Files | SidebarTool::Search => None,
+        SidebarTool::Files => None,
         SidebarTool::Git => Some(SidebarAction::ShowFocusedDiff),
-        SidebarTool::Terminal => Some(SidebarAction::ShowTerminal),
         SidebarTool::Mcp => Some(SidebarAction::OpenConnectors),
     }
 }
@@ -935,8 +941,6 @@ pub struct FileTreeUi {
     /// 가시 행 평탄화 캐시 — 펼침/접힘/조작 시에만 재계산(§3).
     flat: Vec<FlatRow>,
     show_hidden: bool,
-    file_search_open: bool,
-    file_search: String,
     /// 사이드바 접힘 (Panel 폭만 줄인다 — 상태/캐시는 유지).
     collapsed: bool,
     /// 내장 SidePanel 리사이저 대신 사용하는 폭. 내장 리사이저는 드래그 가이드선을
@@ -1033,8 +1037,6 @@ impl FileTreeUi {
             children: None,
             flat: Vec::new(),
             show_hidden: false,
-            file_search_open: false,
-            file_search: String::new(),
             collapsed: false,
             sidebar_width: 200.0,
             navigation_rail_width: crate::ui::designall::NAV_RAIL_WIDTH,
@@ -1540,8 +1542,6 @@ impl FileTreeUi {
         self.root_error = None;
         self.children = None;
         self.flat.clear();
-        self.file_search.clear();
-        self.file_search_open = false;
         self.error = None;
         self.inaccessible_paths.clear();
         self.edit = None;
@@ -2345,16 +2345,7 @@ impl FileTreeUi {
         let mut create_file = false;
         let (header_rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
-        let tabs = [
-            (SidebarTool::Files, catalog.t("sidebar.tool.files", &[])),
-            (SidebarTool::Search, catalog.t("sidebar.tool.search", &[])),
-            (SidebarTool::Git, catalog.t("sidebar.tool.git", &[])),
-            (
-                SidebarTool::Terminal,
-                catalog.t("sidebar.tool.terminal", &[]),
-            ),
-            (SidebarTool::Mcp, catalog.t("sidebar.tool.mcp", &[])),
-        ];
+        let tabs = SIDEBAR_TOOLS.map(|tool| (tool, catalog.t(sidebar_tool_label_key(tool), &[])));
         let tab_widths = tabs
             .iter()
             .map(|(_, label)| {
@@ -2439,16 +2430,11 @@ impl FileTreeUi {
                 egui::pos2(tab_left, header_rect.top()),
                 egui::vec2(width, header_rect.height()),
             );
-            let active = matches!(tool, SidebarTool::Files) && !self.file_search_open
-                || matches!(tool, SidebarTool::Search) && self.file_search_open;
+            let active = matches!(tool, SidebarTool::Files);
             if sidebar_tool_tab_at(ui, rect, label, active).clicked() {
                 match tool {
-                    SidebarTool::Files => {
-                        self.file_search_open = false;
-                        self.file_search.clear();
-                    }
-                    SidebarTool::Search => self.file_search_open = true,
-                    SidebarTool::Git | SidebarTool::Terminal | SidebarTool::Mcp => {
+                    SidebarTool::Files => {}
+                    SidebarTool::Git | SidebarTool::Mcp => {
                         action = sidebar_tool_action(*tool);
                     }
                 }
@@ -2461,20 +2447,6 @@ impl FileTreeUi {
             separator_y,
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
-
-        if self.file_search_open {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.file_search)
-                    .hint_text(catalog.t("file_tree.search_hint", &[]))
-                    .desired_width(f32::INFINITY)
-                    .margin(egui::Margin::symmetric(8, 5)),
-            );
-            response.request_focus();
-            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                self.file_search_open = false;
-                self.file_search.clear();
-            }
-        }
 
         let header_drop = ui.interact(
             header_rect,
@@ -2681,15 +2653,7 @@ impl FileTreeUi {
         // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
         // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
         let row_height = self.measured_row_height.unwrap_or(25.0);
-        let query = self.file_search.trim().to_lowercase();
-        let visible_rows: Vec<usize> = self
-            .flat
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| query.is_empty() || row.name.to_lowercase().contains(&query))
-            .map(|(index, _)| index)
-            .collect();
-        let total = visible_rows.len();
+        let total = self.flat.len();
         let mut toggle: Option<PathBuf> = None;
         let mut navigate_root: Option<PathBuf> = None;
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
@@ -2718,8 +2682,8 @@ impl FileTreeUi {
         let scroll_output = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
-                for index in &visible_rows[range] {
-                    let row = &self.flat[*index];
+                for index in range {
+                    let row = &self.flat[index];
                     let inaccessible = self.inaccessible_paths.contains(&row.path);
                     // 이름 변경 중인 행은 인라인 TextEdit로 대체 (FT-3, §9-8)
                     if let Some(EditState::Rename {
@@ -3913,7 +3877,7 @@ fn disclosure_chevron_points(center: egui::Pos2, expanded: bool) -> [egui::Pos2;
 }
 
 /// 워크스페이스 행 우클릭 메뉴 — 「이름 바꾸기」(별칭 편집)는 세션이 없어도 항상,
-/// 「워크스페이스 종료」(세션 일괄 닫기, 확인은 App)는 닫을 세션이 있는 비 Idle만.
+/// 「워크스페이스 종료」(세션 일괄 닫기, 선택적 확인은 App)는 닫을 세션이 있는 비 Idle만.
 fn workspace_context_menu(
     resp: &egui::Response,
     workspace: &SidebarWorkspaceEntry,
@@ -4309,7 +4273,7 @@ fn inactive_workspace_sessions(
                                 }
                             };
                         }
-                        if response.hovered()
+                        if ui.rect_contains_pointer(response.rect)
                             && can_open_session_beside(active_workspace_id, &entry.target)
                         {
                             let button_rect = egui::Rect::from_center_size(
@@ -6177,14 +6141,14 @@ mod tests {
 
     #[test]
     fn designall_사이드바도구는_기존기능으로만_연결된다() {
+        assert_eq!(
+            SIDEBAR_TOOLS,
+            [SidebarTool::Files, SidebarTool::Git, SidebarTool::Mcp]
+        );
         assert!(sidebar_tool_action(SidebarTool::Files).is_none());
         assert!(matches!(
             sidebar_tool_action(SidebarTool::Git),
             Some(SidebarAction::ShowFocusedDiff)
-        ));
-        assert!(matches!(
-            sidebar_tool_action(SidebarTool::Terminal),
-            Some(SidebarAction::ShowTerminal)
         ));
         assert!(matches!(
             sidebar_tool_action(SidebarTool::Mcp),
@@ -8285,6 +8249,180 @@ mod tests {
     }
 
     #[test]
+    fn kittest_warm_세션행_hover_오른쪽열기가_정확한_대상을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "workspace-b".to_owned(),
+            name: "Workspace B".to_owned(),
+            state: SidebarWorkspaceState::Warm,
+            summary: SidebarSessionSummary::default(),
+        };
+        let entry = SidebarSessionRow::from_live(
+            "workspace-b",
+            7,
+            SessionEntry {
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: Some(runtime::SessionId(42)),
+                title: "Session B".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: false,
+                in_worktree: false,
+                status_line: None,
+            },
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(360.0, 160.0))
+            .build_ui_state(
+                |ui, state: &mut (Option<SidebarAction>, bool)| {
+                    if !state.1 {
+                        return;
+                    }
+                    let (next_action, _) = inactive_workspace_sessions(
+                        ui,
+                        &workspace,
+                        "workspace-a",
+                        std::slice::from_ref(&entry),
+                        120.0,
+                        egui::Color32::LIGHT_BLUE,
+                        &catalog,
+                    );
+                    if next_action.is_some() {
+                        state.0 = next_action;
+                    }
+                },
+                (None, false),
+            );
+        let font_config = crate::config::Config::default();
+        crate::fonts::install_cjk_fallback(
+            &harness.ctx,
+            None,
+            &font_config.terminal.mono_font,
+            &font_config.terminal.mono_weight,
+        );
+        harness.state_mut().1 = true;
+
+        harness.run();
+        let row_rect = harness.get_by_label("Session B").rect();
+        harness.hover_at(row_rect.center());
+        harness.run();
+        harness.get_by_label("↗").click();
+        harness.run();
+
+        match &harness.state().0 {
+            Some(SidebarAction::OpenSessionBeside(SessionRowTarget::Live {
+                workspace_id,
+                runtime_instance,
+                tab,
+                pane,
+                session,
+            })) => {
+                assert_eq!(workspace_id, "workspace-b");
+                assert_eq!(*runtime_instance, 7);
+                assert_eq!(tab.0, "tab-b");
+                assert_eq!(pane.0, "pane-b");
+                assert_eq!(*session, runtime::SessionId(42));
+            }
+            Some(SidebarAction::FocusSession { .. }) => {
+                panic!("hover 오른쪽 열기 클릭을 세션 행 클릭이 탈취함")
+            }
+            None => panic!("hover 오른쪽 열기 클릭이 액션을 내지 않음"),
+            _ => panic!("hover 오른쪽 열기가 다른 액션을 냄"),
+        }
+    }
+
+    #[test]
+    fn kittest_warm_세션행_drag가_정확한_payload를_시작한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "workspace-b".to_owned(),
+            name: "Workspace B".to_owned(),
+            state: SidebarWorkspaceState::Warm,
+            summary: SidebarSessionSummary::default(),
+        };
+        let entry = SidebarSessionRow::from_live(
+            "workspace-b",
+            7,
+            SessionEntry {
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: Some(runtime::SessionId(42)),
+                title: "Session B".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: false,
+                in_worktree: false,
+                status_line: None,
+            },
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(360.0, 160.0))
+            .build_ui_state(
+                |ui, fonts_ready: &mut bool| {
+                    if !*fonts_ready {
+                        return;
+                    }
+                    let _ = inactive_workspace_sessions(
+                        ui,
+                        &workspace,
+                        "workspace-a",
+                        std::slice::from_ref(&entry),
+                        120.0,
+                        egui::Color32::LIGHT_BLUE,
+                        &catalog,
+                    );
+                },
+                false,
+            );
+        let font_config = crate::config::Config::default();
+        crate::fonts::install_cjk_fallback(
+            &harness.ctx,
+            None,
+            &font_config.terminal.mono_font,
+            &font_config.terminal.mono_weight,
+        );
+        *harness.state_mut() = true;
+
+        harness.run();
+        let row_rect = harness.get_by_label("Session B").rect();
+        harness.hover_at(row_rect.center());
+        harness.drag_at(row_rect.center());
+        harness.run();
+        harness.hover_at(row_rect.center() + egui::vec2(20.0, 0.0));
+        harness.run();
+
+        let payload = egui::DragAndDrop::payload::<SessionRowDragPayload>(&harness.ctx)
+            .expect("session row drag payload");
+        assert_eq!(
+            payload.target(),
+            &SessionRowTarget::Live {
+                workspace_id: "workspace-b".to_owned(),
+                runtime_instance: 7,
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: runtime::SessionId(42),
+            }
+        );
+    }
+
+    #[test]
     fn kittest_warm_세션의_오른쪽열기_메뉴가_정확한_대상을_낸다() {
         use egui_kittest::kittest::Queryable;
 
@@ -8670,6 +8808,23 @@ mod tests {
 
         assert!((navigation.size().x - crate::ui::designall::NAV_RAIL_WIDTH).abs() < 0.1);
         assert!(project.size().x >= 40.0);
+    }
+
+    #[test]
+    fn kittest_파일헤더는_파일_git_mcp탭만_표시한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let tree = FileTreeUi::new(egui::Context::default());
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+
+        assert!(harness.query_by_label("Files").is_some());
+        assert!(harness.query_by_label("Git").is_some());
+        assert!(harness.query_by_label("MCP").is_some());
+        assert!(harness.query_by_label("Search").is_none());
+        assert!(harness.query_by_label("Terminal").is_none());
     }
 
     #[test]

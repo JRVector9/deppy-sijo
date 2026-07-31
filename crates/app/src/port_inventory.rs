@@ -80,7 +80,7 @@ mod tests {
         let runner = RecordingCommandRunner::new([
             b"p41\ncnode\nn*:3000\n".to_vec(),
             b"p41\nn/tmp/project\n".to_vec(),
-            b"41 Thu Jul 31 12:00:00 2026 /usr/bin/node server.js\n".to_vec(),
+            b"41 /usr/bin/node server.js\n".to_vec(),
         ]);
 
         run_lsof_with(&runner, Duration::from_millis(10)).unwrap();
@@ -91,6 +91,23 @@ mod tests {
             runner.programs(),
             [TRUSTED_LSOF_PATH, TRUSTED_LSOF_PATH, TRUSTED_PS_PATH]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_birth_token_distinguishes_same_second_reuse() {
+        let original = encode_process_birth_identity(1_722_424_800, 41);
+        let replacement = encode_process_birth_identity(1_722_424_800, 42);
+
+        assert_ne!(original, replacement);
+        assert_eq!(original.len(), PROCESS_BIRTH_TOKEN_LEN);
+        assert_eq!(replacement.len(), PROCESS_BIRTH_TOKEN_LEN);
+        let live = query_process_birth_with_operation(
+            std::process::id(),
+            &OperationContext::new(Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert_eq!(live.len(), PROCESS_BIRTH_TOKEN_LEN);
     }
 
     #[cfg(target_os = "macos")]
@@ -138,6 +155,21 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn clean_parent_descendant_cannot_hold_reader_join_past_deadline() {
+        let _process_guard = test_process_guard();
+        reset_test_process_group();
+        let before = test_reader_thread_count();
+        let operation = OperationContext::new(Duration::from_millis(120));
+        let started = std::time::Instant::now();
+
+        assert!(run_test_clean_parent_descendant(&operation, Duration::from_millis(900)).is_ok());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(wait_until_process_group_is_gone(Duration::from_secs(1)));
+        assert_eq!(test_reader_thread_count(), before);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn dropping_inventory_worker_cancels_and_reaps_active_process_group() {
         let _process_guard = test_process_guard();
         reset_test_process_group();
@@ -155,6 +187,30 @@ mod tests {
         drop(worker);
 
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(wait_until_process_group_is_gone(Duration::from_secs(1)));
+        assert_eq!(test_reader_thread_count(), before);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dropping_worker_does_not_wait_for_clean_parent_descendant_pipes() {
+        let _process_guard = test_process_guard();
+        reset_test_process_group();
+        let before = test_reader_thread_count();
+        let mut worker = test_clean_parent_descendant_worker(Duration::from_millis(900));
+        worker
+            .try_request(PortJob::Scan {
+                generation: 1,
+                roots: Arc::from([]),
+            })
+            .unwrap();
+        assert!(wait_until_test_process_group_starts(Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = std::time::Instant::now();
+        drop(worker);
+
+        assert!(started.elapsed() < Duration::from_millis(500));
         assert!(wait_until_process_group_is_gone(Duration::from_secs(1)));
         assert_eq!(test_reader_thread_count(), before);
     }
@@ -203,13 +259,15 @@ mod tests {
     #[test]
     fn terminate_rejects_reused_pid_with_changed_birth_identity() {
         let mut reused = row_fixture("ws-a", 77, 3000, PortOwnership::Workspace);
-        reused.process_started_at = Arc::from("birth-b");
+        reused.process_started_at = encode_process_birth_identity(1_722_424_800, 42);
+        let mut target = termination_fixture("ws-a", 77, 3000);
+        target.process_started_at = encode_process_birth_identity(1_722_424_800, 41);
         let scanner = FakeScanner::new([Ok(vec![reused])]);
         let signaler = FakeSignaler::default();
         let mut backend = PortBackend::new(scanner, signaler, u32::MAX);
 
         assert_eq!(
-            backend.terminate(termination_fixture("ws-a", 77, 3000)),
+            backend.terminate(target),
             Err(PortErrorCode::OwnershipChanged)
         );
         assert!(backend.signaler().signals().is_empty());
@@ -451,6 +509,7 @@ const PORT_WORKER_IDLE_TTL: Duration = Duration::from_secs(30);
 const TRUSTED_LSOF_PATH: &str = "/usr/sbin/lsof";
 const TRUSTED_PS_PATH: &str = "/bin/ps";
 const COMMAND_PATH_TOKEN_MAX: usize = 64;
+const PROCESS_BIRTH_TOKEN_LEN: usize = 32;
 
 #[cfg(target_os = "macos")]
 const TERMINATE_SIGNAL: i32 = libc::SIGTERM;
@@ -505,6 +564,12 @@ impl OperationContext {
         self.check()?;
         Ok(self.deadline.saturating_duration_since(Instant::now()))
     }
+}
+
+fn encode_process_birth_identity(seconds: u64, microseconds: u64) -> Arc<str> {
+    let encoded = format!("{seconds:016x}{microseconds:016x}");
+    debug_assert_eq!(encoded.len(), PROCESS_BIRTH_TOKEN_LEN);
+    Arc::from(encoded)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -864,7 +929,7 @@ impl PortScanner for SystemPortScanner {
         pid: u32,
         operation: &OperationContext,
     ) -> Result<Arc<str>, PortErrorCode> {
-        query_process_birth_with_operation(&SystemCommandRunner, pid, operation)
+        query_process_birth_with_operation(pid, operation)
     }
 }
 
@@ -909,11 +974,13 @@ fn scan_local_ports(
         let mut rows = parse_lsof_fields(&output)?;
         let pids = admitted_pids(&rows);
         let cwd_by_pid = query_cwds_with_operation(&runner, &pids, operation)?;
+        let birth_by_pid = query_process_births(&pids, operation)?;
         let process_by_pid = query_processes_with_operation(&runner, &pids, operation)?;
         classify_rows(
             &mut rows,
             roots,
             &cwd_by_pid,
+            &birth_by_pid,
             &process_by_pid,
             std::process::id(),
         );
@@ -933,6 +1000,7 @@ fn classify_rows(
     rows: &mut [PortRow],
     roots: &[NormalizedRoot],
     cwd_by_pid: &HashMap<u32, PathBuf>,
+    birth_by_pid: &HashMap<u32, Arc<str>>,
     process_by_pid: &HashMap<u32, ProcessInfo>,
     protected_pid: u32,
 ) {
@@ -943,6 +1011,7 @@ fn classify_rows(
                 row,
                 roots,
                 cwd_by_pid.get(&row.pid),
+                birth_by_pid.get(&row.pid),
                 process_by_pid.get(&row.pid),
                 protected_pid,
             )
@@ -963,11 +1032,11 @@ fn classify_pid(
     row: &PortRow,
     roots: &[NormalizedRoot],
     cwd: Option<&PathBuf>,
+    process_birth: Option<&Arc<str>>,
     process: Option<&ProcessInfo>,
     protected_pid: u32,
 ) -> PidClassification {
-    let process_started_at =
-        process.map_or_else(|| Arc::from(""), |process| Arc::clone(&process.started_at));
+    let process_started_at = process_birth.map_or_else(|| Arc::from(""), Arc::clone);
     let command = process.map(|process| process.command.as_str());
     if row.pid == protected_pid
         || is_protected_agent_command(&row.process)
@@ -1046,7 +1115,6 @@ fn query_cwds_with_operation(
 }
 
 struct ProcessInfo {
-    started_at: Arc<str>,
     command: String,
 }
 
@@ -1072,8 +1140,6 @@ fn query_processes_with_operation(
         "-o".to_owned(),
         "pid=".to_owned(),
         "-o".to_owned(),
-        "lstart=".to_owned(),
-        "-o".to_owned(),
         "command=".to_owned(),
     ];
     let output = checked_output(runner.run(TRUSTED_PS_PATH, &args, operation)?)?;
@@ -1084,14 +1150,9 @@ fn query_processes_with_operation(
         let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
             continue;
         };
-        let started_at = fields.by_ref().take(5).collect::<Vec<_>>();
-        if started_at.len() != 5 {
-            continue;
-        }
         processes.insert(
             pid,
             ProcessInfo {
-                started_at: Arc::from(started_at.join(" ")),
                 command: fields
                     .take(COMMAND_PATH_TOKEN_MAX)
                     .collect::<Vec<_>>()
@@ -1102,20 +1163,68 @@ fn query_processes_with_operation(
     Ok(processes)
 }
 
-fn query_process_birth(runner: &impl CommandRunner, pid: u32) -> Result<Arc<str>, PortErrorCode> {
-    let operation = OperationContext::new(PORT_COMMAND_TIMEOUT);
-    query_process_birth_with_operation(runner, pid, &operation)
-}
-
 fn query_process_birth_with_operation(
-    runner: &impl CommandRunner,
     pid: u32,
     operation: &OperationContext,
 ) -> Result<Arc<str>, PortErrorCode> {
-    query_processes_with_operation(runner, &[pid], operation)?
-        .remove(&pid)
-        .map(|process| process.started_at)
-        .ok_or(PortErrorCode::OwnershipChanged)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, operation);
+        return Err(PortErrorCode::UnsupportedPlatform);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        operation.check()?;
+        let pid = i32::try_from(pid).map_err(|_| PortErrorCode::OwnershipChanged)?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .map_err(|_| PortErrorCode::OwnershipChanged)?;
+        // SAFETY: `info` is a correctly sized writable `proc_bsdinfo` buffer. The PID and fixed
+        // flavor are range checked, and the buffer is initialized only after an exact-size return.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read != size {
+            return Err(PortErrorCode::OwnershipChanged);
+        }
+        // SAFETY: the exact-size `proc_pidinfo` result above initialized the complete structure.
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pid != pid as u32
+            || info.pbi_start_tvsec == 0
+            || info.pbi_start_tvusec >= 1_000_000
+        {
+            return Err(PortErrorCode::OwnershipChanged);
+        }
+        operation.check()?;
+        Ok(encode_process_birth_identity(
+            info.pbi_start_tvsec,
+            info.pbi_start_tvusec,
+        ))
+    }
+}
+
+fn query_process_births(
+    pids: &[u32],
+    operation: &OperationContext,
+) -> Result<HashMap<u32, Arc<str>>, PortErrorCode> {
+    let mut births = HashMap::with_capacity(pids.len());
+    for pid in pids {
+        match query_process_birth_with_operation(*pid, operation) {
+            Ok(identity) => {
+                births.insert(*pid, identity);
+            }
+            Err(PortErrorCode::OwnershipChanged) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(births)
 }
 
 fn join_pids(pids: &[u32]) -> String {
@@ -1488,14 +1597,17 @@ fn run_system_command_with_operation(
     };
     let mut terminal_error = None;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if overflow.load(Ordering::Acquire) => {
-                terminal_error = Some(PortErrorCode::OutputTooLarge);
+        if overflow.load(Ordering::Acquire) {
+            terminal_error = Some(PortErrorCode::OutputTooLarge);
+            kill_process_group(pid);
+            break child.wait().map_err(|_| PortErrorCode::Io);
+        }
+        match observe_child_exit_without_reaping(pid) {
+            Ok(true) => {
                 kill_process_group(pid);
                 break child.wait().map_err(|_| PortErrorCode::Io);
             }
-            Ok(None) => match operation.remaining() {
+            Ok(false) => match operation.remaining() {
                 Ok(remaining) => std::thread::sleep(remaining.min(Duration::from_millis(10))),
                 Err(error) => {
                     terminal_error = Some(error);
@@ -1503,10 +1615,11 @@ fn run_system_command_with_operation(
                     break child.wait().map_err(|_| PortErrorCode::Io);
                 }
             },
-            Err(_) => {
+            Err(error) => {
+                terminal_error = Some(error);
                 kill_process_group(pid);
                 let _ = child.wait();
-                break Err(PortErrorCode::Io);
+                break Err(error);
             }
         }
     };
@@ -1522,6 +1635,29 @@ fn run_system_command_with_operation(
         overflow: overflow.load(Ordering::Acquire),
         success: status.success(),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn observe_child_exit_without_reaping(pid: u32) -> Result<bool, PortErrorCode> {
+    let pid = i32::try_from(pid).map_err(|_| PortErrorCode::Io)?;
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: `info` is a valid writable siginfo buffer. `WNOWAIT` keeps the exact child zombie
+    // owned by this process, preventing PID/process-group reuse until `Child::wait` reaps it.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(PortErrorCode::Io);
+    }
+    // SAFETY: successful `waitid` initialized `info`; with `WNOHANG`, `si_pid == 0` means no
+    // matching state change, while this exact PID means the still-unreaped child exited.
+    let observed_pid = unsafe { info.assume_init().si_pid() };
+    Ok(observed_pid == pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -1653,6 +1789,15 @@ fn run_test_overflowing_command(operation: &OperationContext) -> Result<(), Port
 }
 
 #[cfg(all(test, target_os = "macos"))]
+fn run_test_clean_parent_descendant(
+    operation: &OperationContext,
+    descendant_lifetime: Duration,
+) -> Result<(), PortErrorCode> {
+    let command = format!("sleep {:.3} & exit 0", descendant_lifetime.as_secs_f64());
+    run_system_command_with_operation("/bin/sh", &["-c".to_owned(), command], operation).map(|_| ())
+}
+
+#[cfg(all(test, target_os = "macos"))]
 fn test_hanging_inventory_worker() -> PortInventoryWorker {
     let cancellation = Arc::new(AtomicBool::new(false));
     let executor_cancellation = Arc::clone(&cancellation);
@@ -1672,6 +1817,33 @@ fn test_hanging_inventory_worker() -> PortInventoryWorker {
                     &operation,
                 )
                 .map(|_| snapshot(1, Vec::new()));
+                PortOutcome::Scanned(result)
+            }
+        },
+        || {},
+    );
+    PortInventoryWorker {
+        inner: Some(inner),
+        cancellation,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn test_clean_parent_descendant_worker(descendant_lifetime: Duration) -> PortInventoryWorker {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let executor_cancellation = Arc::clone(&cancellation);
+    let inner = LazyBoundedWorker::new(
+        "port-descendant-test",
+        PORT_WORKER_IDLE_TTL,
+        move || {
+            let cancellation = Arc::clone(&executor_cancellation);
+            move |_job| {
+                let operation = OperationContext::with_cancellation(
+                    Duration::from_secs(30),
+                    Arc::clone(&cancellation),
+                );
+                let result = run_test_clean_parent_descendant(&operation, descendant_lifetime)
+                    .map(|_| snapshot(1, Vec::new()));
                 PortOutcome::Scanned(result)
             }
         },

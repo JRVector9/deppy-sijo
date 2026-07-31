@@ -1,4 +1,6 @@
-use super::activity::{ActivitySessionRow, ActivityWorkspaceRow, ActivityWorkspaceState};
+use super::activity::{
+    ActivityMetricAvailability, ActivitySessionRow, ActivityWorkspaceRow, ActivityWorkspaceState,
+};
 use super::format_bytes;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -61,33 +63,38 @@ impl ResourceManagerUi {
         self.set_open(!self.open);
     }
 
-    pub(crate) fn take_open_intent(&mut self) -> Option<ResourceManagerIntent> {
-        None
-    }
-
     pub(crate) fn contents(
         &mut self,
         ui: &mut egui::Ui,
         rows: &[ActivityWorkspaceRow],
         unattached_counts: &HashMap<String, u16>,
         now_ms: u64,
+        catalog: &i18n::Catalog,
     ) -> Option<ResourceManagerIntent> {
         ui.set_min_width(RESOURCE_POPOVER_WIDTH);
         let mut intent = None;
         ui.horizontal(|ui| {
-            ui.heading("리소스 관리자");
+            ui.heading(catalog.t("resource_manager.title", &[]));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("새로고침").clicked() {
+                if ui
+                    .button(catalog.t("resource_manager.refresh", &[]))
+                    .clicked()
+                {
                     intent = Some(ResourceManagerIntent::Refresh);
                 }
             });
         });
         ui.add_space(4.0);
-        ui.weak("앱과 세션의 최근 로컬 샘플입니다. 원격 측정값은 — 로 표시합니다.");
+        ui.weak(catalog.t("resource_manager.description", &[]));
         ui.separator();
 
         let app = app_totals(rows);
-        resource_heading(ui, "Deppy Sijo", app.metrics(), app.age_text(now_ms));
+        resource_heading(
+            ui,
+            &catalog.t("resource_manager.app_name", &[]),
+            app.metrics(catalog),
+            app.age_text(now_ms, catalog),
+        );
         self.expanded.retain(|id| {
             rows.iter()
                 .any(|row| row.workspace_id.as_ref() == id.as_ref())
@@ -112,18 +119,22 @@ impl ResourceManagerUi {
                             .unwrap_or(0),
                         now_ms,
                         &mut intent,
+                        catalog,
                     );
                 }
                 if rows.is_empty() {
-                    ui.weak("표시할 워크스페이스가 없습니다.");
+                    ui.weak(catalog.t("resource_manager.empty", &[]));
                 }
             });
 
         ui.separator();
-        if ui.button("연결되지 않은 세션 검토").clicked() {
+        if ui
+            .button(catalog.t("resource_manager.inspect_unattached", &[]))
+            .clicked()
+        {
             intent = Some(ResourceManagerIntent::InspectUnattached);
         }
-        self.render_confirmation(ui, &mut intent);
+        self.render_confirmation(ui, &mut intent, catalog);
         intent
     }
 
@@ -134,30 +145,40 @@ impl ResourceManagerUi {
         unattached_count: u16,
         now_ms: u64,
         intent: &mut Option<ResourceManagerIntent>,
+        catalog: &i18n::Catalog,
     ) {
         if self.known_workspaces.insert(Arc::clone(&row.workspace_id)) {
             self.expanded.insert(Arc::clone(&row.workspace_id));
         }
         let expanded = self.expanded.contains(row.workspace_id.as_ref());
         let state = match row.state {
-            ActivityWorkspaceState::Active => "활성",
-            ActivityWorkspaceState::Warm => "대기",
-            ActivityWorkspaceState::Idle => "비활성",
+            ActivityWorkspaceState::Active => catalog.t("resource_manager.state.active", &[]),
+            ActivityWorkspaceState::Warm => catalog.t("resource_manager.state.warm", &[]),
+            ActivityWorkspaceState::Idle => catalog.t("resource_manager.state.idle", &[]),
         };
         egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(4, 7))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let marker = if expanded { "▾" } else { "▸" };
-                    let response = ui.add(
-                        egui::Button::new(
-                            egui::RichText::new(format!("{marker} {}", row.name)).strong(),
-                        )
-                        .frame(false),
+                    let response = ui.add(egui::Button::new(marker).frame(false));
+                    let disclosure_label = catalog.t(
+                        if expanded {
+                            "resource_manager.workspace_collapse"
+                        } else {
+                            "resource_manager.workspace_expand"
+                        },
+                        &[("workspace", row.name.as_ref())],
                     );
                     response.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, row.name.as_ref())
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::Button,
+                            ui.is_enabled(),
+                            expanded,
+                            &disclosure_label,
+                        )
                     });
+                    ui.label(egui::RichText::new(row.name.as_ref()).strong());
                     if response.clicked() {
                         if expanded {
                             self.expanded.remove(row.workspace_id.as_ref());
@@ -167,15 +188,21 @@ impl ResourceManagerUi {
                     }
                     ui.weak(state);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak(workspace_age(row, now_ms));
-                        ui.label(workspace_metrics(row));
+                        let (metrics, age) = workspace_metric_display(row, now_ms, catalog);
+                        if !age.is_empty() {
+                            ui.weak(age);
+                        }
+                        ui.label(metrics);
                     });
                 });
 
                 if expanded {
                     if let Some(pressure) = &row.input_pressure {
                         ui.indent(("workspace_pressure", row.workspace_id.as_ref()), |ui| {
-                            ui.colored_label(ui.visuals().warn_fg_color, pressure_text(pressure));
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                pressure_text(pressure, catalog),
+                            );
                         });
                     }
                     if unattached_count > 0 {
@@ -183,9 +210,28 @@ impl ResourceManagerUi {
                             ui.horizontal(|ui| {
                                 ui.colored_label(
                                     ui.visuals().warn_fg_color,
-                                    format!("연결되지 않은 세션 {unattached_count}개"),
+                                    catalog.t(
+                                        "resource_manager.unattached_count",
+                                        &[("count", &unattached_count.to_string())],
+                                    ),
                                 );
-                                if ui.button("종료 검토").clicked() {
+                                let accessible = catalog.t(
+                                    "resource_manager.review_unattached_for",
+                                    &[
+                                        ("workspace", row.name.as_ref()),
+                                        ("count", &unattached_count.to_string()),
+                                    ],
+                                );
+                                let response =
+                                    ui.button(catalog.t("resource_manager.kill_unattached", &[]));
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        ui.is_enabled(),
+                                        &accessible,
+                                    )
+                                });
+                                if response.clicked() {
                                     self.confirm = Some(ResourceConfirm::Unattached {
                                         workspace_id: Arc::clone(&row.workspace_id),
                                         workspace_name: Arc::clone(&row.name),
@@ -196,7 +242,7 @@ impl ResourceManagerUi {
                         });
                     }
                     for session in row.sessions.iter() {
-                        self.render_session(ui, row, session, now_ms, intent);
+                        self.render_session(ui, row, session, now_ms, intent, catalog);
                     }
                 }
             });
@@ -210,6 +256,7 @@ impl ResourceManagerUi {
         session: &ActivitySessionRow,
         now_ms: u64,
         intent: &mut Option<ResourceManagerIntent>,
+        catalog: &i18n::Catalog,
     ) {
         ui.indent(
             (
@@ -221,36 +268,62 @@ impl ResourceManagerUi {
                 ui.horizontal(|ui| {
                     ui.label(session.name.as_ref());
                     if session.storm {
-                        ui.colored_label(ui.visuals().error_fg_color, "프로세스 급증");
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            catalog.t("resource_manager.storm", &[]),
+                        );
                     }
                     if let Some(pressure) = &session.pressure {
-                        ui.colored_label(ui.visuals().warn_fg_color, pressure_text(pressure));
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            pressure_text(pressure, catalog),
+                        );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(session_id) = session.session {
-                            if ui.button("종료").clicked() {
+                            let kill_accessible = catalog.t(
+                                "resource_manager.kill_session_accessible",
+                                &[("session", session.name.as_ref())],
+                            );
+                            let kill = ui.button(catalog.t("resource_manager.kill_session", &[]));
+                            kill.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    ui.is_enabled(),
+                                    &kill_accessible,
+                                )
+                            });
+                            if kill.clicked() {
                                 self.confirm = Some(ResourceConfirm::Session {
                                     workspace_id: Arc::clone(&workspace.workspace_id),
                                     session: session_id,
                                     session_name: Arc::clone(&session.name),
                                 });
                             }
-                            if ui.button("이동").clicked() {
+                            let focus_accessible = catalog.t(
+                                "resource_manager.focus_session_accessible",
+                                &[("session", session.name.as_ref())],
+                            );
+                            let focus = ui.button(catalog.t("resource_manager.focus_session", &[]));
+                            focus.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    ui.is_enabled(),
+                                    &focus_accessible,
+                                )
+                            });
+                            if focus.clicked() {
                                 *intent = Some(ResourceManagerIntent::FocusSession {
                                     workspace_id: Arc::clone(&workspace.workspace_id),
                                     session: session_id,
                                 });
                             }
                         }
-                        match &session.resource {
-                            Some(resource) => {
-                                ui.weak(sample_age(resource.sampled_at_ms, now_ms));
-                                ui.label(session_metrics(resource));
-                            }
-                            None => {
-                                ui.label("—");
-                            }
+                        let (metrics, age) = session_metric_display(session, now_ms, catalog);
+                        if !age.is_empty() {
+                            ui.weak(age);
                         }
+                        ui.label(metrics);
                     });
                 });
             },
@@ -261,6 +334,7 @@ impl ResourceManagerUi {
         &mut self,
         ui: &mut egui::Ui,
         intent: &mut Option<ResourceManagerIntent>,
+        catalog: &i18n::Catalog,
     ) {
         let Some(confirm) = self.confirm.clone() else {
             return;
@@ -271,14 +345,24 @@ impl ResourceManagerUi {
                 workspace_name,
                 count,
                 ..
-            } => format!("{workspace_name}의 연결되지 않은 세션 {count}개를 종료할까요?"),
-            ResourceConfirm::Session { session_name, .. } => {
-                format!("{session_name} 세션을 종료할까요?")
-            }
+            } => catalog.t(
+                "resource_manager.confirm_unattached",
+                &[
+                    ("workspace", workspace_name.as_ref()),
+                    ("count", &count.to_string()),
+                ],
+            ),
+            ResourceConfirm::Session { session_name, .. } => catalog.t(
+                "resource_manager.confirm_session",
+                &[("session", session_name.as_ref())],
+            ),
         };
         ui.colored_label(ui.visuals().warn_fg_color, message);
         ui.horizontal(|ui| {
-            if ui.button("종료 확인").clicked() {
+            if ui
+                .button(catalog.t("resource_manager.confirm_accept", &[]))
+                .clicked()
+            {
                 *intent = Some(match confirm {
                     ResourceConfirm::Unattached { workspace_id, .. } => {
                         ResourceManagerIntent::KillUnattached { workspace_id }
@@ -294,7 +378,10 @@ impl ResourceManagerUi {
                 });
                 self.confirm = None;
             }
-            if ui.button("취소").clicked() {
+            if ui
+                .button(catalog.t("resource_manager.cancel", &[]))
+                .clicked()
+            {
                 self.confirm = None;
             }
         });
@@ -311,21 +398,24 @@ struct AppTotals {
 }
 
 impl AppTotals {
-    fn metrics(&self) -> String {
+    fn metrics(&self, catalog: &i18n::Catalog) -> String {
         let cpu = if self.cpu_seen {
             format!("{:.1}%", self.cpu_percent)
         } else {
             "—".to_owned()
         };
-        format!(
-            "CPU {cpu} · 메모리 {} · 프로세스 {}",
-            format_bytes(self.rss_bytes),
-            self.process_count
+        catalog.t(
+            "resource_manager.metric_app",
+            &[
+                ("cpu", &cpu),
+                ("memory", &format_bytes(self.rss_bytes)),
+                ("processes", &self.process_count.to_string()),
+            ],
         )
     }
 
-    fn age_text(&self, now_ms: u64) -> String {
-        sample_age(self.sampled_at_ms, now_ms)
+    fn age_text(&self, now_ms: u64, catalog: &i18n::Catalog) -> String {
+        sample_age(self.sampled_at_ms, now_ms, catalog)
     }
 }
 
@@ -375,62 +465,125 @@ fn resource_heading(ui: &mut egui::Ui, name: &str, metrics: String, age: String)
     });
 }
 
-fn workspace_metrics(row: &ActivityWorkspaceRow) -> String {
-    let Some(resource) = row.resource else {
-        return "—".to_owned();
-    };
-    let cpu = resource
-        .cpu_percent
+fn workspace_metric_display(
+    row: &ActivityWorkspaceRow,
+    now_ms: u64,
+    catalog: &i18n::Catalog,
+) -> (String, String) {
+    match row.metric_availability {
+        ActivityMetricAvailability::Pending => {
+            return (
+                catalog.t("resource_manager.metric_pending", &[]),
+                String::new(),
+            );
+        }
+        ActivityMetricAvailability::RemoteUnavailable => {
+            return (
+                catalog.t("resource_manager.remote_unavailable", &[]),
+                String::new(),
+            );
+        }
+        ActivityMetricAvailability::Local => {}
+    }
+    let cpu = row
+        .resource
+        .and_then(|resource| resource.cpu_percent)
         .map(|value| format!("{value:.1}%"))
         .unwrap_or_else(|| "—".to_owned());
     let session_rss = row
         .session_resources
         .iter()
         .fold(0u64, |sum, usage| sum.saturating_add(usage.rss_bytes));
-    format!(
-        "CPU {cpu} · 앱 {} · 세션 {}",
-        format_bytes(resource.rss_bytes),
-        format_bytes(session_rss)
+    let app = format_bytes(row.resource.map_or(0, |resource| resource.rss_bytes));
+    let sessions = format_bytes(session_rss);
+    (
+        catalog.t(
+            "resource_manager.metric_workspace",
+            &[("cpu", &cpu), ("app", &app), ("sessions", &sessions)],
+        ),
+        workspace_age(row, now_ms, catalog),
     )
 }
 
-fn workspace_age(row: &ActivityWorkspaceRow, now_ms: u64) -> String {
+fn workspace_age(row: &ActivityWorkspaceRow, now_ms: u64, catalog: &i18n::Catalog) -> String {
     let sampled_at_ms = row.session_resources.iter().fold(
         row.resource.map_or(0, |resource| resource.sampled_at_ms),
         |age, usage| age.max(usage.sampled_at_ms),
     );
-    sample_age(sampled_at_ms, now_ms)
+    sample_age(sampled_at_ms, now_ms, catalog)
 }
 
-fn session_metrics(resource: &runtime::SessionResourceUsage) -> String {
+fn session_metric_display(
+    session: &ActivitySessionRow,
+    now_ms: u64,
+    catalog: &i18n::Catalog,
+) -> (String, String) {
+    match session.metric_availability {
+        ActivityMetricAvailability::Pending => {
+            return (
+                catalog.t("resource_manager.metric_pending", &[]),
+                String::new(),
+            );
+        }
+        ActivityMetricAvailability::RemoteUnavailable => {
+            return (
+                catalog.t("resource_manager.remote_unavailable", &[]),
+                String::new(),
+            );
+        }
+        ActivityMetricAvailability::Local => {}
+    }
+    let Some(resource) = &session.resource else {
+        return (
+            catalog.t("resource_manager.metric_pending", &[]),
+            String::new(),
+        );
+    };
     let cpu = resource
         .cpu_percent
         .map(|value| format!("{value:.1}%"))
         .unwrap_or_else(|| "—".to_owned());
-    format!(
-        "CPU {cpu} · {} · {}p",
-        format_bytes(resource.rss_bytes),
-        resource.process_count
+    let memory = format_bytes(resource.rss_bytes);
+    (
+        catalog.t(
+            "resource_manager.metric_session",
+            &[
+                ("cpu", &cpu),
+                ("memory", &memory),
+                ("processes", &resource.process_count.to_string()),
+            ],
+        ),
+        sample_age(resource.sampled_at_ms, now_ms, catalog),
     )
 }
 
-fn sample_age(sampled_at_ms: u64, now_ms: u64) -> String {
+fn sample_age(sampled_at_ms: u64, now_ms: u64, catalog: &i18n::Catalog) -> String {
     if sampled_at_ms == 0 || now_ms == 0 || sampled_at_ms > now_ms {
-        return "—".to_owned();
+        return catalog.t("resource_manager.age_pending", &[]);
     }
     let seconds = now_ms.saturating_sub(sampled_at_ms) / 1_000;
     if seconds == 0 {
-        "방금".to_owned()
+        catalog.t("resource_manager.age_now", &[])
+    } else if seconds >= 10 {
+        catalog.t(
+            "resource_manager.age_stale",
+            &[("seconds", &seconds.to_string())],
+        )
     } else {
-        format!("{seconds}초 전")
+        catalog.t(
+            "resource_manager.age_seconds",
+            &[("seconds", &seconds.to_string())],
+        )
     }
 }
 
-fn pressure_text(pressure: &runtime::PtyInputPressure) -> String {
-    format!(
-        "입력 대기 {} / {}",
-        format_bytes(pressure.queued_bytes as u64),
-        format_bytes(pressure.max_bytes as u64)
+fn pressure_text(pressure: &runtime::PtyInputPressure, catalog: &i18n::Catalog) -> String {
+    catalog.t(
+        "resource_manager.input_pressure",
+        &[
+            ("queued", &format_bytes(pressure.queued_bytes as u64)),
+            ("max", &format_bytes(pressure.max_bytes as u64)),
+        ],
     )
 }
 
@@ -446,8 +599,9 @@ mod tests {
         vec![ActivityWorkspaceRow {
             workspace_id: Arc::from("workspace-a"),
             name: Arc::from("Workspace A"),
+            metric_availability: ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Active,
-            session_count: 2,
+            session_count: 3,
             pending_events: 0,
             input_pressure: None,
             backgrounded_for_secs: None,
@@ -465,6 +619,7 @@ mod tests {
                 ActivitySessionRow {
                     session: Some(runtime::SessionId(11)),
                     name: Arc::from("Local Session"),
+                    metric_availability: ActivityMetricAvailability::Local,
                     agent_line: None,
                     status_line: None,
                     resource: Some(runtime::SessionResourceUsage {
@@ -485,6 +640,17 @@ mod tests {
                 ActivitySessionRow {
                     session: None,
                     name: Arc::from("Remote Session"),
+                    metric_availability: ActivityMetricAvailability::RemoteUnavailable,
+                    agent_line: None,
+                    status_line: None,
+                    resource: None,
+                    pressure: None,
+                    storm: false,
+                },
+                ActivitySessionRow {
+                    session: Some(runtime::SessionId(12)),
+                    name: Arc::from("Pending Session"),
+                    metric_availability: ActivityMetricAvailability::Pending,
                     agent_line: None,
                     status_line: None,
                     resource: None,
@@ -498,6 +664,7 @@ mod tests {
     fn harness(
         rows: Vec<ActivityWorkspaceRow>,
     ) -> egui_kittest::Harness<'static, (ResourceManagerUi, Vec<ResourceManagerIntent>)> {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
         egui_kittest::Harness::new_ui_state(
             move |ui, (manager, intents)| {
                 if let Some(intent) = manager.contents(
@@ -505,6 +672,7 @@ mod tests {
                     &rows,
                     &HashMap::from([(String::from("workspace-a"), 1)]),
                     10_000,
+                    &catalog,
                 ) {
                     intents.push(intent);
                 }
@@ -521,20 +689,22 @@ mod tests {
         harness.get_by_label("Workspace A");
         harness.get_by_label("Local Session");
         harness.get_by_label("Remote Session");
-        harness.get_by_label("—");
+        harness.get_by_label("Pending Session");
+        harness.get_by_label("Unavailable for remote sessions");
+        harness.get_by_label("Local metrics pending");
     }
 
     #[test]
     fn resource_manager_refresh_and_inspect_emit_typed_intents_only() {
         let mut harness = harness(fixture());
         harness.run();
-        harness.get_by_label("새로고침").click();
+        harness.get_by_label("Refresh").click();
         harness.run();
         assert_eq!(
             harness.state().1.last(),
             Some(&ResourceManagerIntent::Refresh)
         );
-        harness.get_by_label("연결되지 않은 세션 검토").click();
+        harness.get_by_label("Review orphaned sessions").click();
         harness.run();
         assert_eq!(
             harness.state().1.last(),
@@ -543,10 +713,57 @@ mod tests {
     }
 
     #[test]
+    fn resource_manager_accessibility_names_target_and_disclosure_state() {
+        let mut harness = harness(fixture());
+        harness.run();
+        harness.get_by_label("Collapse Workspace A");
+        harness.get_by_label("Focus Local Session");
+        harness.get_by_label("End Local Session");
+
+        harness.get_by_label("Collapse Workspace A").click();
+        harness.run();
+        harness.get_by_label("Expand Workspace A");
+        assert!(harness.query_by_label("Focus Local Session").is_none());
+    }
+
+    #[test]
+    fn resource_manager_session_confirmation_can_cancel_then_confirm() {
+        let mut harness = harness(fixture());
+        harness.run();
+        harness.get_by_label("End Local Session").click();
+        harness.run();
+        harness.get_by_label("End Local Session?");
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert!(harness.query_by_label("End Local Session?").is_none());
+
+        harness.get_by_label("End Local Session").click();
+        harness.run();
+        harness.get_by_label("Confirm end").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.last(),
+            Some(&ResourceManagerIntent::KillSession {
+                workspace_id: Arc::from("workspace-a"),
+                session: runtime::SessionId(11),
+            })
+        );
+    }
+
+    #[test]
+    fn resource_manager_uses_requested_locale_without_korean_fallback_text() {
+        let mut harness = harness(fixture());
+        harness.run();
+        harness.get_by_label("Resource Manager");
+        harness.get_by_label("Active");
+        assert!(harness.query_by_label("리소스 관리자").is_none());
+        assert!(harness.query_by_label("활성").is_none());
+    }
+
+    #[test]
     fn closed_resource_manager_emits_no_intent() {
-        let mut manager = ResourceManagerUi::default();
+        let manager = ResourceManagerUi::default();
         assert!(!manager.is_open());
-        assert_eq!(manager.take_open_intent(), None);
     }
 
     #[test]

@@ -1,6 +1,4 @@
-use crate::port_inventory::{
-    PortOwnership, PortProtocol, PortRow, PortSnapshot, PortTerminationTarget,
-};
+use crate::port_inventory::{PortOwnership, PortRow, PortSnapshot, PortTerminationTarget};
 use std::sync::Arc;
 
 const PORTS_POPOVER_WIDTH: f32 = 500.0;
@@ -10,15 +8,22 @@ const PORTS_POPOVER_MAX_HEIGHT: f32 = 560.0;
 pub(crate) enum PortsIntent {
     Refresh,
     Terminate(PortTerminationTarget),
-    OpenAddress(Arc<str>),
     CopyAddress(Arc<str>),
+}
+
+#[derive(Clone)]
+struct PortConfirmation {
+    target: PortTerminationTarget,
+    process: Arc<str>,
+    socket: Arc<str>,
+    workspace: Arc<str>,
 }
 
 #[derive(Default)]
 pub(crate) struct PortsUi {
     open: bool,
-    confirm: Option<PortTerminationTarget>,
-    initial_refresh_requested: bool,
+    confirm: Option<PortConfirmation>,
+    open_refresh_pending: bool,
 }
 
 impl PortsUi {
@@ -27,6 +32,9 @@ impl PortsUi {
     }
 
     pub(crate) fn set_open(&mut self, open: bool) {
+        if open && !self.open {
+            self.open_refresh_pending = true;
+        }
         self.open = open;
         if !open {
             self.confirm = None;
@@ -37,18 +45,11 @@ impl PortsUi {
         self.set_open(!self.open);
     }
 
-    pub(crate) fn take_initial_refresh(
-        &mut self,
-        snapshot: Option<&PortSnapshot>,
-    ) -> Option<PortsIntent> {
-        if snapshot.is_some() {
-            self.initial_refresh_requested = true;
+    pub(crate) fn take_open_refresh(&mut self) -> Option<PortsIntent> {
+        if !self.open_refresh_pending {
             return None;
         }
-        if !self.open || self.initial_refresh_requested {
-            return None;
-        }
-        self.initial_refresh_requested = true;
+        self.open_refresh_pending = false;
         Some(PortsIntent::Refresh)
     }
 
@@ -57,25 +58,29 @@ impl PortsUi {
         ui: &mut egui::Ui,
         snapshot: Option<&PortSnapshot>,
         active_workspace_id: Option<&str>,
+        now_ms: u64,
+        catalog: &i18n::Catalog,
     ) -> Option<PortsIntent> {
         ui.set_min_width(PORTS_POPOVER_WIDTH);
         let mut intent = None;
         ui.horizontal(|ui| {
-            ui.heading("포트");
+            ui.heading(catalog.t("ports.title", &[]));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("새로고침").clicked() {
+                if ui.button(catalog.t("ports.refresh", &[])).clicked() {
                     intent = Some(PortsIntent::Refresh);
                 }
             });
         });
         ui.add_space(4.0);
-        ui.weak("로컬 수신 포트입니다. 소유권이 다시 확인된 프로세스만 종료합니다.");
+        ui.weak(catalog.t("ports.description", &[]));
         ui.separator();
 
         let Some(snapshot) = snapshot else {
-            ui.weak("아직 포트를 조회하지 않았습니다.");
+            ui.weak(catalog.t("ports.not_scanned", &[]));
             return intent;
         };
+        ui.weak(port_sample_age(snapshot.sampled_at_ms, now_ms, catalog));
+        ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
             .id_salt("ports_manager_rows")
@@ -84,36 +89,39 @@ impl PortsUi {
             .show(ui, |ui| {
                 self.render_section(
                     ui,
-                    "현재 워크스페이스",
+                    &catalog.t("ports.active_workspace", &[]),
                     snapshot.rows.iter().filter(|row| {
                         row.ownership == PortOwnership::Workspace
                             && row.workspace_id.as_deref() == active_workspace_id
                     }),
                     &mut intent,
+                    catalog,
                 );
                 self.render_section(
                     ui,
-                    "다른 워크스페이스",
+                    &catalog.t("ports.other_workspaces", &[]),
                     snapshot.rows.iter().filter(|row| {
                         row.ownership == PortOwnership::Workspace
                             && row.workspace_id.as_deref() != active_workspace_id
                     }),
                     &mut intent,
+                    catalog,
                 );
                 self.render_section(
                     ui,
-                    "외부 프로세스",
+                    &catalog.t("ports.external", &[]),
                     snapshot
                         .rows
                         .iter()
                         .filter(|row| row.ownership != PortOwnership::Workspace),
                     &mut intent,
+                    catalog,
                 );
                 if snapshot.rows.is_empty() {
-                    ui.weak("열려 있는 수신 포트가 없습니다.");
+                    ui.weak(catalog.t("ports.empty", &[]));
                 }
             });
-        self.render_confirmation(ui, &mut intent);
+        self.render_confirmation(ui, &mut intent, catalog);
         intent
     }
 
@@ -123,6 +131,7 @@ impl PortsUi {
         title: &str,
         rows: impl Iterator<Item = &'a PortRow>,
         intent: &mut Option<PortsIntent>,
+        catalog: &i18n::Catalog,
     ) {
         let mut rows = rows.peekable();
         if rows.peek().is_none() {
@@ -130,13 +139,24 @@ impl PortsUi {
         }
         ui.label(egui::RichText::new(title).strong());
         for row in rows {
-            self.render_row(ui, row, intent);
+            self.render_row(ui, row, intent, catalog);
         }
         ui.add_space(6.0);
     }
 
-    fn render_row(&mut self, ui: &mut egui::Ui, row: &PortRow, intent: &mut Option<PortsIntent>) {
-        let address = listener_address(row);
+    fn render_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: &PortRow,
+        intent: &mut Option<PortsIntent>,
+        catalog: &i18n::Catalog,
+    ) {
+        let socket = listener_socket(row);
+        let workspace = row
+            .workspace_name
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| catalog.t("ports.workspace_unknown", &[]));
         egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(6, 5))
             .show(ui, |ui| {
@@ -152,42 +172,84 @@ impl PortsUi {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if row.ownership == PortOwnership::Workspace {
-                            if ui.button("종료").clicked()
+                            let accessible = catalog.t(
+                                "ports.terminate_socket_accessible",
+                                &[
+                                    ("process", row.process.as_ref()),
+                                    ("socket", socket.as_str()),
+                                    ("workspace", workspace.as_str()),
+                                ],
+                            );
+                            let response = ui.button(catalog.t("ports.terminate", &[]));
+                            response.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    ui.is_enabled(),
+                                    &accessible,
+                                )
+                            });
+                            if response.clicked()
                                 && let Some(target) = termination_target(row)
                             {
-                                self.confirm = Some(target);
+                                self.confirm = Some(PortConfirmation {
+                                    target,
+                                    process: Arc::clone(&row.process),
+                                    socket: Arc::from(socket.as_str()),
+                                    workspace: Arc::from(workspace.as_str()),
+                                });
                             }
                         } else {
-                            ui.weak(read_only_reason(row.ownership));
+                            ui.weak(read_only_reason(row.ownership, catalog));
                         }
-                        if ui.button("복사").clicked() {
-                            *intent = Some(PortsIntent::CopyAddress(Arc::from(address.as_str())));
-                        }
-                        if ui.button("열기").clicked() {
-                            *intent = Some(PortsIntent::OpenAddress(Arc::from(address.as_str())));
+                        let accessible = catalog.t(
+                            "ports.copy_socket_accessible",
+                            &[("socket", socket.as_str())],
+                        );
+                        let response = ui.button(catalog.t("ports.copy_address", &[]));
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                &accessible,
+                            )
+                        });
+                        if response.clicked() {
+                            *intent = Some(PortsIntent::CopyAddress(Arc::from(socket.as_str())));
                         }
                     });
                 });
-                ui.weak(address.as_str());
+                ui.weak(socket.as_str());
             });
         ui.separator();
     }
 
-    fn render_confirmation(&mut self, ui: &mut egui::Ui, intent: &mut Option<PortsIntent>) {
-        let Some(target) = self.confirm.clone() else {
+    fn render_confirmation(
+        &mut self,
+        ui: &mut egui::Ui,
+        intent: &mut Option<PortsIntent>,
+        catalog: &i18n::Catalog,
+    ) {
+        let Some(confirm) = self.confirm.clone() else {
             return;
         };
         ui.separator();
         ui.colored_label(
             ui.visuals().warn_fg_color,
-            format!("{} 포트의 프로세스를 종료할까요?", target.port),
+            catalog.t(
+                "ports.confirm_target",
+                &[
+                    ("process", confirm.process.as_ref()),
+                    ("socket", confirm.socket.as_ref()),
+                    ("workspace", confirm.workspace.as_ref()),
+                ],
+            ),
         );
         ui.horizontal(|ui| {
-            if ui.button("종료 확인").clicked() {
-                *intent = Some(PortsIntent::Terminate(target));
+            if ui.button(catalog.t("ports.confirm_accept", &[])).clicked() {
+                *intent = Some(PortsIntent::Terminate(confirm.target));
                 self.confirm = None;
             }
-            if ui.button("취소").clicked() {
+            if ui.button(catalog.t("ports.cancel", &[])).clicked() {
                 self.confirm = None;
             }
         });
@@ -205,24 +267,34 @@ fn termination_target(row: &PortRow) -> Option<PortTerminationTarget> {
     })
 }
 
-fn listener_address(row: &PortRow) -> String {
+fn listener_socket(row: &PortRow) -> String {
     let bind = match row.bind.as_ref() {
-        "*" | "0.0.0.0" | "::" => "127.0.0.1".to_owned(),
         value if value.contains(':') => format!("[{value}]"),
         value => value.to_owned(),
     };
-    let scheme = match row.protocol {
-        PortProtocol::Tcp => "http",
-    };
-    format!("{scheme}://{bind}:{}", row.port)
+    format!("{bind}:{}", row.port)
 }
 
-fn read_only_reason(ownership: PortOwnership) -> &'static str {
+fn read_only_reason(ownership: PortOwnership, catalog: &i18n::Catalog) -> String {
     match ownership {
-        PortOwnership::Protected => "보호됨 · 읽기 전용",
-        PortOwnership::Ambiguous => "소유권 불명 · 읽기 전용",
-        PortOwnership::External => "외부 · 읽기 전용",
-        PortOwnership::Workspace => "",
+        PortOwnership::Protected => catalog.t("ports.protected_read_only", &[]),
+        PortOwnership::Ambiguous => catalog.t("ports.ambiguous_read_only", &[]),
+        PortOwnership::External => catalog.t("ports.external_read_only", &[]),
+        PortOwnership::Workspace => String::new(),
+    }
+}
+
+fn port_sample_age(sampled_at_ms: u64, now_ms: u64, catalog: &i18n::Catalog) -> String {
+    if sampled_at_ms == 0 || now_ms == 0 || sampled_at_ms > now_ms {
+        return catalog.t("ports.sample_pending", &[]);
+    }
+    let seconds = now_ms.saturating_sub(sampled_at_ms) / 1_000;
+    if seconds == 0 {
+        catalog.t("ports.sample_now", &[])
+    } else if seconds >= 30 {
+        catalog.t("ports.sample_stale", &[("seconds", &seconds.to_string())])
+    } else {
+        catalog.t("ports.sample_age", &[("seconds", &seconds.to_string())])
     }
 }
 
@@ -239,17 +311,33 @@ mod tests {
             sampled_at_ms: 1_000,
             rows: Arc::from([
                 row("active", "Active workspace", 3000, PortOwnership::Workspace),
-                row("other", "Other workspace", 4000, PortOwnership::Workspace),
+                row_with_bind(
+                    "other",
+                    "Other workspace",
+                    4000,
+                    "::1",
+                    PortOwnership::Workspace,
+                ),
                 row("", "", 5000, PortOwnership::External),
             ]),
         }
     }
 
     fn row(id: &str, name: &str, port: u16, ownership: PortOwnership) -> PortRow {
+        row_with_bind(id, name, port, "127.0.0.1", ownership)
+    }
+
+    fn row_with_bind(
+        id: &str,
+        name: &str,
+        port: u16,
+        bind: &str,
+        ownership: PortOwnership,
+    ) -> PortRow {
         PortRow {
             pid: u32::from(port),
             port,
-            bind: Arc::from("127.0.0.1"),
+            bind: Arc::from(bind),
             protocol: PortProtocol::Tcp,
             process: Arc::from("node"),
             process_started_at: Arc::from("fixture-start"),
@@ -261,9 +349,12 @@ mod tests {
 
     fn harness() -> egui_kittest::Harness<'static, (PortsUi, Vec<PortsIntent>)> {
         let snapshot = snapshot();
+        let catalog = i18n::Catalog::load("en-US").unwrap();
         egui_kittest::Harness::new_ui_state(
             move |ui, (manager, intents)| {
-                if let Some(intent) = manager.contents(ui, Some(&snapshot), Some("active")) {
+                if let Some(intent) =
+                    manager.contents(ui, Some(&snapshot), Some("active"), 41_000, &catalog)
+                {
                     intents.push(intent);
                 }
             },
@@ -275,34 +366,105 @@ mod tests {
     fn ports_manager_groups_active_other_and_external_rows() {
         let mut harness = harness();
         harness.run();
-        harness.get_by_label("현재 워크스페이스");
-        harness.get_by_label("다른 워크스페이스");
-        harness.get_by_label("외부 프로세스");
+        assert!(harness.get_all_by_label("Active workspace").count() >= 1);
+        harness.get_by_label("Other workspaces");
+        harness.get_by_label("External");
+        harness.get_by_label("Stale · 40 seconds ago");
     }
 
     #[test]
     fn ports_manager_exposes_terminate_only_for_owned_workspace_rows() {
         let mut harness = harness();
         harness.run();
-        assert_eq!(harness.get_all_by_label("종료").count(), 2);
+        harness.get_by_label("Terminate node on 127.0.0.1:3000 in Active workspace");
+        harness.get_by_label("Terminate node on [::1]:4000 in Other workspace");
+        assert!(harness.query_by_label("Terminate").is_none());
+        assert!(harness.query_by_label("Open address").is_none());
+        harness.get_by_label("Copy 127.0.0.1:3000");
+        harness.get_by_label("Copy [::1]:4000");
     }
 
     #[test]
     fn unopened_ports_manager_emits_no_scan_intent() {
         let mut manager = PortsUi::default();
         assert!(!manager.is_open());
-        assert_eq!(manager.take_initial_refresh(None), None);
+        assert_eq!(manager.take_open_refresh(), None);
     }
 
     #[test]
-    fn first_open_requests_one_scan_only() {
+    fn every_open_transition_requests_one_refresh_even_with_cached_snapshot() {
         let mut manager = PortsUi::default();
-        manager.toggle_open();
-        assert_eq!(
-            manager.take_initial_refresh(None),
-            Some(PortsIntent::Refresh)
+        manager.set_open(true);
+        assert_eq!(manager.take_open_refresh(), Some(PortsIntent::Refresh));
+        assert_eq!(manager.take_open_refresh(), None);
+        manager.set_open(false);
+        manager.set_open(true);
+        assert_eq!(manager.take_open_refresh(), Some(PortsIntent::Refresh));
+    }
+
+    #[test]
+    fn port_confirmation_identifies_exact_target_and_can_cancel_then_confirm() {
+        let mut harness = harness();
+        harness.run();
+        let terminate = "Terminate node on 127.0.0.1:3000 in Active workspace";
+        harness.get_by_label(terminate).click();
+        harness.run();
+        harness.get_by_label("Terminate node at 127.0.0.1:3000 in Active workspace?");
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("Terminate node at 127.0.0.1:3000 in Active workspace?")
+                .is_none()
         );
-        assert_eq!(manager.take_initial_refresh(None), None);
+
+        harness.get_by_label(terminate).click();
+        harness.run();
+        harness.get_by_label("Confirm termination").click();
+        harness.run();
+        assert!(matches!(
+            harness.state().1.last(),
+            Some(PortsIntent::Terminate(target))
+                if target.port == 3000 && target.bind.as_ref() == "127.0.0.1"
+        ));
+    }
+
+    #[test]
+    fn socket_address_preserves_ipv4_ipv6_and_wildcards_without_http_guessing() {
+        assert_eq!(
+            listener_socket(&row("a", "A", 3000, PortOwnership::Workspace)),
+            "127.0.0.1:3000"
+        );
+        assert_eq!(
+            listener_socket(&row_with_bind(
+                "a",
+                "A",
+                4000,
+                "::1",
+                PortOwnership::Workspace
+            )),
+            "[::1]:4000"
+        );
+        assert_eq!(
+            listener_socket(&row_with_bind(
+                "a",
+                "A",
+                5000,
+                "::",
+                PortOwnership::Workspace
+            )),
+            "[::]:5000"
+        );
+        assert_eq!(
+            listener_socket(&row_with_bind(
+                "a",
+                "A",
+                6000,
+                "*",
+                PortOwnership::Workspace
+            )),
+            "*:6000"
+        );
     }
 
     #[test]

@@ -16837,9 +16837,6 @@ impl App {
                 ui::ports::PortsIntent::Terminate(target) => {
                     self.request_port_termination(target);
                 }
-                ui::ports::PortsIntent::OpenAddress(address) => {
-                    ctx.open_url(egui::OpenUrl::new_tab(address.to_string()));
-                }
                 ui::ports::PortsIntent::CopyAddress(address) => {
                     ctx.copy_text(address.to_string());
                 }
@@ -16871,34 +16868,47 @@ impl App {
                     let sessions = entries
                         .iter()
                         .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
-                        .map(|e| ui::activity::ActivitySessionRow {
-                            session: e.session,
-                            name: Arc::from(e.title.as_str()),
-                            agent_line: e.agent_line.as_deref().map(Arc::from),
-                            status_line: e.status_line.as_deref().map(Arc::from),
-                            resource: e.session.and_then(|s| {
+                        .map(|e| {
+                            let resource = e.session.and_then(|s| {
                                 self.active
                                     .session_resource_usage
                                     .iter()
                                     .find(|u| u.session == s)
                                     .cloned()
-                            }),
-                            pressure: Self::fresh_pressure(
-                                e.session
-                                    .and_then(|s| self.active.session_input_pressure.get(&s)),
-                                now,
-                            ),
-                            storm: e.session.is_some_and(|s| {
-                                self.active
-                                    .storm_episodes
-                                    .get(&s)
-                                    .is_some_and(|ep| ep.confirmed)
-                            }),
+                            });
+                            ui::activity::ActivitySessionRow {
+                                session: e.session,
+                                name: Arc::from(e.title.as_str()),
+                                metric_availability: if resource.is_some() {
+                                    ui::activity::ActivityMetricAvailability::Local
+                                } else {
+                                    ui::activity::ActivityMetricAvailability::Pending
+                                },
+                                agent_line: e.agent_line.as_deref().map(Arc::from),
+                                status_line: e.status_line.as_deref().map(Arc::from),
+                                resource,
+                                pressure: Self::fresh_pressure(
+                                    e.session
+                                        .and_then(|s| self.active.session_input_pressure.get(&s)),
+                                    now,
+                                ),
+                                storm: e.session.is_some_and(|s| {
+                                    self.active
+                                        .storm_episodes
+                                        .get(&s)
+                                        .is_some_and(|ep| ep.confirmed)
+                                }),
+                            }
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
                         workspace_id: Arc::from(ws.id.as_str()),
                         name: Self::workspace_display_name(ws).into(),
+                        metric_availability: if self.active.resource_usage.is_some() {
+                            ui::activity::ActivityMetricAvailability::Local
+                        } else {
+                            ui::activity::ActivityMetricAvailability::Pending
+                        },
                         state: ui::activity::ActivityWorkspaceState::Active,
                         session_count: entries.len(),
                         pending_events: self.active.pending_events.len(),
@@ -16941,31 +16951,47 @@ impl App {
                     ids.sort_by_key(|s| s.0);
                     let sessions = ids
                         .iter()
-                        .map(|s| ui::activity::ActivitySessionRow {
-                            session: Some(*s),
-                            // 기본 제목이면 프로젝트명으로 표시 (활성 워크스페이스와 동일 규칙).
-                            name: rt
-                                .session_titles
-                                .get(s)
-                                .map(|raw| self.activity_session_name(&ws.id, raw))
-                                .unwrap_or_default()
-                                .into(),
-                            // 대기(warm)는 에이전트가 살아있음 — 활성일 때 감지한 마지막 에이전트
-                            // 줄을 유지해 보여준다(방안①). 셸이면 None.
-                            agent_line: rt.workspace_ui.agent_line_for(*s).map(Into::into),
-                            status_line: None,
-                            resource: rt
+                        .map(|s| {
+                            let resource = rt
                                 .session_resource_usage
                                 .iter()
                                 .find(|u| u.session == *s)
-                                .cloned(),
-                            pressure: Self::fresh_pressure(rt.session_input_pressure.get(s), now),
-                            storm: rt.storm_episodes.get(s).is_some_and(|ep| ep.confirmed),
+                                .cloned();
+                            ui::activity::ActivitySessionRow {
+                                session: Some(*s),
+                                // 기본 제목이면 프로젝트명으로 표시 (활성 워크스페이스와 동일 규칙).
+                                name: rt
+                                    .session_titles
+                                    .get(s)
+                                    .map(|raw| self.activity_session_name(&ws.id, raw))
+                                    .unwrap_or_default()
+                                    .into(),
+                                metric_availability: if resource.is_some() {
+                                    ui::activity::ActivityMetricAvailability::Local
+                                } else {
+                                    ui::activity::ActivityMetricAvailability::Pending
+                                },
+                                // 대기(warm)는 에이전트가 살아있음 — 활성일 때 감지한 마지막 에이전트
+                                // 줄을 유지해 보여준다(방안①). 셸이면 None.
+                                agent_line: rt.workspace_ui.agent_line_for(*s).map(Into::into),
+                                status_line: None,
+                                resource,
+                                pressure: Self::fresh_pressure(
+                                    rt.session_input_pressure.get(s),
+                                    now,
+                                ),
+                                storm: rt.storm_episodes.get(s).is_some_and(|ep| ep.confirmed),
+                            }
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
                         workspace_id: Arc::from(ws.id.as_str()),
                         name: Self::workspace_display_name(ws).into(),
+                        metric_availability: if rt.resource_usage.is_some() {
+                            ui::activity::ActivityMetricAvailability::Local
+                        } else {
+                            ui::activity::ActivityMetricAvailability::Pending
+                        },
                         state: ui::activity::ActivityWorkspaceState::Warm,
                         session_count: rt.session_titles.len(),
                         pending_events: rt.pending_events.len(),
@@ -16993,6 +17019,7 @@ impl App {
                         session: None,
                         // 유휴 워크스페이스도 프로젝트명으로 표시 (활성/warm과 동일 규칙).
                         name: self.activity_session_name(&ws.id, &row.title).into(),
+                        metric_availability: ui::activity::ActivityMetricAvailability::Local,
                         agent_line: None,
                         status_line: None,
                         resource: None,
@@ -17004,6 +17031,7 @@ impl App {
                 ui::activity::ActivityWorkspaceRow {
                     workspace_id: Arc::from(ws.id.as_str()),
                     name: Self::workspace_display_name(ws).into(),
+                    metric_availability: ui::activity::ActivityMetricAvailability::Local,
                     // DB에는 있으나 active/warm runtime이 없는 워크스페이스도 숨기지 않고
                     // 유휴 카드로 표시한다. 현재 복원 레이아웃의 pane은 위 snapshot에서
                     // 하위 세션 행으로 복구한다.
@@ -22836,6 +22864,36 @@ mod tests {
                 "missing exact session projection: {session_projection}"
             );
         }
+    }
+
+    #[test]
+    fn status_resource_port_app_projection_sets_explicit_metric_availability() {
+        let source = include_str!("app.rs");
+        let activity_rows = source
+            .split_once("    fn activity_rows(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn refresh_activity_snapshot_if_needed"))
+            .map(|(body, _)| body)
+            .expect("activity_rows function remains discoverable");
+        assert_eq!(
+            activity_rows.matches("metric_availability:").count(),
+            6,
+            "all three workspace and session projections must set availability"
+        );
+        assert!(!activity_rows.contains("RemoteUnavailable"));
+    }
+
+    #[test]
+    fn status_resource_port_app_never_opens_arbitrary_tcp_listener_as_url() {
+        let source = include_str!("app.rs");
+        let dispatch = source
+            .split_once("    fn dispatch_status_bar_intent(")
+            .and_then(|(_, tail)| tail.split_once("    fn activity_rows(&self)"))
+            .map(|(body, _)| body)
+            .expect("status dispatch remains discoverable");
+        assert!(!dispatch.contains("OpenAddress"));
+        assert!(!dispatch.contains("open_url"));
+        assert!(dispatch.contains("CopyAddress"));
+        assert!(dispatch.contains("copy_text"));
     }
 
     #[test]

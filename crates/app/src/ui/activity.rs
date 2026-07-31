@@ -16,6 +16,7 @@ const ARC_ALLOCATION_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
 pub struct ActivityWorkspaceRow {
     pub workspace_id: Arc<str>,
     pub name: Arc<str>,
+    pub metric_availability: ActivityMetricAvailability,
     pub state: ActivityWorkspaceState,
     pub session_count: usize,
     pub pending_events: usize,
@@ -33,6 +34,7 @@ impl std::fmt::Debug for ActivityWorkspaceRow {
         f.debug_struct("ActivityWorkspaceRow")
             .field("workspace_id", &REDACTED)
             .field("name", &REDACTED)
+            .field("metric_availability", &self.metric_availability)
             .field("state", &self.state)
             .field("session_count", &self.session_count)
             .field("pending_events", &self.pending_events)
@@ -55,6 +57,7 @@ impl std::fmt::Debug for ActivityWorkspaceRow {
 pub struct ActivitySessionRow {
     pub session: Option<runtime::SessionId>,
     pub name: Arc<str>,
+    pub metric_availability: ActivityMetricAvailability,
     /// "Codex · gpt-5.5 · xhigh" — 에이전트가 아니면 None(셸).
     pub agent_line: Option<Arc<str>>,
     /// "실행 중 · ctx 69%" — warm/셸은 None.
@@ -72,6 +75,7 @@ impl std::fmt::Debug for ActivitySessionRow {
         f.debug_struct("ActivitySessionRow")
             .field("session", &self.session)
             .field("name", &REDACTED)
+            .field("metric_availability", &self.metric_availability)
             .field("agent_line", &self.agent_line.as_ref().map(|_| REDACTED))
             .field("status_line", &self.status_line.as_ref().map(|_| REDACTED))
             .field("resource", &self.resource)
@@ -251,6 +255,20 @@ pub enum ActivityWorkspaceState {
     Warm,
     /// DB에는 존재하지만 현재 runtime/세션이 없는 워크스페이스.
     Idle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityMetricAvailability {
+    Local,
+    Pending,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reserved for remote activity projections; local App projections must not fake it"
+        )
+    )]
+    RemoteUnavailable,
 }
 
 pub enum ActivityAction {
@@ -750,6 +768,7 @@ mod tests {
         ActivitySessionRow {
             session: None,
             name: name.into(),
+            metric_availability: ActivityMetricAvailability::Pending,
             agent_line: None,
             status_line: None,
             resource: None,
@@ -765,6 +784,7 @@ mod tests {
         ActivityWorkspaceRow {
             workspace_id: Arc::from(""),
             name: name.into(),
+            metric_availability: ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Idle,
             session_count: sessions.len(),
             pending_events: 0,
@@ -831,6 +851,7 @@ mod tests {
             |name: &str, app_cpu: f32, child_session: u64, child_rss: u64| ActivityWorkspaceRow {
                 workspace_id: Arc::from(name),
                 name: Arc::from(name),
+                metric_availability: ActivityMetricAvailability::Local,
                 state: ActivityWorkspaceState::Warm,
                 session_count: 1,
                 pending_events: 0,
@@ -876,6 +897,7 @@ mod tests {
         let rows = [ActivityWorkspaceRow {
             workspace_id: Arc::from("idle-project"),
             name: Arc::from("idle-project"),
+            metric_availability: ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Idle,
             session_count: 0,
             pending_events: 0,
@@ -1147,6 +1169,7 @@ mod tests {
             vec![ActivitySessionRow {
                 session: Some(runtime::SessionId(1)),
                 name: Arc::from("secret pane title"),
+                metric_availability: ActivityMetricAvailability::RemoteUnavailable,
                 agent_line: Some(Arc::from("provider and model")),
                 status_line: Some(Arc::from("private status")),
                 resource: None,

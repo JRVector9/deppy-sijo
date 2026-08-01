@@ -198,6 +198,24 @@ pub fn sidebar_font(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(SIDEBAR_FONT_FAMILY.into()))
 }
 
+/// `sidebar_font`와 같지만, 이 named family가 아직 `ctx`에 등록되지 않았으면(예:
+/// `install_cjk_fallback` 실행 전 프레임, 혹은 폰트 설치 없이 위젯만 그리는 kittest
+/// 하네스) 패닉 대신 Proportional로 내려간다. `set_fonts`/`add_font`는 다음 pass
+/// 시작 시점에만 반영되므로, 같은 pass 안에서 참조하는 곳은 "미등록이면 폴백"만이
+/// 즉시 안전하다.
+pub fn sidebar_font_or_fallback(ctx: &egui::Context, size: f32) -> egui::FontId {
+    let family = egui::FontFamily::Name(SIDEBAR_FONT_FAMILY.into());
+    let bound = ctx.fonts(|fonts| fonts.definitions().families.contains_key(&family));
+    egui::FontId::new(
+        size,
+        if bound {
+            family
+        } else {
+            egui::FontFamily::Proportional
+        },
+    )
+}
+
 /// Panel 내부 기본 label/button/menu/TextEdit 스타일도 사이드바 가족을 쓰게 한다.
 pub fn apply_sidebar_text_styles(ui: &mut egui::Ui) {
     let family = egui::FontFamily::Name(SIDEBAR_FONT_FAMILY.into());

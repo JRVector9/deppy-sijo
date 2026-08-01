@@ -182,7 +182,9 @@ fn read_bounded(path: &Path) -> Option<String> {
     if !metadata.is_file() || metadata.len() > CATALOG_MAX_BYTES {
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    let text = std::fs::read_to_string(path).ok()?;
+    // CLI가 이 사이에 파일을 늘렸을 수 있다. 읽은 뒤 한 번 더 확인해야 상한이 실효한다.
+    (text.len() as u64 <= CATALOG_MAX_BYTES).then_some(text)
 }
 
 #[derive(Deserialize)]
@@ -686,6 +688,17 @@ display_name = "Plain"
       }
     }"#;
 
+    /// 테스트마다 다른 경로를 쓴다. 고정 이름이면 같은 호스트에서 테스트 바이너리가
+    /// 두 번 동시에 돌 때 서로의 픽스처를 덮어쓴다. `agent_launcher`의 테스트들이 쓰는
+    /// 방식과 같다.
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "deppy-catalog-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
     fn values(models: &[ModelChoice]) -> Vec<&str> {
         models.iter().map(ModelChoice::value).collect()
     }
@@ -1082,7 +1095,7 @@ display_name = "K2.7 Coding"
 
     #[test]
     fn kimi_env_var_guard_only_suppresses_when_actually_non_empty() {
-        let dir = std::env::temp_dir().join("deppy-catalog-kimi-default-model-env-test");
+        let dir = unique_temp_dir("kimi-default-model-env");
         let _ = std::fs::create_dir_all(dir.join(".kimi-code"));
         std::fs::write(
             dir.join(".kimi-code/config.toml"),
@@ -1108,7 +1121,7 @@ display_name = "K2.7 Coding"
 
     #[test]
     fn configured_default_model_reads_codex_and_claude_config_from_disk() {
-        let dir = std::env::temp_dir().join("deppy-catalog-configured-default-model-test");
+        let dir = unique_temp_dir("configured-default-model");
         let _ = std::fs::create_dir_all(dir.join(".codex"));
         let _ = std::fs::create_dir_all(dir.join(".claude"));
         std::fs::write(
@@ -1132,7 +1145,7 @@ display_name = "K2.7 Coding"
 
     #[test]
     fn oversized_catalog_files_are_not_parsed() {
-        let dir = std::env::temp_dir().join("deppy-catalog-bound-test");
+        let dir = unique_temp_dir("bound");
         let _ = std::fs::create_dir_all(dir.join(".codex"));
         let path = dir.join(".codex/models_cache.json");
         let padding = " ".repeat(usize::try_from(CATALOG_MAX_BYTES).unwrap_or(usize::MAX) + 1);

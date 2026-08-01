@@ -385,10 +385,15 @@ impl AgentKind {
     }
 
     /// 카탈로그에 없는 모델(=CLI 자신의 기본 모델)에 쓰는 보수적 강도 목록.
+    ///
+    /// Kimi는 여기에 넣지 않는다. Kimi 모델은 단계형(`support_efforts`)과 boolean
+    /// thinking(켬/끔) 두 종류인데 모르는 모델이 어느 쪽인지 알 수 없다. 틀린 종류의
+    /// 조작을 제시하느니 제시하지 않는 편이 낫다.
     const fn fallback_efforts(self) -> &'static [ReasoningEffort] {
         match self {
             Self::Codex => CODEX_EFFORTS_XHIGH,
             Self::Claude => CLAUDE_EFFORTS,
+            Self::Grok => GROK_EFFORTS,
             _ => &[],
         }
     }
@@ -402,6 +407,8 @@ impl AgentKind {
             Self::Claude => Some(ReasoningEffort::High),
             // Codex 카탈로그 7개 중 5개가 `medium`이다.
             Self::Codex => Some(ReasoningEffort::Medium),
+            // grok-4.5가 선언하는 기본값이다.
+            Self::Grok => Some(ReasoningEffort::High),
             _ => None,
         }
     }
@@ -620,15 +627,18 @@ pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> Dete
     let agents = AgentKind::ALL
         .into_iter()
         .filter_map(|kind| {
-            resolve_executable(kind.detect_command(), &paths).map(|executable| DetectedAgent {
-                kind,
-                executable,
-                launch_path: launch_path.clone(),
-                models: resolve_models(kind, home.as_deref()),
-                default_model: crate::agent_model_catalog::configured_default_model(
+            resolve_executable(kind.detect_command(), &paths).map(|executable| {
+                // 설정 파일은 종류마다 한 번만 읽는다. 모델 목록과 초기 선택이 같은 값을
+                // 쓰므로 각각 읽으면 같은 파일을 두 번 열고 파싱하게 된다.
+                let configured =
+                    crate::agent_model_catalog::configured_default_model(kind, home.as_deref());
+                DetectedAgent {
                     kind,
-                    home.as_deref(),
-                ),
+                    executable,
+                    launch_path: launch_path.clone(),
+                    models: resolve_models(kind, home.as_deref(), configured.as_deref()),
+                    default_model: configured,
+                }
             })
         })
         .collect();
@@ -637,7 +647,11 @@ pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> Dete
 
 /// CLI가 디스크에 남긴 카탈로그를 우선하고, 없거나 못 읽으면 내장 목록으로 폴백한다.
 /// 폴백 덕분에 새 설치·로그아웃·손상된 파일에서도 런처가 빈 목록이 되지 않는다.
-fn resolve_models(kind: AgentKind, home: Option<&Path>) -> Vec<ModelChoice> {
+fn resolve_models(
+    kind: AgentKind,
+    home: Option<&Path>,
+    configured: Option<&str>,
+) -> Vec<ModelChoice> {
     let mut models = if crate::agent_model_catalog::has_disk_catalog(kind) {
         crate::agent_model_catalog::load(kind, home)
     } else {
@@ -646,7 +660,9 @@ fn resolve_models(kind: AgentKind, home: Option<&Path>) -> Vec<ModelChoice> {
     if models.is_empty() {
         models = kind.builtin_model_choices();
     }
-    adopt_configured_model(kind, home, &mut models);
+    if let Some(configured) = configured {
+        adopt_model(kind, configured, &mut models);
+    }
     models
 }
 
@@ -656,14 +672,6 @@ fn resolve_models(kind: AgentKind, home: Option<&Path>) -> Vec<ModelChoice> {
 /// `opus[1m]` 같은 변형이나 사용자가 직접 추가한 모델은 빠진다. 그 상태로 두면 런처가
 /// 사용자가 설정해 둔 모델 대신 목록 첫 항목을 조용히 띄우게 된다. CLI가 설정에 적어 둔
 /// 값은 그 CLI에서 유효한 값이므로, 모르는 값이어도 선택지로 인정한다.
-fn adopt_configured_model(kind: AgentKind, home: Option<&Path>, models: &mut Vec<ModelChoice>) {
-    let Some(configured) = crate::agent_model_catalog::configured_default_model(kind, home) else {
-        return;
-    };
-    adopt_model(kind, &configured, models);
-}
-
-/// 디스크 조회를 뺀 순수 부분. 테스트가 실제 홈 디렉터리에 의존하지 않게 분리했다.
 fn adopt_model(kind: AgentKind, configured: &str, models: &mut Vec<ModelChoice>) {
     if models.is_empty() {
         return;

@@ -5542,6 +5542,7 @@ pub(crate) fn top_provider_usage(
     claude_usage: Option<(u8, u8)>,
     codex_usage: Option<(u8, u8)>,
 ) {
+    let sidebar_font = crate::fonts::sidebar_font_or_fallback(ui.ctx(), 13.0);
     for text_style in [
         egui::TextStyle::Body,
         egui::TextStyle::Button,
@@ -5549,7 +5550,7 @@ pub(crate) fn top_provider_usage(
     ] {
         ui.style_mut()
             .text_styles
-            .insert(text_style, crate::fonts::sidebar_font(13.0));
+            .insert(text_style, sidebar_font.clone());
     }
 
     fn separator(ui: &mut egui::Ui, height: f32) {

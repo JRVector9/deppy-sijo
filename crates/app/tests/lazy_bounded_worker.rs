@@ -189,8 +189,16 @@ fn published_unread_outcome_keeps_aggregate_result_bound_at_one() {
     );
 }
 
+// Regression test for the `Publishing`/`Disconnected` conflation: while the worker is alive but
+// mid-publish (result already sent, wake callback still running), a concurrent `try_request` must
+// see plain `Full` backpressure, not a join-and-retire. Before the fix, `try_admit_once` treated
+// any non-`Running` lifecycle as `Disconnected`, so this request instead blocked in
+// `retire_slot()`'s `handle.join()` until `wake()` returned, then needlessly tore down a live
+// worker and spawned a fresh generation. The gate below makes the `Publishing` window fully
+// deterministic (no sleep-based timing race): the assertions only proceed once wake has
+// provably been entered, and the gate is only released after the backpressure/no-teardown checks.
 #[test]
-fn consumed_result_during_wake_cannot_admit_into_retiring_generation() {
+fn publishing_worker_returns_backpressure_and_reuses_generation() {
     let starts = Arc::new(AtomicUsize::new(0));
     let starts_for_factory = Arc::clone(&starts);
     let wake_gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -215,19 +223,153 @@ fn consumed_result_during_wake_cannot_admit_into_retiring_generation() {
 
     worker.try_request(1).unwrap();
     wake_entered_rx.recv_timeout(WAIT).unwrap();
+    // Consuming the result clears `outstanding` so the next `try_request` reaches the lifecycle
+    // check in `try_admit_once` instead of being short-circuited by the aggregate-outstanding gate.
     assert_eq!(worker.try_recv().unwrap().into_result(), Ok(1));
 
-    let gate_for_release = Arc::clone(&wake_gate);
+    // At this point the worker is still parked inside `wake()`: lifecycle is `Publishing`, and the
+    // gate is deliberately held closed. Call `try_request` on THIS thread and time it.
+    //
+    // A watchdog opens the gate after a long delay so that a regression fails instead of hanging.
+    // If `try_request` ever again treats `Publishing` as `Disconnected`, it blocks inside
+    // `retire_slot()`'s `handle.join()` until the watchdog releases `wake()`; the call then returns
+    // late and the elapsed-time assertion below reports it. Never run this on a scoped thread: a
+    // blocked child cannot be abandoned, and `thread::scope` joins it even while unwinding from a
+    // failed assertion, which turns a regression into a hung test binary rather than a red test.
+    let watchdog_gate = Arc::clone(&wake_gate);
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(10));
-        let (lock, changed) = &*gate_for_release;
+        std::thread::sleep(WAIT);
+        let (lock, changed) = &*watchdog_gate;
         *lock.lock().unwrap() = true;
         changed.notify_all();
     });
-    worker.try_request(2).unwrap();
+
+    let started = std::time::Instant::now();
+    let result = worker.try_request(2);
+    let elapsed = started.elapsed();
+    let full = result.unwrap_err();
+    assert_eq!(full.error_code(), None);
+    assert_eq!(full.into_job(), 2);
+    assert!(
+        elapsed < WAIT / 2,
+        "try_request must return as backpressure while Publishing, not block on join(); took {elapsed:?}"
+    );
+    assert!(
+        worker.has_live_worker(),
+        "the live worker must not be retired while merely Publishing"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+    // Let wake() return; the worker loops back to `Running` and can accept the retried request.
+    // The flip from `Publishing` back to `Running` happens on the worker thread after `wake()`
+    // returns, racing this thread's next `try_request`, so poll (as the real caller would on its
+    // next frame) instead of asserting the very first retry succeeds.
+    let (lock, changed) = &*wake_gate;
+    *lock.lock().unwrap() = true;
+    changed.notify_all();
+
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut retry_job = 2_u64;
+    loop {
+        match worker.try_request(retry_job) {
+            Ok(()) => break,
+            Err(err) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker never returned to Running after wake completed"
+                );
+                retry_job = err.into_job();
+            }
+        }
+    }
     wake_entered_rx.recv_timeout(WAIT).unwrap();
     assert_eq!(worker.try_recv().unwrap().into_result(), Ok(2));
-    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the same generation must be reused, not respawned"
+    );
+}
+
+// Mirror of `publishing_worker_returns_backpressure_and_reuses_generation`: proves the fix is
+// scoped to `Publishing` only. On a panicking job, lifecycle jumps straight to `Exited` *before*
+// `wake()` runs (see `run_worker`), so a concurrent `try_request` here races a worker that is
+// genuinely gone, not merely busy. It must still retire (join) and land the retry on a fresh
+// generation, exactly as before this fix.
+#[test]
+fn exited_worker_still_retires_and_respawns_while_wake_is_in_flight() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let panic_once = Arc::new(AtomicBool::new(true));
+    let starts_for_factory = Arc::clone(&starts);
+    let panic_for_factory = Arc::clone(&panic_once);
+    let wake_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let wake_gate_for_callback = Arc::clone(&wake_gate);
+    let (wake_entered_tx, wake_entered_rx) = mpsc::sync_channel(1);
+    let mut worker = LazyBoundedWorker::new(
+        "test-exited-race",
+        Duration::from_secs(1),
+        move || {
+            starts_for_factory.fetch_add(1, Ordering::SeqCst);
+            let panic_once = Arc::clone(&panic_for_factory);
+            move |job: u64| {
+                if panic_once.swap(false, Ordering::SeqCst) {
+                    panic!("injected_worker_panic");
+                }
+                job
+            }
+        },
+        move || {
+            let _ = wake_entered_tx.send(());
+            let (lock, changed) = &*wake_gate_for_callback;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+        },
+    );
+
+    worker.try_request(1).unwrap();
+    wake_entered_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(
+        worker.try_recv().unwrap().error_code(),
+        Some(LazyWorkerErrorCode::WorkerPanicked)
+    );
+
+    // The worker is still blocked in `wake()`, with lifecycle already `Exited` (set before `wake()`
+    // runs on the panic path). Unlike the `Publishing` case, it is correct for the retry to block
+    // until the gate is released, since this generation truly is finishing.
+    let (lock, changed) = &*wake_gate;
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| worker.try_request(2));
+        // Not load-bearing for correctness — only gives the retry a chance to actually reach
+        // `retire_slot`'s `handle.join()` before the gate opens, so this exercises the blocking
+        // path rather than racing past it. The assertions below hold regardless of this timing.
+        std::thread::sleep(Duration::from_millis(20));
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+        handle.join().unwrap().unwrap();
+    });
+
+    // The replacement generation runs job 2 on its own thread, so the outcome is not necessarily
+    // published by the time this line is reached. Poll to a deadline instead of sampling once —
+    // a single `try_recv()` here made this test flaky (~1 run in 5).
+    let deadline = std::time::Instant::now() + WAIT;
+    let outcome = loop {
+        if let Some(outcome) = worker.try_recv() {
+            break outcome;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replacement generation never published the retried job"
+        );
+        std::thread::yield_now();
+    };
+    assert_eq!(outcome.into_result(), Ok(2));
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "a genuinely exited worker must still be replaced by a fresh generation"
+    );
 }
 
 #[test]

@@ -221,41 +221,110 @@ impl ShortcutAction {
         }
     }
 
-    fn default_serialized(self) -> Option<&'static str> {
+    /// 두 플랫폼이 같은 기본값을 쓰는 액션.
+    ///
+    /// `Command`는 egui가 macOS에서 ⌘, 그 외에서 Ctrl로 푸는 논리 수정자다. 즉 여기
+    /// 적는 `Command+X`는 Windows에서 **평문 Ctrl+X**가 된다 — 터미널 제어문자와
+    /// 겹치는 글자는 이쪽에 두면 안 되고 `windows_default_serialized`로 분리한다.
+    fn shared_default_serialized(self) -> Option<&'static str> {
         match self {
-            Self::ToggleSidebar => Some("Command+B"),
             Self::OpenEnvironment => Some("Command+Shift+E"),
             Self::OpenAgents => Some("Command+Shift+A"),
             Self::OpenActivity => Some("Command+Shift+Y"),
             Self::OpenNotifications => Some("Command+Shift+U"),
+            // 두 플랫폼 통일 — Windows에서 SplitVertical이 Ctrl+Shift+D를 가져가므로
+            // ⌘⇧D를 비우고 H(horizontal)로 옮겼다.
+            Self::SplitHorizontal => Some("Command+Shift+H"),
+            // ⌘+ 는 US 배열에서 Shift+= 라 egui가 `Key::Plus`+shift:true로 준다.
+            // matches_exact는 shift까지 정확히 요구하므로 "Command+Plus"는 전용 + 키
+            // (numpad)에서만 먹었다. Chrome/VS Code와 같은 `=` 기본으로 바꾼다 —
+            // ⌘⇧= 를 쓰고 싶으면 설정에서 녹화하면 "Command+Shift+Plus"로 저장된다.
+            Self::IncreaseTerminalFont => Some("Command+Equals"),
+            Self::DecreaseTerminalFont => Some("Command+Minus"),
+            Self::ScrollToBottom => Some("Command+Down"),
+            // 에이전트 강도 다이얼. 여기만 논리 Command가 아니라 **실제 Ctrl**이다 —
+            // macOS에서 ⌃⇧↑↓, Windows에서 Ctrl+Shift+↑↓ 로 물리 제스처가 같아진다.
+            // macOS ⌃↑/⌃↓ 는 Mission Control이지만 Shift가 붙으면 시스템 예약이 아니다.
+            Self::IncreaseAgentEffort => Some("Ctrl+Shift+Up"),
+            Self::DecreaseAgentEffort => Some("Ctrl+Shift+Down"),
+            Self::PreviousAgent => Some("Ctrl+Shift+OpenBracket"),
+            Self::NextAgent => Some("Ctrl+Shift+CloseBracket"),
+            Self::FocusAgentInput => Some("Command+Shift+I"),
+            Self::NewStructuredAgent => Some("Command+Shift+N"),
+            // ⌘. 은 macOS 고전 "취소". Windows Ctrl+. 도 비어 있다.
+            Self::InterruptAgent => Some("Command+Period"),
+            Self::ApproveAgent => Some("Command+Shift+Enter"),
+            Self::RejectAgent => Some("Command+Shift+Backspace"),
+            _ => None,
+        }
+    }
+
+    /// Windows 전용 기본값. 두 부류를 피한다.
+    ///
+    /// 1. **터미널 제어문자** — `Command+D`는 Windows에서 Ctrl+D(EOF)라 셸을 끝내고,
+    ///    `Command+OpenBracket`은 Ctrl+\[(ESC)라 vim 삽입모드 탈출을 먹는다. 앱은
+    ///    터미널 포커스 중에도 가로채므로(`handle_configured_shortcut`의 게이트는
+    ///    `text_edit_focused`뿐이고 터미널 pane은 TextEdit이 아니다) 회피가 유일한 답이다.
+    ///    Windows Terminal 관례인 `Ctrl+Shift+*`로 옮긴다.
+    /// 2. **Ctrl+Alt** — 독일어/북유럽/폴란드어 배열에서 AltGr이 Ctrl+Alt로 들어와
+    ///    문자 입력 중 오발동한다. 또 Ctrl+Alt+화살표는 Intel/AMD 드라이버의 화면 회전
+    ///    핫키라 앱에 도달조차 하지 않는다.
+    ///
+    /// 두 표 모두 **항상 컴파일**한다. `#[cfg(windows)]`로 잘라두면 macOS에서 Windows
+    /// 기본값을 검증할 방법이 없어, Ctrl+Shift+D 중복 같은 사고가 Windows 빌드에
+    /// 도달해서야 드러난다. `cfg!`는 어느 표를 쓸지만 고른다.
+    fn windows_default_serialized(self) -> Option<&'static str> {
+        match self {
+            Self::ToggleSidebar => Some("Ctrl+Shift+B"), // Ctrl+B: backward-char, tmux prefix
+            Self::NewShell => Some("Ctrl+Shift+T"),      // Ctrl+T: transpose-chars
+            Self::ClosePane => Some("Ctrl+Shift+W"),     // Ctrl+W: kill-word
+            Self::SplitVertical => Some("Ctrl+Shift+D"), // Ctrl+D: EOF
+            Self::TerminalSearch => Some("Ctrl+Shift+F"), // Ctrl+F: forward-char
+            Self::FocusComposer => Some("Ctrl+Shift+J"), // Ctrl+J: LF
+            // Ctrl+[ = ESC, Ctrl+] = GS. Ctrl+Shift+대괄호는 에이전트 선택이 쓰므로
+            // pane 이동은 WezTerm/Windows Terminal 관례인 Alt+화살표로 간다.
+            Self::FocusNextPane => Some("Alt+Right"),
+            Self::FocusPreviousPane => Some("Alt+Left"),
+            // Ctrl+Alt+화살표 = 드라이버 화면 회전. Ctrl+PageUp/Down은 Windows 표준
+            // "이전/다음 탭"이라 워크스페이스 전환에 그대로 맞는다.
+            Self::NextWorkspace => Some("Ctrl+PageDown"),
+            Self::PreviousWorkspace => Some("Ctrl+PageUp"),
+            // Ctrl+Shift+↑↓ 를 에이전트 강도에 내주고 프롬프트 점프가 비킨다.
+            // Alt+화살표와 달리 Alt+↑↓ 는 pane 이동과 겹치지 않는다.
+            Self::PromptJumpPrev => Some("Alt+Up"),
+            Self::PromptJumpNext => Some("Alt+Down"),
+            Self::ClearRenderCaches => Some("Ctrl+Shift+K"), // Ctrl+Alt+K: AltGr
+            _ => self.shared_default_serialized(),
+        }
+    }
+
+    fn unix_default_serialized(self) -> Option<&'static str> {
+        match self {
+            Self::ToggleSidebar => Some("Command+B"),
             Self::NewShell => Some("Command+T"),
             Self::ClosePane => Some("Command+W"),
             Self::SplitVertical => Some("Command+D"),
-            Self::SplitHorizontal => Some("Command+Shift+D"),
+            // macOS Cmd+F 기본. 평문 Ctrl+F는 readline forward-char(C-f)와 충돌하므로
+            // 기본으로 가로채지 않는다 — 사용자는 설정에서 Ctrl+F로 rebind할 수 있다 (T3).
+            Self::TerminalSearch => Some("Command+F"),
+            Self::FocusComposer => Some("Command+J"),
             Self::FocusNextPane => Some("Command+CloseBracket"),
             Self::FocusPreviousPane => Some("Command+OpenBracket"),
             Self::NextWorkspace => Some("Command+Alt+Right"),
             Self::PreviousWorkspace => Some("Command+Alt+Left"),
-            Self::IncreaseTerminalFont => Some("Command+Plus"),
-            Self::DecreaseTerminalFont => Some("Command+Minus"),
-            // macOS Cmd+F 기본. 평문 Ctrl+F는 readline forward-char(C-f)와 충돌하므로
-            // 기본으로 가로채지 않는다 — 사용자는 설정에서 Ctrl+F로 rebind할 수 있다 (T3).
-            Self::TerminalSearch => Some("Command+F"),
-            Self::ScrollToBottom => Some("Command+Down"),
             // egui Key::name()은 화살표를 "Up"/"Down"으로 직렬화한다 (⌘⇧↑/⌘⇧↓).
             Self::PromptJumpPrev => Some("Command+Shift+Up"),
             Self::PromptJumpNext => Some("Command+Shift+Down"),
-            Self::FocusComposer => Some("Command+J"),
             Self::ClearRenderCaches => Some("Command+Alt+K"),
-            Self::PreviousAgent
-            | Self::NextAgent
-            | Self::FocusAgentInput
-            | Self::NewStructuredAgent
-            | Self::InterruptAgent
-            | Self::ApproveAgent
-            | Self::RejectAgent
-            | Self::IncreaseAgentEffort
-            | Self::DecreaseAgentEffort => None,
+            _ => self.shared_default_serialized(),
+        }
+    }
+
+    fn default_serialized(self) -> Option<&'static str> {
+        if cfg!(windows) {
+            self.windows_default_serialized()
+        } else {
+            self.unix_default_serialized()
         }
     }
 }
@@ -310,12 +379,46 @@ pub fn reset_all(config: &mut ShortcutsConfig) {
     config.disabled.clear();
 }
 
+/// 같은 물리 입력이 두 binding에 모두 매칭되는지 판정할 때 쓰는 키.
+///
+/// `serialize_binding`을 그대로 쓰면 안 된다. macOS 밖에서는 winit이 Ctrl을 누를 때
+/// `ctrl`과 `command`를 **둘 다** 세우고, egui `cmd_ctrl_matches`는 `Command+X`와
+/// `Ctrl+X` 양쪽 패턴을 모두 통과시킨다. 직렬화 문자열은 다르지만 실제로는 같은 키다 —
+/// 이 경우 `take_triggered_action_from_events`의 `find`가 `ShortcutAction::ALL` 순서상
+/// 앞선 액션만 실행하고 나머지는 조용히 죽는다. 그래서 mac이 아닌 곳에서는 두 수정자를
+/// 한 비트로 접어서 중복으로 잡는다. macOS에서는 ⌘와 ⌃가 실제로 다른 키라 구분한다.
+fn conflict_key_on(binding: egui::KeyboardShortcut, macos: bool) -> String {
+    let m = binding.modifiers;
+    let cmd_ctrl = if macos {
+        match (m.command, m.ctrl) {
+            (true, true) => "cmd+ctrl",
+            (true, false) => "cmd",
+            (false, true) => "ctrl",
+            (false, false) => "",
+        }
+    } else if m.command || m.ctrl {
+        "cmdctrl"
+    } else {
+        ""
+    };
+    format!(
+        "{cmd_ctrl}|{}|{}|{}",
+        m.alt,
+        m.shift,
+        binding.logical_key.name()
+    )
+}
+
+fn conflict_key(binding: egui::KeyboardShortcut) -> String {
+    conflict_key_on(binding, cfg!(target_os = "macos"))
+}
+
 pub fn conflicts(config: &ShortcutsConfig) -> BTreeSet<ShortcutAction> {
     let mut by_chord: BTreeMap<String, Vec<ShortcutAction>> = BTreeMap::new();
     for action in ShortcutAction::ALL {
         if let Some(binding) = effective_binding(config, action) {
             by_chord
-                .entry(serialize_binding(binding))
+                .entry(conflict_key(binding))
                 .or_default()
                 .push(action);
         }
@@ -498,6 +601,214 @@ mod tests {
         assert!(conflicts.contains(&ShortcutAction::OpenActivity));
     }
 
+    /// (표 이름, 조회 함수, 그 표가 macOS 규칙을 쓰는지)
+    ///
+    /// 두 표를 **어느 플랫폼에서 돌려도** 검사한다. macOS에서만 테스트를 돌리면서
+    /// Windows 표를 cfg로 잘라두면, Ctrl+Shift+D 중복 같은 사고가 Windows 사용자에게
+    /// 가서야 드러난다 — 실제로 SplitVertical(Ctrl+Shift+D)이 기존
+    /// SplitHorizontal(⌘⇧D → Windows에서 Ctrl+Shift+D)과 부딪혀 H로 옮겼다.
+    const DEFAULT_TABLES: [(&str, fn(ShortcutAction) -> Option<&'static str>, bool); 2] = [
+        ("unix", ShortcutAction::unix_default_serialized, true),
+        ("windows", ShortcutAction::windows_default_serialized, false),
+    ];
+
+    /// 기본값끼리 겹치면 `conflicts()`가 **양쪽 다** 비활성화해서 두 동작이 통째로
+    /// 사라진다. 조용한 실패라 테스트로만 잡힌다.
+    #[test]
+    fn 두_플랫폼_기본값_모두_중복이_없다() {
+        for (name, table, macos) in DEFAULT_TABLES {
+            let mut by_chord: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+            for action in ShortcutAction::ALL {
+                let Some(default) = table(action) else {
+                    continue;
+                };
+                let binding = parse_binding(default)
+                    .unwrap_or_else(|| panic!("{name}: {}의 {default}를 파싱 실패", action.id()));
+                by_chord
+                    .entry(conflict_key_on(binding, macos))
+                    .or_default()
+                    .push(action.id());
+            }
+            let dupes: Vec<_> = by_chord
+                .iter()
+                .filter(|(_, actions)| actions.len() > 1)
+                .collect();
+            assert!(dupes.is_empty(), "{name} 기본값 충돌: {dupes:?}");
+        }
+    }
+
+    /// 모든 기본값이 파싱돼야 한다. `binding_is_safe`가 거르면 `parse_binding`이 None을
+    /// 주고 그 액션은 조용히 바인딩 없이 출시된다.
+    #[test]
+    fn 두_플랫폼_기본값_모두_파싱된다() {
+        for (name, table, _) in DEFAULT_TABLES {
+            for action in ShortcutAction::ALL {
+                let Some(default) = table(action) else {
+                    continue;
+                };
+                let binding = parse_binding(default)
+                    .unwrap_or_else(|| panic!("{name}: {}의 {default} 파싱 실패", action.id()));
+                assert_eq!(
+                    parse_binding(&serialize_binding(binding)),
+                    Some(binding),
+                    "{name}: {}의 {default}가 왕복하지 않는다",
+                    action.id()
+                );
+            }
+        }
+    }
+
+    /// 두 표는 같은 액션 집합을 덮어야 한다 — 한쪽에만 기본값이 있으면 그 플랫폼
+    /// 사용자만 조용히 단축키 없이 쓰게 된다.
+    #[test]
+    fn 두_플랫폼_기본값_집합이_같다() {
+        for action in ShortcutAction::ALL {
+            assert_eq!(
+                action.unix_default_serialized().is_some(),
+                action.windows_default_serialized().is_some(),
+                "{}의 기본값 유무가 플랫폼마다 다르다",
+                action.id()
+            );
+        }
+    }
+
+    /// 에이전트 그룹은 전부 기본 바인딩을 가진다 — 예약해 둔 모델 전환 2종만 예외이며
+    /// 그건 아직 액션 자체가 없다.
+    #[test]
+    fn 에이전트_액션에_기본값이_있다() {
+        for action in ShortcutAction::ALL {
+            if action.group() != ShortcutGroup::Agent {
+                continue;
+            }
+            assert!(
+                action.default_serialized().is_some(),
+                "{}에 기본 바인딩이 없다",
+                action.id()
+            );
+        }
+    }
+
+    /// Windows 기본값에 Ctrl+Alt가 있으면 두 가지로 깨진다: AltGr(Ctrl+Alt) 배열에서
+    /// 문자 입력 중 오발동하고, 화살표 조합은 Intel/AMD 드라이버 화면 회전 핫키가
+    /// 먼저 먹어 앱에 도달하지 않는다.
+    #[test]
+    fn windows_기본값은_ctrl_alt를_쓰지_않는다() {
+        for action in ShortcutAction::ALL {
+            let Some(binding) = action.windows_default_serialized().and_then(parse_binding) else {
+                continue;
+            };
+            let cmd_or_ctrl = binding.modifiers.command || binding.modifiers.ctrl;
+            assert!(
+                !(cmd_or_ctrl && binding.modifiers.alt),
+                "{}의 Windows 기본값이 Ctrl+Alt다 (AltGr/화면회전 충돌)",
+                action.id()
+            );
+        }
+    }
+
+    /// Windows에서 앱이 가로채면 셸에 도달하지 못하는 제어문자 조합. 터미널 pane은
+    /// TextEdit이 아니라 `handle_configured_shortcut`의 포커스 게이트를 통과하므로,
+    /// 기본값 단계에서 피하는 것 말고 방법이 없다.
+    #[test]
+    fn windows_기본값은_터미널_제어문자를_가로채지_않는다() {
+        // (키, 무엇을 먹는지)
+        let reserved = [
+            (egui::Key::D, "EOF"),
+            (egui::Key::OpenBracket, "ESC"),
+            (egui::Key::CloseBracket, "GS"),
+            (egui::Key::B, "backward-char/tmux prefix"),
+            (egui::Key::T, "transpose-chars"),
+            (egui::Key::W, "kill-word"),
+            (egui::Key::F, "forward-char"),
+            (egui::Key::J, "LF"),
+            (egui::Key::C, "SIGINT"),
+            (egui::Key::Z, "SIGTSTP"),
+            (egui::Key::U, "kill-line"),
+        ];
+        for action in ShortcutAction::ALL {
+            let Some(binding) = action.windows_default_serialized().and_then(parse_binding) else {
+                continue;
+            };
+            let m = binding.modifiers;
+            // Shift가 붙으면 제어문자가 아니라 별개 chord다 (Ctrl+Shift+D ≠ Ctrl+D).
+            if !(m.command || m.ctrl) || m.shift || m.alt {
+                continue;
+            }
+            if let Some((_, meaning)) = reserved.iter().find(|(key, _)| *key == binding.logical_key)
+            {
+                panic!(
+                    "{}의 Windows 기본값이 Ctrl+{:?} — 셸의 {meaning}를 먹는다",
+                    action.id(),
+                    binding.logical_key
+                );
+            }
+        }
+    }
+
+    /// macOS가 아닌 곳에서 winit은 Ctrl 하나에 `ctrl`과 `command`를 둘 다 세운다.
+    /// 그래서 `Command+B`와 `Ctrl+B`는 직렬화 문자열만 다를 뿐 같은 물리 키다.
+    /// `conflict_key`가 이걸 접지 않으면 둘 중 하나가 조용히 죽는다.
+    #[test]
+    fn command와_ctrl은_mac_밖에서_같은_키로_취급된다() {
+        let command_b = parse_binding("Command+B").unwrap();
+        let ctrl_b = parse_binding("Ctrl+B").unwrap();
+        assert_ne!(command_b, ctrl_b, "두 chord는 서로 다른 값이어야 한다");
+        if cfg!(target_os = "macos") {
+            assert_ne!(conflict_key(command_b), conflict_key(ctrl_b));
+        } else {
+            assert_eq!(conflict_key(command_b), conflict_key(ctrl_b));
+        }
+    }
+
+    /// 위 규칙이 `conflicts()`까지 실제로 전달되는지 — 단위 함수만 맞고 호출부가
+    /// 옛 키를 쓰면 의미가 없다.
+    #[test]
+    fn mac_밖에서는_command와_ctrl_바인딩이_충돌로_잡힌다() {
+        let mut config = ShortcutsConfig::default();
+        set_binding(
+            &mut config,
+            ShortcutAction::ToggleSidebar,
+            parse_binding("Command+Shift+Y"),
+        );
+        set_binding(
+            &mut config,
+            ShortcutAction::OpenActivity,
+            parse_binding("Ctrl+Shift+Y"),
+        );
+        let conflicts = conflicts(&config);
+        if cfg!(target_os = "macos") {
+            assert!(conflicts.is_empty(), "macOS에서 ⌘와 ⌃는 다른 키다");
+        } else {
+            assert!(conflicts.contains(&ShortcutAction::ToggleSidebar));
+            assert!(conflicts.contains(&ShortcutAction::OpenActivity));
+        }
+    }
+
+    /// ⌘+ 는 US 배열에서 Shift+= 라 egui가 `Key::Plus` + `shift: true`로 준다.
+    /// `matches_exact`는 shift까지 정확히 요구하므로 옛 기본값 "Command+Plus"는
+    /// 전용 + 키에서만 먹었다. 새 기본값은 shift 없이 눌리는 `=` 여야 한다.
+    #[test]
+    fn 글꼴_확대_기본값은_shift_없이_눌린다() {
+        let binding = ShortcutAction::IncreaseTerminalFont
+            .default_serialized()
+            .and_then(parse_binding)
+            .expect("기본값이 있어야 한다");
+        assert!(!binding.modifiers.shift);
+        assert_eq!(binding.logical_key, egui::Key::Equals);
+        // 실제 입력 경로 재현: '=' 를 shift 없이 누르면 매칭돼야 한다.
+        assert!(
+            egui::Modifiers::COMMAND.matches_exact(binding.modifiers),
+            "⌘= 가 매칭되지 않는다"
+        );
+        // 옛 기본값이 왜 안 먹었는지 고정 — Shift+= 는 Plus+shift로 온다.
+        let old = parse_binding("Command+Plus").unwrap();
+        let shift_equals = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        assert!(
+            !shift_equals.matches_exact(old.modifiers),
+            "옛 기본값이 갑자기 매칭되면 이 회귀 테스트의 전제가 바뀐 것이다"
+        );
+    }
+
     #[test]
     fn disabled_binding_survives_default_fallback() {
         let mut config = ShortcutsConfig::default();
@@ -550,10 +861,12 @@ mod tests {
         );
     }
 
+    /// 에이전트 액션은 원래 전부 미할당이었다(사용자가 설정에서 직접 걸어야 했다).
+    /// 이제 기본값을 준다 — 미할당이 아니라 "해제하면 없어진다"가 계약이다.
     #[test]
-    fn agent_actions_are_unassigned_by_default() {
-        let config = ShortcutsConfig::default();
-        for action in [
+    fn agent_actions_are_bound_by_default_and_stay_unbindable() {
+        let mut config = ShortcutsConfig::default();
+        let agent_actions = [
             ShortcutAction::PreviousAgent,
             ShortcutAction::NextAgent,
             ShortcutAction::FocusAgentInput,
@@ -563,8 +876,41 @@ mod tests {
             ShortcutAction::RejectAgent,
             ShortcutAction::IncreaseAgentEffort,
             ShortcutAction::DecreaseAgentEffort,
-        ] {
+        ];
+        for action in agent_actions {
+            assert!(
+                effective_binding(&config, action).is_some(),
+                "{}에 기본 바인딩이 없다",
+                action.id()
+            );
+        }
+        for action in agent_actions {
+            set_binding(&mut config, action, None);
             assert_eq!(effective_binding(&config, action), None);
+        }
+    }
+
+    /// 사용자가 요청한 강도 다이얼이 실제로 그 chord로 나가는지 고정한다.
+    /// macOS ⌃⇧↑↓ / Windows Ctrl+Shift+↑↓ — 물리 제스처가 같아야 한다.
+    #[test]
+    fn 강도_다이얼은_양_플랫폼에서_같은_제스처다() {
+        let up = ShortcutAction::IncreaseAgentEffort
+            .default_serialized()
+            .and_then(parse_binding)
+            .unwrap();
+        let down = ShortcutAction::DecreaseAgentEffort
+            .default_serialized()
+            .and_then(parse_binding)
+            .unwrap();
+        assert_eq!(up.logical_key, egui::Key::ArrowUp);
+        assert_eq!(down.logical_key, egui::Key::ArrowDown);
+        for binding in [up, down] {
+            assert!(
+                binding.modifiers.ctrl,
+                "논리 Command가 아니라 실제 Ctrl이어야 한다"
+            );
+            assert!(binding.modifiers.shift);
+            assert!(!binding.modifiers.alt);
         }
     }
 

@@ -4,6 +4,10 @@ use std::sync::Arc;
 
 const EXECUTABLE_PATH_MAX_BYTES: usize = 4 * 1024;
 const MODEL_MAX_BYTES: usize = 256;
+/// 표시 이름 상한. 카탈로그가 긴 문자열을 넣어도 콤보박스가 무너지지 않게 한다.
+const MODEL_LABEL_MAX_BYTES: usize = 128;
+/// 에이전트 하나가 제시할 모델 수 상한. 카탈로그 상한과 같은 값을 유지한다.
+const MODELS_PER_AGENT_MAX: usize = 64;
 const DETECTION_PATH_ITEMS_MAX: usize = 96;
 const DETECTION_LAUNCH_PATH_MAX_BYTES: usize = 32 * 1024;
 const CODEX_EFFORTS_XHIGH: &[ReasoningEffort] = &[
@@ -34,6 +38,21 @@ const CLAUDE_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::XHigh,
     ReasoningEffort::Max,
 ];
+// Kimi 모델 카탈로그가 선언하는 `support_efforts` 그대로다(low/high/max).
+const KIMI_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::High,
+    ReasoningEffort::Max,
+];
+// `support_efforts`가 없는 Kimi 모델은 강도 단계 없이 thinking 켬/끔만 있다.
+const KIMI_THINKING_TOGGLE: &[ReasoningEffort] = &[ReasoningEffort::On, ReasoningEffort::Off];
+// grok-4.5가 광고하는 단계. Grok의 전체 어휘는 none/minimal도 포함하지만 모델마다
+// 부분집합만 받으므로, 카탈로그를 못 읽을 때 쓰는 이 폴백은 기본 모델 기준으로 둔다.
+const GROK_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+];
 
 #[cfg(unix)]
 const AGENT_THEN_SHELL_SCRIPT: &str = r#""$@"; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${SHELL:-/bin/sh}""#;
@@ -49,38 +68,78 @@ pub(crate) enum AgentKind {
     Amp,
     Kimi,
     QwenCode,
+    Grok,
     Cursor,
     Copilot,
 }
 
+/// 앱에 컴파일해 넣은 모델 항목. 디스크 카탈로그를 못 읽을 때의 폴백이다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ModelChoice {
+struct BuiltinModel {
     value: &'static str,
     label: &'static str,
     efforts: &'static [ReasoningEffort],
     default_effort: Option<ReasoningEffort>,
 }
 
+/// 런처가 제시하는 모델 하나. 디스크 카탈로그에서 읽을 수도 있으므로 소유 데이터다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelChoice {
+    value: String,
+    label: String,
+    efforts: Vec<ReasoningEffort>,
+    default_effort: Option<ReasoningEffort>,
+}
+
 impl ModelChoice {
-    pub(crate) const fn value(self) -> &'static str {
-        self.value
+    /// 실행 계약이 거부할 값은 애초에 목록에 올리지 않는다. 표시 이름이 비었거나
+    /// 지나치게 길면 식별자를 그대로 쓰고, 선언된 기본 강도가 지원 목록 밖이면 버린다.
+    pub(crate) fn new(
+        value: &str,
+        label: &str,
+        efforts: Vec<ReasoningEffort>,
+        default_effort: Option<ReasoningEffort>,
+    ) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty()
+            || value.len() > MODEL_MAX_BYTES
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return None;
+        }
+        let label = label.trim();
+        let label = if label.is_empty() || label.len() > MODEL_LABEL_MAX_BYTES {
+            value.to_owned()
+        } else {
+            label.replace(|c: char| c.is_control(), " ")
+        };
+        Some(Self {
+            value: value.to_owned(),
+            label,
+            default_effort: default_effort.filter(|effort| efforts.contains(effort)),
+            efforts,
+        })
     }
 
-    pub(crate) const fn label(self) -> &'static str {
-        self.label
+    pub(crate) fn value(&self) -> &str {
+        &self.value
     }
 
-    pub(crate) const fn efforts(self) -> &'static [ReasoningEffort] {
-        self.efforts
+    pub(crate) fn label(&self) -> &str {
+        &self.label
     }
 
-    pub(crate) const fn default_effort(self) -> Option<ReasoningEffort> {
+    pub(crate) fn efforts(&self) -> &[ReasoningEffort] {
+        &self.efforts
+    }
+
+    pub(crate) fn default_effort(&self) -> Option<ReasoningEffort> {
         self.default_effort
     }
 }
 
 impl AgentKind {
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::Claude,
         Self::Codex,
         Self::OpenCode,
@@ -90,6 +149,7 @@ impl AgentKind {
         Self::Amp,
         Self::Kimi,
         Self::QwenCode,
+        Self::Grok,
         Self::Cursor,
         Self::Copilot,
     ];
@@ -105,6 +165,7 @@ impl AgentKind {
             Self::Amp => "amp",
             Self::Kimi => "kimi",
             Self::QwenCode => "qwen-code",
+            Self::Grok => "grok",
             Self::Cursor => "cursor",
             Self::Copilot => "copilot",
         }
@@ -121,6 +182,7 @@ impl AgentKind {
             Self::Amp => "deppy-builtin-amp",
             Self::Kimi => "deppy-builtin-kimi",
             Self::QwenCode => "deppy-builtin-qwen-code",
+            Self::Grok => "deppy-builtin-grok",
             Self::Cursor => "deppy-builtin-cursor",
             Self::Copilot => "deppy-builtin-copilot",
         }
@@ -137,6 +199,7 @@ impl AgentKind {
             Self::Amp => "Amp",
             Self::Kimi => "Kimi CLI",
             Self::QwenCode => "Qwen Code",
+            Self::Grok => "Grok",
             Self::Cursor => "Cursor Agent",
             Self::Copilot => "GitHub Copilot",
         }
@@ -153,6 +216,7 @@ impl AgentKind {
             Self::Amp => "AM",
             Self::Kimi => "KI",
             Self::QwenCode => "QW",
+            Self::Grok => "GK",
             Self::Cursor => "CU",
             Self::Copilot => "CP",
         }
@@ -169,6 +233,7 @@ impl AgentKind {
             Self::Amp => (0xf0, 0x62, 0x92),
             Self::Kimi => (0x4e, 0x7d, 0xf2),
             Self::QwenCode => (0x72, 0x63, 0xd9),
+            Self::Grok => (0x1d, 0x1d, 0x1f),
             Self::Cursor => (0x55, 0x58, 0x60),
             Self::Copilot => (0x78, 0x7f, 0x89),
         }
@@ -185,75 +250,79 @@ impl AgentKind {
             Self::Amp => "amp",
             Self::Kimi => "kimi",
             Self::QwenCode => "qwen",
+            Self::Grok => "grok",
             Self::Cursor => "cursor-agent",
             Self::Copilot => "copilot",
         }
     }
 
     pub(crate) const fn supports_model(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex | Self::Kimi)
+        matches!(
+            self,
+            Self::Claude | Self::Codex | Self::Kimi | Self::Grok | Self::QwenCode
+        )
     }
 
-    pub(crate) const fn supported_models(self) -> &'static [ModelChoice] {
+    const fn builtin_models(self) -> &'static [BuiltinModel] {
         match self {
             Self::Claude => &[
-                ModelChoice {
+                BuiltinModel {
                     value: "sonnet",
                     label: "Sonnet",
                     efforts: CLAUDE_EFFORTS,
-                    default_effort: None,
+                    default_effort: Some(ReasoningEffort::High),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "opus",
                     label: "Opus",
                     efforts: CLAUDE_EFFORTS,
-                    default_effort: None,
+                    default_effort: Some(ReasoningEffort::High),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "fable",
                     label: "Fable",
                     efforts: CLAUDE_EFFORTS,
-                    default_effort: None,
+                    default_effort: Some(ReasoningEffort::High),
                 },
             ],
             Self::Codex => &[
-                ModelChoice {
+                BuiltinModel {
                     value: "gpt-5.6-sol",
                     label: "GPT-5.6-Sol",
                     efforts: CODEX_EFFORTS_ULTRA,
                     default_effort: Some(ReasoningEffort::Low),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "gpt-5.6-terra",
                     label: "GPT-5.6-Terra",
                     efforts: CODEX_EFFORTS_ULTRA,
                     default_effort: Some(ReasoningEffort::Medium),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "gpt-5.6-luna",
                     label: "GPT-5.6-Luna",
                     efforts: CODEX_EFFORTS_MAX,
                     default_effort: Some(ReasoningEffort::Medium),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "gpt-5.5",
                     label: "GPT-5.5",
                     efforts: CODEX_EFFORTS_XHIGH,
                     default_effort: Some(ReasoningEffort::Medium),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "gpt-5.4",
                     label: "GPT-5.4",
                     efforts: CODEX_EFFORTS_XHIGH,
                     default_effort: Some(ReasoningEffort::Medium),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "gpt-5.4-mini",
                     label: "GPT-5.4-Mini",
                     efforts: CODEX_EFFORTS_XHIGH,
                     default_effort: Some(ReasoningEffort::Medium),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "gpt-5.3-codex-spark",
                     label: "GPT-5.3-Codex-Spark",
                     efforts: CODEX_EFFORTS_XHIGH,
@@ -261,31 +330,48 @@ impl AgentKind {
                 },
             ],
             Self::Kimi => &[
-                ModelChoice {
+                BuiltinModel {
                     value: "kimi-code/kimi-for-coding",
                     label: "K2.7 Coding",
-                    efforts: &[],
+                    efforts: KIMI_THINKING_TOGGLE,
                     default_effort: None,
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "kimi-code/kimi-for-coding-highspeed",
                     label: "K2.7 Coding Highspeed",
-                    efforts: &[],
+                    efforts: KIMI_THINKING_TOGGLE,
                     default_effort: None,
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "kimi-code/k3",
                     label: "K3",
-                    efforts: &[],
-                    default_effort: None,
+                    efforts: KIMI_EFFORTS,
+                    default_effort: Some(ReasoningEffort::High),
                 },
-                ModelChoice {
+                BuiltinModel {
                     value: "kimi-code/k3-256k",
                     label: "K3-256k",
-                    efforts: &[],
-                    default_effort: None,
+                    efforts: KIMI_EFFORTS,
+                    default_effort: Some(ReasoningEffort::High),
                 },
             ],
+            // Grok의 `~/.grok/models_cache.json`은 로그인 후 서버에서 받아야 생긴다.
+            // 그 전까지는 내장 기본 모델 하나만 제시한다.
+            Self::Grok => &[BuiltinModel {
+                value: "grok-4.5",
+                label: "Grok 4.5",
+                efforts: GROK_EFFORTS,
+                default_effort: Some(ReasoningEffort::High),
+            }],
+            // Qwen Code는 모델 카탈로그를 받아오지 않는다. OAuth 기본 모델만 확실하고,
+            // 나머지는 사용자가 settings.json에 직접 선언해야 쓸 수 있어 카탈로그에서 읽는다.
+            // 추론 강도는 CLI 플래그가 없어(설정 파일/슬래시 명령 전용) 제시하지 않는다.
+            Self::QwenCode => &[BuiltinModel {
+                value: "coder-model",
+                label: "Qwen Coder",
+                efforts: &[],
+                default_effort: None,
+            }],
             _ => &[],
         }
     }
@@ -298,25 +384,48 @@ impl AgentKind {
         matches!(self, Self::Claude | Self::Codex)
     }
 
-    pub(crate) fn supported_efforts(self, model: &str) -> &'static [ReasoningEffort] {
-        self.supported_models()
-            .iter()
-            .find(|choice| choice.value() == model)
-            .map_or_else(
-                || match self {
-                    Self::Codex => CODEX_EFFORTS_XHIGH,
-                    Self::Claude => CLAUDE_EFFORTS,
-                    _ => &[],
-                },
-                |choice| choice.efforts(),
-            )
+    /// 카탈로그에 없는 모델(=CLI 자신의 기본 모델)에 쓰는 보수적 강도 목록.
+    ///
+    /// Kimi는 여기에 넣지 않는다. Kimi 모델은 단계형(`support_efforts`)과 boolean
+    /// thinking(켬/끔) 두 종류인데 모르는 모델이 어느 쪽인지 알 수 없다. 틀린 종류의
+    /// 조작을 제시하느니 제시하지 않는 편이 낫다.
+    const fn fallback_efforts(self) -> &'static [ReasoningEffort] {
+        match self {
+            Self::Codex => CODEX_EFFORTS_XHIGH,
+            Self::Claude => CLAUDE_EFFORTS,
+            Self::Grok => GROK_EFFORTS,
+            _ => &[],
+        }
     }
 
-    pub(crate) fn default_effort(self, model: &str) -> Option<ReasoningEffort> {
-        self.supported_models()
+    /// 카탈로그에 없는 모델의 기본 강도. 이 값이 없으면 UI가 목록 첫 단계(=가장 낮음)를
+    /// 고르게 되어, CLI를 그냥 실행했을 때보다 낮은 강도로 조용히 실행된다.
+    /// 두 값 모두 해당 CLI가 자기 모델들에 선언한 기본값에서 가져왔다.
+    const fn fallback_default_effort(self) -> Option<ReasoningEffort> {
+        match self {
+            // Claude 카탈로그의 5계열 모델은 전부 `default_effort: "high"`다.
+            Self::Claude => Some(ReasoningEffort::High),
+            // Codex 카탈로그 7개 중 5개가 `medium`이다.
+            Self::Codex => Some(ReasoningEffort::Medium),
+            // grok-4.5가 선언하는 기본값이다.
+            Self::Grok => Some(ReasoningEffort::High),
+            _ => None,
+        }
+    }
+
+    /// 디스크 카탈로그를 못 읽었을 때 쓰는 내장 목록.
+    fn builtin_model_choices(self) -> Vec<ModelChoice> {
+        self.builtin_models()
             .iter()
-            .find(|choice| choice.value() == model)
-            .and_then(|choice| choice.default_effort())
+            .filter_map(|model| {
+                ModelChoice::new(
+                    model.value,
+                    model.label,
+                    model.efforts.to_vec(),
+                    model.default_effort,
+                )
+            })
+            .collect()
     }
 }
 
@@ -334,6 +443,10 @@ pub(crate) enum ReasoningEffort {
     XHigh,
     Max,
     Ultra,
+    // `support_efforts`를 선언하지 않은 Kimi 모델의 boolean thinking 값이다.
+    // Kimi 자신도 같은 effort 필드에 이 두 의사(pseudo) 값을 쓴다.
+    On,
+    Off,
 }
 
 impl ReasoningEffort {
@@ -345,7 +458,17 @@ impl ReasoningEffort {
             Self::XHigh => "xhigh",
             Self::Max => "max",
             Self::Ultra => "ultra",
+            Self::On => "on",
+            Self::Off => "off",
         }
+    }
+
+    /// 강도 단계가 아니라 thinking 켬/끔만 고르는 목록인지.
+    pub(crate) fn is_thinking_toggle(levels: &[Self]) -> bool {
+        !levels.is_empty()
+            && levels
+                .iter()
+                .all(|level| matches!(level, Self::On | Self::Off))
     }
 }
 
@@ -354,6 +477,11 @@ pub(crate) struct DetectedAgent {
     kind: AgentKind,
     executable: PathBuf,
     launch_path: Option<Arc<str>>,
+    /// 감지 시점에 확정된 모델 목록. 디스크 카탈로그를 읽었으면 그 결과, 아니면 내장 목록.
+    models: Vec<ModelChoice>,
+    /// CLI가 자기 설정에 적어 둔 기본 모델(목록 안에 있을 때만). 런처는 이 값을 미리
+    /// 골라 두어, 앱으로 띄운 결과가 CLI를 그냥 실행한 것과 같게 유지한다.
+    default_model: Option<String>,
 }
 
 impl DetectedAgent {
@@ -364,6 +492,40 @@ impl DetectedAgent {
     pub(crate) fn executable(&self) -> &Path {
         &self.executable
     }
+
+    pub(crate) fn models(&self) -> &[ModelChoice] {
+        &self.models
+    }
+
+    /// 런처가 처음 제시할 모델. CLI 설정의 기본 모델을 쓰되, 그 값이 카탈로그에 없으면
+    /// (설정이 비었거나 모델이 내려갔거나 env로 대체된 경우) 목록 첫 항목으로 물러난다.
+    pub(crate) fn initial_model(&self) -> &str {
+        self.default_model
+            .as_deref()
+            .filter(|model| find_model(&self.models, model).is_some())
+            .or_else(|| self.models.first().map(ModelChoice::value))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn supported_efforts(&self, model: &str) -> &[ReasoningEffort] {
+        efforts_for(self.kind, &self.models, model)
+    }
+}
+
+/// 목록에서 이 식별자의 모델을 찾는다. 빈 문자열(= CLI 자신의 기본 모델)은 못 찾는다.
+pub(crate) fn find_model<'a>(models: &'a [ModelChoice], model: &str) -> Option<&'a ModelChoice> {
+    models.iter().find(|choice| choice.value() == model)
+}
+
+/// 실행 계약이 허용하는 강도 목록. 카탈로그에 없는 모델(= CLI 자신의 기본 모델)에는
+/// 종류별 보수적 폴백을 쓴다. UI는 이 폴백을 제시하지 않고, 여기서는 UI 밖에서 들어온
+/// 요청을 막는 상한으로만 쓴다.
+fn efforts_for<'a>(
+    kind: AgentKind,
+    models: &'a [ModelChoice],
+    model: &str,
+) -> &'a [ReasoningEffort] {
+    find_model(models, model).map_or_else(|| kind.fallback_efforts(), ModelChoice::efforts)
 }
 
 impl std::fmt::Debug for DetectedAgent {
@@ -403,6 +565,8 @@ impl DetectionSnapshot {
                     kind,
                     executable,
                     launch_path: None,
+                    models: kind.builtin_model_choices(),
+                    default_model: None,
                 })
                 .collect(),
         }
@@ -454,20 +618,82 @@ pub(crate) fn wrap_agent_then_shell(command: String, args: Vec<String>) -> (Stri
     (command, args)
 }
 
+/// 설치된 에이전트를 찾고, 각 에이전트의 모델 목록을 그 자리에서 확정한다.
+/// 파일 I/O를 하므로 렌더 스레드가 아니라 lazy 감지 워커에서만 호출한다.
 pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> DetectionSnapshot {
     let paths = detection_paths(excluded_directory);
     let launch_path = launch_search_path(&paths);
+    let home = crate::paths::home_dir();
     let agents = AgentKind::ALL
         .into_iter()
         .filter_map(|kind| {
-            resolve_executable(kind.detect_command(), &paths).map(|executable| DetectedAgent {
-                kind,
-                executable,
-                launch_path: launch_path.clone(),
+            resolve_executable(kind.detect_command(), &paths).map(|executable| {
+                // 설정 파일은 종류마다 한 번만 읽는다. 모델 목록과 초기 선택이 같은 값을
+                // 쓰므로 각각 읽으면 같은 파일을 두 번 열고 파싱하게 된다.
+                let configured =
+                    crate::agent_model_catalog::configured_default_model(kind, home.as_deref());
+                DetectedAgent {
+                    kind,
+                    executable,
+                    launch_path: launch_path.clone(),
+                    models: resolve_models(kind, home.as_deref(), configured.as_deref()),
+                    default_model: configured,
+                }
             })
         })
         .collect();
     DetectionSnapshot { agents }
+}
+
+/// CLI가 디스크에 남긴 카탈로그를 우선하고, 없거나 못 읽으면 내장 목록으로 폴백한다.
+/// 폴백 덕분에 새 설치·로그아웃·손상된 파일에서도 런처가 빈 목록이 되지 않는다.
+fn resolve_models(
+    kind: AgentKind,
+    home: Option<&Path>,
+    configured: Option<&str>,
+) -> Vec<ModelChoice> {
+    let mut models = if crate::agent_model_catalog::has_disk_catalog(kind) {
+        crate::agent_model_catalog::load(kind, home)
+    } else {
+        Vec::new()
+    };
+    if models.is_empty() {
+        models = kind.builtin_model_choices();
+    }
+    if let Some(configured) = configured {
+        adopt_model(kind, configured, &mut models);
+    }
+    models
+}
+
+/// CLI 설정이 가리키는 모델이 목록에 없으면 그 모델을 목록 맨 앞에 넣는다.
+///
+/// 카탈로그가 모든 모델을 담지는 못한다 — Claude은 카탈로그 자체가 없어 내장 별칭만 갖고,
+/// `opus[1m]` 같은 변형이나 사용자가 직접 추가한 모델은 빠진다. 그 상태로 두면 런처가
+/// 사용자가 설정해 둔 모델 대신 목록 첫 항목을 조용히 띄우게 된다. CLI가 설정에 적어 둔
+/// 값은 그 CLI에서 유효한 값이므로, 모르는 값이어도 선택지로 인정한다.
+fn adopt_model(kind: AgentKind, configured: &str, models: &mut Vec<ModelChoice>) {
+    if models.is_empty() {
+        return;
+    }
+    if find_model(models, configured).is_some() {
+        return;
+    }
+    // 강도 목록도 기본 강도도 알 수 없으므로 그 종류의 보수적 폴백을 쓴다. 기본 강도를
+    // 비워 두면 UI가 목록 첫 단계(=가장 낮음)를 골라, CLI 단독 실행보다 낮은 강도로
+    // 조용히 실행된다.
+    let Some(choice) = ModelChoice::new(
+        configured,
+        configured,
+        kind.fallback_efforts().to_vec(),
+        kind.fallback_default_effort(),
+    ) else {
+        return;
+    };
+    // 상한을 먼저 확보하고 넣는다. 넣고 나서 자르면 목록 끝의 진짜 카탈로그 항목이
+    // 밀려나고, 그게 사용자가 고른 모델이면 다음 새로고침에 말없이 바뀐다.
+    models.truncate(MODELS_PER_AGENT_MAX.saturating_sub(1));
+    models.insert(0, choice);
 }
 
 pub(crate) fn build_launch_spec(
@@ -486,17 +712,13 @@ pub(crate) fn build_launch_spec(
     }
     if !model.is_empty()
         && (!agent.kind.supports_model()
-            || !agent
-                .kind
-                .supported_models()
-                .iter()
-                .any(|choice| choice.value() == model))
+            || !agent.models().iter().any(|choice| choice.value() == model))
     {
         return Err(LaunchSpecErrorCode::UnsupportedModel);
     }
     if options
         .effort
-        .is_some_and(|effort| !agent.kind.supported_efforts(model).contains(&effort))
+        .is_some_and(|effort| !agent.supported_efforts(model).contains(&effort))
     {
         return Err(LaunchSpecErrorCode::UnsupportedEffort);
     }
@@ -529,6 +751,17 @@ pub(crate) fn build_launch_spec(
                 args.push("--effort".to_owned());
                 args.push(effort.value().to_owned());
             }
+            AgentKind::Grok => {
+                args.push("--reasoning-effort".to_owned());
+                args.push(effort.value().to_owned());
+            }
+            // Kimi CLI에는 effort 플래그가 없고 이 env 오버라이드만 있다.
+            AgentKind::Kimi => {
+                env_plain.push((
+                    "KIMI_MODEL_THINKING_EFFORT".to_owned(),
+                    effort.value().to_owned(),
+                ));
+            }
             _ => return Err(LaunchSpecErrorCode::UnsupportedEffort),
         }
     }
@@ -552,6 +785,8 @@ fn append_yolo(kind: AgentKind, args: &mut Vec<String>, env_plain: &mut Vec<(Str
         AgentKind::Goose => env_plain.push(("GOOSE_MODE".to_owned(), "auto".to_owned())),
         AgentKind::Amp => args.push("--dangerously-allow-all".to_owned()),
         AgentKind::Kimi => args.push("--yolo".to_owned()),
+        // `--yolo`도 파싱되지만 `--help`에 실린 정식 이름은 이쪽이다.
+        AgentKind::Grok => args.push("--always-approve".to_owned()),
         AgentKind::QwenCode => {
             args.push("--approval-mode".to_owned());
             args.push("yolo".to_owned());
@@ -736,6 +971,8 @@ mod tests {
             kind,
             executable: PathBuf::from(format!("/opt/deppy/{}", kind.detect_command())),
             launch_path: None,
+            models: kind.builtin_model_choices(),
+            default_model: None,
         }
     }
 
@@ -815,13 +1052,222 @@ mod tests {
     }
 
     #[test]
+    fn kimi_launch_passes_thinking_effort_through_env() {
+        let spec = build_launch_spec(
+            &detected(AgentKind::Kimi),
+            LaunchOptions {
+                model: "kimi-code/k3-256k".to_owned(),
+                effort: Some(ReasoningEffort::Max),
+                yolo: false,
+            },
+            None,
+        )
+        .unwrap();
+        let (_, _, args, env) = spec.into_parts();
+        assert_eq!(args, ["--model", "kimi-code/k3-256k"]);
+        assert_eq!(
+            env,
+            [("KIMI_MODEL_THINKING_EFFORT".to_owned(), "max".to_owned())]
+        );
+    }
+
+    #[test]
+    fn kimi_boolean_thinking_models_offer_on_off_instead_of_levels() {
+        for model in [
+            "kimi-code/kimi-for-coding",
+            "kimi-code/kimi-for-coding-highspeed",
+        ] {
+            let levels = detected(AgentKind::Kimi).supported_efforts(model).to_vec();
+            assert_eq!(
+                levels,
+                [ReasoningEffort::On, ReasoningEffort::Off],
+                "{model}"
+            );
+            assert!(ReasoningEffort::is_thinking_toggle(&levels), "{model}");
+        }
+        assert!(!ReasoningEffort::is_thinking_toggle(
+            detected(AgentKind::Kimi).supported_efforts("kimi-code/k3")
+        ));
+        assert!(!ReasoningEffort::is_thinking_toggle(
+            detected(AgentKind::Claude).supported_efforts("opus")
+        ));
+
+        let spec = build_launch_spec(
+            &detected(AgentKind::Kimi),
+            LaunchOptions {
+                model: "kimi-code/kimi-for-coding".to_owned(),
+                effort: Some(ReasoningEffort::Off),
+                yolo: false,
+            },
+            None,
+        )
+        .unwrap();
+        let (_, _, _, env) = spec.into_parts();
+        assert_eq!(
+            env,
+            [("KIMI_MODEL_THINKING_EFFORT".to_owned(), "off".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_configured_model_missing_from_the_catalog_is_still_offered() {
+        // Claude 설정의 `opus[1m]`처럼 내장 목록에 없는 값이 실제로 존재한다. 그대로
+        // 두면 런처가 사용자가 설정한 모델 대신 목록 첫 항목을 조용히 띄운다.
+        let mut models = AgentKind::Claude.builtin_model_choices();
+        let known = models.len();
+        assert!(find_model(&models, "opus[1m]").is_none());
+
+        adopt_model(AgentKind::Claude, "opus[1m]", &mut models);
+
+        assert_eq!(models.len(), known + 1);
+        assert_eq!(models[0].value(), "opus[1m]");
+        assert_eq!(models[0].efforts(), CLAUDE_EFFORTS);
+        // 기본 강도가 없으면 UI가 첫 단계(Low)를 골라 CLI 단독 실행보다 낮아진다.
+        assert_eq!(models[0].default_effort(), Some(ReasoningEffort::High));
+        // 실행 계약도 이 값을 받아들여야 한다.
+        let agent = DetectedAgent {
+            kind: AgentKind::Claude,
+            executable: PathBuf::from("/opt/deppy/claude"),
+            launch_path: None,
+            models,
+            default_model: Some("opus[1m]".to_owned()),
+        };
+        assert_eq!(agent.initial_model(), "opus[1m]");
+        let spec = build_launch_spec(
+            &agent,
+            LaunchOptions {
+                model: "opus[1m]".to_owned(),
+                effort: Some(ReasoningEffort::High),
+                yolo: false,
+            },
+            None,
+        )
+        .unwrap();
+        let (_, _, args, _) = spec.into_parts();
+        assert_eq!(args, ["--model", "opus[1m]", "--effort", "high"]);
+    }
+
+    #[test]
+    fn adopting_a_model_does_not_displace_a_catalog_entry_past_the_cap() {
+        // 카탈로그가 상한을 채운 상태에서 설정 모델을 넣을 때, 넣고 나서 자르면 목록 끝의
+        // 진짜 항목이 밀려난다. 그게 사용자가 고른 모델이면 다음 새로고침에 말없이 바뀐다.
+        let mut models: Vec<ModelChoice> = (0..MODELS_PER_AGENT_MAX)
+            .filter_map(|index| {
+                ModelChoice::new(&format!("m{index}"), "", CLAUDE_EFFORTS.to_vec(), None)
+            })
+            .collect();
+        assert_eq!(models.len(), MODELS_PER_AGENT_MAX);
+        let last_before = models[MODELS_PER_AGENT_MAX - 1].value().to_owned();
+
+        adopt_model(AgentKind::Claude, "opus[1m]", &mut models);
+
+        assert_eq!(models.len(), MODELS_PER_AGENT_MAX);
+        assert_eq!(models[0].value(), "opus[1m]");
+        assert!(
+            find_model(&models, &last_before).is_none(),
+            "상한이 있으니 하나는 빠지지만, 빠지는 자리는 결정적이어야 한다"
+        );
+        // 이미 목록에 있으면 아무것도 바뀌지 않는다.
+        let before = models.clone();
+        adopt_model(AgentKind::Claude, "opus[1m]", &mut models);
+        assert_eq!(models, before);
+    }
+
+    #[test]
+    fn grok_launch_uses_its_own_effort_and_approval_flags() {
+        let spec = build_launch_spec(
+            &detected(AgentKind::Grok),
+            LaunchOptions {
+                model: "grok-4.5".to_owned(),
+                effort: Some(ReasoningEffort::High),
+                yolo: true,
+            },
+            None,
+        )
+        .unwrap();
+        let (_, _, args, env) = spec.into_parts();
+        assert_eq!(
+            args,
+            [
+                "--always-approve",
+                "--model",
+                "grok-4.5",
+                "--reasoning-effort",
+                "high",
+            ]
+        );
+        assert!(env.is_empty());
+
+        // grok-4.5는 xhigh를 광고하지 않으므로 실행 계약이 막는다.
+        assert!(matches!(
+            build_launch_spec(
+                &detected(AgentKind::Grok),
+                LaunchOptions {
+                    model: "grok-4.5".to_owned(),
+                    effort: Some(ReasoningEffort::XHigh),
+                    yolo: false,
+                },
+                None,
+            ),
+            Err(LaunchSpecErrorCode::UnsupportedEffort)
+        ));
+    }
+
+    #[test]
+    fn qwen_offers_models_but_no_effort_because_its_cli_has_no_flag() {
+        let qwen = detected(AgentKind::QwenCode);
+        assert!(!qwen.models().is_empty());
+        assert!(qwen.supported_efforts("coder-model").is_empty());
+        assert!(matches!(
+            build_launch_spec(
+                &qwen,
+                LaunchOptions {
+                    model: "coder-model".to_owned(),
+                    effort: Some(ReasoningEffort::High),
+                    yolo: false,
+                },
+                None,
+            ),
+            Err(LaunchSpecErrorCode::UnsupportedEffort)
+        ));
+    }
+
+    #[test]
+    fn claude_models_report_their_catalog_default_effort() {
+        for model in ["sonnet", "opus", "fable"] {
+            assert_eq!(
+                find_model(&AgentKind::Claude.builtin_model_choices(), model)
+                    .and_then(ModelChoice::default_effort),
+                Some(ReasoningEffort::High),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_rejects_an_effort_the_model_does_not_declare() {
+        assert!(matches!(
+            build_launch_spec(
+                &detected(AgentKind::Kimi),
+                LaunchOptions {
+                    model: "kimi-code/k3".to_owned(),
+                    effort: Some(ReasoningEffort::Medium),
+                    yolo: false,
+                },
+                None,
+            ),
+            Err(LaunchSpecErrorCode::UnsupportedEffort)
+        ));
+    }
+
+    #[test]
     fn model_capabilities_expose_bounded_unique_selectable_values() {
         for kind in AgentKind::ALL {
-            let choices = kind.supported_models();
+            let choices = kind.builtin_model_choices();
             assert_eq!(kind.supports_model(), !choices.is_empty(), "{}", kind.id());
             assert!(choices.len() <= 16, "{}", kind.id());
             let mut values = HashSet::new();
-            for choice in choices {
+            for choice in &choices {
                 assert!(!choice.value().is_empty(), "{}", kind.id());
                 assert!(choice.value().len() <= MODEL_MAX_BYTES, "{}", kind.id());
                 assert!(
@@ -846,7 +1292,7 @@ mod tests {
                         choice.value()
                     );
                 }
-                assert!(values.insert(choice.value()), "{}", kind.id());
+                assert!(values.insert(choice.value().to_owned()), "{}", kind.id());
             }
         }
     }
@@ -854,23 +1300,28 @@ mod tests {
     #[test]
     fn codex_reasoning_capabilities_follow_the_selected_model() {
         assert_eq!(
-            AgentKind::Codex.supported_efforts("gpt-5.6-sol"),
+            detected(AgentKind::Codex).supported_efforts("gpt-5.6-sol"),
             CODEX_EFFORTS_ULTRA
         );
         assert_eq!(
-            AgentKind::Codex.default_effort("gpt-5.6-sol"),
+            find_model(&AgentKind::Codex.builtin_model_choices(), "gpt-5.6-sol")
+                .and_then(ModelChoice::default_effort),
             Some(ReasoningEffort::Low)
         );
         assert_eq!(
-            AgentKind::Codex.supported_efforts("gpt-5.6-luna"),
+            detected(AgentKind::Codex).supported_efforts("gpt-5.6-luna"),
             CODEX_EFFORTS_MAX
         );
         assert_eq!(
-            AgentKind::Codex.supported_efforts("gpt-5.4"),
+            detected(AgentKind::Codex).supported_efforts("gpt-5.4"),
             CODEX_EFFORTS_XHIGH
         );
         assert_eq!(
-            AgentKind::Codex.default_effort("gpt-5.3-codex-spark"),
+            find_model(
+                &AgentKind::Codex.builtin_model_choices(),
+                "gpt-5.3-codex-spark"
+            )
+            .and_then(ModelChoice::default_effort),
             Some(ReasoningEffort::High)
         );
     }
@@ -919,6 +1370,8 @@ mod tests {
             launch_path: Some(Arc::from(
                 "/home/test/.kimi-code/bin:/home/test/.nvm/versions/node/v24/bin:/usr/bin",
             )),
+            models: AgentKind::Kimi.builtin_model_choices(),
+            default_model: None,
         };
         let spec = build_launch_spec(
             &agent,

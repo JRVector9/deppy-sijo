@@ -2364,7 +2364,7 @@ impl FileTreeUi {
             .map(|(_, label)| {
                 let galley = ui.painter().layout_no_wrap(
                     label.clone(),
-                    crate::fonts::sidebar_font(11.5),
+                    crate::fonts::sidebar_font(ui.ctx(), 11.5),
                     ui.visuals().text_color(),
                 );
                 (galley.size().x + 12.0).max(34.0)
@@ -2520,7 +2520,7 @@ impl FileTreeUi {
             egui::pos2(parent_rect.left() + 47.0, parent_rect.center().y),
             egui::Align2::LEFT_CENTER,
             "..",
-            crate::fonts::sidebar_font(12.5),
+            crate::fonts::sidebar_font(ui.ctx(), 12.5),
             parent_color,
         );
         if parent_response.clicked()
@@ -2838,9 +2838,7 @@ impl FileTreeUi {
                                     entry_color
                                 };
                                 let rich = egui::RichText::new(&row.name)
-                                    .family(egui::FontFamily::Name(
-                                        crate::fonts::SIDEBAR_FONT_FAMILY.into(),
-                                    ))
+                                    .family(crate::fonts::sidebar_font_family(ui.ctx()))
                                     .size(12.5)
                                     .color(text_color);
                                 ui.add(
@@ -3769,7 +3767,7 @@ fn workspace_row(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
         initial,
-        crate::fonts::sidebar_font(9.0),
+        crate::fonts::sidebar_font(ui.ctx(), 9.0),
         egui::Color32::WHITE,
     );
     let summary_mode = workspace_summary_mode(rect.width());
@@ -3793,7 +3791,7 @@ fn workspace_row(
                 workspace_label(&workspace.name),
                 // 워크스페이스명은 좌측 사이드바 전용 Apple SD Gothic 가족을 사용해
                 // 원래 대소문자와 자연스러운 자폭을 보존한다.
-                crate::fonts::sidebar_font(14.0),
+                crate::fonts::sidebar_font(ui.ctx(), 14.0),
                 name_width,
                 None,
             );
@@ -4494,10 +4492,10 @@ fn session_title_lines(
     Option<std::sync::Arc<egui::Galley>>,
 ) {
     let title_size = 13.0;
-    let title_font_id = crate::fonts::sidebar_font(title_size);
+    let title_font_id = crate::fonts::sidebar_font(ui.ctx(), title_size);
     // 제목보다 상태를 1pt 작게 두어 `폴더명 · 상태`의 시각적 위계를 분리한다.
     let status_size = 12.0;
-    let status_font_id = crate::fonts::sidebar_font(status_size);
+    let status_font_id = crate::fonts::sidebar_font(ui.ctx(), status_size);
     let status_line_height = status_size * SESSION_LINE_HEIGHT_RATIO;
     let status_galley = entry
         .status_label
@@ -4619,7 +4617,7 @@ fn session_row_impl(
         clipped_line(
             ui,
             t,
-            crate::fonts::sidebar_font(subline_size),
+            crate::fonts::sidebar_font(ui.ctx(), subline_size),
             max_w,
             subline_line_height,
         )
@@ -4628,7 +4626,7 @@ fn session_row_impl(
         clipped_line(
             ui,
             t,
-            crate::fonts::sidebar_font(subline_size),
+            crate::fonts::sidebar_font(ui.ctx(), subline_size),
             max_w,
             subline_line_height,
         )
@@ -4763,7 +4761,7 @@ fn session_row_impl(
         let edit_resp = ui.put(
             title_rect,
             egui::TextEdit::singleline(buf)
-                .font(crate::fonts::sidebar_font(13.0))
+                .font(crate::fonts::sidebar_font(ui.ctx(), 13.0))
                 .frame(egui::Frame::NONE)
                 .margin(egui::Margin::ZERO)
                 .vertical_align(egui::Align::Center),
@@ -4848,7 +4846,7 @@ fn file_toolbar_more_at(
         rect.center() + egui::vec2(0.0, -2.0),
         egui::Align2::CENTER_CENTER,
         "...",
-        crate::fonts::sidebar_font(13.0),
+        crate::fonts::sidebar_font(ui.ctx(), 13.0),
         color,
     );
     response
@@ -4878,7 +4876,7 @@ fn sidebar_tool_tab_at(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        crate::fonts::sidebar_font(11.5),
+        crate::fonts::sidebar_font(ui.ctx(), 11.5),
         color,
     );
     if active {
@@ -5230,7 +5228,7 @@ fn nav_row(
             layout.label_anchor,
             egui::Align2::CENTER_CENTER,
             label,
-            crate::fonts::sidebar_font(12.0),
+            crate::fonts::sidebar_font(ui.ctx(), 12.0),
             color,
         );
         if let Some(badge) = badge {
@@ -5244,7 +5242,7 @@ fn nav_row(
 fn paint_nav_badge(ui: &egui::Ui, row: egui::Rect, text: &str) {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
-        crate::fonts::sidebar_font(10.0),
+        crate::fonts::sidebar_font(ui.ctx(), 10.0),
         egui::Color32::WHITE,
     );
     let h = 16.0;

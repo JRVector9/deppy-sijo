@@ -248,8 +248,16 @@ impl<J: Send + 'static, O: Send + 'static> LazyBoundedWorker<J, O> {
         }
         let slot = self.slot.as_ref().expect("worker slot spawned above");
         let lifecycle = lock_unpoisoned(&slot.lifecycle);
-        if *lifecycle != WorkerLifecycle::Running {
-            return Err(AdmitOnceError::Disconnected(job));
+        match *lifecycle {
+            WorkerLifecycle::Running => {}
+            // The worker is alive and mid-publish (result sent, wake callback running, not yet
+            // back to `Running`). It is neither gone nor about to vanish, so treat this as plain
+            // backpressure: no retire/join, no fresh generation. The caller retries on its next
+            // poll, by which point the worker has looped back to `Running` on its own.
+            WorkerLifecycle::Publishing => return Err(AdmitOnceError::Full(job)),
+            WorkerLifecycle::Exited | WorkerLifecycle::Stopping => {
+                return Err(AdmitOnceError::Disconnected(job));
+            }
         }
         match slot.jobs.try_send(job) {
             Ok(()) => Ok(()),

@@ -14076,6 +14076,13 @@ impl App {
             return;
         };
         if let Err(error) = self.env_secret_reveal_worker.try_request(job) {
+            if error.error_code().is_none() {
+                // 워커가 살아 있고 잠시 받지 못할 뿐이다(결과 발행 중이거나 이미 한 건
+                // 처리 중). 요청을 버리면 사용자의 "값 보기" 클릭이 조용히 사라지므로
+                // 되돌려 두고 다음 폴에서 다시 시도한다.
+                self.pending_env_secret_reveal = Some(error.into_job());
+                return;
+            }
             let error_code = error
                 .error_code()
                 .map_or("backpressure", |code| code.as_str());
@@ -14156,6 +14163,11 @@ impl App {
                 Ok(()) => {
                     self.env_project_rows_in_flight = Some(generation);
                     self.env_project_rows_failed = false;
+                }
+                Err(error) if error.error_code().is_none() => {
+                    // 일시적 backpressure다. 여기서 캐시를 빈 값으로 채우면 재시도 조건
+                    // (`env_api_projects_cache.is_none()`)이 영구히 닫혀 목록이 빈 채로
+                    // 굳는다. 아무것도 바꾸지 않고 다음 폴에서 다시 시도한다.
                 }
                 Err(error) => {
                     let error_code = error

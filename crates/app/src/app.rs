@@ -5542,7 +5542,7 @@ pub(crate) fn top_provider_usage(
     claude_usage: Option<(u8, u8)>,
     codex_usage: Option<(u8, u8)>,
 ) {
-    let sidebar_font = crate::fonts::sidebar_font_or_fallback(ui.ctx(), 13.0);
+    let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
         egui::TextStyle::Body,
         egui::TextStyle::Button,

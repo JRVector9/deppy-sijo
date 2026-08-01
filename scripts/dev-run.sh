@@ -29,7 +29,12 @@ if [ "${1:-}" = "--release" ]; then
 fi
 [ "${1:-}" = "--" ] && shift
 
-cargo build -p deppy-sijo $CARGO_ARGS
+# mcp-proxy도 함께 빌드한다 — 앱이 자기 실행 파일 옆의 deppy-mcp-proxy를 statusLine/hook
+# 커맨드로 그대로 등록하므로(app.rs mcp_proxy_bin), 이걸 빼먹으면 stale 빌드가 계속 실행돼
+# 그 바이너리에 새로 추가한 기능(예: Claude usage 기록)이 조용히 반영되지 않는다
+# (2026-08-01 실증: target/debug/deppy-mcp-proxy가 7/24 빌드로 멈춰 있어 7/26에 추가한
+# claude-usage.json 기록이 며칠째 안 됐다). package-macos.sh와 같은 패턴을 유지한다.
+cargo build -p deppy-sijo -p mcp-proxy $CARGO_ARGS
 BIN="target/$PROFILE_DIR/deppy-sijo"
 
 # 서명 우선순위는 package-macos.sh와 동일하게 유지한다 — 배포본과 개발본의

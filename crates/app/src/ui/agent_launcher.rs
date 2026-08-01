@@ -1,4 +1,13 @@
-use crate::agent_launcher::{AgentKind, DetectionSnapshot, LaunchOptions, ReasoningEffort};
+use crate::agent_launcher::{
+    AgentKind, DetectedAgent, DetectionSnapshot, LaunchOptions, ModelChoice, ReasoningEffort,
+};
+
+/// 감지 스냅샷에서 이 종류의 모델 목록을 꺼낸다. 아직 감지 전이면 빈 목록이다.
+fn models_for(snapshot: Option<&DetectionSnapshot>, kind: AgentKind) -> &[ModelChoice] {
+    snapshot
+        .and_then(|snapshot| snapshot.find(kind))
+        .map_or(&[], DetectedAgent::models)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LauncherErrorCode {
@@ -134,16 +143,18 @@ impl AgentLauncherUi {
 
             match snapshot {
                 Some(snapshot) if !snapshot.agents().is_empty() => {
+                    // 설치 목록은 화면이 허용하는 만큼 늘어나고, 그래도 모자랄 때만
+                    // 스크롤한다. 고정 상한을 두면 에이전트가 몇 개든 항상 잘린다.
                     egui::ScrollArea::vertical()
                         .id_salt("agent-launcher-installed")
-                        .max_height(260.0)
+                        .max_height(installed_list_max_height(ctx))
                         .show(ui, |ui| {
                             for agent in snapshot.agents() {
                                 let kind = agent.kind();
                                 if agent_card(ui, kind, self.selected == Some(kind)).clicked()
                                     && !self.launch_pending
                                 {
-                                    self.select(kind);
+                                    self.select(agent);
                                 }
                                 ui.add_space(5.0);
                             }
@@ -164,7 +175,7 @@ impl AgentLauncherUi {
                 ui.add_space(8.0);
                 crate::ui::hairline(ui);
                 ui.add_space(8.0);
-                self.render_options(ui, kind, catalog);
+                self.render_options(ui, kind, models_for(snapshot, kind), catalog);
             }
 
             if let Some(error) = self.error {
@@ -227,40 +238,32 @@ impl AgentLauncherUi {
         intent
     }
 
-    fn render_options(&mut self, ui: &mut egui::Ui, kind: AgentKind, catalog: &i18n::Catalog) {
-        let models = kind.supported_models();
+    fn render_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        kind: AgentKind,
+        models: &[ModelChoice],
+        catalog: &i18n::Catalog,
+    ) {
         if !models.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(catalog.t("agent_launcher.model", &[]));
-                let selected = models
-                    .iter()
-                    .find(|choice| choice.value() == self.model)
-                    .map_or_else(
-                        || catalog.t("agent_launcher.model_hint", &[]),
-                        |choice| choice.label().to_owned(),
-                    );
+                let selected = crate::agent_launcher::find_model(models, &self.model)
+                    .map(ModelChoice::label)
+                    .unwrap_or_default();
                 ui.add_enabled_ui(!self.launch_pending, |ui| {
                     egui::ComboBox::from_id_salt(("agent-launcher-model", kind.id()))
                         .selected_text(selected)
                         .width(360.0)
+                        .height(combo_popup_height(ui))
                         .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(
-                                    self.model.is_empty(),
-                                    catalog.t("agent_launcher.model_hint", &[]),
-                                )
-                                .clicked()
-                            {
-                                self.model.clear();
-                                self.reconcile_effort(kind);
-                            }
                             for choice in models {
                                 if ui
                                     .selectable_label(self.model == choice.value(), choice.label())
                                     .clicked()
                                 {
                                     self.model = choice.value().to_owned();
-                                    self.reconcile_effort(kind);
+                                    self.reconcile_effort(models);
                                 }
                             }
                         });
@@ -268,34 +271,26 @@ impl AgentLauncherUi {
             });
         }
 
-        let efforts = kind.supported_efforts(&self.model);
+        // 모델 개념이 없는 에이전트(models가 비어 있음)는 강도도 제시하지 않는다.
+        let efforts = crate::agent_launcher::find_model(models, &self.model)
+            .map_or(&[][..], ModelChoice::efforts);
         if !efforts.is_empty() {
+            let row_label = if ReasoningEffort::is_thinking_toggle(efforts) {
+                "agent_launcher.thinking"
+            } else {
+                "agent_launcher.effort"
+            };
             ui.horizontal(|ui| {
-                ui.label(catalog.t("agent_launcher.effort", &[]));
-                let default_label = kind.default_effort(&self.model).map_or_else(
-                    || catalog.t("agent_launcher.effort.default", &[]),
-                    |effort| {
-                        let effort = catalog.t(effort_message_key(effort), &[]);
-                        catalog.t(
-                            "agent_launcher.effort.default_value",
-                            &[("effort", effort.as_str())],
-                        )
-                    },
-                );
-                let selected = self.effort.map_or_else(
-                    || default_label.clone(),
-                    |effort| catalog.t(effort_message_key(effort), &[]),
-                );
+                ui.label(catalog.t(row_label, &[]));
+                let selected = self
+                    .effort
+                    .map(|effort| catalog.t(effort_message_key(effort), &[]))
+                    .unwrap_or_default();
                 ui.add_enabled_ui(!self.launch_pending, |ui| {
                     egui::ComboBox::from_id_salt("agent-launcher-effort")
                         .selected_text(selected)
+                        .height(combo_popup_height(ui))
                         .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(self.effort.is_none(), default_label)
-                                .clicked()
-                            {
-                                self.effort = None;
-                            }
                             for effort in efforts {
                                 if ui
                                     .selectable_label(
@@ -350,45 +345,51 @@ impl AgentLauncherUi {
         if self.selected != previous_selected {
             self.model.clear();
         }
-        if let Some(kind) = self.selected {
-            self.reconcile_model(kind);
-            self.reconcile_effort(kind);
-            if !kind.supports_yolo() {
-                self.yolo = false;
-            }
+        if let Some(agent) = self.selected.and_then(|kind| snapshot.find(kind)) {
+            self.reconcile_options(agent);
         }
     }
 
-    fn select(&mut self, kind: AgentKind) {
-        if self.selected != Some(kind) {
+    fn select(&mut self, agent: &DetectedAgent) {
+        if self.selected != Some(agent.kind()) {
             self.model.clear();
         }
-        self.selected = Some(kind);
+        self.selected = Some(agent.kind());
         self.error = None;
-        self.reconcile_model(kind);
-        self.reconcile_effort(kind);
-        if !kind.supports_yolo() {
+        self.reconcile_options(agent);
+    }
+
+    /// 선택된 모델/강도/YOLO가 이 에이전트에서 여전히 유효한지 맞춘다.
+    fn reconcile_options(&mut self, agent: &DetectedAgent) {
+        self.reconcile_model(agent);
+        self.reconcile_effort(agent.models());
+        if !agent.kind().supports_yolo() {
             self.yolo = false;
         }
     }
 
-    fn reconcile_model(&mut self, kind: AgentKind) {
-        if !self.model.is_empty()
-            && !kind
-                .supported_models()
-                .iter()
-                .any(|choice| choice.value() == self.model)
-        {
-            self.model.clear();
+    /// 모델은 "기본 모델" 항목 없이 항상 하나가 선택돼 있다. 선택이 비었거나 이 에이전트가
+    /// 더 이상 제공하지 않는 모델이면, CLI가 자기 설정에 적어 둔 기본 모델로 되돌린다.
+    /// 그래야 앱으로 띄운 결과가 CLI를 그냥 실행한 것과 같다.
+    fn reconcile_model(&mut self, agent: &DetectedAgent) {
+        if crate::agent_launcher::find_model(agent.models(), &self.model).is_none() {
+            self.model = agent.initial_model().to_owned();
         }
     }
 
-    fn reconcile_effort(&mut self, kind: AgentKind) {
-        if self
-            .effort
-            .is_some_and(|effort| !kind.supported_efforts(&self.model).contains(&effort))
-        {
+    /// 강도는 "기본값" 항목 없이 항상 하나가 선택돼 있다. 화면에 보이는 값이 곧
+    /// 실행에 전달되는 값이므로, 선택이 비었거나 현재 모델이 지원하지 않는 값이면
+    /// 카탈로그가 선언한 기본 강도(없으면 첫 단계)로 되돌린다.
+    fn reconcile_effort(&mut self, models: &[ModelChoice]) {
+        let Some(model) = crate::agent_launcher::find_model(models, &self.model) else {
             self.effort = None;
+            return;
+        };
+        let efforts = model.efforts();
+        if efforts.is_empty() {
+            self.effort = None;
+        } else if self.effort.is_none_or(|effort| !efforts.contains(&effort)) {
+            self.effort = model.default_effort().or_else(|| efforts.first().copied());
         }
     }
 }
@@ -397,6 +398,29 @@ impl Default for AgentLauncherUi {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 모달의 나머지 요소(제목·옵션·버튼)가 쓰는 세로 공간을 뺀 나머지를 설치 목록에 준다.
+/// 그래서 창이 충분히 크면 감지된 에이전트가 전부 보이고 스크롤이 아예 생기지 않는다.
+///
+/// 드롭다운 몫(`POPUP_CLEARANCE`)을 따로 남긴다. egui는 팝업이 창 안에 완전히 들어가는
+/// 배치를 못 찾으면 뒤집지 않고 그냥 아래로 펼친 뒤 창 밖을 잘라내기 때문에, 모달이 창
+/// 높이를 다 쓰면 옵션 콤보박스의 목록이 잘린다.
+fn installed_list_max_height(ctx: &egui::Context) -> f32 {
+    const MODAL_CHROME_HEIGHT: f32 = 330.0;
+    const POPUP_CLEARANCE: f32 = 200.0;
+    const MIN_LIST_HEIGHT: f32 = 132.0;
+    (ctx.viewport_rect().height() - MODAL_CHROME_HEIGHT - POPUP_CLEARANCE).max(MIN_LIST_HEIGHT)
+}
+
+/// 드롭다운 팝업이 스크롤 없이 항목을 다 보여주도록 상한을 창 높이까지 연다.
+///
+/// 지정하지 않으면 egui가 `Spacing::combo_height`(기본 200px)에서 잘라 항목이 몇 개든
+/// 스크롤이 생긴다. 행 높이를 직접 계산해 넘기는 방법은 위젯 패딩·글꼴에 따라 어긋나
+/// 오히려 더 작게 잡히므로, 계산하지 않고 상한만 창 높이로 둔다. egui의 `ScrollArea`는
+/// 내용 크기만큼만 차지하므로, 목록이 창보다 길 때만 스크롤이 남는다.
+fn combo_popup_height(ui: &egui::Ui) -> f32 {
+    ui.ctx().viewport_rect().height()
 }
 
 fn agent_card(ui: &mut egui::Ui, kind: AgentKind, selected: bool) -> egui::Response {
@@ -458,6 +482,8 @@ const fn effort_message_key(effort: ReasoningEffort) -> &'static str {
         ReasoningEffort::XHigh => "agent_launcher.effort.xhigh",
         ReasoningEffort::Max => "agent_launcher.effort.max",
         ReasoningEffort::Ultra => "agent_launcher.effort.ultra",
+        ReasoningEffort::On => "agent_launcher.effort.on",
+        ReasoningEffort::Off => "agent_launcher.effort.off",
     }
 }
 
@@ -502,35 +528,115 @@ mod tests {
         assert!(!ui.yolo);
     }
 
-    #[test]
-    fn changing_provider_clears_an_incompatible_model_choice() {
-        let mut ui = AgentLauncherUi::new();
-        ui.select(AgentKind::Claude);
-        ui.model = "sonnet".to_owned();
-        ui.select(AgentKind::Codex);
-        assert!(ui.model.is_empty());
+    /// 감지된 에이전트. 테스트 스냅샷에는 내장 모델 목록이 실린다.
+    fn agent(snapshot: &DetectionSnapshot, kind: AgentKind) -> &DetectedAgent {
+        snapshot.find(kind).expect("detected agent")
+    }
 
+    #[test]
+    fn changing_provider_replaces_an_incompatible_model_with_a_concrete_one() {
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Codex]);
+        let codex = agent(&detected, AgentKind::Codex);
+        let mut ui = AgentLauncherUi::new();
+        ui.select(agent(&detected, AgentKind::Claude));
+        ui.model = "sonnet".to_owned();
+
+        // "기본 모델" 항목이 없으므로 비우지 않고 Codex가 실제로 제공하는 모델로 바꾼다.
+        ui.select(codex);
+        assert_eq!(ui.model, codex.initial_model());
+        assert!(crate::agent_launcher::find_model(codex.models(), &ui.model).is_some());
+
+        // 이미 유효한 선택은 그대로 둔다.
         ui.model = "gpt-5.6-sol".to_owned();
-        ui.select(AgentKind::Codex);
+        ui.select(codex);
         assert_eq!(ui.model, "gpt-5.6-sol");
     }
 
     #[test]
-    fn changing_codex_model_clears_an_unsupported_reasoning_effort() {
+    fn changing_codex_model_falls_back_to_the_declared_default_effort() {
+        let detected = snapshot(&[AgentKind::Codex]);
+        let codex = agent(&detected, AgentKind::Codex);
         let mut ui = AgentLauncherUi::new();
-        ui.select(AgentKind::Codex);
+        ui.select(codex);
         ui.model = "gpt-5.6-sol".to_owned();
         ui.effort = Some(ReasoningEffort::Ultra);
-        ui.reconcile_effort(AgentKind::Codex);
+        ui.reconcile_effort(codex.models());
         assert_eq!(ui.effort, Some(ReasoningEffort::Ultra));
 
+        // luna는 ultra를 지원하지 않는다. "기본값" 항목이 없으므로 비우는 대신
+        // 그 모델이 선언한 기본 강도로 되돌아간다.
         ui.model = "gpt-5.6-luna".to_owned();
-        ui.reconcile_effort(AgentKind::Codex);
-        assert!(ui.effort.is_none());
+        ui.reconcile_effort(codex.models());
+        assert_eq!(ui.effort, Some(ReasoningEffort::Medium));
 
-        ui.model = "gpt-5.6-luna".to_owned();
         ui.effort = Some(ReasoningEffort::Max);
-        ui.reconcile_effort(AgentKind::Codex);
+        ui.reconcile_effort(codex.models());
         assert_eq!(ui.effort, Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn a_selected_agent_always_carries_an_explicit_effort() {
+        // 화면에 보이는 값이 곧 실행값이 되도록, 강도가 있는 모델은 빈 선택이 없다.
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Kimi]);
+        let mut ui = AgentLauncherUi::new();
+
+        ui.select(agent(&detected, AgentKind::Claude));
+        ui.model = "opus".to_owned();
+        ui.reconcile_effort(agent(&detected, AgentKind::Claude).models());
+        assert_eq!(ui.effort, Some(ReasoningEffort::High));
+
+        // 기본 강도를 선언하지 않은 boolean thinking 모델은 첫 항목(켬)을 쓴다.
+        let kimi = agent(&detected, AgentKind::Kimi);
+        ui.select(kimi);
+        ui.model = "kimi-code/kimi-for-coding".to_owned();
+        ui.reconcile_effort(kimi.models());
+        assert_eq!(ui.effort, Some(ReasoningEffort::On));
+
+        // 강도 개념이 없는 에이전트는 계속 비어 있다.
+        let none = snapshot(&[AgentKind::Gemini]);
+        ui.select(agent(&none, AgentKind::Gemini));
+        assert!(ui.effort.is_none());
+    }
+
+    #[test]
+    fn a_model_the_detected_catalog_no_longer_offers_is_replaced() {
+        // 카탈로그가 동적이므로 CLI가 모델을 내리면 UI의 이전 선택도 풀려야 하는데,
+        // "기본 모델" 항목이 없으니 빈 값이 아니라 실제 제공 모델로 대체돼야 한다.
+        let detected = snapshot(&[AgentKind::Codex]);
+        let codex = agent(&detected, AgentKind::Codex);
+        let mut ui = AgentLauncherUi::new();
+        ui.model = "gpt-retired".to_owned();
+        ui.reconcile_model(codex);
+        assert_eq!(ui.model, codex.initial_model());
+        assert!(crate::agent_launcher::find_model(codex.models(), &ui.model).is_some());
+    }
+
+    #[test]
+    fn a_model_supporting_agent_never_launches_without_a_model() {
+        // 모델을 가진 에이전트는 항상 구체 모델이 선택돼 있고, 없는 에이전트는 비어 있다.
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Codex, AgentKind::Kimi]);
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Kimi] {
+            let mut ui = AgentLauncherUi::new();
+            ui.select(agent(&detected, kind));
+            assert!(!ui.model.is_empty(), "{}", kind.id());
+        }
+
+        let none = snapshot(&[AgentKind::Gemini]);
+        let mut ui = AgentLauncherUi::new();
+        ui.select(agent(&none, AgentKind::Gemini));
+        assert!(ui.model.is_empty());
+    }
+
+    #[test]
+    fn thinking_toggle_is_distinguished_from_graded_effort() {
+        assert!(ReasoningEffort::is_thinking_toggle(&[
+            ReasoningEffort::On,
+            ReasoningEffort::Off
+        ]));
+        assert!(!ReasoningEffort::is_thinking_toggle(&[
+            ReasoningEffort::Low,
+            ReasoningEffort::High
+        ]));
+        assert!(!ReasoningEffort::is_thinking_toggle(&[]));
     }
 }

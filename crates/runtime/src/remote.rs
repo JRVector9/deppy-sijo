@@ -50,6 +50,8 @@ use crate::protocol::{
 };
 use crate::tls_identity::TlsIdentity;
 
+mod liveness;
+
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
 const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 /// heartbeat 주기 — 이 시간 동안 보낼 이벤트가 없으면 길이 0 프레임(keepalive)을
@@ -62,6 +64,8 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCROLLBACK_LINES: usize = 100_000;
 /// 인증 프레임 대기 상한 — 접속만 열고 침묵하는 peer가 서버를 잡아두지 못하게.
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 클라이언트 최초 TCP connect 상한 — OS 기본 connect timeout에 의존하지 않는다.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// TLS 접속당 단일 I/O 루프가 아무 진전이 없을 때 다음 tick 전 짧게 재운다 —
 /// busy-spin(CPU 100%) 방지. 1~5ms 범위(설계 §2.4). read/write 어느 쪽도 블록하지 않는다.
 const TLS_IDLE_SLEEP: Duration = Duration::from_millis(2);
@@ -126,6 +130,25 @@ fn read_frame(reader: &mut impl Read) -> Option<Vec<u8>> {
     Some(payload)
 }
 
+fn connect_with(
+    addr: SocketAddr,
+    connect: impl FnOnce(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+) -> std::io::Result<TcpStream> {
+    connect(&addr, CONNECT_TIMEOUT)
+}
+
+fn observe_client_frame_for_liveness(
+    tracker: &mut liveness::LivenessTracker,
+    _frame: &[u8],
+    now: Instant,
+) {
+    tracker.observe_frame(now);
+}
+
+fn client_liveness_expired(tracker: &liveness::LivenessTracker, now: Instant) -> bool {
+    tracker.expired(now)
+}
+
 /// 상수 시간 비교 — 토큰 길이/내용의 타이밍 누설 방지.
 fn token_matches(expected: &str, provided: &[u8]) -> bool {
     let expected = expected.as_bytes();
@@ -164,10 +187,16 @@ fn token_matches(expected: &str, provided: &[u8]) -> bool {
 enum FramePoll {
     /// 완성된 프레임 하나(길이 0 = heartbeat 포함).
     Frame(Vec<u8>),
-    /// 지금은 더 읽을 게 없다(WouldBlock/부분 프레임) — 다음 tick에 이어 읽는다.
+    /// 성공적으로 바이트를 소비했지만 아직 프레임이 완성되지 않았다.
+    Partial,
+    /// 지금은 더 읽을 게 없다(WouldBlock/TimedOut) — 다음 tick에 이어 읽는다.
     Pending,
     /// EOF 또는 프로토콜 위반(상한 초과) — 접속 종료.
     Closed,
+}
+
+fn tls_idle_sleep_needed(progressed: bool) -> bool {
+    !progressed
 }
 
 /// `[u32 LE len][payload]` 프레임을 **부분 진척을 tick 간 보존**하며 디코드한다.
@@ -192,8 +221,9 @@ impl FrameDecoder {
         }
     }
 
-    /// 준비된 만큼 읽어 프레임 하나가 완성되면 반환한다. WouldBlock이면 `Pending`(상태 보존),
-    /// EOF/상한 초과면 `Closed`. `r`은 WouldBlock을 돌려주는 non-blocking Read여야 한다.
+    /// 준비된 만큼 읽어 프레임 하나가 완성되면 반환한다. 성공적으로 일부 바이트만 읽었으면
+    /// `Partial`(상태 보존 + IO 진척), WouldBlock/TimedOut이면 `Pending`(true idle),
+    /// EOF/상한 초과면 `Closed`.
     fn advance(&mut self, r: &mut impl Read) -> FramePoll {
         loop {
             match self.need {
@@ -209,9 +239,16 @@ impl FrameDecoder {
                             self.payload = vec![0u8; len];
                             self.payload_filled = 0;
                             self.need = Some(len);
+                            if len == 0 {
+                                continue;
+                            }
                         }
+                        return FramePoll::Partial;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
                         return FramePoll::Pending;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -228,8 +265,16 @@ impl FrameDecoder {
                     }
                     match r.read(&mut self.payload[self.payload_filled..need]) {
                         Ok(0) => return FramePoll::Closed, // EOF (부분 프레임 중 단절)
-                        Ok(n) => self.payload_filled += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        Ok(n) => {
+                            self.payload_filled += n;
+                            if self.payload_filled < need {
+                                return FramePoll::Partial;
+                            }
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
                             return FramePoll::Pending;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -401,6 +446,9 @@ fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         } if *scrollback_lines > MAX_SCROLLBACK_LINES => {
             return Err("scrollback_lines 상한 초과");
         }
+        RuntimeCommand::DurableEventBarrier { correlation_id: 0 } => {
+            return Err("durable event barrier correlation_id는 0일 수 없음");
+        }
         _ => {}
     }
     Ok(())
@@ -430,6 +478,9 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
             agent_config_id, ..
         } if !agent_config_id.is_valid() => {
             return Err("agent_config_id가 비었거나 상한/NUL 규칙 위반");
+        }
+        RuntimeEvent::DurableEventBarrierReached { correlation_id: 0 } => {
+            return Err("durable event barrier correlation_id는 0일 수 없음");
         }
         _ => {}
     }
@@ -1120,7 +1171,7 @@ fn serve_connection_tls(
     let mut exited_sessions = ExitedSessionTombstones::new();
     let mut keyframe_requests: Vec<SessionId> = Vec::new();
     let mut outbound = OutboundEventQueue::new();
-    let mut last_activity = Instant::now();
+    let mut heartbeat = liveness::OutboundHeartbeatTracker::new(Instant::now(), HEARTBEAT_INTERVAL);
 
     'main: loop {
         if stop.load(Ordering::SeqCst) {
@@ -1161,6 +1212,10 @@ fn serve_connection_tls(
                                 break 'main;
                             }
                         }
+                    }
+                    FramePoll::Partial => {
+                        progressed = true;
+                        continue;
                     }
                     FramePoll::Pending => break,
                     FramePoll::Closed => break 'main,
@@ -1222,6 +1277,7 @@ fn serve_connection_tls(
                 if write_frame(&mut conn.writer(), &payload).is_err() {
                     break 'main;
                 }
+                heartbeat.observe_frame(Instant::now());
                 progressed = true;
                 if tls_flush(&mut conn, &mut sock).is_err() {
                     break 'main;
@@ -1236,24 +1292,19 @@ fn serve_connection_tls(
         }
 
         // (4) heartbeat — 유휴가 HEARTBEAT_INTERVAL 넘고 보낼 것도 없으면 길이 0 프레임.
-        if progressed {
-            last_activity = Instant::now();
-        } else if last_activity.elapsed() >= HEARTBEAT_INTERVAL
-            && outbound.is_empty()
-            && !conn.wants_write()
-        {
+        if heartbeat.due(Instant::now()) && outbound.is_empty() && !conn.wants_write() {
             if write_frame(&mut conn.writer(), &[]).is_err()
                 || tls_flush(&mut conn, &mut sock).is_err()
             {
                 break;
             }
-            last_activity = Instant::now();
+            heartbeat.observe_frame(Instant::now());
         }
 
         if eof {
             break;
         }
-        if !progressed {
+        if tls_idle_sleep_needed(progressed) {
             std::thread::sleep(TLS_IDLE_SLEEP);
         }
     }
@@ -1288,6 +1339,7 @@ fn tls_server_handshake(
         match dec.advance(&mut conn.reader()) {
             FramePoll::Frame(frame) if !frame.is_empty() => break frame,
             FramePoll::Frame(_) => {} // 길이 0(있을 리 없지만) 무시
+            FramePoll::Partial => {}
             FramePoll::Pending => std::thread::sleep(TLS_IDLE_SLEEP),
             FramePoll::Closed => return None,
         }
@@ -1453,6 +1505,7 @@ pub struct RemoteRuntimeClient {
     /// 명령 송신 경로 — 평문은 소켓 직접 write, TLS는 IO 스레드로 채널 enqueue.
     transport: ClientTransport,
     subscribers: Arc<Mutex<Vec<RemoteSubscriber>>>,
+    connected: Arc<AtomicBool>,
     /// 평문은 reader 스레드, TLS는 단일 IO 스레드.
     reader_thread: Option<JoinHandle<()>>,
     /// 핸드셰이크에서 협상된 접속 코덱 (§3.2). loopback은 Delta.
@@ -1489,8 +1542,8 @@ impl RemoteRuntimeClient {
         if !addr.ip().is_loopback() {
             bail!("remote attach는 localhost만 허용합니다 (public remote는 v1+): {addr}");
         }
-        let mut stream =
-            TcpStream::connect(addr).with_context(|| format!("remote 서버 연결 실패: {addr}"))?;
+        let mut stream = connect_with(addr, TcpStream::connect_timeout)
+            .with_context(|| format!("remote 서버 연결 실패: {addr}"))?;
         // 핸드셰이크 v2 (§3.1): ClientHello 송신 → ServerHello 대기. 토큰은 hello 안에 실린다.
         let hello = ClientHello {
             magic: PROTO_MAGIC,
@@ -1528,19 +1581,29 @@ impl RemoteRuntimeClient {
         // 위 검사로 features ⊆ CLIENT_FEATURES 보장됨 → 코덱 확정 (§3.2). loopback은 Delta.
         let codec = Codec::from_features(server_hello.features);
         let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
+        let connected = Arc::new(AtomicBool::new(true));
         let writer = Arc::new(Mutex::new(stream));
 
         let reader_subscribers = Arc::clone(&subscribers);
+        let reader_connected = Arc::clone(&connected);
         let reader_writer = Arc::clone(&writer);
         let reader_stream = writer
             .lock()
             .expect("remote writer lock")
             .try_clone()
             .context("remote stream clone 실패")?;
+        reader_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .context("remote plain reader timeout 설정 실패")?;
         let reader_thread = std::thread::Builder::new()
             .name("remote-events".into())
             .spawn(move || {
-                let mut reader = BufReader::new(reader_stream);
+                let mut reader = reader_stream;
+                let mut decoder = FrameDecoder::new();
+                let mut liveness = liveness::LivenessTracker::new(
+                    Instant::now(),
+                    liveness::CLIENT_LIVENESS_TIMEOUT,
+                );
                 // 접속별 재구성 상태 (§4.3): 세션마다 (마지막 적용 seq, 현재 재구성본).
                 // reader가 TCP를 UI 소비와 무관하게 완전히 드레인하므로 delta는 여기서 유실되지 않고,
                 // slot에는 항상 "재구성된 전체 스냅샷"만 담긴다 — UI 계약(전체 Viewport)은 불변.
@@ -1549,34 +1612,55 @@ impl RemoteRuntimeClient {
                 // seq gap으로 keyframe을 이미 요청한 세션 — keyframe 도착 전까지 delta를 조용히 버려
                 // RequestKeyframe 폭주를 막는다.
                 let mut pending_keyframe: HashSet<SessionId> = HashSet::new();
-                while let Some(frame) = read_frame(&mut reader) {
-                    if frame.is_empty() {
-                        continue; // heartbeat(길이 0 프레임) — decode 전에 소비
+                loop {
+                    match decoder.advance(&mut reader) {
+                        FramePoll::Frame(frame) => {
+                            observe_client_frame_for_liveness(
+                                &mut liveness,
+                                &frame,
+                                Instant::now(),
+                            );
+                            if !frame.is_empty() {
+                                // 접속 코덱으로 디코딩. Plain은 postcard(RuntimeEvent)와 바이트 동일.
+                                let Ok(decoded) = codec.decode_event(&frame) else {
+                                    tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
+                                    break;
+                                };
+                                if !handle_decoded_event(
+                                    decoded,
+                                    &reader_subscribers,
+                                    &reader_writer,
+                                    &mut recon,
+                                    &mut pending_keyframe,
+                                ) {
+                                    break;
+                                }
+                            }
+                        }
+                        FramePoll::Partial => {}
+                        FramePoll::Pending => {}
+                        FramePoll::Closed => break,
                     }
-                    // 접속 코덱으로 디코딩. Plain은 postcard(RuntimeEvent)와 바이트 동일.
-                    let Ok(decoded) = codec.decode_event(&frame) else {
-                        tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
-                        break;
-                    };
-                    if !handle_decoded_event(
-                        decoded,
-                        &reader_subscribers,
-                        &reader_writer,
-                        &mut recon,
-                        &mut pending_keyframe,
-                    ) {
+                    if client_liveness_expired(&liveness, Instant::now()) {
+                        tracing::warn!(
+                            "remote client liveness timeout — no frames received, 접속 종료"
+                        );
                         break;
                     }
                 }
                 // 수신이 죽은 클라이언트가 명령 전송만 성공하는 반쪽 상태 방지 —
                 // 소켓을 양방향으로 닫아 이후 send_command도 실패하게 한다 (codex 리뷰)
-                let _ = reader.into_inner().shutdown(Shutdown::Both);
+                let _ = reader.shutdown(Shutdown::Both);
+                let mut subscribers = reader_subscribers.lock().expect("remote subscribers lock");
+                reader_connected.store(false, Ordering::Release);
+                subscribers.clear();
             })
             .context("remote reader thread 생성 실패")?;
 
         Ok(Self {
             transport: ClientTransport::Plain(writer),
             subscribers,
+            connected,
             reader_thread: Some(reader_thread),
             codec,
         })
@@ -1641,8 +1725,8 @@ impl RemoteRuntimeClient {
             .context("rustls ClientConnection 생성 실패")?
             .into();
         conn.set_buffer_limit(None);
-        let mut sock =
-            TcpStream::connect(addr).with_context(|| format!("remote TLS 연결 실패: {addr}"))?;
+        let mut sock = connect_with(addr, TcpStream::connect_timeout)
+            .with_context(|| format!("remote TLS 연결 실패: {addr}"))?;
         sock.set_nonblocking(true)
             .context("remote TLS non-blocking 설정 실패")?;
 
@@ -1651,14 +1735,16 @@ impl RemoteRuntimeClient {
         let codec = tls_client_handshake(&mut conn, &mut sock, &mut dec, token)?;
 
         let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
+        let connected = Arc::new(AtomicBool::new(true));
         // 유계 채널 — 명령 outbound backpressure를 채널 용량으로 상한한다 (codex HIGH).
         let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(TLS_CMD_QUEUE_CAP);
         let shutdown = sock.try_clone().context("remote TLS shutdown clone 실패")?;
         let io_subscribers = Arc::clone(&subscribers);
+        let io_connected = Arc::clone(&connected);
         let reader_thread = std::thread::Builder::new()
             .name("remote-tls-io".into())
             .spawn(move || {
-                client_tls_io_loop(conn, sock, dec, codec, io_subscribers, cmd_rx);
+                client_tls_io_loop(conn, sock, dec, codec, io_subscribers, io_connected, cmd_rx);
             })
             .context("remote TLS IO thread 생성 실패")?;
 
@@ -1670,6 +1756,7 @@ impl RemoteRuntimeClient {
                     shutdown,
                 },
                 subscribers,
+                connected,
                 reader_thread: Some(reader_thread),
                 codec,
             },
@@ -1825,6 +1912,7 @@ fn tls_client_handshake(
                 }
                 return Ok(Codec::from_features(server_hello.features));
             }
+            FramePoll::Partial => {}
             FramePoll::Pending => std::thread::sleep(TLS_IDLE_SLEEP),
             FramePoll::Closed => bail!("remote TLS 인증 거부 — 접속 종료"),
         }
@@ -1840,11 +1928,14 @@ fn client_tls_io_loop(
     mut dec: FrameDecoder,
     codec: Codec,
     subscribers: Arc<Mutex<Vec<RemoteSubscriber>>>,
+    connected: Arc<AtomicBool>,
     commands: std::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
     let mut pending_keyframe: HashSet<SessionId> = HashSet::new();
     let mut out: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut liveness =
+        liveness::LivenessTracker::new(Instant::now(), liveness::CLIENT_LIVENESS_TIMEOUT);
 
     'main: loop {
         let mut progressed = false;
@@ -1861,6 +1952,7 @@ fn client_tls_io_loop(
                 match dec.advance(&mut conn.reader()) {
                     FramePoll::Frame(frame) => {
                         progressed = true;
+                        observe_client_frame_for_liveness(&mut liveness, &frame, Instant::now());
                         if frame.is_empty() {
                             continue; // heartbeat 소비
                         }
@@ -1884,7 +1976,25 @@ fn client_tls_io_loop(
                             }
                         }
                     }
-                    FramePoll::Pending => break,
+                    FramePoll::Partial => {
+                        progressed = true;
+                        if client_liveness_expired(&liveness, Instant::now()) {
+                            tracing::warn!(
+                                "remote client liveness timeout — no frames received, 접속 종료"
+                            );
+                            break 'main;
+                        }
+                        continue;
+                    }
+                    FramePoll::Pending => {
+                        if client_liveness_expired(&liveness, Instant::now()) {
+                            tracing::warn!(
+                                "remote client liveness timeout — no frames received, 접속 종료"
+                            );
+                            break 'main;
+                        }
+                        break;
+                    }
                     FramePoll::Closed => break 'main,
                 }
             }
@@ -1905,6 +2015,11 @@ fn client_tls_io_loop(
                 }
                 Err(_) => break 'main,
             }
+        }
+
+        if client_liveness_expired(&liveness, Instant::now()) {
+            tracing::warn!("remote client liveness timeout — no frames received, 접속 종료");
+            break 'main;
         }
 
         // (2) 송신 명령 흡수 — 서버 outbound와 같은 원칙(codex HIGH): 직전 배치를 소켓에 다
@@ -1943,13 +2058,25 @@ fn client_tls_io_loop(
         if eof {
             break;
         }
-        if !progressed {
+        if tls_idle_sleep_needed(progressed) {
             std::thread::sleep(TLS_IDLE_SLEEP);
         }
     }
 
+    publish_tls_disconnect(commands, subscribers, connected);
     let _ = conn.write_tls(&mut sock);
     let _ = sock.shutdown(Shutdown::Both);
+}
+
+fn publish_tls_disconnect(
+    commands: std::sync::mpsc::Receiver<Vec<u8>>,
+    subscribers: Arc<Mutex<Vec<RemoteSubscriber>>>,
+    connected: Arc<AtomicBool>,
+) {
+    drop(commands);
+    let mut subscribers = subscribers.lock().expect("remote subscribers lock");
+    connected.store(false, Ordering::Release);
+    subscribers.clear();
 }
 
 /// [`reconstruct_and_dispatch`] 결과 — 접속 종료 여부 + keyframe 재동기화 요청 세션.
@@ -2218,15 +2345,16 @@ impl RuntimeEventStream for RemoteRuntimeClient {
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let overflowed = Arc::new(AtomicBool::new(false));
-        self.subscribers
-            .lock()
-            .expect("remote subscribers lock")
-            .push(RemoteSubscriber {
+        let mut subscribers = self.subscribers.lock().expect("remote subscribers lock");
+        if self.connected.load(Ordering::Acquire) {
+            subscribers.push(RemoteSubscriber {
                 events: tx,
                 overflowed: Arc::clone(&overflowed),
                 viewports: Arc::clone(&viewports),
                 input_pressures: Arc::clone(&input_pressures),
             });
+        }
+        drop(subscribers);
         RuntimeEventReceiver {
             events: rx,
             pending_durable: Mutex::new(None),
@@ -2328,6 +2456,18 @@ mod tests {
         panic!("이벤트 대기 시간 초과 — 수신: {}개", seen.len());
     }
 
+    fn wait_for_disconnect(rx: &RuntimeEventReceiver, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if rx.is_disconnected() {
+                return;
+            }
+            let _ = rx.drain();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("remote event receiver did not observe disconnect");
+    }
+
     #[test]
     fn 서버는_loopback에만_bind() {
         let server = RemoteRuntimeServer::serve(test_backend("bind"), 0).unwrap();
@@ -2336,11 +2476,164 @@ mod tests {
     }
 
     #[test]
+    fn plain_server_disconnect_closes_event_subscription() {
+        let server = RemoteRuntimeServer::serve(test_backend("plain-disconnect"), 0).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let receiver = client.subscribe();
+
+        server.shutdown();
+
+        wait_for_disconnect(&receiver, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn subscribing_after_plain_disconnect_is_immediately_closed() {
+        let server = RemoteRuntimeServer::serve(test_backend("plain-late-subscribe"), 0).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let receiver = client.subscribe();
+
+        server.shutdown();
+        wait_for_disconnect(&receiver, Duration::from_secs(5));
+
+        let late_receiver = client.subscribe();
+        assert!(late_receiver.is_disconnected());
+    }
+
+    #[test]
     fn 비loopback_attach는_거부() {
         let Err(e) = RemoteRuntimeClient::attach("8.8.8.8:1".parse().unwrap(), "t") else {
             panic!("비loopback attach가 성공하면 안 된다");
         };
         assert!(format!("{e:#}").contains("localhost"));
+    }
+
+    #[test]
+    fn connect_timeout_is_applied_by_connector_helper() {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let err = connect_with(addr, |_addr, timeout| {
+            assert_eq!(timeout, Duration::from_secs(30));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "fake deadline",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn client_liveness_observes_empty_heartbeat_frame() {
+        let start = Instant::now();
+        let observed = start + Duration::from_secs(44);
+        let mut tracker = liveness::LivenessTracker::new(start, liveness::CLIENT_LIVENESS_TIMEOUT);
+
+        observe_client_frame_for_liveness(&mut tracker, &[], observed);
+
+        assert!(!client_liveness_expired(
+            &tracker,
+            observed + liveness::CLIENT_LIVENESS_TIMEOUT - Duration::from_nanos(1),
+        ));
+    }
+
+    #[test]
+    fn client_liveness_observes_ordinary_event_frame() {
+        let start = Instant::now();
+        let observed = start + Duration::from_secs(44);
+        let mut tracker = liveness::LivenessTracker::new(start, liveness::CLIENT_LIVENESS_TIMEOUT);
+
+        observe_client_frame_for_liveness(&mut tracker, &[1, 2, 3], observed);
+
+        assert!(!client_liveness_expired(
+            &tracker,
+            observed + liveness::CLIENT_LIVENESS_TIMEOUT - Duration::from_nanos(1),
+        ));
+    }
+
+    #[test]
+    fn client_liveness_idle_poll_at_deadline_requests_disconnect() {
+        let start = Instant::now();
+        let tracker = liveness::LivenessTracker::new(start, liveness::CLIENT_LIVENESS_TIMEOUT);
+
+        assert!(client_liveness_expired(
+            &tracker,
+            start + liveness::CLIENT_LIVENESS_TIMEOUT,
+        ));
+    }
+
+    #[test]
+    fn frame_decoder_treats_timed_out_like_pending() {
+        struct TimedOutReader;
+        impl Read for TimedOutReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "fake timeout",
+                ))
+            }
+        }
+
+        let mut decoder = FrameDecoder::new();
+
+        assert!(matches!(
+            decoder.advance(&mut TimedOutReader),
+            FramePoll::Pending
+        ));
+    }
+
+    #[test]
+    fn frame_decoder_yields_partial_after_incomplete_successful_read() {
+        struct OneByteReader {
+            used: bool,
+        }
+        impl Read for OneByteReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(!self.used, "decoder must return after one partial read");
+                self.used = true;
+                buf[0] = 1;
+                Ok(1)
+            }
+        }
+
+        let mut decoder = FrameDecoder::new();
+        let mut reader = OneByteReader { used: false };
+
+        assert!(matches!(decoder.advance(&mut reader), FramePoll::Partial));
+    }
+
+    #[test]
+    fn frame_decoder_reports_idle_after_partial_progress_is_exhausted() {
+        struct SplitThenTimeout {
+            reads: usize,
+        }
+        impl Read for SplitThenTimeout {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                match self.reads {
+                    1 => {
+                        buf[..2].copy_from_slice(&[5, 0]);
+                        Ok(2)
+                    }
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "fake timeout",
+                    )),
+                }
+            }
+        }
+
+        let mut decoder = FrameDecoder::new();
+        let mut reader = SplitThenTimeout { reads: 0 };
+
+        assert!(matches!(decoder.advance(&mut reader), FramePoll::Partial));
+        assert!(matches!(decoder.advance(&mut reader), FramePoll::Pending));
+    }
+
+    #[test]
+    fn tls_idle_sleep_is_skipped_after_partial_frame_progress() {
+        assert!(!tls_idle_sleep_needed(true));
+        assert!(tls_idle_sleep_needed(false));
     }
 
     /// 완료 기준: InProcess와 같은 명령/이벤트 모델로 localhost attach.
@@ -2433,14 +2726,14 @@ mod tests {
     }
 
     #[test]
-    fn v9_peer_is_rejected_at_hello_before_event_decode() {
+    fn v10_peer_is_rejected_at_hello_before_event_decode() {
         let old = ClientHello {
             magic: PROTO_MAGIC,
-            proto_version: 9,
+            proto_version: 10,
             features: CLIENT_FEATURES,
             token: b"irrelevant".to_vec(),
         };
-        assert_eq!(PROTO_VERSION, 10);
+        assert_eq!(PROTO_VERSION, 12);
         assert!(!client_hello_matches_protocol(&old));
     }
 
@@ -2508,6 +2801,71 @@ mod tests {
             Codec::Plain.decode_command(&cmd_frame).unwrap(),
             DecodedCommand::Command(RuntimeCommand::SpawnAgent { cols: 80, .. })
         ));
+    }
+
+    #[test]
+    fn durable_event_barrier_remote_codecs_roundtrip_and_reject_invalid_payloads() {
+        let command = RuntimeCommand::DurableEventBarrier { correlation_id: 91 };
+        let event = RuntimeEvent::DurableEventBarrierReached { correlation_id: 91 };
+
+        for codec in [Codec::Plain, Codec::Delta] {
+            let command_frame = codec.encode_command(&command).unwrap();
+            let DecodedCommand::Command(decoded_command) =
+                codec.decode_command(&command_frame).unwrap()
+            else {
+                panic!("barrier decoded as keyframe request");
+            };
+            assert!(matches!(
+                decoded_command,
+                RuntimeCommand::DurableEventBarrier { correlation_id: 91 }
+            ));
+            validate_command(&decoded_command).unwrap();
+
+            let event_frame = codec.encode_event(&event).unwrap();
+            let DecodedEvent::Event(decoded_event) = codec.decode_event(&event_frame).unwrap()
+            else {
+                panic!("barrier decoded as viewport frame");
+            };
+            assert!(matches!(
+                decoded_event,
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 91 }
+            ));
+            validate_event(&decoded_event).unwrap();
+
+            assert!(codec.decode_command(&[0xff, 0xff]).is_err());
+            assert!(codec.decode_event(&[0xff, 0xff]).is_err());
+        }
+
+        assert!(
+            validate_command(&RuntimeCommand::DurableEventBarrier { correlation_id: 0 }).is_err()
+        );
+        assert!(
+            validate_event(&RuntimeEvent::DurableEventBarrierReached { correlation_id: 0 })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn durable_event_barrier_crosses_remote_runtime_transport() {
+        let server = RemoteRuntimeServer::serve(test_backend("durable-event-barrier"), 0).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let receiver = client.subscribe();
+
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 92 })
+            .unwrap();
+        let mut seen = Vec::new();
+        wait_for(&receiver, &mut seen, Duration::from_secs(10), |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::DurableEventBarrierReached { correlation_id: 92 }
+                )
+            })
+        });
+
+        drop(client);
+        server.shutdown();
     }
 
     /// rogue/버그 서버가 클라이언트가 요청하지 않은 feature를 ack하면 클라이언트는
@@ -2628,6 +2986,27 @@ mod tests {
         }
         handle.join().unwrap();
         drop(client);
+    }
+
+    #[test]
+    fn plain_client_drop_joins_reader_liveness_thread() {
+        let server = RemoteRuntimeServer::serve(test_backend("plain-client-drop"), 0).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            drop(client);
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "plain client drop did not join");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        handle.join().unwrap();
+        server.shutdown();
     }
 
     /// 동시 접속: 두 클라이언트가 같은 runtime에 함께 attach해 있고, 한쪽이
@@ -2995,6 +3374,83 @@ mod tests {
     }
 
     #[test]
+    fn remote_outbound_preserves_stale_and_requested_mux_before_durable_event_barrier() {
+        let stale = mux_snapshot("stale", &[("stale", SessionId(1))]);
+        let requested = mux_snapshot(
+            "requested",
+            &[("stale", SessionId(1)), ("requested", SessionId(2))],
+        );
+        let mut queue = OutboundEventQueue::with_caps(3, 2);
+        queue
+            .enqueue(RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&stale),
+            })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&requested),
+            })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::DurableEventBarrierReached { correlation_id: 94 })
+            .unwrap();
+
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::MuxUpdated { snapshot }) if Arc::ptr_eq(&snapshot, &stale)
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::MuxUpdated { snapshot }) if Arc::ptr_eq(&snapshot, &requested)
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::DurableEventBarrierReached { correlation_id: 94 })
+        ));
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn durable_event_barrier_explicitly_does_not_fence_viewport_slots() {
+        let mut queue = OutboundEventQueue::with_caps(2, 1);
+        queue
+            .enqueue(RuntimeEvent::Viewport {
+                session: SessionId(1),
+                snapshot: make_snapshot(8, 2, &["before"], false),
+                bracketed_paste: false,
+            })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::DurableEventBarrierReached { correlation_id: 95 })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::Viewport {
+                session: SessionId(1),
+                snapshot: make_snapshot(8, 2, &["after"], false),
+                bracketed_paste: false,
+            })
+            .unwrap();
+
+        assert_eq!(
+            queue.viewport_len(),
+            1,
+            "viewport remains one bounded latest slot"
+        );
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::DurableEventBarrierReached { correlation_id: 95 })
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::Viewport {
+                session: SessionId(1),
+                ..
+            })
+        ));
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
     fn outbound_queue는_durable_overflow를_silent_drop하지_않는다() {
         let mut queue = OutboundEventQueue::with_caps(2, 8);
         queue
@@ -3117,6 +3573,35 @@ mod tests {
             RuntimeEvent::LastOutputExtracted { .. } => "LastOutputExtracted",
             RuntimeEvent::AgentSpawnResolved { .. } => "AgentSpawnResolved",
             RuntimeEvent::SessionFreezeChanged { .. } => "SessionFreezeChanged",
+            RuntimeEvent::DurableEventBarrierReached { .. } => "DurableEventBarrierReached",
+            RuntimeEvent::UnattachedSessionsInspected { .. } => "UnattachedSessionsInspected",
+            RuntimeEvent::UnattachedSessionsKilled { .. } => "UnattachedSessionsKilled",
+        }
+    }
+
+    #[test]
+    fn unattached_session_event_names_and_remote_codecs_roundtrip() {
+        let events = [
+            (
+                RuntimeEvent::UnattachedSessionsInspected { count: 7 },
+                "UnattachedSessionsInspected",
+            ),
+            (
+                RuntimeEvent::UnattachedSessionsKilled { count: 3 },
+                "UnattachedSessionsKilled",
+            ),
+        ];
+
+        for (event, expected_name) in events {
+            assert_eq!(kind_of(&event), expected_name);
+            for codec in [Codec::Plain, Codec::Delta] {
+                let frame = codec.encode_event(&event).unwrap();
+                let DecodedEvent::Event(decoded) = codec.decode_event(&frame).unwrap() else {
+                    panic!("unattached session event decoded as a viewport frame");
+                };
+                validate_event(&decoded).unwrap();
+                assert_eq!(kind_of(&decoded), expected_name);
+            }
         }
     }
 
@@ -3973,6 +4458,27 @@ mod tests {
         server.shutdown();
     }
 
+    #[test]
+    fn tls_server_disconnect_closes_event_subscription() {
+        let identity = test_identity();
+        let fingerprint = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-disconnect"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+            false,
+        )
+        .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fingerprint)
+                .unwrap();
+        let receiver = client.subscribe();
+
+        server.shutdown();
+
+        wait_for_disconnect(&receiver, Duration::from_secs(5));
+    }
+
     /// 지문 불일치 → TLS 핸드셰이크에서 검증기가 거부 → attach Err. 서버는 생존해 올바른 지문의
     /// 재접속을 정상 처리한다.
     #[test]
@@ -4097,6 +4603,36 @@ mod tests {
         server.shutdown();
     }
 
+    #[test]
+    fn tls_client_drop_joins_io_liveness_thread() {
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-client-drop"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+            false,
+        )
+        .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            drop(client);
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "TLS client drop did not join");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        handle.join().unwrap();
+        server.shutdown();
+    }
+
     /// slow-consumer 스모크: 한 세션이 대량 출력을 뿜어 이벤트가 서버 쪽에 쌓이는 동안에도
     /// 서버는 두 번째 명령을 계속 읽어 처리한다 (write backpressure가 read를 굶기지 않음, §2.4).
     /// 단일 IO 루프가 매 tick write 진척과 무관하게 read를 먼저 수행하고, 나갈 배치는 앱계층
@@ -4170,6 +4706,7 @@ mod tests {
                 shutdown: client_sock,
             },
             subscribers: Arc::default(),
+            connected: Arc::new(AtomicBool::new(true)),
             reader_thread: None,
             codec: Codec::Delta,
         };
@@ -4193,6 +4730,53 @@ mod tests {
             format!("{err:#}").contains("종료"),
             "IO 스레드 종료는 종료 Err여야 한다: {err:#}"
         );
+    }
+
+    #[test]
+    fn tls_event_disconnect_is_published_after_command_channel_closes() {
+        let (client_sock, _server_sock) = socket_pair();
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+        let subscribers = Arc::default();
+        let connected = Arc::new(AtomicBool::new(true));
+        let client = RemoteRuntimeClient {
+            transport: ClientTransport::Tls {
+                commands,
+                shutdown: client_sock,
+            },
+            subscribers: Arc::clone(&subscribers),
+            connected: Arc::clone(&connected),
+            reader_thread: None,
+            codec: Codec::Delta,
+        };
+        let events = client.subscribe();
+        let disconnect = std::thread::spawn(move || {
+            publish_tls_disconnect(command_receiver, subscribers, connected);
+        });
+
+        wait_for_disconnect(&events, Duration::from_secs(5));
+
+        std::thread::scope(|scope| {
+            let start = Arc::new(std::sync::Barrier::new(9));
+            let mut sends = Vec::new();
+            for _ in 0..8 {
+                let start = Arc::clone(&start);
+                let client = &client;
+                sends.push(scope.spawn(move || {
+                    start.wait();
+                    client.send_command(RuntimeCommand::SpawnShell {
+                        cols: 80,
+                        rows: 24,
+                        scrollback_lines: 100,
+                    })
+                }));
+            }
+            start.wait();
+            for send in sends {
+                let err = send.join().unwrap().unwrap_err();
+                assert!(format!("{err:#}").contains("종료"), "{err:#}");
+            }
+        });
+        disconnect.join().unwrap();
     }
 
     /// 명령 폭주 스모크 (codex HIGH): send_command를 대량 호출해 큐를 압박해도(가득참 Err는

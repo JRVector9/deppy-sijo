@@ -122,9 +122,7 @@ mod tests {
     #[test]
     fn summary_상태별_집계와_주목수() {
         use AgentVisualState::*;
-        let s = FleetSummary::from_states([
-            Waiting, Waiting, Error, Complete, Active, Idle, Off,
-        ]);
+        let s = FleetSummary::from_states([Waiting, Waiting, Error, Complete, Active, Idle, Off]);
         assert_eq!(s.total, 7);
         assert_eq!(s.waiting, 2);
         assert_eq!(s.error, 1);

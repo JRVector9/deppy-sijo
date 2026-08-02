@@ -14,7 +14,10 @@ const ARC_ALLOCATION_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
 
 #[derive(Clone, PartialEq)]
 pub struct ActivityWorkspaceRow {
+    pub workspace_id: Arc<str>,
+    pub runtime_instance: Option<u64>,
     pub name: Arc<str>,
+    pub metric_availability: ActivityMetricAvailability,
     pub state: ActivityWorkspaceState,
     pub session_count: usize,
     pub pending_events: usize,
@@ -30,7 +33,10 @@ pub struct ActivityWorkspaceRow {
 impl std::fmt::Debug for ActivityWorkspaceRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActivityWorkspaceRow")
+            .field("workspace_id", &REDACTED)
+            .field("runtime_instance", &self.runtime_instance)
             .field("name", &REDACTED)
+            .field("metric_availability", &self.metric_availability)
             .field("state", &self.state)
             .field("session_count", &self.session_count)
             .field("pending_events", &self.pending_events)
@@ -51,7 +57,9 @@ impl std::fmt::Debug for ActivityWorkspaceRow {
 /// warm은 제목·자원만 채워진다(감지 워커가 활성에서만 돈다).
 #[derive(Clone, PartialEq)]
 pub struct ActivitySessionRow {
+    pub session: Option<runtime::SessionId>,
     pub name: Arc<str>,
+    pub metric_availability: ActivityMetricAvailability,
     /// "Codex · gpt-5.5 · xhigh" — 에이전트가 아니면 None(셸).
     pub agent_line: Option<Arc<str>>,
     /// "실행 중 · ctx 69%" — warm/셸은 None.
@@ -67,7 +75,9 @@ pub struct ActivitySessionRow {
 impl std::fmt::Debug for ActivitySessionRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActivitySessionRow")
+            .field("session", &self.session)
             .field("name", &REDACTED)
+            .field("metric_availability", &self.metric_availability)
             .field("agent_line", &self.agent_line.as_ref().map(|_| REDACTED))
             .field("status_line", &self.status_line.as_ref().map(|_| REDACTED))
             .field("resource", &self.resource)
@@ -157,6 +167,8 @@ impl ActivitySnapshot {
             }
 
             retained_bytes = checked_retained_add(retained_bytes, ARC_ALLOCATION_OVERHEAD)?;
+            retained_bytes = checked_retained_add(retained_bytes, row.workspace_id.len())?;
+            retained_bytes = checked_retained_add(retained_bytes, ARC_ALLOCATION_OVERHEAD)?;
             retained_bytes = checked_retained_add(retained_bytes, row.name.len())?;
             retained_bytes = checked_retained_add(retained_bytes, ARC_ALLOCATION_OVERHEAD)?;
             retained_bytes = checked_retained_add(
@@ -175,6 +187,7 @@ impl ActivitySnapshot {
                     .ok_or(ActivitySnapshotError::TooManyRetainedBytes)?,
             )?;
 
+            validate_text(row.workspace_id.as_ref())?;
             validate_text(row.name.as_ref())?;
             for session in row.sessions.iter() {
                 validate_text(session.name.as_ref())?;
@@ -244,6 +257,20 @@ pub enum ActivityWorkspaceState {
     Warm,
     /// DB에는 존재하지만 현재 runtime/세션이 없는 워크스페이스.
     Idle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityMetricAvailability {
+    Local,
+    Pending,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reserved for remote activity projections; local App projections must not fake it"
+        )
+    )]
+    RemoteUnavailable,
 }
 
 pub enum ActivityAction {
@@ -741,7 +768,9 @@ mod tests {
 
     fn session(name: impl Into<Arc<str>>) -> ActivitySessionRow {
         ActivitySessionRow {
+            session: None,
             name: name.into(),
+            metric_availability: ActivityMetricAvailability::Pending,
             agent_line: None,
             status_line: None,
             resource: None,
@@ -755,7 +784,10 @@ mod tests {
         sessions: Vec<ActivitySessionRow>,
     ) -> ActivityWorkspaceRow {
         ActivityWorkspaceRow {
+            workspace_id: Arc::from(""),
+            runtime_instance: None,
             name: name.into(),
+            metric_availability: ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Idle,
             session_count: sessions.len(),
             pending_events: 0,
@@ -792,7 +824,7 @@ mod tests {
         let sessions = workspaces * sessions_per_workspace;
         ARC_ALLOCATION_OVERHEAD
             + workspaces * std::mem::size_of::<ActivityWorkspaceRow>()
-            + workspaces * 3 * ARC_ALLOCATION_OVERHEAD
+            + workspaces * 4 * ARC_ALLOCATION_OVERHEAD
             + sessions * std::mem::size_of::<ActivitySessionRow>()
             + sessions * ARC_ALLOCATION_OVERHEAD
     }
@@ -820,7 +852,10 @@ mod tests {
     fn summary_deduplicates_app_pid_but_keeps_distinct_session_children() {
         let row =
             |name: &str, app_cpu: f32, child_session: u64, child_rss: u64| ActivityWorkspaceRow {
+                workspace_id: Arc::from(name),
+                runtime_instance: Some(child_session),
                 name: Arc::from(name),
+                metric_availability: ActivityMetricAvailability::Local,
                 state: ActivityWorkspaceState::Warm,
                 session_count: 1,
                 pending_events: 0,
@@ -864,7 +899,10 @@ mod tests {
     #[test]
     fn idle_workspace_is_kept_in_the_full_summary() {
         let rows = [ActivityWorkspaceRow {
+            workspace_id: Arc::from("idle-project"),
+            runtime_instance: None,
             name: Arc::from("idle-project"),
+            metric_availability: ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Idle,
             session_count: 0,
             pending_events: 0,
@@ -1066,6 +1104,24 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_counts_and_validates_workspace_identity_text() {
+        let exact = ActivityWorkspaceRow {
+            workspace_id: Arc::from("x".repeat(MAX_ACTIVITY_TEXT_BYTES)),
+            ..workspace("visible", Vec::new())
+        };
+        assert!(ActivitySnapshot::try_new([exact]).is_ok());
+
+        let plus_one = ActivityWorkspaceRow {
+            workspace_id: Arc::from("x".repeat(MAX_ACTIVITY_TEXT_BYTES + 1)),
+            ..workspace("visible", Vec::new())
+        };
+        assert_eq!(
+            ActivitySnapshot::try_new([plus_one]),
+            Err(ActivitySnapshotError::TextTooLong)
+        );
+    }
+
+    #[test]
     fn snapshot_accepts_exact_retained_byte_cap_and_rejects_plus_one() {
         let exact = snapshot_with_retained_bytes(MAX_ACTIVITY_RETAINED_BYTES);
         assert_eq!(exact.retained_bytes, MAX_ACTIVITY_RETAINED_BYTES);
@@ -1116,7 +1172,9 @@ mod tests {
         let row = workspace(
             Arc::<str>::from("/private/workspace"),
             vec![ActivitySessionRow {
+                session: Some(runtime::SessionId(1)),
                 name: Arc::from("secret pane title"),
+                metric_availability: ActivityMetricAvailability::RemoteUnavailable,
                 agent_line: Some(Arc::from("provider and model")),
                 status_line: Some(Arc::from("private status")),
                 resource: None,

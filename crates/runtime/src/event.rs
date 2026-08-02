@@ -185,6 +185,25 @@ pub enum RuntimeEvent {
         session: SessionId,
         frozen: bool,
     },
+    /// Exact acknowledgement for a handled `RuntimeCommand::DurableEventBarrier`.
+    /// Durable lifecycle/mux events synchronously emitted by earlier FIFO commands
+    /// have already entered the same bounded FIFO channel. Coalesced Viewport,
+    /// PtyInputPressure, and ResourceUsage slots are explicitly outside this fence.
+    /// Correlation ids retain the issuing command's shared-backend uniqueness contract.
+    /// **variant는 enum 끝에만 추가** (postcard discriminant — remote wire 호환).
+    DurableEventBarrierReached {
+        correlation_id: u64,
+    },
+    /// `InspectUnattachedSessions` 결과. 고정 크기 count만 전달하며 후보 id는 런타임
+    /// 경계를 벗어나지 않는다. **variant는 끝에만 추가** (wire 계약).
+    UnattachedSessionsInspected {
+        count: u16,
+    },
+    /// `KillUnattachedSessions`가 실행 시점 재검증 후 실제 정리한 수.
+    /// **variant는 끝에만 추가** (wire 계약).
+    UnattachedSessionsKilled {
+        count: u16,
+    },
 }
 
 /// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의
@@ -351,5 +370,65 @@ mod tests {
             }
             _ => panic!("unexpected event"),
         }
+    }
+
+    #[test]
+    fn runtime_event_variant_order_is_source_locked() {
+        let source = include_str!("event.rs");
+        let body = source
+            .split_once("pub enum RuntimeEvent {")
+            .unwrap()
+            .1
+            .split_once("\n}\n\n/// 최신값 슬롯")
+            .unwrap()
+            .0;
+        let actual = body
+            .lines()
+            .filter_map(|line| {
+                let line = line.strip_prefix("    ")?;
+                if line.starts_with([' ', '/']) {
+                    return None;
+                }
+                let name = line
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .next()?;
+                name.chars()
+                    .next()
+                    .is_some_and(char::is_uppercase)
+                    .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                "ShellSpawned",
+                "AgentSpawned",
+                "SpawnFailed",
+                "Viewport",
+                "SessionExited",
+                "MuxUpdated",
+                "SessionStatusChanged",
+                "ResourceUsage",
+                "PtyInputPressure",
+                "SessionStatusViewChanged",
+                "SessionRestored",
+                "ScrollbackSearchResult",
+                "LastOutputExtracted",
+                "AgentSpawnResolved",
+                "SessionFreezeChanged",
+                "DurableEventBarrierReached",
+                "UnattachedSessionsInspected",
+                "UnattachedSessionsKilled",
+            ]
+        );
+    }
+
+    #[test]
+    fn unattached_session_events_have_only_fixed_count_payloads() {
+        let inspected = RuntimeEvent::UnattachedSessionsInspected { count: 7 };
+        let killed = RuntimeEvent::UnattachedSessionsKilled { count: 3 };
+
+        assert_eq!(postcard::to_allocvec(&inspected).unwrap(), vec![16, 7]);
+        assert_eq!(postcard::to_allocvec(&killed).unwrap(), vec![17, 3]);
     }
 }

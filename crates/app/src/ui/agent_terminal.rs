@@ -1,5 +1,15 @@
 use super::activity::{ActivityWorkspaceRow, ActivityWorkspaceState};
+use super::ports::{PortsIntent, PortsUi};
+use super::resource_manager::{ResourceManagerIntent, ResourceManagerUi};
+use crate::port_inventory::PortSnapshot;
 use crate::status_feed::{ProviderStatus, ServiceIndicator, StatusFeedSnapshot};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StatusBarIntent {
+    Resource(ResourceManagerIntent),
+    Ports(PortsIntent),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentTerminalView {
@@ -72,6 +82,8 @@ struct WorkspaceTotals {
 pub struct AgentTerminalUi {
     view: AgentTerminalView,
     announcement_filter: AnnouncementFilter,
+    resource_manager: ResourceManagerUi,
+    ports: PortsUi,
 }
 
 impl AgentTerminalUi {
@@ -79,6 +91,8 @@ impl AgentTerminalUi {
         Self {
             view: AgentTerminalView::Terminal,
             announcement_filter: AnnouncementFilter::All,
+            resource_manager: ResourceManagerUi::default(),
+            ports: PortsUi::default(),
         }
     }
 
@@ -144,9 +158,9 @@ impl AgentTerminalUi {
         action
     }
 
-    #[allow(clippy::too_many_arguments)] // 하단 상태바가 provider usage까지 함께 그린다.
-    pub fn status_bar(
-        &self,
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn status_bar_with_managers(
+        &mut self,
         ui: &mut egui::Ui,
         claude_usage: Option<(u8, u8)>,
         codex_usage: Option<(u8, u8)>,
@@ -154,32 +168,38 @@ impl AgentTerminalUi {
         waiting: usize,
         mcp_count: usize,
         feed: &StatusFeedSnapshot,
+        ports: Option<&PortSnapshot>,
+        unattached_counts: &HashMap<String, u16>,
+        active_workspace_id: Option<&str>,
+        now_ms: u64,
         catalog: &i18n::Catalog,
-    ) {
+    ) -> Option<StatusBarIntent> {
         let totals = workspace_totals(rows);
-        let cpu = if totals.cpu_seen {
-            format!("CPU {:.1}%", totals.cpu_percent)
+        let cpu_value = if totals.cpu_seen {
+            format!("{:.1}%", totals.cpu_percent)
         } else {
-            "CPU —".to_owned()
+            "—".to_owned()
         };
+        let cpu = catalog.t("status_bar.cpu", &[("value", &cpu_value)]);
+        let mut intent = None;
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 25.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
                 crate::app::top_provider_usage(ui, claude_usage, codex_usage);
-                ui.separator();
+                crate::ui::designall::vertical_separator(ui, 14.0);
                 ui.weak(catalog.t(
                     "status_bar.sessions",
                     &[("count", &totals.sessions.to_string())],
                 ));
-                ui.separator();
+                crate::ui::designall::vertical_separator(ui, 14.0);
                 // 등록·활성화된 MCP 서버 수 (2026-07-18 사용자 요청).
                 ui.weak(catalog.t("status_bar.mcp", &[("count", &mcp_count.to_string())]))
                     .on_hover_text(catalog.t("status_bar.mcp_hover", &[]));
                 // 핵심 서비스 상태 점등 — Claude/OpenAI/GitHub를 5분마다 폴링하고
                 // 클릭하면 각 공식 상태 페이지를 연다.
-                ui.separator();
+                crate::ui::designall::vertical_separator(ui, 14.0);
                 service_status_light(
                     ui,
                     "Claude",
@@ -202,7 +222,7 @@ impl AgentTerminalUi {
                     catalog,
                 );
                 if waiting > 0 {
-                    ui.separator();
+                    crate::ui::designall::vertical_separator(ui, 14.0);
                     ui.colored_label(
                         egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
                         catalog.t("status_bar.waiting", &[("count", &waiting.to_string())]),
@@ -219,22 +239,69 @@ impl AgentTerminalUi {
                         totals.session_rss_bytes,
                         compact,
                     );
-                    ui.weak(memory).on_hover_text(catalog.t(
-                        "status_bar.memory_hover",
-                        &[("sessions", &super::format_bytes(totals.session_rss_bytes))],
-                    ));
-                    ui.separator();
-                    ui.weak(cpu);
-                    ui.separator();
-                    ui.weak(match self.view {
-                        AgentTerminalView::Home => catalog.t("status_bar.view.home", &[]),
-                        AgentTerminalView::Inbox => catalog.t("status_bar.view.inbox", &[]),
-                        AgentTerminalView::Fleet => catalog.t("status_bar.view.fleet", &[]),
-                        AgentTerminalView::Terminal => catalog.t("status_bar.view.terminal", &[]),
-                    });
+                    let resource_label = format!("{cpu} · {memory}");
+                    let resource_response = status_action_button(ui, &resource_label)
+                        .on_hover_text(catalog.t(
+                            "status_bar.memory_hover",
+                            &[("sessions", &super::format_bytes(totals.session_rss_bytes))],
+                        ));
+                    if resource_response.clicked() {
+                        self.resource_manager.toggle_open();
+                    }
+                    let mut resource_open = self.resource_manager.is_open();
+                    egui::Popup::menu(&resource_response)
+                        .open_bool(&mut resource_open)
+                        .align(egui::RectAlign::TOP_END)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .width(560.0)
+                        .show(|ui| {
+                            if let Some(action) = self.resource_manager.contents(
+                                ui,
+                                rows,
+                                unattached_counts,
+                                now_ms,
+                                catalog,
+                            ) {
+                                intent = Some(StatusBarIntent::Resource(action));
+                            }
+                        });
+                    self.resource_manager.set_open(resource_open);
+                    crate::ui::designall::vertical_separator(ui, 14.0);
+                    let port_label = ports
+                        .map(|snapshot| {
+                            catalog.t(
+                                "status_bar.ports",
+                                &[("count", &snapshot.rows.len().to_string())],
+                            )
+                        })
+                        .unwrap_or_else(|| catalog.t("status_bar.ports_unknown", &[]));
+                    let port_response = status_action_button(ui, &port_label)
+                        .on_hover_text(catalog.t("status_bar.ports_hint", &[]));
+                    if port_response.clicked() {
+                        self.ports.toggle_open();
+                        if let Some(action) = self.ports.take_open_refresh() {
+                            intent = Some(StatusBarIntent::Ports(action));
+                        }
+                    }
+                    let mut ports_open = self.ports.is_open();
+                    egui::Popup::menu(&port_response)
+                        .open_bool(&mut ports_open)
+                        .align(egui::RectAlign::TOP_END)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .width(500.0)
+                        .show(|ui| {
+                            if let Some(action) =
+                                self.ports
+                                    .contents(ui, ports, active_workspace_id, now_ms, catalog)
+                            {
+                                intent = Some(StatusBarIntent::Ports(action));
+                            }
+                        });
+                    self.ports.set_open(ports_open);
                 });
             },
         );
+        intent
     }
 
     /// 반환: 수동 갱신(⟳) 클릭 여부.
@@ -601,11 +668,7 @@ fn announcement_columns(row_rect: egui::Rect) -> AnnouncementColumns {
 
 /// 외부 이미지 없이 작은 크기에 맞춰 그리는 provider mark. 공급자명은 화면에서 제거하되
 /// hover/accessibility에는 남겨 로고만으로 구분하기 어려운 사용자도 확인할 수 있게 한다.
-pub(crate) fn paint_announcement_provider_logo(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    source: &str,
-) {
+pub(crate) fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Rect, source: &str) {
     let label = format!("{} logo", announcement_source_label(source));
     let response = ui
         .interact(
@@ -685,8 +748,7 @@ pub(crate) fn paint_announcement_provider_logo(
             let stroke = egui::Stroke::new(1.35 * scale, color);
             for index in 0..6 {
                 let angle = index as f32 * std::f32::consts::TAU / 6.0;
-                let loop_center =
-                    center + egui::vec2(angle.cos(), angle.sin()) * (4.2 * scale);
+                let loop_center = center + egui::vec2(angle.cos(), angle.sin()) * (4.2 * scale);
                 painter.circle_stroke(loop_center, 3.4 * scale, stroke);
             }
             painter.circle_stroke(center, 2.2 * scale, stroke);
@@ -893,6 +955,18 @@ fn workspace_has_warning(row: &ActivityWorkspaceRow) -> bool {
             .any(|session| session.pressure.is_some())
 }
 
+fn status_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new(label).weak())
+            .frame(false)
+            .min_size(egui::vec2(0.0, 22.0)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    response
+}
+
 fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
@@ -935,6 +1009,21 @@ fn service_status_light(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn install_sidebar_test_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        fonts.families.insert(
+            egui::FontFamily::Name(crate::fonts::SIDEBAR_FONT_FAMILY.into()),
+            fallback,
+        );
+        ctx.set_fonts(fonts);
+    }
 
     #[test]
     fn view_defaults_to_terminal() {
@@ -953,7 +1042,10 @@ mod tests {
         // 앱(중복 pid 1회)과 세션 프로세스 합을 분리 집계해야 한다 — 합쳐 "RAM"으로
         // 표시하면 에이전트 메모리가 앱 급증으로 오독된다(2026-07-18 사용자 보고).
         let row = |child_session: u64, child_rss: u64| ActivityWorkspaceRow {
+            workspace_id: "ws".into(),
+            runtime_instance: Some(child_session),
             name: "ws".into(),
+            metric_availability: super::super::activity::ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Warm,
             session_count: 1,
             pending_events: 0,
@@ -1008,14 +1100,230 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let feed = StatusFeedSnapshot::default();
-        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
-            AgentTerminalUi::new().status_bar(ui, None, None, &[], 0, 0, &feed, &catalog);
-        });
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, fonts_ready| {
+                if !*fonts_ready {
+                    return;
+                }
+                AgentTerminalUi::new().status_bar_with_managers(
+                    ui,
+                    None,
+                    None,
+                    &[],
+                    2,
+                    5,
+                    &feed,
+                    None,
+                    &HashMap::new(),
+                    None,
+                    0,
+                    &catalog,
+                );
+            },
+            false,
+        );
+        harness.set_size(egui::vec2(1400.0, 100.0));
+        install_sidebar_test_fonts(&harness.ctx);
+        *harness.state_mut() = true;
         harness.run();
 
+        harness.get_by_label("Sessions 0");
+        harness.get_by_label("MCP 5");
         harness.get_by_label("Claude");
         harness.get_by_label("OpenAI");
         harness.get_by_label("GitHub");
+        harness.get_by_label("Waiting for input 2");
+        assert!(harness.query_by_label("Terminal").is_none());
+        harness.get_by_label("CPU — · App 0 B · Sessions 0 B");
+        harness.get_by_label("Ports —");
+    }
+
+    #[test]
+    fn status_bar_has_resource_and_port_actions_without_terminal_label() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let feed = StatusFeedSnapshot::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui,
+                  (terminal, intents, fonts_ready): &mut (
+                AgentTerminalUi,
+                Vec<StatusBarIntent>,
+                bool,
+            )| {
+                if !*fonts_ready {
+                    return;
+                }
+                if let Some(intent) = terminal.status_bar_with_managers(
+                    ui,
+                    None,
+                    None,
+                    &[],
+                    0,
+                    0,
+                    &feed,
+                    None,
+                    &HashMap::new(),
+                    None,
+                    0,
+                    &catalog,
+                ) {
+                    intents.push(intent);
+                }
+            },
+            (AgentTerminalUi::new(), Vec::new(), false),
+        );
+        harness.set_size(egui::vec2(1400.0, 100.0));
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().2 = true;
+        harness.run();
+
+        assert!(harness.query_by_label("터미널").is_none());
+        harness.get_by_label("CPU — · 앱 0 B · 세션 0 B");
+        harness.get_by_label("포트 —");
+    }
+
+    #[test]
+    fn status_bar_port_action_is_the_same_for_pointer_and_keyboard() {
+        use egui_kittest::kittest::Queryable;
+
+        fn harness() -> egui_kittest::Harness<'static, (AgentTerminalUi, Vec<StatusBarIntent>, bool)>
+        {
+            let catalog = i18n::Catalog::load("ko-KR").unwrap();
+            let feed = StatusFeedSnapshot::default();
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                move |ui,
+                      (terminal, intents, fonts_ready): &mut (
+                    AgentTerminalUi,
+                    Vec<StatusBarIntent>,
+                    bool,
+                )| {
+                    if !*fonts_ready {
+                        return;
+                    }
+                    if let Some(intent) = terminal.status_bar_with_managers(
+                        ui,
+                        None,
+                        None,
+                        &[],
+                        0,
+                        0,
+                        &feed,
+                        None,
+                        &HashMap::new(),
+                        None,
+                        0,
+                        &catalog,
+                    ) {
+                        intents.push(intent);
+                    }
+                },
+                (AgentTerminalUi::new(), Vec::new(), false),
+            );
+            harness.set_size(egui::vec2(1400.0, 100.0));
+            install_sidebar_test_fonts(&harness.ctx);
+            harness.state_mut().2 = true;
+            harness.run();
+            harness
+        }
+
+        let mut pointer = harness();
+        pointer.get_by_label("포트 —").click();
+        pointer.run();
+        assert_eq!(
+            pointer.state().1,
+            vec![StatusBarIntent::Ports(PortsIntent::Refresh)]
+        );
+
+        let mut keyboard = harness();
+        keyboard.get_by_label("포트 —").focus();
+        keyboard.key_press(egui::Key::Enter);
+        keyboard.run();
+        assert_eq!(keyboard.state().1, pointer.state().1);
+    }
+
+    #[test]
+    fn status_bar_cached_ports_popup_refreshes_on_every_reopen() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let feed = StatusFeedSnapshot::default();
+        let snapshot = crate::port_inventory::PortSnapshot {
+            generation: 7,
+            sampled_at_ms: 1_000,
+            rows: Arc::from([crate::port_inventory::PortRow {
+                pid: 41,
+                port: 3000,
+                bind: Arc::from("127.0.0.1"),
+                protocol: crate::port_inventory::PortProtocol::Tcp,
+                process: Arc::from("node"),
+                process_started_at: Arc::from("birth"),
+                workspace_id: Some(Arc::from("active")),
+                workspace_name: Some(Arc::from("Active")),
+                ownership: crate::port_inventory::PortOwnership::Workspace,
+            }]),
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui,
+                  (terminal, intents, fonts_ready): &mut (
+                AgentTerminalUi,
+                Vec<StatusBarIntent>,
+                bool,
+            )| {
+                if !*fonts_ready {
+                    return;
+                }
+                if let Some(intent) = terminal.status_bar_with_managers(
+                    ui,
+                    None,
+                    None,
+                    &[],
+                    0,
+                    0,
+                    &feed,
+                    Some(&snapshot),
+                    &HashMap::new(),
+                    Some("active"),
+                    41_000,
+                    &catalog,
+                ) {
+                    intents.push(intent);
+                }
+            },
+            (AgentTerminalUi::new(), Vec::new(), false),
+        );
+        harness.set_size(egui::vec2(1400.0, 140.0));
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().2 = true;
+        harness.run();
+
+        harness.get_by_label("Ports 1").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1,
+            vec![StatusBarIntent::Ports(PortsIntent::Refresh)]
+        );
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        harness.get_by_label("Ports 1").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1,
+            vec![
+                StatusBarIntent::Ports(PortsIntent::Refresh),
+                StatusBarIntent::Ports(PortsIntent::Refresh),
+            ]
+        );
+    }
+
+    #[test]
+    fn production_has_only_context_aware_status_bar_entry_point() {
+        let source = include_str!("agent_terminal.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!source.contains("pub(crate) fn status_bar("));
+        assert!(source.contains("pub(crate) fn status_bar_with_managers("));
     }
 
     #[test]

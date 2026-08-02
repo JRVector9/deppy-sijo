@@ -1095,8 +1095,7 @@ fn unix_reader_loop(
                     if !acc.is_empty()
                         && acc.len() < PTY_COALESCE_CAP_BYTES
                         && batch_start.is_some_and(|start| {
-                            start.elapsed()
-                                < std::time::Duration::from_millis(PTY_COALESCE_MAX_MS)
+                            start.elapsed() < std::time::Duration::from_millis(PTY_COALESCE_MAX_MS)
                         })
                         && reader_ready_within(
                             reader.as_raw_fd(),

@@ -31,6 +31,17 @@ const EXPANDED_MIN_ROWS: usize = 3;
 /// 접힘↔펼침 높이 트윈 시간(초).
 const ANIM_SECONDS: f32 = 0.16;
 
+fn composer_frame(visuals: &egui::Visuals) -> egui::Frame {
+    let tokens = crate::ui::designall::tokens(visuals);
+    egui::Frame::NONE
+        .fill(tokens.input_background)
+        .stroke(crate::ui::designall::separator_stroke(visuals))
+        .corner_radius(egui::CornerRadius::same(
+            crate::ui::designall::INTERACTION_CORNER_RADIUS,
+        ))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+}
+
 /// web-remote P6a `encode_input`과 동일한 붙여넣기 판정 임계값.
 const INPUT_PASTE_THRESHOLD: usize = 512;
 
@@ -521,16 +532,6 @@ impl ComposerUi {
             send_requested = false;
         }
 
-        // ── 도크 카드 (ChatGPT 컴포저 언어: 둥근 모서리 + 1px 테두리 + 은은한 그림자) ──
-        let dark = ui.visuals().dark_mode;
-        let card_fill = ui.visuals().extreme_bg_color;
-        let card_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
-        let shadow = egui::epaint::Shadow {
-            offset: [0, 2],
-            blur: 10,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(if dark { 72 } else { 28 }),
-        };
         let row_h = ui.text_style_height(&egui::TextStyle::Body);
         let line_count = buffer.split('\n').count().max(1);
         let target_rows = if self.expanded {
@@ -560,12 +561,7 @@ impl ComposerUi {
             }
         };
 
-        let card = egui::Frame::new()
-            .fill(card_fill)
-            .stroke(card_stroke)
-            .corner_radius(2)
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .shadow(shadow);
+        let card = composer_frame(ui.visuals());
         let card_response = card.show(ui, |ui| {
             let output = egui::ScrollArea::vertical()
                 .id_salt(text_id.with("scroll"))
@@ -1742,6 +1738,14 @@ pub fn plan_composer_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn designall_composer는_그림자없는_입력표면이다() {
+        let frame = composer_frame(&egui::Visuals::dark());
+        assert_eq!(frame.shadow, egui::epaint::Shadow::NONE);
+        assert_eq!(frame.corner_radius, egui::CornerRadius::same(4));
+        assert_eq!(frame.fill, crate::ui::designall::DARK.input_background);
+    }
 
     fn arc_str(value: &str) -> std::sync::Arc<str> {
         std::sync::Arc::from(value)

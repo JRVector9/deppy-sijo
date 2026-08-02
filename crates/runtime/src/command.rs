@@ -402,7 +402,8 @@ pub(crate) fn runtime_command_retained_bytes(
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
-        | RuntimeCommand::FocusPane { pane } => retained_string(&mut total, &pane.0)?,
+        | RuntimeCommand::FocusPane { pane }
+        | RuntimeCommand::RestoreWorkspacePane { pane } => retained_string(&mut total, &pane.0)?,
         RuntimeCommand::CloseTab { tab } | RuntimeCommand::SelectTab { tab } => {
             retained_string(&mut total, &tab.0)?;
         }
@@ -445,7 +446,10 @@ pub(crate) fn runtime_command_retained_bytes(
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
-        | RuntimeCommand::NoteTurnStart { .. } => {}
+        | RuntimeCommand::NoteTurnStart { .. }
+        | RuntimeCommand::DurableEventBarrier { .. }
+        | RuntimeCommand::InspectUnattachedSessions
+        | RuntimeCommand::KillUnattachedSessions => {}
     }
     Ok(total)
 }
@@ -517,7 +521,8 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
-        | RuntimeCommand::FocusPane { pane } => canonicalize_mux_pane_id(pane),
+        | RuntimeCommand::FocusPane { pane }
+        | RuntimeCommand::RestoreWorkspacePane { pane } => canonicalize_mux_pane_id(pane),
         RuntimeCommand::CloseTab { tab } | RuntimeCommand::SelectTab { tab } => {
             canonicalize_mux_tab_id(tab);
         }
@@ -558,7 +563,10 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
-        | RuntimeCommand::NoteTurnStart { .. } => {}
+        | RuntimeCommand::NoteTurnStart { .. }
+        | RuntimeCommand::DurableEventBarrier { .. }
+        | RuntimeCommand::InspectUnattachedSessions
+        | RuntimeCommand::KillUnattachedSessions => {}
     }
 }
 
@@ -688,7 +696,9 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 return Err(admission_error("runtime_command_pane_title_invalid"));
             }
         }
-        RuntimeCommand::ClosePane { pane } | RuntimeCommand::FocusPane { pane } => {
+        RuntimeCommand::ClosePane { pane }
+        | RuntimeCommand::FocusPane { pane }
+        | RuntimeCommand::RestoreWorkspacePane { pane } => {
             if !mux_pane_id_is_valid(pane) {
                 return Err(admission_error("runtime_command_pane_id_invalid"));
             }
@@ -713,6 +723,11 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 return Err(admission_error("runtime_command_search_invalid"));
             }
         }
+        RuntimeCommand::DurableEventBarrier { correlation_id } => {
+            if *correlation_id == 0 {
+                return Err(admission_error("runtime_durable_event_barrier_invalid"));
+            }
+        }
         RuntimeCommand::Scroll { .. }
         | RuntimeCommand::KillSession { .. }
         | RuntimeCommand::RestoreWorkspace
@@ -727,7 +742,9 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         | RuntimeCommand::EmergencyPersistFlush
         | RuntimeCommand::FreezeSession { .. }
         | RuntimeCommand::ResumeSession { .. }
-        | RuntimeCommand::NoteTurnStart { .. } => {}
+        | RuntimeCommand::NoteTurnStart { .. }
+        | RuntimeCommand::InspectUnattachedSessions
+        | RuntimeCommand::KillUnattachedSessions => {}
     }
     Ok(())
 }
@@ -931,6 +948,27 @@ pub enum RuntimeCommand {
     NoteTurnStart {
         session: SessionId,
     },
+    /// 저장된 canonical pane 하나만 materialize한다. 첫 요청은 bounded restore
+    /// snapshot의 tab/layout/pane skeleton을 설치하고, 지정 pane만 기존 복원 경로로
+    /// 세션을 붙인다. **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    RestoreWorkspacePane {
+        pane: MuxPaneId,
+    },
+    /// FIFO marker proving that durable lifecycle/mux events synchronously emitted by
+    /// earlier commands have entered their bounded FIFO channel. Coalesced Viewport,
+    /// PtyInputPressure, and ResourceUsage slots are explicitly outside this fence.
+    /// The opaque id is fixed-size and nonzero; issuers sharing one runtime backend
+    /// must keep their outstanding ids unique.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    DurableEventBarrier {
+        correlation_id: u64,
+    },
+    /// 현재 워커가 소유하지만 mux pane 및 원격 시청 lease에 연결되지 않은 로컬
+    /// 세션 수를 런타임 상태에서 계산한다. **variant는 끝에만 추가** (wire 계약).
+    InspectUnattachedSessions,
+    /// 실행 시점에 unattached 후보를 다시 계산해 런타임 소유 세션만 정리한다.
+    /// UI가 session id를 전달하지 않는다. **variant는 끝에만 추가** (wire 계약).
+    KillUnattachedSessions,
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1076,6 +1114,16 @@ impl std::fmt::Debug for RuntimeCommand {
                 f.debug_struct("FocusPane").field("pane", pane).finish()
             }
             RuntimeCommand::RestoreWorkspace => f.write_str("RestoreWorkspace"),
+            RuntimeCommand::RestoreWorkspacePane { pane } => f
+                .debug_struct("RestoreWorkspacePane")
+                .field("pane", pane)
+                .finish(),
+            RuntimeCommand::DurableEventBarrier { correlation_id } => f
+                .debug_struct("DurableEventBarrier")
+                .field("correlation_id", correlation_id)
+                .finish(),
+            RuntimeCommand::InspectUnattachedSessions => f.write_str("InspectUnattachedSessions"),
+            RuntimeCommand::KillUnattachedSessions => f.write_str("KillUnattachedSessions"),
             RuntimeCommand::SetWorkspaceState(state) => {
                 f.debug_tuple("SetWorkspaceState").field(state).finish()
             }
@@ -1542,6 +1590,7 @@ mod tests {
             },
             RuntimeCommand::ClosePane { pane: pane() },
             RuntimeCommand::FocusPane { pane: pane() },
+            RuntimeCommand::RestoreWorkspacePane { pane: pane() },
             RuntimeCommand::RenamePane {
                 pane: pane(),
                 title: String::new(),
@@ -1571,6 +1620,18 @@ mod tests {
                 assert!(validate_host_command(&command).is_err(), "{command:?}");
             }
         }
+    }
+
+    #[test]
+    fn restore_workspace_pane_debug_exposes_only_bounded_identifier() {
+        let command = RuntimeCommand::RestoreWorkspacePane {
+            pane: MuxPaneId("pane-safe".to_owned()),
+        };
+
+        assert_eq!(
+            format!("{command:?}"),
+            "RestoreWorkspacePane { pane: MuxPaneId(\"pane-safe\") }"
+        );
     }
 
     fn spare_string(value: &str, capacity: usize) -> String {
@@ -1837,7 +1898,44 @@ mod tests {
                 "FreezeSession",
                 "ResumeSession",
                 "NoteTurnStart",
+                "RestoreWorkspacePane",
+                "DurableEventBarrier",
+                "InspectUnattachedSessions",
+                "KillUnattachedSessions",
             ]
+        );
+    }
+
+    #[test]
+    fn unattached_session_commands_retain_no_heap_payload() {
+        for mut command in [
+            RuntimeCommand::InspectUnattachedSessions,
+            RuntimeCommand::KillUnattachedSessions,
+        ] {
+            assert!(validate_host_command(&command).is_ok());
+            let retained = prepare_runtime_command_for_retention(&mut command).unwrap();
+            assert_eq!(
+                retained.retained_bytes(),
+                std::mem::size_of::<RuntimeCommand>()
+            );
+        }
+    }
+
+    #[test]
+    fn durable_event_barrier_requires_nonzero_correlation_and_retains_no_heap() {
+        let mut valid = RuntimeCommand::DurableEventBarrier { correlation_id: 7 };
+        assert!(validate_host_command(&valid).is_ok());
+        let retained = prepare_runtime_command_for_retention(&mut valid).unwrap();
+        assert_eq!(
+            retained.retained_bytes(),
+            std::mem::size_of::<RuntimeCommand>()
+        );
+
+        let invalid = RuntimeCommand::DurableEventBarrier { correlation_id: 0 };
+        assert!(validate_host_command(&invalid).is_err());
+        assert_eq!(
+            format!("{valid:?}"),
+            "DurableEventBarrier { correlation_id: 7 }"
         );
     }
 }

@@ -41,6 +41,174 @@ pub struct SessionEntry {
     pub status_line: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionRowTarget {
+    Live {
+        workspace_id: String,
+        runtime_instance: u64,
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+        session: runtime::SessionId,
+    },
+    PersistedPane {
+        workspace_id: String,
+        pane: runtime::MuxPaneId,
+    },
+}
+
+impl SessionRowTarget {
+    pub(crate) fn live(
+        workspace_id: impl Into<String>,
+        runtime_instance: u64,
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+        session: runtime::SessionId,
+    ) -> Self {
+        Self::Live {
+            workspace_id: workspace_id.into(),
+            runtime_instance,
+            tab,
+            pane,
+            session,
+        }
+    }
+
+    pub(crate) fn persisted(workspace_id: impl Into<String>, pane: runtime::MuxPaneId) -> Self {
+        Self::PersistedPane {
+            workspace_id: workspace_id.into(),
+            pane,
+        }
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        match self {
+            Self::Live { workspace_id, .. } | Self::PersistedPane { workspace_id, .. } => {
+                workspace_id
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_instance(&self) -> Option<u64> {
+        match self {
+            Self::Live {
+                runtime_instance, ..
+            } => Some(*runtime_instance),
+            Self::PersistedPane { .. } => None,
+        }
+    }
+
+    pub(crate) fn pane(&self) -> &runtime::MuxPaneId {
+        match self {
+            Self::Live { pane, .. } | Self::PersistedPane { pane, .. } => pane,
+        }
+    }
+
+    pub(crate) fn session(&self) -> Option<runtime::SessionId> {
+        match self {
+            Self::Live { session, .. } => Some(*session),
+            Self::PersistedPane { .. } => None,
+        }
+    }
+
+    fn live_tab(&self) -> Option<&runtime::MuxTabId> {
+        match self {
+            Self::Live { tab, .. } => Some(tab),
+            Self::PersistedPane { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionRowDragPayload {
+    target: SessionRowTarget,
+}
+
+impl SessionRowDragPayload {
+    fn new(target: SessionRowTarget) -> Self {
+        Self { target }
+    }
+
+    pub(crate) fn target(&self) -> &SessionRowTarget {
+        &self.target
+    }
+}
+
+pub(crate) struct SidebarSessionRow {
+    pub target: SessionRowTarget,
+    pub title: String,
+    pub status: Option<runtime::SessionStatus>,
+    pub summary: String,
+    pub focused: bool,
+    pub attention: bool,
+    pub pulse: Option<(f32, egui::Color32)>,
+    pub agent_line: Option<String>,
+    pub status_label: Option<String>,
+    pub resumable: bool,
+    pub has_cwd: bool,
+    pub in_worktree: bool,
+    pub status_line: Option<String>,
+}
+
+impl SidebarSessionRow {
+    pub(crate) fn from_live(
+        workspace_id: impl Into<String>,
+        runtime_instance: u64,
+        entry: SessionEntry,
+    ) -> Self {
+        let workspace_id = workspace_id.into();
+        let target = match entry.session {
+            Some(session) => SessionRowTarget::live(
+                workspace_id,
+                runtime_instance,
+                entry.tab,
+                entry.pane,
+                session,
+            ),
+            None => SessionRowTarget::persisted(workspace_id, entry.pane),
+        };
+        Self {
+            target,
+            title: entry.title,
+            status: entry.status,
+            summary: entry.summary,
+            focused: entry.focused,
+            attention: entry.attention,
+            pulse: entry.pulse,
+            agent_line: entry.agent_line,
+            status_label: entry.status_label,
+            resumable: entry.resumable,
+            has_cwd: entry.has_cwd,
+            in_worktree: entry.in_worktree,
+            status_line: entry.status_line,
+        }
+    }
+
+    pub(crate) fn from_persisted_parts(
+        workspace_id: impl Into<String>,
+        pane: runtime::MuxPaneId,
+        title: String,
+        cwd: String,
+    ) -> Self {
+        let has_cwd = !cwd.is_empty();
+        Self {
+            target: SessionRowTarget::persisted(workspace_id, pane),
+            title,
+            status: None,
+            summary: cwd,
+            focused: false,
+            attention: false,
+            pulse: None,
+            agent_line: None,
+            status_label: None,
+            resumable: false,
+            has_cwd,
+            in_worktree: false,
+            status_line: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarWorkspaceState {
     Active,
@@ -52,7 +220,6 @@ pub enum SidebarWorkspaceState {
 pub struct SidebarWorkspaceEntry {
     pub id: String,
     pub name: String,
-    pub repo: Option<String>,
     pub state: SidebarWorkspaceState,
     pub summary: SidebarSessionSummary,
 }
@@ -119,6 +286,10 @@ pub enum SidebarAction {
     /// App이 현재 view를 보고 결정한다 — 이 모듈은 view를 바꾸지 않는다.
     ShowInbox,
     OpenAgents,
+    OpenSettings,
+    OpenHelp,
+    ShowFocusedDiff,
+    OpenConnectors,
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
     OpenMacosFileAccessSettings,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
@@ -131,6 +302,8 @@ pub enum SidebarAction {
         tab: runtime::MuxTabId,
         pane: runtime::MuxPaneId,
     },
+    /// 비활성 workspace의 canonical pane을 현재 화면 오른쪽에 연결한다.
+    OpenSessionBeside(SessionRowTarget),
     /// 세션 이름 변경 — pane 제목을 갱신한다(더블클릭/메뉴 인라인 편집).
     RenameSession {
         pane: runtime::MuxPaneId,
@@ -173,8 +346,8 @@ pub enum SidebarAction {
         session: runtime::SessionId,
     },
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 워크스페이스 자체(경로·설정·DB
-    /// 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분). 실행 중 에이전트를 죽일 수
-    /// 있어 App이 확인 다이얼로그를 거친 뒤 수행한다.
+    /// 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분). 확인 다이얼로그 사용 여부는
+    /// App의 사용자 설정이 결정한다.
     CloseWorkspace(String),
     /// 워크스페이스 표시명(별칭) 편집 모달을 연다 — 실제 폴더/경로는 불변.
     /// 편집 자체는 App 소유 모달이 하고(현재 별칭 원본은 App만 안다), 여기서는
@@ -184,6 +357,31 @@ pub enum SidebarAction {
     /// 워크스페이스를 만들어 전환한다. rfd 다이얼로그는 UI leaf가 아니라 App이 연다
     /// (기존 ws_create 관례, 2026-07-18).
     CreateWorkspaceFromPicker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarTool {
+    Files,
+    Git,
+    Mcp,
+}
+
+const SIDEBAR_TOOLS: [SidebarTool; 3] = [SidebarTool::Files, SidebarTool::Git, SidebarTool::Mcp];
+
+fn sidebar_tool_label_key(tool: SidebarTool) -> &'static str {
+    match tool {
+        SidebarTool::Files => "sidebar.tool.files",
+        SidebarTool::Git => "sidebar.tool.git",
+        SidebarTool::Mcp => "sidebar.tool.mcp",
+    }
+}
+
+fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
+    match tool {
+        SidebarTool::Files => None,
+        SidebarTool::Git => Some(SidebarAction::ShowFocusedDiff),
+        SidebarTool::Mcp => Some(SidebarAction::OpenConnectors),
+    }
 }
 
 const FILE_TREE_IO_QUEUE_CAP: usize = 1;
@@ -743,16 +941,12 @@ pub struct FileTreeUi {
     /// 가시 행 평탄화 캐시 — 펼침/접힘/조작 시에만 재계산(§3).
     flat: Vec<FlatRow>,
     show_hidden: bool,
-    file_search_open: bool,
-    file_search: String,
     /// 사이드바 접힘 (Panel 폭만 줄인다 — 상태/캐시는 유지).
     collapsed: bool,
     /// 내장 SidePanel 리사이저 대신 사용하는 폭. 내장 리사이저는 드래그 가이드선을
     /// 하단 상태바까지 그리므로, 상태바 위에서 끝나는 전용 핸들로 직접 조절한다.
     sidebar_width: f32,
-    /// 사이드바 최하단 내비게이션 뷰포트 높이. 위 경계선을 드래그해 조절하며,
-    /// 작게 접었을 때는 내부 ScrollArea로 홈/작업함/플릿/에이전트를 탐색한다.
-    navigation_section_height: f32,
+    navigation_rail_width: f32,
     /// 마지막 조작 에러 (하단 빨간 라벨, §4).
     error: Option<String>,
     /// macOS/TCC 등에서 나열 권한이 거부된 디렉터리. 전역 오류로 승격하지 않고
@@ -799,6 +993,9 @@ pub struct FileTreeUi {
     /// 마지막 외부 파일 붙여넣기(⌘V) 처리 시각 — 같은 제스처의 press(native)와
     /// release(egui fallback)가 두 번 복사하는 것을 막는다(터미널 PASTE_GESTURE 관례).
     last_external_paste: Option<std::time::Instant>,
+    /// 마지막 외부 파일 복사(⌘C) 처리 시각 — native key-down 뒤 늦게 도착한
+    /// Event::Copy가 같은 파일 URL 쓰기를 중복하지 않게 한다.
+    last_external_copy: Option<std::time::Instant>,
     /// 이번 프레임 트리가 ⌘V를 소비했는지 — App이 터미널의 같은 제스처 붙여넣기를 누른다.
     consumed_paste_shortcut: bool,
     /// 이번 프레임 트리가 ⌘C를 소비했는지 — App이 터미널 선택 복사의 덮어쓰기를 누른다.
@@ -840,11 +1037,9 @@ impl FileTreeUi {
             children: None,
             flat: Vec::new(),
             show_hidden: false,
-            file_search_open: false,
-            file_search: String::new(),
             collapsed: false,
-            sidebar_width: 360.0,
-            navigation_section_height: SIDEBAR_NAV_DEFAULT_HEIGHT,
+            sidebar_width: 200.0,
+            navigation_rail_width: crate::ui::designall::NAV_RAIL_WIDTH,
             error: None,
             inaccessible_paths: HashSet::new(),
             io_generation: 1,
@@ -868,10 +1063,28 @@ impl FileTreeUi {
             workspace_sessions_expanded: HashMap::new(),
             last_sidebar_active_workspace: None,
             last_external_paste: None,
+            last_external_copy: None,
             consumed_paste_shortcut: false,
             consumed_copy_shortcut: false,
             workspace_section_height: 270.0,
         }
+    }
+
+    pub fn designall_titlebar_widths(&self) -> (f32, f32) {
+        let navigation = self.navigation_rail_width.clamp(
+            crate::ui::designall::NAV_RAIL_MIN_WIDTH,
+            crate::ui::designall::NAV_RAIL_MAX_WIDTH,
+        );
+        let project = if self.collapsed {
+            22.0
+        } else {
+            self.sidebar_width.clamp(40.0, 680.0)
+        };
+        (navigation, project)
+    }
+
+    pub fn collapse_project_file_panel(&mut self) {
+        self.collapsed = true;
     }
 
     /// 이번 프레임 트리가 소비한 (⌘V, ⌘C). App이 같은 프레임 터미널 이중 처리
@@ -1329,8 +1542,6 @@ impl FileTreeUi {
         self.root_error = None;
         self.children = None;
         self.flat.clear();
-        self.file_search.clear();
-        self.file_search_open = false;
         self.error = None;
         self.inaccessible_paths.clear();
         self.edit = None;
@@ -1405,27 +1616,110 @@ impl FileTreeUi {
     pub fn panel(
         &mut self,
         ui: &mut egui::Ui,
-        sessions_by_workspace: &HashMap<String, Vec<SessionEntry>>,
+        sessions_by_workspace: &HashMap<String, Vec<SidebarSessionRow>>,
+        sidebar: &SidebarSnapshot<'_>,
+        catalog: &i18n::Catalog,
+    ) -> Option<SidebarAction> {
+        let navigation_action = self.navigation_rail_panel(ui, sidebar, catalog);
+        let project_action = self.project_file_panel(ui, sessions_by_workspace, sidebar, catalog);
+        project_action.or(navigation_action)
+    }
+
+    fn navigation_rail_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        sidebar: &SidebarSnapshot<'_>,
+        catalog: &i18n::Catalog,
+    ) -> Option<SidebarAction> {
+        self.navigation_rail_width = self.navigation_rail_width.clamp(
+            crate::ui::designall::NAV_RAIL_MIN_WIDTH,
+            crate::ui::designall::NAV_RAIL_MAX_WIDTH,
+        );
+        let frame = crate::ui::designall::structural_frame(ui.visuals());
+        let panel = egui::Panel::left("designall_navigation_rail")
+            .resizable(false)
+            .exact_size(self.navigation_rail_width)
+            .show_separator_line(false)
+            .frame(frame)
+            .show(ui, |ui| {
+                crate::ui::designall::apply_workspace_visuals(ui);
+                crate::fonts::apply_sidebar_text_styles(ui);
+                let width = ui.available_width();
+                let utility_height = nav_utility_height(width);
+                let navigation_height = (ui.available_height() - utility_height).max(0.0);
+                let navigation_action = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(width, navigation_height),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("designall_navigation_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.navigation(ui, sidebar, catalog))
+                                .inner
+                        },
+                    )
+                    .inner;
+                let utility_action = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(width, utility_height),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| nav_utilities(ui, catalog),
+                    )
+                    .inner;
+                utility_action.or(navigation_action)
+            });
+        let panel_rect = panel.response.rect;
+        let resize_bottom = panel_rect
+            .bottom()
+            .min(ui.ctx().content_rect().bottom() - 26.0);
+        let resize_rect = egui::Rect::from_min_max(
+            egui::pos2(panel_rect.right() - 3.0, panel_rect.top()),
+            egui::pos2(panel_rect.right() + 3.0, resize_bottom),
+        );
+        let resize_response = ui
+            .interact(
+                resize_rect,
+                egui::Id::new("designall_navigation_rail_resize"),
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if resize_response.dragged() {
+            let delta_x = ui.input(|input| input.pointer.delta().x);
+            self.navigation_rail_width = (self.navigation_rail_width + delta_x).clamp(
+                crate::ui::designall::NAV_RAIL_MIN_WIDTH,
+                crate::ui::designall::NAV_RAIL_MAX_WIDTH,
+            );
+            ui.ctx().request_repaint();
+        }
+        let separator_stroke = if resize_response.dragged() {
+            ui.visuals().widgets.active.bg_stroke
+        } else if resize_response.hovered() {
+            ui.visuals().widgets.hovered.bg_stroke
+        } else {
+            crate::ui::designall::separator_stroke(ui.visuals())
+        };
+        paint_sidebar_separator(ui, panel_rect, separator_stroke);
+        panel.inner
+    }
+
+    fn project_file_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        sessions_by_workspace: &HashMap<String, Vec<SidebarSessionRow>>,
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
         let status_bar_top = ui.ctx().content_rect().bottom() - 26.0;
-        let paint_separator = |ui: &egui::Ui, rect: egui::Rect, stroke: egui::Stroke| {
-            let bottom = rect.bottom().min(status_bar_top);
-            if bottom > rect.top() {
-                ui.painter().vline(
-                    rect.right(),
-                    egui::Rangef::new(rect.top(), bottom),
-                    stroke,
-                );
-            }
-        };
         if self.collapsed {
-            let panel = egui::Panel::left("file_tree_panel_collapsed")
-                  .resizable(false)
-                  .exact_size(22.0)
-                  .show_separator_line(false)
-                  .show(ui, |ui| {
+            let frame = crate::ui::designall::structural_frame(ui.visuals());
+            let panel = egui::Panel::left("designall_project_file_panel")
+                .resizable(false)
+                .exact_size(22.0)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(ui, |ui| {
+                    crate::ui::designall::apply_workspace_visuals(ui);
                     crate::fonts::apply_sidebar_text_styles(ui);
                     if ui
                         .small_button("▸")
@@ -1433,58 +1727,27 @@ impl FileTreeUi {
                         .clicked()
                     {
                         self.collapsed = false;
-                      }
-                  });
-            paint_separator(
+                    }
+                });
+            paint_sidebar_separator(
                 ui,
                 panel.response.rect,
-                ui.visuals().widgets.noninteractive.bg_stroke,
+                crate::ui::designall::separator_stroke(ui.visuals()),
             );
             return None;
         }
         self.sidebar_width = self.sidebar_width.clamp(40.0, 680.0);
-        let panel = egui::Panel::left("file_tree_panel")
-              .resizable(false)
-              .exact_size(self.sidebar_width)
-              .show_separator_line(false)
-            // 패널 기본 inner_margin 제거 — 첫 워크스페이스가 상단 라인에 붙게
-            // (2026-07-18 사용자). 각 행이 자체 좌측 인셋을 그리므로 여백 0이 안전.
-            .frame(
-                egui::Frame::side_top_panel(&ui.ctx().global_style())
-                    .inner_margin(egui::Margin::ZERO)
-                    .fill(SIDEBAR_BACKGROUND),
-            )
+        let frame = crate::ui::designall::structural_frame(ui.visuals());
+        let panel = egui::Panel::left("designall_project_file_panel")
+            .resizable(false)
+            .exact_size(self.sidebar_width)
+            .show_separator_line(false)
+            .frame(frame)
             .show(ui, |ui| {
+                crate::ui::designall::apply_workspace_visuals(ui);
                 crate::fonts::apply_sidebar_text_styles(ui);
-                let available_height = ui.available_height();
-                let (body_h, navigation_h) = sidebar_vertical_section_heights(
-                    available_height,
-                    self.navigation_section_height,
-                );
-                self.navigation_section_height = navigation_h;
-                let body = ui
-                    .allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), body_h),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| self.contents(ui, sessions_by_workspace, sidebar, catalog),
-                    )
-                    .inner;
-                self.navigation_split_handle(ui, available_height);
-                let navigation = ui
-                    .allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), navigation_h),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt("sidebar_navigation_scroll")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| self.navigation(ui, sidebar, catalog))
-                                .inner
-                        },
-                    )
-                    .inner;
-                body.or(navigation)
-              });
+                self.contents(ui, sessions_by_workspace, sidebar, catalog)
+            });
         let panel_rect = panel.response.rect;
         let resize_bottom = panel_rect.bottom().min(status_bar_top);
         let resize_rect = egui::Rect::from_min_max(
@@ -1508,41 +1771,10 @@ impl FileTreeUi {
         } else if resize_response.hovered() {
             ui.visuals().widgets.hovered.bg_stroke
         } else {
-            ui.visuals().widgets.noninteractive.bg_stroke
+            crate::ui::designall::separator_stroke(ui.visuals())
         };
-        paint_separator(ui, panel_rect, separator_stroke);
+        paint_sidebar_separator(ui, panel_rect, separator_stroke);
         panel.inner
-    }
-
-    fn navigation_split_handle(&mut self, ui: &mut egui::Ui, available_height: f32) {
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), SIDEBAR_NAV_SPLIT_HANDLE_HEIGHT),
-            egui::Sense::hover(),
-        );
-        let response = ui
-            .interact(
-                rect.expand2(egui::vec2(0.0, 2.0)),
-                ui.id().with("file_tree_navigation_split_handle"),
-                egui::Sense::drag(),
-            )
-            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
-        if response.dragged() {
-            let delta_y = ui.input(|input| input.pointer.delta().y);
-            let (_, navigation_height) = sidebar_vertical_section_heights(
-                available_height,
-                self.navigation_section_height - delta_y,
-            );
-            self.navigation_section_height = navigation_height;
-            ui.ctx().request_repaint();
-        }
-        let color = if response.hovered() || response.dragged() {
-            ui.visuals().selection.bg_fill
-        } else {
-            ui.visuals().widgets.noninteractive.bg_stroke.color
-        };
-        let y = ui.painter().round_to_pixel_center(rect.center().y);
-        ui.painter()
-            .hline(rect.x_range(), y, egui::Stroke::new(1.0, color));
     }
 
     /// 「워크스페이스·세션」 블록과 폴더 트리 사이 경계선 — 위아래로 끌면
@@ -1551,17 +1783,23 @@ impl FileTreeUi {
     /// 반환값 = 이번 프레임에 드래그 중인지 — 드래그로 아래 폴더 트리 행이 밀려
     /// 포인터 밑에 오면 hover 판정만으로 클릭 가능한 것처럼 보이는 오작동을
     /// 막기 위해 호출측이 행 상호작용을 잠시 꺼야 한다(2026-07-24 사용자 보고).
-    fn workspace_split_handle(&mut self, ui: &mut egui::Ui) -> bool {
-        let gap = 6.0;
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), gap), egui::Sense::hover());
+    fn workspace_split_handle(
+        &mut self,
+        ui: &mut egui::Ui,
+        background_top: f32,
+        background: egui::Color32,
+    ) -> bool {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), PROJECT_FILE_SPLIT_HEIGHT),
+            egui::Sense::hover(),
+        );
         let hit_rect = rect.expand2(egui::vec2(0.0, 2.0));
         let id = ui.id().with("file_tree_workspace_split_handle");
         let resp = ui
             .interact(hit_rect, id, egui::Sense::drag())
             .on_hover_cursor(egui::CursorIcon::ResizeVertical);
         if resp.dragged() {
-            self.workspace_section_height += resp.drag_delta().y;
+            self.workspace_section_height += ui.input(|input| input.pointer.delta().y);
         }
         let color = if resp.hovered() || resp.dragged() {
             ui.visuals().selection.bg_fill
@@ -1569,6 +1807,11 @@ impl FileTreeUi {
             ui.visuals().widgets.noninteractive.bg_stroke.color
         };
         let painter = ui.painter();
+        let background_rect = egui::Rect::from_min_max(
+            egui::pos2(ui.max_rect().left(), background_top),
+            egui::pos2(ui.max_rect().right(), ui.cursor().min.y),
+        );
+        painter.rect_filled(background_rect, 0.0, background);
         let y = painter.round_to_pixel_center(rect.center().y);
         painter.hline(ui.clip_rect().x_range(), y, egui::Stroke::new(1.0, color));
         resp.dragged()
@@ -1577,299 +1820,307 @@ impl FileTreeUi {
     fn contents(
         &mut self,
         ui: &mut egui::Ui,
-        sessions_by_workspace: &HashMap<String, Vec<SessionEntry>>,
+        sessions_by_workspace: &HashMap<String, Vec<SidebarSessionRow>>,
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
         // (워처/백그라운드 채널 수거는 panel()이 접힘 여부와 무관하게 이미 수행했다)
         let mut action: Option<SidebarAction> = None;
+        let available_height = ui.available_height();
+        let (workspace_height, folder_height) =
+            project_file_section_heights(available_height, self.workspace_section_height);
+        self.workspace_section_height = workspace_height;
+        let workspace_width = ui.available_width();
+        let workspace_background = crate::ui::designall::tokens(ui.visuals()).workspace_background;
+        let outer_item_spacing_y = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let workspace_section = ui.allocate_ui_with_layout(
+            egui::vec2(workspace_width, workspace_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = outer_item_spacing_y;
+                ui.painter()
+                    .rect_filled(ui.max_rect(), 0.0, workspace_background);
 
-        // ── 통합 워크스페이스·세션 계층 ──
-        let compact_sidebar = ui.available_width() < 120.0;
-        self.workspace_sessions_expanded.retain(|workspace_id, _| {
-            sidebar
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.id == *workspace_id)
-        });
-        if self.last_sidebar_active_workspace.as_deref() != Some(sidebar.active_workspace_id) {
-            if let Some(previous) = self.last_sidebar_active_workspace.as_ref() {
-                self.workspace_sessions_expanded
-                    .entry(previous.clone())
-                    .or_insert(true);
-            }
-            self.workspace_sessions_expanded
-                .entry(sidebar.active_workspace_id.to_owned())
-                .or_insert(true);
-            self.last_sidebar_active_workspace = Some(sidebar.active_workspace_id.to_owned());
-        }
-        if sidebar.workspaces.is_empty() {
-            ui.add_space(3.0);
-            // 빈 상태 — 워크스페이스가 하나도 없으면(종료 숨김 반영) 헤더/목록 대신
-            // 가운데 큰 + 버튼과 안내문을 보여준다. 클릭 = 폴더 선택(App이 rfd로 열고
-            // 기존 ws_create 흐름으로 생성·전환, 2026-07-18 사용자 요구).
-            ui.add_space(18.0);
-            ui.vertical_centered(|ui| {
-                let side = 44.0_f32.min((ui.available_width() - 8.0).max(24.0));
-                let plus = egui::Button::new(egui::RichText::new("+").size(24.0))
-                    .min_size(egui::vec2(side, side));
-                if ui
-                    .add(plus)
-                    .on_hover_text(catalog.t("sidebar.empty.start_workspace", &[]))
-                    .clicked()
+                // ── 통합 워크스페이스·세션 계층 ──
+                let compact_sidebar = ui.available_width() < 120.0;
+                self.workspace_sessions_expanded.retain(|workspace_id, _| {
+                    sidebar
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == *workspace_id)
+                });
+                if self.last_sidebar_active_workspace.as_deref()
+                    != Some(sidebar.active_workspace_id)
                 {
-                    action = Some(SidebarAction::CreateWorkspaceFromPicker);
-                }
-                if !compact_sidebar {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(catalog.t("sidebar.empty.start_workspace", &[])).weak(),
-                    );
-                }
-            });
-            ui.add_space(14.0);
-        } else {
-            // 헤더 바("워크스페이스 & 세션 +") 제거 — 첫 워크스페이스가 여백 없이
-            // 상단에 붙는다(2026-07-18 사용자). 워크스페이스 추가(+)는 목록 아래로
-            // 옮기고, 새 세션은 워크스페이스 우클릭 메뉴가 담당한다.
-            // DB list_workspaces가 보장하는 created_at 순서를 그대로 그린다. 이전 구현은
-            // 활성 workspace를 먼저 뽑아 맨 위에 렌더해 선택할 때마다 행이 이동했다.
-            let (before_active, active, after_active) =
-                workspace_creation_order_partition(sidebar.workspaces, sidebar.active_workspace_id);
-            // 세션 블록 상한은 스크롤 진입 **전** 실제 패널 높이로 계산한다 — ScrollArea
-            // 내부의 available_height는 사실상 무한이라 비례 계산이 무의미해진다.
-            let session_max_h = (ui.available_height() * 0.34).clamp(70.0, 230.0);
-            let active_sessions = sessions_by_workspace
-                .get(sidebar.active_workspace_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let any_sessions_visible = sidebar.workspaces.iter().any(|workspace| {
-                self.workspace_sessions_expanded
-                    .get(&workspace.id)
-                    .copied()
-                    .unwrap_or(false)
-                    && sessions_by_workspace
-                        .get(&workspace.id)
-                        .is_some_and(|sessions| !sessions.is_empty())
-            });
-            // 활성 워크스페이스가 생성순 뒤쪽이면 before_active 행들이 스크롤 밖에 그려져
-            // 46px씩 사이드바 고정 높이를 잠식했다 (codex P2 — 세션·파일 트리가 클립 밖으로
-            // 밀리는데 스크롤할 방법이 없었다). 전체 순서 목록(before + 활성 + 세션 + after)을
-            // 하나의 bounded 스크롤 영역이 공유한다. 상한은 기존 워크스페이스 목록 예산에
-            // 활성 행(46px)과 세션 블록 예산을 더한 값 — before가 없던 기존 화면과 동일한
-            // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
-            let session_block_h = if any_sessions_visible {
-                session_max_h
-            } else {
-                0.0
-            };
-            // 사용자가 아래 경계선(workspace_split_handle)을 드래그해 조절한 높이 —
-            // 창 크기가 바뀌어도 안전하도록 매 프레임 가용 높이 기준으로 재클램프한다.
-            let min_list_h = 118.0_f32;
-            let max_list_h = (ui.available_height() - 160.0).max(min_list_h);
-            self.workspace_section_height =
-                self.workspace_section_height.clamp(min_list_h, max_list_h);
-            let list_max_h = self.workspace_section_height + session_block_h;
-            egui::ScrollArea::vertical()
-                .id_salt("workspace_list_scroll")
-                  .max_height(list_max_h)
-                  .auto_shrink([false, true])
-                  .show(ui, |ui| {
-                      ui.painter()
-                          .add(workspace_list_background_gradient(ui.clip_rect()));
-                      ui.spacing_mut().item_spacing.y = 3.0;
-                      ui.add_space(4.0);
-                      for workspace in before_active {
-                        // 워크스페이스 헤더 + 그 세션 목록을 한 카드(#0f171d 배경·
-                        // #131c23 테두리)로 묶는다 — paint_workspace_group_wrap 주석 참고.
-                        // 세션 구간만 살짝 다른 톤(#121a20)을 더 얹는다(inset_reserve) —
-                        // paint_workspace_session_inset 참고.
-                        let reserve = ui.painter().add(egui::Shape::Noop);
-                        let inset_reserve = ui.painter().add(egui::Shape::Noop);
-                        let inner = ui.scope(|ui| {
-                            let color = workspace_accent(sidebar.workspaces, &workspace.id);
-                            let expanded = self
-                                .workspace_sessions_expanded
-                                .get(&workspace.id)
-                                .copied()
-                                .unwrap_or(false);
-                            let resp =
-                                workspace_row(ui, workspace, color, false, Some(expanded), catalog);
-                            let header_bottom = resp.rect.bottom();
-                            workspace_context_menu(&resp, workspace, catalog, &mut action);
-                            if resp.clicked() {
-                                self.workspace_sessions_expanded
-                                    .insert(workspace.id.clone(), true);
-                                action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
-                            }
-                            let mut session_rows_rect = None;
-                            if expanded
-                                && let Some(sessions) = sessions_by_workspace.get(&workspace.id)
-                            {
-                                 let (session_action, rect) = inactive_workspace_sessions(
-                                     ui,
-                                     &workspace.id,
-                                     sessions,
-                                     session_max_h,
-                                     color,
-                                 );
-                                if let Some(session_action) = session_action {
-                                    action = Some(session_action);
-                                }
-                                session_rows_rect = rect;
-                            }
-                            if session_rows_rect.is_some() {
-                                ui.add_space(2.5);
-                            }
-                            (header_bottom, session_rows_rect)
-                        });
-                        let group_rect = inner.response.rect;
-                        let (header_bottom, session_rows_rect) = inner.inner;
-                        paint_workspace_group_wrap(ui, reserve, group_rect);
-                          paint_workspace_session_inset(
-                              ui,
-                              inset_reserve,
-                            group_rect,
-                            header_bottom,
-                            session_rows_rect,
-                        );
+                    if let Some(previous) = self.last_sidebar_active_workspace.as_ref() {
+                        self.workspace_sessions_expanded
+                            .entry(previous.clone())
+                            .or_insert(true);
                     }
-                    // 활성 워크스페이스 헤더 + 그 세션 목록을 하나의 카드 배경(#0f171d)·
-                    // 테두리(#131c23)로 묶는다(2026-07-25 사용자). 배경 자리를 먼저
-                    // 예약(add)해 두고, 아래 두 블록을 ui.scope로 감싸 실제 점유 rect를
-                    // 얻은 뒤 그 자리에 칠한다(paint_workspace_group_wrap 참고) — 두
-                    // 블록의 기존 조건(if let Some(active)/if active_sessions_visible)은
-                    // 그대로 두어 동작을 바꾸지 않는다.
-                     let active_group_reserve = ui.painter().add(egui::Shape::Noop);
-                     let active_inset_reserve = ui.painter().add(egui::Shape::Noop);
-                     let active_color =
-                         workspace_accent(sidebar.workspaces, sidebar.active_workspace_id);
-                     let active_inner = ui.scope(|ui| {
-                         let mut header_bottom = None;
-                         if let Some(active) = active {
-                             let expanded = self
-                                .workspace_sessions_expanded
-                                .get(&active.id)
-                                .copied()
-                                .unwrap_or(true);
-                             let resp =
-                                 workspace_row(ui, active, active_color, true, Some(expanded), catalog);
-                            header_bottom = Some(resp.rect.bottom());
-                            workspace_context_menu(&resp, active, catalog, &mut action);
-                            if resp.clicked() {
-                                self.workspace_sessions_expanded
-                                    .insert(active.id.clone(), !expanded);
-                                // Home/Inbox/Agents에서 현재 활성 워크스페이스를 다시 눌러도
-                                // App dispatch가 Terminal view로 복귀할 수 있게 명시적 전환을
-                                // 방출한다. 같은 id의 runtime 전환은 App에서 no-op이다.
-                                action = Some(SidebarAction::SwitchWorkspace(active.id.clone()));
-                            }
+                    self.workspace_sessions_expanded
+                        .entry(sidebar.active_workspace_id.to_owned())
+                        .or_insert(true);
+                    self.last_sidebar_active_workspace =
+                        Some(sidebar.active_workspace_id.to_owned());
+                }
+                if sidebar.workspaces.is_empty() {
+                    ui.add_space(3.0);
+                    // 빈 상태 — 워크스페이스가 하나도 없으면(종료 숨김 반영) 헤더/목록 대신
+                    // 가운데 큰 + 버튼과 안내문을 보여준다. 클릭 = 폴더 선택(App이 rfd로 열고
+                    // 기존 ws_create 흐름으로 생성·전환, 2026-07-18 사용자 요구).
+                    ui.add_space(18.0);
+                    ui.vertical_centered(|ui| {
+                        let side = 44.0_f32.min((ui.available_width() - 8.0).max(24.0));
+                        let plus = egui::Button::new(egui::RichText::new("+").size(24.0))
+                            .min_size(egui::vec2(side, side));
+                        if ui
+                            .add(plus)
+                            .on_hover_text(catalog.t("sidebar.empty.start_workspace", &[]))
+                            .clicked()
+                        {
+                            action = Some(SidebarAction::CreateWorkspaceFromPicker);
                         }
+                        if !compact_sidebar {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    catalog.t("sidebar.empty.start_workspace", &[]),
+                                )
+                                .weak(),
+                            );
+                        }
+                    });
+                    ui.add_space(14.0);
+                } else {
+                    // 헤더 바("워크스페이스 & 세션 +") 제거 — 첫 워크스페이스가 여백 없이
+                    // 상단에 붙는다(2026-07-18 사용자). 워크스페이스 추가(+)는 목록 아래로
+                    // 옮기고, 새 세션은 워크스페이스 우클릭 메뉴가 담당한다.
+                    // DB list_workspaces가 보장하는 created_at 순서를 그대로 그린다. 이전 구현은
+                    // 활성 workspace를 먼저 뽑아 맨 위에 렌더해 선택할 때마다 행이 이동했다.
+                    let (before_active, active, after_active) = workspace_creation_order_partition(
+                        sidebar.workspaces,
+                        sidebar.active_workspace_id,
+                    );
+                    // 세션 블록 상한은 스크롤 진입 **전** 실제 패널 높이로 계산한다 — ScrollArea
+                    // 내부의 available_height는 사실상 무한이라 비례 계산이 무의미해진다.
+                    let session_max_h = (ui.available_height() * 0.34).clamp(70.0, 230.0);
+                    let active_sessions = sessions_by_workspace
+                        .get(sidebar.active_workspace_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    // 활성 워크스페이스가 생성순 뒤쪽이면 before_active 행들이 스크롤 밖에 그려져
+                    // 46px씩 사이드바 고정 높이를 잠식했다 (codex P2 — 세션·파일 트리가 클립 밖으로
+                    // 밀리는데 스크롤할 방법이 없었다). 전체 순서 목록(before + 활성 + 세션 + after)을
+                    // 하나의 bounded 스크롤 영역이 공유한다. 상한은 기존 워크스페이스 목록 예산에
+                    // 활성 행(46px)과 세션 블록 예산을 더한 값 — before가 없던 기존 화면과 동일한
+                    // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
+                    egui::ScrollArea::vertical()
+                        .id_salt("workspace_list_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.add_space(4.0);
+                            for workspace in before_active {
+                                let inner = ui.scope(|ui| {
+                                    let color = workspace_accent(sidebar.workspaces, &workspace.id);
+                                    let expanded = self
+                                        .workspace_sessions_expanded
+                                        .get(&workspace.id)
+                                        .copied()
+                                        .unwrap_or(false);
+                                    let resp = workspace_row(
+                                        ui,
+                                        workspace,
+                                        color,
+                                        false,
+                                        Some(expanded),
+                                        catalog,
+                                    );
+                                    workspace_context_menu(&resp, workspace, catalog, &mut action);
+                                    if resp.clicked() {
+                                        self.workspace_sessions_expanded
+                                            .insert(workspace.id.clone(), true);
+                                        action = Some(SidebarAction::SwitchWorkspace(
+                                            workspace.id.clone(),
+                                        ));
+                                    }
+                                    let mut session_rows_rect = None;
+                                    if expanded
+                                        && let Some(sessions) =
+                                            sessions_by_workspace.get(&workspace.id)
+                                    {
+                                        let (session_action, rect) = inactive_workspace_sessions(
+                                            ui,
+                                            workspace,
+                                            sidebar.active_workspace_id,
+                                            sessions,
+                                            session_max_h,
+                                            color,
+                                            catalog,
+                                        );
+                                        if let Some(session_action) = session_action {
+                                            action = Some(session_action);
+                                        }
+                                        session_rows_rect = rect;
+                                    }
+                                    if session_rows_rect.is_some() {
+                                        ui.add_space(2.5);
+                                    }
+                                });
+                                paint_workspace_group_separator(ui, inner.response.rect);
+                            }
+                            let active_color =
+                                workspace_accent(sidebar.workspaces, sidebar.active_workspace_id);
+                            let active_inner = ui.scope(|ui| {
+                                if let Some(active) = active {
+                                    let expanded = self
+                                        .workspace_sessions_expanded
+                                        .get(&active.id)
+                                        .copied()
+                                        .unwrap_or(true);
+                                    let resp = workspace_row(
+                                        ui,
+                                        active,
+                                        active_color,
+                                        true,
+                                        Some(expanded),
+                                        catalog,
+                                    );
+                                    workspace_context_menu(&resp, active, catalog, &mut action);
+                                    if resp.clicked() {
+                                        self.workspace_sessions_expanded
+                                            .insert(active.id.clone(), !expanded);
+                                        // Home/Inbox/Agents에서 현재 활성 워크스페이스를 다시 눌러도
+                                        // App dispatch가 Terminal view로 복귀할 수 있게 명시적 전환을
+                                        // 방출한다. 같은 id의 runtime 전환은 App에서 no-op이다.
+                                        action =
+                                            Some(SidebarAction::SwitchWorkspace(active.id.clone()));
+                                    }
+                                }
 
-                        // 현재 workspace의 셸/에이전트를 활성 워크스페이스 아래에 들여써 나열한다.
-                        let mut session_rows_rect = None;
-                        let active_sessions_visible = self
-                            .workspace_sessions_expanded
-                            .get(sidebar.active_workspace_id)
-                            .copied()
-                            .unwrap_or(true)
-                            && !active_sessions.is_empty();
-                        if active_sessions_visible {
-                            // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05
-                            // 사용자 보고). 세션 목록은 자기 상한 안에서만 스크롤하고, 나머지는
-                            // 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
-                            egui::ScrollArea::vertical()
-                                .id_salt("session_list_scroll")
+                                // 현재 workspace의 셸/에이전트를 활성 워크스페이스 아래에 들여써 나열한다.
+                                let mut session_rows_rect = None;
+                                let active_sessions_visible = self
+                                    .workspace_sessions_expanded
+                                    .get(sidebar.active_workspace_id)
+                                    .copied()
+                                    .unwrap_or(true)
+                                    && !active_sessions.is_empty();
+                                if active_sessions_visible {
+                                    // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05
+                                    // 사용자 보고). 세션 목록은 자기 상한 안에서만 스크롤하고, 나머지는
+                                    // 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("session_list_scroll")
                                         .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    // 헤더-세션 사이 여백 없음(2026-07-25 사용자) — 첫 행이
-                                    // 인셋 상단에 바로 붙는다.
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    for (index, entry) in active_sessions.iter().enumerate() {
-                                        let is_last = index + 1 == active_sessions.len();
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(16.0);
-                                            ui.vertical(|ui| {
-                                                let editing = matches!(
-                                                    &self.session_name_edit,
-                                                    Some((p, _)) if *p == entry.pane
-                                                );
-                                                if editing {
-                                                    // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
-                                                    // 행(레일/상태줄) 레이아웃은 유지하고 제목 자리만 편집기로.
-                                                    let buf = &mut self
-                                                        .session_name_edit
-                                                        .as_mut()
-                                                        .unwrap()
-                                                        .1;
-                                                     let resp = session_row_editing(
-                                                         ui,
-                                                         entry,
-                                                         buf,
-                                                         is_last,
-                                                         active_color,
-                                                     );
-                                                    {
-                                                        let row_rect = resp.rect;
-                                                        session_rows_rect = Some(
-                                                            session_rows_rect.map_or(row_rect, |rect: egui::Rect| rect.union(row_rect)),
+                                        .show(ui, |ui| {
+                                            // 헤더-세션 사이 여백 없음(2026-07-25 사용자) — 첫 행이
+                                            // 인셋 상단에 바로 붙는다.
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            for (index, entry) in active_sessions.iter().enumerate()
+                                            {
+                                                let is_last = index + 1 == active_sessions.len();
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(16.0);
+                                                    ui.vertical(|ui| {
+                                                        let editing = matches!(
+                                                            &self.session_name_edit,
+                                                            Some((p, _)) if p == entry.target.pane()
                                                         );
-                                                    }
-                                                    let (enter, esc) = ui.input(|i| {
-                                                        (
-                                                            i.key_pressed(egui::Key::Enter),
-                                                            i.key_pressed(egui::Key::Escape),
-                                                        )
-                                                    });
-                                                    if enter {
-                                                        if let Some((pane, title)) =
-                                                            self.session_name_edit.take()
-                                                        {
-                                                            let title = title.trim().to_owned();
-                                                            if !title.is_empty() {
-                                                                action = Some(
+                                                        if editing {
+                                                            // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
+                                                            // 행(레일/상태줄) 레이아웃은 유지하고 제목 자리만 편집기로.
+                                                            let buf = &mut self
+                                                                .session_name_edit
+                                                                .as_mut()
+                                                                .unwrap()
+                                                                .1;
+                                                            let resp = session_row_editing(
+                                                                ui,
+                                                                entry,
+                                                                buf,
+                                                                is_last,
+                                                                active_color,
+                                                            );
+                                                            {
+                                                                let row_rect = resp.rect;
+                                                                session_rows_rect =
+                                                                    Some(session_rows_rect.map_or(
+                                                                        row_rect,
+                                                                        |rect: egui::Rect| {
+                                                                            rect.union(row_rect)
+                                                                        },
+                                                                    ));
+                                                            }
+                                                            let (enter, esc) = ui.input(|i| {
+                                                                (
+                                                                    i.key_pressed(egui::Key::Enter),
+                                                                    i.key_pressed(
+                                                                        egui::Key::Escape,
+                                                                    ),
+                                                                )
+                                                            });
+                                                            if enter {
+                                                                if let Some((pane, title)) =
+                                                                    self.session_name_edit.take()
+                                                                {
+                                                                    let title =
+                                                                        title.trim().to_owned();
+                                                                    if !title.is_empty() {
+                                                                        action = Some(
                                                                     SidebarAction::RenameSession {
                                                                         pane,
                                                                         title,
                                                                     },
                                                                 );
+                                                                    }
+                                                                }
+                                                            } else if esc {
+                                                                self.session_name_edit = None;
                                                             }
-                                                        }
-                                                    } else if esc {
-                                                        self.session_name_edit = None;
-                                                    }
-                                                } else {
-                                                    // 세션 행 자체에는 hover tooltip을 띄우지 않는다.
-                                                    // 상태 감지 출처/신뢰도 같은 내부 진단과 이름 변경
-                                                    // 안내가 터미널 위를 가리는 문제(2026-07-19 사용자).
-                                                 let resp =
-                                                     session_row(ui, entry, is_last, active_color);
-                                                    {
-                                                        let row_rect = resp.rect;
-                                                        session_rows_rect = Some(
-                                                            session_rows_rect.map_or(row_rect, |rect: egui::Rect| rect.union(row_rect)),
-                                                        );
-                                                    }
-                                                    // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
-                                                    // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
-                                                    // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
-                                                    if let Some(session) = entry.session {
-                                                        resp.context_menu(|ui| {
-                                                            if ui
-                                                                .button(catalog.t(
-                                                                    "workspace.rename_menu",
-                                                                    &[],
-                                                                ))
-                                                                .clicked()
+                                                        } else {
+                                                            // 세션 행 자체에는 hover tooltip을 띄우지 않는다.
+                                                            // 상태 감지 출처/신뢰도 같은 내부 진단과 이름 변경
+                                                            // 안내가 터미널 위를 가리는 문제(2026-07-19 사용자).
+                                                            let resp = session_row(
+                                                                ui,
+                                                                entry,
+                                                                is_last,
+                                                                active_color,
+                                                            );
                                                             {
-                                                                self.session_name_edit = Some((
-                                                                    entry.pane.clone(),
-                                                                    entry.title.clone(),
-                                                                ));
-                                                                ui.close();
+                                                                let row_rect = resp.rect;
+                                                                session_rows_rect =
+                                                                    Some(session_rows_rect.map_or(
+                                                                        row_rect,
+                                                                        |rect: egui::Rect| {
+                                                                            rect.union(row_rect)
+                                                                        },
+                                                                    ));
                                                             }
-                                                            ui.separator();
-                                                            if ui
+                                                            // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
+                                                            // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
+                                                            // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
+                                                            if let Some(session) = entry.target.session() {
+                                                                resp.context_menu(|ui| {
+                                                                    live_session_context_menu_items(ui, |ui| {
+                                                                    if ui
+                                                                        .button(catalog.t(
+                                                                            "workspace.rename_menu",
+                                                                            &[],
+                                                                        ))
+                                                                        .clicked()
+                                                                    {
+                                                                        self.session_name_edit =
+                                                                            Some((
+                                                                                entry.target.pane().clone(),
+                                                                                entry.title.clone(),
+                                                                            ));
+                                                                        ui.close();
+                                                                    }
+                                                                    ui.separator();
+                                                                    if ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.open_folder",
                                                                     &[],
@@ -1883,7 +2134,7 @@ impl FileTreeUi {
                                                             );
                                                                 ui.close();
                                                             }
-                                                            if ui
+                                                                    if ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.copy_path",
                                                                     &[],
@@ -1897,7 +2148,7 @@ impl FileTreeUi {
                                                             );
                                                                 ui.close();
                                                             }
-                                                            if ui
+                                                                    if ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.new_shell_here",
                                                                     &[],
@@ -1911,8 +2162,8 @@ impl FileTreeUi {
                                                             );
                                                                 ui.close();
                                                             }
-                                                            // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
-                                                            if ui
+                                                                    // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
+                                                                    if ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.show_diff",
                                                                     &[],
@@ -1925,9 +2176,9 @@ impl FileTreeUi {
                                                                     });
                                                                 ui.close();
                                                             }
-                                                            // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
-                                                            // dispatch의 백그라운드 repo_root가 한다, PR-W).
-                                                            if entry.has_cwd
+                                                                    // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
+                                                                    // dispatch의 백그라운드 repo_root가 한다, PR-W).
+                                                                    if entry.has_cwd
                                                         && ui
                                                             .button(catalog.t(
                                                                 "sidebar.menu.new_worktree_cell",
@@ -1941,9 +2192,9 @@ impl FileTreeUi {
                                                             });
                                                         ui.close();
                                                     }
-                                                            // 워크트리 삭제 — 이 세션 cwd가 `.deppy/worktrees/`
-                                                            // 하위일 때만 노출(2026-07-18 사용자 제안).
-                                                            if entry.in_worktree
+                                                                    // 워크트리 삭제 — 이 세션 cwd가 `.deppy/worktrees/`
+                                                                    // 하위일 때만 노출(2026-07-18 사용자 제안).
+                                                                    if entry.in_worktree
                                                             && ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.remove_worktree",
@@ -1958,7 +2209,7 @@ impl FileTreeUi {
                                                             );
                                                             ui.close();
                                                         }
-                                                            if entry.resumable
+                                                                    if entry.resumable
                                                                 && ui
                                                                     .button(catalog.t(
                                                                         "sidebar.menu.resume_agent",
@@ -1968,15 +2219,15 @@ impl FileTreeUi {
                                                             {
                                                                 action = Some(
                                                                     SidebarAction::ResumeAgent {
-                                                                        pane: entry.pane.clone(),
+                                                                        pane: entry.target.pane().clone(),
                                                                         session,
                                                                         title: entry.title.clone(),
                                                                     },
                                                                 );
                                                                 ui.close();
                                                             }
-                                                            ui.separator();
-                                                            if ui
+                                                                    ui.separator();
+                                                                    if ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.close_pane",
                                                                     &[],
@@ -1985,234 +2236,235 @@ impl FileTreeUi {
                                                             {
                                                                 action = Some(
                                                                     SidebarAction::ClosePane {
-                                                                        pane: entry.pane.clone(),
+                                                                        pane: entry.target.pane().clone(),
                                                                     },
                                                                 );
                                                                 ui.close();
                                                             }
-                                                        });
-                                                    }
-                                                    if resp.double_clicked() {
-                                                        self.session_name_edit = Some((
-                                                            entry.pane.clone(),
-                                                            entry.title.clone(),
-                                                        ));
-                                                    } else if resp.clicked() && !entry.focused {
-                                                        action =
-                                                            Some(SidebarAction::FocusSession {
-                                                                workspace_id: sidebar
-                                                                    .active_workspace_id
-                                                                    .to_owned(),
-                                                                tab: entry.tab.clone(),
-                                                                pane: entry.pane.clone(),
-                                                            });
-                                                    }
-                                                }
-                                            });
+                                                                    });
+                                                                });
+                                                            }
+                                                            let close_clicked =
+                                                                active_session_close_button(
+                                                                    ui, &resp, catalog,
+                                                                );
+                                                            if close_clicked {
+                                                                action = Some(
+                                                                    SidebarAction::ClosePane {
+                                                                        pane: entry
+                                                                            .target
+                                                                            .pane()
+                                                                            .clone(),
+                                                                    },
+                                                                );
+                                                            } else if resp.double_clicked() {
+                                                                self.session_name_edit = Some((
+                                                                    entry.target.pane().clone(),
+                                                                    entry.title.clone(),
+                                                                ));
+                                                            } else if resp.clicked()
+                                                                && !entry.focused
+                                                                && let Some(tab) = entry.target.live_tab()
+                                                            {
+                                                                action = Some(
+                                                                    SidebarAction::FocusSession {
+                                                                        workspace_id: sidebar
+                                                                            .active_workspace_id
+                                                                            .to_owned(),
+                                                                        tab: tab.clone(),
+                                                                        pane: entry.target.pane().clone(),
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                            }
                                         });
+                                }
+                                if session_rows_rect.is_some() {
+                                    ui.add_space(2.5);
+                                }
+                            });
+                            paint_workspace_group_separator(ui, active_inner.response.rect);
+                            for workspace in after_active {
+                                let inner = ui.scope(|ui| {
+                                    let color = workspace_accent(sidebar.workspaces, &workspace.id);
+                                    let expanded = self
+                                        .workspace_sessions_expanded
+                                        .get(&workspace.id)
+                                        .copied()
+                                        .unwrap_or(false);
+                                    let resp = workspace_row(
+                                        ui,
+                                        workspace,
+                                        color,
+                                        false,
+                                        Some(expanded),
+                                        catalog,
+                                    );
+                                    workspace_context_menu(&resp, workspace, catalog, &mut action);
+                                    if resp.clicked() {
+                                        self.workspace_sessions_expanded
+                                            .insert(workspace.id.clone(), true);
+                                        action = Some(SidebarAction::SwitchWorkspace(
+                                            workspace.id.clone(),
+                                        ));
+                                    }
+                                    let mut session_rows_rect = None;
+                                    if expanded
+                                        && let Some(sessions) =
+                                            sessions_by_workspace.get(&workspace.id)
+                                    {
+                                        let (session_action, rect) = inactive_workspace_sessions(
+                                            ui,
+                                            workspace,
+                                            sidebar.active_workspace_id,
+                                            sessions,
+                                            session_max_h,
+                                            color,
+                                            catalog,
+                                        );
+                                        if let Some(session_action) = session_action {
+                                            action = Some(session_action);
+                                        }
+                                        session_rows_rect = rect;
+                                    }
+                                    if session_rows_rect.is_some() {
+                                        ui.add_space(2.5);
                                     }
                                 });
-                        }
-                        if session_rows_rect.is_some() {
-                            ui.add_space(2.5);
-                        }
-                        (header_bottom, session_rows_rect)
-                    });
-                    let active_group_rect = active_inner.response.rect;
-                    let (active_header_bottom, active_last_row_rect) = active_inner.inner;
-                    paint_workspace_group_wrap(ui, active_group_reserve, active_group_rect);
-                    // 헤더가 없으면(활성 workspace를 못 찾은 예외적 상태) 카드 전체를
-                    // 세션 구간으로 본다.
-                    paint_workspace_session_inset(
-                        ui,
-                        active_inset_reserve,
-                        active_group_rect,
-                        active_header_bottom.unwrap_or(active_group_rect.top()),
-                        active_last_row_rect,
-                    );
-                    for workspace in after_active {
-                        // before_active와 동일한 카드 배경/테두리 + 세션 인셋 묶음.
-                        let reserve = ui.painter().add(egui::Shape::Noop);
-                        let inset_reserve = ui.painter().add(egui::Shape::Noop);
-                        let inner = ui.scope(|ui| {
-                            let color = workspace_accent(sidebar.workspaces, &workspace.id);
-                            let expanded = self
-                                .workspace_sessions_expanded
-                                .get(&workspace.id)
-                                .copied()
-                                .unwrap_or(false);
-                            let resp =
-                                workspace_row(ui, workspace, color, false, Some(expanded), catalog);
-                            let header_bottom = resp.rect.bottom();
-                            workspace_context_menu(&resp, workspace, catalog, &mut action);
-                            if resp.clicked() {
-                                self.workspace_sessions_expanded
-                                    .insert(workspace.id.clone(), true);
-                                action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+                                paint_workspace_group_separator(ui, inner.response.rect);
                             }
-                            let mut session_rows_rect = None;
-                            if expanded
-                                && let Some(sessions) = sessions_by_workspace.get(&workspace.id)
-                            {
-                                let (session_action, rect) = inactive_workspace_sessions(
-                                    ui,
-                                    &workspace.id,
-                                    sessions,
-                                    session_max_h,
-                                    color,
-                                );
-                                if let Some(session_action) = session_action {
-                                    action = Some(session_action);
-                                }
-                                session_rows_rect = rect;
-                            }
-                            if session_rows_rect.is_some() {
-                                ui.add_space(2.5);
-                            }
-                            (header_bottom, session_rows_rect)
                         });
-                        let group_rect = inner.response.rect;
-                        let (header_bottom, session_rows_rect) = inner.inner;
-                        paint_workspace_group_wrap(ui, reserve, group_rect);
-                        paint_workspace_session_inset(
-                            ui,
-                            inset_reserve,
-                            group_rect,
-                            header_bottom,
-                              session_rows_rect,
-                          );
-                      }
-                  });
-        }
-        ui.add_space(4.0);
-        let resizing_workspace_split = self.workspace_split_handle(ui);
+                }
+            },
+        );
+        let resizing_workspace_split = self.workspace_split_handle(
+            ui,
+            workspace_section.response.rect.bottom(),
+            workspace_background,
+        );
+        ui.spacing_mut().item_spacing.y = outer_item_spacing_y;
+        let folder_background = crate::ui::designall::tokens(ui.visuals()).folder_tree_background;
+        let folder_background_rect = egui::Rect::from_min_size(
+            egui::pos2(ui.max_rect().left(), ui.cursor().min.y),
+            egui::vec2(workspace_width, folder_height),
+        );
+        ui.painter()
+            .rect_filled(folder_background_rect, 0.0, folder_background);
 
-        // 독립 「파일」 제목행은 제거하고 현재 경로와 핵심 도구를 한 행에 합친다.
-        // 패널이 극단적으로 좁아지면 검색 → 새 폴더 → 숨김 순으로 도구를 남겨
-        // 40pt까지 실제로 축소할 수 있게 한다.
         let mut create_folder = false;
         let mut create_file = false;
         let (header_rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
-        let visible_tools = (((header_rect.width() - 4.0).max(0.0) / 20.0).floor() as usize).min(4);
+        let tabs = SIDEBAR_TOOLS.map(|tool| (tool, catalog.t(sidebar_tool_label_key(tool), &[])));
+        let tab_widths = tabs
+            .iter()
+            .map(|(_, label)| {
+                let galley = ui.painter().layout_no_wrap(
+                    label.clone(),
+                    crate::fonts::sidebar_font(ui.ctx(), 11.5),
+                    ui.visuals().text_color(),
+                );
+                (galley.size().x + 12.0).max(34.0)
+            })
+            .collect::<Vec<_>>();
+        let all_tabs_width = tab_widths.iter().sum::<f32>();
+        let visible_tools = (((header_rect.width() - all_tabs_width - 8.0).max(0.0) / 20.0).floor()
+            as usize)
+            .min(2);
         let mut tool_right = header_rect.right() - 4.0;
-        if visible_tools >= 2 {
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
-                egui::vec2(20.0, 20.0),
-            );
-            create_folder =
-                file_toolbar_icon_at(ui, rect, "new_folder", FileToolbarIcon::Folder, false)
-                    .on_hover_text(catalog.t("file_tree.new_folder_root", &[]))
-                    .clicked();
-            tool_right -= 20.0;
-        }
         if visible_tools >= 1 {
             let rect = egui::Rect::from_min_size(
                 egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
                 egui::vec2(20.0, 20.0),
             );
-            let search = file_toolbar_icon_at(
-                ui,
-                rect,
-                "search",
-                FileToolbarIcon::Search,
-                self.file_search_open,
-            )
-            .on_hover_text(catalog.t("file_tree.search", &[]));
-            if search.clicked() {
-                self.file_search_open = !self.file_search_open;
-                if !self.file_search_open {
-                    self.file_search.clear();
+            let more_label = catalog.t("sidebar.tool.more", &[]);
+            let more =
+                file_toolbar_more_at(ui, rect, &more_label).on_hover_text(more_label.clone());
+            let mut toggle_hidden = false;
+            egui::Popup::menu(&more).show(|ui| {
+                ui.set_min_width(170.0);
+                if ui
+                    .button(catalog.t("file_tree.new_file_root", &[]))
+                    .clicked()
+                {
+                    create_file = true;
+                    ui.close();
                 }
-            }
-            tool_right -= 20.0;
-        }
-        if visible_tools >= 3 {
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
-                egui::vec2(20.0, 20.0),
-            );
-            let hidden = file_toolbar_icon_at(
-                ui,
-                rect,
-                "hidden",
-                FileToolbarIcon::Hidden,
-                self.show_hidden,
-            )
-            .on_hover_text(if self.show_hidden {
-                "숨김 파일 감추기"
-            } else {
-                "숨김 파일 표시"
+                let hidden_label = if self.show_hidden {
+                    catalog.t("file_tree.hide_hidden_files", &[])
+                } else {
+                    catalog.t("file_tree.show_hidden_files", &[])
+                };
+                if ui.button(hidden_label).clicked() {
+                    toggle_hidden = true;
+                    ui.close();
+                }
+                if ui
+                    .button(catalog.t("file_tree.new_folder_root", &[]))
+                    .clicked()
+                {
+                    create_folder = true;
+                    ui.close();
+                }
             });
-            if hidden.clicked() {
+            if toggle_hidden {
                 self.show_hidden = !self.show_hidden;
                 self.rebuild_flat();
             }
             tool_right -= 20.0;
         }
-        // 새 파일 — 툴바 리팩토링(2026-07-18)에서 빠졌던 버튼 복원. EditState::NewFile
-        // 소비 흐름(인라인 편집·커밋)은 그대로 살아 있어 생성 지점만 다시 잇는다.
-        if visible_tools >= 4 {
+        if visible_tools >= 2 {
             let rect = egui::Rect::from_min_size(
                 egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
                 egui::vec2(20.0, 20.0),
             );
-            create_file = file_toolbar_icon_at(ui, rect, "new_file", FileToolbarIcon::File, false)
-                .on_hover_text(catalog.t("file_tree.new_file_root", &[]))
-                .clicked();
+            let refresh_label = catalog.t("sidebar.tool.refresh", &[]);
+            if file_toolbar_icon_at(
+                ui,
+                rect,
+                "refresh",
+                &refresh_label,
+                FileToolbarIcon::Refresh,
+                false,
+            )
+            .on_hover_text(refresh_label)
+            .clicked()
+            {
+                self.refresh();
+            }
             tool_right -= 20.0;
         }
 
-        let path_left = header_rect.left() + 10.0;
-        if tool_right - path_left >= 20.0 {
-            let icon_center = egui::pos2(path_left + 8.0, header_rect.center().y);
-            // 최상단은 "현재 열린 폴더" 헤더 — 트리의 닫힌 폴더와 구분해 열린 폴더로
-            // (고정 앵커 아님, 2026-07-19 사용자).
-            paint_folder_open(
-                ui.painter(),
-                icon_center,
-                ui.visuals().text_color(),
-                egui::vec2(12.825, 11.875),
-            );
-            let text_left = path_left + 27.0;
-            let text_width = (tool_right - text_left - 5.0).max(0.0);
-            if text_width > 8.0
-                && let Some(root) = &self.root
-            {
-                let name = root
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| root.display().to_string());
-                let label = format!("{name}  {}", compact_root_path(root));
-                let galley = clipped_line(
-                    ui,
-                    &label,
-                    crate::fonts::sidebar_font(ui.ctx(), 11.5),
-                    text_width,
-                    None,
-                );
-                ui.painter().galley(
-                    egui::pos2(text_left, header_rect.center().y - galley.size().y / 2.0),
-                    galley,
-                    ui.visuals().text_color(),
-                );
+        let tab_right = tool_right - 2.0;
+        let mut tab_left = header_rect.left() + 4.0;
+        for ((tool, label), width) in tabs.iter().zip(tab_widths) {
+            if tab_left + width > tab_right {
+                break;
             }
-        }
-
-        if self.file_search_open {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.file_search)
-                    .hint_text(catalog.t("file_tree.search_hint", &[]))
-                    .desired_width(f32::INFINITY)
-                    .margin(egui::Margin::symmetric(8, 5)),
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(tab_left, header_rect.top()),
+                egui::vec2(width, header_rect.height()),
             );
-            response.request_focus();
-            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                self.file_search_open = false;
-                self.file_search.clear();
+            let active = matches!(tool, SidebarTool::Files);
+            if sidebar_tool_tab_at(ui, rect, label, active).clicked() {
+                match tool {
+                    SidebarTool::Files => {}
+                    SidebarTool::Git | SidebarTool::Mcp => {
+                        action = sidebar_tool_action(*tool);
+                    }
+                }
             }
+            tab_left += width;
         }
+        let separator_y = ui.painter().round_to_pixel_center(header_rect.bottom());
+        ui.painter().hline(
+            header_rect.x_range(),
+            separator_y,
+            crate::ui::designall::separator_stroke(ui.visuals()),
+        );
 
         let header_drop = ui.interact(
             header_rect,
@@ -2419,15 +2671,7 @@ impl FileTreeUi {
         // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
         // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
         let row_height = self.measured_row_height.unwrap_or(25.0);
-        let query = self.file_search.trim().to_lowercase();
-        let visible_rows: Vec<usize> = self
-            .flat
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| query.is_empty() || row.name.to_lowercase().contains(&query))
-            .map(|(index, _)| index)
-            .collect();
-        let total = visible_rows.len();
+        let total = self.flat.len();
         let mut toggle: Option<PathBuf> = None;
         let mut navigate_root: Option<PathBuf> = None;
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
@@ -2456,8 +2700,8 @@ impl FileTreeUi {
         let scroll_output = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
-                for index in &visible_rows[range] {
-                    let row = &self.flat[*index];
+                for index in range {
+                    let row = &self.flat[index];
                     let inaccessible = self.inaccessible_paths.contains(&row.path);
                     // 이름 변경 중인 행은 인라인 TextEdit로 대체 (FT-3, §9-8)
                     if let Some(EditState::Rename {
@@ -2945,9 +3189,8 @@ impl FileTreeUi {
         action
     }
 
-    /// 사이드바 최하단 nav — 홈 / 작업함 / 플릿 / 에이전트. 각 행은 painter 아이콘 +
-    /// 라벨의 둥근 필(pill)이고,
-    /// 작업함 행 우측에 대기+안읽음 카운트 배지가 붙는다(0이면 숨김).
+    /// 고정 내비게이션 레일 — 홈 / 작업함 / 플릿 / 에이전트. 작업함 행 우측에
+    /// 대기+안읽음 카운트 배지가 붙는다(0이면 숨김).
     /// 홈/작업함 재클릭 시 터미널 복귀 토글은 App이 처리한다(view 소유자).
     fn navigation(
         &mut self,
@@ -3071,12 +3314,11 @@ impl FileTreeUi {
             return;
         }
         // ⌘C(③): 포인터 밑 행을 파일 URL로 pasteboard에 — Finder에서 ⌘V 가능.
-        if let Some(path) = row_path
-            && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
-        {
-            self.consumed_copy_shortcut = true;
-            self.copy_files_to_clipboard(std::slice::from_ref(&path));
-        }
+        // AppKit native key-down을 먼저 peek해 비-Latin 배열에서 Event::Copy가 빠져도
+        // WorkspaceUi drain 전에 트리가 소유권을 확정한다.
+        let egui_copy = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        let native_copy = crate::native_key_monitor::peek_clipboard_copy();
+        self.handle_copy_shortcut_signal(row_path, native_copy, egui_copy);
         // ⌘V(②): 클립보드 파일 목록을 대상 폴더로 복사. macOS는 press가 native
         // key-down(peek)으로, 텍스트 표현이 있으면 Event::Paste로, release가 V key-up
         // fallback으로 온다(터미널 관례) — 어느 쪽이든 한 제스처는 한 번만 처리한다.
@@ -3104,6 +3346,29 @@ impl FileTreeUi {
         }
         self.consumed_paste_shortcut = true;
         self.last_external_paste = Some(std::time::Instant::now());
+    }
+
+    fn handle_copy_shortcut_signal(
+        &mut self,
+        row_path: Option<PathBuf>,
+        native_copy: bool,
+        egui_copy: bool,
+    ) {
+        let Some(path) = row_path else {
+            return;
+        };
+        if !native_copy && !egui_copy {
+            return;
+        }
+        self.consumed_copy_shortcut = true;
+        if self
+            .last_external_copy
+            .is_some_and(|at| at.elapsed() < EXTERNAL_COPY_GESTURE_WINDOW)
+        {
+            return;
+        }
+        self.last_external_copy = Some(std::time::Instant::now());
+        self.copy_files_to_clipboard(std::slice::from_ref(&path));
     }
 
     /// 파일 URL pasteboard 쓰기 — 실패는 하단 에러 라벨로 표면화(조용한 실패 금지).
@@ -3399,14 +3664,40 @@ pub enum ShellKind {
     Cmd,
 }
 
-fn paint_git_branch_icon(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
-    ui.painter().rect_filled(rect, 0.0, color);
-}
-
 /// 세션 행을 painter로 직접 그린다 (2026-07-06 목업 반영). 상태를 이모지 글리프로
 /// 쓰면 폰트(AppleGothic)에 ⏳/✋/▸/◆ 글리프가 없어 □(두부)로 깨진다 — 색 점·삼각형·
 /// 마름모를 도형으로 그려 회피한다. 선택 시 액센트 배경 + 좌측 레일, agent는 레일 표시,
 /// 요약 한 줄(dim/Apple SD Gothic). 반환 Response로 클릭을 처리한다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkspaceRowStyle {
+    fill: Option<egui::Color32>,
+    accent: Option<egui::Color32>,
+}
+
+fn workspace_row_style(
+    tokens: crate::ui::designall::Tokens,
+    selected: bool,
+    hovered: bool,
+) -> WorkspaceRowStyle {
+    WorkspaceRowStyle {
+        fill: crate::ui::designall::row_fill(tokens, selected, hovered),
+        accent: None,
+    }
+}
+
+pub const WORKSPACE_AVATAR_LEFT_INSET: f32 = 9.8;
+const WORKSPACE_AVATAR_SIZE: f32 = 18.0;
+
+fn workspace_avatar_rect(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(
+            row.left() + WORKSPACE_AVATAR_LEFT_INSET + WORKSPACE_AVATAR_SIZE * 0.5,
+            row.center().y,
+        ),
+        egui::vec2(WORKSPACE_AVATAR_SIZE, WORKSPACE_AVATAR_SIZE),
+    )
+}
+
 fn workspace_row(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
@@ -3416,8 +3707,7 @@ fn workspace_row(
     catalog: &i18n::Catalog,
 ) -> egui::Response {
     // 2026-07-26 사용자: 워크스페이스 헤더와 아바타를 다시 10% 축소한다.
-    let has_repo = workspace.repo.as_deref().is_some_and(|repo| !repo.is_empty());
-    let row_height = if has_repo { 34.0 } else { 29.19 };
+    let row_height = 29.19;
     let (full_rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_height),
         egui::Sense::click(),
@@ -3434,6 +3724,21 @@ fn workspace_row(
     if !ui.is_rect_visible(full_rect) {
         return response;
     }
+    let style = workspace_row_style(
+        crate::ui::designall::tokens(ui.visuals()),
+        active,
+        response.hovered(),
+    );
+    if let Some(fill) = style.fill {
+        ui.painter().rect_filled(full_rect, 0.0, fill);
+    }
+    if let Some(accent) = style.accent {
+        let rail = egui::Rect::from_min_max(
+            full_rect.left_top(),
+            egui::pos2(full_rect.left() + 2.0, full_rect.bottom()),
+        );
+        ui.painter().rect_filled(rail, 0.0, accent);
+    }
     // 좌우 여백(2026-07-19 사용자) — 패널 좌우 margin이 0이라 pill이 가장자리에
     // 붙었다. 그리기 rect만 좌우 8px 안으로 들여 pill·내용에 숨 공간을 준다
     // (클릭 판정은 full_rect라 가장자리도 눌린다).
@@ -3446,27 +3751,14 @@ fn workspace_row(
             full_rect.bottom(),
         ),
     );
-    // 접힘/펼침 여부와 무관하게 헤더 자체를 가리킬 때만 워크스페이스 고유색으로
-    // hover를 표시한다. 세션 행과 같은 0.16 강도를 사용해 상호작용 규칙을 통일한다.
-    if response.hovered() {
-        let hover_rect = egui::Rect::from_min_max(
-            rect.min,
-            egui::pos2((rect.right() + 1.0).min(full_rect.right()), rect.bottom()),
-        );
-        ui.painter()
-            .rect_filled(hover_rect, 1.0, color.gamma_multiply(0.16));
-    }
     // 선택/실행 상태와 무관한 프로젝트 고유색. 목록 전체에서 같은 계열이 겹치지 않게
     // 미리 배정된 색을 받아 비활성 행과 40pt 아이콘 레일에서도 그대로 유지한다.
-    let avatar = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 5.8 + 10.5, rect.center().y),
-        egui::vec2(21.0, 21.0),
-    );
+    let avatar = workspace_avatar_rect(full_rect);
     // 워크스페이스 마크는 별도 테두리 없이 상태색을 채운다(HTML 목업과 같은 규칙).
     ui.painter().rect_filled(
         avatar,
         1.0,
-        color.gamma_multiply(if active { 0.48 } else { 0.36 }),
+        color.gamma_multiply(if active { 0.42 } else { 0.32 }),
     );
     // 아바타는 빠른 식별용 마크라 첫 글자를 항상 대문자로 고정한다. 반대로 실제
     // 워크스페이스 이름은 사용자가 지정한 대소문자를 그대로 보존한다.
@@ -3475,13 +3767,12 @@ fn workspace_row(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
         initial,
-        crate::fonts::sidebar_font(ui.ctx(), 10.8),
+        crate::fonts::sidebar_font(ui.ctx(), 9.0),
         egui::Color32::WHITE,
     );
     let summary_mode = workspace_summary_mode(rect.width());
     let show_summary = summary_mode != WorkspaceSummaryMode::IconOnly;
     let show_disclosure = expanded.is_some() && rect.width() >= 56.0;
-    let total_sessions = workspace_total_sessions(workspace.summary);
     let (_, badge_color) = workspace_primary_summary_segment(workspace.summary, catalog);
     if rect.width() >= 64.0 {
         // 요약 배지 자리를 **실제 폭**만큼만 예약한다 — 고정 198px는 "유휴 5"처럼
@@ -3489,7 +3780,7 @@ fn workspace_row(
         // 우측 여백 8 + 이름/요약 간격 16 + disclosure 폭(있으면 14)을 더한다.
         let reserved_right = if show_summary {
             let disclosure = if show_disclosure { 12.0 } else { 0.0 };
-            workspace_status_badge_width(ui, total_sessions) + 22.0 + disclosure
+            workspace_status_dot_width() + 22.0 + disclosure
         } else {
             6.8
         };
@@ -3505,56 +3796,21 @@ fn workspace_row(
                 None,
             );
             let text_x = avatar.right() + 7.65;
-            let name_center_y = if has_repo {
-                rect.center().y - 7.2
-            } else {
-                rect.center().y
-            };
             ui.painter().galley(
-                egui::pos2(text_x, name_center_y - name.size().y / 2.0),
+                egui::pos2(text_x, rect.center().y - name.size().y / 2.0),
                 name,
                 ui.visuals().text_color(),
             );
-            if let Some(repo) = workspace.repo.as_deref().filter(|repo| !repo.is_empty()) {
-                let branch_icon_size = 3.0;
-                let branch_gap = 3.0;
-                let branch_text_x = text_x + branch_icon_size + branch_gap;
-                let repo = clipped_line(
-                    ui,
-                    repo,
-                    crate::fonts::sidebar_font(ui.ctx(), 10.5),
-                    (name_width - branch_icon_size - branch_gap).max(4.0),
-                    None,
-                );
-                let repo_y = rect.center().y + 1.8;
-                let branch_icon_center_y = repo_y + repo.size().y / 2.0;
-                paint_git_branch_icon(
-                    ui,
-                    egui::Rect::from_center_size(
-                        egui::pos2(text_x + branch_icon_size / 2.0, branch_icon_center_y),
-                        egui::vec2(branch_icon_size, branch_icon_size),
-                    ),
-                    ui.visuals().weak_text_color(),
-                );
-                ui.painter().galley(
-                    egui::pos2(branch_text_x, repo_y),
-                    repo,
-                    ui.visuals().weak_text_color(),
-                );
-            }
         }
     }
     if show_summary {
-        // 텍스트 요약("유휴"/"비활성" 등) 대신 상태색 dot + 세션 수 배지 — 활성/닫힌
-        // 행 공용(2026-07-25 사용자: "비활성" 문구 제거, 색으로 상태 표기).
-        // chevron과의 간격 22→14(너무 붙음)→16으로 재조정(2026-07-25 사용자:
-        // 숫자·화살표 사이 여백 2 추가).
+        // 텍스트나 세션 수 없이 상태색 점만 표시한다.
         let right = if show_disclosure {
             rect.right() - 22.0
         } else {
             rect.right() - 10.0
         };
-        paint_workspace_status_badge(ui, right, rect.center().y, badge_color, total_sessions);
+        paint_workspace_status_dot(ui, right, rect.center().y, badge_color);
     } else {
         // 40pt 아이콘 레일까지 줄였을 때는 배지 자리가 없으므로 아바타 우하단의
         // 작은 점으로 primary state를 계속 표시한다. 이름이 보이는 폭부터는 반드시
@@ -3576,129 +3832,31 @@ fn workspace_row(
     response
 }
 
-const SIDEBAR_NAV_MIN_HEIGHT: f32 = 50.0;
-const SIDEBAR_NAV_DEFAULT_HEIGHT: f32 = 108.0;
-const SIDEBAR_NAV_SPLIT_HANDLE_HEIGHT: f32 = 6.0;
-const SIDEBAR_BODY_MIN_HEIGHT: f32 = 180.0;
-const SIDEBAR_NAV_ROW_HEIGHT: f32 = 24.0;
-const SIDEBAR_NAV_ITEM_SPACING: f32 = 0.8;
-const SIDEBAR_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
+const SIDEBAR_NAV_ROW_HEIGHT: f32 = 58.0;
+const SIDEBAR_NAV_ITEM_SPACING: f32 = 2.0;
+const PROJECT_SECTION_MIN_HEIGHT: f32 = 84.0;
+const FILE_SECTION_MIN_HEIGHT: f32 = 50.0;
+const PROJECT_FILE_SPLIT_HEIGHT: f32 = 6.0;
 const WORKSPACE_CARD_HORIZONTAL_INSET: f32 = 6.0;
-const WORKSPACE_LIST_BACKGROUND_TOP: egui::Color32 = SIDEBAR_BACKGROUND;
-const WORKSPACE_LIST_BACKGROUND_BOTTOM: egui::Color32 = SIDEBAR_BACKGROUND;
-const WORKSPACE_GROUP_FILL: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
-const WORKSPACE_GROUP_TOP_FILL: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
-const WORKSPACE_GROUP_BORDER: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
-const WORKSPACE_GROUP_SHADOW: egui::Color32 = egui::Color32::from_black_alpha(54);
-
-fn vertical_gradient_rect(
-    rect: egui::Rect,
-    top: egui::Color32,
-    bottom: egui::Color32,
-) -> egui::Shape {
-    let mut mesh = egui::epaint::Mesh::default();
-    let first = mesh.vertices.len() as u32;
-    mesh.colored_vertex(rect.left_top(), top);
-    mesh.colored_vertex(rect.right_top(), top);
-    mesh.colored_vertex(rect.right_bottom(), bottom);
-    mesh.colored_vertex(rect.left_bottom(), bottom);
-    mesh.indices
-        .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
-    egui::Shape::mesh(mesh)
-}
-
-fn workspace_list_background_gradient(rect: egui::Rect) -> egui::Shape {
-    vertical_gradient_rect(
-        rect,
-        WORKSPACE_LIST_BACKGROUND_TOP,
-        WORKSPACE_LIST_BACKGROUND_BOTTOM,
-    )
-}
-
-fn workspace_group_gradient(rect: egui::Rect) -> egui::Shape {
-    vertical_gradient_rect(rect, WORKSPACE_GROUP_TOP_FILL, WORKSPACE_GROUP_FILL)
-}
-
-/// 워크스페이스 헤더 + (펼쳐졌으면) 그 세션 목록을 배경(#0f171d)·테두리(#131c23)로
-/// 하나의 카드처럼 묶어 그린다(2026-07-25 사용자: 여백 없이 이어지는 카드).
-///
-/// 실제 행 크기는 렌더 전에 알 수 없으므로(에이전트 유무로 세션 행 높이가
-/// 38/52px로 갈리고, 세션 목록 자체도 자기 상한 안에서 스크롤될 수 있다) 배경을
-/// 먼저 계산하지 않는다. 대신 `ui.painter().add(Shape::Noop)`로 그리기 순서상의
-/// 자리만 예약해 두고(`reserve`), 실제 행들을 `ui.scope`로 감싸 그 결과 rect(=
-/// 스크롤 클리핑까지 반영된 실제 점유 영역)를 얻은 뒤 `set`으로 그 자리에 채워
-/// 넣는다 — 순서는 예약 시점 그대로라 배경이 행 콘텐츠보다 항상 아래에 그려진다.
-fn paint_workspace_group_wrap(ui: &egui::Ui, reserve: egui::layers::ShapeIdx, rect: egui::Rect) {
-    let rect = egui::Rect::from_min_max(
-        rect.left_top(),
-        egui::pos2(rect.right() - WORKSPACE_CARD_HORIZONTAL_INSET, rect.bottom()),
-    );
-    if rect.height() <= 0.0 || rect.width() <= 0.0 {
-        return;
-    }
-    let rounding = 6.0;
-    let shadow_rect = rect.translate(egui::vec2(0.0, 2.0)).expand(1.0);
-    ui.painter().set(
-        reserve,
-        egui::Shape::Vec(vec![
-            egui::Shape::rect_filled(shadow_rect, rounding, WORKSPACE_GROUP_SHADOW),
-            egui::Shape::rect_filled(rect, rounding, WORKSPACE_GROUP_FILL),
-            workspace_group_gradient(rect.shrink(1.0)),
-            egui::Shape::rect_stroke(
-                rect,
-                rounding,
-                egui::Stroke::new(1.0, WORKSPACE_GROUP_BORDER),
-                egui::StrokeKind::Inside,
-            ),
-        ]),
-    );
-}
-
-const WORKSPACE_SESSION_INSET_FILL: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
-const WORKSPACE_SESSION_INSET_BORDER: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x17);
-
-// 좌측 인셋 8px = 세션 행 자체의 hover 좌측 경계와 같은 값(20px 들여쓰기 -
-// SESSION_HIGHLIGHT_LEFT_EXTEND 12px, 아래 session_highlight_rect 참고) —
-// workspace_row의 아바타 영역과도 같은 여백 관례라 우연히 같은 8이다.
 const WORKSPACE_SESSION_INSET_LEFT: f32 = 24.0;
 
-/// 카드 안에서 세션 목록 구간만 살짝 다른 톤(#121a20 채우기 + #19222a 테두리)을
-/// 얹어 헤더와 분리해 보이게 한다(2026-07-25 사용자) — group_rect(헤더+세션 전체)
-/// 에서 헤더가 이미 차지한 위쪽을 뺀 나머지에만 칠한다. 헤더와 맞닿는 위쪽까지
-/// 포함해 네 모서리 모두 1px로 통일한다(2026-07-25 사용자: "위쪽도 1px만").
-///
-/// 네 경계는 group_rect가 아니라 **세션 행 전체의 실제 합집합 rect**로 계산한다
-/// (2026-07-25 사용자: "인셋이 hover보다 커서 빈 공간 생기는거"). group_rect의
-/// 우측은 세션 ScrollArea 밖에 있는 헤더 full_rect까지 합친 값이라, 세션 행이
-/// (스크롤바 유무 등으로) 헤더보다 좁아지면 인셋이 hover 영역보다 넓게 그려져
-/// 빈 공간이 남았다. 세션 행 합집합에 포커스 배경이 쓰는 `session_inset_fill_rect`를 직접
-/// 적용해 상단/우측/하단 경계를 정확히 맞춘다. 좌측은 헤더 폭에 영향받지 않아
-/// group_rect 기준 8px 인셋을 유지한다.
-fn paint_workspace_session_inset(
-    ui: &egui::Ui,
-    reserve: egui::layers::ShapeIdx,
-    group_rect: egui::Rect,
-    header_bottom: f32,
-    session_rows_rect: Option<egui::Rect>,
-) {
-    let Some(session_rows_rect) = session_rows_rect else {
-        return;
-    };
-    let rect = workspace_session_inset_rect(group_rect, header_bottom, session_rows_rect);
+fn project_file_section_heights(available: f32, requested_project: f32) -> (f32, f32) {
+    let usable = (available - PROJECT_FILE_SPLIT_HEIGHT).max(0.0);
+    let max_project = (usable - FILE_SECTION_MIN_HEIGHT).max(PROJECT_SECTION_MIN_HEIGHT);
+    let project = requested_project.clamp(PROJECT_SECTION_MIN_HEIGHT, max_project);
+    let files = (usable - project).max(FILE_SECTION_MIN_HEIGHT);
+    (project, files)
+}
+
+fn paint_workspace_group_separator(ui: &egui::Ui, rect: egui::Rect) {
     if rect.height() <= 0.0 || rect.width() <= 0.0 {
         return;
     }
-    ui.painter().set(
-        reserve,
-        egui::Shape::Vec(vec![
-            egui::Shape::rect_filled(rect, 0.0, WORKSPACE_SESSION_INSET_FILL),
-            egui::Shape::rect_stroke(
-                rect,
-                0.0,
-                egui::Stroke::new(1.0, WORKSPACE_SESSION_INSET_BORDER),
-                egui::StrokeKind::Inside,
-            ),
-        ]),
+    let y = ui.painter().round_to_pixel_center(rect.bottom());
+    ui.painter().hline(
+        rect.x_range(),
+        y,
+        crate::ui::designall::separator_stroke(ui.visuals()),
     );
 }
 
@@ -3731,7 +3889,7 @@ fn disclosure_chevron_points(center: egui::Pos2, expanded: bool) -> [egui::Pos2;
 }
 
 /// 워크스페이스 행 우클릭 메뉴 — 「이름 바꾸기」(별칭 편집)는 세션이 없어도 항상,
-/// 「워크스페이스 종료」(세션 일괄 닫기, 확인은 App)는 닫을 세션이 있는 비 Idle만.
+/// 「워크스페이스 종료」(세션 일괄 닫기, 선택적 확인은 App)는 닫을 세션이 있는 비 Idle만.
 fn workspace_context_menu(
     resp: &egui::Response,
     workspace: &SidebarWorkspaceEntry,
@@ -3817,58 +3975,22 @@ fn workspace_summary_mode(width: f32) -> WorkspaceSummaryMode {
     }
 }
 
-/// 접힌/펼친 워크스페이스 행 공용 총 세션 수(우측 dot+카운트 배지에 쓴다,
-/// 2026-07-25 사용자: 텍스트 요약 대신 색+숫자로 상태 표기).
-fn workspace_total_sessions(summary: SidebarSessionSummary) -> usize {
-    summary.running + summary.waiting + summary.done + summary.error + summary.idle + summary.inactive
-}
-
 const WORKSPACE_STATUS_DOT_DIAMETER: f32 = 6.0;
-// dot↔숫자 간격 — 6→4(너무 넓음)→5→6으로 재조정(2026-07-25 사용자: 여백 1 추가).
-const WORKSPACE_STATUS_DOT_GAP: f32 = 4.5;
+const WORKSPACE_STATUS_SLOT_WIDTH: f32 = WORKSPACE_STATUS_DOT_DIAMETER;
 
-/// 세션 수 자리의 고정 슬롯 폭(dot+간격+숫자 전체) — 실제 글리프 폭(자릿수마다
-/// 다름)으로 dot 위치를 정하면 0→1→10처럼 자릿수가 바뀔 때마다 dot이 옆으로
-/// 밀린다(2026-07-25 사용자: 버튼 정렬 안 맞음). 두 자리(예 "99")까지 넉넉한
-/// 고정폭이라 dot의 x 위치가 행마다 항상 같다.
-const WORKSPACE_STATUS_COUNT_SLOT_WIDTH: f32 = 22.0;
-
-/// 상태색 dot + 세션 수 배지의 그리기 폭 — 이름 자리 예약 계산에 쓴다.
-fn workspace_status_badge_width(_ui: &egui::Ui, _count: usize) -> f32 {
-    WORKSPACE_STATUS_COUNT_SLOT_WIDTH
+fn workspace_status_dot_width() -> f32 {
+    WORKSPACE_STATUS_SLOT_WIDTH
 }
 
-/// 상태색 dot + 세션 수 — `right`를 오른쪽 끝으로 왼쪽으로 그린다. dot은 고정
-/// 슬롯의 좌측 경계에 앵커링해 자릿수가 바뀌어도 흔들리지 않고, 숫자는 dot
-/// 바로 옆(고정 간격)에 좌측 정렬해 실제 자폭과 무관하게 여백이 일정하다.
-fn paint_workspace_status_badge(
-    ui: &egui::Ui,
-    right: f32,
-    center_y: f32,
-    color: egui::Color32,
-    count: usize,
-) {
-    let dot_x = right - WORKSPACE_STATUS_COUNT_SLOT_WIDTH + WORKSPACE_STATUS_DOT_DIAMETER / 2.0;
+fn paint_workspace_status_dot(ui: &egui::Ui, right: f32, center_y: f32, color: egui::Color32) {
     ui.painter().circle_filled(
-        egui::pos2(dot_x, center_y),
+        egui::pos2(right - WORKSPACE_STATUS_DOT_DIAMETER / 2.0, center_y),
         WORKSPACE_STATUS_DOT_DIAMETER / 2.0,
         color,
     );
-    let text_x = dot_x + WORKSPACE_STATUS_DOT_DIAMETER / 2.0 + WORKSPACE_STATUS_DOT_GAP;
-    // Align2::LEFT_CENTER — 아바타 이니셜(CENTER_CENTER)과 같은 방식으로 egui가
-    // 직접 세로 중앙을 잡게 한다. 수동으로 size().y/2를 빼는 방식은 폰트 라인하이트
-    // 여백 때문에 dot과 시각적으로 어긋나 보였다(2026-07-25 사용자). +1px는 그
-    // 위에 얹은 미세 보정(2026-07-25 사용자: 숫자를 아래로 1).
-    ui.painter().text(
-        egui::pos2(text_x, center_y + 1.0),
-        egui::Align2::LEFT_CENTER,
-        count.to_string(),
-        crate::fonts::sidebar_font(ui.ctx(), 11.5),
-        ui.visuals().weak_text_color().gamma_multiply(0.9),
-    );
 }
 
-// workspace_row는 이제 상태색 dot + 세션 수 배지만 그려 이 세그먼트 목록을 쓰지
+// workspace_row는 이제 상태색 점만 그려 이 세그먼트 목록을 쓰지
 // 않지만(2026-07-25 사용자), 세그먼트별 텍스트·색 우선순위 로직은 테스트가 여전히
 // 검증한다 — 프로덕션 미사용이라 cfg(test)로 경고만 제거한다.
 #[cfg(test)]
@@ -4065,19 +4187,18 @@ fn workspace_summary_segments(
     parts
 }
 
-/// 비활성(warm) workspace의 마지막 세션 스냅샷. 편집/컨텍스트 작업은 활성 runtime을
-/// 전제로 하므로 노출하지 않고, 클릭만 workspace 전환 + 정확한 tab/pane focus로 보낸다.
-/// 반환값 두 번째 필드는 세션 행 전체의 합집합 rect — 인셋 배경의 네 경계를
-/// 이걸로 맞춰야 hover 영역과 정확히 일치한다(아래 paint_workspace_session_inset
-/// 참고, 2026-07-25 사용자: "인셋이 hover보다 커서 빈 공간 생기는거"). 헤더의
-/// full_rect는 세션 ScrollArea 밖이라 스크롤바 유무로 폭이 안 흔들리지만, 세션
-/// 행은 ScrollArea 안이라 실제 폭이 다를 수 있어 group_rect로 대체할 수 없다.
+/// 비활성 workspace의 마지막 세션 스냅샷. 편집/수명주기 작업은 활성 runtime을
+/// 전제로 하므로 노출하지 않는다. 좌클릭은 workspace 전환 + 정확한 tab/pane focus,
+/// warm 세션의 우클릭은 현재 화면 오른쪽 연결 요청만 보낸다.
+/// 반환값 두 번째 필드는 실제로 그려진 세션 행이 있는지 확인하는 합집합 rect다.
 fn inactive_workspace_sessions(
     ui: &mut egui::Ui,
-    workspace_id: &str,
-    sessions: &[SessionEntry],
+    workspace: &SidebarWorkspaceEntry,
+    active_workspace_id: &str,
+    sessions: &[SidebarSessionRow],
     _max_height: f32,
     accent_color: egui::Color32,
+    catalog: &i18n::Catalog,
 ) -> (Option<SidebarAction>, Option<egui::Rect>) {
     if sessions.is_empty() {
         return (None, None);
@@ -4085,7 +4206,7 @@ fn inactive_workspace_sessions(
     let mut action = None;
     let mut session_rows_rect = None;
     egui::ScrollArea::vertical()
-        .id_salt(("inactive_session_list_scroll", workspace_id))
+        .id_salt(("inactive_session_list_scroll", &workspace.id))
         .auto_shrink([false, true])
         .show(ui, |ui| {
             // 헤더-세션 사이 여백 없음(2026-07-25 사용자) — 첫 행이 인셋 상단에
@@ -4096,17 +4217,58 @@ fn inactive_workspace_sessions(
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
                     ui.vertical(|ui| {
-                    let response = session_row(ui, entry, is_last, accent_color);
-                        session_rows_rect = Some(
-                            session_rows_rect.map_or(response.rect, |rect: egui::Rect| rect.union(response.rect)),
-                        );
-                        if response.clicked() {
-                            action = Some(SidebarAction::FocusSession {
-                                workspace_id: workspace_id.to_owned(),
-                                tab: entry.tab.clone(),
-                                pane: entry.pane.clone(),
-                            });
+                        let response = draggable_session_row(ui, entry, is_last, accent_color);
+                        session_rows_rect =
+                            Some(session_rows_rect.map_or(response.rect, |rect: egui::Rect| {
+                                rect.union(response.rect)
+                            }));
+                        if response.drag_started() {
+                            response.dnd_set_drag_payload(SessionRowDragPayload::new(
+                                entry.target.clone(),
+                            ));
                         }
+                        let drag_happened = response.drag_started()
+                            || response.dragged()
+                            || response.drag_stopped();
+                        if session_row_click_allowed(response.clicked(), drag_happened) {
+                            action = match &entry.target {
+                                SessionRowTarget::Live { tab, pane, .. } => {
+                                    Some(SidebarAction::FocusSession {
+                                        workspace_id: workspace.id.clone(),
+                                        tab: tab.clone(),
+                                        pane: pane.clone(),
+                                    })
+                                }
+                                SessionRowTarget::PersistedPane { .. } => {
+                                    Some(SidebarAction::SwitchWorkspace(workspace.id.clone()))
+                                }
+                            };
+                        }
+                        if ui.rect_contains_pointer(response.rect)
+                            && can_open_session_beside(active_workspace_id, &entry.target)
+                        {
+                            let button_rect = egui::Rect::from_center_size(
+                                egui::pos2(response.rect.right() - 14.0, response.rect.center().y),
+                                egui::vec2(22.0, 22.0),
+                            );
+                            if ui
+                                .put(button_rect, egui::Button::new("↗").frame(false))
+                                .on_hover_text(catalog.t("workspace.menu.open_beside", &[]))
+                                .clicked()
+                            {
+                                action = Some(open_beside_action(entry.target.clone()));
+                            }
+                        }
+                        response.context_menu(|ui| {
+                            inactive_session_context_menu_items(
+                                ui,
+                                workspace,
+                                active_workspace_id,
+                                entry,
+                                catalog,
+                                &mut action,
+                            );
+                        });
                     });
                 });
             }
@@ -4114,13 +4276,109 @@ fn inactive_workspace_sessions(
     (action, session_rows_rect)
 }
 
+fn inactive_session_context_menu_items(
+    ui: &mut egui::Ui,
+    workspace: &SidebarWorkspaceEntry,
+    active_workspace_id: &str,
+    entry: &SidebarSessionRow,
+    catalog: &i18n::Catalog,
+    action: &mut Option<SidebarAction>,
+) {
+    if !can_open_session_beside(active_workspace_id, &entry.target) {
+        return;
+    }
+    let menu_style = inactive_session_menu_style();
+    ui.set_min_width(menu_style.min_width);
+    let previous_wrap_mode = ui.style().wrap_mode;
+    ui.style_mut().wrap_mode = Some(menu_style.wrap_mode);
+    if ui
+        .button(catalog.t("workspace.menu.open_beside", &[]))
+        .clicked()
+    {
+        debug_assert_eq!(workspace.id, entry.target.workspace_id());
+        *action = Some(open_beside_action(entry.target.clone()));
+        ui.close();
+    }
+    ui.style_mut().wrap_mode = previous_wrap_mode;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InactiveSessionMenuStyle {
+    min_width: f32,
+    wrap_mode: egui::TextWrapMode,
+}
+
+fn inactive_session_menu_style() -> InactiveSessionMenuStyle {
+    InactiveSessionMenuStyle {
+        min_width: 220.0,
+        wrap_mode: egui::TextWrapMode::Extend,
+    }
+}
+
+fn live_session_context_menu_items<R>(
+    ui: &mut egui::Ui,
+    add_items: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let menu_style = inactive_session_menu_style();
+    ui.scope(|ui| {
+        ui.set_min_width(menu_style.min_width);
+        ui.style_mut().wrap_mode = Some(menu_style.wrap_mode);
+        add_items(ui)
+    })
+}
+
+fn open_beside_action(target: SessionRowTarget) -> SidebarAction {
+    SidebarAction::OpenSessionBeside(target)
+}
+
+fn can_open_session_beside(active_workspace_id: &str, target: &SessionRowTarget) -> bool {
+    target.workspace_id() != active_workspace_id
+}
+
+fn session_row_click_allowed(clicked: bool, dragged: bool) -> bool {
+    clicked && !dragged
+}
+
+fn active_session_close_button(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    catalog: &i18n::Catalog,
+) -> bool {
+    if !ui.rect_contains_pointer(response.rect) {
+        return false;
+    }
+    let button_rect = egui::Rect::from_center_size(
+        egui::pos2(response.rect.right() - 14.0, response.rect.center().y),
+        egui::vec2(22.0, 22.0),
+    );
+    ui.put(button_rect, egui::Button::new("×").frame(false))
+        .on_hover_text(catalog.t("sidebar.menu.close_pane", &[]))
+        .clicked()
+}
+
 fn session_row(
     ui: &mut egui::Ui,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     is_last: bool,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    session_row_impl(ui, entry, None, is_last, accent_color)
+    session_row_impl(ui, entry, None, is_last, accent_color, egui::Sense::click())
+}
+
+fn draggable_session_row(
+    ui: &mut egui::Ui,
+    entry: &SidebarSessionRow,
+    is_last: bool,
+    accent_color: egui::Color32,
+) -> egui::Response {
+    session_row_impl(
+        ui,
+        entry,
+        None,
+        is_last,
+        accent_color,
+        egui::Sense::click_and_drag(),
+    )
 }
 
 /// 이름 인라인 편집 중인 행 — 레일/보조 행(2·3행)은 그대로 유지하고 **제목 자리만**
@@ -4128,12 +4386,19 @@ fn session_row(
 /// (2026-07-16 사용자).
 fn session_row_editing(
     ui: &mut egui::Ui,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     buf: &mut String,
     is_last: bool,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    session_row_impl(ui, entry, Some(buf), is_last, accent_color)
+    session_row_impl(
+        ui,
+        entry,
+        Some(buf),
+        is_last,
+        accent_color,
+        egui::Sense::click(),
+    )
 }
 
 // 워크스페이스 헤더의 우측 인셋(workspace_row 내부 rect =
@@ -4155,12 +4420,48 @@ fn session_text_inset(rail_width: f32) -> f32 {
 const SESSION_LINE_HEIGHT_RATIO: f32 = 1.0;
 const SESSION_CONTENT_RIGHT_INSET: f32 = 24.0;
 /// 세션 행은 호출부(session_list_scroll/inactive_workspace_sessions)가
-    /// `ui.add_space(16.0)`으로 들여쓰는데, 워크스페이스 헤더는 같은 원점 기준 8px만
+/// `ui.add_space(16.0)`으로 들여쓰는데, 워크스페이스 헤더는 같은 원점 기준 8px만
 /// 들여쓴다(위 SESSION_HIGHLIGHT_RIGHT_INSET 주석 참고). 배경을 그대로
 /// rect.left()에서 시작하면 워크스페이스 카드보다 12px(20-8) 더 안쪽에서
 /// 시작해 레일 왼쪽에 배경이 안 칠해진 틈이 생긴다(2026-07-25 사용자) — 그만큼
 /// 왼쪽으로 더 그린다.
 const SESSION_HIGHLIGHT_LEFT_EXTEND: f32 = 20.0 - WORKSPACE_SESSION_INSET_LEFT;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SessionDragStyle {
+    fill: Option<egui::Color32>,
+    stroke: egui::Stroke,
+    shadow: egui::epaint::Shadow,
+    rail_multiplier: f32,
+}
+
+fn session_drag_style(active: bool, tokens: crate::ui::designall::Tokens) -> SessionDragStyle {
+    if active {
+        SessionDragStyle {
+            fill: Some(tokens.selected_background),
+            stroke: egui::Stroke::new(1.0, tokens.accent),
+            shadow: egui::epaint::Shadow {
+                offset: [0, 2],
+                blur: 8,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(96),
+            },
+            rail_multiplier: 1.2,
+        }
+    } else {
+        SessionDragStyle {
+            fill: None,
+            stroke: egui::Stroke::NONE,
+            shadow: egui::epaint::Shadow::NONE,
+            rail_multiplier: 1.0,
+        }
+    }
+}
+
+fn session_drag_payload_matches(ctx: &egui::Context, target: &SessionRowTarget) -> bool {
+    egui::DragAndDrop::payload::<SessionRowDragPayload>(ctx)
+        .is_some_and(|payload| payload.target() == target)
+}
 
 fn session_highlight_rect(rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
@@ -4172,14 +4473,6 @@ fn session_highlight_rect(rect: egui::Rect) -> egui::Rect {
     )
 }
 
-fn session_inset_fill_rect(rect: egui::Rect) -> egui::Rect {
-    let highlight = session_highlight_rect(rect);
-    egui::Rect::from_min_max(
-        egui::pos2(highlight.left(), highlight.top() - 1.0),
-        egui::pos2(highlight.right(), highlight.bottom() - 1.0),
-    )
-}
-
 fn session_focus_fill_rect(rect: egui::Rect) -> egui::Rect {
     let highlight = session_highlight_rect(rect);
     egui::Rect::from_min_max(
@@ -4188,24 +4481,9 @@ fn session_focus_fill_rect(rect: egui::Rect) -> egui::Rect {
     )
 }
 
-fn workspace_session_inset_rect(
-    group_rect: egui::Rect,
-    header_bottom: f32,
-    session_rows_rect: egui::Rect,
-) -> egui::Rect {
-    let hover = session_inset_fill_rect(session_rows_rect);
-    egui::Rect::from_min_max(
-        egui::pos2(
-            group_rect.left() + WORKSPACE_SESSION_INSET_LEFT,
-            hover.top().max(header_bottom),
-        ),
-        hover.max,
-    )
-}
-
 fn session_title_lines(
     ui: &egui::Ui,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     status_color: egui::Color32,
     separator_color: egui::Color32,
     max_width: f32,
@@ -4261,10 +4539,11 @@ fn session_title_lines(
 
 fn session_row_impl(
     ui: &mut egui::Ui,
-    entry: &SessionEntry,
+    entry: &SidebarSessionRow,
     edit_buf: Option<&mut String>,
     is_last: bool,
-    accent_color: egui::Color32,
+    _accent_color: egui::Color32,
+    sense: egui::Sense,
 ) -> egui::Response {
     // 에이전트면 3줄(제목/에이전트·모델·effort/상태·ctx%), 아니면 2줄(제목/요약).
     // 요약이 없어도(유휴/시작 직후) 2행에 '~'를 표시해 행 높이를 유지한다(2026-07-07).
@@ -4289,10 +4568,7 @@ fn session_row_impl(
     } else {
         36.0
     };
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), row_h),
-        egui::Sense::click(),
-    );
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), sense);
     // 제목은 painter galley로 그리므로 별도 접근성 라벨이 없으면 키보드/스크린리더와
     // kittest가 세션 행을 식별할 수 없다. 클릭 행 자체를 제목이 있는 버튼으로 노출한다.
     resp.widget_info(|| {
@@ -4358,32 +4634,37 @@ fn session_row_impl(
 
     let painter = ui.painter();
     let highlight_rect = session_highlight_rect(rect);
-    // 행 자체의 상시 배경(구 #2a2a33)은 걷어냈다 — 워크스페이스 헤더와 한 카드로
-    // 감싸는 배경(paint_workspace_group_wrap, #0f171d)이 호출부에서 먼저 깔린다.
-    // selected가 hover보다 우선한다. 두 상태 모두 같은 행 영역을 사용해
-    // 포인터 이동 시 크기나 좌표가 달라지지 않는다.
-    let state_fill = if entry.focused {
-        Some(accent_color.gamma_multiply(0.24))
-    } else if resp.hovered() {
-        Some(accent_color.gamma_multiply(0.16))
-    } else {
-        None
-    };
-    if let Some(fill) = state_fill {
+    let tokens = crate::ui::designall::tokens(ui.visuals());
+    let drag_style = session_drag_style(
+        session_drag_payload_matches(ui.ctx(), &entry.target),
+        tokens,
+    );
+    if let Some(fill) = drag_style.fill {
+        painter.add(drag_style.shadow.as_shape(highlight_rect, 4.0));
+        painter.rect(
+            highlight_rect,
+            4.0,
+            fill,
+            drag_style.stroke,
+            egui::StrokeKind::Inside,
+        );
+    } else if let Some(fill) = crate::ui::designall::row_fill(tokens, entry.focused, resp.hovered())
+    {
         let focus_rect = session_focus_fill_rect(rect);
         let focus_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + SESSION_RAIL_LEFT_INSET + rail_w, focus_rect.top()),
+            egui::pos2(
+                rect.left() + SESSION_RAIL_LEFT_INSET + rail_w,
+                focus_rect.top(),
+            ),
             focus_rect.max,
         );
-        painter.rect_filled(focus_rect, 1.0, fill);
+        painter.rect_filled(focus_rect, 0.0, fill);
     }
-    // 세션이 둘 이상일 때 행 사이를 구분선으로 나눈다(2026-07-25 사용자) — 마지막
-    // 행은 그리지 않는다(카드/인셋 바닥과 겹쳐 이중선으로 보이는 것 방지).
-    if !is_last {
+    if !is_last && drag_style.fill.is_none() {
         painter.hline(
             highlight_rect.x_range(),
             highlight_rect.bottom(),
-            egui::Stroke::new(1.0, WORKSPACE_SESSION_INSET_BORDER),
+            crate::ui::designall::separator_stroke(ui.visuals()),
         );
     }
     // 좌측 상태 레일 — 항상 표시, 상태 색으로 세로로 훑어 파악 (목업 §세션).
@@ -4397,13 +4678,18 @@ fn session_row_impl(
         ),
         egui::vec2(rail_w, SESSION_RAIL_HEIGHT),
     );
+    let rail_color = if drag_style.rail_multiplier > 1.0 {
+        rail_color.gamma_multiply(drag_style.rail_multiplier)
+    } else {
+        rail_color
+    };
     painter.rect_filled(rail, 0.0, rail_color);
     // 제목(1행) + 2행 + 3행 — 세로 위치는 행 수에 맞춰.
     // 위/아래 여백을 2px로 대칭 맞춘다(2026-07-25 사용자: 텍스트 내리고, 아래
     // 여백 2, 위아래 대칭). 실제 렌더된 줄 높이(galley.size().y)로 계산해야
     // 고정 오프셋(9/23/37 등)처럼 가정한 줄 높이가 틀려서 어긋나는 일이 없다.
     // 남는 공간은 줄 사이에 균등 배분한다.
-const SESSION_TEXT_MARGIN: f32 = 2.25;
+    const SESSION_TEXT_MARGIN: f32 = 2.25;
     let line_heights = [
         Some(title_galley.size().y),
         line2_galley.as_ref().map(|g| g.size().y),
@@ -4535,16 +4821,79 @@ fn paint_caret(p: &egui::Painter, c: egui::Pos2, expanded: bool, col: egui::Colo
 }
 
 enum FileToolbarIcon {
-    Hidden,
-    Folder,
-    File,
-    Search,
+    Refresh,
+}
+
+fn file_toolbar_more_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    accessible_label: &str,
+) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("file_toolbar_icon", "more")),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), accessible_label)
+    });
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.painter().text(
+        rect.center() + egui::vec2(0.0, -2.0),
+        egui::Align2::CENTER_CENTER,
+        "...",
+        crate::fonts::sidebar_font(ui.ctx(), 13.0),
+        color,
+    );
+    response
+}
+
+fn sidebar_tool_tab_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    active: bool,
+) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("sidebar_tool_tab", label)),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let tokens = crate::ui::designall::tokens(ui.visuals());
+    let color = if active || response.hovered() {
+        tokens.text
+    } else {
+        tokens.muted_text
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        crate::fonts::sidebar_font(ui.ctx(), 11.5),
+        color,
+    );
+    if active {
+        let line = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0),
+            egui::pos2(rect.right() - 4.0, rect.bottom()),
+        );
+        ui.painter().rect_filled(line, 0.0, tokens.accent);
+    }
+    response
 }
 
 fn file_toolbar_icon_at(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     id: &'static str,
+    accessible_label: &str,
     icon: FileToolbarIcon,
     active: bool,
 ) -> egui::Response {
@@ -4553,6 +4902,9 @@ fn file_toolbar_icon_at(
         ui.id().with(("file_toolbar_icon", id)),
         egui::Sense::click(),
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), accessible_label)
+    });
     let color = if active {
         ui.visuals().selection.stroke.color
     } else if response.hovered() {
@@ -4561,103 +4913,24 @@ fn file_toolbar_icon_at(
         ui.visuals().weak_text_color()
     };
     match icon {
-        FileToolbarIcon::Hidden => {
+        FileToolbarIcon::Refresh => {
             let center = rect.center();
-            let stroke = egui::Stroke::new(1.2, color);
-            // 원본(±7, ±4, 동공 r2)의 14.5% 축소 (2026-07-18 사용자).
-            let upper = vec![
-                egui::pos2(center.x - 5.985, center.y),
-                egui::pos2(center.x - 2.9925, center.y - 2.736),
-                egui::pos2(center.x, center.y - 3.42),
-                egui::pos2(center.x + 2.9925, center.y - 2.736),
-                egui::pos2(center.x + 5.985, center.y),
-            ];
-            let lower = vec![
-                egui::pos2(center.x - 5.985, center.y),
-                egui::pos2(center.x - 2.9925, center.y + 2.736),
-                egui::pos2(center.x, center.y + 3.42),
-                egui::pos2(center.x + 2.9925, center.y + 2.736),
-                egui::pos2(center.x + 5.985, center.y),
-            ];
-            ui.painter().add(egui::Shape::line(upper, stroke));
-            ui.painter().add(egui::Shape::line(lower, stroke));
-            ui.painter().circle_filled(center, 1.71, color);
-        }
-        FileToolbarIcon::Folder => {
-            // 원본 15×14의 14.5% 축소 (2026-07-18 사용자).
-            paint_folder(
-                ui.painter(),
-                rect.center(),
-                color,
-                egui::vec2(12.825, 11.875),
-            )
-        }
-        FileToolbarIcon::File => paint_file(
-            ui.painter(),
-            rect.center(),
-            color,
-            ui.visuals().panel_fill,
-            // 원본 11×14의 23% 축소 (툴바 파일만 추가 10%, 2026-07-18 사용자).
-            egui::vec2(8.4645, 10.773),
-        ),
-        FileToolbarIcon::Search => {
-            // 터미널 pane 헤더 검색(workspace.rs paint_terminal_toolbar_icon)과 동일
-            // 디자인 — 렌즈 r3.2·얇은 스트로크·짧은 핸들. 크기만 툴바에 맞춰 1.3배
-            // (스트로크는 헤더의 1.25 유지, 2026-07-18 사용자).
-            let lens = rect.center() + egui::vec2(-1.17, -1.17);
             let stroke = egui::Stroke::new(1.25, color);
-            ui.painter().circle_stroke(lens, 4.16, stroke);
-            ui.painter().line_segment(
-                [lens + egui::vec2(2.99, 2.99), lens + egui::vec2(5.85, 5.85)],
-                stroke,
-            );
+            let points = (0..=14)
+                .map(|index| {
+                    let angle = -0.7 + index as f32 * 5.2 / 14.0;
+                    center + egui::vec2(angle.cos(), angle.sin()) * 4.5
+                })
+                .collect::<Vec<_>>();
+            ui.painter().add(egui::Shape::line(points, stroke));
+            let tip = center + egui::vec2(4.5 * (-0.7_f32).cos(), 4.5 * (-0.7_f32).sin());
+            ui.painter()
+                .line_segment([tip, tip + egui::vec2(-0.4, 3.2)], stroke);
+            ui.painter()
+                .line_segment([tip, tip + egui::vec2(-3.0, 0.9)], stroke);
         }
     }
     response
-}
-
-/// 현재 위치(파일 도크 루트) 표식 — 열린 폴더. 아래 트리의 닫힌 폴더와 구분해
-/// "지금 이 폴더가 열려 있다"를 나타낸다(고정 앵커 아님 — `..`로 자유 이동,
-/// 2026-07-19 사용자). `size`는 전체 (폭, 높이).
-fn paint_folder_open(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, size: egui::Vec2) {
-    let w = size.x;
-    let stroke = egui::Stroke::new(1.2, col);
-    let rise = (size.y * 0.24).round().max(2.0);
-    // 뒤판(탭 달린 몸통) — paint_folder와 같은 비율.
-    let body = egui::Rect::from_min_size(
-        egui::pos2(c.x - w / 2.0, c.y - size.y / 2.0 + rise),
-        egui::vec2(w, size.y - rise),
-    );
-    let tab = egui::Rect::from_min_size(
-        egui::pos2(body.left(), body.top() - rise),
-        egui::vec2(w * 0.45, rise + 1.0),
-    );
-    p.rect_stroke(tab, 1.0, stroke, egui::StrokeKind::Inside);
-    p.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Inside);
-    // 앞면(열린 덮개) — 몸통 안쪽에서 오른쪽으로 벌어진 사다리꼴로 "열림"을 표현.
-    let inset = 1.5;
-    let flap = vec![
-        egui::pos2(body.left() + inset, body.bottom() - inset),
-        egui::pos2(body.right() - inset, body.bottom() - inset),
-        egui::pos2(
-            body.right() - inset - w * 0.14,
-            body.top() + body.height() * 0.42,
-        ),
-        egui::pos2(
-            body.left() + inset + w * 0.14,
-            body.top() + body.height() * 0.42,
-        ),
-    ];
-    p.add(egui::Shape::closed_line(flap, stroke));
-}
-
-fn compact_root_path(root: &Path) -> String {
-    if let Some(home) = crate::paths::home_dir()
-        && let Ok(relative) = root.strip_prefix(home)
-    {
-        return format!("~/{}", relative.display());
-    }
-    root.display().to_string()
 }
 
 /// 파일 트리와 셸 `LS_COLORS`가 공유하는 어두운 배경용 유형 팔레트.
@@ -4727,7 +5000,10 @@ const WORKSPACE_ACCENT_PALETTE: [(u8, u8, u8); 8] = [
 /// 계열은 녹색·주황·보라·빨강·금색·파랑 순으로 의도적으로 떨어뜨렸다. 따라서 선택/
 /// 접힘으로 렌더 순서가 바뀌어도 색은 유지되고, 같은 이니셜도 서로 다른 계열을 갖는다.
 /// 생성순 목록 끝에 새 워크스페이스를 추가해도 기존 배정은 변하지 않는다.
-fn workspace_accent(workspaces: &[SidebarWorkspaceEntry], workspace_id: &str) -> egui::Color32 {
+pub(crate) fn workspace_accent(
+    workspaces: &[SidebarWorkspaceEntry],
+    workspace_id: &str,
+) -> egui::Color32 {
     let slot = workspaces
         .iter()
         .position(|workspace| workspace.id == workspace_id)
@@ -4797,12 +5073,14 @@ fn paint_file(
     ));
 }
 
-/// 하단 nav 아이콘 종류 (2026-07-18 확정 디자인).
+/// 내비게이션 레일 아이콘 종류.
 enum NavIcon {
     Home,
     Inbox,
     Fleet,
     Agents,
+    Settings,
+    Help,
 }
 
 /// 작업함 배지 문구 — 0이면 숨김(None).
@@ -4810,16 +5088,106 @@ fn nav_badge_text(count: usize) -> Option<String> {
     (count > 0).then(|| count.to_string())
 }
 
-fn sidebar_vertical_section_heights(available: f32, requested_navigation: f32) -> (f32, f32) {
-    let max_navigation = (available - SIDEBAR_NAV_SPLIT_HANDLE_HEIGHT - SIDEBAR_BODY_MIN_HEIGHT)
-        .max(SIDEBAR_NAV_MIN_HEIGHT);
-    let navigation = requested_navigation.clamp(SIDEBAR_NAV_MIN_HEIGHT, max_navigation);
-    let body = (available - SIDEBAR_NAV_SPLIT_HANDLE_HEIGHT - navigation).max(0.0);
-    (body, navigation)
+fn paint_sidebar_separator(ui: &egui::Ui, rect: egui::Rect, stroke: egui::Stroke) {
+    let status_bar_top = ui.ctx().content_rect().bottom() - 26.0;
+    let bottom = rect.bottom().min(status_bar_top);
+    if bottom > rect.top() {
+        ui.painter()
+            .vline(rect.right(), egui::Rangef::new(rect.top(), bottom), stroke);
+    }
 }
 
-/// 하단 nav 행 하나 — 외곽선 아이콘 + 라벨, hover/선택 시 둥근 필(pill) 배경
-/// (workspace_row와 같은 색 계열). painter 텍스트라 접근성 라벨은 widget_info로 단다.
+fn nav_utility_height(width: f32) -> f32 {
+    if width < 56.0 { 48.0 } else { 28.0 }
+}
+
+fn nav_utilities(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<SidebarAction> {
+    let mut action = None;
+    let stacked = ui.available_width() < 56.0;
+    if stacked {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.vertical_centered(|ui| {
+            let side = ui.available_width().min(24.0);
+            if nav_utility_button(
+                ui,
+                NavIcon::Settings,
+                &catalog.t("settings.title", &[]),
+                side,
+            )
+            .clicked()
+            {
+                action = Some(SidebarAction::OpenSettings);
+            }
+            if nav_utility_button(ui, NavIcon::Help, &catalog.t("sidebar.nav.help", &[]), side)
+                .clicked()
+            {
+                action = Some(SidebarAction::OpenHelp);
+            }
+        });
+    } else {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.horizontal_centered(|ui| {
+            if nav_utility_button(
+                ui,
+                NavIcon::Settings,
+                &catalog.t("settings.title", &[]),
+                28.0,
+            )
+            .clicked()
+            {
+                action = Some(SidebarAction::OpenSettings);
+            }
+            if nav_utility_button(ui, NavIcon::Help, &catalog.t("sidebar.nav.help", &[]), 28.0)
+                .clicked()
+            {
+                action = Some(SidebarAction::OpenHelp);
+            }
+        });
+    }
+    action
+}
+
+fn nav_utility_button(ui: &mut egui::Ui, icon: NavIcon, label: &str, side: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if response.hovered() {
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        ui.painter()
+            .rect_filled(rect.shrink(2.0), 0.0, tokens.hover_background);
+    }
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    paint_nav_icon(ui.painter(), rect.center(), icon, color);
+    response.on_hover_text(label)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NavRowLayout {
+    icon_center: egui::Pos2,
+    label_anchor: egui::Pos2,
+}
+
+fn nav_row_layout(row: egui::Rect, show_label: bool) -> NavRowLayout {
+    if show_label {
+        NavRowLayout {
+            icon_center: egui::pos2(row.center().x, row.center().y - 9.0),
+            label_anchor: egui::pos2(row.center().x, row.center().y + 15.0),
+        }
+    } else {
+        NavRowLayout {
+            icon_center: row.center(),
+            label_anchor: row.center(),
+        }
+    }
+}
+
+/// 내비게이션 레일 행 하나 — 외곽선 아이콘 + 라벨, 선택/hover 상태에서만 평면 배경.
+/// painter 텍스트라 접근성 라벨은 widget_info로 단다.
 fn nav_row(
     ui: &mut egui::Ui,
     icon: NavIcon,
@@ -4837,47 +5205,41 @@ fn nav_row(
     if !ui.is_rect_visible(rect) {
         return response;
     }
-    let pill = rect.shrink2(egui::vec2(6.0, 0.8));
+    let row = rect.shrink2(egui::vec2(4.0, 0.0));
+    let tokens = crate::ui::designall::tokens(ui.visuals());
+    if let Some(fill) = crate::ui::designall::row_fill(tokens, selected, response.hovered()) {
+        ui.painter().rect_filled(row, 0.0, fill);
+    }
     if selected {
-        ui.painter().rect_filled(
-            pill,
-            6.0,
-            ui.visuals().selection.bg_fill.gamma_multiply(0.16),
-        );
-    } else if response.hovered() {
-        ui.painter()
-            .rect_filled(pill, 6.0, ui.visuals().widgets.hovered.bg_fill);
+        let rail =
+            egui::Rect::from_min_max(row.left_top(), egui::pos2(row.left() + 2.0, row.bottom()));
+        ui.painter().rect_filled(rail, 0.0, tokens.accent);
     }
     let color = if selected || response.hovered() {
-        ui.visuals().text_color()
+        tokens.text
     } else {
-        ui.visuals().weak_text_color()
+        tokens.muted_text
     };
-    // 아이콘 레일(좁은 폭)에서는 아이콘만 중앙에 — workspace_row의 폭 단계 규칙과 동일.
     let show_label = rect.width() >= 64.0;
-    let icon_center = if show_label {
-        egui::pos2(pill.left() + 16.0, rect.center().y)
-    } else {
-        egui::pos2(rect.center().x, rect.center().y)
-    };
-    paint_nav_icon(ui.painter(), icon_center, icon, color);
+    let layout = nav_row_layout(row, show_label);
+    paint_nav_icon(ui.painter(), layout.icon_center, icon, color);
     if show_label {
         ui.painter().text(
-            egui::pos2(pill.left() + 32.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
+            layout.label_anchor,
+            egui::Align2::CENTER_CENTER,
             label,
-            crate::fonts::sidebar_font(ui.ctx(), 13.0),
+            crate::fonts::sidebar_font(ui.ctx(), 12.0),
             color,
         );
         if let Some(badge) = badge {
-            paint_nav_badge(ui, pill, badge);
+            paint_nav_badge(ui, row, badge);
         }
     }
     response
 }
 
-/// 작업함 카운트 배지 — 빨간 원형(두 자리부터는 알약꼴), 흰 숫자.
-fn paint_nav_badge(ui: &egui::Ui, pill: egui::Rect, text: &str) {
+/// 작업 카운트 배지 — 빨간 원형(두 자리부터는 알약꼴), 흰 숫자.
+fn paint_nav_badge(ui: &egui::Ui, row: egui::Rect, text: &str) {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
         crate::fonts::sidebar_font(ui.ctx(), 10.0),
@@ -4885,7 +5247,7 @@ fn paint_nav_badge(ui: &egui::Ui, pill: egui::Rect, text: &str) {
     );
     let h = 16.0;
     let w = (galley.size().x + 8.0).max(h);
-    let center = egui::pos2(pill.right() - 8.0 - w / 2.0, pill.center().y);
+    let center = egui::pos2(row.right() - 6.0 - w / 2.0, row.top() + 10.0);
     let rect = egui::Rect::from_center_size(center, egui::vec2(w, h));
     ui.painter()
         .rect_filled(rect, h / 2.0, egui::Color32::from_rgb(0xed, 0x5b, 0x61));
@@ -4893,7 +5255,7 @@ fn paint_nav_badge(ui: &egui::Ui, pill: egui::Rect, text: &str) {
         .galley(center - galley.size() / 2.0, galley, egui::Color32::WHITE);
 }
 
-/// 하단 nav 아이콘 — 이모지는 폰트 글리프가 없어 □로 깨진다(레포 관례: painter 직접
+/// 레일 아이콘 — 이모지는 폰트 글리프가 없어 □로 깨진다(레포 관례: painter 직접
 /// 드로잉 — paint_folder/file_toolbar_icon_at 참고). 1.3px 스트로크로 기존 톤과 맞춘다.
 fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Color32) {
     let stroke = egui::Stroke::new(1.3, col);
@@ -4950,6 +5312,25 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
             p.circle_filled(egui::pos2(c.x - 2.5, c.y + 1.0), 1.2, col);
             p.circle_filled(egui::pos2(c.x + 2.5, c.y + 1.0), 1.2, col);
         }
+        NavIcon::Settings => {
+            p.circle_stroke(c, 5.0, stroke);
+            p.circle_stroke(c, 1.8, stroke);
+            for index in 0..8 {
+                let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                p.line_segment([c + direction * 5.5, c + direction * 7.0], stroke);
+            }
+        }
+        NavIcon::Help => {
+            p.circle_stroke(c, 6.0, stroke);
+            p.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                "?",
+                egui::FontId::monospace(10.0),
+                col,
+            );
+        }
     }
 }
 
@@ -4964,7 +5345,7 @@ pub(crate) fn session_status_color(
 
 /// 세션 행의 상태 점 색 — 에이전트 감지 여부까지 반영한다(from_pty_with_agent).
 /// fleet 카드와 같은 규칙을 써야 같은 세션이 두 표면에서 다른 색으로 보이지 않는다.
-pub(crate) fn session_entry_status_color(entry: &SessionEntry) -> egui::Color32 {
+pub(crate) fn session_entry_status_color(entry: &SidebarSessionRow) -> egui::Color32 {
     let state = crate::agent_surface::AgentVisualState::from_pty_with_agent(
         entry.status,
         entry.agent_line.is_some(),
@@ -5251,6 +5632,7 @@ fn row_target_dir(row: &FlatRow, root: Option<&Path>) -> PathBuf {
 
 /// 같은 ⌘V 제스처(press+release) 이중 처리 방지 창 — 터미널 PASTE_GESTURE_WINDOW 관례.
 const EXTERNAL_PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+const EXTERNAL_COPY_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// 트리 ⌘V 신호(egui 이벤트 기반). macOS는 press가 Event::Paste(클립보드에 텍스트
 /// 표현이 있을 때만)로 오고 파일-only pasteboard면 press 이벤트가 없다 — release
@@ -5507,6 +5889,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_only_copy는_유효한_트리_행이_소유한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let path = PathBuf::from("/tmp/native-copy.txt");
+
+        tree.handle_copy_shortcut_signal(Some(path.clone()), true, false);
+
+        let intent = tree.take_io_intent().expect("native copy intent");
+        match intent.request {
+            FileTreeIoRequest::CopyFileUrls { paths } => {
+                assert_eq!(paths.into_paths(), vec![path]);
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+        let (paste_consumed, copy_consumed) = tree.take_clipboard_shortcut_consumption();
+        assert!(!paste_consumed);
+        assert!(
+            copy_consumed,
+            "App이 터미널 선택 복사로 파일 URL을 덮어쓰지 않도록 해야 한다"
+        );
+    }
+
+    #[test]
+    fn native_copy뒤_늦은_egui_copy는_소유권만_유지하고_중복하지_않는다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let path = PathBuf::from("/tmp/deduplicated-copy.txt");
+
+        tree.handle_copy_shortcut_signal(Some(path.clone()), true, false);
+        assert!(
+            tree.take_io_intent().is_some(),
+            "첫 신호는 파일 URL을 복사한다"
+        );
+        assert_eq!(tree.take_clipboard_shortcut_consumption(), (false, true));
+
+        tree.handle_copy_shortcut_signal(Some(path), false, true);
+
+        assert!(
+            tree.take_io_intent().is_none(),
+            "후속 신호는 intent를 중복하지 않는다"
+        );
+        assert_eq!(
+            tree.take_clipboard_shortcut_consumption(),
+            (false, true),
+            "후속 신호도 터미널 복사는 계속 억제한다"
+        );
+        assert!(
+            tree.error.is_none(),
+            "중복 신호가 busy 오류를 만들면 안 된다"
+        );
+    }
+
+    #[test]
     fn maintenance_constructor는_thread_channel_watcher와_intent가_없다() {
         let tree = FileTreeUi::new(egui::Context::default());
         assert!(tree.maintenance_intent.is_none());
@@ -5659,12 +6092,54 @@ mod tests {
     }
 
     #[test]
+    fn designall_선택워크스페이스는_배경만쓰고_좌측레일이_없다() {
+        let tokens = crate::ui::designall::DARK;
+        assert_eq!(
+            workspace_row_style(tokens, false, false),
+            WorkspaceRowStyle {
+                fill: None,
+                accent: None,
+            }
+        );
+        assert_eq!(
+            workspace_row_style(tokens, true, false),
+            WorkspaceRowStyle {
+                fill: Some(tokens.selected_background),
+                accent: None,
+            }
+        );
+    }
+
+    #[test]
+    fn designall_프로젝트파일분할은_파일영역_50px를_보존한다() {
+        assert_eq!(project_file_section_heights(700.0, 900.0), (644.0, 50.0));
+        assert_eq!(project_file_section_heights(700.0, 270.0), (270.0, 424.0));
+        assert_eq!(project_file_section_heights(140.0, 0.0), (84.0, 50.0));
+    }
+
+    #[test]
+    fn designall_사이드바도구는_기존기능으로만_연결된다() {
+        assert_eq!(
+            SIDEBAR_TOOLS,
+            [SidebarTool::Files, SidebarTool::Git, SidebarTool::Mcp]
+        );
+        assert!(sidebar_tool_action(SidebarTool::Files).is_none());
+        assert!(matches!(
+            sidebar_tool_action(SidebarTool::Git),
+            Some(SidebarAction::ShowFocusedDiff)
+        ));
+        assert!(matches!(
+            sidebar_tool_action(SidebarTool::Mcp),
+            Some(SidebarAction::OpenConnectors)
+        ));
+    }
+
+    #[test]
     fn 같은_이니셜의_워크스페이스도_서로_다른_색상_계열을_쓴다() {
         let workspaces = (0..6)
             .map(|index| SidebarWorkspaceEntry {
                 id: format!("stable-id-{index}"),
                 name: format!("same-{index}"),
-                repo: None,
                 state: SidebarWorkspaceState::Idle,
                 summary: SidebarSessionSummary::default(),
             })
@@ -5682,6 +6157,70 @@ mod tests {
             workspace_accent(&selected_elsewhere, &workspaces[0].id),
             original,
             "선택 상태는 아바타 색상 배정에 영향을 주지 않는다"
+        );
+    }
+
+    #[test]
+    fn designall_워크스페이스_아바타는_18px이고_기존좌측선에_고정된다() {
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 29.19));
+        let avatar = workspace_avatar_rect(row);
+
+        assert!((avatar.width() - 18.0).abs() < 0.01);
+        assert!((avatar.height() - 18.0).abs() < 0.01);
+        assert!((avatar.left() - 9.8).abs() < 0.01);
+        assert!((avatar.center().y - row.center().y).abs() < 0.01);
+    }
+
+    #[test]
+    fn 워크스페이스_행은_상태점만_그리고_세션수는_그리지않는다() {
+        let context = egui::Context::default();
+        install_sidebar_test_fonts(&context);
+        let workspace = SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary {
+                running: 7,
+                ..SidebarSessionSummary::default()
+            },
+        };
+        let catalog = catalog();
+
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_width(220.0);
+            workspace_row(
+                ui,
+                &workspace,
+                egui::Color32::LIGHT_BLUE,
+                true,
+                None,
+                &catalog,
+            );
+        });
+
+        assert!(
+            !output.shapes.iter().any(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::Shape::Text(text) if text.galley.text() == "7"
+                )
+            }),
+            "워크스페이스 행에 세션 수가 남아 있다"
+        );
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .filter(|clipped| {
+                    matches!(
+                        &clipped.shape,
+                        egui::Shape::Circle(circle)
+                            if (circle.radius - WORKSPACE_STATUS_DOT_DIAMETER / 2.0).abs() < 0.01
+                    )
+                })
+                .count(),
+            1,
+            "워크스페이스 상태 점은 하나 유지돼야 한다"
         );
     }
 
@@ -5706,7 +6245,6 @@ mod tests {
         let workspaces = ["first", "second", "third"].map(|id| SidebarWorkspaceEntry {
             id: id.to_owned(),
             name: id.to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Idle,
             summary: SidebarSessionSummary::default(),
         });
@@ -5816,25 +6354,24 @@ mod tests {
     }
 
     #[test]
-    fn 세션_하이라이트와_인셋은_같은_경계를_쓰고_레일텍스트간격은_절반이다() {
+    fn 세션_하이라이트는_평면경계를_쓰고_레일텍스트간격은_없다() {
         let full = egui::Rect::from_min_max(egui::pos2(20.0, 10.0), egui::pos2(500.0, 62.0));
         let highlight = session_highlight_rect(full);
-        // 좌측은 호출부의 20px 들여쓰기를 걷어내 워크스페이스 헤더와 같은 8px
-        // 인셋으로 맞춘다(SESSION_HIGHLIGHT_LEFT_EXTEND 주석 참고).
-        assert_eq!(highlight.left(), full.left() - SESSION_HIGHLIGHT_LEFT_EXTEND);
-        assert_eq!(highlight.right(), full.right() - SESSION_HIGHLIGHT_RIGHT_INSET);
-        let last = egui::Rect::from_min_max(egui::pos2(20.0, 62.0), egui::pos2(500.0, 100.0));
-        let inset = workspace_session_inset_rect(
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(506.0, 100.0)),
-            8.0,
-            full.union(last),
+        assert_eq!(
+            highlight.left(),
+            full.left() - SESSION_HIGHLIGHT_LEFT_EXTEND
         );
-        assert_eq!(inset.left(), session_inset_fill_rect(full).left());
-        assert_eq!(inset.top(), session_inset_fill_rect(full).top());
-        assert_eq!(inset.right(), session_inset_fill_rect(last).right());
-        assert_eq!(inset.bottom(), session_inset_fill_rect(last).bottom());
+        assert_eq!(
+            highlight.right(),
+            full.right() - SESSION_HIGHLIGHT_RIGHT_INSET
+        );
+        let last = egui::Rect::from_min_max(egui::pos2(20.0, 62.0), egui::pos2(500.0, 100.0));
         let focus = session_focus_fill_rect(last);
-        assert_eq!(focus.top(), last.top(), "포커스 배경은 이전 행을 침범하지 않음");
+        assert_eq!(
+            focus.top(),
+            last.top(),
+            "포커스 배경은 이전 행을 침범하지 않음"
+        );
         assert_eq!(focus.bottom(), last.bottom() - 1.0);
         assert_eq!(
             session_text_inset(SESSION_RAIL_MAX_WIDTH)
@@ -6527,7 +7064,6 @@ mod tests {
         let workspaces = vec![SidebarWorkspaceEntry {
             id: "workspace-a".to_owned(),
             name: "Workspace A".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Active,
             summary: SidebarSessionSummary::default(),
         }];
@@ -7099,27 +7635,32 @@ mod tests {
             .map(|i| SidebarWorkspaceEntry {
                 id: format!("ws-{i}"),
                 name: format!("workspace-{i}"),
-                repo: None,
                 state: SidebarWorkspaceState::Idle,
                 summary: SidebarSessionSummary::default(),
             })
             .collect();
-        let make_session = |n: usize, agent: bool| SessionEntry {
-            tab: runtime::MuxTabId(format!("t{n}")),
-            pane: runtime::MuxPaneId(format!("p{n}")),
-            session: Some(runtime::SessionId(n as u64)),
-            title: format!("세션 {n}"),
-            status: agent.then_some(runtime::SessionStatus::Running),
-            summary: "요약".to_owned(),
-            focused: n == 0,
-            attention: false,
-            pulse: None,
-            agent_line: agent.then(|| "Codex · gpt-5.5 · high".to_owned()),
-            status_label: agent.then(|| "실행 중".to_owned()),
-            resumable: agent,
-            has_cwd: true,
-            in_worktree: false,
-            status_line: agent.then(|| "PR #124 코드 리뷰".to_owned()),
+        let make_session = |n: usize, agent: bool| {
+            SidebarSessionRow::from_live(
+                "ws-2",
+                2,
+                SessionEntry {
+                    tab: runtime::MuxTabId(format!("t{n}")),
+                    pane: runtime::MuxPaneId(format!("p{n}")),
+                    session: Some(runtime::SessionId(n as u64)),
+                    title: format!("세션 {n}"),
+                    status: agent.then_some(runtime::SessionStatus::Running),
+                    summary: "요약".to_owned(),
+                    focused: n == 0,
+                    attention: false,
+                    pulse: None,
+                    agent_line: agent.then(|| "Codex · gpt-5.5 · high".to_owned()),
+                    status_label: agent.then(|| "실행 중".to_owned()),
+                    resumable: agent,
+                    has_cwd: true,
+                    in_worktree: false,
+                    status_line: agent.then(|| "PR #124 코드 리뷰".to_owned()),
+                },
+            )
         };
         let sessions = std::collections::HashMap::from([(
             "ws-2".to_owned(),
@@ -7253,34 +7794,38 @@ mod tests {
             SidebarWorkspaceEntry {
                 id: "workspace-a".to_owned(),
                 name: "Workspace A".to_owned(),
-                repo: None,
                 state: SidebarWorkspaceState::Active,
                 summary: SidebarSessionSummary::default(),
             },
             SidebarWorkspaceEntry {
                 id: "workspace-b".to_owned(),
                 name: "Workspace B".to_owned(),
-                repo: None,
                 state: SidebarWorkspaceState::Warm,
                 summary: SidebarSessionSummary::default(),
             },
         ];
-        let session = |workspace: &str, title: &str| SessionEntry {
-            tab: runtime::MuxTabId(format!("tab-{workspace}")),
-            pane: runtime::MuxPaneId(format!("pane-{workspace}")),
-            session: Some(runtime::SessionId(1)),
-            title: title.to_owned(),
-            status: None,
-            summary: String::new(),
-            focused: false,
-            attention: false,
-            pulse: None,
-            agent_line: None,
-            status_label: None,
-            resumable: false,
-            has_cwd: false,
-            in_worktree: false,
-            status_line: None,
+        let session = |workspace: &str, title: &str| {
+            SidebarSessionRow::from_live(
+                format!("workspace-{workspace}"),
+                2,
+                SessionEntry {
+                    tab: runtime::MuxTabId(format!("tab-{workspace}")),
+                    pane: runtime::MuxPaneId(format!("pane-{workspace}")),
+                    session: Some(runtime::SessionId(1)),
+                    title: title.to_owned(),
+                    status: None,
+                    summary: String::new(),
+                    focused: false,
+                    attention: false,
+                    pulse: None,
+                    agent_line: None,
+                    status_label: None,
+                    resumable: false,
+                    has_cwd: false,
+                    in_worktree: false,
+                    status_line: None,
+                },
+            )
         };
         let sessions = std::collections::HashMap::from([
             ("workspace-a".to_owned(), vec![session("a", "Session A")]),
@@ -7401,7 +7946,6 @@ mod tests {
             .map(|i| SidebarWorkspaceEntry {
                 id: format!("ws-{i}"),
                 name: format!("workspace-{i}"),
-                repo: None,
                 state: SidebarWorkspaceState::Idle,
                 summary: SidebarSessionSummary::default(),
             })
@@ -7643,7 +8187,6 @@ mod tests {
         let workspaces = vec![SidebarWorkspaceEntry {
             id: "ws-close".to_owned(),
             name: "closer".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Active,
             summary: SidebarSessionSummary::default(),
         }];
@@ -7662,7 +8205,6 @@ mod tests {
         let workspace = SidebarWorkspaceEntry {
             id: "ws-close".to_owned(),
             name: "closer".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Warm,
             summary: SidebarSessionSummary::default(),
         };
@@ -7693,7 +8235,6 @@ mod tests {
         let workspace = SidebarWorkspaceEntry {
             id: "ws-rename".to_owned(),
             name: "sleeper".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Idle,
             summary: SidebarSessionSummary::inactive(0),
         };
@@ -7723,7 +8264,6 @@ mod tests {
         let workspaces = vec![SidebarWorkspaceEntry {
             id: "ws-idle".to_owned(),
             name: "sleeper".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Idle,
             summary: SidebarSessionSummary::inactive(0),
         }];
@@ -7739,6 +8279,447 @@ mod tests {
         assert!(harness.state().1.is_empty(), "Idle 행 우클릭이 액션을 냄");
     }
 
+    #[test]
+    fn kittest_warm_세션행_hover_오른쪽열기가_정확한_대상을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "workspace-b".to_owned(),
+            name: "Workspace B".to_owned(),
+            state: SidebarWorkspaceState::Warm,
+            summary: SidebarSessionSummary::default(),
+        };
+        let entry = SidebarSessionRow::from_live(
+            "workspace-b",
+            7,
+            SessionEntry {
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: Some(runtime::SessionId(42)),
+                title: "Session B".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: false,
+                in_worktree: false,
+                status_line: None,
+            },
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(360.0, 160.0))
+            .build_ui_state(
+                |ui, state: &mut (Option<SidebarAction>, bool)| {
+                    if !state.1 {
+                        return;
+                    }
+                    let (next_action, _) = inactive_workspace_sessions(
+                        ui,
+                        &workspace,
+                        "workspace-a",
+                        std::slice::from_ref(&entry),
+                        120.0,
+                        egui::Color32::LIGHT_BLUE,
+                        &catalog,
+                    );
+                    if next_action.is_some() {
+                        state.0 = next_action;
+                    }
+                },
+                (None, false),
+            );
+        let font_config = crate::config::Config::default();
+        crate::fonts::install_cjk_fallback(
+            &harness.ctx,
+            None,
+            &font_config.terminal.mono_font,
+            &font_config.terminal.mono_weight,
+        );
+        harness.state_mut().1 = true;
+
+        harness.run();
+        let row_rect = harness.get_by_label("Session B").rect();
+        harness.hover_at(row_rect.center());
+        harness.run();
+        harness.get_by_label("↗").click();
+        harness.run();
+
+        match &harness.state().0 {
+            Some(SidebarAction::OpenSessionBeside(SessionRowTarget::Live {
+                workspace_id,
+                runtime_instance,
+                tab,
+                pane,
+                session,
+            })) => {
+                assert_eq!(workspace_id, "workspace-b");
+                assert_eq!(*runtime_instance, 7);
+                assert_eq!(tab.0, "tab-b");
+                assert_eq!(pane.0, "pane-b");
+                assert_eq!(*session, runtime::SessionId(42));
+            }
+            Some(SidebarAction::FocusSession { .. }) => {
+                panic!("hover 오른쪽 열기 클릭을 세션 행 클릭이 탈취함")
+            }
+            None => panic!("hover 오른쪽 열기 클릭이 액션을 내지 않음"),
+            _ => panic!("hover 오른쪽 열기가 다른 액션을 냄"),
+        }
+    }
+
+    #[test]
+    fn kittest_활성_세션행_hover_닫기가_정확한_pane을_닫는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let sessions = std::collections::HashMap::from([(
+            "workspace-a".to_owned(),
+            vec![SidebarSessionRow::from_live(
+                "workspace-a",
+                7,
+                SessionEntry {
+                    tab: runtime::MuxTabId("tab-a".to_owned()),
+                    pane: runtime::MuxPaneId("pane-a".to_owned()),
+                    session: Some(runtime::SessionId(42)),
+                    title: "Session A".to_owned(),
+                    status: None,
+                    summary: String::new(),
+                    focused: false,
+                    attention: false,
+                    pulse: None,
+                    agent_line: None,
+                    status_label: None,
+                    resumable: false,
+                    has_cwd: false,
+                    in_worktree: false,
+                    status_line: None,
+                },
+            )],
+        )]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>, bool)| {
+                    if !state.2 {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "workspace-a",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        inbox_count: 0,
+                        fleet_count: 0,
+                        agents_open: false,
+                    };
+                    if let Some(action) = state.0.panel(ui, &sessions, &snapshot, &catalog) {
+                        state.1.push(action);
+                    }
+                },
+                (FileTreeUi::new(egui::Context::default()), Vec::new(), false),
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().2 = true;
+
+        harness.run();
+        let row_rect = harness.get_by_label("Session A").rect();
+        harness.hover_at(row_rect.center());
+        harness.run();
+        harness.get_by_label("×").click();
+        harness.run();
+
+        assert!(matches!(
+            harness.state().1.as_slice(),
+            [SidebarAction::ClosePane { pane }] if pane.0 == "pane-a"
+        ));
+    }
+
+    #[test]
+    fn kittest_warm_세션행_drag가_정확한_payload를_시작한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "workspace-b".to_owned(),
+            name: "Workspace B".to_owned(),
+            state: SidebarWorkspaceState::Warm,
+            summary: SidebarSessionSummary::default(),
+        };
+        let entry = SidebarSessionRow::from_live(
+            "workspace-b",
+            7,
+            SessionEntry {
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: Some(runtime::SessionId(42)),
+                title: "Session B".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: false,
+                in_worktree: false,
+                status_line: None,
+            },
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(360.0, 160.0))
+            .build_ui_state(
+                |ui, fonts_ready: &mut bool| {
+                    if !*fonts_ready {
+                        return;
+                    }
+                    let _ = inactive_workspace_sessions(
+                        ui,
+                        &workspace,
+                        "workspace-a",
+                        std::slice::from_ref(&entry),
+                        120.0,
+                        egui::Color32::LIGHT_BLUE,
+                        &catalog,
+                    );
+                },
+                false,
+            );
+        let font_config = crate::config::Config::default();
+        crate::fonts::install_cjk_fallback(
+            &harness.ctx,
+            None,
+            &font_config.terminal.mono_font,
+            &font_config.terminal.mono_weight,
+        );
+        *harness.state_mut() = true;
+
+        harness.run();
+        let row_rect = harness.get_by_label("Session B").rect();
+        harness.hover_at(row_rect.center());
+        harness.drag_at(row_rect.center());
+        harness.run();
+        harness.hover_at(row_rect.center() + egui::vec2(20.0, 0.0));
+        harness.run();
+
+        let payload = egui::DragAndDrop::payload::<SessionRowDragPayload>(&harness.ctx)
+            .expect("session row drag payload");
+        assert_eq!(
+            payload.target(),
+            &SessionRowTarget::Live {
+                workspace_id: "workspace-b".to_owned(),
+                runtime_instance: 7,
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: runtime::SessionId(42),
+            }
+        );
+    }
+
+    #[test]
+    fn kittest_warm_세션의_오른쪽열기_메뉴가_정확한_대상을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "workspace-b".to_owned(),
+            name: "Workspace B".to_owned(),
+            state: SidebarWorkspaceState::Warm,
+            summary: SidebarSessionSummary::default(),
+        };
+        let entry = SidebarSessionRow::from_live(
+            "workspace-b",
+            7,
+            SessionEntry {
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-b".to_owned()),
+                session: Some(runtime::SessionId(42)),
+                title: "Session B".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: false,
+                in_worktree: false,
+                status_line: None,
+            },
+        );
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, action: &mut Option<SidebarAction>| {
+                inactive_session_context_menu_items(
+                    ui,
+                    &workspace,
+                    "workspace-a",
+                    &entry,
+                    &catalog,
+                    action,
+                );
+            },
+            None,
+        );
+
+        harness.run();
+        harness.get_by_label("Open beside").click();
+        harness.run();
+
+        match harness.state() {
+            Some(SidebarAction::OpenSessionBeside(SessionRowTarget::Live {
+                workspace_id,
+                runtime_instance,
+                tab,
+                pane,
+                session,
+            })) => {
+                assert_eq!(workspace_id, "workspace-b");
+                assert_eq!(*runtime_instance, 7);
+                assert_eq!(tab.0, "tab-b");
+                assert_eq!(pane.0, "pane-b");
+                assert_eq!(*session, runtime::SessionId(42));
+            }
+            _ => panic!("오른쪽 열기 메뉴가 namespaced target 액션을 내지 않음"),
+        }
+    }
+
+    #[test]
+    fn kittest_live_session_context_menu_keeps_all_items_on_one_line() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let labels = [
+            catalog.t("workspace.rename_menu", &[]),
+            catalog.t("sidebar.menu.open_folder", &[]),
+            catalog.t("sidebar.menu.copy_path", &[]),
+            catalog.t("sidebar.menu.new_shell_here", &[]),
+            catalog.t("sidebar.menu.show_diff", &[]),
+            catalog.t("sidebar.menu.new_worktree_cell", &[]),
+            catalog.t("sidebar.menu.remove_worktree", &[]),
+            catalog.t("sidebar.menu.resume_agent", &[]),
+            catalog.t("sidebar.menu.close_pane", &[]),
+        ];
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (f32, bool, bool)| {
+                ui.allocate_ui(egui::vec2(100.0, 500.0), |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    let menu = live_session_context_menu_items(ui, |ui| {
+                        let extends = ui.wrap_mode() == egui::TextWrapMode::Extend;
+                        for label in &labels {
+                            let _ = ui.button(label);
+                        }
+                        extends
+                    });
+                    state.0 = menu.response.rect.width();
+                    state.1 = menu.inner;
+                    state.2 = ui.wrap_mode() == egui::TextWrapMode::Wrap;
+                });
+            },
+            (0.0, false, false),
+        );
+
+        harness.run();
+        assert!(harness.state().0 >= 220.0);
+        assert!(harness.state().1, "menu scope did not use Extend wrapping");
+        assert!(
+            harness.state().2,
+            "menu wrap mode leaked into its parent UI"
+        );
+        let baseline_height = harness.get_by_label(&labels[0]).rect().height();
+        for label in &labels {
+            let rect = harness.get_by_label(label).rect();
+            assert!(
+                (rect.height() - baseline_height).abs() < 0.5,
+                "menu item wrapped instead of extending: {label} ({rect:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn live_session_row_context_menu_uses_the_multi_item_renderer() {
+        let source = include_str!("file_tree.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source");
+        let context_menu = production
+            .split("resp.context_menu(|ui| {")
+            .nth(1)
+            .and_then(|tail| tail.split("if resp.double_clicked()").next())
+            .expect("live session context menu");
+
+        assert!(context_menu.contains("live_session_context_menu_items("));
+    }
+
+    #[test]
+    fn kittest_활성_workspace_세션에는_옆에열기_메뉴가_없다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        for state in [SidebarWorkspaceState::Active, SidebarWorkspaceState::Warm] {
+            let workspace_id = "workspace-a";
+            let active_workspace_id = "workspace-a";
+            let workspace = SidebarWorkspaceEntry {
+                id: workspace_id.to_owned(),
+                name: workspace_id.to_owned(),
+                state,
+                summary: SidebarSessionSummary::default(),
+            };
+            let entry = SidebarSessionRow::from_live(
+                workspace_id,
+                7,
+                SessionEntry {
+                    tab: runtime::MuxTabId("tab".to_owned()),
+                    pane: runtime::MuxPaneId("pane".to_owned()),
+                    session: Some(runtime::SessionId(1)),
+                    title: "Session".to_owned(),
+                    status: None,
+                    summary: String::new(),
+                    focused: false,
+                    attention: false,
+                    pulse: None,
+                    agent_line: None,
+                    status_label: None,
+                    resumable: false,
+                    has_cwd: false,
+                    in_worktree: false,
+                    status_line: None,
+                },
+            );
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                |ui, action: &mut Option<SidebarAction>| {
+                    inactive_session_context_menu_items(
+                        ui,
+                        &workspace,
+                        active_workspace_id,
+                        &entry,
+                        &catalog,
+                        action,
+                    );
+                },
+                None,
+            );
+
+            harness.run();
+            assert!(
+                harness.query_by_label("Open beside").is_none(),
+                "state={state:?}, workspace={workspace_id}, active={active_workspace_id}"
+            );
+            assert!(harness.state().is_none());
+        }
+    }
+
     /// 좁은 폭에서도 워크스페이스 메뉴 항목은 한 줄로 그려진다 — 이전에는 메뉴가
     /// 좁은 폭을 물려받아 「워크스페이스 종료」가 두 줄로 잘렸다(2026-07-18 스샷).
     /// 메뉴 본문이 가장 긴 항목의 no-wrap 폭으로 최소 폭을 강제하므로 100px 제약
@@ -7750,7 +8731,6 @@ mod tests {
         let workspace = SidebarWorkspaceEntry {
             id: "ws-narrow".to_owned(),
             name: "narrow".to_owned(),
-            repo: None,
             state: SidebarWorkspaceState::Active,
             summary: SidebarSessionSummary::default(),
         };
@@ -7839,19 +8819,148 @@ mod tests {
     }
 
     #[test]
-    fn 하단_nav높이는_50px와_폴더영역180px_경계를_지킨다() {
-        assert_eq!(
-            sidebar_vertical_section_heights(700.0, 0.0),
-            (644.0, SIDEBAR_NAV_MIN_HEIGHT)
-        );
-        assert_eq!(
-            sidebar_vertical_section_heights(700.0, SIDEBAR_NAV_DEFAULT_HEIGHT),
-            (586.0, SIDEBAR_NAV_DEFAULT_HEIGHT)
-        );
-        assert_eq!(
-            sidebar_vertical_section_heights(700.0, 1_000.0),
-            (SIDEBAR_BODY_MIN_HEIGHT, 514.0)
-        );
+    fn designall_nav행은_아이콘위_텍스트아래_중앙정렬한다() {
+        let row = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 58.0));
+        let layout = nav_row_layout(row, true);
+
+        assert_eq!(layout.icon_center.x, row.center().x);
+        assert_eq!(layout.label_anchor.x, row.center().x);
+        assert!(layout.icon_center.y < layout.label_anchor.y);
+    }
+
+    #[test]
+    fn 한국어_레일문구는_작업과_ai를_사용한다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        assert_eq!(catalog.t("sidebar.nav.inbox", &[]), "작업");
+        assert_eq!(catalog.t("sidebar.nav.agents", &[]), "AI");
+    }
+
+    #[test]
+    fn kittest_설정은_레일하단에_고정되고_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut fonts_ready = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(520.0, 700.0))
+            .build_ui_state(
+                move |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    if !fonts_ready {
+                        install_sidebar_test_fonts(ui.ctx());
+                        fonts_ready = true;
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        inbox_count: 0,
+                        fleet_count: 0,
+                        agents_open: false,
+                    };
+                    if let Some(action) =
+                        state
+                            .0
+                            .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog)
+                    {
+                        state.1.push(action);
+                    }
+                },
+                (FileTreeUi::new(egui::Context::default()), Vec::new()),
+            );
+        harness.run();
+
+        let settings_rect = harness.get_by_label("Settings").rect();
+        let rail = egui::PanelState::load(&harness.ctx, egui::Id::new("designall_navigation_rail"))
+            .unwrap();
+        assert!((settings_rect.bottom() - rail.outer_rect.bottom()).abs() < 4.0);
+
+        harness.get_by_label("Settings").click();
+        harness.run();
+        assert!(matches!(
+            harness.state().1.as_slice(),
+            [SidebarAction::OpenSettings]
+        ));
+    }
+
+    #[test]
+    fn kittest_designall은_내비게이션레일과_프로젝트패널을_분리한다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let snapshot = SidebarSnapshot {
+            active_workspace_id: "ws-test",
+            workspaces: &[],
+            view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+            home_notice_count: 0,
+            inbox_count: 0,
+            fleet_count: 0,
+            agents_open: false,
+        };
+        let ctx = egui::Context::default();
+        install_sidebar_test_fonts(&ctx);
+        let mut tree = FileTreeUi::new(ctx.clone());
+        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = tree.panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog);
+            });
+        });
+
+        let navigation = egui::PanelState::load(&ctx, egui::Id::new("designall_navigation_rail"))
+            .expect("DesignALL 내비게이션 레일이 별도 패널이어야 한다");
+        let project = egui::PanelState::load(&ctx, egui::Id::new("designall_project_file_panel"))
+            .expect("DesignALL 프로젝트·파일 영역이 별도 패널이어야 한다");
+
+        assert!((navigation.size().x - crate::ui::designall::NAV_RAIL_WIDTH).abs() < 0.1);
+        assert!(project.size().x >= 40.0);
+    }
+
+    #[test]
+    fn kittest_파일헤더는_파일_git_mcp탭만_표시한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let tree = FileTreeUi::new(egui::Context::default());
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+
+        assert!(harness.query_by_label("Files").is_some());
+        assert!(harness.query_by_label("Git").is_some());
+        assert!(harness.query_by_label("MCP").is_some());
+        assert!(harness.query_by_label("Search").is_none());
+        assert!(harness.query_by_label("Terminal").is_none());
+    }
+
+    #[test]
+    fn kittest_파일헤더는_새로고침과_더보기만_노출하고_나머지는_메뉴에_둔다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let tree = FileTreeUi::new(egui::Context::default());
+        let mut harness = drop_harness(&catalog, tree);
+        harness.run();
+        harness.run();
+
+        assert!(harness.query_by_label("Refresh").is_some());
+        harness.get_by_label("More").click();
+        harness.run();
+
+        assert!(harness.query_by_label("New file (root)").is_some());
+        assert!(harness.query_by_label("Show hidden files").is_some());
+        assert!(harness.query_by_label("New folder (root)").is_some());
+    }
+
+    #[test]
+    fn designall_titlebar는_조절된_레일과_프로젝트폭을_따른다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        assert_eq!(tree.designall_titlebar_widths(), (88.0, 200.0));
+
+        tree.navigation_rail_width = 10.0;
+        tree.sidebar_width = 900.0;
+        assert_eq!(tree.designall_titlebar_widths(), (20.0, 680.0));
+
+        tree.collapse_project_file_panel();
+        assert_eq!(tree.designall_titlebar_widths(), (20.0, 22.0));
     }
 
     /// 하단 nav 4항목 렌더 + 클릭 → 액션 방출. 재클릭 토글은 App 로직이라
@@ -7892,11 +9001,11 @@ mod tests {
         harness.run();
         harness.get_by_label("Home").click();
         harness.run();
-        harness.get_by_label("Inbox").click();
+        harness.get_by_label("Work").click();
         harness.run();
         harness.get_by_label("Fleet").click();
         harness.run();
-        harness.get_by_label("Agents").click();
+        harness.get_by_label("AI").click();
         harness.run();
         let kinds: Vec<&'static str> = harness
             .state()
@@ -7915,58 +9024,6 @@ mod tests {
             vec!["home", "inbox", "fleet", "agents"],
             "nav 4항목 클릭이 각각의 액션을 순서대로 내야 한다"
         );
-    }
-
-    #[test]
-    fn kittest_50px_하단_nav는_내부스크롤로_에이전트까지_접근한다() {
-        use egui_kittest::kittest::Queryable;
-
-        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let mut tree = FileTreeUi::new(egui::Context::default());
-        tree.navigation_section_height = SIDEBAR_NAV_MIN_HEIGHT;
-        let mut fonts_ready = false;
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(420.0, 700.0))
-            .build_ui_state(
-                move |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
-                    if !fonts_ready {
-                        install_sidebar_test_fonts(ui.ctx());
-                        fonts_ready = true;
-                        return;
-                    }
-                    let snapshot = SidebarSnapshot {
-                        active_workspace_id: "ws-test",
-                        workspaces: &[],
-                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
-                        home_notice_count: 0,
-                        inbox_count: 0,
-                        fleet_count: 0,
-                        agents_open: false,
-                    };
-                    if let Some(action) =
-                        state
-                            .0
-                            .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog)
-                    {
-                        state.1.push(action);
-                    }
-                },
-                (tree, Vec::new()),
-            );
-        harness.run();
-        harness.get_by_label("Agents").scroll_to_me();
-        harness.run();
-        harness.get_by_label("Agents").click();
-        harness.run();
-
-        assert_eq!(
-            harness.state().0.navigation_section_height,
-            SIDEBAR_NAV_MIN_HEIGHT
-        );
-        assert!(matches!(
-            harness.state().1.as_slice(),
-            [SidebarAction::OpenAgents]
-        ));
     }
 
     /// 반입 대상 폴더 판정(§과제①②) — 폴더 행은 자신, 파일 행은 부모.
@@ -8212,5 +9269,206 @@ mod tests {
             harness.state().0.error
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn typed_persisted_row_carries_exact_pane_id_into_session_target() {
+        let target =
+            SessionRowTarget::persisted("workspace-b", runtime::MuxPaneId("pane-exact".to_owned()));
+
+        assert_eq!(
+            target,
+            SessionRowTarget::PersistedPane {
+                workspace_id: "workspace-b".to_owned(),
+                pane: runtime::MuxPaneId("pane-exact".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn live_session_target_keeps_all_exact_identifiers() {
+        let target = SessionRowTarget::live(
+            "workspace-b",
+            41,
+            runtime::MuxTabId("tab-b".to_owned()),
+            runtime::MuxPaneId("pane-b".to_owned()),
+            runtime::SessionId(42),
+        );
+
+        assert_eq!(target.workspace_id(), "workspace-b");
+        assert_eq!(target.runtime_instance(), Some(41));
+        assert_eq!(target.pane().0, "pane-b");
+        assert_eq!(target.session(), Some(runtime::SessionId(42)));
+    }
+
+    #[test]
+    fn warm_unmaterialized_pane_keeps_exact_persisted_target() {
+        let row = SidebarSessionRow::from_live(
+            "workspace-b",
+            41,
+            SessionEntry {
+                tab: runtime::MuxTabId("tab-b".to_owned()),
+                pane: runtime::MuxPaneId("pane-cold".to_owned()),
+                session: None,
+                title: "Saved shell".to_owned(),
+                status: None,
+                summary: String::new(),
+                focused: false,
+                attention: false,
+                pulse: None,
+                agent_line: None,
+                status_label: None,
+                resumable: false,
+                has_cwd: true,
+                in_worktree: false,
+                status_line: None,
+            },
+        );
+
+        assert_eq!(
+            &row.target,
+            &SessionRowTarget::PersistedPane {
+                workspace_id: "workspace-b".to_owned(),
+                pane: runtime::MuxPaneId("pane-cold".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn session_drag_payload_debug_excludes_presentation_and_terminal_data() {
+        let payload = SessionRowDragPayload::new(SessionRowTarget::persisted(
+            "workspace-safe",
+            runtime::MuxPaneId("pane-safe".to_owned()),
+        ));
+        let debug = format!("{payload:?}");
+
+        assert!(debug.contains("workspace-safe"));
+        assert!(debug.contains("pane-safe"));
+        assert!(!debug.contains("SECRET_TITLE"));
+        assert!(!debug.contains("SECRET/CWD"));
+        assert!(!debug.to_ascii_lowercase().contains("scrollback"));
+    }
+
+    #[test]
+    fn persisted_sidebar_row_preserves_canonical_fields_and_entry_target() {
+        let row = SidebarSessionRow::from_persisted_parts(
+            "workspace-b",
+            runtime::MuxPaneId("pane-exact".to_owned()),
+            "Saved shell".to_owned(),
+            "/private/project-b".to_owned(),
+        );
+
+        assert_eq!(
+            row.target,
+            SessionRowTarget::PersistedPane {
+                workspace_id: "workspace-b".to_owned(),
+                pane: runtime::MuxPaneId("pane-exact".to_owned()),
+            }
+        );
+        assert_eq!(row.title, "Saved shell");
+        assert_eq!(row.summary, "/private/project-b");
+        assert!(row.has_cwd);
+
+        let hover = open_beside_action(row.target.clone());
+        let context = open_beside_action(row.target.clone());
+        let drag = SessionRowDragPayload::new(row.target.clone());
+        assert!(matches!(
+            (hover, context),
+            (
+                SidebarAction::OpenSessionBeside(left),
+                SidebarAction::OpenSessionBeside(right)
+            ) if left == right
+        ));
+        assert_eq!(drag.target(), &row.target);
+    }
+
+    #[test]
+    fn hover_and_context_open_beside_emit_identical_action() {
+        let target = SessionRowTarget::PersistedPane {
+            workspace_id: "workspace-b".to_owned(),
+            pane: runtime::MuxPaneId("pane-b".to_owned()),
+        };
+
+        let hover = open_beside_action(target.clone());
+        let context = open_beside_action(target);
+        assert!(matches!(
+            (hover, context),
+            (
+                SidebarAction::OpenSessionBeside(left),
+                SidebarAction::OpenSessionBeside(right)
+            ) if left == right
+        ));
+    }
+
+    #[test]
+    fn session_row_drag_suppresses_ordinary_click_activation() {
+        assert!(session_row_click_allowed(true, false));
+        assert!(!session_row_click_allowed(true, true));
+    }
+
+    #[test]
+    fn unrelated_dnd_payload_does_not_suppress_session_row_click() {
+        let unrelated_file_payload_is_active = true;
+        assert!(unrelated_file_payload_is_active);
+        assert!(session_row_click_allowed(true, false));
+    }
+
+    #[test]
+    fn inactive_session_menu_keeps_korean_labels_on_one_line() {
+        let style = inactive_session_menu_style();
+
+        assert!(style.min_width >= 220.0);
+        assert_eq!(style.wrap_mode, egui::TextWrapMode::Extend);
+    }
+
+    #[test]
+    fn exact_session_drag_projects_elevated_source_style() {
+        let style = session_drag_style(true, crate::ui::designall::DARK);
+
+        assert!(style.fill.is_some());
+        assert_eq!(style.stroke.width, 1.0);
+        assert!(style.shadow.blur > 0);
+        assert!(style.rail_multiplier > 1.0);
+    }
+
+    #[test]
+    fn inactive_session_drag_style_is_a_visual_noop() {
+        let style = session_drag_style(false, crate::ui::designall::DARK);
+
+        assert!(style.fill.is_none());
+        assert_eq!(style.stroke, egui::Stroke::NONE);
+        assert_eq!(style.shadow, egui::epaint::Shadow::NONE);
+        assert_eq!(style.rail_multiplier, 1.0);
+    }
+
+    #[test]
+    fn session_drag_matches_only_the_exact_active_payload() {
+        let context = egui::Context::default();
+        let exact = SessionRowTarget::persisted(
+            "workspace-exact",
+            runtime::MuxPaneId("pane-exact".to_owned()),
+        );
+        let other = SessionRowTarget::persisted(
+            "workspace-other",
+            runtime::MuxPaneId("pane-other".to_owned()),
+        );
+
+        egui::DragAndDrop::set_payload(&context, SessionRowDragPayload::new(exact.clone()));
+        assert!(session_drag_payload_matches(&context, &exact));
+        assert!(!session_drag_payload_matches(&context, &other));
+
+        egui::DragAndDrop::set_payload(&context, PathBuf::from("/tmp/unrelated"));
+        assert!(!session_drag_payload_matches(&context, &exact));
+    }
+
+    #[test]
+    fn active_workspace_target_is_denied_for_cross_workspace_attach() {
+        let target = SessionRowTarget::PersistedPane {
+            workspace_id: "workspace-a".to_owned(),
+            pane: runtime::MuxPaneId("pane-a".to_owned()),
+        };
+
+        assert!(!can_open_session_beside("workspace-a", &target));
+        assert!(can_open_session_beside("workspace-b", &target));
     }
 }

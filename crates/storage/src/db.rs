@@ -930,6 +930,14 @@ impl std::fmt::Debug for AgentStateJob {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedActivityPane {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub title: String,
+    pub cwd: String,
+}
+
 /// Requested complete-or-error bounded projection returned after an [`AgentStateJob`] commits.
 /// Every included row is read from the same transaction snapshot, omitted sections are empty, and
 /// total retained heap bytes are capped globally.
@@ -944,9 +952,9 @@ pub struct AgentStateSnapshot {
     pub working_sessions: Vec<String>,
     pub agent_sessions: Vec<AgentSessionRow>,
     pub structured_threads: Vec<StructuredThreadRow>,
-    /// Complete bounded `(workspace_id, title, cwd)` activity catalog when requested; otherwise
-    /// empty without querying activity storage.
-    pub activity_panes: Vec<(String, String, String)>,
+    /// Complete bounded activity catalog when requested; otherwise empty without querying
+    /// activity storage.
+    pub activity_panes: Vec<PersistedActivityPane>,
 }
 
 impl std::fmt::Debug for AgentStateSnapshot {
@@ -1549,6 +1557,7 @@ const ACTIVITY_PANES_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
            COALESCE(NULLIF(pane.title, ''), NULLIF(session.title, ''), pane.id) AS title,
            COALESCE(session.cwd, '') AS cwd,
            length(CAST(pane.workspace_id AS BLOB))
+             + length(CAST(pane.id AS BLOB))
              + length(CAST(COALESCE(NULLIF(pane.title, ''),
                                     NULLIF(session.title, ''), pane.id) AS BLOB))
              + length(CAST(COALESCE(session.cwd, '') AS BLOB)) AS row_bytes
@@ -1564,7 +1573,7 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR typeof(cwd) != 'text' OR length(CAST(cwd AS BLOB)) > ?3
     OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
-const ACTIVITY_PANES_BOUNDED_SELECT: &str = "SELECT pane.workspace_id,
+const ACTIVITY_PANES_BOUNDED_SELECT: &str = "SELECT pane.workspace_id, pane.id,
             COALESCE(NULLIF(pane.title, ''), NULLIF(session.title, ''), pane.id),
             COALESCE(session.cwd, '')
        FROM mux_panes pane
@@ -1994,10 +2003,11 @@ fn agent_state_snapshot_retained_bytes(
         checked_agent_state_optional_string_capacity(&mut total, &row.model)?;
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.activity_panes)?;
-    for (workspace_id, title, cwd) in &snapshot.activity_panes {
-        checked_agent_state_string_capacity(&mut total, workspace_id)?;
-        checked_agent_state_string_capacity(&mut total, title)?;
-        checked_agent_state_string_capacity(&mut total, cwd)?;
+    for row in &snapshot.activity_panes {
+        checked_agent_state_string_capacity(&mut total, &row.workspace_id)?;
+        checked_agent_state_string_capacity(&mut total, &row.pane_id)?;
+        checked_agent_state_string_capacity(&mut total, &row.title)?;
+        checked_agent_state_string_capacity(&mut total, &row.cwd)?;
     }
     Ok(total)
 }
@@ -5798,21 +5808,28 @@ impl Db {
     }
 
     /// 런타임이 없는(또는 warm) 워크스페이스의 활동 화면에 쓸 영속 pane snapshot —
-    /// (workspace_id, 제목, 세션 cwd). `sessions` 전체는 닫힌 과거 이력도 남으므로,
+    /// (workspace_id, pane_id, 제목, 세션 cwd). `sessions` 전체는 닫힌 과거 이력도 남으므로,
     /// 현재 복원 레이아웃에 연결된 `mux_panes`만 읽는다. 한 쿼리로 모든 workspace를
     /// 반환해 UI의 N+1을 피한다. cwd는 기본 제목("셸 N")을 프로젝트명으로 바꿔 표시하는
     /// 데 쓴다(활성 워크스페이스의 resolve_session_title과 같은 규칙) — 세션이 없는
     /// pane이면 빈 문자열.
-    pub fn list_persisted_activity_panes(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+    pub fn list_persisted_activity_panes(&self) -> anyhow::Result<Vec<PersistedActivityPane>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT p.workspace_id,
+            "SELECT p.workspace_id, p.id,
                     COALESCE(NULLIF(p.title, ''), NULLIF(s.title, ''), p.id),
                     COALESCE(s.cwd, '')
                FROM mux_panes p
                LEFT JOIN sessions s ON s.id = p.session_id
               ORDER BY p.workspace_id, p.created_at, p.id",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PersistedActivityPane {
+                workspace_id: row.get(0)?,
+                pane_id: row.get(1)?,
+                title: row.get(2)?,
+                cwd: row.get(3)?,
+            })
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -5822,7 +5839,7 @@ impl Db {
     pub fn list_persisted_activity_panes_bounded(
         &self,
         limit: usize,
-    ) -> anyhow::Result<Vec<(String, String, String)>> {
+    ) -> anyhow::Result<Vec<PersistedActivityPane>> {
         let sql_limit = bounded_limit_plus_one(limit, ACTIVITY_PANE_ROWS_MAX)?;
         let tx = self
             .conn
@@ -5856,9 +5873,15 @@ impl Db {
                 .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
             {
                 let workspace_id = bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?;
-                let title = bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?;
-                let cwd = bounded_required_text(row, 2, BOUNDED_TEXT_BYTES_MAX, false, false)?;
-                result.push((workspace_id.to_owned(), title.to_owned(), cwd.to_owned()));
+                let pane_id = bounded_required_text(row, 1, BOUNDED_ID_BYTES_MAX, true, true)?;
+                let title = bounded_required_text(row, 2, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                let cwd = bounded_required_text(row, 3, BOUNDED_TEXT_BYTES_MAX, false, false)?;
+                result.push(PersistedActivityPane {
+                    workspace_id: workspace_id.to_owned(),
+                    pane_id: pane_id.to_owned(),
+                    title: title.to_owned(),
+                    cwd: cwd.to_owned(),
+                });
             }
         }
         tx.commit()
@@ -7085,32 +7108,31 @@ impl Db {
             } else {
                 Vec::new()
             };
-        let working_sessions = if let Some((_, _, working_probe, sql_limit, snapshot_epoch)) =
-            &attention_probes
-        {
-            let mut result = Vec::with_capacity(working_probe.count);
-            let mut stmt = tx
-                .prepare(WORKING_SESSIONS_SELECT)
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
-            let mut rows = stmt
-                .query(rusqlite::params![
-                    sql_limit,
-                    BOUNDED_ID_BYTES_MAX as i64,
-                    snapshot_epoch,
-                ])
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
-            while let Some(row) = rows
-                .next()
-                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
-            {
-                result.push(
-                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
-                );
-            }
-            result
-        } else {
-            Vec::new()
-        };
+        let working_sessions =
+            if let Some((_, _, working_probe, sql_limit, snapshot_epoch)) = &attention_probes {
+                let mut result = Vec::with_capacity(working_probe.count);
+                let mut stmt = tx
+                    .prepare(WORKING_SESSIONS_SELECT)
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                let mut rows = stmt
+                    .query(rusqlite::params![
+                        sql_limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                        snapshot_epoch,
+                    ])
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+                {
+                    result.push(
+                        bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                    );
+                }
+                result
+            } else {
+                Vec::new()
+            };
         let agent_sessions = if let Some((agent_probe, sql_limit)) = &agent_probe {
             let mut result = Vec::with_capacity(agent_probe.count);
             let mut stmt = tx
@@ -7250,9 +7272,15 @@ impl Db {
                 .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
             {
                 let workspace_id = bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?;
-                let title = bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?;
-                let cwd = bounded_required_text(row, 2, BOUNDED_TEXT_BYTES_MAX, false, false)?;
-                result.push((workspace_id.to_owned(), title.to_owned(), cwd.to_owned()));
+                let pane_id = bounded_required_text(row, 1, BOUNDED_ID_BYTES_MAX, true, true)?;
+                let title = bounded_required_text(row, 2, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                let cwd = bounded_required_text(row, 3, BOUNDED_TEXT_BYTES_MAX, false, false)?;
+                result.push(PersistedActivityPane {
+                    workspace_id: workspace_id.to_owned(),
+                    pane_id: pane_id.to_owned(),
+                    title: title.to_owned(),
+                    cwd: cwd.to_owned(),
+                });
             }
             result
         } else {
@@ -10302,11 +10330,21 @@ mod tests {
         // cwd도 함께 온다 — 기본 제목("셸 N")을 프로젝트명으로 표시하는 데 쓴다.
         assert_eq!(
             db.list_persisted_activity_panes().unwrap(),
-            vec![(ws.clone(), "saved shell".to_owned(), "/".to_owned())]
+            vec![PersistedActivityPane {
+                workspace_id: ws.clone(),
+                pane_id: "pane-1".to_owned(),
+                title: "saved shell".to_owned(),
+                cwd: "/".to_owned(),
+            }]
         );
         assert_eq!(
             db.list_persisted_activity_panes_bounded(1).unwrap(),
-            vec![(ws, "saved shell".to_owned(), "/".to_owned())]
+            vec![PersistedActivityPane {
+                workspace_id: ws,
+                pane_id: "pane-1".to_owned(),
+                title: "saved shell".to_owned(),
+                cwd: "/".to_owned(),
+            }]
         );
     }
 
@@ -10316,7 +10354,17 @@ mod tests {
         let workspace_id = seed_activity_panes(&db, 3, "saved shell");
         let rows = db.list_persisted_activity_panes_bounded(3).unwrap();
         assert_eq!(rows.len(), 3);
-        assert!(rows.iter().all(|row| row.0 == workspace_id));
+        assert!(rows.iter().all(|row| row.workspace_id == workspace_id));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "activity-pane-00000",
+                "activity-pane-00001",
+                "activity-pane-00002"
+            ]
+        );
         assert_eq!(
             db.list_persisted_activity_panes_bounded(2)
                 .unwrap_err()
@@ -10334,6 +10382,42 @@ mod tests {
                 "UPDATE mux_panes SET title = CAST(x'7879' AS BLOB)
                   WHERE id = 'activity-pane-00000'",
                 [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_persisted_activity_panes_bounded(1)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn bounded_activity_panes는_pane_id_byte_limit을_검사한다() {
+        let db = Db::open_in_memory().unwrap();
+        seed_activity_panes(&db, 1, "saved shell");
+        db.conn
+            .execute(
+                "UPDATE mux_panes SET id = ?1 WHERE id = 'activity-pane-00000'",
+                [&"p".repeat(BOUNDED_ID_BYTES_MAX + 1)],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_persisted_activity_panes_bounded(1)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn bounded_activity_panes는_text_byte_limit을_검사한다() {
+        let db = Db::open_in_memory().unwrap();
+        seed_activity_panes(&db, 1, "saved shell");
+        db.conn
+            .execute(
+                "UPDATE mux_panes SET title = ?1 WHERE id = 'activity-pane-00000'",
+                [&"x".repeat(BOUNDED_TEXT_BYTES_MAX + 1)],
             )
             .unwrap();
         assert_eq!(
@@ -11262,9 +11346,10 @@ mod tests {
             snapshot
                 .activity_panes
                 .iter()
-                .all(|(workspace, title, cwd)| workspace == &workspace_id
-                    && title == "saved shell"
-                    && cwd.is_empty())
+                .all(|row| row.workspace_id == workspace_id
+                    && row.pane_id.starts_with("activity-pane-")
+                    && row.title == "saved shell"
+                    && row.cwd.is_empty())
         );
         assert!(snapshot.retained_bytes() <= AGENT_STATE_SNAPSHOT_BYTES_MAX);
     }
@@ -12061,7 +12146,12 @@ mod tests {
             working_sessions: vec![marker.to_owned()],
             agent_sessions: reconcile.desired_bindings.clone(),
             structured_threads: vec![structured],
-            activity_panes: vec![(marker.to_owned(), marker.to_owned(), marker.to_owned())],
+            activity_panes: vec![PersistedActivityPane {
+                workspace_id: marker.to_owned(),
+                pane_id: marker.to_owned(),
+                title: marker.to_owned(),
+                cwd: marker.to_owned(),
+            }],
         };
 
         for debug in [
@@ -18512,16 +18602,8 @@ mod tests {
                 STATUSLINES_PREFIX_SELECT,
                 "3600",
             ),
-            (
-                TURN_DONE_PREFIX_PREFLIGHT,
-                TURN_DONE_PREFIX_SELECT,
-                "86400",
-            ),
-            (
-                WAITING_SESSIONS_PREFLIGHT,
-                WAITING_SESSIONS_SELECT,
-                "86400",
-            ),
+            (TURN_DONE_PREFIX_PREFLIGHT, TURN_DONE_PREFIX_SELECT, "86400"),
+            (WAITING_SESSIONS_PREFLIGHT, WAITING_SESSIONS_SELECT, "86400"),
             (
                 TURN_DONE_SESSIONS_PREFLIGHT,
                 TURN_DONE_SESSIONS_SELECT,
@@ -18549,17 +18631,46 @@ mod tests {
                 .unwrap();
             let preflight_at = body.find("bounded_read_preflight").unwrap();
             let vector_at = body.find("Vec::with_capacity").unwrap();
-            let materialize_at = body.find("result.push").unwrap();
             assert!(preflight_at < vector_at);
-            assert!(
-                body[..materialize_at]
-                    .matches("bounded_required_text(")
-                    .count()
-                    >= 3
-            );
             assert!(body.contains("unchecked_transaction"));
             assert!(body.contains("sql_limit"));
         }
+        let activity_body = source
+            .split_once("pub fn list_persisted_activity_panes_bounded")
+            .unwrap()
+            .1
+            .split("\n    pub fn ")
+            .next()
+            .unwrap();
+        let activity_before_push = &activity_body[..activity_body.find("result.push").unwrap()];
+        for validation in [
+            "let workspace_id = bounded_required_text(row, 0",
+            "let pane_id = bounded_required_text(row, 1",
+            "let title = bounded_required_text(row, 2",
+            "let cwd = bounded_required_text(row, 3",
+        ] {
+            assert!(activity_before_push.contains(validation));
+        }
+        assert_eq!(
+            activity_before_push
+                .matches("bounded_required_text(")
+                .count(),
+            4
+        );
+        let web_push_body = source
+            .split_once("pub fn list_web_push_subscriptions_bounded")
+            .unwrap()
+            .1
+            .split("\n    pub fn ")
+            .next()
+            .unwrap();
+        let web_push_before_push = &web_push_body[..web_push_body.find("result.push").unwrap()];
+        assert_eq!(
+            web_push_before_push
+                .matches("bounded_required_text(")
+                .count(),
+            3
+        );
         for (preflight, projection) in [
             (
                 ACTIVITY_PANES_BOUNDED_PREFLIGHT,
@@ -18572,6 +18683,8 @@ mod tests {
             assert!(preflight.contains("rowid LIMIT ?"));
             assert!(projection.contains("rowid LIMIT ?"));
         }
+        assert!(ACTIVITY_PANES_BOUNDED_PREFLIGHT.contains("length(CAST(pane.id AS BLOB))"));
+        assert!(ACTIVITY_PANES_BOUNDED_SELECT.contains("pane.id"));
         for method in [
             "list_hook_sessions_for_prefix_bounded",
             "list_statuslines_for_prefix_bounded",

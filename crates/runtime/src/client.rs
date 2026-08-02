@@ -59,6 +59,26 @@ impl RuntimeEventReceiver {
         self.overflowed.swap(false, Ordering::AcqRel)
     }
 
+    /// 송신측이 모두 종료되고 durable 큐도 소진됐는지 확인한다.
+    pub fn is_disconnected(&self) -> bool {
+        if self
+            .pending_durable
+            .lock()
+            .expect("pending durable lock")
+            .is_some()
+        {
+            return false;
+        }
+        match self.events.try_recv() {
+            Ok(event) => {
+                *self.pending_durable.lock().expect("pending durable lock") = Some(event);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => true,
+        }
+    }
+
     /// overflow로 송신측이 이 구독자를 끊은 뒤, 이미 큐에 들어온 durable 이벤트를 모두
     /// 소비했는지 확인한다. 한 건을 미리 읽으면 pending에 돌려놔 순서를 보존한다.
     pub fn durable_backlog_exhausted(&self) -> bool {

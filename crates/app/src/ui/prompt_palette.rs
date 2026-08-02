@@ -164,24 +164,26 @@ impl PromptPaletteUi {
         if matches.is_empty() {
             ui.weak(catalog.t("prompt.no_match", &[]));
         } else {
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                for prompt in matches {
-                    let tags = if prompt.tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!("   #{}", prompt.tags.join(" #"))
-                    };
-                    let hit = ui
-                        .selectable_label(false, egui::RichText::new(&prompt.title).strong())
-                        .on_hover_text(&prompt.body);
-                    ui.add(egui::Label::new(egui::RichText::new(tags).small().weak()));
-                    if hit.clicked() {
-                        self.selected = Some(prompt.id.clone());
-                        self.params.clear();
-                        self.confirm_delete = false;
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for prompt in matches {
+                        let tags = if prompt.tags.is_empty() {
+                            String::new()
+                        } else {
+                            format!("   #{}", prompt.tags.join(" #"))
+                        };
+                        let hit = ui
+                            .selectable_label(false, egui::RichText::new(&prompt.title).strong())
+                            .on_hover_text(&prompt.body);
+                        ui.add(egui::Label::new(egui::RichText::new(tags).small().weak()));
+                        if hit.clicked() {
+                            self.selected = Some(prompt.id.clone());
+                            self.params.clear();
+                            self.confirm_delete = false;
+                        }
                     }
-                }
-            });
+                });
         }
     }
 
@@ -206,16 +208,22 @@ impl PromptPaletteUi {
         if names.is_empty() {
             ui.weak(catalog.t("prompt.no_params", &[]));
         } else {
-            egui::Grid::new("prompt_params").num_columns(2).show(ui, |ui| {
-                for name in &names {
-                    ui.monospace(format!("{{{{{name}}}}}"));
-                    ui.text_edit_singleline(self.params.entry(name.clone()).or_default());
-                    ui.end_row();
-                }
-            });
+            egui::Grid::new("prompt_params")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for name in &names {
+                        ui.monospace(format!("{{{{{name}}}}}"));
+                        ui.text_edit_singleline(self.params.entry(name.clone()).or_default());
+                        ui.end_row();
+                    }
+                });
         }
         ui.add_space(8.0);
-        ui.label(egui::RichText::new(catalog.t("prompt.preview", &[])).small().weak());
+        ui.label(
+            egui::RichText::new(catalog.t("prompt.preview", &[]))
+                .small()
+                .weak(),
+        );
         let rendered = crate::prompt_library::render(&prompt.body, &self.params);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.add(egui::Label::new(egui::RichText::new(&rendered).monospace()).wrap());
@@ -247,7 +255,10 @@ impl PromptPaletteUi {
         if self.confirm_delete {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().warn_fg_color, catalog.t("prompt.delete_confirm", &[]));
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    catalog.t("prompt.delete_confirm", &[]),
+                );
                 if ui.button(catalog.t("prompt.delete_yes", &[])).clicked() {
                     action = Some(PromptPaletteAction::Delete(prompt.id.clone()));
                     self.selected = None;
@@ -305,7 +316,11 @@ impl PromptPaletteUi {
                     ui.end_row();
                 });
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(catalog.t("prompt.form.body", &[])).small().weak());
+            ui.label(
+                egui::RichText::new(catalog.t("prompt.form.body", &[]))
+                    .small()
+                    .weak(),
+            );
             ui.add(
                 egui::TextEdit::multiline(&mut draft.body)
                     .desired_rows(7)
@@ -327,7 +342,10 @@ impl PromptPaletteUi {
             let can_save = !draft.title.trim().is_empty() && !draft.body.trim().is_empty();
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(can_save, egui::Button::new(catalog.t("prompt.form.save", &[])))
+                    .add_enabled(
+                        can_save,
+                        egui::Button::new(catalog.t("prompt.form.save", &[])),
+                    )
                     .clicked()
                 {
                     save = true;
@@ -343,9 +361,7 @@ impl PromptPaletteUi {
         }
         if save {
             let draft = self.editing.take().expect("editing.is_some() checked");
-            let id = draft
-                .id
-                .unwrap_or_else(|| library.fresh_id(&draft.title));
+            let id = draft.id.unwrap_or_else(|| library.fresh_id(&draft.title));
             // 저장 후 목록으로 — 저장된 항목을 목록에서 확인한다.
             self.selected = None;
             return Some(PromptPaletteAction::Upsert(Prompt {

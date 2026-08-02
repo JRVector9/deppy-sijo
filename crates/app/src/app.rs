@@ -14,6 +14,116 @@ use storage::Db;
 /// 쓰인다(main.rs의 `set_traffic_light_titlebar_height`). 값이 바뀌면 신호등도 다시
 /// 어긋나므로 두 곳이 이 상수 하나만 본다.
 pub(crate) const TOP_BAR_HEIGHT: f32 = 38.0;
+const DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE: bool = false;
+const TOP_BAR_TEXT_BUTTON_HORIZONTAL_PADDING: f32 = 20.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesignAllTitlebarRegions {
+    traffic: egui::Rect,
+    project: egui::Rect,
+    workspace: egui::Rect,
+    status: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesignAllProjectTitlebarLayout {
+    label_anchor: egui::Pos2,
+    collapse: egui::Rect,
+    add: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesignAllProjectTitlebarControls {
+    collapse: Option<egui::Rect>,
+    add: Option<egui::Rect>,
+}
+
+fn designall_project_titlebar_layout(project: egui::Rect) -> DesignAllProjectTitlebarLayout {
+    let button_size = egui::vec2(24.0, 24.0);
+    let add = egui::Rect::from_center_size(
+        egui::pos2(project.right() - 16.0, project.center().y),
+        button_size,
+    );
+    let collapse = egui::Rect::from_center_size(
+        egui::pos2(add.center().x - 28.0, project.center().y),
+        button_size,
+    );
+    DesignAllProjectTitlebarLayout {
+        label_anchor: egui::pos2(
+            project.left() + crate::ui::file_tree::WORKSPACE_AVATAR_LEFT_INSET - 2.0,
+            project.center().y + 3.0,
+        ),
+        collapse,
+        add,
+    }
+}
+
+fn designall_project_titlebar_controls(
+    project: egui::Rect,
+    has_file_tree: bool,
+) -> DesignAllProjectTitlebarControls {
+    let layout = designall_project_titlebar_layout(project);
+    if !has_file_tree {
+        return DesignAllProjectTitlebarControls {
+            collapse: None,
+            add: Some(layout.add),
+        };
+    }
+    if project.width() < 40.0 {
+        return DesignAllProjectTitlebarControls {
+            collapse: None,
+            add: None,
+        };
+    }
+    if project.width() < 72.0 {
+        return DesignAllProjectTitlebarControls {
+            collapse: Some(layout.add),
+            add: None,
+        };
+    }
+    DesignAllProjectTitlebarControls {
+        collapse: Some(layout.collapse),
+        add: Some(layout.add),
+    }
+}
+
+fn designall_titlebar_status_width(
+    locale_text_width: f32,
+    bell_text_width: f32,
+    item_spacing: f32,
+) -> f32 {
+    (10.0
+        + locale_text_width
+        + item_spacing
+        + bell_text_width
+        + TOP_BAR_TEXT_BUTTON_HORIZONTAL_PADDING)
+        .ceil()
+        .max(96.0)
+}
+
+fn designall_titlebar_regions(
+    bar: egui::Rect,
+    navigation_width: f32,
+    project_width: f32,
+    status_width: f32,
+) -> DesignAllTitlebarRegions {
+    let navigation_right = (bar.left() + navigation_width.max(0.0)).min(bar.right());
+    let project_right = (navigation_right + project_width.max(0.0)).min(bar.right());
+    let status_left = (bar.right() - status_width.max(0.0)).max(project_right);
+    DesignAllTitlebarRegions {
+        traffic: egui::Rect::from_min_max(bar.min, egui::pos2(navigation_right, bar.bottom())),
+        project: egui::Rect::from_min_max(
+            egui::pos2(navigation_right, bar.top()),
+            egui::pos2(project_right, bar.bottom()),
+        ),
+        workspace: egui::Rect::from_min_max(
+            egui::pos2(project_right, bar.top()),
+            egui::pos2(status_left, bar.bottom()),
+        ),
+        status: egui::Rect::from_min_max(egui::pos2(status_left, bar.top()), bar.max),
+    }
+}
+
 const APPROVAL_WAKE_MARKER: u8 = 1;
 const APPROVAL_CONTROL_MARKER: u8 = 2;
 const APPROVAL_COMMAND_CAP: usize = 8;
@@ -1239,7 +1349,937 @@ fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
             | runtime::RuntimeCommand::SpawnAgent { .. }
             | runtime::RuntimeCommand::SplitPane { .. }
             | runtime::RuntimeCommand::RestoreWorkspace
+    ) || runtime_command_is_targeted_workspace_restore(command)
+}
+
+fn runtime_command_is_targeted_workspace_restore(command: &runtime::RuntimeCommand) -> bool {
+    matches!(
+        command,
+        runtime::RuntimeCommand::RestoreWorkspacePane { .. }
     )
+}
+
+const CROSS_WORKSPACE_RESTORE_QUEUE_CAP: usize = 6;
+const CROSS_WORKSPACE_RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[derive(Debug, PartialEq, Eq)]
+struct DurableBarrierCorrelationAllocator {
+    next: u64,
+}
+
+impl Default for DurableBarrierCorrelationAllocator {
+    fn default() -> Self {
+        Self { next: 1 }
+    }
+}
+
+impl DurableBarrierCorrelationAllocator {
+    fn allocate(&mut self) -> Option<u64> {
+        let correlation_id = std::num::NonZeroU64::new(self.next)?.get();
+        self.next = self.next.checked_add(1).unwrap_or(0);
+        Some(correlation_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreBarrierDelivery {
+    NotSent,
+    RestoreSentUnarmed,
+    BarrierArmed(u64),
+}
+
+fn send_restore_with_durable_barrier(
+    pane: runtime::MuxPaneId,
+    correlation_id: u64,
+    mut send: impl FnMut(runtime::RuntimeCommand) -> bool,
+) -> RestoreBarrierDelivery {
+    if correlation_id == 0 || !send(runtime::RuntimeCommand::RestoreWorkspacePane { pane }) {
+        return RestoreBarrierDelivery::NotSent;
+    }
+    if !send(runtime::RuntimeCommand::DurableEventBarrier { correlation_id }) {
+        return RestoreBarrierDelivery::RestoreSentUnarmed;
+    }
+    RestoreBarrierDelivery::BarrierArmed(correlation_id)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrossWorkspaceRestoreRequest {
+    workspace_id: String,
+    pane: runtime::MuxPaneId,
+    attachment_id: ui::cross_workspace::AttachmentId,
+}
+
+impl CrossWorkspaceRestoreRequest {
+    fn new(
+        workspace_id: impl Into<String>,
+        pane: runtime::MuxPaneId,
+        attachment_id: ui::cross_workspace::AttachmentId,
+    ) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            pane,
+            attachment_id,
+        }
+    }
+
+    fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    fn attachment_id(&self) -> ui::cross_workspace::AttachmentId {
+        self.attachment_id
+    }
+
+    fn same_canonical_pane(&self, workspace_id: &str, pane: &runtime::MuxPaneId) -> bool {
+        self.workspace_id == workspace_id && self.pane == *pane
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrossWorkspaceRestoreDispatch {
+    request: CrossWorkspaceRestoreRequest,
+    runtime_instance: u64,
+    deadline: std::time::Instant,
+    state: CrossWorkspaceRestoreDispatchState,
+    cancelled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossWorkspaceRestoreDispatchState {
+    Pending,
+    RestoreSentUnarmed,
+    BarrierArmed(u64),
+}
+
+impl CrossWorkspaceRestoreDispatch {
+    #[cfg(test)]
+    fn request(&self) -> &CrossWorkspaceRestoreRequest {
+        &self.request
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrossWorkspaceRestoreCompletion {
+    attachment_id: ui::cross_workspace::AttachmentId,
+    target: ui::cross_workspace::WorkspacePaneTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RestoreBarrierOutcome {
+    Promote(CrossWorkspaceRestoreCompletion),
+    Failed(CrossWorkspaceRestoreRequest),
+    Ignored(CrossWorkspaceRestoreRequest),
+}
+
+#[derive(Default)]
+struct CrossWorkspaceRestoreCoordinator {
+    pending: std::collections::VecDeque<CrossWorkspaceRestoreRequest>,
+    in_flight: Option<CrossWorkspaceRestoreDispatch>,
+}
+
+impl CrossWorkspaceRestoreCoordinator {
+    fn enqueue(&mut self, request: CrossWorkspaceRestoreRequest) -> bool {
+        if self.in_flight.as_ref().is_some_and(|dispatch| {
+            dispatch
+                .request
+                .same_canonical_pane(&request.workspace_id, &request.pane)
+        }) || self
+            .pending
+            .iter()
+            .any(|pending| pending.same_canonical_pane(&request.workspace_id, &request.pane))
+            || self.pending.len() + usize::from(self.in_flight.is_some())
+                >= CROSS_WORKSPACE_RESTORE_QUEUE_CAP
+        {
+            return false;
+        }
+        self.pending.push_back(request);
+        true
+    }
+
+    fn begin_next(
+        &mut self,
+        runtime_instance: u64,
+        now: std::time::Instant,
+    ) -> Option<CrossWorkspaceRestoreDispatch> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let request = self.pending.pop_front()?;
+        let dispatch = CrossWorkspaceRestoreDispatch {
+            request,
+            runtime_instance,
+            deadline: now + CROSS_WORKSPACE_RESTORE_TIMEOUT,
+            state: CrossWorkspaceRestoreDispatchState::Pending,
+            cancelled: false,
+        };
+        self.in_flight = Some(dispatch.clone());
+        Some(dispatch)
+    }
+
+    fn mark_restore_sent(&mut self, runtime_instance: u64, pane: &runtime::MuxPaneId) -> bool {
+        let Some(dispatch) = self.in_flight.as_mut() else {
+            return false;
+        };
+        if dispatch.runtime_instance != runtime_instance
+            || dispatch.request.pane != *pane
+            || dispatch.state != CrossWorkspaceRestoreDispatchState::Pending
+        {
+            return false;
+        }
+        dispatch.state = CrossWorkspaceRestoreDispatchState::RestoreSentUnarmed;
+        true
+    }
+
+    fn arm_durable_barrier(
+        &mut self,
+        runtime_instance: u64,
+        pane: &runtime::MuxPaneId,
+        correlation_id: u64,
+    ) -> bool {
+        let Some(dispatch) = self.in_flight.as_mut() else {
+            return false;
+        };
+        if correlation_id == 0
+            || dispatch.runtime_instance != runtime_instance
+            || dispatch.request.pane != *pane
+            || dispatch.state != CrossWorkspaceRestoreDispatchState::RestoreSentUnarmed
+        {
+            return false;
+        }
+        dispatch.state = CrossWorkspaceRestoreDispatchState::BarrierArmed(correlation_id);
+        true
+    }
+
+    fn allows_command(&self, runtime_instance: u64, pane: &runtime::MuxPaneId) -> bool {
+        self.in_flight.as_ref().is_some_and(|dispatch| {
+            !dispatch.cancelled
+                && dispatch.state == CrossWorkspaceRestoreDispatchState::Pending
+                && dispatch.runtime_instance == runtime_instance
+                && dispatch.request.pane == *pane
+        })
+    }
+
+    fn fail_before_command(
+        &mut self,
+        runtime_instance: u64,
+        pane: &runtime::MuxPaneId,
+    ) -> Option<CrossWorkspaceRestoreRequest> {
+        let dispatch = self.in_flight.as_ref()?;
+        if dispatch.state != CrossWorkspaceRestoreDispatchState::Pending
+            || dispatch.runtime_instance != runtime_instance
+            || dispatch.request.pane != *pane
+        {
+            return None;
+        }
+        self.in_flight.take().map(|dispatch| dispatch.request)
+    }
+
+    fn settle_durable_barrier(
+        &mut self,
+        workspace_id: &str,
+        runtime_instance: u64,
+        correlation_id: u64,
+        mux: Option<&runtime::MuxSnapshot>,
+    ) -> Option<RestoreBarrierOutcome> {
+        let dispatch = self.in_flight.as_ref()?;
+        if dispatch.request.workspace_id() != workspace_id
+            || dispatch.runtime_instance != runtime_instance
+            || dispatch.state != CrossWorkspaceRestoreDispatchState::BarrierArmed(correlation_id)
+        {
+            return None;
+        }
+        let dispatch = self.in_flight.take().unwrap();
+        if dispatch.cancelled {
+            return Some(RestoreBarrierOutcome::Ignored(dispatch.request));
+        }
+        let target = mux.and_then(|mux| {
+            restored_workspace_pane_target(
+                workspace_id,
+                runtime_instance,
+                &dispatch.request.pane,
+                mux,
+            )
+        });
+        match target {
+            Some(target) => Some(RestoreBarrierOutcome::Promote(
+                CrossWorkspaceRestoreCompletion {
+                    attachment_id: dispatch.request.attachment_id,
+                    target,
+                },
+            )),
+            None => Some(RestoreBarrierOutcome::Failed(dispatch.request)),
+        }
+    }
+
+    fn expire(&mut self, now: std::time::Instant) -> Option<RestoreBarrierOutcome> {
+        let expired = self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.deadline <= now);
+        expired.then(|| {
+            let dispatch = self.in_flight.take().unwrap();
+            if dispatch.cancelled {
+                RestoreBarrierOutcome::Ignored(dispatch.request)
+            } else {
+                RestoreBarrierOutcome::Failed(dispatch.request)
+            }
+        })
+    }
+
+    fn cancel_attachment(
+        &mut self,
+        attachment_id: ui::cross_workspace::AttachmentId,
+    ) -> Option<CrossWorkspaceRestoreRequest> {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.request.attachment_id == attachment_id)
+        {
+            let dispatch = self.in_flight.as_mut().unwrap();
+            if dispatch.state != CrossWorkspaceRestoreDispatchState::Pending {
+                dispatch.cancelled = true;
+                return Some(dispatch.request.clone());
+            }
+            return self.in_flight.take().map(|dispatch| dispatch.request);
+        }
+        let index = self
+            .pending
+            .iter()
+            .position(|request| request.attachment_id == attachment_id)?;
+        self.pending.remove(index)
+    }
+
+    fn retain_attachments(
+        &mut self,
+        retained_ids: &std::collections::HashSet<ui::cross_workspace::AttachmentId>,
+    ) -> Vec<CrossWorkspaceRestoreRequest> {
+        let mut cancelled = Vec::new();
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| !retained_ids.contains(&dispatch.request.attachment_id))
+        {
+            let attachment_id = self.in_flight.as_ref().unwrap().request.attachment_id;
+            if let Some(request) = self.cancel_attachment(attachment_id) {
+                cancelled.push(request);
+            }
+        }
+        let mut retained = std::collections::VecDeque::with_capacity(self.pending.len());
+        while let Some(request) = self.pending.pop_front() {
+            if retained_ids.contains(&request.attachment_id) {
+                retained.push_back(request);
+            } else {
+                cancelled.push(request);
+            }
+        }
+        self.pending = retained;
+        cancelled
+    }
+
+    fn retain_workspaces(
+        &mut self,
+        workspace_ids: &std::collections::HashSet<String>,
+    ) -> Vec<CrossWorkspaceRestoreRequest> {
+        let mut cancelled = Vec::new();
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| !workspace_ids.contains(&dispatch.request.workspace_id))
+        {
+            let attachment_id = self.in_flight.as_ref().unwrap().request.attachment_id;
+            if let Some(request) = self.cancel_attachment(attachment_id) {
+                cancelled.push(request);
+            }
+        }
+        let mut retained = std::collections::VecDeque::with_capacity(self.pending.len());
+        while let Some(request) = self.pending.pop_front() {
+            if workspace_ids.contains(&request.workspace_id) {
+                retained.push_back(request);
+            } else {
+                cancelled.push(request);
+            }
+        }
+        self.pending = retained;
+        cancelled
+    }
+
+    fn remove_workspace(&mut self, workspace_id: &str) -> Option<runtime::MuxPaneId> {
+        let sent_restore_pane = if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.request.workspace_id() == workspace_id)
+        {
+            let dispatch = self.in_flight.take().unwrap();
+            (dispatch.state != CrossWorkspaceRestoreDispatchState::Pending)
+                .then_some(dispatch.request.pane)
+        } else {
+            None
+        };
+        self.pending
+            .retain(|request| request.workspace_id() != workspace_id);
+        sent_restore_pane
+    }
+
+    fn cancel_visible_requests(&mut self) -> Vec<CrossWorkspaceRestoreRequest> {
+        let mut cancelled = self.pending.drain(..).collect::<Vec<_>>();
+        if let Some(attachment_id) = self
+            .in_flight
+            .as_ref()
+            .map(|dispatch| dispatch.request.attachment_id)
+            && let Some(request) = self.cancel_attachment(attachment_id)
+        {
+            cancelled.push(request);
+        }
+        cancelled
+    }
+
+    fn force_clear_for_shutdown(&mut self) {
+        self.pending.clear();
+        self.in_flight = None;
+    }
+
+    fn protects_runtime(&self, workspace_id: &str, runtime_instance: u64) -> bool {
+        self.in_flight.as_ref().is_some_and(|dispatch| {
+            dispatch.request.workspace_id == workspace_id
+                && dispatch.runtime_instance == runtime_instance
+        })
+    }
+
+    fn in_flight(&self) -> Option<&CrossWorkspaceRestoreDispatch> {
+        self.in_flight.as_ref()
+    }
+
+    fn armed_barrier(&self) -> Option<(&str, u64, u64)> {
+        let dispatch = self.in_flight.as_ref()?;
+        let CrossWorkspaceRestoreDispatchState::BarrierArmed(correlation_id) = dispatch.state
+        else {
+            return None;
+        };
+        Some((
+            dispatch.request.workspace_id(),
+            dispatch.runtime_instance,
+            correlation_id,
+        ))
+    }
+
+    fn next_request(&self) -> Option<&CrossWorkspaceRestoreRequest> {
+        self.pending.front()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.in_flight.is_none()
+    }
+
+    #[cfg(test)]
+    fn total_len(&self) -> usize {
+        self.pending.len() + usize::from(self.in_flight.is_some())
+    }
+
+    #[cfg(test)]
+    fn active_request_len(&self) -> usize {
+        self.pending.len()
+            + usize::from(
+                self.in_flight
+                    .as_ref()
+                    .is_some_and(|dispatch| !dispatch.cancelled),
+            )
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    fn in_flight_len(&self) -> usize {
+        usize::from(self.in_flight.is_some())
+    }
+
+    #[cfg(test)]
+    fn pending_attachment_ids(&self) -> Vec<ui::cross_workspace::AttachmentId> {
+        self.pending
+            .iter()
+            .map(|request| request.attachment_id)
+            .collect()
+    }
+}
+
+const DEFAULT_CROSS_WORKSPACE_PANE_WIDTH: f32 = 420.0;
+const MIN_PRIMARY_TERMINAL_WIDTH_PX: f32 = 50.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossWorkspaceOpenWarning {
+    SameWorkspace,
+    StaleTarget,
+    CapacityReached { limit: usize },
+    StaleInsertionAnchor,
+    ColdRuntimeLimit,
+    RestoreQueueBusy,
+}
+
+impl CrossWorkspaceOpenWarning {
+    fn message(self, catalog: &i18n::Catalog) -> String {
+        match self {
+            Self::SameWorkspace => {
+                catalog.t("workspace.cross_pane.open_failed.same_workspace", &[])
+            }
+            Self::StaleTarget => catalog.t("workspace.cross_pane.open_failed.stale_target", &[]),
+            Self::CapacityReached { limit } => catalog.t(
+                "workspace.cross_pane.open_failed.capacity",
+                &[("limit", &limit.to_string())],
+            ),
+            Self::StaleInsertionAnchor => {
+                catalog.t("workspace.cross_pane.open_failed.stale_anchor", &[])
+            }
+            Self::ColdRuntimeLimit => {
+                catalog.t("workspace.cross_pane.open_failed.runtime_limit", &[])
+            }
+            Self::RestoreQueueBusy => {
+                catalog.t("workspace.cross_pane.open_failed.restore_busy", &[])
+            }
+        }
+    }
+}
+
+fn cross_workspace_attach_outcome(
+    outcome: Result<ui::cross_workspace::AttachOutcome, ui::cross_workspace::InsertAnchorError>,
+    limit: usize,
+) -> Result<ui::cross_workspace::AttachOutcome, CrossWorkspaceOpenWarning> {
+    match outcome {
+        Ok(ui::cross_workspace::AttachOutcome::CapacityReached) => {
+            Err(CrossWorkspaceOpenWarning::CapacityReached { limit })
+        }
+        Ok(outcome) => Ok(outcome),
+        Err(ui::cross_workspace::InsertAnchorError::StaleAttachment(_)) => {
+            Err(CrossWorkspaceOpenWarning::StaleInsertionAnchor)
+        }
+    }
+}
+
+fn attach_live_cross_workspace_pane(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: impl Into<String>,
+    target: ui::cross_workspace::WorkspacePaneTarget,
+    limit: usize,
+    anchor: ui::cross_workspace::InsertAnchor,
+) -> Result<ui::cross_workspace::AttachOutcome, ui::cross_workspace::InsertAnchorError> {
+    if anchor == ui::cross_workspace::InsertAnchor::End {
+        return Ok(append_live_cross_workspace_pane(
+            panes,
+            primary_workspace_id,
+            target,
+            limit,
+        ));
+    }
+    panes.attach_at_anchor(
+        primary_workspace_id,
+        target,
+        DEFAULT_CROSS_WORKSPACE_PANE_WIDTH,
+        limit,
+        anchor,
+    )
+}
+
+fn append_live_cross_workspace_pane(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: impl Into<String>,
+    target: ui::cross_workspace::WorkspacePaneTarget,
+    limit: usize,
+) -> ui::cross_workspace::AttachOutcome {
+    panes.attach_right(
+        primary_workspace_id,
+        target,
+        DEFAULT_CROSS_WORKSPACE_PANE_WIDTH,
+        limit,
+    )
+}
+
+fn switch_cross_workspace_pane_layout(
+    current_primary_workspace_id: &str,
+    target_primary_workspace_id: &str,
+    active: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    parked: &mut std::collections::HashMap<String, ui::cross_workspace::CrossWorkspacePaneState>,
+    limit: usize,
+) {
+    if current_primary_workspace_id == target_primary_workspace_id {
+        return;
+    }
+    let current = std::mem::take(active);
+    if current.attachments().is_empty() {
+        parked.remove(current_primary_workspace_id);
+    } else {
+        parked.insert(current_primary_workspace_id.to_owned(), current);
+    }
+    *active = parked
+        .remove(target_primary_workspace_id)
+        .unwrap_or_default();
+    let _ = enforce_cross_workspace_capacity_non_destructive(
+        active,
+        limit.clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES),
+    );
+}
+
+fn remove_workspace_attachments(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    workspace_id: &str,
+) {
+    let attachment_ids = panes
+        .attachments()
+        .iter()
+        .filter(|attachment| attachment.workspace_id() == workspace_id)
+        .map(ui::cross_workspace::AttachedPane::id)
+        .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
+        .collect::<Vec<_>>();
+    for attachment_id in attachment_ids {
+        let _ = panes.detach_attachment(attachment_id);
+    }
+}
+
+fn remove_workspace_cross_workspace_state(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    visible_ids: &mut Vec<ui::cross_workspace::AttachmentId>,
+    coordinator: &mut CrossWorkspaceRestoreCoordinator,
+    workspace_id: &str,
+) -> Option<runtime::MuxPaneId> {
+    remove_workspace_attachments(panes, workspace_id);
+    visible_ids.retain(|attachment_id| {
+        panes
+            .attachments()
+            .iter()
+            .any(|attachment| attachment.id() == *attachment_id)
+    });
+    coordinator.remove_workspace(workspace_id)
+}
+
+fn remove_workspace_cross_workspace_layouts(
+    active: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    parked: &mut std::collections::HashMap<String, ui::cross_workspace::CrossWorkspacePaneState>,
+    visible_ids: &mut Vec<ui::cross_workspace::AttachmentId>,
+    coordinator: &mut CrossWorkspaceRestoreCoordinator,
+    workspace_id: &str,
+) -> Option<runtime::MuxPaneId> {
+    let sent_restore_pane =
+        remove_workspace_cross_workspace_state(active, visible_ids, coordinator, workspace_id);
+    parked.remove(workspace_id);
+    for panes in parked.values_mut() {
+        remove_workspace_attachments(panes, workspace_id);
+    }
+    parked.retain(|_, panes| !panes.attachments().is_empty());
+    sent_restore_pane
+}
+
+fn clear_primary_cross_workspace_layout(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    visible_ids: &mut Vec<ui::cross_workspace::AttachmentId>,
+    coordinator: &mut CrossWorkspaceRestoreCoordinator,
+) {
+    let retained = std::collections::HashSet::new();
+    let _ = coordinator.retain_attachments(&retained);
+    let _ = panes.enforce_capacity(0);
+    visible_ids.clear();
+}
+
+fn apply_restore_outcome(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    outcome: RestoreBarrierOutcome,
+) -> bool {
+    match outcome {
+        RestoreBarrierOutcome::Promote(completion) => {
+            panes.promote_restoring(completion.attachment_id, completion.target)
+        }
+        RestoreBarrierOutcome::Failed(request) => {
+            let _ = panes.detach_attachment(request.attachment_id());
+            false
+        }
+        RestoreBarrierOutcome::Ignored(_) => false,
+    }
+}
+
+fn attach_cold_cross_workspace_pane(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: impl Into<String>,
+    request: ui::cross_workspace::PersistedPaneRequest,
+    limit: usize,
+    anchor: ui::cross_workspace::InsertAnchor,
+) -> Result<ui::cross_workspace::AttachOutcome, ui::cross_workspace::InsertAnchorError> {
+    if anchor == ui::cross_workspace::InsertAnchor::End {
+        return Ok(append_cold_cross_workspace_pane(
+            panes,
+            primary_workspace_id,
+            request,
+            limit,
+        ));
+    }
+    panes.insert_restoring_at_anchor(
+        primary_workspace_id,
+        request,
+        DEFAULT_CROSS_WORKSPACE_PANE_WIDTH,
+        limit,
+        anchor,
+    )
+}
+
+fn append_cold_cross_workspace_pane(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: impl Into<String>,
+    request: ui::cross_workspace::PersistedPaneRequest,
+    limit: usize,
+) -> ui::cross_workspace::AttachOutcome {
+    panes.append_restoring(
+        primary_workspace_id,
+        request,
+        DEFAULT_CROSS_WORKSPACE_PANE_WIDTH,
+        limit,
+    )
+}
+
+fn enforce_cross_workspace_capacity_non_destructive(
+    panes: &mut ui::cross_workspace::CrossWorkspacePaneState,
+    limit: usize,
+) -> Vec<ui::cross_workspace::DetachDecision> {
+    panes.enforce_capacity(limit)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripSurface {
+    Primary,
+    Attached(ui::cross_workspace::AttachmentId),
+}
+
+#[cfg(test)]
+fn strip_surface_order(panes: &ui::cross_workspace::CrossWorkspacePaneState) -> Vec<StripSurface> {
+    std::iter::once(StripSurface::Primary)
+        .chain(
+            panes
+                .attachments()
+                .iter()
+                .map(|pane| StripSurface::Attached(pane.id())),
+        )
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisibleRuntimeIdentity {
+    workspace_id: String,
+    runtime_instance: u64,
+}
+
+impl VisibleRuntimeIdentity {
+    fn new(workspace_id: impl Into<String>, runtime_instance: u64) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            runtime_instance,
+        }
+    }
+
+    fn matches(&self, workspace_id: &str, runtime_instance: u64) -> bool {
+        self.workspace_id == workspace_id && self.runtime_instance == runtime_instance
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisibleRuntimeGroup {
+    identity: VisibleRuntimeIdentity,
+    attachment_ids: Vec<ui::cross_workspace::AttachmentId>,
+}
+
+#[derive(Clone, Debug)]
+struct CrossWorkspaceRenderPane {
+    id: ui::cross_workspace::AttachmentId,
+    target: Option<ui::cross_workspace::WorkspacePaneTarget>,
+    width_px: f32,
+    render_state: ui::cross_workspace::AttachedRenderState,
+    workspace_label: String,
+    display_title: String,
+    identity_color: egui::Color32,
+}
+
+fn session_pane_drop_interaction(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    anchor: ui::cross_workspace::InsertAnchor,
+    label: &str,
+) -> Option<(
+    ui::file_tree::SessionRowTarget,
+    ui::cross_workspace::InsertAnchor,
+)> {
+    let response = ui.interact(rect, id, egui::Sense::hover());
+    if response
+        .dnd_hover_payload::<ui::file_tree::SessionRowDragPayload>()
+        .is_some()
+    {
+        ui::workspace::paint_session_pane_drop_feedback(ui, rect, label);
+    }
+    response
+        .dnd_release_payload::<ui::file_tree::SessionRowDragPayload>()
+        .map(|payload| (payload.target().clone(), anchor))
+}
+
+fn group_visible_cross_workspace_panes(
+    panes: &ui::cross_workspace::CrossWorkspacePaneState,
+    visible_ids: &[ui::cross_workspace::AttachmentId],
+    mut exact_runtime: impl FnMut(&ui::cross_workspace::WorkspacePaneTarget) -> bool,
+) -> Vec<VisibleRuntimeGroup> {
+    let mut groups: Vec<VisibleRuntimeGroup> =
+        Vec::with_capacity(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
+    for attachment in panes
+        .attachments()
+        .iter()
+        .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
+    {
+        if !visible_ids.contains(&attachment.id()) {
+            continue;
+        }
+        let ui::cross_workspace::AttachedPaneSource::Live(target) = attachment.source() else {
+            continue;
+        };
+        if !exact_runtime(target) {
+            continue;
+        }
+        let group = groups.iter_mut().find(|group| {
+            group
+                .identity
+                .matches(&target.workspace_id, target.runtime_instance)
+        });
+        if let Some(group) = group {
+            group.attachment_ids.push(attachment.id());
+        } else {
+            let mut attachment_ids =
+                Vec::with_capacity(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
+            attachment_ids.push(attachment.id());
+            groups.push(VisibleRuntimeGroup {
+                identity: VisibleRuntimeIdentity::new(
+                    &target.workspace_id,
+                    target.runtime_instance,
+                ),
+                attachment_ids,
+            });
+        }
+    }
+    groups
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FrameTerminalOwner {
+    Primary,
+    Attached(ui::cross_workspace::AttachmentId),
+    #[default]
+    None,
+}
+
+fn frame_terminal_owner(
+    panes: &ui::cross_workspace::CrossWorkspacePaneState,
+    terminal_visible: bool,
+    visible_ids: &[ui::cross_workspace::AttachmentId],
+    mut exact_runtime: impl FnMut(&ui::cross_workspace::WorkspacePaneTarget) -> bool,
+) -> FrameTerminalOwner {
+    if !terminal_visible {
+        return FrameTerminalOwner::None;
+    }
+    match panes.focused() {
+        ui::cross_workspace::FocusedSurface::Primary => FrameTerminalOwner::Primary,
+        ui::cross_workspace::FocusedSurface::Attached(id) => panes
+            .attachments()
+            .iter()
+            .find(|attachment| attachment.id() == id && visible_ids.contains(&id))
+            .filter(|attachment| {
+                panes.render_state_for(id) == Some(ui::cross_workspace::AttachedRenderState::Live)
+                    && attachment.live_target().is_some_and(&mut exact_runtime)
+            })
+            .map(|_| FrameTerminalOwner::Attached(id))
+            .unwrap_or(FrameTerminalOwner::None),
+    }
+}
+
+fn suppress_terminal_owner_during_pointer_focus(
+    owner: FrameTerminalOwner,
+    pointer_transition: bool,
+    pointer_pos: Option<egui::Pos2>,
+    terminal_rect: egui::Rect,
+) -> FrameTerminalOwner {
+    if pointer_transition_inside_rect(Some(terminal_rect), pointer_transition, pointer_pos) {
+        FrameTerminalOwner::None
+    } else {
+        owner
+    }
+}
+
+fn pointer_transition_inside_rect(
+    rect: Option<egui::Rect>,
+    pointer_transition: bool,
+    pointer_pos: Option<egui::Pos2>,
+) -> bool {
+    pointer_transition
+        && rect.is_some_and(|rect| pointer_pos.is_some_and(|position| rect.contains(position)))
+}
+
+fn runtime_visible_attachment_ids(
+    central_terminal_visible: bool,
+    visible_ids: &[ui::cross_workspace::AttachmentId],
+) -> &[ui::cross_workspace::AttachmentId] {
+    if central_terminal_visible {
+        visible_ids
+    } else {
+        &[]
+    }
+}
+
+fn owner_attached_target(
+    owner: FrameTerminalOwner,
+    panes: &ui::cross_workspace::CrossWorkspacePaneState,
+) -> Option<&ui::cross_workspace::WorkspacePaneTarget> {
+    let FrameTerminalOwner::Attached(id) = owner else {
+        return None;
+    };
+    panes
+        .attachments()
+        .iter()
+        .find(|attachment| attachment.id() == id)
+        .and_then(ui::cross_workspace::AttachedPane::live_target)
+}
+
+fn terminal_runtime_identity_for_owner(
+    owner: FrameTerminalOwner,
+    panes: &ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: &str,
+    primary_runtime_instance: u64,
+) -> Option<(String, u64)> {
+    match owner {
+        FrameTerminalOwner::Primary => {
+            Some((primary_workspace_id.to_owned(), primary_runtime_instance))
+        }
+        FrameTerminalOwner::Attached(_) => owner_attached_target(owner, panes)
+            .map(|target| (target.workspace_id.clone(), target.runtime_instance)),
+        FrameTerminalOwner::None => None,
+    }
+}
+
+fn focused_composer_target_for_owner(
+    owner: FrameTerminalOwner,
+    panes: &ui::cross_workspace::CrossWorkspacePaneState,
+    primary_workspace_id: &str,
+    primary_runtime_instance: u64,
+    primary_session: Option<runtime::SessionId>,
+) -> Option<AppTerminalInputTarget> {
+    match owner {
+        FrameTerminalOwner::Primary => {
+            primary_session.map(|session| AppTerminalInputTarget::Primary {
+                workspace_id: primary_workspace_id.to_owned(),
+                runtime_instance: primary_runtime_instance,
+                session,
+            })
+        }
+        FrameTerminalOwner::Attached(_) => owner_attached_target(owner, panes)
+            .cloned()
+            .map(AppTerminalInputTarget::Attached),
+        FrameTerminalOwner::None => None,
+    }
+}
+
+fn cross_workspace_restore_command(pane: runtime::MuxPaneId) -> runtime::RuntimeCommand {
+    runtime::RuntimeCommand::RestoreWorkspacePane { pane }
 }
 
 struct AppDotenvResource {
@@ -5447,62 +6487,8 @@ struct WorkspaceRuntime {
     event_overflow_pending: bool,
     /// active receiver 재구독 뒤 전체 mux/viewport snapshot 재전송 명령이 아직 남아 있다.
     event_resync_pending: bool,
-}
-
-#[derive(Clone)]
-struct WorkspaceGitLabelCacheEntry {
-    checked_at: std::time::Instant,
-    label: Option<String>,
-}
-
-fn workspace_git_label(path: &str) -> Option<String> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<String, WorkspaceGitLabelCacheEntry>,
-        >,
-    > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Ok(entries) = cache.lock()
-        && let Some(entry) = entries.get(path)
-        && entry.checked_at.elapsed() < std::time::Duration::from_secs(2)
-    {
-        return entry.label.clone();
-    }
-
-    let root = std::path::Path::new(path);
-    let dot_git = root.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        Some(dot_git)
-    } else {
-        std::fs::read_to_string(&dot_git).ok().and_then(|contents| {
-            let relative = contents.trim().strip_prefix("gitdir:")?.trim();
-            let candidate = std::path::PathBuf::from(relative);
-            Some(if candidate.is_absolute() {
-                candidate
-            } else {
-                root.join(candidate)
-            })
-        })
-    };
-    let label = git_dir.and_then(|git_dir| {
-        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-        let head = head.trim();
-        let branch = head
-            .strip_prefix("ref: refs/heads/")
-            .map(str::to_owned)
-            .unwrap_or_else(|| head.chars().take(7).collect());
-        Some(branch)
-    });
-    if let Ok(mut entries) = cache.lock() {
-        entries.insert(
-            path.to_owned(),
-            WorkspaceGitLabelCacheEntry {
-                checked_at: std::time::Instant::now(),
-                label: label.clone(),
-            },
-        );
-    }
-    label
+    /// replay cap overflow 뒤 다음 Warm→Active full snapshot 전환으로 보정해야 한다.
+    pending_replay_resync: bool,
 }
 
 fn claude_usage_snapshot() -> Option<(u8, u8)> {
@@ -5562,19 +6548,13 @@ pub(crate) fn top_provider_usage(
         );
     }
 
-    fn provider(
-        ui: &mut egui::Ui,
-        name: &str,
-        accent: egui::Color32,
-        usage: Option<(u8, u8)>,
-    ) {
+    fn provider(ui: &mut egui::Ui, name: &str, accent: egui::Color32, usage: Option<(u8, u8)>) {
         let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
         crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, name);
 
         let five_hour = usage.map(|value| value.0);
         let weekly = usage.map(|value| value.1);
-        let five_hour_label =
-            five_hour.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
+        let five_hour_label = five_hour.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
         let weekly_label = weekly.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
         ui.label(
             egui::RichText::new(five_hour_label)
@@ -5584,7 +6564,8 @@ pub(crate) fn top_provider_usage(
         );
 
         let (bar, _) = ui.allocate_exact_size(egui::vec2(42.0, 6.0), egui::Sense::hover());
-        ui.painter().rect_filled(bar, 3.0, egui::Color32::from_gray(42));
+        ui.painter()
+            .rect_filled(bar, 3.0, egui::Color32::from_gray(42));
         if let Some(five_hour) = five_hour {
             let filled = egui::Rect::from_min_max(
                 bar.min,
@@ -5612,22 +6593,17 @@ pub(crate) fn top_provider_usage(
         |ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
             provider(
-                  ui,
-                  "Claude",
-                  egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-                  claude_usage,
-              );
-              ui.add_space(4.0);
-              separator(ui, 18.0);
-              ui.add_space(4.0);
-              provider(
-                  ui,
-                  "Codex",
-                  ui.visuals().hyperlink_color,
-                  codex_usage,
-              );
-          },
-      );
+                ui,
+                "Claude",
+                egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+                claude_usage,
+            );
+            ui.add_space(4.0);
+            separator(ui, 18.0);
+            ui.add_space(4.0);
+            provider(ui, "Codex", ui.visuals().hyperlink_color, codex_usage);
+        },
+    );
 }
 
 impl WorkspaceRuntime {
@@ -5980,6 +6956,8 @@ pub struct App {
     runtime_stream_warning: bool,
     /// live warm hard cap을 넘기는 workspace 전환을 거부했을 때 대상 표시명.
     warm_limit_warning: Option<String>,
+    /// 다른 workspace Pane 열기 거부 사유. 마지막 한 건만 보관하는 유계 데스크톱 경고다.
+    cross_workspace_open_warning: Option<CrossWorkspaceOpenWarning>,
     /// 폰(미러 진입 — I1b-2)이 보낸 워크스페이스 전환 요청 큐. 웹 스레드가 push하고 egui
     /// 스레드가 ui() 시작에서 drain해 switch_workspace로 넘긴다(App은 egui 스레드 소유).
     web_switch_queue: Arc<std::sync::Mutex<Vec<String>>>,
@@ -6127,6 +7105,24 @@ pub struct App {
     /// 전 워크스페이스 × 세션의 String/Vec 재조립을 피한다. 리소스 샘플 주기(2s)보다
     /// 짧아 표시 신선도는 유지된다.
     activity_rows_cache: Option<(std::time::Instant, ui::activity::ActivitySnapshot)>,
+    /// 명시적 포트 열기/새로고침 전에는 thread/channel/process가 없는 lazy worker다.
+    port_worker: crate::port_inventory::PortInventoryWorker,
+    /// 마지막으로 현재 세대에서 승인된 bounded 포트 스냅샷.
+    port_snapshot: Option<crate::port_inventory::PortSnapshot>,
+    /// 사용자가 요청한 최신 포트 작업 세대. 오래된 결과는 이 값으로 폐기한다.
+    port_generation: u64,
+    /// worker가 소유한 단 한 건의 작업 세대. 결과를 받으면 즉시 비운다.
+    port_in_flight_generation: Option<u64>,
+    /// worker가 바쁠 때 보존하는 최신 known-unsent 작업 한 건.
+    pending_port_job: Option<crate::port_inventory::PortJob>,
+    /// worker 생성/채널 실패 뒤 매 프레임 재시도하지 않도록 새 사용자 요청까지 차단한다.
+    port_admission_blocked: bool,
+    /// 로컬 runtime이 마지막으로 재검증해 보고한 연결되지 않은 세션 수.
+    unattached_counts: std::collections::HashMap<String, u16>,
+    /// local runtime별 최신 유지보수 명령 한 건만 보존하는 bounded 순차 큐다.
+    pending_resource_maintenance: std::collections::VecDeque<ResourceMaintenanceTarget>,
+    /// Render가 반환한 상태바 intent 한 건. host/runtime 작업은 다음 logic tick에서만 한다.
+    pending_status_bar_intent: Option<ui::agent_terminal::StatusBarIntent>,
     /// 홈 업데이트 피드 수신(Claude/OpenAI 상태 5분, 공지/HF/Grok 4시간) + 최신
     /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
     status_feed_rx: crate::status_feed::StatusFeedReceiver,
@@ -6198,11 +7194,23 @@ pub struct App {
     active: WorkspaceRuntime,
     /// Next concrete runtime identity; zero is never issued.
     next_runtime_instance: u64,
+    next_restore_barrier: DurableBarrierCorrelationAllocator,
     /// warm workspace들 (전환으로 물러났지만 워커는 계속 실행 — §14.1 Warm). 이벤트는
     /// drain만 하고(채널 backup 방지) 렌더/알림은 안 한다. 재활성 시 즉시 복귀.
     warm: std::collections::HashMap<String, WorkspaceRuntime>,
     /// warm LRU 순서 (앞이 가장 오래됨) — max_warm 초과 시 앞에서부터 Suspended(shutdown).
     warm_order: Vec<String>,
+    /// 현재 활성 workspace가 소유한 화면 오른쪽에 붙인 exact warm pane. 런타임과 mux
+    /// 소유권은 이동하지 않으며 이 상태는 메모리에만 존재한다.
+    cross_workspace_pane: ui::cross_workspace::CrossWorkspacePaneState,
+    /// 비활성 workspace별 화면 분할 구성. 세션/스크롤백을 복제하지 않고 최대 pane 6개의
+    /// 식별자·너비만 보관하며, 해당 workspace 복귀 시 활성 상태와 move-swap한다.
+    parked_cross_workspace_panes:
+        std::collections::HashMap<String, ui::cross_workspace::CrossWorkspacePaneState>,
+    cross_workspace_restore: CrossWorkspaceRestoreCoordinator,
+    visible_cross_workspace_attachments: Vec<ui::cross_workspace::AttachmentId>,
+    frame_terminal_owner: FrameTerminalOwner,
+    last_multi_pane_terminal_rect: Option<egui::Rect>,
     egui_ctx: egui::Context,
     db_path: PathBuf,
     logs_base: PathBuf,
@@ -6215,7 +7223,8 @@ pub struct App {
     /// refresh_workspaces에서 한 쿼리로 갱신한다.
     /// 워크스페이스별 영속 pane snapshot — (raw 제목, 세션 cwd). cwd는 기본 제목
     /// ("셸 N")을 프로젝트명으로 표시하는 데 쓴다(활성 워크스페이스와 같은 규칙).
-    persisted_activity_panes: std::collections::HashMap<String, Vec<(String, String)>>,
+    persisted_activity_panes:
+        std::collections::HashMap<String, Vec<storage::PersistedActivityPane>>,
     /// 옵션2: 활성 세션별 에이전트 transcript 활동(working/idle) — 레일 상태에 반영.
     agent_activity:
         std::collections::HashMap<runtime::SessionId, crate::agent_transcript::AgentActivity>,
@@ -6280,7 +7289,7 @@ pub struct App {
     resumed_panes: std::collections::HashSet<String>,
     resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
-    pending_focus: Option<(String, runtime::SessionId)>,
+    pending_focus: Option<(String, u64, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
     pending_shutdowns: PendingShutdownRegistry,
@@ -6370,6 +7379,26 @@ fn workspace_visible_after_close(
     workspace_id: &str,
 ) -> bool {
     !closed.contains_key(workspace_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceCloseDisposition {
+    Ignore,
+    Confirm,
+    CloseNow,
+}
+
+fn workspace_close_disposition(
+    confirmation_enabled: bool,
+    has_closeable_sessions: bool,
+) -> WorkspaceCloseDisposition {
+    if !has_closeable_sessions {
+        WorkspaceCloseDisposition::Ignore
+    } else if confirmation_enabled {
+        WorkspaceCloseDisposition::Confirm
+    } else {
+        WorkspaceCloseDisposition::CloseNow
+    }
 }
 
 /// hook 상태에서 "새 턴 시작"으로 볼 전이만 고른다 — 직전에 막혀 있던(대기 또는 완료)
@@ -6598,6 +7627,7 @@ enum AppHostIoAction {
     Connector(connector_service::HostAction),
     Workspace {
         workspace_id: String,
+        runtime_instance: u64,
         intent: ui::workspace::WorkspaceIoIntent,
     },
     FileTree(ui::file_tree::FileTreeIoIntent),
@@ -6639,6 +7669,11 @@ enum AppControllerAction {
 enum WorkspaceControllerAction {
     OpenAgentLauncher,
     SwitchWorkspace(String),
+    OpenSessionBeside {
+        target: ui::file_tree::SessionRowTarget,
+        anchor: ui::cross_workspace::InsertAnchor,
+    },
+    DetachWorkspacePane(ui::cross_workspace::AttachmentId),
     FocusSession {
         workspace_id: String,
         tab: runtime::MuxTabId,
@@ -6656,7 +7691,8 @@ enum WorkspaceControllerAction {
     ClosePane(runtime::MuxPaneId),
     CloseWorkspace(String),
     FocusPty {
-        switch_workspace: Option<String>,
+        workspace_id: String,
+        runtime_instance: Option<u64>,
         session: runtime::SessionId,
     },
     OpenStructured {
@@ -6667,8 +7703,199 @@ enum WorkspaceControllerAction {
         summary: String,
         body: String,
     },
-    ComposerPrompt(Arc<str>),
+    ComposerPrompt {
+        target: AppTerminalInputTarget,
+        prompt: Arc<str>,
+    },
     SyncDotenv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceMaintenanceAction {
+    InspectUnattached,
+    KillUnattached,
+    KillSession(runtime::SessionId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResourceMaintenanceTarget {
+    workspace_id: String,
+    runtime_instance: u64,
+    action: ResourceMaintenanceAction,
+}
+
+fn resource_target_matches_runtime(
+    target: &ResourceMaintenanceTarget,
+    workspace_id: &str,
+    runtime_instance: u64,
+) -> bool {
+    target.workspace_id == workspace_id && target.runtime_instance == runtime_instance
+}
+
+fn workspace_focus_target_matches_runtime(
+    target_workspace_id: &str,
+    target_runtime_instance: Option<u64>,
+    runtime_workspace_id: &str,
+    runtime_instance: u64,
+) -> bool {
+    target_workspace_id == runtime_workspace_id
+        && target_runtime_instance.is_none_or(|expected| expected == runtime_instance)
+}
+
+fn invalidate_resource_projection(
+    activity_rows_cache: &mut Option<(std::time::Instant, ui::activity::ActivitySnapshot)>,
+) {
+    *activity_rows_cache = None;
+}
+
+fn stage_resource_maintenance(
+    queue: &mut std::collections::VecDeque<ResourceMaintenanceTarget>,
+    target: ResourceMaintenanceTarget,
+) -> bool {
+    if let Some(existing) = queue
+        .iter_mut()
+        .find(|existing| existing.workspace_id == target.workspace_id)
+    {
+        *existing = target;
+        return true;
+    }
+    if queue.len() >= ui::activity::MAX_ACTIVITY_WORKSPACES {
+        return false;
+    }
+    queue.push_back(target);
+    true
+}
+
+fn apply_unattached_events(
+    counts: &mut std::collections::HashMap<String, u16>,
+    workspace_id: &str,
+    events: &[runtime::RuntimeEvent],
+) -> bool {
+    let mut updated = None;
+    for event in events {
+        match event {
+            runtime::RuntimeEvent::UnattachedSessionsInspected { count } => {
+                updated = Some(*count);
+            }
+            runtime::RuntimeEvent::UnattachedSessionsKilled { .. } => {
+                updated = Some(0);
+            }
+            _ => {}
+        }
+    }
+    let Some(count) = updated else {
+        return false;
+    };
+    if counts.contains_key(workspace_id) || counts.len() < ui::activity::MAX_ACTIVITY_WORKSPACES {
+        counts.insert(workspace_id.to_owned(), count);
+        true
+    } else {
+        false
+    }
+}
+
+fn prune_resource_tracking(
+    counts: &mut std::collections::HashMap<String, u16>,
+    queue: &mut std::collections::VecDeque<ResourceMaintenanceTarget>,
+    mut retain: impl FnMut(&str) -> bool,
+) {
+    counts.retain(|workspace_id, _| retain(workspace_id));
+    queue.retain(|target| retain(&target.workspace_id));
+}
+
+fn next_port_generation(generation: &mut u64) -> u64 {
+    *generation = generation.wrapping_add(1).max(1);
+    *generation
+}
+
+fn next_port_scan_job(
+    generation: &mut u64,
+    roots: Arc<[crate::port_inventory::PortWorkspaceRoot]>,
+) -> crate::port_inventory::PortJob {
+    crate::port_inventory::PortJob::Scan {
+        generation: next_port_generation(generation),
+        roots,
+    }
+}
+
+fn next_port_termination_job(
+    generation: &mut u64,
+    roots: Arc<[crate::port_inventory::PortWorkspaceRoot]>,
+    target: crate::port_inventory::PortTerminationTarget,
+) -> crate::port_inventory::PortJob {
+    crate::port_inventory::PortJob::Terminate {
+        generation: next_port_generation(generation),
+        roots,
+        target,
+    }
+}
+
+fn port_job_generation(job: &crate::port_inventory::PortJob) -> u64 {
+    match job {
+        crate::port_inventory::PortJob::Scan { generation, .. }
+        | crate::port_inventory::PortJob::Terminate { generation, .. } => *generation,
+    }
+}
+
+fn stage_pending_port_job(
+    pending: &mut Option<crate::port_inventory::PortJob>,
+    job: crate::port_inventory::PortJob,
+) {
+    *pending = Some(job);
+}
+
+fn prepare_port_job_submission(
+    pending: &mut Option<crate::port_inventory::PortJob>,
+    snapshot: &mut Option<crate::port_inventory::PortSnapshot>,
+    current_generation: u64,
+    job_generation: u64,
+    explicit: bool,
+) -> bool {
+    if explicit {
+        *pending = None;
+        *snapshot = None;
+    }
+    job_generation == current_generation
+}
+
+fn stage_status_bar_intent(
+    pending: &mut Option<ui::agent_terminal::StatusBarIntent>,
+    intent: Option<ui::agent_terminal::StatusBarIntent>,
+) -> bool {
+    let Some(intent) = intent else {
+        return false;
+    };
+    *pending = Some(intent);
+    true
+}
+
+fn apply_port_outcome_if_current(
+    cached: &mut Option<crate::port_inventory::PortSnapshot>,
+    current_generation: u64,
+    outcome: crate::port_inventory::PortOutcome,
+) -> bool {
+    let result = match outcome {
+        crate::port_inventory::PortOutcome::Scanned(result)
+        | crate::port_inventory::PortOutcome::Terminated(result) => result,
+    };
+    let Ok(snapshot) = result else {
+        return false;
+    };
+    if snapshot.generation != current_generation {
+        return false;
+    }
+    *cached = Some(snapshot);
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AppTerminalInputTarget {
+    Primary {
+        workspace_id: String,
+        runtime_instance: u64,
+        session: runtime::SessionId,
+    },
+    Attached(ui::cross_workspace::WorkspacePaneTarget),
 }
 
 #[derive(Clone)]
@@ -6682,6 +7909,7 @@ enum AppHostIoCompletion {
     Dispatch(connector_contract::ConnectorIntent),
     Workspace {
         workspace_id: String,
+        runtime_instance: u64,
         completion: ui::workspace::WorkspaceIoCompletion,
     },
     FileTree(ui::file_tree::FileTreeIoCompletion),
@@ -6714,11 +7942,13 @@ enum AppHostIoFallback {
     Cancel(connector_contract::OperationId),
     WorkspacePath {
         workspace_id: String,
+        runtime_instance: u64,
         operation: ui::workspace::WorkspaceIoOperation,
         generation: u64,
     },
     WorkspaceClipboard {
         workspace_id: String,
+        runtime_instance: u64,
         operation: ui::workspace::WorkspaceIoOperation,
         generation: u64,
     },
@@ -6764,6 +7994,7 @@ impl AppHostIoFallback {
             }) => Self::None,
             AppHostIoAction::Workspace {
                 workspace_id,
+                runtime_instance,
                 intent:
                     ui::workspace::WorkspaceIoIntent::ResolvePath {
                         operation,
@@ -6772,11 +8003,13 @@ impl AppHostIoFallback {
                     },
             } => Self::WorkspacePath {
                 workspace_id: workspace_id.clone(),
+                runtime_instance: *runtime_instance,
                 operation: *operation,
                 generation: *generation,
             },
             AppHostIoAction::Workspace {
                 workspace_id,
+                runtime_instance,
                 intent:
                     ui::workspace::WorkspaceIoIntent::ReadTerminalClipboard {
                         operation,
@@ -6784,6 +8017,7 @@ impl AppHostIoFallback {
                     },
             } => Self::WorkspaceClipboard {
                 workspace_id: workspace_id.clone(),
+                runtime_instance: *runtime_instance,
                 operation: *operation,
                 generation: *generation,
             },
@@ -6832,10 +8066,12 @@ impl AppHostIoFallback {
             ),
             Self::WorkspacePath {
                 workspace_id,
+                runtime_instance,
                 operation,
                 generation,
             } => AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::PathResolved {
                     operation,
                     generation,
@@ -6844,10 +8080,12 @@ impl AppHostIoFallback {
             },
             Self::WorkspaceClipboard {
                 workspace_id,
+                runtime_instance,
                 operation,
                 generation,
             } => AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::TerminalClipboardRead {
                     operation,
                     generation,
@@ -7786,6 +9024,7 @@ fn run_app_host_io(
     match action {
         AppHostIoAction::Workspace {
             workspace_id,
+            runtime_instance,
             intent:
                 ui::workspace::WorkspaceIoIntent::ResolvePath {
                     operation,
@@ -7801,6 +9040,7 @@ fn run_app_host_io(
                 .or_else(|| pid.and_then(platform::process_cwd));
             AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::PathResolved {
                     operation,
                     generation,
@@ -7810,6 +9050,7 @@ fn run_app_host_io(
         }
         AppHostIoAction::Workspace {
             workspace_id,
+            runtime_instance,
             intent:
                 ui::workspace::WorkspaceIoIntent::ReadTerminalClipboard {
                     operation,
@@ -7823,6 +9064,7 @@ fn run_app_host_io(
             let text = ui::clipboard_image::read_clipboard_text();
             AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion: ui::workspace::WorkspaceIoCompletion::TerminalClipboardRead {
                     operation,
                     generation,
@@ -8092,14 +9334,20 @@ impl App {
             }
             AppHostIoCompletion::Workspace {
                 workspace_id,
+                runtime_instance,
                 completion,
             } => {
-                let runtime = if self.active.id == workspace_id {
-                    Some(&mut self.active)
-                } else {
-                    self.warm.get_mut(&workspace_id)
-                };
-                if let Some(runtime) = runtime {
+                if let Some(runtime) =
+                    self.runtime_by_instance_mut(runtime_instance)
+                        .filter(|runtime| {
+                            workspace_runtime_identity_matches(
+                                &runtime.id,
+                                runtime.runtime_instance,
+                                &workspace_id,
+                                runtime_instance,
+                            )
+                        })
+                {
                     runtime.workspace_ui.complete_io(completion);
                 }
             }
@@ -8269,48 +9517,75 @@ impl App {
         if !self.try_apply_pending_folder_picker_completion() {
             return;
         }
-        let action =
-            self.connector_coordinator
-                .try_take_host_action()
-                .map(AppHostIoAction::Connector)
-                .or_else(|| self.pending_app_host_action.take())
-                .or_else(|| {
-                    self.active.workspace_ui.take_io_intent().map(|intent| {
-                        AppHostIoAction::Workspace {
-                            workspace_id: self.active.id.clone(),
-                            intent,
-                        }
-                    })
+        let action = self
+            .connector_coordinator
+            .try_take_host_action()
+            .map(AppHostIoAction::Connector)
+            .or_else(|| self.pending_app_host_action.take())
+            .or_else(|| {
+                let active = match self.frame_terminal_owner {
+                    FrameTerminalOwner::Primary => {
+                        self.active.workspace_ui.take_io_intent().map(|intent| {
+                            (self.active.id.clone(), self.active.runtime_instance, intent)
+                        })
+                    }
+                    FrameTerminalOwner::Attached(_) | FrameTerminalOwner::None => None,
+                };
+                let attached =
+                    owner_attached_target(self.frame_terminal_owner, &self.cross_workspace_pane)
+                        .cloned()
+                        .and_then(|target| {
+                            self.warm
+                                .get_mut(&target.workspace_id)
+                                .filter(|runtime| {
+                                    runtime.runtime_instance == target.runtime_instance
+                                })
+                                .and_then(|runtime| runtime.workspace_ui.take_io_intent())
+                                .and_then(|intent| match self.frame_terminal_owner {
+                                    FrameTerminalOwner::Attached(attachment_id) => Some((
+                                        attachment_id,
+                                        target.workspace_id,
+                                        target.runtime_instance,
+                                        intent,
+                                    )),
+                                    FrameTerminalOwner::Primary | FrameTerminalOwner::None => None,
+                                })
+                        });
+                select_workspace_host_io_action_for_owner(
+                    self.frame_terminal_owner,
+                    active,
+                    attached,
+                )
+            })
+            .or_else(|| {
+                self.file_tree
+                    .as_mut()
+                    .and_then(ui::file_tree::FileTreeUi::take_io_intent)
+                    .map(AppHostIoAction::FileTree)
+            })
+            .or_else(|| {
+                self.pending_file_tree_maintenance
+                    .take()
+                    .map(AppHostIoAction::FileTreeMaintenance)
+            })
+            .or_else(|| {
+                self.inbox_waiting_ui
+                    .take_preview_intent()
+                    .map(AppHostIoAction::InboxPreview)
+            })
+            .or_else(|| {
+                self.diff_panel_ui
+                    .take_io_intent()
+                    .map(AppHostIoAction::Diff)
+            })
+            .or_else(|| {
+                self.pending_composer_history.take().map(|history| {
+                    AppHostIoAction::PersistComposerHistory {
+                        path: self.composer_history_path.clone(),
+                        history,
+                    }
                 })
-                .or_else(|| {
-                    self.file_tree
-                        .as_mut()
-                        .and_then(ui::file_tree::FileTreeUi::take_io_intent)
-                        .map(AppHostIoAction::FileTree)
-                })
-                .or_else(|| {
-                    self.pending_file_tree_maintenance
-                        .take()
-                        .map(AppHostIoAction::FileTreeMaintenance)
-                })
-                .or_else(|| {
-                    self.inbox_waiting_ui
-                        .take_preview_intent()
-                        .map(AppHostIoAction::InboxPreview)
-                })
-                .or_else(|| {
-                    self.diff_panel_ui
-                        .take_io_intent()
-                        .map(AppHostIoAction::Diff)
-                })
-                .or_else(|| {
-                    self.pending_composer_history.take().map(|history| {
-                        AppHostIoAction::PersistComposerHistory {
-                            path: self.composer_history_path.clone(),
-                            history,
-                        }
-                    })
-                });
+            });
         let Some(action) = action else {
             return;
         };
@@ -8571,6 +9846,10 @@ impl App {
             )
         };
         let status_feed_rx_channel = crate::status_feed::spawn(egui_ctx.clone());
+        let port_worker = {
+            let wake_ctx = egui_ctx.clone();
+            crate::port_inventory::worker(move || wake_ctx.request_repaint())
+        };
         let notice_translation_cache_path = db_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -8659,6 +9938,7 @@ impl App {
             ws_rename_edit: None,
             runtime_stream_warning: false,
             warm_limit_warning: None,
+            cross_workspace_open_warning: None,
             web_switch_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             web_notice: None,
             dismissed_renames: std::collections::HashSet::new(),
@@ -8748,6 +10028,15 @@ impl App {
             pending_batch_spawn: None,
             broadcast_working: std::collections::HashMap::new(),
             activity_rows_cache: None,
+            port_worker,
+            port_snapshot: None,
+            port_generation: 0,
+            port_in_flight_generation: None,
+            pending_port_job: None,
+            port_admission_blocked: false,
+            unattached_counts: std::collections::HashMap::new(),
+            pending_resource_maintenance: std::collections::VecDeque::new(),
+            pending_status_bar_intent: None,
             status_feed_rx: status_feed_rx_channel.0,
             status_feed_refresh: status_feed_rx_channel.1,
             status_feed_startup_polled: false,
@@ -8782,8 +10071,17 @@ impl App {
             startup_positioned: false,
             active,
             next_runtime_instance: 2,
+            next_restore_barrier: DurableBarrierCorrelationAllocator::default(),
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
+            cross_workspace_pane: ui::cross_workspace::CrossWorkspacePaneState::default(),
+            parked_cross_workspace_panes: std::collections::HashMap::new(),
+            cross_workspace_restore: CrossWorkspaceRestoreCoordinator::default(),
+            visible_cross_workspace_attachments: Vec::with_capacity(
+                ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES,
+            ),
+            frame_terminal_owner: FrameTerminalOwner::None,
+            last_multi_pane_terminal_rect: None,
             frame_stats: crate::perf::FrameStats::new(),
             bench,
             perf_harness_next: crate::perf::harness_enabled().then_some(0),
@@ -8971,6 +10269,7 @@ impl App {
             pending_agent_spawns: 0,
             event_overflow_pending: false,
             event_resync_pending: false,
+            pending_replay_resync: false,
         }
     }
 
@@ -9199,6 +10498,13 @@ impl App {
             tracing::warn!(workspace = %delete_id, "벤치: 활성 워크스페이스라 삭제 불가");
             return;
         }
+        let _ = remove_workspace_cross_workspace_layouts(
+            &mut self.cross_workspace_pane,
+            &mut self.parked_cross_workspace_panes,
+            &mut self.visible_cross_workspace_attachments,
+            &mut self.cross_workspace_restore,
+            delete_id,
+        );
         self.join_pending_shutdown(delete_id);
         if let Some(mut runtime) = self.warm.remove(delete_id) {
             self.close_approval_workspace(delete_id);
@@ -9461,11 +10767,12 @@ impl App {
                 cwd: cwd.clone(),
             });
         }
-        for (_, cwd) in self
+        for row in self
             .persisted_activity_panes
             .values()
             .flat_map(|panes| panes.iter())
         {
+            let cwd = &row.cwd;
             if rows.len() >= PROJECT_NAME_ITEMS_MAX {
                 break;
             }
@@ -9672,13 +10979,15 @@ impl App {
                         "agent state catalog projection rejected"
                     );
                 }
-                let mut by_workspace: std::collections::HashMap<String, Vec<(String, String)>> =
-                    std::collections::HashMap::new();
-                for (workspace_id, title, cwd) in &snapshot.activity_panes {
+                let mut by_workspace: std::collections::HashMap<
+                    String,
+                    Vec<storage::PersistedActivityPane>,
+                > = std::collections::HashMap::new();
+                for row in &snapshot.activity_panes {
                     by_workspace
-                        .entry(workspace_id.clone())
+                        .entry(row.workspace_id.clone())
                         .or_default()
-                        .push((title.clone(), cwd.clone()));
+                        .push(row.clone());
                 }
                 self.persisted_activity_panes = by_workspace;
                 self.request_project_name_projection();
@@ -10376,6 +11685,24 @@ impl App {
         self.session_cwds.get(&session).cloned()
     }
 
+    fn open_session_diff(&mut self, ctx: &egui::Context, session: runtime::SessionId) {
+        let cwd = self.cached_session_cwd(session);
+        let workspace_name = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.active.id)
+            .map(Self::workspace_display_name);
+        let session_label = self.inbox_session_label(&self.active.id, session);
+        let title = match (workspace_name, session_label) {
+            (Some(workspace), Some(session)) => format!("{workspace} · {session}"),
+            (Some(workspace), None) => workspace,
+            (None, Some(session)) => session,
+            (None, None) => String::new(),
+        };
+        self.diff_panel_ui
+            .open_for(ctx, self.active.id.clone(), session, cwd, title);
+    }
+
     /// shim PATH env — hook 토글 ON이고 shim이 설치돼 있으면 셸 PATH 앞에 주입한다.
     fn shim_shell_env(config: &Config) -> Vec<(String, String)> {
         // .env 라이브 반영(E5 ⑨): zsh ZDOTDIR 훅 — 래퍼는 항상 주입(passthrough,
@@ -10685,9 +12012,9 @@ impl App {
                                 .get(&ws.id)
                                 .into_iter()
                                 .flatten()
-                                .map(|(title, _cwd)| SessionSeed {
+                                .map(|row| SessionSeed {
                                     id: None, // 표시 전용
-                                    title: self.activity_session_name(&ws.id, title),
+                                    title: self.activity_session_name(&ws.id, &row.title),
                                     status: None,
                                     agent: None, // 절전 — 에이전트 죽음
                                     exited: false,
@@ -10823,6 +12150,7 @@ impl App {
         }
         ctx.set_theme(self.config.ui.theme.to_egui());
         self.sync_agent_hooks();
+        self.enforce_cross_workspace_capacity();
         self.broadcast_terminal_cache_policy();
         if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
             self.file_tree = self
@@ -10864,6 +12192,12 @@ impl App {
             }
             WorkspaceControllerAction::SwitchWorkspace(workspace_id) => {
                 self.switch_workspace(&workspace_id);
+            }
+            WorkspaceControllerAction::OpenSessionBeside { target, anchor } => {
+                self.open_session_beside(target, anchor);
+            }
+            WorkspaceControllerAction::DetachWorkspacePane(attachment_id) => {
+                self.detach_cross_workspace_pane(attachment_id);
             }
             WorkspaceControllerAction::FocusSession {
                 workspace_id,
@@ -10952,13 +12286,22 @@ impl App {
                 }
             }
             WorkspaceControllerAction::FocusPty {
-                switch_workspace,
+                workspace_id,
+                runtime_instance,
                 session,
             } => {
-                if let Some(workspace_id) = switch_workspace {
+                if workspace_id != self.active.id {
                     self.switch_workspace(&workspace_id);
-                    self.pending_focus = Some((workspace_id, session));
-                } else if let Some(pane) = self
+                }
+                if !workspace_focus_target_matches_runtime(
+                    &workspace_id,
+                    runtime_instance,
+                    &self.active.id,
+                    self.active.runtime_instance,
+                ) {
+                    return;
+                }
+                if let Some(pane) = self
                     .active
                     .workspace_ui
                     .mux()
@@ -10968,6 +12311,9 @@ impl App {
                         .active
                         .runtime
                         .send_command(runtime::RuntimeCommand::FocusPane { pane });
+                } else {
+                    self.pending_focus =
+                        Some((workspace_id, self.active.runtime_instance, session));
                 }
             }
             WorkspaceControllerAction::OpenStructured {
@@ -10982,8 +12328,8 @@ impl App {
             WorkspaceControllerAction::Notify { summary, body } => {
                 platform::notify(&summary, &body);
             }
-            WorkspaceControllerAction::ComposerPrompt(prompt) => {
-                self.send_composer_prompt(&prompt);
+            WorkspaceControllerAction::ComposerPrompt { target, prompt } => {
+                self.send_composer_prompt(&target, &prompt);
             }
             WorkspaceControllerAction::SyncDotenv => self.sync_dotenv_env(),
         }
@@ -11072,10 +12418,15 @@ impl App {
     }
 
     fn poll_pending_workspace_focus(&mut self) {
-        let Some((workspace_id, session)) = self.pending_focus.clone() else {
+        let Some((workspace_id, runtime_instance, session)) = self.pending_focus.clone() else {
             return;
         };
-        if workspace_id != self.active.id {
+        if !workspace_focus_target_matches_runtime(
+            &workspace_id,
+            Some(runtime_instance),
+            &self.active.id,
+            self.active.runtime_instance,
+        ) {
             self.pending_focus = None;
             return;
         }
@@ -11558,6 +12909,458 @@ impl App {
         }
     }
 
+    fn open_session_beside(
+        &mut self,
+        row_target: ui::file_tree::SessionRowTarget,
+        anchor: ui::cross_workspace::InsertAnchor,
+    ) {
+        if let Err(warning) = self.try_open_session_beside(row_target, anchor) {
+            self.cross_workspace_open_warning = Some(warning);
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    fn try_open_session_beside(
+        &mut self,
+        row_target: ui::file_tree::SessionRowTarget,
+        anchor: ui::cross_workspace::InsertAnchor,
+    ) -> Result<(), CrossWorkspaceOpenWarning> {
+        if row_target.workspace_id() == self.active.id {
+            return Err(CrossWorkspaceOpenWarning::SameWorkspace);
+        }
+        match row_target {
+            ui::file_tree::SessionRowTarget::Live {
+                workspace_id,
+                runtime_instance,
+                tab,
+                pane,
+                session,
+            } => {
+                let target = self.warm.get(&workspace_id).and_then(|runtime| {
+                    (runtime.runtime_instance == runtime_instance)
+                        .then(|| {
+                            resolve_exact_warm_pane_target(
+                                &self.active.id,
+                                &workspace_id,
+                                Some(runtime.runtime_instance),
+                                runtime.workspace_ui.mux().map(AsRef::as_ref),
+                                &tab,
+                                &pane,
+                                session,
+                            )
+                        })
+                        .flatten()
+                });
+                let target = target.ok_or(CrossWorkspaceOpenWarning::StaleTarget)?;
+                let limit = (self.config.performance.max_cross_workspace_panes as usize)
+                    .clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
+                let outcome = cross_workspace_attach_outcome(
+                    attach_live_cross_workspace_pane(
+                        &mut self.cross_workspace_pane,
+                        self.active.id.clone(),
+                        target,
+                        limit,
+                        anchor,
+                    ),
+                    limit,
+                )?;
+                if let ui::cross_workspace::AttachOutcome::FocusedExisting(attachment_id) = outcome
+                {
+                    let _ = self
+                        .cross_workspace_restore
+                        .cancel_attachment(attachment_id);
+                }
+                self.refresh_warm_idle_deadline();
+                self.egui_ctx.request_repaint();
+            }
+            ui::file_tree::SessionRowTarget::PersistedPane { workspace_id, pane } => {
+                let canonical = self
+                    .persisted_activity_panes
+                    .get(&workspace_id)
+                    .is_some_and(|rows| rows.iter().any(|row| row.pane_id == pane.0));
+                if !canonical {
+                    return Err(CrossWorkspaceOpenWarning::StaleTarget);
+                }
+                let request = ui::cross_workspace::PersistedPaneRequest::new(
+                    workspace_id.clone(),
+                    pane.clone(),
+                );
+                let limit = (self.config.performance.max_cross_workspace_panes as usize)
+                    .clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
+                let outcome = cross_workspace_attach_outcome(
+                    attach_cold_cross_workspace_pane(
+                        &mut self.cross_workspace_pane,
+                        self.active.id.clone(),
+                        request,
+                        limit,
+                        anchor,
+                    ),
+                    limit,
+                )?;
+                let ui::cross_workspace::AttachOutcome::Appended(attachment_id) = outcome else {
+                    if matches!(
+                        outcome,
+                        ui::cross_workspace::AttachOutcome::FocusedExisting(_)
+                    ) {
+                        self.egui_ctx.request_repaint();
+                    }
+                    return Ok(());
+                };
+                let existing_runtime_instance = self
+                    .warm
+                    .get(&workspace_id)
+                    .map(|runtime| runtime.runtime_instance);
+                let live_warm = count_live_warm_runtimes(
+                    self.warm.values().map(WorkspaceRuntime::has_live_sessions),
+                );
+                if cold_restore_runtime_admission(
+                    existing_runtime_instance,
+                    live_warm,
+                    self.config.performance.max_live_warm as usize,
+                ) == ColdRestoreRuntimeAdmission::Denied
+                {
+                    let _ = self.cross_workspace_pane.detach_attachment(attachment_id);
+                    return Err(CrossWorkspaceOpenWarning::ColdRuntimeLimit);
+                }
+                if !self
+                    .cross_workspace_restore
+                    .enqueue(CrossWorkspaceRestoreRequest::new(
+                        workspace_id,
+                        pane,
+                        attachment_id,
+                    ))
+                {
+                    let _ = self.cross_workspace_pane.detach_attachment(attachment_id);
+                    return Err(CrossWorkspaceOpenWarning::RestoreQueueBusy);
+                }
+                self.drive_cross_workspace_restore(std::time::Instant::now());
+                self.refresh_warm_idle_deadline();
+                self.egui_ctx.request_repaint();
+            }
+        }
+        Ok(())
+    }
+
+    fn drive_cross_workspace_restore(&mut self, now: std::time::Instant) {
+        if self.cross_workspace_restore.is_idle() {
+            return;
+        }
+        let workspace_ids = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let cancelled = self
+            .cross_workspace_restore
+            .retain_workspaces(&workspace_ids);
+        self.detach_cancelled_cross_workspace_restores(cancelled);
+
+        if let Some(expired) = self.cross_workspace_restore.expire(now) {
+            self.apply_cross_workspace_restore_barrier(expired);
+        }
+
+        if self.cross_workspace_restore.in_flight().is_some() {
+            return;
+        }
+
+        let Some(next) = self.cross_workspace_restore.next_request().cloned() else {
+            return;
+        };
+        let existing_runtime_instance = self
+            .warm
+            .get(next.workspace_id())
+            .map(|runtime| runtime.runtime_instance);
+        let live_warm =
+            count_live_warm_runtimes(self.warm.values().map(WorkspaceRuntime::has_live_sessions));
+        let runtime_instance = match cold_restore_runtime_admission(
+            existing_runtime_instance,
+            live_warm,
+            self.config.performance.max_live_warm as usize,
+        ) {
+            ColdRestoreRuntimeAdmission::Reuse(runtime_instance) => runtime_instance,
+            ColdRestoreRuntimeAdmission::Denied => {
+                if let Some(cancelled) = self
+                    .cross_workspace_restore
+                    .cancel_attachment(next.attachment_id())
+                {
+                    let _ = self
+                        .cross_workspace_pane
+                        .detach_attachment(cancelled.attachment_id());
+                }
+                return;
+            }
+            ColdRestoreRuntimeAdmission::Create => {
+                self.join_pending_shutdown(next.workspace_id());
+                let runtime_instance = self.next_runtime_instance;
+                self.next_runtime_instance = self.next_runtime_instance.wrapping_add(1).max(1);
+                let mut runtime = Self::make_runtime(
+                    &self.config,
+                    &self.logs_base,
+                    next.workspace_id(),
+                    runtime_instance,
+                    &self.db_path,
+                    self.runtime_host_factory.as_ref(),
+                    &self.db,
+                    &self.egui_ctx,
+                );
+                let delivered = runtime
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                        runtime::WorkspaceRuntimeState::Warm,
+                    ))
+                    .is_ok();
+                runtime.render_active = !delivered;
+                runtime.backgrounded_at = None;
+                self.warm.insert(next.workspace_id().to_owned(), runtime);
+                push_warm_order_unique(&mut self.warm_order, next.workspace_id().to_owned());
+                self.broadcast_terminal_cache_policy();
+                runtime_instance
+            }
+        };
+        let Some(dispatch) = self
+            .cross_workspace_restore
+            .begin_next(runtime_instance, now)
+        else {
+            return;
+        };
+        let command = cross_workspace_restore_command(dispatch.request.pane.clone());
+        if self
+            .stage_dotenv_continuation(
+                runtime_instance,
+                PendingDotenvContinuation::RuntimeCommand(command),
+            )
+            .is_err()
+        {
+            if let Some(cancelled) = self
+                .cross_workspace_restore
+                .fail_before_command(runtime_instance, &dispatch.request.pane)
+            {
+                let _ = self
+                    .cross_workspace_pane
+                    .detach_attachment(cancelled.attachment_id());
+            }
+            self.refresh_warm_idle_deadline();
+            return;
+        }
+        self.egui_ctx
+            .request_repaint_after(CROSS_WORKSPACE_RESTORE_TIMEOUT);
+    }
+
+    fn apply_cross_workspace_restore_barrier(&mut self, outcome: RestoreBarrierOutcome) {
+        if apply_restore_outcome(&mut self.cross_workspace_pane, outcome) {
+            self.egui_ctx.request_repaint();
+        }
+        self.refresh_warm_idle_deadline();
+    }
+
+    fn detach_cancelled_cross_workspace_restores(
+        &mut self,
+        cancelled: Vec<CrossWorkspaceRestoreRequest>,
+    ) {
+        for request in cancelled {
+            let _ = self
+                .cross_workspace_pane
+                .detach_attachment(request.attachment_id());
+        }
+    }
+
+    fn cancel_all_cross_workspace_restores(&mut self) {
+        let cancelled = self.cross_workspace_restore.cancel_visible_requests();
+        self.detach_cancelled_cross_workspace_restores(cancelled);
+        self.refresh_warm_idle_deadline();
+    }
+
+    fn enforce_cross_workspace_capacity(&mut self) {
+        let limit = (self.config.performance.max_cross_workspace_panes as usize)
+            .clamp(1, ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
+        let detached =
+            enforce_cross_workspace_capacity_non_destructive(&mut self.cross_workspace_pane, limit);
+        let detached_live_runtimes = detached
+            .iter()
+            .filter_map(ui::cross_workspace::DetachDecision::live_target)
+            .map(|target| {
+                VisibleRuntimeIdentity::new(&target.workspace_id, target.runtime_instance)
+            })
+            .collect::<Vec<_>>();
+        let retained = self
+            .cross_workspace_pane
+            .attachments()
+            .iter()
+            .map(ui::cross_workspace::AttachedPane::id)
+            .collect();
+        let cancelled = self.cross_workspace_restore.retain_attachments(&retained);
+        self.detach_cancelled_cross_workspace_restores(cancelled);
+        self.retain_visible_cross_workspace_attachments();
+        for runtime in detached_live_runtimes {
+            if !self
+                .cross_workspace_pane
+                .protects_runtime(&runtime.workspace_id, runtime.runtime_instance)
+            {
+                self.set_warm_runtime_visible(
+                    &runtime.workspace_id,
+                    runtime.runtime_instance,
+                    false,
+                );
+            }
+        }
+        self.sync_attached_runtime_visibility();
+        self.refresh_warm_idle_deadline();
+    }
+
+    fn detach_cross_workspace_pane(&mut self, attachment_id: ui::cross_workspace::AttachmentId) {
+        let Some(detached) = self.cross_workspace_pane.detach_attachment(attachment_id) else {
+            return;
+        };
+        if detached.restoring_request().is_some() {
+            let _ = self
+                .cross_workspace_restore
+                .cancel_attachment(attachment_id);
+        }
+        self.retain_visible_cross_workspace_attachments();
+        self.sync_attached_runtime_visibility();
+        self.refresh_warm_idle_deadline();
+        self.egui_ctx.request_repaint();
+    }
+
+    fn reconcile_cross_workspace_pane(&mut self) {
+        let targets = self
+            .cross_workspace_pane
+            .attachments()
+            .iter()
+            .filter_map(|attachment| {
+                attachment
+                    .live_target()
+                    .cloned()
+                    .map(|target| (attachment.id(), target))
+            })
+            .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (attachment_id, target) in targets {
+            let runtime_state = match self.warm.get(&target.workspace_id) {
+                Some(runtime) if runtime.runtime_instance != target.runtime_instance => {
+                    ui::cross_workspace::AttachedRuntimeState::Live {
+                        runtime_instance: runtime.runtime_instance,
+                        target_relation: ui::cross_workspace::LiveTargetRelation::PaneMissing,
+                    }
+                }
+                Some(runtime) => match runtime.workspace_ui.mux() {
+                    Some(mux) => ui::cross_workspace::AttachedRuntimeState::Live {
+                        runtime_instance: runtime.runtime_instance,
+                        target_relation: attached_target_relation(mux, &target),
+                    },
+                    None => ui::cross_workspace::AttachedRuntimeState::Disconnected {
+                        runtime_instance: Some(runtime.runtime_instance),
+                    },
+                },
+                None if self
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == target.workspace_id) =>
+                {
+                    ui::cross_workspace::AttachedRuntimeState::Suspended {
+                        runtime_instance: target.runtime_instance,
+                    }
+                }
+                None => ui::cross_workspace::AttachedRuntimeState::Disconnected {
+                    runtime_instance: None,
+                },
+            };
+            changed |= matches!(
+                self.cross_workspace_pane.reconcile_target(
+                    &self.active.id,
+                    attachment_id,
+                    runtime_state,
+                ),
+                ui::cross_workspace::ReconcileDecision::Detached(_)
+            );
+        }
+        if changed {
+            self.retain_visible_cross_workspace_attachments();
+            self.sync_attached_runtime_visibility();
+            self.refresh_warm_idle_deadline();
+        }
+    }
+
+    fn set_warm_runtime_visible(
+        &mut self,
+        workspace_id: &str,
+        runtime_instance: u64,
+        visible: bool,
+    ) {
+        let Some(runtime) = self.warm.get_mut(workspace_id) else {
+            return;
+        };
+        if runtime.runtime_instance != runtime_instance {
+            return;
+        }
+        if runtime.render_active != visible {
+            let client = &runtime.runtime;
+            let delivered = deliver_workspace_state_transition(
+                &mut runtime.render_active,
+                &mut runtime.pending_replay_resync,
+                visible,
+                |_| {
+                    client
+                        .send_command(attached_visibility_command(visible))
+                        .is_ok()
+                },
+            );
+            if !delivered {
+                self.egui_ctx.request_repaint();
+            }
+        }
+        runtime.backgrounded_at = (!visible).then(std::time::Instant::now);
+    }
+
+    fn retain_visible_cross_workspace_attachments(&mut self) {
+        self.visible_cross_workspace_attachments
+            .retain(|attachment_id| {
+                self.cross_workspace_pane
+                    .attachments()
+                    .iter()
+                    .any(|attachment| attachment.id() == *attachment_id)
+            });
+    }
+
+    fn sync_attached_runtime_visibility(&mut self) {
+        let visible_ids = runtime_visible_attachment_ids(
+            self.active.render_active
+                && self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Terminal,
+            &self.visible_cross_workspace_attachments,
+        );
+        let groups = group_visible_cross_workspace_panes(
+            &self.cross_workspace_pane,
+            visible_ids,
+            |target| {
+                self.warm.get(&target.workspace_id).is_some_and(|runtime| {
+                    runtime.runtime_instance == target.runtime_instance
+                        && runtime.workspace_ui.mux().is_some_and(|mux| {
+                            attached_target_relation(mux, target)
+                                == ui::cross_workspace::LiveTargetRelation::Exact
+                        })
+                })
+            },
+        );
+        let visible_runtimes = groups
+            .into_iter()
+            .map(|group| group.identity)
+            .collect::<Vec<_>>();
+        let transitions = warm_visibility_transitions(
+            self.warm.values().map(|runtime| {
+                (
+                    runtime.id.as_str(),
+                    runtime.runtime_instance,
+                    runtime.render_active,
+                )
+            }),
+            &visible_runtimes,
+        );
+        for (workspace_id, runtime_instance, visible) in transitions {
+            self.set_warm_runtime_visible(&workspace_id, runtime_instance, visible);
+        }
+    }
+
     fn switch_workspace(&mut self, target_id: &str) {
         // 명시적 전환은 종료 숨김 해제 — 사용자가 다시 연 것이다(사이드바 행 클릭·
         // 워크스페이스 순환·알림/에이전트 이동·같은 폴더 재선택 모두 이 경로).
@@ -11565,6 +13368,7 @@ impl App {
         if target_id == self.active.id {
             return;
         }
+        self.cancel_all_cross_workspace_restores();
         let live_warm = self
             .warm
             .values()
@@ -11630,16 +13434,35 @@ impl App {
         // 이벤트 포함)를 그대로 ui()가 처리해 exit/status 상태를 재구성해야 하고, workspace_ui는
         // 마지막 active 상태 + 아래 Active 재emit(전체 mux 스냅샷)으로 최신화된다. (새 워커는
         // 이미 fresh + RestoreWorkspace라 리셋 불필요.)
-        new_active.render_active = true;
+        new_active.render_active = false;
         new_active.backgrounded_at = None;
-        let _ = new_active
-            .runtime
-            .send_command(runtime::RuntimeCommand::SetWorkspaceState(
-                runtime::WorkspaceRuntimeState::Active,
-            ));
+        let runtime = &new_active.runtime;
+        let activated = deliver_workspace_state_transition(
+            &mut new_active.render_active,
+            &mut new_active.pending_replay_resync,
+            true,
+            |state| {
+                runtime
+                    .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
+                    .is_ok()
+            },
+        );
+        if !activated {
+            self.egui_ctx.request_repaint();
+        }
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
+        switch_cross_workspace_pane_layout(
+            &old.id,
+            &self.active.id,
+            &mut self.cross_workspace_pane,
+            &mut self.parked_cross_workspace_panes,
+            self.config.performance.max_cross_workspace_panes as usize,
+        );
+        self.visible_cross_workspace_attachments.clear();
+        self.frame_terminal_owner = FrameTerminalOwner::None;
+        self.last_multi_pane_terminal_rect = None;
         // Retain only the pending scope metadata before any old-scope completion can be applied
         // against the new active runtime. The worker drain barrier installs the new epoch later.
         self.request_agent_state_scope();
@@ -11667,7 +13490,9 @@ impl App {
         old.backgrounded_at = Some(std::time::Instant::now());
         let old_id = old.id.clone();
         self.warm.insert(old_id.clone(), old);
-        self.warm_order.push(old_id.clone());
+        push_warm_order_unique(&mut self.warm_order, old_id.clone());
+        self.reconcile_cross_workspace_pane();
+        self.sync_attached_runtime_visibility();
         self.refresh_warm_idle_deadline();
 
         // pending 상태 정리 (이전 워커 응답 못 받음, 교차-ws 감사 방지).
@@ -11731,7 +13556,8 @@ impl App {
                 if workspace_id != self.active.id {
                     self.switch_workspace(&workspace_id);
                     self.refresh_workspaces();
-                    self.pending_focus = Some((workspace_id, session_id));
+                    self.pending_focus =
+                        Some((workspace_id, self.active.runtime_instance, session_id));
                     return;
                 }
                 let target = runtime::MuxPaneId(pane_id);
@@ -11800,6 +13626,24 @@ impl App {
         else {
             return;
         };
+        let attached_focused = self.cross_workspace_pane.focused_surface()
+            == ui::cross_workspace::TerminalSurfaceFocus::Attached;
+        let multi_pane_pointer_transition = !self.cross_workspace_pane.attachments().is_empty()
+            && self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Terminal
+            && ctx.input(|input| {
+                pointer_transition_inside_rect(
+                    self.last_multi_pane_terminal_rect,
+                    input.pointer.primary_pressed() || input.pointer.primary_released(),
+                    input.pointer.interact_pos(),
+                )
+            });
+        if configured_terminal_shortcut_blocked(
+            action,
+            attached_focused,
+            multi_pane_pointer_transition,
+        ) {
+            return;
+        }
 
         use crate::shortcuts::ShortcutAction as A;
         match action {
@@ -11995,9 +13839,20 @@ impl App {
     fn evict_warm(&mut self) {
         self.warm_eviction_deferred = false;
         let max_warm = self.config.performance.max_warm as usize;
-        let evictable = warm_eviction_candidates(&self.warm_order, max_warm, |id| {
-            self.warm.get(id).is_some_and(|rt| rt.has_live_sessions())
-        });
+        let evictable = protected_warm_eviction_candidates(
+            &self.warm_order,
+            max_warm,
+            |id| {
+                self.warm.get(id).is_some_and(|runtime| {
+                    self.cross_workspace_pane
+                        .protects_runtime(id, runtime.runtime_instance)
+                        || self
+                            .cross_workspace_restore
+                            .protects_runtime(id, runtime.runtime_instance)
+                })
+            },
+            |id| self.warm.get(id).is_some_and(|rt| rt.has_live_sessions()),
+        );
         for evict_id in evictable {
             self.suspend_warm_workspace(&evict_id, false);
             if self.warm_eviction_deferred {
@@ -12016,6 +13871,14 @@ impl App {
         let next = self
             .warm
             .values()
+            .filter(|runtime| {
+                !self
+                    .cross_workspace_pane
+                    .protects_runtime(&runtime.id, runtime.runtime_instance)
+                    && !self
+                        .cross_workspace_restore
+                        .protects_runtime(&runtime.id, runtime.runtime_instance)
+            })
             .filter(|runtime| {
                 !runtime.has_live_sessions() || runtime.can_auto_suspend_idle_shells()
             })
@@ -12050,8 +13913,17 @@ impl App {
     fn evict_idle_warm(&mut self, now: std::time::Instant) {
         self.next_warm_idle_eviction_at = None;
         let resident_before = 1 + self.warm.len();
-        let expired = expired_warm_workspace_ids(
+        let expired = expired_unprotected_warm_workspace_ids(
             &self.warm_order,
+            |id| {
+                self.warm.get(id).is_some_and(|runtime| {
+                    self.cross_workspace_pane
+                        .protects_runtime(id, runtime.runtime_instance)
+                        || self
+                            .cross_workspace_restore
+                            .protects_runtime(id, runtime.runtime_instance)
+                })
+            },
             |id| self.warm.get(id).and_then(|rt| rt.backgrounded_at),
             now,
             Self::WARM_AUTO_SUSPEND_AFTER,
@@ -12126,7 +13998,7 @@ impl App {
                     !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
                 }));
                 self.warm.insert(workspace_id.to_owned(), rt);
-                self.warm_order.push(workspace_id.to_owned());
+                push_warm_order_unique(&mut self.warm_order, workspace_id.to_owned());
                 self.refresh_warm_idle_deadline();
                 return;
             }
@@ -12136,6 +14008,9 @@ impl App {
             // 축출 = Suspended(워커 종료) — 그 workspace의 진행형 알림은 더는 조치
             // 불가하므로 정리한다 (결과 알림은 기록이라 유지, codex 리뷰).
             self.notifications_ui.prune_transient(workspace_id);
+            self.unattached_counts.remove(workspace_id);
+            self.pending_resource_maintenance
+                .retain(|target| target.workspace_id != workspace_id);
             let evict_id = workspace_id.to_owned();
             let wake = self.egui_ctx.clone();
             let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -12174,7 +14049,22 @@ impl App {
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
     /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
     fn close_workspace_sessions(&mut self, workspace_id: &str) {
+        let sent_restore_pane = remove_workspace_cross_workspace_layouts(
+            &mut self.cross_workspace_pane,
+            &mut self.parked_cross_workspace_panes,
+            &mut self.visible_cross_workspace_attachments,
+            &mut self.cross_workspace_restore,
+            workspace_id,
+        );
         if workspace_id == self.active.id {
+            clear_primary_cross_workspace_layout(
+                &mut self.cross_workspace_pane,
+                &mut self.visible_cross_workspace_attachments,
+                &mut self.cross_workspace_restore,
+            );
+            self.frame_terminal_owner = FrameTerminalOwner::None;
+            self.last_multi_pane_terminal_rect = None;
+            self.sync_attached_runtime_visibility();
             // 활성: 전 pane을 확인 없이 즉시 닫는다(확인은 모달이 이미 했다). 워크스
             // 페이스는 활성인 채 빈 상태로 남는다 — 바로 새 셸을 열 수 있다.
             let panes: Vec<runtime::MuxPaneId> = self
@@ -12220,7 +14110,7 @@ impl App {
             // 남아 재활성 시 fresh 셸로만 뜬다.
             self.join_pending_shutdown(workspace_id);
             if let Some(mut rt) = self.warm.remove(workspace_id) {
-                let panes: Vec<runtime::MuxPaneId> = rt
+                let mut panes: Vec<runtime::MuxPaneId> = rt
                     .workspace_ui
                     .mux()
                     .map(|mux| {
@@ -12230,6 +14120,11 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default();
+                if let Some(pane) = sent_restore_pane
+                    && !panes.contains(&pane)
+                {
+                    panes.push(pane);
+                }
                 tracing::info!(
                     workspace = %workspace_id,
                     panes = panes.len(),
@@ -12275,6 +14170,10 @@ impl App {
         }
         // 홈/상태바가 최대 500ms 전 activity_rows를 재사용하므로 종료 직후 즉시 폐기한다.
         self.activity_rows_cache = None;
+        self.unattached_counts.remove(workspace_id);
+        self.pending_resource_maintenance
+            .retain(|target| target.workspace_id != workspace_id);
+        self.invalidate_port_inventory_topology();
     }
 
     /// 종료 숨김을 해제하고 config에도 즉시 반영한다. 같은 활성 워크스페이스 재선택처럼
@@ -12287,6 +14186,7 @@ impl App {
         );
         if changed {
             self.activity_rows_cache = None;
+            self.invalidate_port_inventory_topology();
             if let Err(error) = self.config.save(&self.config_path) {
                 tracing::warn!(workspace = %workspace_id, "종료 워크스페이스 재열기 저장 실패: {error:#}");
             }
@@ -12496,6 +14396,12 @@ impl App {
         pending: PendingDotenvOperation,
         outcome: Result<DotenvSyncOutcome, crate::dotenv_sync::DotenvWorkerErrorCode>,
     ) {
+        let restore_pane = match &pending.continuation {
+            PendingDotenvContinuation::RuntimeCommand(
+                runtime::RuntimeCommand::RestoreWorkspacePane { pane },
+            ) => Some(pane.clone()),
+            _ => None,
+        };
         let current_root = self.workspace_tree_root(&pending.workspace_id);
         let outcome = outcome.ok().filter(|outcome| {
             outcome.workspace_id == pending.workspace_id
@@ -12553,6 +14459,13 @@ impl App {
                 error_code = "source_unavailable",
                 "dotenv-gated launch failed closed"
             );
+            if let Some(pane) = restore_pane.as_ref() {
+                self.finish_cross_workspace_restore_dotenv(
+                    pending.runtime_instance,
+                    pane,
+                    RestoreBarrierDelivery::NotSent,
+                );
+            }
             return;
         };
         let baseline = outcome.baseline;
@@ -12596,6 +14509,13 @@ impl App {
                     .push(("DEPPY_PROJECT_ROOT".to_owned(), root.display().to_string()));
             }
         }
+        let restore_command_allowed = restore_pane.as_ref().is_none_or(|pane| {
+            self.cross_workspace_restore
+                .allows_command(pending.runtime_instance, pane)
+        });
+        let restore_correlation = (restore_pane.is_some() && restore_command_allowed)
+            .then(|| self.next_restore_barrier.allocate())
+            .flatten();
         let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) else {
             if let Some(ticket_id) = agent_ticket {
                 self.approval_launch_tracker.cancel(ticket_id);
@@ -12613,6 +14533,13 @@ impl App {
                 error_code = "stale_runtime",
                 "dotenv launch target became stale"
             );
+            if let Some(pane) = restore_pane.as_ref() {
+                self.finish_cross_workspace_restore_dotenv(
+                    pending.runtime_instance,
+                    pane,
+                    RestoreBarrierDelivery::NotSent,
+                );
+            }
             return;
         };
         let env_delivered = match payload {
@@ -12629,7 +14556,7 @@ impl App {
             runtime.dotenv_state = Some(baseline);
         }
         let policy_delivered = env_delivered && runtime.runtime.send_command(cache_policy).is_ok();
-        let delivered = match pending.continuation {
+        let (delivered, restore_delivery) = match pending.continuation {
             PendingDotenvContinuation::WorkspaceProtocol {
                 operation,
                 generation,
@@ -12645,13 +14572,37 @@ impl App {
                             .ok_or(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed),
                     },
                 );
-                delivered
+                (delivered, None)
+            }
+            PendingDotenvContinuation::RuntimeCommand(
+                runtime::RuntimeCommand::RestoreWorkspacePane { pane },
+            ) => {
+                let delivery = match restore_correlation {
+                    Some(correlation_id) if policy_delivered => {
+                        send_restore_with_durable_barrier(pane, correlation_id, |command| {
+                            runtime.runtime.send_command(command).is_ok()
+                        })
+                    }
+                    _ => RestoreBarrierDelivery::NotSent,
+                };
+                (
+                    matches!(delivery, RestoreBarrierDelivery::BarrierArmed(_)),
+                    Some(delivery),
+                )
             }
             PendingDotenvContinuation::RuntimeCommand(command)
-            | PendingDotenvContinuation::AgentLaunch { command, .. } => {
-                policy_delivered && runtime.runtime.send_command(command).is_ok()
-            }
+            | PendingDotenvContinuation::AgentLaunch { command, .. } => (
+                policy_delivered && runtime.runtime.send_command(command).is_ok(),
+                None,
+            ),
         };
+        if let Some(pane) = restore_pane.as_ref() {
+            self.finish_cross_workspace_restore_dotenv(
+                pending.runtime_instance,
+                pane,
+                restore_delivery.unwrap_or(RestoreBarrierDelivery::NotSent),
+            );
+        }
         if delivered {
             self.invalidate_env_profile_ui();
             self.credentials_ui.invalidate_cache();
@@ -12677,6 +14628,46 @@ impl App {
                 error_code = "delivery_failed",
                 "dotenv-gated launch failed closed"
             );
+        }
+    }
+
+    fn finish_cross_workspace_restore_dotenv(
+        &mut self,
+        runtime_instance: u64,
+        pane: &runtime::MuxPaneId,
+        delivery: RestoreBarrierDelivery,
+    ) {
+        match delivery {
+            RestoreBarrierDelivery::BarrierArmed(correlation_id) => {
+                if self
+                    .cross_workspace_restore
+                    .mark_restore_sent(runtime_instance, pane)
+                {
+                    let _ = self.cross_workspace_restore.arm_durable_barrier(
+                        runtime_instance,
+                        pane,
+                        correlation_id,
+                    );
+                }
+                return;
+            }
+            RestoreBarrierDelivery::RestoreSentUnarmed => {
+                let _ = self
+                    .cross_workspace_restore
+                    .mark_restore_sent(runtime_instance, pane);
+                return;
+            }
+            RestoreBarrierDelivery::NotSent => {}
+        }
+        if let Some(failed) = self
+            .cross_workspace_restore
+            .fail_before_command(runtime_instance, pane)
+        {
+            let _ = self
+                .cross_workspace_pane
+                .detach_attachment(failed.attachment_id());
+            self.refresh_warm_idle_deadline();
+            self.egui_ctx.request_repaint();
         }
     }
 
@@ -12987,6 +14978,42 @@ impl App {
             (Some(folder), None) => folder,
             (None, None) => "~".to_owned(),
         }
+    }
+
+    fn workspace_project_name(row: &storage::WorkspaceRow) -> String {
+        std::path::Path::new(row.path.trim())
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| Self::workspace_display_name(row))
+    }
+
+    fn attached_workspace_title(row: &storage::WorkspaceRow) -> String {
+        format!(
+            "{} ({})",
+            Self::workspace_project_name(row),
+            Self::workspace_display_name(row)
+        )
+    }
+
+    fn attached_workspace_labels(
+        row: Option<&storage::WorkspaceRow>,
+        workspace_id: &str,
+    ) -> (String, String) {
+        row.map_or_else(
+            || {
+                (
+                    workspace_id.to_owned(),
+                    format!("{workspace_id} ({workspace_id})"),
+                )
+            },
+            |row| {
+                (
+                    Self::workspace_display_name(row),
+                    Self::attached_workspace_title(row),
+                )
+            },
+        )
     }
 
     fn active_workspace_display_name(&self) -> String {
@@ -14258,6 +16285,7 @@ impl App {
     }
 
     fn refresh_workspaces(&mut self) {
+        let previous_port_roots = self.port_workspace_roots();
         match self.db.settings_workspace_projection_rows() {
             Ok(list) => {
                 let mut anchors = std::collections::HashMap::with_capacity(list.len());
@@ -14299,6 +16327,16 @@ impl App {
             .retain(|id, _| workspaces.iter().any(|workspace| workspace.id == *id));
         self.dismissed_renames
             .retain(|id| workspaces.iter().any(|workspace| workspace.id == *id));
+        let known_workspace_ids = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        prune_resource_tracking(
+            &mut self.unattached_counts,
+            &mut self.pending_resource_maintenance,
+            |workspace_id| known_workspace_ids.contains(workspace_id),
+        );
         let persisted_before = self.config.ui.closed_workspace_ids.len();
         self.config
             .ui
@@ -14324,6 +16362,9 @@ impl App {
         }
         // 워크스페이스 목록/이름/경로가 바뀌었을 수 있다 — env/API 프로젝트 행 캐시 무효화.
         self.invalidate_env_api_projects();
+        if previous_port_roots != self.port_workspace_roots() {
+            self.invalidate_port_inventory_topology();
+        }
     }
 
     /// pressure 뱃지 표시 TTL — 회복 이벤트가 없어(큐가 빠져도 신호 없음) 마지막 관측이
@@ -14639,6 +16680,318 @@ impl App {
         }
     }
 
+    fn port_workspace_roots(&self) -> Arc<[crate::port_inventory::PortWorkspaceRoot]> {
+        self.workspaces
+            .iter()
+            .filter(|workspace| {
+                workspace_visible_after_close(&self.closed_workspaces, &workspace.id)
+            })
+            .filter_map(|workspace| {
+                let path = PathBuf::from(workspace.path.trim());
+                if !path.is_absolute() {
+                    return None;
+                }
+                Some(crate::port_inventory::PortWorkspaceRoot {
+                    id: Arc::from(workspace.id.as_str()),
+                    name: Arc::from(Self::workspace_display_name(workspace)),
+                    path: Arc::from(path),
+                })
+            })
+            .take(crate::port_inventory::PORT_ROW_MAX)
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    fn submit_port_job(&mut self, job: crate::port_inventory::PortJob, explicit: bool) {
+        if explicit {
+            self.port_admission_blocked = false;
+        }
+        let generation = port_job_generation(&job);
+        if !prepare_port_job_submission(
+            &mut self.pending_port_job,
+            &mut self.port_snapshot,
+            self.port_generation,
+            generation,
+            explicit,
+        ) {
+            return;
+        }
+        if self.port_in_flight_generation.is_some() || self.port_admission_blocked {
+            stage_pending_port_job(&mut self.pending_port_job, job);
+            return;
+        }
+        match self.port_worker.try_request(job) {
+            Ok(()) => self.port_in_flight_generation = Some(generation),
+            Err(crate::lazy_worker::LazyWorkerSubmitError::Full(job)) => {
+                stage_pending_port_job(&mut self.pending_port_job, job);
+            }
+            Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { job, code }) => {
+                tracing::warn!(
+                    kind = "ports",
+                    phase = "worker_admission",
+                    error_code = code.as_str(),
+                    "port inventory worker unavailable"
+                );
+                self.port_admission_blocked = true;
+                stage_pending_port_job(&mut self.pending_port_job, job);
+            }
+        }
+    }
+
+    fn request_port_scan(&mut self) {
+        let roots = self.port_workspace_roots();
+        let job = next_port_scan_job(&mut self.port_generation, roots);
+        self.submit_port_job(job, true);
+    }
+
+    fn request_port_termination(&mut self, target: crate::port_inventory::PortTerminationTarget) {
+        let roots = self.port_workspace_roots();
+        let job = next_port_termination_job(&mut self.port_generation, roots, target);
+        self.submit_port_job(job, true);
+    }
+
+    fn invalidate_port_inventory_topology(&mut self) {
+        next_port_generation(&mut self.port_generation);
+        self.port_snapshot = None;
+        self.pending_port_job = None;
+        self.port_admission_blocked = false;
+    }
+
+    fn poll_port_inventory(&mut self, ctx: &egui::Context) {
+        let Some(outcome) = self.port_worker.try_recv() else {
+            return;
+        };
+        let completed_generation = self.port_in_flight_generation.take();
+        match outcome.into_result() {
+            Ok(outcome) => {
+                let error = match &outcome {
+                    crate::port_inventory::PortOutcome::Scanned(result)
+                    | crate::port_inventory::PortOutcome::Terminated(result) => {
+                        result.as_ref().err().copied()
+                    }
+                };
+                if let Some(error) = error {
+                    tracing::warn!(
+                        kind = "ports",
+                        phase = "operation",
+                        error_code = ?error,
+                        "port inventory operation failed"
+                    );
+                    if completed_generation == Some(self.port_generation) {
+                        self.port_snapshot = None;
+                    }
+                }
+                if apply_port_outcome_if_current(
+                    &mut self.port_snapshot,
+                    self.port_generation,
+                    outcome,
+                ) {
+                    ctx.request_repaint();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    kind = "ports",
+                    phase = "worker_result",
+                    error_code = error.as_str(),
+                    "port inventory worker failed"
+                );
+                if completed_generation == Some(self.port_generation) {
+                    self.port_snapshot = None;
+                }
+            }
+        }
+        if !self.port_admission_blocked
+            && let Some(job) = self.pending_port_job.take()
+            && port_job_generation(&job) == self.port_generation
+        {
+            self.submit_port_job(job, false);
+        }
+    }
+
+    fn resource_runtime_contains_session(
+        &self,
+        workspace_id: &str,
+        runtime_instance: u64,
+        session: runtime::SessionId,
+    ) -> bool {
+        let runtime = if workspace_id == self.active.id {
+            Some(&self.active)
+        } else {
+            self.warm.get(workspace_id)
+        };
+        runtime
+            .filter(|runtime| runtime.runtime_instance == runtime_instance)
+            .and_then(|runtime| runtime.workspace_ui.mux())
+            .is_some_and(|mux| pane_of_session(mux, session).is_some())
+    }
+
+    fn stage_resource_target(
+        &mut self,
+        workspace_id: String,
+        runtime_instance: u64,
+        action: ResourceMaintenanceAction,
+    ) {
+        let owns_local_runtime = (workspace_id == self.active.id
+            && self.active.runtime_instance == runtime_instance)
+            || self
+                .warm
+                .get(&workspace_id)
+                .is_some_and(|runtime| runtime.runtime_instance == runtime_instance);
+        if !owns_local_runtime {
+            return;
+        }
+        if !stage_resource_maintenance(
+            &mut self.pending_resource_maintenance,
+            ResourceMaintenanceTarget {
+                workspace_id,
+                runtime_instance,
+                action,
+            },
+        ) {
+            tracing::warn!(
+                kind = "resource",
+                phase = "maintenance_admission",
+                error_code = "bounded_queue_full",
+                "resource maintenance request rejected"
+            );
+        }
+    }
+
+    fn stage_unattached_inspection(&mut self) {
+        // Every resident workspace is backed by the concrete in-process runtime client. SSH
+        // sessions are child processes inside that local runtime; no RemoteRuntimeClient is owned
+        // by this collection, so maintenance cannot cross a remote transport boundary.
+        let workspace_ids = std::iter::once((self.active.id.clone(), self.active.runtime_instance))
+            .chain(
+                self.warm
+                    .values()
+                    .map(|runtime| (runtime.id.clone(), runtime.runtime_instance)),
+            )
+            .take(ui::activity::MAX_ACTIVITY_WORKSPACES)
+            .collect::<Vec<_>>();
+        for (workspace_id, runtime_instance) in workspace_ids {
+            self.stage_resource_target(
+                workspace_id,
+                runtime_instance,
+                ResourceMaintenanceAction::InspectUnattached,
+            );
+        }
+    }
+
+    fn pump_resource_maintenance(&mut self) {
+        let Some(target) = self.pending_resource_maintenance.pop_front() else {
+            return;
+        };
+        let command = match target.action {
+            ResourceMaintenanceAction::InspectUnattached => {
+                runtime::RuntimeCommand::InspectUnattachedSessions
+            }
+            ResourceMaintenanceAction::KillUnattached => {
+                runtime::RuntimeCommand::KillUnattachedSessions
+            }
+            ResourceMaintenanceAction::KillSession(session) => {
+                runtime::RuntimeCommand::KillSession { session }
+            }
+        };
+        let result = if resource_target_matches_runtime(
+            &target,
+            &self.active.id,
+            self.active.runtime_instance,
+        ) {
+            self.active.runtime.send_command(command)
+        } else if let Some(runtime) = self.warm.get(&target.workspace_id).filter(|runtime| {
+            resource_target_matches_runtime(&target, &runtime.id, runtime.runtime_instance)
+        }) {
+            runtime.runtime.send_command(command)
+        } else {
+            return;
+        };
+        if result.is_err() {
+            // Runtime queue pressure is transient and emits a later wake. Keep exactly this one
+            // known-unsent command and rotate it behind other workspaces without adding a timer.
+            stage_resource_maintenance(&mut self.pending_resource_maintenance, target);
+        }
+    }
+
+    fn dispatch_status_bar_intent(
+        &mut self,
+        intent: Option<ui::agent_terminal::StatusBarIntent>,
+        ctx: &egui::Context,
+    ) {
+        let Some(intent) = intent else {
+            return;
+        };
+        match intent {
+            ui::agent_terminal::StatusBarIntent::Resource(intent) => match intent {
+                ui::resource_manager::ResourceManagerIntent::Refresh => {
+                    invalidate_resource_projection(&mut self.activity_rows_cache);
+                    ctx.request_repaint();
+                }
+                ui::resource_manager::ResourceManagerIntent::InspectUnattached => {
+                    self.stage_unattached_inspection();
+                }
+                ui::resource_manager::ResourceManagerIntent::KillUnattached {
+                    workspace_id,
+                    runtime_instance,
+                } => {
+                    self.stage_resource_target(
+                        workspace_id.to_string(),
+                        runtime_instance,
+                        ResourceMaintenanceAction::KillUnattached,
+                    );
+                }
+                ui::resource_manager::ResourceManagerIntent::FocusSession {
+                    workspace_id,
+                    runtime_instance,
+                    session,
+                } => {
+                    if self.resource_runtime_contains_session(
+                        &workspace_id,
+                        runtime_instance,
+                        session,
+                    ) {
+                        self.agent_terminal_ui
+                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                        self.stage_workspace_controller_action(
+                            WorkspaceControllerAction::FocusPty {
+                                workspace_id: workspace_id.to_string(),
+                                runtime_instance: Some(runtime_instance),
+                                session,
+                            },
+                        );
+                    }
+                }
+                ui::resource_manager::ResourceManagerIntent::KillSession {
+                    workspace_id,
+                    runtime_instance,
+                    session,
+                } => {
+                    if self.resource_runtime_contains_session(
+                        &workspace_id,
+                        runtime_instance,
+                        session,
+                    ) {
+                        self.stage_resource_target(
+                            workspace_id.to_string(),
+                            runtime_instance,
+                            ResourceMaintenanceAction::KillSession(session),
+                        );
+                    }
+                }
+            },
+            ui::agent_terminal::StatusBarIntent::Ports(intent) => match intent {
+                ui::ports::PortsIntent::Refresh => self.request_port_scan(),
+                ui::ports::PortsIntent::Terminate(target) => {
+                    self.request_port_termination(target);
+                }
+                ui::ports::PortsIntent::CopyAddress(address) => {
+                    ctx.copy_text(address.to_string());
+                }
+            },
+        }
+    }
+
     fn activity_rows(&self) -> ui::activity::ActivitySnapshot {
         let now = std::time::Instant::now();
         let rows: Vec<ui::activity::ActivityWorkspaceRow> = self
@@ -14663,32 +17016,48 @@ impl App {
                     let sessions = entries
                         .iter()
                         .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
-                        .map(|e| ui::activity::ActivitySessionRow {
-                            name: Arc::from(e.title.as_str()),
-                            agent_line: e.agent_line.as_deref().map(Arc::from),
-                            status_line: e.status_line.as_deref().map(Arc::from),
-                            resource: e.session.and_then(|s| {
+                        .map(|e| {
+                            let resource = e.session.and_then(|s| {
                                 self.active
                                     .session_resource_usage
                                     .iter()
                                     .find(|u| u.session == s)
                                     .cloned()
-                            }),
-                            pressure: Self::fresh_pressure(
-                                e.session
-                                    .and_then(|s| self.active.session_input_pressure.get(&s)),
-                                now,
-                            ),
-                            storm: e.session.is_some_and(|s| {
-                                self.active
-                                    .storm_episodes
-                                    .get(&s)
-                                    .is_some_and(|ep| ep.confirmed)
-                            }),
+                            });
+                            ui::activity::ActivitySessionRow {
+                                session: e.session,
+                                name: Arc::from(e.title.as_str()),
+                                metric_availability: if resource.is_some() {
+                                    ui::activity::ActivityMetricAvailability::Local
+                                } else {
+                                    ui::activity::ActivityMetricAvailability::Pending
+                                },
+                                agent_line: e.agent_line.as_deref().map(Arc::from),
+                                status_line: e.status_line.as_deref().map(Arc::from),
+                                resource,
+                                pressure: Self::fresh_pressure(
+                                    e.session
+                                        .and_then(|s| self.active.session_input_pressure.get(&s)),
+                                    now,
+                                ),
+                                storm: e.session.is_some_and(|s| {
+                                    self.active
+                                        .storm_episodes
+                                        .get(&s)
+                                        .is_some_and(|ep| ep.confirmed)
+                                }),
+                            }
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
+                        workspace_id: Arc::from(ws.id.as_str()),
+                        runtime_instance: Some(self.active.runtime_instance),
                         name: Self::workspace_display_name(ws).into(),
+                        metric_availability: if self.active.resource_usage.is_some() {
+                            ui::activity::ActivityMetricAvailability::Local
+                        } else {
+                            ui::activity::ActivityMetricAvailability::Pending
+                        },
                         state: ui::activity::ActivityWorkspaceState::Active,
                         session_count: entries.len(),
                         pending_events: self.active.pending_events.len(),
@@ -14731,29 +17100,48 @@ impl App {
                     ids.sort_by_key(|s| s.0);
                     let sessions = ids
                         .iter()
-                        .map(|s| ui::activity::ActivitySessionRow {
-                            // 기본 제목이면 프로젝트명으로 표시 (활성 워크스페이스와 동일 규칙).
-                            name: rt
-                                .session_titles
-                                .get(s)
-                                .map(|raw| self.activity_session_name(&ws.id, raw))
-                                .unwrap_or_default()
-                                .into(),
-                            // 대기(warm)는 에이전트가 살아있음 — 활성일 때 감지한 마지막 에이전트
-                            // 줄을 유지해 보여준다(방안①). 셸이면 None.
-                            agent_line: rt.workspace_ui.agent_line_for(*s).map(Into::into),
-                            status_line: None,
-                            resource: rt
+                        .map(|s| {
+                            let resource = rt
                                 .session_resource_usage
                                 .iter()
                                 .find(|u| u.session == *s)
-                                .cloned(),
-                            pressure: Self::fresh_pressure(rt.session_input_pressure.get(s), now),
-                            storm: rt.storm_episodes.get(s).is_some_and(|ep| ep.confirmed),
+                                .cloned();
+                            ui::activity::ActivitySessionRow {
+                                session: Some(*s),
+                                // 기본 제목이면 프로젝트명으로 표시 (활성 워크스페이스와 동일 규칙).
+                                name: rt
+                                    .session_titles
+                                    .get(s)
+                                    .map(|raw| self.activity_session_name(&ws.id, raw))
+                                    .unwrap_or_default()
+                                    .into(),
+                                metric_availability: if resource.is_some() {
+                                    ui::activity::ActivityMetricAvailability::Local
+                                } else {
+                                    ui::activity::ActivityMetricAvailability::Pending
+                                },
+                                // 대기(warm)는 에이전트가 살아있음 — 활성일 때 감지한 마지막 에이전트
+                                // 줄을 유지해 보여준다(방안①). 셸이면 None.
+                                agent_line: rt.workspace_ui.agent_line_for(*s).map(Into::into),
+                                status_line: None,
+                                resource,
+                                pressure: Self::fresh_pressure(
+                                    rt.session_input_pressure.get(s),
+                                    now,
+                                ),
+                                storm: rt.storm_episodes.get(s).is_some_and(|ep| ep.confirmed),
+                            }
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
+                        workspace_id: Arc::from(ws.id.as_str()),
+                        runtime_instance: Some(rt.runtime_instance),
                         name: Self::workspace_display_name(ws).into(),
+                        metric_availability: if rt.resource_usage.is_some() {
+                            ui::activity::ActivityMetricAvailability::Local
+                        } else {
+                            ui::activity::ActivityMetricAvailability::Pending
+                        },
                         state: ui::activity::ActivityWorkspaceState::Warm,
                         session_count: rt.session_titles.len(),
                         pending_events: rt.pending_events.len(),
@@ -14777,9 +17165,11 @@ impl App {
                     .into_iter()
                     .flatten()
                     .take(ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE + 1)
-                    .map(|(title, _cwd)| ui::activity::ActivitySessionRow {
+                    .map(|row| ui::activity::ActivitySessionRow {
+                        session: None,
                         // 유휴 워크스페이스도 프로젝트명으로 표시 (활성/warm과 동일 규칙).
-                        name: self.activity_session_name(&ws.id, title).into(),
+                        name: self.activity_session_name(&ws.id, &row.title).into(),
+                        metric_availability: ui::activity::ActivityMetricAvailability::Local,
                         agent_line: None,
                         status_line: None,
                         resource: None,
@@ -14789,7 +17179,10 @@ impl App {
                     })
                     .collect::<Vec<_>>();
                 ui::activity::ActivityWorkspaceRow {
+                    workspace_id: Arc::from(ws.id.as_str()),
+                    runtime_instance: None,
                     name: Self::workspace_display_name(ws).into(),
+                    metric_availability: ui::activity::ActivityMetricAvailability::Local,
                     // DB에는 있으나 active/warm runtime이 없는 워크스페이스도 숨기지 않고
                     // 유휴 카드로 표시한다. 현재 복원 레이아웃의 pane은 위 snapshot에서
                     // 하위 세션 행으로 복구한다.
@@ -15358,20 +17751,44 @@ impl App {
     }
 
     fn render_composer_dock(&mut self, ui: &mut egui::Ui, text: &i18n::Catalog) {
-        let composer_session = self.active.workspace_ui.focused_session();
-        let composer_agent = composer_session
-            .and_then(|session| self.active.workspace_ui.agent_provider_for(session));
-        let composer_root = self.agent_workspace_cwd.as_deref().map(PathBuf::from);
-        let composer_workspace_id = self.active.id.clone();
+        let primary_session = self.active.workspace_ui.focused_session();
+        let composer_target = focused_composer_target_for_owner(
+            self.frame_terminal_owner,
+            &self.cross_workspace_pane,
+            &self.active.id,
+            self.active.runtime_instance,
+            primary_session,
+        );
+        let attached_focus_target =
+            owner_attached_target(self.frame_terminal_owner, &self.cross_workspace_pane).cloned();
+        let composer_workspace_id = attached_focus_target.as_ref().map_or_else(
+            || self.active.id.clone(),
+            |target| target.workspace_id.clone(),
+        );
+        let composer_agent = match composer_target.as_ref() {
+            Some(AppTerminalInputTarget::Primary { session, .. }) => {
+                self.active.workspace_ui.agent_provider_for(*session)
+            }
+            Some(AppTerminalInputTarget::Attached(target)) => self
+                .warm
+                .get(&target.workspace_id)
+                .filter(|runtime| runtime.runtime_instance == target.runtime_instance)
+                .and_then(|runtime| runtime.workspace_ui.agent_provider_for(target.session)),
+            None => None,
+        };
+        let composer_root = if attached_focus_target.is_some() {
+            self.workspace_tree_root(&composer_workspace_id)
+        } else {
+            self.agent_workspace_cwd.as_deref().map(PathBuf::from)
+        };
         // 프롬프트 라이브러리(기능2) 열기 요청 — 아래 도크 클로저에서 self.composer를
         // 이미 빌린 상태라 로컬 플래그로 모았다가 블록 뒤에서 연다(빌림 충돌 회피).
         // enabled 여부도 미리 복사한다(클로저 안에서 self.config를 못 읽음).
         let mut open_palette = false;
         let prompt_library_enabled = self.config.ui.prompt_library_enabled;
         let composer_action = {
-            // 도크 배경은 패널색(테마 파생) — 카드가 살짝 떠 보이도록 여백을 준다.
             let dock_frame =
-                egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin {
+                ui::designall::structural_frame(ui.visuals()).inner_margin(egui::Margin {
                     left: 10,
                     right: 10,
                     top: 8,
@@ -15381,7 +17798,7 @@ impl App {
             let composer_ctx = ui::composer::ComposerContext {
                 workspace_id: &composer_workspace_id,
                 send_key: self.config.ui.composer_send_key,
-                can_send: composer_session.is_some(),
+                can_send: composer_target.is_some(),
                 agent: composer_agent,
                 workspace_root: composer_root.as_deref(),
                 // 접힘 단축키 = FocusComposer의 유효 바인딩 + dispatcher와 같은 충돌
@@ -15389,7 +17806,7 @@ impl App {
                 collapse_shortcut: composer_collapse_shortcut(&self.config.shortcuts),
                 connector_snapshot: self.connector_snapshot_reader.snapshot(),
             };
-            egui::Panel::bottom("composer_dock")
+            let dock_response = egui::Panel::bottom("composer_dock")
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(dock_frame)
@@ -15409,8 +17826,16 @@ impl App {
                         });
                     }
                     composer.render(ui, text, &composer_ctx)
-                })
-                .inner
+                });
+            let separator_y = ui
+                .painter()
+                .round_to_pixel_center(dock_response.response.rect.top());
+            ui.painter().hline(
+                dock_response.response.rect.x_range(),
+                separator_y,
+                ui::designall::separator_stroke(ui.visuals()),
+            );
+            dock_response.inner
         };
         // 설정에서 꺼져 있으면(PR-7) 팔레트를 그리지 않는다. 켜져 있던 중 끄면 닫는다.
         if prompt_library_enabled {
@@ -15450,9 +17875,11 @@ impl App {
         match composer_action {
             Some(ui::composer::ComposerAction::Send(submission)) => {
                 let (prompt, history) = submission.into_parts();
-                if self.stage_workspace_controller_action(
-                    WorkspaceControllerAction::ComposerPrompt(prompt),
-                ) {
+                if let Some(target) = composer_target
+                    && self.stage_workspace_controller_action(
+                        WorkspaceControllerAction::ComposerPrompt { target, prompt },
+                    )
+                {
                     self.pending_composer_history = Some(history);
                 }
             }
@@ -15506,34 +17933,56 @@ impl App {
         }
     }
 
-    /// 컴포저 프롬프트를 활성 워크스페이스의 포커스 세션에 주입한다 (2026-07-17).
+    /// 컴포저 프롬프트를 렌더 시점에 캡처한 exact runtime/session에 주입한다.
     /// bracketed-paste TUI에는 짧은 한 줄도 명시적 paste 본문과 별도 submit CR로
     /// 보낸다. Codex 감지 워커가 아직 결과를 내기 전에는 일반 키 입력 경로를 타던
     /// 타이밍 의존을 없애고, PTY writer의 FIFO 순서로 두 입력을 전달한다.
     /// 주입 전 clear_selection은 WriteInput 직접 전송 관례(inject_waiting_answer와 동일).
-    fn send_composer_prompt(&mut self, prompt: &str) {
-        let Some(session) = self.active.workspace_ui.focused_session() else {
-            tracing::info!("컴포저 전송: 포커스된 터미널 세션 없음 — 무시");
-            return;
-        };
-        let bracketed = self.active.workspace_ui.session_bracketed_paste(session);
-        let provider = self.active.workspace_ui.agent_provider_for(session);
-        self.active.workspace_ui.clear_selection(session);
-        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider) else {
-            return;
-        };
-        let writes = match plan {
-            ui::composer::ComposerInputPlan::Single(bytes) => vec![bytes],
-            ui::composer::ComposerInputPlan::BracketedPaste { body, submit } => vec![body, submit],
-        };
-        for bytes in writes {
-            if let Err(e) = self
-                .active
-                .runtime
-                .send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
-            {
-                tracing::warn!("컴포저 전송 실패: {e:#}");
-                return;
+    fn send_composer_prompt(&mut self, target: &AppTerminalInputTarget, prompt: &str) {
+        match target {
+            AppTerminalInputTarget::Primary {
+                workspace_id,
+                runtime_instance,
+                session,
+            } => {
+                let Some(runtime) = self.runtime_by_instance_mut(*runtime_instance) else {
+                    return;
+                };
+                if runtime.id != *workspace_id
+                    || !runtime.workspace_ui.mux().is_some_and(|mux| {
+                        mux.tabs
+                            .iter()
+                            .flat_map(|tab| &tab.panes)
+                            .any(|pane| pane.session_id == Some(*session))
+                    })
+                {
+                    return;
+                }
+                Self::write_prompt_to_session(
+                    &mut runtime.workspace_ui,
+                    &runtime.runtime,
+                    *session,
+                    prompt,
+                );
+            }
+            AppTerminalInputTarget::Attached(target) => {
+                let Some(runtime) = self.warm.get_mut(&target.workspace_id) else {
+                    return;
+                };
+                if runtime.runtime_instance != target.runtime_instance
+                    || runtime.workspace_ui.mux().is_none_or(|mux| {
+                        attached_target_relation(mux, target)
+                            != ui::cross_workspace::LiveTargetRelation::Exact
+                    })
+                {
+                    return;
+                }
+                Self::write_prompt_to_session(
+                    &mut runtime.workspace_ui,
+                    &runtime.runtime,
+                    target.session,
+                    prompt,
+                );
             }
         }
     }
@@ -15948,6 +18397,8 @@ impl App {
         if let Some(bench) = self.bench.as_mut() {
             bench.finish();
         }
+        self.cancel_all_cross_workspace_restores();
+        self.cross_workspace_restore.force_clear_for_shutdown();
         self.status_feed_rx.shutdown();
         if let Some(task) = self.app_host_io.take() {
             task.cancel
@@ -16221,6 +18672,11 @@ impl eframe::App for App {
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
         self.poll_agent_state_worker();
+        if let Some(intent) = self.pending_status_bar_intent.take() {
+            self.dispatch_status_bar_intent(Some(intent), ctx);
+        }
+        self.poll_port_inventory(ctx);
+        self.pump_resource_maintenance();
         self.pump_perf_harness();
         self.pump_batch_spawn(ctx);
         if let Some((intent, subject)) = self.pending_connector_dispatch.take() {
@@ -16366,22 +18822,41 @@ impl eframe::App for App {
         }
 
         if want_active != self.active.render_active {
-            self.active.render_active = want_active;
-            let state = if want_active {
-                runtime::WorkspaceRuntimeState::Active
-            } else {
-                runtime::WorkspaceRuntimeState::Warm
-            };
-            let _ = self
-                .active
-                .runtime
-                .send_command(runtime::RuntimeCommand::SetWorkspaceState(state));
+            let runtime = &self.active.runtime;
+            deliver_workspace_state_transition(
+                &mut self.active.render_active,
+                &mut self.active.pending_replay_resync,
+                want_active,
+                |state| {
+                    runtime
+                        .send_command(runtime::RuntimeCommand::SetWorkspaceState(state))
+                        .is_ok()
+                },
+            );
             if want_active {
                 // 재개된 Viewport push는 비동기 — 다음 프레임을 예약해 드레인한다.
                 // (안 그러면 hidden 중 종료된 pane이 stale/"연결 중…"에 갇힐 수 있다)
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
+
+        self.reconcile_cross_workspace_pane();
+        self.sync_attached_runtime_visibility();
+        self.frame_terminal_owner = frame_terminal_owner(
+            &self.cross_workspace_pane,
+            want_active
+                && self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Terminal,
+            &self.visible_cross_workspace_attachments,
+            |target| {
+                self.warm.get(&target.workspace_id).is_some_and(|runtime| {
+                    runtime.runtime_instance == target.runtime_instance
+                        && runtime.workspace_ui.mux().is_some_and(|mux| {
+                            attached_target_relation(mux, target)
+                                == ui::cross_workspace::LiveTargetRelation::Exact
+                        })
+                })
+            },
+        );
 
         // warm 워커의 이벤트는 drain해서 그 워커의 pending_events에 '누적'한다 (버리지
         // 않는다 — SessionExited/StatusChanged 같은 일회성 lifecycle 이벤트를 버리면
@@ -16391,8 +18866,31 @@ impl eframe::App for App {
         let mut approval_events_overflowed = false;
         let mut approval_runtime_events = Vec::new();
         let mut warm_lifecycle_changed = false;
+        let mut resource_maintenance_changed = false;
+        let expected_restore_barrier = self.cross_workspace_restore.armed_barrier().map(
+            |(workspace_id, runtime_instance, correlation_id)| {
+                (workspace_id.to_owned(), runtime_instance, correlation_id)
+            },
+        );
+        let mut warm_restore_outcome = None;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
+            resource_maintenance_changed |=
+                apply_unattached_events(&mut self.unattached_counts, &rt.id, &events);
+            if let Some((workspace_id, runtime_instance, correlation_id)) =
+                expected_restore_barrier.as_ref()
+                && *workspace_id == rt.id
+                && *runtime_instance == rt.runtime_instance
+                && let Some(mux) =
+                    runtime_mux_at_durable_barrier(rt.workspace_ui.mux(), &events, *correlation_id)
+            {
+                warm_restore_outcome = self.cross_workspace_restore.settle_durable_barrier(
+                    workspace_id,
+                    *runtime_instance,
+                    *correlation_id,
+                    mux.map(Arc::as_ref),
+                );
+            }
             // active와 동일 — 예산 초과 backlog는 wake가 이미 소진돼 직접 예약해야 한다.
             if rt.events.has_backlog() {
                 ctx.request_repaint();
@@ -16429,26 +18927,44 @@ impl eframe::App for App {
                     &agent_providers,
                     &self.i18n,
                 );
-                // 표시 상태(mux 구조·세션 status·종료 결과)는 warm에서도 지금 반영한다 —
-                // 안 하면 fleet/사이드바가 warm 진입 시점 스냅샷에 얼어붙어 종료된 pane이
-                // 계속 실행 중으로, 새 pane은 없는 것으로 보인다. 렌더 상태는 그대로
-                // pending에 남겨 재활성 replay가 처리한다(둘 다 last-write-wins라 중복
-                // 적용이 안전하다).
-                rt.workspace_ui.apply_warm_events(&events);
-                rt.pending_events.extend(events.into_iter().filter(|event| {
-                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
-                }));
-                // MuxUpdated는 매번 전체 스냅샷이라 오래된 건 최신에 완전히 대체된다.
-                // chatty한 warm 워커가 pending_events를 무한 누적하지 않도록 최신 하나만
-                // 남기고 합친다 (lifecycle은 순서 보존, Viewport는 세션별 최신본 — replay 정확성).
-                // 새 이벤트가 들어온 이 분기에서만 호출돼 프레임마다 도는 걸 피한다.
-                coalesce_mux_updated(&mut rt.pending_events);
+                if rt.render_active {
+                    // App에 붙어 실제로 보이는 warm runtime은 자기 WorkspaceUi surface가
+                    // 이벤트를 소비한다. A의 UI나 warm projection에 대신 적용하지 않는다.
+                    rt.pending_events.extend(events.into_iter().filter(|event| {
+                        !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                    }));
+                } else {
+                    // 표시 상태(mux 구조·세션 status·종료 결과)와 shell spawn 완료는
+                    // 숨겨진 warm에서도 지금 반영한다. 렌더 replay는 유계로 보존한다.
+                    rt.workspace_ui.apply_warm_events(&events, &self.i18n);
+                    rt.pending_events
+                        .extend(events.into_iter().filter(warm_replay_event));
+                    let compacted = coalesce_mux_updated(&mut rt.pending_events);
+                    rt.pending_replay_resync |= compacted.overflowed;
+                }
             }
             if rt.event_overflow_pending && rt.events.durable_backlog_exhausted() {
                 rt.events = Self::subscribe_runtime_events(&rt.runtime, ctx);
                 rt.event_overflow_pending = false;
-                // warm→active 전환 자체가 전체 mux/viewport snapshot을 보내므로 지금은
-                // worker를 깨우지 않는다.
+                rt.event_resync_pending = rt.render_active;
+            }
+            if rt.render_active
+                && rt.event_resync_pending
+                && rt
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                        runtime::WorkspaceRuntimeState::Warm,
+                    ))
+                    .is_ok()
+                && rt
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                        runtime::WorkspaceRuntimeState::Active,
+                    ))
+                    .is_ok()
+            {
+                rt.event_resync_pending = false;
+                ctx.request_repaint();
             }
         }
         for (workspace_id, event) in approval_runtime_events {
@@ -16456,15 +18972,50 @@ impl eframe::App for App {
             self.observe_approval_runtime_events(&workspace_id, std::slice::from_ref(&event));
         }
         self.runtime_stream_warning |= runtime_stream_overflowed;
+        if resource_maintenance_changed {
+            invalidate_resource_projection(&mut self.activity_rows_cache);
+        }
         if warm_lifecycle_changed {
             self.refresh_warm_idle_deadline();
         }
+        if let Some(outcome) = warm_restore_outcome {
+            self.apply_cross_workspace_restore_barrier(outcome);
+        }
+        self.drive_cross_workspace_restore(std::time::Instant::now());
         self.maintain_warm_evictions(std::time::Instant::now());
 
         // 이벤트 drain + 알림 생성은 non-render 경로인 여기서 한다 (§14.1 Warm:
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
+        if apply_unattached_events(&mut self.unattached_counts, &self.active.id, &new_events) {
+            invalidate_resource_projection(&mut self.activity_rows_cache);
+        }
+        let active_restore_barrier = self
+            .cross_workspace_restore
+            .armed_barrier()
+            .map(|(workspace_id, runtime_instance, correlation_id)| {
+                (workspace_id.to_owned(), runtime_instance, correlation_id)
+            })
+            .and_then(|(workspace_id, runtime_instance, correlation_id)| {
+                (workspace_id == self.active.id && runtime_instance == self.active.runtime_instance)
+                    .then(|| {
+                        runtime_mux_at_durable_barrier(
+                            self.active.workspace_ui.mux(),
+                            &new_events,
+                            correlation_id,
+                        )
+                        .and_then(|mux| {
+                            self.cross_workspace_restore.settle_durable_barrier(
+                                &workspace_id,
+                                runtime_instance,
+                                correlation_id,
+                                mux.map(Arc::as_ref),
+                            )
+                        })
+                    })
+                    .flatten()
+            });
         if !new_events.is_empty() {
             Self::record_activity_events(&mut self.active, &new_events);
             for event in &new_events {
@@ -16488,22 +19039,34 @@ impl eframe::App for App {
                 &agent_providers,
                 &self.i18n,
             );
-            self.active
-                .pending_events
-                .extend(new_events.into_iter().filter(|event| {
-                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
-                }));
             // 창이 숨겨져(render_active=false) ui()가 스킵되면 active의 pending도 warm처럼
-            // 무한 누적된다 — 동일하게 coalesce로 유계화한다. 보일 때는 ui()가 매 프레임
-            // take()로 소비해 자라지 않으므로 coalesce가 불필요하다.
+            // 무한 누적된다. 이때 표시 상태도 warm과 같은 경로로 먼저 반영한 뒤 replay를
+            // 유계화한다. 보일 때는 ui()가 매 프레임 take()로 소비해 자라지 않으므로
+            // coalesce가 불필요하다.
             if !self.active.render_active {
-                coalesce_mux_updated(&mut self.active.pending_events);
+                let compacted = admit_hidden_active_replay_events(
+                    &mut self.active.workspace_ui,
+                    &mut self.active.pending_events,
+                    new_events,
+                    &self.i18n,
+                );
+                self.active.pending_replay_resync |= compacted.overflowed;
+            } else {
+                self.active
+                    .pending_events
+                    .extend(new_events.into_iter().filter(|event| {
+                        !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                    }));
             }
             // 여기서 리페인트를 재요청하지 않는다 — 이벤트를 여기까지 실어나른 모든 경로
             // (emit_gated의 Viewport/InputPressure/ResourceUsage slot + enqueue_durable_event)가
             // 이미 subscribe_runtime_events의 wake로 리페인트를 요청했다. 재요청하면 이번
             // 프레임이 그리는 내용을 위해 프레임을 한 장 더 잡고, egui가 거기에 settle 프레임을
             // 하나 더 붙여 갱신 1회당 3프레임이 된다 (agenttui 실측: 페인트의 70%가 헛 프레임).
+        }
+        if let Some(outcome) = active_restore_barrier {
+            self.apply_cross_workspace_restore_barrier(outcome);
+            self.drive_cross_workspace_restore(std::time::Instant::now());
         }
         // 예외: drain이 durable 예산(256/프레임)을 다 써 backlog를 남겼으면 다음
         // 프레임을 직접 예약한다 — 남은 이벤트의 wake는 이미 coalesce돼 사라졌으므로
@@ -16605,14 +19168,70 @@ impl eframe::App for App {
             egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin::ZERO);
         egui::Panel::top("top_bar")
             .resizable(false)
+            .show_separator_line(DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE)
             .frame(top_frame)
             .show(ui, |ui| {
-                // 빈 곳을 잡으면 창을 드래그로 옮긴다. auto-sized Panel의 max_rect는
-                // content 측정 전 매우 커질 수 있으므로 실제 titlebar 높이만 hit-test한다.
-                let bar_rect = egui::Rect::from_min_size(
-                    ui.cursor().min,
+                let (bar_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), bar_h),
+                    egui::Sense::hover(),
                 );
+                let tokens = ui::designall::tokens(ui.visuals());
+                let locale_short = self
+                    .config
+                    .i18n
+                    .locale
+                    .split('-')
+                    .next()
+                    .unwrap_or(&self.config.i18n.locale)
+                    .to_owned();
+                let unread = self.notifications_ui.unread();
+                unread_before = unread;
+                let waiting = self.approvals_ui.pending().len() + self.global_waiting.len();
+                let bell_label = if waiting > 0 {
+                    format!("🔔 {waiting}")
+                } else if unread > 0 {
+                    format!("🔔 {unread}")
+                } else {
+                    "🔔".to_owned()
+                };
+                let locale_width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        locale_short.clone(),
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        tokens.muted_text,
+                    )
+                    .size()
+                    .x;
+                let bell_width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        bell_label.clone(),
+                        egui::FontId::proportional(13.0),
+                        tokens.muted_text,
+                    )
+                    .size()
+                    .x;
+                let status_width = designall_titlebar_status_width(
+                    locale_width,
+                    bell_width,
+                    ui.spacing().item_spacing.x,
+                );
+                let has_file_tree = self.file_tree.is_some();
+                let (navigation_width, project_width) = self
+                    .file_tree
+                    .as_ref()
+                    .map(|tree| tree.designall_titlebar_widths())
+                    .unwrap_or((76.0, 40.0));
+                let regions = designall_titlebar_regions(
+                    bar_rect,
+                    navigation_width,
+                    project_width,
+                    status_width,
+                );
+
+                // 빈 곳을 잡으면 창을 드래그로 옮긴다. 버튼과 pane 도구는 이 interact
+                // 뒤에 등록되므로 클릭은 각 도구가 우선하고 나머지 영역만 창을 옮긴다.
                 let drag = ui.interact(
                     bar_rect,
                     egui::Id::new("titlebar_drag"),
@@ -16621,72 +19240,128 @@ impl eframe::App for App {
                 if drag.drag_started_by(egui::PointerButton::Primary) {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), bar_h),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS. 브랜드
-                        // 텍스트("Deppy Sijo"/"AI Agent Workspace")는 제거(2026-07-25
-                        // 사용자) — 신호등 3개만 이 자리에서 수직 중앙 정렬로 보인다
-                        // (실제 재배치는 main.rs의 set_traffic_light_titlebar_height).
-                        #[cfg(target_os = "macos")]
-                        ui.add_space(76.0);
-                        // 신호등 옆 "+" — 워크스페이스 추가(폴더 선택), 사이드바의
-                        // CreateWorkspaceFromPicker와 동일 경로(2026-07-25 사용자).
-                        if tbtn_response(ui, "+".to_owned(), false)
-                            .on_hover_text(text.t("sidebar.empty.start_workspace", &[]))
-                            .clicked()
-                            && self.pending_app_host_action.is_none()
-                        {
-                            self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
-                                FolderPickerPurpose::SwitchWorkspace,
-                            ));
-                            ui.ctx().request_repaint();
+
+                let project_layout = designall_project_titlebar_layout(regions.project);
+                let project_controls =
+                    designall_project_titlebar_controls(regions.project, has_file_tree);
+                if regions.project.width() >= 120.0 {
+                    let label_rect = egui::Rect::from_min_max(
+                        egui::pos2(project_layout.label_anchor.x, regions.project.top() + 3.0),
+                        egui::pos2(
+                            project_layout.collapse.left() - 4.0,
+                            regions.project.bottom() + 3.0,
+                        ),
+                    );
+                    let mut label_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt("designall_project_label")
+                            .max_rect(label_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    label_ui.set_clip_rect(regions.project.intersect(ui.clip_rect()));
+                    label_ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("Project")
+                                .strong()
+                                .size(12.0)
+                                .color(tokens.muted_text),
+                        )
+                        .truncate(),
+                    );
+                }
+                if let Some(collapse_rect) = project_controls.collapse {
+                    let collapse = ui.interact(
+                        collapse_rect,
+                        egui::Id::new("designall_project_panel_collapse"),
+                        egui::Sense::click(),
+                    );
+                    let collapse_color = if collapse.hovered() || collapse.has_focus() {
+                        tokens.text
+                    } else {
+                        tokens.muted_text
+                    };
+                    let icon = egui::Rect::from_center_size(
+                        collapse_rect.center(),
+                        egui::vec2(12.0, 10.0),
+                    );
+                    ui.painter().rect_stroke(
+                        icon,
+                        1.5,
+                        egui::Stroke::new(1.0, collapse_color),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().vline(
+                        icon.left() + 3.5,
+                        icon.y_range(),
+                        egui::Stroke::new(1.0, collapse_color),
+                    );
+                    if collapse
+                        .on_hover_text(text.t("file_tree.collapse_sidebar", &[]))
+                        .clicked()
+                    {
+                        if let Some(tree) = self.file_tree.as_mut() {
+                            tree.collapse_project_file_panel();
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(10.0);
-                            // 우측: 로케일. 중앙에는 검색/워크스페이스 선택기를 두지
-                            // 않아 목업처럼 작업 표면이 비어 있게 한다. 메모리 표시는
-                            // 하단 상태바로 일원화(2026-07-18 사용자 — 상/하단 수치가
-                            // 샘플 시점 차이로 어긋나 보였음).
-                            let locale_short = self
-                                .config
-                                .i18n
-                                .locale
-                                .split('-')
-                                .next()
-                                .unwrap_or(&self.config.i18n.locale);
-                            ui.weak(locale_short.to_owned());
-                            let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
-                                tbtn_response(ui, label, selected).clicked()
-                            };
-                            let sel = self.settings_open;
-                            if tbtn(ui, text.t("top.settings", &[]), sel) {
-                                self.settings_open = !sel;
-                            }
-                            let unread = self.notifications_ui.unread();
-                            unread_before = unread;
-                            let waiting =
-                                self.approvals_ui.pending().len() + self.global_waiting.len();
-                            let bell_label = if waiting > 0 {
-                                format!("🔔 {waiting}")
-                            } else if unread > 0 {
-                                format!("🔔 {unread}")
-                            } else {
-                                "🔔".to_owned()
-                            };
-                            let bell_open =
-                                egui::Popup::is_id_open(ui.ctx(), Self::inbox_popup_id());
-                              let bell = tbtn_response(ui, bell_label, bell_open)
-                                  .on_hover_text(text.t("top.notifications", &[]));
-                              inbox_click = self.inbox_popup(&bell, &text);
-                            // Agents 진입은 사이드바 하단 nav가 담당한다 — 상단바 버튼은
-                            // 삭제(2026-07-18 사용자 확정). 단축키·기타 진입점은 유지.
-                        });
-                    },
+                        ui.ctx().request_repaint();
+                    }
+                }
+
+                if let Some(add_rect) = project_controls.add {
+                    let add = ui.interact(
+                        add_rect,
+                        egui::Id::new("designall_project_add"),
+                        egui::Sense::click(),
+                    );
+                    let add_color = if add.hovered() || add.has_focus() {
+                        tokens.text
+                    } else {
+                        tokens.muted_text
+                    };
+                    let center = project_layout.add.center();
+                    let stroke = egui::Stroke::new(1.5, add_color);
+                    ui.painter().hline(
+                        egui::Rangef::new(center.x - 5.0, center.x + 5.0),
+                        center.y,
+                        stroke,
+                    );
+                    ui.painter().vline(
+                        center.x,
+                        egui::Rangef::new(center.y - 5.0, center.y + 5.0),
+                        stroke,
+                    );
+                    if add
+                        .on_hover_text(text.t("sidebar.empty.start_workspace", &[]))
+                        .clicked()
+                        && self.pending_app_host_action.is_none()
+                    {
+                        self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
+                            FolderPickerPurpose::SwitchWorkspace,
+                        ));
+                        ui.ctx().request_repaint();
+                    }
+                }
+
+                let mut status_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(regions.status)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
                 );
-                // 툴바-본문 경계선은 egui Panel::top이 자체로 그린다 — 커스텀 hairline을
-                // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
+                status_ui.set_clip_rect(regions.status.intersect(ui.clip_rect()));
+                status_ui.add_space(10.0);
+                status_ui.weak(locale_short);
+                let bell_open = egui::Popup::is_id_open(status_ui.ctx(), Self::inbox_popup_id());
+                let bell = tbtn_response(&mut status_ui, bell_label, bell_open)
+                    .on_hover_text(text.t("top.notifications", &[]));
+                inbox_click = self.inbox_popup(&bell, &text);
+
+                let separator = ui::designall::separator_stroke(ui.visuals());
+                let painter = ui.painter();
+                let bottom = painter.round_to_pixel_center(bar_rect.bottom());
+                painter.hline(bar_rect.x_range(), bottom, separator);
+                for x in [regions.traffic.right(), regions.project.right()] {
+                    let x = painter.round_to_pixel_center(x);
+                    painter.vline(x, bar_rect.y_range(), separator);
+                }
             });
 
         // 폭주 경고 배너 (로드맵 B2) — 타이틀바 바로 아래, 어떤 탭을 보든 보이게
@@ -16855,13 +19530,12 @@ impl eframe::App for App {
                         ),
                     )
                 };
-                  ui::file_tree::SidebarWorkspaceEntry {
-                      id: workspace.id.clone(),
-                      name: Self::workspace_display_name(workspace),
-                      repo: workspace_git_label(&workspace.path),
-                      state,
-                      summary,
-                  }
+                ui::file_tree::SidebarWorkspaceEntry {
+                    id: workspace.id.clone(),
+                    name: Self::workspace_display_name(workspace),
+                    state,
+                    summary,
+                }
             })
             .collect();
         // 사이드바 펼침은 활성 선택과 독립적이다. 활성 세션뿐 아니라 warm runtime의
@@ -16874,15 +19548,31 @@ impl eframe::App for App {
         > = std::collections::HashMap::new();
         let mut sidebar_sessions: std::collections::HashMap<
             String,
-            Vec<ui::file_tree::SessionEntry>,
+            Vec<ui::file_tree::SidebarSessionRow>,
         > = std::collections::HashMap::new();
         for workspace in &sidebar_workspaces {
             if workspace.id == active_workspace_id {
                 continue;
             }
             let Some(warm_runtime) = self.warm.get(&workspace.id) else {
+                let persisted = self
+                    .persisted_activity_panes
+                    .get(&workspace.id)
+                    .into_iter()
+                    .flatten()
+                    .map(|row| {
+                        ui::file_tree::SidebarSessionRow::from_persisted_parts(
+                            row.workspace_id.clone(),
+                            runtime::MuxPaneId(row.pane_id.clone()),
+                            self.activity_session_name(&workspace.id, &row.title),
+                            row.cwd.clone(),
+                        )
+                    })
+                    .collect();
+                sidebar_sessions.insert(workspace.id.clone(), persisted);
                 continue;
             };
+            let runtime_instance = warm_runtime.runtime_instance;
             let needs_input: std::collections::HashSet<_> = self
                 .global_waiting
                 .iter()
@@ -16920,9 +19610,30 @@ impl eframe::App for App {
                 entry.resumable =
                     entry.agent_line.is_none() && self.restore_agents.contains_key(&entry.pane.0);
             }
+            let entries = entries
+                .into_iter()
+                .map(|entry| {
+                    ui::file_tree::SidebarSessionRow::from_live(
+                        workspace.id.clone(),
+                        runtime_instance,
+                        entry,
+                    )
+                })
+                .collect();
             sidebar_sessions.insert(workspace.id.clone(), entries);
         }
-        sidebar_sessions.insert(active_workspace_id.clone(), terminal_sessions);
+        let active_runtime_instance = self.active.runtime_instance;
+        let active_sidebar_sessions = terminal_sessions
+            .into_iter()
+            .map(|entry| {
+                ui::file_tree::SidebarSessionRow::from_live(
+                    active_workspace_id.clone(),
+                    active_runtime_instance,
+                    entry,
+                )
+            })
+            .collect();
+        sidebar_sessions.insert(active_workspace_id.clone(), active_sidebar_sessions);
         // Home을 보고 있는 동안 도착했거나 이미 표시 중인 공지는 읽음이다. sidebar
         // snapshot을 만들기 전에 반영해 같은 프레임에 Home 배지가 사라지게 한다.
         if self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home {
@@ -16962,6 +19673,7 @@ impl eframe::App for App {
             .iter()
             .filter(|server| server.enabled)
             .count();
+        let mut status_intent = None;
         egui::Panel::bottom("agent_terminal_status_bar")
             .resizable(false)
             .exact_size(26.0)
@@ -16970,7 +19682,7 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
-                self.agent_terminal_ui.status_bar(
+                status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx())),
                     self.agent_sessions_ui.codex_usage(),
@@ -16978,6 +19690,10 @@ impl eframe::App for App {
                     waiting_count,
                     mcp_count,
                     &self.status_feed,
+                    self.port_snapshot.as_ref(),
+                    &self.unattached_counts,
+                    Some(active_workspace_id.as_str()),
+                    deppy_core::time::unix_ms(),
                     &text,
                 );
             });
@@ -17008,9 +19724,28 @@ impl eframe::App for App {
                 .map(|tree| tree.take_clipboard_shortcut_consumption())
                 && (paste_consumed || copy_consumed)
             {
-                self.active
-                    .workspace_ui
-                    .suppress_clipboard_shortcuts_this_frame(paste_consumed, copy_consumed);
+                let target = terminal_runtime_identity_for_owner(
+                    self.frame_terminal_owner,
+                    &self.cross_workspace_pane,
+                    &self.active.id,
+                    self.active.runtime_instance,
+                );
+                if let Some((workspace_id, runtime_instance)) = target
+                    && let Some(runtime) =
+                        self.runtime_by_instance_mut(runtime_instance)
+                            .filter(|runtime| {
+                                workspace_runtime_identity_matches(
+                                    &runtime.id,
+                                    runtime.runtime_instance,
+                                    &workspace_id,
+                                    runtime_instance,
+                                )
+                            })
+                {
+                    runtime
+                        .workspace_ui
+                        .suppress_clipboard_shortcuts_this_frame(paste_consumed, copy_consumed);
+                }
             }
             match sidebar_action {
                 Some(ui::file_tree::SidebarAction::SwitchWorkspace(workspace_id)) => {
@@ -17058,6 +19793,23 @@ impl eframe::App for App {
                 }
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
                     self.agent_sessions_ui.open();
+                }
+                Some(ui::file_tree::SidebarAction::OpenSettings) => {
+                    self.settings_open = true;
+                }
+                Some(ui::file_tree::SidebarAction::OpenHelp) => {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/JRVector9/deppy-sijo",
+                    ));
+                }
+                Some(ui::file_tree::SidebarAction::ShowFocusedDiff) => {
+                    if let Some(session) = self.active.workspace_ui.focused_session() {
+                        self.open_session_diff(ui.ctx(), session);
+                    }
+                }
+                Some(ui::file_tree::SidebarAction::OpenConnectors) => {
+                    self.settings_category = ui::settings::Category::Connectors;
+                    self.settings_open = true;
                 }
                 Some(ui::file_tree::SidebarAction::OpenMacosFileAccessSettings) => {
                     if self.pending_app_controller_action.is_none() {
@@ -17137,6 +19889,16 @@ impl eframe::App for App {
                         },
                     );
                 }
+                Some(ui::file_tree::SidebarAction::OpenSessionBeside(target)) => {
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    self.stage_workspace_controller_action(
+                        WorkspaceControllerAction::OpenSessionBeside {
+                            target,
+                            anchor: ui::cross_workspace::InsertAnchor::End,
+                        },
+                    );
+                }
                 // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)
                 // 세션 이름 변경 — pane 제목 갱신(mux 반영 + 영속).
                 Some(ui::file_tree::SidebarAction::RenameSession { pane, title }) => {
@@ -17167,26 +19929,7 @@ impl eframe::App for App {
                 // 제목은 인박스와 같은 관례로 해석 — "세션 #2"보다 "SKRT · Claude"가
                 // 무엇의 변경분인지 바로 판단된다(2026-07-18 사용자: 가독성 개선 요청).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
-                    let cwd = self.cached_session_cwd(session);
-                    let ws_name = self
-                        .workspaces
-                        .iter()
-                        .find(|w| w.id == self.active.id)
-                        .map(Self::workspace_display_name);
-                    let session_label = self.inbox_session_label(&self.active.id, session);
-                    let title = match (ws_name, session_label) {
-                        (Some(ws), Some(s)) => format!("{ws} · {s}"),
-                        (Some(ws), None) => ws,
-                        (None, Some(s)) => s,
-                        (None, None) => String::new(),
-                    };
-                    self.diff_panel_ui.open_for(
-                        ui.ctx(),
-                        self.active.id.clone(),
-                        session,
-                        cwd,
-                        title,
-                    );
+                    self.open_session_diff(ui.ctx(), session);
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
                 // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.
@@ -17252,18 +19995,31 @@ impl eframe::App for App {
                     ));
                 }
                 Some(ui::file_tree::SidebarAction::CloseWorkspace(workspace_id)) => {
-                    // 세션·실행 중 수는 사이드바 행이 그린 것과 같은 원천(summary) —
-                    // 다이얼로그 숫자가 방금 본 행 요약과 어긋나지 않는다.
-                    match sidebar_workspaces.iter().find(|w| w.id == workspace_id) {
-                        Some(entry)
-                            if entry.state != ui::file_tree::SidebarWorkspaceState::Idle =>
-                        {
+                    let entry = sidebar_workspaces
+                        .iter()
+                        .find(|entry| entry.id == workspace_id);
+                    let has_closeable_sessions = entry.is_some_and(|entry| {
+                        entry.state != ui::file_tree::SidebarWorkspaceState::Idle
+                    });
+                    match workspace_close_disposition(
+                        self.config.ui.confirm_workspace_close,
+                        has_closeable_sessions,
+                    ) {
+                        WorkspaceCloseDisposition::Confirm => {
+                            let entry = entry.expect("closeable workspace entry");
+                            // 세션·실행 중 수는 사이드바 행이 그린 것과 같은 원천(summary) —
+                            // 다이얼로그 숫자가 방금 본 행 요약과 어긋나지 않는다.
                             let s = entry.summary;
                             let total = s.running + s.waiting + s.done + s.error + s.idle;
                             self.ws_close_confirm =
                                 Some((workspace_id, entry.name.clone(), total, s.running));
                         }
-                        _ => {
+                        WorkspaceCloseDisposition::CloseNow => {
+                            self.stage_workspace_controller_action(
+                                WorkspaceControllerAction::CloseWorkspace(workspace_id),
+                            );
+                        }
+                        WorkspaceCloseDisposition::Ignore => {
                             // 메뉴는 Idle에 안 붙지만 요청 프레임 사이 상태 변화 방어.
                             tracing::info!(
                                 workspace = %workspace_id,
@@ -17314,8 +20070,7 @@ impl eframe::App for App {
         // fleet 뷰모델은 Fleet 뷰일 때만 조립한다(active+warm 순회 비용 회피).
         let (fleet_sessions, fleet_summary) = if fleet_visible {
             let sessions = self.build_fleet_sessions(&text);
-            let summary =
-                crate::fleet::FleetSummary::from_states(sessions.iter().map(|s| s.state));
+            let summary = crate::fleet::FleetSummary::from_states(sessions.iter().map(|s| s.state));
             (sessions, summary)
         } else {
             (Vec::new(), crate::fleet::FleetSummary::default())
@@ -17332,21 +20087,85 @@ impl eframe::App for App {
             Vec::new()
         };
 
+        let terminal_visible = !home_visible && !inbox_visible && !fleet_visible;
+        if terminal_visible {
+            self.frame_terminal_owner = frame_terminal_owner(
+                &self.cross_workspace_pane,
+                true,
+                &self.visible_cross_workspace_attachments,
+                |target| {
+                    self.warm.get(&target.workspace_id).is_some_and(|runtime| {
+                        runtime.runtime_instance == target.runtime_instance
+                            && runtime.workspace_ui.mux().is_some_and(|mux| {
+                                attached_target_relation(mux, target)
+                                    == ui::cross_workspace::LiveTargetRelation::Exact
+                            })
+                    })
+                },
+            );
+        }
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
-        if !home_visible && !inbox_visible && !fleet_visible && self.config.ui.composer_enabled {
+        if terminal_visible && self.config.ui.composer_enabled {
             self.render_composer_dock(ui, &text);
         }
 
         // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에
         // pane 좌/상/우 여백이 보였다(#69 사용자).
-        // 작업창 배경은 Target의 tab strip 바탕(#17171c)으로 고정한다. 실제 PTY는
-        // WorkspaceUi가 한 단계 더 어두운 inset surface(#0f1117)에 렌더한다.
-        let central_frame = egui::Frame::central_panel(&ui.ctx().global_style())
-            .inner_margin(egui::Margin::ZERO)
-            .fill(egui::Color32::from_rgb(0x17, 0x17, 0x1c));
+        let central_frame = ui::designall::structural_frame(ui.visuals());
         let mut home_action = None;
         let mut inbox_page_click = None;
         let mut fleet_action = None;
+        let render_panes = if terminal_visible {
+            self.cross_workspace_pane
+                .attachments()
+                .iter()
+                .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
+                .map(|attachment| {
+                    let workspace_id = attachment.workspace_id();
+                    let (workspace_label, display_title) = Self::attached_workspace_labels(
+                        self.workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == workspace_id),
+                        workspace_id,
+                    );
+                    CrossWorkspaceRenderPane {
+                        id: attachment.id(),
+                        target: attachment.live_target().cloned(),
+                        width_px: attachment.width_px(),
+                        render_state: self
+                            .cross_workspace_pane
+                            .render_state_for(attachment.id())
+                            .unwrap_or(ui::cross_workspace::AttachedRenderState::Placeholder(
+                                ui::cross_workspace::AttachedPlaceholder::Disconnected,
+                            )),
+                        workspace_label,
+                        display_title,
+                        identity_color: ui::file_tree::workspace_accent(
+                            &sidebar_workspaces,
+                            workspace_id,
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut primary_focus_requested = false;
+        let mut attached_focus_requested = None;
+        let mut attached_detach_requested = None;
+        let mut attached_reorder_requested = None;
+        let mut attached_width_requested = None;
+        let mut adjacent_width_requested = None;
+        let mut visible_attachment_ids =
+            Vec::with_capacity(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
+        let mut current_owner = FrameTerminalOwner::None;
+        let mut dropped_session_open = None;
+        let session_drop_label = (terminal_visible
+            && egui::DragAndDrop::has_payload_of_type::<ui::file_tree::SessionRowDragPayload>(
+                ui.ctx(),
+            ))
+        .then(|| text.t("workspace.menu.open_in_current_view_right", &[]));
+        self.last_multi_pane_terminal_rect = None;
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
@@ -17375,12 +20194,396 @@ impl eframe::App for App {
                             max: self.config.ui.fleet_batch_spawn_max,
                         },
                     );
+                } else if !render_panes.is_empty() {
+                    let rect = ui.available_rect_before_wrap();
+                    self.last_multi_pane_terminal_rect = Some(rect);
+                    let widths = render_panes
+                        .iter()
+                        .map(|pane| pane.width_px)
+                        .collect::<Vec<_>>();
+                    let layout = fluid_cross_workspace_layout(rect, &widths);
+                    let primary_rect = layout.primary;
+                    let divider_rect = layout.divider;
+                    let foreign_rect = layout.foreign;
+                    let (pointer_transition, pointer_pos) = ui.ctx().input(|input| {
+                        (
+                            input.pointer.primary_pressed() || input.pointer.primary_released(),
+                            input.pointer.interact_pos(),
+                        )
+                    });
+                    let primary_resize_id = ui.id().with("cross_workspace_primary_width");
+                    let primary_resize = ui
+                        .interact(divider_rect, primary_resize_id, egui::Sense::drag())
+                        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                    ui.painter().rect_filled(
+                        divider_rect,
+                        0.0,
+                        ui::designall::separator_stroke(ui.visuals()).color,
+                    );
+                    let primary_resize_start_id = primary_resize_id.with("drag_start_width");
+                    if primary_resize.drag_started()
+                        && let Some(first) = render_panes.first()
+                    {
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(primary_resize_start_id, first.width_px)
+                        });
+                    }
+                    if let Some(total_drag_delta) = primary_resize.total_drag_delta()
+                        && let Some(first) = render_panes.first()
+                    {
+                        let start_width = ui
+                            .ctx()
+                            .data(|data| data.get_temp::<f32>(primary_resize_start_id))
+                            .unwrap_or(first.width_px);
+                        if let Some(requested_width) = primary_divider_requested_width(
+                            start_width,
+                            total_drag_delta.x,
+                        ) {
+                            attached_width_requested = Some((first.id, requested_width));
+                        }
+                    }
+                    if primary_resize.drag_stopped() {
+                        ui.ctx()
+                            .data_mut(|data| data.remove::<f32>(primary_resize_start_id));
+                    }
+                    let mut foreign = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(foreign_rect)
+                            .id_salt("cross_workspace_foreign_strip"),
+                    );
+                    foreign.set_clip_rect(foreign_rect.intersect(ui.clip_rect()));
+                    egui::ScrollArea::horizontal()
+                        .id_salt("cross_workspace_foreign_scroll")
+                        .auto_shrink([false, false])
+                        .show_viewport(&mut foreign, |scroll_ui, viewport| {
+                            let relative_rects = foreign_strip_rects(
+                                egui::Pos2::ZERO,
+                                foreign_rect.height(),
+                                &widths,
+                            );
+                            let content_width = relative_rects
+                                .last()
+                                .map_or(0.0, egui::Rect::right);
+                            scroll_ui.set_min_size(egui::vec2(
+                                content_width,
+                                foreign_rect.height(),
+                            ));
+                            let visible_indices = ui::workspace::visible_attachment_indices(
+                                viewport,
+                                &relative_rects,
+                            )
+                            .collect::<Vec<_>>();
+                            visible_attachment_ids.extend(
+                                visible_indices
+                                    .iter()
+                                    .map(|index| render_panes[*index].id),
+                            );
+                            current_owner = frame_terminal_owner(
+                                &self.cross_workspace_pane,
+                                true,
+                                &visible_attachment_ids,
+                                |target| {
+                                    self.warm.get(&target.workspace_id).is_some_and(|runtime| {
+                                        runtime.runtime_instance == target.runtime_instance
+                                            && runtime.workspace_ui.mux().is_some_and(|mux| {
+                                                attached_target_relation(mux, target)
+                                                    == ui::cross_workspace::LiveTargetRelation::Exact
+                                            })
+                                    })
+                                },
+                            );
+                            current_owner = suppress_terminal_owner_during_pointer_focus(
+                                current_owner,
+                                pointer_transition,
+                                pointer_pos,
+                                rect,
+                            );
+                            drain_native_input_if_unowned(
+                                current_owner == FrameTerminalOwner::Primary,
+                                matches!(current_owner, FrameTerminalOwner::Attached(_)),
+                                || {
+                                    let _ = crate::native_key_monitor::drain();
+                                },
+                            );
+
+                            let groups = group_visible_cross_workspace_panes(
+                                &self.cross_workspace_pane,
+                                &visible_attachment_ids,
+                                |target| {
+                                    self.warm.get(&target.workspace_id).is_some_and(|runtime| {
+                                        runtime.runtime_instance == target.runtime_instance
+                                            && runtime.workspace_ui.mux().is_some_and(|mux| {
+                                                attached_target_relation(mux, target)
+                                                    == ui::cross_workspace::LiveTargetRelation::Exact
+                                            })
+                                    })
+                                },
+                            );
+                            let origin = scroll_ui.min_rect().min.to_vec2();
+                            let mut rendered_ids = Vec::with_capacity(
+                                ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES,
+                            );
+                            for group in groups {
+                                let mut targets = Vec::with_capacity(
+                                    ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES,
+                                );
+                                for attachment_id in &group.attachment_ids {
+                                    if let Some(target) = render_panes
+                                        .iter()
+                                        .find(|pane| pane.id == *attachment_id)
+                                        .and_then(|pane| pane.target.as_ref())
+                                    {
+                                        targets.push(ui::workspace::AttachedPaneTarget {
+                                            workspace_id: target.workspace_id.clone(),
+                                            tab: target.tab.clone(),
+                                            pane: target.pane.clone(),
+                                            session: target.session,
+                                        });
+                                    }
+                                }
+                                let input_target = match current_owner {
+                                    FrameTerminalOwner::Attached(owner_id) => group
+                                        .attachment_ids
+                                        .iter()
+                                        .position(|attachment_id| *attachment_id == owner_id)
+                                        .and_then(|index| targets.get(index)),
+                                    FrameTerminalOwner::Primary | FrameTerminalOwner::None => None,
+                                };
+                                let Some(runtime) = self
+                                    .warm
+                                    .get_mut(&group.identity.workspace_id)
+                                    .filter(|runtime| {
+                                        runtime.runtime_instance
+                                            == group.identity.runtime_instance
+                                    })
+                                else {
+                                    continue;
+                                };
+                                let runtime_events =
+                                    std::mem::take(&mut runtime.pending_events);
+                                runtime.workspace_ui.prepare_attached_panes(
+                                    scroll_ui.ctx(),
+                                    &runtime_events,
+                                    &text,
+                                    &targets,
+                                    input_target,
+                                );
+                                for (group_index, attachment_id) in
+                                    group.attachment_ids.iter().enumerate()
+                                {
+                                    let Some(index) = render_panes
+                                        .iter()
+                                        .position(|pane| pane.id == *attachment_id)
+                                    else {
+                                        continue;
+                                    };
+                                    let pane = &render_panes[index];
+                                    let Some(target) = targets.get(group_index) else {
+                                        continue;
+                                    };
+                                    let pane_rect = relative_rects[index].translate(origin);
+                                    let mut attached_ui = scroll_ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(pane_rect)
+                                            .id_salt(("cross_workspace_attached", pane.id)),
+                                    );
+                                    attached_ui.set_clip_rect(
+                                        pane_rect.intersect(scroll_ui.clip_rect()),
+                                    );
+                                    let availability = match pane.render_state {
+                                        ui::cross_workspace::AttachedRenderState::Live => {
+                                            ui::workspace::AttachedPaneAvailability::Available
+                                        }
+                                        ui::cross_workspace::AttachedRenderState::Placeholder(
+                                            ui::cross_workspace::AttachedPlaceholder::Suspended,
+                                        ) => ui::workspace::AttachedPaneAvailability::Suspended,
+                                        ui::cross_workspace::AttachedRenderState::Placeholder(
+                                            ui::cross_workspace::AttachedPlaceholder::Disconnected,
+                                        ) => ui::workspace::AttachedPaneAvailability::Disconnected,
+                                    };
+                                    let output = runtime.workspace_ui.show_prepared_attached_pane(
+                                        &mut attached_ui,
+                                        &self.config.terminal,
+                                        &text,
+                                        target,
+                                        &pane.workspace_label,
+                                        &pane.display_title,
+                                        availability,
+                                        Some(ui::workspace::AttachedPaneHeaderContext::new(
+                                            pane.id,
+                                            index,
+                                        )
+                                        .with_identity_color(pane.identity_color)),
+                                    );
+                                    if output.surface.focus_requested {
+                                        attached_focus_requested = Some(pane.id);
+                                    }
+                                    if output.surface.detach_requested
+                                        || (pane.render_state
+                                            == ui::cross_workspace::AttachedRenderState::Live
+                                            && !output.surface.target_present)
+                                    {
+                                        attached_detach_requested = Some(pane.id);
+                                    }
+                                    if let Some(reorder) = output.reorder_requested {
+                                        attached_reorder_requested = Some(reorder);
+                                    }
+                                    rendered_ids.push(pane.id);
+                                }
+                            }
+
+                            for index in visible_indices {
+                                let pane = &render_panes[index];
+                                let pane_rect = relative_rects[index].translate(origin);
+                                if !rendered_ids.contains(&pane.id) {
+                                    let output = show_app_attached_placeholder(
+                                        scroll_ui,
+                                        pane_rect,
+                                        pane,
+                                        &text,
+                                    );
+                                    if output.focus_requested {
+                                        attached_focus_requested = Some(pane.id);
+                                    }
+                                    if output.detach_requested {
+                                        attached_detach_requested = Some(pane.id);
+                                    }
+                                }
+                                if let Some(next_pane) = render_panes.get(index + 1) {
+                                    let resize_rect = egui::Rect::from_min_max(
+                                        egui::pos2(pane_rect.right(), pane_rect.top()),
+                                        egui::pos2(
+                                            pane_rect.right() + ATTACHED_DIVIDER_WIDTH,
+                                            pane_rect.bottom(),
+                                        ),
+                                    );
+                                    let resize = scroll_ui
+                                        .interact(
+                                            resize_rect,
+                                            scroll_ui.id().with(("attached_width", pane.id)),
+                                            egui::Sense::drag(),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                                    scroll_ui.painter().rect_filled(
+                                        resize_rect,
+                                        0.0,
+                                        ui::designall::separator_stroke(scroll_ui.visuals()).color,
+                                    );
+                                    if resize.dragged()
+                                        && let Some(pointer) = resize.interact_pointer_pos()
+                                    {
+                                        adjacent_width_requested = Some((
+                                            pane.id,
+                                            next_pane.id,
+                                            pointer.x
+                                                - pane_rect.left()
+                                                - ATTACHED_DIVIDER_WIDTH * 0.5,
+                                        ));
+                                    }
+                                }
+                                if let Some(label) = session_drop_label.as_deref()
+                                    && dropped_session_open.is_none()
+                                {
+                                    let drop_id =
+                                        scroll_ui.id().with(("session_drop", pane.id));
+                                    dropped_session_open = session_pane_drop_interaction(
+                                        scroll_ui,
+                                        pane_rect,
+                                        drop_id,
+                                        ui::cross_workspace::InsertAnchor::Attached(pane.id),
+                                        label,
+                                    );
+                                }
+                            }
+                        });
+
+                    let mut primary = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(primary_rect)
+                            .id_salt("cross_workspace_primary"),
+                    );
+                    primary.set_clip_rect(primary_rect.intersect(ui.clip_rect()));
+                    primary_focus_requested = self
+                        .active
+                        .workspace_ui
+                        .show_with_input(
+                            &mut primary,
+                            &self.config.terminal,
+                            &events,
+                            &text,
+                            current_owner == FrameTerminalOwner::Primary,
+                        )
+                        .focus_requested;
+                    if let Some(label) = session_drop_label.as_deref()
+                        && dropped_session_open.is_none()
+                    {
+                        let drop_id = primary.id().with("session_drop");
+                        dropped_session_open = session_pane_drop_interaction(
+                            &mut primary,
+                            primary_rect,
+                            drop_id,
+                            ui::cross_workspace::InsertAnchor::Primary,
+                            label,
+                        );
+                    }
                 } else {
+                    current_owner = FrameTerminalOwner::Primary;
+                    let primary_rect = ui.available_rect_before_wrap();
                     self.active
                         .workspace_ui
                         .show(ui, &self.config.terminal, &events, &text);
+                    if let Some(label) = session_drop_label.as_deref() {
+                        dropped_session_open = session_pane_drop_interaction(
+                            ui,
+                            primary_rect,
+                            ui.id().with("cross_workspace_primary_session_drop"),
+                            ui::cross_workspace::InsertAnchor::Primary,
+                            label,
+                        );
+                    }
                 }
             });
+        self.visible_cross_workspace_attachments.clear();
+        self.visible_cross_workspace_attachments.extend(
+            visible_attachment_ids
+                .into_iter()
+                .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES),
+        );
+        self.frame_terminal_owner = current_owner;
+        self.sync_attached_runtime_visibility();
+        if let Some((target, anchor)) = dropped_session_open {
+            self.agent_terminal_ui
+                .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+            self.stage_workspace_controller_action(WorkspaceControllerAction::OpenSessionBeside {
+                target,
+                anchor,
+            });
+        }
+        if let Some((attachment_id, width_px)) = attached_width_requested {
+            let _ = self.cross_workspace_pane.set_width(attachment_id, width_px);
+            ui.ctx().request_repaint();
+        }
+        if let Some((left_id, right_id, left_width_px)) = adjacent_width_requested {
+            let _ = self
+                .cross_workspace_pane
+                .resize_adjacent(left_id, right_id, left_width_px);
+            ui.ctx().request_repaint();
+        }
+        if let Some(reorder) = attached_reorder_requested {
+            let _ = self
+                .cross_workspace_pane
+                .reorder(reorder.attachment_id, reorder.destination_index);
+        }
+        if let Some(attachment_id) = attached_focus_requested {
+            let _ = self.cross_workspace_pane.focus_attachment(attachment_id);
+        } else if primary_focus_requested {
+            self.cross_workspace_pane.focus_primary();
+        }
+        if let Some(attachment_id) = attached_detach_requested {
+            self.stage_workspace_controller_action(WorkspaceControllerAction::DetachWorkspacePane(
+                attachment_id,
+            ));
+        }
         if self.active.workspace_ui.take_new_session_requested() {
             self.stage_workspace_controller_action(WorkspaceControllerAction::OpenAgentLauncher);
         }
@@ -17462,6 +20665,9 @@ impl eframe::App for App {
         }
         // take/put-back 마무리 — 위 take에서 꺼낸 rows를 타임스탬프 그대로 되돌린다.
         self.activity_rows_cache = Some((activity_rows_stamp, activity_rows));
+        if stage_status_bar_intent(&mut self.pending_status_bar_intent, status_intent) {
+            ui.ctx().request_repaint();
+        }
         match home_action {
             Some(ui::agent_terminal::HomeAction::Connectors) => {
                 self.settings_category = ui::settings::Category::Connectors;
@@ -17474,7 +20680,27 @@ impl eframe::App for App {
             }
             None => {}
         }
-        if self.active.workspace_ui.take_terminal_focus_claimed() {
+        let primary_terminal_focus_claimed = (self.frame_terminal_owner
+            == FrameTerminalOwner::Primary)
+            && self.active.workspace_ui.take_terminal_focus_claimed();
+        let attached_terminal_focus_claimed =
+            owner_attached_target(self.frame_terminal_owner, &self.cross_workspace_pane)
+                .cloned()
+                .and_then(|target| {
+                    self.warm.get_mut(&target.workspace_id).map(|runtime| {
+                        let runtime_id = runtime.id.clone();
+                        let runtime_instance = runtime.runtime_instance;
+                        take_exact_runtime_focus_claim(
+                            &runtime_id,
+                            runtime_instance,
+                            &target.workspace_id,
+                            target.runtime_instance,
+                            || runtime.workspace_ui.take_terminal_focus_claimed(),
+                        )
+                    })
+                })
+                .unwrap_or(false);
+        if primary_terminal_focus_claimed || attached_terminal_focus_claimed {
             self.agent_sessions_ui.surrender_text_focus(ui.ctx());
         }
         // logic에서 workspace/path 변경 때만 검증한 immutable cwd projection을 넘긴다.
@@ -17655,8 +20881,25 @@ impl eframe::App for App {
             }
         }
 
-        // 「워크스페이스 종료」 확인 모달 — 실행 중 에이전트를 죽일 수 있어 반드시
-        // 확인을 거친다(pane 닫기 confirm_close와 같은 중앙 egui::Window 관례).
+        if let Some(warning) = self.cross_workspace_open_warning {
+            let mut close = false;
+            egui::Window::new(text.t("workspace.cross_pane.open_failed.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(warning.message(&text));
+                    ui.add_space(8.0);
+                    if ui.button(text.t("action.close", &[])).clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.cross_workspace_open_warning = None;
+            }
+        }
+
+        // 「워크스페이스 종료」 확인 모달 — 설정에서 명시적으로 ON한 경우에만 표시한다.
         if let Some((close_id, close_name, total, running)) = self.ws_close_confirm.clone() {
             let mut decision: Option<bool> = None; // Some(true)=모두 종료, Some(false)=취소
             egui::Window::new(text.t("workspace.close_ws_confirm.title", &[]))
@@ -18619,7 +21862,8 @@ impl eframe::App for App {
                     AgentNotificationNavigation::FocusCurrentPty { session } => {
                         self.stage_workspace_controller_action(
                             WorkspaceControllerAction::FocusPty {
-                                switch_workspace: None,
+                                workspace_id: self.active.id.clone(),
+                                runtime_instance: Some(self.active.runtime_instance),
                                 session,
                             },
                         );
@@ -18628,9 +21872,14 @@ impl eframe::App for App {
                         workspace_id,
                         session,
                     } => {
+                        let runtime_instance = self
+                            .warm
+                            .get(&workspace_id)
+                            .map(|runtime| runtime.runtime_instance);
                         self.stage_workspace_controller_action(
                             WorkspaceControllerAction::FocusPty {
-                                switch_workspace: Some(workspace_id),
+                                workspace_id,
+                                runtime_instance,
                                 session,
                             },
                         );
@@ -18773,7 +22022,7 @@ fn tbtn_response(ui: &mut egui::Ui, label: String, selected: bool) -> egui::Resp
     };
     let font = egui::FontId::proportional(13.0);
     let galley = ui.painter().layout_no_wrap(label, font, col);
-    let w = galley.size().x + 20.0;
+    let w = galley.size().x + TOP_BAR_TEXT_BUTTON_HORIZONTAL_PADDING;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
     if selected {
         ui.painter()
@@ -18886,6 +22135,7 @@ fn load_catalog(locale: &str) -> i18n::Catalog {
 
 /// warm 풀 상한 초과분 중 축출 가능한(live 세션 없는) workspace를 앞(가장 오래됨)에서부터
 /// 고른다. live workspace는 건너뛰며, 그만큼 상한 초과가 허용된다 (작업 보호 우선).
+#[cfg(test)]
 fn warm_eviction_candidates(
     warm_order: &[String],
     max_warm: usize,
@@ -18898,6 +22148,26 @@ fn warm_eviction_candidates(
         .take(overflow)
         .cloned()
         .collect()
+}
+
+fn protected_warm_eviction_candidates(
+    warm_order: &[String],
+    max_warm: usize,
+    is_protected: impl Fn(&str) -> bool,
+    has_live: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let overflow = warm_order.len().saturating_sub(max_warm);
+    warm_order
+        .iter()
+        .filter(|id| !is_protected(id) && !has_live(id))
+        .take(overflow)
+        .cloned()
+        .collect()
+}
+
+fn push_warm_order_unique(warm_order: &mut Vec<String>, workspace_id: String) {
+    warm_order.retain(|id| id != &workspace_id);
+    warm_order.push(workspace_id);
 }
 
 /// 설정의 전역 MB 예산을 resident runtime 수로 나눈 워커별 share.
@@ -19015,6 +22285,410 @@ fn expired_warm_workspace_ids(
         .collect()
 }
 
+fn expired_unprotected_warm_workspace_ids(
+    warm_order: &[String],
+    is_protected: impl Fn(&str) -> bool,
+    backgrounded_at: impl Fn(&str) -> Option<std::time::Instant>,
+    now: std::time::Instant,
+    timeout: std::time::Duration,
+) -> Vec<String> {
+    expired_warm_workspace_ids(
+        warm_order,
+        |id| (!is_protected(id)).then(|| backgrounded_at(id)).flatten(),
+        now,
+        timeout,
+    )
+}
+
+fn resolve_exact_warm_pane_target(
+    active_workspace_id: &str,
+    workspace_id: &str,
+    runtime_instance: Option<u64>,
+    mux: Option<&runtime::MuxSnapshot>,
+    tab: &runtime::MuxTabId,
+    pane: &runtime::MuxPaneId,
+    session: runtime::SessionId,
+) -> Option<ui::cross_workspace::WorkspacePaneTarget> {
+    if workspace_id == active_workspace_id {
+        return None;
+    }
+    let runtime_instance = runtime_instance?;
+    let exact = mux?
+        .tabs
+        .iter()
+        .find(|candidate| &candidate.id == tab)?
+        .panes
+        .iter()
+        .any(|candidate| candidate.id == *pane && candidate.session_id == Some(session));
+    exact.then(|| {
+        ui::cross_workspace::WorkspacePaneTarget::new(
+            workspace_id,
+            runtime_instance,
+            tab.clone(),
+            pane.clone(),
+            session,
+        )
+    })
+}
+
+fn restored_workspace_pane_target(
+    workspace_id: &str,
+    runtime_instance: u64,
+    requested_pane: &runtime::MuxPaneId,
+    mux: &runtime::MuxSnapshot,
+) -> Option<ui::cross_workspace::WorkspacePaneTarget> {
+    mux.tabs.iter().find_map(|tab| {
+        tab.panes
+            .iter()
+            .find(|pane| pane.id == *requested_pane)
+            .and_then(|pane| {
+                pane.session_id.map(|session| {
+                    ui::cross_workspace::WorkspacePaneTarget::new(
+                        workspace_id,
+                        runtime_instance,
+                        tab.id.clone(),
+                        pane.id.clone(),
+                        session,
+                    )
+                })
+            })
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColdRestoreRuntimeAdmission {
+    Reuse(u64),
+    Create,
+    Denied,
+}
+
+fn cold_restore_runtime_admission(
+    existing_runtime_instance: Option<u64>,
+    live_warm_count: usize,
+    max_live_warm: usize,
+) -> ColdRestoreRuntimeAdmission {
+    match existing_runtime_instance {
+        Some(runtime_instance) => ColdRestoreRuntimeAdmission::Reuse(runtime_instance),
+        None if live_warm_count < max_live_warm => ColdRestoreRuntimeAdmission::Create,
+        None => ColdRestoreRuntimeAdmission::Denied,
+    }
+}
+
+fn count_live_warm_runtimes(live: impl IntoIterator<Item = bool>) -> usize {
+    live.into_iter().filter(|is_live| *is_live).count()
+}
+
+fn attached_target_relation(
+    mux: &runtime::MuxSnapshot,
+    target: &ui::cross_workspace::WorkspacePaneTarget,
+) -> ui::cross_workspace::LiveTargetRelation {
+    let pane = mux
+        .tabs
+        .iter()
+        .find(|tab| tab.id == target.tab)
+        .and_then(|tab| tab.panes.iter().find(|pane| pane.id == target.pane));
+    match pane {
+        None => ui::cross_workspace::LiveTargetRelation::PaneMissing,
+        Some(pane) if pane.session_id != Some(target.session) => {
+            ui::cross_workspace::LiveTargetRelation::SessionMismatch
+        }
+        Some(_) => ui::cross_workspace::LiveTargetRelation::Exact,
+    }
+}
+
+const ATTACHED_DIVIDER_WIDTH: f32 = 4.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FluidCrossWorkspaceLayout {
+    primary: egui::Rect,
+    divider: egui::Rect,
+    foreign: egui::Rect,
+}
+
+fn foreign_strip_content_width(widths: &[f32]) -> f32 {
+    let mut content_width = 0.0;
+    for (index, width) in widths
+        .iter()
+        .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
+        .enumerate()
+    {
+        if index > 0 {
+            content_width += ATTACHED_DIVIDER_WIDTH;
+        }
+        content_width += width.max(0.0);
+    }
+    content_width
+}
+
+fn fluid_cross_workspace_layout(
+    rect: egui::Rect,
+    attached_widths: &[f32],
+) -> FluidCrossWorkspaceLayout {
+    let divider_width = ATTACHED_DIVIDER_WIDTH.min(rect.width().max(0.0));
+    let available_after_divider = (rect.width() - divider_width).max(0.0);
+    let primary_min = MIN_PRIMARY_TERMINAL_WIDTH_PX.min(available_after_divider);
+    let content_width = foreign_strip_content_width(attached_widths);
+    let foreign_width = content_width.min((available_after_divider - primary_min).max(0.0));
+    let primary_right = rect.right() - divider_width - foreign_width;
+    let primary = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(primary_right.max(rect.left()), rect.bottom()),
+    );
+    let divider = egui::Rect::from_min_max(
+        egui::pos2(primary.right(), rect.top()),
+        egui::pos2(primary.right() + divider_width, rect.bottom()),
+    );
+    let foreign = egui::Rect::from_min_max(egui::pos2(divider.right(), rect.top()), rect.max);
+    FluidCrossWorkspaceLayout {
+        primary,
+        divider,
+        foreign,
+    }
+}
+
+fn primary_divider_requested_width(start_width: f32, total_drag_delta_x: f32) -> Option<f32> {
+    if !start_width.is_finite() || !total_drag_delta_x.is_finite() {
+        return None;
+    }
+    Some((start_width - total_drag_delta_x).max(0.0))
+}
+
+fn foreign_strip_rects(origin: egui::Pos2, height: f32, widths: &[f32]) -> Vec<egui::Rect> {
+    let mut rects = Vec::with_capacity(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES);
+    let mut left = origin.x;
+    for width in widths
+        .iter()
+        .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)
+    {
+        let right = left + width.max(0.0);
+        rects.push(egui::Rect::from_min_max(
+            egui::pos2(left, origin.y),
+            egui::pos2(right, origin.y + height.max(0.0)),
+        ));
+        left = right + ATTACHED_DIVIDER_WIDTH;
+    }
+    rects
+}
+
+fn attached_visibility_command(visible: bool) -> runtime::RuntimeCommand {
+    runtime::RuntimeCommand::SetWorkspaceState(if visible {
+        runtime::WorkspaceRuntimeState::Active
+    } else {
+        runtime::WorkspaceRuntimeState::Warm
+    })
+}
+
+fn warm_visibility_transitions<'a>(
+    runtimes: impl IntoIterator<Item = (&'a str, u64, bool)>,
+    visible_runtimes: &[VisibleRuntimeIdentity],
+) -> Vec<(String, u64, bool)> {
+    runtimes
+        .into_iter()
+        .filter_map(|(workspace_id, runtime_instance, render_active)| {
+            let visible = visible_runtimes
+                .iter()
+                .any(|identity| identity.matches(workspace_id, runtime_instance));
+            (visible != render_active).then(|| (workspace_id.to_owned(), runtime_instance, visible))
+        })
+        .collect()
+}
+
+fn shortcut_targets_primary_terminal(action: crate::shortcuts::ShortcutAction) -> bool {
+    use crate::shortcuts::ShortcutAction as A;
+
+    matches!(
+        action,
+        A::NewShell
+            | A::ClosePane
+            | A::SplitVertical
+            | A::SplitHorizontal
+            | A::FocusNextPane
+            | A::FocusPreviousPane
+            | A::TerminalSearch
+            | A::ScrollToBottom
+            | A::PromptJumpPrev
+            | A::PromptJumpNext
+    )
+}
+
+fn configured_terminal_shortcut_blocked(
+    action: crate::shortcuts::ShortcutAction,
+    attached_focused: bool,
+    multi_pane_pointer_transition: bool,
+) -> bool {
+    (attached_focused && shortcut_targets_primary_terminal(action))
+        || (multi_pane_pointer_transition && shortcut_depends_on_terminal_owner(action))
+}
+
+fn shortcut_depends_on_terminal_owner(action: crate::shortcuts::ShortcutAction) -> bool {
+    shortcut_targets_primary_terminal(action)
+        || action == crate::shortcuts::ShortcutAction::FocusComposer
+}
+
+fn select_workspace_host_io_action_for_owner(
+    owner: FrameTerminalOwner,
+    active: Option<(String, u64, ui::workspace::WorkspaceIoIntent)>,
+    attached: Option<(
+        ui::cross_workspace::AttachmentId,
+        String,
+        u64,
+        ui::workspace::WorkspaceIoIntent,
+    )>,
+) -> Option<AppHostIoAction> {
+    match owner {
+        FrameTerminalOwner::Primary => active,
+        FrameTerminalOwner::Attached(owner_id) => {
+            attached.and_then(|(attachment_id, workspace_id, runtime_instance, intent)| {
+                (attachment_id == owner_id).then_some((workspace_id, runtime_instance, intent))
+            })
+        }
+        FrameTerminalOwner::None => None,
+    }
+    .map(
+        |(workspace_id, runtime_instance, intent)| AppHostIoAction::Workspace {
+            workspace_id,
+            runtime_instance,
+            intent,
+        },
+    )
+}
+
+fn workspace_runtime_identity_matches(
+    runtime_workspace_id: &str,
+    runtime_instance: u64,
+    target_workspace_id: &str,
+    target_runtime_instance: u64,
+) -> bool {
+    runtime_workspace_id == target_workspace_id && runtime_instance == target_runtime_instance
+}
+
+fn drain_native_input_if_unowned(
+    primary_input_enabled: bool,
+    attached_input_enabled: bool,
+    drain: impl FnOnce(),
+) {
+    if !primary_input_enabled && !attached_input_enabled {
+        drain();
+    }
+}
+
+fn take_exact_runtime_focus_claim(
+    runtime_workspace_id: &str,
+    runtime_instance: u64,
+    target_workspace_id: &str,
+    target_runtime_instance: u64,
+    take_claim: impl FnOnce() -> bool,
+) -> bool {
+    workspace_runtime_identity_matches(
+        runtime_workspace_id,
+        runtime_instance,
+        target_workspace_id,
+        target_runtime_instance,
+    ) && take_claim()
+}
+
+fn show_app_attached_placeholder(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    pane: &CrossWorkspaceRenderPane,
+    catalog: &i18n::Catalog,
+) -> ui::workspace::AttachedPaneOutput {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .id_salt(app_attached_placeholder_id(pane.id)),
+    );
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    let response = child.interact(rect, child.id().with("focus"), egui::Sense::click());
+    let (header_rect, title_rect, close_rect) = app_attached_placeholder_header_rects(rect);
+    let detach_requested = child
+        .put(
+            close_rect,
+            egui::Button::new(egui::RichText::new("×").size(16.0)).frame(false),
+        )
+        .on_hover_text(catalog.t("workspace.cross_pane.detach", &[]))
+        .clicked();
+    let tokens = ui::designall::tokens(child.visuals());
+    let mut title_job = egui::text::LayoutJob::single_section(
+        pane.display_title.clone(),
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(12.0),
+            color: tokens.muted_text,
+            ..Default::default()
+        },
+    );
+    title_job.wrap = egui::text::TextWrapping {
+        max_width: title_rect.width().max(0.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let title_galley = child.painter().layout_job(title_job);
+    child.painter().with_clip_rect(title_rect).galley(
+        egui::pos2(
+            title_rect.left(),
+            title_rect.center().y - title_galley.size().y / 2.0,
+        ),
+        title_galley,
+        tokens.muted_text,
+    );
+    let body_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.left(), header_rect.bottom()), rect.max);
+    let mut body = child.new_child(
+        egui::UiBuilder::new()
+            .max_rect(body_rect)
+            .id_salt("placeholder_body"),
+    );
+    body.centered_and_justified(|ui| {
+        let key = match pane.render_state {
+            ui::cross_workspace::AttachedRenderState::Placeholder(placeholder) => match placeholder
+            {
+                ui::cross_workspace::AttachedPlaceholder::Suspended => {
+                    "workspace.cross_pane.suspended"
+                }
+                ui::cross_workspace::AttachedPlaceholder::Disconnected => {
+                    "workspace.cross_pane.disconnected"
+                }
+            },
+            ui::cross_workspace::AttachedRenderState::Live => "workspace.cross_pane.disconnected",
+        };
+        ui.weak(catalog.t(key, &[("workspace", &pane.workspace_label)]));
+    });
+    child.painter().hline(
+        rect.x_range(),
+        child.painter().round_to_pixel_center(rect.top() + 0.5),
+        egui::Stroke::new(1.0, pane.identity_color),
+    );
+    ui::workspace::AttachedPaneOutput {
+        focus_requested: response.clicked(),
+        detach_requested,
+        target_present: false,
+    }
+}
+
+fn app_attached_placeholder_header_rects(rect: egui::Rect) -> (egui::Rect, egui::Rect, egui::Rect) {
+    let header_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(
+            rect.right(),
+            rect.top() + 32.0_f32.min(rect.height().max(0.0)),
+        ),
+    );
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(header_rect.right() - 15.0, header_rect.center().y),
+        egui::vec2(24.0, 24.0),
+    );
+    let title_rect = egui::Rect::from_min_max(
+        egui::pos2(header_rect.left() + 8.0, header_rect.top()),
+        egui::pos2(close_rect.left() - 4.0, header_rect.bottom()),
+    );
+    (header_rect, title_rect, close_rect)
+}
+
+fn app_attached_placeholder_id(attachment_id: ui::cross_workspace::AttachmentId) -> egui::Id {
+    egui::Id::new(("app_attached_placeholder", attachment_id))
+}
+
 /// warm workspace의 pending_events를 합쳐(coalesce) 재활성 replay를 정확+유계로 만든다.
 ///
 /// replay 규칙(중요): pending_events는 재활성 시 workspace_ui.show()로 렌더 상태를
@@ -19039,12 +22713,145 @@ fn expired_warm_workspace_ids(
 ///
 /// 알림은 coalesce 전에 process_ws_notifications가 전량 소비하므로(렌더 replay 전용)
 /// 공격적으로 줄여도 알림엔 영향이 없다.
-fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
+const PENDING_REPLAY_EVENT_CAP: usize = 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayCompaction {
+    overflowed: bool,
+}
+
+fn clear_pending_replay_resync_after_activation(
+    pending_replay_resync: &mut bool,
+    want_active: bool,
+    delivered: bool,
+) {
+    if want_active && delivered {
+        *pending_replay_resync = false;
+    }
+}
+
+fn commit_workspace_state_transition(
+    render_active: &mut bool,
+    pending_replay_resync: &mut bool,
+    want_active: bool,
+    delivered: bool,
+) {
+    if !delivered {
+        return;
+    }
+    *render_active = want_active;
+    clear_pending_replay_resync_after_activation(pending_replay_resync, want_active, delivered);
+}
+
+fn deliver_workspace_state_transition(
+    render_active: &mut bool,
+    pending_replay_resync: &mut bool,
+    want_active: bool,
+    deliver: impl FnOnce(runtime::WorkspaceRuntimeState) -> bool,
+) -> bool {
+    let state = if want_active {
+        runtime::WorkspaceRuntimeState::Active
+    } else {
+        runtime::WorkspaceRuntimeState::Warm
+    };
+    let delivered = deliver(state);
+    commit_workspace_state_transition(render_active, pending_replay_resync, want_active, delivered);
+    delivered
+}
+
+fn admit_hidden_active_replay_events(
+    workspace_ui: &mut ui::workspace::WorkspaceUi,
+    pending_events: &mut Vec<runtime::RuntimeEvent>,
+    events: Vec<runtime::RuntimeEvent>,
+    catalog: &i18n::Catalog,
+) -> ReplayCompaction {
+    workspace_ui.apply_warm_events(&events, catalog);
+    pending_events.extend(events.into_iter().filter(warm_replay_event));
+    coalesce_mux_updated(pending_events)
+}
+
+fn warm_replay_event(event: &runtime::RuntimeEvent) -> bool {
+    !matches!(
+        event,
+        runtime::RuntimeEvent::AgentSpawnResolved { .. }
+            | runtime::RuntimeEvent::ShellSpawned { .. }
+            | runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Shell,
+                ..
+            }
+    )
+}
+
+fn runtime_mux_at_durable_barrier<'a>(
+    current_mux: Option<&'a Arc<runtime::MuxSnapshot>>,
+    events: &'a [runtime::RuntimeEvent],
+    correlation_id: u64,
+) -> Option<Option<&'a Arc<runtime::MuxSnapshot>>> {
+    if correlation_id == 0 {
+        return None;
+    }
+    let mut mux = current_mux;
+    for event in events {
+        match event {
+            runtime::RuntimeEvent::MuxUpdated { snapshot } => mux = Some(snapshot),
+            runtime::RuntimeEvent::DurableEventBarrierReached {
+                correlation_id: reached,
+            } if *reached == correlation_id => return Some(mux),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn mux_live_sessions(mux: &runtime::MuxSnapshot) -> std::collections::HashSet<runtime::SessionId> {
+    mux.tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .filter_map(|pane| pane.session_id)
+        .collect()
+}
+
+fn event_session(event: &runtime::RuntimeEvent) -> Option<runtime::SessionId> {
+    match event {
+        runtime::RuntimeEvent::ShellSpawned { session }
+        | runtime::RuntimeEvent::AgentSpawned { session }
+        | runtime::RuntimeEvent::Viewport { session, .. }
+        | runtime::RuntimeEvent::SessionExited { session, .. }
+        | runtime::RuntimeEvent::SessionStatusChanged { session, .. }
+        | runtime::RuntimeEvent::PtyInputPressure { session, .. }
+        | runtime::RuntimeEvent::SessionStatusViewChanged { session, .. }
+        | runtime::RuntimeEvent::SessionRestored { session, .. }
+        | runtime::RuntimeEvent::ScrollbackSearchResult { session, .. }
+        | runtime::RuntimeEvent::LastOutputExtracted { session, .. }
+        | runtime::RuntimeEvent::SessionFreezeChanged { session, .. } => Some(*session),
+        runtime::RuntimeEvent::AgentSpawnResolved {
+            session: Some(session),
+            ..
+        } => Some(*session),
+        _ => None,
+    }
+}
+
+fn replay_transient_event(event: &runtime::RuntimeEvent) -> bool {
+    matches!(
+        event,
+        runtime::RuntimeEvent::ShellSpawned { .. }
+            | runtime::RuntimeEvent::AgentSpawned { .. }
+            | runtime::RuntimeEvent::SpawnFailed { .. }
+            | runtime::RuntimeEvent::AgentSpawnResolved { .. }
+    )
+}
+
+fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) -> ReplayCompaction {
     // 남길 최신 MuxUpdated(있으면) — 뽑아서 나중에 맨 앞에 재삽입.
     let latest_mux = events
         .iter()
         .rposition(|e| matches!(e, runtime::RuntimeEvent::MuxUpdated { .. }))
         .map(|i| events[i].clone());
+    let latest_mux_live_sessions = latest_mux.as_ref().and_then(|event| match event {
+        runtime::RuntimeEvent::MuxUpdated { snapshot } => Some(mux_live_sessions(snapshot)),
+        _ => None,
+    });
     let latest_resource_idx = events
         .iter()
         .rposition(|e| matches!(e, runtime::RuntimeEvent::ResourceUsage { .. }));
@@ -19095,6 +22902,10 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
             }
             _ => true,
         };
+        let keep = keep
+            && latest_mux_live_sessions
+                .as_ref()
+                .is_none_or(|live| event_session(e).is_none_or(|session| live.contains(&session)));
         idx += 1;
         keep
     });
@@ -19102,6 +22913,33 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
     if let Some(mux) = latest_mux {
         events.insert(0, mux);
     }
+
+    let mut overflowed = false;
+    if events.len() > PENDING_REPLAY_EVENT_CAP {
+        overflowed = true;
+        let mut drop_remaining = events.len() - PENDING_REPLAY_EVENT_CAP;
+        events.retain(|event| {
+            if drop_remaining > 0 && replay_transient_event(event) {
+                drop_remaining -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    if events.len() > PENDING_REPLAY_EVENT_CAP {
+        overflowed = true;
+        let keep_tail = PENDING_REPLAY_EVENT_CAP.saturating_sub(1);
+        let non_mux_len = events.len().saturating_sub(1);
+        let drop_non_mux = non_mux_len.saturating_sub(keep_tail);
+        if drop_non_mux > 0 {
+            events.drain(1..1 + drop_non_mux);
+        }
+        events.truncate(PENDING_REPLAY_EVENT_CAP);
+    }
+
+    ReplayCompaction { overflowed }
 }
 
 /// T1: pane 우클릭 → 환경설정 진입 시 감지한 focused 세션 폴더 배너 상태.
@@ -19132,11 +22970,11 @@ fn cwd_belongs_to_any(cwd: &std::path::Path, roots: &[std::path::PathBuf]) -> bo
 /// **키는 DB에 저장된 raw 제목**("workspace.spawn.shell 3")이다. 호출측이 i18n 렌더된
 /// 값("셸 3")을 넘기면 항상 miss가 되어 프로젝트명 해석이 조용히 실패한다 —
 /// warm 워크스페이스에서 실제로 그랬다(리뷰 P2-1). session_titles는 raw를 보관한다.
-fn pane_cwd<'a>(panes: &'a [(String, String)], raw_title: &str) -> Option<&'a str> {
+fn pane_cwd<'a>(panes: &'a [storage::PersistedActivityPane], raw_title: &str) -> Option<&'a str> {
     panes
         .iter()
-        .find(|(title, _)| title == raw_title)
-        .map(|(_, cwd)| cwd.as_str())
+        .find(|row| row.title == raw_title)
+        .map(|row| row.cwd.as_str())
         .filter(|cwd| !cwd.is_empty())
 }
 
@@ -19165,6 +23003,2313 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    #[test]
+    fn status_resource_port_app_activity_projection_preserves_exact_identities() {
+        let source = include_str!("app.rs");
+        let activity_rows = source
+            .split_once("    fn activity_rows(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn refresh_activity_snapshot_if_needed"))
+            .map(|(body, _)| body)
+            .expect("activity_rows function remains discoverable");
+
+        assert_eq!(
+            activity_rows
+                .matches("workspace_id: Arc::from(ws.id.as_str())")
+                .count(),
+            3,
+            "active, warm, and idle rows must retain the exact workspace id"
+        );
+        for session_projection in ["session: e.session", "session: Some(*s)", "session: None"] {
+            assert!(
+                activity_rows.contains(session_projection),
+                "missing exact session projection: {session_projection}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_resource_port_app_projection_sets_explicit_metric_availability() {
+        let source = include_str!("app.rs");
+        let activity_rows = source
+            .split_once("    fn activity_rows(&self)")
+            .and_then(|(_, tail)| tail.split_once("    fn refresh_activity_snapshot_if_needed"))
+            .map(|(body, _)| body)
+            .expect("activity_rows function remains discoverable");
+        assert_eq!(
+            activity_rows.matches("metric_availability:").count(),
+            6,
+            "all three workspace and session projections must set availability"
+        );
+        assert!(!activity_rows.contains("RemoteUnavailable"));
+    }
+
+    #[test]
+    fn status_resource_port_app_never_opens_arbitrary_tcp_listener_as_url() {
+        let source = include_str!("app.rs");
+        let dispatch = source
+            .split_once("    fn dispatch_status_bar_intent(")
+            .and_then(|(_, tail)| tail.split_once("    fn activity_rows(&self)"))
+            .map(|(body, _)| body)
+            .expect("status dispatch remains discoverable");
+        assert!(!dispatch.contains("OpenAddress"));
+        assert!(!dispatch.contains("open_url"));
+        assert!(dispatch.contains("CopyAddress"));
+        assert!(dispatch.contains("copy_text"));
+    }
+
+    #[test]
+    fn status_resource_port_app_resource_refresh_only_invalidates_activity_cache() {
+        let mut activity_cache = Some((
+            std::time::Instant::now(),
+            ui::activity::ActivitySnapshot::empty(),
+        ));
+        let port_snapshot = port_snapshot_fixture(7, 3000);
+        let port_generation = 7;
+
+        invalidate_resource_projection(&mut activity_cache);
+
+        assert!(activity_cache.is_none());
+        assert_eq!(port_snapshot.generation, 7);
+        assert_eq!(port_generation, 7);
+    }
+
+    #[test]
+    fn status_resource_port_app_maintenance_is_latest_only_per_workspace_and_bounded() {
+        let mut queue = std::collections::VecDeque::new();
+        for index in 0..=ui::activity::MAX_ACTIVITY_WORKSPACES {
+            stage_resource_maintenance(
+                &mut queue,
+                ResourceMaintenanceTarget {
+                    workspace_id: format!("workspace-{index}"),
+                    runtime_instance: index as u64 + 1,
+                    action: ResourceMaintenanceAction::InspectUnattached,
+                },
+            );
+        }
+        assert_eq!(queue.len(), ui::activity::MAX_ACTIVITY_WORKSPACES);
+
+        stage_resource_maintenance(
+            &mut queue,
+            ResourceMaintenanceTarget {
+                workspace_id: "workspace-1".to_owned(),
+                runtime_instance: 999,
+                action: ResourceMaintenanceAction::KillUnattached,
+            },
+        );
+        let retained = queue
+            .iter()
+            .find(|target| target.workspace_id == "workspace-1")
+            .expect("existing workspace command remains staged");
+        assert_eq!(retained.action, ResourceMaintenanceAction::KillUnattached);
+        assert_eq!(queue.len(), ui::activity::MAX_ACTIVITY_WORKSPACES);
+    }
+
+    #[test]
+    fn status_resource_port_app_unattached_events_update_and_prune_bounded_state() {
+        let mut counts = HashMap::new();
+        let mut queue = std::collections::VecDeque::from([
+            ResourceMaintenanceTarget {
+                workspace_id: "kept".to_owned(),
+                runtime_instance: 1,
+                action: ResourceMaintenanceAction::InspectUnattached,
+            },
+            ResourceMaintenanceTarget {
+                workspace_id: "removed".to_owned(),
+                runtime_instance: 2,
+                action: ResourceMaintenanceAction::KillUnattached,
+            },
+        ]);
+
+        assert!(apply_unattached_events(
+            &mut counts,
+            "kept",
+            &[runtime::RuntimeEvent::UnattachedSessionsInspected { count: 3 }]
+        ));
+        assert_eq!(counts.get("kept"), Some(&3));
+        assert!(apply_unattached_events(
+            &mut counts,
+            "kept",
+            &[runtime::RuntimeEvent::UnattachedSessionsKilled { count: 3 }]
+        ));
+        assert_eq!(counts.get("kept"), Some(&0));
+        counts.insert("removed".to_owned(), 8);
+
+        prune_resource_tracking(&mut counts, &mut queue, |id| id == "kept");
+        assert_eq!(counts.len(), 1);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].workspace_id, "kept");
+    }
+
+    #[test]
+    fn status_resource_port_app_port_replacement_and_generation_fence_are_bounded() {
+        let roots: Arc<[crate::port_inventory::PortWorkspaceRoot]> = Arc::from([]);
+        let mut generation = 0;
+        let first = next_port_scan_job(&mut generation, Arc::clone(&roots));
+        let in_flight = Some(port_job_generation(&first));
+        let mut pending = None;
+        let second = next_port_scan_job(&mut generation, roots);
+
+        stage_pending_port_job(&mut pending, second);
+
+        assert_eq!(in_flight, Some(1));
+        assert_eq!(pending.as_ref().map(port_job_generation), Some(2));
+        assert_eq!(generation, 2);
+
+        let mut snapshot = None;
+        assert!(!apply_port_outcome_if_current(
+            &mut snapshot,
+            generation,
+            crate::port_inventory::PortOutcome::Scanned(Ok(port_snapshot_fixture(1, 3000))),
+        ));
+        assert!(snapshot.is_none());
+        assert!(apply_port_outcome_if_current(
+            &mut snapshot,
+            generation,
+            crate::port_inventory::PortOutcome::Terminated(Ok(port_snapshot_fixture(2, 8443))),
+        ));
+        assert_eq!(snapshot.as_ref().map(|value| value.generation), Some(2));
+        assert_eq!(
+            snapshot.as_ref().map(|value| value.rows[0].port),
+            Some(8443)
+        );
+    }
+
+    #[test]
+    fn status_resource_port_app_new_refresh_discards_unavailable_stale_terminate() {
+        let roots: Arc<[crate::port_inventory::PortWorkspaceRoot]> = Arc::from([]);
+        let mut generation = 0;
+        let stale = next_port_termination_job(
+            &mut generation,
+            Arc::clone(&roots),
+            crate::port_inventory::PortTerminationTarget {
+                workspace_id: Arc::from("workspace"),
+                pid: 41,
+                port: 3000,
+                bind: Arc::from("127.0.0.1"),
+                protocol: crate::port_inventory::PortProtocol::Tcp,
+                process_started_at: Arc::from("birth"),
+            },
+        );
+        let mut pending = Some(stale);
+        let mut snapshot = Some(port_snapshot_fixture(generation, 3000));
+        let refresh = next_port_scan_job(&mut generation, roots);
+
+        assert!(prepare_port_job_submission(
+            &mut pending,
+            &mut snapshot,
+            generation,
+            port_job_generation(&refresh),
+            true,
+        ));
+        assert!(
+            pending.is_none(),
+            "the stale terminate must never run later"
+        );
+        assert!(snapshot.is_none(), "a new generation hides stale rows");
+    }
+
+    #[test]
+    fn status_resource_port_app_replaced_runtime_rejects_stale_kill() {
+        let target = ResourceMaintenanceTarget {
+            workspace_id: "workspace".to_owned(),
+            runtime_instance: 7,
+            action: ResourceMaintenanceAction::KillSession(runtime::SessionId(11)),
+        };
+
+        assert!(resource_target_matches_runtime(&target, "workspace", 7));
+        assert!(!resource_target_matches_runtime(&target, "workspace", 8));
+        assert!(!resource_target_matches_runtime(&target, "replacement", 7));
+    }
+
+    #[test]
+    fn status_resource_port_app_replaced_runtime_rejects_stale_focus() {
+        assert!(workspace_focus_target_matches_runtime(
+            "workspace",
+            Some(7),
+            "workspace",
+            7,
+        ));
+        assert!(!workspace_focus_target_matches_runtime(
+            "workspace",
+            Some(7),
+            "workspace",
+            8,
+        ));
+        assert!(!workspace_focus_target_matches_runtime(
+            "workspace",
+            Some(7),
+            "replacement",
+            7,
+        ));
+        assert!(workspace_focus_target_matches_runtime(
+            "workspace",
+            None,
+            "workspace",
+            8,
+        ));
+    }
+
+    #[test]
+    fn status_resource_port_app_ui_only_stages_intent_for_logic() {
+        let source = include_str!("app.rs");
+        let logic = source
+            .split_once("    fn logic(&mut self")
+            .and_then(|(_, tail)| tail.split_once("    fn ui(&mut self"))
+            .map(|(body, _)| body)
+            .expect("logic function remains discoverable");
+        let ui = source
+            .split_once("    fn ui(&mut self")
+            .map(|(_, body)| body)
+            .expect("ui function remains discoverable");
+
+        let staged = ["stage_status_bar_", "intent("].concat();
+        let forbidden_render_dispatch =
+            ["self.dispatch_status_bar_", "intent(status_intent"].concat();
+        assert!(ui.contains(&staged));
+        assert!(!ui.contains(&forbidden_render_dispatch));
+        let dispatch = logic
+            .find("dispatch_status_bar_intent")
+            .expect("logic consumes the status intent");
+        let port_pump = logic
+            .find("poll_port_inventory")
+            .expect("logic pumps the port worker");
+        let resource_pump = logic
+            .find("pump_resource_maintenance")
+            .expect("logic pumps resource maintenance");
+        assert!(dispatch < port_pump);
+        assert!(dispatch < resource_pump);
+    }
+
+    fn port_snapshot_fixture(generation: u64, port: u16) -> crate::port_inventory::PortSnapshot {
+        crate::port_inventory::PortSnapshot {
+            generation,
+            sampled_at_ms: generation,
+            rows: Arc::from([crate::port_inventory::PortRow {
+                pid: 41,
+                port,
+                bind: Arc::from("127.0.0.1"),
+                protocol: crate::port_inventory::PortProtocol::Tcp,
+                process: Arc::from("fixture"),
+                process_started_at: Arc::from("birth"),
+                workspace_id: Some(Arc::from("workspace")),
+                workspace_name: Some(Arc::from("Workspace")),
+                ownership: crate::port_inventory::PortOwnership::Workspace,
+            }]),
+        }
+    }
+
+    fn cross_workspace_test_mux(
+        tab: &str,
+        pane: &str,
+        session: runtime::SessionId,
+    ) -> runtime::MuxSnapshot {
+        let tab = runtime::MuxTabId(tab.to_owned());
+        let pane = runtime::MuxPaneId(pane.to_owned());
+        runtime::MuxSnapshot {
+            tabs: vec![runtime::TabSnapshot {
+                id: tab.clone(),
+                title: "attached".to_owned(),
+                layout: runtime::LayoutNode::Pane(pane.clone()),
+                panes: vec![runtime::PaneSnapshot {
+                    id: pane.clone(),
+                    session_id: Some(session),
+                    title: "attached".to_owned(),
+                    persistent_session_id: None,
+                }],
+            }],
+            active_tab: Some(tab),
+            focused_pane: Some(pane),
+        }
+    }
+
+    fn cross_workspace_test_target(
+        workspace_id: &str,
+        runtime_instance: u64,
+    ) -> ui::cross_workspace::WorkspacePaneTarget {
+        ui::cross_workspace::WorkspacePaneTarget::new(
+            workspace_id,
+            runtime_instance,
+            runtime::MuxTabId("tab-b".to_owned()),
+            runtime::MuxPaneId("pane-b".to_owned()),
+            runtime::SessionId(42),
+        )
+    }
+
+    fn cross_workspace_test_target_named(
+        workspace_id: &str,
+        runtime_instance: u64,
+        suffix: &str,
+        session: u64,
+    ) -> ui::cross_workspace::WorkspacePaneTarget {
+        ui::cross_workspace::WorkspacePaneTarget::new(
+            workspace_id,
+            runtime_instance,
+            runtime::MuxTabId(format!("tab-{suffix}")),
+            runtime::MuxPaneId(format!("pane-{suffix}")),
+            runtime::SessionId(session),
+        )
+    }
+
+    fn cross_workspace_test_row(id: &str, name: &str, path: &str) -> storage::WorkspaceRow {
+        storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            path: path.to_owned(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_fits_foreign_content_to_right_edge() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_200.0, 700.0));
+        let layout = fluid_cross_workspace_layout(rect, &[420.0]);
+
+        assert_eq!(layout.primary.width(), 776.0);
+        assert_eq!(layout.divider.width(), ATTACHED_DIVIDER_WIDTH);
+        assert_eq!(layout.foreign.width(), 420.0);
+        assert_eq!(layout.foreign.right(), rect.right());
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_overflow_preserves_primary_minimum() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(880.0, 700.0));
+        let layout = fluid_cross_workspace_layout(rect, &[420.0, 420.0]);
+
+        assert_eq!(foreign_strip_content_width(&[420.0, 420.0]), 844.0);
+        assert_eq!(layout.primary.width(), 50.0);
+        assert_eq!(layout.foreign.width(), 826.0);
+        assert_eq!(layout.foreign.right(), rect.right());
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_narrow_viewport_prioritizes_primary() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 700.0));
+        let layout = fluid_cross_workspace_layout(rect, &[420.0]);
+
+        assert_eq!(layout.primary.width(), 50.0);
+        assert_eq!(layout.divider.width(), ATTACHED_DIVIDER_WIDTH);
+        assert_eq!(layout.foreign.width(), 246.0);
+        assert_eq!(layout.foreign.right(), rect.right());
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_has_no_fitting_right_gutter() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_200.0, 700.0));
+        let widths = [320.0, 320.0];
+        let layout = fluid_cross_workspace_layout(rect, &widths);
+        let panes = foreign_strip_rects(layout.foreign.min, layout.foreign.height(), &widths);
+
+        assert_eq!(panes.last().unwrap().right(), rect.right());
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_title_uses_project_then_workspace_alias() {
+        let row = cross_workspace_test_row("workspace-b", "Deploy", "/repo/VisionAI2");
+
+        assert_eq!(App::attached_workspace_title(&row), "VisionAI2 (Deploy)");
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_title_falls_back_without_usable_path() {
+        let row = cross_workspace_test_row("workspace-b", "Deploy", "/");
+
+        assert_eq!(App::attached_workspace_title(&row), "Deploy (Deploy)");
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_labels_use_bounded_id_when_row_is_missing() {
+        assert_eq!(
+            App::attached_workspace_labels(None, "workspace-b"),
+            (
+                "workspace-b".to_owned(),
+                "workspace-b (workspace-b)".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_divider_uses_drag_start_width_and_total_delta() {
+        assert_eq!(primary_divider_requested_width(420.0, 0.0), Some(420.0));
+        assert_eq!(primary_divider_requested_width(420.0, 50.0), Some(370.0));
+        assert_eq!(primary_divider_requested_width(420.0, -50.0), Some(470.0));
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_divider_overflow_does_not_jump_at_drag_start() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(880.0, 700.0));
+        let widths = [420.0, 420.0];
+        let layout = fluid_cross_workspace_layout(rect, &widths);
+
+        assert_eq!(layout.foreign.width(), 826.0);
+        assert_eq!(primary_divider_requested_width(widths[0], 0.0), Some(420.0));
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_divider_uses_total_drag_from_drag_start() {
+        let source = include_str!("app.rs");
+        let divider = source
+            .split_once("let primary_resize_id")
+            .unwrap()
+            .1
+            .split_once("let mut foreign")
+            .unwrap()
+            .0;
+
+        assert!(divider.contains("primary_resize.total_drag_delta()"));
+        assert!(!divider.contains("primary_resize.drag_delta().x"));
+    }
+
+    #[test]
+    fn cross_workspace_app_placeholder_ids_are_unique_within_same_workspace() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let second = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(
+            app_attached_placeholder_id(first),
+            app_attached_placeholder_id(second)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_placeholder_elides_title_before_close_action() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let attachment_id = restoring_attachment_id("workspace-b", "pane-b");
+        let long_title = "Extremely Long Project Name (Extremely Long Workspace Name)";
+        let pane = CrossWorkspaceRenderPane {
+            id: attachment_id,
+            target: None,
+            width_px: 420.0,
+            render_state: ui::cross_workspace::AttachedRenderState::Placeholder(
+                ui::cross_workspace::AttachedPlaceholder::Suspended,
+            ),
+            workspace_label: "Workspace".to_owned(),
+            display_title: long_title.to_owned(),
+            identity_color: egui::Color32::LIGHT_BLUE,
+        };
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180.0, 180.0));
+        let (_, title_rect, close_rect) = app_attached_placeholder_header_rects(rect);
+        let context = egui::Context::default();
+
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            show_app_attached_placeholder(ui, rect, &pane, &catalog);
+        });
+        let clipped_title = output
+            .shapes
+            .iter()
+            .find(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::Shape::Text(text) if text.galley.text() == long_title
+                )
+            })
+            .expect("placeholder title shape");
+        let egui::Shape::Text(title) = &clipped_title.shape else {
+            unreachable!("matched title shape")
+        };
+        let close = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "×" => Some(text),
+                _ => None,
+            })
+            .expect("placeholder close action shape");
+
+        assert!(title.galley.elided);
+        assert_eq!(title.galley.rows.len(), 1);
+        assert_eq!(
+            title
+                .galley
+                .rows
+                .last()
+                .and_then(|row| row.glyphs.last())
+                .map(|glyph| glyph.chr),
+            Some('…')
+        );
+        assert!(clipped_title.clip_rect.right() <= title_rect.right());
+        assert!(clipped_title.clip_rect.right() < close_rect.left());
+        assert!(close.pos.x >= close_rect.left());
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_primary_inserts_at_foreign_index_zero() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = cross_workspace_test_target_named("workspace-b", 9, "b1", 41);
+        let inserted = cross_workspace_test_target_named("workspace-c", 10, "c1", 42);
+        let first_id = attach_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            first,
+            6,
+            ui::cross_workspace::InsertAnchor::End,
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+
+        let inserted_id = attach_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            inserted,
+            6,
+            ui::cross_workspace::InsertAnchor::Primary,
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+
+        assert_eq!(
+            state
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![inserted_id, first_id]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_middle_inserts_immediately_after_exact_foreign() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let last_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        let inserted_id = attach_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-d", 11, "d1", 43),
+            6,
+            ui::cross_workspace::InsertAnchor::Attached(first_id),
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+
+        assert_eq!(
+            state
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![first_id, inserted_id, last_id]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_rightmost_inserts_after_multiple_foreign_panes() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let second_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        let inserted_id = cross_workspace_attach_outcome(
+            attach_live_cross_workspace_pane(
+                &mut state,
+                "workspace-a",
+                cross_workspace_test_target_named("workspace-d", 11, "d1", 43),
+                6,
+                ui::cross_workspace::InsertAnchor::Attached(second_id),
+            ),
+            6,
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+
+        assert_eq!(
+            state
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id, inserted_id]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_attach_rejections_map_to_desktop_warnings() {
+        let mut full = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(
+            &mut full,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            2,
+        );
+        append_live_cross_workspace_pane(
+            &mut full,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+            2,
+        );
+        assert_eq!(
+            cross_workspace_attach_outcome(
+                attach_live_cross_workspace_pane(
+                    &mut full,
+                    "workspace-a",
+                    cross_workspace_test_target_named("workspace-d", 11, "d1", 43),
+                    2,
+                    ui::cross_workspace::InsertAnchor::End,
+                ),
+                2,
+            ),
+            Err(CrossWorkspaceOpenWarning::CapacityReached { limit: 2 })
+        );
+
+        let stale_id = full.attachments()[1].id();
+        let _ = full.detach_attachment(stale_id);
+        assert_eq!(
+            cross_workspace_attach_outcome(
+                attach_live_cross_workspace_pane(
+                    &mut full,
+                    "workspace-a",
+                    cross_workspace_test_target_named("workspace-e", 12, "e1", 44),
+                    2,
+                    ui::cross_workspace::InsertAnchor::Attached(stale_id),
+                ),
+                2,
+            ),
+            Err(CrossWorkspaceOpenWarning::StaleInsertionAnchor)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_open_rejections_have_localized_desktop_messages() {
+        let catalog = load_catalog("ko-KR");
+        let warnings = [
+            CrossWorkspaceOpenWarning::SameWorkspace,
+            CrossWorkspaceOpenWarning::StaleTarget,
+            CrossWorkspaceOpenWarning::CapacityReached { limit: 2 },
+            CrossWorkspaceOpenWarning::StaleInsertionAnchor,
+            CrossWorkspaceOpenWarning::ColdRuntimeLimit,
+            CrossWorkspaceOpenWarning::RestoreQueueBusy,
+        ];
+
+        for warning in warnings {
+            let message = warning.message(&catalog);
+            assert!(!message.is_empty());
+            assert!(!message.starts_with("workspace.cross_pane.open_failed."));
+        }
+        assert!(
+            CrossWorkspaceOpenWarning::CapacityReached { limit: 2 }
+                .message(&catalog)
+                .contains('2')
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_open_session_beside_surfaces_every_rejection_branch() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn open_session_beside(")
+            .unwrap()
+            .1
+            .split_once("fn drive_cross_workspace_restore")
+            .unwrap()
+            .0;
+
+        assert!(body.contains("self.try_open_session_beside(row_target, anchor)"));
+        assert!(body.contains("self.cross_workspace_open_warning = Some(warning)"));
+        assert!(body.contains("CrossWorkspaceOpenWarning::SameWorkspace"));
+        assert!(body.contains("CrossWorkspaceOpenWarning::StaleTarget"));
+        assert!(body.contains("CrossWorkspaceOpenWarning::ColdRuntimeLimit"));
+        assert!(body.contains("CrossWorkspaceOpenWarning::RestoreQueueBusy"));
+        assert!(body.contains("cross_workspace_attach_outcome("));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_hover_and_context_remain_end_compatible() {
+        let target = ui::file_tree::SessionRowTarget::persisted(
+            "workspace-b",
+            runtime::MuxPaneId("pane-b".to_owned()),
+        );
+        let action = WorkspaceControllerAction::OpenSessionBeside {
+            target: target.clone(),
+            anchor: ui::cross_workspace::InsertAnchor::End,
+        };
+
+        assert!(matches!(
+            action,
+            WorkspaceControllerAction::OpenSessionBeside {
+                target: staged,
+                anchor: ui::cross_workspace::InsertAnchor::End,
+            } if staged == target
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_stale_live_and_cold_fail_without_mutation() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let stale_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let _ = state.detach_attachment(stale_id);
+
+        assert!(
+            attach_live_cross_workspace_pane(
+                &mut state,
+                "workspace-a",
+                cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+                6,
+                ui::cross_workspace::InsertAnchor::Attached(stale_id),
+            )
+            .is_err()
+        );
+        assert!(
+            attach_cold_cross_workspace_pane(
+                &mut state,
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("c1".to_owned()),
+                ),
+                6,
+                ui::cross_workspace::InsertAnchor::Attached(stale_id),
+            )
+            .is_err()
+        );
+        assert!(state.attachments().is_empty());
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_source_has_only_exact_visible_pane_surfaces() {
+        let source = include_str!("app.rs");
+        assert!(!source.contains(&["cross_workspace_session_drop", "_surface",].concat()));
+        let render = source
+            .split_once("egui::CentralPanel::default()")
+            .unwrap()
+            .1
+            .split_once("self.visible_cross_workspace_attachments.clear()")
+            .unwrap()
+            .0;
+        assert!(render.contains("InsertAnchor::Primary"));
+        assert!(render.contains("InsertAnchor::Attached(pane.id)"));
+        assert!(render.contains("for index in visible_indices"));
+        assert!(!render.contains("InsertAnchor::End"));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_has_no_foreign_or_non_terminal_fallback() {
+        let source = include_str!("app.rs");
+        let render = source
+            .split_once("egui::CentralPanel::default()")
+            .unwrap()
+            .1
+            .split_once("self.visible_cross_workspace_attachments.clear()")
+            .unwrap()
+            .0;
+        assert!(render.contains("session_pane_drop_interaction("));
+        assert!(!render.contains("ui.max_rect()"));
+        assert!(!render.contains("home_visible &&"));
+        assert!(!render.contains("inbox_visible &&"));
+        assert!(!render.contains("fleet_visible &&"));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_wires_identity_color_to_live_and_placeholder_headers() {
+        let source = include_str!("app.rs");
+        let render_panes = source
+            .split_once("let render_panes = if terminal_visible")
+            .unwrap()
+            .1
+            .split_once("let mut primary_focus_requested")
+            .unwrap()
+            .0;
+        assert!(render_panes.contains("ui::file_tree::workspace_accent"));
+        let render = source
+            .split_once("show_prepared_attached_pane")
+            .unwrap()
+            .1
+            .split_once("if output.surface.focus_requested")
+            .unwrap()
+            .0;
+        assert!(render.contains("with_identity_color(pane.identity_color)"));
+        let placeholder = source
+            .split_once("fn show_app_attached_placeholder")
+            .unwrap()
+            .1
+            .split_once("/// warm workspace")
+            .unwrap()
+            .0;
+        assert!(placeholder.contains("egui::Stroke::new(1.0, pane.identity_color)"));
+        assert!(!placeholder.contains("rect_filled"));
+    }
+
+    #[test]
+    fn cross_workspace_app_drop_anchor_cold_restore_rollback_detaches_exact_inserted_pane() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let retained_id = append_live_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let inserted_id = attach_cold_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            ui::cross_workspace::PersistedPaneRequest::new(
+                "workspace-c",
+                runtime::MuxPaneId("c1".to_owned()),
+            ),
+            6,
+            ui::cross_workspace::InsertAnchor::Attached(retained_id),
+        )
+        .unwrap()
+        .appended_id()
+        .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-c", "c1", inserted_id)));
+        coordinator.begin_next(11, now).unwrap();
+
+        let failed = coordinator
+            .fail_before_command(11, &runtime::MuxPaneId("c1".to_owned()))
+            .unwrap();
+        let detached = panes.detach_attachment(failed.attachment_id()).unwrap();
+
+        assert_eq!(
+            detached.restoring_request(),
+            Some(&ui::cross_workspace::PersistedPaneRequest::new(
+                "workspace-c",
+                runtime::MuxPaneId("c1".to_owned()),
+            ))
+        );
+        assert_eq!(panes.attachments().len(), 1);
+        assert_eq!(panes.attachments()[0].id(), retained_id);
+        assert_eq!(coordinator.total_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_live_and_cold_append_right_until_configured_limit() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = cross_workspace_test_target_named("workspace-b", 9, "b1", 41);
+        let second = cross_workspace_test_target_named("workspace-c", 10, "c1", 42);
+        let third = cross_workspace_test_target_named("workspace-d", 11, "d1", 43);
+
+        assert!(matches!(
+            append_live_cross_workspace_pane(&mut state, "workspace-a", first, 2),
+            ui::cross_workspace::AttachOutcome::Appended(_)
+        ));
+        assert!(matches!(
+            append_live_cross_workspace_pane(&mut state, "workspace-a", second, 2),
+            ui::cross_workspace::AttachOutcome::Appended(_)
+        ));
+        assert_eq!(
+            append_live_cross_workspace_pane(&mut state, "workspace-a", third, 2),
+            ui::cross_workspace::AttachOutcome::CapacityReached
+        );
+
+        let mut cold = ui::cross_workspace::CrossWorkspacePaneState::default();
+        for index in 0..2 {
+            assert!(matches!(
+                append_cold_cross_workspace_pane(
+                    &mut cold,
+                    "workspace-a",
+                    ui::cross_workspace::PersistedPaneRequest::new(
+                        format!("workspace-{index}"),
+                        runtime::MuxPaneId(format!("pane-{index}")),
+                    ),
+                    2,
+                ),
+                ui::cross_workspace::AttachOutcome::Appended(_)
+            ));
+        }
+        assert_eq!(
+            append_cold_cross_workspace_pane(
+                &mut cold,
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-3",
+                    runtime::MuxPaneId("pane-3".to_owned()),
+                ),
+                2,
+            ),
+            ui::cross_workspace::AttachOutcome::CapacityReached
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_duplicate_focuses_existing_without_reorder() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = cross_workspace_test_target_named("workspace-b", 9, "b1", 41);
+        let second = cross_workspace_test_target_named("workspace-c", 10, "c1", 42);
+        let first_id =
+            append_live_cross_workspace_pane(&mut state, "workspace-a", first.clone(), 6)
+                .appended_id()
+                .unwrap();
+        let second_id = append_live_cross_workspace_pane(&mut state, "workspace-a", second, 6)
+            .appended_id()
+            .unwrap();
+        let before = state
+            .attachments()
+            .iter()
+            .map(ui::cross_workspace::AttachedPane::id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            append_live_cross_workspace_pane(&mut state, "workspace-a", first, 6),
+            ui::cross_workspace::AttachOutcome::FocusedExisting(first_id)
+        );
+        assert_eq!(
+            state
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(
+            state.focused(),
+            ui::cross_workspace::FocusedSurface::Attached(first_id)
+        );
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn cross_workspace_app_cap_reduction_detaches_rightmost_without_destructive_command() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            ids.push(
+                append_live_cross_workspace_pane(
+                    &mut state,
+                    "workspace-a",
+                    cross_workspace_test_target_named(
+                        &format!("workspace-{index}"),
+                        index + 10,
+                        &index.to_string(),
+                        index + 40,
+                    ),
+                    6,
+                )
+                .appended_id()
+                .unwrap(),
+            );
+        }
+
+        let detached = enforce_cross_workspace_capacity_non_destructive(&mut state, 1);
+
+        assert_eq!(state.attachments()[0].id(), ids[0]);
+        assert_eq!(detached.len(), 2);
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn enforce_cross_workspace_capacity_non_destructive")
+            .unwrap()
+            .1
+            .split_once("fn ")
+            .unwrap()
+            .0;
+        for forbidden in ["ClosePane", "KillSession", "ResizeSplit"] {
+            assert!(
+                !body.contains(forbidden),
+                "capacity trim contains {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_stays_first_after_foreign_reorder() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let second = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        assert!(state.reorder(second, 0));
+
+        assert_eq!(
+            strip_surface_order(&state),
+            vec![
+                StripSurface::Primary,
+                StripSurface::Attached(second),
+                StripSurface::Attached(first),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_viewport_intersection_culls_offscreen_foreign_panes() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(320.0, 0.0), egui::vec2(640.0, 500.0));
+        let rects = foreign_strip_rects(egui::pos2(0.0, 0.0), 500.0, &[320.0, 320.0, 320.0, 320.0]);
+
+        assert_eq!(
+            ui::workspace::visible_attachment_indices(viewport, &rects).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_same_runtime_prepares_once_and_renders_two() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let second = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b2", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        let groups = group_visible_cross_workspace_panes(&state, &[first, second], |_| true);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].attachment_ids, vec![first, second]);
+    }
+
+    #[test]
+    fn cross_workspace_app_visibility_is_set_based_and_sibling_detach_stays_active() {
+        let runtimes = [("workspace-b", 9, false), ("workspace-c", 10, true)];
+        let visible = vec![VisibleRuntimeIdentity::new("workspace-b", 9)];
+        assert_eq!(
+            warm_visibility_transitions(runtimes, &visible),
+            vec![
+                ("workspace-b".to_owned(), 9, true),
+                ("workspace-c".to_owned(), 10, false),
+            ]
+        );
+
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let second = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b2", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        state.detach_attachment(first).unwrap();
+        let groups = group_visible_cross_workspace_panes(&state, &[second], |_| true);
+        assert_eq!(
+            groups[0].identity,
+            VisibleRuntimeIdentity::new("workspace-b", 9)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_hidden_or_non_terminal_central_view_hides_attached_runtimes() {
+        let id = restoring_attachment_id("workspace-b", "pane-b");
+        let visible = [id];
+
+        assert_eq!(runtime_visible_attachment_ids(true, &visible), &visible);
+        assert!(runtime_visible_attachment_ids(false, &visible).is_empty());
+    }
+
+    #[test]
+    fn cross_workspace_app_last_detach_releases_visibility_and_deadline_path() {
+        assert_eq!(
+            warm_visibility_transitions([("workspace-b", 9, true)], &[]),
+            vec![("workspace-b".to_owned(), 9, false)]
+        );
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn detach_cross_workspace_pane")
+            .unwrap()
+            .1
+            .split_once("fn reconcile_cross_workspace_pane")
+            .unwrap()
+            .0;
+        assert!(body.contains("refresh_warm_idle_deadline"));
+    }
+
+    #[test]
+    fn cross_workspace_app_exact_second_attachment_owns_all_input_routes() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let second = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "c1", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let visible = [first, second];
+        let owner = frame_terminal_owner(&state, true, &visible, |_| true);
+
+        assert_eq!(owner, FrameTerminalOwner::Attached(second));
+        assert!(matches!(
+            focused_composer_target_for_owner(
+                owner,
+                &state,
+                "workspace-a",
+                1,
+                Some(runtime::SessionId(1)),
+            ),
+            Some(AppTerminalInputTarget::Attached(target))
+                if target.workspace_id == "workspace-c" && target.session == runtime::SessionId(42)
+        ));
+        assert_eq!(
+            terminal_runtime_identity_for_owner(owner, &state, "workspace-a", 1),
+            Some(("workspace-c".to_owned(), 10))
+        );
+        let action = select_workspace_host_io_action_for_owner(
+            owner,
+            Some((
+                "workspace-a".to_owned(),
+                1,
+                ui::workspace::WorkspaceIoIntent::OpenUrl(
+                    ui::workspace::WorkspaceUrlPayload::try_new(
+                        "https://primary.example".to_owned(),
+                    )
+                    .unwrap(),
+                ),
+            )),
+            Some((
+                second,
+                "workspace-c".to_owned(),
+                10,
+                ui::workspace::WorkspaceIoIntent::OpenUrl(
+                    ui::workspace::WorkspaceUrlPayload::try_new(
+                        "https://attached.example".to_owned(),
+                    )
+                    .unwrap(),
+                ),
+            )),
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            AppHostIoAction::Workspace {
+                workspace_id,
+                runtime_instance: 10,
+                ..
+            } if workspace_id == "workspace-c"
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_pointer_focus_transition_fails_closed_for_one_frame() {
+        let terminal_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let previous =
+            FrameTerminalOwner::Attached(restoring_attachment_id("workspace-b", "pane-b"));
+
+        let owner = suppress_terminal_owner_during_pointer_focus(
+            previous,
+            true,
+            Some(egui::pos2(100.0, 100.0)),
+            terminal_rect,
+        );
+
+        assert_eq!(owner, FrameTerminalOwner::None);
+        let mut drains = 0;
+        drain_native_input_if_unowned(false, false, || drains += 1);
+        assert_eq!(drains, 1);
+        assert_eq!(
+            suppress_terminal_owner_during_pointer_focus(
+                previous,
+                false,
+                Some(egui::pos2(100.0, 100.0)),
+                terminal_rect,
+            ),
+            previous
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_production_uses_prepared_strip_renderer_only() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let strip = production
+            .split_once("let terminal_visible =")
+            .unwrap()
+            .1
+            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .unwrap()
+            .0;
+
+        assert_eq!(production.matches(".show_attached_pane(").count(), 0);
+        assert_eq!(strip.matches(".prepare_attached_panes(").count(), 1);
+        assert_eq!(strip.matches(".show_prepared_attached_pane(").count(), 1);
+        assert!(strip.contains("visible_cross_workspace_attachments.extend"));
+        assert!(strip.contains(".take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES)"));
+        for forbidden in ["ClosePane", "KillSession", "ResizeSplit"] {
+            assert!(!strip.contains(forbidden), "strip contains {forbidden}");
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_fluid_strip_preserves_visibility_owner_and_drop_contracts() {
+        let source = include_str!("app.rs");
+        let strip = source
+            .split_once("let terminal_visible =")
+            .unwrap()
+            .1
+            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .unwrap()
+            .0;
+
+        assert!(strip.contains("fluid_cross_workspace_layout(rect, &widths)"));
+        assert!(strip.contains("visible_attachment_indices"));
+        assert!(strip.contains("frame_terminal_owner"));
+        assert!(strip.contains("InsertAnchor::Attached(pane.id)"));
+        assert!(strip.contains("render_panes.get(index + 1)"));
+        assert!(strip.contains("resize_adjacent(left_id, right_id, left_width_px)"));
+    }
+
+    #[test]
+    fn cross_workspace_app_production_routes_composer_and_host_io_by_exact_owner() {
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("fn render_composer_dock")
+            .unwrap()
+            .1
+            .split_once("fn send_composer_prompt")
+            .unwrap()
+            .0;
+        let host_io = source
+            .split_once("fn poll_app_host_io")
+            .unwrap()
+            .1
+            .split_once("fn try_apply_pending_folder_picker_completion")
+            .unwrap()
+            .0;
+
+        assert!(composer.contains("focused_composer_target_for_owner"));
+        assert!(!composer.contains("focused_composer_target("));
+        assert!(host_io.contains("select_workspace_host_io_action_for_owner"));
+        assert!(!host_io.contains("select_workspace_host_io_action("));
+    }
+
+    #[test]
+    fn cross_workspace_app_offscreen_owner_has_no_primary_fallback() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attached = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "b1", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        let owner = frame_terminal_owner(&state, true, &[], |_| true);
+
+        assert_eq!(owner, FrameTerminalOwner::None);
+        assert_ne!(owner, FrameTerminalOwner::Attached(attached));
+        assert_eq!(
+            terminal_runtime_identity_for_owner(owner, &state, "workspace-a", 1),
+            None
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_six_panes_are_bounded_without_runtime_event_duplication() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            ids.push(
+                append_live_cross_workspace_pane(
+                    &mut state,
+                    "workspace-a",
+                    cross_workspace_test_target_named(
+                        if index < 3 {
+                            "workspace-b"
+                        } else {
+                            "workspace-c"
+                        },
+                        if index < 3 { 9 } else { 10 },
+                        &index.to_string(),
+                        index + 40,
+                    ),
+                    6,
+                )
+                .appended_id()
+                .unwrap(),
+            );
+        }
+
+        let groups = group_visible_cross_workspace_panes(&state, &ids, |_| true);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.attachment_ids.len())
+                .sum::<usize>(),
+            6
+        );
+        assert!(groups.iter().all(|group| group.attachment_ids.len() == 3));
+    }
+
+    #[test]
+    fn cross_workspace_app_exact_warm_session_resolves_without_fallback() {
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+
+        let target = resolve_exact_warm_pane_target(
+            "workspace-a",
+            "workspace-b",
+            Some(9),
+            Some(&mux),
+            &runtime::MuxTabId("tab-b".to_owned()),
+            &runtime::MuxPaneId("pane-b".to_owned()),
+            runtime::SessionId(42),
+        )
+        .expect("exact warm pane");
+
+        assert_eq!(target, cross_workspace_test_target("workspace-b", 9));
+        assert!(
+            resolve_exact_warm_pane_target(
+                "workspace-a",
+                "workspace-b",
+                Some(9),
+                Some(&mux),
+                &runtime::MuxTabId("tab-b".to_owned()),
+                &runtime::MuxPaneId("pane-b".to_owned()),
+                runtime::SessionId(43),
+            )
+            .is_none(),
+            "a reused pane must not fall back to a different session"
+        );
+        assert!(
+            resolve_exact_warm_pane_target(
+                "workspace-a",
+                "workspace-a",
+                Some(9),
+                Some(&mux),
+                &runtime::MuxTabId("tab-b".to_owned()),
+                &runtime::MuxPaneId("pane-b".to_owned()),
+                runtime::SessionId(42),
+            )
+            .is_none(),
+            "the active workspace is not a warm attachment source"
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_switch_auto_detaches() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        assert_eq!(
+            state.reconcile_target(
+                "workspace-c",
+                attachment_id,
+                ui::cross_workspace::AttachedRuntimeState::Live {
+                    runtime_instance: 9,
+                    target_relation: ui::cross_workspace::LiveTargetRelation::Exact,
+                },
+            ),
+            ui::cross_workspace::ReconcileDecision::Detached(
+                ui::cross_workspace::DetachReason::PrimaryWorkspaceChanged
+            )
+        );
+        assert!(state.attachments().is_empty());
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_switch_restores_parked_layout_on_return() {
+        let mut active = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut active,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        assert!(active.set_width(attachment_id, 512.0));
+        let mut parked = std::collections::HashMap::new();
+
+        switch_cross_workspace_pane_layout(
+            "workspace-a",
+            "workspace-c",
+            &mut active,
+            &mut parked,
+            6,
+        );
+
+        assert!(active.attachments().is_empty());
+        assert_eq!(parked["workspace-a"].attachments().len(), 1);
+
+        switch_cross_workspace_pane_layout(
+            "workspace-c",
+            "workspace-a",
+            &mut active,
+            &mut parked,
+            6,
+        );
+
+        assert!(parked.is_empty());
+        assert_eq!(active.attachments().len(), 1);
+        assert_eq!(active.attachments()[0].id(), attachment_id);
+        assert_eq!(active.attachments()[0].workspace_id(), "workspace-b");
+        assert_eq!(active.attachments()[0].width_px(), 512.0);
+    }
+
+    #[test]
+    fn cross_workspace_app_workspace_removal_prunes_active_and_every_parked_layout() {
+        let mut active = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let removed_active = append_live_cross_workspace_pane(
+            &mut active,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "active-b", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let retained_active = append_live_cross_workspace_pane(
+            &mut active,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "active-c", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let mut removed_primary = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(
+            &mut removed_primary,
+            "workspace-b",
+            cross_workspace_test_target_named("workspace-d", 11, "primary-b", 43),
+            6,
+        );
+        let mut retained_primary = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(
+            &mut retained_primary,
+            "workspace-c",
+            cross_workspace_test_target_named("workspace-b", 9, "parked-b", 44),
+            6,
+        );
+        let retained_parked = append_live_cross_workspace_pane(
+            &mut retained_primary,
+            "workspace-c",
+            cross_workspace_test_target_named("workspace-d", 11, "parked-d", 45),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let mut emptied_primary = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(
+            &mut emptied_primary,
+            "workspace-e",
+            cross_workspace_test_target_named("workspace-b", 9, "only-b", 46),
+            6,
+        );
+        let mut parked = std::collections::HashMap::from([
+            ("workspace-b".to_owned(), removed_primary),
+            ("workspace-c".to_owned(), retained_primary),
+            ("workspace-e".to_owned(), emptied_primary),
+        ]);
+        let mut visible = vec![removed_active, retained_active];
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+
+        let sent = remove_workspace_cross_workspace_layouts(
+            &mut active,
+            &mut parked,
+            &mut visible,
+            &mut coordinator,
+            "workspace-b",
+        );
+
+        assert_eq!(sent, None);
+        assert_eq!(
+            active
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![retained_active]
+        );
+        assert_eq!(visible, vec![retained_active]);
+        assert!(!parked.contains_key("workspace-b"));
+        assert!(!parked.contains_key("workspace-e"));
+        assert_eq!(
+            parked["workspace-c"]
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![retained_parked]
+        );
+        assert_eq!(
+            parked["workspace-c"].focused(),
+            ui::cross_workspace::FocusedSurface::Attached(retained_parked)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_active_primary_close_clears_the_entire_layout() {
+        let mut active = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let live = append_live_cross_workspace_pane(
+            &mut active,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "live", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let restoring = active
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut visible = vec![live, restoring];
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", restoring,)));
+
+        clear_primary_cross_workspace_layout(&mut active, &mut visible, &mut coordinator);
+
+        assert!(active.attachments().is_empty());
+        assert!(visible.is_empty());
+        assert!(coordinator.is_idle());
+    }
+
+    #[test]
+    fn cross_workspace_app_parked_restore_reapplies_current_cap_from_the_right() {
+        let mut active = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut restored = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = append_live_cross_workspace_pane(
+            &mut restored,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 9, "first", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let second = append_live_cross_workspace_pane(
+            &mut restored,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-c", 10, "second", 42),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        append_live_cross_workspace_pane(
+            &mut restored,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-d", 11, "third", 43),
+            6,
+        );
+        assert!(restored.focus_attachment(second));
+        let mut parked = std::collections::HashMap::from([("workspace-a".to_owned(), restored)]);
+
+        switch_cross_workspace_pane_layout(
+            "workspace-x",
+            "workspace-a",
+            &mut active,
+            &mut parked,
+            2,
+        );
+
+        assert!(parked.is_empty());
+        assert_eq!(
+            active
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            active.focused(),
+            ui::cross_workspace::FocusedSurface::Attached(second)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_close_and_delete_paths_prune_parked_layouts() {
+        let source = include_str!("app.rs");
+        let close = source
+            .split_once("fn close_workspace_sessions")
+            .unwrap()
+            .1
+            .split_once("fn reveal_closed_workspace")
+            .unwrap()
+            .0;
+        let delete = source
+            .split_once("fn bench_delete_workspace")
+            .unwrap()
+            .1
+            .split_once("fn subscribe_runtime_events")
+            .unwrap()
+            .0;
+
+        assert!(close.contains("remove_workspace_cross_workspace_layouts("));
+        assert!(delete.contains("remove_workspace_cross_workspace_layouts("));
+    }
+
+    #[test]
+    fn cross_workspace_app_production_switches_layout_before_reconcile() {
+        let source = include_str!("app.rs");
+        let switch = source
+            .split_once("fn switch_workspace(&mut self")
+            .unwrap()
+            .1
+            .split_once("fn cycle_workspace")
+            .unwrap()
+            .0;
+        let layout_switch = switch.find("switch_cross_workspace_pane_layout(").unwrap();
+        let reconcile = switch
+            .find("self.reconcile_cross_workspace_pane();")
+            .unwrap();
+
+        assert!(layout_switch < reconcile);
+        assert!(switch.contains("self.visible_cross_workspace_attachments.clear();"));
+        assert!(switch.contains("self.sync_attached_runtime_visibility();"));
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_runtime_counts_toward_capacity_but_blocks_eviction() {
+        let order = vec!["workspace-b".to_owned(), "workspace-d".to_owned()];
+        let protected = |workspace_id: &str| workspace_id == "workspace-b";
+
+        assert_eq!(
+            protected_warm_eviction_candidates(&order, 1, protected, |_| false),
+            vec!["workspace-d".to_owned()],
+            "protected runtime consumes capacity but is not itself evicted"
+        );
+
+        let now = std::time::Instant::now();
+        assert_eq!(
+            expired_unprotected_warm_workspace_ids(
+                &order,
+                protected,
+                |_| Some(now - std::time::Duration::from_secs(60)),
+                now,
+                std::time::Duration::from_secs(30),
+            ),
+            vec!["workspace-d".to_owned()]
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_composer_target_is_mutually_exclusive_and_unavailable_never_falls_back()
+    {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        assert!(matches!(
+            focused_composer_target_for_owner(
+                FrameTerminalOwner::Attached(attachment_id),
+                &state,
+                "workspace-a",
+                1,
+                Some(runtime::SessionId(7)),
+            ),
+            Some(AppTerminalInputTarget::Attached(target))
+                if target == cross_workspace_test_target("workspace-b", 9)
+        ));
+
+        state.focus_primary();
+        assert!(matches!(
+            focused_composer_target_for_owner(
+                FrameTerminalOwner::Primary,
+                &state,
+                "workspace-a",
+                1,
+                Some(runtime::SessionId(7)),
+            ),
+            Some(AppTerminalInputTarget::Primary {
+                workspace_id,
+                runtime_instance: 1,
+                session: runtime::SessionId(7),
+            }) if workspace_id == "workspace-a"
+        ));
+
+        state.focus_attachment(attachment_id);
+        state.reconcile_target(
+            "workspace-a",
+            attachment_id,
+            ui::cross_workspace::AttachedRuntimeState::Disconnected {
+                runtime_instance: None,
+            },
+        );
+        assert_eq!(
+            focused_composer_target_for_owner(
+                FrameTerminalOwner::None,
+                &state,
+                "workspace-a",
+                1,
+                Some(runtime::SessionId(7)),
+            ),
+            None,
+            "focused unavailable B must not route composer input to A"
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_composer_owner_refreshes_after_pointer_focus_transition() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        state.focus_primary();
+        let stale_owner = FrameTerminalOwner::Primary;
+
+        assert!(state.focus_attachment(attachment_id));
+        let fresh_owner = frame_terminal_owner(&state, true, &[attachment_id], |_| true);
+        let target = focused_composer_target_for_owner(
+            fresh_owner,
+            &state,
+            "workspace-a",
+            1,
+            Some(runtime::SessionId(7)),
+        );
+
+        assert_ne!(fresh_owner, stale_owner);
+        assert_eq!(fresh_owner, FrameTerminalOwner::Attached(attachment_id));
+        assert!(matches!(
+            target,
+            Some(AppTerminalInputTarget::Attached(target))
+                if target == cross_workspace_test_target("workspace-b", 9)
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_detach_transition_has_no_destructive_runtime_command() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        assert!(state.detach_attachment(attachment_id).is_some());
+
+        let command = attached_visibility_command(false);
+        assert!(matches!(
+            command,
+            runtime::RuntimeCommand::SetWorkspaceState(runtime::WorkspaceRuntimeState::Warm)
+        ));
+        assert!(!matches!(
+            command,
+            runtime::RuntimeCommand::ClosePane { .. }
+                | runtime::RuntimeCommand::KillSession { .. }
+                | runtime::RuntimeCommand::ResizeSplit { .. }
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_second_cold_open_appends_right() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first_request = ui::cross_workspace::PersistedPaneRequest::new(
+            "workspace-b",
+            runtime::MuxPaneId("pane-b".to_owned()),
+        );
+        let first = state
+            .append_restoring("workspace-a", first_request.clone(), 420.0, 6)
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(CrossWorkspaceRestoreRequest::new(
+            "workspace-b",
+            runtime::MuxPaneId("pane-b".to_owned()),
+            first,
+        )));
+        let second_request = ui::cross_workspace::PersistedPaneRequest::new(
+            "workspace-c",
+            runtime::MuxPaneId("pane-c".to_owned()),
+        );
+
+        let outcome =
+            append_cold_cross_workspace_pane(&mut state, "workspace-a", second_request.clone(), 6);
+        let second = outcome.appended_id().unwrap();
+
+        assert_eq!(state.attachments().len(), 2);
+        assert_eq!(state.attachments()[0].id(), first);
+        assert_eq!(state.attachments()[1].id(), second);
+        assert_eq!(state.attachments()[1].workspace_id(), "workspace-c");
+        assert_eq!(state.attachments()[1].live_target(), None);
+        assert_eq!(
+            state.focused(),
+            ui::cross_workspace::FocusedSurface::Attached(second)
+        );
+        assert_eq!(coordinator.total_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_second_live_open_appends_without_closing_source() {
+        let first = cross_workspace_test_target("workspace-b", 9);
+        let second = ui::cross_workspace::WorkspacePaneTarget::new(
+            "workspace-c",
+            10,
+            runtime::MuxTabId("tab-c".to_owned()),
+            runtime::MuxPaneId("pane-c".to_owned()),
+            runtime::SessionId(43),
+        );
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(&mut state, "workspace-a", first.clone(), 6);
+
+        let outcome =
+            append_live_cross_workspace_pane(&mut state, "workspace-a", second.clone(), 6);
+
+        assert!(matches!(
+            outcome,
+            ui::cross_workspace::AttachOutcome::Appended(_)
+        ));
+        assert_eq!(state.attachments().len(), 2);
+        assert_eq!(state.attachments()[0].live_target(), Some(&first));
+        assert_eq!(state.attachments()[1].live_target(), Some(&second));
+        assert_eq!(
+            state.focused(),
+            ui::cross_workspace::FocusedSurface::Attached(state.attachments()[1].id())
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_same_runtime_live_append_keeps_both_targets() {
+        let first = cross_workspace_test_target("workspace-b", 9);
+        let second = ui::cross_workspace::WorkspacePaneTarget::new(
+            "workspace-b",
+            9,
+            runtime::MuxTabId("tab-c".to_owned()),
+            runtime::MuxPaneId("pane-c".to_owned()),
+            runtime::SessionId(43),
+        );
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        append_live_cross_workspace_pane(&mut state, "workspace-a", first.clone(), 6);
+
+        let outcome =
+            append_live_cross_workspace_pane(&mut state, "workspace-a", second.clone(), 6);
+
+        assert!(matches!(
+            outcome,
+            ui::cross_workspace::AttachOutcome::Appended(_)
+        ));
+        assert_eq!(state.attachments()[0].live_target(), Some(&first));
+        assert_eq!(state.attachments()[1].live_target(), Some(&second));
+    }
+
+    #[test]
+    fn cross_workspace_app_live_append_preserves_restore_state_coherently() {
+        let now = std::time::Instant::now();
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = state
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let second = state
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", first)));
+        assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", second)));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        let replacement = ui::cross_workspace::WorkspacePaneTarget::new(
+            "workspace-d",
+            12,
+            runtime::MuxTabId("tab-d".to_owned()),
+            runtime::MuxPaneId("pane-d".to_owned()),
+            runtime::SessionId(44),
+        );
+
+        let outcome =
+            append_live_cross_workspace_pane(&mut state, "workspace-a", replacement.clone(), 6);
+
+        assert!(matches!(
+            outcome,
+            ui::cross_workspace::AttachOutcome::Appended(_)
+        ));
+        assert_eq!(state.attachments().len(), 3);
+        assert_eq!(state.attachments()[2].live_target(), Some(&replacement));
+        assert_eq!(coordinator.active_request_len(), 2);
+        assert_eq!(coordinator.pending_len(), 1);
+        assert_eq!(coordinator.in_flight_len(), 1);
+        assert!(coordinator.protects_runtime("workspace-b", 11));
+    }
+
+    #[test]
+    fn cross_workspace_app_live_append_emits_no_destructive_source_command() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn append_live_cross_workspace_pane")
+            .unwrap()
+            .1
+            .split_once("fn append_cold_cross_workspace_pane")
+            .unwrap()
+            .0;
+
+        for forbidden in ["ClosePane", "KillSession", "ResizeSplit"] {
+            assert!(
+                !body.contains(forbidden),
+                "live append contains {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_visibility_retries_failed_warm_after_detach() {
+        let runtimes = [("workspace-b", 9, true), ("workspace-c", 10, false)];
+
+        assert_eq!(
+            warm_visibility_transitions(runtimes, &[]),
+            vec![("workspace-b".to_owned(), 9, false)]
+        );
+        assert_eq!(
+            warm_visibility_transitions(runtimes, &[]),
+            vec![("workspace-b".to_owned(), 9, false)],
+            "an unchanged render_active flag must schedule the failed Warm transition again"
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_focus_blocks_only_primary_terminal_shortcuts() {
+        use crate::shortcuts::ShortcutAction as A;
+
+        for action in [
+            A::NewShell,
+            A::ClosePane,
+            A::SplitVertical,
+            A::SplitHorizontal,
+            A::FocusNextPane,
+            A::FocusPreviousPane,
+            A::TerminalSearch,
+            A::ScrollToBottom,
+            A::PromptJumpPrev,
+            A::PromptJumpNext,
+        ] {
+            assert!(shortcut_targets_primary_terminal(action), "{action:?}");
+        }
+        for action in [
+            A::NextWorkspace,
+            A::PreviousWorkspace,
+            A::IncreaseTerminalFont,
+            A::DecreaseTerminalFont,
+            A::ClearRenderCaches,
+            A::ToggleSidebar,
+            A::OpenEnvironment,
+            A::FocusComposer,
+        ] {
+            assert!(!shortcut_targets_primary_terminal(action), "{action:?}");
+        }
+        assert!(shortcut_depends_on_terminal_owner(A::FocusComposer));
+    }
+
+    #[test]
+    fn cross_workspace_app_pointer_transition_blocks_only_terminal_shortcuts() {
+        use crate::shortcuts::ShortcutAction as A;
+        let terminal_rect =
+            egui::Rect::from_min_size(egui::pos2(100.0, 80.0), egui::vec2(900.0, 700.0));
+        let inside = pointer_transition_inside_rect(
+            Some(terminal_rect),
+            true,
+            Some(egui::pos2(400.0, 300.0)),
+        );
+        let outside = pointer_transition_inside_rect(
+            Some(terminal_rect),
+            true,
+            Some(egui::pos2(40.0, 300.0)),
+        );
+
+        assert!(configured_terminal_shortcut_blocked(
+            A::ClosePane,
+            false,
+            inside,
+        ));
+        assert!(configured_terminal_shortcut_blocked(
+            A::FocusComposer,
+            false,
+            inside,
+        ));
+        assert!(configured_terminal_shortcut_blocked(
+            A::TerminalSearch,
+            true,
+            false,
+        ));
+        assert!(!configured_terminal_shortcut_blocked(
+            A::ClosePane,
+            false,
+            outside,
+        ));
+        assert!(!configured_terminal_shortcut_blocked(
+            A::FocusComposer,
+            true,
+            false,
+        ));
+        assert!(!configured_terminal_shortcut_blocked(
+            A::ToggleSidebar,
+            false,
+            inside,
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_host_io_selection_keeps_runtime_instance() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let attached_intent = ui::workspace::WorkspaceIoIntent::OpenUrl(
+            ui::workspace::WorkspaceUrlPayload::try_new("https://example.com".to_owned()).unwrap(),
+        );
+
+        let action = select_workspace_host_io_action_for_owner(
+            FrameTerminalOwner::Attached(attachment_id),
+            None,
+            Some((attachment_id, "workspace-b".to_owned(), 9, attached_intent)),
+        )
+        .expect("attached workspace intent");
+
+        assert!(matches!(
+            action,
+            AppHostIoAction::Workspace {
+                workspace_id,
+                runtime_instance: 9,
+                ..
+            } if workspace_id == "workspace-b"
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_workspace_completion_rejects_replaced_runtime_instance() {
+        assert!(workspace_runtime_identity_matches(
+            "workspace-b",
+            9,
+            "workspace-b",
+            9,
+        ));
+        assert!(!workspace_runtime_identity_matches(
+            "workspace-b",
+            10,
+            "workspace-b",
+            9,
+        ));
+        assert!(!workspace_runtime_identity_matches(
+            "workspace-c",
+            9,
+            "workspace-b",
+            9,
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_clipboard_suppression_has_one_live_focus_owner_without_fallback() {
+        let mut state = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let attachment_id = append_live_cross_workspace_pane(
+            &mut state,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 9),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+
+        assert_eq!(
+            terminal_runtime_identity_for_owner(
+                FrameTerminalOwner::Attached(attachment_id),
+                &state,
+                "workspace-a",
+                1,
+            ),
+            Some(("workspace-b".to_owned(), 9))
+        );
+        assert_eq!(
+            terminal_runtime_identity_for_owner(FrameTerminalOwner::None, &state, "workspace-a", 1,),
+            None,
+            "a hidden attached pane must not retain deferred suppression"
+        );
+        state.focus_primary();
+        assert_eq!(
+            terminal_runtime_identity_for_owner(
+                FrameTerminalOwner::Primary,
+                &state,
+                "workspace-a",
+                1,
+            ),
+            Some(("workspace-a".to_owned(), 1))
+        );
+        assert_eq!(
+            terminal_runtime_identity_for_owner(FrameTerminalOwner::None, &state, "workspace-a", 1,),
+            None,
+            "a hidden primary pane is not an input-owning terminal surface"
+        );
+        state.focus_attachment(attachment_id);
+        state.reconcile_target(
+            "workspace-a",
+            attachment_id,
+            ui::cross_workspace::AttachedRuntimeState::Disconnected {
+                runtime_instance: Some(9),
+            },
+        );
+        assert_eq!(
+            terminal_runtime_identity_for_owner(FrameTerminalOwner::None, &state, "workspace-a", 1,),
+            None,
+            "an unavailable attached focus must not fall back to A"
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_unowned_input_drains_once_but_live_attached_does_not() {
+        let drains = std::cell::Cell::new(0);
+        drain_native_input_if_unowned(false, false, || drains.set(drains.get() + 1));
+        assert_eq!(drains.get(), 1);
+
+        drain_native_input_if_unowned(false, true, || drains.set(drains.get() + 1));
+        assert_eq!(
+            drains.get(),
+            1,
+            "B owns native input in the normal split path"
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_focus_claim_uses_exact_runtime_instance() {
+        let calls = std::cell::Cell::new(0);
+        assert!(!take_exact_runtime_focus_claim(
+            "workspace-b",
+            10,
+            "workspace-b",
+            9,
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(calls.get(), 0, "replacement runtime must not be consumed");
+        assert!(take_exact_runtime_focus_claim(
+            "workspace-b",
+            9,
+            "workspace-b",
+            9,
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(calls.get(), 1);
+    }
 
     /// 턴 시작 판정 — 막혀 있던(대기/완료) 세션이 작업 중으로 바뀐 것만 새 턴이다.
     /// working 재진입(2분 stale 창 만료 뒤 하트비트 재개)을 턴 시작으로 오인하면
@@ -19697,10 +25842,12 @@ mod tests {
     fn cwd_조회는_raw_제목을_키로_쓴다() {
         let catalog = load_catalog("ko-KR");
         let raw = "workspace.spawn.shell 3";
-        let panes = vec![(
-            raw.to_owned(),
-            "/Users/jr/Desktop/Projects/deppy-sijo".to_owned(),
-        )];
+        let panes = vec![storage::PersistedActivityPane {
+            workspace_id: "workspace".to_owned(),
+            pane_id: "pane".to_owned(),
+            title: raw.to_owned(),
+            cwd: "/Users/jr/Desktop/Projects/deppy-sijo".to_owned(),
+        }];
         // raw로 조회 → cwd 적중 → 프로젝트명 해석 가능
         assert_eq!(
             pane_cwd(&panes, raw),
@@ -19718,7 +25865,12 @@ mod tests {
             "렌더 값으로 조회가 적중하면 회귀"
         );
         // 빈 cwd는 없는 것으로 취급
-        let empty = vec![(raw.to_owned(), String::new())];
+        let empty = vec![storage::PersistedActivityPane {
+            workspace_id: "workspace".to_owned(),
+            pane_id: "pane".to_owned(),
+            title: raw.to_owned(),
+            cwd: String::new(),
+        }];
         assert_eq!(pane_cwd(&empty, raw), None);
     }
 
@@ -19823,6 +25975,34 @@ mod tests {
         }
     }
 
+    fn live_mux_event(tag: &str, sessions: &[u64]) -> runtime::RuntimeEvent {
+        runtime::RuntimeEvent::MuxUpdated {
+            snapshot: std::sync::Arc::new(runtime::MuxSnapshot {
+                tabs: vec![runtime::TabSnapshot {
+                    id: runtime::MuxTabId(tag.to_owned()),
+                    title: tag.to_owned(),
+                    layout: runtime::LayoutNode::Pane(runtime::MuxPaneId(format!(
+                        "{tag}-pane-{}",
+                        sessions.first().copied().unwrap_or(0)
+                    ))),
+                    panes: sessions
+                        .iter()
+                        .map(|session| runtime::PaneSnapshot {
+                            id: runtime::MuxPaneId(format!("{tag}-pane-{session}")),
+                            session_id: Some(runtime::SessionId(*session)),
+                            title: format!("session-{session}"),
+                            persistent_session_id: None,
+                        })
+                        .collect(),
+                }],
+                active_tab: Some(runtime::MuxTabId(tag.to_owned())),
+                focused_pane: sessions
+                    .first()
+                    .map(|session| runtime::MuxPaneId(format!("{tag}-pane-{session}"))),
+            }),
+        }
+    }
+
     fn mux_tag(e: &runtime::RuntimeEvent) -> Option<&str> {
         match e {
             runtime::RuntimeEvent::MuxUpdated { snapshot } => {
@@ -19830,6 +26010,46 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    fn workspace_with_pending_shell(cwd: &str) -> ui::workspace::WorkspaceUi {
+        let mut workspace_ui = ui::workspace::WorkspaceUi::new();
+        workspace_ui.spawn_shell_at(1_000, Some(cwd.to_owned()));
+        let intent = workspace_ui.take_protocol_intent().unwrap();
+        let operation = intent.operation();
+        let generation = intent.generation();
+        workspace_ui.complete_protocol(ui::workspace::WorkspaceProtocolCompletion {
+            operation,
+            generation,
+            result: Ok(()),
+        });
+        assert_eq!(workspace_ui.pending_spawns(), 1);
+        workspace_ui
+    }
+
+    fn overflow_spawn_replay(
+        completion: runtime::RuntimeEvent,
+    ) -> (
+        ui::workspace::WorkspaceUi,
+        Vec<runtime::RuntimeEvent>,
+        ReplayCompaction,
+    ) {
+        let mut workspace_ui = workspace_with_pending_shell("/tmp/deppy-spawn");
+        let mut events = vec![completion];
+        events.extend((0..=PENDING_REPLAY_EVENT_CAP).map(|idx| {
+            runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Agent,
+                message: runtime::MessagePayload::new(format!("agent.failed.{idx}")),
+            }
+        }));
+        let mut pending_events = Vec::new();
+        let compacted = admit_hidden_active_replay_events(
+            &mut workspace_ui,
+            &mut pending_events,
+            events,
+            &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+        );
+        (workspace_ui, pending_events, compacted)
     }
 
     fn resource_event(sampled_at_ms: u64) -> runtime::RuntimeEvent {
@@ -20637,6 +26857,128 @@ mod tests {
     }
 
     #[test]
+    fn designall_top_bar는_본문위에_추가선을_그리지_않는다() {
+        let source = include_str!("app.rs");
+        assert!(source.contains("const DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE: bool = false;"));
+        assert!(source.contains(".show_separator_line(DESIGNALL_TOP_BAR_SEPARATOR_VISIBLE)"));
+    }
+
+    #[test]
+    fn designall_titlebar는_신호등_project_terminal_status영역을_한줄에_배치한다() {
+        let regions = designall_titlebar_regions(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_200.0, TOP_BAR_HEIGHT)),
+            88.0,
+            360.0,
+            96.0,
+        );
+
+        assert_eq!(regions.traffic.x_range(), egui::Rangef::new(0.0, 88.0));
+        assert_eq!(regions.project.x_range(), egui::Rangef::new(88.0, 448.0));
+        assert_eq!(
+            regions.workspace.x_range(),
+            egui::Rangef::new(448.0, 1_104.0)
+        );
+        assert_eq!(
+            regions.status.x_range(),
+            egui::Rangef::new(1_104.0, 1_200.0)
+        );
+    }
+
+    #[test]
+    fn designall_titlebar_p2_file_tree가_없어도_workspace_add를_노출한다() {
+        let project =
+            egui::Rect::from_min_size(egui::pos2(76.0, 0.0), egui::vec2(40.0, TOP_BAR_HEIGHT));
+        let controls = designall_project_titlebar_controls(project, false);
+
+        assert!(controls.collapse.is_none());
+        let add = controls.add.expect("workspace add must remain reachable");
+        assert!(project.contains_rect(add));
+    }
+
+    #[test]
+    fn designall_titlebar_p2_좁은_project는_겹치지_않는_collapse만_노출한다() {
+        for width in [40.0, 56.0, 71.0] {
+            let project =
+                egui::Rect::from_min_size(egui::pos2(76.0, 0.0), egui::vec2(width, TOP_BAR_HEIGHT));
+            let controls = designall_project_titlebar_controls(project, true);
+
+            let collapse = controls.collapse.expect("collapse must remain reachable");
+            assert!(project.contains_rect(collapse));
+            assert!(controls.add.is_none());
+        }
+
+        let collapsed =
+            egui::Rect::from_min_size(egui::pos2(76.0, 0.0), egui::vec2(22.0, TOP_BAR_HEIGHT));
+        assert_eq!(
+            designall_project_titlebar_controls(collapsed, true),
+            DesignAllProjectTitlebarControls {
+                collapse: None,
+                add: None,
+            }
+        );
+    }
+
+    #[test]
+    fn designall_titlebar_p2_status폭은_dynamic_count를_수용한다() {
+        let compact = designall_titlebar_status_width(14.0, 18.0, 8.0);
+        let counted = designall_titlebar_status_width(14.0, 128.0, 8.0);
+
+        assert_eq!(compact, 96.0);
+        assert!(counted >= 160.0);
+        assert!(counted > compact);
+    }
+
+    #[test]
+    fn designall_titlebar_p2_render는_fallback과_dynamic_status를_사용한다() {
+        let source = include_str!("app.rs");
+        let start = source.find("        let bar_h = TOP_BAR_HEIGHT;").unwrap();
+        let end = source[start..]
+            .find("\n        // 폭주 경고 배너")
+            .map(|offset| start + offset)
+            .unwrap();
+        let top_bar = &source[start..end];
+
+        assert!(top_bar.contains("unwrap_or((76.0, 40.0))"));
+        assert!(top_bar.contains("designall_project_titlebar_controls("));
+        assert!(top_bar.contains("designall_titlebar_status_width("));
+        assert!(!top_bar.contains("project.width() >= 72.0"));
+        assert!(!top_bar.contains("project_width, 96.0"));
+    }
+
+    #[test]
+    fn designall_project_titlebar는_아바타보다_2px왼쪽이고_글씨를_3px내린다() {
+        let project =
+            egui::Rect::from_min_size(egui::pos2(88.0, 0.0), egui::vec2(200.0, TOP_BAR_HEIGHT));
+        let layout = designall_project_titlebar_layout(project);
+
+        assert!((layout.label_anchor.x - 95.8).abs() < 0.01);
+        assert_eq!(layout.label_anchor.y, project.center().y + 3.0);
+        assert_eq!(layout.collapse.center().y, project.center().y);
+        assert_eq!(layout.add.center().y, project.center().y);
+        assert!(layout.collapse.right() < layout.add.left());
+    }
+
+    #[test]
+    fn designall_top_bar는_bold_project만_렌더하고_terminal_header는_렌더하지_않는다() {
+        let source = include_str!("app.rs");
+        let start = source.find("        let bar_h = TOP_BAR_HEIGHT;").unwrap();
+        let end = source[start..]
+            .find("\n        // 폭주 경고 배너")
+            .map(|offset| start + offset)
+            .unwrap();
+        let top_bar = &source[start..end];
+
+        assert!(top_bar.contains("designall_titlebar_widths()"));
+        assert!(!top_bar.contains("render_titlebar_header("));
+        assert!(top_bar.contains("collapse_project_file_panel()"));
+        assert!(top_bar.contains("file_tree.collapse_sidebar"));
+        assert!(!top_bar.contains(".on_hover_text(text.t(\"action.close\""));
+        assert!(top_bar.contains("egui::RichText::new(\"Project\")"));
+        assert!(top_bar.contains(".strong()"));
+        assert!(!top_bar.contains("\"PROJECT\""));
+    }
+
+    #[test]
     fn settings_snapshot_worker는_idle_exit_race와_queued_result를_유실하지_않는다() {
         let path = temp_db_path("settings-idle-race");
         let db = storage::Db::open(&path).unwrap();
@@ -20886,19 +27228,248 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_mux_updated_pending_replay_caps_exact_boundary_and_reports_overflow() {
+        let mut exact = vec![mux_event("old")];
+        exact.extend((0..PENDING_REPLAY_EVENT_CAP - 1).map(|idx| {
+            runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Shell,
+                message: runtime::MessagePayload::new(format!("spawn.failed.{idx}")),
+            }
+        }));
+        exact.push(mux_event("latest"));
+
+        let exact_result = coalesce_mux_updated(&mut exact);
+
+        assert!(!exact_result.overflowed);
+        assert_eq!(exact.len(), PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&exact[0]), Some("latest"));
+
+        let mut events = vec![mux_event("old")];
+        events.extend((0..PENDING_REPLAY_EVENT_CAP).map(|idx| {
+            runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Shell,
+                message: runtime::MessagePayload::new(format!("spawn.failed.{idx}")),
+            }
+        }));
+        events.push(mux_event("latest"));
+
+        let result = coalesce_mux_updated(&mut events);
+
+        assert!(result.overflowed);
+        assert!(events.len() <= PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&events[0]), Some("latest"));
+    }
+
+    #[test]
+    fn workspace_state_transition_retries_after_failed_delivery() {
+        let mut render_active = false;
+        let mut pending_replay_resync = true;
+
+        commit_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            false,
+        );
+        assert!(!render_active);
+        assert!(pending_replay_resync);
+
+        commit_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            true,
+        );
+        assert!(render_active);
+        assert!(!pending_replay_resync);
+    }
+
+    #[test]
+    fn switched_warm_activation_failure_remains_retryable() {
+        let mut render_active = false;
+        let mut pending_replay_resync = true;
+        let mut deliveries = std::collections::VecDeque::from([false, true]);
+
+        deliver_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            |state| {
+                assert_eq!(state, runtime::WorkspaceRuntimeState::Active);
+                deliveries.pop_front().unwrap()
+            },
+        );
+        assert!(!render_active);
+        assert!(pending_replay_resync);
+        assert!(!render_active, "next frame must retry activation");
+
+        deliver_workspace_state_transition(
+            &mut render_active,
+            &mut pending_replay_resync,
+            true,
+            |state| {
+                assert_eq!(state, runtime::WorkspaceRuntimeState::Active);
+                deliveries.pop_front().unwrap()
+            },
+        );
+        assert!(render_active);
+        assert!(!pending_replay_resync);
+        assert!(deliveries.is_empty());
+    }
+
+    #[test]
+    fn pending_replay_hidden_active_applies_required_state_before_cap_discards_replay() {
+        let session_ids: Vec<u64> = (1..=(PENDING_REPLAY_EVENT_CAP + 1) as u64).collect();
+        let target = runtime::SessionId(session_ids[0]);
+        let mut events = vec![live_mux_event("latest", &session_ids)];
+        events.extend(session_ids.iter().copied().map(|session| {
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(session),
+                exit_code: Some(if session == target.0 { 1 } else { 0 }),
+            }
+        }));
+        let mut workspace_ui = ui::workspace::WorkspaceUi::new();
+        let mut pending_events = Vec::new();
+
+        let result = admit_hidden_active_replay_events(
+            &mut workspace_ui,
+            &mut pending_events,
+            events,
+            &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+        );
+
+        assert!(result.overflowed);
+        assert_eq!(pending_events.len(), PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&pending_events[0]), Some("latest"));
+        assert_eq!(
+            workspace_ui.last_session_status(target),
+            Some(runtime::SessionStatus::Error)
+        );
+        assert!(
+            !pending_events.iter().any(|event| matches!(
+                event,
+                runtime::RuntimeEvent::SessionExited { session, .. } if *session == target
+            )),
+            "target exit replay should be dropped by the hard cap"
+        );
+    }
+
+    #[test]
+    fn warm_spawn_completion_success_survives_replay_overflow() {
+        let session = runtime::SessionId(77);
+        let (workspace_ui, pending_events, compacted) =
+            overflow_spawn_replay(runtime::RuntimeEvent::ShellSpawned { session });
+
+        assert!(compacted.overflowed);
+        assert_eq!(workspace_ui.pending_spawns(), 0);
+        assert!(!pending_events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::ShellSpawned { session: spawned } if *spawned == session
+        )));
+    }
+
+    #[test]
+    fn warm_spawn_completion_failure_survives_replay_overflow() {
+        let message_id = "shell.failed.target";
+        let (workspace_ui, pending_events, compacted) =
+            overflow_spawn_replay(runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Shell,
+                message: runtime::MessagePayload::new(message_id),
+            });
+
+        assert!(compacted.overflowed);
+        assert_eq!(workspace_ui.pending_spawns(), 0);
+        assert!(!pending_events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::SpawnFailed { message, .. }
+                if message.message_id == message_id
+        )));
+    }
+
+    #[test]
+    fn coalesce_mux_updated_pending_replay_preserves_latest_live_session_state_after_churn() {
+        let session = runtime::SessionId(7);
+        let stale_session = runtime::SessionId(9);
+        let mut events = vec![live_mux_event("old", &[session.0, stale_session.0])];
+        events.extend((0..PENDING_REPLAY_EVENT_CAP).map(|idx| {
+            runtime::RuntimeEvent::SpawnFailed {
+                kind: runtime::SpawnKind::Agent,
+                message: runtime::MessagePayload::new(format!("agent.failed.{idx}")),
+            }
+        }));
+        events.extend([
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session,
+                status: runtime::SessionStatus::Running,
+            },
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session,
+                status: runtime::SessionStatus::Waiting,
+            },
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: stale_session,
+                status: runtime::SessionStatus::Waiting,
+            },
+            viewport_event(session.0, "final"),
+            viewport_event(stale_session.0, "stale"),
+            runtime::RuntimeEvent::SessionExited {
+                session,
+                exit_code: Some(0),
+            },
+            runtime::RuntimeEvent::SessionExited {
+                session: stale_session,
+                exit_code: Some(1),
+            },
+            live_mux_event("latest", &[session.0]),
+        ]);
+
+        let result = coalesce_mux_updated(&mut events);
+
+        assert!(result.overflowed);
+        assert!(events.len() <= PENDING_REPLAY_EVENT_CAP);
+        assert_eq!(mux_tag(&events[0]), Some("latest"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: changed,
+                status: runtime::SessionStatus::Waiting,
+            } if *changed == session
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::Viewport { session: changed, snapshot, .. }
+                if *changed == session && snapshot.title.as_deref() == Some("final")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::SessionExited {
+                session: exited,
+                exit_code: Some(0),
+            } if *exited == session
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            runtime::RuntimeEvent::SessionStatusChanged { session, .. }
+                | runtime::RuntimeEvent::Viewport { session, .. }
+                | runtime::RuntimeEvent::SessionExited { session, .. }
+                if *session == stale_session
+        )));
+    }
+
+    #[test]
     fn coalesce_moves_latest_mux_to_front() {
         let mut events = vec![
-            mux_event("a"),
+            live_mux_event("a", &[1]),
             runtime::RuntimeEvent::SessionStatusChanged {
                 session: runtime::SessionId(1),
                 status: runtime::SessionStatus::Running,
             },
-            mux_event("b"),
+            live_mux_event("b", &[1]),
             runtime::RuntimeEvent::SessionExited {
                 session: runtime::SessionId(1),
                 exit_code: None,
             },
-            mux_event("c"),
+            live_mux_event("c", &[1]),
         ];
 
         coalesce_mux_updated(&mut events);
@@ -21094,7 +27665,7 @@ mod tests {
         // [MuxUpdated(세션X 도입), SessionExited(X)] → coalesce 후에도 exit이 mux 뒤에.
         // (mux가 맨 앞으로 가므로 replay 시 X를 먼저 확립하고 exit이 적용됨.)
         let mut events = vec![
-            mux_event("x"),
+            live_mux_event("x", &[9]),
             runtime::RuntimeEvent::SessionExited {
                 session: runtime::SessionId(9),
                 exit_code: Some(0),
@@ -21464,6 +28035,22 @@ mod tests {
     }
 
     #[test]
+    fn 워크스페이스_종료확인_policy는_기본즉시종료와_opt_in확인을_구분한다() {
+        assert_eq!(
+            workspace_close_disposition(false, true),
+            WorkspaceCloseDisposition::CloseNow
+        );
+        assert_eq!(
+            workspace_close_disposition(true, true),
+            WorkspaceCloseDisposition::Confirm
+        );
+        assert_eq!(
+            workspace_close_disposition(false, false),
+            WorkspaceCloseDisposition::Ignore
+        );
+    }
+
+    #[test]
     fn 종료한_워크스페이스는_사이드바와_홈의_공통_visible_set에서_빠진다() {
         let mut closed = std::collections::HashMap::new();
         closed.insert("closed".to_owned(), ClosedWorkspaceState::Persisted);
@@ -21733,5 +28320,876 @@ mod tests {
         };
         assert!(turn_done_clear_matches_workspace(&current, "workspace-a"));
         assert!(!turn_done_clear_matches_workspace(&stale, "workspace-a"));
+    }
+
+    fn restore_request(
+        workspace_id: &str,
+        pane: &str,
+        attachment_id: ui::cross_workspace::AttachmentId,
+    ) -> CrossWorkspaceRestoreRequest {
+        CrossWorkspaceRestoreRequest::new(
+            workspace_id,
+            runtime::MuxPaneId(pane.to_owned()),
+            attachment_id,
+        )
+    }
+
+    fn restoring_attachment_id(
+        workspace_id: &str,
+        pane: &str,
+    ) -> ui::cross_workspace::AttachmentId {
+        ui::cross_workspace::CrossWorkspacePaneState::default()
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    workspace_id,
+                    runtime::MuxPaneId(pane.to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap()
+    }
+
+    #[test]
+    fn cross_workspace_app_workspace_close_removes_exact_attachments_and_restores() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let live_b = append_live_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            cross_workspace_test_target_named("workspace-b", 11, "b-live", 41),
+            6,
+        )
+        .appended_id()
+        .unwrap();
+        let restoring_b = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b-restore".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let restoring_c = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let pending_b = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b-pending".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request(
+            "workspace-b",
+            "pane-b-restore",
+            restoring_b,
+        )));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(
+            coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b-restore".to_owned()),)
+        );
+        assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", restoring_c,)));
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b-pending", pending_b,)));
+        let mut visible = vec![live_b, restoring_b, restoring_c, pending_b];
+
+        let sent_restore_pane = remove_workspace_cross_workspace_state(
+            &mut panes,
+            &mut visible,
+            &mut coordinator,
+            "workspace-b",
+        );
+
+        assert_eq!(
+            panes
+                .attachments()
+                .iter()
+                .map(ui::cross_workspace::AttachedPane::id)
+                .collect::<Vec<_>>(),
+            vec![restoring_c]
+        );
+        assert_eq!(visible, vec![restoring_c]);
+        assert_eq!(coordinator.in_flight_len(), 0);
+        assert_eq!(coordinator.pending_len(), 1);
+        assert_eq!(
+            sent_restore_pane,
+            Some(runtime::MuxPaneId("pane-b-restore".to_owned()))
+        );
+        assert_eq!(
+            coordinator.next_request().unwrap().workspace_id(),
+            "workspace-c"
+        );
+
+        let source = include_str!("app.rs");
+        let helper = source
+            .split_once("fn remove_workspace_cross_workspace_state")
+            .unwrap()
+            .1
+            .split_once("fn apply_restore_outcome")
+            .unwrap()
+            .0;
+        for forbidden in ["ClosePane", "KillSession", "ResizeSplit"] {
+            assert!(!helper.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_workspace_close_ignores_unsent_restore_pane() {
+        let now = std::time::Instant::now();
+        let id = restoring_attachment_id("workspace-b", "pane-b");
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        coordinator.begin_next(11, now).unwrap();
+
+        assert_eq!(coordinator.remove_workspace("workspace-b"), None);
+        assert_eq!(coordinator.in_flight_len(), 0);
+        assert_eq!(coordinator.pending_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_live_promotion_survives_cancelled_barrier() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+
+        let outcome = append_live_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 11),
+            6,
+        );
+        assert_eq!(
+            outcome,
+            ui::cross_workspace::AttachOutcome::FocusedExisting(id)
+        );
+        assert!(coordinator.cancel_attachment(id).is_some());
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        let ignored = coordinator
+            .settle_durable_barrier("workspace-b", 11, 41, Some(&mux))
+            .unwrap();
+
+        assert!(matches!(ignored, RestoreBarrierOutcome::Ignored(_)));
+        assert!(!apply_restore_outcome(&mut panes, ignored));
+        assert!(panes.attachments()[0].live_target().is_some());
+    }
+
+    #[test]
+    fn cross_workspace_app_live_promotion_survives_cancelled_timeout() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        let outcome = append_live_cross_workspace_pane(
+            &mut panes,
+            "workspace-a",
+            cross_workspace_test_target("workspace-b", 11),
+            6,
+        );
+        assert_eq!(
+            outcome,
+            ui::cross_workspace::AttachOutcome::FocusedExisting(id)
+        );
+        assert!(coordinator.cancel_attachment(id).is_some());
+
+        let ignored = coordinator
+            .expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT)
+            .unwrap();
+
+        assert!(matches!(ignored, RestoreBarrierOutcome::Ignored(_)));
+        assert!(!apply_restore_outcome(&mut panes, ignored));
+        assert!(panes.attachments()[0].live_target().is_some());
+    }
+
+    #[test]
+    fn cross_workspace_app_real_restore_failure_detaches_placeholder() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+
+        assert!(!apply_restore_outcome(
+            &mut panes,
+            RestoreBarrierOutcome::Failed(restore_request("workspace-b", "pane-b", id)),
+        ));
+        assert!(panes.attachments().is_empty());
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_queue_has_one_in_flight() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let first = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let second = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-c",
+                    runtime::MuxPaneId("pane-c".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", first)));
+        assert!(coordinator.enqueue(restore_request("workspace-c", "pane-c", second)));
+
+        let first_dispatch = coordinator.begin_next(11, now).unwrap();
+        assert_eq!(first_dispatch.request().workspace_id(), "workspace-b");
+        assert!(coordinator.begin_next(12, now).is_none());
+        assert_eq!(coordinator.pending_len(), 1);
+        assert_eq!(coordinator.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_stale_pre_command_mux_updated_cannot_settle() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        let stale = cross_workspace_test_mux("tab-b", "pane-old", runtime::SessionId(7));
+
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 41, Some(&stale))
+                .is_none()
+        );
+        assert_eq!(coordinator.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_requested_restore_exact_barrier_promotes() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+
+        let outcome = coordinator.settle_durable_barrier("workspace-b", 11, 41, Some(&mux));
+
+        assert!(matches!(outcome, Some(RestoreBarrierOutcome::Promote(_))));
+        assert_eq!(coordinator.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_exact_barrier_uses_mux_at_fifo_boundary() {
+        let restored = Arc::new(cross_workspace_test_mux(
+            "tab-b",
+            "pane-b",
+            runtime::SessionId(42),
+        ));
+        let later = Arc::new(cross_workspace_test_mux(
+            "tab-b",
+            "pane-other",
+            runtime::SessionId(43),
+        ));
+        let events = vec![
+            runtime::RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&restored),
+            },
+            runtime::RuntimeEvent::DurableEventBarrierReached { correlation_id: 41 },
+            runtime::RuntimeEvent::MuxUpdated {
+                snapshot: Arc::clone(&later),
+            },
+        ];
+
+        let mux = runtime_mux_at_durable_barrier(None, &events, 41)
+            .flatten()
+            .unwrap();
+
+        assert!(Arc::ptr_eq(mux, &restored));
+    }
+
+    #[test]
+    fn cross_workspace_app_missing_exact_barrier_fails() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+        let mux = cross_workspace_test_mux("tab-b", "pane-other", runtime::SessionId(42));
+
+        let outcome = coordinator.settle_durable_barrier("workspace-b", 11, 41, Some(&mux));
+
+        assert!(matches!(outcome, Some(RestoreBarrierOutcome::Failed(_))));
+    }
+
+    #[test]
+    fn cross_workspace_app_wrong_correlation_or_runtime_barrier_is_ignored() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 40, Some(&mux))
+                .is_none()
+        );
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 12, 41, Some(&mux))
+                .is_none()
+        );
+        assert_eq!(coordinator.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_cancelled_inflight_blocks_until_exact_barrier() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        let attachment_id = request.attachment_id();
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".into()), 41,));
+        assert!(coordinator.cancel_attachment(attachment_id).is_some());
+        assert!(coordinator.begin_next(12, now).is_none());
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 40, Some(&mux))
+                .is_none()
+        );
+
+        let outcome = coordinator.settle_durable_barrier("workspace-b", 11, 41, Some(&mux));
+
+        assert!(matches!(outcome, Some(RestoreBarrierOutcome::Ignored(_))));
+        assert_eq!(coordinator.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_barrier_ids_are_nonzero_monotonic_across_runtime_replacement() {
+        let mut allocator = DurableBarrierCorrelationAllocator::default();
+        let first = allocator.allocate().unwrap();
+        let _runtime_replaced = 12_u64;
+        let second = allocator.allocate().unwrap();
+
+        assert_ne!(first, 0);
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_second_barrier_send_failure_never_promotes() {
+        let now = std::time::Instant::now();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let request = restore_request(
+            "workspace-b",
+            "pane-b",
+            restoring_attachment_id("workspace-b", "pane-b"),
+        );
+        assert!(coordinator.enqueue(request));
+        coordinator.begin_next(11, now).unwrap();
+        let mut sent = 0;
+        let delivery =
+            send_restore_with_durable_barrier(runtime::MuxPaneId("pane-b".into()), 41, |_| {
+                sent += 1;
+                sent == 1
+            });
+        assert_eq!(delivery, RestoreBarrierDelivery::RestoreSentUnarmed);
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".into())));
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 41, Some(&mux))
+                .is_none()
+        );
+        assert_eq!(coordinator.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_queue_deduplicates_workspace_and_pane() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        assert!(coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        assert!(!coordinator.enqueue(restore_request("workspace-b", "pane-b", id)));
+        assert_eq!(coordinator.pending_len(), 1);
+    }
+
+    #[test]
+    fn cross_workspace_app_cancelled_inflight_blocks_next_until_mux_barrier() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        assert!(coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned())));
+        assert!(coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".to_owned()), 41,));
+        assert!(coordinator.protects_runtime("workspace-b", 11));
+
+        let cancelled = coordinator.cancel_attachment(id).unwrap();
+
+        assert_eq!(cancelled.attachment_id(), id);
+        assert!(coordinator.protects_runtime("workspace-b", 11));
+        assert_eq!(coordinator.in_flight_len(), 1);
+        assert!(coordinator.begin_next(12, now).is_none());
+        assert!(
+            coordinator
+                .settle_durable_barrier("workspace-b", 11, 41, None)
+                .is_some()
+        );
+        assert_eq!(coordinator.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_timeout_releases_all_bookkeeping() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+
+        let expired = coordinator.expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT);
+
+        assert!(matches!(
+            expired,
+            Some(RestoreBarrierOutcome::Failed(request)) if request.attachment_id() == id
+        ));
+        assert_eq!(coordinator.pending_len(), 0);
+        assert_eq!(coordinator.in_flight_len(), 0);
+        assert!(!coordinator.protects_runtime("workspace-b", 11));
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_queue_hard_cap_is_six() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        for index in 0..6 {
+            let workspace = format!("workspace-{index}");
+            let pane = format!("pane-{index}");
+            let id = panes
+                .append_restoring(
+                    "workspace-a",
+                    ui::cross_workspace::PersistedPaneRequest::new(
+                        workspace.clone(),
+                        runtime::MuxPaneId(pane.clone()),
+                    ),
+                    420.0,
+                    6,
+                )
+                .appended_id()
+                .unwrap();
+            assert!(coordinator.enqueue(restore_request(&workspace, &pane, id)));
+        }
+        assert_eq!(coordinator.total_len(), 6);
+        let seventh = restore_request("workspace-7", "pane-7", panes.attachments()[0].id());
+        assert!(!coordinator.enqueue(seventh));
+        assert_eq!(coordinator.total_len(), 6);
+    }
+
+    #[test]
+    fn cross_workspace_app_missing_pane_mux_barrier_settles_failure() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".to_owned()), 41);
+
+        let outcome = coordinator.settle_durable_barrier("workspace-b", 11, 41, None);
+
+        assert!(matches!(outcome, Some(RestoreBarrierOutcome::Failed(_))));
+        assert_eq!(coordinator.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_timeout_rejects_late_completion() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".to_owned()), 41);
+        assert!(
+            coordinator
+                .expire(now + CROSS_WORKSPACE_RESTORE_TIMEOUT)
+                .is_some()
+        );
+
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        let late = coordinator.settle_durable_barrier("workspace-b", 11, 41, Some(&mux));
+
+        assert!(late.is_none());
+    }
+
+    #[test]
+    fn cross_workspace_app_dotenv_failure_releases_placeholder_and_queue() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+
+        let failed = coordinator
+            .fail_before_command(11, &runtime::MuxPaneId("pane-b".to_owned()))
+            .unwrap();
+        let _ = panes.detach_attachment(failed.attachment_id());
+
+        assert!(panes.attachments().is_empty());
+        assert_eq!(coordinator.total_len(), 0);
+        assert!(!coordinator.protects_runtime("workspace-b", 11));
+    }
+
+    #[test]
+    fn cross_workspace_app_primary_switch_and_shutdown_clear_all_restore_state() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+
+        let cancelled = coordinator.cancel_visible_requests();
+        for request in cancelled {
+            let _ = panes.detach_attachment(request.attachment_id());
+        }
+        assert!(panes.attachments().is_empty());
+        assert_eq!(coordinator.active_request_len(), 0);
+        assert_eq!(
+            coordinator.in_flight_len(),
+            1,
+            "cancelled tombstone blocks overlap"
+        );
+
+        coordinator.force_clear_for_shutdown();
+        assert_eq!(coordinator.total_len(), 0);
+    }
+
+    #[test]
+    fn cross_workspace_app_same_workspace_requests_reuse_runtime() {
+        assert_eq!(
+            cold_restore_runtime_admission(Some(11), 6, 6),
+            ColdRestoreRuntimeAdmission::Reuse(11)
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_capacity_denial_creates_no_hidden_runtime() {
+        assert_eq!(
+            cold_restore_runtime_admission(None, 2, 2),
+            ColdRestoreRuntimeAdmission::Denied
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_attached_runtimes_still_count_toward_live_budget() {
+        assert_eq!(count_live_warm_runtimes([true, true, false]), 2);
+    }
+
+    #[test]
+    fn cross_workspace_app_exact_workspace_runtime_pane_session_only_promotes() {
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        assert_eq!(
+            restored_workspace_pane_target(
+                "workspace-b",
+                11,
+                &runtime::MuxPaneId("pane-b".to_owned()),
+                &mux,
+            ),
+            Some(ui::cross_workspace::WorkspacePaneTarget::new(
+                "workspace-b",
+                11,
+                runtime::MuxTabId("tab-b".to_owned()),
+                runtime::MuxPaneId("pane-b".to_owned()),
+                runtime::SessionId(42),
+            ))
+        );
+    }
+
+    #[test]
+    fn cross_workspace_app_cold_restore_never_stages_full_restore_or_agent_resume() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn drive_cross_workspace_restore")
+            .unwrap()
+            .1
+            .split_once("fn detach_cancelled_cross_workspace_restores")
+            .unwrap()
+            .0;
+        for forbidden in [
+            "switch_workspace(",
+            "stage_runtime_restore(",
+            "stage_agent_resume(",
+            "RuntimeCommand::RestoreWorkspace,",
+            "OpenAgentLauncher",
+        ] {
+            assert!(!body.contains(forbidden), "cold path contains {forbidden}");
+        }
+    }
+
+    #[test]
+    fn cross_workspace_app_restore_workspace_pane_requires_dotenv() {
+        assert!(runtime_command_requires_dotenv(
+            &runtime::RuntimeCommand::RestoreWorkspacePane {
+                pane: runtime::MuxPaneId("pane-b".to_owned())
+            }
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_archived_agent_is_not_restarted_by_restore_dispatch() {
+        let command = cross_workspace_restore_command(runtime::MuxPaneId("pane-b".to_owned()));
+        assert!(matches!(
+            command,
+            runtime::RuntimeCommand::RestoreWorkspacePane { .. }
+        ));
+    }
+
+    #[test]
+    fn cross_workspace_app_capacity_reduction_cancels_rightmost_pending() {
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let workspace_id = format!("workspace-{index}");
+            let pane_id = format!("pane-{index}");
+            let id = panes
+                .append_restoring(
+                    "workspace-a",
+                    ui::cross_workspace::PersistedPaneRequest::new(
+                        workspace_id.clone(),
+                        runtime::MuxPaneId(pane_id.clone()),
+                    ),
+                    420.0,
+                    6,
+                )
+                .appended_id()
+                .unwrap();
+            coordinator.enqueue(restore_request(&workspace_id, &pane_id, id));
+            ids.push(id);
+        }
+
+        let _detached = panes.enforce_capacity(1);
+        let retained = panes
+            .attachments()
+            .iter()
+            .map(ui::cross_workspace::AttachedPane::id)
+            .collect();
+        let cancelled = coordinator.retain_attachments(&retained);
+
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(coordinator.pending_len(), 1);
+        assert_eq!(coordinator.pending_attachment_ids(), vec![ids[0]]);
+    }
+
+    #[test]
+    fn cross_workspace_app_stale_exact_relation_mismatch_does_not_promote() {
+        let now = std::time::Instant::now();
+        let mut panes = ui::cross_workspace::CrossWorkspacePaneState::default();
+        let id = panes
+            .append_restoring(
+                "workspace-a",
+                ui::cross_workspace::PersistedPaneRequest::new(
+                    "workspace-b",
+                    runtime::MuxPaneId("pane-b".to_owned()),
+                ),
+                420.0,
+                6,
+            )
+            .appended_id()
+            .unwrap();
+        let mut coordinator = CrossWorkspaceRestoreCoordinator::default();
+        coordinator.enqueue(restore_request("workspace-b", "pane-b", id));
+        coordinator.begin_next(11, now).unwrap();
+        coordinator.mark_restore_sent(11, &runtime::MuxPaneId("pane-b".to_owned()));
+        coordinator.arm_durable_barrier(11, &runtime::MuxPaneId("pane-b".to_owned()), 41);
+
+        let mux = cross_workspace_test_mux("tab-b", "pane-b", runtime::SessionId(42));
+        let stale = coordinator.settle_durable_barrier("workspace-b", 12, 41, Some(&mux));
+
+        assert!(stale.is_none());
+        assert_eq!(coordinator.in_flight_len(), 1);
+        assert!(panes.attachments()[0].live_target().is_none());
     }
 }

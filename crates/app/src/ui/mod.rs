@@ -8,6 +8,8 @@ pub mod approvals;
 pub mod clipboard_image;
 pub mod composer;
 pub mod credentials;
+pub(crate) mod cross_workspace;
+pub mod designall;
 pub mod diff_panel;
 pub mod env_profiles;
 pub mod env_project_list;
@@ -16,7 +18,9 @@ pub mod fleet;
 pub mod inbox_approvals;
 pub mod inbox_waiting;
 pub mod notifications;
+pub(crate) mod ports;
 pub mod prompt_palette;
+pub(crate) mod resource_manager;
 pub mod settings;
 pub mod workspace;
 

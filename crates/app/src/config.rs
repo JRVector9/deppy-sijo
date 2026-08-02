@@ -184,6 +184,10 @@ pub struct UiConfig {
     pub session_name_style: SessionNameStyle,
     /// 다음 실행 때 다시 열 마지막 활성 workspace. 삭제되었거나 없으면 default workspace로 대체.
     pub last_workspace_id: Option<String>,
+    /// 워크스페이스 종료 전 확인 팝업. 기본 OFF라 메뉴 선택 즉시 세션을 종료하며,
+    /// 사용자가 명시적으로 ON한 경우에만 실행 중 세션 수를 보여주는 확인창을 띄운다.
+    #[serde(default)]
+    pub confirm_workspace_close: bool,
     /// 사이드바에서 「워크스페이스 종료」한 프로젝트 ID. 종료는 프로젝트 삭제가 아니므로
     /// DB 행은 보존하고, 사용자가 워크스페이스 선택기로 다시 열 때까지 목록에서 숨긴다.
     #[serde(default)]
@@ -265,6 +269,7 @@ impl Default for UiConfig {
             agent_send_presets: default_agent_send_presets(),
             session_name_style: SessionNameStyle::default(),
             last_workspace_id: None,
+            confirm_workspace_close: false,
             closed_workspace_ids: BTreeSet::new(),
             hidden_env_project_ids: BTreeSet::new(),
             ui_font: None,
@@ -377,6 +382,13 @@ pub struct PerformanceConfig {
     /// 않고 거부한다. 높이면 동시 워커+에이전트가 늘어 메모리↑ (지배 요인은 에이전트).
     /// 기본값은 RAM 유도([`recommended_max_live_warm`]) — 첫 실행 시 1회, 이후 사용자 값.
     pub max_live_warm: u32,
+    /// 활성 워크스페이스 옆에 동시에 표시할 다른 워크스페이스 Pane의 최대 개수.
+    #[serde(default = "default_max_cross_workspace_panes")]
+    pub max_cross_workspace_panes: u32,
+}
+
+fn default_max_cross_workspace_panes() -> u32 {
+    6
 }
 
 impl Default for PerformanceConfig {
@@ -385,6 +397,7 @@ impl Default for PerformanceConfig {
             output_batch_ms: 25,
             max_warm: 2,
             max_live_warm: recommended_max_live_warm(),
+            max_cross_workspace_panes: default_max_cross_workspace_panes(),
         }
     }
 }
@@ -492,6 +505,8 @@ impl Config {
             .clamp(MIN_OUTPUT_BATCH_MS, 1_000);
         self.performance.max_warm = self.performance.max_warm.clamp(0, 8);
         self.performance.max_live_warm = self.performance.max_live_warm.clamp(1, 12);
+        self.performance.max_cross_workspace_panes =
+            self.performance.max_cross_workspace_panes.clamp(1, 6);
         self.ui.fleet_batch_spawn_max = self.ui.fleet_batch_spawn_max.clamp(1, 16);
         self.i18n.locale = i18n::normalize_locale(&self.i18n.locale);
         // TOML을 손으로 고친 미지 프로바이더는 기본(None)으로 — spawn 경계의 검증과 별개로
@@ -755,6 +770,50 @@ mod tests {
     }
 
     #[test]
+    fn max_cross_workspace_panes_신규_기본값은_6이다() {
+        assert_eq!(PerformanceConfig::default().max_cross_workspace_panes, 6);
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.performance.max_cross_workspace_panes, 6);
+    }
+
+    #[test]
+    fn max_cross_workspace_panes_명시적_2_설정은_유지된다() {
+        let mut config: Config =
+            toml::from_str("[performance]\nmax_cross_workspace_panes = 2\n").unwrap();
+
+        config.normalize();
+
+        assert_eq!(config.performance.max_cross_workspace_panes, 2);
+    }
+
+    #[test]
+    fn max_cross_workspace_panes_범위밖_값은_1에서_6으로_정규화된다() {
+        let mut config = Config::default();
+        config.performance.max_cross_workspace_panes = 0;
+        config.normalize();
+        assert_eq!(config.performance.max_cross_workspace_panes, 1);
+
+        config.performance.max_cross_workspace_panes = 7;
+        config.normalize();
+        assert_eq!(config.performance.max_cross_workspace_panes, 6);
+
+        config.performance.max_cross_workspace_panes = u32::MAX;
+        config.normalize();
+        assert_eq!(config.performance.max_cross_workspace_panes, 6);
+    }
+
+    #[test]
+    fn max_cross_workspace_panes_유효값은_toml_라운드트립된다() {
+        for value in [1, 2, 6] {
+            let mut config = Config::default();
+            config.performance.max_cross_workspace_panes = value;
+            let text = toml::to_string(&config).unwrap();
+            let reloaded: Config = toml::from_str(&text).unwrap();
+            assert_eq!(reloaded.performance.max_cross_workspace_panes, value);
+        }
+    }
+
+    #[test]
     fn 누락_필드는_기본값으로_채운다() {
         let parsed: Config = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
         assert_eq!(parsed.ui.theme, Theme::Dark);
@@ -791,6 +850,17 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert!(!parsed.ui.file_tree_enabled);
+    }
+
+    #[test]
+    fn 워크스페이스_종료확인은_기본_off이고_roundtrip된다() {
+        let mut config = Config::default();
+        assert!(!config.ui.confirm_workspace_close);
+
+        config.ui.confirm_workspace_close = true;
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.ui.confirm_workspace_close);
     }
 
     #[test]

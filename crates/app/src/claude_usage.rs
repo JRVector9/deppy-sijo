@@ -167,8 +167,9 @@ fn usage_panel_rendered(lower: &str) -> bool {
 
 fn parse_usage(output: &str) -> Option<(u8, u8)> {
     let lines = output.split(['\r', '\n']).collect::<Vec<_>>();
-    let session =
-        extract_percent_after_label(&lines, |line| compact_label(line).contains("currentsession"))?;
+    let session = extract_percent_after_label(&lines, |line| {
+        compact_label(line).contains("currentsession")
+    })?;
     let weekly = extract_percent_after_label(&lines, |line| {
         let line = compact_label(line);
         !line.contains("fable")
@@ -188,16 +189,11 @@ fn compact_label(text: &str) -> String {
         .collect()
 }
 
-fn extract_percent_after_label(
-    lines: &[&str],
-    matches_label: impl Fn(&str) -> bool,
-) -> Option<u8> {
+fn extract_percent_after_label(lines: &[&str], matches_label: impl Fn(&str) -> bool) -> Option<u8> {
     static PERCENT: OnceLock<regex::Regex> = OnceLock::new();
     let percent = PERCENT.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)(\d{1,3})(?:\.\d+)?\s*%\s*(used|consumed|left|remaining|available)",
-        )
-        .expect("static Claude usage regex")
+        regex::Regex::new(r"(?i)(\d{1,3})(?:\.\d+)?\s*%\s*(used|consumed|left|remaining|available)")
+            .expect("static Claude usage regex")
     });
     // Claude TUI는 같은 패널을 여러 번 다시 그린다. 첫 프레임의 임시 0%가 아니라
     // 가장 마지막으로 그려진 안정된 값을 사용한다.
@@ -227,8 +223,8 @@ fn strip_terminal_control_sequences(output: &str) -> String {
     let osc = OSC.get_or_init(|| {
         regex::Regex::new(r"\x1b\][^\x07]*(?:\x07|\x1b\\)").expect("static OSC regex")
     });
-    let csi = CSI.get_or_init(|| {
-        regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("static CSI regex")
-    });
-    csi.replace_all(&osc.replace_all(output, ""), "").into_owned()
+    let csi = CSI
+        .get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("static CSI regex"));
+    csi.replace_all(&osc.replace_all(output, ""), "")
+        .into_owned()
 }

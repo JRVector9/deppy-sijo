@@ -255,7 +255,8 @@ impl InProcessRuntimeClient {
                 // 증분 예산 캐시 시드 — 이전 실행/재시작이 남긴 디스크 아카이브 총량을
                 // 워커당 1회 읽기 전용 스캔으로 복원한다 (A1 리뷰 P2). 이후 exit는
                 // 이 캐시에 증분만 더하고 예산 초과 시에만 전체 스캔(gc)한다.
-                let archive_disk_bytes = storage::scrollback_archive::scan_total(&logs_root);
+                let (archive_disk_bytes, archive_root_identity) =
+                    scan_archive_usage_snapshot(&logs_root);
                 Worker {
                     command_rx,
                     subscribers: worker_subscribers,
@@ -283,6 +284,8 @@ impl InProcessRuntimeClient {
                     mux: MuxState::new(),
                     tab_counter: 0,
                     persist: persist_pipe,
+                    persist_db_path: persist.as_ref().map(|config| config.db_path.clone()),
+                    lazy_restore: None,
                     exited_order: std::collections::VecDeque::new(),
                     max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                     cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
@@ -290,6 +293,7 @@ impl InProcessRuntimeClient {
                     archived_order: std::collections::VecDeque::new(),
                     archived_on_disk: std::collections::HashSet::new(),
                     archive_disk_bytes,
+                    archive_root_identity,
                     hidden_scrollback: std::collections::HashSet::new(),
                     render_active: true,
                     suspended: false,
@@ -653,6 +657,10 @@ fn prepare_queued_command(
     })
 }
 
+struct LazyWorkspaceRestore {
+    pending_panes: Vec<persist::PaneState>,
+}
+
 struct Worker {
     command_rx: Receiver<QueuedRuntimeCommand>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
@@ -693,6 +701,10 @@ struct Worker {
     tab_counter: u64,
     /// 세션/mux 영속 파이프 (설정 시에만 — 실패는 best-effort warn)
     persist: Option<crate::persistence::PersistPipe>,
+    persist_db_path: Option<PathBuf>,
+    /// 첫 targeted restore가 설치한 bounded pane catalog. worker 명령 직렬화로 한 번에
+    /// 하나만 materialize하며, 성공한 항목은 제거하고 실패한 항목은 재시도를 위해 남긴다.
+    lazy_restore: Option<LazyWorkspaceRestore>,
     /// backend를 유지 중인 exited 세션들 (종료 순서 — 오래된 것이 앞). §14.3 cap.
     exited_order: std::collections::VecDeque<SessionId>,
     /// exited 백엔드 LRU 상한 (SetTerminalCachePolicy로 변경 — 설정 UI).
@@ -711,6 +723,9 @@ struct Worker {
     /// 시드하고, 기록 성공마다 그 파일 크기만 더한다. 예산 초과가 확정될 때만 gc를
     /// 호출(그때만 전체 디렉터리 스캔+제거)해 매 exit 전체 스캔 비용을 없앤다.
     archive_disk_bytes: u64,
+    /// `archive_disk_bytes`를 측정한 logs_root의 dev/inode. root가 교체되면 증분값을
+    /// 폐기하고 fresh GC 스캔이 성공하기 전까지 신규 기록을 회계하지 않는다.
+    archive_root_identity: Option<storage::scrollback_archive::ArchiveRootIdentity>,
     /// 현재 hidden scrollback cap이 적용된 running 세션들 (§14.3) — 전이 감지용.
     hidden_scrollback: std::collections::HashSet<SessionId>,
     /// Active면 visible pane snapshot 생성, false(Warm 등)면 중단 (§14.1). 세션은 유지.
@@ -758,6 +773,49 @@ fn archive_kind_from_u8(byte: u8) -> session::SessionKind {
 /// 단위 테스트로 "스캔 없이 정확히 감지"를 검증한다.
 fn archive_cache_needs_gc(cached_bytes: u64, written_len: u64, budget: u64) -> bool {
     cached_bytes.saturating_add(written_len) > budget
+}
+
+fn scan_archive_usage_snapshot(
+    logs_root: &std::path::Path,
+) -> (
+    u64,
+    Option<storage::scrollback_archive::ArchiveRootIdentity>,
+) {
+    let Ok(before) = storage::scrollback_archive::root_identity(logs_root) else {
+        return (
+            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN,
+            None,
+        );
+    };
+    let total = storage::scrollback_archive::scan_total(logs_root);
+    let Ok(after) = storage::scrollback_archive::root_identity(logs_root) else {
+        return (
+            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN,
+            None,
+        );
+    };
+    if before == after {
+        (total, after)
+    } else {
+        (
+            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN,
+            after,
+        )
+    }
+}
+
+fn gc_archive_usage_snapshot(
+    logs_root: &std::path::Path,
+    budget: u64,
+) -> anyhow::Result<(
+    u64,
+    Option<storage::scrollback_archive::ArchiveRootIdentity>,
+)> {
+    let before = storage::scrollback_archive::root_identity(logs_root)?;
+    let total = storage::scrollback_archive::gc(logs_root, budget)?;
+    let after = storage::scrollback_archive::root_identity(logs_root)?;
+    anyhow::ensure!(before == after, "scrollback_archive_root_replaced");
+    Ok((total, after))
 }
 
 /// 압축 아카이브 항목 — 백엔드를 내린 exited 세션의 복원 재료 (§14.3 확장).
@@ -1818,25 +1876,7 @@ impl Worker {
                 }
             }
             RuntimeCommand::KillSession { session } => {
-                self.final_drain(session);
-                // Session drop → PtySession Drop이 process group 정리를 보장한다
-                self.remove_session(session);
-                self.exited_order.retain(|s| *s != session);
-                self.hidden_scrollback.remove(&session);
-                self.remote_viewing.remove(&session);
-                self.detectors.remove(&session);
-                self.status_overrides.remove(&session);
-                self.close_session_log(session, "killed", None);
-                if let Some(pipe) = &mut self.persist {
-                    pipe.session_exited(session);
-                }
-                // 세션을 잃은 pane은 attach 해제 (pane/session 분리 — 5.2)
-                for pane in self.mux.panes.values_mut() {
-                    if pane.session_id == Some(session) {
-                        pane.session_id = None;
-                    }
-                }
-                self.emit_mux_and_watched();
+                self.kill_session_owned(session, true);
             }
             RuntimeCommand::SplitPane {
                 pane,
@@ -1901,9 +1941,34 @@ impl Worker {
                 // "완전히 빈 상태(세션 0)"일 때만 복원한다 — 시작 직후 SpawnShell/
                 // SpawnAgent가 먼저 처리돼 세션이 생겼으면 skip해 hybrid 상태를 막는다.
                 // suspended면 복원하지 않는다 (shutdown 큐 잔여 — 복원 즉시 죽는 것 방지).
-                if !self.suspended && self.sessions.is_empty() {
+                if !self.suspended && (self.sessions.is_empty() || self.lazy_restore.is_some()) {
                     self.restore_saved_layout();
                 }
+            }
+            RuntimeCommand::RestoreWorkspacePane { pane } => {
+                if !self.suspended {
+                    self.restore_saved_pane(&pane);
+                }
+            }
+            RuntimeCommand::DurableEventBarrier { correlation_id } => {
+                self.emit(RuntimeEvent::DurableEventBarrierReached { correlation_id });
+            }
+            RuntimeCommand::InspectUnattachedSessions => {
+                let count = u16::try_from(self.unattached_session_ids().len()).unwrap_or(u16::MAX);
+                self.emit(RuntimeEvent::UnattachedSessionsInspected { count });
+            }
+            RuntimeCommand::KillUnattachedSessions => {
+                let candidates = self.unattached_session_ids();
+                let mut killed = 0_u16;
+                for session in candidates {
+                    killed =
+                        killed.saturating_add(u16::from(self.kill_session_owned(session, false)));
+                }
+                if killed > 0 {
+                    self.emit_mux_and_watched();
+                    crate::signal_memory_released();
+                }
+                self.emit(RuntimeEvent::UnattachedSessionsKilled { count: killed });
             }
             RuntimeCommand::RenamePane { pane, title } => {
                 if let Some(p) = self.mux.panes.get_mut(&pane) {
@@ -2166,23 +2231,19 @@ impl Worker {
     /// 복원 경로에 없어 app::config::TerminalConfig 기본값(10_000)과 맞춘 상수를 쓴다.
     const RESTORE_SCROLLBACK_LINES: usize = 10_000;
 
-    /// 이전 실행이 저장한 mux layout을 복원한다 (설계문서 §11.1~11.5, §14, PR-14).
-    /// `RestoreWorkspace` 명령 핸들러가 빈 상태(세션 0)를 확인한 뒤 호출한다.
-    /// 저장된 tab이 없으면 아무 것도 하지 않는다(기존 빈 시작 동작 유지).
-    ///
-    /// agent 세션은 재실행하지 않는다 — 저장된 pane의 session_kind와 무관하게
-    /// 항상 fresh 셸만 spawn한다(agent 명령 재실행은 파괴적일 수 있다).
-    fn restore_saved_layout(&mut self) {
+    /// bounded startup snapshot을 정확히 한 번 소비해 tab/layout과 session 없는 pane
+    /// skeleton을 설치한다. PaneState는 최대 256개로 persist loader에서 이미 제한된다.
+    fn prepare_saved_layout_skeleton(&mut self) -> bool {
+        if self.lazy_restore.is_some() {
+            return true;
+        }
         let (tabs, active_tab) = match &mut self.persist {
             Some(pipe) => pipe.take_saved_layout(),
-            None => return,
+            None => return false,
         };
         if tabs.is_empty() {
-            return;
+            return false;
         }
-        // 복원 tab/pane 제목의 "셸 N"/"에이전트 N" 최대 N 이상으로 counter를 전진 —
-        // tabs.len()만으로는 중간 tab을 닫았던 경우(셸 1·3만 남음) 다음 spawn이
-        // 기존 "셸 3"과 충돌한다 (codex 리뷰). id는 유일하지만 제목 정합을 위해.
         let max_suffix = tabs
             .iter()
             .flat_map(|tab| {
@@ -2192,29 +2253,122 @@ impl Worker {
             .filter_map(title_suffix)
             .max()
             .unwrap_or(0);
+        let mut pending_panes = Vec::new();
         for tab in tabs {
-            self.restore_tab(tab);
+            let persist::TabState {
+                id,
+                title,
+                layout,
+                active_pane,
+                panes,
+            } = tab;
+            for pane_state in panes {
+                self.mux.panes.insert(
+                    pane_state.id.clone(),
+                    MuxPane::new(pane_state.id.clone(), pane_state.title.clone()),
+                );
+                pending_panes.push(pane_state);
+            }
+            let restored = MuxTab {
+                id,
+                title,
+                layout,
+                active_pane,
+            };
+            self.mux.window.add_tab(restored.id.clone());
+            self.mux.tabs.insert(restored.id.clone(), restored);
         }
         self.tab_counter = self.tab_counter.max(max_suffix);
         if active_tab.is_some() {
             self.mux.window.active_tab = active_tab;
         }
         self.mux.fix_focus();
+        self.lazy_restore = Some(LazyWorkspaceRestore { pending_panes });
+        true
+    }
+
+    fn restore_saved_pane(&mut self, pane: &MuxPaneId) {
+        if self.lazy_restore.is_none()
+            && (!self.sessions.is_empty() || !self.prepare_saved_layout_skeleton())
+        {
+            return;
+        }
+        if self
+            .mux
+            .panes
+            .get(pane)
+            .is_some_and(|pane| pane.session_id.is_some())
+        {
+            return;
+        }
+        let pane_state = self.lazy_restore.as_mut().and_then(|restore| {
+            restore
+                .pending_panes
+                .iter()
+                .position(|candidate| candidate.id == *pane)
+                .map(|position| (position, restore.pending_panes.remove(position)))
+        });
+        let restored_session = match pane_state {
+            Some((position, pane_state)) => match self.restore_pane(&pane_state) {
+                Some(session) => Some(session),
+                None => {
+                    if let Some(restore) = &mut self.lazy_restore {
+                        restore.pending_panes.insert(position, pane_state);
+                    }
+                    None
+                }
+            },
+            None => None,
+        };
+        if self
+            .lazy_restore
+            .as_ref()
+            .is_some_and(|restore| restore.pending_panes.is_empty())
+        {
+            self.lazy_restore = None;
+        }
         self.emit_mux_and_watched();
-        // PR-A2: 열람 전용으로 복원된 exited 세션을 UI에 알린다. SessionRestored는
-        // 완료 알림을 재발화하지 않으면서(재시작마다 done 알림 중복 방지) UI의 생존
-        // 추적(LiveSessionTracker)·exit_code 부기·상태 배지를 갱신한다. SessionExited를
-        // 그대로 쓰면 알림이 중복되고, 안 쓰면 세션이 "영원히 살아있는 것"으로 취급돼
-        // auto-suspend/warm 축출이 무력화된다 (codex 리뷰 P1).
-        let restored_exited: Vec<(SessionId, Option<u32>)> = self
-            .sessions
-            .iter()
-            .filter_map(|(id, live)| match live.lifecycle() {
-                session::SessionLifecycle::Exited { exit_code } => Some((*id, exit_code)),
-                session::SessionLifecycle::Running => None,
-            })
-            .collect();
-        for (session, exit_code) in restored_exited {
+        if let Some(session) = restored_session {
+            self.emit_restored_session(session);
+        }
+    }
+
+    /// 이전 실행이 저장한 mux layout을 완전히 복원한다. targeted restore가 먼저
+    /// 진행됐으면 남은 catalog만 worker에서 순서대로 materialize하고, 실패한 항목은
+    /// 원래 영속 session association을 유지한 채 다음 복원 시도를 위해 보존한다.
+    fn restore_saved_layout(&mut self) {
+        if self.lazy_restore.is_none() && !self.prepare_saved_layout_skeleton() {
+            return;
+        }
+        let pending_panes = self
+            .lazy_restore
+            .take()
+            .map(|restore| restore.pending_panes)
+            .unwrap_or_default();
+        let mut restored_sessions = Vec::new();
+        let mut failed_panes = Vec::new();
+        for pane in pending_panes {
+            match self.restore_pane(&pane) {
+                Some(session) => restored_sessions.push(session),
+                None => failed_panes.push(pane),
+            }
+        }
+        if !failed_panes.is_empty() {
+            self.lazy_restore = Some(LazyWorkspaceRestore {
+                pending_panes: failed_panes,
+            });
+        }
+        self.mux.fix_focus();
+        self.emit_mux_and_watched();
+        for session in restored_sessions {
+            self.emit_restored_session(session);
+        }
+    }
+
+    fn emit_restored_session(&self, session: SessionId) {
+        if let Some(session::SessionLifecycle::Exited { exit_code }) =
+            self.sessions.get(&session).map(Session::lifecycle)
+        {
             let status = if exit_code == Some(0) {
                 session::SessionStatus::Done
             } else {
@@ -2226,22 +2380,6 @@ impl Worker {
             });
             self.emit(RuntimeEvent::SessionRestored { session, exit_code });
         }
-    }
-
-    /// 저장된 tab 하나를 재구성한다 — tab/pane id, layout 구조, active_pane은
-    /// 저장된 그대로 재사용한다(내부 일관성 + 재저장 시 같은 행을 갱신하기 위함).
-    fn restore_tab(&mut self, tab: persist::TabState) {
-        for pane in &tab.panes {
-            self.restore_pane(pane);
-        }
-        let restored = MuxTab {
-            id: tab.id,
-            title: tab.title,
-            layout: tab.layout,
-            active_pane: tab.active_pane,
-        };
-        self.mux.window.add_tab(restored.id.clone());
-        self.mux.tabs.insert(restored.id.clone(), restored);
     }
 
     /// Bounded dotenv projection for restored panes. Any missing/invalid/over-limit input is an
@@ -2258,12 +2396,12 @@ impl Worker {
     /// layout/tab 구조는 살아있게 한다.
     /// agent였던 pane은 respawn 대신 열람 전용 복원(PR-A2) — agent 재실행 금지는
     /// persistence 헤더의 안전 요구사항이고, 결과 화면 보존이 목적이다.
-    fn restore_pane(&mut self, pane_state: &persist::PaneState) {
+    fn restore_pane(&mut self, pane_state: &persist::PaneState) -> Option<SessionId> {
         if !self.session_capacity_available() {
             let pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
             self.mux.panes.insert(pane_state.id.clone(), pane);
             tracing::warn!(error_code = "runtime_session_limit", "복원 세션 상한 도달");
-            return;
+            return None;
         }
         if let Some(persistent_id) = pane_state.session_id.as_deref() {
             let was_agent = self
@@ -2272,7 +2410,11 @@ impl Worker {
                 .and_then(|pipe| pipe.restored_session_kind(persistent_id))
                 .is_some_and(|kind| kind == "agent");
             if was_agent && self.restore_archived_pane(pane_state, persistent_id) {
-                return;
+                return self
+                    .mux
+                    .panes
+                    .get(&pane_state.id)
+                    .and_then(|pane| pane.session_id);
             }
         }
         let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
@@ -2286,7 +2428,7 @@ impl Worker {
             Err(_) => {
                 tracing::warn!(pane_id = %pane_state.id.0, "복원 중 셸 secret 준비 실패");
                 self.mux.panes.insert(pane_state.id.clone(), pane);
-                return;
+                return None;
             }
         };
         let restored_cwd = pane_state
@@ -2304,7 +2446,7 @@ impl Worker {
                 Err(_) => {
                     tracing::warn!(pane_id = %pane_state.id.0, "복원 중 dotenv redaction 준비 실패");
                     self.mux.panes.insert(pane_state.id.clone(), pane);
-                    return;
+                    return None;
                 }
             }
             // 워크스페이스 기본 env보다 뒤에 붙어 pane 폴더 값이 이긴다.
@@ -2316,7 +2458,7 @@ impl Worker {
             .as_deref()
             .map(|persistent_id| Self::restored_terminal_size(&self.logs_root, persistent_id))
             .unwrap_or((DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS));
-        match Self::spawn_session(
+        let restored_session = match Self::spawn_session(
             id,
             session::SessionKind::Shell,
             &spec,
@@ -2363,12 +2505,15 @@ impl Worker {
                     }
                 }
                 self.open_session_log(id);
+                Some(id)
             }
             Err(error) => {
                 trace_runtime_failure("restore_shell_spawn", "pty_spawn_failed", error);
+                None
             }
-        }
+        };
         self.mux.panes.insert(pane_state.id.clone(), pane);
+        restored_session
     }
 
     /// agent pane의 열람 전용 복원 (PR-A2): 디스크 아카이브 1차, 로그 tail 폴백.
@@ -2381,13 +2526,6 @@ impl Worker {
     ) -> bool {
         let id = SessionId(self.next_id);
         self.next_id += 1;
-        // 재결속 먼저 — save_layout이 rows에서 UUID를 찾으므로 이게 빠지면
-        // 다음 저장에서 pane↔세션 연결이 영구 유실된다 (계획 문서 §1 함정)
-        if let Some(pipe) = &mut self.persist
-            && !pipe.session_rebound_archived(id, persistent_id)
-        {
-            return false;
-        }
         // 아카이브는 스트리밍으로 backend에 직접 feed — dump(≤32MB)를 통째로 올리면
         // 시작 복원이 pane 수만큼 순간 메모리 스파이크를 만든다 (2026-07-16).
         let archived = match storage::scrollback_archive::open(&self.logs_root, persistent_id) {
@@ -2416,11 +2554,8 @@ impl Worker {
             }
             _ => None,
         };
-        let restored = match archived {
-            Some(session) => {
-                self.archived_on_disk.insert(id);
-                session
-            }
+        let (restored, restored_from_disk) = match archived {
+            Some(session) => (session, true),
             None => {
                 // 폴백: 아카이브 부재(레거시/GC/손상) — redacted.ansi.log tail을
                 // 열람 전용 세션에 재생 (VS Code revive/reconnection 2계층 차용)
@@ -2436,10 +2571,18 @@ impl Worker {
                 );
                 // 열람 전용 — 모드 경계 리셋 생략(alt-screen 화면 보존, codex 리뷰 P2)
                 Self::replay_saved_ansi_ext(&self.logs_root, persistent_id, &mut session, false);
-                session
+                (session, false)
             }
         };
+        if let Some(pipe) = &mut self.persist
+            && !pipe.session_rebound_archived(id, persistent_id)
+        {
+            return false;
+        }
         self.sessions.insert(id, restored);
+        if restored_from_disk {
+            self.archived_on_disk.insert(id);
+        }
         self.exited_order.push_back(id);
         let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
         pane.session_id = Some(id);
@@ -2554,6 +2697,12 @@ impl Worker {
         let Some(tab_id) = self.mux.tab_of_pane(&pane_id) else {
             return;
         };
+        if let Some(restore) = &mut self.lazy_restore {
+            restore.pending_panes.retain(|pane| pane.id != pane_id);
+            if restore.pending_panes.is_empty() {
+                self.lazy_restore = None;
+            }
+        }
         // 세션 kill
         if let Some(session) = self
             .mux
@@ -2586,11 +2735,68 @@ impl Worker {
         self.emit_mux_and_watched();
     }
 
+    fn unattached_session_ids(&self) -> Vec<SessionId> {
+        let now = Instant::now();
+        let attached = self
+            .mux
+            .panes
+            .values()
+            .filter_map(|pane| pane.session_id)
+            .collect::<std::collections::HashSet<_>>();
+        self.sessions
+            .keys()
+            .copied()
+            .filter(|session| {
+                !attached.contains(session)
+                    && self
+                        .remote_viewing
+                        .get(session)
+                        .is_none_or(|expiry| *expiry <= now)
+            })
+            .take(RUNTIME_SESSION_CAP)
+            .collect()
+    }
+
+    fn kill_session_owned(&mut self, session: SessionId, emit_mux: bool) -> bool {
+        let existed = self.sessions.contains_key(&session);
+        self.final_drain(session);
+        // Session drop → PtySession Drop이 process group 정리를 보장한다.
+        self.remove_session(session);
+        self.exited_order.retain(|candidate| *candidate != session);
+        self.hidden_scrollback.remove(&session);
+        self.remote_viewing.remove(&session);
+        self.detectors.remove(&session);
+        self.status_overrides.remove(&session);
+        self.close_session_log(session, "killed", None);
+        if let Some(pipe) = &mut self.persist {
+            pipe.session_exited(session);
+        }
+        // 세션을 잃은 pane은 attach 해제 (pane/session 분리 — 5.2).
+        for pane in self.mux.panes.values_mut() {
+            if pane.session_id == Some(session) {
+                pane.session_id = None;
+            }
+        }
+        if emit_mux {
+            self.emit_mux_and_watched();
+        }
+        existed
+    }
+
     fn close_tab(&mut self, tab_id: MuxTabId) {
         let Some(tab) = self.mux.tabs.remove(&tab_id) else {
             return;
         };
-        for pane_id in tab.panes() {
+        let pane_ids = tab.panes();
+        if let Some(restore) = &mut self.lazy_restore {
+            restore
+                .pending_panes
+                .retain(|pane| !pane_ids.contains(&pane.id));
+            if restore.pending_panes.is_empty() {
+                self.lazy_restore = None;
+            }
+        }
+        for pane_id in pane_ids {
             if let Some(pane) = self.mux.panes.remove(&pane_id)
                 && let Some(session) = pane.session_id
             {
@@ -2655,6 +2861,80 @@ impl Worker {
         self.push_watched_viewports();
     }
 
+    fn save_lazy_merged_layout(&self) {
+        let (Some(restore), Some(db_path), Some(pipe)) = (
+            self.lazy_restore.as_ref(),
+            self.persist_db_path.as_ref(),
+            self.persist.as_ref(),
+        ) else {
+            return;
+        };
+        let saved = (|| -> anyhow::Result<()> {
+            let mut conn = rusqlite::Connection::open(db_path)?;
+            conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+            conn.pragma_update(None, "foreign_keys", true)?;
+            conn.busy_timeout(Duration::from_secs(5))?;
+            let window_id = conn.query_row(
+                "SELECT id FROM mux_windows
+                 WHERE workspace_id = ?1
+                 ORDER BY created_at, id
+                 LIMIT 1",
+                [&self.workspace_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let state = persist::WindowState {
+                id: deppy_core::MuxWindowId(window_id),
+                title: None,
+                active_tab: self.mux.window.active_tab.clone(),
+                tabs: self
+                    .mux
+                    .window
+                    .tabs
+                    .iter()
+                    .filter_map(|tab_id| self.mux.tabs.get(tab_id))
+                    .map(|tab| persist::TabState {
+                        id: tab.id.clone(),
+                        title: tab.title.clone(),
+                        layout: tab.layout.clone(),
+                        active_pane: tab.active_pane.clone(),
+                        panes: tab
+                            .layout
+                            .panes()
+                            .into_iter()
+                            .filter_map(|pane_id| self.mux.panes.get(&pane_id))
+                            .map(|pane| {
+                                let pending = restore
+                                    .pending_panes
+                                    .iter()
+                                    .find(|pending| pending.id == pane.id);
+                                persist::PaneState {
+                                    id: pane.id.clone(),
+                                    session_id: pending
+                                        .and_then(|pending| pending.session_id.clone())
+                                        .or_else(|| {
+                                            pane.session_id.and_then(|session| {
+                                                pipe.session_log_key(session).map(str::to_owned)
+                                            })
+                                        }),
+                                    title: pane.title.clone(),
+                                    pane_kind: pane.pane_kind,
+                                    cwd: pending.and_then(|pending| pending.cwd.clone()),
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
+            persist::save_window_layout(&mut conn, &self.workspace_id, &state)
+        })();
+        if saved.is_err() {
+            tracing::warn!(
+                error_code = "lazy_restore_layout_save_failed",
+                "부분 복원 mux layout 영속 실패"
+            );
+        }
+    }
+
     /// mux 스냅샷만 emit (+ 영속 저장). spawn 경로는 이걸 먼저 부르고
     /// Spawned 이벤트를 보낸 뒤 [`Self::push_watched_viewports`]를 불러야
     /// "slot에 Viewport가 있으면 그 세션의 Spawned가 같은 drain에 포함"이라는
@@ -2662,8 +2942,9 @@ impl Worker {
     fn emit_mux_snapshot(&mut self) {
         // mux 구조가 바뀐 지점 — 가시성 전이에 맞춰 scrollback cap 조정 (§14.3)
         self.reconcile_visibility();
-        // 영속 layout도 같은 시점에 저장 (§11.2~11.5)
-        if let Some(pipe) = &mut self.persist {
+        if self.lazy_restore.is_some() {
+            self.save_lazy_merged_layout();
+        } else if let Some(pipe) = &mut self.persist {
             pipe.save_layout(&self.mux.window, &self.mux.tabs, &self.mux.panes);
         }
         self.emit(RuntimeEvent::MuxUpdated {
@@ -3132,7 +3413,8 @@ impl Worker {
         let mut trimmed_any = false;
         // 트림을 못 하는(불변식이 깨진) 세션은 제외하고 다른 세션 계속 — 한 세션 때문에
         // 전체를 포기하지 않는다(리뷰 A-L1). 실무상 도달 불가하나 방어적.
-        let mut cannot_trim: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
+        let mut cannot_trim: std::collections::HashSet<SessionId> =
+            std::collections::HashSet::new();
         loop {
             // 현재 세션들의 (id, 추정바이트, 히스토리, 가시성) 스냅샷. cache_bytes는 전
             // 세션 합(제외 세션 포함)이어야 예산 판정이 정확하다 — 후보만 제외한다.
@@ -3238,6 +3520,16 @@ impl Worker {
         else {
             return; // 비영속 세션 — 메모리 아카이브만
         };
+        if !self.refresh_archive_root_identity() {
+            return;
+        }
+        if self.archive_disk_bytes == storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN
+            && !self.reconcile_archive_disk_usage(
+                storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES,
+            )
+        {
+            return;
+        }
         if storage::scrollback_archive::exists(&self.logs_root, &key) {
             self.archived_on_disk.insert(session);
             return;
@@ -3253,6 +3545,9 @@ impl Worker {
         let Some(dump) = live.serialize_scrollback() else {
             return; // 직렬화 미지원 백엔드 (experimental ghostty)
         };
+        if dump.len() > storage::scrollback_archive::MAX_UNCOMPRESSED_BYTES as usize {
+            return;
+        }
         let mut redactor = self.redaction.stream_redactor();
         let mut redacted = redactor.redact_chunk(&dump);
         redacted.extend(redactor.flush());
@@ -3266,11 +3561,8 @@ impl Worker {
                 session::SessionLifecycle::Running => None,
             },
         };
-        match storage::scrollback_archive::write(&self.logs_root, &key, &meta, &redacted) {
-            Ok(written_len) => {
-                self.archived_on_disk.insert(session);
-                self.account_archive_write(written_len);
-            }
+        match storage::scrollback_archive::write_receipt(&self.logs_root, &key, &meta, &redacted) {
+            Ok(receipt) => self.finish_archive_write(session, &key, receipt),
             Err(error) => trace_runtime_failure(
                 "scrollback_archive_write",
                 "scrollback_archive_write_failed",
@@ -3279,27 +3571,102 @@ impl Worker {
         }
     }
 
+    fn finish_archive_write(
+        &mut self,
+        session: SessionId,
+        key: &str,
+        receipt: storage::scrollback_archive::ArchiveWriteReceipt,
+    ) {
+        let accounted = self.account_archive_write(receipt.bytes());
+        let current =
+            match storage::scrollback_archive::written_is_current(&self.logs_root, key, &receipt) {
+                Ok(current) => current,
+                Err(error) => {
+                    trace_runtime_failure(
+                        "scrollback_archive_revalidate",
+                        "scrollback_archive_revalidate_failed",
+                        error,
+                    );
+                    false
+                }
+            };
+        if accounted && current {
+            self.archived_on_disk.insert(session);
+        } else {
+            if !current {
+                self.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                self.archive_root_identity =
+                    storage::scrollback_archive::root_identity(&self.logs_root)
+                        .ok()
+                        .flatten();
+            }
+            if let Err(error) =
+                storage::scrollback_archive::remove_written(&self.logs_root, key, receipt)
+            {
+                trace_runtime_failure(
+                    "scrollback_archive_rollback",
+                    "scrollback_archive_rollback_failed",
+                    error,
+                );
+            }
+        }
+    }
+
+    fn refresh_archive_root_identity(&mut self) -> bool {
+        match storage::scrollback_archive::root_identity(&self.logs_root) {
+            Ok(current) => {
+                if current != self.archive_root_identity {
+                    self.archive_root_identity = current;
+                    self.archive_disk_bytes =
+                        storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                }
+                true
+            }
+            Err(error) => {
+                trace_runtime_failure(
+                    "scrollback_archive_root_identity",
+                    "scrollback_archive_root_identity_failed",
+                    error,
+                );
+                self.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                false
+            }
+        }
+    }
+
+    fn reconcile_archive_disk_usage(&mut self, budget: u64) -> bool {
+        match gc_archive_usage_snapshot(&self.logs_root, budget) {
+            Ok((total, identity)) => {
+                self.archive_disk_bytes = total;
+                self.archive_root_identity = identity;
+                true
+            }
+            Err(error) => {
+                trace_runtime_failure(
+                    "scrollback_archive_gc",
+                    "scrollback_archive_gc_failed",
+                    error,
+                );
+                self.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                false
+            }
+        }
+    }
+
     /// 디스크 아카이브 기록 후 증분 예산 캐시를 갱신한다 (A1 리뷰 P2). 예산 내면
     /// 전체 스캔 없이 크기만 더하고, 초과가 확정될 때만 gc(전체 스캔+오래된 것부터
     /// 제거)를 호출해 캐시를 실제 총량으로 재동기화한다. 이로써 매 exit의 GC 비용이
     /// "지금까지 존재한 세션 수"에 비례하는 문제를 없앤다.
-    fn account_archive_write(&mut self, written_len: u64) {
+    fn account_archive_write(&mut self, written_len: u64) -> bool {
         let budget = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
+        if !self.refresh_archive_root_identity() {
+            return false;
+        }
         if archive_cache_needs_gc(self.archive_disk_bytes, written_len, budget) {
-            match storage::scrollback_archive::gc(&self.logs_root, budget) {
-                Ok(total) => self.archive_disk_bytes = total,
-                Err(error) => {
-                    // 스캔 실패 — 기록한 만큼은 반영해 undercount를 막는다 (다음 기록에서 재시도).
-                    trace_runtime_failure(
-                        "scrollback_archive_gc",
-                        "scrollback_archive_gc_failed",
-                        error,
-                    );
-                    self.archive_disk_bytes = self.archive_disk_bytes.saturating_add(written_len);
-                }
-            }
+            self.reconcile_archive_disk_usage(budget)
         } else {
             self.archive_disk_bytes = self.archive_disk_bytes.saturating_add(written_len);
+            true
         }
     }
 
@@ -3946,6 +4313,9 @@ mod tests {
             render_bound: false,
         }]));
         let logs_root = test_logs_root(name);
+        let archive_root_identity = storage::scrollback_archive::root_identity(&logs_root)
+            .ok()
+            .flatten();
         (
             Worker {
                 command_rx,
@@ -3969,6 +4339,8 @@ mod tests {
                 mux: MuxState::new(),
                 tab_counter: 0,
                 persist: None,
+                persist_db_path: None,
+                lazy_restore: None,
                 exited_order: std::collections::VecDeque::new(),
                 max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
                 cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
@@ -3976,6 +4348,7 @@ mod tests {
                 archived_order: std::collections::VecDeque::new(),
                 archived_on_disk: std::collections::HashSet::new(),
                 archive_disk_bytes: 0,
+                archive_root_identity,
                 hidden_scrollback: std::collections::HashSet::new(),
                 render_active: true,
                 suspended: false,
@@ -3988,6 +4361,195 @@ mod tests {
             },
             event_rx,
         )
+    }
+
+    struct UnattachedHarness {
+        worker: Worker,
+        events: std::sync::mpsc::Receiver<RuntimeEvent>,
+        _viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+        _input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+        _resource_usage: Arc<Mutex<Option<RuntimeEvent>>>,
+    }
+
+    impl UnattachedHarness {
+        fn new(name: &str) -> Self {
+            init_mock_store();
+            let resolver = Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: Some("runtime-secret-value".to_owned()),
+            });
+            let (mut worker, events) = admission_worker(resolver, name);
+            worker.shell = spec("/bin/cat", &[]);
+            let (viewports, input_pressures, resource_usage) = {
+                let subscribers = worker.subscribers.lock().expect("subscribers lock");
+                let subscriber = subscribers.first().expect("test subscriber");
+                (
+                    Arc::clone(&subscriber.viewports),
+                    Arc::clone(&subscriber.input_pressures),
+                    Arc::clone(&subscriber.resource_usage),
+                )
+            };
+            Self {
+                worker,
+                events,
+                _viewports: viewports,
+                _input_pressures: input_pressures,
+                _resource_usage: resource_usage,
+            }
+        }
+
+        fn spawn_attached(&mut self) -> SessionId {
+            self.worker.handle_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            });
+            let events = self.events.try_iter().collect::<Vec<_>>();
+            if let Some(session) = events.iter().find_map(|event| match event {
+                RuntimeEvent::ShellSpawned { session } => Some(*session),
+                _ => None,
+            }) {
+                return session;
+            }
+            let failure = events.iter().find_map(|event| match event {
+                RuntimeEvent::SpawnFailed { message, .. } => Some(message),
+                _ => None,
+            });
+            panic!(
+                "real worker must emit ShellSpawned; sessions={}, failure={failure:?}",
+                self.worker.sessions.len()
+            );
+        }
+
+        fn spawn_unattached(&mut self) -> SessionId {
+            let session = self.spawn_attached();
+            let pane = self
+                .worker
+                .mux
+                .panes
+                .values_mut()
+                .find(|pane| pane.session_id == Some(session))
+                .expect("spawned session must have a pane");
+            pane.session_id = None;
+            session
+        }
+
+        fn set_remote_viewing(&mut self, session: SessionId, viewing: bool) {
+            self.set_remote_viewing_ttl(session, viewing, 60_000);
+        }
+
+        fn set_remote_viewing_ttl(&mut self, session: SessionId, viewing: bool, ttl_ms: u32) {
+            self.worker
+                .handle_command(RuntimeCommand::SetRemoteViewing {
+                    session,
+                    viewing,
+                    ttl_ms,
+                });
+            let _ = self.events.try_iter().count();
+        }
+
+        fn expire_remote_viewing_without_pump(&mut self, session: SessionId) {
+            *self
+                .worker
+                .remote_viewing
+                .get_mut(&session)
+                .expect("remote viewing lease") = Instant::now();
+        }
+
+        fn attach_new_pane(&mut self, session: SessionId) {
+            self.worker.attach_in_new_tab(session, SHELL_TITLE_ID);
+        }
+
+        fn inspect_unattached(&mut self) -> u16 {
+            self.worker
+                .handle_command(RuntimeCommand::InspectUnattachedSessions);
+            self.events
+                .try_iter()
+                .find_map(|event| match event {
+                    RuntimeEvent::UnattachedSessionsInspected { count } => Some(count),
+                    _ => None,
+                })
+                .expect("inspect command must emit a result")
+        }
+
+        fn kill_unattached(&mut self) -> u16 {
+            self.worker
+                .handle_command(RuntimeCommand::KillUnattachedSessions);
+            self.events
+                .try_iter()
+                .find_map(|event| match event {
+                    RuntimeEvent::UnattachedSessionsKilled { count } => Some(count),
+                    _ => None,
+                })
+                .expect("kill command must emit a result")
+        }
+
+        fn session_exists(&self, session: SessionId) -> bool {
+            self.worker.sessions.contains_key(&session)
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inspect_unattached_excludes_mux_and_remote_viewed_sessions() {
+        let mut harness = UnattachedHarness::new("inspect-unattached");
+        let attached = harness.spawn_attached();
+        let remote = harness.spawn_unattached();
+        harness.set_remote_viewing(remote, true);
+        let orphan = harness.spawn_unattached();
+
+        assert_eq!(harness.inspect_unattached(), 1);
+        assert!(harness.session_exists(attached));
+        assert!(harness.session_exists(remote));
+        assert!(harness.session_exists(orphan));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inspect_unattached_treats_zero_ttl_remote_lease_as_expired_in_same_burst() {
+        let mut harness = UnattachedHarness::new("inspect-zero-ttl");
+        let candidate = harness.spawn_unattached();
+        harness.set_remote_viewing(candidate, true);
+        harness.set_remote_viewing_ttl(candidate, true, 0);
+
+        assert_eq!(harness.inspect_unattached(), 1);
+        assert!(harness.session_exists(candidate));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_unattached_treats_expired_remote_lease_as_candidate_without_pump() {
+        let mut harness = UnattachedHarness::new("kill-expired-lease");
+        let candidate = harness.spawn_unattached();
+        harness.set_remote_viewing(candidate, true);
+        harness.expire_remote_viewing_without_pump(candidate);
+
+        assert_eq!(harness.kill_unattached(), 1);
+        assert!(!harness.session_exists(candidate));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_unattached_recomputes_after_a_session_becomes_attached() {
+        let mut harness = UnattachedHarness::new("reattach-before-kill");
+        let candidate = harness.spawn_unattached();
+        assert_eq!(harness.inspect_unattached(), 1);
+        harness.attach_new_pane(candidate);
+
+        assert_eq!(harness.kill_unattached(), 0);
+        assert!(harness.session_exists(candidate));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_unattached_removes_only_current_local_candidates() {
+        let mut harness = UnattachedHarness::new("kill-unattached");
+        let attached = harness.spawn_attached();
+        let orphan = harness.spawn_unattached();
+
+        assert_eq!(harness.kill_unattached(), 1);
+        assert!(harness.session_exists(attached));
+        assert!(!harness.session_exists(orphan));
     }
 
     fn correlated_agent_command() -> RuntimeCommand {
@@ -4219,6 +4781,958 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("deppy-rt-logs-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-rt-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn create_persist_db(db_path: &std::path::Path, workspace_id: &str) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                 created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+             CREATE TABLE agent_configs (id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO workspaces (id) VALUES (?1)", [workspace_id])
+            .unwrap();
+        conn.execute("INSERT INTO agent_configs (id) VALUES ('cfg-sf03')", [])
+            .unwrap();
+        conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+    }
+
+    fn persisted_single_pane_window(
+        session_id: &str,
+        title: &str,
+        cwd: Option<String>,
+    ) -> persist::WindowState {
+        let pane_id = MuxPaneId::new();
+        let tab_id = MuxTabId::new();
+        persist::WindowState {
+            id: deppy_core::MuxWindowId::new(),
+            title: Some("restore".to_owned()),
+            active_tab: Some(tab_id.clone()),
+            tabs: vec![persist::TabState {
+                id: tab_id,
+                title: "restore".to_owned(),
+                layout: mux::LayoutNode::Pane(pane_id.clone()),
+                active_pane: Some(pane_id.clone()),
+                panes: vec![persist::PaneState {
+                    id: pane_id,
+                    session_id: Some(session_id.to_owned()),
+                    title: title.to_owned(),
+                    pane_kind: mux::PaneKind::Terminal,
+                    cwd,
+                }],
+            }],
+        }
+    }
+
+    fn seed_persisted_session_pane(
+        db_path: &std::path::Path,
+        workspace_id: &str,
+        session_id: &str,
+        session_kind: &str,
+        agent_id: Option<&str>,
+        status: &str,
+        cwd: &str,
+    ) {
+        let mut conn = rusqlite::Connection::open(db_path).unwrap();
+        let row = persist::SessionRow {
+            id: session_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            session_kind: session_kind.to_owned(),
+            agent_id: agent_id.map(str::to_owned),
+            title: "restored".to_owned(),
+            command: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "echo restored".to_owned()],
+            cwd: cwd.to_owned(),
+            status: status.to_owned(),
+            last_log_offset: 0,
+        };
+        persist::upsert_session(&conn, &row).unwrap();
+        let window = persisted_single_pane_window(session_id, "restored", Some(cwd.to_owned()));
+        persist::save_window_layout(&mut conn, workspace_id, &window).unwrap();
+    }
+
+    fn seed_persisted_two_pane_window(
+        db_path: &std::path::Path,
+        workspace_id: &str,
+        first_kind: &str,
+    ) -> (MuxPaneId, MuxPaneId) {
+        let mut conn = rusqlite::Connection::open(db_path).unwrap();
+        let first_session = "restore-pane-first";
+        let second_session = "restore-pane-second";
+        for (id, kind) in [(first_session, first_kind), (second_session, "shell")] {
+            persist::upsert_session(
+                &conn,
+                &persist::SessionRow {
+                    id: id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                    session_kind: kind.to_owned(),
+                    agent_id: (kind == "agent").then(|| "cfg-sf03".to_owned()),
+                    title: id.to_owned(),
+                    command: "/bin/cat".to_owned(),
+                    args: Vec::new(),
+                    cwd: "/tmp".to_owned(),
+                    status: if kind == "agent" {
+                        persist::SESSION_STATUS_EXITED.to_owned()
+                    } else {
+                        persist::SESSION_STATUS_RUNNING.to_owned()
+                    },
+                    last_log_offset: 0,
+                },
+            )
+            .unwrap();
+        }
+        let first_pane = MuxPaneId("restore-pane-first".to_owned());
+        let second_pane = MuxPaneId("restore-pane-second".to_owned());
+        let first_tab = MuxTabId("restore-tab-first".to_owned());
+        let second_tab = MuxTabId("restore-tab-second".to_owned());
+        let window = persist::WindowState {
+            id: deppy_core::MuxWindowId::new(),
+            title: Some("lazy restore".to_owned()),
+            active_tab: Some(first_tab.clone()),
+            tabs: vec![
+                persist::TabState {
+                    id: first_tab.clone(),
+                    title: "first".to_owned(),
+                    layout: mux::LayoutNode::Pane(first_pane.clone()),
+                    active_pane: Some(first_pane.clone()),
+                    panes: vec![persist::PaneState {
+                        id: first_pane.clone(),
+                        session_id: Some(first_session.to_owned()),
+                        title: "first".to_owned(),
+                        pane_kind: mux::PaneKind::Terminal,
+                        cwd: Some("/tmp".to_owned()),
+                    }],
+                },
+                persist::TabState {
+                    id: second_tab,
+                    title: "second".to_owned(),
+                    layout: mux::LayoutNode::Pane(second_pane.clone()),
+                    active_pane: Some(second_pane.clone()),
+                    panes: vec![persist::PaneState {
+                        id: second_pane.clone(),
+                        session_id: Some(second_session.to_owned()),
+                        title: "second".to_owned(),
+                        pane_kind: mux::PaneKind::Terminal,
+                        cwd: Some("/tmp".to_owned()),
+                    }],
+                },
+            ],
+        };
+        persist::save_window_layout(&mut conn, workspace_id, &window).unwrap();
+        (first_pane, second_pane)
+    }
+
+    #[cfg(unix)]
+    fn lazy_restore_durable_event_barrier_fixture(
+        name: &str,
+    ) -> (InProcessRuntimeClient, Probe, MuxPaneId, MuxPaneId, PathBuf) {
+        init_mock_store();
+        let dir = unique_test_dir(name);
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = format!("ws-{name}");
+        create_persist_db(&db_path, &workspace_id);
+        let (first_pane, second_pane) =
+            seed_persisted_two_pane_window(&db_path, &workspace_id, "shell");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id,
+            }),
+        );
+        let probe = Probe::new(client.subscribe());
+        (client, probe, first_pane, second_pane, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_durable_event_barrier_follows_requested_mux_result() {
+        let (client, mut probe, first_pane, _second_pane, dir) =
+            lazy_restore_durable_event_barrier_fixture("restore-durable-barrier-order");
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: first_pane.clone(),
+            })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 41 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| {
+            matches!(
+                event,
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 41 }
+            )
+            .then_some(())
+        });
+
+        let restore_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::MuxUpdated { snapshot }
+                        if snapshot.tabs.iter().flat_map(|tab| &tab.panes).any(|pane|
+                            pane.id == first_pane && pane.session_id.is_some())
+                )
+            })
+            .expect("requested restore mux result");
+        let barrier_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::DurableEventBarrierReached { correlation_id: 41 }
+                )
+            })
+            .expect("exact barrier");
+        assert!(restore_index < barrier_index);
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_mux_can_precede_restore_while_durable_event_barrier_stays_after_requested_result() {
+        let (client, mut probe, first_pane, second_pane, dir) =
+            lazy_restore_durable_event_barrier_fixture("restore-durable-barrier-stale-mux");
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane { pane: first_pane })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 50 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| {
+            matches!(
+                event,
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 50 }
+            )
+            .then_some(())
+        });
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane { pane: second_pane })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 51 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| {
+            matches!(
+                event,
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 51 }
+            )
+            .then_some(())
+        });
+
+        let stale_mux_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::MuxUpdated { snapshot }
+                        if snapshot.tabs.iter().flat_map(|tab| &tab.panes)
+                            .filter(|pane| pane.session_id.is_some()).count() == 1
+                )
+            })
+            .expect("stale mux before requested restore");
+        let first_barrier_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::DurableEventBarrierReached { correlation_id: 50 }
+                )
+            })
+            .expect("first barrier");
+        let requested_mux_index = probe
+            .seen
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                (index > first_barrier_index
+                    && matches!(
+                        event,
+                        RuntimeEvent::MuxUpdated { snapshot }
+                            if snapshot.tabs.iter().flat_map(|tab| &tab.panes)
+                                .filter(|pane| pane.session_id.is_some()).count() == 2
+                    ))
+                .then_some(index)
+            })
+            .expect("requested restore mux result");
+        let requested_barrier_index = probe
+            .seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::DurableEventBarrierReached { correlation_id: 51 }
+                )
+            })
+            .expect("requested barrier");
+        assert!(stale_mux_index < first_barrier_index);
+        assert!(first_barrier_index < requested_mux_index);
+        assert!(requested_mux_index < requested_barrier_index);
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn back_to_back_durable_event_barriers_preserve_fifo_and_exact_ids() {
+        let client = InProcessRuntimeClient::new(
+            5,
+            test_store(),
+            test_logs_root("back-to-back-barriers"),
+            RedactionService::new(),
+            None,
+            None,
+            Vec::new(),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 70 })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 71 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                RuntimeEvent::DurableEventBarrierReached { correlation_id: 71 }
+            )
+            .then_some(())
+        });
+
+        let ids = probe
+            .seen
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::DurableEventBarrierReached { correlation_id } => {
+                    Some(*correlation_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [70, 71]);
+
+        drop(client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_materializes_only_requested_panes_and_reuses_catalog() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-two-pane");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore";
+        create_persist_db(&db_path, workspace_id);
+        let (first_pane, second_pane) =
+            seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: first_pane.clone(),
+            })
+            .unwrap();
+        let first = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot.tabs.len() == 2
+                    && snapshot
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| &tab.panes)
+                        .any(|pane| pane.id == first_pane && pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            first
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .filter(|pane| pane.session_id.is_some())
+                .count(),
+            1
+        );
+        assert!(first.tabs.iter().any(|tab| {
+            tab.layout.contains(&second_pane)
+                && tab
+                    .panes
+                    .iter()
+                    .any(|pane| pane.id == second_pane && pane.session_id.is_none())
+        }));
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: second_pane.clone(),
+            })
+            .unwrap();
+        let second = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter(|pane| pane.session_id.is_some())
+                    .count()
+                    == 2 =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            second
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|pane| pane.id == second_pane && pane.session_id.is_some())
+        );
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_unknown_target_creates_no_partial_session() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-unknown");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-unknown";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: MuxPaneId("missing-pane".to_owned()),
+            })
+            .unwrap();
+        let snapshot = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .all(|pane| pane.session_id.is_none())
+        );
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_spawn_failure_preserves_persisted_association() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-spawn-failure");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-spawn-failure";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            "persisted-shell",
+            "shell",
+            None,
+            persist::SESSION_STATUS_RUNNING,
+            "/tmp",
+        );
+        let pane_id = MuxPaneId(
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row("SELECT id FROM mux_panes", [], |row| row.get(0))
+                .unwrap(),
+        );
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "lazy-restore-spawn-failure",
+        );
+        worker.shell = spec("/definitely/missing/deppy-shell", &[]);
+        worker.persist = Some(
+            crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            })
+            .unwrap(),
+        );
+
+        worker.handle_command(RuntimeCommand::RestoreWorkspacePane { pane: pane_id });
+        assert!(worker.sessions.is_empty());
+        drop(worker);
+
+        let association: Option<String> = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT session_id FROM mux_panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(association.as_deref(), Some("persisted-shell"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_closed_skeleton_is_not_materialized_by_full_restore() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-close-skeleton");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-close-skeleton";
+        create_persist_db(&db_path, workspace_id);
+        let (first_pane, second_pane) =
+            seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "lazy-restore-close-skeleton",
+        );
+        worker.shell = spec("/bin/cat", &[]);
+        worker.persist = Some(
+            crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            })
+            .unwrap(),
+        );
+
+        worker.handle_command(RuntimeCommand::RestoreWorkspacePane {
+            pane: MuxPaneId("missing-pane".to_owned()),
+        });
+        worker.handle_command(RuntimeCommand::ClosePane {
+            pane: second_pane.clone(),
+        });
+        worker.handle_command(RuntimeCommand::RestoreWorkspace);
+
+        assert_eq!(worker.sessions.len(), 1);
+        assert!(worker.mux.panes.contains_key(&first_pane));
+        assert!(!worker.mux.panes.contains_key(&second_pane));
+        assert!(worker.lazy_restore.is_none());
+        drop(worker);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    fn assert_lazy_restore_close_survives_restart(close_tab: bool) {
+        init_mock_store();
+        let dir = unique_test_dir(if close_tab {
+            "lazy-restore-close-tab-restart"
+        } else {
+            "lazy-restore-close-pane-restart"
+        });
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = if close_tab {
+            "ws-lazy-close-tab-restart"
+        } else {
+            "ws-lazy-close-pane-restart"
+        };
+        create_persist_db(&db_path, workspace_id);
+        let (first_pane, second_pane) =
+            seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        {
+            let client = InProcessRuntimeClient::with_shell(
+                5,
+                test_store(),
+                dir.join("logs-first"),
+                RedactionService::new(),
+                spec("/bin/cat", &[]),
+                Some(crate::persistence::PersistConfig {
+                    db_path: db_path.clone(),
+                    workspace_id: workspace_id.to_owned(),
+                }),
+            );
+            let mut probe = Probe::new(client.subscribe());
+            client
+                .send_command(RuntimeCommand::RestoreWorkspacePane {
+                    pane: MuxPaneId("missing-pane".to_owned()),
+                })
+                .unwrap();
+            probe.wait_for(Duration::from_secs(15), |event| match event {
+                RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => Some(()),
+                _ => None,
+            });
+            let command = if close_tab {
+                RuntimeCommand::CloseTab {
+                    tab: MuxTabId("restore-tab-second".to_owned()),
+                }
+            } else {
+                RuntimeCommand::ClosePane {
+                    pane: second_pane.clone(),
+                }
+            };
+            client.send_command(command).unwrap();
+            probe.wait_for(Duration::from_secs(15), |event| match event {
+                RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 1 => Some(()),
+                _ => None,
+            });
+        }
+
+        let persisted_panes = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .prepare("SELECT id FROM mux_panes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(persisted_panes, vec![first_pane.0.clone()]);
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs-second"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let snapshot = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot.tabs.len() == 1
+                    && snapshot.tabs[0]
+                        .panes
+                        .iter()
+                        .any(|pane| pane.id == first_pane && pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(snapshot.tabs.len(), 1);
+        assert!(
+            !snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|pane| pane.id == second_pane)
+        );
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_pending_close_survives_restart() {
+        assert_lazy_restore_close_survives_restart(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_pending_tab_close_survives_restart() {
+        assert_lazy_restore_close_survives_restart(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_full_failure_preserves_remaining_association_for_restart() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-full-failure-restart");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-full-failure-restart";
+        create_persist_db(&db_path, workspace_id);
+        let (agent_pane, shell_pane) =
+            seed_persisted_two_pane_window(&db_path, workspace_id, "agent");
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "lazy-restore-full-failure-restart",
+        );
+        worker.shell = spec("/definitely/missing/deppy-shell", &[]);
+        worker.persist = Some(
+            crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            })
+            .unwrap(),
+        );
+        worker.persist_db_path = Some(db_path.clone());
+
+        worker.handle_command(RuntimeCommand::RestoreWorkspacePane { pane: agent_pane });
+        worker.handle_command(RuntimeCommand::RestoreWorkspace);
+        assert_eq!(worker.sessions.len(), 1, "remaining shell spawn must fail");
+        drop(worker);
+
+        let association: Option<String> = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT session_id FROM mux_panes WHERE id = ?1",
+                [&shell_pane.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(association.as_deref(), Some("restore-pane-second"));
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs-restart"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let snapshot = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id == shell_pane && pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert!(snapshot.tabs.iter().flat_map(|tab| &tab.panes).any(|pane| {
+            pane.id == shell_pane
+                && pane.persistent_session_id.as_deref() == Some("restore-pane-second")
+        }));
+        drop(client);
+
+        let session_count: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            session_count, 2,
+            "retry must not duplicate persisted sessions"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_then_full_restore_materializes_remaining_once() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-full");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-full";
+        create_persist_db(&db_path, workspace_id);
+        let (first_pane, _) = seed_persisted_two_pane_window(&db_path, workspace_id, "shell");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane { pane: first_pane })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter(|pane| pane.session_id.is_some())
+                    .count()
+                    == 1 =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let full = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter(|pane| pane.session_id.is_some())
+                    .count()
+                    == 2 =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            full.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .filter(|pane| pane.session_id.is_some())
+                .count(),
+            2
+        );
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_workspace_pane_agent_is_archived_without_agent_start_event() {
+        init_mock_store();
+        let dir = unique_test_dir("lazy-restore-agent");
+        let db_path = dir.join("metadata.sqlite3");
+        let workspace_id = "ws-lazy-restore-agent";
+        create_persist_db(&db_path, workspace_id);
+        let (agent_pane, _) = seed_persisted_two_pane_window(&db_path, workspace_id, "agent");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            dir.join("logs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+
+        client
+            .send_command(RuntimeCommand::RestoreWorkspacePane {
+                pane: agent_pane.clone(),
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id == agent_pane && pane.session_id.is_some()) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        probe.seen.extend(probe.rx.drain());
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::AgentSpawned { .. }))
+        );
+        let conn = rusqlite::Connection::open(dir.join("metadata.sqlite3")).unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT session_kind FROM sessions WHERE id = 'restore-pane-first'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "agent");
+
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn restore_workspace_from_fixture(
+        db_path: &std::path::Path,
+        logs_root: &std::path::Path,
+        workspace_id: &str,
+        shell: CommandSpec,
+    ) -> Arc<MuxSnapshot> {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.to_path_buf(),
+            RedactionService::new(),
+            shell,
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.to_path_buf(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let mux = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter())
+                    .any(|pane| pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        drop(client);
+        mux
     }
 
     /// mock keyring store는 test only (설계문서 1.4). 프로세스 전역 1회만 등록 —
@@ -6433,6 +7947,161 @@ mod tests {
         assert!(archive_cache_needs_gc(u64::MAX, 1, budget));
     }
 
+    #[test]
+    fn archive_gc_failure_marks_cached_usage_unknown() {
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "archive-gc-failure",
+        );
+        let invalid_root = worker.logs_root.join("not-a-directory");
+        std::fs::create_dir_all(&worker.logs_root).unwrap();
+        std::fs::write(&invalid_root, b"file").unwrap();
+        worker.logs_root = invalid_root;
+        worker.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
+
+        assert!(!worker.account_archive_write(1));
+
+        assert_eq!(
+            worker.archive_disk_bytes,
+            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_cache_revalidates_replaced_logs_root_before_incrementing() {
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "archive-root-cache-replacement",
+        );
+        worker.archive_disk_bytes = 0;
+        worker.archive_root_identity =
+            storage::scrollback_archive::root_identity(&worker.logs_root).unwrap();
+        let old_root = worker.logs_root.with_extension("old");
+        std::fs::rename(&worker.logs_root, &old_root).unwrap();
+        let seeded = worker.logs_root.join("seed").join("scrollback.zlib");
+        std::fs::create_dir_all(seeded.parent().unwrap()).unwrap();
+        let seeded_file = std::fs::File::create(&seeded).unwrap();
+        seeded_file
+            .set_len(storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES)
+            .unwrap();
+        seeded_file
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+        let key = "trigger";
+        let receipt = storage::scrollback_archive::write_receipt(
+            &worker.logs_root,
+            key,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            b"new archive",
+        )
+        .unwrap();
+        let written = receipt.bytes();
+        let session = SessionId(100);
+
+        worker.finish_archive_write(session, key, receipt);
+
+        assert!(
+            !seeded.exists(),
+            "fresh GC must account the replacement root"
+        );
+        assert!(storage::scrollback_archive::exists(&worker.logs_root, key));
+        assert!(worker.archived_on_disk.contains(&session));
+        assert_eq!(worker.archive_disk_bytes, written);
+        assert_eq!(
+            worker.archive_root_identity,
+            storage::scrollback_archive::root_identity(&worker.logs_root).unwrap()
+        );
+        std::fs::remove_dir_all(&worker.logs_root).unwrap();
+        std::fs::remove_dir_all(old_root).unwrap();
+    }
+
+    #[test]
+    fn oversized_archive_dump_is_rejected_before_redaction() {
+        let production = include_str!("in_process.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let length_check = production
+            .find("dump.len() > storage::scrollback_archive::MAX_UNCOMPRESSED_BYTES")
+            .expect("archive dump length must be checked before redaction");
+        let redaction = production
+            .find("let mut redactor = self.redaction.stream_redactor()")
+            .unwrap();
+
+        assert!(length_check < redaction);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_evicted_triggering_archive_does_not_leave_disk_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "archive-trigger-evicted",
+        );
+        std::fs::create_dir_all(&worker.logs_root).unwrap();
+        let old_path = worker.logs_root.join("old").join("scrollback.zlib");
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        let old_file = std::fs::File::create(&old_path).unwrap();
+        old_file
+            .set_len(storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES)
+            .unwrap();
+        old_file
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+        std::fs::set_permissions(
+            old_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let key = "new";
+        let receipt = storage::scrollback_archive::write_receipt(
+            &worker.logs_root,
+            key,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            b"new archive",
+        )
+        .unwrap();
+        worker.archive_disk_bytes = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
+        let session = SessionId(99);
+
+        worker.finish_archive_write(session, key, receipt);
+
+        std::fs::set_permissions(
+            old_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(!storage::scrollback_archive::exists(&worker.logs_root, key));
+        assert!(
+            !worker.archived_on_disk.contains(&session),
+            "a GC-evicted triggering archive must not leave a false disk marker"
+        );
+    }
+
     /// PR-A1: 세션 exit 시 최종 grid가 디스크 아카이브(scrollback.zlib)로 기록되고,
     /// 메타·내용이 라운드트립된다 (suspend/재시작 생존의 원천).
     #[cfg(unix)]
@@ -6488,6 +8157,130 @@ mod tests {
         let text = String::from_utf8_lossy(&dump);
         assert!(text.contains("archive-roundtrip-marker"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_archive_usage_blocks_new_writes_and_makes_gc_progress() {
+        init_mock_store();
+        let dir = unique_test_dir("archive-scan-over-limit");
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-archive-limit');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let logs_root = dir.join("logs");
+        std::fs::create_dir_all(&logs_root).unwrap();
+        for index in 0..=4_096 {
+            let session_dir = logs_root.join(format!("noise-{index}"));
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(session_dir.join("scrollback.zlib"), b"").unwrap();
+        }
+        let entries_before = std::fs::read_dir(&logs_root).unwrap().count();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: "ws-archive-limit".into(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd("echo blocked-archive", None, None))
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SessionExited { .. } => Some(()),
+            _ => None,
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let uuid: String = conn
+            .query_row("SELECT id FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            !storage::scrollback_archive::exists(&logs_root, &uuid),
+            "unknown disk usage must fail closed before writing"
+        );
+        assert!(
+            std::fs::read_dir(&logs_root).unwrap().count() < entries_before,
+            "failed admission must still make bounded GC progress"
+        );
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_over_limit_archive_scan_rolls_back_the_triggering_write() {
+        init_mock_store();
+        let dir = unique_test_dir("archive-scan-growth-over-limit");
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-archive-growth');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let logs_root = dir.join("logs");
+        let seeded_archive = logs_root.join("seed").join("scrollback.zlib");
+        std::fs::create_dir_all(seeded_archive.parent().unwrap()).unwrap();
+        std::fs::File::create(&seeded_archive)
+            .unwrap()
+            .set_len(storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES)
+            .unwrap();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: "ws-archive-growth".into(),
+            }),
+        );
+        for index in 0..=4_096 {
+            let session_dir = logs_root.join(format!("noise-{index}"));
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(session_dir.join("scrollback.zlib"), b"").unwrap();
+        }
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd("echo rollback-archive", None, None))
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SessionExited { .. } => Some(()),
+            _ => None,
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let uuid: String = conn
+            .query_row("SELECT id FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            !storage::scrollback_archive::exists(&logs_root, &uuid),
+            "failed post-write GC must roll back the triggering archive"
+        );
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// PR-A2: agent pane은 재시작 후 respawn 대신 열람 전용 복원된다 —
@@ -6599,6 +8392,199 @@ mod tests {
         restore_and_check("로그폴백");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archived_restore_invalid_metadata_preserves_persistent_row_for_fallback() {
+        init_mock_store();
+        let dir = unique_test_dir("sf03-invalid-archive");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-sf03-invalid";
+        let persistent_id = "persisted-agent-invalid";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "agent",
+            Some("cfg-sf03"),
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        storage::scrollback_archive::write(
+            &logs_root,
+            persistent_id,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 500,
+                rows: 500,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            b"invalid dimensions should fall back without consuming row",
+        )
+        .unwrap();
+
+        restore_workspace_from_fixture(&db_path, &logs_root, workspace_id, spec("/bin/cat", &[]));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let pane_session: String = conn
+            .query_row("SELECT session_id FROM mux_panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "fallback must not create a second session row");
+        assert_eq!(pane_session, persistent_id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archived_restore_truncated_stream_preserves_persistent_row_for_fallback() {
+        init_mock_store();
+        let dir = unique_test_dir("sf03-truncated-archive");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-sf03-truncated";
+        let persistent_id = "persisted-agent-truncated";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "agent",
+            Some("cfg-sf03"),
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        storage::scrollback_archive::write(
+            &logs_root,
+            persistent_id,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            &vec![b'x'; 4096],
+        )
+        .unwrap();
+        let archive = storage::scrollback_archive::archive_path(&logs_root, persistent_id).unwrap();
+        let truncated_len = archive.metadata().unwrap().len().saturating_sub(4);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_len(truncated_len)
+            .unwrap();
+
+        let mux = restore_workspace_from_fixture(
+            &db_path,
+            &logs_root,
+            workspace_id,
+            spec("/bin/cat", &[]),
+        );
+
+        let restored_sessions: Vec<SessionId> = mux
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|pane| pane.session_id)
+            .collect();
+        assert_eq!(
+            restored_sessions.len(),
+            1,
+            "fallback must expose exactly one restored runtime session"
+        );
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let pane_session: String = conn
+            .query_row("SELECT session_id FROM mux_panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "fallback must not create a second session row");
+        assert_eq!(pane_session, persistent_id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archived_restore_failed_rebind_leaves_no_runtime_marker() {
+        let dir = unique_test_dir("sf03-rebind-fail-marker");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-sf03-rebind-fail";
+        let persistent_id = "persisted-agent-rebind-fail";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "agent",
+            Some("cfg-sf03"),
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        storage::scrollback_archive::write(
+            &logs_root,
+            persistent_id,
+            &storage::scrollback_archive::ArchiveMeta {
+                kind: 1,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                exit_code: Some(0),
+            },
+            b"valid archive prepared before failed rebind",
+        )
+        .unwrap();
+
+        let (mut worker, _event_rx) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::new(Vec::new()),
+                value: None,
+            }),
+            "sf03-rebind-fail-marker",
+        );
+        worker.logs_root = logs_root.clone();
+        worker.persist = Some(
+            crate::persistence::PersistPipe::open(&crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            })
+            .unwrap(),
+        );
+        assert!(
+            worker
+                .persist
+                .as_mut()
+                .unwrap()
+                .session_rebound_archived(SessionId(99), persistent_id),
+            "test setup must consume the restored persistence row"
+        );
+        let pane_state = persist::PaneState {
+            id: MuxPaneId::new(),
+            session_id: Some(persistent_id.to_owned()),
+            title: "restored".to_owned(),
+            pane_kind: mux::PaneKind::Terminal,
+            cwd: Some("/tmp".to_owned()),
+        };
+
+        assert!(!worker.restore_archived_pane(&pane_state, persistent_id));
+        let failed_session = SessionId(1);
+        assert!(!worker.sessions.contains_key(&failed_session));
+        assert!(!worker.exited_order.contains(&failed_session));
+        assert!(!worker.mux.panes.contains_key(&pane_state.id));
+        assert!(
+            !worker.archived_on_disk.contains(&failed_session),
+            "failed rebind must not leave a disk archive marker without a session"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 복원 UX (PR-14, 설계문서 §11.1~11.5·§14): 첫 worker가 만든 셸 2개 + split
@@ -6738,6 +8724,61 @@ mod tests {
         }
 
         drop(client2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_cwd_uses_persisted_session_cwd_for_shell_spawn() {
+        init_mock_store();
+        let dir = unique_test_dir("sf03-restore-cwd");
+        let cwd = dir.join("cwd-target");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-sf03-cwd";
+        let persistent_id = "persisted-shell-cwd";
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "shell",
+            None,
+            persist::SESSION_STATUS_RUNNING,
+            &cwd_text,
+        );
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root,
+            RedactionService::new(),
+            spec("/bin/pwd", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let text = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport { snapshot, .. } => {
+                let text = snapshot
+                    .visible_cells
+                    .iter()
+                    .filter(|cell| !cell.wide_spacer)
+                    .map(|cell| cell.c)
+                    .collect::<String>();
+                text.contains(&cwd_text).then_some(text)
+            }
+            _ => None,
+        });
+        assert!(text.contains(&cwd_text), "{text}");
+        drop(client);
         std::fs::remove_dir_all(&dir).ok();
     }
 

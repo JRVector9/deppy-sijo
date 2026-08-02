@@ -1526,6 +1526,16 @@ fn general_page(
     );
     row(
         ui,
+        &catalog.t("settings.confirm_workspace_close", &[]),
+        Some(&catalog.t("settings.confirm_workspace_close.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut config.ui.confirm_workspace_close) {
+                *changed = true;
+            }
+        },
+    );
+    row(
+        ui,
         &catalog.t("settings.session_name_style", &[]),
         Some(&catalog.t("settings.session_name_style.hint", &[])),
         |ui| {
@@ -2187,6 +2197,18 @@ fn performance_page(
             let mut v = config.performance.max_warm as i64;
             if stepper(ui, &mut v, 1, 0, 8, "") {
                 config.performance.max_warm = v as u32;
+                *changed = true;
+            }
+        },
+    );
+    row(
+        ui,
+        &catalog.t("settings.max_cross_workspace_panes", &[]),
+        Some(&catalog.t("settings.max_cross_workspace_panes.hint", &[])),
+        |ui| {
+            let mut v = config.performance.max_cross_workspace_panes as i64;
+            if stepper(ui, &mut v, 1, 1, 6, "") {
+                config.performance.max_cross_workspace_panes = v as u32;
                 *changed = true;
             }
         },

@@ -939,6 +939,7 @@ impl DashboardHandle {
 
     /// 브리지 스레드에 종료를 알린다(서버 shutdown이 join 전에 호출).
     pub fn stop(&self) {
+        let _inner = self.shared.inner.lock().expect("dashboard inner lock");
         self.shared.stop.store(true, Ordering::SeqCst);
         self.shared.cvar.notify_all();
     }
@@ -1274,6 +1275,24 @@ mod tests {
         );
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[&10].status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn durable_event_barrier_is_not_dashboard_or_session_data() {
+        let mut sessions = BTreeMap::new();
+        let mut resource = None;
+        let mut ids = IdMap::default();
+
+        assert!(!apply_event(
+            &mut sessions,
+            &mut resource,
+            &mut ids,
+            &RuntimeEvent::DurableEventBarrierReached { correlation_id: 1 },
+        ));
+        assert!(sessions.is_empty());
+        assert!(resource.is_none());
+        assert!(ids.to_session.is_empty());
+        assert!(ids.to_uuid.is_empty());
     }
 
     /// 표시명은 앱 스냅샷에서 오고, mux의 raw 제목이 덮지 않는다 (폰에서 사람이 읽는 이름).

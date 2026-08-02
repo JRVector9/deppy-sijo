@@ -25,6 +25,25 @@ pub enum EffortStep {
     Down,
 }
 
+/// 무엇을 조정하는가. 낙관적 값을 강도/모델별로 따로 들고 있기 위한 키다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdjustKind {
+    Effort,
+    Model,
+}
+
+/// 권위 있는 값(statusLine→DB)이 우리가 방금 보낸 값을 따라잡았는지.
+///
+/// 강도는 표기가 같아서 그대로 비교하면 되고, 모델은 권위 쪽이 표시명("Opus 5 (1M
+/// context)")이라 슬러그(`opus`) 포함 여부로 본다.
+pub fn authoritative_caught_up(kind: AdjustKind, authoritative: &str, pending: &str) -> bool {
+    let authoritative = authoritative.trim().to_ascii_lowercase();
+    match kind {
+        AdjustKind::Effort => authoritative == pending.to_ascii_lowercase(),
+        AdjustKind::Model => authoritative.contains(&pending.to_ascii_lowercase()),
+    }
+}
+
 /// 이 provider에서 강도를 바꾸는 방법.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffortPlan {
@@ -41,10 +60,10 @@ pub enum EffortPlan {
 /// 먼저 걸러 여기까지 오지 않는다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffortBlocked {
-    /// 현재 강도를 몰라 다음 단계를 계산할 수 없다 (Claude 경로 전용).
+    /// 현재 값을 몰라 다음 단계를 계산할 수 없다 (Claude 경로 전용).
+    ///
+    /// "사다리 끝" 변형은 없다 — 끝에서 순환하므로 막힐 일이 없다.
     UnknownCurrentEffort,
-    /// 이미 사다리 끝이다.
-    AtLimit,
 }
 
 /// Claude `/effort`가 받는 단계. `agent_launcher::CLAUDE_EFFORTS`와 같은 순서다.
@@ -68,7 +87,13 @@ const CLAUDE_LADDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_INCREASE: &[u8] = b"\x1b[1;2A";
 const CODEX_DECREASE: &[u8] = b"\x1b[1;2B";
 
-/// 현재 강도에서 한 단계 옮긴 값을 사다리에서 찾는다.
+/// 현재 값에서 한 칸 옮긴다. **사다리 끝에서 순환한다.**
+///
+/// 끝에서 막으면 정상 동작인데도 화면에 아무 일이 없어 고장으로 읽힌다 — 실제로
+/// 최대 강도에 있던 세션에서 올리기를 눌러 "안 된다"고 보고됐다(2026-08-02).
+/// 순환하면 어느 방향으로 눌러도 항상 반응이 있고, 되돌리기도 한 번이면 된다.
+/// 강도 순환은 max에서 low로 크게 떨어지므로, 호출부는 보낸 값을 CLI 출력으로
+/// 확인할 수 있어야 한다(Claude가 `Set effort level to ...`를 pane에 찍는다).
 ///
 /// 비교는 대소문자를 무시한다 — statusLine이 주는 표기(`XHigh`)와 CLI가 받는
 /// 표기(`xhigh`)가 다를 수 있다.
@@ -82,11 +107,12 @@ fn step_ladder(
         .iter()
         .position(|level| level.eq_ignore_ascii_case(current))
         .ok_or(EffortBlocked::UnknownCurrentEffort)?;
+    let len = ladder.len();
     let next = match step {
-        EffortStep::Up => index.checked_add(1).filter(|next| *next < ladder.len()),
-        EffortStep::Down => index.checked_sub(1),
+        EffortStep::Up => (index + 1) % len,
+        EffortStep::Down => (index + len - 1) % len,
     };
-    next.map(|next| ladder[next]).ok_or(EffortBlocked::AtLimit)
+    Ok(ladder[next])
 }
 
 /// PTY 에이전트 한 건의 강도를 옮기기 위해 보낼 입력을 정한다.
@@ -157,15 +183,16 @@ pub fn plan_model(
         return Err(EffortBlocked::UnknownCurrentEffort);
     }
     let current = current_model.ok_or(EffortBlocked::UnknownCurrentEffort)?;
+    // 모델은 statusLine이 표시명("Opus 5 (1M context)")을 주므로 슬러그 포함으로 맞춘다.
     let lowered = current.to_ascii_lowercase();
     let index = CLAUDE_MODEL_LADDER
         .iter()
         .position(|slug| lowered.contains(slug))
         .ok_or(EffortBlocked::UnknownCurrentEffort)?;
-    // 모델은 사다리 끝에서 멈추지 않고 순환한다 — 3개뿐이라 왕복시키면 답답하다.
+    let len = CLAUDE_MODEL_LADDER.len();
     let next = match step {
-        EffortStep::Up => (index + 1) % CLAUDE_MODEL_LADDER.len(),
-        EffortStep::Down => (index + CLAUDE_MODEL_LADDER.len() - 1) % CLAUDE_MODEL_LADDER.len(),
+        EffortStep::Up => (index + 1) % len,
+        EffortStep::Down => (index + len - 1) % len,
     };
     let level = CLAUDE_MODEL_LADDER[next];
     Ok(EffortPlan::Slash {
@@ -244,16 +271,23 @@ mod tests {
         }
     }
 
+    /// 끝에서 막으면 정상 동작인데도 "안 된다"로 읽힌다 — 실제 보고된 증상이다.
+    /// 어느 방향으로 눌러도 항상 값이 바뀌어야 한다.
     #[test]
-    fn 사다리_끝에서는_at_limit이다() {
-        assert_eq!(
-            plan(AgentProvider::Claude, EffortStep::Up, Some("max")),
-            Err(EffortBlocked::AtLimit)
-        );
-        assert_eq!(
-            plan(AgentProvider::Claude, EffortStep::Down, Some("low")),
-            Err(EffortBlocked::AtLimit)
-        );
+    fn 강도는_사다리_끝에서_순환한다() {
+        let level = |step, current| {
+            let Ok(EffortPlan::Slash { level, .. }) =
+                plan(AgentProvider::Claude, step, Some(current))
+            else {
+                panic!("{current}에서 계획이 나와야 한다");
+            };
+            level
+        };
+        assert_eq!(level(EffortStep::Up, "max"), "low");
+        assert_eq!(level(EffortStep::Down, "low"), "max");
+        // 중간은 그대로 한 칸씩.
+        assert_eq!(level(EffortStep::Up, "high"), "xhigh");
+        assert_eq!(level(EffortStep::Down, "high"), "medium");
     }
 
     /// 현재 강도를 모르면 **아무것도 보내지 않는다.** 임의로 "high"를 가정하면
@@ -342,6 +376,27 @@ mod tests {
                 "{current:?}에서 계획이 나왔다"
             );
         }
+    }
+
+    /// 낙관적 값을 언제 버릴지 판정한다. 이게 어긋나면 둘 중 하나가 된다 —
+    /// 너무 일찍 버리면 연속 입력이 다시 낡은 값에서 움직이고, 안 버리면 사용자가
+    /// CLI에서 직접 바꾼 값을 영영 무시한다.
+    #[test]
+    fn 권위값이_따라잡으면_낙관적_값을_버린다() {
+        use AdjustKind::{Effort, Model};
+        // 강도는 표기가 같다.
+        assert!(authoritative_caught_up(Effort, "high", "high"));
+        assert!(authoritative_caught_up(Effort, "HIGH", "high"));
+        assert!(authoritative_caught_up(Effort, "  high  ", "high"));
+        assert!(!authoritative_caught_up(Effort, "medium", "high"));
+        // 모델은 권위 쪽이 표시명이라 슬러그 포함으로 본다.
+        assert!(authoritative_caught_up(
+            Model,
+            "Opus 5 (1M context)",
+            "opus"
+        ));
+        assert!(authoritative_caught_up(Model, "Sonnet 5", "sonnet"));
+        assert!(!authoritative_caught_up(Model, "Sonnet 5", "opus"));
     }
 
     /// 슬래시 명령은 CR로 끝나야 제출된다. 실측에서 CR 없이는 composer에 글자만

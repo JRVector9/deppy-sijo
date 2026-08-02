@@ -77,6 +77,19 @@ struct ProcRow {
     command: String,
 }
 
+/// 한 번의 감지 패스 결과.
+///
+/// `bindings`는 **transcript 경로까지 확정된** 것만 담는다(`AgentBinding` 정의). 그래서
+/// 방금 띄워 아직 대화를 시작하지 않은 에이전트는 여기 없다 — 강도/모델 단축키는 바로
+/// 그 시점(첫 프롬프트 전)에 쓰고 싶은 기능이라, 프로세스만으로 판정한 `kinds`를 함께
+/// 낸다. transcript가 생기기 전에도 "이 pane은 Codex다"를 알 수 있어야 한다
+/// (2026-08-02: 에이전트가 멀쩡히 도는데 bindings=0이라 단축키가 대상을 못 찾았다).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DetectedAgents {
+    pub bindings: HashMap<SessionId, AgentBinding>,
+    pub kinds: HashMap<SessionId, AgentKind>,
+}
+
 /// 이미 확정된 세션→바인딩을 캐시해 재발견(lsof/codex 재귀 스캔)을 스킵한다(codex #3).
 /// 각 세션(셸 pid)에서 실행 중인 에이전트를 감지해 transcript로 바인딩한다 — ps를 한 번
 /// 에이전트 프로세스(owner_pid)가 여전히 ps 결과에 살아있으면 캐시를 재사용하고, 사라졌으면
@@ -100,19 +113,43 @@ impl DetectionBudget {
     }
 }
 
+/// 세션별로 **실행 중인 에이전트 종류**만 고른다 — transcript를 요구하지 않는다.
+///
+/// `AgentBinding`은 정의상 transcript 경로까지 확정된 상태라, 방금 띄워 아직 대화를
+/// 시작하지 않은 에이전트는 바인딩되지 않는다. 강도/모델 단축키는 바로 그 시점(첫
+/// 프롬프트 전)에 쓰고 싶은 기능이므로 프로세스만으로 판정할 수단이 따로 필요하다.
+fn agent_kinds_from_rows(
+    sessions: &[(SessionId, u32)],
+    rows: &[ProcRow],
+) -> HashMap<SessionId, AgentKind> {
+    sessions
+        .iter()
+        .filter_map(|(sid, shell_pid)| {
+            let descendants = descendant_pids(*shell_pid, rows);
+            rows.iter()
+                .filter(|row| descendants.contains(&row.pid))
+                .find_map(|row| classify(&row.command).map(|(kind, _)| kind))
+                .map(|kind| (*sid, kind))
+        })
+        .collect()
+}
+
 /// 캐시를 활용한 detect. `cache`는 호출측(워커 스레드)이 소유·유지한다.
 pub fn detect_cached(
     sessions: &[(SessionId, u32)],
     overrides: &HashMap<SessionId, AgentBinding>,
     cache: &mut BindingCache,
-) -> HashMap<SessionId, AgentBinding> {
+) -> DetectedAgents {
     if sessions.len() > MAX_SESSIONS {
         cache.entries.clear();
-        return HashMap::new();
+        return DetectedAgents::default();
     }
     let rows = process_rows();
     let mut budget = DetectionBudget::default();
     let mut out = HashMap::new();
+    // transcript와 무관하게 "이 세션에서 무슨 에이전트가 돌고 있나"만 따로 모은다.
+    // 같은 ps 결과를 재사용하므로 추가 비용이 없다.
+    let kinds = agent_kinds_from_rows(sessions, &rows);
     for (sid, shell_pid) in sessions {
         // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적이다. 단 같은 pane에서
         // Codex를 종료한 뒤 Claude를 실행할 수 있으므로, 살아 있는 에이전트의 종류까지 hook
@@ -171,7 +208,10 @@ pub fn detect_cached(
     // 더는 존재하지 않는 세션의 캐시 항목 정리(누수 방지).
     let alive: HashSet<SessionId> = sessions.iter().map(|(s, _)| *s).collect();
     cache.entries.retain(|sid, _| alive.contains(sid));
-    out
+    DetectedAgents {
+        bindings: out,
+        kinds,
+    }
 }
 
 /// 바인딩된 transcript를 파싱해 전체 상태(활동 + 표시 정보)를 읽는다. 파싱은 한 번만.
@@ -1849,6 +1889,54 @@ mod tests {
     fn classify_ignores_unrelated() {
         assert!(classify("/bin/zsh -l").is_none());
         assert!(classify("vim claude_notes.md").is_none()); // 인자 언급은 오탐 안 함
+    }
+
+    /// transcript가 없어도 프로세스만으로 종류를 잡아야 한다.
+    ///
+    /// 실제 증상(2026-08-02): 에이전트를 띄우자마자 강도 단축키를 누르면 아무 일도
+    /// 일어나지 않았다. 아직 대화를 시작하지 않아 transcript가 없었고, 그래서
+    /// `bindings=0`이라 PTY 표면 자체가 만들어지지 않았다.
+    #[test]
+    fn transcript_없이도_프로세스로_종류를_잡는다() {
+        let rows = vec![
+            ProcRow {
+                pid: 100,
+                ppid: Some(1),
+                command: "/bin/sh".into(),
+            },
+            // 실제로 사용자 환경에서 관측된 형태 — 셸의 자식으로 뜬다.
+            ProcRow {
+                pid: 101,
+                ppid: Some(100),
+                command: "/Users/jr/.local/bin/codex --enable hooks".into(),
+            },
+            ProcRow {
+                pid: 200,
+                ppid: Some(1),
+                command: "/bin/zsh".into(),
+            },
+            ProcRow {
+                pid: 201,
+                ppid: Some(200),
+                command: "claude".into(),
+            },
+            // 에이전트가 없는 셸은 목록에 없어야 한다.
+            ProcRow {
+                pid: 300,
+                ppid: Some(1),
+                command: "/bin/zsh".into(),
+            },
+        ];
+        let sessions = [
+            (SessionId(1), 100),
+            (SessionId(2), 200),
+            (SessionId(3), 300),
+        ];
+        let kinds = agent_kinds_from_rows(&sessions, &rows);
+
+        assert_eq!(kinds.get(&SessionId(1)), Some(&AgentKind::Codex));
+        assert_eq!(kinds.get(&SessionId(2)), Some(&AgentKind::Claude));
+        assert_eq!(kinds.get(&SessionId(3)), None);
     }
 
     #[test]

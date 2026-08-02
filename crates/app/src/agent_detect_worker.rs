@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use runtime::SessionId;
 
-use crate::agent_detect::{self, AgentBinding, AgentDisplay};
+use crate::agent_detect::{self, AgentBinding, AgentDisplay, AgentKind};
 use crate::agent_transcript::AgentActivity;
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
@@ -207,6 +207,9 @@ pub struct DetectOutcome {
     pub session_cwds: Option<HashMap<SessionId, String>>,
     /// 세션별 에이전트 표시 정보(model/effort/context) — 바인딩 tier에서만.
     pub agent_info: Option<HashMap<SessionId, AgentDisplay>>,
+    /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. 방금 띄워 아직
+    /// 대화를 시작하지 않은 에이전트는 `bindings`에 없으므로 이쪽으로 잡는다.
+    pub agent_kinds: Option<HashMap<SessionId, AgentKind>>,
 }
 
 struct MailboxState {
@@ -379,6 +382,7 @@ struct BindingPass {
     activity: HashMap<SessionId, AgentActivity>,
     session_cwds: HashMap<SessionId, String>,
     agent_info: HashMap<SessionId, AgentDisplay>,
+    agent_kinds: HashMap<SessionId, AgentKind>,
 }
 
 trait DetectionBackend: Send + 'static {
@@ -448,7 +452,11 @@ impl DetectionBackend for ProductionBackend {
         sessions: &[(SessionId, u32)],
         overrides: &HashMap<SessionId, AgentBinding>,
     ) -> BindingPass {
-        let bindings = agent_detect::detect_cached(sessions, overrides, &mut self.cache);
+        let detected = agent_detect::detect_cached(sessions, overrides, &mut self.cache);
+        let agent_detect::DetectedAgents {
+            bindings,
+            kinds: agent_kinds,
+        } = detected;
         let (activity, agent_info) = compute_activity_and_info(&bindings);
         let pids: Vec<u32> = sessions.iter().map(|(_, pid)| *pid).collect();
         let cwd_by_pid = agent_detect::session_cwds(&pids);
@@ -461,6 +469,7 @@ impl DetectionBackend for ProductionBackend {
             activity,
             session_cwds,
             agent_info,
+            agent_kinds,
         }
     }
 
@@ -545,6 +554,7 @@ fn run_worker<B: DetectionBackend>(
                             activity: HashMap::new(),
                             session_cwds: Some(HashMap::new()),
                             agent_info: Some(HashMap::new()),
+                            agent_kinds: Some(HashMap::new()),
                         },
                     )
                 {
@@ -592,6 +602,7 @@ fn run_worker<B: DetectionBackend>(
                     activity: pass.activity,
                     session_cwds: Some(pass.session_cwds),
                     agent_info: Some(pass.agent_info),
+                    agent_kinds: Some(pass.agent_kinds),
                 },
             ) {
                 break;
@@ -615,6 +626,7 @@ fn run_worker<B: DetectionBackend>(
                     activity,
                     session_cwds: None,
                     agent_info: None,
+                    agent_kinds: None,
                 },
             ) {
                 break;
@@ -700,6 +712,7 @@ mod tests {
             bindings: Some(HashMap::from([(session, binding(session))])),
             activity: HashMap::from([(session, state)]),
             session_cwds: Some(HashMap::from([(session, "/fixture".to_owned())])),
+            agent_kinds: Some(HashMap::from([(session, AgentKind::Claude)])),
             agent_info: Some(HashMap::from([(
                 session,
                 AgentDisplay {
@@ -752,6 +765,10 @@ mod tests {
                 .map(|(session, _)| (*session, binding(*session)))
                 .collect();
             BindingPass {
+                agent_kinds: bindings
+                    .keys()
+                    .map(|session| (*session, AgentKind::Claude))
+                    .collect(),
                 activity: bindings
                     .keys()
                     .map(|session| (*session, AgentActivity::Idle))
@@ -865,6 +882,7 @@ mod tests {
             activity: HashMap::from([(SessionId(1), AgentActivity::Working)]),
             session_cwds: None,
             agent_info: None,
+            agent_kinds: None,
         };
         assert!(matches!(mailbox.publish(partial), PublishResult::Changed));
         let merged = receiver.try_recv().expect("merged outcome");
@@ -880,6 +898,7 @@ mod tests {
             activity: HashMap::from([(SessionId(1), AgentActivity::Working)]),
             session_cwds: None,
             agent_info: None,
+            agent_kinds: None,
         };
         assert!(matches!(
             mailbox.publish(unchanged),
@@ -997,6 +1016,10 @@ mod tests {
         bindings.insert(extra, binding(extra));
         let pass = bound_pass(
             BindingPass {
+                agent_kinds: bindings
+                    .keys()
+                    .map(|session| (*session, AgentKind::Claude))
+                    .collect(),
                 activity: bindings
                     .keys()
                     .map(|session| (*session, AgentActivity::Idle))

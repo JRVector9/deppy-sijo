@@ -15,6 +15,7 @@ const ARC_ALLOCATION_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
 #[derive(Clone, PartialEq)]
 pub struct ActivityWorkspaceRow {
     pub workspace_id: Arc<str>,
+    pub runtime_instance: Option<u64>,
     pub name: Arc<str>,
     pub metric_availability: ActivityMetricAvailability,
     pub state: ActivityWorkspaceState,
@@ -33,6 +34,7 @@ impl std::fmt::Debug for ActivityWorkspaceRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActivityWorkspaceRow")
             .field("workspace_id", &REDACTED)
+            .field("runtime_instance", &self.runtime_instance)
             .field("name", &REDACTED)
             .field("metric_availability", &self.metric_availability)
             .field("state", &self.state)
@@ -783,6 +785,7 @@ mod tests {
     ) -> ActivityWorkspaceRow {
         ActivityWorkspaceRow {
             workspace_id: Arc::from(""),
+            runtime_instance: None,
             name: name.into(),
             metric_availability: ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Idle,
@@ -850,6 +853,7 @@ mod tests {
         let row =
             |name: &str, app_cpu: f32, child_session: u64, child_rss: u64| ActivityWorkspaceRow {
                 workspace_id: Arc::from(name),
+                runtime_instance: Some(child_session),
                 name: Arc::from(name),
                 metric_availability: ActivityMetricAvailability::Local,
                 state: ActivityWorkspaceState::Warm,
@@ -896,6 +900,7 @@ mod tests {
     fn idle_workspace_is_kept_in_the_full_summary() {
         let rows = [ActivityWorkspaceRow {
             workspace_id: Arc::from("idle-project"),
+            runtime_instance: None,
             name: Arc::from("idle-project"),
             metric_availability: ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Idle,

@@ -14,13 +14,16 @@ pub(crate) enum ResourceManagerIntent {
     InspectUnattached,
     KillUnattached {
         workspace_id: Arc<str>,
+        runtime_instance: u64,
     },
     FocusSession {
         workspace_id: Arc<str>,
+        runtime_instance: u64,
         session: runtime::SessionId,
     },
     KillSession {
         workspace_id: Arc<str>,
+        runtime_instance: u64,
         session: runtime::SessionId,
     },
 }
@@ -29,11 +32,13 @@ pub(crate) enum ResourceManagerIntent {
 enum ResourceConfirm {
     Unattached {
         workspace_id: Arc<str>,
+        runtime_instance: u64,
         workspace_name: Arc<str>,
         count: u16,
     },
     Session {
         workspace_id: Arc<str>,
+        runtime_instance: u64,
         session: runtime::SessionId,
         session_name: Arc<str>,
     },
@@ -205,7 +210,9 @@ impl ResourceManagerUi {
                             );
                         });
                     }
-                    if unattached_count > 0 {
+                    if unattached_count > 0
+                        && let Some(runtime_instance) = row.runtime_instance
+                    {
                         ui.indent(("workspace_unattached", row.workspace_id.as_ref()), |ui| {
                             ui.horizontal(|ui| {
                                 ui.colored_label(
@@ -234,6 +241,7 @@ impl ResourceManagerUi {
                                 if response.clicked() {
                                     self.confirm = Some(ResourceConfirm::Unattached {
                                         workspace_id: Arc::clone(&row.workspace_id),
+                                        runtime_instance,
                                         workspace_name: Arc::clone(&row.name),
                                         count: unattached_count,
                                     });
@@ -280,7 +288,9 @@ impl ResourceManagerUi {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(session_id) = session.session {
+                        if let (Some(session_id), Some(runtime_instance)) =
+                            (session.session, workspace.runtime_instance)
+                        {
                             let kill_accessible = catalog.t(
                                 "resource_manager.kill_session_accessible",
                                 &[("session", session.name.as_ref())],
@@ -296,6 +306,7 @@ impl ResourceManagerUi {
                             if kill.clicked() {
                                 self.confirm = Some(ResourceConfirm::Session {
                                     workspace_id: Arc::clone(&workspace.workspace_id),
+                                    runtime_instance,
                                     session: session_id,
                                     session_name: Arc::clone(&session.name),
                                 });
@@ -315,6 +326,7 @@ impl ResourceManagerUi {
                             if focus.clicked() {
                                 *intent = Some(ResourceManagerIntent::FocusSession {
                                     workspace_id: Arc::clone(&workspace.workspace_id),
+                                    runtime_instance,
                                     session: session_id,
                                 });
                             }
@@ -364,15 +376,22 @@ impl ResourceManagerUi {
                 .clicked()
             {
                 *intent = Some(match confirm {
-                    ResourceConfirm::Unattached { workspace_id, .. } => {
-                        ResourceManagerIntent::KillUnattached { workspace_id }
-                    }
+                    ResourceConfirm::Unattached {
+                        workspace_id,
+                        runtime_instance,
+                        ..
+                    } => ResourceManagerIntent::KillUnattached {
+                        workspace_id,
+                        runtime_instance,
+                    },
                     ResourceConfirm::Session {
                         workspace_id,
+                        runtime_instance,
                         session,
                         ..
                     } => ResourceManagerIntent::KillSession {
                         workspace_id,
+                        runtime_instance,
                         session,
                     },
                 });
@@ -598,6 +617,7 @@ mod tests {
     fn fixture() -> Vec<ActivityWorkspaceRow> {
         vec![ActivityWorkspaceRow {
             workspace_id: Arc::from("workspace-a"),
+            runtime_instance: Some(17),
             name: Arc::from("Workspace A"),
             metric_availability: ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Active,
@@ -745,6 +765,37 @@ mod tests {
             harness.state().1.last(),
             Some(&ResourceManagerIntent::KillSession {
                 workspace_id: Arc::from("workspace-a"),
+                runtime_instance: 17,
+                session: runtime::SessionId(11),
+            })
+        );
+    }
+
+    #[test]
+    fn resource_manager_intents_keep_the_rendered_runtime_instance() {
+        let mut harness = harness(fixture());
+        harness.run();
+
+        harness.get_by_label("Focus Local Session").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.last(),
+            Some(&ResourceManagerIntent::FocusSession {
+                workspace_id: Arc::from("workspace-a"),
+                runtime_instance: 17,
+                session: runtime::SessionId(11),
+            })
+        );
+
+        harness.get_by_label("End Local Session").click();
+        harness.run();
+        harness.get_by_label("Confirm end").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.last(),
+            Some(&ResourceManagerIntent::KillSession {
+                workspace_id: Arc::from("workspace-a"),
+                runtime_instance: 17,
                 session: runtime::SessionId(11),
             })
         );

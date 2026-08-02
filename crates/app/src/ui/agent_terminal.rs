@@ -1043,6 +1043,7 @@ mod tests {
         // 표시하면 에이전트 메모리가 앱 급증으로 오독된다(2026-07-18 사용자 보고).
         let row = |child_session: u64, child_rss: u64| ActivityWorkspaceRow {
             workspace_id: "ws".into(),
+            runtime_instance: Some(child_session),
             name: "ws".into(),
             metric_availability: super::super::activity::ActivityMetricAvailability::Local,
             state: ActivityWorkspaceState::Warm,

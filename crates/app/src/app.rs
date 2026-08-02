@@ -7121,6 +7121,8 @@ pub struct App {
     unattached_counts: std::collections::HashMap<String, u16>,
     /// local runtime별 최신 유지보수 명령 한 건만 보존하는 bounded 순차 큐다.
     pending_resource_maintenance: std::collections::VecDeque<ResourceMaintenanceTarget>,
+    /// Render가 반환한 상태바 intent 한 건. host/runtime 작업은 다음 logic tick에서만 한다.
+    pending_status_bar_intent: Option<ui::agent_terminal::StatusBarIntent>,
     /// 홈 업데이트 피드 수신(Claude/OpenAI 상태 5분, 공지/HF/Grok 4시간) + 최신
     /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
     status_feed_rx: crate::status_feed::StatusFeedReceiver,
@@ -7287,7 +7289,7 @@ pub struct App {
     resumed_panes: std::collections::HashSet<String>,
     resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
-    pending_focus: Option<(String, runtime::SessionId)>,
+    pending_focus: Option<(String, u64, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
     pending_shutdowns: PendingShutdownRegistry,
@@ -7689,7 +7691,8 @@ enum WorkspaceControllerAction {
     ClosePane(runtime::MuxPaneId),
     CloseWorkspace(String),
     FocusPty {
-        switch_workspace: Option<String>,
+        workspace_id: String,
+        runtime_instance: Option<u64>,
         session: runtime::SessionId,
     },
     OpenStructured {
@@ -7717,7 +7720,26 @@ enum ResourceMaintenanceAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResourceMaintenanceTarget {
     workspace_id: String,
+    runtime_instance: u64,
     action: ResourceMaintenanceAction,
+}
+
+fn resource_target_matches_runtime(
+    target: &ResourceMaintenanceTarget,
+    workspace_id: &str,
+    runtime_instance: u64,
+) -> bool {
+    target.workspace_id == workspace_id && target.runtime_instance == runtime_instance
+}
+
+fn workspace_focus_target_matches_runtime(
+    target_workspace_id: &str,
+    target_runtime_instance: Option<u64>,
+    runtime_workspace_id: &str,
+    runtime_instance: u64,
+) -> bool {
+    target_workspace_id == runtime_workspace_id
+        && target_runtime_instance.is_none_or(|expected| expected == runtime_instance)
 }
 
 fn invalidate_resource_projection(
@@ -7820,6 +7842,31 @@ fn stage_pending_port_job(
     job: crate::port_inventory::PortJob,
 ) {
     *pending = Some(job);
+}
+
+fn prepare_port_job_submission(
+    pending: &mut Option<crate::port_inventory::PortJob>,
+    snapshot: &mut Option<crate::port_inventory::PortSnapshot>,
+    current_generation: u64,
+    job_generation: u64,
+    explicit: bool,
+) -> bool {
+    if explicit {
+        *pending = None;
+        *snapshot = None;
+    }
+    job_generation == current_generation
+}
+
+fn stage_status_bar_intent(
+    pending: &mut Option<ui::agent_terminal::StatusBarIntent>,
+    intent: Option<ui::agent_terminal::StatusBarIntent>,
+) -> bool {
+    let Some(intent) = intent else {
+        return false;
+    };
+    *pending = Some(intent);
+    true
 }
 
 fn apply_port_outcome_if_current(
@@ -9989,6 +10036,7 @@ impl App {
             port_admission_blocked: false,
             unattached_counts: std::collections::HashMap::new(),
             pending_resource_maintenance: std::collections::VecDeque::new(),
+            pending_status_bar_intent: None,
             status_feed_rx: status_feed_rx_channel.0,
             status_feed_refresh: status_feed_rx_channel.1,
             status_feed_startup_polled: false,
@@ -12238,13 +12286,22 @@ impl App {
                 }
             }
             WorkspaceControllerAction::FocusPty {
-                switch_workspace,
+                workspace_id,
+                runtime_instance,
                 session,
             } => {
-                if let Some(workspace_id) = switch_workspace {
+                if workspace_id != self.active.id {
                     self.switch_workspace(&workspace_id);
-                    self.pending_focus = Some((workspace_id, session));
-                } else if let Some(pane) = self
+                }
+                if !workspace_focus_target_matches_runtime(
+                    &workspace_id,
+                    runtime_instance,
+                    &self.active.id,
+                    self.active.runtime_instance,
+                ) {
+                    return;
+                }
+                if let Some(pane) = self
                     .active
                     .workspace_ui
                     .mux()
@@ -12254,6 +12311,9 @@ impl App {
                         .active
                         .runtime
                         .send_command(runtime::RuntimeCommand::FocusPane { pane });
+                } else {
+                    self.pending_focus =
+                        Some((workspace_id, self.active.runtime_instance, session));
                 }
             }
             WorkspaceControllerAction::OpenStructured {
@@ -12358,10 +12418,15 @@ impl App {
     }
 
     fn poll_pending_workspace_focus(&mut self) {
-        let Some((workspace_id, session)) = self.pending_focus.clone() else {
+        let Some((workspace_id, runtime_instance, session)) = self.pending_focus.clone() else {
             return;
         };
-        if workspace_id != self.active.id {
+        if !workspace_focus_target_matches_runtime(
+            &workspace_id,
+            Some(runtime_instance),
+            &self.active.id,
+            self.active.runtime_instance,
+        ) {
             self.pending_focus = None;
             return;
         }
@@ -13491,7 +13556,8 @@ impl App {
                 if workspace_id != self.active.id {
                     self.switch_workspace(&workspace_id);
                     self.refresh_workspaces();
-                    self.pending_focus = Some((workspace_id, session_id));
+                    self.pending_focus =
+                        Some((workspace_id, self.active.runtime_instance, session_id));
                     return;
                 }
                 let target = runtime::MuxPaneId(pane_id);
@@ -14107,6 +14173,7 @@ impl App {
         self.unattached_counts.remove(workspace_id);
         self.pending_resource_maintenance
             .retain(|target| target.workspace_id != workspace_id);
+        self.invalidate_port_inventory_topology();
     }
 
     /// 종료 숨김을 해제하고 config에도 즉시 반영한다. 같은 활성 워크스페이스 재선택처럼
@@ -14119,6 +14186,7 @@ impl App {
         );
         if changed {
             self.activity_rows_cache = None;
+            self.invalidate_port_inventory_topology();
             if let Err(error) = self.config.save(&self.config_path) {
                 tracing::warn!(workspace = %workspace_id, "종료 워크스페이스 재열기 저장 실패: {error:#}");
             }
@@ -16217,6 +16285,7 @@ impl App {
     }
 
     fn refresh_workspaces(&mut self) {
+        let previous_port_roots = self.port_workspace_roots();
         match self.db.settings_workspace_projection_rows() {
             Ok(list) => {
                 let mut anchors = std::collections::HashMap::with_capacity(list.len());
@@ -16293,6 +16362,9 @@ impl App {
         }
         // 워크스페이스 목록/이름/경로가 바뀌었을 수 있다 — env/API 프로젝트 행 캐시 무효화.
         self.invalidate_env_api_projects();
+        if previous_port_roots != self.port_workspace_roots() {
+            self.invalidate_port_inventory_topology();
+        }
     }
 
     /// pressure 뱃지 표시 TTL — 회복 이벤트가 없어(큐가 빠져도 신호 없음) 마지막 관측이
@@ -16634,11 +16706,20 @@ impl App {
         if explicit {
             self.port_admission_blocked = false;
         }
+        let generation = port_job_generation(&job);
+        if !prepare_port_job_submission(
+            &mut self.pending_port_job,
+            &mut self.port_snapshot,
+            self.port_generation,
+            generation,
+            explicit,
+        ) {
+            return;
+        }
         if self.port_in_flight_generation.is_some() || self.port_admission_blocked {
             stage_pending_port_job(&mut self.pending_port_job, job);
             return;
         }
-        let generation = port_job_generation(&job);
         match self.port_worker.try_request(job) {
             Ok(()) => self.port_in_flight_generation = Some(generation),
             Err(crate::lazy_worker::LazyWorkerSubmitError::Full(job)) => {
@@ -16669,11 +16750,18 @@ impl App {
         self.submit_port_job(job, true);
     }
 
+    fn invalidate_port_inventory_topology(&mut self) {
+        next_port_generation(&mut self.port_generation);
+        self.port_snapshot = None;
+        self.pending_port_job = None;
+        self.port_admission_blocked = false;
+    }
+
     fn poll_port_inventory(&mut self, ctx: &egui::Context) {
         let Some(outcome) = self.port_worker.try_recv() else {
             return;
         };
-        self.port_in_flight_generation = None;
+        let completed_generation = self.port_in_flight_generation.take();
         match outcome.into_result() {
             Ok(outcome) => {
                 let error = match &outcome {
@@ -16689,6 +16777,9 @@ impl App {
                         error_code = ?error,
                         "port inventory operation failed"
                     );
+                    if completed_generation == Some(self.port_generation) {
+                        self.port_snapshot = None;
+                    }
                 }
                 if apply_port_outcome_if_current(
                     &mut self.port_snapshot,
@@ -16705,10 +16796,14 @@ impl App {
                     error_code = error.as_str(),
                     "port inventory worker failed"
                 );
+                if completed_generation == Some(self.port_generation) {
+                    self.port_snapshot = None;
+                }
             }
         }
         if !self.port_admission_blocked
             && let Some(job) = self.pending_port_job.take()
+            && port_job_generation(&job) == self.port_generation
         {
             self.submit_port_job(job, false);
         }
@@ -16717,6 +16812,7 @@ impl App {
     fn resource_runtime_contains_session(
         &self,
         workspace_id: &str,
+        runtime_instance: u64,
         session: runtime::SessionId,
     ) -> bool {
         let runtime = if workspace_id == self.active.id {
@@ -16725,13 +16821,23 @@ impl App {
             self.warm.get(workspace_id)
         };
         runtime
+            .filter(|runtime| runtime.runtime_instance == runtime_instance)
             .and_then(|runtime| runtime.workspace_ui.mux())
             .is_some_and(|mux| pane_of_session(mux, session).is_some())
     }
 
-    fn stage_resource_target(&mut self, workspace_id: String, action: ResourceMaintenanceAction) {
-        let owns_local_runtime =
-            workspace_id == self.active.id || self.warm.contains_key(&workspace_id);
+    fn stage_resource_target(
+        &mut self,
+        workspace_id: String,
+        runtime_instance: u64,
+        action: ResourceMaintenanceAction,
+    ) {
+        let owns_local_runtime = (workspace_id == self.active.id
+            && self.active.runtime_instance == runtime_instance)
+            || self
+                .warm
+                .get(&workspace_id)
+                .is_some_and(|runtime| runtime.runtime_instance == runtime_instance);
         if !owns_local_runtime {
             return;
         }
@@ -16739,6 +16845,7 @@ impl App {
             &mut self.pending_resource_maintenance,
             ResourceMaintenanceTarget {
                 workspace_id,
+                runtime_instance,
                 action,
             },
         ) {
@@ -16755,12 +16862,20 @@ impl App {
         // Every resident workspace is backed by the concrete in-process runtime client. SSH
         // sessions are child processes inside that local runtime; no RemoteRuntimeClient is owned
         // by this collection, so maintenance cannot cross a remote transport boundary.
-        let workspace_ids = std::iter::once(self.active.id.clone())
-            .chain(self.warm.keys().cloned())
+        let workspace_ids = std::iter::once((self.active.id.clone(), self.active.runtime_instance))
+            .chain(
+                self.warm
+                    .values()
+                    .map(|runtime| (runtime.id.clone(), runtime.runtime_instance)),
+            )
             .take(ui::activity::MAX_ACTIVITY_WORKSPACES)
             .collect::<Vec<_>>();
-        for workspace_id in workspace_ids {
-            self.stage_resource_target(workspace_id, ResourceMaintenanceAction::InspectUnattached);
+        for (workspace_id, runtime_instance) in workspace_ids {
+            self.stage_resource_target(
+                workspace_id,
+                runtime_instance,
+                ResourceMaintenanceAction::InspectUnattached,
+            );
         }
     }
 
@@ -16779,9 +16894,15 @@ impl App {
                 runtime::RuntimeCommand::KillSession { session }
             }
         };
-        let result = if target.workspace_id == self.active.id {
+        let result = if resource_target_matches_runtime(
+            &target,
+            &self.active.id,
+            self.active.runtime_instance,
+        ) {
             self.active.runtime.send_command(command)
-        } else if let Some(runtime) = self.warm.get(&target.workspace_id) {
+        } else if let Some(runtime) = self.warm.get(&target.workspace_id).filter(|runtime| {
+            resource_target_matches_runtime(&target, &runtime.id, runtime.runtime_instance)
+        }) {
             runtime.runtime.send_command(command)
         } else {
             return;
@@ -16810,24 +16931,32 @@ impl App {
                 ui::resource_manager::ResourceManagerIntent::InspectUnattached => {
                     self.stage_unattached_inspection();
                 }
-                ui::resource_manager::ResourceManagerIntent::KillUnattached { workspace_id } => {
+                ui::resource_manager::ResourceManagerIntent::KillUnattached {
+                    workspace_id,
+                    runtime_instance,
+                } => {
                     self.stage_resource_target(
                         workspace_id.to_string(),
+                        runtime_instance,
                         ResourceMaintenanceAction::KillUnattached,
                     );
                 }
                 ui::resource_manager::ResourceManagerIntent::FocusSession {
                     workspace_id,
+                    runtime_instance,
                     session,
                 } => {
-                    if self.resource_runtime_contains_session(&workspace_id, session) {
+                    if self.resource_runtime_contains_session(
+                        &workspace_id,
+                        runtime_instance,
+                        session,
+                    ) {
                         self.agent_terminal_ui
                             .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-                        let switch_workspace = (workspace_id.as_ref() != self.active.id)
-                            .then(|| workspace_id.to_string());
                         self.stage_workspace_controller_action(
                             WorkspaceControllerAction::FocusPty {
-                                switch_workspace,
+                                workspace_id: workspace_id.to_string(),
+                                runtime_instance: Some(runtime_instance),
                                 session,
                             },
                         );
@@ -16835,11 +16964,17 @@ impl App {
                 }
                 ui::resource_manager::ResourceManagerIntent::KillSession {
                     workspace_id,
+                    runtime_instance,
                     session,
                 } => {
-                    if self.resource_runtime_contains_session(&workspace_id, session) {
+                    if self.resource_runtime_contains_session(
+                        &workspace_id,
+                        runtime_instance,
+                        session,
+                    ) {
                         self.stage_resource_target(
                             workspace_id.to_string(),
+                            runtime_instance,
                             ResourceMaintenanceAction::KillSession(session),
                         );
                     }
@@ -16916,6 +17051,7 @@ impl App {
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
                         workspace_id: Arc::from(ws.id.as_str()),
+                        runtime_instance: Some(self.active.runtime_instance),
                         name: Self::workspace_display_name(ws).into(),
                         metric_availability: if self.active.resource_usage.is_some() {
                             ui::activity::ActivityMetricAvailability::Local
@@ -16999,6 +17135,7 @@ impl App {
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
                         workspace_id: Arc::from(ws.id.as_str()),
+                        runtime_instance: Some(rt.runtime_instance),
                         name: Self::workspace_display_name(ws).into(),
                         metric_availability: if rt.resource_usage.is_some() {
                             ui::activity::ActivityMetricAvailability::Local
@@ -17043,6 +17180,7 @@ impl App {
                     .collect::<Vec<_>>();
                 ui::activity::ActivityWorkspaceRow {
                     workspace_id: Arc::from(ws.id.as_str()),
+                    runtime_instance: None,
                     name: Self::workspace_display_name(ws).into(),
                     metric_availability: ui::activity::ActivityMetricAvailability::Local,
                     // DB에는 있으나 active/warm runtime이 없는 워크스페이스도 숨기지 않고
@@ -18534,6 +18672,9 @@ impl eframe::App for App {
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
         self.poll_agent_state_worker();
+        if let Some(intent) = self.pending_status_bar_intent.take() {
+            self.dispatch_status_bar_intent(Some(intent), ctx);
+        }
         self.poll_port_inventory(ctx);
         self.pump_resource_maintenance();
         self.pump_perf_harness();
@@ -20524,7 +20665,9 @@ impl eframe::App for App {
         }
         // take/put-back 마무리 — 위 take에서 꺼낸 rows를 타임스탬프 그대로 되돌린다.
         self.activity_rows_cache = Some((activity_rows_stamp, activity_rows));
-        self.dispatch_status_bar_intent(status_intent, ui.ctx());
+        if stage_status_bar_intent(&mut self.pending_status_bar_intent, status_intent) {
+            ui.ctx().request_repaint();
+        }
         match home_action {
             Some(ui::agent_terminal::HomeAction::Connectors) => {
                 self.settings_category = ui::settings::Category::Connectors;
@@ -21719,7 +21862,8 @@ impl eframe::App for App {
                     AgentNotificationNavigation::FocusCurrentPty { session } => {
                         self.stage_workspace_controller_action(
                             WorkspaceControllerAction::FocusPty {
-                                switch_workspace: None,
+                                workspace_id: self.active.id.clone(),
+                                runtime_instance: Some(self.active.runtime_instance),
                                 session,
                             },
                         );
@@ -21728,9 +21872,14 @@ impl eframe::App for App {
                         workspace_id,
                         session,
                     } => {
+                        let runtime_instance = self
+                            .warm
+                            .get(&workspace_id)
+                            .map(|runtime| runtime.runtime_instance);
                         self.stage_workspace_controller_action(
                             WorkspaceControllerAction::FocusPty {
-                                switch_workspace: Some(workspace_id),
+                                workspace_id,
+                                runtime_instance,
                                 session,
                             },
                         );
@@ -22933,6 +23082,7 @@ mod tests {
                 &mut queue,
                 ResourceMaintenanceTarget {
                     workspace_id: format!("workspace-{index}"),
+                    runtime_instance: index as u64 + 1,
                     action: ResourceMaintenanceAction::InspectUnattached,
                 },
             );
@@ -22943,6 +23093,7 @@ mod tests {
             &mut queue,
             ResourceMaintenanceTarget {
                 workspace_id: "workspace-1".to_owned(),
+                runtime_instance: 999,
                 action: ResourceMaintenanceAction::KillUnattached,
             },
         );
@@ -22960,10 +23111,12 @@ mod tests {
         let mut queue = std::collections::VecDeque::from([
             ResourceMaintenanceTarget {
                 workspace_id: "kept".to_owned(),
+                runtime_instance: 1,
                 action: ResourceMaintenanceAction::InspectUnattached,
             },
             ResourceMaintenanceTarget {
                 workspace_id: "removed".to_owned(),
+                runtime_instance: 2,
                 action: ResourceMaintenanceAction::KillUnattached,
             },
         ]);
@@ -23020,6 +23173,112 @@ mod tests {
             snapshot.as_ref().map(|value| value.rows[0].port),
             Some(8443)
         );
+    }
+
+    #[test]
+    fn status_resource_port_app_new_refresh_discards_unavailable_stale_terminate() {
+        let roots: Arc<[crate::port_inventory::PortWorkspaceRoot]> = Arc::from([]);
+        let mut generation = 0;
+        let stale = next_port_termination_job(
+            &mut generation,
+            Arc::clone(&roots),
+            crate::port_inventory::PortTerminationTarget {
+                workspace_id: Arc::from("workspace"),
+                pid: 41,
+                port: 3000,
+                bind: Arc::from("127.0.0.1"),
+                protocol: crate::port_inventory::PortProtocol::Tcp,
+                process_started_at: Arc::from("birth"),
+            },
+        );
+        let mut pending = Some(stale);
+        let mut snapshot = Some(port_snapshot_fixture(generation, 3000));
+        let refresh = next_port_scan_job(&mut generation, roots);
+
+        assert!(prepare_port_job_submission(
+            &mut pending,
+            &mut snapshot,
+            generation,
+            port_job_generation(&refresh),
+            true,
+        ));
+        assert!(
+            pending.is_none(),
+            "the stale terminate must never run later"
+        );
+        assert!(snapshot.is_none(), "a new generation hides stale rows");
+    }
+
+    #[test]
+    fn status_resource_port_app_replaced_runtime_rejects_stale_kill() {
+        let target = ResourceMaintenanceTarget {
+            workspace_id: "workspace".to_owned(),
+            runtime_instance: 7,
+            action: ResourceMaintenanceAction::KillSession(runtime::SessionId(11)),
+        };
+
+        assert!(resource_target_matches_runtime(&target, "workspace", 7));
+        assert!(!resource_target_matches_runtime(&target, "workspace", 8));
+        assert!(!resource_target_matches_runtime(&target, "replacement", 7));
+    }
+
+    #[test]
+    fn status_resource_port_app_replaced_runtime_rejects_stale_focus() {
+        assert!(workspace_focus_target_matches_runtime(
+            "workspace",
+            Some(7),
+            "workspace",
+            7,
+        ));
+        assert!(!workspace_focus_target_matches_runtime(
+            "workspace",
+            Some(7),
+            "workspace",
+            8,
+        ));
+        assert!(!workspace_focus_target_matches_runtime(
+            "workspace",
+            Some(7),
+            "replacement",
+            7,
+        ));
+        assert!(workspace_focus_target_matches_runtime(
+            "workspace",
+            None,
+            "workspace",
+            8,
+        ));
+    }
+
+    #[test]
+    fn status_resource_port_app_ui_only_stages_intent_for_logic() {
+        let source = include_str!("app.rs");
+        let logic = source
+            .split_once("    fn logic(&mut self")
+            .and_then(|(_, tail)| tail.split_once("    fn ui(&mut self"))
+            .map(|(body, _)| body)
+            .expect("logic function remains discoverable");
+        let ui = source
+            .split_once("    fn ui(&mut self")
+            .map(|(_, body)| body)
+            .expect("ui function remains discoverable");
+
+        let staged = ["stage_status_bar_", "intent("].concat();
+        let forbidden_render_dispatch =
+            ["self.dispatch_status_bar_", "intent(status_intent"].concat();
+        assert!(ui.contains(&staged));
+        assert!(!ui.contains(&forbidden_render_dispatch));
+        let dispatch = logic
+            .find("dispatch_status_bar_intent")
+            .expect("logic consumes the status intent");
+        let port_pump = logic
+            .find("poll_port_inventory")
+            .expect("logic pumps the port worker");
+        let resource_pump = logic
+            .find("pump_resource_maintenance")
+            .expect("logic pumps resource maintenance");
+        assert!(dispatch < port_pump);
+        assert!(dispatch < resource_pump);
     }
 
     fn port_snapshot_fixture(generation: u64, port: u16) -> crate::port_inventory::PortSnapshot {

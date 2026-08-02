@@ -7277,6 +7277,10 @@ pub struct App {
     /// 세션별 에이전트 표시 정보(model/effort/context) — 워커 raw(transcript). claude는
     /// effort/context를 statusLine DB(아래)에서 병합해 최종본을 WorkspaceUi로 넘긴다.
     agent_info: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
+    /// 직전 프레임의 PTY 에이전트 표면. 단축키 처리가 에이전트 패널 렌더보다 먼저
+    /// 돌기 때문에, 패널이 채워주는 목록을 기다리면 대상을 못 찾는다 (2026-08-02:
+    /// pane은 포커스돼 있는데 `pty_surfaces=0`이라 강도 단축키가 패널만 열었다).
+    pty_agent_surfaces_cache: Vec<crate::agent_surface::AgentSurfaceSnapshot>,
     /// claude statusLine이 보고한 effort/model/context% — 1s 스로틀로 DB에서 읽어 병합.
     statuslines: std::collections::HashMap<runtime::SessionId, storage::StatuslineRow>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
@@ -10111,6 +10115,7 @@ impl App {
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
+            pty_agent_surfaces_cache: Vec::new(),
             statuslines: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
@@ -11361,23 +11366,11 @@ impl App {
     /// WorkspaceUi에 넘긴다. claude는 statusLine의 effort/model/context%를 우선(정확),
     /// 없으면 transcript 값. codex는 raw 그대로.
     fn push_agent_display(&mut self) {
-        use crate::agent_detect::{AgentDisplay, AgentKind};
+        use crate::agent_detect::AgentDisplay;
         let mut merged: std::collections::HashMap<runtime::SessionId, AgentDisplay> =
             self.agent_info.clone();
-        for (sid, d) in merged.iter_mut() {
-            if d.kind == AgentKind::Claude
-                && let Some(sl) = self.statuslines.get(sid)
-            {
-                if sl.effort.is_some() {
-                    d.effort = sl.effort.clone();
-                }
-                if sl.model.is_some() {
-                    d.model = sl.model.clone(); // "Opus 4.8 (1M context)" — transcript보다 나음
-                }
-                if let Some(pct) = sl.context_pct {
-                    d.context_pct = Some(pct.clamp(0, 100) as u8);
-                }
-            }
+        for (sid, display) in merged.iter_mut() {
+            apply_claude_statusline(display, self.statuslines.get(sid));
         }
         self.active.workspace_ui.set_agent_info(merged);
     }
@@ -11390,19 +11383,38 @@ impl App {
             .iter()
             .filter_map(|entry| {
                 let session_id = entry.session?;
-                let info = self.agent_info.get(&session_id)?;
+                // 표면의 존재 근거는 **바인딩**이다 — "이 pane이 어떤 에이전트를
+                // 돌리고 있는가". `agent_info`는 transcript를 읽어야 생기는 부가
+                // 정보(model/effort/context)라 그걸 필수로 걸면, 에이전트가 이미
+                // 돌고 있는데도 transcript가 파싱되기 전까지 표면이 통째로 없다.
+                // 실제로 그 때문에 강도 단축키가 대상을 못 찾고 패널만 열렸다
+                // (2026-08-02: focused_session=Some(1)인데 pty_surfaces=0).
+                let kind = self.agent_bindings.get(&session_id)?.kind;
+                // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. claude는
+                // transcript에 effort가 아예 없고 statusLine에만 있어서, 병합을 건너뛰면
+                // effort가 영영 None이고 강도 단축키가 조용히 아무것도 안 한다.
+                let mut display = self.agent_info.get(&session_id).cloned().unwrap_or(
+                    crate::agent_detect::AgentDisplay {
+                        kind,
+                        model: None,
+                        effort: None,
+                        context_pct: None,
+                        last_agent_summary: None,
+                    },
+                );
+                apply_claude_statusline(&mut display, self.statuslines.get(&session_id));
                 Some(crate::agent_surface::AgentSurfaceSnapshot {
                     id: crate::agent_surface::AgentSurfaceId::Pty {
                         workspace_id: self.active.id.clone(),
                         pane_id: entry.pane.0.clone(),
                         session_id,
                     },
-                    provider: crate::agent_surface::AgentProvider::from(info.kind),
+                    provider: crate::agent_surface::AgentProvider::from(kind),
                     transport: crate::agent_surface::AgentTransport::Pty,
                     title: entry.title.clone(),
-                    model: info.model.clone(),
-                    effort: info.effort.clone(),
-                    context_pct: info.context_pct,
+                    model: display.model,
+                    effort: display.effort,
+                    context_pct: display.context_pct,
                     state: crate::agent_surface::AgentVisualState::from_pty(entry.status),
                 })
             })
@@ -13480,6 +13492,8 @@ impl App {
         self.session_cwds.clear();
         self.workspace_rename_prompt = None; // 워크스페이스 전환 시 옛 rename 제안 폐기
         self.agent_info.clear();
+        // 이전 워크스페이스의 표면이 남아 있으면 단축키가 그쪽 세션에 입력을 쓴다.
+        self.pty_agent_surfaces_cache.clear();
         self.statuslines.clear();
         let _ = old
             .runtime
@@ -13731,7 +13745,9 @@ impl App {
             | A::ApproveAgent
             | A::RejectAgent
             | A::IncreaseAgentEffort
-            | A::DecreaseAgentEffort => {
+            | A::DecreaseAgentEffort
+            | A::NextAgentModel
+            | A::PreviousAgentModel => {
                 self.handle_agent_shortcut(action, ctx);
             }
         }
@@ -13757,9 +13773,56 @@ impl App {
             A::RejectAgent => AgentAction::Reject,
             A::IncreaseAgentEffort => AgentAction::EffortUp,
             A::DecreaseAgentEffort => AgentAction::EffortDown,
+            A::NextAgentModel => AgentAction::ModelNext,
+            A::PreviousAgentModel => AgentAction::ModelPrev,
             _ => return,
         };
-        let selected = self.agent_sessions_ui.selected_surface_snapshot();
+        // 명시적으로 고른 표면이 없으면 **지금 보고 있는 pane**의 에이전트로 폴백한다.
+        // 패널에서 행을 클릭하거나 순회 단축키를 눌러야만 대상이 잡히면, 사용자는
+        // pane을 보면서 단축키를 눌렀는데 패널만 열리는 경험을 한다.
+        //
+        // 폴백은 **강도 조절에만** 건다. 다른 동작(중단·승인·거절)은 실행부가
+        // `agent_sessions_ui`의 내부 선택 상태를 다시 읽으므로, 게이트만 통과시키면
+        // 실행에서 막혀 "허용됐다는데 아무 일도 안 일어나는" 실패가 된다. 강도 조절의
+        // PTY 경로만 여기서 넘긴 스냅샷을 그대로 쓴다.
+        let selected = self
+            .agent_sessions_ui
+            .selected_surface_snapshot()
+            .or_else(|| {
+                if !matches!(
+                    action,
+                    AgentAction::EffortUp
+                        | AgentAction::EffortDown
+                        | AgentAction::ModelNext
+                        | AgentAction::ModelPrev
+                ) {
+                    return None;
+                }
+                let session = self.active.workspace_ui.focused_session();
+                let surface = session.and_then(|session| {
+                    self.pty_agent_surfaces_cache
+                        .iter()
+                        .find(|surface| {
+                            matches!(
+                                &surface.id,
+                                crate::agent_surface::AgentSurfaceId::Pty { session_id, .. }
+                                    if *session_id == session
+                            )
+                        })
+                        .cloned()
+                });
+                if surface.is_none() {
+                    // 폴백이 빗나가면 사용자는 "패널만 열리는" 결과만 본다. 어느
+                    // 단계에서 끊겼는지 남겨야 진단이 된다.
+                    tracing::info!(
+                        focused_session = ?session,
+                        pty_surfaces = self.pty_agent_surfaces_cache.len(),
+                        bindings = self.agent_bindings.len(),
+                        "PTY effort 폴백 실패"
+                    );
+                }
+                surface
+            });
         let pending = self.agent_sessions_ui.selected_pending_approval_count();
         let gate = gate_action(action, selected.as_ref(), pending);
         if !gate.is_allowed() {
@@ -13811,14 +13874,43 @@ impl App {
                 None
             }
             AgentAction::EffortUp | AgentAction::EffortDown => {
-                self.agent_sessions_ui.open();
-                let delta = if action == AgentAction::EffortUp {
-                    1
+                let step = if action == AgentAction::EffortUp {
+                    crate::pty_effort::EffortStep::Up
                 } else {
-                    -1
+                    crate::pty_effort::EffortStep::Down
                 };
-                if let Err(error) = self.agent_sessions_ui.adjust_selected_effort(delta) {
-                    tracing::warn!("에이전트 effort 단축키 실패: {error:#}");
+                // PTY는 CLI에 직접 써 넣는다. 패널을 열지 않는다 — 사용자가 보고
+                // 있는 건 pane이고, 강도 조절 때마다 패널이 튀어나오면 방해다.
+                if let Some(surface) = selected.as_ref().filter(|surface| {
+                    surface.transport == crate::agent_surface::AgentTransport::Pty
+                }) {
+                    self.adjust_pty_effort(surface, step);
+                    None
+                } else {
+                    self.agent_sessions_ui.open();
+                    let delta = if action == AgentAction::EffortUp {
+                        1
+                    } else {
+                        -1
+                    };
+                    if let Err(error) = self.agent_sessions_ui.adjust_selected_effort(delta) {
+                        tracing::warn!("에이전트 effort 단축키 실패: {error:#}");
+                    }
+                    None
+                }
+            }
+            AgentAction::ModelNext | AgentAction::ModelPrev => {
+                let step = if action == AgentAction::ModelNext {
+                    crate::pty_effort::EffortStep::Up
+                } else {
+                    crate::pty_effort::EffortStep::Down
+                };
+                // structured 세션의 모델 전환은 아직 없다(`model_control`은 캡만 있고
+                // 소비자가 없음). PTY만 처리하고, 나머지는 게이트가 이미 막는다.
+                if let Some(surface) = selected.as_ref().filter(|surface| {
+                    surface.transport == crate::agent_surface::AgentTransport::Pty
+                }) {
+                    self.adjust_pty_model(surface, step);
                 }
                 None
             }
@@ -13830,6 +13922,107 @@ impl App {
         if let Some(request) = request {
             self.handle_agent_sessions_request(request);
         }
+    }
+
+    /// PTY 에이전트의 추론 강도를 한 단계 옮긴다.
+    ///
+    /// 보내는 입력은 provider마다 다르다 — `pty_effort` 참조. 여기서는 **보내도
+    /// 안전한지**만 판단한다:
+    ///
+    /// 1. `InterruptPty`와 같은 신원 재검증 — 단축키를 누른 프레임과 여기 사이에
+    ///    workspace가 바뀌거나 pane이 닫혔을 수 있다. 엉뚱한 세션에 쓰면 그 CLI에
+    ///    `/effort high`가 **사용자 프롬프트로** 들어간다.
+    /// 2. 슬래시 경로는 에이전트가 유휴일 때만 보낸다. 작업 중 composer에 넣으면
+    ///    그대로 프롬프트가 된다. 키 경로(Codex)는 CLI가 자체 판단하므로 면제다.
+    fn adjust_pty_effort(
+        &mut self,
+        surface: &crate::agent_surface::AgentSurfaceSnapshot,
+        step: crate::pty_effort::EffortStep,
+    ) {
+        let plan = crate::pty_effort::plan(surface.provider, step, surface.effort.as_deref());
+        self.send_pty_agent_plan(surface, plan, "effort");
+    }
+
+    /// 모델을 카탈로그 순서로 한 칸 옮긴다. Claude 전용 — Codex는 게이트가 막는다
+    /// (`pty_effort::supports_model` 참조: 슬래시 인자가 프롬프트로 흘러 턴을 태운다).
+    fn adjust_pty_model(
+        &mut self,
+        surface: &crate::agent_surface::AgentSurfaceSnapshot,
+        step: crate::pty_effort::EffortStep,
+    ) {
+        let plan = crate::pty_effort::plan_model(surface.provider, step, surface.model.as_deref());
+        self.send_pty_agent_plan(surface, plan, "model");
+    }
+
+    /// 계획된 입력을 대상 PTY에 써 넣는다. 강도·모델이 같은 안전 규칙을 공유한다.
+    fn send_pty_agent_plan(
+        &mut self,
+        surface: &crate::agent_surface::AgentSurfaceSnapshot,
+        plan: Result<crate::pty_effort::EffortPlan, crate::pty_effort::EffortBlocked>,
+        what: &'static str,
+    ) {
+        use crate::agent_surface::{AgentSurfaceId, AgentVisualState};
+        use crate::pty_effort::{EffortBlocked, EffortPlan};
+
+        let AgentSurfaceId::Pty {
+            workspace_id,
+            pane_id,
+            session_id,
+        } = &surface.id
+        else {
+            return;
+        };
+        let still_matches = *workspace_id == self.active.id
+            && self.active.workspace_ui.mux().is_some_and(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id.0 == *pane_id && pane.session_id == Some(*session_id))
+            });
+        if !still_matches {
+            tracing::info!(what, "PTY 조정: 대상 세션이 더 이상 활성 workspace에 없다");
+            return;
+        }
+
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(EffortBlocked::AtLimit) => {
+                tracing::info!(what, "PTY 조정: 이미 사다리 끝");
+                return;
+            }
+            Err(EffortBlocked::UnknownCurrentEffort) => {
+                // 임의로 가정하지 않는다 — 틀리면 사용자가 누른 적 없는 값으로
+                // 세션과 전역 기본값이 함께 바뀐다.
+                tracing::info!(what, "PTY 조정: 현재 값을 몰라 다음 단계를 못 정한다");
+                return;
+            }
+        };
+
+        let bytes = match plan {
+            EffortPlan::Keys(bytes) => bytes,
+            EffortPlan::Slash { line, .. } => {
+                // 진행 중이면 슬래시 한 줄이 프롬프트로 먹힌다. 유휴일 때만 보낸다.
+                if !matches!(
+                    surface.state,
+                    AgentVisualState::Idle | AgentVisualState::Complete | AgentVisualState::Off
+                ) {
+                    tracing::info!(what, "PTY 조정: 에이전트가 작업 중이라 보내지 않는다");
+                    return;
+                }
+                // 결과는 CLI가 pane에 직접 찍는다 — Claude는 전역 기본값까지
+                // 바뀐다는 사실을 자기 출력에 포함한다("saved as your default for
+                // new sessions"). deppy가 따로 알릴 필요가 없다.
+                line.into_bytes()
+            }
+        };
+
+        let _ = self
+            .active
+            .runtime
+            .send_command(runtime::RuntimeCommand::WriteInput {
+                session: *session_id,
+                bytes,
+            });
     }
 
     /// warm 풀이 max_warm(설정)을 넘으면 가장 오래된 것부터 Suspended로 내린다 (워커
@@ -19472,6 +19665,12 @@ impl eframe::App for App {
         // 같은 상태 원천을 사용하므로 사이드바가 꺼져 있어도 계산한다.
         self.update_session_alerts(&mut terminal_sessions);
         let pty_agent_surfaces = self.pty_agent_surfaces(&terminal_sessions);
+        // 단축키 처리(`handle_configured_shortcut`)는 이 지점보다 **앞서** 돈다. 그때
+        // `agent_sessions_ui.pty_surfaces`를 읽으면 패널이 아직 렌더되지 않은 프레임에서
+        // 빈 목록을 보게 되고, 강도 단축키가 대상을 못 찾아 패널만 열린다. App이 직접
+        // 들고 있으면 UI 렌더 여부와 무관해진다.
+        self.pty_agent_surfaces_cache
+            .clone_from(&pty_agent_surfaces);
         let active_workspace_id = self.active.id.clone();
         // 종료 숨김 해제 — 종료 때 닫히던 pane이 아닌 **새** 세션이 활성에 나타나면
         // (새 셸/에이전트) 목록에 복귀시킨다. 종료 직후 exit 이벤트를 기다리는 옛
@@ -22509,6 +22708,36 @@ fn shortcut_targets_primary_terminal(action: crate::shortcuts::ShortcutAction) -
             | A::PromptJumpPrev
             | A::PromptJumpNext
     )
+}
+
+/// claude statusLine 값을 표시정보에 덮어쓴다.
+///
+/// claude transcript에는 **effort가 아예 없다** — statusLine(→DB)만이 원천이다.
+/// model/context%도 statusLine 쪽이 정확하다("Opus 4.8 (1M context)"처럼 표기가 낫다).
+/// codex는 transcript가 전부를 담으므로 건드리지 않는다.
+///
+/// 사이드바 표시와 PTY 표면이 **같은 함수**를 쓰게 묶어둔 이유는, 한쪽만 병합하면
+/// 화면에는 강도가 보이는데 단축키는 "현재 강도를 모른다"며 아무것도 안 하는 상태가
+/// 되기 때문이다 (2026-08-02 실제 증상).
+fn apply_claude_statusline(
+    display: &mut crate::agent_detect::AgentDisplay,
+    statusline: Option<&storage::StatuslineRow>,
+) {
+    if display.kind != crate::agent_detect::AgentKind::Claude {
+        return;
+    }
+    let Some(statusline) = statusline else {
+        return;
+    };
+    if statusline.effort.is_some() {
+        display.effort = statusline.effort.clone();
+    }
+    if statusline.model.is_some() {
+        display.model = statusline.model.clone();
+    }
+    if let Some(pct) = statusline.context_pct {
+        display.context_pct = Some(pct.clamp(0, 100) as u8);
+    }
 }
 
 fn configured_terminal_shortcut_blocked(

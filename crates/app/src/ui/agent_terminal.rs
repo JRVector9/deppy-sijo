@@ -9,6 +9,10 @@ use std::collections::HashMap;
 pub(crate) enum StatusBarIntent {
     Resource(ResourceManagerIntent),
     Ports(PortsIntent),
+    /// 대기 개수 클릭 — 작업함(이미 있는 대기 카드 목록)을 연다.
+    OpenInbox,
+    /// 대기 중인 세션 칩 클릭 — 그 세션으로 바로 이동한다. 작업함을 거치지 않는다.
+    FocusWaiting(crate::ui::notifications::AgentNotificationTarget),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -84,6 +88,28 @@ pub struct AgentTerminalUi {
     announcement_filter: AnnouncementFilter,
     resource_manager: ResourceManagerUi,
     ports: PortsUi,
+}
+
+/// 한 줄에 펼 칩 개수. 넘치면 작업함이 받는다 — 상태바가 목록이 되면 안 된다.
+const WAITING_CHIP_MAX: usize = 3;
+/// 승인은 되돌리기 어려워 더 강한 신호를 준다.
+const APPROVAL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x71, 0x4a);
+/// 입력 대기는 기다림일 뿐이라 한 단계 낮춘다.
+const WAITING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe7, 0x9a, 0x3b);
+/// 예약은 아직 일어나지 않은 일이라 가장 약하게 — 알리되 주장하지 않는다.
+const QUEUED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x9b, 0xb0);
+
+/// 주목 항목용 클릭 가능한 라벨. 눌리는 것은 눌리게 보여야 한다.
+fn status_attention_button(ui: &mut egui::Ui, label: &str, color: egui::Color32) -> egui::Response {
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new(label).color(color).size(11.5))
+            .frame(false)
+            .small(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 impl AgentTerminalUi {
@@ -165,7 +191,11 @@ impl AgentTerminalUi {
         claude_usage: Option<(u8, u8)>,
         codex_usage: Option<(u8, u8)>,
         rows: &[ActivityWorkspaceRow],
-        waiting: usize,
+        approvals: usize,
+        // `waiting_sessions`: 입력 대기 세션 — (표시 라벨, 이동 대상). 칩으로 직접 노출한다.
+        waiting_sessions: &[(String, crate::ui::notifications::AgentNotificationTarget)],
+        // `queued`: 턴이 끝나면 보낼 예약. 눌렀는데 화면이 그대로면 "안 먹었다"로 읽힌다.
+        queued: &[String],
         mcp_count: usize,
         feed: &StatusFeedSnapshot,
         ports: Option<&PortSnapshot>,
@@ -221,12 +251,50 @@ impl AgentTerminalUi {
                     crate::status_feed::GITHUB_STATUS_URL,
                     catalog,
                 );
-                if waiting > 0 {
+                // 주목이 필요한 것만 자리를 차지한다 — 조용할 땐 아무것도 그리지 않는다.
+                // 승인과 입력 대기는 성격이 달라 나눈다(승인은 되돌리기 어렵고, 입력은
+                // 그냥 기다림이다). 화면에서 보고 합칠지 정한다.
+                // 예약은 사용자가 방금 누른 것의 영수증이다 — 대기/승인보다 먼저 보인다.
+                if !queued.is_empty() {
                     crate::ui::designall::vertical_separator(ui, 14.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-                        catalog.t("status_bar.waiting", &[("count", &waiting.to_string())]),
+                    for label in queued.iter().take(WAITING_CHIP_MAX) {
+                        ui.colored_label(
+                            QUEUED_COLOR,
+                            egui::RichText::new(label).size(11.5).italics(),
+                        );
+                    }
+                }
+                if approvals > 0 {
+                    crate::ui::designall::vertical_separator(ui, 14.0);
+                    let label =
+                        catalog.t("status_bar.approvals", &[("count", &approvals.to_string())]);
+                    if status_attention_button(ui, &label, APPROVAL_COLOR).clicked() {
+                        intent = Some(StatusBarIntent::OpenInbox);
+                    }
+                }
+                if !waiting_sessions.is_empty() {
+                    crate::ui::designall::vertical_separator(ui, 14.0);
+                    let label = catalog.t(
+                        "status_bar.waiting",
+                        &[("count", &waiting_sessions.len().to_string())],
                     );
+                    if status_attention_button(ui, &label, WAITING_COLOR).clicked() {
+                        intent = Some(StatusBarIntent::OpenInbox);
+                    }
+                    // 칩은 "일일이 찾아가지 않기" 위한 직접 이동 대상이다. 한 줄이
+                    // 목록을 다 담을 수는 없으므로 몇 개만 펴고 나머지는 작업함이 받는다.
+                    for (label, target) in waiting_sessions.iter().take(WAITING_CHIP_MAX) {
+                        if status_attention_button(ui, label, WAITING_COLOR).clicked() {
+                            intent = Some(StatusBarIntent::FocusWaiting(target.clone()));
+                        }
+                    }
+                    let overflow = waiting_sessions.len().saturating_sub(WAITING_CHIP_MAX);
+                    if overflow > 0
+                        && status_attention_button(ui, &format!("+{overflow}"), WAITING_COLOR)
+                            .clicked()
+                    {
+                        intent = Some(StatusBarIntent::OpenInbox);
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
@@ -1111,6 +1179,8 @@ mod tests {
                     None,
                     &[],
                     2,
+                    &[],
+                    &[],
                     5,
                     &feed,
                     None,
@@ -1132,10 +1202,73 @@ mod tests {
         harness.get_by_label("Claude");
         harness.get_by_label("OpenAI");
         harness.get_by_label("GitHub");
-        harness.get_by_label("Waiting for input 2");
+        // 승인과 입력 대기는 성격이 달라 따로 센다 — 여기서는 승인 2건만 있고
+        // 입력 대기 세션은 없으므로 승인 라벨만 나와야 한다.
+        harness.get_by_label("Approval 2");
+        assert!(harness.query_by_label("Waiting for input 0").is_none());
         assert!(harness.query_by_label("Terminal").is_none());
         harness.get_by_label("CPU — · App 0 B · Sessions 0 B");
         harness.get_by_label("Ports —");
+    }
+
+    /// 칩은 "일일이 찾아가지 않고 클릭해서 이동"의 실체다. 한 줄이 목록이 되면 안 되므로
+    /// `WAITING_CHIP_MAX`까지만 펴고 나머지는 `+N`으로 접어 작업함이 받는다.
+    #[test]
+    fn kittest_입력대기_칩은_상한까지만_펴고_나머지는_접는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let feed = StatusFeedSnapshot::default();
+        let waiting: Vec<(String, crate::ui::notifications::AgentNotificationTarget)> = (1..=5)
+            .map(|n| {
+                (
+                    format!("agent-{n}"),
+                    crate::ui::notifications::AgentNotificationTarget::Pty {
+                        workspace_id: "ws".to_owned(),
+                        session: runtime::SessionId(n),
+                    },
+                )
+            })
+            .collect();
+        let mut harness = egui_kittest::Harness::builder().build_ui_state(
+            move |ui, fonts_ready| {
+                if !*fonts_ready {
+                    return;
+                }
+                AgentTerminalUi::new().status_bar_with_managers(
+                    ui,
+                    None,
+                    None,
+                    &[],
+                    0,
+                    &waiting,
+                    &[],
+                    0,
+                    &feed,
+                    None,
+                    &HashMap::new(),
+                    None,
+                    0,
+                    &catalog,
+                );
+            },
+            false,
+        );
+        harness.set_size(egui::vec2(1400.0, 100.0));
+        install_sidebar_test_fonts(&harness.ctx);
+        *harness.state_mut() = true;
+        harness.run();
+
+        // 개수는 전부를 센다 — 접힌 것도 대기 중이다.
+        harness.get_by_label("입력 대기 5");
+        for n in 1..=WAITING_CHIP_MAX {
+            harness.get_by_label(format!("agent-{n}").as_str());
+        }
+        assert!(
+            harness.query_by_label("agent-4").is_none(),
+            "상한을 넘은 칩이 펴졌다 — 상태바가 목록이 되면 한 줄 원칙이 깨진다"
+        );
+        harness.get_by_label("+2");
     }
 
     #[test]
@@ -1160,6 +1293,8 @@ mod tests {
                     None,
                     &[],
                     0,
+                    &[],
+                    &[],
                     0,
                     &feed,
                     None,
@@ -1207,6 +1342,8 @@ mod tests {
                         None,
                         &[],
                         0,
+                        &[],
+                        &[],
                         0,
                         &feed,
                         None,
@@ -1279,6 +1416,8 @@ mod tests {
                     None,
                     &[],
                     0,
+                    &[],
+                    &[],
                     0,
                     &feed,
                     Some(&snapshot),

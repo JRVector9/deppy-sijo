@@ -1270,6 +1270,7 @@ impl AgentSessionsUi {
                     effort: session.effort.clone(),
                     context_pct: None,
                     state: AgentVisualState::from_structured(session.status),
+                    pty_status: None,
                 })
             }
         }
@@ -4030,6 +4031,7 @@ mod tests {
             effort: None,
             context_pct: None,
             state: AgentVisualState::Idle,
+            pty_status: Some(runtime::SessionStatus::Idle),
         }
     }
 

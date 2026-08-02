@@ -123,6 +123,7 @@ mod tests {
             effort: None,
             context_pct: None,
             state: AgentVisualState::Idle,
+            pty_status: Some(runtime::SessionStatus::Idle),
         }
     }
 

@@ -200,6 +200,29 @@ fn pty_output_channel() -> (PtyOutputSender, PtyOutputReceiver, Arc<PtyOutputQue
     )
 }
 
+/// pane 자식에게 물려주면 안 되는 **부모 에이전트 세션 마커**.
+///
+/// 값이 아니라 "부모가 어떤 에이전트 세션 안에 있었는가"를 나타내는 것만 고른다.
+/// 자격증명(`ANTHROPIC_API_KEY`)이나 사용자 설정(`CLAUDE_CONFIG_DIR` 등)은 건드리지
+/// 않는다 — 앱이 사용자의 의도를 말없이 버리면 안 된다.
+///
+/// prefix 와일드카드를 쓰지 않는 이유: `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`처럼
+/// 사용자가 일부러 켤 수 있는 것이 같은 prefix에 있다. 목록은 리뷰 가능해야 한다.
+pub const INHERITED_AGENT_SESSION_VARS: &[&str] = &[
+    // Claude Code — 자식 세션 표시. 이게 남으면 transcript 저장이 꺼진다.
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    // 부모 세션의 추론 강도 — 상속되면 사용자가 고르지 않은 값으로 에이전트가 뜬다.
+    "CLAUDE_EFFORT",
+    // Codex — 부모 스레드 식별자와 내부 오버라이드.
+    "CODEX_THREAD_ID",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+];
+
 /// 실행할 프로그램. portable-pty CommandBuilder를 노출하지 않기 위한 최소 스펙.
 /// env 값에 secret 평문이 올 수 있다 — 절대 로그에 찍지 말 것 (Debug 미구현 이유).
 #[derive(Clone)]
@@ -345,6 +368,21 @@ impl PortablePtyBackend {
             .context("PTY 생성 실패")?;
         let mut builder = portable_pty::CommandBuilder::new(&cmd.program);
         builder.args(&cmd.args);
+        // 부모의 **에이전트 세션 마커**를 먼저 지운다. deppy가 다른 코딩 에이전트
+        // 안에서 실행되면(개발 중 흔하다) 그 세션 변수가 통째로 상속돼 pane에서
+        // 띄운 에이전트가 "부모 세션의 자식"으로 오인된다 — 실증(2026-08-02):
+        // `CLAUDE_CODE_CHILD_SESSION=1`이 상속돼 **transcript 저장이 꺼졌고**,
+        // deppy의 에이전트 감지가 transcript에 의존하므로 사이드바 상태·단축키가
+        // 통째로 동작하지 않았다. `CLAUDE_EFFORT`까지 새어 사용자가 고르지 않은
+        // 추론 강도로 뜨기도 했다.
+        //
+        // 아래 TERM/COLORTERM 처리와 같은 논리다 — pane 안의 환경은 deppy가
+        // 결정해야지 실행 방식에 좌우되면 안 된다. 다만 prefix 통째로 지우지 않고
+        // **명시 목록**만 지운다: 사용자가 의도적으로 설정한 값(자격증명, 설정 경로)을
+        // 앱이 말없이 버리면 안 된다.
+        for key in INHERITED_AGENT_SESSION_VARS {
+            builder.env_remove(key);
+        }
         for (key, value) in &cmd.env {
             builder.env(key, value);
         }
@@ -1616,6 +1654,73 @@ mod tests {
                 24,
             )
             .unwrap()
+    }
+
+    /// deppy가 다른 코딩 에이전트 안에서 실행되면 그 세션 마커가 pane 자식까지
+    /// 상속된다. 실증(2026-08-02): `CLAUDE_CODE_CHILD_SESSION=1`이 새어 들어가
+    /// **transcript 저장이 꺼졌고**, deppy의 에이전트 감지가 transcript에 의존하므로
+    /// 사이드바 상태와 단축키가 통째로 죽었다. 원인이 환경이라 코드만 봐서는 안 보인다.
+    #[test]
+    fn 부모_에이전트_세션_마커는_pane에_상속되지_않는다() {
+        // 프로세스 전역 env를 건드린다 — 이 리포는 `--test-threads=1`로 돌린다.
+        for key in INHERITED_AGENT_SESSION_VARS {
+            unsafe { std::env::set_var(key, "leaked") };
+        }
+
+        let script = INHERITED_AGENT_SESSION_VARS
+            .iter()
+            .map(|key| format!("echo {key}=${{{key}:-absent}}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut session = spawn("/bin/sh", &["-c", &script]);
+        let output = session.take_output().expect("출력 채널");
+
+        let mut seen = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && seen.matches('=').count() < INHERITED_AGENT_SESSION_VARS.len()
+        {
+            match output.recv_timeout(Duration::from_millis(200)) {
+                Ok(bytes) => seen.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = session.kill();
+
+        for key in INHERITED_AGENT_SESSION_VARS {
+            assert!(
+                seen.contains(&format!("{key}=absent")),
+                "{key}가 pane 자식에 상속됐다. 실제 출력:\n{seen}"
+            );
+        }
+
+        for key in INHERITED_AGENT_SESSION_VARS {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    /// prefix 와일드카드로 지우면 사용자가 일부러 켠 값까지 날아간다 — 그 경고문이
+    /// 스스로 안내하는 `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`가 같은 prefix에 있다.
+    #[test]
+    fn 스크럽_목록은_사용자_설정을_건드리지_않는다() {
+        for key in INHERITED_AGENT_SESSION_VARS {
+            assert!(
+                !key.contains('*'),
+                "{key}: 와일드카드는 쓰지 않는다 — 목록은 리뷰 가능해야 한다"
+            );
+        }
+        for keep in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE",
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+        ] {
+            assert!(
+                !INHERITED_AGENT_SESSION_VARS.contains(&keep),
+                "{keep}는 사용자 설정이라 지우면 안 된다"
+            );
+        }
     }
 
     fn spawn_tracked(

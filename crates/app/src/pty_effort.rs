@@ -25,6 +25,25 @@ pub enum EffortStep {
     Down,
 }
 
+/// 무엇을 조정하는가. 낙관적 값을 강도/모델별로 따로 들고 있기 위한 키다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdjustKind {
+    Effort,
+    Model,
+}
+
+/// 권위 있는 값(statusLine→DB)이 우리가 방금 보낸 값을 따라잡았는지.
+///
+/// 강도는 표기가 같아서 그대로 비교하면 되고, 모델은 권위 쪽이 표시명("Opus 5 (1M
+/// context)")이라 슬러그(`opus`) 포함 여부로 본다.
+pub fn authoritative_caught_up(kind: AdjustKind, authoritative: &str, pending: &str) -> bool {
+    let authoritative = authoritative.trim().to_ascii_lowercase();
+    match kind {
+        AdjustKind::Effort => authoritative == pending.to_ascii_lowercase(),
+        AdjustKind::Model => authoritative.contains(&pending.to_ascii_lowercase()),
+    }
+}
+
 /// 이 provider에서 강도를 바꾸는 방법.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffortPlan {
@@ -342,6 +361,27 @@ mod tests {
                 "{current:?}에서 계획이 나왔다"
             );
         }
+    }
+
+    /// 낙관적 값을 언제 버릴지 판정한다. 이게 어긋나면 둘 중 하나가 된다 —
+    /// 너무 일찍 버리면 연속 입력이 다시 낡은 값에서 움직이고, 안 버리면 사용자가
+    /// CLI에서 직접 바꾼 값을 영영 무시한다.
+    #[test]
+    fn 권위값이_따라잡으면_낙관적_값을_버린다() {
+        use AdjustKind::{Effort, Model};
+        // 강도는 표기가 같다.
+        assert!(authoritative_caught_up(Effort, "high", "high"));
+        assert!(authoritative_caught_up(Effort, "HIGH", "high"));
+        assert!(authoritative_caught_up(Effort, "  high  ", "high"));
+        assert!(!authoritative_caught_up(Effort, "medium", "high"));
+        // 모델은 권위 쪽이 표시명이라 슬러그 포함으로 본다.
+        assert!(authoritative_caught_up(
+            Model,
+            "Opus 5 (1M context)",
+            "opus"
+        ));
+        assert!(authoritative_caught_up(Model, "Sonnet 5", "sonnet"));
+        assert!(!authoritative_caught_up(Model, "Sonnet 5", "opus"));
     }
 
     /// 슬래시 명령은 CR로 끝나야 제출된다. 실측에서 CR 없이는 composer에 글자만

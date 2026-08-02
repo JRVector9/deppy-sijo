@@ -7277,6 +7277,15 @@ pub struct App {
     /// 세션별 에이전트 표시 정보(model/effort/context) — 워커 raw(transcript). claude는
     /// effort/context를 statusLine DB(아래)에서 병합해 최종본을 WorkspaceUi로 넘긴다.
     agent_info: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
+    /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. `agent_bindings`는
+    /// transcript가 확정돼야 생겨서, 방금 띄운 에이전트는 여기에만 있다.
+    agent_kinds: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentKind>,
+    /// 방금 우리가 PTY에 보낸 강도/모델. statusLine(→DB)은 다음 턴에야 갱신돼서,
+    /// 이게 없으면 연속으로 눌러도 매번 같은 낡은 값에서 한 칸 움직여 같은 명령을
+    /// 반복한다 (2026-08-02 실증: 강도를 올렸는데 계속 같은 단계가 적용됐다).
+    /// 권위 있는 값이 따라잡으면 지운다.
+    pty_agent_pending:
+        std::collections::HashMap<(runtime::SessionId, crate::pty_effort::AdjustKind), String>,
     /// 직전 프레임의 PTY 에이전트 표면. 단축키 처리가 에이전트 패널 렌더보다 먼저
     /// 돌기 때문에, 패널이 채워주는 목록을 기다리면 대상을 못 찾는다 (2026-08-02:
     /// pane은 포커스돼 있는데 `pty_surfaces=0`이라 강도 단축키가 패널만 열었다).
@@ -10115,6 +10124,8 @@ impl App {
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
+            agent_kinds: std::collections::HashMap::new(),
+            pty_agent_pending: std::collections::HashMap::new(),
             pty_agent_surfaces_cache: Vec::new(),
             statuslines: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
@@ -11288,6 +11299,7 @@ impl App {
         let mut latest_activity = None;
         let mut latest_cwds = None;
         let mut latest_info = None;
+        let mut latest_kinds = None;
         if let Ok(outcome) = self.agent_detect_rx.try_recv()
             && outcome.epoch == self.agent_detect_epoch
         {
@@ -11301,9 +11313,15 @@ impl App {
             if outcome.agent_info.is_some() {
                 latest_info = outcome.agent_info.clone();
             }
+            if outcome.agent_kinds.is_some() {
+                latest_kinds = outcome.agent_kinds.clone();
+            }
         }
         if let Some(info) = latest_info {
             self.agent_info = info;
+        }
+        if let Some(kinds) = latest_kinds {
+            self.agent_kinds = kinds;
         }
         // 에이전트 표시정보 최종본(claude는 statusLine으로 effort/model/context 병합) →
         // WorkspaceUi. statuslines가 매 1s 갱신되므로 매 poll에서 병합해 최신을 반영한다.
@@ -11389,7 +11407,14 @@ impl App {
                 // 돌고 있는데도 transcript가 파싱되기 전까지 표면이 통째로 없다.
                 // 실제로 그 때문에 강도 단축키가 대상을 못 찾고 패널만 열렸다
                 // (2026-08-02: focused_session=Some(1)인데 pty_surfaces=0).
-                let kind = self.agent_bindings.get(&session_id)?.kind;
+                // 프로세스 감지 결과를 먼저 본다 — 방금 띄워 아직 대화를 시작하지
+                // 않은 에이전트는 transcript가 없어 `agent_bindings`에 없다. 강도/모델
+                // 단축키는 바로 그 시점에 쓰고 싶은 기능이라 여기서 막히면 안 된다.
+                let kind = self
+                    .agent_kinds
+                    .get(&session_id)
+                    .copied()
+                    .or_else(|| self.agent_bindings.get(&session_id).map(|b| b.kind))?;
                 // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. claude는
                 // transcript에 effort가 아예 없고 statusLine에만 있어서, 병합을 건너뛰면
                 // effort가 영영 None이고 강도 단축키가 조용히 아무것도 안 한다.
@@ -13492,6 +13517,8 @@ impl App {
         self.session_cwds.clear();
         self.workspace_rename_prompt = None; // 워크스페이스 전환 시 옛 rename 제안 폐기
         self.agent_info.clear();
+        self.agent_kinds.clear();
+        self.pty_agent_pending.clear();
         // 이전 워크스페이스의 표면이 남아 있으면 단축키가 그쪽 세션에 입력을 쓴다.
         self.pty_agent_surfaces_cache.clear();
         self.statuslines.clear();
@@ -13939,8 +13966,10 @@ impl App {
         surface: &crate::agent_surface::AgentSurfaceSnapshot,
         step: crate::pty_effort::EffortStep,
     ) {
-        let plan = crate::pty_effort::plan(surface.provider, step, surface.effort.as_deref());
-        self.send_pty_agent_plan(surface, plan, "effort");
+        let kind = crate::pty_effort::AdjustKind::Effort;
+        let current = self.current_pty_value(surface, kind, surface.effort.as_deref());
+        let plan = crate::pty_effort::plan(surface.provider, step, current.as_deref());
+        self.send_pty_agent_plan(surface, plan, kind);
     }
 
     /// 모델을 카탈로그 순서로 한 칸 옮긴다. Claude 전용 — Codex는 게이트가 막는다
@@ -13950,8 +13979,38 @@ impl App {
         surface: &crate::agent_surface::AgentSurfaceSnapshot,
         step: crate::pty_effort::EffortStep,
     ) {
-        let plan = crate::pty_effort::plan_model(surface.provider, step, surface.model.as_deref());
-        self.send_pty_agent_plan(surface, plan, "model");
+        let kind = crate::pty_effort::AdjustKind::Model;
+        let current = self.current_pty_value(surface, kind, surface.model.as_deref());
+        let plan = crate::pty_effort::plan_model(surface.provider, step, current.as_deref());
+        self.send_pty_agent_plan(surface, plan, kind);
+    }
+
+    /// 다음 단계를 계산할 때 쓸 "현재 값".
+    ///
+    /// 우리가 방금 보낸 값이 있으면 그게 더 최신이다 — Claude statusLine은 다음 턴에야
+    /// 갱신되므로, 권위 있는 값만 믿으면 연속으로 눌러도 같은 낡은 값에서 한 칸씩
+    /// 움직여 매번 같은 명령을 보낸다. 권위 쪽이 따라잡으면 낙관적 값을 버린다.
+    fn current_pty_value(
+        &mut self,
+        surface: &crate::agent_surface::AgentSurfaceSnapshot,
+        kind: crate::pty_effort::AdjustKind,
+        authoritative: Option<&str>,
+    ) -> Option<String> {
+        let crate::agent_surface::AgentSurfaceId::Pty { session_id, .. } = &surface.id else {
+            return authoritative.map(str::to_owned);
+        };
+        let key = (*session_id, kind);
+        if let Some(pending) = self.pty_agent_pending.get(&key) {
+            let caught_up = authoritative.is_some_and(|value| {
+                crate::pty_effort::authoritative_caught_up(kind, value, pending)
+            });
+            if caught_up {
+                self.pty_agent_pending.remove(&key);
+            } else {
+                return Some(pending.clone());
+            }
+        }
+        authoritative.map(str::to_owned)
     }
 
     /// 계획된 입력을 대상 PTY에 써 넣는다. 강도·모델이 같은 안전 규칙을 공유한다.
@@ -13959,7 +14018,7 @@ impl App {
         &mut self,
         surface: &crate::agent_surface::AgentSurfaceSnapshot,
         plan: Result<crate::pty_effort::EffortPlan, crate::pty_effort::EffortBlocked>,
-        what: &'static str,
+        kind: crate::pty_effort::AdjustKind,
     ) {
         use crate::agent_surface::{AgentSurfaceId, AgentVisualState};
         use crate::pty_effort::{EffortBlocked, EffortPlan};
@@ -13980,38 +14039,43 @@ impl App {
                     .any(|pane| pane.id.0 == *pane_id && pane.session_id == Some(*session_id))
             });
         if !still_matches {
-            tracing::info!(what, "PTY 조정: 대상 세션이 더 이상 활성 workspace에 없다");
+            tracing::info!(?kind, "PTY 조정: 대상 세션이 더 이상 활성 workspace에 없다");
             return;
         }
 
         let plan = match plan {
             Ok(plan) => plan,
             Err(EffortBlocked::AtLimit) => {
-                tracing::info!(what, "PTY 조정: 이미 사다리 끝");
+                tracing::info!(?kind, "PTY 조정: 이미 사다리 끝");
                 return;
             }
             Err(EffortBlocked::UnknownCurrentEffort) => {
                 // 임의로 가정하지 않는다 — 틀리면 사용자가 누른 적 없는 값으로
                 // 세션과 전역 기본값이 함께 바뀐다.
-                tracing::info!(what, "PTY 조정: 현재 값을 몰라 다음 단계를 못 정한다");
+                tracing::info!(?kind, "PTY 조정: 현재 값을 몰라 다음 단계를 못 정한다");
                 return;
             }
         };
 
         let bytes = match plan {
             EffortPlan::Keys(bytes) => bytes,
-            EffortPlan::Slash { line, .. } => {
+            EffortPlan::Slash { line, level } => {
                 // 진행 중이면 슬래시 한 줄이 프롬프트로 먹힌다. 유휴일 때만 보낸다.
                 if !matches!(
                     surface.state,
                     AgentVisualState::Idle | AgentVisualState::Complete | AgentVisualState::Off
                 ) {
-                    tracing::info!(what, "PTY 조정: 에이전트가 작업 중이라 보내지 않는다");
+                    tracing::info!(?kind, "PTY 조정: 에이전트가 작업 중이라 보내지 않는다");
                     return;
                 }
                 // 결과는 CLI가 pane에 직접 찍는다 — Claude는 전역 기본값까지
                 // 바뀐다는 사실을 자기 출력에 포함한다("saved as your default for
                 // new sessions"). deppy가 따로 알릴 필요가 없다.
+                //
+                // 보낸 값을 기억한다. statusLine이 따라잡기 전까지 다음 단계 계산의
+                // 기준이 된다 — 없으면 연속 입력이 매번 같은 명령을 반복한다.
+                self.pty_agent_pending
+                    .insert((*session_id, kind), level.to_owned());
                 line.into_bytes()
             }
         };

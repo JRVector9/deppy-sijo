@@ -413,6 +413,16 @@ impl AgentKind {
         }
     }
 
+    /// 내장 목록의 모델 값만. PTY 모델 순환(`pty_effort`)이 자기 사다리를 이것과
+    /// 대조해 두 카탈로그가 말없이 갈라지지 않게 한다 — 대조 전용이라 테스트에서만 쓴다.
+    #[cfg(test)]
+    pub(crate) fn builtin_model_values(self) -> Vec<&'static str> {
+        self.builtin_models()
+            .iter()
+            .map(|model| model.value)
+            .collect()
+    }
+
     /// 디스크 카탈로그를 못 읽었을 때 쓰는 내장 목록.
     fn builtin_model_choices(self) -> Vec<ModelChoice> {
         self.builtin_models()

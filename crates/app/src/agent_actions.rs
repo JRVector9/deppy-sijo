@@ -17,6 +17,8 @@ pub enum AgentAction {
     Reject,
     EffortUp,
     EffortDown,
+    ModelNext,
+    ModelPrev,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,12 +71,27 @@ pub fn gate_action(
         AgentAction::ApproveOnce | AgentAction::Reject => AgentActionGate::ApprovalCountMismatch {
             pending: pending_approval_count,
         },
-        AgentAction::EffortUp | AgentAction::EffortDown if capabilities.effort_control => {
+        // PTY는 transport 자체에 effort 채널이 없지만(capabilities.effort_control =
+        // false), CLI가 이해하는 입력을 써 넣으면 바뀐다 — 되는 provider가 정해져
+        // 있어 transport가 아니라 provider로 판정한다 (`pty_effort` 참조).
+        AgentAction::EffortUp | AgentAction::EffortDown
+            if capabilities.effort_control || crate::pty_effort::supports(selected.provider) =>
+        {
             AgentActionGate::Allowed
         }
-        AgentAction::Interrupt | AgentAction::EffortUp | AgentAction::EffortDown => {
-            AgentActionGate::Unsupported
+        // 모델 전환은 provider가 더 좁다 — Codex는 슬래시 인자가 프롬프트로 흘러
+        // 실제 턴을 태우므로 아예 막는다 (`pty_effort::supports_model`).
+        AgentAction::ModelNext | AgentAction::ModelPrev
+            if capabilities.model_control
+                || crate::pty_effort::supports_model(selected.provider) =>
+        {
+            AgentActionGate::Allowed
         }
+        AgentAction::Interrupt
+        | AgentAction::EffortUp
+        | AgentAction::EffortDown
+        | AgentAction::ModelNext
+        | AgentAction::ModelPrev => AgentActionGate::Unsupported,
         AgentAction::OpenAgents
         | AgentAction::SelectPrevious
         | AgentAction::SelectNext
@@ -148,10 +165,25 @@ mod tests {
             gate_action(AgentAction::Reject, Some(&pty), 1),
             AgentActionGate::Unsupported
         );
-        assert_eq!(
-            gate_action(AgentAction::EffortUp, Some(&pty), 0),
-            AgentActionGate::Unsupported
+    }
+
+    /// PTY transport 자체에는 effort 채널이 없지만(`effort_control: false`), CLI가
+    /// 이해하는 입력을 써 넣으면 바뀐다 — 그래서 transport가 아니라 provider로
+    /// 판정한다. 여기서 막으면 단축키가 pane 안의 에이전트에 영영 닿지 못한다.
+    #[test]
+    fn pty_effort는_provider가_지원하면_통과한다() {
+        let pty = snapshot(AgentTransport::Pty);
+        assert!(
+            !pty.capabilities().effort_control,
+            "전제: PTY 캡은 여전히 false"
         );
+        assert!(
+            crate::pty_effort::supports(pty.provider),
+            "전제: provider 지원"
+        );
+        for action in [AgentAction::EffortUp, AgentAction::EffortDown] {
+            assert!(gate_action(action, Some(&pty), 0).is_allowed());
+        }
     }
 
     #[test]

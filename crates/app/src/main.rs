@@ -36,6 +36,7 @@ mod perf;
 mod port_inventory;
 mod process_storm;
 mod prompt_library;
+mod pty_effort;
 mod shortcuts;
 mod status_feed;
 mod tailscale;

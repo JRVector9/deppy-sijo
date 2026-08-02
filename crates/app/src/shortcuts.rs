@@ -45,6 +45,8 @@ pub enum ShortcutAction {
     RejectAgent,
     IncreaseAgentEffort,
     DecreaseAgentEffort,
+    NextAgentModel,
+    PreviousAgentModel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +76,7 @@ impl ShortcutGroup {
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 32] = [
         Self::ToggleSidebar,
         Self::OpenEnvironment,
         Self::OpenAgents,
@@ -105,6 +107,8 @@ impl ShortcutAction {
         Self::RejectAgent,
         Self::IncreaseAgentEffort,
         Self::DecreaseAgentEffort,
+        Self::NextAgentModel,
+        Self::PreviousAgentModel,
     ];
 
     pub const fn id(self) -> &'static str {
@@ -139,6 +143,8 @@ impl ShortcutAction {
             Self::RejectAgent => "reject_agent",
             Self::IncreaseAgentEffort => "increase_agent_effort",
             Self::DecreaseAgentEffort => "decrease_agent_effort",
+            Self::NextAgentModel => "next_agent_model",
+            Self::PreviousAgentModel => "previous_agent_model",
         }
     }
 
@@ -174,6 +180,8 @@ impl ShortcutAction {
             Self::RejectAgent => "shortcuts.action.reject_agent",
             Self::IncreaseAgentEffort => "shortcuts.action.increase_agent_effort",
             Self::DecreaseAgentEffort => "shortcuts.action.decrease_agent_effort",
+            Self::NextAgentModel => "shortcuts.action.next_agent_model",
+            Self::PreviousAgentModel => "shortcuts.action.previous_agent_model",
         }
     }
 
@@ -217,7 +225,9 @@ impl ShortcutAction {
             | Self::ApproveAgent
             | Self::RejectAgent
             | Self::IncreaseAgentEffort
-            | Self::DecreaseAgentEffort => ShortcutGroup::Agent,
+            | Self::DecreaseAgentEffort
+            | Self::NextAgentModel
+            | Self::PreviousAgentModel => ShortcutGroup::Agent,
         }
     }
 
@@ -247,6 +257,9 @@ impl ShortcutAction {
             // macOS ⌃↑/⌃↓ 는 Mission Control이지만 Shift가 붙으면 시스템 예약이 아니다.
             Self::IncreaseAgentEffort => Some("Ctrl+Shift+Up"),
             Self::DecreaseAgentEffort => Some("Ctrl+Shift+Down"),
+            // 강도가 세로축이면 모델은 가로축이다 — 같은 손 모양에서 방향만 바뀐다.
+            Self::NextAgentModel => Some("Ctrl+Shift+Right"),
+            Self::PreviousAgentModel => Some("Ctrl+Shift+Left"),
             Self::PreviousAgent => Some("Ctrl+Shift+OpenBracket"),
             Self::NextAgent => Some("Ctrl+Shift+CloseBracket"),
             Self::FocusAgentInput => Some("Command+Shift+I"),

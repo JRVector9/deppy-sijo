@@ -99,13 +99,32 @@ const WAITING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe7, 0x9a, 0x3b);
 /// 예약은 아직 일어나지 않은 일이라 가장 약하게 — 알리되 주장하지 않는다.
 const QUEUED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x9b, 0xb0);
 
+/// 상태를 **모양으로도** 구분한다. 색만으로 나누면 색각 차이가 있는 사용자에게는
+/// 두 항목이 같은 것으로 읽히고, 26px 줄에서는 색 면적이 작아 누구에게나 약하다.
+const APPROVAL_MARK: &str = "◆";
+const WAITING_MARK: &str = "◐";
+
 /// 주목 항목용 클릭 가능한 라벨. 눌리는 것은 눌리게 보여야 한다.
-fn status_attention_button(ui: &mut egui::Ui, label: &str, color: egui::Color32) -> egui::Response {
-    let response = ui.add(
-        egui::Button::new(egui::RichText::new(label).color(color).size(11.5))
-            .frame(false)
-            .small(),
-    );
+///
+/// `outlined`는 칩(개별 이동 대상)에만 준다 — 개수는 문이고 칩은 목적지라, 테두리가
+/// 그 차이를 만든다.
+fn status_attention_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    color: egui::Color32,
+    outlined: bool,
+) -> egui::Response {
+    let button = egui::Button::new(egui::RichText::new(label).color(color).size(11.5)).small();
+    let button = if outlined {
+        button
+            .frame(true)
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.55)))
+            .corner_radius(3.0)
+    } else {
+        button.frame(false)
+    };
+    let response = ui.add(button);
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -266,31 +285,36 @@ impl AgentTerminalUi {
                 }
                 if approvals > 0 {
                     crate::ui::designall::vertical_separator(ui, 14.0);
-                    let label =
-                        catalog.t("status_bar.approvals", &[("count", &approvals.to_string())]);
-                    if status_attention_button(ui, &label, APPROVAL_COLOR).clicked() {
+                    let label = format!(
+                        "{APPROVAL_MARK} {}",
+                        catalog.t("status_bar.approvals", &[("count", &approvals.to_string())])
+                    );
+                    if status_attention_button(ui, &label, APPROVAL_COLOR, false).clicked() {
                         intent = Some(StatusBarIntent::OpenInbox);
                     }
                 }
                 if !waiting_sessions.is_empty() {
                     crate::ui::designall::vertical_separator(ui, 14.0);
-                    let label = catalog.t(
-                        "status_bar.waiting",
-                        &[("count", &waiting_sessions.len().to_string())],
+                    let label = format!(
+                        "{WAITING_MARK} {}",
+                        catalog.t(
+                            "status_bar.waiting",
+                            &[("count", &waiting_sessions.len().to_string())],
+                        )
                     );
-                    if status_attention_button(ui, &label, WAITING_COLOR).clicked() {
+                    if status_attention_button(ui, &label, WAITING_COLOR, false).clicked() {
                         intent = Some(StatusBarIntent::OpenInbox);
                     }
                     // 칩은 "일일이 찾아가지 않기" 위한 직접 이동 대상이다. 한 줄이
                     // 목록을 다 담을 수는 없으므로 몇 개만 펴고 나머지는 작업함이 받는다.
                     for (label, target) in waiting_sessions.iter().take(WAITING_CHIP_MAX) {
-                        if status_attention_button(ui, label, WAITING_COLOR).clicked() {
+                        if status_attention_button(ui, label, WAITING_COLOR, true).clicked() {
                             intent = Some(StatusBarIntent::FocusWaiting(target.clone()));
                         }
                     }
                     let overflow = waiting_sessions.len().saturating_sub(WAITING_CHIP_MAX);
                     if overflow > 0
-                        && status_attention_button(ui, &format!("+{overflow}"), WAITING_COLOR)
+                        && status_attention_button(ui, &format!("+{overflow}"), WAITING_COLOR, true)
                             .clicked()
                     {
                         intent = Some(StatusBarIntent::OpenInbox);
@@ -1203,8 +1227,9 @@ mod tests {
         harness.get_by_label("OpenAI");
         harness.get_by_label("GitHub");
         // 승인과 입력 대기는 성격이 달라 따로 센다 — 여기서는 승인 2건만 있고
-        // 입력 대기 세션은 없으므로 승인 라벨만 나와야 한다.
-        harness.get_by_label("Approval 2");
+        // 입력 대기 세션은 없으므로 승인 라벨만 나와야 한다. 표식(◆)이 붙어야
+        // 색각 차이와 무관하게 승인/입력이 구분된다.
+        harness.get_by_label(format!("{APPROVAL_MARK} Approval 2").as_str());
         assert!(harness.query_by_label("Waiting for input 0").is_none());
         assert!(harness.query_by_label("Terminal").is_none());
         harness.get_by_label("CPU — · App 0 B · Sessions 0 B");
@@ -1259,8 +1284,10 @@ mod tests {
         *harness.state_mut() = true;
         harness.run();
 
-        // 개수는 전부를 센다 — 접힌 것도 대기 중이다.
-        harness.get_by_label("입력 대기 5");
+        // 개수는 전부를 센다 — 접힌 것도 대기 중이다. 표식(◐)은 승인(◆)과 모양이
+        // 달라야 한다 — 색만으로 나누면 색각 차이가 있으면 같게 읽힌다.
+        assert_ne!(WAITING_MARK, APPROVAL_MARK);
+        harness.get_by_label(format!("{WAITING_MARK} 입력 대기 5").as_str());
         for n in 1..=WAITING_CHIP_MAX {
             harness.get_by_label(format!("agent-{n}").as_str());
         }

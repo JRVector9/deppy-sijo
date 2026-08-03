@@ -601,6 +601,19 @@ fn write_rgba_png(path: &Path, width: usize, height: usize, rgba: &[u8]) -> anyh
 mod tests {
     use super::*;
 
+    /// 전역 캐시 admission을 쓰는 테스트끼리 직렬화한다.
+    ///
+    /// `ClipboardCacheAdmission::acquire`의 `CACHE_MUTEX`는 프로세스 전역이고
+    /// `try_lock`이라, 다른 테스트가 쥐고 있으면 즉시 `clipboard.cache.busy`로 실패한다.
+    /// 이건 UI를 막지 않기 위한 정상 제품 동작이므로 제품을 고치지 않고 테스트만 줄 세운다
+    /// (실증: `--workspace` 동시 실행에서 3/5 실패, 앱 크레이트 단독으로는 재현 안 됨).
+    fn cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn test_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "deppy-sijo-clipboard-{label}-{}-{}",
@@ -747,6 +760,7 @@ mod tests {
 
     #[test]
     fn cache_gc_deletes_only_valid_app_owned_names() {
+        let _cache_guard = cache_test_guard();
         let dir = test_dir("cache-owned-gc");
         let owned = dir.join(cache_name(1, "tmp"));
         let unrelated = dir.join("clipboard-image-not-owned.png");
@@ -766,6 +780,7 @@ mod tests {
 
     #[test]
     fn cache_lock_releases_and_can_be_reacquired() {
+        let _cache_guard = cache_test_guard();
         let dir = test_dir("cache-lock");
         let first = ClipboardCacheAdmission::acquire(&dir).unwrap();
         let second_error = match ClipboardCacheAdmission::acquire(&dir) {
@@ -802,6 +817,7 @@ mod tests {
 
     #[test]
     fn small_actual_file_does_not_over_evict_cache() {
+        let _cache_guard = cache_test_guard();
         let dir = test_dir("cache-small-admission");
         let existing = dir.join(cache_name(1, "png"));
         let next = dir.join(cache_name(2, "png"));
@@ -820,6 +836,7 @@ mod tests {
 
     #[test]
     fn atomic_writer_cleans_temporary_file_on_error() {
+        let _cache_guard = cache_test_guard();
         let dir = test_dir("atomic-error");
         let path = dir.join(cache_name(1, "png"));
         let error = write_clipboard_cache_file(&path, |file| {
@@ -835,6 +852,7 @@ mod tests {
 
     #[test]
     fn rgba_png_writer_rejects_wrong_buffer_size() {
+        let _cache_guard = cache_test_guard();
         let path = std::env::temp_dir().join(format!(
             "deppy-sijo-bad-clipboard-image-{}.png",
             std::process::id()
@@ -866,6 +884,7 @@ mod tests {
 
     #[test]
     fn rgba_png_writer_creates_png_file_atomically() {
+        let _cache_guard = cache_test_guard();
         let dir = test_dir("png-writer");
         let path = dir.join(cache_name(1, "png"));
         let rgba = [255, 0, 0, 255, 0, 255, 0, 255];

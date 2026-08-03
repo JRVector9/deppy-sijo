@@ -80,6 +80,24 @@ impl LocalhostCallbackServer {
         })
     }
 
+    /// 테스트 전용 — 고정 포트를 건드리지 않고 임의 포트에만 bind한다.
+    ///
+    /// `bind()`는 [`FIXED_CALLBACK_PORT`]를 먼저 잡는다. 그래서 "해제한 포트를 다시
+    /// bind해 해제를 증명"하는 테스트가 그 포트를 쓰면, 같은 바이너리에서 병렬로 도는
+    /// `고정_포트_점유_시_임의_포트로_폴백`의 점유에 걸려 재bind가 실패한다(실증:
+    /// auth 전체 104건을 돌리면 3/3 실패, `callback` 11건만 돌리면 통과).
+    /// 임의 포트에는 그 경합 상대가 없다.
+    #[cfg(test)]
+    fn bind_ephemeral() -> anyhow::Result<Self> {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).context("callback 서버 임의 포트 bind 실패")?;
+        let port = listener.local_addr()?.port();
+        Ok(Self {
+            listener,
+            redirect_uri: format!("http://127.0.0.1:{port}/callback"),
+        })
+    }
+
     /// 수동 등록한 데스크톱 OAuth client용 고정 callback. provider 설정에 미리 등록할
     /// 수 있도록 포트 fallback을 허용하지 않고, PKCE provider가 desktop redirect로
     /// 분류하는 `localhost` host를 사용한다.
@@ -319,6 +337,22 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    /// 포트를 bind하는 테스트끼리 직렬화한다.
+    ///
+    /// `cargo test`는 한 프로세스 안에서 테스트를 병렬로 돌린다. 그래서 "해제한 포트를
+    /// 다시 bind해 해제를 증명"하는 단정이, 해제와 재bind 사이에 다른 테스트의
+    /// `bind`가 그 포트를 채가면 `AddrInUse`로 깨진다. 고정 포트든 임의 포트든 마찬가지다
+    /// — OS가 방금 반납된 포트를 다음 `bind(0)`에 그대로 내줄 수 있다.
+    /// (실증: auth 전체 104건에서 재현, `callback` 11건만 돌리면 통과.)
+    fn port_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static PORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // 한 테스트가 단정에 실패해도 나머지가 poison으로 연쇄 실패하지 않게 한다 —
+        // 이 잠금은 데이터를 지키는 게 아니라 순서만 지킨다.
+        PORT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn http_get(addr: &str, path: &str) -> String {
         let mut stream = TcpStream::connect(addr).unwrap();
         write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
@@ -339,6 +373,7 @@ mod tests {
 
     #[test]
     fn 콜백_왕복과_다른_경로_무시() {
+        let _port_guard = port_test_guard();
         let server = LocalhostCallbackServer::bind().unwrap();
         let addr = server.redirect_uri().trim_start_matches("http://")
             [..server.redirect_uri().len() - "http://".len() - "/callback".len()]
@@ -369,6 +404,7 @@ mod tests {
 
     #[test]
     fn error_파라미터는_거부로_끝난다() {
+        let _port_guard = port_test_guard();
         let server = LocalhostCallbackServer::bind().unwrap();
         let uri = server.redirect_uri().to_owned();
         let addr = uri
@@ -440,6 +476,7 @@ mod tests {
 
     #[test]
     fn 대기_시간_초과() {
+        let _port_guard = port_test_guard();
         let server = LocalhostCallbackServer::bind().unwrap();
         let result = server.wait_for_callback(Duration::from_millis(120), "s");
         assert!(result.is_err());
@@ -449,7 +486,10 @@ mod tests {
     fn 취소하면_callback_listener를_즉시_해제한다() {
         use std::sync::Arc;
 
-        let server = LocalhostCallbackServer::bind().unwrap();
+        let _port_guard = port_test_guard();
+        // 고정 포트를 쓰면 재bind(아래)가 다른 테스트의 점유에 걸린다 —
+        // `bind_ephemeral` 주석 참조.
+        let server = LocalhostCallbackServer::bind_ephemeral().unwrap();
         let port: u16 = oauth2::url::Url::parse(server.redirect_uri())
             .unwrap()
             .port()
@@ -475,6 +515,7 @@ mod tests {
     fn 고정_포트_점유_시_임의_포트로_폴백() {
         // 포트가 비어 있으면 이 테스트가 점유하고, 다른 테스트 프로세스가 이미
         // 점유했다면 그 상태를 그대로 이용한다. 외부 점유 해제를 무한 대기하지 않는다.
+        let _port_guard = port_test_guard();
         let _occupier = TcpListener::bind(("127.0.0.1", FIXED_CALLBACK_PORT)).ok();
         let server = LocalhostCallbackServer::bind().unwrap();
         let port: u16 = server

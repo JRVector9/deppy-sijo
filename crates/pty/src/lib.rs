@@ -1660,6 +1660,11 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
+    const PTY_SIGNAL_PROBE_ENV: &str = "DEPPY_PTY_SIGNAL_PROBE";
+    const PTY_SIGNAL_PROBE_READY: &[u8] = b"PTY_SIGNAL_PROBE_READY";
+    const PTY_SIGNAL_PROBE_HUP: &[u8] = b"PTY_SIGNAL_PROBE_HUP";
+    const PTY_SIGNAL_PROBE_CONT: &[u8] = b"PTY_SIGNAL_PROBE_CONT";
+
     fn spawn(program: &str, args: &[&str]) -> Box<dyn PtySession> {
         PortablePtyBackend
             .spawn(
@@ -1673,6 +1678,103 @@ mod tests {
                 24,
             )
             .unwrap()
+    }
+
+    extern "C" fn record_pty_signal_probe(signal: libc::c_int) {
+        let marker = match signal {
+            libc::SIGHUP => PTY_SIGNAL_PROBE_HUP,
+            libc::SIGCONT => PTY_SIGNAL_PROBE_CONT,
+            _ => return,
+        };
+        // SAFETY: marker는 정적이고 write(2)는 async-signal-safe다.
+        unsafe {
+            let _ = libc::write(libc::STDOUT_FILENO, marker.as_ptr().cast(), marker.len());
+        }
+    }
+
+    fn install_pty_signal_probe_handlers() {
+        // SAFETY: action은 완전히 초기화되고 handler는 sa_handler ABI를 따른다. 이
+        // 설정은 전용 자식 테스트 프로세스에만 적용된다.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_pty_signal_probe as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(
+                libc::sigaction(libc::SIGCONT, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn pty_signal_probe_helper() {
+        if std::env::var_os(PTY_SIGNAL_PROBE_ENV).is_none() {
+            return;
+        }
+        install_pty_signal_probe_handlers();
+        // SAFETY: marker는 정적이고 write(2)는 async-signal-safe다. 이 write가
+        // 완료됐다는 관찰이 exec 전환을 벗어나 userland에 도달했다는 handshake다.
+        unsafe {
+            let _ = libc::write(
+                libc::STDOUT_FILENO,
+                PTY_SIGNAL_PROBE_READY.as_ptr().cast(),
+                PTY_SIGNAL_PROBE_READY.len(),
+            );
+        }
+        loop {
+            // SAFETY: 전용 probe는 측정 대상 신호를 기다리는 일만 한다.
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+
+    fn spawn_pty_signal_probe() -> Box<dyn PtySession> {
+        let test_exe = std::env::current_exe().expect("현재 테스트 실행 파일");
+        PortablePtyBackend
+            .spawn(
+                &CommandSpec {
+                    program: test_exe.to_string_lossy().into_owned(),
+                    args: vec![
+                        "--exact".into(),
+                        "tests::pty_signal_probe_helper".into(),
+                        "--nocapture".into(),
+                    ],
+                    env: vec![(PTY_SIGNAL_PROBE_ENV.into(), "1".into())],
+                    cwd: None,
+                },
+                80,
+                24,
+            )
+            .unwrap()
+    }
+
+    fn output_contains(output: &[u8], marker: &[u8]) -> bool {
+        output.windows(marker.len()).any(|window| window == marker)
+    }
+
+    fn receive_until(
+        receiver: &PtyOutputReceiver,
+        output: &mut Vec<u8>,
+        marker: &[u8],
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if output_contains(output, marker) {
+                return true;
+            }
+            match receiver.recv_timeout(Duration::from_millis(30)) {
+                Ok(chunk) => output.extend(chunk),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        output_contains(output, marker)
     }
 
     /// deppy가 다른 코딩 에이전트 안에서 실행되면 그 세션 마커가 pane 자식까지
@@ -2432,26 +2534,38 @@ mod tests {
         assert_eq!(signal_target(Some(9999), own), Some(9999));
     }
 
-    /// **알려진 flake — 원인 미상.** 이 브랜치와 무관하게 4회 중 3회 실패한다.
+    /// 2026-08-03 원인 규명:
+    /// - `killpg(SIGSTOP)`은 실패 회차에도 0이었고 pgid도 정확했으며,
+    ///   `waitpid(WUNTRACED)`는 실제 정지 전이를 관찰했다.
+    /// - XNU exec는 `fdt_exec()`에서 CLOEXEC fd를 닫은 뒤 새 task로 교체하고,
+    ///   마지막 `task_clear_return_wait(..., TCRW_CLEAR_FINAL_WAIT)`에서 새 task의
+    ///   userland 실행을 허용한다. Rust 부모는 exec 오류용 CLOEXEC pipe EOF를 보고
+    ///   `spawn()`에서 먼저 돌아올 수 있다. 이 전환 구간에 보낸 SIGSTOP은 기존
+    ///   task를 실제로 멈추지만, 뒤이은 새 task 실행 허용으로 정지 상태가 사라졌다.
+    /// - constructor에서 SIGHUP/SIGCONT를 기록하는 probe를 READY 전에 즉시 멈추면
+    ///   12회 중 5회가 다시 풀렸고, 그 5회 모두 HUP/CONT 기록은 0이었다. 같은
+    ///   probe의 READY를 기다린 뒤에는 20회 연속 정지를 유지했다.
+    /// - 고아 프로세스 그룹 가설은 틀렸다. setsid로 만든 그룹은 처음부터
+    ///   `pg_jobc == 0`이고 다른 세션 프로세스의 종료로 새로 고아가 되지 않는다.
+    ///   XNU `orphanpg()` 경로라면 반드시 HUP 뒤 CONT가 기록돼야 한다.
     ///
-    /// 2026-08-02 측정으로 배제한 것:
-    /// - 대상 그룹이 틀렸다 → 아니다. 실패 회차에도
-    ///   `cached_pgid == getpgid(child) != own_pgrp`로 **정확**했다.
-    /// - 자식이 아직 자기 그룹을 못 만들었다 → 아니다. freeze 직전까지 기다려도 같다.
-    /// - 대상 그룹을 신호 시점에 다시 읽으면 된다 → 아니다. 재조회해도 재현된다.
-    ///
-    /// 남은 관찰: 올바른 pgid로 `killpg(SIGSTOP)`을 보냈는데도 자식이 `Ss+`(sleeping)로
-    /// 남는다. `killpg` 반환값을 버리고 있어 성공 여부조차 몰랐다 — 이번에 로그를
-    /// 남기게 했으니 다음 조사는 그 값에서 출발하면 된다.
-    ///
-    /// CI를 흔들지 않도록 무시한다. freeze 기능 자체를 건드릴 때 `--ignored`로 함께
-    /// 돌려야 한다.
+    /// 따라서 제품 `freeze()`는 블로킹 retry 없이 SIGSTOP 한 번만 보낸다. 테스트만
+    /// 임의 sleep이 아니라 자식 userland의 명시적 READY handshake를 기다린다.
     #[test]
-    #[ignore = "알려진 flake(원인 미상) — 위 주석의 측정 기록 참조. --ignored로 실행"]
     fn freeze는_프로세스를_정지시키고_resume이_되살린다() {
-        // sleep 자식을 동결하면 ps 상태가 T(stopped)가 되고, 재개하면 다시 S/R.
-        let mut session = spawn("/bin/sleep", &["30"]);
-        let _rx = session.take_output().unwrap();
+        let mut session = spawn_pty_signal_probe();
+        let rx = session.take_output().unwrap();
+        let mut probe_output = Vec::new();
+        assert!(
+            receive_until(
+                &rx,
+                &mut probe_output,
+                PTY_SIGNAL_PROBE_READY,
+                Duration::from_secs(3),
+            ),
+            "PTY signal probe가 userland에 도달하지 못함: {:?}",
+            String::from_utf8_lossy(&probe_output)
+        );
         let pid = session.process_identity().pid.expect("pid");
 
         let state = |pid: u32| -> String {
@@ -2462,29 +2576,12 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
-        // 자식이 `setsid`로 자기 프로세스 그룹을 갖기 전에 SIGSTOP을 보내면 신호가
-        // 빈 그룹으로 가고 자식은 그대로 잠들어 있다(실증: freeze 직후에도 `Ss+`,
-        // 4회 중 3회 실패). 신호는 기다려주지 않으므로 **보내기 전에** 전제를
-        // 맞춘다 — 실사용에서 freeze는 spawn 한참 뒤에 사용자가 누르는 것이라
-        // 이 대기는 테스트가 현실을 흉내 내는 것이지 결함을 감추는 게 아니다.
         let own_group = unsafe { libc::getpgrp() };
-        let child_owns_group = {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
-                if pgid > 0 && pgid != own_group {
-                    break true;
-                }
-                if Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-        assert!(child_owns_group, "자식이 자기 프로세스 그룹을 갖지 못했다");
+        let child_group = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert_eq!(child_group, pid as libc::pid_t, "자식 pgid가 pid와 다름");
+        assert_ne!(child_group, own_group, "자식이 부모 프로세스 그룹에 남음");
 
         session.freeze().unwrap();
-        // SIGSTOP 반영까지 짧게 폴링 — state 첫 글자가 T면 stopped.
         let stopped = {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -2497,7 +2594,17 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(30));
             }
         };
-        assert!(stopped, "freeze 후 T(stopped) 상태가 아님: {}", state(pid));
+        if !stopped {
+            while let Ok(chunk) = rx.try_recv() {
+                probe_output.extend(chunk);
+            }
+        }
+        assert!(
+            stopped,
+            "freeze 후 T(stopped) 상태가 아님: {}; probe={:?}",
+            state(pid),
+            String::from_utf8_lossy(&probe_output),
+        );
 
         session.resume().unwrap();
         let resumed = {
@@ -2513,6 +2620,21 @@ mod tests {
             }
         };
         assert!(resumed, "resume 후에도 정지 상태: {}", state(pid));
+        assert!(
+            receive_until(
+                &rx,
+                &mut probe_output,
+                PTY_SIGNAL_PROBE_CONT,
+                Duration::from_secs(3),
+            ),
+            "resume의 SIGCONT가 probe에 도달하지 않음: {:?}",
+            String::from_utf8_lossy(&probe_output),
+        );
+        assert!(
+            !output_contains(&probe_output, PTY_SIGNAL_PROBE_HUP),
+            "freeze/resume 사이에 예상하지 못한 SIGHUP 도달: {:?}",
+            String::from_utf8_lossy(&probe_output),
+        );
 
         session.kill().unwrap();
         assert!(wait_exit(&mut session, Duration::from_secs(5)).is_some());

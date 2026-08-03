@@ -27556,7 +27556,10 @@ mod tests {
             );
         }
 
-        let slot = worker.spawn_slot_with_idle_ttl(std::time::Duration::from_millis(2));
+        // 위 루프는 2ms TTL로 **유휴 종료 경쟁 자체**를 찍는 것이 목적이다. 여기부터는
+        // "살아 있는 워커가 결과를 돌려주는가"만 보므로 TTL을 넉넉히 준다 — 2ms를 그대로
+        // 쓰면 spawn과 send 사이에 워커가 유휴 종료해 `is_ok()`가 부하에 따라 깨진다.
+        let slot = worker.spawn_slot_with_idle_ttl(std::time::Duration::from_secs(5));
         assert!(
             SettingsSnapshotWorker::try_send_to_slot(
                 &slot,
@@ -27571,8 +27574,20 @@ mod tests {
             .is_ok()
         );
         worker.slot = Some(slot);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        assert_eq!(worker.try_recv().map(|outcome| outcome.revision), Some(99));
+        // 고정 대기 대신 마감까지 폴링한다. 워커는 첫 작업에서 DB를 여는데, 부하가
+        // 걸리면 그 시간이 10ms를 넘어 결과가 늦는다 — 그때 단언이 깨졌다(전체 스위트
+        // 3회 중 1회). 기다리는 상한만 넉넉히 두면 검증 내용은 그대로다.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let delivered = loop {
+            if let Some(outcome) = worker.try_recv() {
+                break Some(outcome.revision);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(delivered, Some(99));
         remove_sqlite_files(&path);
     }
 

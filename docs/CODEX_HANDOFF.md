@@ -3,12 +3,13 @@
 ## Current task
 
 - Diagnose direct-shell Claude/Codex effort/model shortcut failures from `docs/agent-shortcut-launch-cases.md`, prioritizing the section 4 process-tree check and removal of silent failures.
-- Status: implementation and merged-state verification complete; commit/main fast-forward/rebuild/relaunch remain. The daemon-reparenting hypothesis is refuted for the live Deppy pane; direct Codex classification and current-value-free key planning pass; RED-first status-bar feedback is implemented. A pre-landing review also found and removed synchronous Claude settings reads from the render path.
+- Status: complete. The daemon-reparenting hypothesis is refuted for the live Deppy pane; direct Codex classification and current-value-free key planning pass; RED-first status-bar feedback is implemented. A pre-landing review also found and removed synchronous Claude settings reads from the render path. The change is committed, fast-forwarded to local `main`, rebuilt, signed, verified, and running.
 
 ## Working area
 
-- Current branch/worktree: `DesignALL` in `/Users/jr/deppy-worktrees/designall`, HEAD `0434ade`; latest `origin/main` (`4c1df44`) merged cleanly before the final review/test wave. The task changes remain uncommitted.
-- Modified files: `crates/app/src/app.rs`, `crates/app/src/agent_launcher.rs`, `crates/app/src/agent_model_catalog.rs`, `crates/app/src/ui/agent_terminal.rs`, all five `crates/i18n/locales/*/messages.txt`, `docs/agent-shortcut-launch-cases.md`, and this handoff.
+- Current branch/worktree: local `main` in `/Users/jr/Desktop/projects/deppy-sijo`; source delivery commit `c64d5b6` (`fix(app): surface agent shortcut failures`) and the post-launch handoff commit are on `main` ahead of `origin/main`. No push was performed.
+- Modified files in `c64d5b6`: `crates/app/src/app.rs`, `crates/app/src/agent_launcher.rs`, `crates/app/src/agent_model_catalog.rs`, `crates/app/src/ui/agent_terminal.rs`, all five `crates/i18n/locales/*/messages.txt`, `docs/agent-shortcut-launch-cases.md`, and this handoff. This post-launch handoff update is the only later source-tree change.
+- Merge preservation: the pre-existing dirty main-worktree handoff was saved as `stash@{0}` with message `preserve-main-handoff-before-agent-shortcut-merge-20260803` before the fast-forward; it was not dropped or reapplied.
 - Live measurement: Deppy PID `36159` owned pane shell PID `56134`, whose direct child PID `65361` was `claude`. The PPID=1 daemon tree in the earlier document belonged to another Claude/Desktop session and cannot explain this pane.
 - Design decision: do not broaden `agent_detect::classify` without an actual missed argv. Distinguish pipeline stages in the existing bottom status bar for four seconds; keep queued effort/model on the existing persistent queued labels; do not add a toast or reuse `web_notice`. Claude's direct-shell defaults are read only by the existing lazy launcher worker, refreshed when a new argument-free Claude appears, and consumed from an immutable render snapshot.
 
@@ -19,7 +20,7 @@
 3. Completed — observe RED for missing status-bar feedback and missing stage classifier, then implement both to GREEN.
 4. Completed — update the investigation record and run focused tests, i18n check, full app tests, and strict Clippy.
 5. Completed — rerun full merged-state tests, strict Clippy, i18n, fmt, and diff checks.
-6. In progress — commit, preserve the dirty main-worktree handoff, fast-forward local `main`, then rebuild and relaunch as requested. Do not push.
+6. Completed — commit, preserve the dirty main-worktree handoff, fast-forward local `main`, rebuild/sign/verify, and relaunch. No push.
 
 ## Agent shortcut investigation status
 
@@ -27,7 +28,9 @@
 - RED evidence: `kittest_에이전트_단축키_실패가_상태바에_보인다` failed to compile because `AgentShortcutFeedback` and its show method did not exist; `pty_단축키_표면_누락은_파이프라인_단계별로_구분된다` failed to compile because the stage classifier did not exist. The pre-landing render-I/O law test then failed against the synchronous `agent_model_catalog`/`home_dir` calls before the lazy-worker correction.
 - GREEN evidence: a combined `단축키` filter passed 3/3 including both feedback tests. Existing direct-Codex classification and current-value-free planning tests passed 1/1 each. The new render-I/O law passed after the fix; the new direct-Claude refresh test passed 1/1; all 26 `agent_model_catalog` tests passed. Final merged-state `cargo test -p deppy-sijo --locked -- --test-threads=1` passed 1,265 unit tests with seven explicit ignores, integration targets 4/4, 5/5, 14/14, and 15/15, with three hardware/release-only integration tests ignored. Strict all-target Clippy with `-D warnings` passed. `xtask i18n-check` passed 7/7 plus its three exact app checks. Final fmt and diff checks passed.
 - Failed approaches: the first AWK descendant-tree probe inherited false keys and printed unrelated ancestors/processes. A corrected strict descendant traversal produced only Deppy PID `36159` → pane shell `56134` → direct `claude` PID `65361` (plus the independent app-server child), disproving the hypothesis. The first post-fix fmt check found one line-wrap-only difference in `poll_agent_launcher_detection`; `cargo fmt --all` applied that non-semantic correction and the fmt/diff checks then passed.
-- Remaining work: inspect the final diff/status; commit on `DesignALL`; preserve the pre-existing dirty main-worktree handoff in a named stash; fast-forward local `main`; rebuild/sign/relaunch from `main`; record the exact PID/path. Exact next commands: `git diff --check`; `git status --short --branch`; `git add crates/app/src/app.rs crates/app/src/agent_launcher.rs crates/app/src/agent_model_catalog.rs crates/app/src/ui/agent_terminal.rs crates/i18n/locales/*/messages.txt docs/agent-shortcut-launch-cases.md docs/CODEX_HANDOFF.md`; `git commit -m 'fix(app): surface agent shortcut failures'`.
+- Delivery/build evidence: `DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh scripts/package-macos.sh` completed the cold release build in 26m20s and passed bundle/helper/archive verification. Independent deep/strict codesign verification passed with identifier `app.vector9.deppy-sijo`, Team ID `ZDTU5LS35K`, arm64, and hardened runtime. Main executable SHA-256 is `52cdb7acaa3bf42db557f23b8133a60f9ccec07446e53e1c44ca6c0b7038597c`; ZIP SHA-256 is `270ae9f73d30ee0800d04137158b3eb2a0e41cbc4a13574c7f8cf07bc183e29a`.
+- Relaunch evidence: exact old debug PID `36159` received SIGTERM and exited within the bounded wait. `open -n` launched PID `28778`, which remained alive after two seconds with PPID 1 and executable `/Users/jr/Desktop/projects/deppy-sijo/target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`.
+- Remaining work: manual UI confirmation only — in a direct Codex/Claude pane, press the effort/model shortcuts and confirm either the adjustment/queued label or the new stage-specific status-bar explanation. Exact state checks: `ps -p 28778 -o pid=,ppid=,command=`; `git status --short --branch`; `git stash list --format='%gd %s' | head -3`.
 
 ## Multi-pane design status
 

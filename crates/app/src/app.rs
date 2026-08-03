@@ -17258,6 +17258,12 @@ impl App {
                     .set_view(ui::agent_terminal::AgentTerminalView::Inbox);
                 ctx.request_repaint();
             }
+            // 상태바 팝오버의 승인/거부 → 벨 카드와 **같은** 처리 경로.
+            // 여기서 갈라지면 DB 되쓰기 규칙이 두 벌이 된다.
+            ui::agent_terminal::StatusBarIntent::Approval(decision) => {
+                self.apply_inbox_approval_decision(Some(decision));
+                ctx.request_repaint();
+            }
             // 칩 클릭 → 벨 팝오버 카드 클릭과 **같은** 네비게이션 경로로 합류시킨다.
             ui::agent_terminal::StatusBarIntent::FocusWaiting(target) => {
                 self.pending_status_bar_navigation = Some(target);
@@ -20012,6 +20018,30 @@ impl eframe::App for App {
             ),
         };
         let approval_count = self.approvals_ui.pending().len();
+        // **대기 중인 승인이 있을 때만** 조립한다. 팝오버 열림 상태로 가르면 여는
+        // 프레임에 카드가 비어 보인다 — 그 값을 상태바 렌더보다 앞서 읽어야 하기
+        // 때문이다. 승인이 0건이면 버튼 자체가 없으므로 평상시 비용은 그대로 0이다.
+        let approvals_open = approval_count > 0;
+        let approval_pending = if approvals_open {
+            self.approvals_ui.pending_shared()
+        } else {
+            std::sync::Arc::from([] as [ui::approvals::PendingApprovalItem; 0])
+        };
+        let approval_workspace_names = if approvals_open {
+            self.inbox_workspace_names()
+        } else {
+            Default::default()
+        };
+        let approval_session_titles = if approvals_open {
+            self.inbox_approval_session_titles()
+        } else {
+            Default::default()
+        };
+        let approval_cards = ui::agent_terminal::StatusBarApprovals {
+            pending: &approval_pending,
+            workspace_names: &approval_workspace_names,
+            session_titles: &approval_session_titles,
+        };
         // 예약된 조정 — 눌렀는데 화면이 그대로면 사용자는 "안 먹었다"고 읽는다.
         // 목표 값은 낙관적 값이 들고 있다(큐에는 바이트만 있다).
         let queued_labels: Vec<String> = self
@@ -20074,6 +20104,7 @@ impl eframe::App for App {
                     approval_count,
                     &waiting_sessions,
                     &queued_labels,
+                    approval_cards,
                     mcp_count,
                     &self.status_feed,
                     self.port_snapshot.as_ref(),

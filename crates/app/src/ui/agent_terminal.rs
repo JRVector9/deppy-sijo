@@ -11,6 +11,8 @@ pub(crate) enum StatusBarIntent {
     Ports(PortsIntent),
     /// 대기 개수 클릭 — 작업함(이미 있는 대기 카드 목록)을 연다.
     OpenInbox,
+    /// 상태바 팝오버에서 승인/거부 — 벨 팝오버 카드와 같은 경로로 처리한다.
+    Approval(crate::ui::approvals::ApprovalDecision),
     /// 대기 중인 세션 칩 클릭 — 그 세션으로 바로 이동한다. 작업함을 거치지 않는다.
     FocusWaiting(crate::ui::notifications::AgentNotificationTarget),
 }
@@ -88,6 +90,22 @@ pub struct AgentTerminalUi {
     announcement_filter: AnnouncementFilter,
     resource_manager: ResourceManagerUi,
     ports: PortsUi,
+    /// 상태바 승인 팝오버 열림 상태. 자원·포트 팝오버가 각자 UI 구조체에 두는 것과
+    /// 같은 자리다 — 열려 있을 때만 App이 카드 데이터를 조립한다.
+    approvals_open: bool,
+}
+
+/// 승인 팝오버가 그릴 데이터. App이 소유한 것을 빌려온다 — 이 모듈은 App을 모른다.
+///
+/// 호출측은 **대기 중인 승인이 있을 때만** 조립한다. 팝오버 열림 상태로 가르지
+/// 않는 이유는 그 값을 상태바 렌더보다 **앞서** 읽어야 해서다 — 여는 프레임에는
+/// 아직 닫힘이라 카드가 빈 채로 그려진다(오늘 `pty_surfaces=0`으로 단축키가 죽은
+/// 것과 같은 프레임 순서 결함). 승인이 0건이면 어차피 버튼 자체가 없고, 있을 때의
+/// 조립 비용은 워크스페이스 목록과 세션 제목 맵뿐이라 프레임당 감당할 수 있다.
+pub(crate) struct StatusBarApprovals<'a> {
+    pub pending: &'a [crate::ui::approvals::PendingApprovalItem],
+    pub workspace_names: &'a HashMap<String, String>,
+    pub session_titles: &'a HashMap<(String, runtime::SessionId), String>,
 }
 
 /// 한 줄에 펼 칩 개수. 넘치면 작업함이 받는다 — 상태바가 목록이 되면 안 된다.
@@ -138,6 +156,7 @@ impl AgentTerminalUi {
             announcement_filter: AnnouncementFilter::All,
             resource_manager: ResourceManagerUi::default(),
             ports: PortsUi::default(),
+            approvals_open: false,
         }
     }
 
@@ -215,6 +234,9 @@ impl AgentTerminalUi {
         waiting_sessions: &[(String, crate::ui::notifications::AgentNotificationTarget)],
         // `queued`: 턴이 끝나면 보낼 예약. 눌렀는데 화면이 그대로면 "안 먹었다"로 읽힌다.
         queued: &[String],
+        // `approval_cards`: 승인 팝오버 내용. 팝오버가 닫혀 있으면 빈 슬라이스가 와서
+        // idle 비용이 0이다(벨 팝오버와 같은 규칙).
+        approval_cards: StatusBarApprovals<'_>,
         mcp_count: usize,
         feed: &StatusFeedSnapshot,
         ports: Option<&PortSnapshot>,
@@ -283,15 +305,66 @@ impl AgentTerminalUi {
                         );
                     }
                 }
+                if approvals == 0 {
+                    // 마지막 승인을 처리하면 이 블록이 통째로 건너뛰어져 열림 상태가
+                    // 그대로 남는다. 그러면 다음 승인이 도착하는 순간 사용자가 누르지도
+                    // 않은 팝오버가 저절로 뜬다.
+                    self.approvals_open = false;
+                }
                 if approvals > 0 {
                     crate::ui::designall::vertical_separator(ui, 14.0);
                     let label = format!(
                         "{APPROVAL_MARK} {}",
                         catalog.t("status_bar.approvals", &[("count", &approvals.to_string())])
                     );
-                    if status_attention_button(ui, &label, APPROVAL_COLOR, false).clicked() {
-                        intent = Some(StatusBarIntent::OpenInbox);
+                    // 뷰를 바꾸지 않고 **그 자리에서** 처리한다 — 승인하려고 터미널을
+                    // 떠나면 "가지 않고 판단"이라는 목적이 사라진다. 자원·포트 팝오버와
+                    // 같은 패턴이라 이 줄의 상호작용이 한 가지로 유지된다.
+                    let approval_response =
+                        status_attention_button(ui, &label, APPROVAL_COLOR, false);
+                    // 버튼은 **열기만** 한다. 닫기는 팝오버의 CloseOnClickOutside가
+                    // 맡는다 — 둘 다 토글하면 열린 상태에서 버튼을 눌렀을 때 닫힘과
+                    // 토글이 같은 프레임에 맞물려 서로 상쇄된다.
+                    if approval_response.clicked() {
+                        self.approvals_open = true;
                     }
+                    let mut open = self.approvals_open;
+                    egui::Popup::menu(&approval_response)
+                        .open_bool(&mut open)
+                        .align(egui::RectAlign::TOP_START)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .width(420.0)
+                        .show(|ui| {
+                            let action = crate::ui::inbox_approvals::render(
+                                ui,
+                                catalog,
+                                approval_cards.pending,
+                                approval_cards.workspace_names,
+                                approval_cards.session_titles,
+                                crate::ui::inbox_approvals::POPUP_MAX_CARDS,
+                            );
+                            if let Some(decision) = action.decision {
+                                intent = Some(StatusBarIntent::Approval(decision));
+                            }
+                            if let Some(target) = action.goto {
+                                intent = Some(StatusBarIntent::FocusWaiting(target));
+                            }
+                            // 상한을 넘으면 카드가 잘린다 — 나머지로 갈 길이 없으면
+                            // 팝오버가 막다른 길이 된다. 링크는 잘렸을 때만 낸다.
+                            if approvals > crate::ui::inbox_approvals::POPUP_MAX_CARDS {
+                                ui.separator();
+                                if ui
+                                    .button(catalog.t("status_bar.approvals_open_inbox", &[]))
+                                    .on_hover_text(
+                                        catalog.t("status_bar.approvals_open_inbox.hint", &[]),
+                                    )
+                                    .clicked()
+                                {
+                                    intent = Some(StatusBarIntent::OpenInbox);
+                                }
+                            }
+                        });
+                    self.approvals_open = open;
                 }
                 if !waiting_sessions.is_empty() {
                     crate::ui::designall::vertical_separator(ui, 14.0);
@@ -1102,6 +1175,7 @@ fn service_status_light(
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     fn install_sidebar_test_fonts(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
@@ -1205,6 +1279,11 @@ mod tests {
                     2,
                     &[],
                     &[],
+                    StatusBarApprovals {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                    },
                     5,
                     &feed,
                     None,
@@ -1234,6 +1313,200 @@ mod tests {
         assert!(harness.query_by_label("Terminal").is_none());
         harness.get_by_label("CPU — · App 0 B · Sessions 0 B");
         harness.get_by_label("Ports —");
+    }
+
+    /// 승인은 **그 자리에서** 끝나야 한다. 뷰를 바꾸면 터미널을 떠나게 되어
+    /// "가지 않고 판단"이라는 목적이 사라진다 — 개수 클릭이 작업함으로 점프하던
+    /// 동작을 팝오버로 바꾼 이유다.
+    ///
+    /// 실제로 **클릭해서** 확인한다. 클릭 없이 라벨만 보면, 누군가 동작을 다시
+    /// `OpenInbox`(= 뷰 전환)로 되돌려도 이 테스트가 통과해 버린다.
+    #[test]
+    fn kittest_승인_개수를_눌러도_뷰가_바뀌지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let feed = StatusFeedSnapshot::default();
+        let seen: Arc<Mutex<Vec<(bool, AgentTerminalView)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let terminal = Arc::new(Mutex::new(AgentTerminalUi::new()));
+        let shared = Arc::clone(&terminal);
+
+        let mut harness = egui_kittest::Harness::builder().build_ui_state(
+            move |ui, fonts_ready| {
+                if !*fonts_ready {
+                    return;
+                }
+                let mut terminal = shared.lock().unwrap();
+                let intent = terminal.status_bar_with_managers(
+                    ui,
+                    None,
+                    None,
+                    &[],
+                    2,
+                    &[],
+                    &[],
+                    StatusBarApprovals {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                    },
+                    0,
+                    &feed,
+                    None,
+                    &HashMap::new(),
+                    None,
+                    0,
+                    &catalog,
+                );
+                // 뷰 전환 의도(OpenInbox)가 나오면 즉시 잡힌다.
+                let switched = matches!(intent, Some(StatusBarIntent::OpenInbox));
+                recorder.lock().unwrap().push((switched, terminal.view()));
+            },
+            false,
+        );
+        harness.set_size(egui::vec2(1400.0, 100.0));
+        install_sidebar_test_fonts(&harness.ctx);
+        *harness.state_mut() = true;
+        harness.run();
+
+        let label = format!("{APPROVAL_MARK} 승인 2");
+        harness.get_by_label(label.as_str()).click();
+        harness.run();
+        harness.run();
+
+        let frames = seen.lock().unwrap();
+        assert!(
+            !frames.iter().any(|(switched, _)| *switched),
+            "승인 개수 클릭이 뷰 전환(OpenInbox) 의도를 냈다 — 터미널을 떠나면 안 된다"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|(_, view)| *view == AgentTerminalView::Terminal),
+            "뷰가 터미널에서 벗어났다"
+        );
+        // 클릭이 팝오버를 실제로 열었는지 — 안 열리면 이 기능이 통째로 죽은 것이다.
+        assert!(
+            terminal.lock().unwrap().approvals_open,
+            "클릭했는데 승인 팝오버가 열리지 않았다"
+        );
+    }
+
+    /// 상한(5건)을 넘으면 카드가 잘리는데 나머지로 갈 길이 없으면 팝오버가 막다른
+    /// 길이 된다. 링크는 **잘렸을 때만** 나와야 한다 — 항상 띄우면 5건 이하에서
+    /// 쓸모없는 버튼이 자리를 차지한다.
+    #[test]
+    fn 승인이_상한을_넘을_때만_작업함_링크가_나온다() {
+        use crate::ui::inbox_approvals::POPUP_MAX_CARDS;
+        use egui_kittest::kittest::Queryable;
+
+        let label = i18n::Catalog::load("ko-KR")
+            .unwrap()
+            .t("status_bar.approvals_open_inbox", &[]);
+
+        // (승인 건수, 링크가 보여야 하는가)
+        for (approvals, expected) in [(POPUP_MAX_CARDS, false), (POPUP_MAX_CARDS + 1, true)] {
+            let catalog = i18n::Catalog::load("ko-KR").unwrap();
+            let feed = StatusFeedSnapshot::default();
+            let terminal = Arc::new(Mutex::new(AgentTerminalUi::new()));
+            terminal.lock().unwrap().approvals_open = true;
+            let shared = Arc::clone(&terminal);
+
+            let mut harness = egui_kittest::Harness::builder().build_ui_state(
+                move |ui, fonts_ready| {
+                    if !*fonts_ready {
+                        return;
+                    }
+                    shared.lock().unwrap().status_bar_with_managers(
+                        ui,
+                        None,
+                        None,
+                        &[],
+                        approvals,
+                        &[],
+                        &[],
+                        StatusBarApprovals {
+                            pending: &[],
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                        },
+                        0,
+                        &feed,
+                        None,
+                        &HashMap::new(),
+                        None,
+                        0,
+                        &catalog,
+                    );
+                },
+                false,
+            );
+            harness.set_size(egui::vec2(1400.0, 300.0));
+            install_sidebar_test_fonts(&harness.ctx);
+            *harness.state_mut() = true;
+            harness.run();
+            harness.run();
+
+            assert_eq!(
+                harness.query_by_label(label.as_str()).is_some(),
+                expected,
+                "승인 {approvals}건에서 작업함 링크 노출이 기대와 다르다"
+            );
+        }
+    }
+
+    /// 마지막 승인을 처리하면 버튼과 함께 팝오버 블록이 사라진다. 열림 상태를
+    /// 그때 정리하지 않으면 **다음 승인이 도착하는 순간 저절로 열린다** — 사용자가
+    /// 누르지 않았는데 화면이 튀어나오는 것은 명백한 오작동이다.
+    #[test]
+    fn 승인이_0이_되면_팝오버_열림_상태가_정리된다() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let feed = StatusFeedSnapshot::default();
+        let terminal = Arc::new(Mutex::new(AgentTerminalUi::new()));
+        // 열린 상태를 만들어 둔다(사용자가 눌러서 연 상황).
+        terminal.lock().unwrap().approvals_open = true;
+        let shared = Arc::clone(&terminal);
+
+        let mut harness = egui_kittest::Harness::builder().build_ui_state(
+            move |ui, fonts_ready| {
+                if !*fonts_ready {
+                    return;
+                }
+                shared.lock().unwrap().status_bar_with_managers(
+                    ui,
+                    None,
+                    None,
+                    &[],
+                    // 승인이 0건 — 마지막 건을 방금 처리한 상황이다.
+                    0,
+                    &[],
+                    &[],
+                    StatusBarApprovals {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                    },
+                    0,
+                    &feed,
+                    None,
+                    &HashMap::new(),
+                    None,
+                    0,
+                    &catalog,
+                );
+            },
+            false,
+        );
+        harness.set_size(egui::vec2(1400.0, 100.0));
+        install_sidebar_test_fonts(&harness.ctx);
+        *harness.state_mut() = true;
+        harness.run();
+
+        assert!(
+            !terminal.lock().unwrap().approvals_open,
+            "승인이 0건인데 팝오버 열림 상태가 남았다 — 다음 승인에서 저절로 열린다"
+        );
     }
 
     /// 칩은 "일일이 찾아가지 않고 클릭해서 이동"의 실체다. 한 줄이 목록이 되면 안 되므로
@@ -1268,6 +1541,11 @@ mod tests {
                     0,
                     &waiting,
                     &[],
+                    StatusBarApprovals {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                    },
                     0,
                     &feed,
                     None,
@@ -1322,6 +1600,11 @@ mod tests {
                     0,
                     &[],
                     &[],
+                    StatusBarApprovals {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                    },
                     0,
                     &feed,
                     None,
@@ -1371,6 +1654,11 @@ mod tests {
                         0,
                         &[],
                         &[],
+                        StatusBarApprovals {
+                            pending: &[],
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                        },
                         0,
                         &feed,
                         None,
@@ -1445,6 +1733,11 @@ mod tests {
                     0,
                     &[],
                     &[],
+                    StatusBarApprovals {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                    },
                     0,
                     &feed,
                     Some(&snapshot),

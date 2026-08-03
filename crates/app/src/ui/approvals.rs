@@ -237,6 +237,12 @@ impl ApprovalsUi {
         &self.pending
     }
 
+    /// 상태바 승인 팝오버용. App이 `&mut self`로 상태바를 그리는 동안에도 목록을
+    /// 들고 있어야 해서 빌림 대신 `Arc`를 복제한다 — 항목 자체는 복사되지 않는다.
+    pub fn pending_shared(&self) -> Arc<[PendingApprovalItem]> {
+        Arc::clone(&self.pending)
+    }
+
     /// 버튼 클릭 → 결정 매핑 (egui 컨텍스트 없이 테스트할 수 있게 분리).
     /// 맨 앞(가장 오래된) 항목 하나에 대해서만 결정을 만든다.
     #[cfg_attr(not(test), allow(dead_code))]

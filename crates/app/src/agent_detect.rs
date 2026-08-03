@@ -87,7 +87,20 @@ struct ProcRow {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DetectedAgents {
     pub bindings: HashMap<SessionId, AgentBinding>,
-    pub kinds: HashMap<SessionId, AgentKind>,
+    pub kinds: HashMap<SessionId, RunningAgent>,
+}
+
+/// 프로세스만으로 알아낸 세션의 에이전트. transcript도 statusLine도 필요 없다.
+///
+/// `model`/`effort`는 **런처가 argv에 넘긴 값**이라 실행 순간의 진실이다. statusLine은
+/// 1시간 창(`STATUSLINES_PREFIX_PREFLIGHT`)으로 만료되므로, 오래 유휴한 세션에서는
+/// 이쪽이 유일한 근거가 된다 — 실증(2026-08-03): 7시간 전 statusLine 행이 걸러져
+/// `effort=None`이 되자 강도 단축키가 조용히 아무것도 하지 않았다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningAgent {
+    pub kind: AgentKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// 이미 확정된 세션→바인딩을 캐시해 재발견(lsof/codex 재귀 스캔)을 스킵한다(codex #3).
@@ -121,17 +134,43 @@ impl DetectionBudget {
 fn agent_kinds_from_rows(
     sessions: &[(SessionId, u32)],
     rows: &[ProcRow],
-) -> HashMap<SessionId, AgentKind> {
+) -> HashMap<SessionId, RunningAgent> {
     sessions
         .iter()
         .filter_map(|(sid, shell_pid)| {
             let descendants = descendant_pids(*shell_pid, rows);
             rows.iter()
                 .filter(|row| descendants.contains(&row.pid))
-                .find_map(|row| classify(&row.command).map(|(kind, _)| kind))
-                .map(|kind| (*sid, kind))
+                .find_map(|row| {
+                    classify(&row.command).map(|(kind, _)| RunningAgent {
+                        kind,
+                        model: argv_flag_value(&row.command, "--model"),
+                        effort: argv_flag_value(&row.command, "--effort"),
+                    })
+                })
+                .map(|agent| (*sid, agent))
         })
         .collect()
+}
+
+/// `--model opus[1m]` 처럼 **공백으로 분리된** 플래그 값을 argv 문자열에서 뽑는다.
+///
+/// `ps`가 준 한 줄이라 인용 정보가 없다. 값에 공백이 있으면 잘리는데, 우리가 읽는
+/// `--model`/`--effort`는 공백 없는 토큰이라 문제되지 않는다. `--model=x` 형태는
+/// 이 런처가 쓰지 않으므로 다루지 않는다 — 쓰게 되면 여기서 함께 처리해야 한다.
+fn argv_flag_value(command: &str, flag: &str) -> Option<String> {
+    let mut parts = command.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == flag {
+            let value = parts.next()?;
+            // 다음 토큰이 또 플래그면 값이 없는 것이다.
+            if value.starts_with('-') {
+                return None;
+            }
+            return Some(value.to_owned());
+        }
+    }
+    None
 }
 
 /// 캐시를 활용한 detect. `cache`는 호출측(워커 스레드)이 소유·유지한다.
@@ -1891,6 +1930,57 @@ mod tests {
         assert!(classify("vim claude_notes.md").is_none()); // 인자 언급은 오탐 안 함
     }
 
+    /// statusLine은 1시간 창으로 만료된다. 오래 유휴한 세션에서는 argv가 유일한
+    /// 근거라, 여기서 값을 못 뽑으면 강도·모델 단축키가 "현재 값을 몰라" 조용히
+    /// 아무것도 하지 않는다(2026-08-03 실증).
+    #[test]
+    fn argv에서_모델과_강도를_뽑는다() {
+        // 사용자 환경에서 실제로 관측된 형태.
+        let command =
+            "/Users/jr/.local/bin/claude --settings /tmp/s.json --model opus[1m] --effort high";
+        assert_eq!(
+            argv_flag_value(command, "--model").as_deref(),
+            Some("opus[1m]")
+        );
+        assert_eq!(
+            argv_flag_value(command, "--effort").as_deref(),
+            Some("high")
+        );
+        assert_eq!(argv_flag_value(command, "--missing"), None);
+
+        // 값 없이 플래그만 있으면 다음 플래그를 값으로 삼으면 안 된다.
+        assert_eq!(
+            argv_flag_value("claude --effort --model opus", "--effort"),
+            None
+        );
+        // 맨 끝이면 값이 없다.
+        assert_eq!(argv_flag_value("claude --effort", "--effort"), None);
+        // 부분 일치에 속지 않는다.
+        assert_eq!(argv_flag_value("claude --effortless x", "--effort"), None);
+    }
+
+    /// 프로세스 스캔 결과에 argv 값이 함께 실려야 폴백이 성립한다.
+    #[test]
+    fn 프로세스_스캔이_모델과_강도를_함께_싣는다() {
+        let rows = vec![
+            ProcRow {
+                pid: 100,
+                ppid: Some(1),
+                command: "/bin/zsh".into(),
+            },
+            ProcRow {
+                pid: 101,
+                ppid: Some(100),
+                command: "claude --model opus[1m] --effort high".into(),
+            },
+        ];
+        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows);
+        let agent = found.get(&SessionId(1)).expect("에이전트를 찾아야 한다");
+        assert_eq!(agent.kind, AgentKind::Claude);
+        assert_eq!(agent.model.as_deref(), Some("opus[1m]"));
+        assert_eq!(agent.effort.as_deref(), Some("high"));
+    }
+
     /// transcript가 없어도 프로세스만으로 종류를 잡아야 한다.
     ///
     /// 실제 증상(2026-08-02): 에이전트를 띄우자마자 강도 단축키를 누르면 아무 일도
@@ -1934,8 +2024,14 @@ mod tests {
         ];
         let kinds = agent_kinds_from_rows(&sessions, &rows);
 
-        assert_eq!(kinds.get(&SessionId(1)), Some(&AgentKind::Codex));
-        assert_eq!(kinds.get(&SessionId(2)), Some(&AgentKind::Claude));
+        assert_eq!(
+            kinds.get(&SessionId(1)).map(|a| a.kind),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            kinds.get(&SessionId(2)).map(|a| a.kind),
+            Some(AgentKind::Claude)
+        );
         assert_eq!(kinds.get(&SessionId(3)), None);
     }
 

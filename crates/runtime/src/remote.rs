@@ -4296,11 +4296,11 @@ mod tests {
     /// 자기서명 신원을 rcgen로 직접 만든다 (keyring 우회 — 신원 수명주기는 tls_identity.rs가
     /// 테스트한다). 여러 테스트가 공유 mock keyring의 고정 키 id를 다투지 않게 한다.
     fn test_identity() -> TlsIdentity {
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["deppy-remote".to_owned()]).unwrap();
         TlsIdentity {
             cert_der: cert.der().to_vec(),
-            key_der: key_pair.serialize_der(),
+            key_der: signing_key.serialize_der(),
         }
     }
 

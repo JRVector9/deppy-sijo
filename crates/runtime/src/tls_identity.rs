@@ -108,11 +108,11 @@ pub fn get_or_create_identity(
         std::fs::remove_file(cert_path)
             .map_err(|_| static_error("tls_identity_stale_cert_remove_failed"))?;
     }
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["deppy-remote".to_owned()])
             .context("자기서명 TLS 인증서 생성 실패")?;
     let cert_der = cert.der().to_vec();
-    let key_der = key_pair.serialize_der();
+    let key_der = signing_key.serialize_der();
     validate_cert_der(&cert_der)?;
 
     // 키를 먼저 keyring에 확정하고 나서 cert를 디스크에 쓴다 — cert 쓰기가 실패해도

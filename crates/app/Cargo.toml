@@ -40,7 +40,7 @@ image = { workspace = true }
 # 모바일 웹 페어링 QR (mobile-pwa v3.3 P1) — 접속 URL을 egui 텍스처로 렌더
 qrcode = { workspace = true }
 # 프로젝트 폴더 선택 네이티브 다이얼로그 (환경 메뉴 — 워크스페이스 path 지정, 2026-07-08)
-rfd = "0.15"
+rfd = "0.17"
 audit = { path = "../audit" }
 auth = { path = "../auth" }
 connector-contract = { path = "../connector-contract" }

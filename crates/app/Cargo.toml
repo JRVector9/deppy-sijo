@@ -69,9 +69,16 @@ toml_edit = "0.25.12"
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# renamex_np(RENAME_EXCL) — 덮어쓰기 금지 rename (§9-5 TOCTOU 회피)
+# libc는 unix 전체에 필요하다. 코드가 `#[cfg(unix)]`로 들어가는데(waitid, mkfifo,
+# O_NOFOLLOW 등 POSIX API) 의존성만 macOS로 좁혀 두면 Linux에서 크레이트를 찾지
+# 못해 컴파일이 깨진다 — 실증(2026-08-03): Ubuntu에서 `cannot find crate libc`
+# 40건. `pty`/`mcp-proxy`는 처음부터 `cfg(unix)`로 잡고 있다.
+# Darwin 전용 API(renamex_np, proc_pid_rusage, sysctlbyname)를 쓰는 자리는 모두
+# `#[cfg(target_os = "macos")]`로 따로 막혀 있어 이 확장에 영향받지 않는다.
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 # 메모리 압박 감지 (로드맵 C1) — rfd가 이미 쓰는 crate라 추가 빌드 비용 없음.
 dispatch2 = "0.3"
 muda = "0.19.3"

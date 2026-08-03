@@ -17,6 +17,37 @@ pub(crate) enum StatusBarIntent {
     FocusWaiting(crate::ui::notifications::AgentNotificationTarget),
 }
 
+/// 강도·모델 단축키가 실행되지 않은 이유를 하단 상태바에 잠시 보여준다.
+///
+/// 감지 파이프라인의 단계별 실패를 하나의 "무반응"으로 숨기지 않는다. 예약 성공은
+/// 기존 `status_bar.queued_*` 라벨이 지속해서 보여주므로 여기에 중복하지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentShortcutFeedback {
+    NoFocusedPane,
+    ProcessInfoPending,
+    NoAgent,
+    SurfacePending,
+    CurrentValueUnknown,
+    Unsupported,
+    TargetUnavailable,
+    DeliveryFailed,
+}
+
+impl AgentShortcutFeedback {
+    fn message_key(self) -> &'static str {
+        match self {
+            Self::NoFocusedPane => "status_bar.agent_shortcut.no_focused_pane",
+            Self::ProcessInfoPending => "status_bar.agent_shortcut.process_info_pending",
+            Self::NoAgent => "status_bar.agent_shortcut.no_agent",
+            Self::SurfacePending => "status_bar.agent_shortcut.surface_pending",
+            Self::CurrentValueUnknown => "status_bar.agent_shortcut.current_value_unknown",
+            Self::Unsupported => "status_bar.agent_shortcut.unsupported",
+            Self::TargetUnavailable => "status_bar.agent_shortcut.target_unavailable",
+            Self::DeliveryFailed => "status_bar.agent_shortcut.delivery_failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentTerminalView {
     Home,
@@ -93,6 +124,8 @@ pub struct AgentTerminalUi {
     /// 상태바 승인 팝오버 열림 상태. 자원·포트 팝오버가 각자 UI 구조체에 두는 것과
     /// 같은 자리다 — 열려 있을 때만 App이 카드 데이터를 조립한다.
     approvals_open: bool,
+    /// 단축키 실패 영수증. 화면을 덮는 토스트 대신 이미 항상 보이는 상태바를 쓴다.
+    agent_shortcut_feedback: Option<(AgentShortcutFeedback, std::time::Instant)>,
 }
 
 /// 승인 팝오버가 그릴 데이터. App이 소유한 것을 빌려온다 — 이 모듈은 App을 모른다.
@@ -116,6 +149,8 @@ const APPROVAL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x71, 0x4a);
 const WAITING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe7, 0x9a, 0x3b);
 /// 예약은 아직 일어나지 않은 일이라 가장 약하게 — 알리되 주장하지 않는다.
 const QUEUED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x9b, 0xb0);
+const SHORTCUT_FEEDBACK_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe7, 0x9a, 0x3b);
+const AGENT_SHORTCUT_FEEDBACK_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// 상태를 **모양으로도** 구분한다. 색만으로 나누면 색각 차이가 있는 사용자에게는
 /// 두 항목이 같은 것으로 읽히고, 26px 줄에서는 색 면적이 작아 누구에게나 약하다.
@@ -157,7 +192,37 @@ impl AgentTerminalUi {
             resource_manager: ResourceManagerUi::default(),
             ports: PortsUi::default(),
             approvals_open: false,
+            agent_shortcut_feedback: None,
         }
+    }
+
+    pub(crate) fn show_agent_shortcut_feedback(&mut self, feedback: AgentShortcutFeedback) {
+        self.agent_shortcut_feedback = Some((
+            feedback,
+            std::time::Instant::now() + AGENT_SHORTCUT_FEEDBACK_TTL,
+        ));
+    }
+
+    pub(crate) fn clear_agent_shortcut_feedback(&mut self) {
+        self.agent_shortcut_feedback = None;
+    }
+
+    pub(crate) fn agent_shortcut_feedback_ttl() -> std::time::Duration {
+        AGENT_SHORTCUT_FEEDBACK_TTL
+    }
+
+    fn active_agent_shortcut_feedback(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<AgentShortcutFeedback> {
+        let active = self
+            .agent_shortcut_feedback
+            .filter(|(_, expires_at)| *expires_at > now)
+            .map(|(feedback, _)| feedback);
+        if active.is_none() {
+            self.agent_shortcut_feedback = None;
+        }
+        active
     }
 
     pub fn view(&self) -> AgentTerminalView {
@@ -245,6 +310,7 @@ impl AgentTerminalUi {
         now_ms: u64,
         catalog: &i18n::Catalog,
     ) -> Option<StatusBarIntent> {
+        let shortcut_feedback = self.active_agent_shortcut_feedback(std::time::Instant::now());
         let totals = workspace_totals(rows);
         let cpu_value = if totals.cpu_seen {
             format!("{:.1}%", totals.cpu_percent)
@@ -296,6 +362,13 @@ impl AgentTerminalUi {
                 // 승인과 입력 대기는 성격이 달라 나눈다(승인은 되돌리기 어렵고, 입력은
                 // 그냥 기다림이다). 화면에서 보고 합칠지 정한다.
                 // 예약은 사용자가 방금 누른 것의 영수증이다 — 대기/승인보다 먼저 보인다.
+                if let Some(feedback) = shortcut_feedback {
+                    crate::ui::designall::vertical_separator(ui, 14.0);
+                    ui.colored_label(
+                        SHORTCUT_FEEDBACK_COLOR,
+                        egui::RichText::new(catalog.t(feedback.message_key(), &[])).size(11.5),
+                    );
+                }
                 if !queued.is_empty() {
                     crate::ui::designall::vertical_separator(ui, 14.0);
                     for label in queued.iter().take(WAITING_CHIP_MAX) {
@@ -1313,6 +1386,51 @@ mod tests {
         assert!(harness.query_by_label("Terminal").is_none());
         harness.get_by_label("CPU — · App 0 B · Sessions 0 B");
         harness.get_by_label("Ports —");
+    }
+
+    #[test]
+    fn kittest_에이전트_단축키_실패가_상태바에_보인다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let feed = StatusFeedSnapshot::default();
+        let mut terminal = AgentTerminalUi::new();
+        terminal.show_agent_shortcut_feedback(AgentShortcutFeedback::NoAgent);
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, fonts_ready| {
+                if !*fonts_ready {
+                    return;
+                }
+                terminal.status_bar_with_managers(
+                    ui,
+                    None,
+                    None,
+                    &[],
+                    0,
+                    &[],
+                    &[],
+                    StatusBarApprovals {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                    },
+                    0,
+                    &feed,
+                    None,
+                    &HashMap::new(),
+                    None,
+                    0,
+                    &catalog,
+                );
+            },
+            false,
+        );
+        harness.set_size(egui::vec2(1400.0, 100.0));
+        install_sidebar_test_fonts(&harness.ctx);
+        *harness.state_mut() = true;
+        harness.run();
+
+        harness.get_by_label("이 pane에서 에이전트를 찾지 못했습니다");
     }
 
     /// 승인은 **그 자리에서** 끝나야 한다. 뷰를 바꾸면 터미널을 떠나게 되어

@@ -6913,6 +6913,12 @@ type WorktreeRemoveOutcome = (
     Vec<(String, runtime::SessionId)>,
 );
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ClaudeDirectDefaults {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 pub struct App {
     config: Config,
     config_path: PathBuf,
@@ -7021,6 +7027,12 @@ pub struct App {
     agent_launcher_worker:
         crate::lazy_worker::LazyBoundedWorker<(), crate::agent_launcher::DetectionSnapshot>,
     agent_launcher_snapshot: Option<crate::agent_launcher::DetectionSnapshot>,
+    /// 셸에서 직접 실행한 Claude는 argv에 model/effort가 없다. 설정 파일은
+    /// lazy 런처 worker가 읽고, 렌더는 이 스냅샷만 본다.
+    claude_direct_defaults: ClaudeDirectDefaults,
+    /// 새 직접-실행 세션을 발견했을 때 기존 런처 감지가 이미 실행 중이면,
+    /// 그 완료는 새 세션용 재감지 요청보다 앞선 것이므로 한 번 버린다.
+    claude_direct_defaults_ignore_next_completion: bool,
     agent_launcher_detection_requested: bool,
     agent_launcher_detection_in_flight: bool,
     pending_agent_launcher_intent: Option<ui::agent_launcher::AgentLauncherIntent>,
@@ -10002,6 +10014,8 @@ impl App {
             agent_launcher_ui: ui::agent_launcher::AgentLauncherUi::new(),
             agent_launcher_worker,
             agent_launcher_snapshot: None,
+            claude_direct_defaults: ClaudeDirectDefaults::default(),
+            claude_direct_defaults_ignore_next_completion: false,
             agent_launcher_detection_requested: false,
             agent_launcher_detection_in_flight: false,
             pending_agent_launcher_intent: None,
@@ -11331,6 +11345,15 @@ impl App {
             self.agent_info = info;
         }
         if let Some(kinds) = latest_kinds {
+            if claude_defaults_refresh_needed(&self.agent_kinds, &kinds) {
+                // 새 직접-실행 Claude 세션은 직전 런처 스냅샷을 재사용하면
+                // 설정 변경 전 값으로 단축키를 보낼 수 있다. 먼저 무효화하고 worker
+                // 재감지를 요청해, 완료 전에는 "현재값 확인 중"으로 안전하게 멈춘다.
+                self.claude_direct_defaults = ClaudeDirectDefaults::default();
+                self.claude_direct_defaults_ignore_next_completion =
+                    self.agent_launcher_detection_in_flight;
+                self.agent_launcher_detection_requested = true;
+            }
             self.agent_kinds = kinds;
         }
         // 에이전트 표시정보 최종본(claude는 statusLine으로 effort/model/context 병합) →
@@ -11407,8 +11430,6 @@ impl App {
         &self,
         entries: &[ui::file_tree::SessionEntry],
     ) -> Vec<crate::agent_surface::AgentSurfaceSnapshot> {
-        // 설정 파일 폴백용 홈. 루프 밖에서 한 번만 구한다.
-        let claude_home = crate::paths::home_dir();
         entries
             .iter()
             .filter_map(|entry| {
@@ -11454,20 +11475,16 @@ impl App {
                 // argv도 비는 경우가 있다 — 사용자가 셸에 `claude`라고 직접 치면
                 // 런처가 붙이는 `--model`/`--effort`가 아예 없다(2026-08-03 실증).
                 // 그때 새 세션은 CLI의 전역 기본값으로 시작하므로 그 값이 곧 현재
-                // 값이다. `/effort`가 "saved as your default for new sessions"로
-                // 써 두는 바로 그 파일을 읽는다.
+                // 값이다. 단, 이 함수는 렌더 경로다. 설정 파일은 lazy 런처
+                // worker가 읽고 여기서는 완성된 스냅샷만 복사한다.
                 if kind == crate::agent_detect::AgentKind::Claude {
                     if display.effort.is_none() {
-                        display.effort =
-                            crate::agent_model_catalog::claude_configured_default_effort(
-                                claude_home.as_deref(),
-                            );
+                        display
+                            .effort
+                            .clone_from(&self.claude_direct_defaults.effort);
                     }
                     if display.model.is_none() {
-                        display.model = crate::agent_model_catalog::configured_default_model(
-                            crate::agent_launcher::AgentKind::Claude,
-                            claude_home.as_deref(),
-                        );
+                        display.model.clone_from(&self.claude_direct_defaults.model);
                     }
                 }
                 Some(crate::agent_surface::AgentSurfaceSnapshot {
@@ -13856,58 +13873,67 @@ impl App {
         // `agent_sessions_ui`의 내부 선택 상태를 다시 읽으므로, 게이트만 통과시키면
         // 실행에서 막혀 "허용됐다는데 아무 일도 안 일어나는" 실패가 된다. 강도 조절의
         // PTY 경로만 여기서 넘긴 스냅샷을 그대로 쓴다.
-        let selected = self
-            .agent_sessions_ui
-            .selected_surface_snapshot()
-            .or_else(|| {
-                if !matches!(
-                    action,
-                    AgentAction::EffortUp
-                        | AgentAction::EffortDown
-                        | AgentAction::ModelNext
-                        | AgentAction::ModelPrev
-                ) {
-                    return None;
-                }
-                let session = self.active.workspace_ui.focused_session();
-                let surface = session.and_then(|session| {
-                    self.pty_agent_surfaces_cache
-                        .iter()
-                        .find(|surface| {
-                            matches!(
-                                &surface.id,
-                                crate::agent_surface::AgentSurfaceId::Pty { session_id, .. }
-                                    if *session_id == session
-                            )
-                        })
-                        .cloned()
-                });
-                if surface.is_none() {
-                    // 폴백이 빗나가면 사용자는 "패널만 열리는" 결과만 본다. 어느
-                    // 단계에서 끊겼는지 남겨야 진단이 된다.
-                    tracing::info!(
-                        focused_session = ?session,
-                        pty_surfaces = self.pty_agent_surfaces_cache.len(),
-                        // 표면의 **존재 근거**다. 이게 비면 감지가 프로세스를 못 잡은
-                        // 것이고, 차 있는데 표면이 0이면 표면 생성 쪽 문제다.
-                        agent_kinds = self.agent_kinds.len(),
-                        bindings = self.agent_bindings.len(),
-                        statuslines = self.statuslines.len(),
-                        // 감지 대상 목록의 원천. 여기가 비면 위의 셋이 **전부** 0이
-                        // 된다 — `poll_agent_detect`가 pid 있는 리소스 행만 감지
-                        // 워커에 넘기고, 비면 statusline 캐시까지 지운다.
-                        resource_rows = self.active.session_resource_usage.len(),
-                        rows_with_pid = self
-                            .active
-                            .session_resource_usage
-                            .iter()
-                            .filter(|row| row.pid.is_some())
-                            .count(),
-                        "PTY effort 폴백 실패"
-                    );
-                }
-                surface
+        let mut selected = self.agent_sessions_ui.selected_surface_snapshot();
+        let mut missing_pty_feedback = None;
+        if selected.is_none()
+            && matches!(
+                action,
+                AgentAction::EffortUp
+                    | AgentAction::EffortDown
+                    | AgentAction::ModelNext
+                    | AgentAction::ModelPrev
+            )
+        {
+            let session = self.active.workspace_ui.focused_session();
+            selected = session.and_then(|session| {
+                self.pty_agent_surfaces_cache
+                    .iter()
+                    .find(|surface| {
+                        matches!(
+                            &surface.id,
+                            crate::agent_surface::AgentSurfaceId::Pty { session_id, .. }
+                                if *session_id == session
+                        )
+                    })
+                    .cloned()
             });
+            if selected.is_none() {
+                let resource_has_pid = session.and_then(|session| {
+                    self.active
+                        .session_resource_usage
+                        .iter()
+                        .find(|row| row.session == session)
+                        .map(|row| row.pid.is_some())
+                });
+                let agent_detected = session.is_some_and(|session| {
+                    self.agent_kinds.contains_key(&session)
+                        || self.agent_bindings.contains_key(&session)
+                });
+                missing_pty_feedback = Some(pty_shortcut_missing_feedback(
+                    session.is_some(),
+                    resource_has_pid,
+                    agent_detected,
+                ));
+                // 화면에는 위 단계별 피드백을 내고, 로그에는 조사에 필요한 원자료를
+                // 그대로 남긴다.
+                tracing::info!(
+                    focused_session = ?session,
+                    pty_surfaces = self.pty_agent_surfaces_cache.len(),
+                    agent_kinds = self.agent_kinds.len(),
+                    bindings = self.agent_bindings.len(),
+                    statuslines = self.statuslines.len(),
+                    resource_rows = self.active.session_resource_usage.len(),
+                    rows_with_pid = self
+                        .active
+                        .session_resource_usage
+                        .iter()
+                        .filter(|row| row.pid.is_some())
+                        .count(),
+                    feedback = ?missing_pty_feedback,
+                    "PTY effort 폴백 실패"
+                );
+            }
+        }
         let pending = self.agent_sessions_ui.selected_pending_approval_count();
         let gate = gate_action(action, selected.as_ref(), pending);
         if !gate.is_allowed() {
@@ -13916,10 +13942,18 @@ impl App {
             // 고를 필요가 없다. 안내가 아니라 방해다 — 사용자가 보고 있던 터미널을
             // 모달이 덮고, 누를 때마다 다시 뜬다(2026-08-03 사용자 보고).
             //
-            // 실패는 로그로만 남긴다. 진단에 필요한 값은 각 분기가 이미 찍는다.
             match gate {
-                AgentActionGate::NoTarget => tracing::info!("에이전트 단축키: 선택 없음"),
+                AgentActionGate::NoTarget => {
+                    self.show_agent_shortcut_feedback(
+                        missing_pty_feedback
+                            .unwrap_or(crate::ui::agent_terminal::AgentShortcutFeedback::NoAgent),
+                    );
+                    tracing::info!("에이전트 단축키: 선택 없음");
+                }
                 AgentActionGate::Unsupported => {
+                    self.show_agent_shortcut_feedback(
+                        crate::ui::agent_terminal::AgentShortcutFeedback::Unsupported,
+                    );
                     tracing::info!("에이전트 단축키: 선택 transport에서 지원하지 않음")
                 }
                 AgentActionGate::ApprovalCountMismatch { pending } => {
@@ -14015,6 +14049,21 @@ impl App {
         }
     }
 
+    fn show_agent_shortcut_feedback(
+        &mut self,
+        feedback: crate::ui::agent_terminal::AgentShortcutFeedback,
+    ) {
+        self.agent_terminal_ui
+            .show_agent_shortcut_feedback(feedback);
+        self.egui_ctx.request_repaint_after(
+            crate::ui::agent_terminal::AgentTerminalUi::agent_shortcut_feedback_ttl(),
+        );
+    }
+
+    fn clear_agent_shortcut_feedback(&mut self) {
+        self.agent_terminal_ui.clear_agent_shortcut_feedback();
+    }
+
     /// PTY 에이전트의 추론 강도를 한 단계 옮긴다.
     ///
     /// 보내는 입력은 provider마다 다르다 — `pty_effort` 참조. 여기서는 **보내도
@@ -14089,14 +14138,27 @@ impl App {
         self.pty_agent_queued
             .retain(|(session, _), _| alive.contains(session));
 
+        let had_ready = !ready.is_empty();
+        let mut delivery_failed = false;
         for (key, bytes) in ready {
             self.pty_agent_queued.remove(&key);
             let (session, kind) = key;
             tracing::info!(?kind, "PTY 조정: 큐에 있던 것을 지금 보낸다");
-            let _ = self
+            if let Err(error) = self
                 .active
                 .runtime
-                .send_command(runtime::RuntimeCommand::WriteInput { session, bytes });
+                .send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
+            {
+                delivery_failed = true;
+                tracing::warn!(?kind, "PTY 큐 입력 전송 실패: {error:#}");
+            }
+        }
+        if delivery_failed {
+            self.show_agent_shortcut_feedback(
+                crate::ui::agent_terminal::AgentShortcutFeedback::DeliveryFailed,
+            );
+        } else if had_ready {
+            self.clear_agent_shortcut_feedback();
         }
     }
 
@@ -14152,6 +14214,9 @@ impl App {
             session_id,
         } = &surface.id
         else {
+            self.show_agent_shortcut_feedback(
+                crate::ui::agent_terminal::AgentShortcutFeedback::Unsupported,
+            );
             return;
         };
         let still_matches = *workspace_id == self.active.id
@@ -14162,6 +14227,9 @@ impl App {
                     .any(|pane| pane.id.0 == *pane_id && pane.session_id == Some(*session_id))
             });
         if !still_matches {
+            self.show_agent_shortcut_feedback(
+                crate::ui::agent_terminal::AgentShortcutFeedback::TargetUnavailable,
+            );
             tracing::info!(?kind, "PTY 조정: 대상 세션이 더 이상 활성 workspace에 없다");
             return;
         }
@@ -14169,6 +14237,9 @@ impl App {
         let plan = match plan {
             Ok(plan) => plan,
             Err(EffortBlocked::UnknownCurrentEffort) => {
+                self.show_agent_shortcut_feedback(
+                    crate::ui::agent_terminal::AgentShortcutFeedback::CurrentValueUnknown,
+                );
                 // 임의로 가정하지 않는다 — 틀리면 사용자가 누른 적 없는 값으로
                 // 세션과 전역 기본값이 함께 바뀐다. 어느 원천이 비었는지 남긴다:
                 // statusLine이 안 실렸는지, 실렸는데 표기가 사다리 밖인지가 갈린다.
@@ -14204,6 +14275,9 @@ impl App {
                         pty_status = ?surface.pty_status,
                         "PTY 조정: 작업 중이라 큐에 넣었다 — 끝나면 보낸다"
                     );
+                    // 큐의 목표값 라벨이 상태바에 지속해서 남는다. 이전 실패 메시지를
+                    // 함께 두면 지금 입력까지 실패한 것으로 오해하므로 지운다.
+                    self.clear_agent_shortcut_feedback();
                     return;
                 }
                 // 결과는 CLI가 pane에 직접 찍는다 — Claude는 전역 기본값까지
@@ -14213,13 +14287,21 @@ impl App {
             }
         };
 
-        let _ = self
+        match self
             .active
             .runtime
             .send_command(runtime::RuntimeCommand::WriteInput {
                 session: *session_id,
                 bytes,
-            });
+            }) {
+            Ok(()) => self.clear_agent_shortcut_feedback(),
+            Err(error) => {
+                self.show_agent_shortcut_feedback(
+                    crate::ui::agent_terminal::AgentShortcutFeedback::DeliveryFailed,
+                );
+                tracing::warn!(?kind, "PTY 조정 입력 전송 실패: {error:#}");
+            }
+        }
     }
 
     /// warm 풀이 max_warm(설정)을 넘으면 가장 오래된 것부터 Suspended로 내린다 (워커
@@ -15448,8 +15530,17 @@ impl App {
     fn poll_agent_launcher_detection(&mut self) {
         while let Some(outcome) = self.agent_launcher_worker.try_recv() {
             self.agent_launcher_detection_in_flight = false;
+            let ignore_claude_defaults =
+                std::mem::take(&mut self.claude_direct_defaults_ignore_next_completion);
             match outcome.into_result() {
                 Ok(snapshot) => {
+                    if !ignore_claude_defaults {
+                        let (model, effort) = snapshot.claude_defaults();
+                        self.claude_direct_defaults = ClaudeDirectDefaults {
+                            model: model.map(str::to_owned),
+                            effort: effort.map(str::to_owned),
+                        };
+                    }
                     self.agent_launcher_snapshot = Some(snapshot);
                     self.agent_launcher_ui.detection_succeeded();
                 }
@@ -23553,12 +23644,125 @@ fn activity_session_name(
         .unwrap_or_else(|| ui::workspace::display_pane_title(raw_title, catalog))
 }
 
+fn claude_defaults_refresh_needed(
+    previous: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::RunningAgent>,
+    latest: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::RunningAgent>,
+) -> bool {
+    latest.iter().any(|(session, agent)| {
+        agent.kind == crate::agent_detect::AgentKind::Claude
+            && (agent.model.is_none() || agent.effort.is_none())
+            && previous.get(session) != Some(agent)
+    })
+}
+
+/// 포커스 pane의 PTY 표면이 아직 없을 때 감지 파이프라인에서 끊긴 단계를 가른다.
+/// `resource_has_pid`는 `None`이면 리소스 행 자체 없음, `Some(false)`면 행은 있으나
+/// 아직 pid가 없는 상태다.
+fn pty_shortcut_missing_feedback(
+    has_focused_session: bool,
+    resource_has_pid: Option<bool>,
+    agent_detected: bool,
+) -> ui::agent_terminal::AgentShortcutFeedback {
+    use ui::agent_terminal::AgentShortcutFeedback as Feedback;
+
+    if !has_focused_session {
+        return Feedback::NoFocusedPane;
+    }
+    if resource_has_pid != Some(true) {
+        return Feedback::ProcessInfoPending;
+    }
+    if !agent_detected {
+        return Feedback::NoAgent;
+    }
+    Feedback::SurfacePending
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    #[test]
+    fn pty_단축키_표면_누락은_파이프라인_단계별로_구분된다() {
+        use ui::agent_terminal::AgentShortcutFeedback as Feedback;
+
+        assert_eq!(
+            pty_shortcut_missing_feedback(false, None, false),
+            Feedback::NoFocusedPane
+        );
+        assert_eq!(
+            pty_shortcut_missing_feedback(true, None, false),
+            Feedback::ProcessInfoPending
+        );
+        assert_eq!(
+            pty_shortcut_missing_feedback(true, Some(false), false),
+            Feedback::ProcessInfoPending
+        );
+        assert_eq!(
+            pty_shortcut_missing_feedback(true, Some(true), false),
+            Feedback::NoAgent
+        );
+        assert_eq!(
+            pty_shortcut_missing_feedback(true, Some(true), true),
+            Feedback::SurfacePending
+        );
+    }
+
+    #[test]
+    fn pty_agent_surfaces는_렌더에서_설정_파일을_읽지_않는다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn pty_agent_surfaces(")
+            .and_then(|(_, tail)| tail.split_once("    fn update_session_alerts("))
+            .map(|(body, _)| body)
+            .expect("pty_agent_surfaces function remains discoverable");
+
+        assert!(
+            !body.contains("agent_model_catalog::") && !body.contains("paths::home_dir"),
+            "render-time PTY surface projection must consume worker snapshots, not read config files"
+        );
+    }
+
+    #[test]
+    fn 새_직접실행_claude만_기본값_worker를_새로_요청한다() {
+        let direct_claude = crate::agent_detect::RunningAgent {
+            kind: crate::agent_detect::AgentKind::Claude,
+            model: None,
+            effort: None,
+        };
+        let latest = HashMap::from([(runtime::SessionId(1), direct_claude.clone())]);
+
+        assert!(claude_defaults_refresh_needed(&HashMap::new(), &latest));
+        assert!(!claude_defaults_refresh_needed(&latest, &latest));
+
+        let explicit_claude = HashMap::from([(
+            runtime::SessionId(2),
+            crate::agent_detect::RunningAgent {
+                kind: crate::agent_detect::AgentKind::Claude,
+                model: Some("sonnet".to_owned()),
+                effort: Some("high".to_owned()),
+            },
+        )]);
+        assert!(!claude_defaults_refresh_needed(
+            &HashMap::new(),
+            &explicit_claude
+        ));
+
+        let direct_codex = HashMap::from([(
+            runtime::SessionId(3),
+            crate::agent_detect::RunningAgent {
+                kind: crate::agent_detect::AgentKind::Codex,
+                model: None,
+                effort: None,
+            },
+        )]);
+        assert!(!claude_defaults_refresh_needed(
+            &HashMap::new(),
+            &direct_codex
+        ));
+    }
 
     #[test]
     fn status_resource_port_app_activity_projection_preserves_exact_identities() {

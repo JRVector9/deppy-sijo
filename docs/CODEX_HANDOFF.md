@@ -2,25 +2,32 @@
 
 ## Current task
 
-- Implement the approved lightweight status-bar resource manager and port manager, remove workspace session-count text, enlarge workspace avatars, and remove the `터미널` status label.
-- Status: Orca source analysis, the approved A-approach design, and the RED-first implementation plan are complete. Parallel implementation is ready to start with disjoint workspace-row, runtime-safety, and port-inventory lanes. PID `36697` still runs the preceding signed bundle.
+- Diagnose direct-shell Claude/Codex effort/model shortcut failures from `docs/agent-shortcut-launch-cases.md`, prioritizing the section 4 process-tree check and removal of silent failures.
+- Status: implementation and merged-state verification complete; commit/main fast-forward/rebuild/relaunch remain. The daemon-reparenting hypothesis is refuted for the live Deppy pane; direct Codex classification and current-value-free key planning pass; RED-first status-bar feedback is implemented. A pre-landing review also found and removed synchronous Claude settings reads from the render path.
 
 ## Working area
 
-- Current branch/worktree: `DesignALL` in `/private/tmp/deppy-sf06-integration`; branch is two commits ahead of `origin/DesignALL` at `da81b2e`. The latest signed bundle is `/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.app`; old PID `9210` exited after `SIGTERM`, and PID `36697` runs the exact rebuilt executable with PPID 1.
-- Confirmed safeguards: PTY output/input queues, runtime command/event queues, terminal scrollback/cache classes, persisted restore size, remote frames, log bytes, exited backends, and shutdown joins are bounded; no Arc cycle or unbounded terminal scrollback leak was found statically.
-- Confirmed gaps after second-pass review: warm/hidden replay retains some lifecycle events without a hard cap; web-push session jobs are admitted without a cap before slow HTTP delivery; archived-row rebinding mutates persistence before archive validation completes; exported `RemoteRuntimeClient` has no bounded TCP connect deadline or missed-heartbeat deadline; the process-global Git label cache never evicts unique paths; session log/archive GC scans have depth/byte but no entry-count budget.
-- Rejected prior finding: valid persisted cwd is restored. `persist::load_workspace_restore_bounded` joins `sessions.cwd` into `PaneState.cwd` before `restore_pane`; the stability wave adds regression evidence only and does not change cwd production behavior unless that exact test fails.
-- Orca's reusable design is architectural rather than a drop-in dependency: per-target generation-fenced connection ownership, bounded reconnect backoff, SSH keepalive plus relay sequence/ACK liveness, sleep/App Nap wake probing, remote relay-owned PTYs, durable leases/incarnation IDs, and explicit detach versus dispose.
+- Current branch/worktree: `DesignALL` in `/Users/jr/deppy-worktrees/designall`, HEAD `0434ade`; latest `origin/main` (`4c1df44`) merged cleanly before the final review/test wave. The task changes remain uncommitted.
+- Modified files: `crates/app/src/app.rs`, `crates/app/src/agent_launcher.rs`, `crates/app/src/agent_model_catalog.rs`, `crates/app/src/ui/agent_terminal.rs`, all five `crates/i18n/locales/*/messages.txt`, `docs/agent-shortcut-launch-cases.md`, and this handoff.
+- Live measurement: Deppy PID `36159` owned pane shell PID `56134`, whose direct child PID `65361` was `claude`. The PPID=1 daemon tree in the earlier document belonged to another Claude/Desktop session and cannot explain this pane.
+- Design decision: do not broaden `agent_detect::classify` without an actual missed argv. Distinguish pipeline stages in the existing bottom status bar for four seconds; keep queued effort/model on the existing persistent queued labels; do not add a toast or reuse `web_notice`. Claude's direct-shell defaults are read only by the existing lazy launcher worker, refreshed when a new argument-free Claude appears, and consumed from an immutable render snapshot.
 
 ## Plan
 
-1. Completed — freeze the design, TDD/resource contracts, and ownership map.
-2. Completed — implement and review state, config, storage, and runtime lanes.
-3. Completed — close the renderer rereview and integrate reviewed lower layers.
-4. Completed — implement and review the App restore coordinator.
-5. Completed — integrate App layout, focus, visibility, and release semantics.
-6. Completed — rebuild and verify the signed release bundle; keep GUI/RSS hardware observations explicit and push only when requested.
+1. Completed — run the section 4 live process-tree recipe and refute the daemon-reparenting hypothesis for the actual pane.
+2. Completed — verify direct Codex classification and key planning with focused tests.
+3. Completed — observe RED for missing status-bar feedback and missing stage classifier, then implement both to GREEN.
+4. Completed — update the investigation record and run focused tests, i18n check, full app tests, and strict Clippy.
+5. Completed — rerun full merged-state tests, strict Clippy, i18n, fmt, and diff checks.
+6. In progress — commit, preserve the dirty main-worktree handoff, fast-forward local `main`, then rebuild and relaunch as requested. Do not push.
+
+## Agent shortcut investigation status
+
+- Completed work: `AgentShortcutFeedback` distinguishes no focused pane, pending process info, no detected agent, pending surface creation, unknown current value, unsupported shortcut, stale target, and runtime delivery failure. The handler now selects the exact message from focused-session resource/detection evidence. Queued adjustments retain the pre-existing `강도/모델 … 예약` status label. Immediate and queued `WriteInput` errors are no longer discarded.
+- RED evidence: `kittest_에이전트_단축키_실패가_상태바에_보인다` failed to compile because `AgentShortcutFeedback` and its show method did not exist; `pty_단축키_표면_누락은_파이프라인_단계별로_구분된다` failed to compile because the stage classifier did not exist. The pre-landing render-I/O law test then failed against the synchronous `agent_model_catalog`/`home_dir` calls before the lazy-worker correction.
+- GREEN evidence: a combined `단축키` filter passed 3/3 including both feedback tests. Existing direct-Codex classification and current-value-free planning tests passed 1/1 each. The new render-I/O law passed after the fix; the new direct-Claude refresh test passed 1/1; all 26 `agent_model_catalog` tests passed. Final merged-state `cargo test -p deppy-sijo --locked -- --test-threads=1` passed 1,265 unit tests with seven explicit ignores, integration targets 4/4, 5/5, 14/14, and 15/15, with three hardware/release-only integration tests ignored. Strict all-target Clippy with `-D warnings` passed. `xtask i18n-check` passed 7/7 plus its three exact app checks. Final fmt and diff checks passed.
+- Failed approaches: the first AWK descendant-tree probe inherited false keys and printed unrelated ancestors/processes. A corrected strict descendant traversal produced only Deppy PID `36159` → pane shell `56134` → direct `claude` PID `65361` (plus the independent app-server child), disproving the hypothesis. The first post-fix fmt check found one line-wrap-only difference in `poll_agent_launcher_detection`; `cargo fmt --all` applied that non-semantic correction and the fmt/diff checks then passed.
+- Remaining work: inspect the final diff/status; commit on `DesignALL`; preserve the pre-existing dirty main-worktree handoff in a named stash; fast-forward local `main`; rebuild/sign/relaunch from `main`; record the exact PID/path. Exact next commands: `git diff --check`; `git status --short --branch`; `git add crates/app/src/app.rs crates/app/src/agent_launcher.rs crates/app/src/agent_model_catalog.rs crates/app/src/ui/agent_terminal.rs crates/i18n/locales/*/messages.txt docs/agent-shortcut-launch-cases.md docs/CODEX_HANDOFF.md`; `git commit -m 'fix(app): surface agent shortcut failures'`.
 
 ## Multi-pane design status
 

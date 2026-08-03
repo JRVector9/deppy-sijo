@@ -123,19 +123,28 @@ struct ClaudeSettingsFile {
     effort_level: Option<String>,
 }
 
+#[cfg(test)]
 fn parse_claude_default_model(text: &str) -> Option<String> {
-    let settings: ClaudeSettingsFile = serde_json::from_str(text).ok()?;
-    trimmed_non_empty(settings.model)
+    parse_claude_defaults(text).0
 }
 
 fn claude_configured_default_model(home: &Path) -> Option<String> {
-    let text = read_bounded(&home.join(".claude/settings.json"))?;
-    parse_claude_default_model(&text)
+    claude_configured_defaults(Some(home)).0
 }
 
+#[cfg(test)]
 fn parse_claude_default_effort(text: &str) -> Option<String> {
-    let settings: ClaudeSettingsFile = serde_json::from_str(text).ok()?;
-    trimmed_non_empty(settings.effort_level)
+    parse_claude_defaults(text).1
+}
+
+fn parse_claude_defaults(text: &str) -> (Option<String>, Option<String>) {
+    let Some(settings) = serde_json::from_str::<ClaudeSettingsFile>(text).ok() else {
+        return (None, None);
+    };
+    (
+        trimmed_non_empty(settings.model),
+        trimmed_non_empty(settings.effort_level),
+    )
 }
 
 /// `~/.claude/settings.json`의 `effortLevel` — Claude가 `/effort`로 저장하는 전역
@@ -145,9 +154,17 @@ fn parse_claude_default_effort(text: &str) -> Option<String> {
 /// (`STATUSLINES_PREFIX_PREFLIGHT`), argv는 **런처로 띄웠을 때만** 값이 있다 —
 /// 사용자가 셸에 `claude`라고 직접 치면 인자가 비어 있다(2026-08-03 실증). 그 경우
 /// 새 세션은 이 전역 기본값으로 시작하므로 이 값이 곧 현재 강도다.
-pub(crate) fn claude_configured_default_effort(home: Option<&Path>) -> Option<String> {
-    let text = read_bounded(&home?.join(".claude/settings.json"))?;
-    parse_claude_default_effort(&text)
+/// Claude 설정 파일을 한 번만 읽고 모델·강도 기본값을 같이 반환한다.
+/// 런처 감지 worker가 한 스냅샷에 두 값을 저장할 때 같은 JSON을 두 번
+/// 열고 파싱하지 않게 하는 경계다.
+pub(crate) fn claude_configured_defaults(home: Option<&Path>) -> (Option<String>, Option<String>) {
+    let Some(home) = home else {
+        return (None, None);
+    };
+    let Some(text) = read_bounded(&home.join(".claude/settings.json")) else {
+        return (None, None);
+    };
+    parse_claude_defaults(&text)
 }
 
 /// `~/.grok/config.toml`의 `[models]` 테이블 아래 `default` 키. Codex의 `model`과 달리
@@ -1177,7 +1194,11 @@ display_name = "K2.7 Coding"
             "model = \"gpt-5.3-codex-spark\"\n",
         )
         .unwrap();
-        std::fs::write(dir.join(".claude/settings.json"), r#"{"model": "sonnet"}"#).unwrap();
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"model": "sonnet", "effortLevel": "high"}"#,
+        )
+        .unwrap();
 
         assert_eq!(
             configured_default_model(AgentKind::Codex, Some(dir.as_path())).as_deref(),
@@ -1186,6 +1207,10 @@ display_name = "K2.7 Coding"
         assert_eq!(
             configured_default_model(AgentKind::Claude, Some(dir.as_path())).as_deref(),
             Some("sonnet")
+        );
+        assert_eq!(
+            claude_configured_defaults(Some(dir.as_path())),
+            (Some("sonnet".to_owned()), Some("high".to_owned()))
         );
 
         let _ = std::fs::remove_dir_all(&dir);

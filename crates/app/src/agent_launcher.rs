@@ -555,6 +555,8 @@ impl std::fmt::Debug for DetectedAgent {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DetectionSnapshot {
     agents: Vec<DetectedAgent>,
+    claude_default_model: Option<String>,
+    claude_default_effort: Option<String>,
 }
 
 impl DetectionSnapshot {
@@ -564,6 +566,13 @@ impl DetectionSnapshot {
 
     pub(crate) fn find(&self, kind: AgentKind) -> Option<&DetectedAgent> {
         self.agents.iter().find(|agent| agent.kind == kind)
+    }
+
+    pub(crate) fn claude_defaults(&self) -> (Option<&str>, Option<&str>) {
+        (
+            self.claude_default_model.as_deref(),
+            self.claude_default_effort.as_deref(),
+        )
     }
 
     #[cfg(test)]
@@ -579,6 +588,8 @@ impl DetectionSnapshot {
                     default_model: None,
                 })
                 .collect(),
+            claude_default_model: None,
+            claude_default_effort: None,
         }
     }
 }
@@ -634,14 +645,19 @@ pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> Dete
     let paths = detection_paths(excluded_directory);
     let launch_path = launch_search_path(&paths);
     let home = crate::paths::home_dir();
+    let (claude_default_model, claude_default_effort) =
+        crate::agent_model_catalog::claude_configured_defaults(home.as_deref());
     let agents = AgentKind::ALL
         .into_iter()
         .filter_map(|kind| {
             resolve_executable(kind.detect_command(), &paths).map(|executable| {
                 // 설정 파일은 종류마다 한 번만 읽는다. 모델 목록과 초기 선택이 같은 값을
                 // 쓰므로 각각 읽으면 같은 파일을 두 번 열고 파싱하게 된다.
-                let configured =
-                    crate::agent_model_catalog::configured_default_model(kind, home.as_deref());
+                let configured = if kind == AgentKind::Claude {
+                    claude_default_model.clone()
+                } else {
+                    crate::agent_model_catalog::configured_default_model(kind, home.as_deref())
+                };
                 DetectedAgent {
                     kind,
                     executable,
@@ -652,7 +668,11 @@ pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> Dete
             })
         })
         .collect();
-    DetectionSnapshot { agents }
+    DetectionSnapshot {
+        agents,
+        claude_default_model,
+        claude_default_effort,
+    }
 }
 
 /// CLI가 디스크에 남긴 카탈로그를 우선하고, 없거나 못 읽으면 내장 목록으로 폴백한다.

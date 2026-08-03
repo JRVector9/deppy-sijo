@@ -1332,53 +1332,6 @@ fn signal_target(process_group: Option<libc::pid_t>, own: libc::pid_t) -> Option
     process_group.filter(|pgid| *pgid > 0 && *pgid != own)
 }
 
-/// `waitpid`가 보고할 수 있는 job-control 전이. `WUNTRACED`는 정지 전이를
-/// **1회성 이벤트**로 보고한다 — 이미 소비한 전이를 다시 보고하지 않으므로,
-/// "지금 이 순간 실제로 정지해 있는가"를 알려주지 않는다(초기 정지 확인에는
-/// 충분하지만, 그 직후 다시 풀렸는지 확인하려면 부적합 — 아래 `ps_is_stopped`
-/// 참고).
-#[cfg(unix)]
-enum JobTransition {
-    Stopped,
-    None,
-}
-
-/// `pid`가 `WUNTRACED`로 관찰 가능한 정지 전이를 `timeout` 안에 보이는지
-/// 확인한다. 이 알림은 프로세스의 최종 종료 reap과는 독립적이라, 이후
-/// `child.wait()`/`kill()`의 정상적인 reap을 방해하지 않는다.
-#[cfg(unix)]
-fn wait_for_stop_transition(pid: libc::pid_t, timeout: std::time::Duration) -> JobTransition {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let mut status: libc::c_int = 0;
-        // SAFETY: `status`는 스택에 있는 유효한 out-parameter이고, WNOHANG이라
-        // 블로킹하지 않는다.
-        let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
-        if result == pid && libc::WIFSTOPPED(status) {
-            return JobTransition::Stopped;
-        }
-        if std::time::Instant::now() >= deadline {
-            return JobTransition::None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-/// `pid`가 **지금 이 순간** stopped 상태인지 `ps`로 직접 확인한다.
-/// `waitpid(WUNTRACED)`/`WCONTINUED`는 각각 1회성 전이 이벤트만 보고하므로,
-/// "정지 → (극히 짧은 시간 뒤) 재개"가 우리가 한 번 관찰하기도 전에 연달아
-/// 일어나면 그 재개를 놓칠 수 있다(2026-08-03 실측: 이 크레이트의 테스트
-/// 바이너리 안에서 `WUNTRACED`로 정지를 확인하고 곧바로 `WCONTINUED`를
-/// 짧게 기다려도 재개를 못 잡은 채로 실제로는 이미 재개된 사례가 있었다).
-/// `ps`는 그 순간의 실제 커널 상태를 다시 조회하므로 이런 놓침이 없다.
-#[cfg(unix)]
-fn ps_is_stopped(pid: libc::pid_t) -> bool {
-    std::process::Command::new("ps")
-        .args(["-o", "state=", "-p", &pid.to_string()])
-        .output()
-        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim().starts_with('T'))
-}
-
 impl PortablePtySession {
     /// Stop both workers without timers. The output queue cancellation covers a reader waiting for
     /// bounded capacity even when its receiver has been moved to the session crate; Unix self-pipes
@@ -1686,61 +1639,8 @@ impl PtySession for PortablePtySession {
             self.process_group.is_some(),
             "process group 없음 — 동결 불가"
         );
-        let Some(pid) = self.child.process_id() else {
-            // pid를 얻을 수 없으면(테스트 더블 등) 확인 없이 신호만 보낸다.
-            self.signal_process_group(libc::SIGSTOP);
-            return Ok(());
-        };
-        let pid = pid as libc::pid_t;
-
-        // 2026-08-03 실측(freeze flake 재조사, 이전 조사가 배제한 세 가설 이후):
-        // killpg는 항상 0(성공)을 반환하는데도 exec 직후의 자식이 실제로는 정지
-        // 상태를 유지하지 못하는 경우가 재현됐다 — 대상 그룹/타이밍 판정은 이미
-        // 정확했다(그래서 killpg가 성공을 보고했다). 격리된 단일 프로세스
-        // 재현(같은 openpty+fork+setsid+TIOCSCTTY+exec+killpg 절차, 스레드 없음,
-        // 이 크레이트 밖의 별도 Rust/C 프로젝트)은 시도한 전부 통과했지만, 이
-        // 크레이트의 테스트 바이너리 안에서는 SIGSTOP 확인(`waitpid(WUNTRACED)`)
-        // 직후 짧은 유예 동안 다시 풀리는 사례가 실제로 있었다. `waitpid`의
-        // `WUNTRACED`/`WCONTINUED`는 1회성 전이 이벤트라 "정지 → 곧바로 재개"가
-        // 우리가 한 번 관찰하기도 전에 연달아 일어나면 그 재개 자체를 놓칠 수
-        // 있다(실측: `WCONTINUED`를 짧게 기다려도 못 잡았는데 `ps`로는 이미
-        // 재개돼 있었다). 그래서 유예 구간에는 "지금 이 순간의 실제 상태"를
-        // 다시 알려주는 `ps_is_stopped`로 재확인하고, 풀려 있으면 SIGSTOP을
-        // 다시 보내는 것을 전체 타임아웃 안에서 반복한다.
-        const OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-        const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
-        const SETTLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
-        let deadline = std::time::Instant::now() + OVERALL_TIMEOUT;
-        loop {
-            self.signal_process_group(libc::SIGSTOP);
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if !matches!(
-                wait_for_stop_transition(pid, remaining),
-                JobTransition::Stopped
-            ) {
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "SIGSTOP을 보냈지만 정지 상태를 확인하지 못함"
-                );
-                continue;
-            }
-            let settle_deadline = std::time::Instant::now() + SETTLE_WINDOW;
-            let mut lost_stop = false;
-            while std::time::Instant::now() < settle_deadline {
-                if !ps_is_stopped(pid) {
-                    lost_stop = true;
-                    break;
-                }
-                std::thread::sleep(SETTLE_POLL_INTERVAL);
-            }
-            if !lost_stop {
-                return Ok(());
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "SIGSTOP 직후 반복적으로 재개돼 동결 실패"
-            );
-        }
+        self.signal_process_group(libc::SIGSTOP);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1760,6 +1660,11 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
+    const PTY_SIGNAL_PROBE_ENV: &str = "DEPPY_PTY_SIGNAL_PROBE";
+    const PTY_SIGNAL_PROBE_READY: &[u8] = b"PTY_SIGNAL_PROBE_READY";
+    const PTY_SIGNAL_PROBE_HUP: &[u8] = b"PTY_SIGNAL_PROBE_HUP";
+    const PTY_SIGNAL_PROBE_CONT: &[u8] = b"PTY_SIGNAL_PROBE_CONT";
+
     fn spawn(program: &str, args: &[&str]) -> Box<dyn PtySession> {
         PortablePtyBackend
             .spawn(
@@ -1773,6 +1678,103 @@ mod tests {
                 24,
             )
             .unwrap()
+    }
+
+    extern "C" fn record_pty_signal_probe(signal: libc::c_int) {
+        let marker = match signal {
+            libc::SIGHUP => PTY_SIGNAL_PROBE_HUP,
+            libc::SIGCONT => PTY_SIGNAL_PROBE_CONT,
+            _ => return,
+        };
+        // SAFETY: marker는 정적이고 write(2)는 async-signal-safe다.
+        unsafe {
+            let _ = libc::write(libc::STDOUT_FILENO, marker.as_ptr().cast(), marker.len());
+        }
+    }
+
+    fn install_pty_signal_probe_handlers() {
+        // SAFETY: action은 완전히 초기화되고 handler는 sa_handler ABI를 따른다. 이
+        // 설정은 전용 자식 테스트 프로세스에만 적용된다.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_pty_signal_probe as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(
+                libc::sigaction(libc::SIGCONT, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn pty_signal_probe_helper() {
+        if std::env::var_os(PTY_SIGNAL_PROBE_ENV).is_none() {
+            return;
+        }
+        install_pty_signal_probe_handlers();
+        // SAFETY: marker는 정적이고 write(2)는 async-signal-safe다. 이 write가
+        // 완료됐다는 관찰이 exec 전환을 벗어나 userland에 도달했다는 handshake다.
+        unsafe {
+            let _ = libc::write(
+                libc::STDOUT_FILENO,
+                PTY_SIGNAL_PROBE_READY.as_ptr().cast(),
+                PTY_SIGNAL_PROBE_READY.len(),
+            );
+        }
+        loop {
+            // SAFETY: 전용 probe는 측정 대상 신호를 기다리는 일만 한다.
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+
+    fn spawn_pty_signal_probe() -> Box<dyn PtySession> {
+        let test_exe = std::env::current_exe().expect("현재 테스트 실행 파일");
+        PortablePtyBackend
+            .spawn(
+                &CommandSpec {
+                    program: test_exe.to_string_lossy().into_owned(),
+                    args: vec![
+                        "--exact".into(),
+                        "tests::pty_signal_probe_helper".into(),
+                        "--nocapture".into(),
+                    ],
+                    env: vec![(PTY_SIGNAL_PROBE_ENV.into(), "1".into())],
+                    cwd: None,
+                },
+                80,
+                24,
+            )
+            .unwrap()
+    }
+
+    fn output_contains(output: &[u8], marker: &[u8]) -> bool {
+        output.windows(marker.len()).any(|window| window == marker)
+    }
+
+    fn receive_until(
+        receiver: &PtyOutputReceiver,
+        output: &mut Vec<u8>,
+        marker: &[u8],
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if output_contains(output, marker) {
+                return true;
+            }
+            match receiver.recv_timeout(Duration::from_millis(30)) {
+                Ok(chunk) => output.extend(chunk),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        output_contains(output, marker)
     }
 
     /// deppy가 다른 코딩 에이전트 안에서 실행되면 그 세션 마커가 pane 자식까지
@@ -2532,36 +2534,38 @@ mod tests {
         assert_eq!(signal_target(Some(9999), own), Some(9999));
     }
 
-    /// 2026-08-02 조사에서 배제한 것(다시 하지 말 것):
-    /// - 대상 그룹이 틀렸다 → 아니다. 실패 회차에도
-    ///   `cached_pgid == getpgid(child) != own_pgrp`로 **정확**했다.
-    /// - 자식이 아직 자기 그룹을 못 만들었다 → 아니다. freeze 직전까지 기다려도 같다.
-    /// - 대상 그룹을 신호 시점에 다시 읽으면 된다 → 아니다. 재조회해도 재현된다.
+    /// 2026-08-03 원인 규명:
+    /// - `killpg(SIGSTOP)`은 실패 회차에도 0이었고 pgid도 정확했으며,
+    ///   `waitpid(WUNTRACED)`는 실제 정지 전이를 관찰했다.
+    /// - XNU exec는 `fdt_exec()`에서 CLOEXEC fd를 닫은 뒤 새 task로 교체하고,
+    ///   마지막 `task_clear_return_wait(..., TCRW_CLEAR_FINAL_WAIT)`에서 새 task의
+    ///   userland 실행을 허용한다. Rust 부모는 exec 오류용 CLOEXEC pipe EOF를 보고
+    ///   `spawn()`에서 먼저 돌아올 수 있다. 이 전환 구간에 보낸 SIGSTOP은 기존
+    ///   task를 실제로 멈추지만, 뒤이은 새 task 실행 허용으로 정지 상태가 사라졌다.
+    /// - constructor에서 SIGHUP/SIGCONT를 기록하는 probe를 READY 전에 즉시 멈추면
+    ///   12회 중 5회가 다시 풀렸고, 그 5회 모두 HUP/CONT 기록은 0이었다. 같은
+    ///   probe의 READY를 기다린 뒤에는 20회 연속 정지를 유지했다.
+    /// - 고아 프로세스 그룹 가설은 틀렸다. setsid로 만든 그룹은 처음부터
+    ///   `pg_jobc == 0`이고 다른 세션 프로세스의 종료로 새로 고아가 되지 않는다.
+    ///   XNU `orphanpg()` 경로라면 반드시 HUP 뒤 CONT가 기록돼야 한다.
     ///
-    /// 2026-08-03 재조사로 찾은 원인: `killpg`는 **항상** 0(성공)을 반환했다(측정
-    /// 다수 회, errno도 항상 0) — 반환값 문제가 아니었다. 그런데도 exec 직후의
-    /// 자식이 실제로는 정지 상태를 유지하지 못하는 경우가 있었다. 격리된 최소
-    /// 재현(순수 C, 그리고 이 크레이트 밖의 별도 Rust 프로젝트에서
-    /// portable-pty만으로, reader/writer 스레드 없이
-    /// openpty+fork+setsid+TIOCSCTTY+exec+killpg를 그대로 재현)은 시도한 전부
-    /// 통과했지만, **이 크레이트의 테스트 바이너리 안에서는** 동일한 최소
-    /// 로직(스레드 없이 CommandBuilder+killpg만)도 시스템 부하가 높을 때(동시
-    /// 실행 중인 다른 에이전트/빌드와의 스케줄링 경합) 최대 50%까지 실패했다
-    /// — reader/writer 스레드나 복제 fd, cancellation pipe는 원인이 아니다
-    /// (그것들 없이도 재현됨). `waitpid(WUNTRACED)`로 정지를 확인한 직후
-    /// `WCONTINUED`를 짧게 기다려 보면 못 잡는데, `ps`로 다시 조회하면 이미
-    /// 재개돼 있는 사례가 실측됐다 — `WUNTRACED`/`WCONTINUED`는 1회성 전이
-    /// 이벤트라 "정지 → 곧바로 재개"가 우리가 한 번 관찰하기도 전에 연달아
-    /// 일어나면 그 재개 자체를 놓친다. 그래서 `freeze()`는 SIGSTOP 전송 후
-    /// `waitpid(WUNTRACED)`로 최초 정지를 확인하고, 그 뒤 짧은 유예 구간
-    /// 동안은 `ps_is_stopped`(그 순간의 실제 상태를 다시 조회)로 재확인해
-    /// 풀렸으면 SIGSTOP을 다시 보내는 것을 전체 타임아웃(3초) 안에서
-    /// 반복한다 — 이 방식으로 45회 연속 통과를 확인했다.
+    /// 따라서 제품 `freeze()`는 블로킹 retry 없이 SIGSTOP 한 번만 보낸다. 테스트만
+    /// 임의 sleep이 아니라 자식 userland의 명시적 READY handshake를 기다린다.
     #[test]
     fn freeze는_프로세스를_정지시키고_resume이_되살린다() {
-        // sleep 자식을 동결하면 ps 상태가 T(stopped)가 되고, 재개하면 다시 S/R.
-        let mut session = spawn("/bin/sleep", &["30"]);
-        let _rx = session.take_output().unwrap();
+        let mut session = spawn_pty_signal_probe();
+        let rx = session.take_output().unwrap();
+        let mut probe_output = Vec::new();
+        assert!(
+            receive_until(
+                &rx,
+                &mut probe_output,
+                PTY_SIGNAL_PROBE_READY,
+                Duration::from_secs(3),
+            ),
+            "PTY signal probe가 userland에 도달하지 못함: {:?}",
+            String::from_utf8_lossy(&probe_output)
+        );
         let pid = session.process_identity().pid.expect("pid");
 
         let state = |pid: u32| -> String {
@@ -2572,29 +2576,12 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
-        // 자식이 `setsid`로 자기 프로세스 그룹을 갖기 전에 SIGSTOP을 보내면 신호가
-        // 빈 그룹으로 가고 자식은 그대로 잠들어 있다(실증: freeze 직후에도 `Ss+`,
-        // 4회 중 3회 실패). 신호는 기다려주지 않으므로 **보내기 전에** 전제를
-        // 맞춘다 — 실사용에서 freeze는 spawn 한참 뒤에 사용자가 누르는 것이라
-        // 이 대기는 테스트가 현실을 흉내 내는 것이지 결함을 감추는 게 아니다.
         let own_group = unsafe { libc::getpgrp() };
-        let child_owns_group = {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
-                if pgid > 0 && pgid != own_group {
-                    break true;
-                }
-                if Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-        assert!(child_owns_group, "자식이 자기 프로세스 그룹을 갖지 못했다");
+        let child_group = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert_eq!(child_group, pid as libc::pid_t, "자식 pgid가 pid와 다름");
+        assert_ne!(child_group, own_group, "자식이 부모 프로세스 그룹에 남음");
 
         session.freeze().unwrap();
-        // SIGSTOP 반영까지 짧게 폴링 — state 첫 글자가 T면 stopped.
         let stopped = {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -2608,25 +2595,16 @@ mod tests {
             }
         };
         if !stopped {
-            // ps 판정이 신뢰할 만한지 waitpid(WUNTRACED)/kill(pid, 0)로 교차 확인.
-            let mut wstatus: libc::c_int = 0;
-            let wait_ret = unsafe {
-                libc::waitpid(
-                    pid as libc::pid_t,
-                    &mut wstatus,
-                    libc::WUNTRACED | libc::WNOHANG,
-                )
-            };
-            let wait_errno = std::io::Error::last_os_error();
-            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-            eprintln!(
-                "[freeze diag] ps state={:?} waitpid(WUNTRACED|WNOHANG)={wait_ret} \
-                 WIFSTOPPED={} errno={wait_errno} kill(pid,0)_alive={alive}",
-                state(pid),
-                wait_ret > 0 && libc::WIFSTOPPED(wstatus),
-            );
+            while let Ok(chunk) = rx.try_recv() {
+                probe_output.extend(chunk);
+            }
         }
-        assert!(stopped, "freeze 후 T(stopped) 상태가 아님: {}", state(pid));
+        assert!(
+            stopped,
+            "freeze 후 T(stopped) 상태가 아님: {}; probe={:?}",
+            state(pid),
+            String::from_utf8_lossy(&probe_output),
+        );
 
         session.resume().unwrap();
         let resumed = {
@@ -2642,6 +2620,21 @@ mod tests {
             }
         };
         assert!(resumed, "resume 후에도 정지 상태: {}", state(pid));
+        assert!(
+            receive_until(
+                &rx,
+                &mut probe_output,
+                PTY_SIGNAL_PROBE_CONT,
+                Duration::from_secs(3),
+            ),
+            "resume의 SIGCONT가 probe에 도달하지 않음: {:?}",
+            String::from_utf8_lossy(&probe_output),
+        );
+        assert!(
+            !output_contains(&probe_output, PTY_SIGNAL_PROBE_HUP),
+            "freeze/resume 사이에 예상하지 못한 SIGHUP 도달: {:?}",
+            String::from_utf8_lossy(&probe_output),
+        );
 
         session.kill().unwrap();
         assert!(wait_exit(&mut session, Duration::from_secs(5)).is_some());

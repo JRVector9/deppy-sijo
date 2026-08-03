@@ -1167,6 +1167,15 @@ mod tests {
                     }
                     Err(error) => panic!("HTTP mock accept failed: {error}"),
                 };
+                // accept()가 리스너의 O_NONBLOCK을 이어받는 플랫폼(macOS 확인됨)에서는
+                // 요청 바이트가 커널 수신 버퍼에 아직 도착하지 않은 순간 read()가
+                // WouldBlock을 리턴한다 — read_http_json은 이를 재시도하지 않고
+                // `.ok()?`로 즉시 None 처리해 연결을 버리고, 드롭된 스트림은 아직
+                // 읽지 않은 inbound 데이터 때문에 RST/EOF로 클라이언트를 끊는다
+                // (관측: "Broken pipe"/"Unexpected EOF" — flake 원인). accept 루프의
+                // 폴링 논리는 리스너에만 필요하므로, 커넥션별 I/O는 기존 5초
+                // read timeout을 상한으로 삼는 blocking 모드로 되돌린다.
+                stream.set_nonblocking(false).unwrap();
                 let Some(request) = read_http_json(&mut stream) else {
                     continue;
                 };

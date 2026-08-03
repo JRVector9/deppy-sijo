@@ -290,7 +290,7 @@ fn encrypt_payload(p256dh_b64: &str, auth_b64: &str, plaintext: &[u8]) -> anyhow
     let as_secret = p256::SecretKey::from_slice(&random_p256_scalar())
         .expect("검증된 스칼라로 임시 ECDH 키 생성");
     let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt).expect("OS 엔트로피(salt) 획득 실패");
+    getrandom::fill(&mut salt).expect("OS 엔트로피(salt) 획득 실패");
     seal(&ua_public, &auth_secret, plaintext, &as_secret, &salt)
 }
 
@@ -1302,7 +1302,7 @@ fn decode_b64_loose(s: &str) -> anyhow::Result<Vec<u8>> {
 fn random_p256_scalar() -> [u8; 32] {
     loop {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).expect("OS 엔트로피 획득 실패");
+        getrandom::fill(&mut bytes).expect("OS 엔트로피 획득 실패");
         if p256::SecretKey::from_slice(&bytes).is_ok() {
             return bytes;
         }

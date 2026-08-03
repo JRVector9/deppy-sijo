@@ -61,7 +61,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 unicode-normalization = "0.1"
-rcgen = "0.13"
+rcgen = "0.14"
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 windows-native-keyring-store = "1"

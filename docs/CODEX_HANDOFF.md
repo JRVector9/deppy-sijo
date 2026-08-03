@@ -7,7 +7,7 @@
 
 ## Working area
 
-- Current branch/worktree: local `main` in `/Users/jr/Desktop/projects/deppy-sijo`; source delivery commit `c64d5b6` (`fix(app): surface agent shortcut failures`) and the post-launch handoff commit are on `main` ahead of `origin/main`. No push was performed.
+- Current branch/worktree: `main` in `/Users/jr/Desktop/projects/deppy-sijo`; source delivery commit `c64d5b6` (`fix(app): surface agent shortcut failures`) and its post-launch handoff were pushed to `origin/main` by a regular non-force fast-forward. Local and remote were verified at the same commit after delivery.
 - Modified files in `c64d5b6`: `crates/app/src/app.rs`, `crates/app/src/agent_launcher.rs`, `crates/app/src/agent_model_catalog.rs`, `crates/app/src/ui/agent_terminal.rs`, all five `crates/i18n/locales/*/messages.txt`, `docs/agent-shortcut-launch-cases.md`, and this handoff. This post-launch handoff update is the only later source-tree change.
 - Merge preservation: the pre-existing dirty main-worktree handoff was saved as `stash@{0}` with message `preserve-main-handoff-before-agent-shortcut-merge-20260803` before the fast-forward; it was not dropped or reapplied.
 - Live measurement: Deppy PID `36159` owned pane shell PID `56134`, whose direct child PID `65361` was `claude`. The PPID=1 daemon tree in the earlier document belonged to another Claude/Desktop session and cannot explain this pane.
@@ -20,7 +20,7 @@
 3. Completed — observe RED for missing status-bar feedback and missing stage classifier, then implement both to GREEN.
 4. Completed — update the investigation record and run focused tests, i18n check, full app tests, and strict Clippy.
 5. Completed — rerun full merged-state tests, strict Clippy, i18n, fmt, and diff checks.
-6. Completed — commit, preserve the dirty main-worktree handoff, fast-forward local `main`, rebuild/sign/verify, and relaunch. No push.
+6. Completed — commit, preserve the dirty main-worktree handoff, fast-forward local `main`, rebuild/sign/verify, relaunch, and non-force push to `origin/main`.
 
 ## Agent shortcut investigation status
 

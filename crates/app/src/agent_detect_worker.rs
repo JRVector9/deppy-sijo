@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use runtime::SessionId;
 
-use crate::agent_detect::{self, AgentBinding, AgentDisplay, AgentKind};
+use crate::agent_detect::{self, AgentBinding, AgentDisplay, RunningAgent};
 use crate::agent_transcript::AgentActivity;
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
@@ -209,7 +209,7 @@ pub struct DetectOutcome {
     pub agent_info: Option<HashMap<SessionId, AgentDisplay>>,
     /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. 방금 띄워 아직
     /// 대화를 시작하지 않은 에이전트는 `bindings`에 없으므로 이쪽으로 잡는다.
-    pub agent_kinds: Option<HashMap<SessionId, AgentKind>>,
+    pub agent_kinds: Option<HashMap<SessionId, RunningAgent>>,
 }
 
 struct MailboxState {
@@ -382,7 +382,7 @@ struct BindingPass {
     activity: HashMap<SessionId, AgentActivity>,
     session_cwds: HashMap<SessionId, String>,
     agent_info: HashMap<SessionId, AgentDisplay>,
-    agent_kinds: HashMap<SessionId, AgentKind>,
+    agent_kinds: HashMap<SessionId, RunningAgent>,
 }
 
 trait DetectionBackend: Send + 'static {
@@ -712,7 +712,14 @@ mod tests {
             bindings: Some(HashMap::from([(session, binding(session))])),
             activity: HashMap::from([(session, state)]),
             session_cwds: Some(HashMap::from([(session, "/fixture".to_owned())])),
-            agent_kinds: Some(HashMap::from([(session, AgentKind::Claude)])),
+            agent_kinds: Some(HashMap::from([(
+                session,
+                RunningAgent {
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                },
+            )])),
             agent_info: Some(HashMap::from([(
                 session,
                 AgentDisplay {
@@ -767,7 +774,16 @@ mod tests {
             BindingPass {
                 agent_kinds: bindings
                     .keys()
-                    .map(|session| (*session, AgentKind::Claude))
+                    .map(|session| {
+                        (
+                            *session,
+                            RunningAgent {
+                                kind: AgentKind::Claude,
+                                model: None,
+                                effort: None,
+                            },
+                        )
+                    })
                     .collect(),
                 activity: bindings
                     .keys()
@@ -1018,7 +1034,16 @@ mod tests {
             BindingPass {
                 agent_kinds: bindings
                     .keys()
-                    .map(|session| (*session, AgentKind::Claude))
+                    .map(|session| {
+                        (
+                            *session,
+                            RunningAgent {
+                                kind: AgentKind::Claude,
+                                model: None,
+                                effort: None,
+                            },
+                        )
+                    })
                     .collect(),
                 activity: bindings
                     .keys()

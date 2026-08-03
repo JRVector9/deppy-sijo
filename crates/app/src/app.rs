@@ -7282,7 +7282,7 @@ pub struct App {
     agent_info: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
     /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. `agent_bindings`는
     /// transcript가 확정돼야 생겨서, 방금 띄운 에이전트는 여기에만 있다.
-    agent_kinds: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentKind>,
+    agent_kinds: std::collections::HashMap<runtime::SessionId, crate::agent_detect::RunningAgent>,
     /// 방금 우리가 PTY에 보낸 강도/모델. statusLine(→DB)은 다음 턴에야 갱신돼서,
     /// 이게 없으면 연속으로 눌러도 매번 같은 낡은 값에서 한 칸 움직여 같은 명령을
     /// 반복한다 (2026-08-02 실증: 강도를 올렸는데 계속 같은 단계가 적용됐다).
@@ -11420,10 +11420,9 @@ impl App {
                 // 프로세스 감지 결과를 먼저 본다 — 방금 띄워 아직 대화를 시작하지
                 // 않은 에이전트는 transcript가 없어 `agent_bindings`에 없다. 강도/모델
                 // 단축키는 바로 그 시점에 쓰고 싶은 기능이라 여기서 막히면 안 된다.
-                let kind = self
-                    .agent_kinds
-                    .get(&session_id)
-                    .copied()
+                let running = self.agent_kinds.get(&session_id);
+                let kind = running
+                    .map(|agent| agent.kind)
                     .or_else(|| self.agent_bindings.get(&session_id).map(|b| b.kind))?;
                 // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. claude는
                 // transcript에 effort가 아예 없고 statusLine에만 있어서, 병합을 건너뛰면
@@ -11438,6 +11437,18 @@ impl App {
                     },
                 );
                 apply_claude_statusline(&mut display, self.statuslines.get(&session_id));
+                // statusLine은 1시간 창으로 만료된다(STATUSLINES_PREFIX_PREFLIGHT).
+                // 오래 유휴한 세션에서는 값이 통째로 사라져 강도·모델 단축키가 "현재
+                // 값을 몰라" 아무것도 못 한다(2026-08-03 실증: 7시간 전 행이 걸러짐).
+                // 런처가 argv에 넘긴 값은 만료되지 않으므로 마지막 근거로 쓴다.
+                if let Some(agent) = running {
+                    if display.effort.is_none() {
+                        display.effort.clone_from(&agent.effort);
+                    }
+                    if display.model.is_none() {
+                        display.model.clone_from(&agent.model);
+                    }
+                }
                 Some(crate::agent_surface::AgentSurfaceSnapshot {
                     id: crate::agent_surface::AgentSurfaceId::Pty {
                         workspace_id: self.active.id.clone(),

@@ -11407,6 +11407,8 @@ impl App {
         &self,
         entries: &[ui::file_tree::SessionEntry],
     ) -> Vec<crate::agent_surface::AgentSurfaceSnapshot> {
+        // 설정 파일 폴백용 홈. 루프 밖에서 한 번만 구한다.
+        let claude_home = crate::paths::home_dir();
         entries
             .iter()
             .filter_map(|entry| {
@@ -11447,6 +11449,25 @@ impl App {
                     }
                     if display.model.is_none() {
                         display.model.clone_from(&agent.model);
+                    }
+                }
+                // argv도 비는 경우가 있다 — 사용자가 셸에 `claude`라고 직접 치면
+                // 런처가 붙이는 `--model`/`--effort`가 아예 없다(2026-08-03 실증).
+                // 그때 새 세션은 CLI의 전역 기본값으로 시작하므로 그 값이 곧 현재
+                // 값이다. `/effort`가 "saved as your default for new sessions"로
+                // 써 두는 바로 그 파일을 읽는다.
+                if kind == crate::agent_detect::AgentKind::Claude {
+                    if display.effort.is_none() {
+                        display.effort =
+                            crate::agent_model_catalog::claude_configured_default_effort(
+                                claude_home.as_deref(),
+                            );
+                    }
+                    if display.model.is_none() {
+                        display.model = crate::agent_model_catalog::configured_default_model(
+                            crate::agent_launcher::AgentKind::Claude,
+                            claude_home.as_deref(),
+                        );
                     }
                 }
                 Some(crate::agent_surface::AgentSurfaceSnapshot {
@@ -13867,7 +13888,21 @@ impl App {
                     tracing::info!(
                         focused_session = ?session,
                         pty_surfaces = self.pty_agent_surfaces_cache.len(),
+                        // 표면의 **존재 근거**다. 이게 비면 감지가 프로세스를 못 잡은
+                        // 것이고, 차 있는데 표면이 0이면 표면 생성 쪽 문제다.
+                        agent_kinds = self.agent_kinds.len(),
                         bindings = self.agent_bindings.len(),
+                        statuslines = self.statuslines.len(),
+                        // 감지 대상 목록의 원천. 여기가 비면 위의 셋이 **전부** 0이
+                        // 된다 — `poll_agent_detect`가 pid 있는 리소스 행만 감지
+                        // 워커에 넘기고, 비면 statusline 캐시까지 지운다.
+                        resource_rows = self.active.session_resource_usage.len(),
+                        rows_with_pid = self
+                            .active
+                            .session_resource_usage
+                            .iter()
+                            .filter(|row| row.pid.is_some())
+                            .count(),
                         "PTY effort 폴백 실패"
                     );
                 }
@@ -13876,7 +13911,12 @@ impl App {
         let pending = self.agent_sessions_ui.selected_pending_approval_count();
         let gate = gate_action(action, selected.as_ref(), pending);
         if !gate.is_allowed() {
-            self.agent_sessions_ui.open();
+            // 패널을 열지 않는다. 원래는 "선택된 에이전트가 없으니 패널에서 고르라"는
+            // 안내였는데, 지금 강도·모델 단축키는 **포커스된 pane**을 대상으로 하므로
+            // 고를 필요가 없다. 안내가 아니라 방해다 — 사용자가 보고 있던 터미널을
+            // 모달이 덮고, 누를 때마다 다시 뜬다(2026-08-03 사용자 보고).
+            //
+            // 실패는 로그로만 남긴다. 진단에 필요한 값은 각 분기가 이미 찍는다.
             match gate {
                 AgentActionGate::NoTarget => tracing::info!("에이전트 단축키: 선택 없음"),
                 AgentActionGate::Unsupported => {
@@ -13937,7 +13977,8 @@ impl App {
                     self.adjust_pty_effort(surface, step);
                     None
                 } else {
-                    self.agent_sessions_ui.open();
+                    // 여기도 열지 않는다 — 위와 같은 이유다. 구조화 세션의 강도는
+                    // 로컬 상태만 바꿔 다음 turn에 실리므로 패널을 봐야 할 일이 없다.
                     let delta = if action == AgentAction::EffortUp {
                         1
                     } else {
@@ -14030,7 +14071,9 @@ impl App {
                                 if session_id == session
                         )
                     })
-                    .is_some_and(slash_input_is_safe)
+                    .is_some_and(|surface| {
+                        slash_input_is_safe(surface, self.hook_waiting_message(*session))
+                    })
             })
             .map(|(key, bytes)| (*key, bytes.clone()))
             .collect();
@@ -14083,6 +14126,14 @@ impl App {
             }
         }
         authoritative.map(str::to_owned)
+    }
+
+    /// hook이 보고한 대기 사유 문구 — `slash_input_is_safe`가 승인/유휴를 가르는 근거다.
+    fn hook_waiting_message(&self, session: runtime::SessionId) -> Option<&str> {
+        self.global_waiting
+            .iter()
+            .find(|(_, waiting, _)| *waiting == session)
+            .and_then(|(_, _, message)| message.as_deref())
     }
 
     /// 계획된 입력을 대상 PTY에 써 넣는다. 강도·모델이 같은 안전 규칙을 공유한다.
@@ -14143,7 +14194,7 @@ impl App {
                 // 연속으로 눌러도 한 칸씩 밀린다.
                 self.pty_agent_pending
                     .insert((*session_id, kind), level.to_owned());
-                if !slash_input_is_safe(surface) {
+                if !slash_input_is_safe(surface, self.hook_waiting_message(*session_id)) {
                     // 지금 쓰면 진행 중인 턴의 프롬프트가 된다. 마지막 목표만 남긴다.
                     self.pty_agent_queued
                         .insert((*session_id, kind), line.clone().into_bytes());
@@ -22959,12 +23010,32 @@ fn shortcut_targets_primary_terminal(action: crate::shortcuts::ShortcutAction) -
 /// **승인 대기**(질문 중 → 보내면 그 텍스트가 답으로 들어감)가 같은 값이다.
 /// 2026-08-02에 이걸 구분하지 않아 "작업 중"으로 뭉뚱그려 막는 바람에, 프롬프트에서
 /// 놀고 있는 claude에 강도 단축키가 전혀 반응하지 않았다.
-fn slash_input_is_safe(surface: &crate::agent_surface::AgentSurfaceSnapshot) -> bool {
+/// hook needsInput의 문구로 유휴 프롬프트와 승인 프롬프트를 가른다.
+///
+/// Claude Code의 Notification hook은 두 경우 모두에 오고 `merge_agent_status`는 둘 다
+/// `NeedsApproval`로 접는다. 위 주석이 말하는 두 가지가 여기서 다시 뭉개지는 것이다.
+/// 아는 문구만 통과시켜(화이트리스트) 모르는 문구는 막는 쪽으로 닫힌다.
+fn waiting_is_idle_prompt(message: Option<&str>) -> bool {
+    const IDLE_PROMPT_MARKERS: &[&str] = &["waiting for your input"];
+    message.is_some_and(|message| {
+        let message = message.to_ascii_lowercase();
+        IDLE_PROMPT_MARKERS
+            .iter()
+            .any(|marker| message.contains(marker))
+    })
+}
+
+fn slash_input_is_safe(
+    surface: &crate::agent_surface::AgentSurfaceSnapshot,
+    waiting_message: Option<&str>,
+) -> bool {
     use runtime::SessionStatus as Status;
     match surface.pty_status {
         // 원본이 있으면 그게 정확하다.
         Some(Status::Idle | Status::Waiting | Status::Done) => true,
-        Some(Status::Running | Status::NeedsApproval | Status::Error) => false,
+        // 승인 대기는 문구로 갈린다 — hook이 보고한 유휴 프롬프트면 오히려 최적기다.
+        Some(Status::NeedsApproval) => waiting_is_idle_prompt(waiting_message),
+        Some(Status::Running | Status::Error) => false,
         // 원본이 없으면(구조화 표면, 미분류) 시각 상태로 보수적으로 판정한다.
         None => matches!(
             surface.state,
@@ -25595,14 +25666,59 @@ mod tests {
             surface(Some(Status::Waiting)).state,
             surface(Some(Status::NeedsApproval)).state
         );
-        assert!(slash_input_is_safe(&surface(Some(Status::Waiting))));
-        assert!(!slash_input_is_safe(&surface(Some(Status::NeedsApproval))));
+        assert!(slash_input_is_safe(&surface(Some(Status::Waiting)), None));
+        // 사유를 모르면 승인으로 보고 막는다.
+        assert!(!slash_input_is_safe(
+            &surface(Some(Status::NeedsApproval)),
+            None
+        ));
 
-        assert!(slash_input_is_safe(&surface(Some(Status::Idle))));
-        assert!(slash_input_is_safe(&surface(Some(Status::Done))));
-        assert!(!slash_input_is_safe(&surface(Some(Status::Running))));
+        assert!(slash_input_is_safe(&surface(Some(Status::Idle)), None));
+        assert!(slash_input_is_safe(&surface(Some(Status::Done)), None));
+        assert!(!slash_input_is_safe(&surface(Some(Status::Running)), None));
         // 미분류는 보수적으로 허용(에이전트 없음 = 셸 프롬프트).
-        assert!(slash_input_is_safe(&surface(None)));
+        assert!(slash_input_is_safe(&surface(None), None));
+    }
+
+    /// hook needsInput은 유휴 프롬프트에도 오는데, merge_agent_status가 그걸 승인 대기와
+    /// 같은 NeedsApproval로 접는다. 문구로 가르지 않으면 프롬프트에서 놀고 있는 claude가
+    /// 영원히 "작업 중"으로 막혀 단축키가 큐에만 쌓인다(2026-08-03 실증: 40분 묵은
+    /// "Claude is waiting for your input" 행 하나 때문에 강도 변경이 전부 무시됐다).
+    #[test]
+    fn hook_유휴_프롬프트_문구는_승인_대기를_열어준다() {
+        use crate::agent_surface::{
+            AgentProvider, AgentSurfaceId, AgentSurfaceSnapshot, AgentTransport, AgentVisualState,
+        };
+        use runtime::SessionStatus as Status;
+
+        let surface = AgentSurfaceSnapshot {
+            id: AgentSurfaceId::Pty {
+                workspace_id: "ws".to_owned(),
+                pane_id: "pane".to_owned(),
+                session_id: runtime::SessionId(1),
+            },
+            provider: AgentProvider::Claude,
+            transport: AgentTransport::Pty,
+            title: "claude".to_owned(),
+            model: None,
+            effort: None,
+            context_pct: None,
+            state: AgentVisualState::from_pty(Some(Status::NeedsApproval)),
+            pty_status: Some(Status::NeedsApproval),
+        };
+
+        // 실제 hook이 보내는 문구 그대로.
+        assert!(slash_input_is_safe(
+            &surface,
+            Some("Claude is waiting for your input")
+        ));
+        // 승인 프롬프트는 여전히 막힌다 — 화이트리스트라 모르는 문구는 전부 불허.
+        assert!(!slash_input_is_safe(
+            &surface,
+            Some("Claude needs your permission to use Bash")
+        ));
+        assert!(!slash_input_is_safe(&surface, Some("")));
+        assert!(!slash_input_is_safe(&surface, None));
     }
 
     #[test]

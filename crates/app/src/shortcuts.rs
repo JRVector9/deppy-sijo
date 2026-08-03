@@ -615,12 +615,18 @@ mod tests {
     }
 
     /// (표 이름, 조회 함수, 그 표가 macOS 규칙을 쓰는지)
+    type DefaultTable = (
+        &'static str,
+        fn(ShortcutAction) -> Option<&'static str>,
+        bool,
+    );
+
     ///
     /// 두 표를 **어느 플랫폼에서 돌려도** 검사한다. macOS에서만 테스트를 돌리면서
     /// Windows 표를 cfg로 잘라두면, Ctrl+Shift+D 중복 같은 사고가 Windows 사용자에게
     /// 가서야 드러난다 — 실제로 SplitVertical(Ctrl+Shift+D)이 기존
     /// SplitHorizontal(⌘⇧D → Windows에서 Ctrl+Shift+D)과 부딪혀 H로 옮겼다.
-    const DEFAULT_TABLES: [(&str, fn(ShortcutAction) -> Option<&'static str>, bool); 2] = [
+    const DEFAULT_TABLES: [DefaultTable; 2] = [
         ("unix", ShortcutAction::unix_default_serialized, true),
         ("windows", ShortcutAction::windows_default_serialized, false),
     ];

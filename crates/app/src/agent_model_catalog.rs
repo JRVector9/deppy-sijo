@@ -118,6 +118,9 @@ fn kimi_configured_default_model(home: &Path, kimi_model_name_env: Option<&str>)
 struct ClaudeSettingsFile {
     #[serde(default)]
     model: Option<String>,
+    /// `/effort <level>`이 "saved as your default for new sessions"로 여기에 쓴다.
+    #[serde(default, rename = "effortLevel")]
+    effort_level: Option<String>,
 }
 
 fn parse_claude_default_model(text: &str) -> Option<String> {
@@ -128,6 +131,23 @@ fn parse_claude_default_model(text: &str) -> Option<String> {
 fn claude_configured_default_model(home: &Path) -> Option<String> {
     let text = read_bounded(&home.join(".claude/settings.json"))?;
     parse_claude_default_model(&text)
+}
+
+fn parse_claude_default_effort(text: &str) -> Option<String> {
+    let settings: ClaudeSettingsFile = serde_json::from_str(text).ok()?;
+    trimmed_non_empty(settings.effort_level)
+}
+
+/// `~/.claude/settings.json`의 `effortLevel` — Claude가 `/effort`로 저장하는 전역
+/// 기본값이다.
+///
+/// 세션의 현재 강도를 아는 마지막 수단이다. statusLine은 1시간이면 만료되고
+/// (`STATUSLINES_PREFIX_PREFLIGHT`), argv는 **런처로 띄웠을 때만** 값이 있다 —
+/// 사용자가 셸에 `claude`라고 직접 치면 인자가 비어 있다(2026-08-03 실증). 그 경우
+/// 새 세션은 이 전역 기본값으로 시작하므로 이 값이 곧 현재 강도다.
+pub(crate) fn claude_configured_default_effort(home: Option<&Path>) -> Option<String> {
+    let text = read_bounded(&home?.join(".claude/settings.json"))?;
+    parse_claude_default_effort(&text)
 }
 
 /// `~/.grok/config.toml`의 `[models]` 테이블 아래 `default` 키. Codex의 `model`과 달리
@@ -564,6 +584,34 @@ fn effort_from_value(value: &str) -> Option<ReasoningEffort> {
 
 #[cfg(test)]
 mod tests {
+    /// `/effort`가 저장하는 전역 기본값을 읽는다. statusLine은 1시간이면 만료되고
+    /// argv는 런처로 띄웠을 때만 값이 있어서, 사용자가 셸에 `claude`라고 직접 친
+    /// 세션에서는 이게 현재 강도를 아는 유일한 근거다.
+    #[test]
+    fn claude_settings에서_전역_기본_강도를_읽는다() {
+        // 사용자 환경의 실제 형태.
+        let text = r#"{"model":"opus[1m]","effortLevel":"xhigh","other":1}"#;
+        assert_eq!(
+            super::parse_claude_default_effort(text).as_deref(),
+            Some("xhigh")
+        );
+        // 모델 파싱과 서로 간섭하지 않는다.
+        assert_eq!(
+            super::parse_claude_default_model(text).as_deref(),
+            Some("opus[1m]")
+        );
+        // 키가 없거나 비면 None — 임의 값을 지어내지 않는다.
+        assert_eq!(
+            super::parse_claude_default_effort(r#"{"model":"opus"}"#),
+            None
+        );
+        assert_eq!(
+            super::parse_claude_default_effort(r#"{"effortLevel":"  "}"#),
+            None
+        );
+        assert_eq!(super::parse_claude_default_effort("not json"), None);
+    }
+
     use super::*;
 
     const CODEX_FIXTURE: &str = r#"{

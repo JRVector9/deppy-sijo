@@ -3,7 +3,7 @@
 ## Current task
 
 - Verify `docs/test-parallelism-and-pty-stability.md` (d53b742), fix the root causes it missed, and correct the doc.
-- Status: complete. Committed as `5e8bd30` (openpty retry) and `74c8d5e` (drain fix) on local `main`; docs follow in a third commit. Not pushed. Both root causes fixed in `crates/pty/src/lib.rs`: (1) `openpty_with_retry` for macOS openpty `errno -6`, (2) unix slave-retention + `pty-reaper` thread for the macOS output-queue-discard-on-last-slave-close drain loss (design-doc 리스크 3 confirmed Windows-only). Serial 36/36, clippy `-D warnings`, fmt clean; parallel failure rate dropped from ~7/12 runs to ~3/290 runs (residual = pre-existing rare flake, suspected scheduling starvation, mechanism uncaptured). Details in "pty parallelism investigation (2026-08-03)" below.
+- Status: complete. Committed as `5e8bd30` (openpty retry) and `74c8d5e` (drain fix) on local `main`; docs follow in a third commit (`81ce212`). Pushed to `origin/main` (non-force fast-forward `d7c7f5b..81ce212`); CI run 30868749745 in progress at push time. Both root causes fixed in `crates/pty/src/lib.rs`: (1) `openpty_with_retry` for macOS openpty `errno -6`, (2) unix slave-retention + `pty-reaper` thread for the macOS output-queue-discard-on-last-slave-close drain loss (design-doc 리스크 3 confirmed Windows-only). Serial 36/36, clippy `-D warnings`, fmt clean; parallel failure rate dropped from ~7/12 runs to ~3/290 runs (residual = pre-existing rare flake, suspected scheduling starvation, mechanism uncaptured). Details in "pty parallelism investigation (2026-08-03)" below.
 
 ## pty parallelism investigation (2026-08-03)
 

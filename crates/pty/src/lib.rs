@@ -456,9 +456,14 @@ impl PortablePtyBackend {
             .slave
             .spawn_command(builder)
             .with_context(|| format!("셸 실행 실패: {}", cmd.program))?;
-        // 설계문서 1.2 리스크 3: slave가 master보다 오래 살면 handle 파괴가
-        // 비결정적 — spawn 직후 즉시 drop한다.
-        #[cfg(not(windows))]
+        // 설계문서 1.2 리스크 3은 **Windows**의 drop 순서 race다 (2026-03 보고:
+        // SlavePty가 MasterPty보다 오래 살아 있으면 handle 파괴가 비결정적). unix는
+        // 반대로 slave를 오래 들고 있어야 한다 — macOS는 마지막 slave close 시 출력
+        // 큐를 폐기하므로(실증 2026-08-03, C 프로브 50/50 유실) spawn 직후 닫으면
+        // 빠르게 종료되는 자식의 꼬리 출력이 유실된다. 그래서 unix는 reader thread가
+        // drain 동안 slave를 보유하고(`unix_reader_loop`), 그 외 플랫폼만 기존
+        // 규칙대로 즉시 drop한다.
+        #[cfg(all(not(unix), not(windows)))]
         drop(pair.slave);
 
         // 여기부터 실패하면 child가 orphan으로 남는다 — 플랫폼 worker 구성도 child와
@@ -466,6 +471,7 @@ impl PortablePtyBackend {
         #[cfg(unix)]
         let session = spawn_unix_session(
             pair.master,
+            pair.slave,
             child,
             output_wake,
             #[cfg(test)]
@@ -488,13 +494,19 @@ impl PortablePtyBackend {
 }
 
 type MasterPtyBox = Box<dyn portable_pty::MasterPty + Send>;
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 type SlavePtyBox = Box<dyn portable_pty::SlavePty + Send>;
 type ChildPtyBox = Box<dyn portable_pty::Child + Send + Sync>;
+/// unix는 reaper thread(`unix_reaper_loop`)와 세션이 같은 child를 조회한다.
+/// portable-pty의 unix Child는 `std::process::Child`라 reap 후 status를 캐시해
+/// 양쪽 `try_wait`가 안전하다.
+#[cfg(unix)]
+type SharedChild = std::sync::Arc<std::sync::Mutex<ChildPtyBox>>;
 
 #[cfg(unix)]
 fn spawn_unix_session(
     master: MasterPtyBox,
+    slave: SlavePtyBox,
     mut child: ChildPtyBox,
     output_wake: Option<PtyOutputWake>,
     #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
@@ -537,15 +549,28 @@ fn spawn_unix_session(
     };
 
     let (output_tx, output_rx, output_queue) = pty_output_channel();
+    // 자식 자연 종료 시 reader가 drain-후-종료하도록 reaper/try_exit_code와 공유하는
+    // flag. kill/Drop 경로에서는 서지 않으므로 기존처럼 즉시 cancel-종료한다.
+    let exit_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // kill/Drop 경로에서 reaper를 멈추는 flag — child가 죽지 않아도 join이 끝난다.
+    let reaper_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(test)]
     let reader_liveness = worker_liveness.clone();
+    let reader_exit_flag = std::sync::Arc::clone(&exit_flag);
     let reader_spawn = || {
         std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
                 #[cfg(test)]
                 let _live = TestWorkerGuard::new(reader_liveness, TestWorkerKind::Reader);
-                unix_reader_loop(reader, reader_cancel_read, output_tx, output_wake);
+                unix_reader_loop(
+                    reader,
+                    reader_cancel_read,
+                    output_tx,
+                    output_wake,
+                    reader_exit_flag,
+                    slave,
+                );
             })
     };
     #[cfg(test)]
@@ -602,6 +627,38 @@ fn spawn_unix_session(
         }
     };
 
+    // reaper: 자식 자연 종료를 감지해 reader를 깨운다. cancel 쓰기 끝은 dup해 넘기고
+    // 세션 쪽(reader_cancel)은 teardown cancel 용도로 그대로 둔다.
+    let child: SharedChild = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let reaper = (|| -> anyhow::Result<_> {
+        let cancel = duplicate_nonblocking_fd(reader_cancel_write.as_raw_fd())
+            .context("PTY reaper cancellation descriptor 생성 실패")?;
+        let thread = std::thread::Builder::new()
+            .name("pty-reaper".into())
+            .spawn({
+                let child = std::sync::Arc::clone(&child);
+                let exit_flag = std::sync::Arc::clone(&exit_flag);
+                let reaper_stop = std::sync::Arc::clone(&reaper_stop);
+                move || unix_reaper_loop(child, exit_flag, reaper_stop, cancel)
+            })
+            .context("PTY reaper thread 생성 실패")?;
+        Ok(thread)
+    })();
+    let reaper_thread = match reaper {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(input_tx);
+            output_queue.cancel();
+            signal_cancellation(&reader_cancel_write);
+            signal_cancellation(&writer_cancel_write);
+            drop(master);
+            kill_and_reap_bounded(&mut child.lock().expect("PTY child mutex poisoned"));
+            join_worker(Some(reader_thread), "reader");
+            join_worker(Some(writer_thread), "writer");
+            return Err(error);
+        }
+    };
+
     Ok(PortablePtySession {
         master: Some(master),
         input_tx: Some(input_tx),
@@ -614,6 +671,9 @@ fn spawn_unix_session(
         reader_cancel: Some(reader_cancel_write),
         writer_cancel: Some(writer_cancel_write),
         process_group,
+        exit_flag,
+        reaper_stop,
+        reaper_thread: Some(reaper_thread),
     })
 }
 
@@ -1076,6 +1136,8 @@ fn unix_reader_loop(
     cancel: OwnedFd,
     output: PtyOutputSender,
     output_wake: Option<PtyOutputWake>,
+    exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    slave: SlavePtyBox,
 ) {
     // reader fd는 non-blocking(duplicate_nonblocking_fd). macOS는 PTY read를 ~1KB로
     // 캡하므로, poll로 한 번 깨어나면 EAGAIN까지 드레인해 한 청크로 합쳐 보낸다 —
@@ -1152,6 +1214,63 @@ fn unix_reader_loop(
         if !flush_pty_chunk(&output, &output_wake, acc) {
             break; // 수신자 종료
         }
+    }
+
+    // 자식의 자연 종료를 reaper/try_exit_code가 먼저 보고 cancel을 낸 경우: macOS는
+    // 마지막 slave close 시 출력 큐를 폐기하므로(실증 2026-08-03, C 프로브 50/50 유실),
+    // 우리가 들고 있는 slave를 닫기 전에 master의 잔여 출력을 끝까지 읽어 본다. 이
+    // 시점에 자식은 이미 종료됐고 남은 slave 참조는 우리(와 무관한 자손)뿐이라
+    // EAGAIN까지 읽으면 drain 완료다. kill/Drop 경로의 cancel은 flag가 서 있지 않아
+    // 기존처럼 즉시 낙한다.
+    if exit_flag.load(std::sync::atomic::Ordering::Acquire) {
+        loop {
+            let count =
+                unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if count > 0 {
+                if !flush_pty_chunk(&output, &output_wake, buf[..count as usize].to_vec()) {
+                    break; // 수신자 종료
+                }
+                continue;
+            }
+            break; // EOF/EAGAIN/오류 — 잔여 출력 없음
+        }
+    }
+    // drain 이후에 닫힌다 — spawn 직후 slave 즉시 drop 규칙(설계문서 1.2 리스크 3)은
+    // Windows drop 순서 race 대응이라 unix에는 적용하지 않는다.
+    drop(slave);
+}
+
+/// 자식의 자연 종료를 감지해 reader를 깨우는 전담 스레드. 종료를 보면 flag를 세우고
+/// reader cancel 신호를 낸다 — reader는 flag가 선 cancel이면 남은 출력을 drain한 뒤
+/// 낙는다(위 `unix_reader_loop` 꼬리 참조). `std::process::Child`(portable-pty의 unix
+/// Child)는 reap 후에도 status를 캐시하므로 세션의 `try_exit_code`와 양쪽에서
+/// `try_wait`를 호출해도 안전하다. 폴링 간격 25ms는 채널 disconnect 지연(테스트의
+/// `collect_output` 조기 종료 조건)과 idle 비용의 타협점이다.
+#[cfg(unix)]
+fn unix_reaper_loop(
+    child: SharedChild,
+    exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader_cancel: OwnedFd,
+) {
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return; // kill/Drop 경로 — reader는 이미 cancel로 낙는다
+        }
+        let exited = match child.lock() {
+            Ok(mut child) => match child.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(_) => return, // 조회 불가 — 더 기다려도 알 수 없다
+            },
+            Err(_) => return, // poisoned — 더 알 수 없다
+        };
+        if exited {
+            exit_flag.store(true, std::sync::atomic::Ordering::Release);
+            signal_cancellation(&reader_cancel);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -1306,6 +1425,9 @@ struct PortablePtySession {
     /// 동기 write하면 reader(backpressure)와 맞물려 full-duplex deadlock — codex P1)
     input_tx: Option<SyncSender<Vec<u8>>>,
     input_queue: input_queue::PtyInputQueueState,
+    #[cfg(unix)]
+    child: SharedChild,
+    #[cfg(not(unix))]
     child: ChildPtyBox,
     output: Option<PtyOutputReceiver>,
     output_queue: Arc<PtyOutputQueue>,
@@ -1317,6 +1439,15 @@ struct PortablePtySession {
     writer_cancel: Option<OwnedFd>,
     #[cfg(unix)]
     process_group: Option<libc::pid_t>,
+    /// 자식 자연 종료 — reader의 drain-후-종료 트리거 (`unix_reader_loop` 꼬리 참조).
+    #[cfg(unix)]
+    exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// kill/Drop 시 reaper를 멈춘다 — 이 flag 없이 join하면 자식이 죽지 않는 한
+    /// reaper가 폴링을 계속해 teardown이 무한 대기한다.
+    #[cfg(unix)]
+    reaper_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    reaper_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// 신호를 보낼 그룹을 고른다. **우리 자신이면 보내지 않는다.**
@@ -1339,6 +1470,8 @@ impl PortablePtySession {
         drop(self.input_tx.take());
         drop(self.output.take());
         self.output_queue.cancel();
+        self.reaper_stop
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(cancel) = self.reader_cancel.as_ref() {
             signal_cancellation(cancel);
         }
@@ -1352,6 +1485,7 @@ impl PortablePtySession {
     fn join_unix_workers(&mut self) {
         join_worker(self.reader_thread.take(), "reader");
         join_worker(self.writer_thread.take(), "writer");
+        join_worker(self.reaper_thread.take(), "reaper");
         drop(self.reader_cancel.take());
         drop(self.writer_cancel.take());
     }
@@ -1526,7 +1660,7 @@ impl Drop for PortablePtySession {
             // 셸이 kill되어도 살아남는 grandchild job까지 정리 대상에 포함.
             self.signal_process_group(libc::SIGHUP);
             // kill 실패해도 무한 wait에 매달리지 않는다 (bounded reap — codex P1)
-            kill_and_reap_bounded(&mut self.child);
+            kill_and_reap_bounded(&mut self.child.lock().expect("PTY child mutex poisoned"));
             // 제품 정책(안정성 감사 Med #3, 2026-07-08): pane/세션 닫기 = 프로세스 트리 정리.
             // SIGHUP을 무시한 자손(nohup류)이 남지 않게 process group에 SIGTERM → 짧은
             // 유예 → SIGKILL로 에스컬레이션한다. pgid 재사용 오발 위험은 Drop 직후 수백 ms
@@ -1561,6 +1695,9 @@ impl PtySession for PortablePtySession {
     }
 
     fn process_identity(&self) -> ProcessIdentity {
+        #[cfg(unix)]
+        let pid = self.child.lock().ok().and_then(|child| child.process_id());
+        #[cfg(not(unix))]
         let pid = self.child.process_id();
         #[cfg(unix)]
         let process_group = self.process_group.and_then(|pgid| u32::try_from(pgid).ok());
@@ -1611,6 +1748,27 @@ impl PtySession for PortablePtySession {
             .context("PTY resize 실패")
     }
 
+    #[cfg(unix)]
+    fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>> {
+        let status = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?
+            .try_wait()
+            .context("exit status 조회 실패")?;
+        if status.is_some() {
+            // reaper가 25ms 안에 같은 신호를 내지만, 소비자 폴링이 먼저 발견했으면
+            // 즉시 reader를 깨워 drain-후-종료를 시작한다(신호는 멱등).
+            self.exit_flag
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(cancel) = self.reader_cancel.as_ref() {
+                signal_cancellation(cancel);
+            }
+        }
+        Ok(status.map(|status| status.exit_code()))
+    }
+
+    #[cfg(not(unix))]
     fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>> {
         Ok(self
             .child
@@ -1626,7 +1784,22 @@ impl PtySession for PortablePtySession {
             // (reap은 try_exit_code/Drop 경로가 담당. codex P2)
             self.signal_process_group(libc::SIGHUP);
             self.stop_unix_worker_io();
-            let result = self.child.kill().context("프로세스 kill 실패");
+            let mut child = self
+                .child
+                .lock()
+                .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
+            // 바로 위 SIGHUP으로 자식이 죽으면 reaper가 25ms 안에 reap한다. 이미
+            // 회수된 자식의 pid로 kill(2)을 보낼 수는 없다 — ESRCH가 나거나,
+            // 최악에는 재사용된 남의 pid를 죽인다. 회수 여부를 먼저 보고, 그 사이의
+            // 좁은 경합으로 ESRCH가 나면 이미 죽은 것으로 간주한다.
+            let result = match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                _ => match child.kill() {
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+                    other => other.context("프로세스 kill 실패"),
+                },
+            };
+            drop(child);
             self.join_unix_workers();
             result
         }
@@ -2009,7 +2182,11 @@ mod tests {
         let _output = session.take_output().unwrap();
         wait_for_workers(&liveness);
         let payload = vec![b'x'; PtyInputQueuePolicy::default().max_bytes];
-        assert!(session.write_input(&payload).unwrap().is_accepted());
+        let enqueue_result = session.write_input(&payload).unwrap();
+        assert!(
+            enqueue_result.is_accepted(),
+            "거절 사유: {enqueue_result:?}"
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while session.input_queue_idle() {
             assert!(
@@ -2444,6 +2621,22 @@ mod tests {
         assert!(session.take_output().is_none()); // 최초 1회만
         let out = collect_output(&rx, Duration::from_secs(5));
         assert!(String::from_utf8_lossy(&out).contains("hello-pty"));
+        assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));
+    }
+
+    /// macOS는 마지막 slave close 시 출력 큐를 폐기한다(실증 2026-08-03, C 프로브
+    /// 50/50 유실). 세션은 drain이 끝날 때까지 slave를 reader thread에 보유시키므로,
+    /// 출력 직후 종료되는 자식의 꼬리 출력이 유실되면 안 된다 — spawn 직후
+    /// `drop(pair.slave)` 하던 시절 병렬 flake의 두 번째 원인이었다.
+    #[test]
+    fn 빠르게_종료되는_자식의_꼬리_출력은_유실되지_않는다() {
+        let mut session = spawn("/bin/sh", &["-c", "printf tail-output; exit 0"]);
+        let rx = session.take_output().unwrap();
+        let out = collect_output(&rx, Duration::from_secs(5));
+        assert!(
+            String::from_utf8_lossy(&out).contains("tail-output"),
+            "꼬리 출력 유실: {out:?}"
+        );
         assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));
     }
 

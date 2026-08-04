@@ -2,8 +2,21 @@
 
 ## Current task
 
-- Diagnose direct-shell Claude/Codex effort/model shortcut failures from `docs/agent-shortcut-launch-cases.md`, prioritizing the section 4 process-tree check and removal of silent failures.
-- Status: complete. The daemon-reparenting hypothesis is refuted for the live Deppy pane; direct Codex classification and current-value-free key planning pass; RED-first status-bar feedback is implemented. A pre-landing review also found and removed synchronous Claude settings reads from the render path. The change is committed, fast-forwarded to local `main`, rebuilt, signed, verified, and running.
+- Verify `docs/test-parallelism-and-pty-stability.md` (d53b742), fix the root causes it missed, and correct the doc.
+- Status: complete. Committed as `5e8bd30` (openpty retry) and `74c8d5e` (drain fix) on local `main`; docs follow in a third commit. Not pushed. Both root causes fixed in `crates/pty/src/lib.rs`: (1) `openpty_with_retry` for macOS openpty `errno -6`, (2) unix slave-retention + `pty-reaper` thread for the macOS output-queue-discard-on-last-slave-close drain loss (design-doc 리스크 3 confirmed Windows-only). Serial 36/36, clippy `-D warnings`, fmt clean; parallel failure rate dropped from ~7/12 runs to ~3/290 runs (residual = pre-existing rare flake, suspected scheduling starvation, mechanism uncaptured). Details in "pty parallelism investigation (2026-08-03)" below.
+
+## pty parallelism investigation (2026-08-03)
+
+- Reproduced the brief's measurements: `cargo test -p pty` default parallel failed 7/12 runs with varying victims; `--test-threads=1` and `RUST_TEST_THREADS=1` each passed 10/10.
+- Refutation 1: a temporary probe test (child echoes all 9 `INHERITED_AGENT_SESSION_VARS` + TERM/LANG, always dumps) showed `absent`/clean values in 40/40 targeted runs and all failing full-suite runs — children never inherit `leaked`; the scrub holds mid-race. Probe reverted.
+- Refutation 2: `--skip 부모_에이전트` parallel runs still failed 6/15 with the same modes — the `set_var` test is innocent.
+- Cause 1 (fixed): concurrent `libc::openpty` fails intermittently with `errno -6` on macOS. Pure C probe (`target/tmp/openpty_probe.c`, 12 threads × 400 calls) reproduced it with zero deppy involvement; retry probe (`target/tmp/openpty_retry.c`) showed 0 permanent failures after ≤5 retries. Fix: `openpty_with_retry` (5 attempts) + regression test `동시_spawn은_openpty_경합에도_전부_성공한다`.
+- Cause 2 (fixed): macOS discards the pty output queue when the LAST slave fd closes; parent-held slave keeps it alive (C probes `pty_drain_probe.c` = 50/50 lost, `pty_drain_probe2.c` = 50/50 ok). deppy dropped `pair.slave` right after spawn per design-doc 리스크 3 — which on inspection (`ai_agent_workspace_final_architecture_v2_5_FINAL.md:146-148`) is a Windows ConPTY drop-order race rule, not a unix constraint. Fix: unix reader thread now owns the slave during its lifetime; a new `pty-reaper` thread (25ms poll on shared `Arc<Mutex<Child>>`; std caches reaped status so dual `try_wait` is safe) detects natural child exit, sets `exit_flag`, and cancels the reader, which then drains the master BEFORE dropping the slave; kill/Drop paths keep the old immediate-cancel behavior via `reaper_stop`. Regression test: `빠르게_종료되는_자식의_꼬리_출력은_유실되지_않는다`.
+- Regression introduced and fixed during the work: the reaper reaps children, so `kill()` on an already-reaped child returned ESRCH (previously kill(2) on a zombie succeeded) — and firing SIGKILL at a reused pid was a real hazard. Fixed with a `try_wait` guard + ESRCH-is-success mapping in `kill()`.
+- Residual rare flake (~3/290 runs post-fix: one `full_pty` write_input rejection, one marker-test partial output): same symptoms existed pre-change, so not a regression; payload never captured despite instrumented batches; suspected load-spike scheduling starvation (two correlated `/bin/sh -c` test failures in one run support this). Tracked in the brief doc §5 for future reproduction.
+- `docs/test-parallelism-and-pty-stability.md` rewritten to final state (subagent + manual): both causes, refuted-hypothesis record, both fixes marked implemented, §5 verification guidance. C probes live in `target/tmp/` (gitignored).
+
+## Previous task (completed)
 
 ## Working area
 

@@ -2327,6 +2327,15 @@ read -r _until_cancel
         let cold_started = Instant::now();
         backend.list_tools().unwrap();
         let cold = cold_started.elapsed();
+        // 느린 공유 CI 러너 대응(2026-08-04): warm < cold 벽시계 비교는 warm 왕복의
+        // 스케줄링 지연이 자식의 80ms sleep을 넘기면 흔들렸다. warm 경로의 본질은 연결
+        // 재사용이므로 pid 파일로 관측한다 — 재스폰 회귀는 자식이 새 pid를 덮어써
+        // 결정적으로 잡힌다.
+        let pid_before_warm = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
         let warm_started = Instant::now();
         backend.call_tool("echo", serde_json::json!({})).unwrap();
         let warm = warm_started.elapsed();
@@ -2338,7 +2347,10 @@ read -r _until_cancel
         let retained_rss_kib = process_rss_kib(pid);
 
         assert!(cold >= Duration::from_millis(70), "cold={cold:?}");
-        assert!(warm < cold, "cold={cold:?}, warm={warm:?}");
+        assert_eq!(
+            pid, pid_before_warm,
+            "warm 경로가 백엔드를 재스폰했다 (연결 재사용 회귀)"
+        );
         assert!(process_exists(pid), "backend process {pid} is not retained");
         if let Some(rss_kib) = retained_rss_kib {
             assert!(rss_kib > 0);

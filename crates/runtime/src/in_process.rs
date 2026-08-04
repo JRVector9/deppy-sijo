@@ -5853,8 +5853,28 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        // 샘플 주기(2s) 두 번 이상 경과 — 드레인하지 않고 방치.
-        std::thread::sleep(Duration::from_millis(5200));
+        // 1) 모니터 동작 확인 — 첫 ResourceUsage를 이벤트로 기다린다. 원래는 고정
+        // 5.2s sleep이 유일한 동기화라 느린 공유 CI 러너에서 모니터 스레드 기아 시
+        // count==0으로 실패할 수 있었다 (2026-08-04). 상한 10s는 2s 주기의 5배.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if rx
+                .drain()
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ResourceUsage { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ResourceUsage 샘플이 오지 않음 (모니터 미동작?)"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 2) 코얼레싱 — 드레인하지 않고 샘플 주기 2회+(4.5s)를 본 후 한 번에 드레인.
+        //    주기 자체가 벽시계 2s라 창은 유지하되, 첫 샘플 기준으로 앵커돼 있어
+        //    마지막 샘플(t0+2s)은 2.5s의 스케줄 여유를 가진다.
+        std::thread::sleep(Duration::from_millis(4500));
         let events = rx.drain();
         let resource_count = events
             .iter()
@@ -5866,7 +5886,7 @@ mod tests {
         );
         assert_eq!(
             resource_count, 1,
-            "5초간 샘플이 최소 1회는 slot에 있어야 함 (모니터 미동작?)"
+            "드레인 사이 샘플이 최소 1회는 slot에 있어야 함 (모니터 미동작?)"
         );
     }
 
@@ -7337,8 +7357,6 @@ mod tests {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
         });
-        // exit 처리(로그 flush)까지 잠시 대기
-        std::thread::sleep(Duration::from_millis(200));
         // with_shell이 run-<ms> 하위 디렉터리를 만든다 — 그 안에서 세션 디렉터리를 찾는다
         let run_dir = std::fs::read_dir(&logs_root)
             .unwrap()
@@ -7347,6 +7365,23 @@ mod tests {
             .expect("run 디렉터리 없음")
             .path();
         let dir = storage::SessionLogWriter::session_dir(&run_dir, session);
+        // exit 처리(로그 flush) 완료를 관측 가능한 상태(치환 마커 기록)로 기다린다 —
+        // 고정 200ms sleep은 느린 공유 CI 러너에서 flush보다 먼저 읽어 실패할 수 있다
+        // (2026-08-04). 상한 5s는 코드베이스 관례(50ms급 작업에 초 단위 상한).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = std::fs::read(dir.join("redacted.ansi.log"))
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            if text.contains("[REDACTED]") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "세션 로그 flush가 끝나지 않음"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         for file in [
             "redacted.ansi.log",
             "redacted.plain.txt",
@@ -7615,13 +7650,46 @@ mod tests {
         });
         probe.seen.clear();
         let saturated = vec![b'x'; pty::PtyInputQueuePolicy::default().max_bytes];
-        client
-            .send_command(RuntimeCommand::WriteInput {
-                session,
-                bytes: saturated.clone(),
-            })
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let pressure_for_session = |event: &RuntimeEvent| {
+            matches!(
+                event,
+                RuntimeEvent::PtyInputPressure {
+                    session: pressure_session,
+                    ..
+                } if *pressure_session == session
+            )
+        };
+        // 첫 쓰기(정확히 max_bytes)는 큐를 채우지만 압박은 내지 않는다 — 압박은
+        // 가득 찬 큐에 대한 다음 쓰기에서 난다. 고정 100ms sleep은 워커가 첫 쓰기를
+        // 큐로 옮길 때까지의 유일한 동기화라 느린 공유 CI 러너에서 실패할 수 있어,
+        // 첫 압박 이벤트("큐 가득"의 관측 가능한 신호)까지 쓰기를 반복한다 (2026-08-04).
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut sent = 0usize;
+        loop {
+            client
+                .send_command(RuntimeCommand::WriteInput {
+                    session,
+                    bytes: saturated.clone(),
+                })
+                .unwrap();
+            sent += 1;
+            if probe.rx.drain().iter().any(pressure_for_session) {
+                break;
+            }
+            // 커맨드 큐 예산(4MB 쓰기 수 건 분)이 차지 않도록, 워커가 이전 명령을
+            // 소비한 뒤 다음 쓰기를 보낸다 — 이 대기가 곧 큐 적체를 기다리는 것이다.
+            while client.command_budget.retained_bytes() != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "워커가 WriteInput을 소비하지 못함"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(sent < 64, "압박 이벤트가 오지 않음");
+        }
+        // 코얼레싱 확인 — 추가 쓰기 8건을 같은 방식으로 전부 소비시킨 뒤 압박이
+        // 더 발행되지 않아야 한다. command_budget이 0이면 워커가 명령을 전부 소비한
+        // 것이고, 그 시점에 발행될 이벤트는 이미 채널에 있다.
         for _ in 0..8 {
             client
                 .send_command(RuntimeCommand::WriteInput {
@@ -7629,23 +7697,19 @@ mod tests {
                     bytes: saturated.clone(),
                 })
                 .unwrap();
-            std::thread::sleep(Duration::from_millis(20));
+            while client.command_budget.retained_bytes() != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "워커가 WriteInput을 소비하지 못함"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        std::thread::sleep(Duration::from_millis(100));
         let events = probe.rx.drain();
-        let pressure_count = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    RuntimeEvent::PtyInputPressure {
-                        session: pressure_session,
-                        ..
-                    } if *pressure_session == session
-                )
-            })
-            .count();
-        assert_eq!(pressure_count, 1);
+        let pressure_count = events.iter().filter(|e| pressure_for_session(e)).count();
+        // 워커는 backpressured된 쓰기마다 발행하지만, 구독 채널은 세션당 최신 1 slot으로
+        // 코얼레싱한다 (ResourceUsage와 같은 latest-value 규칙) — 드레인에는 1건만 남는다.
+        assert_eq!(pressure_count, 1, "세션당 압박 이벤트 코얼레싱 회귀");
     }
 
     #[test]
@@ -7897,8 +7961,23 @@ mod tests {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
         });
-        // exit 기록이 pump에서 일어난 뒤 확인 — 약간의 여유
-        std::thread::sleep(Duration::from_millis(100));
+        // exit 기록(persist pump) 완료를 DB 상태로 관측한다 — 고정 100ms sleep은
+        // 느린 공유 CI 러너에서 pump보다 먼저 읽어 실패할 수 있다 (2026-08-04).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row("SELECT status FROM sessions", [], |r| r.get::<_, String>(0))
+                .ok();
+            if status.as_deref() == Some("exited") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exit 상태가 영속되지 않음"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let (kind, command, status): (String, String, String) = conn
@@ -8142,16 +8221,27 @@ mod tests {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
         });
-        std::thread::sleep(Duration::from_millis(200));
-
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let uuid: String = conn
-            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        drop(conn);
-        let (meta, dump) = storage::scrollback_archive::read(&logs_root, &uuid)
-            .unwrap()
-            .expect("exit 시점에 아카이브 파일이 기록돼야 함");
+        // 아카이브 기록(exit 처리) 완료를 관측 가능한 상태로 기다린다 — 고정 200ms
+        // sleep은 느린 공유 CI 러너에서 워커보다 먼저 읽어 실패할 수 있다 (2026-08-04).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (meta, dump) = loop {
+            let uuid = rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row("SELECT id FROM sessions", [], |r| r.get::<_, String>(0))
+                .ok();
+            let archived = uuid
+                .as_deref()
+                .and_then(|uuid| storage::scrollback_archive::read(&logs_root, uuid).ok())
+                .flatten();
+            if let Some(archived) = archived {
+                break archived;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "아카이브가 기록되지 않음"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert_eq!(meta.kind, 1, "SpawnAgent 세션은 agent kind");
         assert_eq!(meta.exit_code, Some(0));
         let text = String::from_utf8_lossy(&dump);
@@ -8203,7 +8293,20 @@ mod tests {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
         });
-        std::thread::sleep(Duration::from_millis(200));
+        // GC 진행(exit 처리) 완료를 관측 가능한 상태로 기다린다 — 고정 200ms sleep은
+        // 느린 공유 CI 러너에서 워커보다 먼저 검사해 실패할 수 있다 (2026-08-04).
+        // 진입 차단된 아카이브는 애초에 기록되지 않으므로 !exists는 GC 관측 후에도 유효.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::fs::read_dir(&logs_root).unwrap().count() < entries_before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GC 진행이 관측되지 않음"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let uuid: String = conn
@@ -8269,16 +8372,27 @@ mod tests {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
         });
-        std::thread::sleep(Duration::from_millis(200));
-
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let uuid: String = conn
-            .query_row("SELECT id FROM sessions", [], |row| row.get(0))
-            .unwrap();
-        assert!(
-            !storage::scrollback_archive::exists(&logs_root, &uuid),
-            "failed post-write GC must roll back the triggering archive"
-        );
+        // 롤백(exit 처리의 post-write GC) 완료를 관측 가능한 상태로 기다린다 — 고정
+        // 200ms sleep은 느린 공유 CI 러너에서 롤백보다 먼저 검사해 실패할 수 있다
+        // (2026-08-04). 롤백 회귀(파일 잔존)는 상한에서 실패한다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let uuid = rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .query_row("SELECT id FROM sessions", [], |row| row.get::<_, String>(0))
+                .ok();
+            if uuid
+                .as_deref()
+                .is_some_and(|uuid| !storage::scrollback_archive::exists(&logs_root, uuid))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed post-write GC must roll back the triggering archive"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         drop(client);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -8345,7 +8459,27 @@ mod tests {
                 RuntimeEvent::SessionExited { .. } => Some(()),
                 _ => None,
             });
-            std::thread::sleep(Duration::from_millis(200));
+            // 아카이브 기록(exit 처리) 완료를 관측 가능한 상태로 기다린다 — 고정
+            // 200ms sleep은 느린 공유 CI 러너에서 복원 라운드가 아카이브를 놓쳐
+            // 실패할 수 있다 (2026-08-04).
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let uuid = rusqlite::Connection::open(&db_path)
+                    .unwrap()
+                    .query_row("SELECT id FROM sessions", [], |r| r.get::<_, String>(0))
+                    .ok();
+                let archived = uuid
+                    .as_deref()
+                    .is_some_and(|uuid| storage::scrollback_archive::exists(&logs_root, uuid));
+                if archived {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "아카이브가 기록되지 않음"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
 
         // 2) 재시작 1: 아카이브로 열람 전용 복원 — respawn 없이 내용이 보인다
@@ -9426,21 +9560,28 @@ mod tests {
                 ttl_ms: 60_000,
             })
             .unwrap();
-        // 스트림이 흐르기 시작한 것 확인 후 측정 창 — 스폰기 상태 이벤트 노이즈를 배제
+        // 스트림이 흐르기 시작한 것 확인 — wake는 발행 시점에 동기 호출되므로, 첫 원격
+        // Viewport 관측 시점에 스폰기 노이즈의 wake는 이미 반영돼 있다. 여기서 0으로
+        // 초기화하면 노이즈가 결정적으로 배제된다 (2026-08-04: 고정 300ms settle +
+        // 800ms 측정 창은 느린 공유 CI 러너에서 스트림 처리 지연으로 bg<5가 될 수 있었다).
         probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::Viewport { session: s, .. } if *s == session => Some(()),
             _ => None,
         });
-        std::thread::sleep(Duration::from_millis(300));
         gui_wakes.store(0, Ordering::SeqCst);
         bg_wakes.store(0, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(800));
+        // bg wake 5회 도달을 관측한다 — 50ms 간격 스트림이 살아 있으면 도달하고,
+        // 깨어나지 않는 회귀는 10s 상한에서 실패한다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while bg_wakes.load(Ordering::SeqCst) < 5 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "백그라운드 구독자가 원격 viewport에 깨어나지 않음"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let gui = gui_wakes.load(Ordering::SeqCst);
         let bg = bg_wakes.load(Ordering::SeqCst);
-        assert!(
-            bg >= 5,
-            "백그라운드 구독자가 원격 viewport에 깨어나지 않음 (bg={bg})"
-        );
         // ResourceUsage(~2s 주기) 등 비-viewport wake 1~2회는 허용 — viewport로 인한
         // 연속 wake(수십 회)만 없으면 된다.
         assert!(

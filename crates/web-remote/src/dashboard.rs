@@ -1655,11 +1655,15 @@ mod tests {
             assert!(Instant::now() < deadline, "초기 Dashboard 미발행");
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(30));
-        let base_builds = handle.dash_build_count();
+        let counters = || (handle.dash_build_count(), handle.poll_count());
+        let (base_builds, base_polls) = counters();
 
-        // Viewport만 반복 주입 — 슬롯 seq는 증가하고 재구축 횟수는 그대로여야 한다.
-        // (등록 시 force_poll이 소진된 뒤라, 다음 승인 폴링 만기(1s)는 이 구간 밖이다.)
+        // Viewport만 반복 주입 — 슬롯 seq는 증가하고 폴 외 재구축은 없어야 한다.
+        // 느린 공유 CI 러너 대응(2026-08-04): 원래는 위 주석의 "승인 폴 만기(1s)가 이 구간
+        // 밖"이라는 벽시계 가정으로 builds 등호를 판정했다. 폴 빌드는 poll_count와 함께
+        // 오륜다(폴 카운트 증가 → 빌드 순서) — builds를 먼저 읽고 polls를 나중에 읽는
+        // counters()는 Δbuilds ≤ Δpolls를 깨지 않으므로, 등호 대신 "모든 빌드가 폴로
+        // 설명된다"로 판정하면 러너 속도와 무관하다.
         for _ in 0..5 {
             handle.inject_event(viewport_event(7));
         }
@@ -1673,10 +1677,11 @@ mod tests {
             assert!(Instant::now() < deadline, "viewport 슬롯 미갱신");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(
-            handle.dash_build_count(),
-            base_builds,
-            "Viewport wake가 Dashboard 재구축을 유발함 (PR-F1 게이트 회귀)"
+        let (builds, polls) = counters();
+        assert!(
+            builds - base_builds <= polls - base_polls,
+            "Viewport wake가 Dashboard 재구축을 유발함 (PR-F1 게이트 회귀) \
+             [builds {base_builds}→{builds}, polls {base_polls}→{polls}]"
         );
 
         // 대시보드 관련 이벤트(상태 변화)는 재구축을 켠다.
@@ -1684,8 +1689,13 @@ mod tests {
             session: SessionId(7),
             status: SessionStatus::NeedsApproval,
         });
+        let (base_builds, base_polls) = counters();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while handle.dash_build_count() == base_builds {
+        loop {
+            let (builds, polls) = counters();
+            if builds - base_builds > polls - base_polls {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
                 "상태 이벤트가 재구축을 켜지 않음"

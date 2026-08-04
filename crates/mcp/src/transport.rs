@@ -95,6 +95,10 @@ struct StdioWiring {
     stderr_log: SharedStderrLog,
     stdout_thread: JoinHandle<()>,
     stderr_thread: JoinHandle<()>,
+    /// 테스트 전용: reader가 이벤트 채널에 넣은 메시지 수 — "응답 도착"을
+    /// 벽시계 sleep 없이 관측하기 위한 게이지 (2026-08-04 CI 하드닝).
+    #[cfg(test)]
+    stdout_message_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// local stdio MCP 서버 하나와의 JSON-RPC 연결.
@@ -113,6 +117,9 @@ pub(crate) struct StdioClient {
     violation: Option<String>,
     #[cfg(test)]
     write_drop_observer: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 테스트 전용 게이지 — reader가 큐에 넣은 메시지 수 (StdioWiring과 공유).
+    #[cfg(test)]
+    stdout_message_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StdioClient {
@@ -182,6 +189,8 @@ impl StdioClient {
                 violation: None,
                 #[cfg(test)]
                 write_drop_observer: None,
+                #[cfg(test)]
+                stdout_message_count: wiring.stdout_message_count,
             }),
             Err(error) => {
                 kill_and_reap(&mut child);
@@ -201,11 +210,21 @@ impl StdioClient {
         // bounded 채널: 소비가 느리면 reader가 send에서 블록 → 표준 backpressure.
         let (tx, rx) = sync_channel(64);
         let stdout_redaction = redaction.clone();
+        #[cfg(test)]
+        let stdout_message_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(test)]
+        let reader_message_count = Arc::clone(&stdout_message_count);
         let stdout_thread = std::thread::Builder::new()
             .name("mcp-stdout".into())
             .spawn(move || {
                 let _thread = ThreadGuard::enter(ThreadKind::StdioStdout);
-                read_stdout(stdout, tx, stdout_redaction);
+                read_stdout(
+                    stdout,
+                    tx,
+                    stdout_redaction,
+                    #[cfg(test)]
+                    reader_message_count,
+                );
             })
             .context("mcp stdout thread 생성 실패")?;
 
@@ -238,6 +257,8 @@ impl StdioClient {
             stderr_log,
             stdout_thread,
             stderr_thread,
+            #[cfg(test)]
+            stdout_message_count,
         })
     }
 
@@ -306,6 +327,14 @@ impl StdioClient {
     pub(crate) fn stderr_log(&self) -> String {
         let log = self.stderr_log.lock().expect("stderr log lock");
         String::from_utf8_lossy(&log).into_owned()
+    }
+
+    /// 테스트 전용: stdout reader가 이벤트 채널에 넣은 메시지 수.
+    /// send 성공 뒤에 증가하므로 이 값이 N이면 N번째 메시지는 이미 큐에 있다.
+    #[cfg(test)]
+    pub(crate) fn stdout_message_count(&self) -> usize {
+        self.stdout_message_count
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 요청 전 대기열 정리: outstanding 요청이 없는 시점에 도착한 response는
@@ -553,7 +582,12 @@ fn unwrap_response(mut value: Value, method: &str) -> anyhow::Result<Value> {
 
 /// stdout reader 본체. 위반을 만나면 Violation을 보내고 즉시 중단한다 —
 /// 위반 이후의 stdout은 신뢰할 수 없으므로 파싱을 계속하지 않는다(거부).
-fn read_stdout(stdout: ChildStdout, tx: SyncSender<ReaderEvent>, redaction: RedactionService) {
+fn read_stdout(
+    stdout: ChildStdout,
+    tx: SyncSender<ReaderEvent>,
+    redaction: RedactionService,
+    #[cfg(test)] message_count: Arc<std::sync::atomic::AtomicUsize>,
+) {
     let mut reader = BufReader::new(stdout);
     loop {
         let line = match read_line_capped(&mut reader, MAX_LINE_BYTES) {
@@ -571,6 +605,8 @@ fn read_stdout(stdout: ChildStdout, tx: SyncSender<ReaderEvent>, redaction: Reda
                 if tx.send(ReaderEvent::Message(value)).is_err() {
                     break; // 수신측이 사라짐
                 }
+                #[cfg(test)]
+                message_count.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
             Err(reason) => {
                 let _ = tx.send(ReaderEvent::Violation(violation_desc(

@@ -217,7 +217,19 @@ mod tests {
                 roots: Arc::from([]),
             })
             .unwrap();
-        assert!(wait_until_test_process_group_starts(Duration::from_secs(1)));
+        // 스폰 기록(pid 등록)을 기다린다. 이 픽스처는 부모가 즉시 exit하고 러너가 그룹을
+        // 곧바로 kill하므로 그룹 생존 창(~10-20ms)이 kill(-pgid, 0) 프로브 간격(10ms)
+        // 사이에 빠질 수 있다 — wait_until_test_process_group_starts로는 그룹 생존을
+        // 놓쳐 실패했다 (2026-08-04, 로컬 워크스페이스 런에서 재현). pid 기록은 스폰
+        // 시점에 남고 그룹 사망 후에도 지워지지 않으므로 결정적이다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while LAST_TEST_PROCESS_GROUP.load(Ordering::Acquire) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test process group not recorded"
+            );
+            std::thread::yield_now();
+        }
         std::thread::sleep(Duration::from_millis(100));
 
         let started = std::time::Instant::now();

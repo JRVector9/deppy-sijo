@@ -1672,15 +1672,6 @@ mod tests {
                 .filter(|e| e.as_str() == endpoint)
                 .count()
         }
-        /// 호출 수가 잠시(폴링 주기 몇 번) 변하지 않을 때까지 기다린다 — 재발송이 멎었는지 판정.
-        fn settle(&self) -> usize {
-            wait_until(|| {
-                let before = self.call_count();
-                std::thread::sleep(FAST_POLL * 3);
-                before == self.call_count()
-            });
-            self.call_count()
-        }
     }
     impl PushTransport for FakeTransport {
         fn post(
@@ -2303,7 +2294,20 @@ mod tests {
 
         // 회복(201) → 성공하면 그제서야 마킹이 커밋돼 재발송이 멎는다.
         transport.set(endpoint, Reply::Status(201));
-        let settled = transport.settle();
+        // 성공 발송 뒤 마킹 커밋을 관측 가능한 상태로 기다린다 — settle()의 120ms
+        // 안정 창은 느린 공유 CI 러너에서 폴 주기 지연을 "정착"으로 오인해 기준값이
+        // 낮게 잡힐 수 있다(2026-08-04). 커밋은 성공 POST 완료 뒤에 일어나므로
+        // 이 시점의 call_count가 최종값이다.
+        assert!(
+            wait_until(|| {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.jobs.is_empty()
+                    && inner.retry_jobs.is_empty()
+                    && inner.notified_approvals.contains("appr-flaky")
+            }),
+            "성공 후 마킹이 커밋되지 않았다"
+        );
+        let settled = transport.call_count();
         std::thread::sleep(FAST_POLL * 4);
         assert_eq!(
             transport.call_count(),
@@ -2350,7 +2354,18 @@ mod tests {
         );
         // 하나라도 전달됐으면 마킹 커밋 — 실패한 기기 때문에 재발송하면 성공한 기기에 중복
         // 알림이 간다. 실패 기기는 다음 새 승인에서 재수렴한다.
-        let settled = transport.settle();
+        // 마킹 커밋을 관측 가능한 상태로 기다린다 (2026-08-04 — settle()의 120ms
+        // 안정 창은 느린 CI 러너에서 폴 지연을 정착으로 오인, 위 테스트와 같은 근거).
+        assert!(
+            wait_until(|| {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.jobs.is_empty()
+                    && inner.retry_jobs.is_empty()
+                    && inner.notified_approvals.contains("appr-partial")
+            }),
+            "부분 성공 후 마킹이 커밋되지 않았다"
+        );
+        let settled = transport.call_count();
         std::thread::sleep(FAST_POLL * 4);
         assert_eq!(
             transport.call_count(),
@@ -2421,7 +2436,18 @@ mod tests {
             "실패가 마킹으로 굳어 재통지가 억제됐다(무음 유실)"
         );
         // 성공 뒤에는 다시 중복 억제된다(기존 동작 회귀 없음).
-        let after = transport.settle();
+        // 성공 후 중복 억제 마킹을 관측 가능한 상태로 기다린다 (2026-08-04 — 위와 같은
+        // settle() 안정 창 문제). 마킹 후 재통지는 조용히 억제돼 call_count가 변하지 않는다.
+        assert!(
+            wait_until(|| {
+                let inner = handle.shared.inner.lock().expect("push inner lock");
+                inner.jobs.is_empty()
+                    && inner.retry_jobs.is_empty()
+                    && inner.notified_status.get("u7") == Some(&SessionKind::Done)
+            }),
+            "성공 후 세션 마킹이 커밋되지 않았다"
+        );
+        let after = transport.call_count();
         handle.notify_session("u7".to_owned(), runtime::SessionStatus::Done);
         std::thread::sleep(FAST_POLL * 4);
         assert_eq!(

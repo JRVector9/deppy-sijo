@@ -422,8 +422,18 @@ fn repeated_idle_exit_and_restart_races_never_lose_or_duplicate_jobs() {
     assert!(starts.load(Ordering::SeqCst) > 1);
     assert!(starts.load(Ordering::SeqCst) <= 64);
 
-    std::thread::sleep(Duration::from_millis(5));
-    assert!(!worker.has_live_worker());
+    // 느린 공유 CI 러너 대응(2026-08-04): 고정 5ms sleep은 워커 스레드의 idle
+    // 종료(2ms TTL)를 기다리는 유일한 동기화라 스케줄링 지연에 실패할 수 있다.
+    // has_live_worker()가 reap_finished를 구동하므로 반복 확인으로 전환 — WAIT(2s) 상한은
+    // idle 미종료 회귀를 잡는 generous 상한이다.
+    let deadline = std::time::Instant::now() + WAIT;
+    while worker.has_live_worker() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle worker did not exit"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]

@@ -437,6 +437,15 @@ impl McpConnection {
             TransportClient::Http(_) => String::new(),
         }
     }
+
+    /// 테스트 전용: stdio reader가 큐에 넣은 메시지 수 (HTTP면 0).
+    #[cfg(test)]
+    fn stdout_message_count(&self) -> usize {
+        match &self.client {
+            TransportClient::Stdio(client) => client.stdout_message_count(),
+            TransportClient::Http(_) => 0,
+        }
+    }
 }
 
 fn validate_tool_arguments(arguments: &Value) -> anyhow::Result<()> {
@@ -881,8 +890,18 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"fake","inputS
 sleep 2
 "#;
         let mut connection = manager().connect(&sh_config(script)).unwrap();
-        // reader thread가 선점 response를 큐에 넣을 시간을 준다
-        std::thread::sleep(Duration::from_millis(300));
+        // reader thread가 선점 response를 큐에 넣을 때까지 관측 가능한 상태(메시지
+        // 카운터 2 = init 응답 + 선점 id=2)로 기다린다 — 고정 sleep은 느린 공유 CI
+        // 러너에서 reader 스케줄링이 밀려 drain이 큐를 놓치고 요청이 "성공"해 실패했다
+        // (2026-08-04). 카운터는 send 성공 뒤에 증가하므로 2 도달 시 id=2는 큐에 있다.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while connection.stdout_message_count() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "선점 response가 reader 큐에 도착하지 않음"
+            );
+            std::thread::yield_now();
+        }
         let error = connection.list_tools().unwrap_err();
         assert!(
             format!("{error:#}").contains("outstanding 요청이 없는데"),

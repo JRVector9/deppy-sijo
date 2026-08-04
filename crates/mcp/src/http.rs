@@ -1462,13 +1462,21 @@ mod tests {
     fn timed_out_http_senders_keep_permits_and_reaper_is_bounded() {
         let governor: &'static HttpSendGovernor = Box::leak(Box::new(HttpSendGovernor::new()));
         for _round in 0..4 {
+            // 느린 공유 CI 러너 대응(2026-08-04, GHA run 30872422317): 원래는 sender의
+            // 80ms sleep이 루프(10ms×MAX)와 20ms backpressure 대기보다 오래 간다는 벽시계
+            // 가정에 의존해, 스폰 지연이 커지면 첫 sender가 일찍 permit을 놓아
+            // "backpressure" 대신 "timeout"이 났다. sender를 barrier에서 블록시켜 permit
+            // 보유 시점을 테스트가 직접 제어하고, reaper 회수는 counts() 반복 호출로
+            // 관측한다.
+            let release = Arc::new(std::sync::Barrier::new(MAX_HTTP_SENDS + 1));
             for _ in 0..MAX_HTTP_SENDS {
+                let sender_release = Arc::clone(&release);
                 let error = run_blocking_send(
                     governor,
-                    Instant::now() + Duration::from_millis(10),
+                    Instant::now() + Duration::from_millis(50),
                     "fixture",
-                    || {
-                        std::thread::sleep(Duration::from_millis(80));
+                    move || {
+                        sender_release.wait();
                         1usize
                     },
                 )
@@ -1477,9 +1485,11 @@ mod tests {
             }
             assert_eq!(governor.counts(), (MAX_HTTP_SENDS, MAX_HTTP_SENDS));
 
+            // barrier에 묶인 sender가 permit을 놓지 않으므로 acquire의 condvar 대기는
+            // deadline 만료로만 끝난다 — 러너 속도와 무관하게 backpressure가 결정적이다.
             let error = run_blocking_send(
                 governor,
-                Instant::now() + Duration::from_millis(20),
+                Instant::now() + Duration::from_millis(50),
                 "fixture",
                 || 2usize,
             )
@@ -1487,8 +1497,16 @@ mod tests {
             assert!(format!("{error:#}").contains("backpressure"), "{error:#}");
             assert_eq!(governor.counts(), (MAX_HTTP_SENDS, MAX_HTTP_SENDS));
 
-            std::thread::sleep(Duration::from_millis(100));
-            assert_eq!(governor.counts(), (0, 0));
+            // barrier를 열어 sender가 permit을 놓게 한 뒤 reaper 회수를 관측한다.
+            // counts()가 reap_finished를 구동하므로 (0, 0) 도달이 곧 join 완료다.
+            // 5s 상한은 "reaper가 permit을 놓지 않는" 회귀를 잡는 generous 상한이다
+            // (코드베이스 관례: 50ms급 작업에 초 단위 상한).
+            release.wait();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while governor.counts() != (0, 0) {
+                assert!(Instant::now() < deadline, "reaper did not free permits");
+                std::thread::yield_now();
+            }
         }
     }
 
@@ -1707,6 +1725,10 @@ mod tests {
 
     #[test]
     fn 진행_tick은_interval마다_호출되고_결과를_보존() {
+        // 느린 공유 CI 러너 대응(2026-08-04): 원래는 work의 80ms sleep 안에 ticker가 두
+        // 번 스케줄돼야 했다. work가 tick 2회를 관측할 때까지 기다리게 해 벽시계 가정을
+        // 없앤다 — run_with_progress는 f 반환 뒤 ticker를 join하므로 데드락은 없고,
+        // tick이 오지 않는 회귀는 5s 상한(10ms interval의 250배)에서 실패한다.
         let ticks = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&ticks);
         let result = run_with_progress(
@@ -1715,7 +1737,11 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
             },
             || {
-                std::thread::sleep(Duration::from_millis(80));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ticks.load(Ordering::SeqCst) < 2 {
+                    assert!(Instant::now() < deadline, "progress tick이 오지 않음");
+                    std::thread::yield_now();
+                }
                 42
             },
         );
@@ -2664,11 +2690,14 @@ mod tests {
             0 => json_reply(request, init_result(), None),
             1 => accepted(),
             2 => Reply::RawThenDrip {
-                // 헤더는 즉시 완성 — Content-Length 미달인 바디만 드립
+                // 헤더는 즉시 완성 — Content-Length 미달인 바디만 드립.
+                // 느린 공유 CI 러너 대응(2026-08-04): 드립을 20→60바이트로 늘려
+                // 회귀(드립 전량 대기) 신호를 2s→6s로 키우고, 아래 elapsed 상한과의
+                // 거리를 양쪽으로 벌렸다.
                 immediate: b"HTTP/1.1 200 OK\r\nConnection: close\r\n\
                              Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n"
                     .to_vec(),
-                drip: vec![b'{'; 20],
+                drip: vec![b'{'; 60],
                 interval: Duration::from_millis(100),
             },
             _ => not_found(),
@@ -2682,8 +2711,10 @@ mod tests {
             .unwrap_err();
         let elapsed = started.elapsed();
         assert!(format!("{error:#}").contains("바디 수신 중"), "{error:#}");
-        // deadline(300ms) + read 한 번(≤300ms) = 이론 상한 2배, 여유 포함 3배 내
-        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+        // deadline(300ms) + read 한 번(≤300ms) = 이론 상한 600ms. 여기에 init/accepted/
+        // list 왕복 3회(전송 스레드 스폰 포함)의 슬로우 러너 오버헤드를 흡수할 3s 상한 —
+        // 드립 전량(6s)을 기다리는 회귀와는 2배 차이를 유지한다 (2026-08-04).
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 
     #[test]

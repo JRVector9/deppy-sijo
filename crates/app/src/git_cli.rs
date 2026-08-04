@@ -495,18 +495,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clean_parent_exit은_inherited_pipe_descendant를_reap전에_정리한다() {
-        let alias = "alias.background=!/bin/sleep 5 & exit 0";
+        // 느린 공유 CI 러너 대응(2026-08-04, GHA run 30868793934): git 스폰+alias 해석+
+        // 그룹 kill이 2s 예산을 넘겨 git_timeout으로 실패했다. 예산을 10s로 키우는 대신
+        // descendant 수명도 5s→30s로 올려 회귀 식별력을 유지한다 — reader join이
+        // descendant 파이프를 기다리는 회귀가 생기면 ~30s가 걸려 elapsed 상한에 걸린다.
+        // 예산 10s는 이 파일의 다른 git 호출 테스트와 같은 관례(50ms급 작업에 초 단위
+        // 상한)이고, descendant 수명 30s와는 3배 차이를 유지한다.
+        let alias = "alias.background=!/bin/sleep 30 & exit 0";
         let started = Instant::now();
         let execution = execute_bounded(
             Path::new("."),
             &["-c", alias, "background"],
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             1024,
         )
         .unwrap();
         assert!(execution.status.success());
         assert!(execution.stdout.bytes.is_empty());
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(execution.active_readers_after_join, 0);
     }
 

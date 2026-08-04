@@ -125,14 +125,27 @@ mod tests {
     #[test]
     fn operation_deadline_is_shared_across_multiple_commands() {
         let _process_guard = test_process_guard();
-        let operation = OperationContext::new(Duration::from_millis(120));
+        // 느린 공유 CI 러너 대응(2026-08-04, GHA run 30868793934): 원래 120ms 예산은
+        // 스폰+파이프+리더 스레드 준비에 50ms 이상이 드는 러너에서 첫 명령부터 예산을
+        // 넘겨 실패했다. 예산을 2s로 키워 스폰 지연 ~1.8s까지 흡수하고(관측치의 20배+),
+        // 두 번째 명령의 sleep 길이는 고정값 대신 `remaining() + 50ms`로 정해 스케줄링
+        // 속도와 무관하게 "남은 예산 초과 → Timeout"이 결정적으로 발생하게 한다.
+        // 50ms 마진은 원래 테스트(70ms sleep / 120ms 예산)와 같은 수준의
+        // fresh-budget 회귀 식별력을 유지한다.
+        let operation = OperationContext::new(Duration::from_secs(2));
         let started = std::time::Instant::now();
         assert!(run_test_sleeping_command(&operation, Duration::from_millis(70)).is_ok());
+        let remaining = operation
+            .remaining()
+            .expect("first command fits the shared budget");
         assert_eq!(
-            run_test_sleeping_command(&operation, Duration::from_millis(70)),
+            run_test_sleeping_command(&operation, remaining + Duration::from_millis(50)),
             Err(PortErrorCode::Timeout)
         );
-        assert!(started.elapsed() < Duration::from_millis(220));
+        // kill+reap+리더 join 오버헤드만 허용하는 상한 — 데드라인 미적용 회귀는
+        // Timeout 결과 assert가, 무한 대기 회귀는 이 상한이 잡는다.
+        // 로컬 실측 오버헤드는 10ms 미만이라 500ms 여유도 매우 크다.
+        assert!(started.elapsed() < Duration::from_millis(2500));
     }
 
     #[cfg(target_os = "macos")]

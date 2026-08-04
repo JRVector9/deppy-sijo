@@ -1663,6 +1663,20 @@ mod tests {
                 }
             }
         }
+
+        fn wait_idle_exit(&mut self) {
+            // idle_ttl 이후 워커 스레드가 실제로 빠져나갈 때까지 관측 가능한 상태(슬롯
+            // 회수)로 기다린다. try_recv가 reap_finished를 구동해 종료된 슬롯을 낸다.
+            // 고정 sleep은 느린 CI 러너에서 워커 스레드 스케줄링이 밀려 슬롯이 살아
+            // 있는 채 admit돼 generation 승격이 일어나지 않았다(2026-08-04, GHA run
+            // 30868793934). 상한은 wait_outcome과 같은 2s.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.worker.has_live_slot() {
+                let _ = self.worker.try_recv();
+                assert!(Instant::now() < deadline, "idle worker did not exit");
+                std::thread::yield_now();
+            }
+        }
     }
 
     #[test]
@@ -2458,7 +2472,7 @@ mod tests {
         harness.worker.admit().unwrap();
         let _ = harness.wait_outcome();
         let first_generation = harness.worker.worker_generation();
-        std::thread::sleep(Duration::from_millis(30));
+        harness.wait_idle_exit();
 
         harness
             .worker

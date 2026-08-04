@@ -363,9 +363,7 @@ impl PortablePtyBackend {
         #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
         #[cfg(test)] worker_spawn_failure: TestWorkerSpawnFailure,
     ) -> anyhow::Result<Box<dyn PtySession>> {
-        let pair = portable_pty::native_pty_system()
-            .openpty(pty_size(cols, rows))
-            .context("PTY 생성 실패")?;
+        let pair = openpty_with_retry(cols, rows)?;
         let mut builder = portable_pty::CommandBuilder::new(&cmd.program);
         builder.args(&cmd.args);
         // 부모의 **에이전트 세션 마커**를 먼저 지운다. deppy가 다른 코딩 에이전트
@@ -1461,6 +1459,26 @@ fn pty_size(cols: u16, rows: u16) -> portable_pty::PtySize {
     }
 }
 
+/// macOS에서 `openpty(3)`를 동시에 여러 스레드가 부륾면 간헐적으로 실패한다
+/// (`errno -6`, 실증 2026-08-03: deppy 무관한 순수 C 프로브 12스레드×400회에서
+/// 재현). 일시적 오류라 재시도하면 성공한다(최대 5회 재시도 프로브에서 영구
+/// 실패 0건). pane을 동시에 여러 개 띄우면 제품에서도 맞을 수 있으므로 여기서
+/// 흡수한다. 진짜 고갈(ptmx 한도 도달 등)이면 재시도 후 같은 오류로 실패한다.
+fn openpty_with_retry(cols: u16, rows: u16) -> anyhow::Result<portable_pty::PtyPair> {
+    const MAX_ATTEMPTS: usize = 5;
+    let pty_system = portable_pty::native_pty_system();
+    let mut last_err = None;
+    for _ in 0..MAX_ATTEMPTS {
+        match pty_system.openpty(pty_size(cols, rows)) {
+            Ok(pair) => return Ok(pair),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err
+        .expect("MAX_ATTEMPTS가 0보다 크므로 최소 1회는 시도한다")
+        .context("PTY 생성 실패"))
+}
+
 impl PtyBackend for PortablePtyBackend {
     fn spawn(
         &self,
@@ -1678,6 +1696,25 @@ mod tests {
                 24,
             )
             .unwrap()
+    }
+
+    /// macOS에서 동시 `openpty(3)`가 간헐적으로 `errno -6`로 실패한다(실증
+    /// 2026-08-03: deppy 무관한 순수 C 프로브에서 재현). `openpty_with_retry`가
+    /// 이를 흡수하므로 동시 spawn은 전부 성공해야 한다 — 재시도 도입 전 `cargo
+    /// test -p pty` 병렬 실행의 주된 실패 지점이 여기였다. 출력 단정은 하지
+    /// 않는다: 검증 대상은 pty 할당 경합이지 출력 경로가 아니다.
+    #[test]
+    fn 동시_spawn은_openpty_경합에도_전부_성공한다() {
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(std::thread::spawn(|| {
+                let mut session = spawn("/bin/sleep", &["5"]);
+                session.kill().expect("kill");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("동시 spawn 스레드 패닉");
+        }
     }
 
     extern "C" fn record_pty_signal_probe(signal: libc::c_int) {

@@ -61,7 +61,11 @@ const SNAPSHOT_DEFAULT_BG: egui::Color32 = egui::Color32::from_rgb(0x18, 0x18, 0
 /// 225도라 축에서 살짝 벗어나 있었고, 무엇보다 L 7.5%로 사이드바 본문(8.6%)과 거의
 /// 같아 터미널이 "깊은 작업면"으로 읽히지 않았다. L 5.5%로 낮춰 사이드바보다 확실히
 /// 뒤로 물러나게 한다(사용자 확인, 목업 A/B 비교).
-const TERMINAL_SURFACE_BG: egui::Color32 = egui::Color32::from_rgb(0x0b, 0x0d, 0x11);
+///
+/// 호출부도 이 색이 필요하다 — 그리드 폭이 셀 단위로 떨어져 pane 우측에 최대 한 셀만큼
+/// 남는데, 그 자리를 pane 본문 rect에 미리 칠해 두지 않으면 CentralPanel 배경(앱 크롬)이
+/// 비쳐 밝은 여백 띠가 된다. pane 폭을 아는 쪽이 호출부라 여기서 공개한다.
+pub const TERMINAL_SURFACE_BG: egui::Color32 = egui::Color32::from_rgb(0x0b, 0x0d, 0x11);
 
 /// 전체 터미널 폭에서 좌우 내부 여백을 제외한 셀 그리드 가용 폭.
 pub fn grid_width_for_available(available_width: f32) -> f32 {
@@ -265,6 +269,9 @@ pub fn draw(
     } else {
         cell.y * snapshot.rows as f32
     };
+    // 그리드 폭은 셀 단위로 떨어지므로 pane 우측에 최대 한 셀만큼 남는다. 그 자리는
+    // **호출부가** 작업면 색으로 미리 덮는다(pane 폭을 아는 쪽은 거기다) — 여기서
+    // avail.x를 그대로 쓰면 무제한 ui에서 터미널이 화면 전체를 차지한다.
     let size = egui::vec2(
         ((cell.x * snapshot.cols as f32).min(grid_width_for_available(avail.x))
             + HORIZONTAL_PADDING * 2.0)

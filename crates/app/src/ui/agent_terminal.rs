@@ -1,8 +1,10 @@
 use super::activity::{ActivityWorkspaceRow, ActivityWorkspaceState};
 use super::ports::{PortsIntent, PortsUi};
 use super::resource_manager::{ResourceManagerIntent, ResourceManagerUi};
+use crate::agent_surface::AgentVisualState;
 use crate::port_inventory::PortSnapshot;
 use crate::status_feed::{ProviderStatus, ServiceIndicator, StatusFeedSnapshot};
+use crate::ui::agent_visuals::status_color;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -722,26 +724,26 @@ fn connections_panel(
                         ),
                         connector_contract::SlackStatus::Ready => (
                             catalog.t("connectors.slack.ready", &[]),
-                            egui::Color32::from_rgb(0x4c, 0xa8, 0xdf),
+                            status_color(AgentVisualState::Active),
                         ),
                         connector_contract::SlackStatus::Checking => (
                             catalog.t("connectors.checking", &[]),
-                            egui::Color32::from_rgb(0x4c, 0xa8, 0xdf),
+                            status_color(AgentVisualState::Active),
                         ),
                         connector_contract::SlackStatus::NeedsAuthorization => (
                             catalog.t("connectors.needs_auth", &[]),
-                            egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+                            status_color(AgentVisualState::Waiting),
                         ),
                         connector_contract::SlackStatus::Connected => (
                             catalog.t(
                                 "connectors.connected_tools",
                                 &[("count", &slack.tool_count.to_string())],
                             ),
-                            egui::Color32::from_rgb(0x55, 0xc8, 0x79),
+                            status_color(AgentVisualState::Complete),
                         ),
                         connector_contract::SlackStatus::Failed => (
                             catalog.t("home.connections.failed", &[]),
-                            egui::Color32::from_rgb(0xed, 0x5b, 0x61),
+                            status_color(AgentVisualState::Error),
                         ),
                     };
                     ui.colored_label(color, label);
@@ -1213,10 +1215,10 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
 /// indicator → 점등 색. 미조회(None)/미지 값은 회색.
 fn indicator_color(ui: &egui::Ui, provider: Option<&ProviderStatus>) -> egui::Color32 {
     match provider.map(|p| p.indicator) {
-        Some(ServiceIndicator::Operational) => egui::Color32::from_rgb(0x55, 0xc8, 0x79),
-        Some(ServiceIndicator::Minor) => egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+        Some(ServiceIndicator::Operational) => status_color(AgentVisualState::Complete),
+        Some(ServiceIndicator::Minor) => status_color(AgentVisualState::Waiting),
         Some(ServiceIndicator::Major) | Some(ServiceIndicator::Critical) => {
-            egui::Color32::from_rgb(0xed, 0x5b, 0x61)
+            status_color(AgentVisualState::Error)
         }
         Some(ServiceIndicator::Unknown) | None => ui.visuals().weak_text_color(),
     }

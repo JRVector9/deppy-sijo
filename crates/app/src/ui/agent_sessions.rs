@@ -2145,12 +2145,21 @@ impl AgentSessionsUi {
                     );
                 });
                 if let Some(error) = &self.transport_error {
+                    // #ff7b72는 agent_visuals가 소유한 Error 색을 복사해 둔 것이었다.
+                    // 그 모듈의 존재 이유가 "표면마다 상태색이 갈리지 않게"이므로 우회하지
+                    // 않는다(2026-08-06). 이 파일도 이미 다른 3곳에서 그렇게 쓰고 있다.
                     ui.colored_label(
-                        egui::Color32::from_rgb(0xff, 0x7b, 0x72),
+                        crate::ui::agent_visuals::status_color(
+                            crate::agent_surface::AgentVisualState::Error,
+                        ),
                         error.render(catalog),
                     );
                 }
                 if let Some(error) = &self.catalog_error {
+                    // 여기만 위와 달리 그대로 둔다. 색(#ffbf69)은 agent_visuals의 Waiting과
+                    // 같지만 의미가 다르다 — 이건 "카탈로그 실패, 폴백 사용"이라는 저하
+                    // 경고이지 대기 상태가 아니다. 색이 같다는 이유로 lifecycle 상태에
+                    // 묶으면 에이전트 UX 때문에 Waiting을 바꿀 때 여기까지 끌려간다.
                     ui.colored_label(
                         egui::Color32::from_rgb(0xff, 0xbf, 0x69),
                         error.render(catalog),
@@ -2930,7 +2939,13 @@ impl AgentSessionsUi {
             });
         }
         if let Some(error) = &session.error {
-            ui.colored_label(egui::Color32::from_rgb(0xff, 0x7b, 0x72), error);
+            // 위 transport_error와 같은 이유 — agent_visuals가 소유한 Error 색을 쓴다.
+            ui.colored_label(
+                crate::ui::agent_visuals::status_color(
+                    crate::agent_surface::AgentVisualState::Error,
+                ),
+                error,
+            );
         }
 
         if session.status == AgentSessionStatus::Running
@@ -2969,8 +2984,12 @@ impl AgentSessionsUi {
         for approval in &session.approvals {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // 승인 대기는 agent_visuals의 Waiting과 같은 의미다 — 그 색을 복사해
+                    // 두는 대신 모듈을 그대로 쓴다(2026-08-06).
                     ui.colored_label(
-                        egui::Color32::from_rgb(0xff, 0xbf, 0x69),
+                        crate::ui::agent_visuals::status_color(
+                            crate::agent_surface::AgentVisualState::Waiting,
+                        ),
                         approval_kind_label(approval.kind, catalog),
                     );
                     ui.strong(

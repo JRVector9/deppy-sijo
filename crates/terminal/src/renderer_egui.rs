@@ -49,8 +49,19 @@ pub const HORIZONTAL_PADDING: f32 = 3.0;
 
 /// backend snapshot이 기본 셀 배경에 쓰는 레거시 색. 새 AgentTerminal surface에서는
 /// 이 색을 아래의 더 어두운 작업면 색으로 remap하고, 그 밖의 ANSI 배경색은 유지한다.
+///
+/// 이 값 자체는 **화면에 칠해지지 않는다** — `build_row_cache`가 이 색과 같은 셀 배경을
+/// 건너뛰어(`if bg == default_bg { continue; }`) 아래 작업면이 그대로 비치게 한다.
+/// 즉 backend가 보고하는 "기본 배경" 센티넬이므로, 두 backend의 `DEFAULT_BG`와 값이
+/// 어긋나면 기본 셀이 통째로 칠해져 작업면 색이 묻힌다.
 const SNAPSHOT_DEFAULT_BG: egui::Color32 = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
-const TERMINAL_SURFACE_BG: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x11, 0x17);
+/// 실제로 보이는 터미널 작업면. 화면에서 가장 넓은 면이라 앱 전체 인상을 좌우한다.
+///
+/// 2026-08-06: 앱 팔레트를 hsl 220도 축으로 옮기면서 여기도 맞췄다. 이전 #0f1117은
+/// 225도라 축에서 살짝 벗어나 있었고, 무엇보다 L 7.5%로 사이드바 본문(8.6%)과 거의
+/// 같아 터미널이 "깊은 작업면"으로 읽히지 않았다. L 5.5%로 낮춰 사이드바보다 확실히
+/// 뒤로 물러나게 한다(사용자 확인, 목업 A/B 비교).
+const TERMINAL_SURFACE_BG: egui::Color32 = egui::Color32::from_rgb(0x0b, 0x0d, 0x11);
 
 /// 전체 터미널 폭에서 좌우 내부 여백을 제외한 셀 그리드 가용 폭.
 pub fn grid_width_for_available(available_width: f32) -> f32 {

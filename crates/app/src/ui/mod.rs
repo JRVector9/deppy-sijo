@@ -33,6 +33,31 @@ pub fn hairline(ui: &mut egui::Ui) {
     hairline_colored(ui, color);
 }
 
+/// 좌표를 물리 픽셀 **경계**로 반올림한다 (`ppp`는 `ctx.pixels_per_point()`).
+///
+/// `hairline`이 선 중심을 픽셀 중심에 맞추는 것과 같은 이유다. epaint는 갤리 **안의**
+/// 글리프 위치만 픽셀에 맞추고(`text_layout.rs`의 `round_to_pixel`), 갤리 원점과 행
+/// 사각형은 호출부가 준 좌표를 그대로 쓴다. 사이드바 행 높이가 29.19처럼 소수라 행이
+/// 쌓일수록 원점이 물리 픽셀에서 밀리고(2x에서 행마다 0.38px), 그 결과 어떤 행은
+/// 글자가 또렷하고 어떤 행은 반 픽셀 흐려서 목록을 훑을 때 선명도가 출렁인다.
+/// 행 배경·레일도 같은 이유로 테두리가 뭉개진다.
+///
+/// 선 중심용인 `Painter::round_to_pixel_center`(x.5로 맞춤)와 용도가 다르다 —
+/// 채움 사각형과 텍스트 원점은 픽셀 경계(정수)에 맞춰야 한다.
+pub fn snap_to_pixel(ppp: f32, v: f32) -> f32 {
+    (v * ppp).round() / ppp
+}
+
+/// [`snap_to_pixel`]의 좌표 버전.
+pub fn snap_pos_to_pixel(ppp: f32, p: egui::Pos2) -> egui::Pos2 {
+    egui::pos2(snap_to_pixel(ppp, p.x), snap_to_pixel(ppp, p.y))
+}
+
+/// [`snap_to_pixel`]의 사각형 버전. min/max를 각각 맞춰 폭·높이가 정수 픽셀이 된다.
+pub fn snap_rect_to_pixel(ppp: f32, r: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(snap_pos_to_pixel(ppp, r.min), snap_pos_to_pixel(ppp, r.max))
+}
+
 /// 색 지정 버전.
 pub fn hairline_colored(ui: &mut egui::Ui, color: egui::Color32) {
     // 기본 `ui.separator()`와 동일한 세로 공간을 차지한다(레이아웃 밀림 방지) —

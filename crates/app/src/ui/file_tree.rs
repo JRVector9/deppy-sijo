@@ -4630,11 +4630,13 @@ fn session_row_impl(
     };
     let text_inset = session_text_inset(SESSION_RAIL_MAX_WIDTH);
     // 2·3행(보조 정보): 다크는 기존 weak 톤, 라이트는 weak가 패널 위에서 너무 옅어
-    // textSecondary(#444444) 수준으로 진하게 (라이트 테마 회색 흐림, 2026-07-10).
+    // textSecondary 수준으로 진하게 (라이트 테마 회색 흐림, 2026-07-10).
+    // 참조하던 #444444는 무채색이라 210도로 통일한 사이드바에서 혼자 튀었다 — 명도는
+    // 그대로 두고 축만 맞춘다(2026-08-06). settings 보조색 라이트값과 같은 색이다.
     let sub_color = if ui.visuals().dark_mode {
         ui.visuals().weak_text_color().gamma_multiply(0.9)
     } else {
-        egui::Color32::from_rgb(0x44, 0x44, 0x44)
+        egui::Color32::from_rgb(0x3f, 0x44, 0x49)
     };
     let title_color = ui.visuals().text_color();
     // 텍스트는 행 폭(좌 11 + 우 여백 16) 안으로 잘라 '…' 처리 — 고정 글자수 truncate는

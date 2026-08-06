@@ -70,14 +70,14 @@ impl EnvProjectListStyle {
 }
 
 // 이 화면(환경 설정의 프로젝트 rail)은 설정 창 안에서 렌더되므로 settings.rs 팔레트와
-// 같은 축(hsl 210도)을 써야 한다. 2026-08-06 팔레트 통일 전 값들이 사본으로 남아 있어
-// 설정 창의 다른 면이 210도로 바뀐 뒤 이 rail만 무채색으로 튀었다.
+// 같은 축(hsl 220도)을 써야 한다. 2026-08-06 팔레트 통일 전 값들이 사본으로 남아 있어
+// 설정 창의 다른 면이 축 위로 옮겨간 뒤 이 rail만 무채색으로 튀었다.
 
 pub fn panel_bg(ui: &egui::Ui) -> egui::Color32 {
     // settings의 '관리 panel'과 값이 달라(#1e1e1e vs #202020) 헬퍼로 위임하지 않고,
     // 이 화면 고유의 명도는 유지한 채 색상축만 맞춘다.
     if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x16, 0x1e, 0x26) // was #1e1e1e (무채색)
+        egui::Color32::from_rgb(0x1a, 0x1c, 0x22) // was #1e1e1e (무채색)
     } else {
         egui::Color32::from_rgb(0xf9, 0xfa, 0xfb) // was #fafafa (무채색)
     }

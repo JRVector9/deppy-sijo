@@ -1015,7 +1015,7 @@ fn credential_columns(rect: egui::Rect) -> [egui::Rect; 5] {
 }
 
 fn credential_secondary_text(ui: &egui::Ui) -> egui::Color32 {
-    // #aaaaaa/#444444는 settings.rs 보조색의 hsl 210도 통일 이전 값이 그대로 남아있던
+    // #aaaaaa/#444444는 settings.rs 보조색의 색상축 통일 이전 값이 그대로 남아있던
     // 사본이었다(2026-08-06) — 같은 설정 창 안에서 렌더되므로 settings.rs 헬퍼로 위임한다.
     super::settings::settings_text_secondary(ui)
 }

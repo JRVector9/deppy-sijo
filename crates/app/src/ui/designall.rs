@@ -24,19 +24,19 @@ pub const NAV_RAIL_MAX_WIDTH: f32 = 180.0;
 pub const SEPARATOR_WIDTH: f32 = 1.0;
 
 pub const DARK: Tokens = Tokens {
-    app_background: egui::Color32::from_rgb(0x0b, 0x10, 0x15),
-    workspace_background: egui::Color32::from_rgb(0x10, 0x16, 0x1c),
-    folder_tree_background: egui::Color32::from_rgb(0x10, 0x16, 0x1c),
-    input_background: egui::Color32::from_rgb(0x11, 0x18, 0x20),
-    separator: egui::Color32::from_rgb(0x26, 0x30, 0x3a),
-    text: egui::Color32::from_rgb(0xd8, 0xde, 0xe6),
-    muted_text: egui::Color32::from_rgb(0x7f, 0x89, 0x96),
+    app_background: egui::Color32::from_rgb(0x0e, 0x0f, 0x12),
+    workspace_background: egui::Color32::from_rgb(0x13, 0x15, 0x19),
+    folder_tree_background: egui::Color32::from_rgb(0x13, 0x15, 0x19),
+    input_background: egui::Color32::from_rgb(0x15, 0x17, 0x1c),
+    separator: egui::Color32::from_rgb(0x2b, 0x2e, 0x35),
+    text: egui::Color32::from_rgb(0xdc, 0xde, 0xe2),
+    muted_text: egui::Color32::from_rgb(0x82, 0x88, 0x93),
     accent: egui::Color32::from_rgb(0x39, 0xb8, 0xe8),
     success: egui::Color32::from_rgb(0x4a, 0xcb, 0x82),
     warning: egui::Color32::from_rgb(0xe0, 0xa4, 0x3a),
     error: egui::Color32::from_rgb(0xef, 0x66, 0x71),
-    selected_background: egui::Color32::from_rgb(0x14, 0x1c, 0x23),
-    hover_background: egui::Color32::from_rgb(0x12, 0x18, 0x1e),
+    selected_background: egui::Color32::from_rgb(0x17, 0x1a, 0x20),
+    hover_background: egui::Color32::from_rgb(0x14, 0x17, 0x1c),
 };
 
 pub const LIGHT: Tokens = Tokens {
@@ -108,17 +108,17 @@ mod tests {
     fn dark_tokens_match_the_approved_design_freeze() {
         assert_eq!(
             DARK.app_background,
-            egui::Color32::from_rgb(0x0b, 0x10, 0x15)
+            egui::Color32::from_rgb(0x0e, 0x0f, 0x12)
         );
         assert_eq!(
             DARK.input_background,
-            egui::Color32::from_rgb(0x11, 0x18, 0x20)
+            egui::Color32::from_rgb(0x15, 0x17, 0x1c)
         );
-        assert_eq!(DARK.separator, egui::Color32::from_rgb(0x26, 0x30, 0x3a));
+        assert_eq!(DARK.separator, egui::Color32::from_rgb(0x2b, 0x2e, 0x35));
         assert_eq!(DARK.accent, egui::Color32::from_rgb(0x39, 0xb8, 0xe8));
         assert_eq!(
             DARK.selected_background,
-            egui::Color32::from_rgb(0x14, 0x1c, 0x23)
+            egui::Color32::from_rgb(0x17, 0x1a, 0x20)
         );
         assert_eq!(
             LIGHT.selected_background,

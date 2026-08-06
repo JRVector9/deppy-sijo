@@ -69,29 +69,29 @@ impl EnvProjectListStyle {
     }
 }
 
+// 이 화면(환경 설정의 프로젝트 rail)은 설정 창 안에서 렌더되므로 settings.rs 팔레트와
+// 같은 축(hsl 210도)을 써야 한다. 2026-08-06 팔레트 통일 전 값들이 사본으로 남아 있어
+// 설정 창의 다른 면이 210도로 바뀐 뒤 이 rail만 무채색으로 튀었다.
+
 pub fn panel_bg(ui: &egui::Ui) -> egui::Color32 {
+    // settings의 '관리 panel'과 값이 달라(#1e1e1e vs #202020) 헬퍼로 위임하지 않고,
+    // 이 화면 고유의 명도는 유지한 채 색상축만 맞춘다.
     if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x1e, 0x1e, 0x1e)
+        egui::Color32::from_rgb(0x16, 0x1e, 0x26) // was #1e1e1e (무채색)
     } else {
-        egui::Color32::from_rgb(0xfa, 0xfa, 0xfa)
+        egui::Color32::from_rgb(0xf9, 0xfa, 0xfb) // was #fafafa (무채색)
     }
 }
 
 fn text_secondary(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0xaa, 0xaa, 0xaa)
-    } else {
-        egui::Color32::from_rgb(0x44, 0x44, 0x44)
-    }
+    // #aaaaaa/#444444는 settings 보조색의 통일 이전 값 그대로였다 — 헬퍼로 위임한다.
+    super::settings::settings_text_secondary(ui)
 }
 
-/// navActive 토큰 — egui visuals에 대응 색이 없어 로컬 상수로 정의한다.
+/// navActive 토큰 — egui visuals에 대응 색이 없어 settings.rs 헬퍼를 재사용한다.
+/// (#2e4a5e/#ccdeed는 그 헬퍼의 통일 이전 값이 복사돼 있던 것이다.)
 fn tok_nav_active(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x2e, 0x4a, 0x5e)
-    } else {
-        egui::Color32::from_rgb(0xcc, 0xde, 0xed)
-    }
+    super::settings::settings_nav_active(ui)
 }
 
 pub fn render_with_style(

@@ -733,7 +733,8 @@ fn settings_detail_shell(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui:
 }
 
 // 아래 세 헬퍼도 apply_settings_palette와 같은 축(hsl 210도)을 쓴다. 명도는 유지.
-fn settings_text_secondary(ui: &egui::Ui) -> egui::Color32 {
+// credentials.rs가 이 값을 재사용하므로 pub(crate)로 노출한다.
+pub(crate) fn settings_text_secondary(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         rgb(0x9e, 0xaa, 0xb6) // was #aaaaaa
     } else {
@@ -751,7 +752,8 @@ fn settings_input_border(ui: &egui::Ui) -> egui::Color32 {
 
 /// 선택 배경은 액센트가 섞인 표면이라 채도를 낮추면 "선택됨"이 약해진다 — 채도·명도는
 /// 그대로 두고 색상축만 210도로 정렬했다.
-fn settings_nav_active(ui: &egui::Ui) -> egui::Color32 {
+/// env_project_list.rs가 이 값을 재사용하므로 pub(crate)로 노출한다.
+pub(crate) fn settings_nav_active(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         rgb(0x2e, 0x46, 0x5e) // was #2e4a5e (205도)
     } else {

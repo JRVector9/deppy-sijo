@@ -19855,11 +19855,15 @@ impl eframe::App for App {
                 inbox_click = self.inbox_popup(&bell, &text);
 
                 let separator = ui::designall::separator_stroke(ui.visuals());
+                // 세로 구분선은 아래 사이드바 구분선과 **같은 물리픽셀**에 놓여야 한다 —
+                // 규칙은 designall::panel_edge_separator_x가 소유한다.
+                let ppp = ui.ctx().pixels_per_point();
                 let painter = ui.painter();
                 let bottom = painter.round_to_pixel_center(bar_rect.bottom());
                 painter.hline(bar_rect.x_range(), bottom, separator);
-                for x in [regions.traffic.right(), regions.project.right()] {
-                    let x = painter.round_to_pixel_center(x);
+                for right in [regions.traffic.right(), regions.project.right()] {
+                    let x = painter
+                        .round_to_pixel_center(ui::designall::panel_edge_separator_x(right, ppp));
                     painter.vline(x, bar_rect.y_range(), separator);
                 }
             });

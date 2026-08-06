@@ -5158,12 +5158,14 @@ fn paint_sidebar_separator(ui: &egui::Ui, rect: egui::Rect, stroke: egui::Stroke
         // 패널 폭은 리사이즈 핸들이 pointer delta를 그대로 누적하므로, 사용자가 사이드바
         // 폭을 한 번이라도 끌면 rect.right()가 영구히 소수가 되어 경계선이 흐려진다.
         //
-        // 그리고 rect.right()를 그대로 쓰면 **선이 안 보인다** — 그 좌표는 이미 다음
-        // 패널의 첫 물리픽셀이라(88.0pt -> 물리 176), 뒤이어 그려지는 패널이 배경을
-        // 칠하면서 선을 덮는다. 이 패널 **안쪽 마지막 픽셀**에 그려야 살아남는다
-        // (2026-08-07: 레일·사이드바·터미널 경계가 전부 안 보인다는 보고).
-        let inset = 1.0 / ui.ctx().pixels_per_point();
-        let x = ui.painter().round_to_pixel_center(rect.right() - inset);
+        // x는 패널 안쪽 마지막 픽셀이다 — 이유와 규칙은
+        // designall::panel_edge_separator_x가 소유한다(상단 바 구분선과 공유).
+        let x = ui
+            .painter()
+            .round_to_pixel_center(crate::ui::designall::panel_edge_separator_x(
+                rect.right(),
+                ui.ctx().pixels_per_point(),
+            ));
         ui.painter()
             .vline(x, egui::Rangef::new(rect.top(), bottom), stroke);
     }

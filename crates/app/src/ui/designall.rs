@@ -81,6 +81,18 @@ pub fn separator_stroke(visuals: &egui::Visuals) -> egui::Stroke {
     egui::Stroke::new(SEPARATOR_WIDTH, tokens(visuals).separator)
 }
 
+/// 패널 경계에 세로 구분선을 놓을 x — 경계 좌표에서 **안쪽으로 1물리픽셀** 민 값.
+/// 호출부는 이 값을 `Painter::round_to_pixel_center`로 감싸 쓴다.
+///
+/// 두 가지를 동시에 만족해야 해서 규칙을 여기 한 곳에 둔다.
+/// 1. 경계 좌표(`rect.right()`)에 그리면 **다음 패널이 배경으로 덮어** 선이 사라진다
+///    (egui는 나중에 그린 것이 위에 온다).
+/// 2. 덮일 일이 없는 상단 바도 같은 규칙을 써야 한다 — 한쪽만 경계 좌표를 쓰면 1픽셀
+///    어긋나 세로선이 상단 바에서 꺾인다(2026-08-07 사용자: "탑헤드쪽 경계가 비뚤어").
+pub fn panel_edge_separator_x(right: f32, pixels_per_point: f32) -> f32 {
+    right - 1.0 / pixels_per_point.max(1.0)
+}
+
 pub fn vertical_separator(ui: &mut egui::Ui, height: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, height), egui::Sense::hover());
     let x = ui.painter().round_to_pixel_center(rect.center().x);
@@ -138,6 +150,26 @@ mod tests {
         );
         assert_eq!(STRUCTURAL_CORNER_RADIUS, 0);
         assert_eq!(NAV_RAIL_WIDTH, 88.0);
+    }
+
+    /// 상단 바와 사이드바가 같은 경계에 그리는 세로선은 **같은 물리픽셀**에 놓여야 한다.
+    /// 두 호출부가 각자 계산하다 1픽셀 어긋나 선이 상단 바에서 꺾였다(2026-08-07).
+    #[test]
+    fn 패널_경계_세로선은_안쪽_마지막_픽셀에_놓인다() {
+        for ppp in [1.0, 2.0, 3.0] {
+            let right = 288.0;
+            let x = panel_edge_separator_x(right, ppp);
+            assert!(x < right, "ppp {ppp}: 경계 위에 그리면 다음 패널이 덮는다");
+            // f32는 288 근처에서 간격이 3e-5쯤이라 EPSILON으로는 못 잰다.
+            assert!(
+                (right - x - 1.0 / ppp).abs() < 1e-3,
+                "ppp {ppp}: 정확히 1물리픽셀만 안쪽이어야 한다 (x={x})"
+            );
+            // 같은 경계를 받은 두 호출부는 항상 같은 좌표를 얻는다.
+            assert_eq!(x, panel_edge_separator_x(right, ppp));
+        }
+        // ppp가 비정상(0 이하)이어도 발산하지 않는다.
+        assert!(panel_edge_separator_x(288.0, 0.0).is_finite());
     }
 
     #[test]

@@ -4417,7 +4417,17 @@ fn session_text_inset(rail_width: f32) -> f32 {
 // 절대 px(예전엔 15.0/12.0 고정값)는 폰트 크기가 바뀌면 그대로 깨진다 —
 // cmux/Warp 조사 후 Warp의 DEFAULT_UI_LINE_HEIGHT_RATIO 패턴을 따라 비율로
 // 바꿨다(2026-07-25 사용자). 호출부는 자기 폰트 크기 × 이 비율을 쓴다.
-const SESSION_LINE_HEIGHT_RATIO: f32 = 1.0;
+//
+// 값은 한글 UI 폰트의 **실제** 줄높이여야 한다. 1.0(= 폰트 크기)이던 동안
+// `galley.size().y`가 실제 잉크 높이보다 작게 나와서, 그걸로 여백·gap을 계산하는
+// 아래 session_row_impl의 상하 여백 대칭이 장부상으로만 맞았다 — 13px 제목의 실제
+// 세로 범위는 ascent 11.7 + descent 3.9 = 15.6px인데 박스는 13px이라 2.6px가 아래로
+// 삐져나갔고, 마지막 줄 디센더가 행 바닥에서 0.15px까지 붙었다(의도한 여백은 2.25px).
+// 그래서 행마다 글자가 바닥에 눌린 것처럼 보였다. 2026-07-25에 "레일·텍스트가 바닥
+// 밖으로 삐져나온다"고 보고돼 행 높이를 5px 키운 것도 같은 원인이다.
+// 1.2 = AppleGothic·Apple SD Gothic Neo 공통 (ascent 0.9 + descent 0.3 em) — 두 폰트
+// 모두 hhea/OS2 기준 정확히 1.2em이라 박스가 잉크와 일치한다(2026-08-06 실측).
+const SESSION_LINE_HEIGHT_RATIO: f32 = 1.2;
 const SESSION_CONTENT_RIGHT_INSET: f32 = 24.0;
 /// 세션 행은 호출부(session_list_scroll/inactive_workspace_sessions)가
 /// `ui.add_space(16.0)`으로 들여쓰는데, 워크스페이스 헤더는 같은 원점 기준 8px만

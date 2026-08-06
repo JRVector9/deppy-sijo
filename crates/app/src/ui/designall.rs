@@ -8,7 +8,14 @@ pub struct Tokens {
     pub text: egui::Color32,
     pub muted_text: egui::Color32,
     pub accent: egui::Color32,
+    /// **현재 사용처 없음** (2026-08-07). 원래 workspace.rs가 "포커스된 pane 점"과
+    /// "닫기 버튼 hover"에 썼는데 둘 다 성공이 아니라 각각 accent·error가 맞는 의미였다.
+    ///
+    /// 새로 초록이 필요하면 여기부터 집지 말 것 — 세션/에이전트의 "완료"는
+    /// `agent_visuals::status_color(AgentVisualState::Complete)`가 소유한다. 이 토큰은
+    /// 그 체계 밖의 일반 성공 표시가 생길 때 쓴다.
     pub success: egui::Color32,
+    /// `apply_workspace_visuals`가 egui의 `warn_fg_color`/`error_fg_color`로 흘려보낸다.
     pub warning: egui::Color32,
     pub error: egui::Color32,
     pub selected_background: egui::Color32,

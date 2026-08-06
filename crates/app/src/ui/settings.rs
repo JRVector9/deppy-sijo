@@ -384,14 +384,14 @@ pub(crate) fn apply_settings_palette(ui: &mut egui::Ui) {
             )
         } else {
             (
-                rgb(0xdb, 0xe0, 0xe5), // was #e0e0e0
-                rgb(0xed, 0xf0, 0xf3), // was #f0f0f0
-                rgb(0xe5, 0xe8, 0xeb), // was #e8e8e8
+                rgb(0xdb, 0xde, 0xe5), // was #e0e0e0
+                rgb(0xee, 0xef, 0xf2), // was #f0f0f0
+                rgb(0xe5, 0xe7, 0xeb), // was #e8e8e8
                 rgb(0xf9, 0xfa, 0xfb), // was #fafafa
-                rgb(0xbc, 0xc2, 0xcc), // was #c4c4c4
+                rgb(0xbc, 0xc1, 0xcc), // was #c4c4c4
                 rgb(0x3a, 0x88, 0xbf),
-                rgb(0x17, 0x1a, 0x1d),              // was #1a1a1a
-                rgb(0x80, 0x88, 0x90),              // was #888888
+                rgb(0x17, 0x19, 0x1d),              // was #1a1a1a
+                rgb(0x80, 0x85, 0x90),              // was #888888
                 crate::ui::designall::LIGHT.accent, // was #3a88bf
                 rgb(0xff, 0xff, 0xff),              // input은 순백 유지
             )
@@ -738,7 +738,7 @@ pub(crate) fn settings_text_secondary(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         rgb(0xa4, 0xa8, 0xb0) // was #aaaaaa
     } else {
-        rgb(0x3f, 0x44, 0x49) // was #444444
+        rgb(0x3f, 0x42, 0x49) // was #444444
     }
 }
 
@@ -746,7 +746,7 @@ fn settings_input_border(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         rgb(0x3a, 0x3e, 0x46) // was #404040
     } else {
-        rgb(0xae, 0xb8, 0xc2) // was #b8b8b8
+        rgb(0xae, 0xb5, 0xc2) // was #b8b8b8
     }
 }
 
@@ -757,7 +757,7 @@ pub(crate) fn settings_nav_active(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         rgb(0x2e, 0x3e, 0x5e) // was #2e4a5e (205도)
     } else {
-        rgb(0xcc, 0xdc, 0xed) // was #ccdeed (207도)
+        rgb(0xcc, 0xd7, 0xed) // was #ccdeed (207도)
     }
 }
 

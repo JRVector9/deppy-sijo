@@ -45,19 +45,19 @@ pub const DARK: Tokens = Tokens {
 };
 
 pub const LIGHT: Tokens = Tokens {
-    app_background: egui::Color32::from_rgb(0xfb, 0xfc, 0xfd),
-    workspace_background: egui::Color32::from_rgb(0xf5, 0xf7, 0xf9),
-    folder_tree_background: egui::Color32::from_rgb(0xf5, 0xf7, 0xf9),
-    input_background: egui::Color32::from_rgb(0xf1, 0xf3, 0xf5),
-    separator: egui::Color32::from_rgb(0xd5, 0xd9, 0xdf),
+    app_background: egui::Color32::from_rgb(0xf1, 0xf2, 0xf5),
+    workspace_background: egui::Color32::from_rgb(0xf1, 0xf2, 0xf5),
+    folder_tree_background: egui::Color32::from_rgb(0xf1, 0xf2, 0xf5),
+    input_background: egui::Color32::from_rgb(0xfd, 0xfd, 0xfd),
+    separator: egui::Color32::from_rgb(0xc9, 0xcd, 0xd6),
     text: egui::Color32::from_rgb(0x23, 0x26, 0x2c),
-    muted_text: egui::Color32::from_rgb(0x65, 0x6b, 0x74),
+    muted_text: egui::Color32::from_rgb(0x65, 0x6a, 0x74),
     accent: egui::Color32::from_rgb(0x1c, 0x93, 0xaa),
     success: egui::Color32::from_rgb(0x27, 0x91, 0x5b),
     warning: egui::Color32::from_rgb(0xb2, 0x70, 0x16),
     error: egui::Color32::from_rgb(0xc8, 0x3d, 0x49),
-    selected_background: egui::Color32::from_rgb(0xed, 0xf1, 0xf4),
-    hover_background: egui::Color32::from_rgb(0xf3, 0xf5, 0xf6),
+    selected_background: egui::Color32::from_rgb(0xe5, 0xe8, 0xec),
+    hover_background: egui::Color32::from_rgb(0xeb, 0xed, 0xf0),
 };
 
 pub fn tokens(visuals: &egui::Visuals) -> Tokens {
@@ -127,7 +127,7 @@ mod tests {
         );
         assert_eq!(
             LIGHT.selected_background,
-            egui::Color32::from_rgb(0xed, 0xf1, 0xf4)
+            egui::Color32::from_rgb(0xe5, 0xe8, 0xec)
         );
         assert_eq!(STRUCTURAL_CORNER_RADIUS, 0);
         assert_eq!(NAV_RAIL_WIDTH, 88.0);

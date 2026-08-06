@@ -25,8 +25,14 @@ pub const SEPARATOR_WIDTH: f32 = 1.0;
 
 pub const DARK: Tokens = Tokens {
     app_background: egui::Color32::from_rgb(0x0e, 0x0f, 0x12),
-    workspace_background: egui::Color32::from_rgb(0x13, 0x15, 0x19),
-    folder_tree_background: egui::Color32::from_rgb(0x13, 0x15, 0x19),
+    // 사이드바 본문은 nav rail(app_background)과 **같은 면**이다 (2026-08-06 사용자).
+    // 원래는 한 단 위(#10161c → 통일 후 #131519, L 8.6%)였는데, 레일과 패널 사이에
+    // 2.3%p 계단이 생겨 경계가 도드라졌다. 팔레트가 무채색에 가까워지면서 그 단차가
+    // "같은 재질에 조명이 다른 것"이 아니라 밋밋한 회색 계단으로 읽혔다. 사이드바는
+    // 하나의 탐색 영역이고 레일과는 이미 구분선이 나누므로 한 면으로 합친다.
+    // 토큰은 분리해 둔다 — 나중에 다시 갈라야 할 수 있고, 칠하는 코드가 서로 다르다.
+    workspace_background: egui::Color32::from_rgb(0x0e, 0x0f, 0x12),
+    folder_tree_background: egui::Color32::from_rgb(0x0e, 0x0f, 0x12),
     input_background: egui::Color32::from_rgb(0x15, 0x17, 0x1c),
     separator: egui::Color32::from_rgb(0x2b, 0x2e, 0x35),
     text: egui::Color32::from_rgb(0xdc, 0xde, 0xe2),

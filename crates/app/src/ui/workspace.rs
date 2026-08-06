@@ -3801,14 +3801,19 @@ impl WorkspaceUi {
                 }
             }
         }
-        // pane 본문을 터미널 작업면 색으로 먼저 덮는다. 그리드 폭은 셀 단위로 떨어져
-        // 우측에 최대 한 셀만큼 남는데, 그 자리를 비워 두면 CentralPanel 배경(앱 크롬)이
-        // 비쳐 터미널 옆에 밝은 여백 띠로 보인다(2026-08-07 사용자). 예전에는 크롬이
-        // 충분히 어두워 티가 안 났지만 크롬을 한 단 올리면서 드러났다. 렌더러가 아니라
-        // 여기서 칠하는 이유는 pane 폭을 아는 쪽이 호출부이기 때문이다 — 렌더러에서
-        // available 폭을 그대로 쓰면 무제한 ui에서 화면 전체를 차지한다.
+        // pane 본문을 터미널 작업면 색으로 먼저 덮는다. 덮지 않으면 CentralPanel
+        // 배경(앱 크롬)이 비쳐 터미널 둘레에 밝은 여백 띠로 보인다(2026-08-07 사용자).
+        // 예전에는 크롬이 충분히 어두워 티가 안 났지만 크롬을 한 단 올리면서 드러났다.
+        //
+        // **content가 아니라 surface를 칠한다.** content는 surface에서 좌우 3px·상하 6px
+        // 안쪽으로 들어간 rect라(TERMINAL_STREAM_*_PADDING), content만 칠하면 그 패딩 링이
+        // 크롬 색으로 그대로 남는다. 거기에 더해 그리드 폭이 셀 단위로 떨어져 우측에
+        // 최대 한 셀만큼 더 남는다 — surface를 칠하면 둘 다 덮인다.
+        //
+        // 렌더러가 아니라 여기서 칠하는 이유는 pane 폭을 아는 쪽이 호출부이기 때문이다 —
+        // 렌더러에서 available 폭을 그대로 쓰면 무제한 ui에서 화면 전체를 차지한다.
         ui.painter()
-            .rect_filled(pane_layout.content, 0.0, renderer_egui::TERMINAL_SURFACE_BG);
+            .rect_filled(pane_layout.surface, 0.0, renderer_egui::TERMINAL_SURFACE_BG);
         let mut terminal_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(pane_layout.content)

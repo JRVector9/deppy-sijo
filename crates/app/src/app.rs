@@ -27797,7 +27797,8 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(88.0, 0.0), egui::vec2(200.0, TOP_BAR_HEIGHT));
         let layout = designall_project_titlebar_layout(project);
 
-        assert!((layout.label_anchor.x - 95.8).abs() < 0.01);
+        // 88.0(nav rail) + WORKSPACE_AVATAR_LEFT_INSET(10.0) - 2.0
+        assert!((layout.label_anchor.x - 96.0).abs() < 0.01);
         assert_eq!(layout.label_anchor.y, project.center().y + 3.0);
         assert_eq!(layout.collapse.center().y, project.center().y);
         assert_eq!(layout.add.center().y, project.center().y);

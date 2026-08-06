@@ -1806,10 +1806,17 @@ impl FileTreeUi {
         } else {
             ui.visuals().widgets.noninteractive.bg_stroke.color
         };
+        let ppp = ui.ctx().pixels_per_point();
         let painter = ui.painter();
-        let background_rect = egui::Rect::from_min_max(
-            egui::pos2(ui.max_rect().left(), background_top),
-            egui::pos2(ui.max_rect().right(), ui.cursor().min.y),
+        // background_top은 워크스페이스 섹션 높이에서 오고, 그 값은 이 핸들의 드래그가
+        // pointer delta를 누적하므로 한 번 끌면 소수가 된다. 바로 아래 hline은 이미
+        // 스냅하고 있었는데 채움만 빠져 있어 같은 함수 안에서 한쪽만 어긋났다.
+        let background_rect = crate::ui::snap_rect_to_pixel(
+            ppp,
+            egui::Rect::from_min_max(
+                egui::pos2(ui.max_rect().left(), background_top),
+                egui::pos2(ui.max_rect().right(), ui.cursor().min.y),
+            ),
         );
         painter.rect_filled(background_rect, 0.0, background);
         let y = painter.round_to_pixel_center(rect.center().y);
@@ -2514,7 +2521,7 @@ impl FileTreeUi {
             ui.painter(),
             parent_icon_center,
             parent_color,
-            egui::vec2(12.825, 11.875),
+            egui::vec2(13.0, 12.0),
         );
         ui.painter().text(
             egui::pos2(parent_rect.left() + 47.0, parent_rect.center().y),
@@ -2671,6 +2678,10 @@ impl FileTreeUi {
         // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
         // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
         let row_height = self.measured_row_height.unwrap_or(25.0);
+        // 행 배경·테두리를 물리 픽셀에 맞추는 데 쓴다. row_height 자체는 스냅하지
+        // 않는다 — 아래 자기보정 루프가 실측값과 0.1 넘게 어긋나면 매 프레임 재저장·
+        // 재그리기를 요청하므로, 저장값을 반올림하면 무한 repaint가 된다.
+        let ppp = ui.ctx().pixels_per_point();
         let total = self.flat.len();
         let mut toggle: Option<PathBuf> = None;
         let mut navigate_root: Option<PathBuf> = None;
@@ -2738,12 +2749,17 @@ impl FileTreeUi {
                         egui::pos2(ui.max_rect().left(), row_top),
                         egui::pos2(ui.max_rect().right(), row_top + row_height),
                     );
+                    // 그리기 전용 스냅본. row_height는 아래 "행높이 자기보정"이 실측
+                    // 갤리 높이를 그대로 저장하므로 2프레임째부터 사실상 항상 소수이고,
+                    // show_rows가 그 값을 곱해 행 top을 잡아 행마다 배경 테두리가 다르게
+                    // 뭉갠다. 판정(rect_contains_pointer/contains)은 원본 rect를 쓴다.
+                    let hover_paint_rect = crate::ui::snap_rect_to_pixel(ppp, hover_rect);
                     // 워크스페이스·폴더 트리 경계선 드래그 중엔 hover 판정을 끈다 —
                     // 리사이즈로 행이 포인터 밑에 밀려 들어오면 클릭 가능한 것처럼
                     // 하이라이트되어 오클릭처럼 보였다(2026-07-24 사용자 보고).
                     if !resizing_workspace_split && ui.rect_contains_pointer(hover_rect) {
                         ui.painter().rect_filled(
-                            hover_rect,
+                            hover_paint_rect,
                             1.0,
                             ui.visuals().widgets.hovered.weak_bg_fill,
                         );
@@ -2762,7 +2778,7 @@ impl FileTreeUi {
                         drop_target_dir = Some(row_target_dir(row, self.root.as_deref()));
                         if row.is_dir && os_drag_active {
                             ui.painter().rect_stroke(
-                                hover_rect,
+                                hover_paint_rect,
                                 2.0,
                                 ui.visuals().widgets.active.bg_stroke,
                                 egui::StrokeKind::Inside,
@@ -2812,7 +2828,7 @@ impl FileTreeUi {
                                         ui.painter(),
                                         ir.center(),
                                         folder_col,
-                                        egui::vec2(12.825, 11.875),
+                                        egui::vec2(13.0, 12.0),
                                     );
                                 } else {
                                     let file_color = if inaccessible {
@@ -2827,7 +2843,7 @@ impl FileTreeUi {
                                         ir.center(),
                                         file_color,
                                         carve,
-                                        egui::vec2(9.5, 11.97),
+                                        egui::vec2(9.5, 12.0),
                                     );
                                 }
                                 let text_color = if inaccessible {
@@ -2885,7 +2901,7 @@ impl FileTreeUi {
                             && hover.as_ref() != &row.path
                         {
                             ui.painter().rect_stroke(
-                                row_rect,
+                                crate::ui::snap_rect_to_pixel(ppp, row_rect),
                                 2.0,
                                 ui.visuals().widgets.active.bg_stroke,
                                 egui::StrokeKind::Inside,
@@ -3001,7 +3017,7 @@ impl FileTreeUi {
             if !drag_row_highlighted {
                 // 특정 폴더 행 위가 아니면 루트 반입 — 트리 영역 전체 테두리로 표시.
                 ui.painter().rect_stroke(
-                    tree_area,
+                    crate::ui::snap_rect_to_pixel(ui.ctx().pixels_per_point(), tree_area),
                     2.0,
                     ui.visuals().widgets.active.bg_stroke,
                     egui::StrokeKind::Inside,
@@ -3685,7 +3701,7 @@ fn workspace_row_style(
     }
 }
 
-pub const WORKSPACE_AVATAR_LEFT_INSET: f32 = 9.8;
+pub const WORKSPACE_AVATAR_LEFT_INSET: f32 = 10.0;
 const WORKSPACE_AVATAR_SIZE: f32 = 18.0;
 
 fn workspace_avatar_rect(row: egui::Rect) -> egui::Rect {
@@ -3707,7 +3723,10 @@ fn workspace_row(
     catalog: &i18n::Catalog,
 ) -> egui::Response {
     // 2026-07-26 사용자: 워크스페이스 헤더와 아바타를 다시 10% 축소한다.
-    let row_height = 29.19;
+    // 축소는 기존 값에 0.9를 곱해 처리돼 29.19가 됐는데, 그 값은 물리 픽셀에 안 맞아
+    // 행이 쌓일수록 원점이 밀렸다(2x에서 행마다 0.38px 누적 → 행마다 선명도가 달랐다).
+    // 축소 의도는 유지하면서 가장 가까운 정렬값으로 내린다(29.0 × 2 = 58px 정수).
+    let row_height = 29.0;
     let (full_rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_height),
         egui::Sense::click(),
@@ -3725,9 +3744,9 @@ fn workspace_row(
         return response;
     }
     // 여기부터는 **그리기 좌표**만 물리 픽셀에 맞춘다 (클릭 판정은 위 response가 원래
-    // rect를 그대로 쓴다). 행 높이 29.19가 픽셀에 안 맞아 행이 쌓일수록 원점이
-    // 밀렸고(2x에서 행마다 0.38px), 카드 배경 테두리와 이름 글자가 행마다 다르게
-    // 뭉갰다. 자세한 이유는 `crate::ui::snap_to_pixel` 주석 참고.
+    // rect를 그대로 쓴다). 행 높이를 정렬값으로 바꿔 누적 드리프트는 없앴지만, 스크롤
+    // 오프셋과 부모 레이아웃에서 오는 소수는 남으므로 스냅은 그대로 필요하다.
+    // 자세한 이유는 `crate::ui::snap_to_pixel` 주석 참고.
     let ppp = ui.ctx().pixels_per_point();
     let full_rect = crate::ui::snap_rect_to_pixel(ppp, full_rect);
     let style = workspace_row_style(
@@ -3788,9 +3807,9 @@ fn workspace_row(
             let disclosure = if show_disclosure { 12.0 } else { 0.0 };
             workspace_status_dot_width() + 22.0 + disclosure
         } else {
-            6.8
+            7.0
         };
-        let name_width = (rect.right() - reserved_right - avatar.right() - 7.65).max(0.0);
+        let name_width = (rect.right() - reserved_right - avatar.right() - 7.5).max(0.0);
         if name_width > 4.0 {
             let name = clipped_line(
                 ui,
@@ -3801,7 +3820,7 @@ fn workspace_row(
                 name_width,
                 None,
             );
-            let text_x = avatar.right() + 7.65;
+            let text_x = avatar.right() + 7.5;
             let name_pos = crate::ui::snap_pos_to_pixel(
                 ppp,
                 egui::pos2(text_x, rect.center().y - name.size().y / 2.0),
@@ -5054,7 +5073,10 @@ pub(crate) fn workspace_accent(
 
 /// 폴더 아이콘 — 참고 시안처럼 탭 + 본체의 얇은 윤곽선.
 /// 폴더 아이콘 — `size`는 탭 돌출까지 포함한 전체 (폭, 높이). 헤더/트리 행은
-/// 13.5×12.5, 툴바는 10×10 (2026-07-18 사용자 확정 수치).
+/// 13×12, 툴바는 10×10.
+/// 2026-07-18 확정 수치는 13.5×12.5였는데 이후 0.95가 곱해져 12.825×11.875로 남아
+/// 있었다 — 물리 픽셀에 안 맞아 아이콘 윤곽선이 흐려서 13×12로 정렬했다(2026-08-06).
+/// `rise`는 11.875·12.0 모두 3px로 같아 형태는 그대로다.
 fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, size: egui::Vec2) {
     let w = size.x;
     let rise = (size.y * 0.24).round().max(2.0); // 12.5 기준 3px 탭 돌출 비례
@@ -5073,7 +5095,10 @@ fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, size: egui
 }
 
 /// 파일 아이콘 — 문서(접힌 모서리). `carve`는 접힌 모서리를 파낼 배경색.
-/// `size` = (폭, 높이) — 트리 행 10×12.6, 툴바 7.9×10 (2026-07-18 사용자 확정).
+/// `size` = (폭, 높이) — 트리 행 9.5×12, 툴바 7.9×10.
+/// 2026-07-18 확정 수치는 10×12.6이었고 이후 0.95가 곱해져 9.5×11.97이 됐다. 폭 9.5는
+/// 2x에서 이미 정렬돼 있어 그대로 두고, 높이만 12.0으로 맞췄다(2026-08-06).
+/// `fold`는 11.97·12.0 모두 3px로 같아 형태는 그대로다.
 fn paint_file(
     p: &egui::Painter,
     c: egui::Pos2,
@@ -5127,8 +5152,12 @@ fn paint_sidebar_separator(ui: &egui::Ui, rect: egui::Rect, stroke: egui::Stroke
     let status_bar_top = ui.ctx().content_rect().bottom() - 26.0;
     let bottom = rect.bottom().min(status_bar_top);
     if bottom > rect.top() {
+        // 선이므로 픽셀 **중심**에 맞춘다 (designall::vertical_separator와 같은 규칙).
+        // 패널 폭은 리사이즈 핸들이 pointer delta를 그대로 누적하므로, 사용자가 사이드바
+        // 폭을 한 번이라도 끌면 rect.right()가 영구히 소수가 되어 경계선이 흐려진다.
+        let x = ui.painter().round_to_pixel_center(rect.right());
         ui.painter()
-            .vline(rect.right(), egui::Rangef::new(rect.top(), bottom), stroke);
+            .vline(x, egui::Rangef::new(rect.top(), bottom), stroke);
     }
 }
 
@@ -6197,12 +6226,12 @@ mod tests {
 
     #[test]
     fn designall_워크스페이스_아바타는_18px이고_기존좌측선에_고정된다() {
-        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 29.19));
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 29.0));
         let avatar = workspace_avatar_rect(row);
 
         assert!((avatar.width() - 18.0).abs() < 0.01);
         assert!((avatar.height() - 18.0).abs() < 0.01);
-        assert!((avatar.left() - 9.8).abs() < 0.01);
+        assert!((avatar.left() - 10.0).abs() < 0.01);
         assert!((avatar.center().y - row.center().y).abs() < 0.01);
     }
 

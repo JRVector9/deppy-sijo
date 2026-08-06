@@ -3372,8 +3372,12 @@ impl WorkspaceUi {
             self.pane_context_menu(&header_response, &pane.id, config, catalog);
         }
 
+        // 이 점이 뜻하는 건 "성공"이 아니라 **포커스됨**이다. 원래 tokens.success를 쓰고
+        // 있었는데 토큰 이름과 의미가 어긋나 있어서, 나중에 누가 success 색을 조정하면
+        // 엉뚱하게 이 점이 따라 바뀐다. 액센트가 앱 전체에서 "선택됨/포커스"를 뜻하므로
+        // 그쪽으로 옮긴다(2026-08-07).
         let status_color = if focused {
-            tokens.success
+            tokens.accent
         } else {
             tokens.muted_text
         };
@@ -3415,8 +3419,11 @@ impl WorkspaceUi {
             egui::Id::new(("terminal_close_tab", &pane.id)),
             egui::Sense::click(),
         );
+        // 닫기는 되돌리기 어려운 동작이라 hover에서 error 톤을 준다(브라우저 탭·에디터의
+        // 관례). 원래는 tokens.success였는데 "닫기"가 초록으로 밝아지는 건 의미가 반대고,
+        // success 색을 조정할 때 이 버튼이 따라 바뀌는 결합도 생긴다(2026-08-07).
         let close_color = if close_response.hovered() || close_response.has_focus() {
-            tokens.success
+            tokens.error
         } else {
             tokens.text
         };

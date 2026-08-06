@@ -229,21 +229,24 @@ pub fn apply_sidebar_text_styles(ui: &mut egui::Ui) {
     }
 }
 
-/// 기본 UI 폰트 경로 (macOS — AppleGothic, 사용자 선호 2026-07-08. 이전 기본은
-/// Apple SD Gothic Neo였고 목록에서 여전히 선택 가능).
+/// 기본 UI 폰트 경로. 사이드바 전용 가족과 **같은 파일**을 쓴다 — 예전에는 기본 UI가
+/// AppleGothic이고 사이드바만 Apple SD Gothic Neo라, 워크스페이스/세션 트리와 그 옆
+/// 작업 영역에 한글 서체가 두 벌 나란히 놓였다(2026-08-06 사용자: "설명할 수 없이
+/// 불편하다"). AppleGothic은 설정 목록에서 여전히 선택 가능하다.
 #[cfg(target_os = "macos")]
-const DEFAULT_UI_FONT: &str = "/System/Library/Fonts/Supplemental/AppleGothic.ttf";
+const DEFAULT_UI_FONT: &str = SIDEBAR_FONT_PATH;
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_UI_FONT: &str = "";
 
 #[cfg(target_os = "macos")]
-pub const DEFAULT_UI_FONT_NAME: &str = "AppleGothic";
+pub const DEFAULT_UI_FONT_NAME: &str = "Apple SD Gothic Neo";
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_UI_FONT_NAME: &str = "System";
 
 /// 한글 fallback 폰트를 등록한다. 실패해도 앱은 계속 뜬다 (한글만 깨짐).
 /// `ui_font`: 설정에서 고른 UI(Proportional) 폰트 파일 경로 — None/로드 실패면 기본
-/// (macOS는 AppleGothic). 설정 변경 시 재호출해 hot reload된다(2026-07-07).
+/// (macOS는 사이드바와 같은 Apple SD Gothic Neo). 설정 변경 시 재호출해 hot
+/// reload된다(2026-07-07).
 pub fn install_cjk_fallback(
     ctx: &egui::Context,
     ui_font: Option<&str>,
@@ -308,15 +311,41 @@ fn build_font_definitions(
         tracing::warn!("한글 폰트를 찾지 못함 — 한글이 깨질 수 있음");
     }
 
+    // 좌측 사이드바 전용 Apple SD Gothic Neo. 시스템 폰트를 실행 파일에 포함하지 않고
+    // 시작 시 한 번만 읽어 Arc로 재사용한다. **UI 후보 루프보다 먼저** 등록해야 한다 —
+    // macOS 기본 UI 폰트가 같은 55MB .ttc라, 루프가 이 항목을 그대로 재사용하지 않으면
+    // 원본 바이트와 skrifa Font가 영구 중복된다(아래 `cjk` 재사용과 같은 이유).
+    #[cfg(target_os = "macos")]
+    let sidebar_font_path = sidebar_font_data().map(|(path, font_data)| {
+        fonts
+            .font_data
+            .insert(SIDEBAR_FONT_FAMILY.to_owned(), font_data);
+        tracing::info!(kind = "sidebar_font", "font registered");
+        path
+    });
+    #[cfg(not(target_os = "macos"))]
+    let sidebar_font_path: Option<&'static str> = None;
+
     // UI(Proportional) 기본 폰트 — 설정 폰트 > 기본(macOS: Apple SD Gothic Neo) 순으로
     // 시도. SFNS.ttf(SF Pro)는 fvar 가변폰트라 egui/skrifa가 무시했다(2026-07-06) —
     // .ttc는 index로 로드된다. 모노(터미널)는 위에서 번들 JetBrains Mono + CJK fallback.
     let ui_candidates = [ui_font.unwrap_or_default(), DEFAULT_UI_FONT];
     for path in ui_candidates.iter().filter(|p| !p.is_empty()) {
+        if sidebar_font_path == Some(*path) {
+            // 기본 macOS 구성 — UI와 사이드바가 같은 Apple SD Gothic Neo다.
+            let family = fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default();
+            family.retain(|name| name != SIDEBAR_FONT_FAMILY);
+            family.insert(0, SIDEBAR_FONT_FAMILY.to_owned());
+            tracing::info!(kind = "ui_shared_sidebar", "font registered");
+            break;
+        }
         if cjk_font_path == Some(*path) {
-            // 기본 macOS 구성은 UI와 CJK fallback 모두 15MB AppleGothic.ttf다. 같은 파일을
-            // `ui`라는 별도 FontData로 다시 읽고 파싱하면 원본 바이트와 skrifa Font가
-            // 영구 중복된다. 기존 `cjk` 항목을 UI의 첫 후보로 재사용한다.
+            // 설정에서 AppleGothic을 고르면 UI와 CJK fallback이 같은 15MB 파일이 된다.
+            // 같은 파일을 `ui`라는 별도 FontData로 다시 읽고 파싱하면 원본 바이트와
+            // skrifa Font가 영구 중복된다. 기존 `cjk` 항목을 UI의 첫 후보로 재사용한다.
             let family = fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -347,23 +376,18 @@ fn build_font_definitions(
         break;
     }
 
-    // 좌측 사이드바 전용 Apple SD Gothic Neo. 시스템 폰트를 실행 파일에 포함하지 않고
-    // 시작 시 한 번만 읽어 Arc로 재사용한다. 비-macOS/로드 실패에서는 현재 UI
-    // Proportional 가족을 그대로 복제해 named family가 항상 해석되게 한다.
+    // 사이드바 named family. 폰트 데이터는 위에서 이미 등록했고, 여기서는 가족 순서만
+    // 정한다. 비-macOS/로드 실패에서는 현재 UI Proportional 가족을 그대로 복제해
+    // named family가 항상 해석되게 한다.
     let sidebar_family = egui::FontFamily::Name(SIDEBAR_FONT_FAMILY.into());
     let mut sidebar_fallback = fonts
         .families
         .get(&egui::FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    #[cfg(target_os = "macos")]
-    if let Some((_path, font_data)) = sidebar_font_data() {
-        fonts
-            .font_data
-            .insert("sidebar_apple_sd_gothic".to_owned(), font_data);
-        sidebar_fallback.retain(|name| name != "sidebar_apple_sd_gothic");
-        sidebar_fallback.insert(0, "sidebar_apple_sd_gothic".to_owned());
-        tracing::info!(kind = "sidebar_font", "font registered");
+    if sidebar_font_path.is_some() {
+        sidebar_fallback.retain(|name| name != SIDEBAR_FONT_FAMILY);
+        sidebar_fallback.insert(0, SIDEBAR_FONT_FAMILY.to_owned());
     }
     fonts.families.insert(sidebar_family, sidebar_fallback);
 
@@ -553,7 +577,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn 기본_macos_ui는_applegothic_fontdata를_중복하지_않는다() {
+    fn 기본_macos_ui와_사이드바는_같은_폰트를_공유하고_중복하지_않는다() {
         let fonts = super::build_font_definitions(
             None,
             super::DEFAULT_MONO_FONT,
@@ -562,10 +586,22 @@ mod tests {
         assert!(fonts.font_data.contains_key("cjk"));
         assert!(
             !fonts.font_data.contains_key("ui"),
-            "기본 UI와 CJK가 같은 AppleGothic인데 별도 원본을 보관하면 안 됨"
+            "기본 UI와 사이드바가 같은 Apple SD Gothic Neo인데 별도 원본을 보관하면 안 됨"
         );
+        // 워크스페이스/세션 트리와 그 옆 작업 영역이 같은 한글 서체를 쓰는지가 핵심 —
+        // 두 벌이 나란히 놓이면 "설명할 수 없이 불편한" 화면이 된다(2026-08-06).
         let proportional = &fonts.families[&egui::FontFamily::Proportional];
-        assert_eq!(proportional.first().map(String::as_str), Some("cjk"));
+        assert_eq!(
+            proportional.first().map(String::as_str),
+            Some(super::SIDEBAR_FONT_FAMILY)
+        );
+        assert_eq!(
+            proportional
+                .iter()
+                .filter(|name| *name == super::SIDEBAR_FONT_FAMILY)
+                .count(),
+            1
+        );
         assert_eq!(proportional.iter().filter(|name| *name == "cjk").count(), 1);
 
         let rebuilt = super::build_font_definitions(

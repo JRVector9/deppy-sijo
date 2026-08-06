@@ -30,8 +30,10 @@
 
 ## 2. 적용 폰트와 타이포그래피
 
-macOS에서 UI 폰트를 따로 선택하지 않았을 때 실제 기본 폰트는 **AppleGothic**이다.
-설정의 닫힌 선택 상자에도 `기본(자동)` 대신 현재 적용값인 `AppleGothic`을 표시한다.
+macOS에서 UI 폰트를 따로 선택하지 않았을 때 실제 기본 폰트는 **Apple SD Gothic Neo**다
+(2026-08-06 이전 기본은 AppleGothic이었고, 좌측 사이드바만 SD Gothic Neo를 써서 한
+창에 한글 서체가 두 벌 놓여 있었다 — `fonts::DEFAULT_UI_FONT` 주석 참고).
+설정의 닫힌 선택 상자에도 `기본(자동)` 대신 현재 적용값인 폰트명을 표시한다.
 팝업 목록에는 기본값 복귀용 `기본(자동)` 항목을 유지한다.
 
 | 토큰 | 적용 위치 | 크기 |
@@ -89,7 +91,7 @@ macOS에서 UI 폰트를 따로 선택하지 않았을 때 실제 기본 폰트�
 
 - 인라인 상세 페이지에 한 번만 적용한다.
 - 내부 행이 자체 높이와 선을 가지므로 `item_spacing.y = 0`이다.
-- 상세 배경은 다크 모드 `#1a1a1a`다.
+- 상세 배경은 다크 모드 `#131a21`다(위 §5 표가 단일 출처).
 - 자체 레이아웃을 가진 관리 페이지에는 적용하지 않는다.
 
 ### SettingsRow
@@ -133,17 +135,17 @@ macOS에서 UI 폰트를 따로 선택하지 않았을 때 실제 기본 폰트�
 
 | 용도 | 다크 | 라이트 | 코드 소스 |
 |---|---|---|---|
-| 상세 배경/input | `#1a1a1a` | `#ffffff` | `extreme_bg_color` |
-| 컨트롤 surface | `#242424` | `#f0f0f0` | `panel_fill` |
-| hover | `#2c2c2c` | `#e8e8e8` | `widgets.hovered.bg_fill` |
-| 관리 panel | `#202020` | `#fafafa` | `faint_bg_color` |
-| 기본 border | `#3a3a3a` | `#c4c4c4` | noninteractive stroke |
-| input border | `#404040` | `#b8b8b8` | `settings_input_border` |
-| 본문 텍스트 | `#d4d4d4` | `#1a1a1a` | `text_color` |
-| muted | `#717171` | `#888888` | `weak_text_color` |
-| 행 설명 | `#aaaaaa` | `#444444` | `settings_text_secondary` |
-| accent | `#4da6c8` | `#3a88bf` | `selection.bg_fill` |
-| 선택 배경 | `#2e4a5e` | `#ccdeed` | `settings_nav_active` |
+| 상세 배경/input | `#131a21` | `#ffffff` | `extreme_bg_color` |
+| 컨트롤 surface | `#1a242e` | `#edf0f3` | `panel_fill` |
+| hover | `#202c38` | `#e5e8eb` | `widgets.hovered.bg_fill` |
+| 관리 panel | `#172029` | `#f9fafb` | `faint_bg_color` |
+| 기본 border | `#2e3a46` | `#bcc2cc` | noninteractive stroke |
+| input border | `#33404d` | `#aeb8c2` | `settings_input_border` |
+| 본문 텍스트 | `#cbd4dd` | `#171a1d` | `text_color` |
+| muted | `#66717c` | `#808890` | `weak_text_color` |
+| 행 설명 | `#9eaab6` | `#3f4449` | `settings_text_secondary` |
+| accent | `#39b8e8` | `#1c93aa` | `designall::DARK/LIGHT.accent` |
+| 선택 배경 | `#2e465e` | `#ccdced` | `settings_nav_active` |
 | focus border | `#5a9fd4` | `#3a88bf` | `selection.stroke` |
 
 터미널 pane과 pane 헤더는 테마와 관계없이 항상 다크다. 설정 창의 라이트/다크 전환이

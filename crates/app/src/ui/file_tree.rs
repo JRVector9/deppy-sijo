@@ -3724,6 +3724,12 @@ fn workspace_row(
     if !ui.is_rect_visible(full_rect) {
         return response;
     }
+    // 여기부터는 **그리기 좌표**만 물리 픽셀에 맞춘다 (클릭 판정은 위 response가 원래
+    // rect를 그대로 쓴다). 행 높이 29.19가 픽셀에 안 맞아 행이 쌓일수록 원점이
+    // 밀렸고(2x에서 행마다 0.38px), 카드 배경 테두리와 이름 글자가 행마다 다르게
+    // 뭉갰다. 자세한 이유는 `crate::ui::snap_to_pixel` 주석 참고.
+    let ppp = ui.ctx().pixels_per_point();
+    let full_rect = crate::ui::snap_rect_to_pixel(ppp, full_rect);
     let style = workspace_row_style(
         crate::ui::designall::tokens(ui.visuals()),
         active,
@@ -3796,11 +3802,12 @@ fn workspace_row(
                 None,
             );
             let text_x = avatar.right() + 7.65;
-            ui.painter().galley(
+            let name_pos = crate::ui::snap_pos_to_pixel(
+                ppp,
                 egui::pos2(text_x, rect.center().y - name.size().y / 2.0),
-                name,
-                ui.visuals().text_color(),
             );
+            ui.painter()
+                .galley(name_pos, name, ui.visuals().text_color());
         }
     }
     if show_summary {
@@ -4642,8 +4649,12 @@ fn session_row_impl(
         )
     });
 
+    // 행 배경·레일·텍스트 원점을 물리 픽셀 경계에 맞춘다 — 행 높이가 소수(49/36에
+    // 소수 여백)라 행이 쌓일수록 원점이 밀려 선명도가 행마다 출렁였다. 자세한 이유는
+    // `crate::ui::snap_to_pixel` 주석 참고.
+    let ppp = ui.ctx().pixels_per_point();
     let painter = ui.painter();
-    let highlight_rect = session_highlight_rect(rect);
+    let highlight_rect = crate::ui::snap_rect_to_pixel(ppp, session_highlight_rect(rect));
     let tokens = crate::ui::designall::tokens(ui.visuals());
     let drag_style = session_drag_style(
         session_drag_payload_matches(ui.ctx(), &entry.target),
@@ -4661,19 +4672,24 @@ fn session_row_impl(
     } else if let Some(fill) = crate::ui::designall::row_fill(tokens, entry.focused, resp.hovered())
     {
         let focus_rect = session_focus_fill_rect(rect);
-        let focus_rect = egui::Rect::from_min_max(
-            egui::pos2(
-                rect.left() + SESSION_RAIL_LEFT_INSET + rail_w,
-                focus_rect.top(),
+        let focus_rect = crate::ui::snap_rect_to_pixel(
+            ppp,
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    rect.left() + SESSION_RAIL_LEFT_INSET + rail_w,
+                    focus_rect.top(),
+                ),
+                focus_rect.max,
             ),
-            focus_rect.max,
         );
         painter.rect_filled(focus_rect, 0.0, fill);
     }
     if !is_last && drag_style.fill.is_none() {
+        // 구분선은 선이므로 픽셀 **중심**에 맞춘다(mod.rs의 hairline과 같은 규칙) —
+        // 여기만 스냅이 빠져 있어 행마다 선 굵기가 달라 보였다.
         painter.hline(
             highlight_rect.x_range(),
-            highlight_rect.bottom(),
+            painter.round_to_pixel_center(highlight_rect.bottom()),
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
     }
@@ -4681,12 +4697,15 @@ fn session_row_impl(
     // 평시 2px, 미확인 완료/입력대기(attention)는 4.5px로 굵힌다. 알림 도착 시 이미
     // 보고 있던 pane은 1회 펄스(2→4.5→2px). 자리는 최대 폭 기준으로 상시 예약한다.
     // 레일 높이는 행 수와 분리해 35px로 고정하고 행의 세로 중앙에 배치한다.
-    let rail = egui::Rect::from_min_size(
-        egui::pos2(
-            rect.left() + SESSION_RAIL_LEFT_INSET,
-            rect.center().y - SESSION_RAIL_HEIGHT / 2.0,
+    let rail = crate::ui::snap_rect_to_pixel(
+        ppp,
+        egui::Rect::from_min_size(
+            egui::pos2(
+                rect.left() + SESSION_RAIL_LEFT_INSET,
+                rect.center().y - SESSION_RAIL_HEIGHT / 2.0,
+            ),
+            egui::vec2(rail_w, SESSION_RAIL_HEIGHT),
         ),
-        egui::vec2(rail_w, SESSION_RAIL_HEIGHT),
     );
     let rail_color = if drag_style.rail_multiplier > 1.0 {
         rail_color.gamma_multiply(drag_style.rail_multiplier)
@@ -4725,16 +4744,22 @@ fn session_row_impl(
 
     // 편집 중에는 제목 갤리 대신 같은 자리에 TextEdit를 얹는다 (아래 edit_buf 분기).
     if edit_buf.is_none() {
-        let title_pos = egui::pos2(
-            rect.left() + text_inset,
-            title_center - title_galley.size().y / 2.0,
+        let title_pos = crate::ui::snap_pos_to_pixel(
+            ppp,
+            egui::pos2(
+                rect.left() + text_inset,
+                title_center - title_galley.size().y / 2.0,
+            ),
         );
         painter.galley(title_pos, title_galley.clone(), title_color);
         if let Some(status_galley) = status_galley {
             painter.galley(
-                egui::pos2(
-                    title_pos.x + title_galley.size().x,
-                    title_center - status_galley.size().y / 2.0,
+                crate::ui::snap_pos_to_pixel(
+                    ppp,
+                    egui::pos2(
+                        title_pos.x + title_galley.size().x,
+                        title_center - status_galley.size().y / 2.0,
+                    ),
                 ),
                 status_galley,
                 egui::Color32::WHITE,
@@ -4744,18 +4769,18 @@ fn session_row_impl(
     // line2_center/line3_center는 line2_galley/line3_galley와 같은 Option에서
     // 나왔으므로(위 계산부) 항상 함께 Some/None이다 — 튜플 매치로 그 관계를 드러낸다.
     if let (Some(g), Some(center)) = (line2_galley, line2_center) {
-        painter.galley(
+        let pos = crate::ui::snap_pos_to_pixel(
+            ppp,
             egui::pos2(rect.left() + text_inset, center - g.size().y / 2.0),
-            g,
-            sub_color,
         );
+        painter.galley(pos, g, sub_color);
     }
     if let (Some(g), Some(center)) = (line3_galley, line3_center) {
-        painter.galley(
+        let pos = crate::ui::snap_pos_to_pixel(
+            ppp,
             egui::pos2(rect.left() + text_inset, center - g.size().y / 2.0),
-            g,
-            sub_color,
         );
+        painter.galley(pos, g, sub_color);
     }
     if let Some(buf) = edit_buf {
         // 제목 1행 자리에 프레임 없는 TextEdit — 글꼴/x 위치를 제목 갤리와 맞춘다.

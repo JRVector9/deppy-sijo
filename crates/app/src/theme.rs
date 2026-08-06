@@ -9,19 +9,36 @@ fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-/// 다크 팔레트 (목업 다크 §토큰: bg #131317 · panel #1b1b21 · accent #43b8cd …).
+/// 다크 팔레트. 목업 §토큰(bg #131317 · panel #1b1b21)의 **명도**는 유지하되 색상축은
+/// designall(hsl 210도)로 맞췄다 — 아래 주석 참고.
 fn dark() -> egui::Visuals {
-    let accent = rgb(0x43, 0xb8, 0xcd);
-    let text = rgb(0xd7, 0xd8, 0xdb);
-    let dim = rgb(0x8b, 0x8f, 0x98);
-    let faint = rgb(0x5b, 0x5f, 0x68);
-    let bg = rgb(0x13, 0x13, 0x17);
-    let panel = rgb(0x1b, 0x1b, 0x21);
-    let panel2 = rgb(0x22, 0x22, 0x2a);
-    let panel_hi = rgb(0x2a, 0x2a, 0x33);
-    // 라인은 패널 위에서 또렷하게 — #2d2d36은 패널(#1b1b21)과 대비 없어 안 보였다(#58).
-    // 목업 타겟 경계선(egui 기본 from_gray(60)) 수준의 쿨그레이로.
-    let hair = rgb(0x3a, 0x3a, 0x42);
+    // 액센트는 designall 토큰이 단일 출처다 — "선택됨/링크/포커스"라는 **같은 의미**가
+    // 사이드바(#39b8e8)·앱 크롬(#43b8cd)·설정(#4da6c8) 세 가지 청록으로 갈려 있었다.
+    // 색상 7도, 밝기 13%p 차이라 다르다고 인식하기엔 가깝고 같다고 넘기기엔 멀어서,
+    // 의도한 대비가 아니라 렌더링 오류처럼 읽혔다(2026-08-06). 라이트 모드는 이미
+    // designall과 값이 같았다 — 어긋난 건 다크뿐이었다.
+    let accent = crate::ui::designall::DARK.accent;
+    // 표면·텍스트는 designall과 **색상축**을 공유한다 (hsl 210도). 명도 위계(사이드바가
+    // 더 어두움)는 의도된 것이라 L은 전부 그대로 두고 H/S만 맞췄다 — 사이드바는 210도
+    // 청록빛 남색인데 여기는 240도 보랏빛 남색이라, 맞닿은 두 면이 서로를 물들여
+    // 보이게 했다(2026-08-06). 채도도 역할별로 designall 실측치를 따른다:
+    // 표면 27% · 본문 22% · dim 10%. 명도를 유지하므로 본문 대비는 12.02 -> 11.80으로
+    // 사실상 그대로다. 라이트 팔레트는 이미 H 214~216도로 축 위에 있어 건드리지 않았다
+    // — 어긋난 건 다크뿐이었다.
+    let text = rgb(0xd1, 0xd9, 0xe1);
+    let dim = rgb(0x87, 0x92, 0x9c);
+    // faint는 palette()가 `_faint`로 받아 쓰지 않는다(기존부터 미사용). 팔레트가 한
+    // 축에서 갈라지지 않게 값만 맞춰 둔다.
+    let faint = rgb(0x58, 0x61, 0x6b);
+    let bg = rgb(0x0f, 0x15, 0x1b);
+    let panel = rgb(0x16, 0x1e, 0x26);
+    let panel2 = rgb(0x1c, 0x26, 0x30);
+    let panel_hi = rgb(0x22, 0x2e, 0x3b);
+    // 구분선은 designall(#26303a)과 **값**을 합칠 수 없다 — 이 패널(#1b1b21) 위에 올리면
+    // 명암비가 1.28로, #58에서 "안 보인다"고 보고된 #2d2d36(1.26)과 같아진다. 대신
+    // 색상축만 designall과 맞추고(hsl 210도·S 21%) 명도는 이 표면에 맞춰 유지한다 —
+    // 그래야 사이드바 경계선과 같은 재질로 보인다. 명암비 1.52 -> 1.57로 오히려 개선.
+    let hair = rgb(0x31, 0x3e, 0x4b);
     palette(
         egui::Visuals::dark(),
         accent,
@@ -36,9 +53,10 @@ fn dark() -> egui::Visuals {
     )
 }
 
-/// 라이트 팔레트 (목업 라이트 §토큰: bg #fbfcfd · panel #f1f3f5 · accent #1c93aa …).
+/// 라이트 팔레트 (목업 라이트 §토큰: bg #fbfcfd · panel #f1f3f5 · accent는 designall …).
 fn light() -> egui::Visuals {
-    let accent = rgb(0x1c, 0x93, 0xaa);
+    // 값은 그대로(#1c93aa) — 라이트는 원래 designall과 일치했다. 출처만 합친다.
+    let accent = crate::ui::designall::LIGHT.accent;
     let text = rgb(0x23, 0x26, 0x2c);
     let dim = rgb(0x65, 0x6b, 0x74);
     let faint = rgb(0x9a, 0xa0, 0xa9);
@@ -46,7 +64,8 @@ fn light() -> egui::Visuals {
     let panel = rgb(0xf1, 0xf3, 0xf5);
     let panel2 = rgb(0xe7, 0xea, 0xee);
     let panel_hi = rgb(0xdd, 0xe1, 0xe7);
-    let hair = rgb(0xd5, 0xd9, 0xdf);
+    // 다크와 달리 라이트 구분선은 designall과 값이 이미 같았다 — 출처만 합친다.
+    let hair = crate::ui::designall::LIGHT.separator;
     palette(
         egui::Visuals::light(),
         accent,

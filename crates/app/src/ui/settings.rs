@@ -361,32 +361,39 @@ fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
 /// `design/.../egui.ts`의 토큰을 설정 창 local visuals에 매핑한다.
 fn apply_settings_palette(ui: &mut egui::Ui) {
     let dark = ui.visuals().dark_mode;
+    // 설정 창은 완전 무채색(S 0%)이었고 사이드바는 hsl 210도라, 화면을 옮겨 다닐 때
+    // 색온도가 출렁였다(2026-08-06). 명도(L)는 전부 그대로 두고 색상축·채도만
+    // designall에 맞춘다 — 역할별 채도는 designall 실측치를 따른다:
+    //   다크  표면 27% · 본문 22% · 보조 14% · muted 10% · border 21%
+    //   라이트 표면 20/15% · 본문 11% · 보조 8% · muted 7% · border 13.5%
+    // L을 유지하므로 명암비는 그대로다(본문 on surface 10.47 -> 10.48).
+    // border_focus는 포커스 링이라 액센트와 다른 의미이므로 유지한다.
     let (bg, surface, surface_hover, panel, border, border_focus, text, muted, accent, input) =
         if dark {
             (
-                rgb(0x1a, 0x1a, 0x1a),
-                rgb(0x24, 0x24, 0x24),
-                rgb(0x2c, 0x2c, 0x2c),
-                rgb(0x20, 0x20, 0x20),
-                rgb(0x3a, 0x3a, 0x3a),
+                rgb(0x13, 0x1a, 0x21), // was #1a1a1a
+                rgb(0x1a, 0x24, 0x2e), // was #242424
+                rgb(0x20, 0x2c, 0x38), // was #2c2c2c
+                rgb(0x17, 0x20, 0x29), // was #202020
+                rgb(0x2e, 0x3a, 0x46), // was #3a3a3a
                 rgb(0x5a, 0x9f, 0xd4),
-                rgb(0xd4, 0xd4, 0xd4),
-                rgb(0x71, 0x71, 0x71),
-                rgb(0x4d, 0xa6, 0xc8),
-                rgb(0x1a, 0x1a, 0x1a),
+                rgb(0xcb, 0xd4, 0xdd),             // was #d4d4d4
+                rgb(0x66, 0x71, 0x7c),             // was #717171
+                crate::ui::designall::DARK.accent, // was #4da6c8
+                rgb(0x13, 0x1a, 0x21),             // was #1a1a1a (bg와 같은 값 유지)
             )
         } else {
             (
-                rgb(0xe0, 0xe0, 0xe0),
-                rgb(0xf0, 0xf0, 0xf0),
-                rgb(0xe8, 0xe8, 0xe8),
-                rgb(0xfa, 0xfa, 0xfa),
-                rgb(0xc4, 0xc4, 0xc4),
+                rgb(0xdb, 0xe0, 0xe5), // was #e0e0e0
+                rgb(0xed, 0xf0, 0xf3), // was #f0f0f0
+                rgb(0xe5, 0xe8, 0xeb), // was #e8e8e8
+                rgb(0xf9, 0xfa, 0xfb), // was #fafafa
+                rgb(0xbc, 0xc2, 0xcc), // was #c4c4c4
                 rgb(0x3a, 0x88, 0xbf),
-                rgb(0x1a, 0x1a, 0x1a),
-                rgb(0x88, 0x88, 0x88),
-                rgb(0x3a, 0x88, 0xbf),
-                rgb(0xff, 0xff, 0xff),
+                rgb(0x17, 0x1a, 0x1d),              // was #1a1a1a
+                rgb(0x80, 0x88, 0x90),              // was #888888
+                crate::ui::designall::LIGHT.accent, // was #3a88bf
+                rgb(0xff, 0xff, 0xff),              // input은 순백 유지
             )
         };
 
@@ -725,27 +732,30 @@ fn settings_detail_shell(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui:
         });
 }
 
+// 아래 세 헬퍼도 apply_settings_palette와 같은 축(hsl 210도)을 쓴다. 명도는 유지.
 fn settings_text_secondary(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
-        rgb(0xaa, 0xaa, 0xaa)
+        rgb(0x9e, 0xaa, 0xb6) // was #aaaaaa
     } else {
-        rgb(0x44, 0x44, 0x44)
+        rgb(0x3f, 0x44, 0x49) // was #444444
     }
 }
 
 fn settings_input_border(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
-        rgb(0x40, 0x40, 0x40)
+        rgb(0x33, 0x40, 0x4d) // was #404040
     } else {
-        rgb(0xb8, 0xb8, 0xb8)
+        rgb(0xae, 0xb8, 0xc2) // was #b8b8b8
     }
 }
 
+/// 선택 배경은 액센트가 섞인 표면이라 채도를 낮추면 "선택됨"이 약해진다 — 채도·명도는
+/// 그대로 두고 색상축만 210도로 정렬했다.
 fn settings_nav_active(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
-        rgb(0x2e, 0x4a, 0x5e)
+        rgb(0x2e, 0x46, 0x5e) // was #2e4a5e (205도)
     } else {
-        rgb(0xcc, 0xde, 0xed)
+        rgb(0xcc, 0xdc, 0xed) // was #ccdeed (207도)
     }
 }
 

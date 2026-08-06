@@ -286,8 +286,12 @@ impl ApprovalsUi {
                 // 않았다. 세션 맥락이 필요하면 벨 인박스가 보여준다(에이전트명까지).
                 // http 서버면 원격 전송 고지 — 이 승인이 신뢰 확인을 겸한다 (H3 리뷰 P1)
                 if let Some(url) = row.remote_url() {
+                    // 주의 톤은 agent_visuals가 소유한다 — 일회성 #d08a00을 쓰면 같은
+                    // 의미가 화면마다 다른 주황이 된다(2026-08-06).
                     ui.colored_label(
-                        egui::Color32::from_rgb(0xd0, 0x8a, 0x00),
+                        crate::ui::agent_visuals::status_color(
+                            crate::agent_surface::AgentVisualState::Waiting,
+                        ),
                         catalog.t("approval.remote_note", &[("url", url)]),
                     );
                 }

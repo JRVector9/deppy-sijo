@@ -77,7 +77,7 @@ pub fn panel_bg(ui: &egui::Ui) -> egui::Color32 {
     // settings의 '관리 panel'과 값이 달라(#1e1e1e vs #202020) 헬퍼로 위임하지 않고,
     // 이 화면 고유의 명도는 유지한 채 색상축만 맞춘다.
     if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x1a, 0x1c, 0x22) // was #1e1e1e (무채색)
+        egui::Color32::from_rgb(0x18, 0x1b, 0x20) // was #1e1e1e (무채색)
     } else {
         egui::Color32::from_rgb(0xf9, 0xfa, 0xfb) // was #fafafa (무채색)
     }

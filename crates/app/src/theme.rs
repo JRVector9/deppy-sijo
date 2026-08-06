@@ -139,3 +139,102 @@ pub fn install_palette(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Dark, dark());
     ctx.set_visuals_of(egui::Theme::Light, light());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// HSL 색상(0~360)과 채도(0~1). 무채색이면 색상은 None.
+    fn hue_sat(c: Color32) -> (Option<f32>, f32) {
+        let [r, g, b] = [c.r(), c.g(), c.b()].map(|v| f32::from(v) / 255.0);
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let delta = max - min;
+        if delta < 1e-6 {
+            return (None, 0.0);
+        }
+        let lightness = (max + min) / 2.0;
+        let sat = delta / (1.0 - (2.0 * lightness - 1.0).abs());
+        let hue = if max == r {
+            60.0 * ((g - b) / delta).rem_euclid(6.0)
+        } else if max == g {
+            60.0 * ((b - r) / delta + 2.0)
+        } else {
+            60.0 * ((r - g) / delta + 4.0)
+        };
+        (Some(hue), sat)
+    }
+
+    #[track_caller]
+    fn assert_on_axis(label: &str, color: Color32) {
+        let (hue, sat) = hue_sat(color);
+        let Some(hue) = hue else {
+            panic!("{label}: 무채색이다 — 표면은 210도 축 위에 있어야 한다");
+        };
+        assert!(
+            (195.0..=225.0).contains(&hue),
+            "{label}: 색상 {hue:.0}도 — 210도 축을 벗어났다"
+        );
+        assert!(
+            sat >= 0.15,
+            "{label}: 채도 {:.0}% — 너무 낮아 무채색으로 보인다",
+            sat * 100.0
+        );
+    }
+
+    /// 2026-08-06: 같은 다크 테마가 세 번 구현돼 색상축이 210도(사이드바)·240도(앱
+    /// 크롬)·무채색(설정 창)으로 갈려 있었다. 맞닿은 면들이 서로를 물들여 보이게 해서
+    /// "설명할 수 없이 불편한" 화면이 됐다. 명도는 화면마다 달라도 되지만(사이드바가 더
+    /// 어두운 위계는 의도된 것) 색상축은 하나여야 한다. 값을 손볼 때 다시 갈라지는 걸
+    /// 이 테스트가 막는다 — 지금은 주석 말고는 막는 장치가 없다.
+    #[test]
+    fn 다크_표면은_세_팔레트가_같은_색상축을_공유한다() {
+        let tokens = crate::ui::designall::DARK;
+        for (label, color) in [
+            ("designall app_background", tokens.app_background),
+            (
+                "designall workspace_background",
+                tokens.workspace_background,
+            ),
+            ("designall input_background", tokens.input_background),
+            ("designall selected_background", tokens.selected_background),
+            ("designall hover_background", tokens.hover_background),
+            ("designall separator", tokens.separator),
+        ] {
+            assert_on_axis(label, color);
+        }
+
+        let chrome = dark();
+        for (label, color) in [
+            ("theme panel_fill", chrome.panel_fill),
+            ("theme extreme_bg_color", chrome.extreme_bg_color),
+            ("theme faint_bg_color", chrome.faint_bg_color),
+            ("theme hovered bg_fill", chrome.widgets.hovered.bg_fill),
+            (
+                "theme separator",
+                chrome.widgets.noninteractive.bg_stroke.color,
+            ),
+        ] {
+            assert_on_axis(label, color);
+        }
+
+        egui::__run_test_ui(|ui| {
+            ui.visuals_mut().dark_mode = true;
+            crate::ui::settings::apply_settings_palette(ui);
+            let settings = ui.visuals();
+            for (label, color) in [
+                ("settings panel_fill", settings.panel_fill),
+                ("settings window_fill", settings.window_fill),
+                ("settings faint_bg_color", settings.faint_bg_color),
+                ("settings extreme_bg_color", settings.extreme_bg_color),
+                ("settings hovered bg_fill", settings.widgets.hovered.bg_fill),
+                (
+                    "settings separator",
+                    settings.widgets.noninteractive.bg_stroke.color,
+                ),
+            ] {
+                assert_on_axis(label, color);
+            }
+        });
+    }
+}

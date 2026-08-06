@@ -359,7 +359,7 @@ fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
 }
 
 /// `design/.../egui.ts`의 토큰을 설정 창 local visuals에 매핑한다.
-fn apply_settings_palette(ui: &mut egui::Ui) {
+pub(crate) fn apply_settings_palette(ui: &mut egui::Ui) {
     let dark = ui.visuals().dark_mode;
     // 설정 창은 완전 무채색(S 0%)이었고 사이드바는 hsl 210도라, 화면을 옮겨 다닐 때
     // 색온도가 출렁였다(2026-08-06). 명도(L)는 전부 그대로 두고 색상축·채도만
@@ -2498,7 +2498,11 @@ fn serve_row(
         }
         ServeView::Ready => {
             ui.colored_label(
-                egui::Color32::from_rgb(0x58, 0xb3, 0x68),
+                // 완료 톤은 agent_visuals가 소유한다 — 일회성 #58b368을 쓰면 같은 의미가
+                // 화면마다 다른 초록이 된다(2026-08-06).
+                crate::ui::agent_visuals::status_color(
+                    crate::agent_surface::AgentVisualState::Complete,
+                ),
                 egui::RichText::new(catalog.t("settings.mobile_web.serve_ready", &[]))
                     .size(SETTINGS_TYPE.row_description),
             );

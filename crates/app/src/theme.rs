@@ -32,8 +32,7 @@ fn dark() -> egui::Visuals {
     // 터미널(L 5.5%)과 명암비 1.01로 붙어 경계가 사라졌다 — 지금은 1.13이라 구분선 없이도
     // 단이 보이고, 구분선이 그 위에 얹힌다.
     //
-    // 라이트 팔레트는 표면이 전부 흰색 근처라 성격이 다르고 화면으로 확인한 적이 없어
-    // 그대로 뒀다.
+    // 라이트도 같은 축·같은 4단 구조를 쓴다 — 아래 light() 주석 참고.
     let text = rgb(0xd5, 0xd8, 0xdd);
     let dim = rgb(0x8a, 0x8f, 0x99);
     // faint는 palette()가 `_faint`로 받아 쓰지 않는다(기존부터 미사용). 팔레트가 한
@@ -61,18 +60,29 @@ fn dark() -> egui::Visuals {
     )
 }
 
-/// 라이트 팔레트 (목업 라이트 §토큰: bg #fbfcfd · panel #f1f3f5 · accent는 designall …).
+/// 라이트 팔레트. 다크와 **같은 축(hsl 220도)·같은 4단 구조**를 쓴다.
 fn light() -> egui::Visuals {
-    // 값은 그대로(#1c93aa) — 라이트는 원래 designall과 일치했다. 출처만 합친다.
+    // 값은 그대로(#1c93aa) — 라이트 액센트는 원래 designall과 일치했다. 출처만 합친다.
     let accent = crate::ui::designall::LIGHT.accent;
+    // 라이트도 다크와 같은 정리를 거쳤다(2026-08-07). 그 전에는 색상이 200~220도로
+    // 흩어지고 명도가 21단계였으며, 무엇보다 다크만 평평·4단으로 바꾼 탓에 **두 모드의
+    // 구조가 서로 달랐다**.
+    //
+    // 계단은 다크의 "표면 기준 상대 거리"를 그대로 뒤집는다. 라이트에서는 올라올수록
+    // 밝고 상호작용(hover/선택)은 반대로 어두워지는 게 관례라서다:
+    //   입력 L 99.3 (+4) · 표면 L 95.3 · hover L 93.3 (-2) · 선택 L 91.3 (-4)
+    // 레일·사이드바·크롬은 전부 표면 한 단(평평) — 다크와 같다.
+    //
+    // 구분선은 명도를 85.5 -> 81.2로 낮췄다. 기존 값은 표면 위 명암비 1.27로 다크(1.42)
+    // 보다 흐려 두 모드에서 경계가 다르게 보였다.
     let text = rgb(0x23, 0x26, 0x2c);
-    let dim = rgb(0x65, 0x6b, 0x74);
-    let faint = rgb(0x9a, 0xa0, 0xa9);
-    let bg = rgb(0xfb, 0xfc, 0xfd);
-    let panel = rgb(0xf1, 0xf3, 0xf5);
-    let panel2 = rgb(0xe7, 0xea, 0xee);
-    let panel_hi = rgb(0xdd, 0xe1, 0xe7);
-    // 다크와 달리 라이트 구분선은 designall과 값이 이미 같았다 — 출처만 합친다.
+    let dim = rgb(0x65, 0x6a, 0x74);
+    let faint = rgb(0x9b, 0x9f, 0xa8);
+    let bg = rgb(0xfd, 0xfd, 0xfd);
+    let panel = rgb(0xf1, 0xf2, 0xf5);
+    let panel2 = rgb(0xeb, 0xed, 0xf0);
+    let panel_hi = rgb(0xe5, 0xe8, 0xec);
+    // 구분선은 designall과 값까지 같다 — 다크와 마찬가지로 표면이 한 단이라 공유 가능하다.
     let hair = crate::ui::designall::LIGHT.separator;
     palette(
         egui::Visuals::light(),
@@ -244,5 +254,78 @@ mod tests {
                 assert_on_axis(label, color);
             }
         });
+    }
+
+    /// 라이트도 같은 축을 쓴다. 2026-08-07 이전에는 다크만 정리해서 **두 모드의 구조가
+    /// 서로 달랐다** — 라이트는 색상이 200~220도로 흩어지고 레일/사이드바가 2단이었다.
+    /// 한쪽만 손보면 다시 갈라지므로 두 모드를 같은 잣대로 검사한다.
+    #[test]
+    fn 라이트_표면도_세_팔레트가_같은_색상축을_공유한다() {
+        let tokens = crate::ui::designall::LIGHT;
+        for (label, color) in [
+            ("designall app_background", tokens.app_background),
+            (
+                "designall workspace_background",
+                tokens.workspace_background,
+            ),
+            ("designall selected_background", tokens.selected_background),
+            ("designall hover_background", tokens.hover_background),
+            ("designall separator", tokens.separator),
+        ] {
+            assert_on_axis(label, color);
+        }
+
+        let chrome = light();
+        for (label, color) in [
+            ("theme panel_fill", chrome.panel_fill),
+            ("theme faint_bg_color", chrome.faint_bg_color),
+            ("theme hovered bg_fill", chrome.widgets.hovered.bg_fill),
+            (
+                "theme separator",
+                chrome.widgets.noninteractive.bg_stroke.color,
+            ),
+        ] {
+            assert_on_axis(label, color);
+        }
+
+        egui::__run_test_ui(|ui| {
+            ui.visuals_mut().dark_mode = false;
+            crate::ui::settings::apply_settings_palette(ui);
+            let settings = ui.visuals();
+            for (label, color) in [
+                ("settings panel_fill", settings.panel_fill),
+                ("settings window_fill", settings.window_fill),
+                ("settings hovered bg_fill", settings.widgets.hovered.bg_fill),
+                (
+                    "settings separator",
+                    settings.widgets.noninteractive.bg_stroke.color,
+                ),
+            ] {
+                assert_on_axis(label, color);
+            }
+        });
+    }
+
+    /// 레일·사이드바·크롬은 두 모드 모두 **같은 단**이다(평평). 한쪽만 어긋나면 그
+    /// 모드에서만 경계가 사라지거나 계단이 생긴다.
+    #[test]
+    fn 레일과_사이드바와_크롬은_두_모드_모두_같은_단이다() {
+        for (mode, tokens, chrome) in [
+            ("다크", crate::ui::designall::DARK, dark()),
+            ("라이트", crate::ui::designall::LIGHT, light()),
+        ] {
+            assert_eq!(
+                tokens.app_background, tokens.workspace_background,
+                "{mode}: 레일과 사이드바 본문이 다른 단이다"
+            );
+            assert_eq!(
+                tokens.app_background, tokens.folder_tree_background,
+                "{mode}: 레일과 파일트리가 다른 단이다"
+            );
+            assert_eq!(
+                tokens.app_background, chrome.panel_fill,
+                "{mode}: 사이드바와 앱 크롬이 다른 단이다"
+            );
+        }
     }
 }

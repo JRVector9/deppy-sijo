@@ -79,7 +79,7 @@ pub fn panel_bg(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         egui::Color32::from_rgb(0x18, 0x1b, 0x20) // was #1e1e1e (무채색)
     } else {
-        egui::Color32::from_rgb(0xf9, 0xfa, 0xfb) // was #fafafa (무채색)
+        egui::Color32::from_rgb(0xf9, 0xfa, 0xfb) // was #fafafa (무채색) — L 유지, 축 정렬
     }
 }
 

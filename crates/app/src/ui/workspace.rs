@@ -865,7 +865,7 @@ fn terminal_toolbar_button(
         // 값은 하드코딩하되 축만 맞춘다: 옛 값 #22222a는 240도 보랏빛이라 220도로 통일한
         // 주변 면들 사이에서 혼자 튀었다. 명도는 그대로 두고 색상만 옮겼다(2026-08-06).
         ui.painter()
-            .rect_filled(rect, 1.0, egui::Color32::from_rgb(0x20, 0x24, 0x2c));
+            .rect_filled(rect, 1.0, egui::Color32::from_rgb(0x21, 0x24, 0x2c));
     }
     let color = if response.hovered() || response.has_focus() {
         egui::Color32::from_rgb(0xf2, 0xf2, 0xf2)

@@ -24,25 +24,24 @@ pub const NAV_RAIL_MAX_WIDTH: f32 = 180.0;
 pub const SEPARATOR_WIDTH: f32 = 1.0;
 
 pub const DARK: Tokens = Tokens {
-    app_background: egui::Color32::from_rgb(0x0e, 0x0f, 0x12),
-    // 사이드바 본문은 nav rail(app_background)과 **같은 면**이다 (2026-08-06 사용자).
-    // 원래는 한 단 위(#10161c → 통일 후 #131519, L 8.6%)였는데, 레일과 패널 사이에
-    // 2.3%p 계단이 생겨 경계가 도드라졌다. 팔레트가 무채색에 가까워지면서 그 단차가
-    // "같은 재질에 조명이 다른 것"이 아니라 밋밋한 회색 계단으로 읽혔다. 사이드바는
-    // 하나의 탐색 영역이고 레일과는 이미 구분선이 나누므로 한 면으로 합친다.
-    // 토큰은 분리해 둔다 — 나중에 다시 갈라야 할 수 있고, 칠하는 코드가 서로 다르다.
-    workspace_background: egui::Color32::from_rgb(0x0e, 0x0f, 0x12),
-    folder_tree_background: egui::Color32::from_rgb(0x0e, 0x0f, 0x12),
-    input_background: egui::Color32::from_rgb(0x15, 0x17, 0x1c),
-    separator: egui::Color32::from_rgb(0x2b, 0x2e, 0x35),
+    app_background: egui::Color32::from_rgb(0x18, 0x1b, 0x20),
+    // 사이드바 본문은 nav rail(app_background)과 **같은 면**이다. 원래는 한 단 위라
+    // 레일과 패널 사이에 계단이 보였는데, 사이드바는 하나의 탐색 영역이고 레일과는 이미
+    // 구분선이 나누므로 합쳤다(2026-08-06 사용자).
+    // 토큰은 분리해 둔다 — 나중에 다시 갈라야 할 수 있고, 칠하는 코드가 서로 다르다
+    // (structural_frame vs 각 섹션의 rect_filled).
+    workspace_background: egui::Color32::from_rgb(0x18, 0x1b, 0x20),
+    folder_tree_background: egui::Color32::from_rgb(0x18, 0x1b, 0x20),
+    input_background: egui::Color32::from_rgb(0x0f, 0x11, 0x15),
+    separator: egui::Color32::from_rgb(0x32, 0x36, 0x3e),
     text: egui::Color32::from_rgb(0xdc, 0xde, 0xe2),
     muted_text: egui::Color32::from_rgb(0x82, 0x88, 0x93),
     accent: egui::Color32::from_rgb(0x39, 0xb8, 0xe8),
     success: egui::Color32::from_rgb(0x4a, 0xcb, 0x82),
     warning: egui::Color32::from_rgb(0xe0, 0xa4, 0x3a),
     error: egui::Color32::from_rgb(0xef, 0x66, 0x71),
-    selected_background: egui::Color32::from_rgb(0x17, 0x1a, 0x20),
-    hover_background: egui::Color32::from_rgb(0x14, 0x17, 0x1c),
+    selected_background: egui::Color32::from_rgb(0x21, 0x24, 0x2c),
+    hover_background: egui::Color32::from_rgb(0x1d, 0x20, 0x26),
 };
 
 pub const LIGHT: Tokens = Tokens {
@@ -114,17 +113,17 @@ mod tests {
     fn dark_tokens_match_the_approved_design_freeze() {
         assert_eq!(
             DARK.app_background,
-            egui::Color32::from_rgb(0x0e, 0x0f, 0x12)
+            egui::Color32::from_rgb(0x18, 0x1b, 0x20)
         );
         assert_eq!(
             DARK.input_background,
-            egui::Color32::from_rgb(0x15, 0x17, 0x1c)
+            egui::Color32::from_rgb(0x0f, 0x11, 0x15)
         );
-        assert_eq!(DARK.separator, egui::Color32::from_rgb(0x2b, 0x2e, 0x35));
+        assert_eq!(DARK.separator, egui::Color32::from_rgb(0x32, 0x36, 0x3e));
         assert_eq!(DARK.accent, egui::Color32::from_rgb(0x39, 0xb8, 0xe8));
         assert_eq!(
             DARK.selected_background,
-            egui::Color32::from_rgb(0x17, 0x1a, 0x20)
+            egui::Color32::from_rgb(0x21, 0x24, 0x2c)
         );
         assert_eq!(
             LIGHT.selected_background,

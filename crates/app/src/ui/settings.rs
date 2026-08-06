@@ -361,7 +361,7 @@ fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
 /// `design/.../egui.ts`의 토큰을 설정 창 local visuals에 매핑한다.
 pub(crate) fn apply_settings_palette(ui: &mut egui::Ui) {
     let dark = ui.visuals().dark_mode;
-    // 설정 창은 완전 무채색(S 0%)이었고 사이드바는 hsl 210도라, 화면을 옮겨 다닐 때
+    // 설정 창은 완전 무채색(S 0%)이었고 사이드바는 색이 있어, 화면을 옮겨 다닐 때
     // 색온도가 출렁였다(2026-08-06). 명도(L)는 전부 그대로 두고 색상축·채도만
     // designall에 맞춘다 — 역할별 채도는 designall 실측치를 따른다:
     //   다크  표면 27% · 본문 22% · 보조 14% · muted 10% · border 21%
@@ -371,16 +371,16 @@ pub(crate) fn apply_settings_palette(ui: &mut egui::Ui) {
     let (bg, surface, surface_hover, panel, border, border_focus, text, muted, accent, input) =
         if dark {
             (
-                rgb(0x13, 0x1a, 0x21), // was #1a1a1a
-                rgb(0x1a, 0x24, 0x2e), // was #242424
-                rgb(0x20, 0x2c, 0x38), // was #2c2c2c
-                rgb(0x17, 0x20, 0x29), // was #202020
-                rgb(0x2e, 0x3a, 0x46), // was #3a3a3a
+                rgb(0x16, 0x19, 0x1e), // was #1a1a1a
+                rgb(0x1f, 0x22, 0x29), // was #242424
+                rgb(0x25, 0x2a, 0x33), // was #2c2c2c
+                rgb(0x1b, 0x1e, 0x25), // was #202020
+                rgb(0x34, 0x38, 0x40), // was #3a3a3a
                 rgb(0x5a, 0x9f, 0xd4),
-                rgb(0xcb, 0xd4, 0xdd),             // was #d4d4d4
-                rgb(0x66, 0x71, 0x7c),             // was #717171
+                rgb(0xd0, 0xd3, 0xd8),             // was #d4d4d4
+                rgb(0x69, 0x6e, 0x79),             // was #717171
                 crate::ui::designall::DARK.accent, // was #4da6c8
-                rgb(0x13, 0x1a, 0x21),             // was #1a1a1a (bg와 같은 값 유지)
+                rgb(0x16, 0x19, 0x1e),             // was #1a1a1a (bg와 같은 값 유지)
             )
         } else {
             (
@@ -732,11 +732,11 @@ fn settings_detail_shell(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui:
         });
 }
 
-// 아래 세 헬퍼도 apply_settings_palette와 같은 축(hsl 210도)을 쓴다. 명도는 유지.
+// 아래 세 헬퍼도 apply_settings_palette와 같은 축(hsl 220도)을 쓴다. 명도는 유지.
 // credentials.rs가 이 값을 재사용하므로 pub(crate)로 노출한다.
 pub(crate) fn settings_text_secondary(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
-        rgb(0x9e, 0xaa, 0xb6) // was #aaaaaa
+        rgb(0xa4, 0xa8, 0xb0) // was #aaaaaa
     } else {
         rgb(0x3f, 0x44, 0x49) // was #444444
     }
@@ -744,18 +744,18 @@ pub(crate) fn settings_text_secondary(ui: &egui::Ui) -> egui::Color32 {
 
 fn settings_input_border(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
-        rgb(0x33, 0x40, 0x4d) // was #404040
+        rgb(0x3a, 0x3e, 0x46) // was #404040
     } else {
         rgb(0xae, 0xb8, 0xc2) // was #b8b8b8
     }
 }
 
 /// 선택 배경은 액센트가 섞인 표면이라 채도를 낮추면 "선택됨"이 약해진다 — 채도·명도는
-/// 그대로 두고 색상축만 210도로 정렬했다.
+/// 그대로 두고 색상축만 220도로 정렬했다.
 /// env_project_list.rs가 이 값을 재사용하므로 pub(crate)로 노출한다.
 pub(crate) fn settings_nav_active(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
-        rgb(0x2e, 0x46, 0x5e) // was #2e4a5e (205도)
+        rgb(0x2e, 0x3e, 0x5e) // was #2e4a5e (205도)
     } else {
         rgb(0xcc, 0xdc, 0xed) // was #ccdeed (207도)
     }

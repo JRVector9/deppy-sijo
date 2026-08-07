@@ -570,6 +570,21 @@ fn attached_identity_style(identity_color: egui::Color32) -> AttachedIdentitySty
     }
 }
 
+/// 헤더 상단선의 y — 선이 헤더 **첫 물리행부터** 덮도록 놓는다.
+///
+/// egui의 `round_to_pixel_center`는 문서대로 홀수 물리픽셀 폭 전용이다. 이 선은
+/// 1.0 포인트라 Retina에서 2 물리픽셀(짝수)이라, 픽셀 중심에 맞추면 양끝이 반 픽셀씩
+/// 걸쳐 뭉개지고 `header.top()`이 소수일 땐 첫 행이 비어 1px 여백처럼 보인다.
+/// 짝수 폭은 픽셀 **경계**에 맞춘 뒤 half-width를 더해야 한다.
+///
+/// 경계는 반올림이 아니라 **내림**이다. header_top이 물리픽셀 중간에 걸릴 때 반올림이
+/// 위로 가면 그만큼 헤더 안쪽에 빈 띠가 남는다 — 살짝 위로 겹치는 쪽이 낫다.
+fn pane_header_top_line_y(header_top: f32, stroke_width: f32, pixels_per_point: f32) -> f32 {
+    let ppp = pixels_per_point.max(1.0);
+    let edge = (header_top * ppp).floor() / ppp;
+    edge + stroke_width * 0.5
+}
+
 fn pane_header_active_boundary(header: egui::Rect, close: egui::Rect) -> f32 {
     (close.right() + 6.0).min(header.right()).max(header.left())
 }
@@ -3374,10 +3389,18 @@ impl WorkspaceUi {
             ui.painter().rect_filled(header, 0.0, selection_fill);
         }
         if let Some(active_stroke) = style.active_stroke {
+            let ppp = ui.ctx().pixels_per_point();
             let painter = ui.painter();
             let boundary_x =
                 painter.round_to_pixel_center(pane_header_active_boundary(header, close));
-            let top_y = painter.round_to_pixel_center(header.top() + active_stroke.width * 0.5);
+            // round_to_pixel_center는 문서가 밝히듯 **홀수 물리픽셀 폭**용이다. 이 선은
+            // 1.0 **포인트**라 Retina에서 2 물리픽셀(짝수)이므로, 픽셀 중심에 맞추면
+            // 양끝이 반 픽셀씩 걸쳐 뭉개지고 header.top()이 소수일 땐 헤더 첫 행이 아예
+            // 비어 1px 여백으로 보인다(2026-08-07 사용자).
+            //
+            // 짝수 폭은 **경계**에 맞춰야 한다 — 헤더 상단을 픽셀 격자에 스냅한 뒤
+            // half-width를 더하면 선이 첫 행부터 정확히 덮는다.
+            let top_y = pane_header_top_line_y(header.top(), active_stroke.width, ppp);
             painter.hline(
                 egui::Rangef::new(header.left(), boundary_x),
                 top_y,
@@ -6011,6 +6034,32 @@ mod tests {
             layout.content.bottom(),
             358.0 - TERMINAL_STREAM_VERTICAL_PADDING
         );
+    }
+
+    /// 상단선은 헤더 **첫 물리행부터** 덮어야 한다. 예전에는 round_to_pixel_center를
+    /// 썼는데 그건 홀수 픽셀 폭 전용이라, header.top()이 소수일 때 첫 행이 비어
+    /// 1px 여백처럼 보였다(2026-08-07 사용자).
+    #[test]
+    fn 헤더_상단선은_첫_물리행부터_덮는다() {
+        let width = 1.0;
+        for ppp in [1.0_f32, 2.0, 3.0] {
+            for header_top in [38.0_f32, 38.5, 100.0, 100.25, 7.3] {
+                let y = pane_header_top_line_y(header_top, width, ppp);
+                let line_top_px = (y - width * 0.5) * ppp;
+                let header_top_px = header_top * ppp;
+                // 선 윗변이 헤더 상단보다 아래로 내려가면 그만큼 빈 띠가 생긴다.
+                assert!(
+                    line_top_px <= header_top_px + 0.001,
+                    "ppp {ppp}, top {header_top}: 선 위에 {:.2}물리픽셀 여백",
+                    line_top_px - header_top_px
+                );
+                // 선 윗변은 물리픽셀 경계여야 뭉개지지 않는다.
+                assert!(
+                    (line_top_px - line_top_px.round()).abs() < 0.001,
+                    "ppp {ppp}, top {header_top}: 선 윗변 {line_top_px}이 픽셀 경계가 아니다"
+                );
+            }
+        }
     }
 
     #[test]

@@ -427,6 +427,24 @@ fn desaturate(color: egui::Color32, factor: f32) -> egui::Color32 {
 /// 채도가 높아 1px 선인데도 쨍하게 튀었다. 낮추면 워크스페이스별 선 무게 편차도 준다.
 const PANE_HEADER_IDENTITY_SATURATION: f32 = 0.6;
 
+/// pane 강조 플래시의 최대 알파. 예전에는 255(완전 불투명)에 풀 채도 시안이라
+/// 2px 4변 면적에서 가장 세게 튀었다(2026-08-08 사용자). "쨍함"의 원인은 채도라
+/// 채도를 0.6으로 낮추는 쪽으로 잡고, 알파는 놓치지 않을 만큼 남긴다 — 150은
+/// 너무 약해 알림을 놓친다는 같은 날 피드백으로 200으로 올렸다.
+const PANE_FLASH_PEAK_ALPHA: f32 = 200.0;
+
+/// pane 전체 강조 플래시 색 — `remain`은 남은 비율(1.0 = 방금, 0.0 = 끝).
+///
+/// 예전에는 `selection.bg_fill`(풀 채도 시안)을 그대로 썼다. 같은 pane의 상단선은
+/// 워크스페이스 고유색인데 플래시만 청록이라 둘이 따로 놀았고, 경계 드래그 라인과도
+/// 같은 색이라 무엇이 반응한 건지 읽히지 않았다. 상단선과 **같은 채도 규칙**을 써서
+/// "이 워크스페이스가 반응했다"로 읽히게 한다.
+fn pane_flash_color(identity_color: egui::Color32, remain: f32) -> egui::Color32 {
+    let accent = desaturate(identity_color, PANE_HEADER_IDENTITY_SATURATION);
+    let alpha = (remain.clamp(0.0, 1.0) * PANE_FLASH_PEAK_ALPHA) as u8;
+    egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha)
+}
+
 fn pane_header_style(identity_color: egui::Color32, focused: bool) -> PaneHeaderStyle {
     PaneHeaderStyle {
         // 탭 바는 터미널과 **같은 면**이다 — 그 pane의 제목이지 앱 크롬이 아니다.
@@ -4481,15 +4499,8 @@ impl WorkspaceUi {
         {
             let now = std::time::Instant::now();
             if now < until {
-                let accent = ui.visuals().selection.bg_fill;
                 let remain = (until - now).as_secs_f32() / duration.as_secs_f32();
-                let alpha = (remain.clamp(0.0, 1.0) * 255.0) as u8;
-                let color = egui::Color32::from_rgba_unmultiplied(
-                    accent.r(),
-                    accent.g(),
-                    accent.b(),
-                    alpha,
-                );
+                let color = pane_flash_color(self.workspace_accent, remain);
                 // 이 시점 `ui`는 pane 안쪽 여백(content)으로 클립된 terminal 자식 UI다.
                 // painter().with_clip_rect는 기존 clip과 **교집합**이라(content∩surface=
                 // content) 테두리 4변이 여전히 잘려 안 보였다(2026-07-23 사용자). layer_painter
@@ -5910,8 +5921,12 @@ fn split_target_pane(snapshot: &MuxSnapshot) -> Option<runtime::MuxPaneId> {
 /// pane 강조 플래시 지속 시간 — 입력요청·작업완료 시 pane 전체 테두리를 이만큼
 /// 포인트색으로 그리고 페이드아웃한다. 탑라인(포커스 지속 표시)은 이와 무관하다.
 const PANE_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
-/// 터미널 선택(포커스 이동) 시 pane 테두리 강조 지속 — 사용자 요청 2초(2026-07-23).
-const FOCUS_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
+/// 터미널 선택(포커스 이동) 시 pane 테두리 강조 지속. 원래 2초였는데(2026-07-23
+/// 사용자 요청) 색이 오래 남는 느낌이라 줄였다 — 1.5초도 길어 1.2초로(2026-08-08 사용자).
+///
+/// 알림(`PANE_FLASH`)보다 짧은 건 의도다 — 포커스 이동은 사용자가 방금 자기 손으로
+/// 한 행동이라 확인 신호면 충분하지만, 입력요청·작업완료는 놓치면 안 되는 알림이다.
+const FOCUS_FLASH: std::time::Duration = std::time::Duration::from_millis(1_200);
 
 /// pane 전체 플래시를 유발하는 상태: 입력요청(Waiting/NeedsApproval)·작업종료(Done/Error).
 /// Running(작업 중)·Idle(쉬는 중)은 제외 — 주목이 필요한 순간만 번쩍인다.
@@ -6072,6 +6087,56 @@ mod tests {
     }
 
     #[test]
+    /// 2026-08-08: pane 전체 플래시가 풀 채도 시안(selection.bg_fill)을 알파 255로
+    /// 2px×4변에 그려 화면에서 가장 세게 튀었다. 상단선과 같은 워크스페이스 색·채도
+    /// 규칙을 쓰고 최대 알파를 낮춘다. 값을 되돌리면 이 테스트가 잡는다.
+    #[test]
+    fn pane_플래시는_워크스페이스색을_낮춘_채도로_쓰고_알파를_제한한다() {
+        let identity = crate::ui::file_tree::WORKSPACE_ACCENT_SAMPLE;
+
+        let peak = pane_flash_color(identity, 1.0);
+        assert_eq!(
+            peak.a(),
+            PANE_FLASH_PEAK_ALPHA as u8,
+            "가장 셀 때도 불투명하면 안 된다"
+        );
+        assert!(peak.a() < 255, "알파 255는 예전의 튀던 값이다");
+
+        // 색은 상단선과 같은 규칙 — 같은 채도로 낮춘 워크스페이스 고유색이다.
+        // Color32는 프리멀티플라이 저장이라 `.r()`은 알파가 곱해진 값이다. 기대값도
+        // 같은 생성자를 태워 비교한다(원본 채널과 직접 비교하면 알파만큼 어긋난다).
+        let header = desaturate(identity, PANE_HEADER_IDENTITY_SATURATION);
+        assert_eq!(
+            peak,
+            egui::Color32::from_rgba_unmultiplied(
+                header.r(),
+                header.g(),
+                header.b(),
+                PANE_FLASH_PEAK_ALPHA as u8
+            ),
+            "플래시와 상단선이 다른 색 계통이면 무엇이 반응했는지 안 읽힌다"
+        );
+
+        // 채도가 실제로 낮아졌는지 — 알파를 되돌린 뒤 원본과 채널 폭을 비교한다.
+        let spread = |channels: [u8; 4]| {
+            let [r, g, b, _] = channels;
+            i32::from(r.max(g).max(b)) - i32::from(r.min(g).min(b))
+        };
+        assert!(
+            spread(peak.to_srgba_unmultiplied()) < spread(identity.to_array()),
+            "원본 채도 그대로면 낮춘 의미가 없다"
+        );
+
+        // 페이드는 0까지 내려가고, 범위를 벗어난 입력도 안전하다.
+        assert_eq!(pane_flash_color(identity, 0.0).a(), 0);
+        assert_eq!(
+            pane_flash_color(identity, 5.0).a(),
+            PANE_FLASH_PEAK_ALPHA as u8,
+            "1.0을 넘겨도 최대치를 넘지 않는다"
+        );
+        assert_eq!(pane_flash_color(identity, -1.0).a(), 0);
+    }
+
     fn designall_pane_header는_1px탑라인을_close옆에서끝낸다() {
         // 상단선은 accent가 아니라 **그 pane이 속한 워크스페이스 고유색**이다.
         // accent를 쓰면 경계 드래그 라인과 같은 청록이 돼 구분되지 않는다.

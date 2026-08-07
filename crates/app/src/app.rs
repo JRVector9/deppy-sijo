@@ -6586,10 +6586,62 @@ fn claude_usage_snapshot() -> Option<ProviderUsage> {
     usage
 }
 
+/// app-server가 5시간 창 없이 주간만 준 결과에 백엔드 보충값을 접붙인다.
+/// 5시간 창이 이미 있거나 서버 결과 자체가 없으면 보충하지 않는다 (orca의
+/// `withBackendSessionWindow`와 같은 조건).
+pub(crate) fn supplement_codex_five_hour(
+    server: Option<ProviderUsage>,
+    backend_five_hour: Option<u8>,
+) -> Option<ProviderUsage> {
+    match server {
+        Some((None, weekly @ Some(_))) => Some((backend_five_hour, weekly)),
+        other => other,
+    }
+}
+
+/// "pro" → "Pro", "chatgpt_business" → "ChatGPT Business" (orca formatPlanLabel).
+fn format_plan_label(plan: &str) -> Option<String> {
+    let trimmed = plan.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        trimmed
+            .split(['_', '-', ' '])
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let lower = word.to_ascii_lowercase();
+                if lower == "chatgpt" {
+                    "ChatGPT".to_owned()
+                } else {
+                    let mut chars = lower.chars();
+                    chars.next().map_or_else(String::new, |first| {
+                        first.to_ascii_uppercase().to_string() + chars.as_str()
+                    })
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// 리셋까지 남은 시간을 짧은 상대 표현으로. 이미 지났거나 시각이 이상하면 None.
+fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
+    let remaining = resets_at.checked_sub(now).filter(|seconds| *seconds > 0)?;
+    Some(if remaining < 60 * 60 {
+        format!("{}분 후", (remaining / 60).max(1))
+    } else if remaining < 48 * 60 * 60 {
+        format!("{}시간 후", remaining / (60 * 60))
+    } else {
+        format!("{}일 후", remaining / (24 * 60 * 60))
+    })
+}
+
 pub(crate) fn top_provider_usage(
     ui: &mut egui::Ui,
     claude_usage: Option<ProviderUsage>,
     codex_usage: Option<ProviderUsage>,
+    codex_meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
 ) {
     let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
@@ -6616,23 +6668,43 @@ pub(crate) fn top_provider_usage(
         name: &str,
         accent: egui::Color32,
         usage: Option<ProviderUsage>,
+        meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
     ) {
         let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
         crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, name);
 
+        // 구독 플랜 — 있으면 로고 옆에 약하게 (orca "Codex · Pro" 대응).
+        if let Some(plan) = meta
+            .and_then(|meta| meta.plan_type.as_deref())
+            .and_then(format_plan_label)
+        {
+            ui.label(egui::RichText::new(plan).size(13.0).weak());
+        }
+
         let five_hour = usage.and_then(|value| value.0);
         let weekly = usage.and_then(|value| value.1);
+        let now = i64::try_from(deppy_core::time::unix_ms() / 1000).unwrap_or(i64::MAX);
+        let reset_hover = |resets_at: Option<i64>, window_label: &str| {
+            resets_at
+                .and_then(|at| relative_reset_label(at, now))
+                .map(|relative| format!("{window_label} 리셋: {relative}"))
+        };
 
         // 값이 없는 창은 칸 자체를 그리지 않는다 — 빈 게이지 바가 남으면 "없는 창"이
         // 아니라 "고장난 표시"로 읽힌다. 창을 하나도 못 받은 프로바이더만 "—"로
         // 자리를 지켜, 로고만 덩그러니 남지 않게 한다.
         if let Some(five_hour) = five_hour {
-            ui.label(
+            let value = ui.label(
                 egui::RichText::new(format!("{five_hour}%"))
                     .size(13.0)
                     .color(accent)
                     .strong(),
             );
+            if let Some(hover) =
+                reset_hover(meta.and_then(|meta| meta.five_hour_resets_at), "5시간")
+            {
+                value.on_hover_text(hover);
+            }
             let (bar, _) = ui.allocate_exact_size(egui::vec2(42.0, 6.0), egui::Sense::hover());
             ui.painter()
                 .rect_filled(bar, 3.0, egui::Color32::from_gray(42));
@@ -6647,22 +6719,33 @@ pub(crate) fn top_provider_usage(
             ui.label(egui::RichText::new("5h").size(13.0).weak());
         }
 
-        let Some(weekly) = weekly else {
-            if five_hour.is_none() {
-                ui.label(egui::RichText::new("—").size(13.0).weak());
+        if let Some(weekly) = weekly {
+            if five_hour.is_some() {
+                separator(ui, 14.0);
             }
-            return;
-        };
-        if five_hour.is_some() {
-            separator(ui, 14.0);
+            ui.label(egui::RichText::new("이번 주").size(13.0).weak());
+            let value = ui.label(
+                egui::RichText::new(format!("{weekly}%"))
+                    .size(13.0)
+                    .color(accent)
+                    .strong(),
+            );
+            if let Some(hover) = reset_hover(meta.and_then(|meta| meta.weekly_resets_at), "주간")
+            {
+                value.on_hover_text(hover);
+            }
+        } else if five_hour.is_none() {
+            ui.label(egui::RichText::new("—").size(13.0).weak());
         }
-        ui.label(egui::RichText::new("이번 주").size(13.0).weak());
-        ui.label(
-            egui::RichText::new(format!("{weekly}%"))
-                .size(13.0)
-                .color(accent)
-                .strong(),
-        );
+
+        // 사용량 리셋 크레딧 — 있을 때만 작은 표식으로 (orca는 redeem까지 있지만
+        // 여기서는 표시만, 사용은 Codex 쪽에서).
+        if let Some(credits) = meta.and_then(|meta| meta.reset_credits).filter(|c| *c > 0) {
+            ui.label(egui::RichText::new(format!("↺{credits}")).size(13.0).weak())
+                .on_hover_text(format!(
+                    "사용량 리셋 크레딧 {credits}개 — Codex에서 사용 가능"
+                ));
+        }
     }
 
     ui.allocate_ui_with_layout(
@@ -6675,11 +6758,18 @@ pub(crate) fn top_provider_usage(
                 "Claude",
                 egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
                 claude_usage,
+                None,
             );
             ui.add_space(4.0);
             separator(ui, 18.0);
             ui.add_space(4.0);
-            provider(ui, "Codex", ui.visuals().hyperlink_color, codex_usage);
+            provider(
+                ui,
+                "Codex",
+                ui.visuals().hyperlink_color,
+                codex_usage,
+                codex_meta,
+            );
         },
     );
 }
@@ -20345,10 +20435,18 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
+                // app-server가 5시간 창 없이 주간만 줬을 때만 백엔드 보충을 깨운다 —
+                // 5시간 창이 있는 계정은 백엔드를 아예 두드리지 않는다.
+                let codex_server_usage = self.agent_sessions_ui.codex_usage();
+                let codex_backend_five_hour = matches!(codex_server_usage, Some((None, Some(_))))
+                    .then(|| crate::codex_backend_usage::current(ui.ctx()))
+                    .flatten()
+                    .and_then(|backend| backend.five_hour);
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx())),
-                    self.agent_sessions_ui.codex_usage(),
+                    supplement_codex_five_hour(codex_server_usage, codex_backend_five_hour),
+                    self.agent_sessions_ui.codex_usage_meta(),
                     activity_rows.rows(),
                     approval_count,
                     &waiting_sessions,
@@ -23830,6 +23928,81 @@ mod tests {
             fresh_usage_after(usage, Duration::from_secs(8 * 24 * 60 * 60)),
             None,
             "둘 다 만료되면 None이라야 PTY 프로브 폴백이 살아난다"
+        );
+    }
+
+    /// 백엔드 보충은 "5시간만 빠진 구멍"에만 끼운다 — 그 외에는 서버 값 그대로.
+    #[test]
+    fn 백엔드_보충은_5시간_구멍에만_끼운다() {
+        let cases: &[(
+            &str,
+            Option<ProviderUsage>,
+            Option<u8>,
+            Option<ProviderUsage>,
+        )] = &[
+            (
+                "구멍 + 보충값 → 접붙임",
+                Some((None, Some(91))),
+                Some(24),
+                Some((Some(24), Some(91))),
+            ),
+            (
+                "구멍인데 보충도 없음 → 그대로",
+                Some((None, Some(91))),
+                None,
+                Some((None, Some(91))),
+            ),
+            (
+                "서버가 이미 5시간을 줌 → 보충 무시",
+                Some((Some(12), Some(91))),
+                Some(99),
+                Some((Some(12), Some(91))),
+            ),
+            (
+                "주간이 없으면 구멍이 아니다 → 그대로",
+                Some((None, None)),
+                Some(24),
+                Some((None, None)),
+            ),
+            ("서버 응답 자체가 없음 → 그대로", None, Some(24), None),
+        ];
+        for (name, server, backend, expected) in cases {
+            assert_eq!(
+                supplement_codex_five_hour(*server, *backend),
+                *expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn 플랜_라벨은_orca_형식으로_대문자화한다() {
+        assert_eq!(format_plan_label("pro").as_deref(), Some("Pro"));
+        assert_eq!(format_plan_label("plus").as_deref(), Some("Plus"));
+        assert_eq!(
+            format_plan_label("chatgpt_business").as_deref(),
+            Some("ChatGPT Business")
+        );
+        assert_eq!(format_plan_label("  ").as_deref(), None);
+    }
+
+    #[test]
+    fn 리셋_상대시각은_지난_시각을_숨긴다() {
+        assert_eq!(relative_reset_label(100, 200), None, "이미 지난 리셋");
+        assert_eq!(relative_reset_label(200, 200), None, "정각도 지난 것");
+        assert_eq!(relative_reset_label(230, 200).as_deref(), Some("1분 후"));
+        assert_eq!(
+            relative_reset_label(200 + 90 * 60, 200).as_deref(),
+            Some("1시간 후"),
+            "1시간 넘으면 시간 단위"
+        );
+        assert_eq!(
+            relative_reset_label(200 + 20 * 60 * 60, 200).as_deref(),
+            Some("20시간 후")
+        );
+        assert_eq!(
+            relative_reset_label(200 + 3 * 24 * 60 * 60, 200).as_deref(),
+            Some("3일 후")
         );
     }
 

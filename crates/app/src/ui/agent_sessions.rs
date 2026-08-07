@@ -652,6 +652,7 @@ pub struct AgentSessionsUi {
     pending_skill_catalog: Option<CodexSkillCatalogReply>,
     pending_rate_limits: Option<CodexAppServerReply>,
     codex_usage: Option<crate::app::ProviderUsage>,
+    codex_usage_meta: Option<CodexUsageMeta>,
     last_rate_limits_request: Option<std::time::Instant>,
     catalog_error: Option<CatalogMessage>,
     text_input_ids: Vec<egui::Id>,
@@ -715,6 +716,7 @@ impl AgentSessionsUi {
             pending_skill_catalog: None,
             pending_rate_limits: None,
             codex_usage: None,
+            codex_usage_meta: None,
             last_rate_limits_request: None,
             catalog_error: None,
             text_input_ids: Vec::new(),
@@ -1551,6 +1553,10 @@ impl AgentSessionsUi {
         self.codex_usage
     }
 
+    pub fn codex_usage_meta(&self) -> Option<CodexUsageMeta> {
+        self.codex_usage_meta.clone()
+    }
+
     fn poll_rate_limits_reply(&mut self) {
         let Some(reply) = self.pending_rate_limits.as_ref() else {
             return;
@@ -1573,6 +1579,12 @@ impl AgentSessionsUi {
         // 계정(예: 주간 창만 있는 플랜)은 읽어낸 쪽을 그대로 반영해야 한다.
         if five_hour.is_some() || weekly.is_some() {
             self.codex_usage = Some((five_hour, weekly));
+        }
+        // 메타(플랜·리셋 시각·리셋 크레딧)는 장식 정보라 부분 유지 없이 매 응답
+        // 그대로 반영한다 — 다음 폴(60초)에서 금방 복구된다.
+        let meta = codex_usage_meta_from_reply(&snapshot);
+        if meta != CodexUsageMeta::default() {
+            self.codex_usage_meta = Some(meta);
         }
     }
 
@@ -3950,6 +3962,48 @@ const CODEX_WINDOW_DURATION_TOLERANCE_MINUTES: f64 = 1.0;
 /// `secondary = null`로 오는데, 위치만 보고 primary를 5시간 칸에 넣으면 주간
 /// 수치가 5시간 수치로 둔갑한다. 그래서 위치 기반 옛 매핑(primary=세션,
 /// secondary=주간)은 그 창의 길이를 **아예 판별할 수 없을 때만** 남긴다.
+/// Codex 사용량의 장식 메타 — 상태바 옆에 곁들이는 정보라 없어도 표시는 성립한다.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodexUsageMeta {
+    /// 구독 플랜 (`planType`, 예: "pro" / "plus").
+    pub plan_type: Option<String>,
+    /// 5시간 창 리셋 시각 (unix 초). 길이로 판별된 창에서만 읽는다.
+    pub five_hour_resets_at: Option<i64>,
+    /// 주간 창 리셋 시각 (unix 초).
+    pub weekly_resets_at: Option<i64>,
+    /// 사용 가능한 사용량 리셋 크레딧 수 (`rateLimitResetCredits.availableCount`).
+    pub reset_credits: Option<u32>,
+}
+
+/// app-server 응답 전체에서 메타를 뽑는다. 리셋 시각은 길이로 판별된 창에서만
+/// 읽는다 — 위치 폴백까지 태우면 어떤 창의 리셋인지 라벨을 보증할 수 없다.
+fn codex_usage_meta_from_reply(snapshot: &serde_json::Value) -> CodexUsageMeta {
+    let limits = snapshot.get("rateLimits").unwrap_or(snapshot);
+    let resets_at = |expected_minutes: f64| {
+        ["primary", "secondary"].into_iter().find_map(|name| {
+            let window = limits.get(name)?;
+            let minutes = window.get("windowDurationMins")?.as_f64()?;
+            if (minutes - expected_minutes).abs() > CODEX_WINDOW_DURATION_TOLERANCE_MINUTES {
+                return None;
+            }
+            window.get("resetsAt")?.as_i64()
+        })
+    };
+    CodexUsageMeta {
+        plan_type: limits
+            .get("planType")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        five_hour_resets_at: resets_at(CODEX_SESSION_WINDOW_MINUTES),
+        weekly_resets_at: resets_at(CODEX_WEEKLY_WINDOW_MINUTES),
+        reset_credits: snapshot
+            .get("rateLimitResetCredits")
+            .and_then(|credits| credits.get("availableCount"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|count| u32::try_from(count).ok()),
+    }
+}
+
 fn classify_codex_rate_limit_windows(limits: &serde_json::Value) -> crate::app::ProviderUsage {
     let used_percent = |name: &str| {
         limits
@@ -5715,6 +5769,53 @@ mod tests {
             classify_codex_rate_limit_windows(limits),
             (None, Some(91)),
             "주간 91%가 5시간 칸에 복제되면 안 된다"
+        );
+    }
+
+    /// 실제 app-server 응답 모양에서 플랜·리셋 시각·리셋 크레딧을 뽑는다.
+    /// 리셋 시각은 길이로 판별된 창에서만 — 자리가 뒤바뀌어도 창을 따라간다.
+    #[test]
+    fn codex_메타는_플랜과_창별_리셋과_크레딧을_읽는다() {
+        let snapshot = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 91, "windowDurationMins": 10_080, "resetsAt": 1_786_160_724i64},
+                "secondary": null,
+                "planType": "pro",
+            },
+            "rateLimitResetCredits": {"availableCount": 1},
+        });
+        assert_eq!(
+            codex_usage_meta_from_reply(&snapshot),
+            CodexUsageMeta {
+                plan_type: Some("pro".to_owned()),
+                five_hour_resets_at: None,
+                weekly_resets_at: Some(1_786_160_724),
+                reset_credits: Some(1),
+            }
+        );
+
+        let plus_swapped = serde_json::json!({
+            "rateLimits": {
+                "primary": {"usedPercent": 81, "windowDurationMins": 10_080, "resetsAt": 200i64},
+                "secondary": {"usedPercent": 21, "windowDurationMins": 300, "resetsAt": 100i64},
+                "planType": "plus",
+            },
+        });
+        assert_eq!(
+            codex_usage_meta_from_reply(&plus_swapped),
+            CodexUsageMeta {
+                plan_type: Some("plus".to_owned()),
+                five_hour_resets_at: Some(100),
+                weekly_resets_at: Some(200),
+                reset_credits: None,
+            }
+        );
+
+        assert_eq!(
+            codex_usage_meta_from_reply(&serde_json::json!({})),
+            CodexUsageMeta::default(),
+            "빈 응답이면 기본값 — poll이 직전 메타를 유지한다"
         );
     }
 }

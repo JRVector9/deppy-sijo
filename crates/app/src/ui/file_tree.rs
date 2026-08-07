@@ -5041,6 +5041,15 @@ fn file_entry_color(name: &str, is_dir: bool, fallback: egui::Color32) -> egui::
     }
 }
 
+/// 워크스페이스 고유색 하나 — 이 팔레트를 쓰는 쪽 테스트가 참조한다(slot 0, emerald).
+/// 테스트가 리터럴을 복사해 두면 팔레트를 바꿀 때 조용히 어긋난다.
+#[cfg(test)]
+pub(crate) const WORKSPACE_ACCENT_SAMPLE: egui::Color32 = egui::Color32::from_rgb(
+    WORKSPACE_ACCENT_PALETTE[0].0,
+    WORKSPACE_ACCENT_PALETTE[0].1,
+    WORKSPACE_ACCENT_PALETTE[0].2,
+);
+
 const WORKSPACE_ACCENT_PALETTE: [(u8, u8, u8); 8] = [
     (0x55, 0xc8, 0x79), // emerald
     (0xe7, 0x9a, 0x3b), // orange

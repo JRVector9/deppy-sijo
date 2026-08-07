@@ -20060,6 +20060,15 @@ impl eframe::App for App {
             String,
             Vec<ui::file_tree::SidebarSessionRow>,
         > = std::collections::HashMap::new();
+        // 포커스된 pane 상단선에 쓸 활성 워크스페이스 고유색. 색은 sidebar_workspaces
+        // 목록에서의 slot으로 배정되므로 그 목록이 완성된 여기서만 구할 수 있다 —
+        // 붙임 pane의 identity_color(아래)와 같은 함수를 쓴다.
+        self.active
+            .workspace_ui
+            .set_workspace_accent(ui::file_tree::workspace_accent(
+                &sidebar_workspaces,
+                &active_workspace_id,
+            ));
         for workspace in &sidebar_workspaces {
             if workspace.id == active_workspace_id {
                 continue;

@@ -6498,19 +6498,24 @@ pub(crate) type ProviderUsage = (Option<u8>, Option<u8>);
 
 const FIVE_HOUR_WINDOW_MINUTES: f64 = 300.0;
 const WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
-/// 창 길이의 이만큼이 지나면 그 수치를 더는 현재값으로 내세우지 않는다.
-/// 5시간 창은 30분, 주간 창은 약 16.8시간이다.
-const USAGE_STALE_FRACTION_OF_WINDOW: f64 = 0.1;
+/// 창 길이의 이만큼이 지나면 그 슬롯을 비운다. 1.0 = 창이 **통째로** 굴러가
+/// 지금과 겹치는 구간이 없어진 값만 버린다 — 5시간 수치는 5시간, 주간은 7일.
+///
+/// 처음엔 0.1(오차 최대 10%p 선)로 잡았지만 5시간 칸이 30분 만에 사라지는 게
+/// 과했다(2026-08-07 사용자 피드백). 신선도 자체는 기록 경로가 담보한다 —
+/// deppy-sijo 안 세션은 mcp-proxy statusline이, 밖(터미널) 세션은 글로벌
+/// `~/.claude/statusline.sh`의 스냅샷 기록이 같은 파일을 갱신한다. 여기서는
+/// 무의미해진 값만 거른다.
+const USAGE_STALE_FRACTION_OF_WINDOW: f64 = 1.0;
 
 /// 나이 든 사용량 수치를 창별로 걸러낸다.
 ///
-/// 수치는 **굴러가는 창**의 한 시점 스냅샷이다. 읽은 뒤 시간이 지나면 창의 앞쪽이
-/// 빠져나가므로 옛 수치는 실제보다 높게 나온다 — 창 길이의 10%가 지났다면 오차가
-/// 최대 10%p다. 그 선을 넘은 슬롯은 비운다.
+/// 수치는 **굴러가는 창**의 한 시점 스냅샷이다. 창 길이만큼 지나면 그 창은
+/// 현재와 전혀 겹치지 않아 값이 무의미해진다. 그 슬롯만 비운다.
 ///
-/// 두 창을 따로 판단하는 이유: mcp-proxy는 Claude Code가 statusline을 다시 그릴
-/// 때만 파일을 쓴다. Claude를 두 시간 안 쓰면 5시간 수치는 이미 못 믿지만 주간
-/// 수치는 그대로 쓸 만하다. 한 덩어리로 버리면 멀쩡한 주간 값까지 잃는다.
+/// 두 창을 따로 판단하는 이유: 파일은 Claude Code가 statusline을 다시 그릴
+/// 때만 갱신된다. Claude를 엿새 안 쓰면 5시간 수치는 무의미하지만 주간 수치는
+/// 아직 정보가 있다. 한 덩어리로 버리면 멀쩡한 주간 값까지 잃는다.
 fn fresh_usage_windows(usage: ProviderUsage, age_minutes: f64) -> ProviderUsage {
     // age가 음수(시계 되감김)면 낡음으로 보지 않는다. NaN이면 어느 비교도 참이
     // 아니라 양쪽 다 비는데, 그때는 나이를 모르는 것이므로 버리는 쪽이 맞다.
@@ -23775,18 +23780,22 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    /// 신선도 계약 표. 창마다 기한이 다르고, 기한이 지난 슬롯만 비워야 한다.
+    /// 신선도 계약 표. 창이 통째로 굴러가 지금과 겹치지 않게 된 슬롯만 비운다.
     #[test]
-    fn 사용량_수치는_창_길이의_10퍼센트가_지나면_슬롯별로_버려진다() {
+    fn 사용량_수치는_창이_통째로_굴러간_뒤에야_슬롯별로_버려진다() {
         let both = (Some(11), Some(77));
         let cases: &[(&str, f64, ProviderUsage)] = &[
             ("방금 기록", 0.0, (Some(11), Some(77))),
-            ("5시간 기한 직전(29분)", 29.0, (Some(11), Some(77))),
-            ("5시간 기한 정각(30분)", 30.0, (Some(11), Some(77))),
-            ("5시간만 만료(31분) — 주간은 살린다", 31.0, (None, Some(77))),
-            ("2시간 — 주간은 여전히 유효", 120.0, (None, Some(77))),
-            ("주간 기한 정각(16.8시간)", 1008.0, (None, Some(77))),
-            ("주간까지 만료(17시간)", 1020.0, (None, None)),
+            (
+                "2시간 — 5시간 창 안이라 둘 다 산다",
+                120.0,
+                (Some(11), Some(77)),
+            ),
+            ("5시간 정각 — 경계는 유효", 300.0, (Some(11), Some(77))),
+            ("5시간 경과 — 5시간만 버린다", 301.0, (None, Some(77))),
+            ("하루 — 주간은 여전히 유효", 1440.0, (None, Some(77))),
+            ("7일 정각 — 경계는 유효", 10_080.0, (None, Some(77))),
+            ("7일 경과 — 둘 다 버린다", 10_081.0, (None, None)),
             ("시계 되감김은 낡음이 아니다", -60.0, (Some(11), Some(77))),
         ];
         for (name, age_minutes, expected) in cases {
@@ -23813,12 +23822,12 @@ mod tests {
             Some((Some(11), Some(77)))
         );
         assert_eq!(
-            fresh_usage_after(usage, Duration::from_secs(60 * 60)),
+            fresh_usage_after(usage, Duration::from_secs(6 * 60 * 60)),
             Some((None, Some(77))),
-            "5시간만 만료되면 주간을 들고 남아야 한다"
+            "5시간 창만 굴러갔으면 주간을 들고 남아야 한다"
         );
         assert_eq!(
-            fresh_usage_after(usage, Duration::from_secs(60 * 60 * 24)),
+            fresh_usage_after(usage, Duration::from_secs(8 * 24 * 60 * 60)),
             None,
             "둘 다 만료되면 None이라야 PTY 프로브 폴백이 살아난다"
         );

@@ -13,7 +13,9 @@ const MAX_OUTPUT_BYTES: usize = 100_000;
 #[derive(Default)]
 struct UsageState {
     pending: Option<mpsc::Receiver<Option<crate::app::ProviderUsage>>>,
-    usage: Option<crate::app::ProviderUsage>,
+    /// 마지막으로 성공한 프로브 값과 **잰 시각**. 시각을 같이 들고 있어야 프로브가
+    /// 계속 실패할 때 옛 값이 현재값 행세를 하며 굳는 것을 막는다.
+    usage: Option<(Instant, crate::app::ProviderUsage)>,
     last_request: Option<Instant>,
 }
 
@@ -27,8 +29,8 @@ pub fn current(ctx: &egui::Context) -> Option<crate::app::ProviderUsage> {
     if let Some(receiver) = state.pending.as_ref() {
         match receiver.try_recv() {
             Ok(usage) => {
-                if usage.is_some() {
-                    state.usage = usage;
+                if let Some(usage) = usage {
+                    state.usage = Some((Instant::now(), usage));
                 }
                 state.pending = None;
             }
@@ -56,7 +58,8 @@ pub fn current(ctx: &egui::Context) -> Option<crate::app::ProviderUsage> {
             state.last_request = Some(Instant::now());
         }
     }
-    state.usage
+    let (measured_at, usage) = state.usage?;
+    crate::app::fresh_usage_after(usage, measured_at.elapsed())
 }
 
 fn fetch_claude_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {

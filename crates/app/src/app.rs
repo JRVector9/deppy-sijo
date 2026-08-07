@@ -17572,11 +17572,11 @@ impl App {
             return;
         };
         match intent {
-            // 대기 개수 클릭 → 이미 있는 작업함(대기 카드 + 승인/거절)을 연다.
+            // 대기 개수 클릭 → 「작업」 페이지(대기 카드 + 승인/거절)를 연다.
             // 상태바는 목록을 복제하지 않고 문 역할만 한다.
-            ui::agent_terminal::StatusBarIntent::OpenInbox => {
+            ui::agent_terminal::StatusBarIntent::OpenWork => {
                 self.agent_terminal_ui
-                    .set_view(ui::agent_terminal::AgentTerminalView::Inbox);
+                    .set_view(ui::agent_terminal::AgentTerminalView::Fleet);
                 ctx.request_repaint();
             }
             // 상태바 팝오버의 승인/거부 → 벨 카드와 **같은** 처리 경로.
@@ -18903,101 +18903,6 @@ impl App {
             egui::Popup::close_id(&self.egui_ctx, Self::inbox_popup_id());
         }
         target
-    }
-
-    /// 「작업함」 전체 페이지 (2026-07-18 사용자 확정 디자인) — 사이드바 하단 nav로
-    /// 진입하는 중앙 뷰. 벨 팝오버(빠른 훑어보기용 — 유지)와 **같은 카드 컴포넌트**를
-    /// 재사용한다: 대기 중 = inbox_approvals::render + InboxWaitingUi::render(승인/거부·
-    /// 자유 입력·미리보기 동작 동일), 액션 처리도 공용 헬퍼(apply_inbox_*)를 거친다.
-    /// 최근 알림은 시간·워크스페이스를 포함한 전체 목록(history_section).
-    /// 반환: 세션 점프 대상 — 호출측이 기존 알림 네비게이션 경로로 처리한다.
-    fn render_inbox_page(
-        &mut self,
-        ui: &mut egui::Ui,
-        text: &i18n::Catalog,
-    ) -> Option<ui::notifications::AgentNotificationTarget> {
-        let workspace_names = self.inbox_workspace_names();
-        let session_titles = self.inbox_approval_session_titles();
-        let waiting_cards = self.build_waiting_cards();
-        let mut approval_decision = None;
-        let mut waiting_action = None;
-        let mut clicked = None;
-        egui::ScrollArea::vertical()
-            .id_salt("inbox_page")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Frame::NONE
-                    .inner_margin(egui::Margin::same(22))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        // 홈 대시보드 섹션과 같은 프레임 톤.
-                        let panel = egui::Frame::NONE
-                            .fill(ui.visuals().panel_fill)
-                            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                            .corner_radius(egui::CornerRadius::same(2))
-                            .inner_margin(egui::Margin::same(16));
-                        // ── 대기 중 (처리하면 사라지는 액션 큐) ──
-                        panel.show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                egui::RichText::new(text.t("inbox.page.waiting", &[]))
-                                    .strong()
-                                    .size(16.0),
-                            );
-                            ui.add_space(4.0);
-                            if self.approvals_ui.pending().is_empty() && waiting_cards.is_empty() {
-                                ui.weak(text.t("inbox.page.no_waiting", &[]));
-                            } else {
-                                // 전체 페이지는 팝오버 카드 상한(5) 없이 전부 그린다 —
-                                // 상한이 있으면 6번째 이후 요청을 조작할 수 없다(codex P2).
-                                let approval_action = ui::inbox_approvals::render(
-                                    ui,
-                                    text,
-                                    self.approvals_ui.pending(),
-                                    &workspace_names,
-                                    &session_titles,
-                                    usize::MAX,
-                                );
-                                approval_decision = approval_action.decision;
-                                clicked = approval_action.goto;
-                                waiting_action =
-                                    self.inbox_waiting_ui.render(ui, text, &waiting_cards);
-                            }
-                            // 카드가 비어도 render의 정리 경로는 돌아야 한다 — SessionId가
-                            // 워커마다 재배정되므로 마지막 카드 해소 시 드래프트를 안 지우면
-                            // 다른 논리 세션이 과거 입력을 물려받는다(codex P2, 팝오버와
-                            // 같은 규칙). 위 else에서 이미 그렸으면 중복 호출하지 않는다.
-                            if self.approvals_ui.pending().is_empty() && waiting_cards.is_empty() {
-                                waiting_action =
-                                    self.inbox_waiting_ui.render(ui, text, &waiting_cards);
-                            }
-                        });
-                        ui.add_space(14.0);
-                        // ── 최근 알림 (지나간 기록 — 시간·워크스페이스 포함 전체) ──
-                        panel.show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                egui::RichText::new(text.t("inbox.recent", &[]))
-                                    .strong()
-                                    .size(16.0),
-                            );
-                            ui.add_space(4.0);
-                            if let Some(target) =
-                                self.notifications_ui
-                                    .history_section(ui, text, &workspace_names)
-                            {
-                                clicked = Some(target);
-                            }
-                        });
-                    });
-            });
-        self.apply_inbox_approval_decision(approval_decision);
-        let goto = self.apply_inbox_waiting_action(waiting_action);
-        // 페이지가 보이는 동안 읽음 처리 — 팝오버·설정→알림과 같은 규약.
-        if self.notifications_ui.mark_all_read() {
-            self.egui_ctx.request_repaint();
-        }
-        clicked.or(goto)
     }
 
     fn prune_resolved_approvals(&self) {
@@ -20331,18 +20236,14 @@ impl eframe::App for App {
         if self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home {
             self.sync_home_notice_badge(true, ui.ctx());
         }
-        let inbox_count = self.approvals_ui.pending().len()
-            + self.global_waiting.len()
-            + self.notifications_ui.unread();
         let sidebar_snapshot = ui::file_tree::SidebarSnapshot {
             active_workspace_id: &active_workspace_id,
             workspaces: &sidebar_workspaces,
             view: self.agent_terminal_ui.view(),
             home_notice_count: self.home_notice_unread,
-            inbox_count,
-            // fleet 배지 = 주목 필요한 에이전트 수. global_waiting(needs-input, 전 워크스페이스)
-            // 을 싼 프록시로 쓴다 — 매 프레임 build_fleet_sessions를 돌리지 않는다.
-            fleet_count: self.global_waiting.len(),
+            // 「작업」 배지 = **나를 막고 있는 세션 수**. 벨 라벨과 같은 식이라 둘이 어긋나면
+            // 안 된다. 매 프레임 build_fleet_sessions를 돌리지 않는 싼 프록시다.
+            fleet_count: self.approvals_ui.pending().len() + self.global_waiting.len(),
             agents_open: self.agent_sessions_ui.is_open(),
         };
 
@@ -20531,20 +20432,8 @@ impl eframe::App for App {
                         },
                     );
                 }
-                Some(ui::file_tree::SidebarAction::ShowInbox) => {
-                    // 작업함 전체 페이지 — 재클릭 토글 규칙은 홈과 동일.
-                    self.agent_terminal_ui.set_view(
-                        if self.agent_terminal_ui.view()
-                            == ui::agent_terminal::AgentTerminalView::Inbox
-                        {
-                            ui::agent_terminal::AgentTerminalView::Terminal
-                        } else {
-                            ui::agent_terminal::AgentTerminalView::Inbox
-                        },
-                    );
-                }
                 Some(ui::file_tree::SidebarAction::ShowFleet) => {
-                    // fleet 그리드 — 재클릭 토글 규칙은 홈/작업함과 동일.
+                    // 「작업」 페이지 — 재클릭 토글 규칙은 홈과 동일.
                     self.agent_terminal_ui.set_view(
                         if self.agent_terminal_ui.view()
                             == ui::agent_terminal::AgentTerminalView::Fleet
@@ -20823,10 +20712,9 @@ impl eframe::App for App {
         let events = std::mem::take(&mut self.active.pending_events);
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
-        let inbox_visible = central_view == ui::agent_terminal::AgentTerminalView::Inbox;
         let fleet_visible = central_view == ui::agent_terminal::AgentTerminalView::Fleet;
         // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
-        if home_visible || inbox_visible || fleet_visible {
+        if home_visible || fleet_visible {
             self.active
                 .workspace_ui
                 .update_hidden(ui.ctx(), &events, &text);
@@ -20850,8 +20738,19 @@ impl eframe::App for App {
         } else {
             Vec::new()
         };
+        // 주의 섹션(승인·입력 대기) 입력 — 옛 작업함 페이지가 쓰던 것과 같은 조립이다.
+        // Fleet 뷰일 때만 만든다(세션 목록과 같은 비용 규칙).
+        let (fleet_workspace_names, fleet_session_titles, fleet_waiting_cards) = if fleet_visible {
+            (
+                self.inbox_workspace_names(),
+                self.inbox_approval_session_titles(),
+                self.build_waiting_cards(),
+            )
+        } else {
+            Default::default()
+        };
 
-        let terminal_visible = !home_visible && !inbox_visible && !fleet_visible;
+        let terminal_visible = !home_visible && !fleet_visible;
         if terminal_visible {
             self.frame_terminal_owner = frame_terminal_owner(
                 &self.cross_workspace_pane,
@@ -20885,8 +20784,10 @@ impl eframe::App for App {
             ui::designall::content_canvas_frame(ui.visuals())
         };
         let mut home_action = None;
-        let mut inbox_page_click = None;
+        let mut fleet_page_click = None;
         let mut fleet_action = None;
+        // 승인 결정·대기 응답은 render 클로저 안에서 &mut self를 또 잡을 수 없어 밖으로 낸다.
+        let mut fleet_page_output = None;
         let render_panes = if terminal_visible {
             self.cross_workspace_pane
                 .attachments()
@@ -20952,10 +20853,15 @@ impl eframe::App for App {
                         &self.connector_snapshot_reader.snapshot().slack,
                         &text,
                     );
-                } else if inbox_visible {
-                    inbox_page_click = self.render_inbox_page(ui, &text);
                 } else if fleet_visible {
-                    fleet_action = self.fleet_ui.render(
+                    // 사용량은 하단 상태바와 **같은 소스**를 쓴다 — 두 곳의 숫자가 갈리면 안 된다.
+                    let codex_server_usage = self.agent_sessions_ui.codex_usage();
+                    let codex_backend_five_hour = matches!(codex_server_usage, Some((None, Some(_))))
+                        .then(|| crate::codex_backend_usage::current(ui.ctx()))
+                        .flatten()
+                        .and_then(|backend| backend.five_hour);
+                    let codex_meta = self.agent_sessions_ui.codex_usage_meta();
+                    let page = self.fleet_ui.render(
                         ui,
                         &fleet_sessions,
                         fleet_summary,
@@ -20965,7 +20871,27 @@ impl eframe::App for App {
                             agents: &fleet_batch_spawn_agents,
                             max: self.config.ui.fleet_batch_spawn_max,
                         },
+                        ui::fleet::AttentionInput {
+                            pending: self.approvals_ui.pending(),
+                            workspace_names: &fleet_workspace_names,
+                            session_titles: &fleet_session_titles,
+                            waiting_cards: &fleet_waiting_cards,
+                            waiting_ui: &mut self.inbox_waiting_ui,
+                        },
+                        ui::fleet::UsageReadout {
+                            claude: claude_usage_snapshot()
+                                .or_else(|| crate::claude_usage::current(ui.ctx())),
+                            codex: supplement_codex_five_hour(
+                                codex_server_usage,
+                                codex_backend_five_hour,
+                            ),
+                            codex_meta: codex_meta.as_ref(),
+                        },
+                        &sidebar_workspaces,
                     );
+                    fleet_action = page.grid;
+                    fleet_page_output = Some((page.approval_decision, page.waiting_action));
+                    fleet_page_click = page.goto;
                 } else if !render_panes.is_empty() {
                     let rect = ui.available_rect_before_wrap();
                     self.last_multi_pane_terminal_rect = Some(rect);
@@ -21361,7 +21287,14 @@ impl eframe::App for App {
         }
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
         // (아래 notif_click 합류 지점)에 태운다(사이드바 FocusSession과 같은 규칙).
-        if inbox_page_click.is_some() {
+        // 「작업」 페이지의 승인 결정·대기 응답 — 옛 작업함 페이지와 같은 apply 경로다.
+        if let Some((approval_decision, waiting_action)) = fleet_page_output {
+            self.apply_inbox_approval_decision(approval_decision);
+            if let Some(goto) = self.apply_inbox_waiting_action(waiting_action) {
+                fleet_page_click = Some(goto);
+            }
+        }
+        if fleet_page_click.is_some() {
             self.agent_terminal_ui
                 .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
         }
@@ -22623,7 +22556,7 @@ impl eframe::App for App {
         // 설정→알림·벨 팝오버·작업함 페이지는 같은 대상 타입을 돌려준다 — 네비게이션 경로 공유.
         if let Some(target) = notif_click
             .or(inbox_click)
-            .or(inbox_page_click)
+            .or(fleet_page_click)
             .or_else(|| self.pending_status_bar_navigation.take())
         {
             let workspace_ids = self

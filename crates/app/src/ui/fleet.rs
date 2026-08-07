@@ -1,9 +1,17 @@
-//! 멀티에이전트 fleet 그리드 (기능1, leaf).
+//! 「작업」 페이지 (leaf) — 에이전트 세션을 한 화면에서 전부 다룬다.
 //!
-//! [`FleetSession`] 스냅샷을 상태별로 정렬된 카드 그리드로 그린다. 카드를 누르면 해당
-//! 세션으로 포커스하는 intent([`FleetAction::Focus`])만 돌려주고, 실제 전환은 App이 기존
-//! FocusSession 경로로 수행한다(leaf+intent+host I/O 경계). 상태 색은 앱 공용 팔레트
-//! (`agent_visuals::status_color`)를 재사용한다.
+//! 2026-08-08까지는 「작업함(Inbox)」과 「플릿」이 별도 페이지였는데, 같은 사실을 다섯
+//! 곳에서 보여주고 배지 두 개가 같은 값(`global_waiting`)을 세고 있었다(사용자 지적).
+//! 승인·입력 대기(주의 섹션)와 세션 그리드를 이 leaf 하나가 소유해 중복을 없앤다.
+//!
+//! 주의 카드는 새로 그리지 않고 [`crate::ui::inbox_approvals::render`]와
+//! [`crate::ui::inbox_waiting::InboxWaitingUi::render`]를 **그대로 호출**한다 — 두 렌더러는
+//! 이미 승인/거절·y/n·이동 액션을 돌려주고 자체 테스트도 갖고 있다. 결과 intent는
+//! [`FleetPageOutput`]으로 묶어 App이 기존 apply 경로(`apply_inbox_approval_decision`,
+//! `apply_inbox_waiting_action`)로 소비한다 — leaf는 host I/O를 하지 않는다.
+//!
+//! 상태 색은 앱 공용 팔레트(`agent_visuals::status_color`), 워크스페이스 색은
+//! `file_tree::workspace_accent`를 재사용한다.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -71,6 +79,32 @@ pub struct BatchSpawnInput<'a> {
     pub max: u32,
 }
 
+/// 주의 섹션(승인·입력 대기) 입력 — App이 매 프레임 조립해 내려준다. 세션 그리드와 달리
+/// 이 데이터는 워크스페이스 런타임이 아니라 승인 DB와 hook에서 온다.
+pub struct AttentionInput<'a> {
+    pub pending: &'a [crate::ui::approvals::PendingApprovalItem],
+    pub workspace_names: &'a std::collections::HashMap<String, String>,
+    pub session_titles: &'a std::collections::HashMap<(String, runtime::SessionId), String>,
+    pub waiting_cards: &'a [crate::ui::inbox_waiting::WaitingCard],
+    pub waiting_ui: &'a mut crate::ui::inbox_waiting::InboxWaitingUi,
+}
+
+/// 헤더 사용량 표기 입력 — 하단 상태바와 **같은 값**을 쓰려고 App이 그대로 넘긴다.
+pub struct UsageReadout<'a> {
+    pub claude: Option<crate::app::ProviderUsage>,
+    pub codex: Option<crate::app::ProviderUsage>,
+    pub codex_meta: Option<&'a crate::ui::agent_sessions::CodexUsageMeta>,
+}
+
+/// 페이지가 App에 돌려주는 intent 묶음. 그리드·승인·대기가 각각 독립적으로 발생할 수 있다.
+#[derive(Default)]
+pub struct FleetPageOutput {
+    pub grid: Option<FleetAction>,
+    pub approval_decision: Option<crate::ui::approvals::ApprovalDecision>,
+    pub waiting_action: Option<crate::ui::inbox_waiting::WaitingAction>,
+    pub goto: Option<crate::ui::notifications::AgentNotificationTarget>,
+}
+
 #[derive(Default)]
 pub struct FleetUi {
     /// Some이면 브로드캐스트 패널이 열려 있다.
@@ -80,7 +114,8 @@ pub struct FleetUi {
 }
 
 impl FleetUi {
-    /// fleet 페이지를 그린다. 세션이 없으면 안내 문구만 보인다.
+    /// 「작업」 페이지를 그린다 — 주의 섹션(승인·입력 대기) + 세션 그리드.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         ui: &mut egui::Ui,
@@ -89,20 +124,24 @@ impl FleetUi {
         catalog: &i18n::Catalog,
         library: &PromptLibrary,
         batch_spawn_input: BatchSpawnInput<'_>,
-    ) -> Option<FleetAction> {
+        attention: AttentionInput<'_>,
+        usage: UsageReadout<'_>,
+        workspaces: &[crate::ui::file_tree::SidebarWorkspaceEntry],
+    ) -> FleetPageOutput {
         let BatchSpawnInput {
             agents,
             max: batch_spawn_max,
         } = batch_spawn_input;
-        let mut action = None;
+        let mut out = FleetPageOutput::default();
+        let action = &mut out.grid;
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::symmetric(16, 14))
             .show(ui, |ui| {
                 // 브로드캐스트 버튼은 브로드캐스트 가능한 세션(PTY)이 있을 때만 — 구조화만
                 // 있는 fleet에서 눌러도 대상이 비는 막다른 버튼이 되지 않게(리뷰 Medium).
                 let has_broadcast_target = sessions.iter().any(|s| s.broadcast_key().is_some());
-                match header(ui, summary, catalog, has_broadcast_target) {
-                    Some(HeaderClick::Launch) => action = Some(FleetAction::LaunchAgent),
+                match header(ui, summary, catalog, has_broadcast_target, usage) {
+                    Some(HeaderClick::Launch) => *action = Some(FleetAction::LaunchAgent),
                     Some(HeaderClick::Broadcast) => {
                         // 대상 기본값 = 작업 중이 아닌 세션(진행 중 에이전트는 방해하지 않음).
                         self.broadcast = Some(BroadcastState {
@@ -129,6 +168,14 @@ impl FleetUi {
                     None => {}
                 }
                 ui.add_space(12.0);
+                // 주의 섹션은 **세션 0 조기반환보다 먼저** 그린다. InboxWaitingUi::render는
+                // 매 프레임 stale 입력버퍼를 정리해야 하고(2026-07-17 P2 회귀), 세션이 하나도
+                // 없는데 승인만 남아 있는 상태가 실제로 존재한다(모든 pane을 닫았지만 MCP
+                // 승인이 미해결).
+                let attention_out = render_attention(ui, catalog, attention);
+                out.approval_decision = attention_out.approval_decision;
+                out.waiting_action = attention_out.waiting_action;
+                out.goto = attention_out.goto;
                 if sessions.is_empty() {
                     ui.add_space(48.0);
                     ui.vertical_centered(|ui| {
@@ -141,7 +188,7 @@ impl FleetUi {
                         );
                         ui.add_space(12.0);
                         if ui.button(catalog.t("fleet.new_agent", &[])).clicked() {
-                            action = Some(FleetAction::LaunchAgent);
+                            *action = Some(FleetAction::LaunchAgent);
                         }
                     });
                     return;
@@ -151,8 +198,8 @@ impl FleetUi {
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             for session in sessions {
-                                if card(ui, session, catalog) {
-                                    action = Some(match &session.target {
+                                if card(ui, session, catalog, card_accent(workspaces, session)) {
+                                    *action = Some(match &session.target {
                                         FleetTarget::Pty { tab, pane, .. } => FleetAction::Focus {
                                             workspace_id: session.workspace_id.clone(),
                                             tab: tab.clone(),
@@ -171,15 +218,15 @@ impl FleetUi {
             });
         // 브로드캐스트 창은 떠 있는 Window라 중앙 패널과 독립적으로 그린다.
         if let Some(sent) = self.broadcast_window(ui.ctx(), sessions, catalog, library) {
-            action = Some(sent);
+            out.grid = Some(sent);
         }
         // 배치 스폰 창도 동일하게 독립 Window.
         if let Some(sent) =
             self.batch_spawn_window(ui.ctx(), agents, batch_spawn_max, catalog, library)
         {
-            action = Some(sent);
+            out.grid = Some(sent);
         }
-        action
+        out
     }
 
     /// 브로드캐스트 창 — 프롬프트 선택 + 파라미터 + 대상 체크 + 전송. 닫혀 있으면 아무것도
@@ -540,12 +587,84 @@ enum HeaderClick {
     BatchSpawn,
 }
 
-/// 상단 헤더: 제목 + 총계 + (우측) 배치 스폰·브로드캐스트·새 에이전트 버튼 + 상태별 칩.
+/// 주의 섹션이 돌려주는 intent — 승인 결정·대기 응답·이동.
+#[derive(Default)]
+struct AttentionOutput {
+    approval_decision: Option<crate::ui::approvals::ApprovalDecision>,
+    waiting_action: Option<crate::ui::inbox_waiting::WaitingAction>,
+    goto: Option<crate::ui::notifications::AgentNotificationTarget>,
+}
+
+/// 「대기 중」 — 나를 막고 있는 것들. 승인·대기 카드는 기존 렌더러를 그대로 호출한다.
+///
+/// 승인도 대기도 없으면 **패널 자체를 그리지 않는다**. 예전 작업함 페이지는 "대기 중인
+/// 항목이 없습니다" 안내를 상시 띄웠는데, 이 화면은 비어 있는 게 정상이라 그 안내가
+/// 세션 그리드와 주의를 다툰다(2026-08-08). 다만 `InboxWaitingUi::render`는 비어 있어도
+/// 반드시 호출한다 — stale 입력버퍼 정리가 그 안에서 일어난다.
+fn render_attention(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    attention: AttentionInput<'_>,
+) -> AttentionOutput {
+    let AttentionInput {
+        pending,
+        workspace_names,
+        session_titles,
+        waiting_cards,
+        waiting_ui,
+    } = attention;
+    let mut out = AttentionOutput::default();
+    if pending.is_empty() && waiting_cards.is_empty() {
+        // 정리 부작용만 얻는다 — 내부에서 빈 입력은 그리지 않고 즉시 반환한다.
+        out.waiting_action = waiting_ui.render(ui, catalog, waiting_cards);
+        return out;
+    }
+    egui::Frame::NONE
+        .fill(ui.visuals().panel_fill)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(2))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(catalog.t("inbox.page.waiting", &[]))
+                    .strong()
+                    .size(15.0),
+            );
+            ui.add_space(4.0);
+            // 팝오버와 달리 상한을 두지 않는다 — 상한이 있으면 그 뒤 요청을 조작할 수 없다.
+            let approvals = crate::ui::inbox_approvals::render(
+                ui,
+                catalog,
+                pending,
+                workspace_names,
+                session_titles,
+                usize::MAX,
+            );
+            out.approval_decision = approvals.decision;
+            out.goto = approvals.goto;
+            out.waiting_action = waiting_ui.render(ui, catalog, waiting_cards);
+        });
+    ui.add_space(12.0);
+    out
+}
+
+/// 카드 좌측 상태색과 별개인 **워크스페이스 고유색** — 어느 프로젝트 일인지 읽지 않고
+/// 구분하게 한다. 사이드바 아바타·pane 상단선과 같은 색 체계다.
+fn card_accent(
+    workspaces: &[crate::ui::file_tree::SidebarWorkspaceEntry],
+    session: &FleetSession,
+) -> egui::Color32 {
+    crate::ui::file_tree::workspace_accent(workspaces, &session.workspace_id)
+}
+
+/// 상단 헤더: 제목 + 총계 + (우측) 사용량 + 배치 스폰·브로드캐스트·새 에이전트 버튼 + 상태별 칩.
 fn header(
     ui: &mut egui::Ui,
     summary: FleetSummary,
     catalog: &i18n::Catalog,
     has_broadcast_target: bool,
+    usage: UsageReadout<'_>,
 ) -> Option<HeaderClick> {
     let mut click = None;
     ui.horizontal(|ui| {
@@ -570,6 +689,10 @@ fn header(
             if ui.button(catalog.t("fleet.batch", &[])).clicked() {
                 click = Some(HeaderClick::BatchSpawn);
             }
+            // 사용량은 일괄 실행·브로드캐스트 **바로 옆**에 둔다 — 여러 에이전트를 한꺼번에
+            // 돌리기 전에 남은 한도가 보여야 한다. 하단 상태바와 같은 렌더러라 숫자도 같다.
+            ui.add_space(10.0);
+            crate::app::top_provider_usage(ui, usage.claude, usage.codex, usage.codex_meta);
         });
     });
     ui.add_space(8.0);
@@ -616,8 +739,14 @@ fn chip(ui: &mut egui::Ui, state: AgentVisualState, count: usize, catalog: &i18n
     );
 }
 
-/// 세션 카드 하나 — 좌측 상태 바 + 제목/상태/워크스페이스/보조 줄. 클릭 시 true.
-fn card(ui: &mut egui::Ui, session: &FleetSession, catalog: &i18n::Catalog) -> bool {
+/// 세션 카드 하나 — 좌측 상태 바 + 우측 워크스페이스 띠 + 제목/상태/워크스페이스/보조 줄.
+/// 클릭 시 true.
+fn card(
+    ui: &mut egui::Ui,
+    session: &FleetSession,
+    catalog: &i18n::Catalog,
+    accent: egui::Color32,
+) -> bool {
     let size = egui::vec2(252.0, 96.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -640,9 +769,16 @@ fn card(ui: &mut egui::Ui, session: &FleetSession, catalog: &i18n::Catalog) -> b
             egui::Stroke::new(1.0, border),
             egui::StrokeKind::Inside,
         );
-        // 좌측 상태 바.
+        // 좌측 상태 바 — 정렬을 지배하는 신호라 시선이 먼저 닿는 자리에 둔다.
         let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(4.0, rect.height()));
         p.rect_filled(bar, 6.0, state_color);
+        // 우측 워크스페이스 띠 — 어느 프로젝트인지 읽지 않고 구분하게 한다. 상태색과
+        // 겹치지 않게 반대편에 두어 둘 중 뭐가 상태인지 헷갈리지 않는다.
+        let accent_bar = egui::Rect::from_min_size(
+            rect.right_top() - egui::vec2(3.0, 0.0),
+            egui::vec2(3.0, rect.height()),
+        );
+        p.rect_filled(accent_bar, 6.0, accent);
     }
 
     // 내용은 child UI(top-down)로 — 라벨 truncate가 카드 폭을 넘지 않게 클립한다.
@@ -700,4 +836,230 @@ fn state_label(state: AgentVisualState, catalog: &i18n::Catalog) -> String {
         AgentVisualState::Off => "fleet.state.off",
     };
     catalog.t(key, &[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::approvals::PendingApprovalItem;
+    use crate::ui::file_tree::{
+        SidebarSessionSummary, SidebarWorkspaceEntry, SidebarWorkspaceState,
+    };
+    use crate::ui::inbox_waiting::{InboxWaitingUi, WaitingCard};
+    use std::collections::HashMap;
+
+    fn catalog() -> i18n::Catalog {
+        i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
+
+    fn approval(id: &str, session_key: Option<&str>) -> PendingApprovalItem {
+        PendingApprovalItem::try_new(
+            id.to_owned(),
+            "srv".to_owned(),
+            "read_file".to_owned(),
+            "{}".to_owned(),
+            session_key.map(str::to_owned),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn waiting_card(workspace_id: &str, session: u64) -> WaitingCard {
+        WaitingCard {
+            workspace_id: workspace_id.to_owned(),
+            session: runtime::SessionId(session),
+            workspace_name: "my-project".to_owned(),
+            session_title: "claude".to_owned(),
+            headline: Some("계속할까요?".to_owned()),
+            preview_source: None,
+        }
+    }
+
+    fn workspace(id: &str) -> SidebarWorkspaceEntry {
+        SidebarWorkspaceEntry {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }
+    }
+
+    fn pty_session(workspace_id: &str, session: u64, state: AgentVisualState) -> FleetSession {
+        FleetSession {
+            workspace_id: workspace_id.to_owned(),
+            workspace_name: workspace_id.to_owned(),
+            target: FleetTarget::Pty {
+                session: runtime::SessionId(session),
+                tab: runtime::MuxTabId("t1".into()),
+                pane: runtime::MuxPaneId("p1".into()),
+            },
+            title: format!("session-{session}"),
+            state,
+            agent_line: None,
+            waiting_message: None,
+            active_workspace: true,
+        }
+    }
+
+    /// 페이지를 한 번 그리고 결과를 돌려주는 최소 하네스. 클릭은 하지 않는다.
+    fn draw(
+        ui_fleet: &mut FleetUi,
+        sessions: &[FleetSession],
+        pending: &[PendingApprovalItem],
+        waiting_cards: &[WaitingCard],
+        waiting_ui: &mut InboxWaitingUi,
+        workspaces: &[SidebarWorkspaceEntry],
+    ) -> FleetPageOutput {
+        let ctx = egui::Context::default();
+        let catalog = catalog();
+        let library = crate::prompt_library::PromptLibrary::default();
+        let summary = FleetSummary::from_states(sessions.iter().map(|s| s.state));
+        let mut out = FleetPageOutput::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            out = ui_fleet.render(
+                ui,
+                sessions,
+                summary,
+                &catalog,
+                &library,
+                BatchSpawnInput {
+                    agents: &[],
+                    max: 4,
+                },
+                AttentionInput {
+                    pending,
+                    workspace_names: &HashMap::new(),
+                    session_titles: &HashMap::new(),
+                    waiting_cards,
+                    waiting_ui,
+                },
+                UsageReadout {
+                    claude: None,
+                    codex: None,
+                    codex_meta: None,
+                },
+                workspaces,
+            );
+        });
+        out
+    }
+
+    /// 2026-08-08 통합의 핵심 위험: 주의 섹션이 `sessions.is_empty()` 조기반환 **뒤에** 오면
+    /// 세션을 전부 닫았는데 승인만 남은 상태에서 승인 카드가 사라지고, InboxWaitingUi의
+    /// stale 입력버퍼 정리(2026-07-17 P2)도 건너뛴다. 순서를 이 테스트가 고정한다.
+    #[test]
+    fn 세션이_없어도_승인_카드는_그린다() {
+        let mut fleet = FleetUi::default();
+        let mut waiting = InboxWaitingUi::new();
+        let out = draw(
+            &mut fleet,
+            &[],
+            &[approval("a1", Some("ws-1:7"))],
+            &[],
+            &mut waiting,
+            &[workspace("ws-1")],
+        );
+        // 클릭이 없으니 액션은 없지만, 패닉 없이 승인과 빈 상태가 함께 그려져야 한다.
+        assert!(out.approval_decision.is_none());
+        assert!(out.grid.is_none());
+    }
+
+    /// 대기 카드가 사라진 다음 프레임에도 정리 경로에 도달해야 한다 — 조기반환으로
+    /// 건너뛰면 여기서 패닉하거나 버퍼가 남는다.
+    #[test]
+    fn 대기카드가_사라져도_다음_프레임에_정리_경로에_도달한다() {
+        let mut fleet = FleetUi::default();
+        let mut waiting = InboxWaitingUi::new();
+        let first = draw(
+            &mut fleet,
+            &[],
+            &[],
+            &[waiting_card("ws-1", 7)],
+            &mut waiting,
+            &[workspace("ws-1")],
+        );
+        assert!(first.waiting_action.is_none());
+        let second = draw(
+            &mut fleet,
+            &[],
+            &[],
+            &[],
+            &mut waiting,
+            &[workspace("ws-1")],
+        );
+        assert!(second.waiting_action.is_none());
+    }
+
+    /// 승인·대기가 모두 없으면 「대기 중」 패널을 그리지 않는다 — 이 화면은 비어 있는 게
+    /// 정상이라 상시 안내가 세션 목록과 주의를 다투면 안 된다(2026-08-08).
+    /// 반대로 승인이 하나라도 있으면 패널이 나와야 한다.
+    #[test]
+    fn 대기중_패널은_막힌_것이_있을_때만_나온다() {
+        use egui_kittest::kittest::Queryable;
+
+        let heading = catalog().t("inbox.page.waiting", &[]);
+        for (pending, expected) in [(Vec::new(), false), (vec![approval("a1", None)], true)] {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(900.0, 600.0))
+                .build_ui(|ui| {
+                    let catalog = catalog();
+                    let library = crate::prompt_library::PromptLibrary::default();
+                    let mut fleet = FleetUi::default();
+                    let mut waiting = InboxWaitingUi::new();
+                    let sessions = [pty_session("ws-1", 7, AgentVisualState::Active)];
+                    let summary = FleetSummary::from_states(sessions.iter().map(|s| s.state));
+                    let _ = fleet.render(
+                        ui,
+                        &sessions,
+                        summary,
+                        &catalog,
+                        &library,
+                        BatchSpawnInput {
+                            agents: &[],
+                            max: 4,
+                        },
+                        AttentionInput {
+                            pending: &pending,
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                            waiting_cards: &[],
+                            waiting_ui: &mut waiting,
+                        },
+                        UsageReadout {
+                            claude: None,
+                            codex: None,
+                            codex_meta: None,
+                        },
+                        &[workspace("ws-1")],
+                    );
+                });
+            harness.run();
+            assert_eq!(
+                harness.query_by_label(&heading).is_some(),
+                expected,
+                "승인 {}건일 때 「{heading}」 패널 표시가 기대와 다르다",
+                pending.len()
+            );
+        }
+    }
+
+    /// 워크스페이스 띠는 프로젝트마다 다르고 같은 프로젝트에서는 안정적이어야 한다 —
+    /// 픽셀을 보지 않고 색 계산만 검증한다.
+    #[test]
+    fn 카드_워크스페이스색은_프로젝트마다_다르고_같은_프로젝트에서_안정적이다() {
+        let workspaces = [workspace("ws-1"), workspace("ws-2")];
+        let a = pty_session("ws-1", 1, AgentVisualState::Active);
+        let b = pty_session("ws-2", 2, AgentVisualState::Active);
+        let a_again = pty_session("ws-1", 3, AgentVisualState::Waiting);
+        assert_ne!(
+            card_accent(&workspaces, &a),
+            card_accent(&workspaces, &b),
+            "다른 워크스페이스가 같은 색이면 구분이 안 된다"
+        );
+        assert_eq!(
+            card_accent(&workspaces, &a),
+            card_accent(&workspaces, &a_again),
+            "같은 워크스페이스는 세션·상태가 달라도 같은 색이어야 한다"
+        );
+    }
 }

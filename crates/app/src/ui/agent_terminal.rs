@@ -12,7 +12,7 @@ pub(crate) enum StatusBarIntent {
     Resource(ResourceManagerIntent),
     Ports(PortsIntent),
     /// 대기 개수 클릭 — 작업함(이미 있는 대기 카드 목록)을 연다.
-    OpenInbox,
+    OpenWork,
     /// 상태바 팝오버에서 승인/거부 — 벨 팝오버 카드와 같은 경로로 처리한다.
     Approval(crate::ui::approvals::ApprovalDecision),
     /// 대기 중인 세션 칩 클릭 — 그 세션으로 바로 이동한다. 작업함을 거치지 않는다.
@@ -53,11 +53,9 @@ impl AgentShortcutFeedback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentTerminalView {
     Home,
-    /// 「작업함」 전체 페이지 — 벨 팝오버와 같은 대기 카드 + 전체 알림 목록
-    /// (2026-07-18 사용자 확정 디자인, 사이드바 하단 nav로 진입).
-    Inbox,
-    /// 멀티에이전트 fleet 그리드 — active/warm 워크스페이스의 에이전트 세션을 한 화면에
-    /// 모아 상태별로 보여준다(기능1, 사이드바 하단 nav로 진입).
+    /// 「작업」 전체 페이지 — 승인·입력 대기(주의 섹션)와 에이전트 세션 그리드를 한 화면에
+    /// 모은다. 2026-08-08까지 작업함(Inbox)과 플릿이 별도 페이지였는데 같은 사실을 두 번
+    /// 세고 있어 합쳤다(사용자 지적).
     Fleet,
     #[default]
     Terminal,
@@ -413,7 +411,7 @@ impl AgentTerminalUi {
                                     )
                                     .clicked()
                                 {
-                                    intent = Some(StatusBarIntent::OpenInbox);
+                                    intent = Some(StatusBarIntent::OpenWork);
                                 }
                             }
                         });
@@ -429,7 +427,7 @@ impl AgentTerminalUi {
                         )
                     );
                     if status_attention_button(ui, &label, WAITING_COLOR, false).clicked() {
-                        intent = Some(StatusBarIntent::OpenInbox);
+                        intent = Some(StatusBarIntent::OpenWork);
                     }
                     // 칩은 "일일이 찾아가지 않기" 위한 직접 이동 대상이다. 한 줄이
                     // 목록을 다 담을 수는 없으므로 몇 개만 펴고 나머지는 작업함이 받는다.
@@ -443,7 +441,7 @@ impl AgentTerminalUi {
                         && status_attention_button(ui, &format!("+{overflow}"), WAITING_COLOR, true)
                             .clicked()
                     {
-                        intent = Some(StatusBarIntent::OpenInbox);
+                        intent = Some(StatusBarIntent::OpenWork);
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1384,7 +1382,7 @@ mod tests {
     /// 동작을 팝오버로 바꾼 이유다.
     ///
     /// 실제로 **클릭해서** 확인한다. 클릭 없이 라벨만 보면, 누군가 동작을 다시
-    /// `OpenInbox`(= 뷰 전환)로 되돌려도 이 테스트가 통과해 버린다.
+    /// `OpenWork`(= 뷰 전환)로 되돌려도 이 테스트가 통과해 버린다.
     #[test]
     fn kittest_승인_개수를_눌러도_뷰가_바뀌지_않는다() {
         use egui_kittest::kittest::Queryable;
@@ -1422,8 +1420,8 @@ mod tests {
                     0,
                     &catalog,
                 );
-                // 뷰 전환 의도(OpenInbox)가 나오면 즉시 잡힌다.
-                let switched = matches!(intent, Some(StatusBarIntent::OpenInbox));
+                // 뷰 전환 의도(OpenWork)가 나오면 즉시 잡힌다.
+                let switched = matches!(intent, Some(StatusBarIntent::OpenWork));
                 recorder.lock().unwrap().push((switched, terminal.view()));
             },
             false,
@@ -1441,7 +1439,7 @@ mod tests {
         let frames = seen.lock().unwrap();
         assert!(
             !frames.iter().any(|(switched, _)| *switched),
-            "승인 개수 클릭이 뷰 전환(OpenInbox) 의도를 냈다 — 터미널을 떠나면 안 된다"
+            "승인 개수 클릭이 뷰 전환(OpenWork) 의도를 냈다 — 터미널을 떠나면 안 된다"
         );
         assert!(
             frames

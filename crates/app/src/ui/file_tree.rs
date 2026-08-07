@@ -269,8 +269,9 @@ pub struct SidebarSnapshot<'a> {
     pub view: super::agent_terminal::AgentTerminalView,
     /// 마지막 Home 열람 뒤 새로 도착한 공지 수 — Home 행에 작업함과 같은 배지로 표시.
     pub home_notice_count: usize,
-    pub inbox_count: usize,
-    /// fleet nav 배지 — 주목 필요한 에이전트 수(대기+오류). 0이면 숨김.
+    /// 「작업」 nav 배지 — **나를 막고 있는 세션 수**(승인 대기 + 입력 대기). 0이면 숨김.
+    /// 2026-08-08까지 작업함·플릿 배지가 둘 다 global_waiting을 세어 같은 사실로 두 개가
+    /// 함께 올랐다(사용자 지적). 이제 의미가 하나다.
     pub fleet_count: usize,
     /// Agents 창 열림 여부 — 하단 nav 「에이전트」 행의 선택 상태 (2026-07-18).
     pub agents_open: bool,
@@ -282,9 +283,6 @@ pub enum SidebarAction {
     ShowHome,
     /// 멀티에이전트 fleet 그리드로 전환(하단 nav). 재클릭 토글은 App이 현재 view로 결정.
     ShowFleet,
-    /// 「작업함」 전체 페이지로 전환 (하단 nav, 2026-07-18). 재클릭 토글(터미널 복귀)은
-    /// App이 현재 view를 보고 결정한다 — 이 모듈은 view를 바꾸지 않는다.
-    ShowInbox,
     OpenAgents,
     OpenSettings,
     OpenHelp,
@@ -2030,7 +2028,7 @@ impl FileTreeUi {
                                     if resp.clicked() {
                                         self.workspace_sessions_expanded
                                             .insert(active.id.clone(), !expanded);
-                                        // Home/Inbox/Agents에서 현재 활성 워크스페이스를 다시 눌러도
+                                        // Home/작업/Agents에서 현재 활성 워크스페이스를 다시 눌러도
                                         // App dispatch가 Terminal view로 복귀할 수 있게 명시적 전환을
                                         // 방출한다. 같은 id의 runtime 전환은 App에서 no-op이다.
                                         action =
@@ -3263,17 +3261,6 @@ impl FileTreeUi {
         .clicked()
         {
             action = Some(SidebarAction::ShowHome);
-        }
-        if nav_row(
-            ui,
-            NavIcon::Inbox,
-            &catalog.t("sidebar.nav.inbox", &[]),
-            sidebar.view == super::agent_terminal::AgentTerminalView::Inbox,
-            nav_badge_text(sidebar.inbox_count).as_deref(),
-        )
-        .clicked()
-        {
-            action = Some(SidebarAction::ShowInbox);
         }
         if nav_row(
             ui,
@@ -5191,7 +5178,6 @@ fn paint_file(
 /// 내비게이션 레일 아이콘 종류.
 enum NavIcon {
     Home,
-    Inbox,
     Fleet,
     Agents,
     Settings,
@@ -5553,18 +5539,6 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
                 egui::pos2(c.x + 4.5, c.y + 6.0),
             );
             p.rect_stroke(body, 0.0, stroke, egui::StrokeKind::Inside);
-        }
-        // 서류함 — 상자 + 투입구 슬롯.
-        NavIcon::Inbox => {
-            let body = egui::Rect::from_center_size(c, egui::vec2(13.0, 11.0));
-            p.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
-            p.line_segment(
-                [
-                    egui::pos2(c.x - 3.5, c.y - 2.0),
-                    egui::pos2(c.x + 3.5, c.y - 2.0),
-                ],
-                stroke,
-            );
         }
         // fleet — 2×2 격자(여러 에이전트를 한 화면에).
         NavIcon::Fleet => {
@@ -7369,7 +7343,6 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -7544,7 +7517,6 @@ mod tests {
             workspaces: &[],
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
             home_notice_count: 0,
-            inbox_count: 0,
             fleet_count: 0,
             agents_open: false,
         };
@@ -7964,7 +7936,6 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -8124,7 +8095,6 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -8185,7 +8155,7 @@ mod tests {
         harness.get_by_label("Session B");
 
         // 활성 행을 다시 누르면 접기와 함께 SwitchWorkspace(A)를 다시 방출한다. App은
-        // 같은 runtime 전환은 생략하되 Home/Inbox에서 Terminal view로 복귀한다.
+        // 같은 runtime 전환은 생략하되 Home/작업에서 Terminal view로 복귀한다.
         harness.state_mut().switch_target = None;
         harness.get_by_label("Workspace A").click();
         harness.run();
@@ -8243,7 +8213,6 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -8312,7 +8281,6 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -8431,7 +8399,6 @@ mod tests {
                         workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -8698,7 +8665,6 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -9060,7 +9026,6 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -9111,7 +9076,7 @@ mod tests {
     #[test]
     fn 한국어_레일문구는_작업과_ai를_사용한다() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
-        assert_eq!(catalog.t("sidebar.nav.inbox", &[]), "작업");
+        assert_eq!(catalog.t("sidebar.nav.fleet", &[]), "작업");
         assert_eq!(catalog.t("sidebar.nav.agents", &[]), "AI");
     }
 
@@ -9135,7 +9100,6 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -9177,7 +9141,6 @@ mod tests {
             workspaces: &[],
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
             home_notice_count: 0,
-            inbox_count: 0,
             fleet_count: 0,
             agents_open: false,
         };
@@ -9248,10 +9211,10 @@ mod tests {
         assert_eq!(tree.designall_titlebar_widths(), (20.0, 22.0));
     }
 
-    /// 하단 nav 4항목 렌더 + 클릭 → 액션 방출. 재클릭 토글은 App 로직이라
-    /// 여기서는 방출까지만 검증한다.
+    /// 하단 nav 3항목 렌더 + 클릭 → 액션 방출. 재클릭 토글은 App 로직이라
+    /// 여기서는 방출까지만 검증한다. 2026-08-08 작업함이 「작업」에 흡수돼 4→3항목이다.
     #[test]
-    fn kittest_하단_nav_클릭이_홈_작업함_플릿_에이전트_액션을_낸다() {
+    fn kittest_하단_nav_클릭이_홈_작업_에이전트_액션을_낸다() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let mut fonts_ready = false;
@@ -9269,7 +9232,6 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 4,
-                        inbox_count: 2,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -9288,8 +9250,6 @@ mod tests {
         harness.run();
         harness.get_by_label("Work").click();
         harness.run();
-        harness.get_by_label("Fleet").click();
-        harness.run();
         harness.get_by_label("AI").click();
         harness.run();
         let kinds: Vec<&'static str> = harness
@@ -9298,16 +9258,15 @@ mod tests {
             .iter()
             .map(|action| match action {
                 SidebarAction::ShowHome => "home",
-                SidebarAction::ShowInbox => "inbox",
-                SidebarAction::ShowFleet => "fleet",
+                SidebarAction::ShowFleet => "work",
                 SidebarAction::OpenAgents => "agents",
                 _ => "other",
             })
             .collect();
         assert_eq!(
             kinds,
-            vec!["home", "inbox", "fleet", "agents"],
-            "nav 4항목 클릭이 각각의 액션을 순서대로 내야 한다"
+            vec!["home", "work", "agents"],
+            "nav 3항목 클릭이 각각의 액션을 순서대로 내야 한다"
         );
     }
 
@@ -9431,7 +9390,6 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };
@@ -9820,7 +9778,6 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
-                        inbox_count: 0,
                         fleet_count: 0,
                         agents_open: false,
                     };

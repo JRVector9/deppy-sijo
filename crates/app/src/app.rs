@@ -20453,7 +20453,6 @@ impl eframe::App for App {
                     &queued_labels,
                     approval_cards,
                     mcp_count,
-                    &self.status_feed,
                     self.port_snapshot.as_ref(),
                     &self.unattached_counts,
                     Some(active_workspace_id.as_str()),
@@ -20465,10 +20464,11 @@ impl eframe::App for App {
         // 새 워크스페이스로 만들 폴더 — 사이드바 빈 상태 CTA와 설정 화면 양쪽이 채우고,
         // 프레임 끝의 공통 생성/전환 흐름이 소비한다(선언을 사이드바 dispatch보다 앞에).
         if self.file_tree.is_some() {
-            let sidebar_action = self
-                .file_tree
-                .as_mut()
-                .and_then(|tree| tree.panel(ui, &sidebar_sessions, &sidebar_snapshot, &text));
+            let sidebar_action = self.file_tree.as_mut().and_then(|tree| {
+                // 레일 하단 서비스 상태 스택 데이터 — leaf는 폴링하지 않는다(§6).
+                tree.set_service_statuses(&self.status_feed);
+                tree.panel(ui, &sidebar_sessions, &sidebar_snapshot, &text)
+            });
             // 워처의 .env* 변경 신호 → 활성 워크스페이스에서 .env가 바뀌거나 사라져도
             // 즉시 재동기화 + 기본 env 재전송 — 시작/전환 시에만 동기화하면 삭제된
             // .env의 secret이 새 셸에 계속 주입된다(codex High).

@@ -76,7 +76,8 @@ pub struct IncidentNotice {
     pub title: String,
     /// Statuspage 원문 상태 (resolved/investigating/identified/monitoring/postmortem).
     pub status: String,
-    /// created_at의 날짜 부분("2026-07-17") — 카드 하단 표기용.
+    /// **로컬 시간대**로 환산한 날짜("2026-07-17") — 카드 하단 표기용.
+    /// 원본은 전부 UTC라 변환하지 않으면 상태 페이지와 하루가 어긋난다.
     pub date: String,
     pub url: String,
 }
@@ -1060,10 +1061,13 @@ fn parse_incidents(json: &str, base: &str) -> anyhow::Result<Vec<IncidentNotice>
             {
                 return None;
             }
+            // 상태 페이지와 RSS(pubDate)는 **마지막 갱신**을 그 사건의 날짜로 쓴다.
+            // created_at만 보면 오래 끈 사건이 시작일에 묶여 실제 활동과 어긋난다.
             let date = incident
-                .get("created_at")
+                .get("updated_at")
+                .or_else(|| incident.get("created_at"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.chars().take(10).collect::<String>())
+                .map(local_date)
                 .unwrap_or_default();
             let url = incident
                 .get("shortlink")
@@ -1104,7 +1108,7 @@ fn parse_hugging_face_models(json: &str) -> anyhow::Result<Vec<IncidentNotice>> 
             let date = model
                 .get("createdAt")
                 .and_then(|value| value.as_str())
-                .map(|value| value.chars().take(10).collect::<String>())
+                .map(local_date)
                 .unwrap_or_default();
             let url = format!("https://huggingface.co/{title}");
             if !valid_bounded_text(&date, NOTICE_DATE_MAX_BYTES, true)
@@ -1164,7 +1168,7 @@ fn parse_grok_status_rss(xml: &str) -> anyhow::Result<Vec<IncidentNotice>> {
         if !seen_titles.insert(dedupe_key) {
             continue;
         }
-        let date = rss_date(&item.published_at);
+        let date = local_date(&item.published_at);
         if !valid_bounded_text(&date, NOTICE_DATE_MAX_BYTES, true) {
             continue;
         }
@@ -1181,40 +1185,118 @@ fn parse_grok_status_rss(xml: &str) -> anyhow::Result<Vec<IncidentNotice>> {
     Ok(notices)
 }
 
-fn rss_date(value: &str) -> String {
-    let value = value.trim();
-    if value.len() >= 10
-        && value.as_bytes().get(4) == Some(&b'-')
-        && value.as_bytes().get(7) == Some(&b'-')
-    {
-        return value[..10].to_owned();
+/// 공지 타임스탬프 → **로컬 시간대** 날짜("YYYY-MM-DD").
+///
+/// 원본은 모두 UTC다(Statuspage/incident.io는 `...Z`, RSS는 `... GMT`). 예전엔 ISO
+/// 문자열의 앞 10글자를 그대로 썼는데, 그러면 UTC 15시 이후 사건이 KST 기준 다음
+/// 날인데도 전날로 찍힌다 — 상태 페이지엔 8월 6일로 보이는 항목이 앱에선 8월 5일이었다
+/// (2026-08-08 사용자). 파싱에 실패하면 빈 문자열이라 호출측이 그 항목을 버린다.
+fn local_date(value: &str) -> String {
+    let Some(utc_secs) = parse_timestamp_utc_secs(value) else {
+        return String::new();
+    };
+    civil_date(utc_secs + local_utc_offset_secs(utc_secs))
+}
+
+/// 로컬 시간대 오프셋(초). std에는 시간대 정보가 없고 이 워크스페이스는 chrono를
+/// 쓰지 않는 관례라(diff_panel.rs 참조), unix에서는 이미 의존 중인 libc의
+/// `localtime_r`로 OS가 계산한 값을 읽는다. 그 외 플랫폼은 UTC 그대로 둔다.
+#[cfg(unix)]
+fn local_utc_offset_secs(utc_secs: i64) -> i64 {
+    let time = utc_secs as libc::time_t;
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `parts`는 스택에 있고 localtime_r이 채운다(전역 상태를 안 쓰는 변형).
+    // 실패하면 널을 돌려주므로 그때는 UTC(0)로 떨어진다.
+    if unsafe { libc::localtime_r(&time, &mut parts) }.is_null() {
+        return 0;
     }
-    let parts: Vec<_> = value
-        .trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == ',')
-        .split_whitespace()
-        .collect();
-    let [day, month, year, ..] = parts.as_slice() else {
-        return String::new();
+    parts.tm_gmtoff as i64
+}
+
+#[cfg(not(unix))]
+fn local_utc_offset_secs(_utc_secs: i64) -> i64 {
+    0
+}
+
+/// ISO 8601(`2026-08-05T23:22:45.278Z`)과 RFC 822(`Wed, 05 Aug 2026 23:22:45 GMT`)를
+/// unix 초로. 두 형식 모두 UTC로만 오므로 오프셋 표기는 다루지 않는다.
+fn parse_timestamp_utc_secs(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 19 && bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-') {
+        let year: i64 = value.get(0..4)?.parse().ok()?;
+        let month: i64 = value.get(5..7)?.parse().ok()?;
+        let day: i64 = value.get(8..10)?.parse().ok()?;
+        let hour: i64 = value.get(11..13)?.parse().ok()?;
+        let minute: i64 = value.get(14..16)?.parse().ok()?;
+        let second: i64 = value.get(17..19)?.parse().ok()?;
+        return civil_to_unix(year, month, day, hour, minute, second);
+    }
+
+    // RFC 822: 요일과 쉼표를 떼고 "05 Aug 2026 23:22:45 GMT".
+    let rest = value.trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == ',');
+    let parts: Vec<_> = rest.split_whitespace().collect();
+    let [day, month, year, clock, ..] = parts.as_slice() else {
+        return None;
     };
-    let month = match *month {
-        "Jan" => "01",
-        "Feb" => "02",
-        "Mar" => "03",
-        "Apr" => "04",
-        "May" => "05",
-        "Jun" => "06",
-        "Jul" => "07",
-        "Aug" => "08",
-        "Sep" => "09",
-        "Oct" => "10",
-        "Nov" => "11",
-        "Dec" => "12",
-        _ => return String::new(),
-    };
-    let Ok(day) = day.parse::<u8>() else {
-        return String::new();
-    };
-    format!("{year}-{month}-{day:02}")
+    let month = MONTH_ABBREVIATIONS.iter().position(|name| name == month)? as i64 + 1;
+    let mut clock = clock.split(':');
+    let hour: i64 = clock.next()?.parse().ok()?;
+    let minute: i64 = clock.next()?.parse().ok()?;
+    let second: i64 = clock.next().unwrap_or("0").parse().ok()?;
+    civil_to_unix(
+        year.parse().ok()?,
+        month,
+        day.parse().ok()?,
+        hour,
+        minute,
+        second,
+    )
+}
+
+const MONTH_ABBREVIATIONS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// (년,월,일,시,분,초) → unix 초. Howard Hinnant의 days_from_civil.
+fn civil_to_unix(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// unix 초 → "YYYY-MM-DD". days_from_civil의 역함수(civil_from_days).
+fn civil_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 #[cfg(test)]
@@ -1675,7 +1757,7 @@ mod tests {
     fn parse_incidents는_최신_5건과_링크_폴백을_처리한다() {
         // Claude형(shortlink 있음)과 OpenAI형(shortlink 없음) 5건 + 초과 1건.
         let json = r#"{"incidents":[
-            {"name":"A","status":"resolved","created_at":"2026-07-17T18:32:32.629Z","shortlink":"https://stspg.io/a"},
+            {"name":"A","status":"resolved","created_at":"2026-07-17T18:32:32.629Z","updated_at":"2026-07-17T18:32:32.629Z","shortlink":"https://stspg.io/a"},
             {"name":"B","status":"investigating","created_at":"2026-07-17T06:47:54.909Z"},
             {"name":"C","status":"resolved","created_at":"2026-07-16T22:54:01Z","id":"abc123"},
             {"name":"D","status":"resolved","created_at":"2026-07-15T00:00:00Z"},
@@ -1685,7 +1767,10 @@ mod tests {
         let notices = parse_incidents(json, "https://status.openai.com").unwrap();
         assert_eq!(notices.len(), 5, "최신 5건만");
         assert_eq!(notices[0].url, "https://stspg.io/a");
-        assert_eq!(notices[0].date, "2026-07-17");
+        // UTC 18:32은 어느 시간대에서도 같은 날이거나 다음 날이다 — 머신 시간대에
+        // 의존하지 않도록 날짜 형식만 확인하고, 변환 자체는 아래 순수 함수 테스트가 본다.
+        assert_eq!(notices[0].date.len(), 10, "YYYY-MM-DD 형식");
+        assert!(notices[0].date.starts_with("2026-07-1"));
         assert_eq!(
             notices[1].url, "https://status.openai.com",
             "shortlink·id 둘 다 없으면 베이스"
@@ -1779,5 +1864,69 @@ mod tests {
         assert!(production.contains("NOTICE_READ_IDS_MAX_BYTES"));
         assert!(!production.contains(&["{", "error:#}"].concat()));
         assert!(!production.contains("error_kind ="));
+    }
+
+    /// 2026-08-08: 공지 날짜를 ISO 문자열 앞 10글자로 잘라 쓰다가, UTC 15시 이후
+    /// 사건이 KST 기준 다음 날인데도 전날로 찍혔다. 상태 페이지엔 8월 6일로 보이는
+    /// 항목이 앱에선 8월 5일이었다. 파싱·환산은 순수 함수라 머신 시간대와 무관하게 본다.
+    #[test]
+    fn 타임스탬프는_iso와_rfc822를_모두_unix초로_읽는다() {
+        // 사용자가 지목한 그 incident의 실제 값.
+        let iso = parse_timestamp_utc_secs("2026-08-05T23:22:45Z").expect("ISO");
+        let rfc = parse_timestamp_utc_secs("Wed, 05 Aug 2026 23:22:45 GMT").expect("RFC 822");
+        assert_eq!(
+            iso, rfc,
+            "같은 시각은 형식이 달라도 같은 값이어야 정렬이 맞는다"
+        );
+        assert_eq!(civil_date(iso), "2026-08-05", "UTC로는 8월 5일");
+
+        // KST(+9)로 환산하면 8월 6일 — 사용자가 상태 페이지에서 본 그 날짜.
+        assert_eq!(civil_date(iso + 9 * 3_600), "2026-08-06");
+        // 반대로 하와이(-10)에서는 여전히 8월 5일이라야 한다.
+        assert_eq!(civil_date(iso - 10 * 3_600), "2026-08-05");
+
+        assert_eq!(
+            parse_timestamp_utc_secs("2026-08-05T13:51:30.287Z"),
+            parse_timestamp_utc_secs("2026-08-05T13:51:30Z"),
+            "소수점 이하 초는 날짜에 영향을 주지 않는다"
+        );
+        for broken in ["", "not a date", "2026-13-40T00:00:00Z", "Xyz, 99 Zzz 2026"] {
+            assert_eq!(parse_timestamp_utc_secs(broken), None, "{broken}");
+            assert_eq!(local_date(broken), "", "{broken}: 실패는 빈 문자열");
+        }
+    }
+
+    /// civil_to_unix ↔ civil_date 왕복. 윤년·세기·연말 경계에서 깨지기 쉬운 부분이다.
+    #[test]
+    fn 날짜_변환은_윤년과_경계에서_왕복한다() {
+        for (year, month, day) in [
+            (1970, 1, 1),
+            (2000, 2, 29),
+            (2024, 2, 29),
+            (2026, 12, 31),
+            (2100, 3, 1),
+        ] {
+            let secs = civil_to_unix(year, month, day, 0, 0, 0).expect("유효한 날짜");
+            assert_eq!(civil_date(secs), format!("{year:04}-{month:02}-{day:02}"));
+        }
+        assert_eq!(civil_to_unix(1970, 1, 1, 0, 0, 0), Some(0), "epoch");
+        assert_eq!(civil_to_unix(2026, 0, 1, 0, 0, 0), None, "0월은 없다");
+        assert_eq!(civil_to_unix(2026, 1, 1, 24, 0, 0), None, "24시는 없다");
+    }
+
+    /// 공급자마다 원본 형식이 다른데(ISO vs RFC 822) 홈은 날짜 문자열로 정렬한다.
+    /// 같은 포맷터를 지나야 문자열 비교가 실제 시간순과 일치한다.
+    #[test]
+    fn 서로_다른_형식도_같은_날짜_문자열로_정렬_가능해진다() {
+        let iso = local_date("2026-08-05T23:22:45Z");
+        let rfc = local_date("Wed, 05 Aug 2026 23:22:45 GMT");
+        assert_eq!(iso, rfc);
+        assert_eq!(iso.len(), 10);
+
+        let older = local_date("2026-07-30T16:01:11Z");
+        assert!(
+            older < iso,
+            "문자열 비교가 시간순과 일치해야 한다: {older} < {iso}"
+        );
     }
 }

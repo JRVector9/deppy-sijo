@@ -114,6 +114,10 @@ struct NotificationItem {
     message_id: String,
     read: bool,
     /// 생성 시각(unix 초) — 작업함 전체 페이지의 「N분 전」 표시용 (2026-07-18).
+    /// 알림이 만들어진 시각. 2026-08-08 작업함 페이지를 「작업」에 합치면서 이 값을
+    /// 읽던 history_section이 사라졌다 — 벨/설정 목록은 시각을 안 쓴다. 값 자체는 알림의
+    /// 실제 속성이고 relative_time_label과 함께 세션 목록의 「끝남」 표기에 쓸 예정이라 둔다.
+    #[allow(dead_code)]
     created_at_secs: i64,
 }
 
@@ -473,61 +477,6 @@ impl NotificationsUi {
         clicked
     }
 
-    /// 작업함 전체 페이지의 「최근 알림」 목록 (2026-07-18) — 시간·워크스페이스·본문을
-    /// 전부 보여준다(팝오버 recent_section은 최신 N개 요약만). 클릭 시 대상 반환 —
-    /// 점프 계약은 recent_section과 동일(호출측이 같은 네비게이션 경로로 처리).
-    /// 읽음 처리는 호출측(페이지 가시 시 mark_all_read — 팝오버와 같은 규약).
-    ///
-    /// `workspace_names`는 workspace_id → 표시 이름 맵(inbox_approvals::render와 같은
-    /// 계약) — 이 모듈은 App을 모르므로 호출측이 미리 만들어 넘긴다.
-    pub fn history_section(
-        &mut self,
-        ui: &mut egui::Ui,
-        catalog: &i18n::Catalog,
-        workspace_names: &std::collections::HashMap<String, String>,
-    ) -> Option<AgentNotificationTarget> {
-        if self.items.is_empty() {
-            ui.label(
-                egui::RichText::new(catalog.t("notification.empty", &[]))
-                    .size(11.0)
-                    .weak(),
-            );
-            return None;
-        }
-        let now = deppy_core::time::unix_secs_i64();
-        let mut clicked = None;
-        // 최신 항목이 위로 — 전체 기록(총량은 push의 100개 cap으로 유계).
-        for item in self.items.iter().rev() {
-            let icon = status_icon(item.status);
-            let label = catalog.t(&item.message_id, &[("title", &item.title)]);
-            let workspace = workspace_names
-                .get(item.target.workspace_id())
-                .cloned()
-                .unwrap_or_else(|| item.target.workspace_id().to_owned());
-            ui.horizontal(|ui| {
-                ui.colored_label(notification_status_color(item.status), "●");
-                // 시간·워크스페이스는 판단 맥락(어디서 언제) — 본문 왼쪽에 고정 톤으로.
-                ui.label(
-                    egui::RichText::new(relative_time_label(
-                        catalog,
-                        now.saturating_sub(item.created_at_secs),
-                    ))
-                    .size(11.0)
-                    .weak(),
-                );
-                ui.label(egui::RichText::new(workspace).size(11.0).weak());
-                if ui
-                    .button(format!("{} {icon} {label}", item.source.badge()))
-                    .on_hover_text(catalog.t("notification.goto_session", &[]))
-                    .clicked()
-                {
-                    clicked = Some(item.target.clone());
-                }
-            });
-        }
-        clicked
-    }
-
     /// 창 프레임 없이 본문만 렌더 (통합 설정 창 우측 패널용). 읽음 처리는 show()가 한다.
     pub fn contents(
         &mut self,
@@ -602,6 +551,7 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
 /// 경과 초 → 「방금/N분 전/N시간 전/N일 전」 로케일 문구 (작업함 페이지 시간 표시).
 /// diff_panel의 relative_time_label과 같은 구간 규칙이되, 새 사용자 문자열 규칙에 따라
 /// i18n 카탈로그를 쓴다.
+#[allow(dead_code)]
 fn relative_time_label(catalog: &i18n::Catalog, elapsed_secs: i64) -> String {
     let secs = elapsed_secs.max(0);
     if secs < 60 {

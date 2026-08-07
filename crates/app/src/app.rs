@@ -6496,6 +6496,46 @@ struct WorkspaceRuntime {
 /// 사라진다. 바깥 Option은 "출처 자체가 없다", 안쪽 Option은 "그 창이 없다"를 뜻한다.
 pub(crate) type ProviderUsage = (Option<u8>, Option<u8>);
 
+const FIVE_HOUR_WINDOW_MINUTES: f64 = 300.0;
+const WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
+/// 창 길이의 이만큼이 지나면 그 수치를 더는 현재값으로 내세우지 않는다.
+/// 5시간 창은 30분, 주간 창은 약 16.8시간이다.
+const USAGE_STALE_FRACTION_OF_WINDOW: f64 = 0.1;
+
+/// 나이 든 사용량 수치를 창별로 걸러낸다.
+///
+/// 수치는 **굴러가는 창**의 한 시점 스냅샷이다. 읽은 뒤 시간이 지나면 창의 앞쪽이
+/// 빠져나가므로 옛 수치는 실제보다 높게 나온다 — 창 길이의 10%가 지났다면 오차가
+/// 최대 10%p다. 그 선을 넘은 슬롯은 비운다.
+///
+/// 두 창을 따로 판단하는 이유: mcp-proxy는 Claude Code가 statusline을 다시 그릴
+/// 때만 파일을 쓴다. Claude를 두 시간 안 쓰면 5시간 수치는 이미 못 믿지만 주간
+/// 수치는 그대로 쓸 만하다. 한 덩어리로 버리면 멀쩡한 주간 값까지 잃는다.
+fn fresh_usage_windows(usage: ProviderUsage, age_minutes: f64) -> ProviderUsage {
+    // age가 음수(시계 되감김)면 낡음으로 보지 않는다. NaN이면 어느 비교도 참이
+    // 아니라 양쪽 다 비는데, 그때는 나이를 모르는 것이므로 버리는 쪽이 맞다.
+    let fresh =
+        |window_minutes: f64| age_minutes <= window_minutes * USAGE_STALE_FRACTION_OF_WINDOW;
+    (
+        usage.0.filter(|_| fresh(FIVE_HOUR_WINDOW_MINUTES)),
+        usage.1.filter(|_| fresh(WEEKLY_WINDOW_MINUTES)),
+    )
+}
+
+/// 프로브가 잰 시각으로부터 흐른 시간을 분으로 — `fresh_usage_windows`의 입력.
+pub(crate) fn usage_age_minutes(elapsed: std::time::Duration) -> f64 {
+    elapsed.as_secs_f64() / 60.0
+}
+
+/// 프로브 값에도 파일과 같은 신선도 규칙을 적용한다.
+pub(crate) fn fresh_usage_after(
+    usage: ProviderUsage,
+    elapsed: std::time::Duration,
+) -> Option<ProviderUsage> {
+    let windows = fresh_usage_windows(usage, usage_age_minutes(elapsed));
+    (windows.0.is_some() || windows.1.is_some()).then_some(windows)
+}
+
 fn claude_usage_snapshot() -> Option<ProviderUsage> {
     type Cache = Option<(std::time::Instant, Option<ProviderUsage>)>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
@@ -6522,8 +6562,17 @@ fn claude_usage_snapshot() -> Option<ProviderUsage> {
                 .filter(|value| value.is_finite())
                 .map(|value| value.clamp(0.0, 100.0).round() as u8)
         };
-        let five_hour = percent("five_hour");
-        let seven_day = percent("seven_day");
+        // mcp-proxy가 파일을 쓴 시각(unix seconds). 이 필드가 없는 옛 파일은 나이를
+        // 알 길이 없으니 0분으로 보고 그대로 살린다.
+        let age_minutes = snapshot
+            .get("updated_at")
+            .and_then(serde_json::Value::as_i64)
+            .map_or(0.0, |updated_at| {
+                let now = i64::try_from(deppy_core::time::unix_ms() / 1000).unwrap_or(i64::MAX);
+                (now - updated_at) as f64 / 60.0
+            });
+        let (five_hour, seven_day) =
+            fresh_usage_windows((percent("five_hour"), percent("seven_day")), age_minutes);
         // mcp-proxy는 둘 중 하나만 읽혀도 파일을 쓴다(없는 쪽은 null). 한쪽이라도
         // 있으면 스냅샷으로 인정해야 나머지 한쪽이 화면에서 사라지지 않는다.
         (five_hour.is_some() || seven_day.is_some()).then_some((five_hour, seven_day))
@@ -23725,6 +23774,55 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    /// 신선도 계약 표. 창마다 기한이 다르고, 기한이 지난 슬롯만 비워야 한다.
+    #[test]
+    fn 사용량_수치는_창_길이의_10퍼센트가_지나면_슬롯별로_버려진다() {
+        let both = (Some(11), Some(77));
+        let cases: &[(&str, f64, ProviderUsage)] = &[
+            ("방금 기록", 0.0, (Some(11), Some(77))),
+            ("5시간 기한 직전(29분)", 29.0, (Some(11), Some(77))),
+            ("5시간 기한 정각(30분)", 30.0, (Some(11), Some(77))),
+            ("5시간만 만료(31분) — 주간은 살린다", 31.0, (None, Some(77))),
+            ("2시간 — 주간은 여전히 유효", 120.0, (None, Some(77))),
+            ("주간 기한 정각(16.8시간)", 1008.0, (None, Some(77))),
+            ("주간까지 만료(17시간)", 1020.0, (None, None)),
+            ("시계 되감김은 낡음이 아니다", -60.0, (Some(11), Some(77))),
+        ];
+        for (name, age_minutes, expected) in cases {
+            assert_eq!(fresh_usage_windows(both, *age_minutes), *expected, "{name}");
+        }
+    }
+
+    /// 없는 값은 신선해도 생기지 않는다 — 필터는 있는 슬롯만 건드린다.
+    #[test]
+    fn 신선도_필터는_비어있는_슬롯을_채우지_않는다() {
+        assert_eq!(fresh_usage_windows((None, Some(77)), 0.0), (None, Some(77)));
+        assert_eq!(fresh_usage_windows((Some(11), None), 0.0), (Some(11), None));
+        assert_eq!(fresh_usage_windows((None, None), 0.0), (None, None));
+    }
+
+    /// 프로브 캐시도 같은 규칙을 쓰고, 두 창이 다 만료되면 "값 없음"으로 접힌다.
+    #[test]
+    fn 프로브_값은_두_창이_모두_만료되면_사라진다() {
+        use std::time::Duration;
+
+        let usage = (Some(11), Some(77));
+        assert_eq!(
+            fresh_usage_after(usage, Duration::from_secs(60)),
+            Some((Some(11), Some(77)))
+        );
+        assert_eq!(
+            fresh_usage_after(usage, Duration::from_secs(60 * 60)),
+            Some((None, Some(77))),
+            "5시간만 만료되면 주간을 들고 남아야 한다"
+        );
+        assert_eq!(
+            fresh_usage_after(usage, Duration::from_secs(60 * 60 * 24)),
+            None,
+            "둘 다 만료되면 None이라야 PTY 프로브 폴백이 살아난다"
+        );
+    }
 
     #[test]
     fn pty_단축키_표면_누락은_파이프라인_단계별로_구분된다() {

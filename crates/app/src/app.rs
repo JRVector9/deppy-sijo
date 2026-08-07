@@ -4975,7 +4975,7 @@ fn render_env_api_project_header(
         });
     }
 
-    let y = painter.round_to_pixel_center(rect.bottom());
+    let y = crate::ui::snap_line_to_pixel(rect.bottom(), 1.0, ui.ctx().pixels_per_point());
     painter.hline(
         rect.x_range(),
         y,
@@ -18326,9 +18326,11 @@ impl App {
                     }
                     composer.render(ui, text, &composer_ctx)
                 });
-            let separator_y = ui
-                .painter()
-                .round_to_pixel_center(dock_response.response.rect.top());
+            let separator_y = ui::snap_line_to_pixel(
+                dock_response.response.rect.top(),
+                1.0,
+                ui.ctx().pixels_per_point(),
+            );
             ui.painter().hline(
                 dock_response.response.rect.x_range(),
                 separator_y,
@@ -19859,11 +19861,14 @@ impl eframe::App for App {
                 // 규칙은 designall::panel_edge_separator_x가 소유한다.
                 let ppp = ui.ctx().pixels_per_point();
                 let painter = ui.painter();
-                let bottom = painter.round_to_pixel_center(bar_rect.bottom());
+                let bottom = ui::snap_line_to_pixel(bar_rect.bottom(), 1.0, ppp);
                 painter.hline(bar_rect.x_range(), bottom, separator);
                 for right in [regions.traffic.right(), regions.project.right()] {
-                    let x = painter
-                        .round_to_pixel_center(ui::designall::panel_edge_separator_x(right, ppp));
+                    let x = ui::snap_line_to_pixel(
+                        ui::designall::panel_edge_separator_x(right, ppp),
+                        1.0,
+                        ppp,
+                    );
                     painter.vline(x, bar_rect.y_range(), separator);
                 }
             });
@@ -23316,7 +23321,7 @@ fn show_app_attached_placeholder(
     });
     child.painter().hline(
         rect.x_range(),
-        child.painter().round_to_pixel_center(rect.top() + 0.5),
+        ui::snap_edge_line_to_pixel(rect.top(), 1.0, child.ctx().pixels_per_point()),
         egui::Stroke::new(1.0, pane.identity_color),
     );
     ui::workspace::AttachedPaneOutput {

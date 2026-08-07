@@ -95,7 +95,11 @@ pub fn panel_edge_separator_x(right: f32, pixels_per_point: f32) -> f32 {
 
 pub fn vertical_separator(ui: &mut egui::Ui, height: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, height), egui::Sense::hover());
-    let x = ui.painter().round_to_pixel_center(rect.center().x);
+    let x = crate::ui::snap_line_to_pixel(
+        rect.center().x,
+        SEPARATOR_WIDTH,
+        ui.ctx().pixels_per_point(),
+    );
     ui.painter()
         .vline(x, rect.y_range(), separator_stroke(ui.visuals()));
 }

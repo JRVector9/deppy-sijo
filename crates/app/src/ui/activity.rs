@@ -502,7 +502,7 @@ fn activity_hairline(ui: &mut egui::Ui) {
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().hline(
         rect.x_range(),
-        ui.painter().round_to_pixel_center(rect.center().y),
+        crate::ui::snap_line_to_pixel(rect.center().y, 1.0, ui.ctx().pixels_per_point()),
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
 }

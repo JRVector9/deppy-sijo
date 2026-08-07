@@ -580,9 +580,7 @@ fn attached_identity_style(identity_color: egui::Color32) -> AttachedIdentitySty
 /// 경계는 반올림이 아니라 **내림**이다. header_top이 물리픽셀 중간에 걸릴 때 반올림이
 /// 위로 가면 그만큼 헤더 안쪽에 빈 띠가 남는다 — 살짝 위로 겹치는 쪽이 낫다.
 fn pane_header_top_line_y(header_top: f32, stroke_width: f32, pixels_per_point: f32) -> f32 {
-    let ppp = pixels_per_point.max(1.0);
-    let edge = (header_top * ppp).floor() / ppp;
-    edge + stroke_width * 0.5
+    crate::ui::snap_edge_line_to_pixel(header_top, stroke_width, pixels_per_point)
 }
 
 fn pane_header_active_boundary(header: egui::Rect, close: egui::Rect) -> f32 {
@@ -3217,14 +3215,17 @@ impl WorkspaceUi {
             .rect_filled(header, 0.0, identity_style.header_fill);
         ui.painter().hline(
             header.x_range(),
-            ui.painter().round_to_pixel_center(header.bottom()),
+            crate::ui::snap_line_to_pixel(header.bottom(), 1.0, ui.ctx().pixels_per_point()),
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
         if identity_style.top_line.color != egui::Color32::TRANSPARENT {
             ui.painter().hline(
                 header.x_range(),
-                ui.painter()
-                    .round_to_pixel_center(header.top() + identity_style.top_line.width * 0.5),
+                pane_header_top_line_y(
+                    header.top(),
+                    identity_style.top_line.width,
+                    ui.ctx().pixels_per_point(),
+                ),
                 identity_style.top_line,
             );
         }
@@ -3409,7 +3410,7 @@ impl WorkspaceUi {
         }
         ui.painter().hline(
             header.x_range(),
-            ui.painter().round_to_pixel_center(header.bottom()),
+            crate::ui::snap_line_to_pixel(header.bottom(), 1.0, ui.ctx().pixels_per_point()),
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
 

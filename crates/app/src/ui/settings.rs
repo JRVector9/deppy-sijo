@@ -765,7 +765,7 @@ pub(crate) fn settings_nav_active(ui: &egui::Ui) -> egui::Color32 {
 fn settings_hairline(ui: &mut egui::Ui) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    let y = ui.painter().round_to_pixel_center(rect.center().y);
+    let y = crate::ui::snap_line_to_pixel(rect.center().y, 1.0, ui.ctx().pixels_per_point());
     ui.painter().hline(
         rect.x_range(),
         y,
@@ -859,7 +859,7 @@ fn row(
     control_ui.set_clip_rect(control_rect.intersect(ui.clip_rect()));
     add_control(&mut control_ui);
 
-    let y = ui.painter().round_to_pixel_center(rect.bottom());
+    let y = crate::ui::snap_line_to_pixel(rect.bottom(), 1.0, ui.ctx().pixels_per_point());
     ui.painter().hline(
         rect.x_range(),
         y,

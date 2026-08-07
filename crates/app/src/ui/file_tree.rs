@@ -1819,7 +1819,7 @@ impl FileTreeUi {
             ),
         );
         painter.rect_filled(background_rect, 0.0, background);
-        let y = painter.round_to_pixel_center(rect.center().y);
+        let y = crate::ui::snap_line_to_pixel(rect.center().y, 1.0, ppp);
         painter.hline(ui.clip_rect().x_range(), y, egui::Stroke::new(1.0, color));
         resp.dragged()
     }
@@ -2466,7 +2466,8 @@ impl FileTreeUi {
             }
             tab_left += width;
         }
-        let separator_y = ui.painter().round_to_pixel_center(header_rect.bottom());
+        let separator_y =
+            crate::ui::snap_line_to_pixel(header_rect.bottom(), 1.0, ui.ctx().pixels_per_point());
         ui.painter().hline(
             header_rect.x_range(),
             separator_y,
@@ -3878,7 +3879,7 @@ fn paint_workspace_group_separator(ui: &egui::Ui, rect: egui::Rect) {
     if rect.height() <= 0.0 || rect.width() <= 0.0 {
         return;
     }
-    let y = ui.painter().round_to_pixel_center(rect.bottom());
+    let y = crate::ui::snap_line_to_pixel(rect.bottom(), 1.0, ui.ctx().pixels_per_point());
     ui.painter().hline(
         rect.x_range(),
         y,
@@ -4710,7 +4711,7 @@ fn session_row_impl(
         // 여기만 스냅이 빠져 있어 행마다 선 굵기가 달라 보였다.
         painter.hline(
             highlight_rect.x_range(),
-            painter.round_to_pixel_center(highlight_rect.bottom()),
+            crate::ui::snap_line_to_pixel(highlight_rect.bottom(), 1.0, ppp),
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
     }
@@ -5169,12 +5170,12 @@ fn paint_sidebar_separator(ui: &egui::Ui, rect: egui::Rect, stroke: egui::Stroke
         //
         // x는 패널 안쪽 마지막 픽셀이다 — 이유와 규칙은
         // designall::panel_edge_separator_x가 소유한다(상단 바 구분선과 공유).
-        let x = ui
-            .painter()
-            .round_to_pixel_center(crate::ui::designall::panel_edge_separator_x(
-                rect.right(),
-                ui.ctx().pixels_per_point(),
-            ));
+        let ppp = ui.ctx().pixels_per_point();
+        let x = crate::ui::snap_line_to_pixel(
+            crate::ui::designall::panel_edge_separator_x(rect.right(), ppp),
+            stroke.width,
+            ppp,
+        );
         ui.painter()
             .vline(x, egui::Rangef::new(rect.top(), bottom), stroke);
     }

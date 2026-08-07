@@ -25,8 +25,8 @@ pub mod settings;
 pub mod workspace;
 
 /// 픽셀 스냅된 1px 가로 헤어라인. egui 기본 `ui.separator()`는 좌표가 물리픽셀에
-/// 정렬되지 않아 안티에일리어싱(feathering)으로 흐릿하게 번진다 — `round_to_pixel_center`
-/// 로 라인 중심을 픽셀 중심에 맞춰 또렷한 1px로 그린다 (egui 0.35 픽셀 완벽 라인 API).
+/// 정렬되지 않아 안티에일리어싱(feathering)으로 흐릿하게 번진다 — `snap_line_to_pixel`로
+/// 굵기의 물리픽셀 패리티에 맞춰 스냅해 또렷하게 그린다.
 /// 색은 기본 separator와 동일한 noninteractive bg_stroke를 쓴다.
 pub fn hairline(ui: &mut egui::Ui) {
     let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
@@ -65,6 +65,38 @@ pub fn snap_rect_to_pixel(ppp: f32, r: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(snap_pos_to_pixel(ppp, r.min), snap_pos_to_pixel(ppp, r.max))
 }
 
+/// 선(hline/vline)의 좌표를 물리픽셀 격자에 맞춘다. 기준이 **굵기의 물리픽셀 패리티**에
+/// 달려 있다 — 홀수면 픽셀 **중심**, 짝수면 픽셀 **경계**여야 양끝이 안티에일리어싱으로
+/// 번지지 않는다.
+///
+/// egui의 `Painter::round_to_pixel_center`는 문서가 밝히듯 홀수 폭 전용이다
+/// ("lines that are one pixel wide (or any odd number of pixels)"). 그런데 이 앱의 선은
+/// 전부 `Stroke::new(1.0, ..)` — **1.0 포인트**라 Retina(ppp 2)에서 2 물리픽셀(짝수)이다.
+/// 그대로 중심에 맞추면 반 픽셀씩 걸쳐 3개 행에 잉크가 퍼지고, 또렷한 1px을 의도한
+/// `hairline`이 오히려 흐려진다(2026-08-07).
+pub fn snap_line_to_pixel(coord: f32, stroke_width: f32, pixels_per_point: f32) -> f32 {
+    let ppp = pixels_per_point.max(1.0);
+    let physical_width = (stroke_width * ppp).round().max(1.0);
+    let physical = coord * ppp;
+    let snapped = if (physical_width as i64) % 2 == 0 {
+        physical.round()
+    } else {
+        (physical - 0.5).round() + 0.5
+    };
+    snapped / ppp
+}
+
+/// 면의 **상단 경계**에 붙이는 선의 중심 y. 선이 첫 물리행부터 덮게 한다.
+///
+/// [`snap_line_to_pixel`]과 다르다 — 저건 "이 좌표를 지나는 선"을 스냅하고, 이건
+/// "이 경계에서 시작하는 선"을 놓는다. 경계는 반올림이 아니라 **내림**이다. 경계가
+/// 물리픽셀 중간에 걸릴 때 반올림이 위로 가면 그만큼 안쪽에 빈 띠가 남는다 — 살짝
+/// 위로 겹치는 쪽이 낫다(2026-08-07).
+pub fn snap_edge_line_to_pixel(edge: f32, stroke_width: f32, pixels_per_point: f32) -> f32 {
+    let ppp = pixels_per_point.max(1.0);
+    (edge * ppp).floor() / ppp + stroke_width * 0.5
+}
+
 /// 색 지정 버전.
 pub fn hairline_colored(ui: &mut egui::Ui, color: egui::Color32) {
     // 기본 `ui.separator()`와 동일한 세로 공간을 차지한다(레이아웃 밀림 방지) —
@@ -75,15 +107,16 @@ pub fn hairline_colored(ui: &mut egui::Ui, color: egui::Color32) {
         egui::vec2(ui.available_width(), space),
         egui::Sense::hover(),
     );
+    let ppp = ui.ctx().pixels_per_point();
     let painter = ui.painter();
-    let y = painter.round_to_pixel_center(rect.center().y);
+    let y = snap_line_to_pixel(rect.center().y, 1.0, ppp);
     painter.hline(rect.x_range(), y, egui::Stroke::new(1.0, color));
 }
 
 /// 레이아웃을 소비하지 않고 지정 y에 긋는 픽셀 스냅 1px 라인 — 행 배경 위에
 /// 테두리를 복원하는 테이블/카드 계열용 (hairline과 달리 painter 직접 호출).
 pub fn hairline_at(painter: &egui::Painter, x_range: egui::Rangef, y: f32, color: egui::Color32) {
-    let y = painter.round_to_pixel_center(y);
+    let y = snap_line_to_pixel(y, 1.0, painter.pixels_per_point());
     painter.hline(x_range, y, egui::Stroke::new(1.0, color));
 }
 
@@ -216,4 +249,40 @@ pub fn render_message(catalog: &i18n::Catalog, message: &runtime::MessagePayload
         .map(|arg| (arg.key.as_str(), arg.value.as_str()))
         .collect();
     catalog.t(&message.message_id, &args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 선의 **양끝이 물리픽셀 경계**에 떨어져야 안티에일리어싱으로 번지지 않는다.
+    /// 홀수 폭이면 중심 정렬, 짝수 폭이면 경계 정렬이라야 그렇게 된다.
+    #[test]
+    fn 선은_굵기_패리티에_맞게_스냅돼_양끝이_픽셀경계에_떨어진다() {
+        let width = 1.0; // 이 앱의 모든 hairline/구분선
+        for ppp in [1.0_f32, 2.0, 3.0] {
+            for coord in [10.0_f32, 10.5, 38.25, 87.4, 200.75] {
+                let y = snap_line_to_pixel(coord, width, ppp);
+                for edge in [(y - width * 0.5) * ppp, (y + width * 0.5) * ppp] {
+                    assert!(
+                        (edge - edge.round()).abs() < 0.001,
+                        "ppp {ppp}, coord {coord}: 끝점 {edge}가 픽셀 경계가 아니다"
+                    );
+                }
+                // 원래 좌표에서 반 픽셀 넘게 밀리면 선이 엉뚱한 자리에 간다.
+                assert!(
+                    ((y - coord) * ppp).abs() <= 0.5 + 0.001,
+                    "ppp {ppp}, coord {coord}: {:.2}물리픽셀이나 밀렸다",
+                    (y - coord) * ppp
+                );
+            }
+        }
+    }
+
+    /// ppp가 비정상이어도 발산하지 않는다.
+    #[test]
+    fn 선_스냅은_비정상_ppp에서도_유한하다() {
+        assert!(snap_line_to_pixel(10.0, 1.0, 0.0).is_finite());
+        assert!(snap_line_to_pixel(10.0, 0.0, 2.0).is_finite());
+    }
 }

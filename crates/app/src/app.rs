@@ -6568,19 +6568,20 @@ pub(crate) fn top_provider_usage(
 
         let five_hour = usage.and_then(|value| value.0);
         let weekly = usage.and_then(|value| value.1);
-        let five_hour_label = five_hour.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
-        let weekly_label = weekly.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
-        ui.label(
-            egui::RichText::new(five_hour_label)
-                .size(13.0)
-                .color(accent)
-                .strong(),
-        );
 
-        let (bar, _) = ui.allocate_exact_size(egui::vec2(42.0, 6.0), egui::Sense::hover());
-        ui.painter()
-            .rect_filled(bar, 3.0, egui::Color32::from_gray(42));
+        // 값이 없는 창은 칸 자체를 그리지 않는다 — 빈 게이지 바가 남으면 "없는 창"이
+        // 아니라 "고장난 표시"로 읽힌다. 창을 하나도 못 받은 프로바이더만 "—"로
+        // 자리를 지켜, 로고만 덩그러니 남지 않게 한다.
         if let Some(five_hour) = five_hour {
+            ui.label(
+                egui::RichText::new(format!("{five_hour}%"))
+                    .size(13.0)
+                    .color(accent)
+                    .strong(),
+            );
+            let (bar, _) = ui.allocate_exact_size(egui::vec2(42.0, 6.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(bar, 3.0, egui::Color32::from_gray(42));
             let filled = egui::Rect::from_min_max(
                 bar.min,
                 egui::pos2(
@@ -6589,12 +6590,21 @@ pub(crate) fn top_provider_usage(
                 ),
             );
             ui.painter().rect_filled(filled, 3.0, accent);
+            ui.label(egui::RichText::new("5h").size(13.0).weak());
         }
-        ui.label(egui::RichText::new("5h").size(13.0).weak());
-        separator(ui, 14.0);
+
+        let Some(weekly) = weekly else {
+            if five_hour.is_none() {
+                ui.label(egui::RichText::new("—").size(13.0).weak());
+            }
+            return;
+        };
+        if five_hour.is_some() {
+            separator(ui, 14.0);
+        }
         ui.label(egui::RichText::new("이번 주").size(13.0).weak());
         ui.label(
-            egui::RichText::new(weekly_label)
+            egui::RichText::new(format!("{weekly}%"))
                 .size(13.0)
                 .color(accent)
                 .strong(),

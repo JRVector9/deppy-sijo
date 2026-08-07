@@ -12,12 +12,12 @@ const MAX_OUTPUT_BYTES: usize = 100_000;
 
 #[derive(Default)]
 struct UsageState {
-    pending: Option<mpsc::Receiver<Option<(u8, u8)>>>,
-    usage: Option<(u8, u8)>,
+    pending: Option<mpsc::Receiver<Option<crate::app::ProviderUsage>>>,
+    usage: Option<crate::app::ProviderUsage>,
     last_request: Option<Instant>,
 }
 
-pub fn current(ctx: &egui::Context) -> Option<(u8, u8)> {
+pub fn current(ctx: &egui::Context) -> Option<crate::app::ProviderUsage> {
     static STATE: OnceLock<Mutex<UsageState>> = OnceLock::new();
     let state = STATE.get_or_init(|| Mutex::new(UsageState::default()));
     let Ok(mut state) = state.lock() else {
@@ -59,7 +59,7 @@ pub fn current(ctx: &egui::Context) -> Option<(u8, u8)> {
     state.usage
 }
 
-fn fetch_claude_usage() -> anyhow::Result<Option<(u8, u8)>> {
+fn fetch_claude_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
     let backend = pty::PortablePtyBackend;
     let probe_dir = crate::paths::home_dir()
         .map(|home| home.join(".deppy-sijo").join("usage-probe"))
@@ -165,11 +165,11 @@ fn usage_panel_rendered(lower: &str) -> bool {
     .any(|needle| compact.contains(needle))
 }
 
-fn parse_usage(output: &str) -> Option<(u8, u8)> {
+fn parse_usage(output: &str) -> Option<crate::app::ProviderUsage> {
     let lines = output.split(['\r', '\n']).collect::<Vec<_>>();
     let session = extract_percent_after_label(&lines, |line| {
         compact_label(line).contains("currentsession")
-    })?;
+    });
     let weekly = extract_percent_after_label(&lines, |line| {
         let line = compact_label(line);
         !line.contains("fable")
@@ -178,8 +178,9 @@ fn parse_usage(output: &str) -> Option<(u8, u8)> {
                 || line.contains("weeklyusage")
                 || line.contains("weeklyratelimit")
                 || line.contains("7day"))
-    })?;
-    Some((session, weekly))
+    });
+    // 한쪽 라벨만 그려진 패널에서도 읽어낸 쪽은 살린다.
+    (session.is_some() || weekly.is_some()).then_some((session, weekly))
 }
 
 fn compact_label(text: &str) -> String {

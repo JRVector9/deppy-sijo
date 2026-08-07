@@ -6491,8 +6491,13 @@ struct WorkspaceRuntime {
     pending_replay_resync: bool,
 }
 
-fn claude_usage_snapshot() -> Option<(u8, u8)> {
-    type Cache = Option<(std::time::Instant, Option<(u8, u8)>)>;
+/// 상태바 사용량 — (5시간, 주간). 창마다 **따로** 없을 수 있어 슬롯별 Option이다.
+/// `(u8, u8)` 한 덩어리로 묶으면 한쪽 창만 보고된 응답에서 나머지 한쪽까지 통째로
+/// 사라진다. 바깥 Option은 "출처 자체가 없다", 안쪽 Option은 "그 창이 없다"를 뜻한다.
+pub(crate) type ProviderUsage = (Option<u8>, Option<u8>);
+
+fn claude_usage_snapshot() -> Option<ProviderUsage> {
+    type Cache = Option<(std::time::Instant, Option<ProviderUsage>)>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
     let mut cache = cache.lock().ok()?;
@@ -6517,7 +6522,11 @@ fn claude_usage_snapshot() -> Option<(u8, u8)> {
                 .filter(|value| value.is_finite())
                 .map(|value| value.clamp(0.0, 100.0).round() as u8)
         };
-        Some((percent("five_hour")?, percent("seven_day")?))
+        let five_hour = percent("five_hour");
+        let seven_day = percent("seven_day");
+        // mcp-proxy는 둘 중 하나만 읽혀도 파일을 쓴다(없는 쪽은 null). 한쪽이라도
+        // 있으면 스냅샷으로 인정해야 나머지 한쪽이 화면에서 사라지지 않는다.
+        (five_hour.is_some() || seven_day.is_some()).then_some((five_hour, seven_day))
     })();
     *cache = Some((std::time::Instant::now(), usage));
     usage
@@ -6525,8 +6534,8 @@ fn claude_usage_snapshot() -> Option<(u8, u8)> {
 
 pub(crate) fn top_provider_usage(
     ui: &mut egui::Ui,
-    claude_usage: Option<(u8, u8)>,
-    codex_usage: Option<(u8, u8)>,
+    claude_usage: Option<ProviderUsage>,
+    codex_usage: Option<ProviderUsage>,
 ) {
     let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
@@ -6548,12 +6557,17 @@ pub(crate) fn top_provider_usage(
         );
     }
 
-    fn provider(ui: &mut egui::Ui, name: &str, accent: egui::Color32, usage: Option<(u8, u8)>) {
+    fn provider(
+        ui: &mut egui::Ui,
+        name: &str,
+        accent: egui::Color32,
+        usage: Option<ProviderUsage>,
+    ) {
         let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
         crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, name);
 
-        let five_hour = usage.map(|value| value.0);
-        let weekly = usage.map(|value| value.1);
+        let five_hour = usage.and_then(|value| value.0);
+        let weekly = usage.and_then(|value| value.1);
         let five_hour_label = five_hour.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
         let weekly_label = weekly.map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
         ui.label(

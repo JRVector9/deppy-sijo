@@ -411,7 +411,7 @@ struct PaneHeaderStyle {
     active_stroke: Option<egui::Stroke>,
 }
 
-fn pane_header_style(tokens: crate::ui::designall::Tokens, focused: bool) -> PaneHeaderStyle {
+fn pane_header_style(identity_color: egui::Color32, focused: bool) -> PaneHeaderStyle {
     PaneHeaderStyle {
         // 탭 바는 터미널과 **같은 면**이다 — 그 pane의 제목이지 앱 크롬이 아니다.
         // app_background(사이드바·크롬과 같은 단)를 쓰던 동안에는 터미널 위에 밝은 띠가
@@ -419,8 +419,13 @@ fn pane_header_style(tokens: crate::ui::designall::Tokens, focused: bool) -> Pan
         // 면이라 tokens가 아니라 렌더러 상수를 그대로 쓴다.
         background: terminal::renderer_egui::TERMINAL_SURFACE_BG,
         selection_fill: None,
+        // 포커스 상단선은 **그 pane이 속한 워크스페이스 색**이다. 예전에는 accent를
+        // 썼는데, 경계 드래그 라인(widgets.active.bg_stroke)도 accent라 둘이 같은 청록으로
+        // 보였다(2026-08-07 사용자). 같은 자리(pane 상단선)를 쓰는 cross-workspace 붙임
+        // pane이 이미 워크스페이스 색을 쓰고 있으므로, 자기 워크스페이스 pane도 같은
+        // 규칙으로 맞춘다 — 사이드바 아바타·세션 레일과도 색이 이어진다.
         active_stroke: focused
-            .then_some(egui::Stroke::new(1.0, tokens.accent.gamma_multiply(0.55))),
+            .then_some(egui::Stroke::new(1.0, identity_color.gamma_multiply(0.55))),
     }
 }
 
@@ -1039,6 +1044,9 @@ pub struct WorkspaceUi {
     /// UI 텍스트 배율(App이 매 프레임 set). 터미널은 zoom_factor로 같이 커지므로 font_size를
     /// 이 값으로 역보정해 물리 크기를 유지한다(UI만 스케일, 터미널 독립 — 2026-07-13).
     ui_scale: f32,
+    /// 활성 워크스페이스의 고유색 — 포커스된 pane 상단선에 쓴다.
+    /// App이 매 프레임 밀어 넣는다(사이드바 목록 순서에 따라 배정되므로 여기서 못 만든다).
+    workspace_accent: egui::Color32,
     /// 세션별 현재 작업 폴더(App이 매 프레임 set) — 1행 제목 폴더명/프로젝트명 원천.
     session_cwds: std::collections::HashMap<SessionId, String>,
     /// App host가 filesystem 밖에서 미리 계산한 세션별 프로젝트 표시명. cwd를 함께
@@ -1406,6 +1414,7 @@ impl WorkspaceUi {
             selection: None,
             project_name: None,
             ui_scale: 1.0,
+            workspace_accent: egui::Color32::TRANSPARENT,
             session_pids: HashMap::new(),
             path_click_cache: None,
             io_generation: 1,
@@ -2071,6 +2080,12 @@ impl WorkspaceUi {
     }
 
     /// UI 텍스트 배율을 세팅한다(App이 매 프레임). 터미널 font_size 역보정에 쓴다.
+    /// 활성 워크스페이스 고유색. 사이드바 아바타·세션 레일과 같은 값이라,
+    /// 포커스된 pane 상단선이 그 워크스페이스에 속한다는 걸 같은 색으로 잇는다.
+    pub fn set_workspace_accent(&mut self, color: egui::Color32) {
+        self.workspace_accent = color;
+    }
+
     pub fn set_ui_scale(&mut self, scale: f32) {
         self.ui_scale = if scale.is_finite() && scale > 0.1 {
             scale
@@ -3335,7 +3350,7 @@ impl WorkspaceUi {
         let center_y = header.center().y;
         let close = buttons.close;
         let tokens = crate::ui::designall::tokens(ui.visuals());
-        let style = pane_header_style(tokens, focused);
+        let style = pane_header_style(self.workspace_accent, focused);
         ui.painter().rect_filled(header, 0.0, style.background);
         if let Some(selection_fill) = style.selection_fill {
             ui.painter().rect_filled(header, 0.0, selection_fill);
@@ -5982,18 +5997,23 @@ mod tests {
 
     #[test]
     fn designall_pane_header는_1px탑라인을_close옆에서끝낸다() {
-        let style = pane_header_style(crate::ui::designall::DARK, true);
+        // 상단선은 accent가 아니라 **그 pane이 속한 워크스페이스 고유색**이다.
+        // accent를 쓰면 경계 드래그 라인과 같은 청록이 돼 구분되지 않는다.
+        let identity = crate::ui::file_tree::WORKSPACE_ACCENT_SAMPLE;
+        let style = pane_header_style(identity, true);
         assert_eq!(
             style.background,
             terminal::renderer_egui::TERMINAL_SURFACE_BG
         );
         assert_eq!(style.selection_fill, None);
+        assert_ne!(
+            style.active_stroke.map(|stroke| stroke.color),
+            Some(crate::ui::designall::DARK.accent.gamma_multiply(0.55)),
+            "상단선이 accent면 경계 드래그 라인과 구분되지 않는다"
+        );
         assert_eq!(
             style.active_stroke,
-            Some(egui::Stroke::new(
-                1.0,
-                crate::ui::designall::DARK.accent.gamma_multiply(0.55)
-            ))
+            Some(egui::Stroke::new(1.0, identity.gamma_multiply(0.55)))
         );
         let header = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 32.0));
         let close = egui::Rect::from_min_max(egui::pos2(100.0, 6.0), egui::pos2(120.0, 26.0));

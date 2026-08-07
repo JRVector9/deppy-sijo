@@ -3,7 +3,7 @@ use super::ports::{PortsIntent, PortsUi};
 use super::resource_manager::{ResourceManagerIntent, ResourceManagerUi};
 use crate::agent_surface::AgentVisualState;
 use crate::port_inventory::PortSnapshot;
-use crate::status_feed::{ProviderStatus, ServiceIndicator, StatusFeedSnapshot};
+use crate::status_feed::StatusFeedSnapshot;
 use crate::ui::agent_visuals::status_color;
 use std::collections::HashMap;
 
@@ -306,7 +306,6 @@ impl AgentTerminalUi {
         // idle 비용이 0이다(벨 팝오버와 같은 규칙).
         approval_cards: StatusBarApprovals<'_>,
         mcp_count: usize,
-        feed: &StatusFeedSnapshot,
         ports: Option<&PortSnapshot>,
         unattached_counts: &HashMap<String, u16>,
         active_workspace_id: Option<&str>,
@@ -337,30 +336,8 @@ impl AgentTerminalUi {
                 // 등록·활성화된 MCP 서버 수 (2026-07-18 사용자 요청).
                 ui.weak(catalog.t("status_bar.mcp", &[("count", &mcp_count.to_string())]))
                     .on_hover_text(catalog.t("status_bar.mcp_hover", &[]));
-                // 핵심 서비스 상태 점등 — Claude/OpenAI/GitHub를 5분마다 폴링하고
-                // 클릭하면 각 공식 상태 페이지를 연다.
-                crate::ui::designall::vertical_separator(ui, 14.0);
-                service_status_light(
-                    ui,
-                    "Claude",
-                    feed.claude.as_ref(),
-                    crate::status_feed::CLAUDE_STATUS_URL,
-                    catalog,
-                );
-                service_status_light(
-                    ui,
-                    "OpenAI",
-                    feed.openai.as_ref(),
-                    crate::status_feed::OPENAI_STATUS_URL,
-                    catalog,
-                );
-                service_status_light(
-                    ui,
-                    "GitHub",
-                    feed.github.as_ref(),
-                    crate::status_feed::GITHUB_STATUS_URL,
-                    catalog,
-                );
+                // 서비스 상태 점등은 레일 하단 세로 스택으로 이동했다
+                // (file_tree::rail_service_status, 2026-08-07 사용자 지시).
                 // 주목이 필요한 것만 자리를 차지한다 — 조용할 땐 아무것도 그리지 않는다.
                 // 승인과 입력 대기는 성격이 달라 나눈다(승인은 되돌리기 어렵고, 입력은
                 // 그냥 기다림이다). 화면에서 보고 합칠지 정한다.
@@ -753,6 +730,11 @@ fn connections_panel(
             });
         });
     manage_clicked
+}
+
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
 fn slack_mark(ui: &mut egui::Ui) {
@@ -1208,48 +1190,10 @@ fn status_action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     response
 }
 
-fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, color);
-}
-
-/// indicator → 점등 색. 미조회(None)/미지 값은 회색.
-fn indicator_color(ui: &egui::Ui, provider: Option<&ProviderStatus>) -> egui::Color32 {
-    match provider.map(|p| p.indicator) {
-        Some(ServiceIndicator::Operational) => status_color(AgentVisualState::Complete),
-        Some(ServiceIndicator::Minor) => status_color(AgentVisualState::Waiting),
-        Some(ServiceIndicator::Major) | Some(ServiceIndicator::Critical) => {
-            status_color(AgentVisualState::Error)
-        }
-        Some(ServiceIndicator::Unknown) | None => ui.visuals().weak_text_color(),
-    }
-}
-
-/// 상태바의 서비스 점등 1개 — 점 + 이름, hover에 상태 문구, 클릭 시 상태 페이지.
-fn service_status_light(
-    ui: &mut egui::Ui,
-    name: &str,
-    provider: Option<&ProviderStatus>,
-    page_url: &str,
-    catalog: &i18n::Catalog,
-) {
-    status_dot(ui, indicator_color(ui, provider));
-    let hover = match provider {
-        Some(p) => p.description.clone(),
-        None => catalog.t("status_bar.service_checking", &[]),
-    };
-    let click = catalog.t("status_bar.service_click", &[("url", page_url)]);
-    let label = ui
-        .add(egui::Label::new(egui::RichText::new(name).weak()).sense(egui::Sense::click()))
-        .on_hover_text(format!("{hover}\n{click}"));
-    if label.clicked() {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(page_url));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status_feed::{ProviderStatus, ServiceIndicator};
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -1337,11 +1281,10 @@ mod tests {
     }
 
     #[test]
-    fn kittest_하단상태바에_claude_openai_github가_함께_표시된다() {
+    fn kittest_하단상태바에는_서비스_점등이_없다_레일로_이동() {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let feed = StatusFeedSnapshot::default();
         let mut harness = egui_kittest::Harness::new_ui_state(
             move |ui, fonts_ready| {
                 if !*fonts_ready {
@@ -1362,7 +1305,6 @@ mod tests {
                         session_titles: &HashMap::new(),
                     },
                     5,
-                    &feed,
                     None,
                     &HashMap::new(),
                     None,
@@ -1379,9 +1321,10 @@ mod tests {
 
         harness.get_by_label("Sessions 0");
         harness.get_by_label("MCP 5");
-        harness.get_by_label("Claude");
-        harness.get_by_label("OpenAI");
-        harness.get_by_label("GitHub");
+        // 서비스 상태 점등은 레일 하단으로 이동했다 — 상태바에 남아 있으면 회귀다.
+        assert!(harness.query_by_label("Claude").is_none());
+        assert!(harness.query_by_label("OpenAI").is_none());
+        assert!(harness.query_by_label("GitHub").is_none());
         // 승인과 입력 대기는 성격이 달라 따로 센다 — 여기서는 승인 2건만 있고
         // 입력 대기 세션은 없으므로 승인 라벨만 나와야 한다. 표식(◆)이 붙어야
         // 색각 차이와 무관하게 승인/입력이 구분된다.
@@ -1397,7 +1340,6 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
-        let feed = StatusFeedSnapshot::default();
         let mut terminal = AgentTerminalUi::new();
         terminal.show_agent_shortcut_feedback(AgentShortcutFeedback::NoAgent);
         let mut harness = egui_kittest::Harness::new_ui_state(
@@ -1420,7 +1362,6 @@ mod tests {
                         session_titles: &HashMap::new(),
                     },
                     0,
-                    &feed,
                     None,
                     &HashMap::new(),
                     None,
@@ -1449,7 +1390,6 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
-        let feed = StatusFeedSnapshot::default();
         let seen: Arc<Mutex<Vec<(bool, AgentTerminalView)>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
         let terminal = Arc::new(Mutex::new(AgentTerminalUi::new()));
@@ -1476,7 +1416,6 @@ mod tests {
                         session_titles: &HashMap::new(),
                     },
                     0,
-                    &feed,
                     None,
                     &HashMap::new(),
                     None,
@@ -1532,7 +1471,6 @@ mod tests {
         // (승인 건수, 링크가 보여야 하는가)
         for (approvals, expected) in [(POPUP_MAX_CARDS, false), (POPUP_MAX_CARDS + 1, true)] {
             let catalog = i18n::Catalog::load("ko-KR").unwrap();
-            let feed = StatusFeedSnapshot::default();
             let terminal = Arc::new(Mutex::new(AgentTerminalUi::new()));
             terminal.lock().unwrap().approvals_open = true;
             let shared = Arc::clone(&terminal);
@@ -1557,7 +1495,6 @@ mod tests {
                             session_titles: &HashMap::new(),
                         },
                         0,
-                        &feed,
                         None,
                         &HashMap::new(),
                         None,
@@ -1587,7 +1524,6 @@ mod tests {
     #[test]
     fn 승인이_0이_되면_팝오버_열림_상태가_정리된다() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
-        let feed = StatusFeedSnapshot::default();
         let terminal = Arc::new(Mutex::new(AgentTerminalUi::new()));
         // 열린 상태를 만들어 둔다(사용자가 눌러서 연 상황).
         terminal.lock().unwrap().approvals_open = true;
@@ -1614,7 +1550,6 @@ mod tests {
                         session_titles: &HashMap::new(),
                     },
                     0,
-                    &feed,
                     None,
                     &HashMap::new(),
                     None,
@@ -1642,7 +1577,6 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
-        let feed = StatusFeedSnapshot::default();
         let waiting: Vec<(String, crate::ui::notifications::AgentNotificationTarget)> = (1..=5)
             .map(|n| {
                 (
@@ -1674,7 +1608,6 @@ mod tests {
                         session_titles: &HashMap::new(),
                     },
                     0,
-                    &feed,
                     None,
                     &HashMap::new(),
                     None,
@@ -1708,7 +1641,6 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
-        let feed = StatusFeedSnapshot::default();
         let mut harness = egui_kittest::Harness::new_ui_state(
             move |ui,
                   (terminal, intents, fonts_ready): &mut (
@@ -1734,7 +1666,6 @@ mod tests {
                         session_titles: &HashMap::new(),
                     },
                     0,
-                    &feed,
                     None,
                     &HashMap::new(),
                     None,
@@ -1763,7 +1694,6 @@ mod tests {
         fn harness() -> egui_kittest::Harness<'static, (AgentTerminalUi, Vec<StatusBarIntent>, bool)>
         {
             let catalog = i18n::Catalog::load("ko-KR").unwrap();
-            let feed = StatusFeedSnapshot::default();
             let mut harness = egui_kittest::Harness::new_ui_state(
                 move |ui,
                       (terminal, intents, fonts_ready): &mut (
@@ -1789,7 +1719,6 @@ mod tests {
                             session_titles: &HashMap::new(),
                         },
                         0,
-                        &feed,
                         None,
                         &HashMap::new(),
                         None,
@@ -1828,7 +1757,6 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load("en-US").unwrap();
-        let feed = StatusFeedSnapshot::default();
         let snapshot = crate::port_inventory::PortSnapshot {
             generation: 7,
             sampled_at_ms: 1_000,
@@ -1869,7 +1797,6 @@ mod tests {
                         session_titles: &HashMap::new(),
                     },
                     0,
-                    &feed,
                     Some(&snapshot),
                     &HashMap::new(),
                     Some("active"),

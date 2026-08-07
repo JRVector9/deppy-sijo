@@ -947,6 +947,9 @@ pub struct FileTreeUi {
     /// 하단 상태바까지 그리므로, 상태바 위에서 끝나는 전용 핸들로 직접 조절한다.
     sidebar_width: f32,
     navigation_rail_width: f32,
+    /// 레일 하단 서비스 상태 스택 데이터 — App이 status_feed 스냅샷으로 매 프레임
+    /// 갱신한다 (`set_service_statuses`). 기본값은 인디케이터 None(회색 로고).
+    service_statuses: [RailServiceStatus; 3],
     /// 마지막 조작 에러 (하단 빨간 라벨, §4).
     error: Option<String>,
     /// macOS/TCC 등에서 나열 권한이 거부된 디렉터리. 전역 오류로 승격하지 않고
@@ -1040,6 +1043,7 @@ impl FileTreeUi {
             collapsed: false,
             sidebar_width: 200.0,
             navigation_rail_width: crate::ui::designall::NAV_RAIL_WIDTH,
+            service_statuses: RailServiceStatus::defaults(),
             error: None,
             inaccessible_paths: HashSet::new(),
             io_generation: 1,
@@ -1613,6 +1617,21 @@ impl FileTreeUi {
     /// 좌측 사이드바 렌더 (§6 — `egui::Panel::left`, CentralPanel 앞에서 호출할 것 §9-1).
     /// 반환: "터미널에 경로 삽입" 요청 경로 (호출측 App이 WriteInput으로 전달 — §6
     /// 유일한 runtime 접점을 App에 남긴다).
+    /// App이 status_feed 스냅샷을 레일 표시용으로 내려준다 (매 프레임, §6 —
+    /// leaf는 폴링하지 않고 App이 데이터를 민다).
+    pub fn set_service_statuses(&mut self, feed: &crate::status_feed::StatusFeedSnapshot) {
+        let mut statuses = RailServiceStatus::defaults();
+        for (slot, provider) in statuses.iter_mut().zip([
+            feed.claude.as_ref(),
+            feed.openai.as_ref(),
+            feed.github.as_ref(),
+        ]) {
+            slot.indicator = provider.map(|p| p.indicator);
+            slot.description = provider.map(|p| p.description.clone());
+        }
+        self.service_statuses = statuses;
+    }
+
     pub fn panel(
         &mut self,
         ui: &mut egui::Ui,
@@ -1636,6 +1655,7 @@ impl FileTreeUi {
             crate::ui::designall::NAV_RAIL_MAX_WIDTH,
         );
         let frame = crate::ui::designall::structural_frame(ui.visuals());
+        let service_statuses = self.service_statuses.clone();
         let panel = egui::Panel::left("designall_navigation_rail")
             .resizable(false)
             .exact_size(self.navigation_rail_width)
@@ -1646,7 +1666,9 @@ impl FileTreeUi {
                 crate::fonts::apply_sidebar_text_styles(ui);
                 let width = ui.available_width();
                 let utility_height = nav_utility_height(width);
-                let navigation_height = (ui.available_height() - utility_height).max(0.0);
+                let status_height = rail_service_status_height();
+                let navigation_height =
+                    (ui.available_height() - utility_height - status_height).max(0.0);
                 let navigation_action = ui
                     .allocate_ui_with_layout(
                         egui::vec2(width, navigation_height),
@@ -1660,6 +1682,16 @@ impl FileTreeUi {
                         },
                     )
                     .inner;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, status_height),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        // allocate는 실제 내용만큼만 커서를 전진시킨다 — 예약 높이를
+                        // min으로 박아 아래 utilities가 당겨 올라오지 않게 한다.
+                        ui.set_min_height(status_height);
+                        rail_service_status(ui, &service_statuses, catalog);
+                    },
+                );
                 let utility_action = ui
                     .allocate_ui_with_layout(
                         egui::vec2(width, utility_height),
@@ -5189,6 +5221,159 @@ fn paint_sidebar_separator(ui: &egui::Ui, rect: egui::Rect, stroke: egui::Stroke
         );
         ui.painter()
             .vline(x, egui::Rangef::new(rect.top(), bottom), stroke);
+    }
+}
+
+/// 레일 하단 서비스 상태 한 칸 — 이름은 그리지 않고 hover로만 노출한다
+/// (2026-08-07 사용자: 상태바의 점+이름 3종을 레일 세로 스택 + 로고 상태색으로).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RailServiceStatus {
+    pub name: &'static str,
+    pub url: &'static str,
+    pub indicator: Option<crate::status_feed::ServiceIndicator>,
+    /// 상태 페이지 요약 문구("All Systems Operational" 등) — hover 첫 줄.
+    pub description: Option<String>,
+}
+
+impl RailServiceStatus {
+    fn defaults() -> [RailServiceStatus; 3] {
+        [
+            RailServiceStatus {
+                name: "Claude",
+                url: crate::status_feed::CLAUDE_STATUS_URL,
+                indicator: None,
+                description: None,
+            },
+            RailServiceStatus {
+                name: "OpenAI",
+                url: crate::status_feed::OPENAI_STATUS_URL,
+                indicator: None,
+                description: None,
+            },
+            RailServiceStatus {
+                name: "GitHub",
+                url: crate::status_feed::GITHUB_STATUS_URL,
+                indicator: None,
+                description: None,
+            },
+        ]
+    }
+}
+
+/// 레일 서비스 로고 크기 — 상태바 시절 점(10px)과 로고(14.5px) 사이,
+/// 목업(18px)보다 작게 (2026-08-07 사용자 지시).
+const RAIL_SERVICE_LOGO_SIZE: f32 = 13.0;
+const RAIL_SERVICE_LOGO_GAP: f32 = 9.0;
+
+fn rail_service_status_height() -> f32 {
+    // 로고 3개 + 사이 간격 2개 + 아래 utilities와 띄우는 여백.
+    3.0 * RAIL_SERVICE_LOGO_SIZE + 2.0 * RAIL_SERVICE_LOGO_GAP + 12.0
+}
+
+/// indicator → 로고 색. 정상 초록 / 저하 노랑 / 장애 빨강, 미조회·미지는 회색
+/// (상태바 시절 indicator_color와 같은 매핑 — 색 자체가 상태 표기다).
+fn rail_service_color(
+    visuals: &egui::Visuals,
+    indicator: Option<crate::status_feed::ServiceIndicator>,
+) -> egui::Color32 {
+    use crate::agent_surface::AgentVisualState;
+    use crate::status_feed::ServiceIndicator;
+    use crate::ui::agent_visuals::status_color;
+    match indicator {
+        Some(ServiceIndicator::Operational) => status_color(AgentVisualState::Complete),
+        Some(ServiceIndicator::Minor) => status_color(AgentVisualState::Waiting),
+        Some(ServiceIndicator::Major | ServiceIndicator::Critical) => {
+            status_color(AgentVisualState::Error)
+        }
+        Some(ServiceIndicator::Unknown) | None => visuals.weak_text_color(),
+    }
+}
+
+fn rail_service_status(
+    ui: &mut egui::Ui,
+    statuses: &[RailServiceStatus; 3],
+    catalog: &i18n::Catalog,
+) {
+    ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing.y = RAIL_SERVICE_LOGO_GAP;
+        for service in statuses {
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(RAIL_SERVICE_LOGO_SIZE, RAIL_SERVICE_LOGO_SIZE),
+                egui::Sense::click(),
+            );
+            let name = service.name;
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), name)
+            });
+            let status_line = service
+                .description
+                .clone()
+                .unwrap_or_else(|| catalog.t("status_bar.service_checking", &[]));
+            let click = catalog.t("status_bar.service_click", &[("url", service.url)]);
+            let response = response
+                .on_hover_text(format!("{name} · {status_line}\n{click}"))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let color = rail_service_color(ui.visuals(), service.indicator);
+            paint_rail_service_glyph(ui.painter(), rect, name, color);
+            if response.clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(service.url));
+            }
+        }
+    });
+}
+
+/// 상태색으로 칠하는 서비스 로고 글리프. announcement 로고(브랜드색 고정)와
+/// 달리 색이 상태를 뜻하므로 별도 페인터를 둔다. base 16 좌표계.
+fn paint_rail_service_glyph(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    service: &str,
+    color: egui::Color32,
+) {
+    let center = rect.center();
+    let scale = rect.width().min(rect.height()) / 16.0;
+    match service {
+        "Claude" => {
+            let stroke = egui::Stroke::new(1.7 * scale, color);
+            for index in 0..8 {
+                let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                painter.line_segment(
+                    [
+                        center + direction * (2.6 * scale),
+                        center + direction * (7.4 * scale),
+                    ],
+                    stroke,
+                );
+            }
+            painter.circle_filled(center, 2.0 * scale, color);
+        }
+        "GitHub" => {
+            // 옥토캣 실루엣 근사 — 몸통 원 + 양쪽 귀. 13px에서 세부는 안 보이므로
+            // "귀 달린 원"이면 충분히 GitHub으로 읽힌다 (hover가 이름을 보증).
+            painter.circle_filled(center, 6.2 * scale, color);
+            for side in [-1.0f32, 1.0] {
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        center + egui::vec2(side * 5.4, -2.8) * scale,
+                        center + egui::vec2(side * 4.6, -7.2) * scale,
+                        center + egui::vec2(side * 1.4, -5.8) * scale,
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
+        }
+        _ => {
+            // OpenAI knot — announcement 페인터와 같은 여섯 루프 단순화.
+            let stroke = egui::Stroke::new(1.25 * scale, color);
+            for index in 0..6 {
+                let angle = index as f32 * std::f32::consts::TAU / 6.0;
+                let loop_center = center + egui::vec2(angle.cos(), angle.sin()) * (3.9 * scale);
+                painter.circle_stroke(loop_center, 3.1 * scale, stroke);
+            }
+            painter.circle_stroke(center, 2.0 * scale, stroke);
+        }
     }
 }
 
@@ -8969,7 +9154,12 @@ mod tests {
         let settings_rect = harness.get_by_label("Settings").rect();
         let rail = egui::PanelState::load(&harness.ctx, egui::Id::new("designall_navigation_rail"))
             .unwrap();
-        assert!((settings_rect.bottom() - rail.outer_rect.bottom()).abs() < 4.0);
+        assert!(
+            (settings_rect.bottom() - rail.outer_rect.bottom()).abs() < 4.0,
+            "settings bottom {} vs rail bottom {}",
+            settings_rect.bottom(),
+            rail.outer_rect.bottom()
+        );
 
         harness.get_by_label("Settings").click();
         harness.run();
@@ -9565,5 +9755,101 @@ mod tests {
 
         assert!(!can_open_session_beside("workspace-a", &target));
         assert!(can_open_session_beside("workspace-b", &target));
+    }
+
+    /// indicator → 로고색 계약 — 색 자체가 상태 표기이므로 매핑을 고정한다.
+    #[test]
+    fn 레일_서비스_로고색은_indicator를_따른다() {
+        use crate::agent_surface::AgentVisualState;
+        use crate::status_feed::ServiceIndicator;
+        use crate::ui::agent_visuals::status_color;
+        let visuals = egui::Visuals::dark();
+        assert_eq!(
+            rail_service_color(&visuals, Some(ServiceIndicator::Operational)),
+            status_color(AgentVisualState::Complete),
+            "정상 = 초록"
+        );
+        assert_eq!(
+            rail_service_color(&visuals, Some(ServiceIndicator::Minor)),
+            status_color(AgentVisualState::Waiting),
+            "저하 = 노랑"
+        );
+        for indicator in [ServiceIndicator::Major, ServiceIndicator::Critical] {
+            assert_eq!(
+                rail_service_color(&visuals, Some(indicator)),
+                status_color(AgentVisualState::Error),
+                "장애 = 빨강"
+            );
+        }
+        assert_eq!(
+            rail_service_color(&visuals, Some(ServiceIndicator::Unknown)),
+            visuals.weak_text_color()
+        );
+        assert_eq!(
+            rail_service_color(&visuals, None),
+            visuals.weak_text_color()
+        );
+    }
+
+    /// 서비스 상태 스택은 레일 하단에 세로로 서고, 이름은 접근 라벨로만 남는다
+    /// (2026-08-07 상태바의 점+이름 3종에서 이동).
+    #[test]
+    fn kittest_레일_하단에_서비스_상태_로고_3개가_세로로_선다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        struct State {
+            tree: FileTreeUi,
+            fonts_ready: bool,
+        }
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    if !state.fonts_ready {
+                        return;
+                    }
+                    let sidebar = SidebarSnapshot {
+                        active_workspace_id: "workspace-a",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        inbox_count: 0,
+                        fleet_count: 0,
+                        agents_open: false,
+                    };
+                    let _ =
+                        state
+                            .tree
+                            .panel(ui, &std::collections::HashMap::new(), &sidebar, &catalog);
+                },
+                State {
+                    tree: FileTreeUi::new(egui::Context::default()),
+                    fonts_ready: false,
+                },
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().fonts_ready = true;
+        harness.run();
+
+        let claude = harness.get_by_label("Claude").rect();
+        let openai = harness.get_by_label("OpenAI").rect();
+        let github = harness.get_by_label("GitHub").rect();
+        assert!(
+            claude.bottom() <= openai.top() && openai.bottom() <= github.top(),
+            "위→아래 Claude→OpenAI→GitHub 세로 스택이어야 한다"
+        );
+        assert!(
+            (claude.center().x - openai.center().x).abs() <= 0.5
+                && (openai.center().x - github.center().x).abs() <= 0.5,
+            "레일 세로 중심축에 정렬돼야 한다"
+        );
+        assert_eq!(claude.width(), RAIL_SERVICE_LOGO_SIZE);
     }
 }

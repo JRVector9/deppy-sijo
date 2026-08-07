@@ -20,6 +20,11 @@ pub struct Tokens {
     pub error: egui::Color32,
     pub selected_background: egui::Color32,
     pub hover_background: egui::Color32,
+    /// 홈·작업함·fleet처럼 **정보를 읽는 페이지**의 바닥. 크롬(app_background)에서
+    /// 한 단 물러난 면이라 레일·사이드바와 콘텐츠가 갈라지고, 그 위의 카드가
+    /// app_background로 떠오른다. 터미널 뷰는 이 토큰을 쓰지 않는다 — 터미널은
+    /// 자기 표면(TERMINAL_SURFACE_BG)이 이미 가장 깊은 면이다.
+    pub content_canvas: egui::Color32,
 }
 
 pub const STRUCTURAL_CORNER_RADIUS: u8 = 0;
@@ -49,6 +54,9 @@ pub const DARK: Tokens = Tokens {
     error: egui::Color32::from_rgb(0xef, 0x66, 0x71),
     selected_background: egui::Color32::from_rgb(0x21, 0x24, 0x2c),
     hover_background: egui::Color32::from_rgb(0x1d, 0x20, 0x26),
+    // 사다리의 elev0 — input_background와 같은 값이지만 뜻이 다르다(입력 우물 vs
+    // 페이지 바닥). 크롬 #181b20보다 한 단 아래, 터미널 #0b0d11보다는 위다.
+    content_canvas: egui::Color32::from_rgb(0x0f, 0x11, 0x15),
 };
 
 pub const LIGHT: Tokens = Tokens {
@@ -65,6 +73,10 @@ pub const LIGHT: Tokens = Tokens {
     error: egui::Color32::from_rgb(0xc8, 0x3d, 0x49),
     selected_background: egui::Color32::from_rgb(0xe5, 0xe8, 0xec),
     hover_background: egui::Color32::from_rgb(0xeb, 0xed, 0xf0),
+    // 라이트에서 "물러남"은 살짝 어두워지는 쪽이다. 카드가 app_background(#f1f2f5)로
+    // 떠오르도록 페이지 바닥을 그보다 낮춘다 — 회색 페이지 + 밝은 카드라는
+    // 라이트 테마의 통상 구성.
+    content_canvas: egui::Color32::from_rgb(0xe0, 0xe4, 0xea),
 };
 
 pub fn tokens(visuals: &egui::Visuals) -> Tokens {
@@ -109,6 +121,12 @@ pub fn structural_frame(visuals: &egui::Visuals) -> egui::Frame {
         .fill(tokens(visuals).app_background)
         .inner_margin(egui::Margin::ZERO)
         .corner_radius(egui::CornerRadius::same(STRUCTURAL_CORNER_RADIUS))
+}
+
+/// 정보 페이지(홈·작업함·fleet) 바닥. `structural_frame`과 여백·모서리는 같고
+/// 채움만 한 단 물러난 면을 쓴다 — 터미널 뷰는 계속 `structural_frame`이다.
+pub fn content_canvas_frame(visuals: &egui::Visuals) -> egui::Frame {
+    structural_frame(visuals).fill(tokens(visuals).content_canvas)
 }
 
 pub fn apply_workspace_visuals(ui: &mut egui::Ui) {

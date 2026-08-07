@@ -20875,7 +20875,15 @@ impl eframe::App for App {
 
         // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에
         // pane 좌/상/우 여백이 보였다(#69 사용자).
-        let central_frame = ui::designall::structural_frame(ui.visuals());
+        //
+        // 정보 페이지(홈·작업함·fleet)는 한 단 물러난 바닥을 쓴다. 예전엔 크롬·페이지·
+        // 카드가 전부 app_background라 화면이 "한 판"으로 보였다(2026-08-08 사용자).
+        // 터미널 뷰는 자기 표면이 이미 가장 깊은 면이라 그대로 둔다.
+        let central_frame = if terminal_visible {
+            ui::designall::structural_frame(ui.visuals())
+        } else {
+            ui::designall::content_canvas_frame(ui.visuals())
+        };
         let mut home_action = None;
         let mut inbox_page_click = None;
         let mut fleet_action = None;

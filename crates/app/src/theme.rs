@@ -218,6 +218,7 @@ mod tests {
             ("designall selected_background", tokens.selected_background),
             ("designall hover_background", tokens.hover_background),
             ("designall separator", tokens.separator),
+            ("designall content_canvas", tokens.content_canvas),
         ] {
             assert_on_axis(label, color);
         }
@@ -271,6 +272,7 @@ mod tests {
             ("designall selected_background", tokens.selected_background),
             ("designall hover_background", tokens.hover_background),
             ("designall separator", tokens.separator),
+            ("designall content_canvas", tokens.content_canvas),
         ] {
             assert_on_axis(label, color);
         }
@@ -325,6 +327,42 @@ mod tests {
             assert_eq!(
                 tokens.app_background, chrome.panel_fill,
                 "{mode}: 사이드바와 앱 크롬이 다른 단이다"
+            );
+        }
+    }
+
+    /// 2026-08-08: 홈·작업함을 띄우면 레일·사이드바·페이지 바닥·카드가 전부
+    /// app_background라 화면이 "한 판"으로 보였다. 정보 페이지 바닥은 크롬에서
+    /// 눈에 띄게 물러난 별도의 단이어야 하고, 그래야 그 위 카드(app_background)가
+    /// 떠오른다. 값을 손보다 다시 같은 단으로 붙는 걸 막는다.
+    #[test]
+    fn 정보페이지_바닥은_크롬에서_한_단_물러나_있다() {
+        for (mode, tokens) in [
+            ("다크", crate::ui::designall::DARK),
+            ("라이트", crate::ui::designall::LIGHT),
+        ] {
+            let canvas = tokens.content_canvas;
+            let chrome = tokens.app_background;
+            assert_ne!(canvas, chrome, "{mode}: 페이지 바닥이 크롬과 같은 단이다");
+
+            // 밝기 차가 너무 작으면 색만 다르고 눈에는 한 판으로 보인다. 다크는
+            // #181b20(L11) → #0f1115(L7), 라이트는 #f1f2f5(L95) → #e0e4ea(L90)로
+            // 둘 다 4단계 이상 떨어져 있다.
+            let step = |c: Color32| {
+                let [r, g, b, _] = c.to_array().map(f32::from);
+                (r.max(g).max(b) + r.min(g).min(b)) / 2.0
+            };
+            let gap = (step(canvas) - step(chrome)).abs();
+            assert!(
+                gap >= 8.0,
+                "{mode}: 페이지 바닥과 크롬의 밝기 차 {gap:.1}/255 — 너무 붙어 한 판으로 보인다"
+            );
+
+            // 다크는 물러남 = 어두워짐, 라이트는 = 밝기가 낮아짐. 두 모드 모두
+            // 바닥이 크롬보다 어두워야 카드가 위로 떠오른다.
+            assert!(
+                step(canvas) < step(chrome),
+                "{mode}: 페이지 바닥이 크롬보다 밝다 — 카드가 가라앉는다"
             );
         }
     }

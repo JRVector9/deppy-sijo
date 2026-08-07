@@ -1568,30 +1568,7 @@ impl AgentSessionsUi {
         // Codex wraps the windows in `result.rateLimits`. Keep the direct-object
         // fallback for older app-server builds that returned the windows at the root.
         let limits = snapshot.get("rateLimits").unwrap_or(&snapshot);
-        let window = |name: &str| {
-            limits
-                .get(name)
-                .and_then(|window| window.get("usedPercent"))
-                .and_then(serde_json::Value::as_f64)
-                .filter(|percent| percent.is_finite())
-                .map(|percent| percent.clamp(0.0, 100.0).round() as u8)
-        };
-        let window_by_duration = |expected_minutes: f64| {
-            ["primary", "secondary"].into_iter().find_map(|name| {
-                let value = limits.get(name)?;
-                let duration = value.get("windowDurationMins")?.as_f64()?;
-                if (duration - expected_minutes).abs() > 1.0 {
-                    return None;
-                }
-                value
-                    .get("usedPercent")?
-                    .as_f64()
-                    .filter(|percent| percent.is_finite())
-                    .map(|percent| percent.clamp(0.0, 100.0).round() as u8)
-            })
-        };
-        let five_hour = window_by_duration(300.0).or_else(|| window("primary"));
-        let weekly = window_by_duration(10_080.0).or_else(|| window("secondary"));
+        let (five_hour, weekly) = classify_codex_rate_limit_windows(limits);
         // 창을 하나도 못 읽은 응답에서만 직전 값을 유지한다. 한쪽 창만 보고하는
         // 계정(예: 주간 창만 있는 플랜)은 읽어낸 쪽을 그대로 반영해야 한다.
         if five_hour.is_some() || weekly.is_some() {
@@ -3961,6 +3938,56 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(end);
 }
 
+const CODEX_SESSION_WINDOW_MINUTES: f64 = 300.0;
+const CODEX_WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
+/// 구버전 app-server가 보고하던 1분 오차만 흡수하고 다른 창 길이는 받지 않는다.
+const CODEX_WINDOW_DURATION_TOLERANCE_MINUTES: f64 = 1.0;
+
+/// Codex 사용량 창을 (5시간, 주간)으로 분류한다 — **길이 우선, 위치는 최후**.
+///
+/// app-server는 창을 `primary`/`secondary`로 주지만 그 자리는 창 길이를 뜻하지
+/// 않는다. 주간 창만 있는 플랜은 `primary.windowDurationMins = 10080`에
+/// `secondary = null`로 오는데, 위치만 보고 primary를 5시간 칸에 넣으면 주간
+/// 수치가 5시간 수치로 둔갑한다. 그래서 위치 기반 옛 매핑(primary=세션,
+/// secondary=주간)은 그 창의 길이를 **아예 판별할 수 없을 때만** 남긴다.
+fn classify_codex_rate_limit_windows(limits: &serde_json::Value) -> crate::app::ProviderUsage {
+    let used_percent = |name: &str| {
+        limits
+            .get(name)?
+            .get("usedPercent")?
+            .as_f64()
+            .filter(|percent| percent.is_finite())
+            .map(|percent| percent.clamp(0.0, 100.0).round() as u8)
+    };
+    let is_window = |name: &str, expected_minutes: f64| {
+        limits
+            .get(name)
+            .and_then(|window| window.get("windowDurationMins"))
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|minutes| {
+                (minutes - expected_minutes).abs() <= CODEX_WINDOW_DURATION_TOLERANCE_MINUTES
+            })
+    };
+    // 길이를 알아본 창 — 두 자리를 모두 훑어 순서가 뒤바뀐 응답도 받는다.
+    let by_duration = |expected_minutes: f64| {
+        ["primary", "secondary"]
+            .into_iter()
+            .filter(|name| is_window(name, expected_minutes))
+            .find_map(used_percent)
+    };
+    // 길이를 못 알아본 창에만 옛 위치 매핑(primary=세션, secondary=주간)을 남긴다.
+    let positional = |name: &str| {
+        (!is_window(name, CODEX_SESSION_WINDOW_MINUTES)
+            && !is_window(name, CODEX_WEEKLY_WINDOW_MINUTES))
+        .then(|| used_percent(name))
+        .flatten()
+    };
+    (
+        by_duration(CODEX_SESSION_WINDOW_MINUTES).or_else(|| positional("primary")),
+        by_duration(CODEX_WEEKLY_WINDOW_MINUTES).or_else(|| positional("secondary")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5540,5 +5567,154 @@ mod tests {
 
         assert!(!ui.surrender_text_focus(&ctx));
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(terminal));
+    }
+
+    /// 창 분류 계약 표. app-server가 창을 `primary`/`secondary` 어느 자리에 담든
+    /// **길이(windowDurationMins)**가 5시간/주간을 정하고, 위치 기반 옛 매핑은
+    /// 길이를 판별할 수 없을 때만 쓴다.
+    #[test]
+    fn codex_사용량_창은_길이로_분류되고_위치는_판별_불가일_때만_쓴다() {
+        let cases: &[(&str, serde_json::Value, crate::app::ProviderUsage)] = &[
+            ("창 객체 자체가 없음", serde_json::json!(null), (None, None)),
+            (
+                "자리가 뒤바뀐 창 — 길이를 따라간다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 81, "windowDurationMins": 10080},
+                    "secondary": {"usedPercent": 21, "windowDurationMins": 300},
+                }),
+                (Some(21), Some(81)),
+            ),
+            (
+                "주간 창만 있는 플랜 — 5시간 칸을 주간 값으로 채우지 않는다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 22, "windowDurationMins": 10080},
+                    "secondary": null,
+                }),
+                (None, Some(22)),
+            ),
+            (
+                "5시간 창만 secondary에 있음",
+                serde_json::json!({
+                    "primary": null,
+                    "secondary": {"usedPercent": 31, "windowDurationMins": 300},
+                }),
+                (Some(31), None),
+            ),
+            (
+                "5시간 창이 둘 — 먼저 온 쪽을 쓰고 주간은 비운다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 41, "windowDurationMins": 300},
+                    "secondary": {"usedPercent": 42, "windowDurationMins": 300},
+                }),
+                (Some(41), None),
+            ),
+            (
+                "주간 창이 둘 — 먼저 온 쪽을 쓰고 5시간은 비운다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 51, "windowDurationMins": 10080},
+                    "secondary": {"usedPercent": 52, "windowDurationMins": 10080},
+                }),
+                (None, Some(51)),
+            ),
+            (
+                "usedPercent가 숫자가 아닌 창은 버린다",
+                serde_json::json!({
+                    "primary": {"usedPercent": "n/a", "windowDurationMins": 300},
+                    "secondary": {"usedPercent": 61, "windowDurationMins": 10080},
+                }),
+                (None, Some(61)),
+            ),
+            (
+                "길이가 숫자가 아니면 판별 불가 — 위치 폴백",
+                serde_json::json!({
+                    "primary": {"usedPercent": 71, "windowDurationMins": "300"},
+                    "secondary": null,
+                }),
+                (Some(71), None),
+            ),
+            (
+                "허용 오차 1분 안쪽은 받는다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 81, "windowDurationMins": 10081},
+                    "secondary": {"usedPercent": 82, "windowDurationMins": 299},
+                }),
+                (Some(82), Some(81)),
+            ),
+            (
+                "허용 오차 반대쪽 경계도 받는다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 83, "windowDurationMins": 10079},
+                    "secondary": {"usedPercent": 84, "windowDurationMins": 301},
+                }),
+                (Some(84), Some(83)),
+            ),
+            (
+                "허용 오차 밖은 판별 불가 — 위치 폴백",
+                serde_json::json!({
+                    "primary": {"usedPercent": 91, "windowDurationMins": 302},
+                    "secondary": {"usedPercent": 92, "windowDurationMins": 10082},
+                }),
+                (Some(91), Some(92)),
+            ),
+            (
+                "길이 필드가 아예 없는 구버전 응답 — 위치 폴백",
+                serde_json::json!({
+                    "primary": {"usedPercent": 61},
+                    "secondary": {"usedPercent": 62},
+                }),
+                (Some(61), Some(62)),
+            ),
+            (
+                "판별된 5시간 창이 위치 폴백을 이긴다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 71, "windowDurationMins": 60},
+                    "secondary": {"usedPercent": 72, "windowDurationMins": 300},
+                }),
+                (Some(72), None),
+            ),
+            (
+                "판별된 주간 창이 위치 폴백을 이긴다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 81, "windowDurationMins": 10080},
+                    "secondary": {"usedPercent": 82, "windowDurationMins": 60},
+                }),
+                (None, Some(81)),
+            ),
+            (
+                "범위를 벗어난 수치는 0~100으로 자른다",
+                serde_json::json!({
+                    "primary": {"usedPercent": 120.4, "windowDurationMins": 300},
+                    "secondary": {"usedPercent": -3.0, "windowDurationMins": 10080},
+                }),
+                (Some(100), Some(0)),
+            ),
+        ];
+        for (name, snapshot, expected) in cases {
+            assert_eq!(
+                classify_codex_rate_limit_windows(snapshot),
+                *expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// 실제 app-server 응답 모양(2026-08 pro 계정) — 주간 창 하나만 오고
+    /// `secondary`가 null이다. 이 응답에서 5시간 칸에 91이 들어가면 회귀다.
+    #[test]
+    fn 주간_창만_보고하는_응답은_5시간_칸을_비워둔다() {
+        let snapshot = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 91, "windowDurationMins": 10080, "resetsAt": 1786160724},
+                "secondary": null,
+                "planType": "pro",
+            }
+        });
+        let limits = snapshot.get("rateLimits").expect("rateLimits");
+        assert_eq!(
+            classify_codex_rate_limit_windows(limits),
+            (None, Some(91)),
+            "주간 91%가 5시간 칸에 복제되면 안 된다"
+        );
     }
 }

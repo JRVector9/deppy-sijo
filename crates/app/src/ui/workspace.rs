@@ -411,6 +411,22 @@ struct PaneHeaderStyle {
     active_stroke: Option<egui::Stroke>,
 }
 
+/// 채도를 `factor`배로 낮춘다 (0.0이면 무채색, 1.0이면 원본). luma 쪽으로 섞으므로
+/// **밝기는 유지되고 채도만 빠진다** — 알파를 낮추는 것과 다르다. 알파를 낮추면 선이
+/// 그냥 어두워져 신호가 약해지는데, "쨍하다"는 건 채도 문제이지 밝기 문제가 아니다
+/// (2026-08-07 사용자).
+fn desaturate(color: egui::Color32, factor: f32) -> egui::Color32 {
+    let [red, green, blue, _] = color.to_array();
+    let luma = 0.2126 * f32::from(red) + 0.7152 * f32::from(green) + 0.0722 * f32::from(blue);
+    let mix =
+        |channel: u8| (f32::from(channel) * factor + luma * (1.0 - factor)).clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgb(mix(red), mix(green), mix(blue))
+}
+
+/// 포커스 상단선이 워크스페이스 고유색을 얼마나 살릴지. 팔레트가 주황 78%·보라 71%처럼
+/// 채도가 높아 1px 선인데도 쨍하게 튀었다. 낮추면 워크스페이스별 선 무게 편차도 준다.
+const PANE_HEADER_IDENTITY_SATURATION: f32 = 0.6;
+
 fn pane_header_style(identity_color: egui::Color32, focused: bool) -> PaneHeaderStyle {
     PaneHeaderStyle {
         // 탭 바는 터미널과 **같은 면**이다 — 그 pane의 제목이지 앱 크롬이 아니다.
@@ -424,8 +440,10 @@ fn pane_header_style(identity_color: egui::Color32, focused: bool) -> PaneHeader
         // 보였다(2026-08-07 사용자). 같은 자리(pane 상단선)를 쓰는 cross-workspace 붙임
         // pane이 이미 워크스페이스 색을 쓰고 있으므로, 자기 워크스페이스 pane도 같은
         // 규칙으로 맞춘다 — 사이드바 아바타·세션 레일과도 색이 이어진다.
-        active_stroke: focused
-            .then_some(egui::Stroke::new(1.0, identity_color.gamma_multiply(0.55))),
+        active_stroke: focused.then_some(egui::Stroke::new(
+            1.0,
+            desaturate(identity_color, PANE_HEADER_IDENTITY_SATURATION).gamma_multiply(0.55),
+        )),
     }
 }
 
@@ -6013,8 +6031,27 @@ mod tests {
         );
         assert_eq!(
             style.active_stroke,
-            Some(egui::Stroke::new(1.0, identity.gamma_multiply(0.55)))
+            Some(egui::Stroke::new(
+                1.0,
+                desaturate(identity, PANE_HEADER_IDENTITY_SATURATION).gamma_multiply(0.55)
+            ))
         );
+        // 탈채도는 **채도만** 낮춘다 — 밝기까지 떨어뜨리면 포커스 신호가 약해진다.
+        let toned = desaturate(identity, PANE_HEADER_IDENTITY_SATURATION);
+        let luma = |c: egui::Color32| {
+            0.2126 * f32::from(c.r()) + 0.7152 * f32::from(c.g()) + 0.0722 * f32::from(c.b())
+        };
+        assert!(
+            (luma(toned) - luma(identity)).abs() < 2.0,
+            "밝기가 바뀌었다: {} -> {}",
+            luma(identity),
+            luma(toned)
+        );
+        let spread = |c: egui::Color32| {
+            let v = [c.r(), c.g(), c.b()];
+            f32::from(v.iter().copied().max().unwrap() - v.iter().copied().min().unwrap())
+        };
+        assert!(spread(toned) < spread(identity), "채도가 안 낮아졌다");
         let header = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 32.0));
         let close = egui::Rect::from_min_max(egui::pos2(100.0, 6.0), egui::pos2(120.0, 26.0));
         let boundary = pane_header_active_boundary(header, close);

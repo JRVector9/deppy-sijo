@@ -651,7 +651,7 @@ pub struct AgentSessionsUi {
     pending_model_catalog: Option<CodexModelCatalogReply>,
     pending_skill_catalog: Option<CodexSkillCatalogReply>,
     pending_rate_limits: Option<CodexAppServerReply>,
-    codex_usage: Option<(u8, u8)>,
+    codex_usage: Option<crate::app::ProviderUsage>,
     last_rate_limits_request: Option<std::time::Instant>,
     catalog_error: Option<CatalogMessage>,
     text_input_ids: Vec<egui::Id>,
@@ -1547,7 +1547,7 @@ impl AgentSessionsUi {
             .and_then(|client| client.read_rate_limits().ok());
     }
 
-    pub fn codex_usage(&self) -> Option<(u8, u8)> {
+    pub fn codex_usage(&self) -> Option<crate::app::ProviderUsage> {
         self.codex_usage
     }
 
@@ -1592,7 +1592,9 @@ impl AgentSessionsUi {
         };
         let five_hour = window_by_duration(300.0).or_else(|| window("primary"));
         let weekly = window_by_duration(10_080.0).or_else(|| window("secondary"));
-        if let (Some(five_hour), Some(weekly)) = (five_hour, weekly) {
+        // 창을 하나도 못 읽은 응답에서만 직전 값을 유지한다. 한쪽 창만 보고하는
+        // 계정(예: 주간 창만 있는 플랜)은 읽어낸 쪽을 그대로 반영해야 한다.
+        if five_hour.is_some() || weekly.is_some() {
             self.codex_usage = Some((five_hour, weekly));
         }
     }

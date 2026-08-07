@@ -293,8 +293,8 @@ impl AgentTerminalUi {
     pub(crate) fn status_bar_with_managers(
         &mut self,
         ui: &mut egui::Ui,
-        claude_usage: Option<(u8, u8)>,
-        codex_usage: Option<(u8, u8)>,
+        claude_usage: Option<crate::app::ProviderUsage>,
+        codex_usage: Option<crate::app::ProviderUsage>,
         rows: &[ActivityWorkspaceRow],
         approvals: usize,
         // `waiting_sessions`: 입력 대기 세션 — (표시 라벨, 이동 대상). 칩으로 직접 노출한다.

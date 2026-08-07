@@ -279,6 +279,22 @@ mod tests {
         }
     }
 
+    /// 이 테스트가 실제로 옛 구현을 잡는지 확인한다 — 통과만 하는 테스트는 안 쓴 것과 같다.
+    /// egui의 round_to_pixel_center(항상 픽셀 중심)는 ppp 2에서 1.0pt 선이 짝수 폭이라
+    /// 끝점이 x.5로 떨어진다.
+    #[test]
+    fn 옛_중심정렬_규칙은_짝수폭에서_끝점이_어긋난다() {
+        let (width, ppp, coord) = (1.0_f32, 2.0_f32, 10.0_f32);
+        let old_y = ((coord * ppp - 0.5).round() + 0.5) / ppp; // round_to_pixel_center
+        let old_edge = (old_y - width * 0.5) * ppp;
+        assert!(
+            (old_edge - old_edge.round()).abs() > 0.4,
+            "옛 규칙이 이미 정렬돼 있으면 이 수정은 의미가 없다"
+        );
+        let new_edge = (snap_line_to_pixel(coord, width, ppp) - width * 0.5) * ppp;
+        assert!((new_edge - new_edge.round()).abs() < 0.001);
+    }
+
     /// ppp가 비정상이어도 발산하지 않는다.
     #[test]
     fn 선_스냅은_비정상_ppp에서도_유한하다() {

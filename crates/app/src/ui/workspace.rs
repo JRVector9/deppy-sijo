@@ -3215,7 +3215,11 @@ impl WorkspaceUi {
             .rect_filled(header, 0.0, identity_style.header_fill);
         ui.painter().hline(
             header.x_range(),
-            crate::ui::snap_line_to_pixel(header.bottom(), 1.0, ui.ctx().pixels_per_point()),
+            crate::ui::snap_line_to_pixel(
+                header.bottom(),
+                crate::ui::designall::SEPARATOR_WIDTH,
+                ui.ctx().pixels_per_point(),
+            ),
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
         if identity_style.top_line.color != egui::Color32::TRANSPARENT {
@@ -3410,7 +3414,11 @@ impl WorkspaceUi {
         }
         ui.painter().hline(
             header.x_range(),
-            crate::ui::snap_line_to_pixel(header.bottom(), 1.0, ui.ctx().pixels_per_point()),
+            crate::ui::snap_line_to_pixel(
+                header.bottom(),
+                crate::ui::designall::SEPARATOR_WIDTH,
+                ui.ctx().pixels_per_point(),
+            ),
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
 

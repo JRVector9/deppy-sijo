@@ -18328,7 +18328,7 @@ impl App {
                 });
             let separator_y = ui::snap_line_to_pixel(
                 dock_response.response.rect.top(),
-                1.0,
+                ui::designall::SEPARATOR_WIDTH,
                 ui.ctx().pixels_per_point(),
             );
             ui.painter().hline(
@@ -19861,12 +19861,12 @@ impl eframe::App for App {
                 // 규칙은 designall::panel_edge_separator_x가 소유한다.
                 let ppp = ui.ctx().pixels_per_point();
                 let painter = ui.painter();
-                let bottom = ui::snap_line_to_pixel(bar_rect.bottom(), 1.0, ppp);
+                let bottom = ui::snap_line_to_pixel(bar_rect.bottom(), separator.width, ppp);
                 painter.hline(bar_rect.x_range(), bottom, separator);
                 for right in [regions.traffic.right(), regions.project.right()] {
                     let x = ui::snap_line_to_pixel(
                         ui::designall::panel_edge_separator_x(right, ppp),
-                        1.0,
+                        separator.width,
                         ppp,
                     );
                     painter.vline(x, bar_rect.y_range(), separator);

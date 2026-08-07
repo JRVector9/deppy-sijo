@@ -2466,8 +2466,11 @@ impl FileTreeUi {
             }
             tab_left += width;
         }
-        let separator_y =
-            crate::ui::snap_line_to_pixel(header_rect.bottom(), 1.0, ui.ctx().pixels_per_point());
+        let separator_y = crate::ui::snap_line_to_pixel(
+            header_rect.bottom(),
+            crate::ui::designall::SEPARATOR_WIDTH,
+            ui.ctx().pixels_per_point(),
+        );
         ui.painter().hline(
             header_rect.x_range(),
             separator_y,
@@ -3879,7 +3882,11 @@ fn paint_workspace_group_separator(ui: &egui::Ui, rect: egui::Rect) {
     if rect.height() <= 0.0 || rect.width() <= 0.0 {
         return;
     }
-    let y = crate::ui::snap_line_to_pixel(rect.bottom(), 1.0, ui.ctx().pixels_per_point());
+    let y = crate::ui::snap_line_to_pixel(
+        rect.bottom(),
+        crate::ui::designall::SEPARATOR_WIDTH,
+        ui.ctx().pixels_per_point(),
+    );
     ui.painter().hline(
         rect.x_range(),
         y,
@@ -4711,7 +4718,11 @@ fn session_row_impl(
         // 여기만 스냅이 빠져 있어 행마다 선 굵기가 달라 보였다.
         painter.hline(
             highlight_rect.x_range(),
-            crate::ui::snap_line_to_pixel(highlight_rect.bottom(), 1.0, ppp),
+            crate::ui::snap_line_to_pixel(
+                highlight_rect.bottom(),
+                crate::ui::designall::SEPARATOR_WIDTH,
+                ppp,
+            ),
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
     }

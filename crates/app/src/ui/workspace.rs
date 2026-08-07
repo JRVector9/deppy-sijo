@@ -413,7 +413,11 @@ struct PaneHeaderStyle {
 
 fn pane_header_style(tokens: crate::ui::designall::Tokens, focused: bool) -> PaneHeaderStyle {
     PaneHeaderStyle {
-        background: tokens.app_background,
+        // 탭 바는 터미널과 **같은 면**이다 — 그 pane의 제목이지 앱 크롬이 아니다.
+        // app_background(사이드바·크롬과 같은 단)를 쓰던 동안에는 터미널 위에 밝은 띠가
+        // 얹혀 pane이 두 조각으로 보였다(2026-08-07 사용자). 테마와 무관하게 항상 다크인
+        // 면이라 tokens가 아니라 렌더러 상수를 그대로 쓴다.
+        background: terminal::renderer_egui::TERMINAL_SURFACE_BG,
         selection_fill: None,
         active_stroke: focused
             .then_some(egui::Stroke::new(1.0, tokens.accent.gamma_multiply(0.55))),
@@ -534,14 +538,12 @@ struct AttachedIdentityStyle {
     body_fill: egui::Color32,
 }
 
-fn attached_identity_style(
-    tokens: crate::ui::designall::Tokens,
-    identity_color: egui::Color32,
-) -> AttachedIdentityStyle {
+fn attached_identity_style(identity_color: egui::Color32) -> AttachedIdentityStyle {
     AttachedIdentityStyle {
         top_line: egui::Stroke::new(1.0, identity_color),
-        header_fill: tokens.app_background,
-        body_fill: tokens.app_background,
+        // 위 pane_header_style과 같은 이유로 터미널 작업면 색을 쓴다.
+        header_fill: terminal::renderer_egui::TERMINAL_SURFACE_BG,
+        body_fill: terminal::renderer_egui::TERMINAL_SURFACE_BG,
     }
 }
 
@@ -3159,7 +3161,6 @@ impl WorkspaceUi {
     ) -> (bool, Option<AttachedPaneReorder>) {
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let identity_style = attached_identity_style(
-            tokens,
             header_context
                 .map(|context| context.identity_color)
                 .unwrap_or(egui::Color32::TRANSPARENT),
@@ -5982,7 +5983,10 @@ mod tests {
     #[test]
     fn designall_pane_header는_1px탑라인을_close옆에서끝낸다() {
         let style = pane_header_style(crate::ui::designall::DARK, true);
-        assert_eq!(style.background, crate::ui::designall::DARK.app_background);
+        assert_eq!(
+            style.background,
+            terminal::renderer_egui::TERMINAL_SURFACE_BG
+        );
         assert_eq!(style.selection_fill, None);
         assert_eq!(
             style.active_stroke,
@@ -6232,11 +6236,17 @@ mod tests {
     #[test]
     fn foreign_identity_color_is_top_line_only() {
         let identity = egui::Color32::LIGHT_BLUE;
-        let style = attached_identity_style(crate::ui::designall::DARK, identity);
+        let style = attached_identity_style(identity);
 
         assert_eq!(style.top_line, egui::Stroke::new(1.0, identity));
-        assert_eq!(style.header_fill, crate::ui::designall::DARK.app_background);
-        assert_eq!(style.body_fill, crate::ui::designall::DARK.app_background);
+        assert_eq!(
+            style.header_fill,
+            terminal::renderer_egui::TERMINAL_SURFACE_BG
+        );
+        assert_eq!(
+            style.body_fill,
+            terminal::renderer_egui::TERMINAL_SURFACE_BG
+        );
     }
 
     #[test]

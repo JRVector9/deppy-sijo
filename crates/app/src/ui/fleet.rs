@@ -10,8 +10,7 @@
 //! [`FleetPageOutput`]으로 묶어 App이 기존 apply 경로(`apply_inbox_approval_decision`,
 //! `apply_inbox_waiting_action`)로 소비한다 — leaf는 host I/O를 하지 않는다.
 //!
-//! 상태 색은 앱 공용 팔레트(`agent_visuals::status_color`), 워크스페이스 색은
-//! `file_tree::workspace_accent`를 재사용한다.
+//! 상태 색은 앱 공용 팔레트(`agent_visuals::status_color`)를 재사용한다.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -264,7 +263,6 @@ impl FleetUi {
         library: &PromptLibrary,
         batch_spawn_input: BatchSpawnInput<'_>,
         attention: AttentionInput<'_>,
-        workspaces: &[crate::ui::file_tree::SidebarWorkspaceEntry],
     ) -> FleetPageOutput {
         let BatchSpawnInput {
             agents,
@@ -399,13 +397,7 @@ impl FleetUi {
                                     section_header(ui, group, members.len(), catalog);
                                     ui.horizontal_wrapped(|ui| {
                                         for session in &members {
-                                            match card(
-                                                ui,
-                                                session,
-                                                catalog,
-                                                card_accent(workspaces, session),
-                                                now,
-                                            ) {
+                                            match card(ui, session, catalog, now) {
                                                 Some(CardClick::Open) => {
                                                     *action = Some(match &session.target {
                                                         FleetTarget::Pty { tab, pane, .. } => {
@@ -1125,15 +1117,6 @@ fn render_hero(
     out
 }
 
-/// 카드 좌측 상태색과 별개인 **워크스페이스 고유색** — 어느 프로젝트 일인지 읽지 않고
-/// 구분하게 한다. 사이드바 아바타·pane 상단선과 같은 색 체계다.
-fn card_accent(
-    workspaces: &[crate::ui::file_tree::SidebarWorkspaceEntry],
-    session: &FleetSession,
-) -> egui::Color32 {
-    crate::ui::file_tree::workspace_accent(workspaces, &session.workspace_id)
-}
-
 /// 상단 헤더: 제목 + 총계 + (우측) 배치 스폰·브로드캐스트·새 에이전트 버튼 + 묶음별 칩.
 fn header(
     ui: &mut egui::Ui,
@@ -1221,7 +1204,6 @@ fn card(
     ui: &mut egui::Ui,
     session: &FleetSession,
     catalog: &i18n::Catalog,
-    accent: egui::Color32,
     now: i64,
 ) -> Option<CardClick> {
     let size = egui::vec2(252.0, 96.0);
@@ -1262,16 +1244,11 @@ fn card(
             egui::Stroke::new(1.0, border),
             egui::StrokeKind::Inside,
         );
-        // 좌측 상태 바 — 정렬을 지배하는 신호라 시선이 먼저 닿는 자리에 둔다.
+        // 좌측 상태 바 하나만 — 정렬을 지배하는 신호라 시선이 먼저 닿는 자리에 둔다.
+        // 우측에 워크스페이스 색 띠도 그렸었지만, 카드마다 색이 둘이라 어느 쪽이 상태인지
+        // 읽는 데 품이 들었다(2026-08-09). 워크스페이스는 2행에 이름으로 이미 있다.
         let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(4.0, rect.height()));
         p.rect_filled(bar, 6.0, state_color);
-        // 우측 워크스페이스 띠 — 어느 프로젝트인지 읽지 않고 구분하게 한다. 상태색과
-        // 겹치지 않게 반대편에 두어 둘 중 뭐가 상태인지 헷갈리지 않는다.
-        let accent_bar = egui::Rect::from_min_size(
-            rect.right_top() - egui::vec2(3.0, 0.0),
-            egui::vec2(3.0, rect.height()),
-        );
-        p.rect_filled(accent_bar, 6.0, accent);
     }
 
     // 내용은 child UI(top-down)로 — 라벨 truncate가 카드 폭을 넘지 않게 클립한다.
@@ -1415,9 +1392,6 @@ fn state_label(state: AgentVisualState, catalog: &i18n::Catalog) -> String {
 mod tests {
     use super::*;
     use crate::ui::approvals::PendingApprovalItem;
-    use crate::ui::file_tree::{
-        SidebarSessionSummary, SidebarWorkspaceEntry, SidebarWorkspaceState,
-    };
     use crate::ui::inbox_waiting::{InboxWaitingUi, WaitingCard};
     use std::collections::HashMap;
 
@@ -1462,15 +1436,6 @@ mod tests {
         }
     }
 
-    fn workspace(id: &str) -> SidebarWorkspaceEntry {
-        SidebarWorkspaceEntry {
-            id: id.to_owned(),
-            name: id.to_owned(),
-            state: SidebarWorkspaceState::Active,
-            summary: SidebarSessionSummary::default(),
-        }
-    }
-
     fn pty_session(workspace_id: &str, session: u64, state: AgentVisualState) -> FleetSession {
         FleetSession {
             workspace_id: workspace_id.to_owned(),
@@ -1498,7 +1463,6 @@ mod tests {
         pending: &[PendingApprovalItem],
         waiting_cards: &[(WaitingCard, i64)],
         waiting_ui: &mut InboxWaitingUi,
-        workspaces: &[SidebarWorkspaceEntry],
     ) -> FleetPageOutput {
         let ctx = egui::Context::default();
         let catalog = catalog();
@@ -1524,7 +1488,6 @@ mod tests {
                     waiting_ui,
                     structured: &[],
                 },
-                workspaces,
             );
         });
         out
@@ -1564,7 +1527,6 @@ mod tests {
                         waiting_ui: &mut waiting,
                         structured: &[],
                     },
-                    &[workspace("ws-1")],
                 );
             });
         harness.run();
@@ -1594,17 +1556,9 @@ mod tests {
             &[],
             &[(waiting_card("ws-1", 7), 0)],
             &mut waiting,
-            &[workspace("ws-1")],
         );
         assert!(first.waiting_action.is_none());
-        let second = draw(
-            &mut fleet,
-            &[],
-            &[],
-            &[],
-            &mut waiting,
-            &[workspace("ws-1")],
-        );
+        let second = draw(&mut fleet, &[], &[], &[], &mut waiting);
         assert!(second.waiting_action.is_none());
     }
 
@@ -1644,7 +1598,6 @@ mod tests {
                             waiting_ui: &mut waiting,
                             structured: &[],
                         },
-                        &[workspace("ws-1")],
                     );
                 });
             harness.run();
@@ -1730,7 +1683,6 @@ mod tests {
                         waiting_ui: &mut waiting,
                         structured: &[],
                     },
-                    &[workspace("ws-1")],
                 );
             });
         harness.run();
@@ -1741,26 +1693,6 @@ mod tests {
         assert!(
             harness.query_by_label(&errored_label).is_none(),
             "오류가 없는데 「{errored_label}」 헤더를 그렸다"
-        );
-    }
-
-    /// 워크스페이스 띠는 프로젝트마다 다르고 같은 프로젝트에서는 안정적이어야 한다 —
-    /// 픽셀을 보지 않고 색 계산만 검증한다.
-    #[test]
-    fn 카드_워크스페이스색은_프로젝트마다_다르고_같은_프로젝트에서_안정적이다() {
-        let workspaces = [workspace("ws-1"), workspace("ws-2")];
-        let a = pty_session("ws-1", 1, AgentVisualState::Active);
-        let b = pty_session("ws-2", 2, AgentVisualState::Active);
-        let a_again = pty_session("ws-1", 3, AgentVisualState::Waiting);
-        assert_ne!(
-            card_accent(&workspaces, &a),
-            card_accent(&workspaces, &b),
-            "다른 워크스페이스가 같은 색이면 구분이 안 된다"
-        );
-        assert_eq!(
-            card_accent(&workspaces, &a),
-            card_accent(&workspaces, &a_again),
-            "같은 워크스페이스는 세션·상태가 달라도 같은 색이어야 한다"
         );
     }
 
@@ -1805,7 +1737,6 @@ mod tests {
                             waiting_ui: &mut state.waiting,
                             structured: &[],
                         },
-                        &[workspace("ws-1")],
                     );
                 },
                 State {
@@ -1878,7 +1809,6 @@ mod tests {
                         waiting_ui: &mut waiting,
                         structured: &[],
                     },
-                    &[workspace("ws-1")],
                 );
             });
         harness.run();
@@ -1960,7 +1890,6 @@ mod tests {
                             waiting_ui: &mut state.waiting,
                             structured: &[structured("s-42", "위험한 작업", 100)],
                         },
-                        &[workspace("ws-1")],
                     );
                     if page.structured_decision.is_some() {
                         state.out = page.structured_decision;
@@ -2021,7 +1950,6 @@ mod tests {
                         waiting_ui: &mut waiting,
                         structured: &[],
                     },
-                    &[workspace("ws-1")],
                 );
             });
         harness.run();
@@ -2079,7 +2007,6 @@ mod tests {
                             waiting_ui: &mut state.waiting,
                             structured: &[],
                         },
-                        &[workspace("ws-1")],
                     );
                     if let Some(FleetAction::ScheduleFollowUp {
                         workspace_id,

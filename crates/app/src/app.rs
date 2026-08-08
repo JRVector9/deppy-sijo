@@ -21055,7 +21055,6 @@ impl eframe::App for App {
                             waiting_ui: &mut self.inbox_waiting_ui,
                             structured: &fleet_structured,
                         },
-                        &sidebar_workspaces,
                     );
                     fleet_action = page.grid;
                     fleet_page_output = Some((

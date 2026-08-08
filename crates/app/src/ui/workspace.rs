@@ -6115,7 +6115,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// 2026-08-08: pane 전체 플래시가 풀 채도 시안(selection.bg_fill)을 알파 255로
     /// 2px×4변에 그려 화면에서 가장 세게 튀었다. 상단선과 같은 워크스페이스 색·채도
     /// 규칙을 쓰고 최대 알파를 낮춘다. 값을 되돌리면 이 테스트가 잡는다.
@@ -6166,6 +6165,7 @@ mod tests {
         assert_eq!(pane_flash_color(identity, -1.0).a(), 0);
     }
 
+    #[test]
     fn designall_pane_header는_1px탑라인을_close옆에서끝낸다() {
         // 상단선은 accent가 아니라 **그 pane이 속한 워크스페이스 고유색**이다.
         // accent를 쓰면 경계 드래그 라인과 같은 청록이 돼 구분되지 않는다.

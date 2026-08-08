@@ -7480,6 +7480,12 @@ pub struct App {
     /// "완료" 표시가 가능해졌다. agent_turn_done(활성 전용)과 달리 워크스페이스별로 갈라
     /// fleet/사이드바 warm 경로에 넘긴다.
     global_turn_done: std::collections::HashMap<(String, runtime::SessionId), i64>,
+    /// 「이 턴 끝나면 이거 해」 — 세션별로 예약해둔 다음 프롬프트 한 칸.
+    ///
+    /// SessionId는 워크스페이스마다 재사용되므로 키는 `(workspace_id, session)` 쌍이다
+    /// (`blocked_since`와 같은 관례). 세션당 하나만 들고 있어 예약이 쌓이지 않는다 —
+    /// 다시 예약하면 덮어쓴다.
+    pty_followup: std::collections::HashMap<(String, runtime::SessionId), QueuedFollowUp>,
     /// 완료/입력대기 주목(attention) 추적 — 미확인이면 레일 6px, 포커스 확인 시 해제.
     session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
     /// 세션별 현재 작업 폴더(감지 워커 lsof) — 행 1행 폴더명 + 워크스페이스명.
@@ -7627,6 +7633,14 @@ fn workspace_close_disposition(
     } else {
         WorkspaceCloseDisposition::CloseNow
     }
+}
+
+/// 예약된 다음 단계 한 칸. 원문과 **예약 시점의 turn_done 세대**를 함께 들고 있어야
+/// 이미 끝나 있던 턴으로 즉시 발사되지 않는다(`crate::fleet::followup_ready`).
+#[derive(Debug, Clone, PartialEq)]
+struct QueuedFollowUp {
+    prompt: String,
+    queued_turn: Option<i64>,
 }
 
 /// hook 상태에서 "새 턴 시작"으로 볼 전이만 고른다 — 직전에 막혀 있던(대기 또는 완료)
@@ -10341,6 +10355,7 @@ impl App {
             agent_working: std::collections::HashSet::new(),
             global_working: std::collections::HashSet::new(),
             global_turn_done: std::collections::HashMap::new(),
+            pty_followup: std::collections::HashMap::new(),
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
@@ -11047,6 +11062,49 @@ impl App {
         }
     }
 
+    /// 턴이 끝난 세션의 예약된 다음 단계를 보낸다.
+    ///
+    /// 판정은 `crate::fleet::followup_ready`가 전부 한다(순수 함수). 여기서는 죽은
+    /// 세션의 예약을 먼저 버리고 — 워크스페이스가 닫혔거나 pane이 사라졌다 — 살아남은
+    /// 것만 발사한다. 보낸 예약은 즉시 지운다: 한 칸이라 반복 발사가 되면 안 된다.
+    fn flush_queued_followups(&mut self) {
+        if self.pty_followup.is_empty() {
+            return;
+        }
+        let dead: Vec<(String, runtime::SessionId)> = self
+            .pty_followup
+            .keys()
+            .filter(|(workspace_id, session)| !self.attention_session_alive(workspace_id, *session))
+            .cloned()
+            .collect();
+        for key in dead {
+            self.pty_followup.remove(&key);
+        }
+        let waiting: std::collections::HashSet<(String, runtime::SessionId)> = self
+            .global_waiting
+            .iter()
+            .map(|(workspace_id, session, _)| (workspace_id.clone(), *session))
+            .collect();
+        let ready: Vec<((String, runtime::SessionId), String)> = self
+            .pty_followup
+            .iter()
+            .filter(|(key, queued)| {
+                crate::fleet::followup_ready(
+                    queued.queued_turn,
+                    self.global_turn_done.get(*key).copied(),
+                    waiting.contains(*key),
+                )
+            })
+            .map(|(key, queued)| (key.clone(), queued.prompt.clone()))
+            .collect();
+        for (key, prompt) in ready {
+            self.pty_followup.remove(&key);
+            let (workspace_id, session) = key;
+            tracing::info!("다음 단계 예약: 턴이 끝나 지금 보낸다");
+            self.broadcast_prompt_to(&workspace_id, session, &prompt);
+        }
+    }
+
     /// hook이 보고한 턴 시작을 해당 워크스페이스 런타임의 status detector에 전달한다.
     /// regex 결과 상태(Error/Done)는 latch라 해제 경로가 on_input(=그 pane에 직접 타이핑)
     /// 하나뿐이었고, 그래서 error regex 오탐 한 번이 무기한 남았다. 턴 경계는 입력과
@@ -11176,6 +11234,11 @@ impl App {
                     turn_start_transitions(&working_now, &self.global_working, &was_blocked);
                 self.global_working = working_now;
                 self.note_turn_starts(&turn_started);
+                // 예약해둔 다음 단계 발사 — 뷰와 무관하게 **여기서** 판정한다.
+                // 「작업」 페이지를 떠났다고 예약이 죽으면 "맡겨두고 다른 일 하기"가
+                // 성립하지 않는다. global_* 셋은 모든 워크스페이스를 덮고 liveness도
+                // 이미 거쳤으므로 warm 세션의 예약도 그대로 발사된다.
+                self.flush_queued_followups();
             }
             crate::agent_state_worker::AgentStateSection::Restore => {
                 let rows = snapshot
@@ -18287,6 +18350,10 @@ impl App {
                 };
                 out.push(crate::fleet::FleetSession {
                     last_output_at: entry.last_output_at,
+                    followup: self
+                        .pty_followup
+                        .get(&(workspace.id.clone(), session))
+                        .map(|queued| queued.prompt.clone()),
                     blocked_since: (state == AgentVisualState::Waiting)
                         .then(|| {
                             self.blocked_since
@@ -18352,6 +18419,8 @@ impl App {
                 blocked_since,
                 // PTY 스냅샷이 없어 출력 시각을 알 수 없다 — 멈춤 표시 대상이 아니다.
                 last_output_at: None,
+                // 예약은 WriteInput 경로라 PTY 전용이다(구조화는 steer).
+                followup: None,
             });
         }
         out
@@ -21482,6 +21551,33 @@ impl eframe::App for App {
                         prompt,
                     });
                     ui.ctx().request_repaint();
+                }
+            }
+            Some(ui::fleet::FleetAction::ScheduleFollowUp {
+                workspace_id,
+                session,
+                prompt,
+            }) => {
+                let key = (workspace_id, session);
+                if prompt.trim().is_empty() {
+                    // 빈 프롬프트 = 해제. 카드의 「예약 취소」가 이 경로로 온다.
+                    self.pty_followup.remove(&key);
+                } else if prompt.len() > FLEET_BATCH_SPAWN_PROMPT_MAX_BYTES {
+                    // 배치 스폰과 같은 상한. PTY에 통째로 붙여넣는 경로라 비정상적으로 큰
+                    // 입력은 예약 자체를 하지 않는다.
+                    self.agents_ui
+                        .report_error(ui::agents::AgentsUiErrorCode::TooManyArguments);
+                } else {
+                    // 예약 시점의 turn_done 세대를 함께 기록한다 — 이미 끝나 있던 턴으로
+                    // 즉시 발사되면 "이 턴 끝나면"이 아니게 된다.
+                    let queued_turn = self.global_turn_done.get(&key).copied();
+                    self.pty_followup.insert(
+                        key,
+                        QueuedFollowUp {
+                            prompt,
+                            queued_turn,
+                        },
+                    );
                 }
             }
             None => {}

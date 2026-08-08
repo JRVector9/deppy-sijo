@@ -50,6 +50,14 @@ pub enum FleetAction {
         count: u32,
         prompt: Option<String>,
     },
+    /// 「이 턴 끝나면 이거 해」 — 한 세션에 다음 프롬프트 한 칸을 예약한다. 브로드캐스트와
+    /// 달리 **지금 보내지 않는다**: App이 hook의 turn_done을 보고 턴이 끝난 뒤 보낸다.
+    /// `prompt`가 비면 예약 해제다.
+    ScheduleFollowUp {
+        workspace_id: String,
+        session: runtime::SessionId,
+        prompt: String,
+    },
 }
 
 /// 브로드캐스트 패널 상태 — 프롬프트 선택 + 파라미터 + 대상 체크.
@@ -61,6 +69,17 @@ struct BroadcastState {
     targets: HashSet<(String, runtime::SessionId)>,
     /// 대상 3개 이상 전송의 2단계 확인 단계(리뷰 Low). 프롬프트·대상이 바뀌면 초기화한다.
     confirm_send: bool,
+}
+
+/// 다음 단계 예약 패널 상태. 대상 세션은 패널을 여는 순간 고정된다 — 브로드캐스트와
+/// 달리 대상이 하나라 고르는 단계가 없다.
+struct FollowUpState {
+    workspace_id: String,
+    session: runtime::SessionId,
+    /// 카드 제목 — 어느 세션에 예약하는지 패널에서 다시 보여준다.
+    title: String,
+    /// 편집 중인 원문. 이미 예약된 세션이면 그 값으로 시작해 고쳐 쓸 수 있다.
+    text: String,
 }
 
 /// 배치 스폰 패널 상태 — 에이전트 선택 + 개수 + (선택) 프롬프트. 패널을 열 때마다
@@ -226,6 +245,8 @@ pub struct FleetUi {
     broadcast: Option<BroadcastState>,
     /// Some이면 배치 스폰 패널이 열려 있다.
     batch_spawn: Option<BatchSpawnState>,
+    /// Some이면 다음 단계 예약 패널이 열려 있다.
+    followup: Option<FollowUpState>,
     /// 「다음」으로 넘긴 항목들. 매 프레임 현재 큐와 대조해 사라진 키는 지우고,
     /// 전부 건너뛴 상태면 비워서 앞으로 되돌아간다(막힌 것을 영영 못 보면 안 된다).
     skipped: HashSet<String>,
@@ -378,29 +399,69 @@ impl FleetUi {
                                     section_header(ui, group, members.len(), catalog);
                                     ui.horizontal_wrapped(|ui| {
                                         for session in &members {
-                                            if card(
+                                            match card(
                                                 ui,
                                                 session,
                                                 catalog,
                                                 card_accent(workspaces, session),
                                                 now,
                                             ) {
-                                                *action = Some(match &session.target {
-                                                    FleetTarget::Pty { tab, pane, .. } => {
-                                                        FleetAction::Focus {
+                                                Some(CardClick::Open) => {
+                                                    *action = Some(match &session.target {
+                                                        FleetTarget::Pty { tab, pane, .. } => {
+                                                            FleetAction::Focus {
+                                                                workspace_id: session
+                                                                    .workspace_id
+                                                                    .clone(),
+                                                                tab: tab.clone(),
+                                                                pane: pane.clone(),
+                                                            }
+                                                        }
+                                                        FleetTarget::Structured { session_id } => {
+                                                            FleetAction::OpenStructured {
+                                                                session_id: session_id.clone(),
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                                Some(CardClick::ScheduleFollowUp) => {
+                                                    if let FleetTarget::Pty {
+                                                        session: id, ..
+                                                    } = &session.target
+                                                    {
+                                                        // 이미 예약된 세션이면 그 원문으로
+                                                        // 열어 고쳐 쓰게 한다.
+                                                        self.followup = Some(FollowUpState {
                                                             workspace_id: session
                                                                 .workspace_id
                                                                 .clone(),
-                                                            tab: tab.clone(),
-                                                            pane: pane.clone(),
-                                                        }
+                                                            session: *id,
+                                                            title: session.title.clone(),
+                                                            text: session
+                                                                .followup
+                                                                .clone()
+                                                                .unwrap_or_default(),
+                                                        });
                                                     }
-                                                    FleetTarget::Structured { session_id } => {
-                                                        FleetAction::OpenStructured {
-                                                            session_id: session_id.clone(),
-                                                        }
+                                                }
+                                                Some(CardClick::CancelFollowUp) => {
+                                                    if let FleetTarget::Pty {
+                                                        session: id, ..
+                                                    } = &session.target
+                                                    {
+                                                        // 빈 프롬프트 = 해제(App이 같은 경로로
+                                                        // 지운다 — 액션을 하나 더 만들지 않는다).
+                                                        *action =
+                                                            Some(FleetAction::ScheduleFollowUp {
+                                                                workspace_id: session
+                                                                    .workspace_id
+                                                                    .clone(),
+                                                                session: *id,
+                                                                prompt: String::new(),
+                                                            });
                                                     }
-                                                });
+                                                }
+                                                None => {}
                                             }
                                         }
                                     });
@@ -420,7 +481,102 @@ impl FleetUi {
         {
             out.grid = Some(sent);
         }
+        // 다음 단계 예약 창도 동일하게 독립 Window.
+        if let Some(scheduled) = self.followup_window(ui.ctx(), catalog, library) {
+            out.grid = Some(scheduled);
+        }
         out
+    }
+
+    /// 다음 단계 예약 창 — 대상 표시 + 프롬프트 입력 + 예약. 닫혀 있으면 아무것도 그리지
+    /// 않는다. 브로드캐스트와 달리 **지금 보내지 않으므로** 2단계 확인이 없다: 되돌릴 수
+    /// 있는 예약이고(카드에서 해제), 실제 전송 시점엔 턴이 끝나 있다.
+    fn followup_window(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: &i18n::Catalog,
+        library: &PromptLibrary,
+    ) -> Option<FleetAction> {
+        self.followup.as_ref()?;
+        let mut action = None;
+        let mut open = true;
+        egui::Window::new(catalog.t("fleet.followup.title", &[]))
+            .id(egui::Id::new("fleet_followup"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                action = self.followup_body(ui, catalog, library);
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        if !open || action.is_some() {
+            self.followup = None;
+        }
+        action
+    }
+
+    fn followup_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        library: &PromptLibrary,
+    ) -> Option<FleetAction> {
+        let state = self.followup.as_mut()?;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(catalog.t("fleet.followup.target", &[]))
+                    .small()
+                    .weak(),
+            );
+            ui.add(egui::Label::new(egui::RichText::new(&state.title).strong()).truncate());
+        });
+        ui.weak(catalog.t("fleet.followup.hint", &[]));
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::multiline(&mut state.text)
+                .desired_rows(4)
+                .desired_width(f32::INFINITY)
+                .hint_text(catalog.t("fleet.followup.placeholder", &[])),
+        );
+        // 저장된 프롬프트는 **본문에 끼워 넣기만** 한다 — 브로드캐스트처럼 선택 하나로
+        // 전송되는 게 아니라 사용자가 이어서 고쳐 쓰는 자리이기 때문이다.
+        if !library.prompts.is_empty() {
+            ui.add_space(4.0);
+            egui::ComboBox::from_id_salt("fleet_followup_prompt")
+                .selected_text(catalog.t("fleet.followup.insert", &[]))
+                .show_ui(ui, |ui| {
+                    for prompt in &library.prompts {
+                        if ui.selectable_label(false, &prompt.title).clicked() {
+                            if !state.text.is_empty() && !state.text.ends_with('\n') {
+                                state.text.push('\n');
+                            }
+                            state.text.push_str(&prompt.body);
+                        }
+                    }
+                });
+        }
+        ui.add_space(8.0);
+        let prompt = state.text.trim().to_owned();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !prompt.is_empty(),
+                    egui::Button::new(catalog.t("fleet.followup.save", &[])),
+                )
+                .clicked()
+            {
+                return Some(FleetAction::ScheduleFollowUp {
+                    workspace_id: state.workspace_id.clone(),
+                    session: state.session,
+                    prompt,
+                });
+            }
+            None
+        })
+        .inner
     }
 
     /// 브로드캐스트 창 — 프롬프트 선택 + 파라미터 + 대상 체크 + 전송. 닫혀 있으면 아무것도
@@ -1052,19 +1208,42 @@ fn chip(ui: &mut egui::Ui, group: SessionGroup, count: usize, catalog: &i18n::Ca
     );
 }
 
+/// 카드에서 나온 사용자 의도. 좌클릭은 열기, 우클릭 메뉴는 예약/해제다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardClick {
+    Open,
+    ScheduleFollowUp,
+    CancelFollowUp,
+}
+
 /// 세션 카드 하나 — 좌측 상태 바 + 우측 워크스페이스 띠 + 제목/상태/워크스페이스/보조 줄.
-/// 클릭 시 true.
 fn card(
     ui: &mut egui::Ui,
     session: &FleetSession,
     catalog: &i18n::Catalog,
     accent: egui::Color32,
     now: i64,
-) -> bool {
+) -> Option<CardClick> {
     let size = egui::vec2(252.0, 96.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let mut click = response.clicked().then_some(CardClick::Open);
+    // 예약은 PTY 전용이다 — 구조화 세션은 steer 경로라 WriteInput 대상이 아니다.
+    if matches!(session.target, FleetTarget::Pty { .. }) {
+        response.context_menu(|ui| {
+            if ui.button(catalog.t("fleet.followup.menu", &[])).clicked() {
+                click = Some(CardClick::ScheduleFollowUp);
+                ui.close();
+            }
+            if session.followup.is_some()
+                && ui.button(catalog.t("fleet.followup.cancel", &[])).clicked()
+            {
+                click = Some(CardClick::CancelFollowUp);
+                ui.close();
+            }
+        });
+    }
     if !ui.is_rect_visible(rect) {
-        return response.clicked();
+        return click;
     }
     let visuals = ui.visuals();
     let bg = if response.hovered() {
@@ -1158,8 +1337,23 @@ fn card(
         content
             .add(egui::Label::new(egui::RichText::new(line).small().weak().monospace()).truncate());
     }
+    // 4행: 예약 칩. 「예약해뒀다」는 사실이 카드에 없으면 예약해둔 걸 잊는다 — 그러면
+    // 나중에 도착한 프롬프트가 내가 안 시킨 일처럼 보인다.
+    if let Some(prompt) = &session.followup {
+        content.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "{} · {prompt}",
+                    catalog.t("fleet.followup.chip", &[])
+                ))
+                .small()
+                .color(status_color(AgentVisualState::Complete)),
+            )
+            .truncate(),
+        );
+    }
 
-    response.clicked()
+    click
 }
 
 /// 상태별 라벨(i18n).
@@ -1293,6 +1487,7 @@ mod tests {
             active_workspace: true,
             blocked_since: None,
             last_output_at: None,
+            followup: None,
         }
     }
 
@@ -1788,6 +1983,130 @@ mod tests {
             harness.state().out,
             Some(("s-42".to_owned(), true)),
             "승인 클릭이 그 세션 id를 허용으로 실어 보내야 한다"
+        );
+    }
+    /// 예약해뒀다는 사실이 카드에 안 보이면, 나중에 도착한 프롬프트가 내가 안 시킨
+    /// 일처럼 보인다. 칩과 **원문**이 함께 보여야 뭘 예약했는지 기억이 난다.
+    #[test]
+    fn 예약된_세션_카드는_칩과_원문을_보여준다() {
+        use egui_kittest::kittest::Queryable;
+
+        let outer = catalog();
+        let chip = outer.t("fleet.followup.chip", &[]);
+        let mut session = pty_session("ws-1", 7, AgentVisualState::Active);
+        session.followup = Some("테스트 돌리고 실패한 것만 고쳐".to_owned());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 600.0))
+            .build_ui(|ui| {
+                let catalog = catalog();
+                let library = crate::prompt_library::PromptLibrary::default();
+                let mut fleet = FleetUi::default();
+                let mut waiting = InboxWaitingUi::new();
+                let sessions = [session.clone()];
+                let _ = fleet.render(
+                    ui,
+                    &sessions,
+                    FleetSummary::from_states(sessions.iter().map(|s| s.state)),
+                    &catalog,
+                    &library,
+                    BatchSpawnInput {
+                        agents: &[],
+                        max: 4,
+                    },
+                    AttentionInput {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                        waiting_cards: &[],
+                        waiting_ui: &mut waiting,
+                        structured: &[],
+                    },
+                    &[workspace("ws-1")],
+                );
+            });
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(&format!("{chip} · 테스트 돌리고 실패한 것만 고쳐"))
+                .is_some(),
+            "예약 칩과 원문이 카드에 보여야 한다"
+        );
+    }
+
+    /// 예약 버튼은 **대상 세션과 원문을 그대로** 실어 보내야 한다. 대상이 어긋나면
+    /// 엉뚱한 에이전트가 남의 다음 단계를 받는다.
+    #[test]
+    fn 예약_버튼은_대상_세션과_원문을_실어_보낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            fleet: FleetUi,
+            waiting: InboxWaitingUi,
+            out: Option<(String, runtime::SessionId, String)>,
+        }
+        let outer = catalog();
+        let save = outer.t("fleet.followup.save", &[]);
+        let mut fleet = FleetUi::default();
+        // 패널은 카드 우클릭으로 열린다. 여는 경로가 아니라 **보내는 계약**을 보는
+        // 테스트라 열린 상태에서 시작한다.
+        fleet.followup = Some(FollowUpState {
+            workspace_id: "ws-1".to_owned(),
+            session: runtime::SessionId(7),
+            title: "session-7".to_owned(),
+            text: "테스트 돌리고 실패한 것만 고쳐".to_owned(),
+        });
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    let catalog = catalog();
+                    let library = crate::prompt_library::PromptLibrary::default();
+                    let page = state.fleet.render(
+                        ui,
+                        &[],
+                        FleetSummary::default(),
+                        &catalog,
+                        &library,
+                        BatchSpawnInput {
+                            agents: &[],
+                            max: 4,
+                        },
+                        AttentionInput {
+                            pending: &[],
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                            waiting_cards: &[],
+                            waiting_ui: &mut state.waiting,
+                            structured: &[],
+                        },
+                        &[workspace("ws-1")],
+                    );
+                    if let Some(FleetAction::ScheduleFollowUp {
+                        workspace_id,
+                        session,
+                        prompt,
+                    }) = page.grid
+                    {
+                        state.out = Some((workspace_id, session, prompt));
+                    }
+                },
+                State {
+                    fleet,
+                    waiting: InboxWaitingUi::new(),
+                    out: None,
+                },
+            );
+        harness.run();
+        harness.get_by_label(&save).click();
+        harness.run();
+        assert_eq!(
+            harness.state().out,
+            Some((
+                "ws-1".to_owned(),
+                runtime::SessionId(7),
+                "테스트 돌리고 실패한 것만 고쳐".to_owned()
+            )),
+            "예약이 대상 세션과 원문을 그대로 실어 보내야 한다"
         );
     }
 }

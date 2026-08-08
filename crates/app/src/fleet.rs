@@ -34,6 +34,10 @@ pub struct FleetSession {
     /// 마지막으로 새 출력이 온 시각(unix 초). 구조화(App Server) 세션은 PTY 스냅샷이
     /// 없어 항상 None이다 — 그 묶음에는 「출력 없음」을 표시하지 않는다.
     pub last_output_at: Option<i64>,
+    /// 이 턴이 끝나면 이어서 보낼 예약 프롬프트. 카드 칩과 예약 패널의 초기값을 함께
+    /// 담당한다 — 원문이 있어야 다시 열었을 때 고쳐 쓸 수 있다. PTY 전용이라 구조화
+    /// 세션은 항상 None이다(steer 경로).
+    pub followup: Option<String>,
 }
 
 /// 「작업 중」인데 이만큼 출력이 없으면 멈춘 것으로 본다.
@@ -49,6 +53,29 @@ pub fn stuck_for(session: &FleetSession, now: i64) -> Option<i64> {
     }
     let silent = now.saturating_sub(session.last_output_at?);
     (silent >= STUCK_AFTER_SECS).then_some(silent)
+}
+
+/// 예약한 다음 단계를 지금 보내도 되는가.
+///
+/// 근거는 hook의 turn_done(Stop) 하나다. **「작업 중이 아니다」는 턴 끝이 아니다** —
+/// working의 stale 창은 2분인데 하트비트는 툴 호출마다라, 툴 하나가 2분을 넘으면 같은
+/// 턴이 working에서 빠졌다 다시 들어온다(app.rs `turn_start_transitions`의 근거와 동일).
+/// 그걸 턴 끝으로 오인하면 **돌고 있는 턴 한가운데에** 프롬프트를 밀어넣게 된다.
+///
+/// 입력 대기면 보내지 않는다. 에이전트가 물어본 질문에 예약해둔 딴소리를 답으로
+/// 밀어넣는 꼴이 되기 때문이다 — 그 경우엔 사람이 먼저 답해야 한다.
+///
+/// `queued_turn`은 예약 시점에 관측한 turn_done 세대다. 이미 끝나 있던 턴으로 즉시
+/// 발사되지 않게 **그보다 새 turn_done**을 요구한다.
+pub fn followup_ready(queued_turn: Option<i64>, turn_done_now: Option<i64>, waiting: bool) -> bool {
+    if waiting {
+        return false;
+    }
+    match (queued_turn, turn_done_now) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(before), Some(now)) => now > before,
+    }
 }
 
 /// fleet 카드의 종류별 포커스 대상. PTY는 tab/pane으로 포커스하고 WriteInput
@@ -196,6 +223,7 @@ mod tests {
             active_workspace: true,
             blocked_since: None,
             last_output_at: None,
+            followup: None,
         }
     }
 
@@ -346,5 +374,59 @@ mod tests {
     fn 구조화_세션은_브로드캐스트_대상이_아니다() {
         let structured = session("ws", "t", AgentVisualState::Idle);
         assert_eq!(structured.broadcast_key(), None);
+    }
+    /// 발사 조건은 **turn_done 하나**다. 이 표의 두 줄이 각각 실제 사고를 막는다:
+    /// turn_done 없이 발사하면 돌고 있는 턴 한가운데에 프롬프트가 들어가고, 입력 대기에
+    /// 발사하면 에이전트가 물어본 질문에 딴소리가 답으로 들어간다.
+    #[test]
+    fn 예약은_턴이_끝났고_질문중이_아닐_때만_발사한다() {
+        // (예약 시점 세대, 지금 turn_done, 입력 대기, 기대)
+        let cases = [
+            (
+                None,
+                None,
+                false,
+                false,
+                "턴이 끝난 근거가 없으면 보내지 않는다",
+            ),
+            (
+                None,
+                Some(500),
+                false,
+                true,
+                "예약 후 처음 끝난 턴에 보낸다",
+            ),
+            (
+                None,
+                Some(500),
+                true,
+                false,
+                "질문으로 멈췄으면 사람이 먼저 답해야 한다",
+            ),
+            (
+                Some(500),
+                Some(500),
+                false,
+                false,
+                "예약 직전에 이미 끝나 있던 턴으로 즉시 발사되면 안 된다",
+            ),
+            (
+                Some(500),
+                Some(501),
+                false,
+                true,
+                "그 뒤에 새 턴이 끝나면 보낸다",
+            ),
+            (
+                Some(500),
+                None,
+                false,
+                false,
+                "turn_done이 사라지면 근거가 없다",
+            ),
+        ];
+        for (queued, now, waiting, expected, why) in cases {
+            assert_eq!(followup_ready(queued, now, waiting), expected, "{why}");
+        }
     }
 }

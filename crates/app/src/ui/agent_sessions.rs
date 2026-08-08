@@ -1454,6 +1454,22 @@ impl AgentSessionsUi {
                     .t("agent_sessions.error.no_selected_app_agent", &[])
             );
         };
+        self.respond_approval_for_session(&session_id, decision, ctx)
+    }
+
+    /// 세션 id로 승인에 응답한다 — **선택 상태와 무관하게**.
+    ///
+    /// 「작업」 페이지의 히어로 카드는 지금 선택된 세션이 아니라 **가장 오래 막힌** 세션을
+    /// 처리한다. 예전에는 선택 기반 경로뿐이라 히어로에서 구조화 세션 승인을 못 했다
+    /// (2026-08-08). 선택을 몰래 바꾸는 대신 id 경로를 열어, Agents 패널의 선택은
+    /// 건드리지 않는다.
+    pub fn respond_approval_for_session(
+        &mut self,
+        session_id: &str,
+        decision: AgentApprovalDecision,
+        ctx: &egui::Context,
+    ) -> anyhow::Result<()> {
+        let session_id = session_id.to_owned();
         let session = self
             .sessions
             .iter()

@@ -20790,7 +20790,19 @@ impl eframe::App for App {
             (
                 self.inbox_workspace_names(),
                 self.inbox_approval_session_titles(),
-                self.build_waiting_cards(),
+                // 카드에 막힌 시각을 붙여 넘긴다 — 히어로 큐가 승인과 같은 기준으로
+                // 정렬하려면 두 쪽 모두 unix 초여야 한다.
+                self.build_waiting_cards()
+                    .into_iter()
+                    .map(|card| {
+                        let since = self
+                            .blocked_since
+                            .get(&(card.workspace_id.clone(), card.session))
+                            .copied()
+                            .unwrap_or_else(deppy_core::time::unix_secs_i64);
+                        (card, since)
+                    })
+                    .collect::<Vec<_>>(),
             )
         } else {
             Default::default()

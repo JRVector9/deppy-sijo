@@ -24121,6 +24121,75 @@ mod tests {
         assert!(map.is_empty());
     }
 
+    /// `SessionId`는 워크스페이스마다 재사용된다(런타임별 카운터). 키를
+    /// `(workspace_id, SessionId)` 쌍이 아니라 `SessionId` 하나로만 뒀다면, 워크스페이스
+    /// A의 세션 1이 계속 막혀 있는 도중 워크스페이스 B의 세션 1이 새로 막히는 순간 A의
+    /// 막힌 시각이 B의 것으로 덮이거나 서로 하나의 항목으로 뒤섞인다. 이 테스트는 워크스페이스
+    /// 이름을 실제로 키에 넣어 서로 다른 항목으로 남는지를 고정한다.
+    #[test]
+    fn 막힌_시각은_워크스페이스로_네임스페이스돼_같은_세션id도_구분한다() {
+        use std::collections::{HashMap, HashSet};
+
+        let key = |ws: &str, id: u64| (ws.to_owned(), runtime::SessionId(id));
+        let mut map: HashMap<(String, runtime::SessionId), i64> = HashMap::new();
+
+        // 1) 워크스페이스 a의 세션 1이 막힌다.
+        let live: HashSet<_> = [key("a", 1)].into_iter().collect();
+        update_blocked_since(&mut map, &live, 100);
+        assert_eq!(map.get(&key("a", 1)), Some(&100));
+
+        // 2) 시간이 흐른 뒤 워크스페이스 b에서 같은 id(1)의 세션이 새로 막힌다 — a의 세션
+        //    1은 그 사이 계속 막혀 있었다.
+        let live: HashSet<_> = [key("a", 1), key("b", 1)].into_iter().collect();
+        update_blocked_since(&mut map, &live, 250);
+        assert_eq!(
+            map.get(&key("a", 1)),
+            Some(&100),
+            "워크스페이스 a의 세션 1은 계속 막혀 있었으므로 최초 시각을 유지해야 한다"
+        );
+        assert_eq!(
+            map.get(&key("b", 1)),
+            Some(&250),
+            "워크스페이스 b의 같은 id(1)는 별도 항목이므로 새로 막힌 시각을 가져야 한다"
+        );
+
+        // 3) a의 세션 1이 풀려도 같은 id를 쓰는 b의 세션 1은 영향받지 않아야 한다.
+        let live: HashSet<_> = [key("b", 1)].into_iter().collect();
+        update_blocked_since(&mut map, &live, 300);
+        assert_eq!(map.get(&key("a", 1)), None, "풀린 a의 세션은 제거돼야 한다");
+        assert_eq!(
+            map.get(&key("b", 1)),
+            Some(&250),
+            "a의 세션이 풀렸다고 같은 id를 쓰는 b의 세션까지 사라지면 네임스페이스가 깨진 것이다"
+        );
+    }
+
+    /// 워크스페이스 전환 블록(`switch_workspace`)은 `pty_agent_pending` 등 SessionId만으로
+    /// 키가 겹치는 맵들은 지우지만 `blocked_since`는 일부러 지우지 않는다 — 이미
+    /// `(workspace_id, SessionId)`로 네임스페이스돼 있어 지울 필요가 없고, 지우면 warm
+    /// 워크스페이스에서 계속 막혀 있던 세션의 "오래 막힘" 타이머가 화면을 옮길 때마다
+    /// 0으로 리셋돼 「작업」 페이지의 FIFO 정렬(오래 막힌 순)이 무의미해진다. 이 계약은
+    /// 런타임 값으로 재현하기 어려워(App 전체 픽스처가 필요) 소스 텍스트 특성화 테스트로
+    /// 고정한다 — 누군가 "정리 누락"으로 오인해 `blocked_since.clear()`를 추가하면 잡는다.
+    #[test]
+    fn 워크스페이스_전환은_blocked_since를_지우지_않는다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn switch_workspace(&mut self, target_id: &str) {")
+            .and_then(|(_, tail)| {
+                tail.split_once("    fn cycle_workspace(&mut self, delta: isize) {")
+            })
+            .map(|(body, _)| body)
+            .expect("switch_workspace function remains discoverable");
+
+        assert!(
+            !body.contains("self.blocked_since.clear()"),
+            "blocked_since는 (workspace_id, SessionId)로 네임스페이스돼 있어 워크스페이스 전환 \
+             시 지우면 안 된다 — 지우면 warm 워크스페이스 세션의 「오래 막힘」 타이머가 화면을 \
+             옮길 때마다 0으로 리셋된다"
+        );
+    }
+
     /// 백엔드 보충은 "5시간만 빠진 구멍"에만 끼운다 — 그 외에는 서버 값 그대로.
     #[test]
     fn 백엔드_보충은_5시간_구멍에만_끼운다() {

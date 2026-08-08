@@ -828,6 +828,15 @@ impl AgentSessionsUi {
     /// Stopped로 하드코딩)를 포함하는 "확실히 죽음/보관"이라, 필터하지 않으면 재시작마다
     /// 죽은 스레드가 fleet를 뒤덮는다. PTY의 Off(status=None)는 스폰 직후 미분류(살아있음)
     /// 라 반대로 표시가 맞다 — 대칭으로 "고치지" 말 것(app.rs build_fleet_sessions 참고).
+    /// 승인 대기 중인 구조화 세션 id — App이 「막힌 시각」을 추적하는 데 쓴다.
+    /// 선택 상태와 무관하게 전부 돌려준다(히어로는 가장 오래 막힌 것을 고른다).
+    pub fn awaiting_approval_ids(&self) -> impl Iterator<Item = &str> {
+        self.sessions
+            .iter()
+            .filter(|session| session.status == AgentSessionStatus::AwaitingApproval)
+            .map(|session| session.id.as_str())
+    }
+
     pub fn fleet_rows(&self) -> Vec<FleetStructuredRow> {
         self.sessions
             .iter()

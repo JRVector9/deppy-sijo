@@ -7499,9 +7499,12 @@ pub struct App {
     /// 방금 우리가 PTY에 보낸 강도/모델. statusLine(→DB)은 다음 턴에야 갱신돼서,
     /// 이게 없으면 연속으로 눌러도 매번 같은 낡은 값에서 한 칸 움직여 같은 명령을
     /// 반복한다 (2026-08-02 실증: 강도를 올렸는데 계속 같은 단계가 적용됐다).
-    /// 권위 있는 값이 따라잡으면 지운다.
-    pty_agent_pending:
-        std::collections::HashMap<(runtime::SessionId, crate::pty_effort::AdjustKind), String>,
+    /// 권위 있는 값이 따라잡으면 지우고, 끝내 안 따라잡으면 시한이 지나 버린다
+    /// (`PTY_PENDING_CONFIRM_TIMEOUT`).
+    pty_agent_pending: std::collections::HashMap<
+        (runtime::SessionId, crate::pty_effort::AdjustKind),
+        PendingPtyValue,
+    >,
     /// 에이전트가 턴을 도는 동안 눌린 조정. 그때 슬래시를 보내면 **프롬프트로** 먹히므로
     /// 보내지 않고 들고 있다가, 입력 대기/유휴로 돌아오면 흘려보낸다. 연속으로 누르면
     /// 낙관적 값이 계속 밀려 **마지막 목표 하나만** 남는다 — 명령이 쌓이지 않는다.
@@ -7633,6 +7636,57 @@ fn workspace_close_disposition(
     } else {
         WorkspaceCloseDisposition::CloseNow
     }
+}
+
+/// 우리가 보낸 낙관값 하나 — 값과 **보낸 시각**.
+///
+/// 시각이 있어야 CLI가 조용히 거절했을 때 빠져나올 수 있다. 값만 들고 있으면
+/// 권위값이 영영 안 따라와도 거짓이 그대로 남는다.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingPtyValue {
+    value: String,
+    sent_at: std::time::Instant,
+}
+
+/// 낙관값을 이만큼 들고도 권위 있는 값이 따라오지 않으면 버린다.
+///
+/// 낙관값은 "방금 보낸 게 곧 반영된다"는 가정이다. 2026-08-09에 그 가정이 깨진 것을
+/// 확인했다 — Claude Code 2.1.226의 `/effort`는 조직 한도·런치 핀(`--effort`로 띄운
+/// 세션)·`CLAUDE_CODE_EFFORT_LEVEL`로 요청을 **거절**하고 그 문구를 pane에만 찍는다.
+/// deppy는 바이트를 쓰는 데 성공했으므로 성공으로 취급하고 침묵한다.
+///
+/// 시한이 없으면 그 거짓값이 계속 남아 **다음 누름이 실재하지 않는 값에서** 한 칸
+/// 움직인다(high→xhigh 거절→앱은 xhigh로 믿음→다음엔 max를 보냄). 사용자에겐 몇 번을
+/// 눌러도 아무 일이 없는 것으로 보인다.
+///
+/// 값은 statusLine 한 바퀴를 넉넉히 덮는다. 짧게 잡으면 정상 반영이 늦은 세션에서
+/// 맞는 낙관값까지 버려 2026-08-02에 고친 "같은 명령 반복"이 되살아난다.
+const PTY_PENDING_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// 낙관값을 지금 어떻게 할 것인가.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingVerdict {
+    /// 권위값이 따라잡았다 — 버리고 권위값을 쓴다.
+    CaughtUp,
+    /// 아직 확인 전 — 낙관값을 계속 쓴다.
+    Trust,
+    /// 시한이 지나도 확인되지 않았다 — 버리고 권위값으로 되돌린다.
+    Unconfirmed,
+}
+
+/// 낙관값의 운명을 정한다.
+///
+/// **아직 안 보낸 예약분(`queued`)은 시한을 세지 않는다.** 턴이 도는 동안 눌린 조정은
+/// 큐에 앉아 턴이 끝나기를 기다리는데, 그 대기 시간을 "확인 안 됨"으로 세면 긴 턴에서
+/// 예약이 통째로 증발한다 — 보내지도 않은 것을 거절당했다고 할 수는 없다.
+fn pending_verdict(caught_up: bool, queued: bool, waited: std::time::Duration) -> PendingVerdict {
+    if caught_up {
+        return PendingVerdict::CaughtUp;
+    }
+    if !queued && waited >= PTY_PENDING_CONFIRM_TIMEOUT {
+        return PendingVerdict::Unconfirmed;
+    }
+    PendingVerdict::Trust
 }
 
 /// 예약된 다음 단계 한 칸. 원문과 **예약 시점의 turn_done 세대**를 함께 들고 있어야
@@ -14456,12 +14510,32 @@ impl App {
         let key = (*session_id, kind);
         if let Some(pending) = self.pty_agent_pending.get(&key) {
             let caught_up = authoritative.is_some_and(|value| {
-                crate::pty_effort::authoritative_caught_up(kind, value, pending)
+                crate::pty_effort::authoritative_caught_up(kind, value, &pending.value)
             });
-            if caught_up {
-                self.pty_agent_pending.remove(&key);
-            } else {
-                return Some(pending.clone());
+            match pending_verdict(
+                caught_up,
+                self.pty_agent_queued.contains_key(&key),
+                pending.sent_at.elapsed(),
+            ) {
+                PendingVerdict::Trust => return Some(pending.value.clone()),
+                PendingVerdict::CaughtUp => {
+                    self.pty_agent_pending.remove(&key);
+                }
+                PendingVerdict::Unconfirmed => {
+                    // 보냈는데 시한 안에 권위값이 안 따라왔다 — CLI가 거절했을 가능성이
+                    // 크다. 거짓값을 버려 다음 누름이 실재하는 값에서 출발하게 하고,
+                    // 사용자에게 "안 먹었다"를 말한다. 침묵하면 왜 안 바뀌는지 알 길이 없다.
+                    tracing::info!(
+                        ?kind,
+                        sent = %pending.value,
+                        authoritative = ?authoritative,
+                        "PTY 조정: 시한 안에 확인되지 않아 낙관값을 버린다"
+                    );
+                    self.pty_agent_pending.remove(&key);
+                    self.show_agent_shortcut_feedback(
+                        crate::ui::agent_terminal::AgentShortcutFeedback::NotConfirmed,
+                    );
+                }
             }
         }
         authoritative.map(str::to_owned)
@@ -14540,8 +14614,13 @@ impl App {
             EffortPlan::Slash { line, level } => {
                 // 낙관적 값은 보내든 큐에 넣든 갱신한다 — 그래야 턴이 도는 동안
                 // 연속으로 눌러도 한 칸씩 밀린다.
-                self.pty_agent_pending
-                    .insert((*session_id, kind), level.to_owned());
+                self.pty_agent_pending.insert(
+                    (*session_id, kind),
+                    PendingPtyValue {
+                        value: level.to_owned(),
+                        sent_at: std::time::Instant::now(),
+                    },
+                );
                 if !slash_input_is_safe(surface, self.hook_waiting_message(*session_id)) {
                     // 지금 쓰면 진행 중인 턴의 프롬프트가 된다. 마지막 목표만 남긴다.
                     self.pty_agent_queued
@@ -20430,7 +20509,7 @@ impl eframe::App for App {
             .pty_agent_queued
             .keys()
             .filter_map(|key| {
-                let target = self.pty_agent_pending.get(key)?;
+                let target = &self.pty_agent_pending.get(key)?.value;
                 let what = match key.1 {
                     crate::pty_effort::AdjustKind::Effort => {
                         text.t("status_bar.queued_effort", &[("value", target)])
@@ -24083,6 +24162,66 @@ mod tests {
             None,
             "둘 다 만료되면 None이라야 PTY 프로브 폴백이 살아난다"
         );
+    }
+
+    /// 낙관값에 시한이 없으면 CLI가 거절했을 때 거짓값이 영영 남고, 그 뒤 모든 누름이
+    /// **실재하지 않는 값에서** 한 칸 움직인다 — 사용자에겐 몇 번을 눌러도 아무 일이
+    /// 없는 것으로 보인다(2026-08-09: Claude Code 2.1.226이 조직 한도·런치 핀으로
+    /// `/effort`를 거절하면서 실제로 이 상태가 됐다).
+    ///
+    /// 반대로 **아직 안 보낸 예약분까지 시한을 세면** 긴 턴을 기다리던 예약이 통째로
+    /// 증발한다. 두 쪽이 다 필요해서 표로 고정한다.
+    #[test]
+    fn 낙관값은_확인되면_버리고_시한이_지나면_되돌린다() {
+        use std::time::Duration;
+
+        let over = PTY_PENDING_CONFIRM_TIMEOUT;
+        let under = PTY_PENDING_CONFIRM_TIMEOUT - Duration::from_secs(1);
+        // (권위값이 따라잡음, 아직 큐에 있음, 기다린 시간, 기대, 이유)
+        let cases = [
+            (
+                true,
+                false,
+                Duration::ZERO,
+                PendingVerdict::CaughtUp,
+                "권위값이 따라잡으면 즉시 버린다",
+            ),
+            (
+                true,
+                true,
+                over,
+                PendingVerdict::CaughtUp,
+                "따라잡았으면 큐에 있든 시한이 지났든 버린다",
+            ),
+            (
+                false,
+                false,
+                under,
+                PendingVerdict::Trust,
+                "시한 전에는 방금 보낸 값을 믿는다 — 안 그러면 연속 누름이 같은 명령을 반복한다",
+            ),
+            (
+                false,
+                false,
+                over,
+                PendingVerdict::Unconfirmed,
+                "보냈는데 시한이 지나도록 확인 안 되면 되돌린다",
+            ),
+            (
+                false,
+                true,
+                over,
+                PendingVerdict::Trust,
+                "아직 안 보낸 예약분은 시한을 세지 않는다 — 긴 턴을 기다리는 중일 뿐이다",
+            ),
+        ];
+        for (caught_up, queued, waited, expected, why) in cases {
+            assert_eq!(
+                pending_verdict(caught_up, queued, waited),
+                expected,
+                "{why}"
+            );
+        }
     }
 
     /// 계속 막혀 있는 세션의 타이머가 폴링마다 0으로 돌아가면 "오래 막힌 순" 정렬이

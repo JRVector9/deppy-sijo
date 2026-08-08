@@ -777,6 +777,7 @@ status_bar.agent_shortcut.current_value_unknown = 에이전트의 현재 값을 
 status_bar.agent_shortcut.unsupported = 이 에이전트는 해당 단축키를 지원하지 않습니다
 status_bar.agent_shortcut.target_unavailable = 대상 pane이 더 이상 활성 상태가 아닙니다
 status_bar.agent_shortcut.delivery_failed = pane에 단축키를 보내지 못했습니다
+status_bar.agent_shortcut.not_confirmed = 적용 확인 안 됨 — 터미널에서 에이전트 응답을 확인하세요
 status_bar.approvals_open_inbox = 작업 열기 →
 status_bar.approvals_open_inbox.hint = 나머지 승인은 작업에서 봅니다
 status_bar.approvals = 승인 {count}

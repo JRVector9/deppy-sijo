@@ -6499,9 +6499,9 @@ struct WorkspaceRuntime {
 /// - 풀린 키 → 제거
 ///
 /// `App`을 만들지 않고 검증하려고 순수 함수로 뺐다.
-fn update_blocked_since(
-    map: &mut std::collections::HashMap<(String, runtime::SessionId), i64>,
-    live: &std::collections::HashSet<(String, runtime::SessionId)>,
+fn update_blocked_since<K: Eq + std::hash::Hash + Clone>(
+    map: &mut std::collections::HashMap<K, i64>,
+    live: &std::collections::HashSet<K>,
     now: i64,
 ) {
     map.retain(|key, _| live.contains(key));
@@ -7458,6 +7458,10 @@ pub struct App {
     /// 표시 데이터는 팝오버가 열렸을 때만 지연 해석한다(idle 비용 0).
     /// agent_needs_input(활성 전용, 사이드바/상태 레일이 쓴다)과는 별개 필드다.
     global_waiting: Vec<(String, runtime::SessionId, Option<String>)>,
+    /// 구조화(App Server) 세션이 승인 대기에 들어간 시각(unix 초). PTY와 규칙은 같지만
+    /// 키가 세션 id 하나다 — app-server 세션 id는 프로세스 전역이라 워크스페이스로
+    /// 네임스페이스할 필요가 없다.
+    structured_blocked_since: std::collections::HashMap<String, i64>,
     /// 세션이 **나를 막기 시작한 시각**(unix 초). global_waiting은 스냅샷마다 통째로
     /// 재구성돼 시각이 없으므로, 아래 Attention 처리에서 들어온/나간 키만 diff해 채운다.
     /// 계속 막혀 있는 키는 값을 유지해야 타이머가 폴링마다 0으로 돌아가지 않는다.
@@ -10332,6 +10336,7 @@ impl App {
             agent_needs_input: std::collections::HashSet::new(),
             global_waiting: Vec::new(),
             blocked_since: std::collections::HashMap::new(),
+            structured_blocked_since: std::collections::HashMap::new(),
             agent_turn_done: std::collections::HashMap::new(),
             agent_working: std::collections::HashSet::new(),
             global_working: std::collections::HashSet::new(),
@@ -18329,6 +18334,10 @@ impl App {
                 Some(model) => format!("[{badge}] Codex · {model}"),
                 None => format!("[{badge}] Codex"),
             });
+            // 승인 대기 중일 때만 막힌 시각을 붙인다 — 다른 상태는 나를 막고 있지 않다.
+            let blocked_since = (row.state == crate::agent_surface::AgentVisualState::Waiting)
+                .then(|| self.structured_blocked_since.get(&row.session_id).copied())
+                .flatten();
             out.push(crate::fleet::FleetSession {
                 active_workspace: row.workspace_id.as_deref() == Some(self.active.id.as_str()),
                 workspace_id,
@@ -18340,9 +18349,7 @@ impl App {
                 state: row.state,
                 agent_line,
                 waiting_message: None,
-                // 구조화 세션의 막힌 시각은 아직 추적하지 않는다 — hook 기반
-                // global_waiting은 PTY 세션 키만 담는다. 이 묶음은 시각 없이 맨 뒤로 간다.
-                blocked_since: None,
+                blocked_since,
                 // PTY 스냅샷이 없어 출력 시각을 알 수 없다 — 멈춤 표시 대상이 아니다.
                 last_output_at: None,
             });
@@ -19338,6 +19345,18 @@ impl eframe::App for App {
             .sync_controller_config(&self.config.agents);
         self.agent_sessions_ui.refresh_rate_limits(ctx);
         self.agent_sessions_ui.poll();
+        // 승인 대기 시각은 **뷰와 무관하게** 갱신한다 — 「작업」 페이지를 떠났다 돌아올
+        // 때마다 타이머가 0으로 돌아가면 안 된다.
+        let awaiting: std::collections::HashSet<String> = self
+            .agent_sessions_ui
+            .awaiting_approval_ids()
+            .map(str::to_owned)
+            .collect();
+        update_blocked_since(
+            &mut self.structured_blocked_since,
+            &awaiting,
+            deppy_core::time::unix_secs_i64(),
+        );
         self.stage_structured_agent_state(true);
         for notice in self.agent_sessions_ui.drain_status_notices() {
             self.notifications_ui.on_structured_status(
@@ -20792,6 +20811,35 @@ impl eframe::App for App {
         } else {
             Vec::new()
         };
+        // 승인 대기 중인 구조화 세션 — 히어로 큐에 세운다. 시각은 뷰와 무관하게
+        // 갱신되는 structured_blocked_since에서 가져온다.
+        let fleet_structured: Vec<ui::fleet::StructuredApproval> = if fleet_visible {
+            self.agent_sessions_ui
+                .fleet_rows()
+                .into_iter()
+                .filter(|row| row.state == crate::agent_surface::AgentVisualState::Waiting)
+                .filter_map(|row| {
+                    let blocked_since = self
+                        .structured_blocked_since
+                        .get(&row.session_id)
+                        .copied()?;
+                    Some(ui::fleet::StructuredApproval {
+                        workspace_name: row
+                            .workspace_id
+                            .as_ref()
+                            .and_then(|id| {
+                                self.workspaces.iter().find(|workspace| &workspace.id == id)
+                            })
+                            .map(Self::workspace_display_name),
+                        session_id: row.session_id,
+                        title: row.title,
+                        blocked_since,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // 주의 섹션(승인·입력 대기) 입력 — 옛 작업함 페이지가 쓰던 것과 같은 조립이다.
         // Fleet 뷰일 때만 만든다(세션 목록과 같은 비용 규칙).
         let (fleet_workspace_names, fleet_session_titles, fleet_waiting_cards) = if fleet_visible {
@@ -20936,11 +20984,16 @@ impl eframe::App for App {
                             session_titles: &fleet_session_titles,
                             waiting_cards: &fleet_waiting_cards,
                             waiting_ui: &mut self.inbox_waiting_ui,
+                            structured: &fleet_structured,
                         },
                         &sidebar_workspaces,
                     );
                     fleet_action = page.grid;
-                    fleet_page_output = Some((page.approval_decision, page.waiting_action));
+                    fleet_page_output = Some((
+                        page.approval_decision,
+                        page.waiting_action,
+                        page.structured_decision,
+                    ));
                     fleet_page_click = page.goto;
                 } else if !render_panes.is_empty() {
                     let rect = ui.available_rect_before_wrap();
@@ -21338,10 +21391,25 @@ impl eframe::App for App {
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
         // (아래 notif_click 합류 지점)에 태운다(사이드바 FocusSession과 같은 규칙).
         // 「작업」 페이지의 승인 결정·대기 응답 — 옛 작업함 페이지와 같은 apply 경로다.
-        if let Some((approval_decision, waiting_action)) = fleet_page_output {
+        if let Some((approval_decision, waiting_action, structured_decision)) = fleet_page_output {
             self.apply_inbox_approval_decision(approval_decision);
             if let Some(goto) = self.apply_inbox_waiting_action(waiting_action) {
                 fleet_page_click = Some(goto);
+            }
+            // 구조화 세션 승인 — Agents 패널의 선택을 건드리지 않는 id 경로로 보낸다.
+            if let Some((session_id, allowed)) = structured_decision {
+                let decision = if allowed {
+                    crate::agent_session::AgentApprovalDecision::Accept
+                } else {
+                    crate::agent_session::AgentApprovalDecision::Decline
+                };
+                if let Err(error) = self.agent_sessions_ui.respond_approval_for_session(
+                    &session_id,
+                    decision,
+                    ui.ctx(),
+                ) {
+                    tracing::warn!(%error, "작업 페이지 구조화 승인 실패");
+                }
             }
         }
         if fleet_page_click.is_some() {

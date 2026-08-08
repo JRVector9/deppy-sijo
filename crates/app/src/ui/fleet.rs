@@ -89,6 +89,17 @@ pub struct AttentionInput<'a> {
     /// App의 blocked_since 맵에서 채워 넘긴다.
     pub waiting_cards: &'a [(crate::ui::inbox_waiting::WaitingCard, i64)],
     pub waiting_ui: &'a mut crate::ui::inbox_waiting::InboxWaitingUi,
+    /// 승인 대기 중인 구조화(App Server) 세션. MCP 승인과 응답 경로가 달라 따로 받는다.
+    pub structured: &'a [StructuredApproval],
+}
+
+/// 승인 대기 중인 구조화 세션 한 건 — 히어로 큐에 세우는 데 필요한 최소 정보.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructuredApproval {
+    pub session_id: String,
+    pub title: String,
+    pub workspace_name: Option<String>,
+    pub blocked_since: i64,
 }
 
 /// 나를 막고 있는 항목 하나 — 승인이든 입력 대기든 같은 큐에 선다.
@@ -114,6 +125,8 @@ pub enum BlockedKind {
         tool_name: String,
         arguments_preview: String,
     },
+    /// 구조화(App Server) 세션 승인 — 응답이 id 기반 steer 경로라 따로 둔다.
+    StructuredApproval { session_id: String },
     /// PTY 입력 대기 — 기존 대기 카드 위젯에 그대로 위임한다(자유 응답·로그 미리보기를
     /// 잃지 않으려고 y/n 버튼을 새로 만들지 않는다). 값은 넘겨받은 카드 슬라이스의 인덱스.
     NeedsInput { card_index: usize },
@@ -125,6 +138,7 @@ pub enum BlockedKind {
 /// 절대 시각으로 하고 표시할 때만 경과를 계산한다.
 pub fn blocked_queue(
     approvals: &[crate::ui::approvals::PendingApprovalItem],
+    structured: &[StructuredApproval],
     waiting: &[(crate::ui::inbox_waiting::WaitingCard, i64)],
     workspace_names: &std::collections::HashMap<String, String>,
     session_titles: &std::collections::HashMap<(String, runtime::SessionId), String>,
@@ -160,6 +174,20 @@ pub fn blocked_queue(
             },
         });
     }
+    for row in structured {
+        items.push(BlockedItem {
+            key: format!("structured:{}", row.session_id),
+            title: row.title.clone(),
+            context: row
+                .workspace_name
+                .clone()
+                .unwrap_or_else(|| unknown_session.to_owned()),
+            blocked_since: row.blocked_since,
+            kind: BlockedKind::StructuredApproval {
+                session_id: row.session_id.clone(),
+            },
+        });
+    }
     for (index, (card, since)) in waiting.iter().enumerate() {
         items.push(BlockedItem {
             key: format!("waiting:{}:{}", card.workspace_id, card.session.0),
@@ -188,6 +216,8 @@ pub struct FleetPageOutput {
     pub approval_decision: Option<crate::ui::approvals::ApprovalDecision>,
     pub waiting_action: Option<crate::ui::inbox_waiting::WaitingAction>,
     pub goto: Option<crate::ui::notifications::AgentNotificationTarget>,
+    /// 구조화 세션 승인 — (session_id, 허용 여부). MCP 승인과 응답 경로가 달라 따로 낸다.
+    pub structured_decision: Option<(String, bool)>,
 }
 
 #[derive(Default)]
@@ -262,9 +292,11 @@ impl FleetUi {
                     session_titles,
                     waiting_cards,
                     waiting_ui,
+                    structured,
                 } = attention;
                 let queue = blocked_queue(
                     pending,
+                    structured,
                     waiting_cards,
                     workspace_names,
                     session_titles,
@@ -302,6 +334,7 @@ impl FleetUi {
                                     out.approval_decision = hero.approval_decision;
                                     out.waiting_action = hero.waiting_action;
                                     out.goto = hero.goto;
+                                    out.structured_decision = hero.structured_decision;
                                 });
                         },
                     );
@@ -754,6 +787,7 @@ struct AttentionOutput {
     approval_decision: Option<crate::ui::approvals::ApprovalDecision>,
     waiting_action: Option<crate::ui::inbox_waiting::WaitingAction>,
     goto: Option<crate::ui::notifications::AgentNotificationTarget>,
+    structured_decision: Option<(String, bool)>,
 }
 
 /// 「지금 처리」 — 가장 오래 막힌 항목 하나를 크게, 나머지는 요약 줄로.
@@ -810,7 +844,9 @@ fn render_hero(
         ui.horizontal(|ui| {
             let badge = match &hero.kind {
                 BlockedKind::NeedsInput { .. } => catalog.t("fleet.hero.needs_input", &[]),
-                BlockedKind::Approval { .. } => catalog.t("fleet.hero.approval", &[]),
+                BlockedKind::Approval { .. } | BlockedKind::StructuredApproval { .. } => {
+                    catalog.t("fleet.hero.approval", &[])
+                }
             };
             ui.label(
                 egui::RichText::new(badge)
@@ -875,6 +911,17 @@ fn render_hero(
                             allowed: false,
                             remember: false,
                         });
+                    }
+                }
+                BlockedKind::StructuredApproval { session_id } => {
+                    if ui
+                        .button(catalog.t("inbox.approval.approve", &[]))
+                        .clicked()
+                    {
+                        out.structured_decision = Some((session_id.clone(), true));
+                    }
+                    if ui.button(catalog.t("inbox.approval.deny", &[])).clicked() {
+                        out.structured_decision = Some((session_id.clone(), false));
                     }
                 }
                 // 입력 대기는 기존 카드 위젯이 통째로 그린다(자유 응답·로그 미리보기 포함).
@@ -1280,6 +1327,7 @@ mod tests {
                     session_titles: &HashMap::new(),
                     waiting_cards,
                     waiting_ui,
+                    structured: &[],
                 },
                 workspaces,
             );
@@ -1319,6 +1367,7 @@ mod tests {
                         session_titles: &HashMap::new(),
                         waiting_cards: &[],
                         waiting_ui: &mut waiting,
+                        structured: &[],
                     },
                     &[workspace("ws-1")],
                 );
@@ -1398,6 +1447,7 @@ mod tests {
                             session_titles: &HashMap::new(),
                             waiting_cards: &[],
                             waiting_ui: &mut waiting,
+                            structured: &[],
                         },
                         &[workspace("ws-1")],
                     );
@@ -1429,6 +1479,7 @@ mod tests {
         ];
         let queue = blocked_queue(
             &[approval("a1", None)],
+            &[],
             &cards,
             &HashMap::new(),
             &HashMap::new(),
@@ -1482,6 +1533,7 @@ mod tests {
                         session_titles: &HashMap::new(),
                         waiting_cards: &[],
                         waiting_ui: &mut waiting,
+                        structured: &[],
                     },
                     &[workspace("ws-1")],
                 );
@@ -1556,6 +1608,7 @@ mod tests {
                             session_titles: &HashMap::new(),
                             waiting_cards: &[],
                             waiting_ui: &mut state.waiting,
+                            structured: &[],
                         },
                         &[workspace("ws-1")],
                     );
@@ -1628,6 +1681,7 @@ mod tests {
                         session_titles: &HashMap::new(),
                         waiting_cards: &[],
                         waiting_ui: &mut waiting,
+                        structured: &[],
                     },
                     &[workspace("ws-1")],
                 );
@@ -1641,6 +1695,99 @@ mod tests {
             sessions_header.left() < NARROW,
             "우측 컬럼이 화면 밖({})에서 시작한다 — 좌측 폭 하한이 available을 무시했다",
             sessions_header.left()
+        );
+    }
+
+    fn structured(id: &str, title: &str, since: i64) -> StructuredApproval {
+        StructuredApproval {
+            session_id: id.to_owned(),
+            title: title.to_owned(),
+            workspace_name: Some("ws-1".to_owned()),
+            blocked_since: since,
+        }
+    }
+
+    /// 구조화(App Server) 승인도 MCP 승인·입력 대기와 **같은 큐**에 서고 같은 기준으로
+    /// 정렬된다 — 사용자에겐 셋 다 "에이전트가 나를 기다린다"는 같은 일이다.
+    #[test]
+    fn 구조화_승인도_같은_큐에_오래_막힌_순으로_선다() {
+        let queue = blocked_queue(
+            &[approval_at("a1", "mcp_tool", 300)],
+            &[structured("s1", "구조화 승인", 100)],
+            &[(waiting_card("ws-1", 7), 200)],
+            &HashMap::new(),
+            &HashMap::new(),
+            "unknown",
+        );
+        assert_eq!(queue.len(), 3);
+        let since: Vec<i64> = queue.iter().map(|item| item.blocked_since).collect();
+        assert_eq!(since, vec![100, 200, 300], "오래 막힌 순이어야 한다");
+        assert!(
+            matches!(queue[0].kind, BlockedKind::StructuredApproval { .. }),
+            "가장 오래 막힌 구조화 승인이 맨 앞이어야 한다"
+        );
+    }
+
+    /// 히어로에서 구조화 승인을 누르면 **id를 실은 결정**이 나온다 — Agents 패널의
+    /// 선택 상태와 무관해야 한다(선택 기반 경로만 있던 것을 id 경로로 뺀 이유).
+    #[test]
+    fn 히어로의_구조화_승인_클릭이_세션_id를_실어_보낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            fleet: FleetUi,
+            waiting: InboxWaitingUi,
+            out: Option<(String, bool)>,
+        }
+        let outer = catalog();
+        let approve = outer.t("inbox.approval.approve", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    let catalog = catalog();
+                    let library = crate::prompt_library::PromptLibrary::default();
+                    let page = state.fleet.render(
+                        ui,
+                        &[],
+                        FleetSummary::default(),
+                        &catalog,
+                        &library,
+                        BatchSpawnInput {
+                            agents: &[],
+                            max: 4,
+                        },
+                        AttentionInput {
+                            pending: &[],
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                            waiting_cards: &[],
+                            waiting_ui: &mut state.waiting,
+                            structured: &[structured("s-42", "위험한 작업", 100)],
+                        },
+                        &[workspace("ws-1")],
+                    );
+                    if page.structured_decision.is_some() {
+                        state.out = page.structured_decision;
+                    }
+                },
+                State {
+                    fleet: FleetUi::default(),
+                    waiting: InboxWaitingUi::new(),
+                    out: None,
+                },
+            );
+        harness.run();
+        assert!(
+            harness.query_by_label("위험한 작업").is_some(),
+            "구조화 승인이 히어로에 보여야 한다"
+        );
+        harness.get_by_label(&approve).click();
+        harness.run();
+        assert_eq!(
+            harness.state().out,
+            Some(("s-42".to_owned(), true)),
+            "승인 클릭이 그 세션 id를 허용으로 실어 보내야 한다"
         );
     }
 }

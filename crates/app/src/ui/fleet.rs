@@ -85,8 +85,100 @@ pub struct AttentionInput<'a> {
     pub pending: &'a [crate::ui::approvals::PendingApprovalItem],
     pub workspace_names: &'a std::collections::HashMap<String, String>,
     pub session_titles: &'a std::collections::HashMap<(String, runtime::SessionId), String>,
-    pub waiting_cards: &'a [crate::ui::inbox_waiting::WaitingCard],
+    /// 대기 카드와 **막히기 시작한 시각**(unix 초) 쌍. 카드 자체에는 시각이 없어
+    /// App의 blocked_since 맵에서 채워 넘긴다.
+    pub waiting_cards: &'a [(crate::ui::inbox_waiting::WaitingCard, i64)],
     pub waiting_ui: &'a mut crate::ui::inbox_waiting::InboxWaitingUi,
+}
+
+/// 나를 막고 있는 항목 하나 — 승인이든 입력 대기든 같은 큐에 선다.
+///
+/// 사용자에게는 둘 다 "에이전트가 나를 기다린다"는 같은 종류의 일이라 화면에서 나누지
+/// 않는다. 정렬 키는 `blocked_since` 하나뿐이고 그 값이 카드에 그대로 보인다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockedItem {
+    /// 건너뛰기 추적용 안정 키.
+    pub key: String,
+    pub title: String,
+    /// "워크스페이스 · 세션" 맥락 줄.
+    pub context: String,
+    pub blocked_since: i64,
+    pub kind: BlockedKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum BlockedKind {
+    /// MCP 승인 — 실행할 도구와 인자를 그대로 보여준다(가서 보지 않고 판단).
+    Approval {
+        id: String,
+        tool_name: String,
+        arguments_preview: String,
+    },
+    /// PTY 입력 대기 — 기존 대기 카드 위젯에 그대로 위임한다(자유 응답·로그 미리보기를
+    /// 잃지 않으려고 y/n 버튼을 새로 만들지 않는다). 값은 넘겨받은 카드 슬라이스의 인덱스.
+    NeedsInput { card_index: usize },
+}
+
+/// 승인·입력 대기를 하나의 큐로 합치고 **오래 막힌 순**으로 세운다.
+///
+/// 순수 함수라 UI 없이 순서 계약을 검증할 수 있다. `now`는 쓰지 않는다 — 정렬은
+/// 절대 시각으로 하고 표시할 때만 경과를 계산한다.
+pub fn blocked_queue(
+    approvals: &[crate::ui::approvals::PendingApprovalItem],
+    waiting: &[(crate::ui::inbox_waiting::WaitingCard, i64)],
+    workspace_names: &std::collections::HashMap<String, String>,
+    session_titles: &std::collections::HashMap<(String, runtime::SessionId), String>,
+    unknown_session: &str,
+) -> Vec<BlockedItem> {
+    let mut items: Vec<BlockedItem> = Vec::with_capacity(approvals.len() + waiting.len());
+    for row in approvals {
+        let parsed = row
+            .session_key()
+            .and_then(crate::ui::inbox_waiting::parse_session_key);
+        let context = match parsed {
+            Some((workspace_id, session)) => {
+                let ws = workspace_names.get(&workspace_id).cloned();
+                let title = session_titles.get(&(workspace_id, session)).cloned();
+                match (ws, title) {
+                    (Some(ws), Some(title)) => format!("{ws} · {title}"),
+                    (Some(ws), None) => ws,
+                    (None, Some(title)) => title,
+                    (None, None) => unknown_session.to_owned(),
+                }
+            }
+            None => unknown_session.to_owned(),
+        };
+        items.push(BlockedItem {
+            key: format!("approval:{}", row.id()),
+            title: row.tool_name().to_owned(),
+            context,
+            blocked_since: row.created_at(),
+            kind: BlockedKind::Approval {
+                id: row.id().to_owned(),
+                tool_name: row.tool_name().to_owned(),
+                arguments_preview: row.arguments_preview().to_owned(),
+            },
+        });
+    }
+    for (index, (card, since)) in waiting.iter().enumerate() {
+        items.push(BlockedItem {
+            key: format!("waiting:{}:{}", card.workspace_id, card.session.0),
+            title: card
+                .headline
+                .clone()
+                .unwrap_or_else(|| card.session_title.clone()),
+            context: format!("{} · {}", card.workspace_name, card.session_title),
+            blocked_since: *since,
+            kind: BlockedKind::NeedsInput { card_index: index },
+        });
+    }
+    // 오래 막힌 순 — 굶는 항목이 없고, 정렬 키가 화면에 보여 순서가 자명하다.
+    items.sort_by(|a, b| {
+        a.blocked_since
+            .cmp(&b.blocked_since)
+            .then(a.key.cmp(&b.key))
+    });
+    items
 }
 
 /// 헤더 사용량 표기 입력 — 하단 상태바와 **같은 값**을 쓰려고 App이 그대로 넘긴다.
@@ -111,6 +203,9 @@ pub struct FleetUi {
     broadcast: Option<BroadcastState>,
     /// Some이면 배치 스폰 패널이 열려 있다.
     batch_spawn: Option<BatchSpawnState>,
+    /// 「다음」으로 넘긴 항목들. 매 프레임 현재 큐와 대조해 사라진 키는 지우고,
+    /// 전부 건너뛴 상태면 비워서 앞으로 되돌아간다(막힌 것을 영영 못 보면 안 된다).
+    skipped: HashSet<String>,
 }
 
 impl FleetUi {
@@ -169,71 +264,123 @@ impl FleetUi {
                     None => {}
                 }
                 ui.add_space(12.0);
-                // 주의 섹션은 **세션 0 조기반환보다 먼저** 그린다. InboxWaitingUi::render는
-                // 매 프레임 stale 입력버퍼를 정리해야 하고(2026-07-17 P2 회귀), 세션이 하나도
-                // 없는데 승인만 남아 있는 상태가 실제로 존재한다(모든 pane을 닫았지만 MCP
-                // 승인이 미해결).
-                let attention_out = render_attention(ui, catalog, attention, now);
-                out.approval_decision = attention_out.approval_decision;
-                out.waiting_action = attention_out.waiting_action;
-                out.goto = attention_out.goto;
-                if sessions.is_empty() {
-                    ui.add_space(48.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new(catalog.t("fleet.empty", &[])).weak());
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(catalog.t("fleet.empty.hint", &[]))
-                                .weak()
-                                .small(),
-                        );
-                        ui.add_space(12.0);
-                        if ui.button(catalog.t("fleet.new_agent", &[])).clicked() {
-                            *action = Some(FleetAction::LaunchAgent);
-                        }
-                    });
-                    return;
-                }
-                // 묶음별 섹션 — 막힌 것이 맨 위다. 정렬은 순수 함수가 하고 여기서는
-                // 그리기만 한다(그래야 순서 계약을 UI 없이 테스트할 수 있다).
-                let grouped = crate::fleet::group_sessions(sessions.to_vec());
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (group, members) in SessionGroup::ORDER.into_iter().zip(grouped) {
-                            if members.is_empty() {
-                                continue;
-                            }
-                            section_header(ui, group, members.len(), catalog);
-                            ui.horizontal_wrapped(|ui| {
-                                for session in &members {
-                                    if card(
+                let AttentionInput {
+                    pending,
+                    workspace_names,
+                    session_titles,
+                    waiting_cards,
+                    waiting_ui,
+                } = attention;
+                let queue = blocked_queue(
+                    pending,
+                    waiting_cards,
+                    workspace_names,
+                    session_titles,
+                    &catalog.t("inbox.approval.unknown_session", &[]),
+                );
+                let plain_cards: Vec<crate::ui::inbox_waiting::WaitingCard> =
+                    waiting_cards.iter().map(|(card, _)| card.clone()).collect();
+
+                // 2컬럼 — 좌측은 "지금 뭘 할까", 우측은 "다 뭐하고 있나". 두 질문이 달라
+                // 화면을 나눈다(2026-08-08 목업).
+                let full = ui.available_width();
+                let hero_width = (full * 0.42).clamp(300.0, 460.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(hero_width, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(hero_width);
+                            egui::ScrollArea::vertical()
+                                .id_salt("fleet_hero")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let hero = render_hero(
                                         ui,
-                                        session,
                                         catalog,
-                                        card_accent(workspaces, session),
+                                        &queue,
+                                        &plain_cards,
+                                        waiting_ui,
+                                        &mut self.skipped,
                                         now,
-                                    ) {
-                                        *action = Some(match &session.target {
-                                            FleetTarget::Pty { tab, pane, .. } => {
-                                                FleetAction::Focus {
-                                                    workspace_id: session.workspace_id.clone(),
-                                                    tab: tab.clone(),
-                                                    pane: pane.clone(),
-                                                }
-                                            }
-                                            FleetTarget::Structured { session_id } => {
-                                                FleetAction::OpenStructured {
-                                                    session_id: session_id.clone(),
-                                                }
-                                            }
-                                        });
-                                    }
+                                    );
+                                    out.approval_decision = hero.approval_decision;
+                                    out.waiting_action = hero.waiting_action;
+                                    out.goto = hero.goto;
+                                });
+                        },
+                    );
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(catalog.t("fleet.hero.sessions", &[]))
+                                .small()
+                                .weak(),
+                        );
+                        ui.add_space(4.0);
+                        if sessions.is_empty() {
+                            ui.add_space(24.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new(catalog.t("fleet.empty", &[])).weak());
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(catalog.t("fleet.empty.hint", &[]))
+                                        .weak()
+                                        .small(),
+                                );
+                                ui.add_space(12.0);
+                                if ui.button(catalog.t("fleet.new_agent", &[])).clicked() {
+                                    *action = Some(FleetAction::LaunchAgent);
                                 }
                             });
-                            ui.add_space(10.0);
+                            return;
                         }
+                        // 묶음별 섹션 — 막힌 것이 맨 위다. 정렬은 순수 함수가 하고
+                        // 여기서는 그리기만 한다(순서 계약을 UI 없이 테스트하려고).
+                        let grouped = crate::fleet::group_sessions(sessions.to_vec());
+                        egui::ScrollArea::vertical()
+                            .id_salt("fleet_sessions")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (group, members) in SessionGroup::ORDER.into_iter().zip(grouped)
+                                {
+                                    if members.is_empty() {
+                                        continue;
+                                    }
+                                    section_header(ui, group, members.len(), catalog);
+                                    ui.horizontal_wrapped(|ui| {
+                                        for session in &members {
+                                            if card(
+                                                ui,
+                                                session,
+                                                catalog,
+                                                card_accent(workspaces, session),
+                                                now,
+                                            ) {
+                                                *action = Some(match &session.target {
+                                                    FleetTarget::Pty { tab, pane, .. } => {
+                                                        FleetAction::Focus {
+                                                            workspace_id: session
+                                                                .workspace_id
+                                                                .clone(),
+                                                            tab: tab.clone(),
+                                                            pane: pane.clone(),
+                                                        }
+                                                    }
+                                                    FleetTarget::Structured { session_id } => {
+                                                        FleetAction::OpenStructured {
+                                                            session_id: session_id.clone(),
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(10.0);
+                                }
+                            });
                     });
+                });
             });
         // 브로드캐스트 창은 떠 있는 Window라 중앙 패널과 독립적으로 그린다.
         if let Some(sent) = self.broadcast_window(ui.ctx(), sessions, catalog, library) {
@@ -614,59 +761,169 @@ struct AttentionOutput {
     goto: Option<crate::ui::notifications::AgentNotificationTarget>,
 }
 
-/// 「대기 중」 — 나를 막고 있는 것들. 승인·대기 카드는 기존 렌더러를 그대로 호출한다.
+/// 「지금 처리」 — 가장 오래 막힌 항목 하나를 크게, 나머지는 요약 줄로.
 ///
-/// 승인도 대기도 없으면 **패널 자체를 그리지 않는다**. 예전 작업함 페이지는 "대기 중인
-/// 항목이 없습니다" 안내를 상시 띄웠는데, 이 화면은 비어 있는 게 정상이라 그 안내가
-/// 세션 그리드와 주의를 다툰다(2026-08-08). 다만 `InboxWaitingUi::render`는 비어 있어도
-/// 반드시 호출한다 — stale 입력버퍼 정리가 그 안에서 일어난다.
-fn render_attention(
+/// 목록을 훑고 고르는 대신 분류(triage)하듯 처리한다. 승인이면 실행할 도구와 인자를
+/// **여기서 바로** 보여줘 터미널로 이동하지 않고 판단할 수 있게 한다 — 지금까지 승인이
+/// 밀린 실제 원인이 그 왕복이었다(2026-08-08).
+#[allow(clippy::too_many_arguments)]
+fn render_hero(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
-    attention: AttentionInput<'_>,
+    queue: &[BlockedItem],
+    waiting_cards: &[crate::ui::inbox_waiting::WaitingCard],
+    waiting_ui: &mut crate::ui::inbox_waiting::InboxWaitingUi,
+    skipped: &mut HashSet<String>,
     now: i64,
 ) -> AttentionOutput {
-    let AttentionInput {
-        pending,
-        workspace_names,
-        session_titles,
-        waiting_cards,
-        waiting_ui,
-    } = attention;
     let mut out = AttentionOutput::default();
-    if pending.is_empty() && waiting_cards.is_empty() {
-        // 정리 부작용만 얻는다 — 내부에서 빈 입력은 그리지 않고 즉시 반환한다.
-        out.waiting_action = waiting_ui.render(ui, catalog, waiting_cards);
+    ui.label(
+        egui::RichText::new(catalog.t("fleet.hero.now", &[]))
+            .small()
+            .weak(),
+    );
+    ui.add_space(4.0);
+    if queue.is_empty() {
+        skipped.clear();
+        // 빈 입력이어도 반드시 호출 — 안에서 stale 입력버퍼를 정리한다(2026-07-17 P2).
+        out.waiting_action = waiting_ui.render(ui, catalog, &[]);
+        ui.label(
+            egui::RichText::new(catalog.t("fleet.hero.clear", &[]))
+                .weak()
+                .small(),
+        );
         return out;
     }
-    egui::Frame::NONE
-        .fill(ui.visuals().panel_fill)
-        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-        .corner_radius(egui::CornerRadius::same(2))
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+    // 사라진 항목의 건너뛰기 기록은 버린다. 전부 건너뛴 상태면 앞으로 되돌아간다.
+    let live: HashSet<&str> = queue.iter().map(|item| item.key.as_str()).collect();
+    skipped.retain(|key| live.contains(key.as_str()));
+    if skipped.len() >= queue.len() {
+        skipped.clear();
+    }
+    let Some(hero) = queue.iter().find(|item| !skipped.contains(&item.key)) else {
+        out.waiting_action = waiting_ui.render(ui, catalog, &[]);
+        return out;
+    };
+    // 히어로가 승인이면 대기 위젯은 빈 입력으로 호출해 정리만 시킨다.
+    let hero_card: &[crate::ui::inbox_waiting::WaitingCard] = match &hero.kind {
+        BlockedKind::NeedsInput { card_index } => &waiting_cards[*card_index..=*card_index],
+        _ => &[],
+    };
+
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let badge = match &hero.kind {
+                BlockedKind::NeedsInput { .. } => catalog.t("fleet.hero.needs_input", &[]),
+                BlockedKind::Approval { .. } => catalog.t("fleet.hero.approval", &[]),
+            };
             ui.label(
-                egui::RichText::new(catalog.t("inbox.page.waiting", &[]))
+                egui::RichText::new(badge)
+                    .small()
+                    .color(status_color(AgentVisualState::Waiting)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(catalog.t(
+                        "fleet.blocked_for",
+                        &[(
+                            "value",
+                            &crate::fleet::format_blocked_duration(now, hero.blocked_since),
+                        )],
+                    ))
+                    .small()
                     .strong()
-                    .size(15.0),
-            );
-            ui.add_space(4.0);
-            // 팝오버와 달리 상한을 두지 않는다 — 상한이 있으면 그 뒤 요청을 조작할 수 없다.
-            let approvals = crate::ui::inbox_approvals::render(
-                ui,
-                catalog,
-                pending,
-                workspace_names,
-                session_titles,
-                usize::MAX,
-                now,
-            );
-            out.approval_decision = approvals.decision;
-            out.goto = approvals.goto;
-            out.waiting_action = waiting_ui.render(ui, catalog, waiting_cards);
+                    .color(status_color(AgentVisualState::Error)),
+                );
+            });
         });
-    ui.add_space(12.0);
+        ui.add(egui::Label::new(egui::RichText::new(&hero.title).strong().size(15.0)).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(&hero.context).small().weak()).truncate());
+        ui.add_space(6.0);
+        // 승인이면 실행할 인자를 그대로 — 가서 보지 않고 판단하는 게 핵심이다.
+        if let BlockedKind::Approval {
+            arguments_preview, ..
+        } = &hero.kind
+            && !arguments_preview.is_empty()
+        {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(arguments_preview)
+                        .monospace()
+                        .small()
+                        .weak(),
+                )
+                .truncate(),
+            );
+            ui.add_space(6.0);
+        }
+        // 입력 대기는 기존 카드 위젯에 위임 — 자유 응답·로그 미리보기를 잃지 않는다.
+        // 히어로 한 장만 넘기므로 나머지 카드의 입력 버퍼는 정리 대상이 된다(보이지도
+        // 않는 카드의 초안이라 잃어도 무해하다).
+        out.waiting_action = waiting_ui.render(ui, catalog, hero_card);
+        ui.horizontal(|ui| {
+            match &hero.kind {
+                BlockedKind::Approval { id, .. } => {
+                    if ui
+                        .button(catalog.t("inbox.approval.approve", &[]))
+                        .clicked()
+                    {
+                        out.approval_decision = Some(crate::ui::approvals::ApprovalDecision {
+                            id: id.clone(),
+                            allowed: true,
+                            remember: false,
+                        });
+                    }
+                    if ui.button(catalog.t("inbox.approval.deny", &[])).clicked() {
+                        out.approval_decision = Some(crate::ui::approvals::ApprovalDecision {
+                            id: id.clone(),
+                            allowed: false,
+                            remember: false,
+                        });
+                    }
+                }
+                // 입력 대기는 기존 카드 위젯이 통째로 그린다(자유 응답·로그 미리보기 포함).
+                BlockedKind::NeedsInput { .. } => {}
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 큐가 하나뿐이면 건너뛸 곳이 없다 — 막다른 버튼을 만들지 않는다.
+                if queue.len() > 1
+                    && ui
+                        .button(catalog.t("fleet.hero.skip", &[]))
+                        .on_hover_text(catalog.t("fleet.hero.next", &[]))
+                        .clicked()
+                {
+                    skipped.insert(hero.key.clone());
+                }
+            });
+        });
+    });
+
+    // 나머지 대기 — 제목과 막힌 시간만.
+    let rest: Vec<&BlockedItem> = queue.iter().filter(|item| item.key != hero.key).collect();
+    if !rest.is_empty() {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(catalog.t("fleet.hero.next", &[]))
+                .small()
+                .weak(),
+        );
+        for item in rest {
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&item.title).small()).truncate());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(crate::fleet::format_blocked_duration(
+                            now,
+                            item.blocked_since,
+                        ))
+                        .small()
+                        .color(status_color(AgentVisualState::Waiting)),
+                    );
+                });
+            });
+        }
+    }
     out
 }
 
@@ -982,7 +1239,7 @@ mod tests {
         ui_fleet: &mut FleetUi,
         sessions: &[FleetSession],
         pending: &[PendingApprovalItem],
-        waiting_cards: &[WaitingCard],
+        waiting_cards: &[(WaitingCard, i64)],
         waiting_ui: &mut InboxWaitingUi,
         workspaces: &[SidebarWorkspaceEntry],
     ) -> FleetPageOutput {
@@ -1050,7 +1307,7 @@ mod tests {
             &mut fleet,
             &[],
             &[],
-            &[waiting_card("ws-1", 7)],
+            &[(waiting_card("ws-1", 7), 0)],
             &mut waiting,
             &[workspace("ws-1")],
         );
@@ -1066,17 +1323,17 @@ mod tests {
         assert!(second.waiting_action.is_none());
     }
 
-    /// 승인·대기가 모두 없으면 「대기 중」 패널을 그리지 않는다 — 이 화면은 비어 있는 게
-    /// 정상이라 상시 안내가 세션 목록과 주의를 다투면 안 된다(2026-08-08).
-    /// 반대로 승인이 하나라도 있으면 패널이 나와야 한다.
+    /// 히어로는 **가장 오래 막힌 항목 하나**를 보여준다. 막힌 게 없으면 안내 문구로
+    /// 바뀐다 — 이 화면은 비어 있는 게 정상이다(2026-08-08).
     #[test]
-    fn 대기중_패널은_막힌_것이_있을_때만_나온다() {
+    fn 히어로는_막힌_것이_있을_때만_항목을_보여준다() {
         use egui_kittest::kittest::Queryable;
 
-        let heading = catalog().t("inbox.page.waiting", &[]);
-        for (pending, expected) in [(Vec::new(), false), (vec![approval("a1", None)], true)] {
+        let cat = catalog();
+        let clear = cat.t("fleet.hero.clear", &[]);
+        for (pending, has_item) in [(Vec::new(), false), (vec![approval("a1", None)], true)] {
             let mut harness = egui_kittest::Harness::builder()
-                .with_size(egui::vec2(900.0, 600.0))
+                .with_size(egui::vec2(1100.0, 600.0))
                 .build_ui(|ui| {
                     let catalog = catalog();
                     let library = crate::prompt_library::PromptLibrary::default();
@@ -1110,13 +1367,48 @@ mod tests {
                     );
                 });
             harness.run();
+            // 승인이 있으면 그 도구 이름이 히어로 제목으로 보이고, 없으면 안내 문구가 뜬다.
             assert_eq!(
-                harness.query_by_label(&heading).is_some(),
-                expected,
-                "승인 {}건일 때 「{heading}」 패널 표시가 기대와 다르다",
+                harness.query_by_label("read_file").is_some(),
+                has_item,
+                "승인 {}건일 때 히어로 항목 표시가 기대와 다르다",
+                pending.len()
+            );
+            assert_eq!(
+                harness.query_by_label(&clear).is_some(),
+                !has_item,
+                "승인 {}건일 때 「{clear}」 표시가 기대와 다르다",
                 pending.len()
             );
         }
+    }
+
+    /// 승인과 입력 대기는 **하나의 큐**에 서고 오래 막힌 순으로 정렬된다 — 사용자에겐
+    /// 둘 다 "에이전트가 나를 기다린다"는 같은 종류의 일이다.
+    #[test]
+    fn 큐는_승인과_대기를_섞어_오래_막힌_순으로_세운다() {
+        let cards = vec![
+            (waiting_card("ws-1", 7), 500_i64),
+            (waiting_card("ws-2", 9), 100),
+        ];
+        let queue = blocked_queue(
+            &[approval("a1", None)],
+            &cards,
+            &HashMap::new(),
+            &HashMap::new(),
+            "unknown",
+        );
+        assert_eq!(queue.len(), 3);
+        let since: Vec<i64> = queue.iter().map(|item| item.blocked_since).collect();
+        assert!(
+            since.windows(2).all(|w| w[0] <= w[1]),
+            "오래 막힌 순이 아니다: {since:?}"
+        );
+        assert_eq!(
+            queue[0].blocked_since, 0,
+            "승인(created_at=0)이 가장 오래됐다"
+        );
+        assert!(matches!(queue[0].kind, BlockedKind::Approval { .. }));
     }
 
     /// 묶음 헤더는 **비어 있지 않은 묶음만** 나온다 — 빈 헤더가 화면을 채우면 안 된다.

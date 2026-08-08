@@ -31,6 +31,24 @@ pub struct FleetSession {
     /// **나를 막기 시작한 시각**(unix 초). Waiting에서만 Some이고, 이 값이 곧 정렬 키다.
     /// 화면에 그대로 보여줘 "왜 이게 위에 있나"를 설명할 필요가 없게 한다.
     pub blocked_since: Option<i64>,
+    /// 마지막으로 새 출력이 온 시각(unix 초). 구조화(App Server) 세션은 PTY 스냅샷이
+    /// 없어 항상 None이다 — 그 묶음에는 「출력 없음」을 표시하지 않는다.
+    pub last_output_at: Option<i64>,
+}
+
+/// 「작업 중」인데 이만큼 출력이 없으면 멈춘 것으로 본다.
+pub const STUCK_AFTER_SECS: i64 = 300;
+
+/// 조용히 멈춘 세션인가 — 돌고 있다고 표시되는데 한참 아무것도 안 뱉은 경우.
+///
+/// "작업 중"과 "멈춘 것"은 화면상 둘 다 파란 점인데 실제로는 전혀 다르다. 출력이 원래
+/// 뜸한 작업도 있어 오탐이 가능하므로 상태를 바꾸지 않고 **표시만** 덧붙인다.
+pub fn stuck_for(session: &FleetSession, now: i64) -> Option<i64> {
+    if session.state != AgentVisualState::Active {
+        return None;
+    }
+    let silent = now.saturating_sub(session.last_output_at?);
+    (silent >= STUCK_AFTER_SECS).then_some(silent)
 }
 
 /// fleet 카드의 종류별 포커스 대상. PTY는 tab/pane으로 포커스하고 WriteInput
@@ -177,6 +195,7 @@ mod tests {
             waiting_message: None,
             active_workspace: true,
             blocked_since: None,
+            last_output_at: None,
         }
     }
 
@@ -275,6 +294,50 @@ mod tests {
             "0초",
             "시계가 되감겨도 음수 표기가 나오면 안 된다"
         );
+    }
+
+    /// 멈춤 판정은 **작업 중**일 때만, 그리고 출력 시각을 아는 세션만 — 구조화 세션은
+    /// PTY 스냅샷이 없어 항상 None이라 오탐이 없어야 한다.
+    #[test]
+    fn 멈춤은_작업중이면서_출력이_끊긴_세션만_잡는다() {
+        let active_silent = FleetSession {
+            state: AgentVisualState::Active,
+            last_output_at: Some(1_000),
+            ..session("ws", "t", AgentVisualState::Active)
+        };
+        assert_eq!(
+            stuck_for(&active_silent, 1_000 + STUCK_AFTER_SECS),
+            Some(STUCK_AFTER_SECS),
+            "경계에서 잡혀야 한다"
+        );
+        assert_eq!(
+            stuck_for(&active_silent, 1_000 + STUCK_AFTER_SECS - 1),
+            None,
+            "경계 직전은 멈춘 게 아니다"
+        );
+
+        // 대기·완료는 원래 출력이 없다 — 멈춤으로 부르면 안 된다.
+        for state in [
+            AgentVisualState::Waiting,
+            AgentVisualState::Complete,
+            AgentVisualState::Idle,
+            AgentVisualState::Error,
+        ] {
+            let other = FleetSession {
+                state,
+                last_output_at: Some(0),
+                ..session("ws", "t", state)
+            };
+            assert_eq!(
+                stuck_for(&other, 100_000),
+                None,
+                "{state:?}는 대상이 아니다"
+            );
+        }
+
+        // 출력 시각을 모르면(구조화 세션·갓 뜬 세션) 판정하지 않는다.
+        let unknown = session("ws", "t", AgentVisualState::Active);
+        assert_eq!(stuck_for(&unknown, 100_000), None);
     }
 
     /// 안전 불변식: 구조화 세션은 브로드캐스트 키를 절대 내지 않는다(steer 경로라

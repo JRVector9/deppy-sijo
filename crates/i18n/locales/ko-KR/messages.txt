@@ -911,6 +911,7 @@ fleet.group.active = 진행 중
 fleet.group.errored = 오류
 fleet.group.finished = 끝남
 fleet.blocked_for = {value} 막힘
+fleet.stuck = {value} 출력 없음
 fleet.hero.now = 지금 처리
 fleet.hero.next = 다음 대기
 fleet.hero.clear = 막힌 에이전트가 없습니다.

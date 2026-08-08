@@ -911,6 +911,7 @@ fleet.group.active = Running
 fleet.group.errored = Failed
 fleet.group.finished = Finished
 fleet.blocked_for = blocked {value}
+fleet.stuck = no output {value}
 fleet.hero.now = Handle now
 fleet.hero.next = Next
 fleet.hero.clear = Nothing is blocked on you.

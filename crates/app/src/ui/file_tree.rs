@@ -39,6 +39,8 @@ pub struct SessionEntry {
     pub in_worktree: bool,
     /// 에이전트 3행: 최신 에이전트 응답/진행 메시지, 없으면 터미널 현재 줄/일반 활동 설명.
     pub status_line: Option<String>,
+    /// 마지막으로 새 출력이 온 시각(unix 초) — 「작업 중」인데 멈춘 세션 판별용.
+    pub last_output_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7911,6 +7913,7 @@ mod tests {
                     has_cwd: true,
                     in_worktree: false,
                     status_line: agent.then(|| "PR #124 코드 리뷰".to_owned()),
+                    last_output_at: None,
                 },
             )
         };
@@ -8075,6 +8078,7 @@ mod tests {
                     has_cwd: false,
                     in_worktree: false,
                     status_line: None,
+                    last_output_at: None,
                 },
             )
         };
@@ -8556,6 +8560,7 @@ mod tests {
                 has_cwd: false,
                 in_worktree: false,
                 status_line: None,
+                last_output_at: None,
             },
         );
         let mut harness = egui_kittest::Harness::builder()
@@ -8650,6 +8655,7 @@ mod tests {
                     has_cwd: false,
                     in_worktree: false,
                     status_line: None,
+                    last_output_at: None,
                 },
             )],
         )]);
@@ -8720,6 +8726,7 @@ mod tests {
                 has_cwd: false,
                 in_worktree: false,
                 status_line: None,
+                last_output_at: None,
             },
         );
         let mut harness = egui_kittest::Harness::builder()
@@ -8802,6 +8809,7 @@ mod tests {
                 has_cwd: false,
                 in_worktree: false,
                 status_line: None,
+                last_output_at: None,
             },
         );
         let mut harness = egui_kittest::Harness::new_ui_state(
@@ -8941,6 +8949,7 @@ mod tests {
                     has_cwd: false,
                     in_worktree: false,
                     status_line: None,
+                    last_output_at: None,
                 },
             );
             let mut harness = egui_kittest::Harness::new_ui_state(
@@ -9565,6 +9574,7 @@ mod tests {
                 has_cwd: true,
                 in_worktree: false,
                 status_line: None,
+                last_output_at: None,
             },
         );
 

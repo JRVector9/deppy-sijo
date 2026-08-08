@@ -1065,6 +1065,17 @@ fn card(
         );
         // 막힌 시간은 정렬 키 그 자체다 — 화면에 보여야 "왜 이게 위에 있나"를
         // 설명할 필요가 없다(2026-08-08 정렬 기준).
+        // 「작업 중」인데 한참 조용한 세션 — 파란 점만으로는 멈춘 걸 알 수 없다.
+        if let Some(silent) = crate::fleet::stuck_for(session, now) {
+            ui.label(
+                egui::RichText::new(catalog.t(
+                    "fleet.stuck",
+                    &[("value", &crate::fleet::format_blocked_duration(silent, 0))],
+                ))
+                .small()
+                .color(status_color(AgentVisualState::Waiting)),
+            );
+        }
         if let Some(since) = session.blocked_since {
             ui.label(
                 egui::RichText::new(catalog.t(
@@ -1218,6 +1229,7 @@ mod tests {
             waiting_message: None,
             active_workspace: true,
             blocked_since: None,
+            last_output_at: None,
         }
     }
 

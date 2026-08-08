@@ -911,6 +911,7 @@ fleet.group.active = 進行中
 fleet.group.errored = 錯誤
 fleet.group.finished = 已結束
 fleet.blocked_for = 受阻 {value}
+fleet.stuck = {value} 無輸出
 fleet.hero.now = 現在處理
 fleet.hero.next = 下一個
 fleet.hero.clear = 沒有受阻的代理。

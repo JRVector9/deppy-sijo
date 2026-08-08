@@ -18276,6 +18276,7 @@ impl App {
                     detected
                 };
                 out.push(crate::fleet::FleetSession {
+                    last_output_at: entry.last_output_at,
                     blocked_since: (state == AgentVisualState::Waiting)
                         .then(|| {
                             self.blocked_since
@@ -18337,6 +18338,8 @@ impl App {
                 // 구조화 세션의 막힌 시각은 아직 추적하지 않는다 — hook 기반
                 // global_waiting은 PTY 세션 키만 담는다. 이 묶음은 시각 없이 맨 뒤로 간다.
                 blocked_since: None,
+                // PTY 스냅샷이 없어 출력 시각을 알 수 없다 — 멈춤 표시 대상이 아니다.
+                last_output_at: None,
             });
         }
         out

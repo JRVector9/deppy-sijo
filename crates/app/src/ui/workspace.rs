@@ -1426,6 +1426,11 @@ struct SessionView {
     status: Option<SessionStatus>,
     status_view: Option<runtime::SessionStatusView>,
     input_pressure: Option<runtime::PtyInputPressure>,
+    /// 이 세션에서 **마지막으로 새 출력이 온 시각**(unix 초).
+    ///
+    /// "작업 중"과 "멈춘 것"은 화면상 둘 다 파란 점인데 실제로는 전혀 다르다. 마지막
+    /// 출력 이후 경과로 조용히 죽은 세션을 찾아낸다(2026-08-08).
+    last_output_at: Option<i64>,
 }
 
 impl WorkspaceUi {
@@ -2437,6 +2442,10 @@ impl WorkspaceUi {
                         let frozen = self.selection.is_some_and(|(s, _, _)| s == *session);
                         let view = self.sessions.entry(*session).or_default();
                         view.bracketed_paste = *bracketed_paste;
+                        // 출력 시각은 frozen 분기 **앞**에서 찍는다. 선택 중이라 화면을
+                        // 얼려도 바이트는 실제로 도착한 것이라, 승격 시점에 찍으면 사용자가
+                        // 텍스트를 고르는 동안 "출력 없음"으로 오판한다.
+                        view.last_output_at = Some(deppy_core::time::unix_secs_i64());
                         if frozen {
                             // 선택 중엔 표시 snapshot을 얼리되, 최신본은 pending에 보관해
                             // 해제 시 catch-up한다(codex — 안 그러면 화면이 선택 당시에 멈춤).
@@ -5029,6 +5038,11 @@ impl WorkspaceUi {
                     .and_then(|s| self.sessions.get(&s))
                     .map(|v| v.summary.clone())
                     .unwrap_or_default();
+                // summary와 같은 통과 패턴 — leaf가 SessionView 내부를 몰라도 되게.
+                let last_output_at = pane
+                    .session_id
+                    .and_then(|s| self.sessions.get(&s))
+                    .and_then(|v| v.last_output_at);
                 let osc = self.session_osc_title(pane.session_id);
                 // 에이전트 정보(2/3행) — 있으면 3줄 렌더. codex/claude 병합본(App).
                 let info = pane.session_id.and_then(|s| self.agent_info.get(&s));
@@ -5061,6 +5075,7 @@ impl WorkspaceUi {
                     agent_line,
                     status_label,
                     status_line,
+                    last_output_at,
                 }
             })
             .collect()

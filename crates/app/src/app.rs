@@ -14411,9 +14411,11 @@ impl App {
         step: crate::pty_effort::EffortStep,
     ) {
         let kind = crate::pty_effort::AdjustKind::Effort;
-        let current = self.current_pty_value(surface, kind, surface.effort.as_deref());
+        let (current, unconfirmed) =
+            self.current_pty_value(surface, kind, surface.effort.as_deref());
         let plan = crate::pty_effort::plan(surface.provider, step, current.as_deref());
         self.send_pty_agent_plan(surface, plan, kind);
+        self.notify_pending_unconfirmed(unconfirmed);
     }
 
     /// 모델을 카탈로그 순서로 한 칸 옮긴다. Claude 전용 — Codex는 게이트가 막는다
@@ -14424,9 +14426,24 @@ impl App {
         step: crate::pty_effort::EffortStep,
     ) {
         let kind = crate::pty_effort::AdjustKind::Model;
-        let current = self.current_pty_value(surface, kind, surface.model.as_deref());
+        let (current, unconfirmed) =
+            self.current_pty_value(surface, kind, surface.model.as_deref());
         let plan = crate::pty_effort::plan_model(surface.provider, step, current.as_deref());
         self.send_pty_agent_plan(surface, plan, kind);
+        self.notify_pending_unconfirmed(unconfirmed);
+    }
+
+    /// 직전 조정이 확인되지 않았다는 사실을 알린다.
+    ///
+    /// **반드시 `send_pty_agent_plan` 뒤에** 불러야 한다. 그쪽은 전송에 성공하면
+    /// 피드백을 지우므로, 먼저 띄우면 같은 호출 사슬 안에서 바로 덮여 사용자는
+    /// 아무것도 못 본다.
+    fn notify_pending_unconfirmed(&mut self, unconfirmed: bool) {
+        if unconfirmed {
+            self.show_agent_shortcut_feedback(
+                crate::ui::agent_terminal::AgentShortcutFeedback::NotConfirmed,
+            );
+        }
     }
 
     /// 턴이 끝나 안전해진 세션의 큐를 흘려보낸다.
@@ -14503,10 +14520,11 @@ impl App {
         surface: &crate::agent_surface::AgentSurfaceSnapshot,
         kind: crate::pty_effort::AdjustKind,
         authoritative: Option<&str>,
-    ) -> Option<String> {
+    ) -> (Option<String>, bool) {
         let crate::agent_surface::AgentSurfaceId::Pty { session_id, .. } = &surface.id else {
-            return authoritative.map(str::to_owned);
+            return (authoritative.map(str::to_owned), false);
         };
+        let mut unconfirmed = false;
         let key = (*session_id, kind);
         if let Some(pending) = self.pty_agent_pending.get(&key) {
             let caught_up = authoritative.is_some_and(|value| {
@@ -14517,14 +14535,13 @@ impl App {
                 self.pty_agent_queued.contains_key(&key),
                 pending.sent_at.elapsed(),
             ) {
-                PendingVerdict::Trust => return Some(pending.value.clone()),
+                PendingVerdict::Trust => return (Some(pending.value.clone()), false),
                 PendingVerdict::CaughtUp => {
                     self.pty_agent_pending.remove(&key);
                 }
                 PendingVerdict::Unconfirmed => {
                     // 보냈는데 시한 안에 권위값이 안 따라왔다 — CLI가 거절했을 가능성이
-                    // 크다. 거짓값을 버려 다음 누름이 실재하는 값에서 출발하게 하고,
-                    // 사용자에게 "안 먹었다"를 말한다. 침묵하면 왜 안 바뀌는지 알 길이 없다.
+                    // 크다. 거짓값을 버려 이번 계산이 실재하는 값에서 출발하게 한다.
                     tracing::info!(
                         ?kind,
                         sent = %pending.value,
@@ -14532,13 +14549,11 @@ impl App {
                         "PTY 조정: 시한 안에 확인되지 않아 낙관값을 버린다"
                     );
                     self.pty_agent_pending.remove(&key);
-                    self.show_agent_shortcut_feedback(
-                        crate::ui::agent_terminal::AgentShortcutFeedback::NotConfirmed,
-                    );
+                    unconfirmed = true;
                 }
             }
         }
-        authoritative.map(str::to_owned)
+        (authoritative.map(str::to_owned), unconfirmed)
     }
 
     /// hook이 보고한 대기 사유 문구 — `slash_input_is_safe`가 승인/유휴를 가르는 근거다.

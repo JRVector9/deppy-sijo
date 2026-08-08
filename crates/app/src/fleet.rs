@@ -28,6 +28,9 @@ pub struct FleetSession {
     pub waiting_message: Option<String>,
     /// active 워크스페이스의 세션인지(그 외는 warm — 물러났지만 워커는 실행 중).
     pub active_workspace: bool,
+    /// **나를 막기 시작한 시각**(unix 초). Waiting에서만 Some이고, 이 값이 곧 정렬 키다.
+    /// 화면에 그대로 보여줘 "왜 이게 위에 있나"를 설명할 필요가 없게 한다.
+    pub blocked_since: Option<i64>,
 }
 
 /// fleet 카드의 종류별 포커스 대상. PTY는 tab/pane으로 포커스하고 WriteInput
@@ -60,16 +63,11 @@ impl FleetSession {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FleetSummary {
     pub total: usize,
-    /// 사용자 입력·승인 대기(가장 주목 필요).
-    pub waiting: usize,
-    pub error: usize,
-    /// 턴 완료 — 검토 대기.
-    pub done: usize,
-    /// 작업 중.
-    pub working: usize,
-    pub idle: usize,
-    /// 상태 미보고(off).
-    pub off: usize,
+    /// 나를 막고 있는 수 — 헤더 칩과 nav 배지가 같이 쓴다.
+    pub blocked: usize,
+    pub active: usize,
+    pub errored: usize,
+    pub finished: usize,
 }
 
 impl FleetSummary {
@@ -78,58 +76,126 @@ impl FleetSummary {
         let mut s = Self::default();
         for state in states {
             s.total += 1;
-            match state {
-                AgentVisualState::Waiting => s.waiting += 1,
-                AgentVisualState::Error => s.error += 1,
-                AgentVisualState::Complete => s.done += 1,
-                AgentVisualState::Active => s.working += 1,
-                AgentVisualState::Idle => s.idle += 1,
-                AgentVisualState::Off => s.off += 1,
+            match session_group(state) {
+                SessionGroup::Blocked => s.blocked += 1,
+                SessionGroup::Active => s.active += 1,
+                SessionGroup::Errored => s.errored += 1,
+                SessionGroup::Finished => s.finished += 1,
             }
         }
         s
     }
 }
 
-/// 정렬 우선순위. 값이 클수록 그리드 앞(주목 필요 순). 대기 > 오류 > 완료 > 작업중 >
-/// 유휴 > off. "지금 나를 필요로 하는 에이전트"를 좌상단에 모으는 게 fleet 뷰의 목적.
-pub fn fleet_urgency(state: AgentVisualState) -> u8 {
+/// 세션이 속한 묶음 — 화면 표시 순서와 같다.
+///
+/// 가장 중요한 구분은 **나를 막고 있느냐**다. 승인·입력 대기는 내가 답할 때까지
+/// 에이전트가 놀지만(시간이 곧 비용), 오류·완료는 이미 끝난 결과라 늦게 봐도 손해가
+/// 늘지 않는다. 그래서 12분 된 오류가 1분 40초 된 대기보다 **아래**다(2026-08-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SessionGroup {
+    /// 나를 막고 있다 — 승인·입력 대기. 이 묶음만 FIFO로 정렬한다.
+    Blocked,
+    /// 돌고 있다.
+    Active,
+    /// 실패로 끝났다 — 나를 막지는 않는다.
+    Errored,
+    /// 끝났다.
+    Finished,
+}
+
+impl SessionGroup {
+    /// 표시 순서대로 — 막힌 것이 맨 위.
+    pub const ORDER: [SessionGroup; 4] = [
+        SessionGroup::Blocked,
+        SessionGroup::Active,
+        SessionGroup::Errored,
+        SessionGroup::Finished,
+    ];
+}
+
+pub fn session_group(state: AgentVisualState) -> SessionGroup {
     match state {
-        AgentVisualState::Waiting => 5,
-        AgentVisualState::Error => 4,
-        AgentVisualState::Complete => 3,
-        AgentVisualState::Active => 2,
-        AgentVisualState::Idle => 1,
-        AgentVisualState::Off => 0,
+        AgentVisualState::Waiting => SessionGroup::Blocked,
+        AgentVisualState::Active | AgentVisualState::Idle => SessionGroup::Active,
+        AgentVisualState::Error => SessionGroup::Errored,
+        AgentVisualState::Complete | AgentVisualState::Off => SessionGroup::Finished,
     }
 }
 
-/// fleet 세션을 주목도 순으로 정렬한다(우선순위 내림차순, 동순위는 워크스페이스명→제목).
-/// 안정 정렬이라 같은 키의 상대 순서는 입력(워크스페이스·pane 순회 순)을 보존한다.
-pub fn sort_sessions(sessions: &mut [FleetSession]) {
-    sessions.sort_by(|a, b| {
-        fleet_urgency(b.state)
-            .cmp(&fleet_urgency(a.state))
-            .then_with(|| a.workspace_name.cmp(&b.workspace_name))
-            .then_with(|| a.title.cmp(&b.title))
-    });
+/// 묶음별로 나누고 각 묶음 안을 정렬한다.
+///
+/// 막힌 묶음만 **오래 막힌 순(FIFO)** 이다 — 굶는 항목이 없고, 정렬 키(막힌 시각)가
+/// 화면에 그대로 보여 순서가 자명하다. 나머지는 기존대로 워크스페이스명→제목.
+/// `blocked_since`가 없는 대기 세션(막 감지된 직후)은 맨 뒤로 보낸다.
+pub fn group_sessions(sessions: Vec<FleetSession>) -> [Vec<FleetSession>; 4] {
+    let mut groups: [Vec<FleetSession>; 4] = Default::default();
+    for session in sessions {
+        let slot = SessionGroup::ORDER
+            .iter()
+            .position(|group| *group == session_group(session.state))
+            .expect("ORDER는 모든 묶음을 담는다");
+        groups[slot].push(session);
+    }
+    for group in &mut groups {
+        group.sort_by(|a, b| {
+            a.workspace_name
+                .cmp(&b.workspace_name)
+                .then_with(|| a.title.cmp(&b.title))
+        });
+    }
+    groups[0].sort_by_key(|s| s.blocked_since.unwrap_or(i64::MAX));
+    groups
+}
+
+/// 막힌 시간을 사람이 읽는 짧은 표기로. `since`가 미래면(시계 되감김) "0초".
+pub fn format_blocked_duration(now: i64, since: i64) -> String {
+    let secs = now.saturating_sub(since).max(0);
+    if secs < 60 {
+        format!("{secs}초")
+    } else if secs < 3_600 {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    } else {
+        format!("{}시간 {}분", secs / 3_600, (secs % 3_600) / 60)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn session(workspace: &str, title: &str, state: AgentVisualState) -> FleetSession {
+        FleetSession {
+            workspace_id: workspace.into(),
+            workspace_name: workspace.into(),
+            target: FleetTarget::Structured {
+                session_id: format!("{workspace}-{title}"),
+            },
+            title: title.into(),
+            state,
+            agent_line: None,
+            waiting_message: None,
+            active_workspace: true,
+            blocked_since: None,
+        }
+    }
+
+    fn blocked(workspace: &str, title: &str, since: i64) -> FleetSession {
+        FleetSession {
+            blocked_since: Some(since),
+            ..session(workspace, title, AgentVisualState::Waiting)
+        }
+    }
+
     #[test]
-    fn summary_상태별_집계와_주목수() {
+    fn summary_묶음별_집계() {
         use AgentVisualState::*;
         let s = FleetSummary::from_states([Waiting, Waiting, Error, Complete, Active, Idle, Off]);
         assert_eq!(s.total, 7);
-        assert_eq!(s.waiting, 2);
-        assert_eq!(s.error, 1);
-        assert_eq!(s.done, 1);
-        assert_eq!(s.working, 1);
-        assert_eq!(s.idle, 1);
-        assert_eq!(s.off, 1);
+        assert_eq!(s.blocked, 2, "대기 2건");
+        assert_eq!(s.errored, 1);
+        assert_eq!(s.active, 2, "작업중 + 유휴");
+        assert_eq!(s.finished, 2, "완료 + off");
     }
 
     #[test]
@@ -138,32 +204,84 @@ mod tests {
         assert_eq!(s, FleetSummary::default());
     }
 
+    /// 묶음의 핵심 계약 — 오류는 "나를 막는" 묶음이 아니다. 이미 끝난 결과라 기다린
+    /// 시간이 비용이 아니므로 대기보다 아래여야 한다(2026-08-08 정렬 기준).
     #[test]
-    fn urgency_순서_대기가_최상_off가_최하() {
+    fn 묶음은_나를_막느냐로_먼저_갈린다() {
         use AgentVisualState::*;
-        assert!(fleet_urgency(Waiting) > fleet_urgency(Error));
-        assert!(fleet_urgency(Error) > fleet_urgency(Complete));
-        assert!(fleet_urgency(Complete) > fleet_urgency(Active));
-        assert!(fleet_urgency(Active) > fleet_urgency(Idle));
-        assert!(fleet_urgency(Idle) > fleet_urgency(Off));
+        assert_eq!(session_group(Waiting), SessionGroup::Blocked);
+        assert_eq!(session_group(Active), SessionGroup::Active);
+        assert_eq!(session_group(Idle), SessionGroup::Active);
+        assert_eq!(session_group(Error), SessionGroup::Errored);
+        assert_eq!(session_group(Complete), SessionGroup::Finished);
+        assert_eq!(session_group(Off), SessionGroup::Finished);
+        assert!(
+            SessionGroup::Blocked < SessionGroup::Errored,
+            "막힌 것이 오류보다 위여야 한다"
+        );
+        assert_eq!(SessionGroup::ORDER[0], SessionGroup::Blocked);
+    }
+
+    /// 막힌 묶음만 FIFO — 오래 막힌 것이 위. 나머지 묶음은 워크스페이스명→제목.
+    #[test]
+    fn 막힌_묶음은_오래된_순_나머지는_이름순() {
+        let grouped = group_sessions(vec![
+            blocked("beta", "새 대기", 300),
+            blocked("alpha", "오래된 대기", 100),
+            session("beta", "b", AgentVisualState::Active),
+            session("alpha", "a", AgentVisualState::Active),
+            session("x", "err", AgentVisualState::Error),
+            session("y", "done", AgentVisualState::Complete),
+        ]);
+        let titles =
+            |group: &Vec<FleetSession>| group.iter().map(|s| s.title.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            titles(&grouped[0]),
+            vec!["오래된 대기", "새 대기"],
+            "막힌 묶음은 오래 막힌 순이어야 한다 — 이름순이 아니다"
+        );
+        assert_eq!(titles(&grouped[1]), vec!["a", "b"], "진행 중은 이름순");
+        assert_eq!(titles(&grouped[2]), vec!["err"]);
+        assert_eq!(titles(&grouped[3]), vec!["done"]);
+    }
+
+    /// 막 감지돼 시각이 아직 없는 대기 세션은 맨 뒤로 — 0으로 취급하면 오래 막힌 것을
+    /// 제치고 맨 위로 올라간다.
+    #[test]
+    fn 시각을_모르는_대기는_맨_뒤로_간다() {
+        let mut unknown = blocked("ws", "시각 없음", 0);
+        unknown.blocked_since = None;
+        let grouped = group_sessions(vec![unknown, blocked("ws", "오래됨", 100)]);
+        assert_eq!(
+            grouped[0]
+                .iter()
+                .map(|s| s.title.clone())
+                .collect::<Vec<_>>(),
+            vec!["오래됨", "시각 없음"]
+        );
+    }
+
+    #[test]
+    fn 막힌_시간_표기는_구간별로_바뀐다() {
+        assert_eq!(format_blocked_duration(100, 100), "0초");
+        assert_eq!(format_blocked_duration(159, 100), "59초");
+        assert_eq!(format_blocked_duration(160, 100), "1:00");
+        assert_eq!(format_blocked_duration(100 + 252, 100), "4:12");
+        assert_eq!(format_blocked_duration(100 + 3_599, 100), "59:59");
+        assert_eq!(format_blocked_duration(100 + 3_600, 100), "1시간 0분");
+        assert_eq!(format_blocked_duration(100 + 7_500, 100), "2시간 5분");
+        assert_eq!(
+            format_blocked_duration(100, 500),
+            "0초",
+            "시계가 되감겨도 음수 표기가 나오면 안 된다"
+        );
     }
 
     /// 안전 불변식: 구조화 세션은 브로드캐스트 키를 절대 내지 않는다(steer 경로라
     /// WriteInput 대상 불가). FleetTarget/match를 미래에 바꿔도 이 회귀를 잡는다(리뷰 Low).
     #[test]
     fn 구조화_세션은_브로드캐스트_대상이_아니다() {
-        let structured = FleetSession {
-            workspace_id: "ws".into(),
-            workspace_name: "ws".into(),
-            target: FleetTarget::Structured {
-                session_id: "s1".into(),
-            },
-            title: "t".into(),
-            state: AgentVisualState::Idle,
-            agent_line: None,
-            waiting_message: None,
-            active_workspace: false,
-        };
+        let structured = session("ws", "t", AgentVisualState::Idle);
         assert_eq!(structured.broadcast_key(), None);
     }
 }

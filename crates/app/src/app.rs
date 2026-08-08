@@ -4085,6 +4085,7 @@ fn load_approval_snapshot(db: &Db) -> anyhow::Result<ApprovalSnapshot> {
                 row.arguments_preview,
                 row.pane_id,
                 remote_url,
+                row.created_at,
             )
             .map_err(|_| anyhow::anyhow!("approval_snapshot_invalid_projection"))
         })
@@ -6491,6 +6492,24 @@ struct WorkspaceRuntime {
     pending_replay_resync: bool,
 }
 
+/// 막힌 시각 맵을 살아있는 집합에 맞춰 갱신한다.
+///
+/// - 새로 막힌 키 → `now`를 찍는다
+/// - 계속 막힌 키 → **값을 건드리지 않는다** (폴링마다 덮어쓰면 타이머가 0으로 돌아간다)
+/// - 풀린 키 → 제거
+///
+/// `App`을 만들지 않고 검증하려고 순수 함수로 뺐다.
+fn update_blocked_since(
+    map: &mut std::collections::HashMap<(String, runtime::SessionId), i64>,
+    live: &std::collections::HashSet<(String, runtime::SessionId)>,
+    now: i64,
+) {
+    map.retain(|key, _| live.contains(key));
+    for key in live {
+        map.entry(key.clone()).or_insert(now);
+    }
+}
+
 /// 상태바 사용량 — (5시간, 주간). 창마다 **따로** 없을 수 있어 슬롯별 Option이다.
 /// `(u8, u8)` 한 덩어리로 묶으면 한쪽 창만 보고된 응답에서 나머지 한쪽까지 통째로
 /// 사라진다. 바깥 Option은 "출처 자체가 없다", 안쪽 Option은 "그 창이 없다"를 뜻한다.
@@ -7439,6 +7458,10 @@ pub struct App {
     /// 표시 데이터는 팝오버가 열렸을 때만 지연 해석한다(idle 비용 0).
     /// agent_needs_input(활성 전용, 사이드바/상태 레일이 쓴다)과는 별개 필드다.
     global_waiting: Vec<(String, runtime::SessionId, Option<String>)>,
+    /// 세션이 **나를 막기 시작한 시각**(unix 초). global_waiting은 스냅샷마다 통째로
+    /// 재구성돼 시각이 없으므로, 아래 Attention 처리에서 들어온/나간 키만 diff해 채운다.
+    /// 계속 막혀 있는 키는 값을 유지해야 타이머가 폴링마다 0으로 돌아가지 않는다.
+    blocked_since: std::collections::HashMap<(String, runtime::SessionId), i64>,
     /// hook이 보고한 턴 완료(Stop) 세션 → updated_at — 레일 '완료(바이올렛)' 트랜지언트
     /// 소스. 값(updated_at)은 소비 시 조건부 clear의 세대 기준(레이스 방지, codex 리뷰).
     agent_turn_done: std::collections::HashMap<runtime::SessionId, i64>,
@@ -10308,6 +10331,7 @@ impl App {
             persisted_agents: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
             global_waiting: Vec::new(),
+            blocked_since: std::collections::HashMap::new(),
             agent_turn_done: std::collections::HashMap::new(),
             agent_working: std::collections::HashSet::new(),
             global_working: std::collections::HashSet::new(),
@@ -11098,6 +11122,18 @@ impl App {
                             .then(|| (workspace_id, session, message.clone()))
                     })
                     .collect();
+                // 막힌 시각 갱신 — global_waiting은 이미 liveness 필터를 거쳤으므로 죽은
+                // 세션은 여기서 자동으로 빠진다.
+                let live_blocked: std::collections::HashSet<(String, runtime::SessionId)> = self
+                    .global_waiting
+                    .iter()
+                    .map(|(workspace_id, session, _)| (workspace_id.clone(), *session))
+                    .collect();
+                update_blocked_since(
+                    &mut self.blocked_since,
+                    &live_blocked,
+                    deppy_core::time::unix_secs_i64(),
+                );
                 self.agent_turn_done = snapshot
                     .turn_done_sessions
                     .iter()
@@ -18240,6 +18276,13 @@ impl App {
                     detected
                 };
                 out.push(crate::fleet::FleetSession {
+                    blocked_since: (state == AgentVisualState::Waiting)
+                        .then(|| {
+                            self.blocked_since
+                                .get(&(workspace.id.clone(), session))
+                                .copied()
+                        })
+                        .flatten(),
                     workspace_id: workspace.id.clone(),
                     workspace_name: workspace_name.clone(),
                     target: crate::fleet::FleetTarget::Pty {
@@ -18291,9 +18334,11 @@ impl App {
                 state: row.state,
                 agent_line,
                 waiting_message: None,
+                // 구조화 세션의 막힌 시각은 아직 추적하지 않는다 — hook 기반
+                // global_waiting은 PTY 세션 키만 담는다. 이 묶음은 시각 없이 맨 뒤로 간다.
+                blocked_since: None,
             });
         }
-        crate::fleet::sort_sessions(&mut out);
         out
     }
 
@@ -18855,6 +18900,7 @@ impl App {
                             &approval_workspace_names,
                             &approval_session_titles,
                             ui::inbox_approvals::POPUP_MAX_CARDS,
+                            deppy_core::time::unix_secs_i64(),
                         );
                         approval_decision = approval_action.decision;
                         clicked = approval_action.goto;
@@ -23870,6 +23916,42 @@ mod tests {
             None,
             "둘 다 만료되면 None이라야 PTY 프로브 폴백이 살아난다"
         );
+    }
+
+    /// 계속 막혀 있는 세션의 타이머가 폴링마다 0으로 돌아가면 "오래 막힌 순" 정렬이
+    /// 무의미해진다. global_waiting이 스냅샷마다 통째로 재구성되기 때문에 생기는 위험이라
+    /// 이 계약을 고정한다(2026-08-08).
+    #[test]
+    fn 막힌_시각은_계속_막힌_키의_값을_유지한다() {
+        use std::collections::{HashMap, HashSet};
+
+        let key = |id: u64| ("ws".to_owned(), runtime::SessionId(id));
+        let mut map: HashMap<(String, runtime::SessionId), i64> = HashMap::new();
+
+        // 1) 처음 막힘 — 지금 시각을 찍는다.
+        let live: HashSet<_> = [key(1), key(2)].into_iter().collect();
+        update_blocked_since(&mut map, &live, 100);
+        assert_eq!(map.get(&key(1)), Some(&100));
+        assert_eq!(map.get(&key(2)), Some(&100));
+
+        // 2) 같은 키가 계속 막힌 채로 다시 폴링 — 값이 그대로여야 한다.
+        update_blocked_since(&mut map, &live, 160);
+        assert_eq!(
+            map.get(&key(1)),
+            Some(&100),
+            "계속 막힌 키의 시각을 덮어쓰면 타이머가 0으로 돌아간다"
+        );
+
+        // 3) 하나가 풀리고 새 세션이 막힘.
+        let live: HashSet<_> = [key(2), key(3)].into_iter().collect();
+        update_blocked_since(&mut map, &live, 200);
+        assert_eq!(map.get(&key(1)), None, "풀린 키는 제거돼야 한다");
+        assert_eq!(map.get(&key(2)), Some(&100), "계속 막힌 키는 유지");
+        assert_eq!(map.get(&key(3)), Some(&200), "새로 막힌 키는 지금 시각");
+
+        // 4) 전부 풀리면 비어야 한다 — 맵이 무한히 자라면 안 된다.
+        update_blocked_since(&mut map, &HashSet::new(), 300);
+        assert!(map.is_empty());
     }
 
     /// 백엔드 보충은 "5시간만 빠진 구멍"에만 끼운다 — 그 외에는 서버 값 그대로.

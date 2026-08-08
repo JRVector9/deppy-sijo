@@ -20912,13 +20912,6 @@ impl eframe::App for App {
                         &text,
                     );
                 } else if fleet_visible {
-                    // 사용량은 하단 상태바와 **같은 소스**를 쓴다 — 두 곳의 숫자가 갈리면 안 된다.
-                    let codex_server_usage = self.agent_sessions_ui.codex_usage();
-                    let codex_backend_five_hour = matches!(codex_server_usage, Some((None, Some(_))))
-                        .then(|| crate::codex_backend_usage::current(ui.ctx()))
-                        .flatten()
-                        .and_then(|backend| backend.five_hour);
-                    let codex_meta = self.agent_sessions_ui.codex_usage_meta();
                     let page = self.fleet_ui.render(
                         ui,
                         &fleet_sessions,
@@ -20935,15 +20928,6 @@ impl eframe::App for App {
                             session_titles: &fleet_session_titles,
                             waiting_cards: &fleet_waiting_cards,
                             waiting_ui: &mut self.inbox_waiting_ui,
-                        },
-                        ui::fleet::UsageReadout {
-                            claude: claude_usage_snapshot()
-                                .or_else(|| crate::claude_usage::current(ui.ctx())),
-                            codex: supplement_codex_five_hour(
-                                codex_server_usage,
-                                codex_backend_five_hour,
-                            ),
-                            codex_meta: codex_meta.as_ref(),
                         },
                         &sidebar_workspaces,
                     );

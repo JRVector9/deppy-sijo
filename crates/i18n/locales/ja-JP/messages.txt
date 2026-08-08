@@ -777,6 +777,7 @@ status_bar.agent_shortcut.current_value_unknown = エージェントの現在値
 status_bar.agent_shortcut.unsupported = このエージェントはそのショートカットに対応していません
 status_bar.agent_shortcut.target_unavailable = 対象paneはすでにアクティブではありません
 status_bar.agent_shortcut.delivery_failed = paneにショートカットを送信できませんでした
+status_bar.agent_shortcut.not_confirmed = 適用が確認できません — ターミナルでエージェントの応答を確認してください
 status_bar.approvals_open_inbox = 作業を開く →
 status_bar.approvals_open_inbox.hint = 残りの承認は作業で確認します
 status_bar.approvals = 承認 {count}

@@ -33,6 +33,9 @@ pub(crate) enum AgentShortcutFeedback {
     Unsupported,
     TargetUnavailable,
     DeliveryFailed,
+    /// 보내긴 했는데 시한 안에 CLI가 그 값을 반영하지 않았다. 조직 한도·런치 핀 등
+    /// **에이전트 쪽 거절**일 수 있고, 거절 사유는 CLI가 pane에 찍는다.
+    NotConfirmed,
 }
 
 impl AgentShortcutFeedback {
@@ -46,6 +49,7 @@ impl AgentShortcutFeedback {
             Self::Unsupported => "status_bar.agent_shortcut.unsupported",
             Self::TargetUnavailable => "status_bar.agent_shortcut.target_unavailable",
             Self::DeliveryFailed => "status_bar.agent_shortcut.delivery_failed",
+            Self::NotConfirmed => "status_bar.agent_shortcut.not_confirmed",
         }
     }
 }

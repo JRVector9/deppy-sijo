@@ -777,6 +777,7 @@ status_bar.agent_shortcut.current_value_unknown = 無法確定代理的目前值
 status_bar.agent_shortcut.unsupported = 此代理不支援該快捷鍵
 status_bar.agent_shortcut.target_unavailable = 目標窗格已不再處於作用中狀態
 status_bar.agent_shortcut.delivery_failed = 無法將快捷鍵傳送到窗格
+status_bar.agent_shortcut.not_confirmed = 未確認已套用 — 請在終端查看代理的回覆
 status_bar.approvals_open_inbox = 開啟工作 →
 status_bar.approvals_open_inbox.hint = 在工作頁檢視其餘審批
 status_bar.approvals = 審批 {count}

@@ -1184,6 +1184,19 @@ mod tests {
         i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
     }
 
+    fn approval_at(id: &str, tool: &str, created_at: i64) -> PendingApprovalItem {
+        PendingApprovalItem::try_new(
+            id.to_owned(),
+            "srv".to_owned(),
+            tool.to_owned(),
+            "{}".to_owned(),
+            None,
+            None,
+            created_at,
+        )
+        .unwrap()
+    }
+
     fn approval(id: &str, session_key: Option<&str>) -> PendingApprovalItem {
         PendingApprovalItem::try_new(
             id.to_owned(),
@@ -1501,6 +1514,133 @@ mod tests {
             card_accent(&workspaces, &a),
             card_accent(&workspaces, &a_again),
             "같은 워크스페이스는 세션·상태가 달라도 같은 색이어야 한다"
+        );
+    }
+
+    /// 「건너뛰기」는 그 항목을 넘기고 **다음으로 오래 막힌** 항목을 히어로로 올린다.
+    /// 건너뛰기 상태가 프레임을 넘어 유지되는지까지 봐야 해서 FleetUi를 상태로 든다.
+    #[test]
+    fn 건너뛰기는_다음_항목을_히어로로_올린다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            fleet: FleetUi,
+            waiting: InboxWaitingUi,
+        }
+        let outer = catalog();
+        let skip_label = outer.t("fleet.hero.skip", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    let catalog = catalog();
+                    let library = crate::prompt_library::PromptLibrary::default();
+                    // 오래 막힌 순: older(100) → newer(200).
+                    let pending = [
+                        approval_at("a1", "older_tool", 100),
+                        approval_at("a2", "newer_tool", 200),
+                    ];
+                    let _ = state.fleet.render(
+                        ui,
+                        &[],
+                        FleetSummary::default(),
+                        &catalog,
+                        &library,
+                        BatchSpawnInput {
+                            agents: &[],
+                            max: 4,
+                        },
+                        AttentionInput {
+                            pending: &pending,
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                            waiting_cards: &[],
+                            waiting_ui: &mut state.waiting,
+                        },
+                        &[workspace("ws-1")],
+                    );
+                },
+                State {
+                    fleet: FleetUi::default(),
+                    waiting: InboxWaitingUi::new(),
+                },
+            );
+        harness.run();
+        // 히어로는 오래 막힌 쪽. 두 도구명이 모두 화면에 있지만(뒤쪽은 요약 줄)
+        // 승인 버튼은 히어로에만 있으므로 그것으로 어느 쪽이 히어로인지 가른다.
+        let approve = outer.t("inbox.approval.approve", &[]);
+        assert!(
+            harness.query_by_label(&approve).is_some(),
+            "히어로에 승인 버튼이 있어야 한다"
+        );
+        let hero_before = harness.get_by_label("older_tool").rect();
+        let next_before = harness.get_by_label("newer_tool").rect();
+        assert!(
+            hero_before.top() < next_before.top(),
+            "오래 막힌 쪽이 위(히어로)여야 한다"
+        );
+
+        harness.get_by_label(&skip_label).click();
+        harness.run();
+
+        // 건너뛴 뒤에는 순서가 뒤집힌다 — newer가 히어로 자리로 올라온다.
+        let hero_after = harness.get_by_label("newer_tool").rect();
+        let skipped_after = harness.get_by_label("older_tool").rect();
+        assert!(
+            hero_after.top() < skipped_after.top(),
+            "건너뛴 뒤에도 같은 항목이 히어로면 건너뛰기가 안 먹은 것이다"
+        );
+    }
+
+    /// 좁은 창에서도 우측 세션 컬럼이 화면 안에 있어야 한다. 창 최소 크기 제한이 없고
+    /// 사이드바가 680px까지 넓어져 available이 아주 작아질 수 있다(2026-08-08 리뷰).
+    #[test]
+    fn 좁은_폭에서도_우측_컬럼이_화면_안에_있다() {
+        use egui_kittest::kittest::Queryable;
+
+        // 300 하한이 실제로 넘치는 폭이어야 결함을 잡는다 — 프레임 여백(좌우 16)을
+        // 빼면 available이 하한보다 작아진다.
+        const NARROW: f32 = 300.0;
+        let outer = catalog();
+        let sessions_label = outer.t("fleet.hero.sessions", &[]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(NARROW, 500.0))
+            .build_ui(|ui| {
+                let catalog = catalog();
+                let library = crate::prompt_library::PromptLibrary::default();
+                let mut fleet = FleetUi::default();
+                let mut waiting = InboxWaitingUi::new();
+                let sessions = [pty_session("ws-1", 7, AgentVisualState::Active)];
+                let summary = FleetSummary::from_states(sessions.iter().map(|s| s.state));
+                let _ = fleet.render(
+                    ui,
+                    &sessions,
+                    summary,
+                    &catalog,
+                    &library,
+                    BatchSpawnInput {
+                        agents: &[],
+                        max: 4,
+                    },
+                    AttentionInput {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                        waiting_cards: &[],
+                        waiting_ui: &mut waiting,
+                    },
+                    &[workspace("ws-1")],
+                );
+            });
+        harness.run();
+        let sessions_header = harness
+            .query_by_label(&sessions_label)
+            .expect("좁은 폭에서 우측 컬럼 헤더가 사라졌다")
+            .rect();
+        assert!(
+            sessions_header.left() < NARROW,
+            "우측 컬럼이 화면 밖({})에서 시작한다 — 좌측 폭 하한이 available을 무시했다",
+            sessions_header.left()
         );
     }
 }

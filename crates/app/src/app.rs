@@ -13772,6 +13772,11 @@ impl App {
         // agent 감지 워커: 전환 시 epoch을 올려 이전 워크스페이스의 잔여 결과를 폐기하고,
         // 즉시 감지가 새 워크스페이스 기준으로 재시작되게 한다(codex #3).
         self.agent_detect_epoch += 1;
+        // 여기서 지우는 맵들은 전부 **SessionId만**을 키로 쓴다 — 워크스페이스가 바뀌면
+        // 같은 id가 다른 세션을 가리키므로 반드시 비워야 한다. `blocked_since`는
+        // (workspace_id, SessionId)로 네임스페이스돼 있어 여기 넣으면 안 된다: 다른
+        // 워크스페이스에서 계속 막혀 있는 세션의 타이머가 전환할 때마다 0으로 돌아간다.
+        // 죽은 항목은 다음 Attention 스냅샷의 update_blocked_since가 정리한다.
         self.agent_bindings.clear();
         self.agent_activity.clear();
         self.agent_needs_input.clear();

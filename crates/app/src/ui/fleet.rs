@@ -181,13 +181,6 @@ pub fn blocked_queue(
     items
 }
 
-/// 헤더 사용량 표기 입력 — 하단 상태바와 **같은 값**을 쓰려고 App이 그대로 넘긴다.
-pub struct UsageReadout<'a> {
-    pub claude: Option<crate::app::ProviderUsage>,
-    pub codex: Option<crate::app::ProviderUsage>,
-    pub codex_meta: Option<&'a crate::ui::agent_sessions::CodexUsageMeta>,
-}
-
 /// 페이지가 App에 돌려주는 intent 묶음. 그리드·승인·대기가 각각 독립적으로 발생할 수 있다.
 #[derive(Default)]
 pub struct FleetPageOutput {
@@ -220,7 +213,6 @@ impl FleetUi {
         library: &PromptLibrary,
         batch_spawn_input: BatchSpawnInput<'_>,
         attention: AttentionInput<'_>,
-        usage: UsageReadout<'_>,
         workspaces: &[crate::ui::file_tree::SidebarWorkspaceEntry],
     ) -> FleetPageOutput {
         let BatchSpawnInput {
@@ -236,7 +228,7 @@ impl FleetUi {
                 // 브로드캐스트 버튼은 브로드캐스트 가능한 세션(PTY)이 있을 때만 — 구조화만
                 // 있는 fleet에서 눌러도 대상이 비는 막다른 버튼이 되지 않게(리뷰 Medium).
                 let has_broadcast_target = sessions.iter().any(|s| s.broadcast_key().is_some());
-                match header(ui, summary, catalog, has_broadcast_target, usage) {
+                match header(ui, summary, catalog, has_broadcast_target) {
                     Some(HeaderClick::Launch) => *action = Some(FleetAction::LaunchAgent),
                     Some(HeaderClick::Broadcast) => {
                         // 대상 기본값 = 작업 중이 아닌 세션(진행 중 에이전트는 방해하지 않음).
@@ -936,13 +928,12 @@ fn card_accent(
     crate::ui::file_tree::workspace_accent(workspaces, &session.workspace_id)
 }
 
-/// 상단 헤더: 제목 + 총계 + (우측) 사용량 + 배치 스폰·브로드캐스트·새 에이전트 버튼 + 상태별 칩.
+/// 상단 헤더: 제목 + 총계 + (우측) 배치 스폰·브로드캐스트·새 에이전트 버튼 + 묶음별 칩.
 fn header(
     ui: &mut egui::Ui,
     summary: FleetSummary,
     catalog: &i18n::Catalog,
     has_broadcast_target: bool,
-    usage: UsageReadout<'_>,
 ) -> Option<HeaderClick> {
     let mut click = None;
     ui.horizontal(|ui| {
@@ -967,10 +958,6 @@ fn header(
             if ui.button(catalog.t("fleet.batch", &[])).clicked() {
                 click = Some(HeaderClick::BatchSpawn);
             }
-            // 사용량은 일괄 실행·브로드캐스트 **바로 옆**에 둔다 — 여러 에이전트를 한꺼번에
-            // 돌리기 전에 남은 한도가 보여야 한다. 하단 상태바와 같은 렌더러라 숫자도 같다.
-            ui.add_space(10.0);
-            crate::app::top_provider_usage(ui, usage.claude, usage.codex, usage.codex_meta);
         });
     });
     ui.add_space(8.0);
@@ -1266,11 +1253,6 @@ mod tests {
                     waiting_cards,
                     waiting_ui,
                 },
-                UsageReadout {
-                    claude: None,
-                    codex: None,
-                    codex_meta: None,
-                },
                 workspaces,
             );
         });
@@ -1358,11 +1340,6 @@ mod tests {
                             waiting_cards: &[],
                             waiting_ui: &mut waiting,
                         },
-                        UsageReadout {
-                            claude: None,
-                            codex: None,
-                            codex_meta: None,
-                        },
                         &[workspace("ws-1")],
                     );
                 });
@@ -1446,11 +1423,6 @@ mod tests {
                         session_titles: &HashMap::new(),
                         waiting_cards: &[],
                         waiting_ui: &mut waiting,
-                    },
-                    UsageReadout {
-                        claude: None,
-                        codex: None,
-                        codex_meta: None,
                     },
                     &[workspace("ws-1")],
                 );

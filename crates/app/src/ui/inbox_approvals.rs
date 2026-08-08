@@ -53,6 +53,8 @@ pub fn render(
     workspace_names: &HashMap<String, String>,
     session_titles: &HashMap<(String, SessionId), String>,
     max_cards: usize,
+    // 막힌 시간 계산 기준(unix 초). 호출측이 넘겨 테스트가 시계에 흔들리지 않게 한다.
+    now: i64,
 ) -> ApprovalCardsAction {
     let mut action = ApprovalCardsAction::default();
     if pending.is_empty() {
@@ -68,6 +70,7 @@ pub fn render(
             workspace_names,
             session_titles,
             &mut action,
+            now,
         );
     }
     let hidden = pending.len().saturating_sub(max_cards);
@@ -91,6 +94,7 @@ fn render_card(
     workspace_names: &HashMap<String, String>,
     session_titles: &HashMap<(String, SessionId), String>,
     action: &mut ApprovalCardsAction,
+    now: i64,
 ) {
     let session_key = row.session_key().and_then(parse_session_key);
     let workspace_label =
@@ -111,7 +115,24 @@ fn render_card(
             (None, Some(title)) => title.clone(),
             (None, None) => catalog.t("inbox.approval.unknown_session", &[]),
         };
-        ui.label(egui::RichText::new(context).size(11.0).weak());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(context).size(11.0).weak());
+            // 승인이 나를 막고 있는 시간 — DB created_at이 진실이라 별도 추적이 없다.
+            // 세션 카드와 같은 표기를 써서 두 자리의 숫자가 같은 뜻으로 읽힌다.
+            ui.label(
+                egui::RichText::new(catalog.t(
+                    "fleet.blocked_for",
+                    &[(
+                        "value",
+                        &crate::fleet::format_blocked_duration(now, row.created_at()),
+                    )],
+                ))
+                .size(11.0)
+                .color(crate::ui::agent_visuals::status_color(
+                    crate::agent_surface::AgentVisualState::Waiting,
+                )),
+            );
+        });
         ui.strong(row.tool_name());
         // arguments_preview는 proxy가 이미 redact한 표시용 텍스트 — 추가 redaction
         // 불필요, 원문 조회 금지(설계 제약).
@@ -219,6 +240,7 @@ mod tests {
             "{}".to_owned(),
             session_key.map(str::to_owned),
             None,
+            0,
         )
         .unwrap()
     }
@@ -334,6 +356,7 @@ mod tests {
                 &workspace_names,
                 &HashMap::new(),
                 POPUP_MAX_CARDS,
+                0,
             );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
@@ -359,6 +382,7 @@ mod tests {
                 &workspace_names,
                 &HashMap::new(),
                 POPUP_MAX_CARDS,
+                0,
             );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
@@ -381,6 +405,7 @@ mod tests {
                 &workspace_names,
                 &HashMap::new(),
                 POPUP_MAX_CARDS,
+                0,
             );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
@@ -399,7 +424,15 @@ mod tests {
     ) -> egui_kittest::Harness<'a, Vec<ApprovalDecision>> {
         egui_kittest::Harness::new_ui_state(
             move |ui, captured: &mut Vec<ApprovalDecision>| {
-                let action = render(ui, catalog, rows, names, &HashMap::new(), POPUP_MAX_CARDS);
+                let action = render(
+                    ui,
+                    catalog,
+                    rows,
+                    names,
+                    &HashMap::new(),
+                    POPUP_MAX_CARDS,
+                    0,
+                );
                 if let Some(decision) = action.decision {
                     captured.push(decision);
                 }

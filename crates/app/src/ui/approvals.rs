@@ -47,6 +47,10 @@ pub struct PendingApprovalItem {
     arguments_preview: String,
     session_key: Option<String>,
     remote_url: Option<Arc<str>>,
+    /// 승인이 만들어진 시각(unix 초, DB `pending_approvals.created_at`). 이 값이 곧
+    /// "얼마나 나를 막고 있나"라 정렬·표시에 쓴다. 2026-08-08까지는 DB에 있는데도
+    /// 투영에서 버려지고 있었다.
+    created_at: i64,
 }
 
 impl std::fmt::Debug for PendingApprovalItem {
@@ -63,6 +67,7 @@ impl PendingApprovalItem {
         arguments_preview: String,
         session_key: Option<String>,
         remote_url: Option<Arc<str>>,
+        created_at: i64,
     ) -> Result<Self, ApprovalDataErrorCode> {
         validate_required(
             &id,
@@ -101,6 +106,7 @@ impl PendingApprovalItem {
             arguments_preview,
             session_key,
             remote_url,
+            created_at,
         })
     }
 
@@ -126,6 +132,11 @@ impl PendingApprovalItem {
 
     pub fn remote_url(&self) -> Option<&str> {
         self.remote_url.as_deref()
+    }
+
+    /// 승인이 만들어진 시각(unix 초) — 막힌 시간 계산의 기준.
+    pub fn created_at(&self) -> i64 {
+        self.created_at
     }
 
     fn retained_bytes(&self) -> usize {
@@ -348,6 +359,7 @@ mod tests {
             "{\"k\":\"v\"}".to_owned(),
             None,
             remote_url.map(Arc::from),
+            0,
         )
         .unwrap()
     }
@@ -421,6 +433,7 @@ mod tests {
             "{\"token\":\"private-value\"}".to_owned(),
             Some("private-workspace:1".to_owned()),
             Some(Arc::from("https://private.example/mcp")),
+            0,
         )
         .unwrap();
         let debug = format!("{item:?}");
@@ -439,6 +452,7 @@ mod tests {
             "p".repeat(APPROVAL_PREVIEW_BYTES_LIMIT),
             Some("k".repeat(APPROVAL_SESSION_KEY_BYTES_LIMIT)),
             Some(Arc::from("u".repeat(APPROVAL_REMOTE_URL_BYTES_LIMIT))),
+            0,
         );
         assert!(exact.is_ok());
         assert_eq!(
@@ -449,6 +463,7 @@ mod tests {
                 String::new(),
                 None,
                 None,
+                0,
             )
             .unwrap_err(),
             ApprovalDataErrorCode::InvalidId
@@ -461,6 +476,7 @@ mod tests {
                 "p".repeat(APPROVAL_PREVIEW_BYTES_LIMIT + 1),
                 None,
                 None,
+                0,
             )
             .unwrap_err(),
             ApprovalDataErrorCode::InvalidPreview
@@ -473,6 +489,7 @@ mod tests {
                 String::new(),
                 None,
                 None,
+                0,
             )
             .unwrap_err(),
             ApprovalDataErrorCode::InvalidServerId
@@ -485,6 +502,7 @@ mod tests {
                 String::new(),
                 None,
                 None,
+                0,
             )
             .unwrap_err(),
             ApprovalDataErrorCode::InvalidToolName
@@ -497,6 +515,7 @@ mod tests {
                 String::new(),
                 Some("k".repeat(APPROVAL_SESSION_KEY_BYTES_LIMIT + 1)),
                 None,
+                0,
             )
             .unwrap_err(),
             ApprovalDataErrorCode::InvalidSessionKey
@@ -509,6 +528,7 @@ mod tests {
                 String::new(),
                 None,
                 Some(Arc::from("u".repeat(APPROVAL_REMOTE_URL_BYTES_LIMIT + 1))),
+                0,
             )
             .unwrap_err(),
             ApprovalDataErrorCode::InvalidRemoteUrl
@@ -524,6 +544,7 @@ mod tests {
             "{\"path\":\"/redacted\"}".to_owned(),
             Some("workspace-id:7".to_owned()),
             Some(Arc::from("https://example.invalid/mcp")),
+            0,
         )
         .unwrap();
         assert_eq!(item.id(), "approval-id");
@@ -560,6 +581,7 @@ mod tests {
                     "p".repeat(APPROVAL_PREVIEW_BYTES_LIMIT),
                     Some("k".repeat(APPROVAL_SESSION_KEY_BYTES_LIMIT)),
                     Some(Arc::from("u".repeat(APPROVAL_REMOTE_URL_BYTES_LIMIT))),
+                    0,
                 )
                 .unwrap()
             })
@@ -574,6 +596,7 @@ mod tests {
                 "p".repeat(APPROVAL_PREVIEW_BYTES_LIMIT),
                 None,
                 Some(Arc::from("u".repeat(last_url_bytes))),
+                0,
             )
             .unwrap(),
         );

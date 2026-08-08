@@ -393,6 +393,7 @@ impl AgentTerminalUi {
                                 approval_cards.workspace_names,
                                 approval_cards.session_titles,
                                 crate::ui::inbox_approvals::POPUP_MAX_CARDS,
+                                deppy_core::time::unix_secs_i64(),
                             );
                             if let Some(decision) = action.decision {
                                 intent = Some(StatusBarIntent::Approval(decision));

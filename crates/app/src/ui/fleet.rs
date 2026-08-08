@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::agent_surface::AgentVisualState;
-use crate::fleet::{FleetSession, FleetSummary, FleetTarget};
+use crate::fleet::{FleetSession, FleetSummary, FleetTarget, SessionGroup};
 use crate::prompt_library::PromptLibrary;
 use crate::ui::agent_visuals::status_color;
 
@@ -134,6 +134,7 @@ impl FleetUi {
         } = batch_spawn_input;
         let mut out = FleetPageOutput::default();
         let action = &mut out.grid;
+        let now = deppy_core::time::unix_secs_i64();
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::symmetric(16, 14))
             .show(ui, |ui| {
@@ -172,7 +173,7 @@ impl FleetUi {
                 // 매 프레임 stale 입력버퍼를 정리해야 하고(2026-07-17 P2 회귀), 세션이 하나도
                 // 없는데 승인만 남아 있는 상태가 실제로 존재한다(모든 pane을 닫았지만 MCP
                 // 승인이 미해결).
-                let attention_out = render_attention(ui, catalog, attention);
+                let attention_out = render_attention(ui, catalog, attention, now);
                 out.approval_decision = attention_out.approval_decision;
                 out.waiting_action = attention_out.waiting_action;
                 out.goto = attention_out.goto;
@@ -193,27 +194,45 @@ impl FleetUi {
                     });
                     return;
                 }
+                // 묶음별 섹션 — 막힌 것이 맨 위다. 정렬은 순수 함수가 하고 여기서는
+                // 그리기만 한다(그래야 순서 계약을 UI 없이 테스트할 수 있다).
+                let grouped = crate::fleet::group_sessions(sessions.to_vec());
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            for session in sessions {
-                                if card(ui, session, catalog, card_accent(workspaces, session)) {
-                                    *action = Some(match &session.target {
-                                        FleetTarget::Pty { tab, pane, .. } => FleetAction::Focus {
-                                            workspace_id: session.workspace_id.clone(),
-                                            tab: tab.clone(),
-                                            pane: pane.clone(),
-                                        },
-                                        FleetTarget::Structured { session_id } => {
-                                            FleetAction::OpenStructured {
-                                                session_id: session_id.clone(),
-                                            }
-                                        }
-                                    });
-                                }
+                        for (group, members) in SessionGroup::ORDER.into_iter().zip(grouped) {
+                            if members.is_empty() {
+                                continue;
                             }
-                        });
+                            section_header(ui, group, members.len(), catalog);
+                            ui.horizontal_wrapped(|ui| {
+                                for session in &members {
+                                    if card(
+                                        ui,
+                                        session,
+                                        catalog,
+                                        card_accent(workspaces, session),
+                                        now,
+                                    ) {
+                                        *action = Some(match &session.target {
+                                            FleetTarget::Pty { tab, pane, .. } => {
+                                                FleetAction::Focus {
+                                                    workspace_id: session.workspace_id.clone(),
+                                                    tab: tab.clone(),
+                                                    pane: pane.clone(),
+                                                }
+                                            }
+                                            FleetTarget::Structured { session_id } => {
+                                                FleetAction::OpenStructured {
+                                                    session_id: session_id.clone(),
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                            ui.add_space(10.0);
+                        }
                     });
             });
         // 브로드캐스트 창은 떠 있는 Window라 중앙 패널과 독립적으로 그린다.
@@ -605,6 +624,7 @@ fn render_attention(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
     attention: AttentionInput<'_>,
+    now: i64,
 ) -> AttentionOutput {
     let AttentionInput {
         pending,
@@ -640,6 +660,7 @@ fn render_attention(
                 workspace_names,
                 session_titles,
                 usize::MAX,
+                now,
             );
             out.approval_decision = approvals.decision;
             out.goto = approvals.goto;
@@ -697,17 +718,15 @@ fn header(
     });
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
-        chip(ui, AgentVisualState::Waiting, summary.waiting, catalog);
-        chip(ui, AgentVisualState::Error, summary.error, catalog);
-        chip(ui, AgentVisualState::Complete, summary.done, catalog);
-        chip(ui, AgentVisualState::Active, summary.working, catalog);
-        chip(ui, AgentVisualState::Idle, summary.idle, catalog);
+        for group in SessionGroup::ORDER {
+            chip(ui, group, group_count(summary, group), catalog);
+        }
     });
     click
 }
 
 /// 상태별 칩 — 색 점 + "라벨 n". 0이면 흐리게(회색) 표시.
-fn chip(ui: &mut egui::Ui, state: AgentVisualState, count: usize, catalog: &i18n::Catalog) {
+fn chip(ui: &mut egui::Ui, group: SessionGroup, count: usize, catalog: &i18n::Catalog) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(88.0, 22.0), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
@@ -716,14 +735,14 @@ fn chip(ui: &mut egui::Ui, state: AgentVisualState, count: usize, catalog: &i18n
     let dot_color = if dim {
         ui.visuals().weak_text_color()
     } else {
-        status_color(state)
+        status_color(group_state(group))
     };
     let text_color = if dim {
         ui.visuals().weak_text_color()
     } else {
         ui.visuals().text_color()
     };
-    let label = state_label(state, catalog);
+    let label = group_label(group, catalog);
     let p = ui.painter();
     p.circle_filled(
         egui::pos2(rect.left() + 6.0, rect.center().y),
@@ -746,6 +765,7 @@ fn card(
     session: &FleetSession,
     catalog: &i18n::Catalog,
     accent: egui::Color32,
+    now: i64,
 ) -> bool {
     let size = egui::vec2(252.0, 96.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -792,13 +812,25 @@ fn card(
     content.spacing_mut().item_spacing.y = 3.0;
     // 1행: 제목.
     content.add(egui::Label::new(egui::RichText::new(&session.title).strong()).truncate());
-    // 2행: 상태 라벨(색) + 워크스페이스 + active/warm.
+    // 2행: 상태 라벨(색) + [막힌 시간] + 워크스페이스 + active/warm.
     content.horizontal(|ui| {
         ui.label(
             egui::RichText::new(state_label(session.state, catalog))
                 .small()
                 .color(state_color),
         );
+        // 막힌 시간은 정렬 키 그 자체다 — 화면에 보여야 "왜 이게 위에 있나"를
+        // 설명할 필요가 없다(2026-08-08 정렬 기준).
+        if let Some(since) = session.blocked_since {
+            ui.label(
+                egui::RichText::new(catalog.t(
+                    "fleet.blocked_for",
+                    &[("value", &crate::fleet::format_blocked_duration(now, since))],
+                ))
+                .small()
+                .color(state_color),
+            );
+        }
         ui.label(egui::RichText::new("·").small().weak());
         ui.add(
             egui::Label::new(egui::RichText::new(&session.workspace_name).small().weak())
@@ -826,6 +858,48 @@ fn card(
 }
 
 /// 상태별 라벨(i18n).
+/// 묶음 구분 헤더 — 라벨 + 개수 + 얇은 선.
+fn section_header(ui: &mut egui::Ui, group: SessionGroup, count: usize, catalog: &i18n::Catalog) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(group_label(group, catalog))
+                .small()
+                .color(status_color(group_state(group))),
+        );
+        ui.label(egui::RichText::new(count.to_string()).small().weak());
+    });
+    ui.add_space(4.0);
+}
+
+/// 묶음을 대표하는 상태 — 칩·구분선 색에만 쓴다.
+fn group_state(group: SessionGroup) -> AgentVisualState {
+    match group {
+        SessionGroup::Blocked => AgentVisualState::Waiting,
+        SessionGroup::Active => AgentVisualState::Active,
+        SessionGroup::Errored => AgentVisualState::Error,
+        SessionGroup::Finished => AgentVisualState::Complete,
+    }
+}
+
+fn group_label(group: SessionGroup, catalog: &i18n::Catalog) -> String {
+    let key = match group {
+        SessionGroup::Blocked => "fleet.group.blocked",
+        SessionGroup::Active => "fleet.group.active",
+        SessionGroup::Errored => "fleet.group.errored",
+        SessionGroup::Finished => "fleet.group.finished",
+    };
+    catalog.t(key, &[])
+}
+
+fn group_count(summary: FleetSummary, group: SessionGroup) -> usize {
+    match group {
+        SessionGroup::Blocked => summary.blocked,
+        SessionGroup::Active => summary.active,
+        SessionGroup::Errored => summary.errored,
+        SessionGroup::Finished => summary.finished,
+    }
+}
+
 fn state_label(state: AgentVisualState, catalog: &i18n::Catalog) -> String {
     let key = match state {
         AgentVisualState::Waiting => "fleet.state.waiting",
@@ -860,6 +934,7 @@ mod tests {
             "{}".to_owned(),
             session_key.map(str::to_owned),
             None,
+            0,
         )
         .unwrap()
     }
@@ -898,6 +973,7 @@ mod tests {
             agent_line: None,
             waiting_message: None,
             active_workspace: true,
+            blocked_since: None,
         }
     }
 
@@ -1041,6 +1117,61 @@ mod tests {
                 pending.len()
             );
         }
+    }
+
+    /// 묶음 헤더는 **비어 있지 않은 묶음만** 나온다 — 빈 헤더가 화면을 채우면 안 된다.
+    /// 그리고 막힌 세션이 있으면 그 묶음 헤더가 반드시 보여야 한다.
+    #[test]
+    fn 묶음_헤더는_비어있지_않은_묶음만_보인다() {
+        use egui_kittest::kittest::Queryable;
+
+        let cat = catalog();
+        let blocked_label = cat.t("fleet.group.blocked", &[]);
+        let errored_label = cat.t("fleet.group.errored", &[]);
+        let mut sessions = vec![pty_session("ws-1", 7, AgentVisualState::Waiting)];
+        sessions[0].blocked_since = Some(1);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .build_ui(|ui| {
+                let catalog = catalog();
+                let library = crate::prompt_library::PromptLibrary::default();
+                let mut fleet = FleetUi::default();
+                let mut waiting = InboxWaitingUi::new();
+                let summary = FleetSummary::from_states(sessions.iter().map(|s| s.state));
+                let _ = fleet.render(
+                    ui,
+                    &sessions,
+                    summary,
+                    &catalog,
+                    &library,
+                    BatchSpawnInput {
+                        agents: &[],
+                        max: 4,
+                    },
+                    AttentionInput {
+                        pending: &[],
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                        waiting_cards: &[],
+                        waiting_ui: &mut waiting,
+                    },
+                    UsageReadout {
+                        claude: None,
+                        codex: None,
+                        codex_meta: None,
+                    },
+                    &[workspace("ws-1")],
+                );
+            });
+        harness.run();
+        assert!(
+            harness.query_by_label(&blocked_label).is_some(),
+            "막힌 세션이 있는데 「{blocked_label}」 헤더가 없다"
+        );
+        assert!(
+            harness.query_by_label(&errored_label).is_none(),
+            "오류가 없는데 「{errored_label}」 헤더를 그렸다"
+        );
     }
 
     /// 워크스페이스 띠는 프로젝트마다 다르고 같은 프로젝트에서는 안정적이어야 한다 —

@@ -2433,6 +2433,14 @@ impl WorkspaceUi {
                                 .and_then(|mux| find_attached_pane(mux, target))
                                 .is_some()
                     });
+                    // 출력 시각은 **가시성과 무관하게** 기록한다. 멈춤 감지는 "자리를
+                    // 비운 사이 멈춘 세션"을 찾는 게 목적이라 안 보이는 세션이야말로
+                    // 대상이다 — 게이트 안에 두면 지금 보고 있는 pane만 판정됐다
+                    // (2026-08-08 리뷰).
+                    if self.session_alive(*session) {
+                        self.sessions.entry(*session).or_default().last_output_at =
+                            Some(deppy_core::time::unix_secs_i64());
+                    }
                     if self.session_visible(*session) || attached_visible {
                         // 이 세션에 선택이 걸려 있으면 화면(snapshot)을 얼린다 — claude/codex
                         // 작업 중엔 화면이 매 프레임 갱신돼 예전엔 선택이 즉시 무효화됐다(#3).
@@ -2442,10 +2450,6 @@ impl WorkspaceUi {
                         let frozen = self.selection.is_some_and(|(s, _, _)| s == *session);
                         let view = self.sessions.entry(*session).or_default();
                         view.bracketed_paste = *bracketed_paste;
-                        // 출력 시각은 frozen 분기 **앞**에서 찍는다. 선택 중이라 화면을
-                        // 얼려도 바이트는 실제로 도착한 것이라, 승격 시점에 찍으면 사용자가
-                        // 텍스트를 고르는 동안 "출력 없음"으로 오판한다.
-                        view.last_output_at = Some(deppy_core::time::unix_secs_i64());
                         if frozen {
                             // 선택 중엔 표시 snapshot을 얼리되, 최신본은 pending에 보관해
                             // 해제 시 catch-up한다(codex — 안 그러면 화면이 선택 당시에 멈춤).
@@ -2884,6 +2888,16 @@ impl WorkspaceUi {
                         } else {
                             SessionStatus::Error
                         });
+                    }
+                }
+                // warm 워크스페이스는 화면을 그리지 않으므로 snapshot·캐시는 받지
+                // 않는다. 다만 **출력이 왔다는 사실**은 기록해야 멈춤 감지가 동작한다 —
+                // 물러난 워크스페이스야말로 조용히 죽은 세션이 생기는 곳이다
+                // (2026-08-08 리뷰: 여기 arm이 없어 warm 세션은 영영 안 잡혔다).
+                RuntimeEvent::Viewport { session, .. } => {
+                    if self.session_alive(*session) {
+                        self.sessions.entry(*session).or_default().last_output_at =
+                            Some(deppy_core::time::unix_secs_i64());
                     }
                 }
                 RuntimeEvent::SpawnFailed { kind, message } => {

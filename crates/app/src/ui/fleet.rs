@@ -276,7 +276,10 @@ impl FleetUi {
                 // 2컬럼 — 좌측은 "지금 뭘 할까", 우측은 "다 뭐하고 있나". 두 질문이 달라
                 // 화면을 나눈다(2026-08-08 목업).
                 let full = ui.available_width();
-                let hero_width = (full * 0.42).clamp(300.0, 460.0);
+                // 하한(300)이 available과 무관하면 좁은 창에서 우측 컬럼이 화면 밖으로
+                // 밀린다 — 창 최소 크기 제한이 없고 사이드바가 680px까지 넓어진다
+                // (2026-08-08 리뷰). 우측에 최소 절반은 남긴다.
+                let hero_width = (full * 0.42).clamp(300.0, 460.0).min(full * 0.5);
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(
                         egui::vec2(hero_width, ui.available_height()),
@@ -1271,24 +1274,55 @@ mod tests {
         out
     }
 
-    /// 2026-08-08 통합의 핵심 위험: 주의 섹션이 `sessions.is_empty()` 조기반환 **뒤에** 오면
-    /// 세션을 전부 닫았는데 승인만 남은 상태에서 승인 카드가 사라지고, InboxWaitingUi의
-    /// stale 입력버퍼 정리(2026-07-17 P2)도 건너뛴다. 순서를 이 테스트가 고정한다.
+    /// 2026-08-08 통합의 핵심 위험: 주의 섹션이 `sessions.is_empty()` 조기반환 **뒤에**
+    /// 오면 세션을 전부 닫았는데 승인만 남은 상태에서 승인 카드가 사라진다. 클릭 없이
+    /// `is_none()`만 보면 이 회귀가 재발해도 통과하므로(2026-08-08 리뷰) 카드가 실제로
+    /// 그려졌는지 라벨로 확인한다.
     #[test]
     fn 세션이_없어도_승인_카드는_그린다() {
-        let mut fleet = FleetUi::default();
-        let mut waiting = InboxWaitingUi::new();
-        let out = draw(
-            &mut fleet,
-            &[],
-            &[approval("a1", Some("ws-1:7"))],
-            &[],
-            &mut waiting,
-            &[workspace("ws-1")],
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 600.0))
+            .build_ui(|ui| {
+                let catalog = catalog();
+                let library = crate::prompt_library::PromptLibrary::default();
+                let mut fleet = FleetUi::default();
+                let mut waiting = InboxWaitingUi::new();
+                let pending = [approval("a1", Some("ws-1:7"))];
+                let _ = fleet.render(
+                    ui,
+                    &[],
+                    FleetSummary::default(),
+                    &catalog,
+                    &library,
+                    BatchSpawnInput {
+                        agents: &[],
+                        max: 4,
+                    },
+                    AttentionInput {
+                        pending: &pending,
+                        workspace_names: &HashMap::new(),
+                        session_titles: &HashMap::new(),
+                        waiting_cards: &[],
+                        waiting_ui: &mut waiting,
+                    },
+                    &[workspace("ws-1")],
+                );
+            });
+        harness.run();
+        let catalog = catalog();
+        assert!(
+            harness.query_by_label("read_file").is_some(),
+            "세션이 0인데 승인 카드가 사라졌다 — 주의 섹션이 조기반환 뒤로 밀렸다"
         );
-        // 클릭이 없으니 액션은 없지만, 패닉 없이 승인과 빈 상태가 함께 그려져야 한다.
-        assert!(out.approval_decision.is_none());
-        assert!(out.grid.is_none());
+        // 세션 빈 상태 안내도 함께 보여야 한다(둘 중 하나만 그리면 안 된다).
+        assert!(
+            harness
+                .query_by_label(&catalog.t("fleet.empty", &[]))
+                .is_some(),
+            "세션 빈 상태 안내가 사라졌다"
+        );
     }
 
     /// 대기 카드가 사라진 다음 프레임에도 정리 경로에 도달해야 한다 — 조기반환으로

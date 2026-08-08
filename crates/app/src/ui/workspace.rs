@@ -10122,6 +10122,122 @@ https://example.test/login \
         assert!(reconciled_text_bytes(&native, &[], false).is_empty());
     }
 
+    // 아래 두 테스트는 `reconcile_ime_text_events` 단독이 아니라 `show_with_input`
+    // 전체 경로(self.preedit 갱신 + terminal_accepts_ime_events 게이트 + 원장)를
+    // egui_kittest Harness로 실제 프레임을 돌려 검증한다. 기존 IME 테스트는 전부
+    // 순수 함수만 호출해 이 배선(wiring) 자체는 한 번도 실행된 적이 없었다 —
+    // "빠르게 칠 때만 자모로 분리된다"는 신고를 조사하며 이 격차를 확인하고
+    // 메꾼다. 두 테스트 모두 특수문자 없는 순수 한글(가/나)만 써서 문장부호
+    // 중복제거 원장(native_key_monitor 기반)이 애초에 관여하지 않는 경로를
+    // 검증한다.
+    fn setup_focused_local_pane_harness(
+        session: SessionId,
+    ) -> egui_kittest::Harness<'static, WorkspaceUi> {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let target_pane = pane_id("pane");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(target_pane.clone()),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(target_pane.clone());
+        workspace.pending_focus = Some(target_pane.clone());
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_with_input(ui, &config, &[], &catalog, true);
+            },
+            workspace,
+        );
+        // pending_focus 1회 소비 + egui 공식 IME 소유권 확보를 끝낸 "이미 타이핑
+        // 중인" 정상 상태로 만든다 — 포커스 전환 첫 프레임의 특수 경로가 아니라
+        // 연속 타이핑 중의 정상 경로를 테스트하기 위함이다.
+        harness.run();
+        drain_protocol(harness.state_mut());
+        harness
+    }
+
+    fn preedit_event(text: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: text.to_owned(),
+            active_range_chars: None,
+        })
+    }
+
+    fn commit_event(text: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Commit(text.to_owned()))
+    }
+
+    fn written_bytes(commands: Vec<RuntimeCommand>) -> Vec<u8> {
+        commands
+            .into_iter()
+            .filter_map(|command| match command {
+                RuntimeCommand::WriteInput { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn 빠른_한글_연타로_한_프레임에_섞인_preedit_commit도_음절대로_pty에_들어간다() {
+        let session = SessionId(7);
+        let mut harness = setup_focused_local_pane_harness(session);
+
+        // 실제 빠른 타이핑 재현: "가"→"나" 두 음절의 조합 이벤트 전부가 렌더
+        // 프레임 하나에 몰려 도착한다(키 입력이 프레임 주기보다 빠를 때 실제로
+        // 벌어지는 배치).
+        harness.input_mut().events.extend([
+            preedit_event("ㄱ"),
+            preedit_event("가"),
+            commit_event("가"),
+            preedit_event("ㄴ"),
+            preedit_event("나"),
+            commit_event("나"),
+        ]);
+        harness.run();
+
+        assert_eq!(
+            written_bytes(drain_protocol(harness.state_mut())),
+            "가나".as_bytes()
+        );
+    }
+
+    #[test]
+    fn 프레임_경계에서_끊긴_한글_조합도_다음_프레임에서_음절대로_이어붙는다() {
+        let session = SessionId(7);
+        let mut harness = setup_focused_local_pane_harness(session);
+
+        // 프레임 1: 첫 자모의 preedit만 도착하고 렌더 프레임이 끼어든 경우 — 아직
+        // 조합 중이므로 PTY로는 아무것도 나가면 안 된다.
+        harness.input_mut().events.extend([preedit_event("ㄱ")]);
+        harness.run();
+        assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+        assert_eq!(harness.state().preedit, "ㄱ");
+
+        // 프레임 2: 나머지 조합과 다음 음절까지 이어서 도착 — self.preedit가
+        // 프레임을 넘어 올바르게 이어지는지 확인한다.
+        harness.input_mut().events.extend([
+            preedit_event("가"),
+            commit_event("가"),
+            preedit_event("ㄴ"),
+            preedit_event("나"),
+            commit_event("나"),
+        ]);
+        harness.run();
+
+        assert_eq!(
+            written_bytes(drain_protocol(harness.state_mut())),
+            "가나".as_bytes()
+        );
+    }
+
     #[test]
     fn terminal_focus_lock_filter는_app_request_focus와_같은_filter를_쓴다() {
         let filter = renderer_egui::terminal_focus_lock_filter();

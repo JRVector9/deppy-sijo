@@ -1206,44 +1206,37 @@ fn card(
     catalog: &i18n::Catalog,
     now: i64,
 ) -> Option<CardClick> {
-    let size = egui::vec2(252.0, 96.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let mut click = response.clicked().then_some(CardClick::Open);
-    // 예약은 PTY 전용이다 — 구조화 세션은 steer 경로라 WriteInput 대상이 아니다.
-    if matches!(session.target, FleetTarget::Pty { .. }) {
-        response.context_menu(|ui| {
-            if ui.button(catalog.t("fleet.followup.menu", &[])).clicked() {
-                click = Some(CardClick::ScheduleFollowUp);
-                ui.close();
-            }
-            if session.followup.is_some()
-                && ui.button(catalog.t("fleet.followup.cancel", &[])).clicked()
-            {
-                click = Some(CardClick::CancelFollowUp);
-                ui.close();
-            }
-        });
-    }
+    // 아래쪽 여백이 넓어 카드가 비어 보였다(2026-08-10 사용자 지적). 4행(예약 칩)이
+    // 다 찼을 때가 기준이라 그보다 더 줄이면 칩이 잘린다.
+    let size = egui::vec2(252.0, 84.0);
+    // 자리만 잡는다. **상호작용은 내용을 그린 뒤에** 잡는다 — 여기서 잡으면 나중에
+    // 그려진 라벨이 위에 놓여 텍스트 위 클릭을 가로챈다(2026-08-10 실증: 「Kimi」
+    // 글자를 눌러도 안 먹혔다).
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
-        return click;
+        return None;
     }
     let visuals = ui.visuals();
-    let bg = if response.hovered() {
+    // 그리기용 hover는 포인터 위치로 본다 — 상호작용 응답이 아직 없기 때문이다.
+    let hovered = ui.rect_contains_pointer(rect);
+    let bg = if hovered {
         visuals.widgets.hovered.bg_fill
     } else {
         visuals.faint_bg_color
     };
-    let border = visuals.widgets.noninteractive.bg_stroke.color;
+    // 테두리도 함께 바뀌어야 **어디까지가 이 카드인가**가 분명해진다. 배경만 바꾸면
+    // 어두운 테마에서 차이가 거의 안 보여 경계가 흐릿하다(2026-08-10 사용자 지적).
+    // 버튼과 같은 팔레트 슬롯을 쓴다 — 카드가 버튼처럼 동작하니 같은 언어여야 한다.
+    let stroke = if hovered {
+        visuals.widgets.hovered.bg_stroke
+    } else {
+        visuals.widgets.noninteractive.bg_stroke
+    };
     let state_color = status_color(session.state);
     {
         let p = ui.painter();
         p.rect_filled(rect, 6.0, bg);
-        p.rect_stroke(
-            rect,
-            6.0,
-            egui::Stroke::new(1.0, border),
-            egui::StrokeKind::Inside,
-        );
+        p.rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
         // 좌측 상태 바 하나만 — 정렬을 지배하는 신호라 시선이 먼저 닿는 자리에 둔다.
         // 우측에 워크스페이스 색 띠도 그렸었지만, 카드마다 색이 둘이라 어느 쪽이 상태인지
         // 읽는 데 품이 들었다(2026-08-09). 워크스페이스는 2행에 이름으로 이미 있다.
@@ -1252,7 +1245,7 @@ fn card(
     }
 
     // 내용은 child UI(top-down)로 — 라벨 truncate가 카드 폭을 넘지 않게 클립한다.
-    let inner = rect.shrink2(egui::vec2(14.0, 10.0));
+    let inner = rect.shrink2(egui::vec2(14.0, 8.0));
     let mut content = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inner)
@@ -1330,7 +1323,38 @@ fn card(
         );
     }
 
+    // 이제 내용 **위에서** 상호작용을 잡는다. 카드 전체가 버튼이므로 커서도 바꾼다.
+    let response = ui
+        .interact(rect, card_id(ui, session), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut click = response.clicked().then_some(CardClick::Open);
+    // 예약은 PTY 전용이다 — 구조화 세션은 steer 경로라 WriteInput 대상이 아니다.
+    if matches!(session.target, FleetTarget::Pty { .. }) {
+        response.context_menu(|ui| {
+            if ui.button(catalog.t("fleet.followup.menu", &[])).clicked() {
+                click = Some(CardClick::ScheduleFollowUp);
+                ui.close();
+            }
+            if session.followup.is_some()
+                && ui.button(catalog.t("fleet.followup.cancel", &[])).clicked()
+            {
+                click = Some(CardClick::CancelFollowUp);
+                ui.close();
+            }
+        });
+    }
     click
+}
+
+/// 카드의 상호작용 id — 세션마다 안정적이어야 한다. `SessionId`는 워크스페이스마다
+/// 재사용되므로 워크스페이스까지 포함한다(이 저장소의 다른 키와 같은 관례).
+fn card_id(ui: &egui::Ui, session: &FleetSession) -> egui::Id {
+    match &session.target {
+        FleetTarget::Pty { session: id, .. } => {
+            ui.id().with(("fleet_card", &session.workspace_id, id.0))
+        }
+        FleetTarget::Structured { session_id } => ui.id().with(("fleet_card_app", session_id)),
+    }
 }
 
 /// 상태별 라벨(i18n).

@@ -18,6 +18,8 @@ use crate::agent_transcript::AgentActivity;
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
 const ACTIVITY_INTERVAL: Duration = Duration::from_millis(1500);
+/// 종류만 보는 싼 tier의 주기. `ps` 한 번뿐이라 바인딩 tier보다 자주 돌 수 있다.
+const KINDS_INTERVAL: Duration = Duration::from_millis(1200);
 /// 창이 숨겨졌을 때(가림/최소화, render_active=false) 두 tier의 폴링 완화 배수.
 /// ps/lsof/transcript 스캔은 pane 배지 표시용이라 안 보일 때 자주 돌 이유가 없다
 /// (2026-07-14 가림 프로파일: 숨김 CPU의 최대 단일 항목이 detect의 ps 스폰이었다).
@@ -27,6 +29,15 @@ const HIDDEN_INTERVAL_MULT: u32 = 4;
 /// map에 동일하게 적용해 장기 실행에서 항목 수가 세션 수를 넘어 증가하지 않게 한다.
 pub const MAX_DETECT_SESSIONS: usize = 256;
 const WORKER_SPAWN_ERROR: &str = "agent_detect_worker_spawn_failed";
+
+/// 숨김이면 주기를 늘린다 — 세 tier가 같은 규칙을 쓴다.
+fn scaled_interval(base: Duration, hidden: bool) -> Duration {
+    if hidden {
+        base * HIDDEN_INTERVAL_MULT
+    } else {
+        base
+    }
+}
 
 /// tier 주기 — 숨김이면 4배로 늘린다 (바인딩 2.5s→10s, 활동 1.5s→6s).
 fn tier_intervals(hidden: bool) -> (Duration, Duration) {
@@ -270,7 +281,12 @@ impl OutcomeMailbox {
                     || outcome
                         .agent_info
                         .as_ref()
-                        .is_some_and(|value| current.agent_info.as_ref() != Some(value));
+                        .is_some_and(|value| current.agent_info.as_ref() != Some(value))
+                    // 종류 tier는 이것만 바꾼다 — 검사에 없으면 Unchanged로 버려진다.
+                    || outcome
+                        .agent_kinds
+                        .as_ref()
+                        .is_some_and(|value| current.agent_kinds.as_ref() != Some(value));
                 if !changed {
                     return PublishResult::Unchanged;
                 }
@@ -282,6 +298,9 @@ impl OutcomeMailbox {
                 }
                 if outcome.agent_info.is_none() {
                     outcome.agent_info.clone_from(&current.agent_info);
+                }
+                if outcome.agent_kinds.is_none() {
+                    outcome.agent_kinds.clone_from(&current.agent_kinds);
                 }
             }
             if current.as_ref() == &outcome {
@@ -398,6 +417,12 @@ trait DetectionBackend: Send + 'static {
         &mut self,
         bindings: &HashMap<SessionId, AgentBinding>,
     ) -> HashMap<SessionId, AgentActivity>;
+
+    /// 종류만 보는 싼 패스(`ps` 한 번). 기본 구현은 빈 결과라 테스트 backend는
+    /// 구현하지 않아도 된다 — 종류 tier가 아무것도 바꾸지 않을 뿐이다.
+    fn kinds_pass(&mut self, _sessions: &[(SessionId, u32)]) -> HashMap<SessionId, RunningAgent> {
+        HashMap::new()
+    }
 }
 
 #[derive(Default)]
@@ -473,6 +498,10 @@ impl DetectionBackend for ProductionBackend {
         }
     }
 
+    fn kinds_pass(&mut self, sessions: &[(SessionId, u32)]) -> HashMap<SessionId, RunningAgent> {
+        agent_detect::detect_kinds(sessions)
+    }
+
     fn activity_pass(
         &mut self,
         bindings: &HashMap<SessionId, AgentBinding>,
@@ -532,6 +561,10 @@ fn run_worker<B: DetectionBackend>(
     let mut had_sessions = false;
     let mut last_binding = Instant::now();
     let mut last_activity = Instant::now();
+    let mut last_kinds = Instant::now();
+    // 종류 tier는 activity를 만들지 않는다. DetectOutcome.activity가 Option이 아니라
+    // 직전 값을 실어 보내야 활동 정보가 지워지지 않는다.
+    let mut current_activity: HashMap<SessionId, AgentActivity> = HashMap::new();
 
     while let Some(versioned) = input.current() {
         let generation = versioned.generation;
@@ -576,9 +609,11 @@ fn run_worker<B: DetectionBackend>(
             accepted_generation = None;
         }
         let (binding_interval, activity_interval) = tier_intervals(*hidden);
+        let kinds_interval = scaled_interval(KINDS_INTERVAL, *hidden);
         let input_changed = accepted_generation != Some(generation);
         let binding_due = input_changed || last_binding.elapsed() >= binding_interval;
         let activity_due = !bindings.is_empty() && last_activity.elapsed() >= activity_interval;
+        let kinds_due = last_kinds.elapsed() >= kinds_interval;
 
         if binding_due {
             let pass = bound_pass(backend.binding_pass(sessions, overrides), sessions);
@@ -590,8 +625,10 @@ fn run_worker<B: DetectionBackend>(
             }
             last_binding = Instant::now();
             last_activity = last_binding;
+            last_kinds = last_binding;
             accepted_generation = Some(generation);
             bindings = pass.bindings;
+            current_activity.clone_from(&pass.activity);
             if !publish_outcome(
                 &mailbox,
                 &ctx,
@@ -616,6 +653,7 @@ fn run_worker<B: DetectionBackend>(
                 continue;
             }
             last_activity = Instant::now();
+            current_activity.clone_from(&activity);
             if !publish_outcome(
                 &mailbox,
                 &ctx,
@@ -634,13 +672,45 @@ fn run_worker<B: DetectionBackend>(
             continue;
         }
 
+        if kinds_due {
+            // `ps` 한 번뿐이다. 빈 터미널에서 손으로 띄운 에이전트는 세션 목록이
+            // 안 바뀌어 즉시 트리거가 없고, 바인딩 없는 pane은 활동 tier도 안 돈다 —
+            // 그래서 이 tier가 없으면 바인딩 주기를 통째로 기다린다.
+            let kinds = backend.kinds_pass(sessions);
+            if !input.is_current(generation) {
+                continue;
+            }
+            last_kinds = Instant::now();
+            if !publish_outcome(
+                &mailbox,
+                &ctx,
+                DetectOutcome {
+                    epoch: *epoch,
+                    generation,
+                    bindings: None,
+                    // activity는 Option이 아니라, 직전 값을 실어야 지워지지 않는다.
+                    activity: current_activity.clone(),
+                    session_cwds: None,
+                    agent_info: None,
+                    agent_kinds: Some(kinds),
+                },
+            ) {
+                break;
+            }
+            continue;
+        }
+
         let binding_wait = binding_interval.saturating_sub(last_binding.elapsed());
         let activity_wait = if bindings.is_empty() {
             binding_wait
         } else {
             activity_interval.saturating_sub(last_activity.elapsed())
         };
-        if !input.wait_for_change(generation, Some(binding_wait.min(activity_wait))) {
+        let kinds_wait = kinds_interval.saturating_sub(last_kinds.elapsed());
+        if !input.wait_for_change(
+            generation,
+            Some(binding_wait.min(activity_wait).min(kinds_wait)),
+        ) {
             break;
         }
     }
@@ -807,6 +877,91 @@ mod tests {
                 .map(|session| (*session, AgentActivity::Idle))
                 .collect()
         }
+    }
+
+    #[test]
+    /// 빈 터미널에서 손으로 띄운 에이전트는 세션 목록이 그대로라 즉시 트리거가 없고,
+    /// 바인딩이 없는 pane은 활동 tier도 안 돈다. 종류 tier가 그 공백을 메우므로
+    /// **바인딩 주기보다 짧아야** 의미가 있다(2026-08-09 신고).
+    #[test]
+    fn 종류_tier는_바인딩보다_자주_돌고_숨김_규칙을_공유한다() {
+        assert!(
+            KINDS_INTERVAL < BINDING_INTERVAL,
+            "바인딩보다 느리면 종류 tier를 둔 이유가 없다"
+        );
+        assert_eq!(scaled_interval(KINDS_INTERVAL, false), KINDS_INTERVAL);
+        assert_eq!(
+            scaled_interval(KINDS_INTERVAL, true),
+            KINDS_INTERVAL * HIDDEN_INTERVAL_MULT,
+            "숨김 완화를 안 따르면 가려진 창에서만 폴링이 상대적으로 늘어난다"
+        );
+    }
+
+    /// 종류 tier는 `agent_kinds`만 바꾼다. publish의 변경 검사에 그 필드가 없으면
+    /// **Unchanged로 버려져** 아무 일도 일어나지 않는다 — 실제로 이 필드만 빠져 있었다.
+    /// 그리고 부분 결과가 기존 bindings/agent_info를 지워서도 안 된다.
+    #[test]
+    fn 종류만_바뀐_결과도_소비자에게_전달되고_기존값을_지우지_않는다() {
+        let mailbox = OutcomeMailbox::new();
+        let receiver = receiver(Arc::clone(&mailbox));
+        assert!(!matches!(
+            mailbox.publish(complete_outcome(1, 7, AgentActivity::Idle)),
+            PublishResult::Closed
+        ));
+        let _ = receiver.try_recv();
+
+        let kimi = HashMap::from([(
+            SessionId(9),
+            RunningAgent {
+                kind: AgentKind::Kimi,
+                model: Some("kimi-code/k3".to_owned()),
+                effort: None,
+            },
+        )]);
+        assert!(matches!(
+            mailbox.publish(DetectOutcome {
+                epoch: 1,
+                generation: 7,
+                bindings: None,
+                activity: HashMap::from([(SessionId(1), AgentActivity::Idle)]),
+                session_cwds: None,
+                agent_info: None,
+                agent_kinds: Some(kimi.clone()),
+            }),
+            PublishResult::Changed
+        ));
+
+        let latest = receiver.try_recv().expect("종류만 바뀐 결과도 와야 한다");
+        assert_eq!(
+            latest.agent_kinds.as_ref(),
+            Some(&kimi),
+            "버려지면 손으로 띄운 에이전트가 카드에 안 뜬다"
+        );
+        assert!(
+            latest.bindings.is_some() && latest.agent_info.is_some(),
+            "부분 결과가 기존 bindings/agent_info를 지우면 카드가 도로 셸이 된다"
+        );
+
+        // 반대 방향 — 활동 tier는 agent_kinds를 None으로 보낸다. 이월하지 않으면
+        // 아직 안 읽힌 종류가 지워져, 소비자가 카드를 셸로 되돌린다.
+        assert!(matches!(
+            mailbox.publish(DetectOutcome {
+                epoch: 1,
+                generation: 7,
+                bindings: None,
+                activity: HashMap::from([(SessionId(1), AgentActivity::Working)]),
+                session_cwds: None,
+                agent_info: None,
+                agent_kinds: None,
+            }),
+            PublishResult::Changed
+        ));
+        let after_activity = receiver.try_recv().expect("활동 갱신이 와야 한다");
+        assert_eq!(
+            after_activity.agent_kinds.as_ref(),
+            Some(&kimi),
+            "활동 tier의 부분 결과가 종류를 지우면 안 된다"
+        );
     }
 
     #[test]

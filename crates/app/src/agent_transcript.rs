@@ -395,6 +395,269 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
 /// codex rollout(`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`) 파싱.
 /// 세션 ID는 파일명 내 UUID, cwd는 session_meta(첫 줄). 상태는 마지막 event_msg로:
 /// `task_complete`/`turn_aborted` → Idle, 그 외(task_started/agent_message 등) → Working.
+/// Kimi `wire.jsonl` 파서 (0.34.0 실측).
+///
+/// Claude/Codex와 달리 레코드가 **명시적 타입 태그**를 달고 있어 추측할 게 없다:
+/// - `profile.bind` / `llm.request` — `modelAlias`, `thinkingEffort`
+/// - `config.update` — 세션 중 바뀐 `thinkingEffort` (`/thinking <level>`이 남긴다)
+/// - `turn.prompt` / `turn.ended` — 활동. `turn.ended`가 마지막이면 유휴다.
+/// - `usage.record` — 턴별 토큰. **매 턴 있진 않다**(취소된 턴엔 없다) → Option.
+/// - `context.append_message` — 마지막 에이전트 메시지 요약.
+///
+/// 역순 1-pass로 필요한 것만 모으고, 다 채워지면 조기 종료한다(codex 경로와 같은 관례).
+pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
+    // 경로는 `<sessionDir>/agents/main/wire.jsonl`이고 sessionDir 이름이 세션 id다.
+    let session_id = kimi_session_id(path)?;
+    let text = tail_text(path, TAIL_BYTES).ok()?;
+    validate_tail_text(&text)?;
+
+    let mut activity: Option<AgentActivity> = None;
+    let mut model: Option<String> = None;
+    let mut effort: Option<String> = None;
+    let mut max_tokens: Option<u64> = None;
+    let mut used_tokens: Option<u64> = None;
+    let mut last_agent_summary: Option<String> = None;
+    // 새 턴이 시작됐는데 아직 응답이 없으면 이전 턴 요약을 재사용하지 않는다.
+    let mut summary_boundary_reached = false;
+
+    for line in text.lines().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            // 역순이라 **먼저 만나는 것이 최신**이다. turn.ended가 turn.prompt보다
+            // 뒤(=역순에서 먼저)면 턴이 끝난 것 → 유휴.
+            Some("turn.ended") => {
+                activity.get_or_insert(AgentActivity::Idle);
+                summary_boundary_reached = false;
+            }
+            Some("turn.prompt") => {
+                activity.get_or_insert(AgentActivity::Working);
+                summary_boundary_reached = true;
+            }
+            // 세션 중 `/thinking <level>`이 남기는 기록. llm.request보다 최신일 수
+            // 있으므로 먼저 만난 쪽(=최신)을 쓴다.
+            Some("config.update") => {
+                if let Some(value) = v.get("thinkingEffort").and_then(Value::as_str) {
+                    effort.get_or_insert_with(|| value.to_owned());
+                }
+            }
+            Some("llm.request") | Some("profile.bind") => {
+                if let Some(value) = v.get("modelAlias").and_then(Value::as_str) {
+                    model.get_or_insert_with(|| value.to_owned());
+                }
+                if let Some(value) = v.get("thinkingEffort").and_then(Value::as_str) {
+                    effort.get_or_insert_with(|| value.to_owned());
+                }
+                if let Some(value) = v.get("maxTokens").and_then(Value::as_u64) {
+                    max_tokens.get_or_insert(value);
+                }
+            }
+            Some("usage.record") => {
+                if used_tokens.is_none()
+                    && let Some(usage) = v.get("usage").and_then(Value::as_object)
+                {
+                    // 필드 이름이 늘어나도 합계가 맞도록 정수 전부를 더한다
+                    // (실측: inputOther/output/inputCacheRead/inputCacheCreation).
+                    let total: u64 = usage.values().filter_map(Value::as_u64).sum();
+                    used_tokens = Some(total);
+                }
+            }
+            Some("context.append_message")
+                if last_agent_summary.is_none() && !summary_boundary_reached =>
+            {
+                last_agent_summary = v
+                    .pointer("/message/content")
+                    .and_then(Value::as_str)
+                    .and_then(clean_agent_summary);
+            }
+            _ => {}
+        }
+        if activity.is_some()
+            && model.is_some()
+            && effort.is_some()
+            && used_tokens.is_some()
+            && last_agent_summary.is_some()
+        {
+            break;
+        }
+    }
+
+    // 남은 비율이 아니라 **사용 비율**이다(codex/claude 경로와 같은 의미).
+    let context_pct = match (used_tokens, max_tokens) {
+        (Some(used), Some(max)) if max > 0 => Some(((used.min(max) * 100) / max).min(100) as u8),
+        _ => None,
+    };
+
+    Some(TranscriptState {
+        session_id,
+        // wire.jsonl에는 cwd가 없다 — 형제 `state.json`이 갖고 있지만 파일을 하나 더
+        // 열 만큼의 값이 없다(바인딩 앵커는 hook의 sessionId가 이미 결정한다).
+        cwd: None,
+        activity: activity.unwrap_or(AgentActivity::Idle),
+        model,
+        effort,
+        context_pct,
+        last_agent_summary,
+    })
+}
+
+/// `<...>/sessions/<wd>/session_<uuid>/agents/main/wire.jsonl` → `session_<uuid>`.
+fn kimi_session_id(path: &Path) -> Option<String> {
+    let session_dir = path.parent()?.parent()?.parent()?;
+    let name = session_dir.file_name()?.to_str()?;
+    name.strip_prefix("session_")
+        .filter(|rest| !rest.is_empty())
+        .map(|_| name.to_owned())
+}
+
+#[cfg(test)]
+mod kimi_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// 2026-08-09 실측한 `wire.jsonl` 레코드 모양 그대로. 필드 이름이 바뀌면 여기서
+    /// 깨져야 한다 — 파서가 조용히 None을 돌려주면 카드가 셸처럼 보인다.
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("deppy-kimi-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn fixture(tag: &str, lines: &[&str]) -> std::path::PathBuf {
+        let wire = temp_root(tag)
+            .join("session_9c21503a-998f-497d-994c-cb4d71507007")
+            .join("agents")
+            .join("main");
+        std::fs::create_dir_all(&wire).unwrap();
+        let path = wire.join("wire.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn kimi_transcript에서_모델_강도_활동_컨텍스트를_읽는다() {
+        let path = fixture(
+            "full",
+            &[
+                r#"{"type":"metadata","protocol_version":1}"#,
+                r#"{"type":"profile.bind","modelAlias":"kimi-code/k3","thinkingEffort":"high"}"#,
+                r#"{"type":"turn.prompt","origin":{"kind":"user"},"time":1}"#,
+                r#"{"type":"llm.request","modelAlias":"kimi-code/k3","thinkingEffort":"high","maxTokens":1000}"#,
+                r#"{"type":"usage.record","usage":{"inputOther":150,"output":50},"usageScope":"turn"}"#,
+                r#"{"type":"context.append_message","message":{"content":"작업을 마쳤습니다"}}"#,
+                r#"{"type":"turn.ended","reason":"completed","durationMs":5993,"turnId":0}"#,
+            ],
+        );
+        let state = parse_kimi(&path).expect("파싱돼야 한다");
+        assert_eq!(
+            state.session_id,
+            "session_9c21503a-998f-497d-994c-cb4d71507007"
+        );
+        assert_eq!(state.model.as_deref(), Some("kimi-code/k3"));
+        assert_eq!(state.effort.as_deref(), Some("high"));
+        assert_eq!(
+            state.activity,
+            AgentActivity::Idle,
+            "turn.ended가 마지막이면 유휴다"
+        );
+        assert_eq!(state.context_pct, Some(20), "200/1000 = 20%");
+    }
+
+    /// `/thinking <level>`은 `config.update`를 남긴다. 그게 llm.request보다 최신이면
+    /// 그쪽이 현재 값이다 — 아니면 강도 단축키가 낡은 값에서 한 칸 움직인다.
+    #[test]
+    fn config_update가_llm_request보다_최신이면_그_강도를_쓴다() {
+        let path = fixture(
+            "cfg",
+            &[
+                r#"{"type":"llm.request","modelAlias":"kimi-code/k3","thinkingEffort":"high","maxTokens":1000}"#,
+                r#"{"type":"turn.ended","reason":"completed","turnId":0}"#,
+                r#"{"type":"config.update","thinkingEffort":"max","time":2}"#,
+            ],
+        );
+        let state = parse_kimi(&path).expect("파싱돼야 한다");
+        assert_eq!(
+            state.effort.as_deref(),
+            Some("max"),
+            "세션 중 바뀐 강도를 못 읽으면 단축키가 낡은 값에서 출발한다"
+        );
+    }
+
+    /// 취소된 턴에는 `usage.record`가 없다(실측). 컨텍스트를 0%로 지어내면 안 된다.
+    #[test]
+    fn usage_record가_없으면_컨텍스트는_none이다() {
+        let path = fixture(
+            "nousage",
+            &[
+                r#"{"type":"llm.request","modelAlias":"kimi-code/k3","thinkingEffort":"high","maxTokens":1000}"#,
+                r#"{"type":"turn.prompt","origin":{"kind":"user"},"time":1}"#,
+            ],
+        );
+        let state = parse_kimi(&path).expect("파싱돼야 한다");
+        assert_eq!(state.context_pct, None, "없는 값을 0%로 지어내면 안 된다");
+        assert_eq!(
+            state.activity,
+            AgentActivity::Working,
+            "turn.prompt 뒤에 turn.ended가 없으면 작업 중이다"
+        );
+    }
+
+    /// 합성 픽스처만 믿지 않는다 — 이 기기에 **실제 Kimi 세션이 있으면** 그것도 파싱해
+    /// 본다. 필드 이름을 잘못 읽고 있었다면 여기서 드러난다. 세션이 없는 기기(CI)에서는
+    /// 조용히 건너뛴다 — 남의 환경에 파일이 있으리라 가정하지 않는다.
+    #[test]
+    fn 실제_kimi_세션이_있으면_그것도_파싱된다() {
+        let Some(home) = crate::paths::home_dir() else {
+            return;
+        };
+        let root = home.join(".kimi-code/sessions");
+        let Ok(workspaces) = std::fs::read_dir(&root) else {
+            return; // Kimi 미사용 기기
+        };
+        let mut checked = 0usize;
+        for ws in workspaces.flatten() {
+            let Ok(sessions) = std::fs::read_dir(ws.path()) else {
+                continue;
+            };
+            for session in sessions.flatten() {
+                let wire = session.path().join("agents/main/wire.jsonl");
+                if !wire.is_file() {
+                    continue;
+                }
+                let state = parse_kimi(&wire);
+                assert!(
+                    state.is_some(),
+                    "실제 transcript를 파싱하지 못했다: 필드 이름이 바뀌었을 수 있다"
+                );
+                let state = state.unwrap();
+                assert!(
+                    state.session_id.starts_with("session_"),
+                    "세션 id를 경로에서 못 뽑았다: {}",
+                    state.session_id
+                );
+                checked += 1;
+                if checked >= 5 {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 경로 모양이 다르면 세션 id를 못 만든다 — 엉뚱한 id로 바인딩하면 안 된다.
+    #[test]
+    fn 세션_디렉터리_모양이_아니면_파싱하지_않는다() {
+        let path = temp_root("shape").join("a").join("b").join("wire.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}\n").unwrap();
+        assert!(parse_kimi(&path).is_none());
+    }
+}
+
 pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     let session_id = codex_session_id(path.file_name()?.to_str()?)?;
     let (cwd, text) = codex_snapshot(path).ok()?;

@@ -326,6 +326,18 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         if let Some(v) = parsed.as_ref() {
             let sid = v.get("session_id").and_then(|x| x.as_str());
             let path = v.get("transcript_path").and_then(|x| x.as_str());
+            // transcript_path를 **안 싣는** 에이전트가 있다. Kimi(0.34.0)가 그렇다 —
+            // 페이로드는 hook_event_name/session_id/cwd뿐이다(바이너리의 triggerInner가
+            // camelCase로 만들고 toHookInputData가 snake_case로 바꿔 보낸다). 그래서
+            // 아래 (sid, path) 쌍이 성립하지 않아 바인딩이 하나도 기록되지 않았다.
+            // 경로가 없을 때만 세션 id로 인덱스를 뒤진다 — 인덱스가 풀어주지 못하면
+            // 바인딩하지 않는다(추측 경로로 묶으면 엉뚱한 세션 상태를 보여준다).
+            if path.is_none()
+                && let Some(sid) = sid
+                && let Some(resolved) = kimi_transcript_path(sid)
+            {
+                let _ = db.upsert_hook_session(&session_key, "kimi", sid, &resolved);
+            }
             if let (Some(sid), Some(path)) = (sid, path) {
                 // kind는 transcript 경로로 판별한다. 폴백이 claude라 새 에이전트를
                 // 안 넣으면 **전부 claude로 기록**돼 카드가 거짓말을 한다.
@@ -341,6 +353,30 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Kimi 세션 id → transcript 경로. `~/.kimi-code/session_index.jsonl`이
+/// `sessionId → sessionDir`을 들고 있고, transcript는 그 아래 고정 위치다.
+///
+/// Kimi hook payload에는 transcript 경로가 없어서(2026-08-09 실측) 여기서 풀어야 한다.
+/// 인덱스가 없거나 항목이 없으면 바인딩을 만들지 않는다 — 추측 경로로 바인딩하면
+/// 엉뚱한 세션의 상태를 보여준다.
+fn kimi_transcript_path(session_id: &str) -> Option<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let index = home.join(".kimi-code/session_index.jsonl");
+    let text = std::fs::read_to_string(index).ok()?;
+    for line in text.lines() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if row.get("sessionId").and_then(|v| v.as_str()) != Some(session_id) {
+            continue;
+        }
+        let dir = row.get("sessionDir").and_then(|v| v.as_str())?;
+        let path = std::path::Path::new(dir).join("agents/main/wire.jsonl");
+        return path.is_file().then(|| path.display().to_string());
+    }
+    None
 }
 
 /// claude statusLine 수신: `--db <path>`, 세션은 env DEPPY_SESSION_ID(=pane_id).

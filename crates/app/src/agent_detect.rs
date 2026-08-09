@@ -276,9 +276,7 @@ pub fn agent_state(binding: &AgentBinding) -> Option<agent_transcript::Transcrip
     match binding.kind {
         AgentKind::Claude => agent_transcript::parse_claude(&binding.transcript),
         AgentKind::Codex => agent_transcript::parse_codex(&binding.transcript),
-        // Kimi transcript 포맷은 아직 실측하지 않았다. 추측 파서를 두면 틀린 모델·
-        // 활동을 자신 있게 보여주게 되므로, 감지(프로세스)까지만 하고 파싱은 비운다.
-        AgentKind::Kimi => None,
+        AgentKind::Kimi => agent_transcript::parse_kimi(&binding.transcript),
     }
 }
 
@@ -451,9 +449,7 @@ fn valid_transcript_path(kind: AgentKind, path: &Path) -> bool {
     let root = match kind {
         AgentKind::Claude => home.join(".claude/projects"),
         AgentKind::Codex => home.join(".codex/sessions"),
-        // 세션 기록은 ~/.kimi-code/sessions/<workspace>/session_<uuid>/ 아래 있지만
-        // 포맷 미실측이라 아직 transcript로 승격하지 않는다.
-        AgentKind::Kimi => return false,
+        AgentKind::Kimi => home.join(".kimi-code/sessions"),
     };
     let Ok(root) = std::fs::canonicalize(root) else {
         return false;

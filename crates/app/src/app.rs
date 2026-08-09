@@ -7316,6 +7316,17 @@ pub struct App {
     pending_port_job: Option<crate::port_inventory::PortJob>,
     /// worker 생성/채널 실패 뒤 매 프레임 재시도하지 않도록 새 사용자 요청까지 차단한다.
     port_admission_blocked: bool,
+    /// 자동 스캔을 이 토폴로지에서 이미 한 번 걸었는가.
+    ///
+    /// 포트 스캔은 `PortsIntent::Refresh` 하나로만 돌았다 — 즉 **포트 패널을 열기
+    /// 전에는 한 번도 돌지 않아** 상태바 칩이 계속 「포트 —」였다. 한눈에 보라고 둔
+    /// 칩이 눌러야만 값을 갖는 건 칩이 아니다.
+    ///
+    /// 래치로 두는 이유는 실패 시 무한 재시도를 막기 위해서다 — 스캔이 실패하면
+    /// `port_snapshot`이 None으로 남으므로, "스냅샷이 없으면 건다"로 쓰면 매 프레임
+    /// lsof를 띄운다. 토폴로지가 바뀌면(`invalidate_port_inventory_topology`) 다시
+    /// 풀려 새 워크스페이스 구성에서 한 번 더 시도한다.
+    port_auto_scan_done: bool,
     /// 로컬 runtime이 마지막으로 재검증해 보고한 연결되지 않은 세션 수.
     unattached_counts: std::collections::HashMap<String, u16>,
     /// local runtime별 최신 유지보수 명령 한 건만 보존하는 bounded 순차 큐다.
@@ -10332,6 +10343,7 @@ impl App {
             port_in_flight_generation: None,
             pending_port_job: None,
             port_admission_blocked: false,
+            port_auto_scan_done: false,
             unattached_counts: std::collections::HashMap::new(),
             pending_resource_maintenance: std::collections::VecDeque::new(),
             pending_status_bar_intent: None,
@@ -14658,6 +14670,7 @@ impl App {
             }
         };
 
+        let bytes_len = bytes.len();
         match self
             .active
             .runtime
@@ -14665,7 +14678,19 @@ impl App {
                 session: *session_id,
                 bytes,
             }) {
-            Ok(()) => self.clear_agent_shortcut_feedback(),
+            Ok(()) => {
+                // 성공 경로만 로그가 없어서, "안 움직인다"는 신고가 들어왔을 때
+                // **보내긴 했는지**를 가릴 수 없었다(2026-08-09). 실패 분기는 전부
+                // 남기는데 이쪽만 침묵해, 로그가 비면 단축키가 아예 안 왔다는 뜻인지
+                // 보냈는데 CLI가 거절한 것인지 구분이 안 됐다.
+                tracing::info!(
+                    ?kind,
+                    session = session_id.0,
+                    bytes = bytes_len,
+                    "PTY 조정: 보냈다"
+                );
+                self.clear_agent_shortcut_feedback();
+            }
             Err(error) => {
                 self.show_agent_shortcut_feedback(
                     crate::ui::agent_terminal::AgentShortcutFeedback::DeliveryFailed,
@@ -17590,6 +17615,21 @@ impl App {
         }
     }
 
+    /// 이 토폴로지에서 아직 포트를 한 번도 안 봤으면 지금 한 번 본다.
+    ///
+    /// 사용자가 패널을 열지 않아도 상태바 칩에 숫자가 뜨게 하는 것이 목적이다.
+    /// 명시적 요청이 아니므로 `explicit=false`로 넣어, 이미 도는 작업이 있으면
+    /// 밀어내지 않고 뒤로 물러난다.
+    fn auto_scan_ports_once(&mut self) {
+        if self.port_auto_scan_done || self.port_snapshot.is_some() {
+            return;
+        }
+        self.port_auto_scan_done = true;
+        let roots = self.port_workspace_roots();
+        let job = next_port_scan_job(&mut self.port_generation, roots);
+        self.submit_port_job(job, false);
+    }
+
     fn request_port_scan(&mut self) {
         let roots = self.port_workspace_roots();
         let job = next_port_scan_job(&mut self.port_generation, roots);
@@ -17607,6 +17647,7 @@ impl App {
         self.port_snapshot = None;
         self.pending_port_job = None;
         self.port_admission_blocked = false;
+        self.port_auto_scan_done = false;
     }
 
     fn poll_port_inventory(&mut self, ctx: &egui::Context) {
@@ -19474,6 +19515,7 @@ impl eframe::App for App {
         if let Some(intent) = self.pending_status_bar_intent.take() {
             self.dispatch_status_bar_intent(Some(intent), ctx);
         }
+        self.auto_scan_ports_once();
         self.poll_port_inventory(ctx);
         self.pump_resource_maintenance();
         self.pump_perf_harness();
@@ -24237,6 +24279,42 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    /// 자동 포트 스캔은 **토폴로지당 한 번**이어야 한다. 스캔이 실패하면
+    /// `port_snapshot`은 None으로 남으므로, 래치 없이 "스냅샷이 없으면 건다"로 쓰면
+    /// 매 프레임 lsof를 띄운다. 반대로 래치가 영영 안 풀리면 워크스페이스를 바꿔도
+    /// 칩이 옛 토폴로지의 값에 머문다. 두 쪽이 다 필요해 소스로 고정한다.
+    #[test]
+    fn 자동_포트_스캔은_토폴로지당_한번이고_무효화때_다시_풀린다() {
+        let source = include_str!("app.rs");
+        let auto = source
+            .split_once("    fn auto_scan_ports_once(&mut self) {")
+            .and_then(|(_, tail)| tail.split_once("    fn request_port_scan("))
+            .map(|(body, _)| body)
+            .expect("auto_scan_ports_once 본문을 찾지 못했다");
+        assert!(
+            auto.contains("if self.port_auto_scan_done || self.port_snapshot.is_some() {"),
+            "래치와 스냅샷을 둘 다 보지 않으면 실패한 스캔이 매 프레임 재시도된다"
+        );
+        assert!(
+            auto.contains("self.port_auto_scan_done = true;"),
+            "래치를 세우지 않으면 무한 재시도가 된다"
+        );
+        assert!(
+            auto.contains("self.submit_port_job(job, false);"),
+            "자동 스캔은 명시적 요청이 아니다 — explicit=true면 진행 중인 사용자 요청을 밀어낸다"
+        );
+
+        let invalidate = source
+            .split_once("    fn invalidate_port_inventory_topology(&mut self) {")
+            .and_then(|(_, tail)| tail.split_once("    fn poll_port_inventory("))
+            .map(|(body, _)| body)
+            .expect("invalidate_port_inventory_topology 본문을 찾지 못했다");
+        assert!(
+            invalidate.contains("self.port_auto_scan_done = false;"),
+            "토폴로지가 바뀌었는데 래치가 남으면 칩이 옛 구성의 값에 머문다"
+        );
     }
 
     /// 계속 막혀 있는 세션의 타이머가 폴링마다 0으로 돌아가면 "오래 막힌 순" 정렬이

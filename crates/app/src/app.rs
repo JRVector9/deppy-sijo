@@ -7655,6 +7655,37 @@ type PtyAdjustKey = (runtime::SessionId, crate::pty_effort::AdjustKind);
 /// **두 조각**이다(`App::encode_slash_writes` 참조).
 type PtyAdjustWrites = Vec<Vec<u8>>;
 
+/// transcript가 아직(또는 영영) 없는 세션도 **종류만으로** 표시한다.
+///
+/// `agent_info`는 `bindings`에서만 만들어진다(`compute_activity_and_info`) — 즉
+/// transcript 파서가 있는 에이전트만 들어온다. 그래서 파서가 없는 Kimi는 프로세스가
+/// 감지돼도 카드에 줄이 없고, `agent_line.is_none()` 때문에 유휴 상태가 Off(회색)로
+/// 강등돼 평범한 셸과 구분되지 않았다(2026-08-09 사용자 신고).
+///
+/// `pty_agent_surfaces`가 같은 이유로 이미 프로세스 감지를 먼저 본다 — 카드도 같은
+/// 근거를 써야 한다. 부수 효과로 방금 띄운 Claude/Codex도 transcript가 파싱되기 전에
+/// 종류만 먼저 뜬다(빈 줄보다 낫다).
+///
+/// 이미 있는 항목은 덮지 않는다. transcript에서 온 model/effort/context가 더 풍부하다.
+/// 새로 넣는 항목은 `RunningAgent`가 **argv에서 뽑아둔** model/effort를 그대로 쓴다 —
+/// 런처가 넘긴 값이라 실행 순간의 진실이고, `--model`/`--effort` 파싱은 provider와
+/// 무관하게 일반적이라 Kimi의 `--model kimi-code/k3`도 그대로 잡힌다.
+fn merge_detected_kinds(
+    info: &mut std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
+    kinds: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::RunningAgent>,
+) {
+    for (session, running) in kinds {
+        info.entry(*session)
+            .or_insert_with(|| crate::agent_detect::AgentDisplay {
+                kind: running.kind,
+                model: running.model.clone(),
+                effort: running.effort.clone(),
+                context_pct: None,
+                last_agent_summary: None,
+            });
+    }
+}
+
 /// 우리가 보낸 낙관값 하나 — 값과 **보낸 시각**.
 ///
 /// 시각이 있어야 CLI가 조용히 거절했을 때 빠져나올 수 있다. 값만 들고 있으면
@@ -11764,6 +11795,7 @@ impl App {
         use crate::agent_detect::AgentDisplay;
         let mut merged: std::collections::HashMap<runtime::SessionId, AgentDisplay> =
             self.agent_info.clone();
+        merge_detected_kinds(&mut merged, &self.agent_kinds);
         for (sid, display) in merged.iter_mut() {
             apply_claude_statusline(display, self.statuslines.get(sid));
         }
@@ -24378,6 +24410,80 @@ mod tests {
             !effort.contains(r#"format!("/effort {level}\r")"#)
                 && !effort.contains(r#"format!("/model {level}\r")"#),
             "EffortPlan::Slash의 line에 CR이 남아 있으면 호출부의 분리가 무의미하다"
+        );
+    }
+
+    /// `agent_info`는 transcript 바인딩에서만 만들어진다. 파서가 없는 에이전트(Kimi)는
+    /// 프로세스가 감지돼도 카드에 줄이 없고, `agent_line.is_none()` 때문에 유휴가
+    /// Off(회색)로 강등돼 평범한 셸과 구분되지 않는다 — 2026-08-09 실제 신고.
+    /// 프로세스 감지로 빈칸을 채우되 **transcript 값은 덮지 않는다**.
+    #[test]
+    fn 프로세스로만_감지된_에이전트도_표시_항목을_얻는다() {
+        use crate::agent_detect::{AgentDisplay, AgentKind, RunningAgent};
+        use std::collections::HashMap;
+
+        let rich = runtime::SessionId(1);
+        let detected_only = runtime::SessionId(2);
+        let mut info = HashMap::from([(
+            rich,
+            AgentDisplay {
+                kind: AgentKind::Claude,
+                model: Some("opus".to_owned()),
+                effort: Some("xhigh".to_owned()),
+                context_pct: Some(42),
+                last_agent_summary: None,
+            },
+        )]);
+        let kinds = HashMap::from([
+            (
+                rich,
+                RunningAgent {
+                    kind: AgentKind::Claude,
+                    model: Some("argv-값".to_owned()),
+                    effort: None,
+                },
+            ),
+            (
+                detected_only,
+                RunningAgent {
+                    kind: AgentKind::Kimi,
+                    model: Some("kimi-code/k3".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+            ),
+        ]);
+
+        merge_detected_kinds(&mut info, &kinds);
+
+        let added = info.get(&detected_only).expect("빈칸이 채워져야 한다");
+        assert_eq!(added.kind, AgentKind::Kimi);
+        assert_eq!(
+            added.model.as_deref(),
+            Some("kimi-code/k3"),
+            "argv가 유일한 근거인 세션에서 모델을 버리면 안 된다"
+        );
+        assert_eq!(added.effort.as_deref(), Some("high"));
+
+        let kept = info.get(&rich).expect("기존 항목은 남아야 한다");
+        assert_eq!(
+            kept.model.as_deref(),
+            Some("opus"),
+            "transcript 값을 argv 값으로 덮으면 더 나쁜 정보로 후퇴한다"
+        );
+        assert_eq!(kept.context_pct, Some(42));
+
+        // 헬퍼가 맞아도 **부르지 않으면** 화면은 그대로다 — PR #93이 정확히 그렇게
+        // 실패했다(감지는 추가했는데 agent_info까지 잇지 않아 카드에 줄이 없었다).
+        // 배선까지 고정한다.
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn push_agent_display(&mut self) {")
+            .and_then(|(_, tail)| tail.split_once("\n    }"))
+            .map(|(body, _)| body)
+            .expect("push_agent_display 본문을 찾지 못했다");
+        assert!(
+            body.contains("merge_detected_kinds(&mut merged, &self.agent_kinds)"),
+            "병합을 부르지 않으면 프로세스로만 감지된 에이전트가 카드에서 셸로 강등된다"
         );
     }
 

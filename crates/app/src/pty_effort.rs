@@ -137,6 +137,9 @@ pub fn plan(
             }
             .to_vec(),
         )),
+        // `supports`가 게이트에서 먼저 걸러 여기까지 오지 않지만, 나중에 게이트를
+        // 건너뛰는 호출부가 생겨도 조용히 엉뚱한 입력을 쓰지 않도록 막아 둔다.
+        AgentProvider::Kimi => Err(EffortBlocked::UnknownCurrentEffort),
         AgentProvider::Claude => {
             let current = current_effort.ok_or(EffortBlocked::UnknownCurrentEffort)?;
             let level = step_ladder(CLAUDE_LADDER, current, step)?;
@@ -152,6 +155,9 @@ pub fn plan(
 pub const fn supports(provider: AgentProvider) -> bool {
     match provider {
         AgentProvider::Codex | AgentProvider::Claude => true,
+        // Kimi는 config.toml의 `[thinking] effort`로 강도를 두지만 실행 중 세션에
+        // 반영하는 방법을 실측하지 않았다. 근거 없이 구현하지 않는다(이 모듈의 규칙).
+        AgentProvider::Kimi => false,
     }
 }
 
@@ -170,7 +176,7 @@ const CLAUDE_MODEL_LADDER: &[&str] = &["sonnet", "opus", "fable"];
 pub const fn supports_model(provider: AgentProvider) -> bool {
     match provider {
         AgentProvider::Claude => true,
-        AgentProvider::Codex => false,
+        AgentProvider::Codex | AgentProvider::Kimi => false,
     }
 }
 

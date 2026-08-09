@@ -16,6 +16,7 @@ use crate::agent_session::AgentSessionStatus;
 pub enum AgentProvider {
     Codex,
     Claude,
+    Kimi,
 }
 
 impl AgentProvider {
@@ -23,6 +24,7 @@ impl AgentProvider {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
+            Self::Kimi => "Kimi",
         }
     }
 }
@@ -32,6 +34,7 @@ impl From<AgentKind> for AgentProvider {
         match value {
             AgentKind::Codex => Self::Codex,
             AgentKind::Claude => Self::Claude,
+            AgentKind::Kimi => Self::Kimi,
         }
     }
 }

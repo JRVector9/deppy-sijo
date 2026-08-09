@@ -7519,8 +7519,7 @@ pub struct App {
     /// 에이전트가 턴을 도는 동안 눌린 조정. 그때 슬래시를 보내면 **프롬프트로** 먹히므로
     /// 보내지 않고 들고 있다가, 입력 대기/유휴로 돌아오면 흘려보낸다. 연속으로 누르면
     /// 낙관적 값이 계속 밀려 **마지막 목표 하나만** 남는다 — 명령이 쌓이지 않는다.
-    pty_agent_queued:
-        std::collections::HashMap<(runtime::SessionId, crate::pty_effort::AdjustKind), Vec<u8>>,
+    pty_agent_queued: std::collections::HashMap<PtyAdjustKey, PtyAdjustWrites>,
     /// 직전 프레임의 PTY 에이전트 표면. 단축키 처리가 에이전트 패널 렌더보다 먼저
     /// 돌기 때문에, 패널이 채워주는 목록을 기다리면 대상을 못 찾는다 (2026-08-02:
     /// pane은 포커스돼 있는데 `pty_surfaces=0`이라 강도 단축키가 패널만 열었다).
@@ -7648,6 +7647,13 @@ fn workspace_close_disposition(
         WorkspaceCloseDisposition::CloseNow
     }
 }
+
+/// 세션별 조정 큐의 키 — 어떤 세션의 어떤 조정인가.
+type PtyAdjustKey = (runtime::SessionId, crate::pty_effort::AdjustKind);
+
+/// 한 조정이 PTY에 써야 할 조각들. 슬래시 명령은 본문과 submit CR로 나뉘어
+/// **두 조각**이다(`App::encode_slash_writes` 참조).
+type PtyAdjustWrites = Vec<Vec<u8>>;
 
 /// 우리가 보낸 낙관값 하나 — 값과 **보낸 시각**.
 ///
@@ -14467,7 +14473,7 @@ impl App {
         if self.pty_agent_queued.is_empty() {
             return;
         }
-        let ready: Vec<((runtime::SessionId, crate::pty_effort::AdjustKind), Vec<u8>)> = self
+        let ready: Vec<(PtyAdjustKey, PtyAdjustWrites)> = self
             .pty_agent_queued
             .iter()
             .filter(|((session, _), _)| {
@@ -14484,7 +14490,7 @@ impl App {
                         slash_input_is_safe(surface, self.hook_waiting_message(*session))
                     })
             })
-            .map(|(key, bytes)| (*key, bytes.clone()))
+            .map(|(key, writes)| (*key, writes.clone()))
             .collect();
         // 표면이 아예 사라진 세션의 큐는 버린다 — 워크스페이스가 바뀌었거나 pane이 닫혔다.
         let alive: std::collections::HashSet<runtime::SessionId> = self
@@ -14500,15 +14506,11 @@ impl App {
 
         let had_ready = !ready.is_empty();
         let mut delivery_failed = false;
-        for (key, bytes) in ready {
+        for (key, writes) in ready {
             self.pty_agent_queued.remove(&key);
             let (session, kind) = key;
             tracing::info!(?kind, "PTY 조정: 큐에 있던 것을 지금 보낸다");
-            if let Err(error) = self
-                .active
-                .runtime
-                .send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
-            {
+            if let Err(error) = self.write_all_to_session(session, writes) {
                 delivery_failed = true;
                 tracing::warn!(?kind, "PTY 큐 입력 전송 실패: {error:#}");
             }
@@ -14576,6 +14578,43 @@ impl App {
             .and_then(|(_, _, message)| message.as_deref())
     }
 
+    /// 여러 조각을 순서대로 한 세션에 써 넣는다. 하나라도 실패하면 거기서 멈춘다 —
+    /// 본문만 들어가고 CR이 빠지면 명령이 입력줄에 남으므로, 부분 성공을 성공으로
+    /// 보고하지 않는다.
+    fn write_all_to_session(
+        &self,
+        session: runtime::SessionId,
+        writes: PtyAdjustWrites,
+    ) -> anyhow::Result<()> {
+        for bytes in writes {
+            self.active
+                .runtime
+                .send_command(runtime::RuntimeCommand::WriteInput { session, bytes })?;
+        }
+        Ok(())
+    }
+
+    /// 슬래시 명령을 **본문과 submit CR로 나눠** 인코딩한다.
+    ///
+    /// 한 덩어리로 보내면 CLI의 paste-burst 휴리스틱이 뒤따르는 CR을 붙여넣기의
+    /// 일부로 보고 삼킨다 — 명령이 입력줄에 남아 사용자가 키를 한 번 더 눌러야
+    /// 실행됐다(2026-08-09 실증). `composer.rs`의 `encode_tui_paste_submission`이
+    /// 같은 이유로 "본문과 submit용 CR은 반드시 별도 WriteInput"이라고 못박는데,
+    /// 강도·모델 경로만 그 규칙 밖에 있었다.
+    ///
+    /// 본문 인코딩은 컴포저와 같은 계획을 쓰되 `submit=false`로 받아 CR을 직접
+    /// 붙이지 않게 하고, CR을 별도 write로 얹는다.
+    fn encode_slash_writes(&mut self, session: runtime::SessionId, line: &str) -> PtyAdjustWrites {
+        let bracketed = self.active.workspace_ui.session_bracketed_paste(session);
+        let provider = self.active.workspace_ui.agent_provider_for(session);
+        let body = match ui::composer::plan_composer_input(line, false, bracketed, provider) {
+            Some(ui::composer::ComposerInputPlan::Single(bytes)) => bytes,
+            Some(ui::composer::ComposerInputPlan::BracketedPaste { body, .. }) => body,
+            None => return Vec::new(),
+        };
+        vec![body, b"\r".to_vec()]
+    }
+
     /// 계획된 입력을 대상 PTY에 써 넣는다. 강도·모델이 같은 안전 규칙을 공유한다.
     fn send_pty_agent_plan(
         &mut self,
@@ -14636,8 +14675,8 @@ impl App {
             }
         };
 
-        let bytes = match plan {
-            EffortPlan::Keys(bytes) => bytes,
+        let writes = match plan {
+            EffortPlan::Keys(bytes) => vec![bytes],
             EffortPlan::Slash { line, level } => {
                 // 낙관적 값은 보내든 큐에 넣든 갱신한다 — 그래야 턴이 도는 동안
                 // 연속으로 눌러도 한 칸씩 밀린다.
@@ -14650,8 +14689,8 @@ impl App {
                 );
                 if !slash_input_is_safe(surface, self.hook_waiting_message(*session_id)) {
                     // 지금 쓰면 진행 중인 턴의 프롬프트가 된다. 마지막 목표만 남긴다.
-                    self.pty_agent_queued
-                        .insert((*session_id, kind), line.clone().into_bytes());
+                    let queued = self.encode_slash_writes(*session_id, &line);
+                    self.pty_agent_queued.insert((*session_id, kind), queued);
                     tracing::info!(
                         ?kind,
                         level,
@@ -14663,21 +14702,14 @@ impl App {
                     self.clear_agent_shortcut_feedback();
                     return;
                 }
-                // 결과는 CLI가 pane에 직접 찍는다 — Claude는 전역 기본값까지
-                // 바뀐다는 사실을 자기 출력에 포함한다("saved as your default for
-                // new sessions"). deppy가 따로 알릴 필요가 없다.
-                line.into_bytes()
+                // 거절 사유는 CLI가 pane에 직접 찍는다(조직 한도·런치 핀 등).
+                // 앱은 확인되지 않은 낙관값에 시한을 두어 그쪽을 가리킨다.
+                self.encode_slash_writes(*session_id, &line)
             }
         };
 
-        let bytes_len = bytes.len();
-        match self
-            .active
-            .runtime
-            .send_command(runtime::RuntimeCommand::WriteInput {
-                session: *session_id,
-                bytes,
-            }) {
+        let bytes_len: usize = writes.iter().map(Vec::len).sum();
+        match self.write_all_to_session(*session_id, writes) {
             Ok(()) => {
                 // 성공 경로만 로그가 없어서, "안 움직인다"는 신고가 들어왔을 때
                 // **보내긴 했는지**를 가릴 수 없었다(2026-08-09). 실패 분기는 전부
@@ -24314,6 +24346,36 @@ mod tests {
         assert!(
             invalidate.contains("self.port_auto_scan_done = false;"),
             "토폴로지가 바뀌었는데 래치가 남으면 칩이 옛 구성의 값에 머문다"
+        );
+    }
+
+    /// 슬래시 명령은 **본문과 submit CR이 따로** 나가야 한다. 한 덩어리로 보내면
+    /// CLI의 paste-burst 휴리스틱이 뒤따르는 CR을 붙여넣기 일부로 보고 삼켜, 명령이
+    /// 입력줄에 남는다 — 사용자가 키를 한 번 더 눌러야 실행됐다(2026-08-09 실증).
+    /// `composer.rs`가 같은 이유로 못박은 규칙인데 강도·모델 경로만 밖에 있었다.
+    #[test]
+    fn 슬래시_명령은_본문과_CR을_나눠_보낸다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn encode_slash_writes(")
+            .and_then(|(_, tail)| tail.split_once("    /// 계획된 입력을 대상 PTY에"))
+            .map(|(body, _)| body)
+            .expect("encode_slash_writes 본문을 찾지 못했다");
+        assert!(
+            body.contains("plan_composer_input(line, false, bracketed, provider)"),
+            "submit=true로 받으면 인코더가 CR을 본문에 붙여 한 덩어리가 된다"
+        );
+        assert!(
+            body.contains(r#"vec![body, b"\r".to_vec()]"#),
+            "CR이 별도 write로 나가지 않으면 paste-burst 휴리스틱에 삼켜진다"
+        );
+
+        // 계획 자체에도 CR이 남아 있으면 안 된다 — 그러면 CR이 두 번 나간다.
+        let effort = include_str!("pty_effort.rs");
+        assert!(
+            !effort.contains(r#"format!("/effort {level}\r")"#)
+                && !effort.contains(r#"format!("/model {level}\r")"#),
+            "EffortPlan::Slash의 line에 CR이 남아 있으면 호출부의 분리가 무의미하다"
         );
     }
 

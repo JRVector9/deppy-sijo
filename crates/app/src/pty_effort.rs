@@ -50,6 +50,11 @@ pub enum EffortPlan {
     /// PTY에 그대로 써 넣을 바이트. CLI의 네이티브 키 입력이다.
     Keys(Vec<u8>),
     /// 슬래시 명령 한 줄. `level`은 사다리에서 계산된 다음 단계다.
+    ///
+    /// **`line`에 CR을 붙이지 않는다.** 호출부가 컴포저 전송과 같은 계획(본문 →
+    /// 별도 CR)으로 나눠 보낸다 — 한 덩어리로 보내면 CLI의 paste-burst 휴리스틱이
+    /// 뒤따르는 Enter를 붙여넣기 일부로 보고 삼켜, 명령이 입력줄에 남는다
+    /// (2026-08-09 실증: 사용자가 화살표를 한 번 더 눌러야 실행됐다).
     Slash { line: String, level: &'static str },
 }
 
@@ -136,7 +141,7 @@ pub fn plan(
             let current = current_effort.ok_or(EffortBlocked::UnknownCurrentEffort)?;
             let level = step_ladder(CLAUDE_LADDER, current, step)?;
             Ok(EffortPlan::Slash {
-                line: format!("/effort {level}\r"),
+                line: format!("/effort {level}"),
                 level,
             })
         }
@@ -196,7 +201,7 @@ pub fn plan_model(
     };
     let level = CLAUDE_MODEL_LADDER[next];
     Ok(EffortPlan::Slash {
-        line: format!("/model {level}\r"),
+        line: format!("/model {level}"),
         level,
     })
 }
@@ -242,14 +247,14 @@ mod tests {
         assert_eq!(
             plan(AgentProvider::Claude, EffortStep::Up, Some("high")),
             Ok(EffortPlan::Slash {
-                line: "/effort xhigh\r".to_owned(),
+                line: "/effort xhigh".to_owned(),
                 level: "xhigh",
             })
         );
         assert_eq!(
             plan(AgentProvider::Claude, EffortStep::Down, Some("high")),
             Ok(EffortPlan::Slash {
-                line: "/effort medium\r".to_owned(),
+                line: "/effort medium".to_owned(),
                 level: "medium",
             })
         );
@@ -263,7 +268,7 @@ mod tests {
             assert_eq!(
                 plan(AgentProvider::Claude, EffortStep::Down, Some(current)),
                 Ok(EffortPlan::Slash {
-                    line: "/effort high\r".to_owned(),
+                    line: "/effort high".to_owned(),
                     level: "high",
                 }),
                 "{current}가 xhigh로 인식되지 않았다"
@@ -327,7 +332,7 @@ mod tests {
             assert_eq!(
                 plan_model(AgentProvider::Claude, EffortStep::Up, Some(current)),
                 Ok(EffortPlan::Slash {
-                    line: format!("/model {expected}\r"),
+                    line: format!("/model {expected}"),
                     level: expected,
                 }),
                 "{current}에서 다음 모델이 {expected}가 아니다"
@@ -399,16 +404,28 @@ mod tests {
         assert!(!authoritative_caught_up(Model, "Sonnet 5", "opus"));
     }
 
-    /// 슬래시 명령은 CR로 끝나야 제출된다. 실측에서 CR 없이는 composer에 글자만
-    /// 남았다.
+    /// 슬래시 명령 **본문에는 CR이 없어야** 한다.
+    ///
+    /// 원래는 여기서 CR로 끝나는 것을 고정했다 — CR 없이는 composer에 글자만
+    /// 남았기 때문이다. 그건 맞지만 CR을 **본문에 붙이면** 안 된다는 게
+    /// 2026-08-09에 드러났다: 한 덩어리로 나가면 CLI의 paste-burst 휴리스틱이
+    /// 그 CR을 붙여넣기 일부로 보고 삼켜, 결국 같은 증상(입력줄에 명령만 남음)이
+    /// 된다. 사용자가 화살표를 한 번 더 눌러야 실행됐다.
+    ///
+    /// 그래서 CR은 호출부(`App::encode_slash_writes`)가 **별도 write**로 얹는다.
+    /// 여기서 붙이면 CR이 두 번 나간다.
     #[test]
-    fn 슬래시_명령은_cr로_끝난다() {
+    fn 슬래시_명령_본문에는_cr을_붙이지_않는다() {
         let Ok(EffortPlan::Slash { line, .. }) =
             plan(AgentProvider::Claude, EffortStep::Up, Some("low"))
         else {
             panic!("Claude는 슬래시 계획이어야 한다");
         };
-        assert!(line.ends_with('\r'), "{line:?}가 CR로 끝나지 않는다");
+        assert!(
+            !line.contains('\r'),
+            "{line:?}에 CR이 있으면 호출부가 얹는 submit CR과 겹쳐 두 번 제출된다"
+        );
         assert!(!line.contains('\n'), "개행이 섞이면 두 번 제출된다");
+        assert_eq!(line, "/effort medium");
     }
 }

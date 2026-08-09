@@ -175,6 +175,20 @@ fn argv_flag_value(command: &str, flag: &str) -> Option<String> {
 }
 
 /// 캐시를 활용한 detect. `cache`는 호출측(워커 스레드)이 소유·유지한다.
+/// 프로세스만 보고 세션별 에이전트 종류를 판정한다 — `ps` 한 번, lsof도 transcript도
+/// 타지 않는다.
+///
+/// 바인딩 tier(2.5s)는 lsof·transcript까지 도는 무거운 패스라 자주 돌릴 수 없다. 그런데
+/// 「빈 터미널에서 손으로 에이전트를 띄운 경우」는 세션 목록이 그대로라 즉시 트리거도
+/// 없어, 카드가 뜨기까지 그 주기를 통째로 기다렸다(2026-08-09 사용자 신고). 종류만
+/// 필요한 그 경우를 위해 싼 패스를 따로 연다.
+pub fn detect_kinds(sessions: &[(SessionId, u32)]) -> HashMap<SessionId, RunningAgent> {
+    if sessions.len() > MAX_SESSIONS {
+        return HashMap::new();
+    }
+    agent_kinds_from_rows(sessions, &process_rows())
+}
+
 pub fn detect_cached(
     sessions: &[(SessionId, u32)],
     overrides: &HashMap<SessionId, AgentBinding>,

@@ -1038,12 +1038,15 @@ impl ComposerUi {
             }
             // ② 모델 — 감지된 에이전트의 후보를 `/model <이름>`으로 버퍼 맨 앞에 삽입.
             if let Some(agent) = ctx.agent {
-                let models = match agent {
+                let models: &[&str] = match agent {
                     crate::agent_surface::AgentProvider::Claude => CLAUDE_MODELS,
                     crate::agent_surface::AgentProvider::Codex => CODEX_MODELS,
+                    // Kimi의 `/model` 어휘를 실측하지 않았다. 추측 목록을 띄우면
+                    // 고르는 순간 프롬프트로 흘러 턴을 태운다(Codex에서 실증된 사고).
+                    crate::agent_surface::AgentProvider::Kimi => &[],
                 };
                 let resp = ui
-                    .small_button("/model")
+                    .add_enabled(!models.is_empty(), egui::Button::new("/model").small())
                     .on_hover_text(catalog.t("composer.model_hint", &[]));
                 egui::Popup::menu(&resp).show(|ui| {
                     for model in models {

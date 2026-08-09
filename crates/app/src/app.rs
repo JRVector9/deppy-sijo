@@ -11937,6 +11937,7 @@ impl App {
                 let kind = match b.kind {
                     crate::agent_detect::AgentKind::Claude => "claude",
                     crate::agent_detect::AgentKind::Codex => "codex",
+                    crate::agent_detect::AgentKind::Kimi => "kimi",
                 };
                 Some((
                     pane.0.clone(),
@@ -19400,6 +19401,7 @@ impl App {
                             kind: match binding.kind {
                                 crate::agent_detect::AgentKind::Claude => "claude".to_owned(),
                                 crate::agent_detect::AgentKind::Codex => "codex".to_owned(),
+                                crate::agent_detect::AgentKind::Kimi => "kimi".to_owned(),
                             },
                             session_id: binding.session_id.clone(),
                         })

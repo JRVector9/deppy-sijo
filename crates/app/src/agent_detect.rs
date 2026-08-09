@@ -50,6 +50,7 @@ const PIPE_READER_STACK_BYTES: usize = 128 * 1024;
 pub enum AgentKind {
     Claude,
     Codex,
+    Kimi,
 }
 
 /// 세션에 바인딩된 에이전트 — transcript 경로까지 확정된 상태.
@@ -261,6 +262,9 @@ pub fn agent_state(binding: &AgentBinding) -> Option<agent_transcript::Transcrip
     match binding.kind {
         AgentKind::Claude => agent_transcript::parse_claude(&binding.transcript),
         AgentKind::Codex => agent_transcript::parse_codex(&binding.transcript),
+        // Kimi transcript 포맷은 아직 실측하지 않았다. 추측 파서를 두면 틀린 모델·
+        // 활동을 자신 있게 보여주게 되므로, 감지(프로세스)까지만 하고 파싱은 비운다.
+        AgentKind::Kimi => None,
     }
 }
 
@@ -373,6 +377,12 @@ fn classify(command: &str) -> Option<(AgentKind, Option<String>)> {
     if is("codex") {
         return Some((AgentKind::Codex, None));
     }
+    // Kimi는 런처가 `kimi`로 띄우지만 실제 워커 프로세스명은 `kimi-code`다
+    // (2026-08-09 실측: pid 21295 `kimi`, pid 27534 `kimi-code`가 함께 뜬다).
+    // 둘 중 하나만 보면 세션을 놓친다.
+    if is("kimi") || is("kimi-code") {
+        return Some((AgentKind::Kimi, None));
+    }
     None
 }
 
@@ -427,6 +437,9 @@ fn valid_transcript_path(kind: AgentKind, path: &Path) -> bool {
     let root = match kind {
         AgentKind::Claude => home.join(".claude/projects"),
         AgentKind::Codex => home.join(".codex/sessions"),
+        // 세션 기록은 ~/.kimi-code/sessions/<workspace>/session_<uuid>/ 아래 있지만
+        // 포맷 미실측이라 아직 transcript로 승격하지 않는다.
+        AgentKind::Kimi => return false,
     };
     let Ok(root) = std::fs::canonicalize(root) else {
         return false;
@@ -457,6 +470,9 @@ fn bind_transcript(
     budget: &mut DetectionBudget,
 ) -> Option<(AgentBinding, bool)> {
     match kind {
+        // transcript 바인딩은 파서가 있어야 의미가 있다. Kimi는 아직 없으므로
+        // 프로세스 감지(agent_kinds)까지만 남고 바인딩은 만들지 않는다.
+        AgentKind::Kimi => None,
         AgentKind::Claude => {
             // 1순위: argv --session-id (결정적 — cmux/자동화 실행 케이스).
             if let Some(sid) = sid_hint {
@@ -541,6 +557,7 @@ impl TranscriptFinder {
             return None;
         }
         match kind {
+            AgentKind::Kimi => None,
             AgentKind::Claude => find_claude_transcript(session_id),
             AgentKind::Codex => {
                 let files = self.codex_files.get_or_insert_with(|| {
@@ -794,6 +811,7 @@ pub fn kind_from_str(s: &str) -> Option<AgentKind> {
     match s {
         "claude" => Some(AgentKind::Claude),
         "codex" => Some(AgentKind::Codex),
+        "kimi" => Some(AgentKind::Kimi),
         _ => None,
     }
 }
@@ -1922,6 +1940,36 @@ mod tests {
         let (kind, sid) = classify("node /opt/homebrew/bin/codex --enable hooks").unwrap();
         assert_eq!(kind, AgentKind::Codex);
         assert_eq!(sid, None);
+    }
+
+    /// Kimi는 런처가 `kimi`로 띄우는데 **실제 워커 프로세스명은 `kimi-code`**다
+    /// (2026-08-09 실측: pid 21295 `kimi`와 pid 27534 `kimi-code`가 함께 떠 있었다).
+    /// 하나만 보면 세션을 놓쳐 카드가 회색 셸로 강등된다.
+    #[test]
+    fn classify_kimi는_런처명과_워커명을_모두_잡는다() {
+        let (kind, sid) = classify("/Users/jr/.kimi-code/bin/kimi --yolo --model k3").unwrap();
+        assert_eq!(kind, AgentKind::Kimi);
+        assert_eq!(sid, None, "Kimi argv에서 세션 id를 뽑는 근거는 아직 없다");
+
+        let (worker, _) = classify("kimi-code").unwrap();
+        assert_eq!(worker, AgentKind::Kimi, "워커 프로세스명을 놓치면 안 된다");
+    }
+
+    /// Kimi는 transcript 파서가 없다. 감지(프로세스)까지만 하고 바인딩을 만들지 않는
+    /// 계약을 고정한다 — 파서 없이 바인딩만 생기면 활동·모델이 영영 비어 있는 채로
+    /// 붙어 다닌다.
+    #[test]
+    fn kimi는_transcript_바인딩을_만들지_않는다() {
+        assert_eq!(kind_from_str("kimi"), Some(AgentKind::Kimi));
+        let binding = AgentBinding {
+            kind: AgentKind::Kimi,
+            session_id: "s".to_owned(),
+            transcript: PathBuf::from("/Users/jr/.kimi-code/sessions/wd_x/session_y"),
+        };
+        assert!(
+            agent_state(&binding).is_none(),
+            "파서가 없는데 상태를 만들어내면 화면이 거짓말을 한다"
+        );
     }
 
     #[test]

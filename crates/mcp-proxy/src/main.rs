@@ -327,9 +327,12 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
             let sid = v.get("session_id").and_then(|x| x.as_str());
             let path = v.get("transcript_path").and_then(|x| x.as_str());
             if let (Some(sid), Some(path)) = (sid, path) {
-                // kind는 transcript 경로로 판별(.codex=codex, 그 외=claude).
+                // kind는 transcript 경로로 판별한다. 폴백이 claude라 새 에이전트를
+                // 안 넣으면 **전부 claude로 기록**돼 카드가 거짓말을 한다.
                 let kind = if path.contains("/.codex/") {
                     "codex"
+                } else if path.contains("/.kimi-code/") {
+                    "kimi"
                 } else {
                     "claude"
                 };

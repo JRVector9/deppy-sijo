@@ -22,6 +22,7 @@ mod env_reload;
 mod fleet;
 mod fonts;
 mod git_cli;
+mod kimi_usage;
 mod lazy_worker;
 mod llm_proxy;
 mod local_llm;

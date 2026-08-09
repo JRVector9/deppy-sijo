@@ -298,6 +298,8 @@ impl AgentTerminalUi {
         claude_usage: Option<crate::app::ProviderUsage>,
         codex_usage: Option<crate::app::ProviderUsage>,
         codex_meta: Option<crate::ui::agent_sessions::CodexUsageMeta>,
+        // `kimi_usage`: Kimi를 쓰는 사용자에게만 Some. None이면 칸 자체를 안 그린다.
+        kimi_usage: Option<crate::app::ProviderUsage>,
         rows: &[ActivityWorkspaceRow],
         approvals: usize,
         // `waiting_sessions`: 입력 대기 세션 — (표시 라벨, 이동 대상). 칩으로 직접 노출한다.
@@ -328,7 +330,13 @@ impl AgentTerminalUi {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
-                crate::app::top_provider_usage(ui, claude_usage, codex_usage, codex_meta.as_ref());
+                crate::app::top_provider_usage(
+                    ui,
+                    claude_usage,
+                    codex_usage,
+                    codex_meta.as_ref(),
+                    kimi_usage,
+                );
                 crate::ui::designall::vertical_separator(ui, 14.0);
                 ui.weak(catalog.t(
                     "status_bar.sessions",
@@ -930,6 +938,17 @@ pub(crate) fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Re
             }
             painter.circle_filled(center, 2.2 * scale, color);
         }
+        // Kimi(Moonshot) — 초승달. 로고 분기가 없으면 기본 아이콘으로 떨어져
+        // 다른 provider와 구분되지 않는다.
+        "Kimi" => {
+            let color = egui::Color32::from_rgb(0x6b, 0x8a, 0xff);
+            painter.circle_filled(center, 8.0 * scale, color);
+            painter.circle_filled(
+                center + egui::vec2(3.4 * scale, -2.2 * scale),
+                6.4 * scale,
+                ui.visuals().panel_fill,
+            );
+        }
         "Grok" => {
             let color = egui::Color32::from_rgb(0xa5, 0x70, 0xff);
             let stroke = egui::Stroke::new(2.0, color);
@@ -1298,6 +1317,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     2,
                     &[],
@@ -1355,6 +1375,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     0,
                     &[],
@@ -1406,6 +1427,7 @@ mod tests {
                 let mut terminal = shared.lock().unwrap();
                 let intent = terminal.status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,
@@ -1488,6 +1510,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                         &[],
                         approvals,
                         &[],
@@ -1539,6 +1562,7 @@ mod tests {
                 }
                 shared.lock().unwrap().status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,
@@ -1601,6 +1625,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     0,
                     &waiting,
@@ -1659,6 +1684,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     0,
                     &[],
@@ -1709,6 +1735,7 @@ mod tests {
                     }
                     if let Some(intent) = terminal.status_bar_with_managers(
                         ui,
+                        None,
                         None,
                         None,
                         None,
@@ -1787,6 +1814,7 @@ mod tests {
                 }
                 if let Some(intent) = terminal.status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,

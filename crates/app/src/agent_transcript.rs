@@ -409,7 +409,7 @@ pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
     // 경로는 `<sessionDir>/agents/main/wire.jsonl`이고 sessionDir 이름이 세션 id다.
     let session_id = kimi_session_id(path)?;
     let text = tail_text(path, TAIL_BYTES).ok()?;
-    validate_tail_text(&text)?;
+    validate_kimi_tail(&text)?;
 
     let mut activity: Option<AgentActivity> = None;
     let mut model: Option<String> = None;
@@ -500,6 +500,27 @@ pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
         context_pct,
         last_agent_summary,
     })
+}
+
+/// Kimi 꼬리 검증 — **줄 수만** 본다.
+///
+/// 공용 `validate_tail_text`는 64KiB를 넘는 줄이 하나라도 있으면 파일 전체를 버린다.
+/// Claude/Codex에서는 그런 줄이 손상 신호라 맞는 규칙이지만, Kimi는 정상 기록이
+/// 그보다 크다 — 실측한 34개 파일 중 최대 줄이 **72KiB**였다(`llm.tools_snapshot`과
+/// systemPrompt를 통째로 싣는다). 그래서 그 규칙을 그대로 쓰면 **거의 모든 실제
+/// 세션이 파싱되지 않고**, 카드가 셸처럼 보인다.
+///
+/// 줄 하나의 크기는 이미 상위에서 막혀 있다 — 꼬리 자체가 `TAIL_BYTES`(256KiB)로
+/// 잘리므로 한 줄이 그보다 클 수 없다. 남은 위험은 줄 수뿐이라 그것만 본다.
+fn validate_kimi_tail(text: &str) -> Option<()> {
+    let mut lines = 0_usize;
+    for _ in text.lines() {
+        lines = lines.checked_add(1)?;
+        if lines > MAX_TAIL_LINES {
+            return None;
+        }
+    }
+    Some(())
 }
 
 /// `<...>/sessions/<wd>/session_<uuid>/agents/main/wire.jsonl` → `session_<uuid>`.
@@ -605,6 +626,23 @@ mod kimi_tests {
             AgentActivity::Working,
             "turn.prompt 뒤에 turn.ended가 없으면 작업 중이다"
         );
+    }
+
+    /// 실측: Kimi 정상 기록에 64KiB를 넘는 줄이 있다(최대 72KiB). 공용 검증 규칙을
+    /// 그대로 쓰면 파일 전체를 버려 거의 모든 실제 세션이 파싱되지 않는다.
+    #[test]
+    fn 긴_줄이_있어도_파일을_통째로_버리지_않는다() {
+        let big = "x".repeat(70 * 1024);
+        let path = fixture(
+            "longline",
+            &[
+                &format!(r#"{{"type":"llm.tools_snapshot","tools":"{big}"}}"#),
+                r#"{"type":"llm.request","modelAlias":"kimi-code/k3","thinkingEffort":"high","maxTokens":1000}"#,
+                r#"{"type":"turn.ended","reason":"completed","turnId":0}"#,
+            ],
+        );
+        let state = parse_kimi(&path).expect("긴 줄 하나 때문에 파일을 버리면 안 된다");
+        assert_eq!(state.model.as_deref(), Some("kimi-code/k3"));
     }
 
     /// 합성 픽스처만 믿지 않는다 — 이 기기에 **실제 Kimi 세션이 있으면** 그것도 파싱해

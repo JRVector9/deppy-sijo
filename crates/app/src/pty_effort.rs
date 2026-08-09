@@ -78,6 +78,13 @@ pub enum EffortBlocked {
 /// 명령이 필요하다. 단축키로 무심코 진입할 자리가 아니다.
 const CLAUDE_LADDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+/// Kimi `/thinking`이 받는 단계. k3의 `support_efforts`(config.toml 카탈로그) 그대로다.
+///
+/// `off`는 넣지 않는다 — k3는 `always_thinking` 능력이라 끌 수 없고, 바이너리의
+/// 설명도 "always-thinking 모델에는 off를 주지 않는다"고 못박는다. `agent_launcher`의
+/// `KIMI_EFFORTS`와 같은 순서다.
+const KIMI_LADDER: &[&str] = &["low", "high", "max"];
+
 /// Codex TUI 네이티브 키를 **CSI 화살표**로 보낸다 — `shift-up` / `shift-down`.
 ///
 /// 같은 액션에 `alt-.` / `alt-,`도 묶여 있지만(문서상 기본값) 그쪽은 쓸 수 없다.
@@ -137,9 +144,17 @@ pub fn plan(
             }
             .to_vec(),
         )),
-        // `supports`가 게이트에서 먼저 걸러 여기까지 오지 않지만, 나중에 게이트를
-        // 건너뛰는 호출부가 생겨도 조용히 엉뚱한 입력을 쓰지 않도록 막아 둔다.
-        AgentProvider::Kimi => Err(EffortBlocked::UnknownCurrentEffort),
+        // Claude와 같은 모양이되 명령 이름과 사다리가 다르다. 현재값은 transcript의
+        // `config.update`/`llm.request`에서 온다(statusLine 만료 문제가 없어 Claude보다
+        // 근거가 튼튼하다).
+        AgentProvider::Kimi => {
+            let current = current_effort.ok_or(EffortBlocked::UnknownCurrentEffort)?;
+            let level = step_ladder(KIMI_LADDER, current, step)?;
+            Ok(EffortPlan::Slash {
+                line: format!("/thinking {level}"),
+                level,
+            })
+        }
         AgentProvider::Claude => {
             let current = current_effort.ok_or(EffortBlocked::UnknownCurrentEffort)?;
             let level = step_ladder(CLAUDE_LADDER, current, step)?;
@@ -155,9 +170,9 @@ pub fn plan(
 pub const fn supports(provider: AgentProvider) -> bool {
     match provider {
         AgentProvider::Codex | AgentProvider::Claude => true,
-        // Kimi는 config.toml의 `[thinking] effort`로 강도를 두지만 실행 중 세션에
-        // 반영하는 방법을 실측하지 않았다. 근거 없이 구현하지 않는다(이 모듈의 규칙).
-        AgentProvider::Kimi => false,
+        // 2026-08-09 실측: `/thinking <level>`이 인자를 받고 즉시 반영된다. transcript에
+        // `{"type":"config.update","thinkingEffort":"max"}`가 남는 것으로 확인했다.
+        AgentProvider::Kimi => true,
     }
 }
 
@@ -408,6 +423,60 @@ mod tests {
         ));
         assert!(authoritative_caught_up(Model, "Sonnet 5", "sonnet"));
         assert!(!authoritative_caught_up(Model, "Sonnet 5", "opus"));
+    }
+
+    /// Kimi는 `/thinking <level>`이고 사다리가 Claude와 다르다(2026-08-09 실측).
+    ///
+    /// `off`가 없는 게 핵심이다 — k3는 `always_thinking`이라 끌 수 없는데, 사다리에
+    /// 넣으면 순환하다 `off`를 보내 CLI가 거절하거나(운 나쁘면) 사고가 난다.
+    #[test]
+    fn kimi는_thinking_명령과_자기_사다리를_쓴다() {
+        let Ok(EffortPlan::Slash { line, level }) =
+            plan(AgentProvider::Kimi, EffortStep::Up, Some("high"))
+        else {
+            panic!("Kimi는 슬래시 계획이어야 한다");
+        };
+        assert_eq!(
+            line, "/thinking max",
+            "명령 이름이 /effort가 아니라 /thinking이다"
+        );
+        assert_eq!(level, "max");
+
+        // 사다리 끝에서 순환한다 — 막으면 정상인데도 화면이 그대로라 고장으로 읽힌다.
+        let Ok(EffortPlan::Slash { level, .. }) =
+            plan(AgentProvider::Kimi, EffortStep::Up, Some("max"))
+        else {
+            panic!("순환해야 한다");
+        };
+        assert_eq!(level, "low", "max에서 올리면 low로 돈다");
+
+        let Ok(EffortPlan::Slash { level, .. }) =
+            plan(AgentProvider::Kimi, EffortStep::Down, Some("low"))
+        else {
+            panic!("순환해야 한다");
+        };
+        assert_eq!(level, "max", "low에서 내리면 max로 돈다");
+
+        // Claude 단계를 Kimi에 쓰면 안 된다 — medium/xhigh는 k3가 모르는 값이다.
+        for unknown in ["medium", "xhigh"] {
+            assert_eq!(
+                plan(AgentProvider::Kimi, EffortStep::Up, Some(unknown)),
+                Err(EffortBlocked::UnknownCurrentEffort),
+                "{unknown}은 Kimi 사다리 밖이라 다음 단계를 정할 수 없어야 한다"
+            );
+        }
+        assert!(
+            !KIMI_LADDER.contains(&"off"),
+            "k3는 always_thinking이라 off로 갈 수 없다"
+        );
+    }
+
+    /// 모델 전환은 여전히 안 된다. `/model`이 모델과 강도를 함께 다루는 대화형이라
+    /// 목록 순서에 의존하게 되고, Codex에서 같은 이유로 뺐다.
+    #[test]
+    fn kimi_모델_전환은_지원하지_않는다() {
+        assert!(supports(AgentProvider::Kimi), "강도는 된다");
+        assert!(!supports_model(AgentProvider::Kimi), "모델은 근거가 없다");
     }
 
     /// 슬래시 명령 **본문에는 CR이 없어야** 한다.

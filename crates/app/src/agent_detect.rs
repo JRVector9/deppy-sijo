@@ -1965,21 +1965,30 @@ mod tests {
         assert_eq!(worker, AgentKind::Kimi, "워커 프로세스명을 놓치면 안 된다");
     }
 
-    /// Kimi는 transcript 파서가 없다. 감지(프로세스)까지만 하고 바인딩을 만들지 않는
-    /// 계약을 고정한다 — 파서 없이 바인딩만 생기면 활동·모델이 영영 비어 있는 채로
-    /// 붙어 다닌다.
+    /// Kimi 바인딩은 **hook에서만** 온다. 프로세스 탐색(`bind`)은 만들지 않는다.
+    ///
+    /// Claude/Codex는 transcript 파일명·경로에서 세션을 역추적할 수 있지만, Kimi는
+    /// 세션 id ↔ 디렉터리 대응이 `session_index.jsonl`에만 있어 프로세스만 보고는
+    /// 어느 세션인지 알 수 없다. 추측해서 묶으면 **엉뚱한 세션의 상태**를 보여준다.
+    ///
+    /// (이 테스트는 원래 "파서가 없으니 상태도 만들지 않는다"를 고정했는데, 파서가
+    /// 생기면서 그 계약은 사라졌다. 지금 지키는 것은 바인딩 출처 쪽이다.)
     #[test]
-    fn kimi는_transcript_바인딩을_만들지_않는다() {
+    fn kimi_바인딩은_프로세스_탐색이_아니라_hook에서만_온다() {
         assert_eq!(kind_from_str("kimi"), Some(AgentKind::Kimi));
-        let binding = AgentBinding {
-            kind: AgentKind::Kimi,
-            session_id: "s".to_owned(),
-            transcript: PathBuf::from("/Users/jr/.kimi-code/sessions/wd_x/session_y"),
-        };
+        let mut budget = DetectionBudget::default();
         assert!(
-            agent_state(&binding).is_none(),
-            "파서가 없는데 상태를 만들어내면 화면이 거짓말을 한다"
+            bind_transcript(AgentKind::Kimi, None, 1, &mut budget).is_none(),
+            "프로세스만 보고 세션을 추측해 묶으면 엉뚱한 상태를 보여준다"
         );
+        // 루트 밖 경로는 hook이 줬더라도 무효다 — 임의 파일을 transcript로 읽지 않는다.
+        let Some(home) = crate::paths::home_dir() else {
+            return;
+        };
+        assert!(!valid_transcript_path(
+            AgentKind::Kimi,
+            &home.join("somewhere-else/wire.jsonl")
+        ));
     }
 
     #[test]

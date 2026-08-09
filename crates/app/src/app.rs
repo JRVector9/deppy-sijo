@@ -6661,6 +6661,7 @@ pub(crate) fn top_provider_usage(
     claude_usage: Option<ProviderUsage>,
     codex_usage: Option<ProviderUsage>,
     codex_meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
+    kimi_usage: Option<ProviderUsage>,
 ) {
     let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
@@ -6767,8 +6768,11 @@ pub(crate) fn top_provider_usage(
         }
     }
 
+    // Kimi 칸은 값이 있을 때만 자리를 차지한다 — 없는 provider 몫으로 폭을 비워두면
+    // 나머지가 왼쪽으로 몰려 보인다.
+    let width = if kimi_usage.is_some() { 620.0 } else { 430.0 };
     ui.allocate_ui_with_layout(
-        egui::vec2(430.0, 20.0),
+        egui::vec2(width, 20.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
@@ -6789,6 +6793,21 @@ pub(crate) fn top_provider_usage(
                 codex_usage,
                 codex_meta,
             );
+            // Claude/Codex는 이 앱의 1급 provider라 값이 없어도 「—」로 자리를 지키지만,
+            // Kimi는 **쓰는 사람에게만** 보여야 한다(2026-08-10 사용자 요구). 값이 없으면
+            // 로고조차 그리지 않는다 — 안 쓰는 사용자에게 빈 칸을 남기지 않는다.
+            if kimi_usage.is_some() {
+                ui.add_space(4.0);
+                separator(ui, 18.0);
+                ui.add_space(4.0);
+                provider(
+                    ui,
+                    "Kimi",
+                    egui::Color32::from_rgb(0x6b, 0x8a, 0xff),
+                    kimi_usage,
+                    None,
+                );
+            }
         },
     );
 }
@@ -20687,11 +20706,20 @@ impl eframe::App for App {
                     .then(|| crate::codex_backend_usage::current(ui.ctx()))
                     .flatten()
                     .and_then(|backend| backend.five_hour);
+                // Kimi 프로브는 CLI 프로세스를 하나 띄운다. 안 쓰는 사용자에게는
+                // 아예 걸지 않는다 — 감지된 세션이 있을 때만 깨운다.
+                let kimi_usage = self
+                    .agent_kinds
+                    .values()
+                    .any(|running| running.kind == crate::agent_detect::AgentKind::Kimi)
+                    .then(|| crate::kimi_usage::current(ui.ctx()))
+                    .flatten();
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx())),
                     supplement_codex_five_hour(codex_server_usage, codex_backend_five_hour),
                     self.agent_sessions_ui.codex_usage_meta(),
+                    kimi_usage,
                     activity_rows.rows(),
                     approval_count,
                     &waiting_sessions,

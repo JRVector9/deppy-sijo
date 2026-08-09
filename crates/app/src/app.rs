@@ -20706,14 +20706,12 @@ impl eframe::App for App {
                     .then(|| crate::codex_backend_usage::current(ui.ctx()))
                     .flatten()
                     .and_then(|backend| backend.five_hour);
-                // Kimi 프로브는 CLI 프로세스를 하나 띄운다. 안 쓰는 사용자에게는
-                // 아예 걸지 않는다 — 감지된 세션이 있을 때만 깨운다.
-                let kimi_usage = self
-                    .agent_kinds
-                    .values()
-                    .any(|running| running.kind == crate::agent_detect::AgentKind::Kimi)
-                    .then(|| crate::kimi_usage::current(ui.ctx()))
-                    .flatten();
+                // 사용량은 계정 단위 값이라 워크스페이스와 무관하다. 「안 쓰는 사용자에게
+                // 걸지 않는다」는 kimi_usage가 설치 여부로 스스로 판정한다 —
+                // agent_kinds는 **활성 워크스페이스만** 담아서, 다른 워크스페이스에서
+                // Kimi를 쓰면 게이트가 조용히 막았다(2026-08-10 실증: 프로브가 한 번도
+                // 안 돌았다). claude 경로와 같은 모양으로 무조건 부른다.
+                let kimi_usage = crate::kimi_usage::current(ui.ctx());
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx())),

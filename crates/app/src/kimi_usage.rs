@@ -42,8 +42,16 @@ struct UsageState {
 
 /// 마지막으로 읽어둔 값. 없으면 백그라운드 프로브를 한 번 건다.
 ///
-/// 호출부가 **Kimi 세션이 있을 때만** 부른다 — 안 쓰는 사용자에게 CLI를 띄우지 않는다.
+/// **Kimi가 설치돼 있지 않으면 아무것도 하지 않는다** — 안 쓰는 사용자에게 CLI를
+/// 띄우지도, 상태바에 칸을 만들지도 않는다.
+///
+/// 처음엔 「감지된 Kimi 세션이 있을 때만」으로 막았는데, 그 판정 근거인 `agent_kinds`가
+/// **활성 워크스페이스만** 담아서 다른 워크스페이스에서 Kimi를 쓰면 프로브가 영영 돌지
+/// 않았다(2026-08-10 실증). 사용량은 계정 단위 값이라 워크스페이스와 무관해야 한다.
 pub fn current(ctx: &egui::Context) -> Option<crate::app::ProviderUsage> {
+    if !kimi_installed() {
+        return None;
+    }
     static STATE: OnceLock<Mutex<UsageState>> = OnceLock::new();
     let state = STATE.get_or_init(|| Mutex::new(UsageState::default()));
     let Ok(mut state) = state.lock() else {
@@ -149,8 +157,22 @@ fn fetch_kimi_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
     Ok(parse_usage(&clean))
 }
 
+/// Kimi를 실제로 쓰는 기기인가 — 실행 파일이 알려진 자리에 있는지로 본다.
+///
+/// PATH 폴백(`"kimi"`)은 여기서 「설치됨」으로 치지 않는다. 없는 명령을 60초마다
+/// 띄우려 시도하는 꼴이 되기 때문이다.
+fn kimi_installed() -> bool {
+    kimi_command_path().is_some()
+}
+
 /// Kimi 실행 파일. 공식 설치 위치를 먼저 보고, 없으면 PATH에 맡긴다.
 fn resolve_kimi_command() -> String {
+    kimi_command_path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "kimi".to_owned())
+}
+
+fn kimi_command_path() -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
     if let Some(home) = crate::paths::home_dir() {
         candidates.push(home.join(".kimi-code/bin/kimi"));
@@ -160,11 +182,7 @@ fn resolve_kimi_command() -> String {
         std::path::PathBuf::from("/opt/homebrew/bin/kimi"),
         std::path::PathBuf::from("/usr/local/bin/kimi"),
     ]);
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "kimi".to_owned())
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 /// 패널이 다 그려졌는지. 무료 계정 안내와 로드 실패도 «더 기다릴 필요 없음»이다.
@@ -253,6 +271,26 @@ fn strip_terminal_control_sequences(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 실제 CLI를 앱과 **같은 PTY 백엔드**로 띄워 값을 읽어본다. expect로 재현했을 때는
+    /// 입력이 전혀 안 닿았는데, 그건 그쪽 PTY 사정이었을 수 있다 — 앱이 쓰는 경로로
+    /// 확인해야 의미가 있다. Kimi가 없는 기기에서는 조용히 건너뛴다.
+    ///
+    /// `--ignored`로 둔다: CLI 프로세스를 띄우고 최대 25초가 걸려 일반 스위트에 넣을
+    /// 성질이 아니다. `cargo test -- --ignored kimi_실측`으로 부른다.
+    #[test]
+    #[ignore = "실제 kimi CLI를 띄운다(최대 25초)"]
+    fn kimi_실측_프로브가_사용량을_읽는다() {
+        if !kimi_installed() {
+            return;
+        }
+        let usage = fetch_kimi_usage().expect("프로브가 오류 없이 끝나야 한다");
+        let usage = usage.expect("Plan usage를 읽지 못했다 — 화면 형식이 바뀌었을 수 있다");
+        assert!(
+            usage.0.is_some() || usage.1.is_some(),
+            "창을 하나도 못 읽었다: {usage:?}"
+        );
+    }
 
     /// 2026-08-10 실측 화면 그대로. 라벨·퍼센트 표기가 바뀌면 여기서 깨져야 한다 —
     /// 조용히 None이 되면 상태바에서 Kimi만 사라지고 이유를 알 수 없다.

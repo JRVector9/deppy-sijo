@@ -933,6 +933,53 @@ mod tests {
         }
     }
 
+    /// 한글 입력 중에도 단축키는 **`Event::Key`의 key로만** 잡는다. 텍스트는 보지 않는다.
+    ///
+    /// 한글 자판에서 `P` 키는 `ㅔ`를 낸다. egui-winit이 `logical_key.or(physical_key)`
+    /// 폴백(egui#3653)으로 `Key::P`를 채워주기 때문에 우리 매칭이 그대로 성립하는데,
+    /// 누군가 IME 문제를 고치다 텍스트 기반 매칭을 끼워 넣으면 이 폴백이 무력해진다.
+    /// Warp는 같은 자리에서 실제로 깨졌다(warpdotdev/warp#428: 한글 모드에서 cmd-P가
+    /// 안 먹는다). 2026-08-09 실측 로그에서 `K(A) T(ㅁ)`처럼 **키 이름은 라틴, 텍스트는
+    /// 한글**로 오는 것을 확인했고, 그 계약을 여기 고정한다.
+    #[test]
+    fn 한글_입력중에도_단축키는_텍스트가_아니라_키로_잡는다() {
+        let binding = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P);
+        let bindings = [(ShortcutAction::InterruptAgent, binding)];
+
+        // ① 텍스트만으로는 절대 발동하지 않는다 — 한글이든 라틴이든.
+        let mut text_only = vec![
+            egui::Event::Text("ㅔ".to_owned()),
+            egui::Event::Text("p".to_owned()),
+        ];
+        assert_eq!(
+            take_triggered_action_from_events(&mut text_only, &bindings),
+            None,
+            "텍스트로 단축키가 잡히면 타이핑이 명령으로 오작동한다"
+        );
+        assert_eq!(
+            text_only.len(),
+            2,
+            "발동하지 않았으면 텍스트를 소비해서도 안 된다"
+        );
+
+        // ② 한글 텍스트가 함께 와도 키로 잡히고, **텍스트는 그대로 남는다**
+        //    (터미널로 흘러가야 할 입력을 단축키 처리가 먹으면 글자가 사라진다).
+        let mut korean_frame = vec![
+            key_event(egui::Key::P, egui::Modifiers::COMMAND, false),
+            egui::Event::Text("ㅔ".to_owned()),
+        ];
+        assert_eq!(
+            take_triggered_action_from_events(&mut korean_frame, &bindings),
+            Some(ShortcutAction::InterruptAgent),
+            "한글 모드에서도 물리 키 폴백으로 단축키가 잡혀야 한다"
+        );
+        assert_eq!(
+            korean_frame,
+            vec![egui::Event::Text("ㅔ".to_owned())],
+            "키 이벤트만 소비하고 텍스트는 남겨야 한다"
+        );
+    }
+
     #[test]
     fn matching_repeat_and_duplicate_events_are_all_consumed_once() {
         let binding = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::F13);

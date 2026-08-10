@@ -186,7 +186,6 @@ top.credentials = 憑證
 top.connectors = 連線
 top.environment = 環境與 API
 top.agents = 代理
-top.workspaces = 工作區
 top.activity = 活動
 top.notifications = 通知
 top.notifications.unread = 通知 ({count})

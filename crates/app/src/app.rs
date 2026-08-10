@@ -7184,7 +7184,8 @@ pub struct App {
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
     /// 설정 창 안에서만 선택된 workspace. 사이드바 표시/활성 runtime/terminal focus와
-    /// 독립이며 Environment/Workspaces 관리 화면의 대상만 바꾼다.
+    /// 독립이며 「환경 및 API」 화면의 대상만 바꾼다 — 그 화면의 프로젝트 목록이
+    /// 유일한 입력원이다(2026-08-10, 설정→워크스페이스 화면 삭제).
     settings_workspace_id: Option<String>,
     settings_search: String,
     env_api_project_edit: EnvApiProjectEditState,
@@ -22684,30 +22685,6 @@ impl eframe::App for App {
                     }
                     C::Agents => {
                         agents_intent = self.agents_ui.contents(ui, &self.agents_snapshot, &text);
-                    }
-                    C::Workspaces => {
-                        // 설정 전용 선택 목록. 여기서 workspace를 눌러도 sidebar 숨김 상태,
-                        // active runtime, terminal focus는 바꾸지 않는다.
-                        // 이름 지정(이름 변경) 기능은 제거(2026-07-08 사용자) — 워크스페이스
-                        // 이름은 항상 프로젝트 폴더명(경로 미설정이면 "~"). 세부 구분은
-                        // 세션(pane) 이름 직접 수정으로 한다.
-                        if ui
-                            .button(text.t("workspace.manager.new", &[]))
-                            .on_hover_text(text.t("workspace.manager.new_hint", &[]))
-                            .clicked()
-                        {
-                            settings_folder_picker_requested = true;
-                        }
-                        ui.add_space(6.0);
-                        for ws in &self.workspaces {
-                            let display = Self::workspace_display_name(ws);
-                            if ui
-                                .selectable_label(ws.id == settings_wsid, display)
-                                .clicked()
-                            {
-                                settings_workspace_select = Some(ws.id.clone());
-                            }
-                        }
                     }
                     C::Activity => {
                         activity_action = self.activity_ui.contents(ui, &text, &activity_rows);

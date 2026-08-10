@@ -186,7 +186,6 @@ top.credentials = 認証情報
 top.connectors = 接続
 top.environment = 環境とAPI
 top.agents = エージェント
-top.workspaces = ワークスペース
 top.activity = アクティビティ
 top.notifications = 通知
 top.notifications.unread = 通知 ({count})

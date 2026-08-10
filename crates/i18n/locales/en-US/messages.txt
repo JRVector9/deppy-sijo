@@ -186,7 +186,6 @@ top.credentials = Credentials
 top.connectors = Connectors
 top.environment = Environment & API
 top.agents = Agents
-top.workspaces = Workspaces
 top.activity = Activity
 top.notifications = Notifications
 top.notifications.unread = Notifications ({count})

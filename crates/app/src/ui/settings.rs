@@ -168,7 +168,6 @@ pub enum Category {
     Connectors,
     Environment,
     Agents,
-    Workspaces,
     // ── 모니터 ──
     Activity,
     Notifications,
@@ -566,12 +565,6 @@ fn nav(
                     catalog.t("top.agents", &[]),
                     "agents command runner status regex",
                 ),
-                (
-                    Category::Workspaces,
-                    Icon::Square,
-                    catalog.t("top.workspaces", &[]),
-                    "workspaces project path folder root",
-                ),
             ];
             let visible_manage: Vec<_> = manage
                 .into_iter()
@@ -955,7 +948,6 @@ pub enum Icon {
     Link,
     Grid,
     Diamond,
-    Square,
     Clock,
     Bell,
     SystemIndicator,
@@ -1104,10 +1096,6 @@ fn paint_icon(p: &egui::Painter, c: egui::Pos2, sz: f32, icon: Icon, col: egui::
                 col,
                 egui::Stroke::NONE,
             ));
-        }
-        Icon::Square => {
-            let b = egui::Rect::from_center_size(c, egui::vec2(sz * 0.85, sz * 0.85));
-            p.rect_stroke(b, 2.0, s, egui::StrokeKind::Inside);
         }
         Icon::Clock => {
             p.circle_stroke(c, r * 0.8, s);
@@ -2862,5 +2850,46 @@ mod tests {
             "터미널",
             "terminal paste clipboard"
         ));
+    }
+
+    /// 「관리」 그룹은 연결·환경 및 API·에이전트 셋만 갖는다. 워크스페이스 항목은
+    /// 삭제됐다(2026-08-10). 워크스페이스 **생성**은 사이드바가, 환경/API 대상
+    /// **선택**은 환경 및 API의 프로젝트 목록이 각각 소유하며, 두 목록은
+    /// `closed_workspace_ids`와 `hidden_env_project_ids`로 독립이다(app.rs의
+    /// "Environment 프로젝트 닫기는 설정 목록의 영속 숨김 상태만 바꾼다" 참조).
+    /// 설정의 워크스페이스 화면은 양쪽 기능을 하나씩 떼어다 붙여 그 경계를 흐렸다.
+    ///
+    /// kittest가 아니라 소스로 고정하는 이유: `nav_row`가 `allocate_exact_size` +
+    /// painter로 그려 접근성 라벨이 없다. 네비 항목은 쿼리로 관측되지 않는다.
+    #[test]
+    fn 설정_네비의_관리그룹은_연결_환경_에이전트_셋뿐이다() {
+        let source = include_str!("settings.rs");
+        let manage = source
+            .split_once("            let manage = [")
+            .and_then(|(_, tail)| tail.split_once("            ];"))
+            .map(|(body, _)| body)
+            .expect("nav()의 manage 배열을 찾지 못했다");
+
+        for expected in [
+            "Category::Connectors",
+            "Category::Environment",
+            "Category::Agents",
+        ] {
+            assert!(
+                manage.contains(expected),
+                "관리 그룹에서 {expected}가 사라졌다 — 삭제 범위가 과하다"
+            );
+        }
+        assert!(
+            !manage.contains("Category::Workspaces"),
+            "관리 그룹에 워크스페이스가 남아 있다"
+        );
+        // 리터럴을 쪼개는 이유: `include_str!`가 이 테스트 모듈까지 읽으므로
+        // 통짜로 쓰면 단언문 자신이 검출돼 항상 실패한다.
+        let removed_key = concat!("top.", "workspaces");
+        assert!(
+            !source.contains(removed_key),
+            "쓰이지 않는 i18n 키 {removed_key}가 남아 있다"
+        );
     }
 }

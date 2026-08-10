@@ -186,7 +186,6 @@ top.credentials = 자격증명
 top.connectors = 연결
 top.environment = 환경 및 API
 top.agents = 에이전트
-top.workspaces = 워크스페이스
 top.activity = 활동
 top.notifications = 알림
 top.notifications.unread = 알림 ({count})

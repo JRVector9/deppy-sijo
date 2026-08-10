@@ -207,6 +207,7 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 /// 30: durable exact cleanup obligations for legacy logical keyring sources (PR-SC01).
 /// 31: bounded finalized-audit retention ordering index (PR-AU02 hardening).
 /// 32: agent_needs_input.working — hook 기반 "작업 중" 신호(cmux식 턴 경계).
+/// 33: workspace_notes — 워크스페이스당 스크래치패드 한 장(사이드바 「메모」 탭).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -677,6 +678,19 @@ END;
     // transcript 폴링 지연·warm 미추적을 훅 신호로 대체한다.
     "
 ALTER TABLE agent_needs_input ADD COLUMN working INTEGER NOT NULL DEFAULT 0;
+",
+    // v33: 워크스페이스당 메모 한 장. workspace_id가 PK라 행이 늘 수 없고,
+    // ON DELETE CASCADE라 `delete_workspace`가 따로 지우지 않아도 함께 사라진다
+    // (고아 메모가 남으면 같은 id 재사용 시 남의 메모가 되살아난다).
+    // 빈 본문은 행을 남기지 않는 규약이라 CHECK로 못박는다 — 저장 경로가 지우고
+    // 들어오지만, 다른 경로가 생겨도 빈 행이 쌓이지 않는다.
+    "
+CREATE TABLE workspace_notes (
+    workspace_id TEXT PRIMARY KEY
+        REFERENCES workspaces(id) ON DELETE CASCADE,
+    body TEXT NOT NULL CHECK (length(body) > 0),
+    updated_at TEXT NOT NULL
+);
 ",
 ];
 
@@ -2614,6 +2628,12 @@ pub const SETTINGS_AGENT_LIMIT_MAX: usize = 1_024;
 pub const SETTINGS_ENV_PROFILE_LIMIT_MAX: usize = 256;
 pub const SETTINGS_ENV_VAR_LIMIT_MAX: usize = 4_096;
 pub const SETTINGS_CREDENTIAL_LIMIT_MAX: usize = 4_096;
+
+/// 워크스페이스 메모 본문 상한(바이트). 설정 스냅샷 경로가 bounded read를 전제로 하므로
+/// 무제한 본문을 허용하지 않는다. 상한을 넘으면 **자르지 않고 거부**한다 — 조용히 자르면
+/// 사용자가 모르는 사이 글이 사라진다. 64 KiB는 사람이 손으로 쓰는 메모에는 충분하고
+/// (A4 약 30장), 붙여넣기 사고로 로그를 통째로 넣는 경우는 막는 크기다.
+pub const WORKSPACE_NOTE_MAX_BYTES: usize = 64 * 1024;
 pub const SETTINGS_ENABLED_MCP_SERVER_LIMIT_MAX: usize = 256;
 pub const SETTINGS_WORKSPACE_LIMIT_MAX: usize = SETTINGS_ENV_PROFILE_LIMIT_MAX;
 pub const SETTINGS_SNAPSHOT_BYTES_MAX: usize = 4 * 1024 * 1024;
@@ -7739,6 +7759,43 @@ impl Db {
     /// workspace + 그 자식 데이터(세션/mux/env)를 한 트랜잭션으로 삭제한다 (destructive).
     /// mcp_servers(전역)·감사 로그(FK 없음)는 남긴다. 활성/마지막 workspace 삭제 방지는
     /// 호출측(UI) 책임.
+    /// 워크스페이스 메모를 읽는다. 미작성이면 `None` — 빈 문자열과 구분해야 UI가
+    /// placeholder를 고를 수 있다(빈 본문은 애초에 행으로 남지 않는다).
+    pub fn load_workspace_note(&self, workspace_id: &str) -> anyhow::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT body FROM workspace_notes WHERE workspace_id = ?1")?;
+        let body = stmt
+            .query_row([workspace_id], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(body)
+    }
+
+    /// 워크스페이스 메모를 저장한다. 공백만 남은 본문은 **행을 지운다** — 빈 행이
+    /// 워크스페이스마다 쌓이는 것을 막고, `load`가 "안 쓴 것"과 "지운 것"을 같게 본다.
+    /// 상한 초과는 거부하며 기존 내용을 건드리지 않는다.
+    pub fn save_workspace_note(&self, workspace_id: &str, body: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            body.len() <= WORKSPACE_NOTE_MAX_BYTES,
+            "workspace_note_bytes_limit"
+        );
+        if body.trim().is_empty() {
+            self.conn.execute(
+                "DELETE FROM workspace_notes WHERE workspace_id = ?1",
+                [workspace_id],
+            )?;
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO workspace_notes (workspace_id, body, updated_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(workspace_id) DO UPDATE
+               SET body = excluded.body, updated_at = excluded.updated_at",
+            (workspace_id, body),
+        )?;
+        Ok(())
+    }
+
     pub fn delete_workspace(&mut self, workspace_id: &str) -> anyhow::Result<()> {
         let tx = self.conn.transaction()?;
         // persist 소유 테이블 (sessions, mux_*) — FK 순서
@@ -10260,6 +10317,136 @@ mod tests {
                 .unwrap();
         }
         workspace_id
+    }
+
+    /// 메모는 워크스페이스당 한 장이다(PR-1). 저장·재읽기가 원문 그대로여야 하며
+    /// 개행·유니코드가 보존돼야 한다 — 「작업 기록」이 용도라 여러 줄이 기본이다.
+    #[test]
+    fn workspace_note는_원문_그대로_라운드트립한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("메모").unwrap();
+
+        // 미작성 워크스페이스는 None — 빈 문자열과 구분한다(UI가 placeholder를 고른다).
+        assert_eq!(db.load_workspace_note(&ws).unwrap(), None);
+
+        let body = "2026-08-10\n- 인증 리팩터 중\n- TODO: 캐시 무효화 🔑";
+        db.save_workspace_note(&ws, body).unwrap();
+        assert_eq!(db.load_workspace_note(&ws).unwrap().as_deref(), Some(body));
+
+        // 같은 워크스페이스에 다시 쓰면 덮어쓴다(행이 늘지 않는다).
+        db.save_workspace_note(&ws, "덮어씀").unwrap();
+        assert_eq!(
+            db.load_workspace_note(&ws).unwrap().as_deref(),
+            Some("덮어씀")
+        );
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM workspace_notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "워크스페이스당 한 행이어야 한다");
+    }
+
+    /// 빈 메모는 행을 남기지 않는다. 남기면 워크스페이스마다 빈 행이 쌓이고,
+    /// load가 Some("")를 돌려줘 "안 쓴 것"과 "지운 것"이 구분되지 않는다.
+    #[test]
+    fn 빈_workspace_note는_행을_지운다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("메모").unwrap();
+        db.save_workspace_note(&ws, "적었다").unwrap();
+        db.save_workspace_note(&ws, "   \n  ").unwrap();
+        assert_eq!(db.load_workspace_note(&ws).unwrap(), None);
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM workspace_notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// 메모는 무제한이 아니다. 설정 스냅샷 경로가 bounded read를 전제로 하므로
+    /// 상한을 넘는 쓰기는 **거부**한다 — 자르면 사용자가 모르게 글이 사라진다.
+    #[test]
+    fn workspace_note는_상한을_넘으면_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("메모").unwrap();
+
+        let at_limit = "a".repeat(WORKSPACE_NOTE_MAX_BYTES);
+        db.save_workspace_note(&ws, &at_limit).unwrap();
+        assert_eq!(
+            db.load_workspace_note(&ws).unwrap().map(|s| s.len()),
+            Some(WORKSPACE_NOTE_MAX_BYTES)
+        );
+
+        let over = "a".repeat(WORKSPACE_NOTE_MAX_BYTES + 1);
+        let error = db.save_workspace_note(&ws, &over).unwrap_err().to_string();
+        assert!(error.contains("workspace_note_bytes_limit"), "{error}");
+        // 거부됐으면 기존 내용이 그대로 남아야 한다.
+        assert_eq!(
+            db.load_workspace_note(&ws).unwrap().map(|s| s.len()),
+            Some(WORKSPACE_NOTE_MAX_BYTES)
+        );
+    }
+
+    /// FK + ON DELETE CASCADE. `delete_workspace`가 메모를 명시적으로 지우지 않아도
+    /// 워크스페이스 행이 사라지면 함께 정리돼야 한다 — 고아 메모가 남으면 같은 id가
+    /// 재사용될 때 남의 메모가 되살아난다.
+    #[test]
+    fn workspace_note는_워크스페이스_삭제와_함께_사라진다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("삭제대상").unwrap();
+        let other = db.create_workspace("유지").unwrap();
+        db.save_workspace_note(&ws, "사라질 메모").unwrap();
+        db.save_workspace_note(&other, "남을 메모").unwrap();
+
+        db.delete_workspace(&ws).unwrap();
+
+        assert_eq!(db.load_workspace_note(&ws).unwrap(), None);
+        assert_eq!(
+            db.load_workspace_note(&other).unwrap().as_deref(),
+            Some("남을 메모")
+        );
+    }
+
+    /// 없는 워크스페이스에는 쓸 수 없다(FK). 이게 막히지 않으면 오타 난 id로
+    /// 메모가 새고 CASCADE 대상에서도 빠진다.
+    #[test]
+    fn 없는_워크스페이스에는_note를_쓸_수_없다() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.save_workspace_note("ghost-ws", "본문").is_err());
+    }
+
+    /// v32 기존 DB를 열면 v33으로 올라가고 메모가 바로 쓰인다. 기존 데이터는 보존.
+    #[test]
+    fn workspace_notes_마이그레이션은_기존_v32_db를_보존한다() {
+        let dir = std::env::temp_dir().join(format!("deppy-notes-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..32] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 32).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (id, name, path, created_at, updated_at)
+                 VALUES ('ws-1', 'existing', '/repo', 't', 't')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        // 기존 워크스페이스 보존
+        assert!(db.list_workspaces().unwrap().iter().any(|w| w.id == "ws-1"));
+        // 새 테이블 사용 가능
+        db.save_workspace_note("ws-1", "업그레이드 후 메모")
+            .unwrap();
+        assert_eq!(
+            db.load_workspace_note("ws-1").unwrap().as_deref(),
+            Some("업그레이드 후 메모")
+        );
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -2859,12 +2859,33 @@ impl FileTreeUi {
                         && hover_rect.contains(pos)
                     {
                         drop_target_dir = Some(row_target_dir(row, self.root.as_deref()));
-                        if row.is_dir && os_drag_active {
-                            ui.painter().rect_stroke(
+                        if os_drag_active {
+                            // 내부 드래그와 **같은 판정·같은 표시**를 쓴다. 예전엔 폴더 행에만
+                            // 외곽선을 그려, 파일 행 위에서는 대상이 부모 폴더로 잡히는데도
+                            // 화면엔 아무것도 안 나왔다(2026-08-11 사용자: Finder에서 끌어도
+                            // 삽입선이 안 뜬다). 외부 드래그는 payload 경로를 알 수 없으므로
+                            // (macOS는 드롭 전까지 경로를 안 준다) eligibility는 Allowed로 둔다 —
+                            // 밖에서 온 파일이라 "이미 그 폴더 안"일 수가 없다.
+                            let target = if row.is_dir
+                                && (hover_rect.top() + hover_rect.height() * 0.30
+                                    ..hover_rect.bottom() - hover_rect.height() * 0.30)
+                                    .contains(&pos.y)
+                            {
+                                super::file_drop::RowDropTarget::IntoFolder
+                            } else if pos.y < hover_rect.center().y {
+                                super::file_drop::RowDropTarget::InsertAbove
+                            } else {
+                                super::file_drop::RowDropTarget::InsertBelow
+                            };
+                            paint_row_drop_target(
+                                ui,
+                                ppp,
                                 hover_paint_rect,
-                                2.0,
-                                ui.visuals().widgets.active.bg_stroke,
-                                egui::StrokeKind::Inside,
+                                row.depth,
+                                super::file_drop::DropDecision {
+                                    target,
+                                    eligibility: super::file_drop::DropEligibility::Allowed,
+                                },
                             );
                             drag_row_highlighted = true;
                         }
@@ -3012,11 +3033,18 @@ impl FileTreeUi {
                             payload.as_ref(),
                         )
                     {
-                        let destination = match target {
-                            super::file_drop::RowDropTarget::IntoFolder => Some(row.path.clone()),
-                            // 삽입선 = 이 행의 부모 폴더로.
-                            _ => row.path.parent().map(Path::to_path_buf),
-                        };
+                        // NoOp(이미 그 폴더 안)이면 표시만 했지 이동은 걸지 않는다 —
+                        // host도 no-op이라 결과는 같지만 불필요한 IO 왕복을 줄인다.
+                        let destination = (target.eligibility
+                            == super::file_drop::DropEligibility::Allowed)
+                            .then(|| match target.target {
+                                super::file_drop::RowDropTarget::IntoFolder => {
+                                    Some(row.path.clone())
+                                }
+                                // 삽입선 = 이 행의 부모 폴더로.
+                                _ => row.path.parent().map(Path::to_path_buf),
+                            })
+                            .flatten();
                         if let Some(destination) = destination {
                             drop_action = Some(((*payload).clone(), destination));
                         }
@@ -3127,12 +3155,12 @@ impl FileTreeUi {
         let tree_area = header_rect.union(scroll_output.inner_rect);
         if os_drag_active && drag_pos.is_some_and(|pos| tree_area.contains(pos)) {
             if !drag_row_highlighted {
-                // 특정 폴더 행 위가 아니면 루트 반입 — 트리 영역 전체 테두리로 표시.
-                ui.painter().rect_stroke(
+                // 행 위가 아니면 루트 반입 — 외곽선 대신 면으로 덮는다(2026-08-10 사용자:
+                // 외곽 테두리 제거). 폴더 행 강조와 같은 언어라 "이 영역이 받는다"로 읽힌다.
+                ui.painter().rect_filled(
                     crate::ui::snap_rect_to_pixel(ui.ctx().pixels_per_point(), tree_area),
                     2.0,
-                    ui.visuals().widgets.active.bg_stroke,
-                    egui::StrokeKind::Inside,
+                    ui.visuals().selection.bg_fill.gamma_multiply(0.12),
                 );
             }
             // 드래그 중엔 winit 이벤트가 없어 즉시 다음 frame을 요청해야 하이라이트가
@@ -5104,9 +5132,16 @@ fn paint_row_drop_target(
     ppp: f32,
     row_rect: egui::Rect,
     depth: usize,
-    target: super::file_drop::RowDropTarget,
+    decision: super::file_drop::DropDecision,
 ) {
-    let accent = ui.visuals().selection.bg_fill;
+    // NoOp(이미 그 폴더 안 — 놓아도 변화 없음)은 **회색**으로 그린다. 침묵하면
+    // 사용자에겐 고장으로 보이고, accent로 그리면 될 것처럼 보인다(2026-08-11 사용자).
+    let accent = if decision.eligibility == super::file_drop::DropEligibility::NoOp {
+        ui.visuals().weak_text_color()
+    } else {
+        ui.visuals().selection.bg_fill
+    };
+    let target = decision.target;
     match target {
         super::file_drop::RowDropTarget::IntoFolder => {
             ui.painter().rect_filled(

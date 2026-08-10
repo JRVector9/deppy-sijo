@@ -58,7 +58,8 @@ fn get_or_create_key(store: &dyn SecretStore) -> anyhow::Result<(String, Vec<u8>
 pub fn encrypt_input(store: &dyn SecretStore, plaintext: &str) -> anyhow::Result<Vec<u8>> {
     let (key_id, key) = get_or_create_key(store)?;
     ensure!(key_id.len() <= u8::MAX as usize, "key_id가 너무 김");
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let key = Key::try_from(key.as_slice()).map_err(|_| anyhow!("audit 키 길이가 32가 아님"))?;
+    let cipher = XChaCha20Poly1305::new(&key);
     let nonce = XNonce::generate();
     let ciphertext = cipher
         .encrypt(&nonce, plaintext.as_bytes())
@@ -81,14 +82,16 @@ pub fn decrypt_input(store: &dyn SecretStore, blob: &[u8]) -> anyhow::Result<Str
         "blob 길이가 헤더보다 짧음"
     );
     let key_id = std::str::from_utf8(&rest[..key_id_len]).context("key_id가 utf8이 아님")?;
-    let nonce = XNonce::from_slice(&rest[key_id_len..key_id_len + NONCE_LEN]);
+    let nonce = XNonce::try_from(&rest[key_id_len..key_id_len + NONCE_LEN])
+        .map_err(|_| anyhow!("nonce 길이가 {NONCE_LEN}이 아님"))?;
     let ciphertext = &rest[key_id_len + NONCE_LEN..];
 
     let key = from_hex(store.get_secret(key_id)?.expose()).context("audit 키 hex 손상")?;
     ensure!(key.len() == 32, "audit 키 길이가 32가 아님");
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let key = Key::try_from(key.as_slice()).map_err(|_| anyhow!("audit 키 길이가 32가 아님"))?;
+    let cipher = XChaCha20Poly1305::new(&key);
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| anyhow!("audit 입력 복호화 실패(위변조 또는 키 불일치): {e}"))?;
     String::from_utf8(plaintext).context("복호 평문이 utf8이 아님")
 }
@@ -148,12 +151,12 @@ mod tests {
         let key_id_len = blob[0] as usize;
         let rest = &blob[1..];
         assert_eq!(&rest[..key_id_len], AUDIT_KEY_ID.as_bytes());
-        let nonce = XNonce::from_slice(&rest[key_id_len..key_id_len + NONCE_LEN]);
+        let nonce = XNonce::try_from(&rest[key_id_len..key_id_len + NONCE_LEN]).expect("nonce");
         let ciphertext = &rest[key_id_len + NONCE_LEN..];
 
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&[7u8; 32]));
+        let cipher = XChaCha20Poly1305::new(&Key::from([7u8; 32]));
         let plaintext = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .expect("구버전 blob을 새 크레이트로 복호화하지 못했다 — 기존 감사 로그가 유실된다");
         assert_eq!(String::from_utf8(plaintext).unwrap(), "감사 원문 payload");
     }

@@ -268,7 +268,7 @@ fn seal(
     let cipher =
         Aes128Gcm::new_from_slice(&cek).map_err(|_| anyhow::anyhow!("AES-128 키 길이 오류"))?;
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), record.as_slice())
+        .encrypt(&Nonce::from(nonce), record.as_slice())
         .map_err(|_| anyhow::anyhow!("AES-128-GCM 암호화 실패"))?;
 
     // RFC 8188 헤더: salt(16) ‖ rs(4, big-endian) ‖ idlen(1) ‖ keyid(=as_public, 65) ‖ 암호문

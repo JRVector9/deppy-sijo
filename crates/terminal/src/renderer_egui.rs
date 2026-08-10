@@ -847,6 +847,181 @@ mod tests {
         GEN.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// 렌더 경로 실측(수동, `#[ignore]`) — 전용 GPU 렌더패스(Rio sugarloaf 방식) 도입을
+    /// 재검토할 때 숫자를 다시 뽑는 도구다.
+    ///
+    /// **회귀 가드가 아니다.** 아무것도 assert하지 않고 stderr로 찍기만 한다 — 타이밍에
+    /// 임계값을 걸면 느린 러너에서 바로 flaky가 되므로 의도적으로 그렇게 뒀다. 감시가
+    /// 필요하면 이 벤치가 아니라 별도 수단을 써야 한다.
+    ///
+    /// 두 축을 잰다: (a) all-dirty = 매 프레임 전 행 재-shaping(무거운 출력),
+    /// (b) cached = 같은 스냅샷 재draw(재-shaping 0인데도 egui가 갤리를 재-테셀레이션하는
+    /// 순수 리페인트 비용 — 이게 sugarloaf가 없애는 부분).
+    ///
+    /// 실행: `cargo test -p terminal --release render_tessellation_bench -- --ignored --nocapture`
+    /// (release 필수 — debug는 테셀레이션이 수십 배 느려 판정에 못 쓴다)
+    ///
+    /// 2026-08-10 실측(M-series, release, 13px): 최악 300x80 all-dirty가 0.59ms/frame으로
+    /// 16.6ms 예산의 3.6%. cached 리페인트 0.25ms. 결론은 `docs/render-path-analysis.md`와
+    /// `docs/render-resource-decision.md`에 있다 — egui 테셀레이션은 병목이 아니다.
+    #[test]
+    #[ignore = "렌더 테셀레이션 실측 — --ignored --nocapture로만"]
+    fn render_tessellation_bench() {
+        use std::time::Instant;
+
+        // 현실적 색 변화(color_period 셀마다 fg 전환)로 run 병합을 실제 수준으로 낮춘다.
+        fn bench_snap(cols: u16, rows: u16, color_period: usize) -> TerminalViewportSnapshot {
+            let palette = [
+                [0xd8u8, 0xd8, 0xd8],
+                [0xe0, 0x6c, 0x75],
+                [0x98, 0xc3, 0x79],
+                [0x61, 0xaf, 0xef],
+                [0xc6, 0x78, 0xdd],
+            ];
+            let cb: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789 (){}[];:=+-*/<>"
+                .chars()
+                .collect();
+            let mut cells = Vec::with_capacity(cols as usize * rows as usize);
+            for idx in 0..cols as usize * rows as usize {
+                cells.push(TerminalCell {
+                    c: cb[idx % cb.len()],
+                    fg: palette[(idx / color_period) % palette.len()],
+                    bg: [0x18, 0x18, 0x1c],
+                    wide: false,
+                    wide_spacer: false,
+                    attrs: Default::default(),
+                });
+            }
+            TerminalViewportSnapshot {
+                cols,
+                rows,
+                cursor: CursorSnapshot {
+                    col: 0,
+                    row: 0,
+                    shape: CursorShape::Block,
+                    visible: false,
+                },
+                visible_cells: cells.into(),
+                dirty_ranges: Vec::new(),
+                title: None,
+                scroll_offset: 0,
+                is_alt_screen: false,
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(4000.0, 2400.0),
+            )),
+            ..Default::default()
+        };
+        let tessellate_ms = |ctx: &egui::Context, full: egui::FullOutput| -> (f64, usize) {
+            let ppp = ctx.pixels_per_point();
+            let t = Instant::now();
+            let prims = ctx.tessellate(full.shapes, ppp);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let tris: usize = prims
+                .iter()
+                .map(|p| match &p.primitive {
+                    egui::epaint::Primitive::Mesh(m) => m.indices.len() / 3,
+                    _ => 0,
+                })
+                .sum();
+            (ms, tris)
+        };
+
+        // 폰트 아틀라스 워밍업(첫 프레임 1회성 비용 제외).
+        {
+            let mut c = TerminalRenderCache::default();
+            let s = bench_snap(80, 24, 8);
+            let full = ctx.run_ui(raw.clone(), |ui| {
+                draw(ui, &s, m(13.0, 1.0), &mut c, None, false, None, next_gen());
+            });
+            let _ = tessellate_ms(&ctx, full);
+        }
+
+        const ITERS: usize = 30;
+        eprintln!("── render 경로 실측 (평균 {ITERS}프레임, font 13px) ──");
+        for (cols, rows) in [(80u16, 24u16), (200, 50), (300, 80)] {
+            let snapshot = bench_snap(cols, rows, 8);
+
+            // (a) all-dirty: 매 프레임 새 캐시 → 전 행 재-shaping + 재-테셀레이션.
+            let (mut d_ms, mut t_ms, mut tris, mut shapes) = (0.0, 0.0, 0usize, 0usize);
+            for _ in 0..ITERS {
+                let mut cache = TerminalRenderCache::default();
+                let t = Instant::now();
+                let full = ctx.run_ui(raw.clone(), |ui| {
+                    draw(
+                        ui,
+                        &snapshot,
+                        m(13.0, 1.0),
+                        &mut cache,
+                        None,
+                        false,
+                        None,
+                        next_gen(),
+                    );
+                });
+                d_ms += t.elapsed().as_secs_f64() * 1e3;
+                shapes = cache.counters.shapes;
+                let (tm, tr) = tessellate_ms(&ctx, full);
+                t_ms += tm;
+                tris = tr;
+            }
+            eprintln!(
+                "[{cols:>3}x{rows:<2} all-dirty] paint-build {:.2}ms + tessellate {:.2}ms = {:.2}ms/frame  shapes={shapes} tris={tris}",
+                d_ms / ITERS as f64,
+                t_ms / ITERS as f64,
+                (d_ms + t_ms) / ITERS as f64,
+            );
+
+            // (b) cached: 같은 세대 재draw → 재-shaping 0, 그래도 재-테셀레이션.
+            let mut cache = TerminalRenderCache::default();
+            let g = next_gen();
+            let full = ctx.run_ui(raw.clone(), |ui| {
+                draw(
+                    ui,
+                    &snapshot,
+                    m(13.0, 1.0),
+                    &mut cache,
+                    None,
+                    false,
+                    None,
+                    g,
+                );
+            });
+            let _ = tessellate_ms(&ctx, full);
+            let (mut cd_ms, mut ct_ms) = (0.0, 0.0);
+            for _ in 0..ITERS {
+                let t = Instant::now();
+                let full = ctx.run_ui(raw.clone(), |ui| {
+                    draw(
+                        ui,
+                        &snapshot,
+                        m(13.0, 1.0),
+                        &mut cache,
+                        None,
+                        false,
+                        None,
+                        g,
+                    );
+                });
+                cd_ms += t.elapsed().as_secs_f64() * 1e3;
+                let (tm, _) = tessellate_ms(&ctx, full);
+                ct_ms += tm;
+            }
+            eprintln!(
+                "[{cols:>3}x{rows:<2} cached   ] paint-build {:.2}ms + tessellate {:.2}ms = {:.2}ms/frame  (rows_rebuilt/frame={})",
+                cd_ms / ITERS as f64,
+                ct_ms / ITERS as f64,
+                (cd_ms + ct_ms) / ITERS as f64,
+                cache.rebuilt_rows_last_frame(),
+            );
+        }
+    }
+
     #[test]
     fn terminal_좌우_내부여백은_각각_3픽셀이다() {
         assert_eq!(HORIZONTAL_PADDING, 3.0);

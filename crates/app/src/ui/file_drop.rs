@@ -71,6 +71,27 @@ pub struct DropDecision {
     pub eligibility: DropEligibility,
 }
 
+/// 포인터가 행의 어느 밴드에 있는지만 본다 — 이동 가능 여부는 따지지 않는다.
+///
+/// 외부(Finder) 드래그는 드롭 전까지 payload 경로를 알 수 없어 `row_drop_target`을
+/// 못 쓴다. 그런 경로도 **밴드 규칙만은 같은 함수**를 쓰게 해서 표시와 목적지가
+/// 갈라지지 않게 한다(2026-08-11: 폴더 행 가장자리에 삽입 마커를 그려놓고 목적지는
+/// 그 폴더로 잡아, 폴더 사이에 놓으면 옆 폴더로 들어갔다).
+pub fn band_target(is_dir: bool, top: f32, bottom: f32, pointer_y: f32) -> RowDropTarget {
+    let height = bottom - top;
+    if height <= 0.0 {
+        return RowDropTarget::InsertAbove;
+    }
+    let offset = (pointer_y - top) / height;
+    if is_dir && (EDGE_BAND..1.0 - EDGE_BAND).contains(&offset) {
+        RowDropTarget::IntoFolder
+    } else if offset < 0.5 {
+        RowDropTarget::InsertAbove
+    } else {
+        RowDropTarget::InsertBelow
+    }
+}
+
 /// 드래그 중인 경로를 이 행에 떨어뜨릴 수 있는지, 있다면 어떤 형태인지.
 ///
 /// `None`인 경우:
@@ -87,20 +108,11 @@ pub fn row_drop_target(row: RowInfo<'_>, pointer_y: f32, dragged: &Path) -> Opti
         return None;
     }
 
-    let offset = (pointer_y - row.top) / height;
-    let wants_into = row.is_dir && (EDGE_BAND..1.0 - EDGE_BAND).contains(&offset);
-
-    let (target, destination) = if wants_into {
-        (RowDropTarget::IntoFolder, row.path)
-    } else {
+    let target = band_target(row.is_dir, row.top, row.bottom, pointer_y);
+    let destination = match target {
+        RowDropTarget::IntoFolder => row.path,
         // 삽입선 = 이 행의 부모 폴더로. 부모가 없으면(루트) 그릴 자리가 없다.
-        let parent = row.path.parent()?;
-        let edge = if offset < 0.5 {
-            RowDropTarget::InsertAbove
-        } else {
-            RowDropTarget::InsertBelow
-        };
-        (edge, parent)
+        _ => row.path.parent()?,
     };
 
     match drop_eligibility(dragged, destination) {
@@ -352,6 +364,42 @@ mod tests {
         );
         let row = dir("/repo/src/ui", 100.0, 120.0);
         assert_eq!(decide(&row, true, 110.0, "/repo/src"), None);
+    }
+
+    /// **폴더 행 가장자리는 그 폴더가 아니라 부모로 간다.** 이게 깨지면 폴더와 폴더
+    /// 사이에 놓았는데 옆 폴더 안으로 들어간다(2026-08-11 사용자 실증).
+    #[test]
+    fn 폴더_행_가장자리는_부모로_간다() {
+        let row = dir("/repo/src", 100.0, 120.0); // 밴드 경계 106.0 / 114.0
+        // 가운데 = 그 폴더로
+        assert_eq!(
+            band_target(true, 100.0, 120.0, 110.0),
+            RowDropTarget::IntoFolder
+        );
+        // 가장자리 = 삽입 → 부모(/repo)로. `/other/a.txt`는 /repo 밖이라 Allowed여야 한다.
+        assert_eq!(
+            decide(&row, true, 101.0, "/other/a.txt").map(|d| d.target),
+            Some(RowDropTarget::InsertAbove)
+        );
+        // 그리고 목적지가 부모라는 사실은 eligibility로 드러난다 — `/repo` 바로 아래
+        // 파일을 끌면 "이미 그 폴더 안"이 되어야 한다(폴더 자신이 대상이면 Allowed가 된다).
+        assert_eq!(
+            decide(&row, true, 101.0, "/repo/a.txt").map(|d| d.eligibility),
+            Some(DropEligibility::NoOp),
+            "가장자리 목적지가 부모가 아니라 그 폴더로 잡히고 있다"
+        );
+    }
+
+    /// 표시(`band_target`)와 목적지(`row_drop_target`)가 **같은 규칙**을 써야 한다.
+    /// 따로 계산하면 반드시 어긋난다 — 실제로 어긋났었다.
+    #[test]
+    fn 표시와_목적지는_같은_밴드_규칙을_쓴다() {
+        let row = dir("/repo/src", 100.0, 120.0);
+        for y in [100.0_f32, 105.9, 106.0, 110.0, 113.9, 114.0, 119.9] {
+            let standalone = band_target(true, 100.0, 120.0, y);
+            let decided = decide(&row, true, y, "/other/a.txt").map(|d| d.target);
+            assert_eq!(decided, Some(standalone), "y={y}에서 갈라졌다");
+        }
     }
 
     /// 높이가 0인 행(레이아웃 과도기)에서 0으로 나누지 않는다.

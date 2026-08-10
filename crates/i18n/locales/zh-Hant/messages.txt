@@ -981,3 +981,5 @@ agent_launcher.error.detection_failed = 無法偵測已安裝的代理。
 agent_launcher.error.busy = 另一項設定或啟動操作正在進行。
 agent_launcher.error.launch_failed = 無法啟動代理工作階段。
 agent_launcher.error.unavailable = 所選代理或選項已無法使用。
+workspace.menu.add_to_note = 新增到備忘
+workspace.menu.add_to_note_too_long = 備忘已超過上限(64KB)，未新增

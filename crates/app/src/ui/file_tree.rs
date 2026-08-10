@@ -1648,6 +1648,13 @@ impl FileTreeUi {
         self.service_statuses = statuses;
     }
 
+    /// 터미널 선택 등 **밖에서** 들어온 메모 편집을 「메모」 탭 버퍼에 반영한다(PR-4).
+    /// App이 pending_note를 세운 직후 호출한다 — 「메모」 탭을 지금 보고 있지 않아도
+    /// 다음에 열면 바로 보인다.
+    pub fn apply_note_append(&mut self, workspace_id: &str, body: String) {
+        self.notes.apply_external_edit(workspace_id, body);
+    }
+
     pub fn panel(
         &mut self,
         ui: &mut egui::Ui,

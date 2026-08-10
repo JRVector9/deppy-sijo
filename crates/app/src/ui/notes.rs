@@ -192,6 +192,15 @@ impl NotesUi {
 
         (date_inserted || response.changed()).then(|| NotesAction::Edited(self.buffer.clone()))
     }
+
+    /// 터미널 선택 등 **밖에서** 들어오는 편집을 버퍼에 즉시 반영한다(PR-4: 「메모에
+    /// 추가」). `sync()`와 달리 같은 워크스페이스여도 **덮어쓴다** — stale snapshot이
+    /// 아니라 방금 확정된 새 편집이기 때문이다. loaded_workspace를 함께 맞춰 두면
+    /// 다음 sync()가 이 값을 stored로 되돌리지 않는다.
+    pub fn apply_external_edit(&mut self, workspace_id: &str, body: String) {
+        self.buffer = body;
+        self.loaded_workspace = Some(workspace_id.to_owned());
+    }
 }
 
 /// 메모 TextEdit 위젯 id — 포커스/커서 판정과 위젯 자신이 같은 값을 써야 한다.
@@ -550,5 +559,27 @@ mod tests {
             matches!(&harness.state().1, Some(NotesAction::Edited(body)) if body == &buffer),
             "삽입 후 Edited가 올라가야 저장 디바운스가 걸린다"
         );
+    }
+
+    /// 밖에서 들어온 편집(터미널 선택 → 메모에 추가)은 `sync()`와 달리 같은
+    /// 워크스페이스여도 버퍼를 덮어써야 한다 — 그래야 「메모」 탭을 이미 열어 둔
+    /// 채로 터미널에서 추가해도 화면에 바로 보인다.
+    #[test]
+    fn 밖에서_들어온_편집은_같은_워크스페이스여도_버퍼를_덮는다() {
+        let mut notes = NotesUi::new();
+        notes.sync(&NotesInput {
+            workspace_id: "ws-a",
+            stored: Some("원래 메모"),
+        });
+
+        notes.apply_external_edit("ws-a", "원래 메모\n추가된 줄".to_owned());
+        assert_eq!(notes.buffer, "원래 메모\n추가된 줄");
+
+        // 이후 sync가 stored(옛 값)로 되돌리면 안 된다 — loaded_workspace가 이미 ws-a.
+        notes.sync(&NotesInput {
+            workspace_id: "ws-a",
+            stored: Some("원래 메모"),
+        });
+        assert_eq!(notes.buffer, "원래 메모\n추가된 줄");
     }
 }

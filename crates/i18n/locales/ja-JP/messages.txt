@@ -981,3 +981,5 @@ agent_launcher.error.detection_failed = インストール済みエージェン�
 agent_launcher.error.busy = 別の設定または起動処理が進行中です。
 agent_launcher.error.launch_failed = エージェントセッションを開始できませんでした。
 agent_launcher.error.unavailable = 選択したエージェントまたはオプションは利用できません。
+workspace.menu.add_to_note = メモに追加
+workspace.menu.add_to_note_too_long = メモの上限(64KB)を超えたため追加できませんでした

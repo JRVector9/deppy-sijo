@@ -981,3 +981,5 @@ agent_launcher.error.detection_failed = 无法检测已安装的智能体。
 agent_launcher.error.busy = 另一项设置或启动操作正在进行。
 agent_launcher.error.launch_failed = 无法启动智能体会话。
 agent_launcher.error.unavailable = 所选智能体或选项已不可用。
+workspace.menu.add_to_note = 添加到备忘
+workspace.menu.add_to_note_too_long = 备忘已超过上限(64KB)，未添加

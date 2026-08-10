@@ -981,3 +981,5 @@ agent_launcher.error.detection_failed = 설치된 에이전트를 감지하지 �
 agent_launcher.error.busy = 다른 설정 또는 실행 작업이 진행 중입니다.
 agent_launcher.error.launch_failed = 에이전트 세션을 시작하지 못했습니다.
 agent_launcher.error.unavailable = 선택한 에이전트 또는 옵션을 더 이상 사용할 수 없습니다.
+workspace.menu.add_to_note = 메모에 추가
+workspace.menu.add_to_note_too_long = 메모 상한(64KB) 초과로 추가하지 못했습니다

@@ -1084,6 +1084,10 @@ pub struct WorkspaceUi {
     /// 해석(lsof 폴백 포함)과 트리·Finder 라우팅은 App 몫이라 요청만 쌓는다 — E4 ⑥
     /// take_open_environment와 같은 프레임 소비 패턴.
     session_folder_request: Option<SessionFolderRequest>,
+    /// pane 우클릭 → "메모에 추가" 요청 (PR-4). 선택 원문만 담는다 — 개행 처리·
+    /// 상한(WORKSPACE_NOTE_MAX_BYTES) 판정은 leaf가 storage 상수를 참조할 수 없어
+    /// App이 한다(check-boundary: leaf UI must not access the storage crate).
+    note_append_request: Option<String>,
     /// 터미널 마우스 선택 (session, anchor 셀, head 셀 — 드래그 방향 그대로,
     /// 렌더/복사 시 정규화). 새 출력(Viewport)이 오면 그 세션의 선택은 해제한다.
     selection: Option<(SessionId, usize, usize)>,
@@ -1465,6 +1469,7 @@ impl WorkspaceUi {
             open_environment_requested: false,
             new_session_requested: false,
             session_folder_request: None,
+            note_append_request: None,
             selection: None,
             project_name: None,
             ui_scale: 1.0,
@@ -4875,6 +4880,17 @@ impl WorkspaceUi {
                         ui.ctx().copy_text(clean_terminal_selection_for_copy(&text));
                         ui.close();
                     }
+                    // 선택 → 메모에 추가 (PR-4): 선택 원문을 그대로 워크스페이스 메모
+                    // 끝에 붙인다. "복사"와 같은 selection 판별을 재사용하고, 개행
+                    // 처리·상한 판정은 요청만 올려보내 App이 한다(leaf는 storage
+                    // 상수를 못 본다).
+                    if ui
+                        .button(catalog.t("workspace.menu.add_to_note", &[]))
+                        .clicked()
+                    {
+                        self.note_append_request = Some(text.clone());
+                        ui.close();
+                    }
                     // 선택 → 에이전트로 보내기 (2026-07-17 시나리오 ①): 에러 출력을
                     // 복사→pane 전환→붙여넣기→타이핑하던 흐름을 우클릭 두 번으로 줄인다.
                     // 대상은 **실행 중으로 감지된 에이전트 pane**(등록 목록이 아니라
@@ -4970,6 +4986,21 @@ impl WorkspaceUi {
     /// 확인해 cwd 해석 후 라우팅한다(2026-07-18).
     pub fn take_session_folder_request(&mut self) -> Option<SessionFolderRequest> {
         self.session_folder_request.take()
+    }
+
+    /// pane 우클릭의 "메모에 추가" 요청을 소비한다 — App이 프레임마다 확인해 개행
+    /// 처리·상한 판정 후 pending_note에 반영한다(PR-4, take_session_folder_request와
+    /// 같은 one-shot 소비 패턴).
+    pub fn take_note_append_request(&mut self) -> Option<String> {
+        self.note_append_request.take()
+    }
+
+    /// "메모에 추가"가 상한 초과로 거부됐음을 사용자에게 알린다. 판정 자체는 App
+    /// 몫이지만(leaf는 storage 상수를 못 본다) 배너 표시는 이 leaf의 self.error가
+    /// 이미 하는 일이라 그대로 위임한다(PR-4).
+    pub fn report_note_append_rejected(&mut self, message: String) {
+        self.error_is_pressure = false;
+        self.error = Some(message);
     }
 
     /// 「파일 트리를 이 폴더로 이동 / Finder에서 폴더 열기」 (2026-07-18 사용자) —

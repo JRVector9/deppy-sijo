@@ -8,8 +8,13 @@
 
 use anyhow::{Context, anyhow, ensure};
 use chacha20poly1305::{
-    Key, XChaCha20Poly1305, XNonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Key,
+    XChaCha20Poly1305,
+    XNonce,
+    // 0.11(aead 0.6)에서 `OsRng` 재노출과 `generate_key`/`generate_nonce`가 사라지고
+    // `Generate`로 통합됐다. `generate()`는 시스템 CSPRNG를 쓴다 — 우리가 RNG를
+    // 직접 들고 다닐 이유가 없어졌다. **알고리즘·blob 포맷은 그대로다.**
+    aead::{Aead, Generate, KeyInit},
 };
 use secret::hex::{from_hex, to_hex};
 use secret::{SecretStore, SecretString};
@@ -44,7 +49,7 @@ fn get_or_create_key(store: &dyn SecretStore) -> anyhow::Result<(String, Vec<u8>
         return Ok((AUDIT_KEY_ID.to_owned(), read_key(store)?));
     }
     // 확인된 부재 → 새 키 생성·저장.
-    let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+    let key = chacha20poly1305::Key::generate();
     store.set_secret(AUDIT_KEY_ID, &SecretString::new(to_hex(&key)))?;
     Ok((AUDIT_KEY_ID.to_owned(), key.to_vec()))
 }
@@ -54,7 +59,7 @@ pub fn encrypt_input(store: &dyn SecretStore, plaintext: &str) -> anyhow::Result
     let (key_id, key) = get_or_create_key(store)?;
     ensure!(key_id.len() <= u8::MAX as usize, "key_id가 너무 김");
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let nonce = XNonce::generate();
     let ciphertext = cipher
         .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| anyhow!("audit 입력 암호화 실패: {e}"))?;
@@ -120,6 +125,37 @@ mod tests {
         fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
             Ok(self.0.lock().unwrap().contains_key(id))
         }
+    }
+
+    /// **교차 버전 호환성 고정 벡터.**
+    ///
+    /// 이 blob은 chacha20poly1305 **0.10.1**(구버전)이 만든 것이다 — 고정 키(0x07×32)와
+    /// 고정 nonce(0x09×24)로 뽑아 hex로 박아 뒀다. 크레이트를 0.11로 올리면서 API가
+    /// 바뀌었는데(`generate_key`/`generate_nonce` → `Generate`), **저장된 감사 원문을
+    /// 여전히 읽을 수 있는지**가 이 변경의 진짜 위험이었다.
+    ///
+    /// XChaCha20-Poly1305는 표준이라 포맷이 같을 «것»이라는 추론에 기대지 않고, 실제
+    /// 구버전 산출물로 복호화를 확인한다. 이 테스트가 깨지면 기존 감사 로그를 못 읽는다.
+    #[test]
+    fn 구버전_0_10이_만든_blob을_그대로_복호화한다() {
+        const OLD_BLOB_HEX: &str = "1661756469742d656e6372797074696f6e2d6b65792d3109090909090909090909090909090909090909090909090954c27266fe06598e6f82e390d053778a539fd8fb24aeb9f4a7e6b27be5c48b0ab69ad24931";
+        let blob: Vec<u8> = (0..OLD_BLOB_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&OLD_BLOB_HEX[i..i + 2], 16).expect("hex"))
+            .collect();
+
+        // blob 구조: [key_id_len][key_id][nonce(24)][ciphertext+tag]
+        let key_id_len = blob[0] as usize;
+        let rest = &blob[1..];
+        assert_eq!(&rest[..key_id_len], AUDIT_KEY_ID.as_bytes());
+        let nonce = XNonce::from_slice(&rest[key_id_len..key_id_len + NONCE_LEN]);
+        let ciphertext = &rest[key_id_len + NONCE_LEN..];
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&[7u8; 32]));
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
+            .expect("구버전 blob을 새 크레이트로 복호화하지 못했다 — 기존 감사 로그가 유실된다");
+        assert_eq!(String::from_utf8(plaintext).unwrap(), "감사 원문 payload");
     }
 
     #[test]

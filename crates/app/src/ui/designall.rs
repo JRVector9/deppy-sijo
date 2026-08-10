@@ -83,6 +83,25 @@ pub fn tokens(visuals: &egui::Visuals) -> Tokens {
     if visuals.dark_mode { DARK } else { LIGHT }
 }
 
+/// `visuals.selection.stroke`에 심을 색 — egui는 이 값을 `selection.bg_fill`(accent)
+/// **위에 그려지는 전경색**으로 쓴다: 드래그로 선택한 글자 색(`text_selection/visuals.rs:40`),
+/// selectable_label/selectable_value의 선택 상태 글자 색(`widget_style.rs:153-154`,
+/// `style.rs:364`), ProgressBar가 채운 구간 위 퍼센트 글자 색(`progress_bar.rs:199`) —
+/// 전부 egui 0.35.0 기준. accent와 같은 값을 쓰면 accent 배경 위 accent 글자가 되어
+/// 통째로 사라진다(2026-08-10 실증). 휘도 기반으로 흑/백을 골라 항상 읽히게 한다.
+///
+/// `crates/app/src/ui/notes.rs`의 메모칸 로컬 우회와 같은 공식이다.
+pub fn selection_text_color(accent: egui::Color32) -> egui::Color32 {
+    let luma = 0.299 * f32::from(accent.r())
+        + 0.587 * f32::from(accent.g())
+        + 0.114 * f32::from(accent.b());
+    if luma > 140.0 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
 pub fn row_fill(tokens: Tokens, selected: bool, hovered: bool) -> Option<egui::Color32> {
     selected
         .then_some(tokens.selected_background)
@@ -142,7 +161,12 @@ pub fn apply_workspace_visuals(ui: &mut egui::Ui) {
     visuals.warn_fg_color = tokens.warning;
     visuals.error_fg_color = tokens.error;
     visuals.selection.bg_fill = tokens.accent;
-    visuals.selection.stroke = egui::Stroke::new(1.0, tokens.accent);
+    // stroke는 accent가 아니라 accent 배경 위에서 읽히는 대비색이다 — 자세한 이유는
+    // `selection_text_color` 문서를 참고. 예전엔 여기도 accent를 그대로 써서 드래그
+    // 선택·selectable_label 선택 글자가 배경에 묻혀 사라졌다(2026-08-10 실증).
+    //
+
+    visuals.selection.stroke = egui::Stroke::new(1.0, selection_text_color(tokens.accent));
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, tokens.separator);
 }
 
@@ -199,5 +223,47 @@ mod tests {
         assert_eq!(row_fill(DARK, false, false), None);
         assert_eq!(row_fill(DARK, true, false), Some(DARK.selected_background));
         assert_eq!(row_fill(DARK, false, true), Some(DARK.hover_background));
+    }
+
+    /// 경계값 표. 다크·라이트 실제 액센트가 각각 어느 쪽으로 갈리는지, 그리고
+    /// 휘도 임계값(140) 바로 위·아래가 실제로 갈라지는지를 고정한다.
+    #[test]
+    fn selection_text_color_picks_contrast_by_luma() {
+        let cases: [(egui::Color32, egui::Color32, &str); 6] = [
+            (
+                DARK.accent,
+                egui::Color32::BLACK,
+                "다크 액센트 #39b8e8, 휘도 151.5 — 밝음",
+            ),
+            (
+                LIGHT.accent,
+                egui::Color32::WHITE,
+                "라이트 액센트 #1c93aa, 휘도 114.0 — 어두움",
+            ),
+            (egui::Color32::BLACK, egui::Color32::WHITE, "순검정, 휘도 0"),
+            (egui::Color32::WHITE, egui::Color32::BLACK, "순백, 휘도 255"),
+            (
+                egui::Color32::from_rgb(140, 140, 140),
+                egui::Color32::WHITE,
+                "무채색 휘도 정확히 140 — 임계값 이하라 흰색",
+            ),
+            (
+                egui::Color32::from_rgb(141, 141, 141),
+                egui::Color32::BLACK,
+                "무채색 휘도 141 — 임계값을 넘어 검정",
+            ),
+        ];
+        for (accent, expected, label) in cases {
+            assert_eq!(selection_text_color(accent), expected, "{label}");
+        }
+    }
+
+    /// 대비색이 accent 자신과 같은 값이면 애초에 이 함수를 만든 이유가 사라진다 —
+    /// accent 배경 위에서 다시 안 보이게 된다.
+    #[test]
+    fn selection_text_color_never_matches_its_input() {
+        for accent in [DARK.accent, LIGHT.accent] {
+            assert_ne!(selection_text_color(accent), accent);
+        }
     }
 }

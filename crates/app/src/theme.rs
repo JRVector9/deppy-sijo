@@ -120,9 +120,17 @@ fn palette(
     v.extreme_bg_color = bg; // TextEdit/깊은 배경
     v.faint_bg_color = panel2;
     v.hyperlink_color = accent;
-    // 컴포넌트들이 accent로 참조하는 selection.bg_fill/stroke = 풀 시안.
+    // 컴포넌트들이 accent로 참조하는 selection.bg_fill = 풀 시안.
     v.selection.bg_fill = accent;
-    v.selection.stroke = Stroke::new(1.0, accent);
+    // stroke는 accent가 아니다 — egui는 이 색을 selection.bg_fill(accent) **배경 위에
+    // 그려지는 전경색**으로 쓴다: 드래그로 선택한 글자 색, selectable_label 선택 글자 색
+    // 등(자세한 근거는 `designall::selection_text_color` 문서). 예전엔 여기도 accent를
+    // 그대로 써서 accent 배경 위 accent 글자가 되어 드래그 선택한 글자가 통째로
+    // 사라졌다(2026-08-10 실증). 휘도 기반 대비색(흑/백)으로 바꾼다.
+    //
+    // accent **원색**이 필요한 곳은 `selection.bg_fill`을 읽는다(그쪽은 그대로 accent다).
+    // 이 커밋에서 activity/file_tree/workspace 세 곳을 그렇게 옮겼다.
+    v.selection.stroke = Stroke::new(1.0, crate::ui::designall::selection_text_color(accent));
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = panel;

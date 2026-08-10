@@ -115,27 +115,6 @@ impl NotesUi {
             .fill(tokens.workspace_background)
             .inner_margin(egui::Margin::symmetric(8, 6));
 
-        // 앱 전역 테마는 `selection.bg_fill`과 `selection.stroke`를 **둘 다 accent**로 둔다
-        // (theme.rs:124-125, designall.rs:144-145 — 다른 컴포넌트가 이 값을 accent 소스로
-        // 참조하기 때문). 그런데 egui는 stroke를 **선택된 글자 색**으로도 쓰므로
-        // (`text_selection/visuals.rs:40`) accent 배경 위 accent 글자가 되어 드래그하면
-        // 글이 사라진다(2026-08-10 실증). 전역을 바꾸면 accent를 참조하는 컴포넌트가
-        // 함께 흔들리므로 **이 칸에서만** 대비가 나오는 색으로 되돌린다.
-        // `.frame()`을 쓰므로 이 값이 테두리로 새지 않는다.
-        let accent = tokens.accent;
-        let accent_luma = 0.299 * f32::from(accent.r())
-            + 0.587 * f32::from(accent.g())
-            + 0.114 * f32::from(accent.b());
-        let mut visuals = ui.visuals().clone();
-        visuals.selection.stroke = egui::Stroke::new(
-            1.0,
-            if accent_luma > 140.0 {
-                egui::Color32::BLACK
-            } else {
-                egui::Color32::WHITE
-            },
-        );
-
         // 뷰포트(보이는 칸)의 자리를 먼저 잡는다. 밑줄은 스크롤과 함께 흘러가면 안 되므로
         // 이 사각형 기준으로 그린다.
         let viewport = egui::Rect::from_min_size(
@@ -153,7 +132,6 @@ impl NotesUi {
         let response = egui::Frame::NONE
             .inner_margin(egui::Margin::same(INSET as i8))
             .show(ui, |ui| {
-                *ui.visuals_mut() = visuals;
                 // 내용이 칸을 넘으면 **안에서** 스크롤한다. 사이드바 전체가 밀리거나
                 // 글이 잘려 나가면 안 된다(2026-08-10 사용자 지적).
                 egui::ScrollArea::vertical()

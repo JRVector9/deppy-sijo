@@ -39,6 +39,20 @@ pub struct RowInfo<'a> {
     pub bottom: f32,
 }
 
+/// 이 행에 놓았을 때 실제로 무슨 일이 일어나는가.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropEligibility {
+    /// 옮겨진다.
+    Allowed,
+    /// 놓아도 **아무 일이 없다** — 이미 그 폴더 안이다. host도 no-op으로 처리한다
+    /// (`app.rs`의 `app_host_move`: `if source_parent == destination_dir { return Ok(()) }`).
+    /// 표시는 하되 회색으로 — 침묵하면 사용자에겐 고장으로 보인다(2026-08-11 사용자).
+    NoOp,
+    /// 애초에 불가능하다 — 자기 자신이거나 자기 자손 안으로 넣으려는 경우.
+    /// 아무것도 그리지 않는다.
+    Forbidden,
+}
+
 /// 이 행에서 판정된 드롭 대상.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowDropTarget {
@@ -50,6 +64,13 @@ pub enum RowDropTarget {
     InsertBelow,
 }
 
+/// 한 행의 판정 결과 — 어디에 그릴지(`target`)와 어떤 톤으로 그릴지(`eligibility`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DropDecision {
+    pub target: RowDropTarget,
+    pub eligibility: DropEligibility,
+}
+
 /// 드래그 중인 경로를 이 행에 떨어뜨릴 수 있는지, 있다면 어떤 형태인지.
 ///
 /// `None`인 경우:
@@ -57,7 +78,7 @@ pub enum RowDropTarget {
 /// - 자기 자신에게 떨어뜨리려는 경우
 /// - 폴더를 **자기 자손** 안으로 넣으려는 경우(디렉터리 순환)
 /// - 부모가 없는 행(루트)에 삽입선을 그리려는 경우
-pub fn row_drop_target(row: RowInfo<'_>, pointer_y: f32, dragged: &Path) -> Option<RowDropTarget> {
+pub fn row_drop_target(row: RowInfo<'_>, pointer_y: f32, dragged: &Path) -> Option<DropDecision> {
     if pointer_y < row.top || pointer_y >= row.bottom {
         return None;
     }
@@ -69,51 +90,50 @@ pub fn row_drop_target(row: RowInfo<'_>, pointer_y: f32, dragged: &Path) -> Opti
     let offset = (pointer_y - row.top) / height;
     let wants_into = row.is_dir && (EDGE_BAND..1.0 - EDGE_BAND).contains(&offset);
 
-    if wants_into {
-        return can_drop_into(dragged, row.path).then_some(RowDropTarget::IntoFolder);
-    }
-
-    // 삽입선 = 이 행의 부모 폴더로. 부모가 없으면(루트) 그릴 자리가 없다.
-    let parent = row.path.parent()?;
-    if !can_drop_into(dragged, parent) {
-        return None;
-    }
-    Some(if offset < 0.5 {
-        RowDropTarget::InsertAbove
+    let (target, destination) = if wants_into {
+        (RowDropTarget::IntoFolder, row.path)
     } else {
-        RowDropTarget::InsertBelow
-    })
+        // 삽입선 = 이 행의 부모 폴더로. 부모가 없으면(루트) 그릴 자리가 없다.
+        let parent = row.path.parent()?;
+        let edge = if offset < 0.5 {
+            RowDropTarget::InsertAbove
+        } else {
+            RowDropTarget::InsertBelow
+        };
+        (edge, parent)
+    };
+
+    match drop_eligibility(dragged, destination) {
+        // 불가능한 것에 표시를 그리면 될 것처럼 보였다가 거부된다 — 아무것도 안 그린다.
+        DropEligibility::Forbidden => None,
+        eligibility => Some(DropDecision {
+            target,
+            eligibility,
+        }),
+    }
 }
 
-/// `dragged`를 `target` 폴더 안으로 옮길 수 있나.
+/// `dragged`를 `target` 폴더에 놓으면 무슨 일이 일어나는가.
 ///
-/// 막는 경우 셋:
-/// - 자기 자신을 자기 안으로
-/// - **이미 그 폴더 안에 있는 것**을 같은 폴더로 (이동이 아무 일도 안 한다)
-/// - 폴더를 자기 자손 안으로 (디렉터리가 자기를 삼킨다)
-///
-/// 비교 전에 `.`/`..`을 컴포넌트 단위로 걷어낸다 — `Path::starts_with`·`parent()`는
-/// 리터럴 컴포넌트만 보므로 `/repo/../repo/src`처럼 정규화 안 된 입력이 오면 실제로는
-/// `/repo/src`인데도 "이미 그 폴더 안"을 놓친다. 트리에서 오는 경로는 항상 정규화돼
-/// 있지만(§set_root 주석), 이 함수는 공개 API라 방어적으로 정규화한다.
-///
-/// symlink는 못 따라간다(파일시스템을 안 읽는 순수 함수라서다) — 그래서 이 함수는
-/// UI 판정이지 보안 경계가 아니다. symlink로 우회한 순환은 host의 `app_host_move`가
-/// canonicalize로 최종 차단한다.
-pub fn can_drop_into(dragged: &Path, target: &Path) -> bool {
+/// 「불가능」과 「해도 아무 일 없음」을 나누는 게 핵심이다. 예전엔 둘 다 `false`로 묶어
+/// 침묵했는데, 같은 폴더 안에서 끄는 흔한 경우에 아무 표시가 없어 **고장으로 보였다**
+/// (2026-08-11 사용자: "파일과 파일 사이엔 안떠").
+pub fn drop_eligibility(dragged: &Path, target: &Path) -> DropEligibility {
     let dragged = normalize_lexically(dragged);
     let target = normalize_lexically(target);
-    if dragged == target {
-        return false;
+    // 자기 자신 / 자기 자손 안으로 — 순환이라 애초에 불가능하다.
+    // (`dragged == target`은 `starts_with`에 포함되지만 의도를 남겨 둔다.)
+    if dragged == target || target.starts_with(&dragged) {
+        return DropEligibility::Forbidden;
     }
     if dragged.parent() == Some(target.as_path()) {
-        return false;
+        return DropEligibility::NoOp;
     }
-    !target.starts_with(&dragged)
+    DropEligibility::Allowed
 }
 
 /// `.`/`..`을 파일시스템 접근 없이 컴포넌트 단위로 걷어낸다. symlink는 고려하지
-/// 않는다(리터럴 경로만 안다) — `can_drop_into`의 문서 참고.
+/// 않는다(리터럴 경로만 안다) — `drop_eligibility`의 문서 참고.
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -143,6 +163,21 @@ mod tests {
         pointer_y: f32,
         dragged: &str,
     ) -> Option<RowDropTarget> {
+        decide(row, is_dir, pointer_y, dragged).map(|decision| decision.target)
+    }
+
+    /// 옛 `can_drop_into`와 같은 의미 — 「옮겨진다」만 참.
+    /// NoOp(이미 그 폴더 안)과 Forbidden(순환)은 둘 다 거짓이다.
+    fn allowed(dragged: &Path, target: &Path) -> bool {
+        matches!(drop_eligibility(dragged, target), DropEligibility::Allowed)
+    }
+
+    fn decide(
+        row: &(PathBuf, f32, f32),
+        is_dir: bool,
+        pointer_y: f32,
+        dragged: &str,
+    ) -> Option<DropDecision> {
         row_drop_target(
             RowInfo {
                 path: &row.0,
@@ -221,25 +256,16 @@ mod tests {
     #[test]
     fn 무의미하거나_순환하는_이동은_막는다() {
         // 자기 자신
-        assert!(!can_drop_into(
-            Path::new("/repo/src"),
-            Path::new("/repo/src")
-        ));
+        assert!(!allowed(Path::new("/repo/src"), Path::new("/repo/src")));
         // 이미 그 폴더 안에 있다 — 옮겨도 아무 일이 없다
-        assert!(!can_drop_into(
+        assert!(!allowed(
             Path::new("/repo/src/main.rs"),
             Path::new("/repo/src")
         ));
         // 폴더를 자기 자손 안으로 — 디렉터리가 자기를 삼킨다
-        assert!(!can_drop_into(
-            Path::new("/repo/src"),
-            Path::new("/repo/src/ui")
-        ));
+        assert!(!allowed(Path::new("/repo/src"), Path::new("/repo/src/ui")));
         // 정상
-        assert!(can_drop_into(
-            Path::new("/repo/a.txt"),
-            Path::new("/repo/src")
-        ));
+        assert!(allowed(Path::new("/repo/a.txt"), Path::new("/repo/src")));
     }
 
     /// `starts_with`는 문자열이 아니라 경로 컴포넌트 단위로 비교한다 — 이름이
@@ -247,11 +273,11 @@ mod tests {
     /// (문자열 prefix로 잘못 구현했다면 이 테스트가 잡아낸다.)
     #[test]
     fn 이름이_겹치는_형제는_조상_자손_관계가_아니다() {
-        assert!(can_drop_into(
+        assert!(allowed(
             Path::new("/repo/src"),
             Path::new("/repo/src-backup")
         ));
-        assert!(can_drop_into(
+        assert!(allowed(
             Path::new("/repo/src-backup"),
             Path::new("/repo/src")
         ));
@@ -262,20 +288,14 @@ mod tests {
     /// `/repo/src`이고 그 부모는 `/repo`이므로 막혀야 한다.
     #[test]
     fn 리터럴_dotdot이_있어도_이미_그_폴더_안이면_막는다() {
-        assert!(!can_drop_into(
-            Path::new("/repo/../repo/src"),
-            Path::new("/repo")
-        ));
+        assert!(!allowed(Path::new("/repo/../repo/src"), Path::new("/repo")));
     }
 
     /// 리터럴 `.`은 Rust `Path`가 컴포넌트 비교에서 이미 걸러낸다(`..`과 달리
     /// 정규화가 필요 없다) — 회귀 방지로 고정해 둔다.
     #[test]
     fn 리터럴_dot은_원래도_안전하다() {
-        assert!(!can_drop_into(
-            Path::new("/repo/./src"),
-            Path::new("/repo/src")
-        ));
+        assert!(!allowed(Path::new("/repo/./src"), Path::new("/repo/src")));
     }
 
     /// 폴더를 자기 자손 위로 끌어도 진입/삽입선 어느 쪽도 뜨지 않아야 한다.
@@ -300,6 +320,38 @@ mod tests {
     fn 부모가_없으면_삽입선을_그리지_않는다() {
         let row = dir("/", 100.0, 120.0);
         assert_eq!(target(&row, true, 101.0, "/other/a.txt"), None);
+    }
+
+    /// **같은 폴더 안**에서 끄는 흔한 경우 — 놓아도 아무 일이 없지만 표시는 나와야 한다.
+    /// 예전엔 `None`(침묵)이라 사용자에게 고장으로 보였다(2026-08-11 실증:
+    /// `Sample.md`를 같은 폴더의 `Sample.html` 위로 끌면 아무것도 안 떴다).
+    #[test]
+    fn 같은_폴더_안_이동은_회색으로라도_표시한다() {
+        let row = dir("/repo/src/main.rs", 100.0, 120.0);
+        let decision =
+            decide(&row, false, 110.0, "/repo/src/other.rs").expect("표시가 있어야 한다");
+        assert_eq!(decision.target, RowDropTarget::InsertBelow);
+        assert_eq!(decision.eligibility, DropEligibility::NoOp);
+    }
+
+    /// 다른 폴더에서 온 것은 Allowed — accent로 그린다.
+    #[test]
+    fn 다른_폴더에서_온_이동은_allowed다() {
+        let row = dir("/repo/src/main.rs", 100.0, 120.0);
+        let decision = decide(&row, false, 110.0, "/other/a.txt").expect("표시가 있어야 한다");
+        assert_eq!(decision.eligibility, DropEligibility::Allowed);
+    }
+
+    /// 불가능한 것(자기 자손 안으로)은 여전히 아무것도 그리지 않는다 — 될 것처럼
+    /// 보였다가 거부되는 게 침묵보다 나쁘다.
+    #[test]
+    fn 순환하는_이동은_회색으로도_표시하지_않는다() {
+        assert_eq!(
+            drop_eligibility(Path::new("/repo/src"), Path::new("/repo/src/ui")),
+            DropEligibility::Forbidden
+        );
+        let row = dir("/repo/src/ui", 100.0, 120.0);
+        assert_eq!(decide(&row, true, 110.0, "/repo/src"), None);
     }
 
     /// 높이가 0인 행(레이아웃 과도기)에서 0으로 나누지 않는다.

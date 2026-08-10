@@ -39,7 +39,10 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use deppy_core::time::unix_secs;
 use hkdf::Hkdf;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+// elliptic-curve 0.14에서 `ToEncodedPoint`는 이름만 남은 deprecated 스텁이 되고
+// 실제 메서드가 `ToSec1Point::to_sec1_point`로 옮겨졌다. 바이트 표현(SEC1
+// uncompressed, 65바이트)은 그대로라 RFC 8291 계산에 영향이 없다.
+use p256::elliptic_curve::sec1::ToSec1Point;
 use secret::hex::{from_hex, to_hex};
 use secret::{SecretStore, SecretString};
 use sha2::Sha256;
@@ -108,7 +111,7 @@ impl VapidKey {
     fn from_scalar(bytes: &[u8]) -> anyhow::Result<Self> {
         let signing = p256::ecdsa::SigningKey::from_slice(bytes)
             .context("VAPID 개인키가 유효한 P-256 스칼라가 아님")?;
-        let point = signing.verifying_key().to_encoded_point(false);
+        let point = signing.verifying_key().to_sec1_point(false);
         let public_raw: [u8; 65] = point
             .as_bytes()
             .try_into()
@@ -237,12 +240,12 @@ fn seal(
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 
-    let as_public_point = as_secret.public_key().to_encoded_point(false);
+    let as_public_point = as_secret.public_key().to_sec1_point(false);
     let as_public: [u8; 65] = as_public_point
         .as_bytes()
         .try_into()
         .context("서버 임시 공개키 인코딩 길이 오류")?;
-    let ua_public_point = ua_public.to_encoded_point(false);
+    let ua_public_point = ua_public.to_sec1_point(false);
     let ua_public_raw: [u8; 65] = ua_public_point
         .as_bytes()
         .try_into()
@@ -1360,9 +1363,9 @@ mod tests {
         let salt: [u8; 16] = ub(RFC_SALT).try_into().unwrap();
 
         // 먼저 CEK/NONCE 중간값을 부록 A와 대조(실패 지점 국소화).
-        let as_public_point = as_secret.public_key().to_encoded_point(false);
+        let as_public_point = as_secret.public_key().to_sec1_point(false);
         let as_public: [u8; 65] = as_public_point.as_bytes().try_into().unwrap();
-        let ua_public_point = ua_public.to_encoded_point(false);
+        let ua_public_point = ua_public.to_sec1_point(false);
         let ua_public_raw: [u8; 65] = ua_public_point.as_bytes().try_into().unwrap();
         let shared =
             p256::ecdh::diffie_hellman(as_secret.to_nonzero_scalar(), ua_public.as_affine());

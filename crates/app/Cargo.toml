@@ -81,11 +81,17 @@ libc = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 # 메모리 압박 감지 (로드맵 C1) — rfd가 이미 쓰는 crate라 추가 빌드 비용 없음.
 dispatch2 = "0.3"
-muda = "0.19.3"
+# default = ["libxdo", "gtk"]. 두 의존 모두 리눅스 타깃 게이팅이지만 feature 해석은
+# 타깃과 무관해 락파일에 gtk3 사슬 전체(gtk/atk/gdk/gio/pango/glib/proc-macro-error)가
+# 들어온다 — RUSTSEC-2024-0412/0413/0415/0416/0418/0419/0420/0429, 0370. muda 0.19.3이
+# 최신이라 버전으로는 못 푼다. macOS 메뉴 백엔드는 이 feature들이 필요 없다.
+muda = { version = "0.19.3", default-features = false }
 # 상단바 신호등(닫기/최소화/전체화면) 수직 재배치 — eframe이 이미 쓰는 winit을
 # 직접 참조해 CreationContext::winit_window()에 WindowExtMacOS를 쓴다
 # (third_party/winit-0.30.13 patch, 2026-07-25).
-winit = "0.30"
+# eframe이 winit에 요청하는 것과 같은 최소 조합. default를 받으면 x11/wayland/
+# wayland-csd-adwaita가 켜져 ttf-parser가 딸려온다(위 eframe 주석 참고).
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 # 클립보드 PNG 바이트 직행(디코드/재인코딩 없이 파일로 — cmux 방식, 2026-07-08).
 # eframe/winit이 이미 쓰는 crate라 추가 빌드 비용 미미.
 objc2-app-kit = { version = "0.3", default-features = false, features = [

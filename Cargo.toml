@@ -39,7 +39,16 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # 기본 feature의 wgpu/Metal만 production에 포함한다. Glow/OpenGL A/B 벤치는 app의
 # `render-glow` feature가 필요할 때만 추가해 일반 배포의 코드/프레임워크 매핑을 줄인다.
-eframe = "0.35"
+# default-features를 끄는 이유: eframe의 default가 `winit/default`를 켜고, 그게
+# wayland-csd-adwaita → sctk-adwaita → ab_glyph → owned_ttf_parser → ttf-parser를
+# 끌어온다(RUSTSEC-2026-0192, 수정판 없음). x11/wayland/web_screen_reader와 함께
+# 전부 리눅스·wasm 전용이라 macOS 빌드에는 쓰이지 않으면서 감사 그래프만 오염시킨다.
+# 리눅스 GUI를 지원하려면 "wayland", "x11", "winit/default"를 다시 켜야 한다.
+eframe = { version = "0.35", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",
+] }
 egui = "0.35"
 anyhow = "1"
 serde = { version = "1", features = ["derive", "rc"] }

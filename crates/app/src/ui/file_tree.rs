@@ -277,6 +277,9 @@ pub struct SidebarSnapshot<'a> {
     pub fleet_count: usize,
     /// Agents 창 열림 여부 — 하단 nav 「에이전트」 행의 선택 상태 (2026-07-18).
     pub agents_open: bool,
+    /// 활성 워크스페이스에 저장된 메모 본문. 미작성이면 `None`.
+    /// leaf는 워크스페이스가 **바뀔 때만** 이 값으로 편집 버퍼를 교체한다.
+    pub workspace_note: Option<&'a str>,
 }
 
 /// 사이드바에서 App으로 올라가는 액션.
@@ -289,7 +292,8 @@ pub enum SidebarAction {
     OpenSettings,
     OpenHelp,
     ShowFocusedDiff,
-    OpenConnectors,
+    /// 메모 본문이 바뀌었다. App이 디바운스해 DB에 쓴다(leaf는 IO를 하지 않는다).
+    NoteEdited(String),
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
     OpenMacosFileAccessSettings,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
@@ -363,24 +367,29 @@ pub enum SidebarAction {
 enum SidebarTool {
     Files,
     Git,
-    Mcp,
+    /// 워크스페이스 스크래치패드. 「파일」과 같이 사이드바 본문을 차지하는 **인라인** 탭이다.
+    Notes,
 }
 
-const SIDEBAR_TOOLS: [SidebarTool; 3] = [SidebarTool::Files, SidebarTool::Git, SidebarTool::Mcp];
+/// MCP 탭은 2026-08-10에 뺐다 — 다른 둘은 사이드바/메인 창 안에서 끝나는데 혼자
+/// **설정(별도 OS 창)** 을 열어 레벨이 달랐다. 연결 설정은 설정 → 관리 → 「연결」이
+/// 계속 담당한다.
+const SIDEBAR_TOOLS: [SidebarTool; 3] = [SidebarTool::Files, SidebarTool::Git, SidebarTool::Notes];
 
 fn sidebar_tool_label_key(tool: SidebarTool) -> &'static str {
     match tool {
         SidebarTool::Files => "sidebar.tool.files",
         SidebarTool::Git => "sidebar.tool.git",
-        SidebarTool::Mcp => "sidebar.tool.mcp",
+        SidebarTool::Notes => "sidebar.tool.notes",
     }
 }
 
+/// 인라인 탭(본문을 차지하는 것)은 `None`을 돌려준다 — 탭 선택만 바꾸면 된다.
+/// `Some`은 "다른 화면에 작용한다"는 뜻이다.
 fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
     match tool {
-        SidebarTool::Files => None,
+        SidebarTool::Files | SidebarTool::Notes => None,
         SidebarTool::Git => Some(SidebarAction::ShowFocusedDiff),
-        SidebarTool::Mcp => Some(SidebarAction::OpenConnectors),
     }
 }
 
@@ -932,6 +941,11 @@ enum RootListingError {
 }
 
 pub struct FileTreeUi {
+    /// 사이드바 본문을 차지하는 인라인 탭(파일 / 메모). Git은 다른 화면에 작용하므로
+    /// 여기 남지 않는다 — 눌러도 선택이 바뀌지 않고 diff만 열린다.
+    selected_tool: SidebarTool,
+    /// 메모 탭 편집 상태. leaf라 DB를 만지지 않고 편집만 소유한다.
+    notes: super::notes::NotesUi,
     /// workspace 루트. None = path 미설정 → 안내 표시(§9-2).
     root: Option<PathBuf>,
     /// 루트 나열 실패 사유 (invalid root — 에러 라벨 + 트리 비활성, §9-2).
@@ -1041,6 +1055,8 @@ impl FileTreeUi {
             flat: Vec::new(),
             show_hidden: false,
             collapsed: false,
+            selected_tool: SidebarTool::Files,
+            notes: super::notes::NotesUi::new(),
             sidebar_width: 200.0,
             navigation_rail_width: crate::ui::designall::NAV_RAIL_WIDTH,
             service_statuses: RailServiceStatus::defaults(),
@@ -2487,13 +2503,18 @@ impl FileTreeUi {
                 egui::pos2(tab_left, header_rect.top()),
                 egui::vec2(width, header_rect.height()),
             );
-            let active = matches!(tool, SidebarTool::Files);
+            let active = *tool == self.selected_tool;
             if sidebar_tool_tab_at(ui, rect, label, active).clicked() {
-                match tool {
-                    SidebarTool::Files => {}
-                    SidebarTool::Git | SidebarTool::Mcp => {
-                        action = sidebar_tool_action(*tool);
+                match sidebar_tool_action(*tool) {
+                    // 인라인 탭 — 본문을 바꾼다. 메모로 들어가면 커서를 바로 잡는다.
+                    None => {
+                        self.selected_tool = *tool;
+                        if *tool == SidebarTool::Notes {
+                            self.notes.request_focus();
+                        }
                     }
+                    // 다른 화면에 작용하는 탭 — 선택은 그대로 둔다.
+                    Some(tool_action) => action = Some(tool_action),
                 }
             }
             tab_left += width;
@@ -2508,6 +2529,24 @@ impl FileTreeUi {
             separator_y,
             crate::ui::designall::separator_stroke(ui.visuals()),
         );
+
+        // 메모 탭은 파일 트리 대신 본문을 통째로 쓴다. 여기서 반환하므로 아래
+        // 파일 트리·에러 표시는 그리지 않는다 — 파일 오류는 「파일」 탭으로 돌아오면
+        // `self.error`가 그대로 남아 있어 다시 보인다.
+        if self.selected_tool == SidebarTool::Notes {
+            let note_action = self.notes.render(
+                ui,
+                super::notes::NotesInput {
+                    workspace_id: sidebar.active_workspace_id,
+                    stored: sidebar.workspace_note,
+                },
+                catalog,
+            );
+            if let Some(super::notes::NotesAction::Edited(body)) = note_action {
+                action = Some(SidebarAction::NoteEdited(body));
+            }
+            return action;
+        }
 
         let header_drop = ui.interact(
             header_rect,
@@ -6377,16 +6416,15 @@ mod tests {
     fn designall_사이드바도구는_기존기능으로만_연결된다() {
         assert_eq!(
             SIDEBAR_TOOLS,
-            [SidebarTool::Files, SidebarTool::Git, SidebarTool::Mcp]
+            [SidebarTool::Files, SidebarTool::Git, SidebarTool::Notes]
         );
+        // 인라인 탭은 액션이 없다 — 탭 선택만 바꾼다.
         assert!(sidebar_tool_action(SidebarTool::Files).is_none());
+        assert!(sidebar_tool_action(SidebarTool::Notes).is_none());
+        // 다른 화면에 작용하는 탭만 액션을 낸다.
         assert!(matches!(
             sidebar_tool_action(SidebarTool::Git),
             Some(SidebarAction::ShowFocusedDiff)
-        ));
-        assert!(matches!(
-            sidebar_tool_action(SidebarTool::Mcp),
-            Some(SidebarAction::OpenConnectors)
         ));
     }
 
@@ -7347,6 +7385,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     if matches!(
                         state.tree.contents(
@@ -7521,6 +7560,7 @@ mod tests {
             home_notice_count: 0,
             fleet_count: 0,
             agents_open: false,
+            workspace_note: None,
         };
         let ctx = egui::Context::default();
         install_sidebar_test_fonts(&ctx);
@@ -7941,6 +7981,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     state.0.panel(ui, &sessions, &snapshot, &catalog);
                 },
@@ -8101,6 +8142,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     match state.tree.panel(ui, &sessions, &snapshot, &catalog) {
                         Some(SidebarAction::SwitchWorkspace(workspace_id)) => {
@@ -8219,6 +8261,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     state
                         .0
@@ -8287,6 +8330,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     if let Some(a) =
                         state
@@ -8405,6 +8449,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     if let Some(a) =
                         state
@@ -8673,6 +8718,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     if let Some(action) = state.0.panel(ui, &sessions, &snapshot, &catalog) {
                         state.1.push(action);
@@ -9037,6 +9083,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     if let Some(a) =
                         state
@@ -9111,6 +9158,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     if let Some(action) =
                         state
@@ -9152,6 +9200,7 @@ mod tests {
             home_notice_count: 0,
             fleet_count: 0,
             agents_open: false,
+            workspace_note: None,
         };
         let ctx = egui::Context::default();
         install_sidebar_test_fonts(&ctx);
@@ -9172,7 +9221,7 @@ mod tests {
     }
 
     #[test]
-    fn kittest_파일헤더는_파일_git_mcp탭만_표시한다() {
+    fn kittest_파일헤더는_파일_git_메모탭만_표시한다() {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -9183,7 +9232,10 @@ mod tests {
 
         assert!(harness.query_by_label("Files").is_some());
         assert!(harness.query_by_label("Git").is_some());
-        assert!(harness.query_by_label("MCP").is_some());
+        assert!(harness.query_by_label("Notes").is_some());
+        // MCP 탭은 뺐다(2026-08-10) — 혼자 설정(별도 OS 창)을 열어 레벨이 달랐다.
+        // 연결 설정은 설정 → 관리 → 「연결」이 계속 담당한다.
+        assert!(harness.query_by_label("MCP").is_none());
         assert!(harness.query_by_label("Search").is_none());
         assert!(harness.query_by_label("Terminal").is_none());
     }
@@ -9243,6 +9295,7 @@ mod tests {
                         home_notice_count: 4,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     if let Some(a) =
                         state
@@ -9401,6 +9454,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     if let Some(a) =
                         state
@@ -9790,6 +9844,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         agents_open: false,
+                        workspace_note: None,
                     };
                     let _ =
                         state

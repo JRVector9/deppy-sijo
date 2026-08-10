@@ -17,6 +17,7 @@ pub mod file_tree;
 pub mod fleet;
 pub mod inbox_approvals;
 pub mod inbox_waiting;
+pub mod notes;
 pub mod notifications;
 pub(crate) mod ports;
 pub mod prompt_palette;

@@ -2858,25 +2858,33 @@ impl FileTreeUi {
                         && let Some(pos) = drag_pos
                         && hover_rect.contains(pos)
                     {
-                        drop_target_dir = Some(row_target_dir(row, self.root.as_deref()));
+                        // 내부 드래그와 **같은 판정 함수**를 쓴다. 표시와 목적지를 각각
+                        // 계산하면 반드시 어긋난다 — 실제로 어긋났었다: 폴더 행 가장자리에
+                        // 삽입 마커를 그려놓고(=부모로 간다는 뜻) `row_target_dir`은 밴드를
+                        // 무시하고 그 폴더 자신을 돌려줘, **폴더와 폴더 사이에 놓으면 옆
+                        // 폴더 안으로 들어갔다**(2026-08-11 사용자). 이제 한 곳에서 정하고
+                        // 그림과 목적지가 그 하나를 함께 쓴다.
+                        //
+                        // 외부 드래그는 payload 경로를 알 수 없으므로(macOS는 드롭 전까지
+                        // 경로를 안 준다) 판정에 넣을 `dragged`가 없다. 밖에서 온 파일이라
+                        // 순환도 "이미 그 폴더 안"도 성립하지 않으니 밴드만 본다.
+                        let target = super::file_drop::band_target(
+                            row.is_dir,
+                            hover_rect.top(),
+                            hover_rect.bottom(),
+                            pos.y,
+                        );
+                        drop_target_dir = Some(match target {
+                            super::file_drop::RowDropTarget::IntoFolder => row.path.clone(),
+                            // 삽입 마커 = 이 행의 **부모** 폴더로. 폴더 행 가장자리도 마찬가지다.
+                            _ => row
+                                .path
+                                .parent()
+                                .map(Path::to_path_buf)
+                                .or_else(|| self.root.clone())
+                                .unwrap_or_else(|| row.path.clone()),
+                        });
                         if os_drag_active {
-                            // 내부 드래그와 **같은 판정·같은 표시**를 쓴다. 예전엔 폴더 행에만
-                            // 외곽선을 그려, 파일 행 위에서는 대상이 부모 폴더로 잡히는데도
-                            // 화면엔 아무것도 안 나왔다(2026-08-11 사용자: Finder에서 끌어도
-                            // 삽입선이 안 뜬다). 외부 드래그는 payload 경로를 알 수 없으므로
-                            // (macOS는 드롭 전까지 경로를 안 준다) eligibility는 Allowed로 둔다 —
-                            // 밖에서 온 파일이라 "이미 그 폴더 안"일 수가 없다.
-                            let target = if row.is_dir
-                                && (hover_rect.top() + hover_rect.height() * 0.30
-                                    ..hover_rect.bottom() - hover_rect.height() * 0.30)
-                                    .contains(&pos.y)
-                            {
-                                super::file_drop::RowDropTarget::IntoFolder
-                            } else if pos.y < hover_rect.center().y {
-                                super::file_drop::RowDropTarget::InsertAbove
-                            } else {
-                                super::file_drop::RowDropTarget::InsertBelow
-                            };
                             paint_row_drop_target(
                                 ui,
                                 ppp,

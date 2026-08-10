@@ -2560,12 +2560,13 @@ impl FileTreeUi {
             egui::Id::new("file_tree_root_drop"),
             egui::Sense::hover(),
         );
+        // 헤더(루트) 드롭도 외곽선을 쓰지 않는다 — 폴더 행과 같은 면 강조로 통일한다
+        // (2026-08-10 사용자: 외곽 테두리 제거).
         if header_drop.dnd_hover_payload::<PathBuf>().is_some() {
-            ui.painter().rect_stroke(
+            ui.painter().rect_filled(
                 header_rect,
-                2.0,
-                ui.visuals().widgets.active.bg_stroke,
-                egui::StrokeKind::Inside,
+                0.0,
+                ui.visuals().selection.bg_fill.gamma_multiply(0.22),
             );
         }
         if let (Some(payload), Some(root)) = (
@@ -2977,21 +2978,50 @@ impl FileTreeUi {
                     {
                         observed_row_height = Some(response.rect.height());
                     }
+                    // 드롭 대상 판정 — 폴더/파일을 가리지 않는다. 폴더 행 가운데는 그
+                    // 폴더로, 가장자리와 파일 행은 **그 행의 부모 폴더**로 간다
+                    // (판정 규칙과 근거는 `super::file_drop`). 파일 행이 대상이 아니던
+                    // 시절엔 파일 사이에 놓으면 아무 일도 안 일어났다(2026-08-10 사용자).
+                    if !inaccessible
+                        && let Some(hover) = row_resp.dnd_hover_payload::<PathBuf>()
+                        && let Some(pointer) = ui.ctx().pointer_interact_pos()
+                        && let Some(target) = super::file_drop::row_drop_target(
+                            super::file_drop::RowInfo {
+                                path: &row.path,
+                                is_dir: row.is_dir,
+                                top: row_rect.top(),
+                                bottom: row_rect.bottom(),
+                            },
+                            pointer.y,
+                            hover.as_ref(),
+                        )
+                    {
+                        paint_row_drop_target(ui, ppp, row_rect, target);
+                    }
+                    if !inaccessible
+                        && let Some(payload) = row_resp.dnd_release_payload::<PathBuf>()
+                        && let Some(pointer) = ui.ctx().pointer_interact_pos()
+                        && let Some(target) = super::file_drop::row_drop_target(
+                            super::file_drop::RowInfo {
+                                path: &row.path,
+                                is_dir: row.is_dir,
+                                top: row_rect.top(),
+                                bottom: row_rect.bottom(),
+                            },
+                            pointer.y,
+                            payload.as_ref(),
+                        )
+                    {
+                        let destination = match target {
+                            super::file_drop::RowDropTarget::IntoFolder => Some(row.path.clone()),
+                            // 삽입선 = 이 행의 부모 폴더로.
+                            _ => row.path.parent().map(Path::to_path_buf),
+                        };
+                        if let Some(destination) = destination {
+                            drop_action = Some(((*payload).clone(), destination));
+                        }
+                    }
                     if row.is_dir && !inaccessible {
-                        // 폴더 행 = 드롭 대상: hover 하이라이트 + release 처리 (§4)
-                        if let Some(hover) = row_resp.dnd_hover_payload::<PathBuf>()
-                            && hover.as_ref() != &row.path
-                        {
-                            ui.painter().rect_stroke(
-                                crate::ui::snap_rect_to_pixel(ppp, row_rect),
-                                2.0,
-                                ui.visuals().widgets.active.bg_stroke,
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                        if let Some(payload) = row_resp.dnd_release_payload::<PathBuf>() {
-                            drop_action = Some(((*payload).clone(), row.path.clone()));
-                        }
                         if row_resp.double_clicked() || label_resp.double_clicked() {
                             navigate_root = Some(row.path.clone());
                         } else if row_resp.clicked() || label_resp.clicked() {
@@ -5022,6 +5052,42 @@ fn sidebar_tool_tab_at(
         ui.painter().rect_filled(line, 0.0, tokens.accent);
     }
     response
+}
+
+/// 드롭 대상 표시. 의미가 둘이라 모양도 둘이다(Finder와 같다).
+///
+/// - `IntoFolder` → **면 강조**. 「이 폴더 **안으로** 들어간다」. 외곽선은 쓰지 않는다 —
+///   테두리는 경계를 말하지 폭 담는 그릇을 말하지 않는다(2026-08-10 사용자).
+/// - `InsertAbove`/`InsertBelow` → **삽입선**. 「이 **위치의 폴더로** 들어간다」.
+///   행 사이에 그어 자리를 가리킨다.
+fn paint_row_drop_target(
+    ui: &egui::Ui,
+    ppp: f32,
+    row_rect: egui::Rect,
+    target: super::file_drop::RowDropTarget,
+) {
+    let accent = ui.visuals().selection.bg_fill;
+    match target {
+        super::file_drop::RowDropTarget::IntoFolder => {
+            ui.painter().rect_filled(
+                crate::ui::snap_rect_to_pixel(ppp, row_rect),
+                2.0,
+                accent.gamma_multiply(0.22),
+            );
+        }
+        edge => {
+            let y = if edge == super::file_drop::RowDropTarget::InsertAbove {
+                row_rect.top()
+            } else {
+                row_rect.bottom()
+            };
+            ui.painter().hline(
+                row_rect.x_range(),
+                crate::ui::snap_line_to_pixel(y, 2.0, ppp),
+                egui::Stroke::new(2.0, accent),
+            );
+        }
+    }
 }
 
 fn file_toolbar_icon_at(

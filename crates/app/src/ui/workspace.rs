@@ -3886,22 +3886,17 @@ impl WorkspaceUi {
 
         // 제목/닫기/검색/새 셸/분할은 각 leaf의 얇은 헤더에 있고, 본문은 그 아래를
         // 카드 외곽 여백 없이 채운다.
+        // 드롭 대상 표시는 pane 외곽선이 아니라 **글자가 실제로 들어갈 자리**에 그린다.
+        // 여기서는 여부만 기억하고, 커서 셀의 픽셀 위치를 아는 draw 이후에 그린다
+        // (2026-08-10 사용자: 테두리 말고 공간이 열려 들어가는 느낌으로).
+        let mut drop_target_hovered = false;
         if mode.is_local() && input_enabled && pane.session_id.is_some() {
-            if pane_resp
+            drop_target_hovered = pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()
                 .is_some()
                 || pane_resp
                     .dnd_hover_payload::<TerminalTextDragPayload>()
-                    .is_some()
-            {
-                ui.painter().rect_stroke(
-                    pane_rect,
-                    2.0,
-                    // accent 원색 — `selection.stroke`는 accent 배경 위 대비색이다.
-                    egui::Stroke::new(1.5, ui.visuals().selection.bg_fill),
-                    egui::StrokeKind::Inside,
-                );
-            }
+                    .is_some();
             if let Some(session) = pane.session_id {
                 if let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&pane_resp) {
                     let bytes = path_insert_paste_bytes(
@@ -4034,6 +4029,20 @@ impl WorkspaceUi {
         };
         // B1 실측: 이 프레임에 그린 pane들의 렌더 비용을 합산한다 (visible pane 전부).
         self.frame_counters += output.counters;
+
+        // 드롭 삽입 마커. 떨어뜨리면 경로/텍스트는 **셸 입력줄 커서 위치**로 들어가므로
+        // (아래 release 처리의 path_insert_paste_bytes) 그 자리를 가리킨다. 터미널은 고정
+        // 셀 격자라 실제로 행을 벌릴 수 없어, 커서 셀 폭만큼 슬롯을 열어 보여주는 것으로
+        // 대신한다 — Finder에서 틈이 벌어지는 것과 같은 신호를 위치로 준다.
+        if drop_target_hovered {
+            Self::paint_drop_insertion_marker(
+                ui,
+                output.origin,
+                output.cell_size,
+                snapshot.cursor.col,
+                snapshot.cursor.row,
+            );
+        }
 
         // 선택된 텍스트 위에서 시작한 드래그는 terminal-internal DnD payload가 된다.
         // 그 외의 마우스 드래그는 기존 셀 선택 동작을 유지한다.
@@ -4805,6 +4814,41 @@ impl WorkspaceUi {
     }
 
     /// pane 우클릭 메뉴 — 분할/닫기 (2026-07-05, 선택한 pane 단위 제어).
+    /// 드롭 삽입 마커 — 떨어뜨린 텍스트가 들어갈 커서 자리를 "열린 슬롯"으로 보여준다.
+    ///
+    /// pane 외곽선 대신 쓰는 이유: 외곽선은 "이 pane이 받는다"까지만 말하고 **어디로
+    /// 들어가는지**는 말하지 않는다. 실제 삽입 지점은 셸 입력줄의 커서다.
+    ///
+    /// 터미널은 고정 셀 격자라 Finder처럼 진짜로 행을 벌릴 수 없다(셸이 렌더링을 소유해서
+    /// 우리가 밀면 그 아래가 전부 어긋난다). 그래서 커서 셀 위에 슬롯을 겹쳐 그려 같은
+    /// 신호를 위치로 전달한다 — 왼쪽 세로 막대가 삽입선, 그 오른쪽 옅은 면이 들어갈 자리다.
+    fn paint_drop_insertion_marker(
+        ui: &egui::Ui,
+        origin: egui::Pos2,
+        cell: egui::Vec2,
+        cursor_col: u16,
+        cursor_row: u16,
+    ) {
+        let accent = ui.visuals().selection.bg_fill;
+        let slot = egui::Rect::from_min_size(
+            origin
+                + egui::vec2(
+                    f32::from(cursor_col) * cell.x,
+                    f32::from(cursor_row) * cell.y,
+                ),
+            cell,
+        );
+        // 들어갈 자리 — 옅게 채워 "빈 칸이 열렸다"를 보여준다. 글자를 덮지 않을 만큼 옅게.
+        ui.painter()
+            .rect_filled(slot, 1.0, accent.gamma_multiply(0.30));
+        // 삽입선 — Finder의 삽입 캐럿과 같은 역할. 셀 높이보다 살짝 키워 격자에 묻히지 않게.
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(slot.left() - 1.0, slot.top() - 1.0),
+            egui::pos2(slot.left() + 1.0, slot.bottom() + 1.0),
+        );
+        ui.painter().rect_filled(bar, 1.0, accent);
+    }
+
     fn pane_context_menu(
         &mut self,
         resp: &egui::Response,

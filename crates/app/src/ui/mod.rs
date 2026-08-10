@@ -13,6 +13,7 @@ pub mod designall;
 pub mod diff_panel;
 pub mod env_profiles;
 pub mod env_project_list;
+pub mod file_drop;
 pub mod file_tree;
 pub mod fleet;
 pub mod inbox_approvals;

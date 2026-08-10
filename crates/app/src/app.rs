@@ -7299,6 +7299,15 @@ pub struct App {
     /// 설정 전체 변경과 단순 config 저장은 각각 latest-only bit로 합쳐 backlog를 막는다.
     pending_settings_config_apply: bool,
     pending_config_save: bool,
+    /// 활성 워크스페이스에 저장된 메모(사이드바 「메모」 탭이 읽는 값).
+    workspace_note: Option<String>,
+    /// 위 캐시가 어느 워크스페이스 것인지. 활성이 바뀌면 다시 읽는다.
+    workspace_note_loaded_for: Option<String>,
+    /// 아직 DB에 안 쓴 편집 (워크스페이스 id, 본문). 디바운스가 끝나거나 워크스페이스가
+    /// 바뀌거나 앱이 종료될 때 기록한다.
+    pending_note: Option<(String, String)>,
+    /// 마지막 타건 시각 — 디바운스 기준.
+    last_note_edit: std::time::Instant,
     /// Send events publish one Arc-backed bounded history snapshot. Only the latest snapshot needs
     /// persistence, so a busy host task retains one replacement rather than a write queue.
     pending_composer_history: Option<Arc<[Arc<str>]>>,
@@ -10384,6 +10393,10 @@ impl App {
             pending_turn_done_clear: None,
             pending_settings_config_apply: false,
             pending_config_save: false,
+            workspace_note: None,
+            workspace_note_loaded_for: None,
+            pending_note: None,
+            last_note_edit: std::time::Instant::now(),
             pending_composer_history: None,
             pending_folder_picker_completion: None,
             credentials_ui: ui::credentials::CredentialsUi::new(),
@@ -16317,6 +16330,47 @@ impl App {
         self.settings_pending_operation = Some(operation);
     }
 
+    /// 메모 자동 저장 디바운스. 타건마다 쓰면 SQLite 트랜잭션이 키 입력 속도로 돈다.
+    /// 0.8초는 "문장 하나 치고 잠깐 멈추는" 간격보다 짧아 체감 지연이 없으면서
+    /// 연타 구간을 한 번의 쓰기로 묶는다.
+    const NOTE_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
+
+    /// 밀린 메모 편집을 지금 기록한다. 실패해도 편집 내용은 버리지 않는다 —
+    /// 다음 기회에 다시 시도한다(사용자가 친 글을 조용히 잃는 것이 최악이다).
+    fn flush_pending_note(&mut self) {
+        let Some((workspace_id, body)) = self.pending_note.clone() else {
+            return;
+        };
+        match self.db.save_workspace_note(&workspace_id, &body) {
+            Ok(()) => {
+                self.pending_note = None;
+                if self.workspace_note_loaded_for.as_deref() == Some(workspace_id.as_str()) {
+                    self.workspace_note = (!body.trim().is_empty()).then_some(body);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(kind = "notes", "메모 저장 실패(재시도 예정): {error:#}");
+            }
+        }
+    }
+
+    /// 활성 워크스페이스가 바뀌었으면 밀린 편집을 먼저 기록하고 새 메모를 읽는다.
+    /// 순서가 중요하다 — 읽기를 먼저 하면 이전 워크스페이스의 마지막 타건이 사라진다.
+    fn sync_workspace_note(&mut self, active_workspace_id: &str) {
+        if self.workspace_note_loaded_for.as_deref() == Some(active_workspace_id) {
+            return;
+        }
+        self.flush_pending_note();
+        self.workspace_note = match self.db.load_workspace_note(active_workspace_id) {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(kind = "notes", "메모 읽기 실패: {error:#}");
+                None
+            }
+        };
+        self.workspace_note_loaded_for = Some(active_workspace_id.to_owned());
+    }
+
     fn queue_settings_action(
         &mut self,
         workspace_id: &str,
@@ -19316,6 +19370,9 @@ impl App {
     /// eframe renderer feature와 무관한 공통 종료 경로. `App::on_exit` 시그니처만
     /// `glow` feature에 따라 달라지므로 실제 정리는 여기 한 번만 유지한다.
     fn shutdown_on_exit(&mut self) {
+        // 디바운스 대기 중이던 메모를 먼저 기록한다 — 종료가 타건보다 빠르면
+        // 마지막 문장이 통째로 사라진다.
+        self.flush_pending_note();
         // B1: 링버퍼에 모은 frame 이벤트 flush + 요약/gpu 이벤트. shutdown보다 **먼저** —
         // egui 텍스처 상태가 살아 있어야 gpu 이벤트가 실제 값을 낸다.
         if let Some(bench) = self.bench.as_mut() {
@@ -19553,6 +19610,18 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 메모 자동 저장 디바운스. 타건이 멎으면 입력 이벤트도 멎으므로 만료 시점을
+        // **한 번** 예약해 깨운다 — 폴링이 아니라 밀린 편집이 있을 때만 거는 one-shot이라
+        // 유휴 프레임을 만들지 않는다. render 경로가 아닌 여기 두는 이유는
+        // check-boundary가 App::ui의 repaint 타이머 설치를 금지하기 때문이다.
+        if self.pending_note.is_some() {
+            let elapsed = self.last_note_edit.elapsed();
+            if elapsed >= Self::NOTE_SAVE_DEBOUNCE {
+                self.flush_pending_note();
+            } else {
+                ctx.request_repaint_after(Self::NOTE_SAVE_DEBOUNCE - elapsed);
+            }
+        }
         // 시스템 메모리 압박 레벨 전이 (로드맵 C1 관측 + C2 비상 플러시).
         if let Some((previous, current)) = crate::mem_pressure_monitor::take_level_transition() {
             tracing::warn!(
@@ -20600,6 +20669,8 @@ impl eframe::App for App {
         if self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home {
             self.sync_home_notice_badge(true, ui.ctx());
         }
+        // 워크스페이스가 바뀌었으면 밀린 편집을 쓰고 새 메모를 읽는다(스냅샷 조립 전).
+        self.sync_workspace_note(&active_workspace_id);
         let sidebar_snapshot = ui::file_tree::SidebarSnapshot {
             active_workspace_id: &active_workspace_id,
             workspaces: &sidebar_workspaces,
@@ -20609,6 +20680,7 @@ impl eframe::App for App {
             // 안 된다. 매 프레임 build_fleet_sessions를 돌리지 않는 싼 프록시다.
             fleet_count: self.approvals_ui.pending().len() + self.global_waiting.len(),
             agents_open: self.agent_sessions_ui.is_open(),
+            workspace_note: self.workspace_note.as_deref(),
         };
 
         // 500ms 캐시에서 꺼내 쓰고 프레임 끝에 되돌린다(take/put-back) — 참조로 들면
@@ -20831,9 +20903,11 @@ impl eframe::App for App {
                         self.open_session_diff(ui.ctx(), session);
                     }
                 }
-                Some(ui::file_tree::SidebarAction::OpenConnectors) => {
-                    self.settings_category = ui::settings::Category::Connectors;
-                    self.settings_open = true;
+                Some(ui::file_tree::SidebarAction::NoteEdited(body)) => {
+                    // 기록은 여기서 하지 않는다 — 디바운스 만료와 깨우기는 logic()이
+                    // 소유한다(check-boundary: App::ui는 repaint 타이머를 설치하지 않는다).
+                    self.pending_note = Some((active_workspace_id.clone(), body));
+                    self.last_note_edit = std::time::Instant::now();
                 }
                 Some(ui::file_tree::SidebarAction::OpenMacosFileAccessSettings) => {
                     if self.pending_app_controller_action.is_none() {
@@ -24390,6 +24464,63 @@ mod tests {
     /// CLI의 paste-burst 휴리스틱이 뒤따르는 CR을 붙여넣기 일부로 보고 삼켜, 명령이
     /// 입력줄에 남는다 — 사용자가 키를 한 번 더 눌러야 실행됐다(2026-08-09 실증).
     /// `composer.rs`가 같은 이유로 못박은 규칙인데 강도·모델 경로만 밖에 있었다.
+    /// 메모 저장에서 **순서가 곧 데이터 보존**이다. 세 지점이 지켜져야 한다.
+    ///
+    /// 1. 워크스페이스 전환 시 **읽기 전에 flush** — 반대로 하면 이전 워크스페이스의
+    ///    마지막 타건이 캐시 교체에 덮여 사라진다.
+    /// 2. 타건이 멎으면 디바운스 만료를 **스스로 깨워야** 한다. egui는 입력이 없으면
+    ///    프레임을 안 돌리므로 `request_repaint_after` 없이는 마지막 문장이 영영
+    ///    저장되지 않는다.
+    /// 3. 종료 시 flush — 종료가 디바운스보다 빠르면 통째로 잃는다.
+    ///
+    /// 셋 다 "실패해도 화면에 아무 일도 안 일어나는" 종류라 소스로 고정한다.
+    #[test]
+    fn 메모_자동저장은_읽기전_flush와_깨우기와_종료flush를_지킨다() {
+        let source = include_str!("app.rs");
+
+        let sync = source
+            .split_once("    fn sync_workspace_note(&mut self, active_workspace_id: &str) {")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("sync_workspace_note 본문을 찾지 못했다");
+        let flush_at = sync
+            .find("self.flush_pending_note();")
+            .expect("전환 시 flush가 없다 — 이전 워크스페이스의 마지막 타건을 잃는다");
+        let load_at = sync
+            .find("self.db.load_workspace_note(")
+            .expect("새 워크스페이스 메모를 읽지 않는다");
+        assert!(
+            flush_at < load_at,
+            "flush가 load보다 뒤에 있다 — 캐시 교체가 미저장 편집을 덮는다"
+        );
+
+        let logic = source
+            .split_once(
+                "    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {",
+            )
+            .and_then(|(_, tail)| tail.split_once("mem_pressure_monitor"))
+            .map(|(body, _)| body)
+            .expect("logic() 서두를 찾지 못했다");
+        assert!(
+            logic.contains("request_repaint_after(Self::NOTE_SAVE_DEBOUNCE - elapsed)"),
+            "디바운스 만료를 깨우지 않으면 타건이 멎은 뒤 마지막 문장이 저장되지 않는다"
+        );
+        assert!(
+            logic.contains("if self.pending_note.is_some()"),
+            "밀린 편집이 없을 때도 타이머를 걸면 유휴 프레임을 만든다"
+        );
+
+        let shutdown = source
+            .split_once("    fn shutdown_on_exit(&mut self) {")
+            .and_then(|(_, tail)| tail.split_once("self.cancel_all_cross_workspace_restores();"))
+            .map(|(body, _)| body)
+            .expect("shutdown_on_exit 본문을 찾지 못했다");
+        assert!(
+            shutdown.contains("self.flush_pending_note();"),
+            "종료 시 flush가 없으면 디바운스 대기 중이던 메모를 잃는다"
+        );
+    }
+
     #[test]
     fn 슬래시_명령은_본문과_CR을_나눠_보낸다() {
         let source = include_str!("app.rs");

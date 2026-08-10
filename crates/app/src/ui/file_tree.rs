@@ -2996,7 +2996,7 @@ impl FileTreeUi {
                             hover.as_ref(),
                         )
                     {
-                        paint_row_drop_target(ui, ppp, row_rect, target);
+                        paint_row_drop_target(ui, ppp, row_rect, row.depth, target);
                     }
                     if !inaccessible
                         && let Some(payload) = row_resp.dnd_release_payload::<PathBuf>()
@@ -5054,16 +5054,56 @@ fn sidebar_tool_tab_at(
     response
 }
 
+/// 삽입 마커가 시작하는 x — 행 내용(캐럿+아이콘)이 시작하는 들여쓰기와 맞춘다
+/// (행을 그리는 `ui.add_space(10.0 + depth * 18.0)`과 같은 값). 마커가 행
+/// 전체 폭이 아니라 이 **깊이**에서 시작해야 "이 깊이의 폴더로 들어간다"는
+/// 뜻을 위치로도 말한다(2026-08-11 사용자: 삽입선이 그냥 가로줄이라 어느
+/// 폴더로 들어가는지 위치로 안 읽혔다).
+fn insertion_marker_indent_x(row_left: f32, depth: usize) -> f32 {
+    row_left + 10.0 + depth as f32 * 18.0
+}
+
+/// 삽입 마커(알약 모양) 사각형 — 그리기와 분리해 순수하게 테스트한다.
+///
+/// 2px 가로줄 하나로는 "밀어내는 느낌"이 안 난다(2026-08-11 사용자). 행을
+/// 실제로 벌리면(레이아웃에 `add_space` 삽입) `show_rows`가 매 행이 같은
+/// 높이라고 가정하는 가상화 계약이 깨지고, 벌어진 틈 때문에 포인터 밑 행이
+/// 바뀌어 다시 틈이 옮겨가는 떨림(flicker) 루프에 빠질 위험이 있다. 그래서
+/// 레이아웃은 안 건드리고 페인트만으로 "두께 있는 조각이 꽂힌" 인상을 낸다 —
+/// 위아래로 `HALF_HEIGHT`씩 부풀린 알약이 행 경계에 걸치게 그린다. 아이콘(12~16px)은
+/// 행 한가운데 있고 위아래 여백이 남으므로 이 정도 두께는 아이콘을 침범하지
+/// 않는다. 오른쪽은 살짝 띄워 행 끝까지 꽉 찬 자로 보이지 않고 "여기 꽂힌
+/// 조각"으로 보이게 한다. 폭이 좁아 남는 공간이 없으면(깊은 들여쓰기 + 좁은
+/// 패널) `MIN_WIDTH`까지는 왼쪽으로 물러나 최소 폭을 지킨다.
+fn insertion_marker_rect(row_rect: egui::Rect, indent_x: f32, at_bottom: bool) -> egui::Rect {
+    const HALF_HEIGHT: f32 = 2.5;
+    const RIGHT_MARGIN: f32 = 10.0;
+    const MIN_WIDTH: f32 = 24.0;
+    let y = if at_bottom {
+        row_rect.bottom()
+    } else {
+        row_rect.top()
+    };
+    let right = (row_rect.right() - RIGHT_MARGIN).max(row_rect.left() + MIN_WIDTH);
+    let left = indent_x.min(right - MIN_WIDTH).max(row_rect.left());
+    egui::Rect::from_min_max(
+        egui::pos2(left, y - HALF_HEIGHT),
+        egui::pos2(right, y + HALF_HEIGHT),
+    )
+}
+
 /// 드롭 대상 표시. 의미가 둘이라 모양도 둘이다(Finder와 같다).
 ///
 /// - `IntoFolder` → **면 강조**. 「이 폴더 **안으로** 들어간다」. 외곽선은 쓰지 않는다 —
 ///   테두리는 경계를 말하지 폭 담는 그릇을 말하지 않는다(2026-08-10 사용자).
-/// - `InsertAbove`/`InsertBelow` → **삽입선**. 「이 **위치의 폴더로** 들어간다」.
-///   행 사이에 그어 자리를 가리킨다.
+/// - `InsertAbove`/`InsertBelow` → **삽입 마커**. 「이 **위치의 폴더로** 들어간다」.
+///   행 경계에 걸치는 알약 모양으로 그려 두께를 준다(위 `insertion_marker_rect`
+///   주석 참고) — 밋밋한 가로줄보다 "여기에 조각이 꽂힌다"는 인상을 준다.
 fn paint_row_drop_target(
     ui: &egui::Ui,
     ppp: f32,
     row_rect: egui::Rect,
+    depth: usize,
     target: super::file_drop::RowDropTarget,
 ) {
     let accent = ui.visuals().selection.bg_fill;
@@ -5076,16 +5116,14 @@ fn paint_row_drop_target(
             );
         }
         edge => {
-            let y = if edge == super::file_drop::RowDropTarget::InsertAbove {
-                row_rect.top()
-            } else {
-                row_rect.bottom()
-            };
-            ui.painter().hline(
-                row_rect.x_range(),
-                crate::ui::snap_line_to_pixel(y, 2.0, ppp),
-                egui::Stroke::new(2.0, accent),
+            let indent_x = insertion_marker_indent_x(row_rect.left(), depth);
+            let at_bottom = edge == super::file_drop::RowDropTarget::InsertBelow;
+            let marker = crate::ui::snap_rect_to_pixel(
+                ppp,
+                insertion_marker_rect(row_rect, indent_x, at_bottom),
             );
+            ui.painter()
+                .rect_filled(marker, marker.height() / 2.0, accent);
         }
     }
 }
@@ -9947,5 +9985,46 @@ mod tests {
             "레일 세로 중심축에 정렬돼야 한다"
         );
         assert_eq!(claude.width(), RAIL_SERVICE_LOGO_SIZE);
+    }
+
+    /// 삽입 마커는 행 왼쪽 끝이 아니라 그 행의 들여쓰기(캐럿+아이콘 시작)에서
+    /// 시작한다 — 깊이가 다르면 시작 x도 달라져야 "이 깊이의 폴더로" 들어간다는
+    /// 뜻이 위치로 읽힌다.
+    #[test]
+    fn 삽입_마커_들여쓰기는_깊이를_따라간다() {
+        assert_eq!(insertion_marker_indent_x(0.0, 0), 10.0);
+        assert_eq!(insertion_marker_indent_x(0.0, 1), 28.0);
+        assert_eq!(insertion_marker_indent_x(100.0, 2), 146.0);
+    }
+
+    /// 마커는 행 경계에 걸치는 알약이다: 위쪽 대상이면 행 top에, 아래쪽
+    /// 대상이면 행 bottom에 중심을 두고 위아래로 부푼다. 오른쪽은 여백만큼
+    /// 안으로 들어와 행 끝까지 꽉 차 보이지 않는다.
+    #[test]
+    fn 삽입_마커는_행_경계에_걸치고_오른쪽에_여백을_둔다() {
+        let row = egui::Rect::from_min_max(egui::pos2(0.0, 100.0), egui::pos2(300.0, 125.0));
+
+        let above = insertion_marker_rect(row, 40.0, false);
+        assert_eq!(above.left(), 40.0);
+        assert_eq!(above.top(), 97.5);
+        assert_eq!(above.bottom(), 102.5);
+        assert_eq!(above.right(), 290.0); // 오른쪽 여백 10px
+
+        let below = insertion_marker_rect(row, 40.0, true);
+        assert_eq!(below.left(), 40.0);
+        assert_eq!(below.top(), 122.5);
+        assert_eq!(below.bottom(), 127.5);
+    }
+
+    /// 들여쓰기가 깊어 남는 폭이 최소 폭보다 좁으면(깊은 트리 + 좁은 패널)
+    /// 왼쪽으로 물러나서라도 최소 폭은 지킨다 — 폭이 음수/역전되는 사고를
+    /// 막는다.
+    #[test]
+    fn 삽입_마커는_좁은_행에서도_최소_폭을_지킨다() {
+        let row = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(60.0, 25.0));
+        let marker = insertion_marker_rect(row, 55.0, false); // 들여쓰기가 오른쪽 여백을 넘어선다
+        assert!(marker.right() > marker.left(), "폭이 역전되면 안 된다");
+        assert!(marker.width() >= 24.0 - f32::EPSILON);
+        assert!(marker.left() >= row.left());
     }
 }

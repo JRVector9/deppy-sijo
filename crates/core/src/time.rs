@@ -26,6 +26,27 @@ pub fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// unix 초 → "YYYY-MM-DD". Howard Hinnant의 `civil_from_days` 알고리즘
+/// (그레고리력 상시 성립, 윤년 포함) — 순수 함수라 시각과 무관하게 테스트할 수 있다.
+/// 시간대는 모른다: `secs`를 그대로 UTC로 읽으므로, 로컬 날짜가 필요하면 호출측이
+/// 로컬 오프셋을 더한 값을 넘겨야 한다(status_feed.rs의 `civil_date`와 같은 계산이며,
+/// 이 워크스페이스는 chrono를 쓰지 않는 관례라 여기 공용으로 둔다).
+pub fn civil_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,5 +58,18 @@ mod tests {
         assert!(s > 1_700_000_000 && s < 4_000_000_000, "{s}");
         assert!(unix_secs_i64() > 1_700_000_000);
         assert!(unix_ms() > 1_700_000_000_000);
+    }
+
+    /// 알려진 기준일들로 civil_date를 고정한다 — epoch 경계, 윤년(2024, 2000),
+    /// 100으로 나눠지지만 400으로는 안 나눠지는 평년(1900) 경계까지 확인한다.
+    #[test]
+    fn civil_date가_알려진_날짜와_일치한다() {
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(86_400), "1970-01-02");
+        assert_eq!(civil_date(-1), "1969-12-31");
+        assert_eq!(civil_date(1_786_320_000), "2026-08-10");
+        assert_eq!(civil_date(1_709_208_000), "2024-02-29");
+        assert_eq!(civil_date(951_868_800), "2000-03-01");
+        assert_eq!(civil_date(-2_203_891_200), "1900-03-01");
     }
 }

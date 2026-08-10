@@ -27,9 +27,9 @@ tungstenite = { workspace = true, features = ["handshake"] }
 # RFC 8291 ECDH(P-256)에 p256, HKDF-SHA256에 hkdf, aes128gcm 레코드에 aes-gcm, base64url 인코딩에
 # base64. sha2/ureq는 워크스페이스 lock 기존(HKDF의 SHA-256, 발송 POST). 엔트로피는 getrandom(sync).
 # 기존 web-push 크레이트는 hyper(async) 의존이라 배제 — 여기 수제 구현(RFC 8291/8292 벡터로 검증).
-p256 = { version = "0.13", features = ["ecdh"] }
+p256 = { version = "0.14", features = ["ecdh"] }
 hkdf = "0.13"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 base64 = "0.22"
 getrandom = "0.4"
 sha2 = { workspace = true }

@@ -16371,6 +16371,44 @@ impl App {
         self.workspace_note_loaded_for = Some(active_workspace_id.to_owned());
     }
 
+    /// 「메모에 추가」(PR-4)의 현재 워크스페이스 기준 본문. 아직 flush 안 된
+    /// `pending_note`가 있으면 그게 최신이고(디바운스 대기 중), 없으면 마지막으로
+    /// 읽은 `workspace_note`를 쓴다.
+    fn current_workspace_note_body(&self, workspace_id: &str) -> Option<String> {
+        if let Some((_, body)) = self
+            .pending_note
+            .as_ref()
+            .filter(|(pending_id, _)| pending_id == workspace_id)
+        {
+            return Some(body.clone());
+        }
+        // 캐시가 **이 워크스페이스 것인지** 반드시 확인한다. 안 하면 캐시가 남의
+        // 것일 때 빈 문자열로 떨어지고, 거기에 선택 텍스트만 붙은 결과가
+        // `pending_note`에 들어가 **기존 메모를 통째로 덮어쓴다**. 지금은 같은
+        // 프레임 앞쪽 `sync_workspace_note`가 캐시를 맞춰 두므로 도달하지 않지만,
+        // 순서가 바뀌면 조용히 글을 잃는 종류라 여기서 못박는다.
+        (self.workspace_note_loaded_for.as_deref() == Some(workspace_id))
+            .then(|| self.workspace_note.clone().unwrap_or_default())
+    }
+
+    /// 터미널에서 선택한 텍스트를 메모 끝에 붙인다. 기존 내용이 있고 개행으로
+    /// 끝나지 않으면 개행 하나를 넣어 줄이 붙지 않게 한다. 결과가 `max_bytes`를
+    /// 넘으면 **거부**한다(자르지 않는다) — 잘라서 저장하면 로그 중간이 잘린 채
+    /// 조용히 남아 오히려 헷갈린다. 상한을 인자로 받아 storage 상수와 분리해 순수
+    /// 테스트한다.
+    fn append_selection_to_note(
+        existing: &str,
+        addition: &str,
+        max_bytes: usize,
+    ) -> Option<String> {
+        let mut appended = existing.to_owned();
+        if !appended.is_empty() && !appended.ends_with('\n') {
+            appended.push('\n');
+        }
+        appended.push_str(addition);
+        (appended.len() <= max_bytes).then_some(appended)
+    }
+
     fn queue_settings_action(
         &mut self,
         workspace_id: &str,
@@ -22027,6 +22065,40 @@ impl eframe::App for App {
                 }
             }
             None => {}
+        }
+        // pane 우클릭 → "메모에 추가" (PR-4): 선택 원문을 워크스페이스 메모 끝에
+        // 붙인다. 개행 처리·상한 판정은 leaf가 못 보는 storage 상수 참조라 여기서
+        // 한다. 성공하면 pending_note(디바운스 저장)와 NotesUi 버퍼(즉시 표시)를
+        // 함께 갱신 — 버퍼만 놓치면 「메모」 탭을 열었을 때 방금 추가한 게 안 보인다.
+        // 캐시가 활성 워크스페이스 것이 아니면 요청을 버린다(take는 이미 됐다).
+        // 같은 프레임 앞쪽 `sync_workspace_note`가 맞춰 두므로 도달하지 않는 경로다.
+        if let Some(selection) = self.active.workspace_ui.take_note_append_request()
+            && let Some(existing) = self.current_workspace_note_body(&active_workspace_id)
+        {
+            match Self::append_selection_to_note(
+                &existing,
+                &selection,
+                storage::WORKSPACE_NOTE_MAX_BYTES,
+            ) {
+                Some(body) => {
+                    if let Some(tree) = self.file_tree.as_mut() {
+                        tree.apply_note_append(&active_workspace_id, body.clone());
+                    }
+                    self.pending_note = Some((active_workspace_id.clone(), body));
+                    self.last_note_edit = std::time::Instant::now();
+                    ui.ctx().request_repaint();
+                }
+                None => {
+                    tracing::warn!(
+                        kind = "notes",
+                        "메모 추가 거부: 상한({} bytes) 초과",
+                        storage::WORKSPACE_NOTE_MAX_BYTES
+                    );
+                    self.active.workspace_ui.report_note_append_rejected(
+                        text.t("workspace.menu.add_to_note_too_long", &[]),
+                    );
+                }
+            }
         }
 
         // 알림 센터 렌더 (생성은 logic()에서 끝났다). 활성 workspace의 사라진 세션의
@@ -31170,5 +31242,42 @@ mod tests {
         assert!(stale.is_none());
         assert_eq!(coordinator.in_flight_len(), 1);
         assert!(panes.attachments()[0].live_target().is_none());
+    }
+
+    // 「메모에 추가」(PR-4) 덧붙이기 순수 함수 — 개행 처리와 상한 판정 경계.
+
+    /// 빈 메모에는 개행 없이 선택 텍스트가 그대로 들어간다.
+    #[test]
+    fn 메모_추가는_빈_메모에_그대로_붙는다() {
+        let result = App::append_selection_to_note("", "선택한 텍스트", 100);
+        assert_eq!(result.as_deref(), Some("선택한 텍스트"));
+    }
+
+    /// 이미 내용이 있으면 앞에 개행을 넣어 기존 마지막 줄과 붙지 않게 한다.
+    #[test]
+    fn 메모_추가는_내용이_있으면_개행을_넣고_붙인다() {
+        let result = App::append_selection_to_note("기존 메모", "추가된 선택", 100);
+        assert_eq!(result.as_deref(), Some("기존 메모\n추가된 선택"));
+    }
+
+    /// 이미 개행으로 끝나 있으면 개행을 하나 더 넣지 않는다 — 빈 줄이 쌓이면 안 된다.
+    #[test]
+    fn 메모_추가는_이미_개행으로_끝나면_개행을_더_넣지_않는다() {
+        let result = App::append_selection_to_note("기존 메모\n", "추가된 선택", 100);
+        assert_eq!(result.as_deref(), Some("기존 메모\n추가된 선택"));
+    }
+
+    /// 결과가 상한과 정확히 같으면 허용한다(`<=` 경계) — 자를 필요가 없다.
+    #[test]
+    fn 메모_추가는_상한과_정확히_같으면_허용한다() {
+        let result = App::append_selection_to_note("", "12345", 5);
+        assert_eq!(result.as_deref(), Some("12345"));
+    }
+
+    /// 결과가 상한을 1바이트라도 넘으면 거부한다 — 잘라서 저장하지 않는다(원본 유지).
+    #[test]
+    fn 메모_추가는_상한을_넘으면_거부한다() {
+        let result = App::append_selection_to_note("", "123456", 5);
+        assert_eq!(result, None);
     }
 }

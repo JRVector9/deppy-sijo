@@ -652,7 +652,9 @@ fn state_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWorkspa
     }
     match row.state {
         ActivityWorkspaceState::Active => {
-            ui.colored_label(ui.visuals().selection.stroke.color, text);
+            // accent 색이 필요한 자리다. `selection.stroke`는 accent **배경 위** 전경색
+            // (흑/백 대비색)이 됐으므로 accent 원색은 `bg_fill`에서 읽는다.
+            ui.colored_label(ui.visuals().selection.bg_fill, text);
         }
         ActivityWorkspaceState::Warm => {
             ui.label(text);

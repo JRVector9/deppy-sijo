@@ -5041,7 +5041,8 @@ fn file_toolbar_icon_at(
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), accessible_label)
     });
     let color = if active {
-        ui.visuals().selection.stroke.color
+        // accent 원색 — `selection.stroke`는 accent 배경 위 대비색이라 여기 쓸 수 없다.
+        ui.visuals().selection.bg_fill
     } else if response.hovered() {
         ui.visuals().text_color()
     } else {

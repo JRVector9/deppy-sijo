@@ -357,6 +357,18 @@ fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
+/// `from`을 `to` 쪽으로 `t`(0..=1)만큼 섞는다. 0이면 `from`, 1이면 `to`.
+/// 선택 배경을 표면 쪽으로 낮춰 그 위 글자가 읽히게 하는 데 쓴다.
+fn mix(from: egui::Color32, to: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    egui::Color32::from_rgb(
+        lerp(from.r(), to.r()),
+        lerp(from.g(), to.g()),
+        lerp(from.b(), to.b()),
+    )
+}
+
 /// `design/.../egui.ts`의 토큰을 설정 창 local visuals에 매핑한다.
 pub(crate) fn apply_settings_palette(ui: &mut egui::Ui) {
     let dark = ui.visuals().dark_mode;
@@ -402,7 +414,12 @@ pub(crate) fn apply_settings_palette(ui: &mut egui::Ui) {
     v.window_fill = bg;
     v.faint_bg_color = panel;
     v.extreme_bg_color = input;
-    v.selection.bg_fill = accent;
+    // 선택 배경은 accent **원색이 아니라 표면 쪽으로 섞은 톤**이다. egui는
+    // `selection.stroke`를 선택 글자 색으로도 쓰는데(text_selection/visuals.rs:40),
+    // 설정 창은 그 값을 **포커스 링**으로 쓰고 있어(아래 줄, :369 주석) 바꿀 수 없다.
+    // accent 원색을 깔면 border_focus 글자가 그 위에서 묻힌다 — 2026-08-10 사용자:
+    // "보이긴 하는데 잘 안 보여". 그래서 글자가 아니라 **배경을 낮춘다**.
+    v.selection.bg_fill = mix(accent, surface, 0.62);
     v.selection.stroke = egui::Stroke::new(1.0, border_focus);
     v.hyperlink_color = accent;
     // #d4d4d4 × 0.535 ≈ 목업 muted #717171.

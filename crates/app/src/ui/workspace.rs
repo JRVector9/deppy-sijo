@@ -3897,7 +3897,8 @@ impl WorkspaceUi {
                 ui.painter().rect_stroke(
                     pane_rect,
                     2.0,
-                    egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                    // accent 원색 — `selection.stroke`는 accent 배경 위 대비색이다.
+                    egui::Stroke::new(1.5, ui.visuals().selection.bg_fill),
                     egui::StrokeKind::Inside,
                 );
             }

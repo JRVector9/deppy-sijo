@@ -14,7 +14,10 @@ const ENV_ITEMS_MAX: usize = 256;
 const ENV_KEY_BYTES_MAX: usize = 1024;
 const ENV_VALUE_BYTES_MAX: usize = 32 * 1024;
 const ENV_AGGREGATE_BYTES_MAX: usize = 1024 * 1024;
-const REGEX_BYTES_MAX: usize = 64 * 1024;
+/// status detector regex 상한 — **persist가 소유한다.** 복원 쪽 상한과 반드시 같아야
+/// 하는데(다르면 정상 저장된 행이 손상 취급된다) 예전엔 양쪽에 같은 숫자를 따로 적고
+/// 주석으로만 묶어뒀다. 한쪽만 바뀌면 조용히 어긋나므로 한 값을 공유한다.
+use persist::REGEX_BYTES_MAX;
 const REGEX_AGGREGATE_BYTES_MAX: usize = 256 * 1024;
 const PATH_BYTES_MAX: usize = 4 * 1024;
 const PANE_TITLE_BYTES_MAX: usize = 4 * 1024;

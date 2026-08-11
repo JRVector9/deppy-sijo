@@ -4551,7 +4551,12 @@ impl WorkspaceUi {
                         .size(12.0)
                         .color(ui.visuals().weak_text_color()),
                 );
-                if row_ui.small_button(button_label).clicked() {
+                // cross-workspace 첨부 뷰(Attached)는 이 pane의 session이 **다른**
+                // 워크스페이스 런타임 소속이다 — 버튼을 누르면 App은 활성 워크스페이스의
+                // runtime으로 보내(dispatch_respawn_archived_agent) 엉뚱한 런타임에 같은
+                // 숫자의 SessionId가 우연히 존재하면 잘못된 세션을 건드릴 수 있다. 그
+                // pane을 소유한 로컬 뷰에서만 버튼을 활성화한다.
+                if mode.is_local() && row_ui.small_button(button_label).clicked() {
                     self.respawn_archived_request = Some(session);
                 }
             } else {

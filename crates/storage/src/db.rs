@@ -208,6 +208,9 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 /// 31: bounded finalized-audit retention ordering index (PR-AU02 hardening).
 /// 32: agent_needs_input.working — hook 기반 "작업 중" 신호(cmux식 턴 경계).
 /// 33: workspace_notes — 워크스페이스당 스크래치패드 한 장(사이드바 「메모」 탭).
+/// 34: sessions.*_regex — RespawnArchivedAgent가 열람 전용 세션을 재실행할 때
+///     status detector regex를 agent_configs 재조회 없이 spawn 시점 값 그대로
+///     복원하도록 세션 행에 함께 저장(persist crate 소유 DDL, runtime PR-2 후속).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -692,6 +695,11 @@ CREATE TABLE workspace_notes (
     updated_at TEXT NOT NULL
 );
 ",
+    // v34: sessions.*_regex — 세션 spawn 시점의 status detector regex를 세션 행에
+    // 함께 저장한다. 기존 행은 컬럼이 없던 시절 것이라 NULL(=미지정, 기존과 동일하게
+    // idle heuristic만 동작) — 재실행이 아니라 재확인(re-run) 없이는 소급 채움이
+    // 불가능하므로 이는 정상 동작이다.
+    persist::MIGRATION_SESSION_REGEX,
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -19864,5 +19872,66 @@ mod tests {
         drop(db);
         fs::remove_dir_all(lock_dir).unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v33 기존 DB(sessions.*_regex 컬럼 없음)를 열면 v34로 올라가고 기존 세션 행이
+    /// 그대로 보존된다. 새 컬럼도 바로 쓸 수 있다 — RespawnArchivedAgent가 재실행 시
+    /// 이 컬럼에서 regex를 복원하므로, 마이그레이션이 기존 행을 깨거나 새 컬럼이
+    /// 막히면 그 복원 경로 전체가 조용히 무너진다.
+    #[test]
+    fn session_regex_마이그레이션은_기존_v33_db를_보존한다() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-session-regex-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..33] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 33).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (id, name, path, created_at, updated_at)
+                 VALUES ('ws-1', 'existing', '/repo', 't', 't')",
+                [],
+            )
+            .unwrap();
+            // v33 스키마 그대로 — waiting_regex 등 컬럼이 아직 없는 실제 구버전 행을 흉내낸다.
+            conn.execute(
+                "INSERT INTO sessions
+                    (id, workspace_id, session_kind, agent_id, title, command, args_json,
+                     cwd, status, created_at, updated_at, last_log_offset)
+                 VALUES ('sess-1', 'ws-1', 'shell', NULL, '기존 세션', '/bin/sh', '[]',
+                    '/tmp', 'exited', 't', 't', 7)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+
+        // 기존 세션 행 보존 — 새 컬럼은 NULL(=미지정)로 채워져 있어야 한다.
+        let preserved = persist::load_sessions(&db.conn, "ws-1").unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].id, "sess-1");
+        assert_eq!(preserved[0].command, "/bin/sh");
+        assert_eq!(preserved[0].last_log_offset, 7);
+        assert_eq!(preserved[0].waiting_regex, None);
+
+        // 새 컬럼 사용 가능 — 업그레이드 후 spawn되는 세션은 regex를 저장/복원할 수 있다.
+        let mut fresh = preserved[0].clone();
+        fresh.id = "sess-2".to_owned();
+        fresh.waiting_regex = Some("Waiting".to_owned());
+        fresh.error_regex = Some("FATAL".to_owned());
+        persist::upsert_session(&db.conn, &fresh).unwrap();
+        let after = persist::load_sessions(&db.conn, "ws-1").unwrap();
+        let saved = after.iter().find(|row| row.id == "sess-2").unwrap();
+        assert_eq!(saved.waiting_regex.as_deref(), Some("Waiting"));
+        assert_eq!(saved.error_regex.as_deref(), Some("FATAL"));
+        assert_eq!(saved.approval_regex, None);
+
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

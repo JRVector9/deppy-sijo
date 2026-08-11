@@ -26,6 +26,10 @@ const RESTORE_MAX_COMMAND_BYTES: usize = 32 * 1024;
 const RESTORE_MAX_ARG_ITEMS: usize = 256;
 const RESTORE_MAX_ARG_BYTES: usize = 32 * 1024;
 const RESTORE_MAX_ARGS_JSON_BYTES: usize = 1024 * 1024;
+/// runtime::command의 REGEX_BYTES_MAX(admission 상한)와 값을 맞춘다 — spawn 시점에
+/// 이미 그 상한으로 검증된 값만 이 컬럼에 들어오므로, 복원 상한이 더 낮으면 정상
+/// 저장된 행을 손상 취급하게 된다.
+const RESTORE_MAX_REGEX_BYTES: usize = 64 * 1024;
 const RESTORE_MAX_LAYOUT_JSON_BYTES: usize = 256 * 1024;
 const RESTORE_MAX_LAYOUT_DEPTH: usize = 64;
 const RESTORE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
@@ -82,6 +86,13 @@ pub struct SessionRow {
     pub cwd: String,
     pub status: String,
     pub last_log_offset: u64,
+    /// status detector regex(spawn 시점 값 — PR-2 RespawnArchivedAgent 복원용).
+    /// agent_configs의 *_regex와 동형이지만 이 세션이 처음 spawn될 때의 값을
+    /// 그대로 굳혀 보존한다(이후 agent_configs가 바뀌거나 삭제돼도 무관).
+    pub waiting_regex: Option<String>,
+    pub approval_regex: Option<String>,
+    pub error_regex: Option<String>,
+    pub done_regex: Option<String>,
 }
 
 /// 한 startup snapshot에서 복원 가능한 canonical window와 그 pane들이 실제로
@@ -729,7 +740,8 @@ where
             .prepare(
                 "SELECT DISTINCT s.id, s.workspace_id, s.session_kind, s.agent_id,
                         s.title, s.command, s.args_json, s.cwd, s.status,
-                        s.last_log_offset
+                        s.last_log_offset, s.waiting_regex, s.approval_regex,
+                        s.error_regex, s.done_regex
                  FROM sessions s
                  JOIN mux_panes p ON p.session_id = s.id
                  JOIN mux_tabs t ON t.id = p.tab_id
@@ -758,6 +770,10 @@ where
             let cwd = required_text(row, 7, RESTORE_MAX_CWD_BYTES)?;
             let status = required_text(row, 8, RESTORE_MAX_TEXT_BYTES)?;
             let offset = optional_nonnegative_integer(row, 9)?;
+            let waiting_regex = optional_text(row, 10, RESTORE_MAX_REGEX_BYTES)?;
+            let approval_regex = optional_text(row, 11, RESTORE_MAX_REGEX_BYTES)?;
+            let error_regex = optional_text(row, 12, RESTORE_MAX_REGEX_BYTES)?;
+            let done_regex = optional_text(row, 13, RESTORE_MAX_REGEX_BYTES)?;
             if row_workspace != workspace_id
                 || agent_id.is_some_and(str::is_empty)
                 || (session_kind == "agent" && agent_id.is_none())
@@ -787,6 +803,18 @@ where
                 cwd: checked_owned(&mut budget, cwd)?,
                 status: checked_owned(&mut budget, status)?,
                 last_log_offset: offset,
+                waiting_regex: waiting_regex
+                    .map(|value| checked_owned(&mut budget, value))
+                    .transpose()?,
+                approval_regex: approval_regex
+                    .map(|value| checked_owned(&mut budget, value))
+                    .transpose()?,
+                error_regex: error_regex
+                    .map(|value| checked_owned(&mut budget, value))
+                    .transpose()?,
+                done_regex: done_regex
+                    .map(|value| checked_owned(&mut budget, value))
+                    .transpose()?,
             });
         }
     }
@@ -814,8 +842,9 @@ pub fn upsert_session(conn: &Connection, row: &SessionRow) -> anyhow::Result<()>
     conn.execute(
         "INSERT INTO sessions
            (id, workspace_id, session_kind, agent_id, title, command, args_json,
-            cwd, status, last_log_offset, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            cwd, status, last_log_offset, waiting_regex, approval_regex, error_regex,
+            done_regex, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
             strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          ON CONFLICT(id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
@@ -827,6 +856,10 @@ pub fn upsert_session(conn: &Connection, row: &SessionRow) -> anyhow::Result<()>
             cwd = excluded.cwd,
             status = excluded.status,
             last_log_offset = excluded.last_log_offset,
+            waiting_regex = excluded.waiting_regex,
+            approval_regex = excluded.approval_regex,
+            error_regex = excluded.error_regex,
+            done_regex = excluded.done_regex,
             updated_at = excluded.updated_at",
         (
             &row.id,
@@ -839,6 +872,10 @@ pub fn upsert_session(conn: &Connection, row: &SessionRow) -> anyhow::Result<()>
             &row.cwd,
             &row.status,
             i64::try_from(row.last_log_offset).unwrap_or(i64::MAX),
+            &row.waiting_regex,
+            &row.approval_regex,
+            &row.error_regex,
+            &row.done_regex,
         ),
     )
     .with_context(|| format!("session 저장 실패: {}", row.id))?;
@@ -848,7 +885,8 @@ pub fn upsert_session(conn: &Connection, row: &SessionRow) -> anyhow::Result<()>
 pub fn load_sessions(conn: &Connection, workspace_id: &str) -> anyhow::Result<Vec<SessionRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, workspace_id, session_kind, agent_id, title, command, args_json,
-                cwd, status, last_log_offset
+                cwd, status, last_log_offset,
+                waiting_regex, approval_regex, error_regex, done_regex
          FROM sessions WHERE workspace_id = ?1 ORDER BY created_at, id",
     )?;
     let rows = stmt
@@ -864,6 +902,10 @@ pub fn load_sessions(conn: &Connection, workspace_id: &str) -> anyhow::Result<Ve
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -881,6 +923,10 @@ pub fn load_sessions(conn: &Connection, workspace_id: &str) -> anyhow::Result<Ve
         cwd,
         status,
         offset,
+        waiting_regex,
+        approval_regex,
+        error_regex,
+        done_regex,
     ) in rows
     {
         match serde_json::from_str(&args_json) {
@@ -895,6 +941,10 @@ pub fn load_sessions(conn: &Connection, workspace_id: &str) -> anyhow::Result<Ve
                 cwd,
                 status,
                 last_log_offset: offset.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
             }),
             Err(e) => tracing::warn!(session_id = %id, "args_json 파싱 실패 — 행 무시: {e}"),
         }
@@ -944,6 +994,9 @@ pub(crate) mod tests {
         .unwrap();
         if !migrated(conn) {
             conn.execute_batch(crate::MIGRATION_SQL).unwrap();
+            // storage의 MIGRATIONS가 실제 앱에서 이어붙이는 v34 — 이 fixture도 같은
+            // 순서로 적용해야 sessions.*_regex가 있는 실제 스키마와 맞는다.
+            conn.execute_batch(crate::MIGRATION_SESSION_REGEX).unwrap();
         }
         conn.execute("INSERT OR IGNORE INTO workspaces (id) VALUES ('ws-1')", [])
             .unwrap();
@@ -971,6 +1024,10 @@ pub(crate) mod tests {
             cwd: "/tmp".into(),
             status: status.into(),
             last_log_offset: 42,
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
         }
     }
 

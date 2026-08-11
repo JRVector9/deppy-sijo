@@ -2,11 +2,130 @@ use crate::agent_launcher::{
     AgentKind, DetectedAgent, DetectionSnapshot, LaunchOptions, ModelChoice, ReasoningEffort,
 };
 
+const LAUNCHER_WIDTH: f32 = 620.0;
+const AGENT_PANE_WIDTH: f32 = LAUNCHER_WIDTH / 2.0;
+const AGENT_ROW_HEIGHT: f32 = 47.0;
+const AGENT_ROW_GAP: f32 = 5.0;
+const VISIBLE_AGENT_ROWS: usize = 3;
+const CONTROL_HEIGHT: f32 = 34.0;
+const ACTION_HEIGHT: f32 = 32.0;
+
+#[derive(Clone, Copy)]
+struct LauncherPalette {
+    app: egui::Color32,
+    options: egui::Color32,
+    surface: egui::Color32,
+    selected: egui::Color32,
+    input: egui::Color32,
+    line: egui::Color32,
+    control_border: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    accent: egui::Color32,
+    warning: egui::Color32,
+    error: egui::Color32,
+    button: egui::Color32,
+    toggle_off: egui::Color32,
+}
+
+fn launcher_palette(dark_mode: bool) -> LauncherPalette {
+    if dark_mode {
+        LauncherPalette {
+            app: egui::Color32::from_rgb(0x18, 0x1b, 0x20),
+            options: egui::Color32::from_rgb(0x17, 0x1a, 0x1f),
+            surface: egui::Color32::from_rgb(0x1d, 0x20, 0x26),
+            selected: egui::Color32::from_rgb(0x21, 0x24, 0x2c),
+            input: egui::Color32::from_rgb(0x0f, 0x11, 0x15),
+            line: egui::Color32::from_rgb(0x32, 0x36, 0x3e),
+            control_border: egui::Color32::from_rgb(0x42, 0x47, 0x51),
+            text: egui::Color32::from_rgb(0xdc, 0xde, 0xe2),
+            muted: egui::Color32::from_rgb(0x92, 0x98, 0xa3),
+            accent: egui::Color32::from_rgb(0x39, 0xb8, 0xe8),
+            warning: egui::Color32::from_rgb(0xe0, 0xa4, 0x3a),
+            error: egui::Color32::from_rgb(0xef, 0x66, 0x71),
+            button: egui::Color32::from_rgb(0x20, 0x24, 0x2a),
+            toggle_off: egui::Color32::from_rgb(0x3a, 0x3f, 0x48),
+        }
+    } else {
+        LauncherPalette {
+            app: egui::Color32::from_rgb(0xf1, 0xf2, 0xf5),
+            options: egui::Color32::from_rgb(0xe9, 0xeb, 0xef),
+            surface: egui::Color32::from_rgb(0xeb, 0xed, 0xf0),
+            selected: egui::Color32::from_rgb(0xe5, 0xe8, 0xec),
+            input: egui::Color32::from_rgb(0xfd, 0xfd, 0xfd),
+            line: egui::Color32::from_rgb(0xc9, 0xcd, 0xd6),
+            control_border: egui::Color32::from_rgb(0xb8, 0xbe, 0xc8),
+            text: egui::Color32::from_rgb(0x23, 0x26, 0x2c),
+            muted: egui::Color32::from_rgb(0x65, 0x6a, 0x74),
+            accent: egui::Color32::from_rgb(0x1c, 0x93, 0xaa),
+            warning: egui::Color32::from_rgb(0xb2, 0x70, 0x16),
+            error: egui::Color32::from_rgb(0xc8, 0x3d, 0x49),
+            button: egui::Color32::from_rgb(0xe5, 0xe8, 0xec),
+            toggle_off: egui::Color32::from_rgb(0xb8, 0xbe, 0xc8),
+        }
+    }
+}
+
+fn apply_launcher_style(ui: &mut egui::Ui, palette: LauncherPalette) {
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+    let visuals = ui.visuals_mut();
+    visuals.override_text_color = Some(palette.text);
+    visuals.weak_text_color = Some(palette.muted);
+    visuals.panel_fill = palette.app;
+    visuals.window_fill = palette.app;
+    visuals.extreme_bg_color = palette.input;
+    visuals.faint_bg_color = palette.surface;
+    visuals.selection.bg_fill = palette.accent;
+    visuals.selection.stroke = egui::Stroke::new(
+        1.0,
+        crate::ui::designall::selection_text_color(palette.accent),
+    );
+    visuals.warn_fg_color = palette.warning;
+    visuals.error_fg_color = palette.error;
+    visuals.window_stroke = egui::Stroke::new(1.0, palette.control_border);
+    visuals.widgets.inactive.bg_fill = palette.input;
+    visuals.widgets.inactive.weak_bg_fill = palette.input;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.control_border);
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+    visuals.widgets.hovered.bg_fill = palette.surface;
+    visuals.widgets.hovered.weak_bg_fill = palette.surface;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette.control_border);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+    visuals.widgets.active.bg_fill = palette.selected;
+    visuals.widgets.active.weak_bg_fill = palette.selected;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette.accent);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
+    visuals.widgets.open.bg_fill = palette.surface;
+    visuals.widgets.open.weak_bg_fill = palette.surface;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, palette.control_border);
+    visuals.widgets.open.corner_radius = egui::CornerRadius::same(4);
+}
+
+fn launcher_hairline(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, color);
+}
+
 /// 감지 스냅샷에서 이 종류의 모델 목록을 꺼낸다. 아직 감지 전이면 빈 목록이다.
 fn models_for(snapshot: Option<&DetectionSnapshot>, kind: AgentKind) -> &[ModelChoice] {
     snapshot
         .and_then(|snapshot| snapshot.find(kind))
         .map_or(&[], DetectedAgent::models)
+}
+
+fn installed_list_height(agent_count: usize) -> f32 {
+    let rows = agent_count.min(VISIBLE_AGENT_ROWS);
+    if rows == 0 {
+        0.0
+    } else {
+        rows as f32 * AGENT_ROW_HEIGHT + (rows - 1) as f32 * AGENT_ROW_GAP
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,128 +231,345 @@ impl AgentLauncherUi {
         self.reconcile_selection(snapshot);
 
         let mut intent = None;
-        let response = egui::Modal::new(egui::Id::new("agent-launcher-modal")).show(ctx, |ui| {
-            ui.set_min_width(560.0);
-            ui.set_max_width(680.0);
-            ui.heading(catalog.t("agent_launcher.title", &[]));
-            ui.weak(catalog.t(
-                "agent_launcher.subtitle",
-                &[("project", self.workspace_name.as_str())],
-            ));
-            ui.add_space(8.0);
+        let palette = launcher_palette(ctx.global_style().visuals.dark_mode);
+        let modal_frame = egui::Frame::NONE
+            .fill(palette.app)
+            .stroke(egui::Stroke::new(1.0, palette.control_border))
+            .corner_radius(egui::CornerRadius::same(8))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 24],
+                blur: 60,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(97),
+            });
+        // v2 resets the oversized Area geometry cached by the old single-column launcher.
+        // The explicit first-pass width also keeps auto-sized modal content from inheriting the
+        // viewport width before its content has been measured.
+        let modal_id = egui::Id::new("agent-launcher-modal-v2");
+        let modal_area = egui::Modal::default_area(modal_id).default_width(LAUNCHER_WIDTH);
+        let response = egui::Modal::new(modal_id)
+            .area(modal_area)
+            .frame(modal_frame)
+            .backdrop_color(egui::Color32::from_black_alpha(145))
+            .show(ctx, |ui| {
+                apply_launcher_style(ui, palette);
+                ui.set_width(LAUNCHER_WIDTH);
 
-            ui.horizontal(|ui| {
-                ui.strong(catalog.t("agent_launcher.installed", &[]));
-                if detecting {
-                    ui.spinner();
-                    ui.weak(catalog.t("agent_launcher.detecting", &[]));
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin {
+                        left: 18,
+                        right: 18,
+                        top: 14,
+                        bottom: 11,
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(catalog.t("agent_launcher.title", &[]))
+                                    .size(18.0)
+                                    .strong(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let close_label = catalog.t("action.close", &[]);
+                                    let close = egui::Button::new(
+                                        egui::RichText::new("×").size(18.0).color(palette.muted),
+                                    )
+                                    .frame(false)
+                                    .min_size(egui::vec2(24.0, 24.0));
+                                    let close_response = ui
+                                        .add_enabled(!self.launch_pending, close)
+                                        .on_hover_text(&close_label);
+                                    close_response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            !self.launch_pending,
+                                            &close_label,
+                                        )
+                                    });
+                                    if close_response.clicked() {
+                                        self.open = false;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().rect_filled(dot_rect, 2.0, palette.accent);
+                            ui.label(
+                                egui::RichText::new(self.workspace_name.as_str())
+                                    .size(13.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    catalog.t("agent_launcher.subtitle_suffix", &[]),
+                                )
+                                .size(13.0)
+                                .color(palette.muted),
+                            );
+                        });
+                    });
+
+                launcher_hairline(ui, palette.line);
+
+                let list_height = snapshot.map_or(0.0, |snapshot| {
+                    installed_list_height(snapshot.agents().len())
+                });
+                let empty_height = if snapshot.is_some_and(|snapshot| snapshot.agents().is_empty())
+                {
+                    36.0
+                } else {
+                    0.0
+                };
+                let detecting_height = if detecting { 20.0 } else { 0.0 };
+                let left_content_height =
+                    24.0 + detecting_height + 5.0 + list_height.max(empty_height);
+
+                let (left_rect, right_rect) = ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let left = egui::Frame::NONE
+                                .inner_margin(egui::Margin {
+                                    left: 16,
+                                    right: 12,
+                                    top: 12,
+                                    bottom: 12,
+                                })
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(AGENT_PANE_WIDTH - 28.0);
+                                        if let Some(list_intent) = self.render_agent_list(
+                                            ui, snapshot, detecting, catalog, palette,
+                                        ) {
+                                            intent = Some(list_intent);
+                                        }
+                                    });
+                                });
+                            let right = egui::Frame::NONE
+                                .fill(palette.options)
+                                .inner_margin(egui::Margin {
+                                    left: 16,
+                                    right: 16,
+                                    top: 12,
+                                    bottom: 12,
+                                })
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(LAUNCHER_WIDTH - AGENT_PANE_WIDTH - 32.0);
+                                        ui.set_min_height(left_content_height);
+                                        if let Some(kind) = self.selected {
+                                            self.render_options(
+                                                ui,
+                                                kind,
+                                                models_for(snapshot, kind),
+                                                catalog,
+                                                palette,
+                                            );
+                                        }
+                                    });
+                                });
+                            (left.response.rect, right.response.rect)
+                        },
+                    )
+                    .inner;
+
+                let body_rect = left_rect.union(right_rect);
+                ui.painter().vline(
+                    crate::ui::snap_line_to_pixel(
+                        left_rect.right(),
+                        crate::ui::designall::SEPARATOR_WIDTH,
+                        ui.ctx().pixels_per_point(),
+                    ),
+                    body_rect.y_range(),
+                    egui::Stroke::new(1.0, palette.line),
+                );
+
+                if let Some(error) = self.error {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(16, 6))
+                        .show(ui, |ui| {
+                            ui.colored_label(palette.error, catalog.t(error.message_key(), &[]));
+                        });
                 }
+
+                launcher_hairline(ui, palette.line);
+                egui::Frame::NONE
+                    .fill(palette.options)
+                    .inner_margin(egui::Margin::symmetric(16, 8))
+                    .show(ui, |ui| {
+                        let row_width = ui.available_width();
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(row_width, 36.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let blank = egui::Button::new(
+                                    egui::RichText::new(
+                                        catalog.t("agent_launcher.blank_terminal", &[]),
+                                    )
+                                    .size(13.0),
+                                )
+                                .min_size(egui::vec2(96.0, ACTION_HEIGHT))
+                                .fill(palette.button)
+                                .stroke(egui::Stroke::new(1.0, palette.control_border))
+                                .corner_radius(4);
+                                if ui
+                                    .add_enabled(!self.launch_pending, blank)
+                                    .on_hover_text(
+                                        catalog.t("agent_launcher.blank_terminal_hint", &[]),
+                                    )
+                                    .clicked()
+                                {
+                                    self.open = false;
+                                    intent = Some(AgentLauncherIntent::BlankTerminal {
+                                        workspace_id: self.workspace_id.clone(),
+                                    });
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let launch =
+                                            egui::Button::new(
+                                                egui::RichText::new(
+                                                    catalog.t("agent_launcher.launch", &[]),
+                                                )
+                                                .size(13.0)
+                                                .strong()
+                                                .color(crate::ui::designall::selection_text_color(
+                                                    palette.accent,
+                                                )),
+                                            )
+                                            .min_size(egui::vec2(116.0, ACTION_HEIGHT))
+                                            .fill(palette.accent)
+                                            .stroke(egui::Stroke::new(1.0, palette.accent))
+                                            .corner_radius(4);
+                                        if ui
+                                            .add_enabled(
+                                                self.selected.is_some() && !self.launch_pending,
+                                                launch,
+                                            )
+                                            .clicked()
+                                            && let Some(launch_intent) = self.start_launch()
+                                        {
+                                            intent = Some(launch_intent);
+                                        }
+                                        if self.launch_pending {
+                                            ui.spinner();
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    catalog.t("agent_launcher.launching", &[]),
+                                                )
+                                                .size(11.0)
+                                                .color(palette.muted),
+                                            );
+                                        }
+                                    },
+                                );
+                            },
+                        );
+                    });
+            });
+
+        if response.should_close() && !self.launch_pending {
+            self.open = false;
+        }
+        intent
+    }
+
+    fn render_agent_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: Option<&DetectionSnapshot>,
+        detecting: bool,
+        catalog: &i18n::Catalog,
+        palette: LauncherPalette,
+    ) -> Option<AgentLauncherIntent> {
+        let mut intent = None;
+        let agent_count = snapshot.map_or(0, |snapshot| snapshot.agents().len());
+        let header_width = ui.available_width();
+        ui.allocate_ui_with_layout(
+            egui::vec2(header_width, 24.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {agent_count}",
+                        catalog.t("agent_launcher.installed", &[])
+                    ))
+                    .size(13.0)
+                    .strong(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let refresh = egui::Button::new(
+                        egui::RichText::new(format!(
+                            "↻ {}",
+                            catalog.t("agent_launcher.refresh", &[])
+                        ))
+                        .size(12.0)
+                        .color(ui.visuals().selection.bg_fill),
+                    )
+                    .frame(false);
                     if ui
-                        .add_enabled(
-                            !detecting && !self.launch_pending,
-                            egui::Button::new(catalog.t("agent_launcher.refresh", &[])),
-                        )
+                        .add_enabled(!detecting && !self.launch_pending, refresh)
                         .clicked()
                     {
                         intent = Some(AgentLauncherIntent::Refresh);
                     }
                 });
-            });
-
-            match snapshot {
-                Some(snapshot) if !snapshot.agents().is_empty() => {
-                    // 설치 목록은 화면이 허용하는 만큼 늘어나고, 그래도 모자랄 때만
-                    // 스크롤한다. 고정 상한을 두면 에이전트가 몇 개든 항상 잘린다.
-                    egui::ScrollArea::vertical()
-                        .id_salt("agent-launcher-installed")
-                        .max_height(installed_list_max_height(ctx))
-                        .show(ui, |ui| {
-                            for agent in snapshot.agents() {
-                                let kind = agent.kind();
-                                let card = agent_card(ui, kind, self.selected == Some(kind));
-                                if (card.clicked() || card.double_clicked()) && !self.launch_pending
-                                {
-                                    self.select(agent);
-                                }
-                                // egui는 더블클릭의 두 번째 릴리즈에서 clicked()도 함께
-                                // 발생시킨다. 위에서 선택이 먼저 반영된 뒤라야 여기서
-                                // "세션 시작" 버튼과 같은 경로(start_launch)가 이 카드의
-                                // 에이전트로 시작한다.
-                                if card.double_clicked()
-                                    && let Some(launch_intent) = self.start_launch()
-                                {
-                                    intent = Some(launch_intent);
-                                }
-                                ui.add_space(5.0);
-                            }
-                        });
-                }
-                Some(_) if !detecting => {
-                    ui.group(|ui| {
-                        ui.label(catalog.t("agent_launcher.none_detected", &[]));
-                        ui.weak(catalog.t("agent_launcher.none_detected_hint", &[]));
-                    });
-                }
-                _ => {
-                    ui.add_space(24.0);
-                }
-            }
-
-            if let Some(kind) = self.selected {
-                ui.add_space(8.0);
-                crate::ui::hairline(ui);
-                ui.add_space(8.0);
-                self.render_options(ui, kind, models_for(snapshot, kind), catalog);
-            }
-
-            if let Some(error) = self.error {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    catalog.t(error.message_key(), &[]),
-                );
-            }
-
-            ui.add_space(10.0);
-            crate::ui::hairline(ui);
-            ui.add_space(8.0);
+            },
+        );
+        if detecting {
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.launch_pending,
-                        egui::Button::new(catalog.t("agent_launcher.blank_terminal", &[])),
-                    )
-                    .on_hover_text(catalog.t("agent_launcher.blank_terminal_hint", &[]))
-                    .clicked()
-                {
-                    self.open = false;
-                    intent = Some(AgentLauncherIntent::BlankTerminal {
-                        workspace_id: self.workspace_id.clone(),
-                    });
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            self.selected.is_some() && !self.launch_pending,
-                            egui::Button::new(catalog.t("agent_launcher.launch", &[])),
-                        )
-                        .clicked()
-                        && let Some(launch_intent) = self.start_launch()
-                    {
-                        intent = Some(launch_intent);
-                    }
-                    if self.launch_pending {
-                        ui.spinner();
-                        ui.weak(catalog.t("agent_launcher.launching", &[]));
-                    }
-                });
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(catalog.t("agent_launcher.detecting", &[]))
+                        .size(11.0)
+                        .weak(),
+                );
             });
-        });
-
-        if response.should_close() && !self.launch_pending {
-            self.open = false;
         }
+        ui.add_space(5.0);
+
+        match snapshot {
+            Some(snapshot) if !snapshot.agents().is_empty() => {
+                egui::ScrollArea::vertical()
+                    .id_salt("agent-launcher-installed")
+                    .max_height(installed_list_height(snapshot.agents().len()))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (index, agent) in snapshot.agents().iter().enumerate() {
+                            let kind = agent.kind();
+                            let card = agent_card(ui, kind, self.selected == Some(kind), palette);
+                            if (card.clicked() || card.double_clicked()) && !self.launch_pending {
+                                self.select(agent);
+                            }
+                            // egui는 더블클릭의 두 번째 릴리즈에서 clicked()도 함께
+                            // 발생시킨다. 선택을 먼저 반영한 뒤 기존 단일 시작 경로를 쓴다.
+                            if card.double_clicked()
+                                && let Some(launch_intent) = self.start_launch()
+                            {
+                                intent = Some(launch_intent);
+                            }
+                            if index + 1 < snapshot.agents().len() {
+                                ui.add_space(AGENT_ROW_GAP);
+                            }
+                        }
+                    });
+            }
+            Some(_) if !detecting => {
+                ui.label(catalog.t("agent_launcher.none_detected", &[]));
+                ui.weak(catalog.t("agent_launcher.none_detected_hint", &[]));
+            }
+            _ => {}
+        }
+
         intent
     }
 
@@ -243,31 +579,38 @@ impl AgentLauncherUi {
         kind: AgentKind,
         models: &[ModelChoice],
         catalog: &i18n::Catalog,
+        palette: LauncherPalette,
     ) {
+        ui.spacing_mut().interact_size.y = CONTROL_HEIGHT;
+        let mut rendered_field = false;
         if !models.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("agent_launcher.model", &[]));
-                let selected = crate::agent_launcher::find_model(models, &self.model)
-                    .map(ModelChoice::label)
-                    .unwrap_or_default();
-                ui.add_enabled_ui(!self.launch_pending, |ui| {
-                    egui::ComboBox::from_id_salt(("agent-launcher-model", kind.id()))
-                        .selected_text(selected)
-                        .width(360.0)
-                        .height(combo_popup_height(ui))
-                        .show_ui(ui, |ui| {
-                            for choice in models {
-                                if ui
-                                    .selectable_label(self.model == choice.value(), choice.label())
-                                    .clicked()
-                                {
-                                    self.model = choice.value().to_owned();
-                                    self.reconcile_effort(models);
-                                }
+            ui.label(
+                egui::RichText::new(catalog.t("agent_launcher.model", &[]))
+                    .size(12.0)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            let selected = crate::agent_launcher::find_model(models, &self.model)
+                .map(ModelChoice::label)
+                .unwrap_or_default();
+            ui.add_enabled_ui(!self.launch_pending, |ui| {
+                egui::ComboBox::from_id_salt(("agent-launcher-model", kind.id()))
+                    .selected_text(selected)
+                    .width(ui.available_width())
+                    .height(combo_popup_height(ui))
+                    .show_ui(ui, |ui| {
+                        for choice in models {
+                            if ui
+                                .selectable_label(self.model == choice.value(), choice.label())
+                                .clicked()
+                            {
+                                self.model = choice.value().to_owned();
+                                self.reconcile_effort(models);
                             }
-                        });
-                });
+                        }
+                    });
             });
+            rendered_field = true;
         }
 
         // 모델 개념이 없는 에이전트(models가 비어 있음)는 강도도 제시하지 않는다.
@@ -279,52 +622,86 @@ impl AgentLauncherUi {
             } else {
                 "agent_launcher.effort"
             };
-            ui.horizontal(|ui| {
-                ui.label(catalog.t(row_label, &[]));
-                let selected = self
-                    .effort
-                    .map(|effort| catalog.t(effort_message_key(effort), &[]))
-                    .unwrap_or_default();
-                ui.add_enabled_ui(!self.launch_pending, |ui| {
-                    egui::ComboBox::from_id_salt("agent-launcher-effort")
-                        .selected_text(selected)
-                        .height(combo_popup_height(ui))
-                        .show_ui(ui, |ui| {
-                            for effort in efforts {
-                                if ui
-                                    .selectable_label(
-                                        self.effort == Some(*effort),
-                                        catalog.t(effort_message_key(*effort), &[]),
-                                    )
-                                    .clicked()
-                                {
-                                    self.effort = Some(*effort);
-                                }
+            if rendered_field {
+                ui.add_space(10.0);
+            }
+            ui.label(
+                egui::RichText::new(catalog.t(row_label, &[]))
+                    .size(12.0)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            let selected = self
+                .effort
+                .map(|effort| catalog.t(effort_message_key(effort), &[]))
+                .unwrap_or_default();
+            ui.add_enabled_ui(!self.launch_pending, |ui| {
+                egui::ComboBox::from_id_salt("agent-launcher-effort")
+                    .selected_text(selected)
+                    .width(ui.available_width())
+                    .height(combo_popup_height(ui))
+                    .show_ui(ui, |ui| {
+                        for effort in efforts {
+                            if ui
+                                .selectable_label(
+                                    self.effort == Some(*effort),
+                                    catalog.t(effort_message_key(*effort), &[]),
+                                )
+                                .clicked()
+                            {
+                                self.effort = Some(*effort);
                             }
-                        });
-                });
+                        }
+                    });
             });
+            rendered_field = true;
         }
 
         let supports_yolo = kind.supports_yolo();
         if !supports_yolo {
             self.yolo = false;
         }
-        ui.add_enabled(
-            supports_yolo && !self.launch_pending,
-            egui::Checkbox::new(&mut self.yolo, catalog.t("agent_launcher.yolo", &[])),
-        );
-        if supports_yolo {
-            ui.weak(catalog.t("agent_launcher.yolo_hint", &[]));
-        } else {
-            ui.weak(catalog.t("agent_launcher.yolo_unsupported", &[]));
+        if rendered_field {
+            ui.add_space(12.0);
+            launcher_hairline(ui, palette.line);
+            ui.add_space(12.0);
         }
-        if self.yolo {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                catalog.t("agent_launcher.yolo_warning", &[]),
-            );
-        }
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.horizontal_top(|ui| {
+                let yolo_label = catalog.t("agent_launcher.yolo", &[]);
+                let toggle = ui
+                    .add_enabled_ui(supports_yolo && !self.launch_pending, |ui| {
+                        launcher_toggle(ui, &mut self.yolo, palette)
+                    })
+                    .inner;
+                toggle.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Checkbox,
+                        ui.is_enabled(),
+                        self.yolo,
+                        &yolo_label,
+                    )
+                });
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(yolo_label).size(13.0).strong());
+                    ui.add_space(3.0);
+                    let (message_key, message_color) = if supports_yolo {
+                        ("agent_launcher.yolo_warning", palette.warning)
+                    } else {
+                        ("agent_launcher.yolo_unsupported", palette.muted)
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(catalog.t(message_key, &[]))
+                                .size(11.0)
+                                .color(message_color),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                    );
+                });
+            });
+        });
     }
 
     fn reconcile_selection(&mut self, snapshot: Option<&DetectionSnapshot>) {
@@ -419,19 +796,6 @@ impl Default for AgentLauncherUi {
     }
 }
 
-/// 모달의 나머지 요소(제목·옵션·버튼)가 쓰는 세로 공간을 뺀 나머지를 설치 목록에 준다.
-/// 그래서 창이 충분히 크면 감지된 에이전트가 전부 보이고 스크롤이 아예 생기지 않는다.
-///
-/// 드롭다운 몫(`POPUP_CLEARANCE`)을 따로 남긴다. egui는 팝업이 창 안에 완전히 들어가는
-/// 배치를 못 찾으면 뒤집지 않고 그냥 아래로 펼친 뒤 창 밖을 잘라내기 때문에, 모달이 창
-/// 높이를 다 쓰면 옵션 콤보박스의 목록이 잘린다.
-fn installed_list_max_height(ctx: &egui::Context) -> f32 {
-    const MODAL_CHROME_HEIGHT: f32 = 330.0;
-    const POPUP_CLEARANCE: f32 = 200.0;
-    const MIN_LIST_HEIGHT: f32 = 132.0;
-    (ctx.viewport_rect().height() - MODAL_CHROME_HEIGHT - POPUP_CLEARANCE).max(MIN_LIST_HEIGHT)
-}
-
 /// 드롭다운 팝업이 스크롤 없이 항목을 다 보여주도록 상한을 창 높이까지 연다.
 ///
 /// 지정하지 않으면 egui가 `Spacing::combo_height`(기본 200px)에서 잘라 항목이 몇 개든
@@ -442,49 +806,97 @@ fn combo_popup_height(ui: &egui::Ui) -> f32 {
     ui.ctx().viewport_rect().height()
 }
 
-fn agent_card(ui: &mut egui::Ui, kind: AgentKind, selected: bool) -> egui::Response {
+fn launcher_toggle(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    palette: LauncherPalette,
+) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(31.0, 18.0), egui::Sense::click());
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+
+    let enabled_alpha = if ui.is_enabled() { 1.0 } else { 0.45 };
+    let track = if *value {
+        palette.accent
+    } else {
+        palette.toggle_off
+    }
+    .gamma_multiply(enabled_alpha);
+    let knob = if *value {
+        egui::Color32::WHITE
+    } else {
+        palette.muted
+    }
+    .gamma_multiply(enabled_alpha);
+    ui.painter().rect_filled(rect, 9.0, track);
+    let center_x = if *value {
+        rect.right() - 9.0
+    } else {
+        rect.left() + 9.0
+    };
+    ui.painter()
+        .circle_filled(egui::pos2(center_x, rect.center().y), 6.0, knob);
+    response
+}
+
+fn agent_card(
+    ui: &mut egui::Ui,
+    kind: AgentKind,
+    selected: bool,
+    palette: LauncherPalette,
+) -> egui::Response {
     let width = ui.available_width().max(240.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 58.0), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, AGENT_ROW_HEIGHT), egui::Sense::click());
     let visuals = ui.visuals();
     let fill = if selected {
-        visuals.selection.bg_fill.gamma_multiply(0.16)
+        palette.selected
     } else if response.hovered() {
-        visuals.widgets.hovered.weak_bg_fill
+        palette.surface
     } else {
-        visuals.widgets.inactive.weak_bg_fill
+        egui::Color32::TRANSPARENT
     };
     let stroke = if selected {
-        egui::Stroke::new(1.25, visuals.selection.bg_fill)
+        egui::Stroke::new(1.0, palette.accent)
     } else {
-        visuals.widgets.inactive.bg_stroke
+        egui::Stroke::NONE
     };
     ui.painter().rect_filled(rect, 5.0, fill);
     ui.painter()
         .rect_stroke(rect, 5.0, stroke, egui::StrokeKind::Inside);
 
     let badge_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 29.0, rect.center().y),
-        egui::vec2(36.0, 36.0),
+        egui::pos2(rect.left() + 23.0, rect.center().y),
+        egui::vec2(30.0, 30.0),
     );
     let (red, green, blue) = kind.badge_color();
     ui.painter()
-        .rect_filled(badge_rect, 8.0, egui::Color32::from_rgb(red, green, blue));
+        .rect_filled(badge_rect, 7.0, egui::Color32::from_rgb(red, green, blue));
     ui.painter().text(
         badge_rect.center(),
         egui::Align2::CENTER_CENTER,
         kind.badge(),
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(10.0),
         egui::Color32::WHITE,
     );
-    // 명령어 줄(kind.id())은 표시명에서 이미 유추되므로 보여주지 않는다. 이름 한 줄만
-    // 남기고 아이콘(badge_rect) 세로 중앙과 같은 y에 그린다.
     ui.painter().text(
-        egui::pos2(rect.left() + 57.0, rect.center().y),
+        egui::pos2(rect.left() + 47.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         kind.label(),
-        egui::FontId::proportional(15.0),
+        egui::FontId::proportional(14.0),
         visuals.text_color(),
     );
+    if selected {
+        ui.painter().text(
+            egui::pos2(rect.right() - 15.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            "✓",
+            egui::FontId::proportional(13.0),
+            palette.accent,
+        );
+    }
     response
 }
 

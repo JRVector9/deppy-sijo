@@ -653,6 +653,10 @@ fn keeps_embedded_pane_header(_layout: &LayoutNode) -> bool {
 /// render_pane_header의 제목 폭 계산이 공유하는 단일 원천.
 const PANE_HEADER_TOOLBAR_BUTTON: f32 = 20.0;
 const PANE_HEADER_TOOLBAR_GAP: f32 = 2.0;
+/// 제목의 좌측 원점. 예전 17px는 앞의 포커스 점(중심 8, 반지름 4)을 피한 값이었다 —
+/// 점을 지웠으니 그 자리를 되돌린다. pane_header_buttons와 render_pane_header가
+/// **같은 값**을 써야 닫기 버튼 위치와 제목 폭 계산이 어긋나지 않는다.
+const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
 
 /// pane 헤더 버튼 기하 — 닫기(×)는 마지막까지 남는 버튼이다.
 struct PaneHeaderButtons {
@@ -676,7 +680,7 @@ fn pane_header_buttons(
     title_width: f32,
     icon_count: usize,
 ) -> PaneHeaderButtons {
-    let title_left = header.left() + 17.0;
+    let title_left = header.left() + PANE_HEADER_TITLE_LEFT;
     let center_y = header.center().y;
     // 제목과 닫기 버튼을 먼저 온전히 확보한다. 분할 pane이 좁아지면 우측 도구를
     // 왼쪽부터 단계적으로 숨겨(0개 허용) 제목 글자가 중간에서 잘리는 일을 막는다.
@@ -3398,7 +3402,7 @@ impl WorkspaceUi {
             TerminalToolbarIcon::SplitColumns,
             TerminalToolbarIcon::SplitRows,
         ];
-        let title_left = header.left() + 17.0;
+        let title_left = header.left() + PANE_HEADER_TITLE_LEFT;
 
         // 우측 도구 4개를 모두 표시하던 기존 제목 폭을 기준으로 실제 글자 수를 구한 뒤
         // 10자를 더 허용한다. 추가 폭이 필요하면 기존 규칙대로 왼쪽 도구부터 숨긴다.
@@ -3481,17 +3485,12 @@ impl WorkspaceUi {
             self.pane_context_menu(&header_response, &pane.id, config, catalog);
         }
 
-        // 이 점이 뜻하는 건 "성공"이 아니라 **포커스됨**이다. 원래 tokens.success를 쓰고
-        // 있었는데 토큰 이름과 의미가 어긋나 있어서, 나중에 누가 success 색을 조정하면
-        // 엉뚱하게 이 점이 따라 바뀐다. 액센트가 앱 전체에서 "선택됨/포커스"를 뜻하므로
-        // 그쪽으로 옮긴다(2026-08-07).
-        let status_color = if focused {
-            tokens.accent
-        } else {
-            tokens.muted_text
-        };
-        ui.painter()
-            .circle_filled(egui::pos2(header.left() + 8.0, center_y), 4.0, status_color);
+        // 포커스 점은 없앴다(2026-08-11 사용자: 상태 표시와 색이 달라 헷갈린다).
+        // 사이드바에서 같은 크기·같은 자리의 점이 **세션 상태**(실행/대기/완료/오류)를
+        // 나르는데, 이 점만 accent 청록으로 「포커스됨」을 뜻해 같은 기호가 두 뜻을
+        // 가졌다. 포커스는 이미 셋이 말한다 — 헤더 배경(style.background), 상단 accent
+        // 선(style.active_stroke), 제목 밝기(text vs muted_text). 네 번째 신호를
+        // 지우면서 팔레트 충돌도 함께 사라진다.
 
         let title_right = (close.left() - 3.0).max(title_left);
         let title_clip = egui::Rect::from_min_max(

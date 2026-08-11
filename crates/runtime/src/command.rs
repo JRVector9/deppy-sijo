@@ -400,6 +400,9 @@ pub(crate) fn runtime_command_retained_bytes(
         RuntimeCommand::SeedRedaction { credential_ids } => {
             retained_strings(&mut total, credential_ids)?;
         }
+        RuntimeCommand::RespawnArchivedAgent { extra_args, .. } => {
+            retained_strings(&mut total, extra_args)?;
+        }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
         | RuntimeCommand::FocusPane { pane }
@@ -518,6 +521,9 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         }
         RuntimeCommand::SeedRedaction { credential_ids } => {
             canonicalize_strings(credential_ids);
+        }
+        RuntimeCommand::RespawnArchivedAgent { extra_args, .. } => {
+            canonicalize_strings(extra_args);
         }
         RuntimeCommand::SplitPane { pane, .. }
         | RuntimeCommand::ClosePane { pane }
@@ -727,6 +733,18 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             if *correlation_id == 0 {
                 return Err(admission_error("runtime_durable_event_barrier_invalid"));
             }
+        }
+        RuntimeCommand::RespawnArchivedAgent {
+            cols,
+            rows,
+            scrollback_lines,
+            extra_args,
+            ..
+        } => {
+            if !dimensions_are_valid(*cols, *rows) || *scrollback_lines > SCROLLBACK_LINES_MAX {
+                return Err(admission_error("runtime_command_respawn_archived_invalid"));
+            }
+            validate_args(extra_args)?;
         }
         RuntimeCommand::Scroll { .. }
         | RuntimeCommand::KillSession { .. }
@@ -969,6 +987,23 @@ pub enum RuntimeCommand {
     /// 실행 시점에 unattached 후보를 다시 계산해 런타임 소유 세션만 정리한다.
     /// UI가 session id를 전달하지 않는다. **variant는 끝에만 추가** (wire 계약).
     KillUnattachedSessions,
+    /// 열람 전용으로 복원된(archived) 에이전트 세션을 그 pane 자리에서 재실행한다
+    /// (PR-2). 사용자가 pane의 「다시 실행」을 눌렀을 때만 온다 — 자동 재실행은 없다.
+    /// persistence 헤더가 금지하는 건 restore 시점의 **자동** 재실행이지, 명시적
+    /// 사용자 확인까지 막는 건 아니다(2026-08-11 정책 변경). 대상이 archived agent
+    /// pane이 아니면(라이브 세션·미존재 세션 등) worker가 안전하게 실패로 처리한다.
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 계약).
+    RespawnArchivedAgent {
+        session: SessionId,
+        /// 저장된 launch args 뒤에 덧붙일 이어가기 인자(`--continue` 등). 비어 있으면
+        /// 새 대화. 판정은 app 쪽 `agent_resume::resume_args`가 하고 여기선 받기만
+        /// 한다 — 저장된 launch spec 자체(영속 args)는 바뀌지 않는다(재실행을 거듭해도
+        /// 인자가 누적되지 않게).
+        extra_args: Vec<String>,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -1124,6 +1159,20 @@ impl std::fmt::Debug for RuntimeCommand {
                 .finish(),
             RuntimeCommand::InspectUnattachedSessions => f.write_str("InspectUnattachedSessions"),
             RuntimeCommand::KillUnattachedSessions => f.write_str("KillUnattachedSessions"),
+            RuntimeCommand::RespawnArchivedAgent {
+                session,
+                extra_args,
+                cols,
+                rows,
+                scrollback_lines,
+            } => f
+                .debug_struct("RespawnArchivedAgent")
+                .field("session", session)
+                .field("extra_args_count", &extra_args.len())
+                .field("cols", cols)
+                .field("rows", rows)
+                .field("scrollback_lines", scrollback_lines)
+                .finish(),
             RuntimeCommand::SetWorkspaceState(state) => {
                 f.debug_tuple("SetWorkspaceState").field(state).finish()
             }
@@ -1902,6 +1951,7 @@ mod tests {
                 "DurableEventBarrier",
                 "InspectUnattachedSessions",
                 "KillUnattachedSessions",
+                "RespawnArchivedAgent",
             ]
         );
     }
@@ -1937,5 +1987,94 @@ mod tests {
             format!("{valid:?}"),
             "DurableEventBarrier { correlation_id: 7 }"
         );
+    }
+
+    fn respawn_archived_agent_command(extra_args: Vec<String>) -> RuntimeCommand {
+        RuntimeCommand::RespawnArchivedAgent {
+            session: SessionId(1),
+            extra_args,
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+        }
+    }
+
+    #[test]
+    fn respawn_archived_agent_admission_bounds_dimensions_and_extra_args() {
+        assert!(validate_host_command(&respawn_archived_agent_command(Vec::new())).is_ok());
+        for invalid in [
+            RuntimeCommand::RespawnArchivedAgent {
+                session: SessionId(1),
+                extra_args: Vec::new(),
+                cols: 0,
+                rows: 24,
+                scrollback_lines: 100,
+            },
+            RuntimeCommand::RespawnArchivedAgent {
+                session: SessionId(1),
+                extra_args: Vec::new(),
+                cols: TERMINAL_DIMENSION_MAX + 1,
+                rows: 24,
+                scrollback_lines: 100,
+            },
+            RuntimeCommand::RespawnArchivedAgent {
+                session: SessionId(1),
+                extra_args: Vec::new(),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: SCROLLBACK_LINES_MAX + 1,
+            },
+        ] {
+            assert!(validate_host_command(&invalid).is_err());
+        }
+
+        assert!(
+            validate_host_command(&respawn_archived_agent_command(vec![
+                String::new();
+                ARG_ITEMS_MAX
+            ]))
+            .is_ok()
+        );
+        assert!(
+            validate_host_command(&respawn_archived_agent_command(vec![
+                String::new();
+                ARG_ITEMS_MAX + 1
+            ]))
+            .is_err()
+        );
+        assert!(
+            validate_host_command(&respawn_archived_agent_command(vec![
+                "x".repeat(ARG_BYTES_MAX + 1)
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn respawn_archived_agent_retention_counts_extra_args_and_canonicalizes() {
+        let mut command =
+            respawn_archived_agent_command(vec![spare_string("--continue", 64 * 1024)]);
+        assert!(validate_host_command(&command).is_ok());
+        canonicalize_host_command(&mut command);
+        let RuntimeCommand::RespawnArchivedAgent { extra_args, .. } = &command else {
+            unreachable!()
+        };
+        assert_eq!(extra_args[0].capacity(), extra_args[0].len());
+
+        let baseline =
+            runtime_command_retained_bytes(&respawn_archived_agent_command(Vec::new())).unwrap();
+        let with_args = runtime_command_retained_bytes(&respawn_archived_agent_command(vec![
+            "--continue".to_owned(),
+        ]))
+        .unwrap();
+        assert!(with_args > baseline);
+    }
+
+    #[test]
+    fn respawn_archived_agent_debug_hides_extra_args_content() {
+        let command = respawn_archived_agent_command(vec!["--continue-secret".to_owned()]);
+        let text = format!("{command:?}");
+        assert!(!text.contains("--continue-secret"));
+        assert!(text.contains("extra_args_count"));
     }
 }

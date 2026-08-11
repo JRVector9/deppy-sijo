@@ -205,6 +205,36 @@ impl PersistPipe {
         true
     }
 
+    /// `session`에 결속된 영속 행을 조회한다(peek — 소비하지 않음). `RespawnArchivedAgent`가
+    /// 재실행 스펙(command/args/cwd/agent_id)을 읽는 데 쓴다. `session_rebound_archived`가
+    /// 이미 `restored_rows`에서 `rows`로 옮겨뒀으므로 archived pane의 세션이면 항상 있다.
+    pub(crate) fn session_row(&self, session: SessionId) -> Option<&SessionRow> {
+        self.rows.get(&session)
+    }
+
+    /// 열람 전용(archived) 세션을 재실행한 새 SessionId로 영속 행을 옮긴다 — 같은 UUID
+    /// (`row.id`)를 재사용해 로그/스크롤백 아카이브 디렉터리가 끊기지 않는다. 저장된
+    /// launch args는 건드리지 않는다: 이어가기 인자(`--continue` 등)는 이번 프로세스
+    /// 호출에만 쓰이고 영속 launch spec에는 반영하지 않는다 — 안 그러면 재실행을
+    /// 거듭할 때마다 인자가 누적된다. 대상 행이 없으면(이미 소비/손상) false —
+    /// 호출측은 새 세션을 그대로 두고 이 실패만 로그로 남긴다.
+    pub(crate) fn session_respawned(
+        &mut self,
+        old_session: SessionId,
+        new_session: SessionId,
+    ) -> bool {
+        let Some(mut row) = self.rows.remove(&old_session) else {
+            tracing::warn!(session = old_session.0, "재실행 대상 영속 행 없음");
+            return false;
+        };
+        row.status = persist::SESSION_STATUS_RUNNING.to_owned();
+        if let Err(e) = persist::upsert_session(&self.conn, &row) {
+            tracing::warn!(persistent_id = %row.id, "세션 영속 실패 (respawn): {e:#}");
+        }
+        self.rows.insert(new_session, row);
+        true
+    }
+
     /// 세션의 현재 작업 폴더 갱신 — 감지 워커(lsof)가 관측한 live cd를 따라간다(A안).
     /// 복원 시 이 값으로 그 폴더에서 셸을 다시 띄운다.
     pub(crate) fn update_session_cwd(&mut self, session: SessionId, cwd: &str) {
@@ -496,6 +526,109 @@ mod tests {
         assert_eq!(status, "done");
         assert_eq!(offset, 64);
         drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn session_row은_소비하지_않고_반복_조회_가능하다() {
+        let (dir, db_path) = temp_db("session-row-peek");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("runtime").unwrap();
+        drop(db);
+
+        let mut pipe = PersistPipe::open(&PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id,
+        })
+        .unwrap();
+        let session = SessionId(1);
+        pipe.session_spawned(
+            session,
+            "shell",
+            None,
+            "agent",
+            "/bin/echo",
+            &["stored".to_owned()],
+            "/tmp",
+        );
+
+        let first = pipe.session_row(session).cloned().unwrap();
+        let second = pipe.session_row(session).cloned().unwrap();
+        assert_eq!(
+            first, second,
+            "peek은 행을 소비하면 안 된다 — 반복 조회해도 그대로"
+        );
+        assert_eq!(first.command, "/bin/echo");
+        assert_eq!(first.args, vec!["stored".to_owned()]);
+
+        assert!(pipe.session_row(SessionId(999)).is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// RespawnArchivedAgent의 핵심 불변식: 같은 영속 UUID를 새 SessionId로 옮기고,
+    /// 이어가기 인자는 영속 launch spec(args)에 누적되지 않는다(재실행을 거듭해도
+    /// 인자가 쌓이지 않게 — app 쪽이 매번 원본 args 기준으로 이어가기 여부를 판정).
+    #[test]
+    fn session_respawned은_같은_uuid를_새_session_id로_옮기고_args는_보존한다() {
+        let (dir, db_path) = temp_db("session-respawned");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("runtime").unwrap();
+        drop(db);
+
+        let mut pipe = PersistPipe::open(&PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id: workspace_id.clone(),
+        })
+        .unwrap();
+        // kind는 "shell"로 둔다 — session_row/session_respawned 자체는 kind를 보지
+        // 않는다(그 판단은 호출측인 respawn_archived_agent 몫). "agent" kind는 스키마
+        // CHECK가 agent_configs FK를 요구해 이 단위 테스트엔 불필요한 fixture가 붙는다.
+        let old_session = SessionId(1);
+        pipe.session_spawned(
+            old_session,
+            "shell",
+            None,
+            "agent",
+            "/bin/echo",
+            &["stored".to_owned()],
+            "/tmp",
+        );
+        // archived 상태를 흉내 — 실제 경로에서는 이전 실행 종료가 exited로 남긴다.
+        pipe.session_exited(old_session);
+        let persistent_id = pipe.session_row(old_session).unwrap().id.clone();
+
+        let new_session = SessionId(2);
+        assert!(pipe.session_respawned(old_session, new_session));
+
+        // 옛 SessionId로는 더 이상 조회되지 않는다 — 재결속은 새 id로만 가능해야 한다.
+        assert!(pipe.session_row(old_session).is_none());
+        let moved = pipe.session_row(new_session).unwrap();
+        assert_eq!(moved.id, persistent_id, "같은 영속 UUID를 재사용해야 한다");
+        assert_eq!(
+            moved.args,
+            vec!["stored".to_owned()],
+            "재실행 인자를 영속 launch spec에 누적하면 안 된다"
+        );
+        assert_eq!(moved.status, persist::SESSION_STATUS_RUNNING);
+
+        // DB에도 실제로 커밋됐는지 별도 연결로 확인 (upsert가 batch가 아닌 direct write).
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows = persist::load_sessions(&conn, &workspace_id).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "행이 늘면 안 된다 — 같은 UUID를 재사용해야 한다"
+        );
+        assert_eq!(rows[0].id, persistent_id);
+        assert_eq!(rows[0].status, persist::SESSION_STATUS_RUNNING);
+        assert_eq!(rows[0].args, vec!["stored".to_owned()]);
+        drop(conn);
+
+        // 이미 옮겨간 old_session을 다시 옮기려 하면 false — 대상 행이 없다.
+        assert!(!pipe.session_respawned(old_session, SessionId(3)));
+
+        drop(pipe);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

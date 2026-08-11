@@ -11,6 +11,7 @@ pub use layout_json::{layout_from_json, layout_to_json};
 pub use recovery::{
     LockFile, delete_workspace_data, reconcile_orphan_sessions, validate_log_offset,
 };
+pub use repo::REGEX_BYTES_MAX;
 pub use repo::{
     PaneState, SESSION_STATUS_EXITED, SESSION_STATUS_RUNNING, SessionRow, TabState, WindowState,
     WorkspaceRestore, load_sessions, load_window_layouts, load_workspace_restore_bounded,

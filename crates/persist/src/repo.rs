@@ -26,10 +26,14 @@ const RESTORE_MAX_COMMAND_BYTES: usize = 32 * 1024;
 const RESTORE_MAX_ARG_ITEMS: usize = 256;
 const RESTORE_MAX_ARG_BYTES: usize = 32 * 1024;
 const RESTORE_MAX_ARGS_JSON_BYTES: usize = 1024 * 1024;
-/// runtime::command의 REGEX_BYTES_MAX(admission 상한)와 값을 맞춘다 — spawn 시점에
-/// 이미 그 상한으로 검증된 값만 이 컬럼에 들어오므로, 복원 상한이 더 낮으면 정상
-/// 저장된 행을 손상 취급하게 된다.
-const RESTORE_MAX_REGEX_BYTES: usize = 64 * 1024;
+/// status detector regex 한 개의 바이트 상한.
+///
+/// **admission(runtime이 spawn 때 거르는 상한)과 restore(여기서 읽을 때의 상한)가
+/// 같은 값이어야 한다.** 복원 상한이 더 낮으면 정상 저장된 행을 손상 취급해 세션
+/// 복원이 통째로 실패한다. 예전엔 두 크레이트가 각자 `64 * 1024`를 적어두고 "값을
+/// 맞춘다"는 주석으로만 묶여 있었다 — 한쪽만 바뀌면 조용히 어긋난다. 의존 방향이
+/// runtime → persist라 여기가 유일하게 둘 다 볼 수 있는 자리다.
+pub const REGEX_BYTES_MAX: usize = 64 * 1024;
 const RESTORE_MAX_LAYOUT_JSON_BYTES: usize = 256 * 1024;
 const RESTORE_MAX_LAYOUT_DEPTH: usize = 64;
 const RESTORE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
@@ -770,10 +774,10 @@ where
             let cwd = required_text(row, 7, RESTORE_MAX_CWD_BYTES)?;
             let status = required_text(row, 8, RESTORE_MAX_TEXT_BYTES)?;
             let offset = optional_nonnegative_integer(row, 9)?;
-            let waiting_regex = optional_text(row, 10, RESTORE_MAX_REGEX_BYTES)?;
-            let approval_regex = optional_text(row, 11, RESTORE_MAX_REGEX_BYTES)?;
-            let error_regex = optional_text(row, 12, RESTORE_MAX_REGEX_BYTES)?;
-            let done_regex = optional_text(row, 13, RESTORE_MAX_REGEX_BYTES)?;
+            let waiting_regex = optional_text(row, 10, REGEX_BYTES_MAX)?;
+            let approval_regex = optional_text(row, 11, REGEX_BYTES_MAX)?;
+            let error_regex = optional_text(row, 12, REGEX_BYTES_MAX)?;
+            let done_regex = optional_text(row, 13, REGEX_BYTES_MAX)?;
             if row_workspace != workspace_id
                 || agent_id.is_some_and(str::is_empty)
                 || (session_kind == "agent" && agent_id.is_none())

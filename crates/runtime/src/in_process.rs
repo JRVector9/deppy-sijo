@@ -1528,6 +1528,10 @@ impl Worker {
                                 &self.shell.program,
                                 &args,
                                 &Self::spawn_cwd_string(&self.shell.cwd),
+                                None,
+                                None,
+                                None,
+                                None,
                             );
                         }
                         self.open_session_log(id);
@@ -1642,6 +1646,10 @@ impl Worker {
                                 &spec.program,
                                 &spec.args,
                                 &Self::spawn_cwd_string(&spec.cwd),
+                                waiting_regex,
+                                approval_regex,
+                                error_regex,
+                                done_regex,
                             );
                         }
                         self.open_session_log(id);
@@ -2517,6 +2525,10 @@ impl Worker {
                             &self.shell.program,
                             &args,
                             &spawn_cwd,
+                            None,
+                            None,
+                            None,
+                            None,
                         );
                     }
                 }
@@ -2657,19 +2669,34 @@ impl Worker {
         // 영속 행이 있어야 재실행 스펙(command/args/cwd)을 안다 — session_rebound_archived가
         // restored_rows에서 self.rows로 이미 옮겨뒀으므로 archived agent pane이면 항상 있다
         // (persistence.rs:196 결속 계약). kind가 agent가 아니면(레거시 shell 등) 대상이 아니다.
-        let Some((persistent_id, command, mut args, cwd_value, agent_config_id)) =
-            self.persist.as_ref().and_then(|pipe| {
-                let row = pipe.session_row(session)?;
-                (row.session_kind == "agent").then(|| {
-                    (
-                        row.id.clone(),
-                        row.command.clone(),
-                        row.args.clone(),
-                        row.cwd.clone(),
-                        row.agent_id.clone(),
-                    )
-                })
+        // regex 4종도 같은 행에서 함께 읽는다 — spawn 시점에 굳혀 저장된 값이라
+        // agent_configs를 다시 조회하지 않아도 된다(§ MIGRATION_SESSION_REGEX).
+        let Some((
+            persistent_id,
+            command,
+            mut args,
+            cwd_value,
+            agent_config_id,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
+        )) = self.persist.as_ref().and_then(|pipe| {
+            let row = pipe.session_row(session)?;
+            (row.session_kind == "agent").then(|| {
+                (
+                    row.id.clone(),
+                    row.command.clone(),
+                    row.args.clone(),
+                    row.cwd.clone(),
+                    row.agent_id.clone(),
+                    row.waiting_regex.clone(),
+                    row.approval_regex.clone(),
+                    row.error_regex.clone(),
+                    row.done_regex.clone(),
+                )
             })
+        })
         else {
             self.fail_respawn_archived_agent(None);
             return;
@@ -2724,11 +2751,18 @@ impl Worker {
                 Self::replay_saved_ansi(&self.logs_root, &persistent_id, &mut new_session);
                 self.sessions.insert(id, new_session);
                 self.retain_session_redaction_leases(id, redaction_leases);
-                // 저장된 regex(waiting/approval/error/done)는 영속되지 않아 복원할 수
-                // 없다 — 셸과 동일하게 idle heuristic만 설치(3단 감지는 그래도 동작).
+                // 세션 행에 함께 저장해둔 spawn 시점 regex를 그대로 복원한다 —
+                // agent_configs를 다시 조회하지 않는다(그 사이 설정이 바뀌었거나
+                // 삭제됐어도 이 세션은 처음 띄울 때 규칙을 그대로 쓴다. command/args/cwd가
+                // 이미 같은 방식으로 spawn 시점 값을 보존하는 것과 동일한 불변식).
                 self.detectors.insert(
                     id,
-                    StatusDetector::new(StatusPatterns::compile(None, None, None, None)),
+                    StatusDetector::new(StatusPatterns::compile(
+                        waiting_regex.as_deref(),
+                        approval_regex.as_deref(),
+                        error_regex.as_deref(),
+                        done_regex.as_deref(),
+                    )),
                 );
 
                 // 여기서부터는 성공이 확정됐을 때만 실행된다 — 이전 archived 상태 정리.
@@ -2843,6 +2877,10 @@ impl Worker {
                         &self.shell.program,
                         &args,
                         &Self::spawn_cwd_string(&self.shell.cwd),
+                        None,
+                        None,
+                        None,
+                        None,
                     );
                 }
                 self.open_session_log(id);
@@ -5002,6 +5040,8 @@ mod tests {
         conn.execute("INSERT INTO agent_configs (id) VALUES ('cfg-sf03')", [])
             .unwrap();
         conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+            .unwrap();
     }
 
     fn persisted_single_pane_window(
@@ -5052,6 +5092,10 @@ mod tests {
             cwd: cwd.to_owned(),
             status: status.to_owned(),
             last_log_offset: 0,
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
         };
         persist::upsert_session(&conn, &row).unwrap();
         let window = persisted_single_pane_window(session_id, "restored", Some(cwd.to_owned()));
@@ -5085,6 +5129,10 @@ mod tests {
             cwd: cwd.to_owned(),
             status: status.to_owned(),
             last_log_offset: 0,
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
         };
         persist::upsert_session(&conn, &row).unwrap();
         let window =
@@ -5118,6 +5166,10 @@ mod tests {
                         persist::SESSION_STATUS_RUNNING.to_owned()
                     },
                     last_log_offset: 0,
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
                 },
             )
             .unwrap();
@@ -8118,6 +8170,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
         let client = InProcessRuntimeClient::with_shell(
             5,
@@ -8167,6 +8221,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
 
         let client = InProcessRuntimeClient::with_shell(
@@ -8430,6 +8486,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
         let logs_root = test_logs_root("archive");
         let client = InProcessRuntimeClient::with_shell(
@@ -8495,6 +8553,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
         let logs_root = dir.join("logs");
         std::fs::create_dir_all(&logs_root).unwrap();
@@ -8570,6 +8630,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
         let logs_root = dir.join("logs");
         let seeded_archive = logs_root.join("seed").join("scrollback.zlib");
@@ -8648,6 +8710,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
         let persist_config = || crate::persistence::PersistConfig {
             db_path: db_path.clone(),
@@ -9319,6 +9383,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
         let persist_config = || crate::persistence::PersistConfig {
             db_path: db_path.clone(),
@@ -9520,6 +9586,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
         let persist_config = || crate::persistence::PersistConfig {
             db_path: db_path.clone(),
@@ -10548,6 +10616,8 @@ mod tests {
             )
             .unwrap();
             conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
         }
         let persist_config = || crate::persistence::PersistConfig {
             db_path: db_path.clone(),
@@ -10622,6 +10692,106 @@ mod tests {
         assert_eq!(max_tabs, 1, "세션이 있는데 복원이 실행돼 tab이 덧붙었다");
 
         drop(client2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// MIGRATION_SESSION_REGEX 불변식의 핵심: 세션 spawn 시점에 저장해둔 error_regex가
+    /// RespawnArchivedAgent를 거친 뒤에도 살아 있어야 한다. `RuntimeCommand`에는 regex가
+    /// 없으므로(시그니처 고정) — 재실행된 세션이 실제로 "FATAL_MARKER" 출력을 error로
+    /// 감지한다면, 그건 오직 세션 행에서 복원한 regex로 detector를 만들었다는 뜻이다.
+    /// (idle heuristic만 있었다면 이 출력은 Running으로 남고 Error는 오지 않는다.)
+    #[cfg(unix)]
+    #[test]
+    fn respawn_archived_agent는_저장된_error_regex로_상태를_감지한다() {
+        init_mock_store();
+        let dir = unique_test_dir("respawn-regex");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-respawn-regex";
+        let persistent_id = "respawn-regex-session";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_agent_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "cfg-sf03",
+            "/bin/sh",
+            vec!["-c".to_owned(), "echo FATAL_MARKER; sleep 30".to_owned()],
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+        // seed 헬퍼는 regex 파라미터가 없다(다른 테스트에 영향 없게) — 저장된 행에
+        // 직접 세팅한다. 실제 경로에서는 SpawnAgent 처리 시 session_spawned가 채운다.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE sessions SET error_regex = 'FATAL_MARKER' WHERE id = ?1",
+                [persistent_id],
+            )
+            .unwrap();
+        }
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let restored = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        let archived_session = restored
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .find_map(|pane| pane.session_id)
+            .unwrap();
+
+        client
+            .send_command(RuntimeCommand::RespawnArchivedAgent {
+                session: archived_session,
+                extra_args: Vec::new(),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let new_session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+
+        // 타임아웃 시 wait_for 자체가 panic한다 — 저장된 error_regex를 복원하지
+        // 못했다면(=None,None,None,None으로 detector가 만들어졌다면) 이 출력은
+        // idle heuristic상 Running으로 남고 Error 이벤트는 영영 오지 않는다.
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SessionStatusChanged {
+                session,
+                status: session::SessionStatus::Error,
+            } if *session == new_session => Some(()),
+            _ => None,
+        });
+
+        drop(probe);
+        drop(client);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

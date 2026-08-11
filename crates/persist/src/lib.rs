@@ -98,3 +98,17 @@ CREATE INDEX idx_mux_windows_workspace_id ON mux_windows(workspace_id);
 CREATE INDEX idx_mux_tabs_window_id ON mux_tabs(window_id);
 CREATE INDEX idx_mux_panes_session_id ON mux_panes(session_id);
 ";
+
+/// sessions.*_regex — status detector regex(waiting/approval/error/done)를 spawn
+/// 시점 값 그대로 세션 행에 함께 저장한다. `RespawnArchivedAgent`(runtime PR-2)가
+/// 열람 전용 세션을 재실행할 때 이 값을 그대로 복원한다 — agent_configs를 다시
+/// 조회하지 않는다(그 사이 설정이 바뀌었거나 삭제됐어도 이 세션은 처음 띄울 때
+/// 규칙을 그대로 쓴다, 이미 살아있는 세션이 regex를 hot-reload하지 않는 것과
+/// 같은 불변식 — command/args/cwd도 이미 이렇게 spawn 시점 값을 보존한다).
+/// 전역 마이그레이션 순서는 storage의 MIGRATIONS가 소유한다(위 헤더 참고).
+pub const MIGRATION_SESSION_REGEX: &str = "
+ALTER TABLE sessions ADD COLUMN waiting_regex TEXT;
+ALTER TABLE sessions ADD COLUMN approval_regex TEXT;
+ALTER TABLE sessions ADD COLUMN error_regex TEXT;
+ALTER TABLE sessions ADD COLUMN done_regex TEXT;
+";

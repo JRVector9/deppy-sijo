@@ -110,6 +110,9 @@ impl PersistPipe {
     }
 
     /// 세션 spawn 기록. agent kind면 agent_id 필수 (스키마 CHECK).
+    /// regex 4종은 spawn 시점의 status detector 설정값(agent_configs *_regex — 셸
+    /// 등 regex가 없는 kind는 전부 None)을 그대로 굳혀 저장한다 — RespawnArchivedAgent가
+    /// 나중에 agent_configs를 다시 조회하지 않고 이 세션 행에서 직접 복원한다.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn session_spawned(
         &mut self,
@@ -120,6 +123,10 @@ impl PersistPipe {
         command: &str,
         args: &[String],
         cwd: &str,
+        waiting_regex: Option<String>,
+        approval_regex: Option<String>,
+        error_regex: Option<String>,
+        done_regex: Option<String>,
     ) {
         let row = SessionRow {
             id: uuid::Uuid::new_v4().to_string(),
@@ -134,6 +141,10 @@ impl PersistPipe {
             cwd: cwd.to_owned(),
             status: persist::SESSION_STATUS_RUNNING.to_owned(),
             last_log_offset: 0,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
         };
         if let Err(e) = persist::upsert_session(&self.conn, &row) {
             tracing::warn!("세션 영속 실패 (spawn): {e:#}");
@@ -158,7 +169,11 @@ impl PersistPipe {
     ) {
         let Some(mut row) = self.restored_rows.remove(persistent_id) else {
             tracing::warn!(persistent_id, "복원 세션 행 없음 — 새 영속 세션으로 폴백");
-            self.session_spawned(session, kind, agent_id, title, command, args, cwd);
+            // 이 경로는 항상 fresh 셸 복원(호출측 유일한 caller가 kind="shell"
+            // 고정) — 셸엔 애초에 regex가 없다.
+            self.session_spawned(
+                session, kind, agent_id, title, command, args, cwd, None, None, None, None,
+            );
             return;
         };
         row.session_kind = kind.to_owned();
@@ -400,7 +415,19 @@ mod tests {
         })
         .unwrap();
         let session = SessionId(1);
-        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[], "/tmp");
+        pipe.session_spawned(
+            session,
+            "shell",
+            None,
+            "shell",
+            "/bin/sh",
+            &[],
+            "/tmp",
+            None,
+            None,
+            None,
+            None,
+        );
         pipe.session_status(session, session::SessionStatus::Waiting);
         pipe.session_status(session, session::SessionStatus::Done);
         pipe.session_log_offset(session, 12);
@@ -454,7 +481,19 @@ mod tests {
         .unwrap();
         let session = SessionId(1);
         // spawn은 동기 커밋(후속 read 의존), status/log_offset은 debounce 배치.
-        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[], "/tmp");
+        pipe.session_spawned(
+            session,
+            "shell",
+            None,
+            "shell",
+            "/bin/sh",
+            &[],
+            "/tmp",
+            None,
+            None,
+            None,
+            None,
+        );
         pipe.session_status(session, session::SessionStatus::Done);
         pipe.session_log_offset(session, 128);
 
@@ -511,7 +550,19 @@ mod tests {
         )
         .unwrap();
         let session = SessionId(1);
-        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[], "/tmp");
+        pipe.session_spawned(
+            session,
+            "shell",
+            None,
+            "shell",
+            "/bin/sh",
+            &[],
+            "/tmp",
+            None,
+            None,
+            None,
+            None,
+        );
         pipe.session_status(session, session::SessionStatus::Done);
         pipe.session_log_offset(session, 64);
         // flush_async_writes 호출 없이 즉시 drop — 타이머가 안 도니 오직 drop만 flush 가능.
@@ -550,6 +601,10 @@ mod tests {
             "/bin/echo",
             &["stored".to_owned()],
             "/tmp",
+            None,
+            None,
+            None,
+            None,
         );
 
         let first = pipe.session_row(session).cloned().unwrap();
@@ -593,6 +648,10 @@ mod tests {
             "/bin/echo",
             &["stored".to_owned()],
             "/tmp",
+            None,
+            None,
+            None,
+            None,
         );
         // archived 상태를 흉내 — 실제 경로에서는 이전 실행 종료가 exited로 남긴다.
         pipe.session_exited(old_session);

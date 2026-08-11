@@ -191,7 +191,7 @@ impl AgentKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
-            Self::Codex => "Codex",
+            Self::Codex => "Codex (ChatGPT)",
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini CLI",
             Self::Aider => "Aider",

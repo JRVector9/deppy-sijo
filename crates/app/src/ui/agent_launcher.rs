@@ -151,10 +151,19 @@ impl AgentLauncherUi {
                         .show(ui, |ui| {
                             for agent in snapshot.agents() {
                                 let kind = agent.kind();
-                                if agent_card(ui, kind, self.selected == Some(kind)).clicked()
-                                    && !self.launch_pending
+                                let card = agent_card(ui, kind, self.selected == Some(kind));
+                                if (card.clicked() || card.double_clicked()) && !self.launch_pending
                                 {
                                     self.select(agent);
+                                }
+                                // egui는 더블클릭의 두 번째 릴리즈에서 clicked()도 함께
+                                // 발생시킨다. 위에서 선택이 먼저 반영된 뒤라야 여기서
+                                // "세션 시작" 버튼과 같은 경로(start_launch)가 이 카드의
+                                // 에이전트로 시작한다.
+                                if card.double_clicked()
+                                    && let Some(launch_intent) = self.start_launch()
+                                {
+                                    intent = Some(launch_intent);
                                 }
                                 ui.add_space(5.0);
                             }
@@ -210,19 +219,9 @@ impl AgentLauncherUi {
                             egui::Button::new(catalog.t("agent_launcher.launch", &[])),
                         )
                         .clicked()
-                        && let Some(kind) = self.selected
+                        && let Some(launch_intent) = self.start_launch()
                     {
-                        self.launch_pending = true;
-                        self.error = None;
-                        intent = Some(AgentLauncherIntent::Launch {
-                            workspace_id: self.workspace_id.clone(),
-                            kind,
-                            options: LaunchOptions {
-                                model: self.model.clone(),
-                                effort: self.effort,
-                                yolo: self.yolo,
-                            },
-                        });
+                        intent = Some(launch_intent);
                     }
                     if self.launch_pending {
                         ui.spinner();
@@ -350,6 +349,26 @@ impl AgentLauncherUi {
         }
     }
 
+    /// 「세션 시작」 버튼과 카드 더블클릭이 공유하는 단 하나의 시작 경로. 선택된
+    /// 에이전트가 없거나 이미 시작이 진행 중이면 아무 것도 하지 않는다.
+    fn start_launch(&mut self) -> Option<AgentLauncherIntent> {
+        if self.launch_pending {
+            return None;
+        }
+        let kind = self.selected?;
+        self.launch_pending = true;
+        self.error = None;
+        Some(AgentLauncherIntent::Launch {
+            workspace_id: self.workspace_id.clone(),
+            kind,
+            options: LaunchOptions {
+                model: self.model.clone(),
+                effort: self.effort,
+                yolo: self.yolo,
+            },
+        })
+    }
+
     fn select(&mut self, agent: &DetectedAgent) {
         if self.selected != Some(agent.kind()) {
             self.model.clear();
@@ -457,19 +476,14 @@ fn agent_card(ui: &mut egui::Ui, kind: AgentKind, selected: bool) -> egui::Respo
         egui::FontId::proportional(11.0),
         egui::Color32::WHITE,
     );
+    // 명령어 줄(kind.id())은 표시명에서 이미 유추되므로 보여주지 않는다. 이름 한 줄만
+    // 남기고 아이콘(badge_rect) 세로 중앙과 같은 y에 그린다.
     ui.painter().text(
-        egui::pos2(rect.left() + 57.0, rect.center().y - 8.0),
+        egui::pos2(rect.left() + 57.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         kind.label(),
         egui::FontId::proportional(15.0),
         visuals.text_color(),
-    );
-    ui.painter().text(
-        egui::pos2(rect.left() + 57.0, rect.center().y + 11.0),
-        egui::Align2::LEFT_CENTER,
-        kind.id(),
-        egui::FontId::monospace(11.0),
-        visuals.weak_text_color(),
     );
     response
 }
@@ -638,5 +652,51 @@ mod tests {
             ReasoningEffort::High
         ]));
         assert!(!ReasoningEffort::is_thinking_toggle(&[]));
+    }
+
+    #[test]
+    fn start_launch_without_a_selection_produces_no_intent() {
+        // 카드가 하나도 선택되지 않았으면 더블클릭이든 버튼이든 시작할 게 없다.
+        let mut ui = AgentLauncherUi::new();
+        assert!(ui.start_launch().is_none());
+        assert!(!ui.launch_pending);
+    }
+
+    #[test]
+    fn start_launch_carries_the_selected_agent_and_current_options() {
+        // 「세션 시작」 버튼과 카드 더블클릭이 공유하는 경로이므로, 선택된 에이전트와
+        // 화면에 보이던 모델/강도/YOLO가 그대로 인텐트에 실려야 한다.
+        let detected = snapshot(&[AgentKind::Codex]);
+        let mut ui = AgentLauncherUi::new();
+        ui.open_for("workspace-1".to_owned(), "Project".to_owned());
+        ui.select(agent(&detected, AgentKind::Codex));
+        ui.yolo = true;
+
+        let intent = ui.start_launch().expect("selected agent should launch");
+        assert!(ui.launch_pending);
+        match intent {
+            AgentLauncherIntent::Launch {
+                workspace_id,
+                kind,
+                options,
+            } => {
+                assert_eq!(workspace_id, "workspace-1");
+                assert_eq!(kind, AgentKind::Codex);
+                assert_eq!(options.model, ui.model);
+                assert_eq!(options.effort, ui.effort);
+                assert!(options.yolo);
+            }
+            _ => panic!("expected a Launch intent"),
+        }
+    }
+
+    #[test]
+    fn start_launch_is_a_no_op_while_a_launch_is_already_pending() {
+        // 중복 실행 금지: 시작이 진행 중이면 버튼이든 더블클릭이든 다시 시작하지 않는다.
+        let detected = snapshot(&[AgentKind::Codex]);
+        let mut ui = AgentLauncherUi::new();
+        ui.select(agent(&detected, AgentKind::Codex));
+        assert!(ui.start_launch().is_some());
+        assert!(ui.start_launch().is_none());
     }
 }

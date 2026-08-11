@@ -1981,8 +1981,10 @@ impl FileTreeUi {
                         .id_salt("workspace_list_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 3.0;
-                            ui.add_space(4.0);
+                            // 워크스페이스 헤더와 그 아래 세션 목록 사이에 여백을 두지
+                            // 않는다(2026-08-11 사용자). 워크스페이스끼리는 그룹 구분선이
+                            // 가르므로 여백이 따로 필요 없다 — 목업의 .ws border-top과 같다.
+                            ui.spacing_mut().item_spacing.y = 0.0;
                             for workspace in before_active {
                                 let inner = ui.scope(|ui| {
                                     let color = workspace_accent(sidebar.workspaces, &workspace.id);
@@ -2007,12 +2009,11 @@ impl FileTreeUi {
                                             workspace.id.clone(),
                                         ));
                                     }
-                                    let mut session_rows_rect = None;
                                     if expanded
                                         && let Some(sessions) =
                                             sessions_by_workspace.get(&workspace.id)
                                     {
-                                        let (session_action, rect) = inactive_workspace_sessions(
+                                        let (session_action, _) = inactive_workspace_sessions(
                                             ui,
                                             workspace,
                                             sidebar.active_workspace_id,
@@ -2024,10 +2025,6 @@ impl FileTreeUi {
                                         if let Some(session_action) = session_action {
                                             action = Some(session_action);
                                         }
-                                        session_rows_rect = rect;
-                                    }
-                                    if session_rows_rect.is_some() {
-                                        ui.add_space(2.5);
                                     }
                                 });
                                 paint_workspace_group_separator(ui, inner.response.rect);
@@ -2077,12 +2074,11 @@ impl FileTreeUi {
                                         .id_salt("session_list_scroll")
                                         .auto_shrink([false, true])
                                         .show(ui, |ui| {
-                                            // 헤더-세션 사이 여백 없음(2026-07-25 사용자) — 첫 행이
-                                            // 인셋 상단에 바로 붙는다.
-                                            ui.spacing_mut().item_spacing.y = 0.0;
-                                            for (index, entry) in active_sessions.iter().enumerate()
-                                            {
-                                                let is_last = index + 1 == active_sessions.len();
+                                            // 행 **사이**에만 여백을 준다 — 첫 행은 헤더에,
+                                            // 마지막 행은 그룹 구분선에 바로 붙는다
+                                            // (2026-07-25·2026-08-11 사용자).
+                                            ui.spacing_mut().item_spacing.y = SESSION_ROW_GAP;
+                                            for entry in active_sessions.iter() {
                                                 ui.horizontal(|ui| {
                                                     ui.add_space(16.0);
                                                     ui.vertical(|ui| {
@@ -2102,7 +2098,6 @@ impl FileTreeUi {
                                                                 ui,
                                                                 entry,
                                                                 buf,
-                                                                is_last,
                                                                 active_color,
                                                             );
                                                             {
@@ -2145,12 +2140,8 @@ impl FileTreeUi {
                                                             // 세션 행 자체에는 hover tooltip을 띄우지 않는다.
                                                             // 상태 감지 출처/신뢰도 같은 내부 진단과 이름 변경
                                                             // 안내가 터미널 위를 가리는 문제(2026-07-19 사용자).
-                                                            let resp = session_row(
-                                                                ui,
-                                                                entry,
-                                                                is_last,
-                                                                active_color,
-                                                            );
+                                                            let resp =
+                                                                session_row(ui, entry, active_color);
                                                             {
                                                                 let row_rect = resp.rect;
                                                                 session_rows_rect =
@@ -2342,9 +2333,6 @@ impl FileTreeUi {
                                             }
                                         });
                                 }
-                                if session_rows_rect.is_some() {
-                                    ui.add_space(2.5);
-                                }
                             });
                             paint_workspace_group_separator(ui, active_inner.response.rect);
                             for workspace in after_active {
@@ -2371,12 +2359,11 @@ impl FileTreeUi {
                                             workspace.id.clone(),
                                         ));
                                     }
-                                    let mut session_rows_rect = None;
                                     if expanded
                                         && let Some(sessions) =
                                             sessions_by_workspace.get(&workspace.id)
                                     {
-                                        let (session_action, rect) = inactive_workspace_sessions(
+                                        let (session_action, _) = inactive_workspace_sessions(
                                             ui,
                                             workspace,
                                             sidebar.active_workspace_id,
@@ -2388,10 +2375,6 @@ impl FileTreeUi {
                                         if let Some(session_action) = session_action {
                                             action = Some(session_action);
                                         }
-                                        session_rows_rect = rect;
-                                    }
-                                    if session_rows_rect.is_some() {
-                                        ui.add_space(2.5);
                                     }
                                 });
                                 paint_workspace_group_separator(ui, inner.response.rect);
@@ -3362,7 +3345,6 @@ impl FileTreeUi {
     ) -> Option<SidebarAction> {
         let mut action = None;
         ui.spacing_mut().item_spacing.y = SIDEBAR_NAV_ITEM_SPACING;
-        ui.add_space(2.0);
         if nav_row(
             ui,
             NavIcon::Home,
@@ -3825,13 +3807,31 @@ struct WorkspaceRowStyle {
     accent: Option<egui::Color32>,
 }
 
+/// 선택된 워크스페이스 면을 그 프로젝트 색 쪽으로 섞는 비율. 회색 한 단(#181b20 →
+/// #21242c, 채널당 +9)만 올리던 예전 값은 패널과 거의 구분이 안 됐다(2026-08-11
+/// 사용자: 선택된 워크스페이스 컬러를 더 명확하게). 새 색을 만들지 않고 **아바타가
+/// 이미 쓰는 그 워크스페이스의 색**을 옅게 깐다 — 한 번에 하나만 선택되므로 목록이
+/// 알록달록해지지 않는다.
+const WORKSPACE_SELECTED_TINT: f32 = 0.2;
+
 fn workspace_row_style(
     tokens: crate::ui::designall::Tokens,
+    accent: egui::Color32,
     selected: bool,
     hovered: bool,
 ) -> WorkspaceRowStyle {
+    if selected {
+        return WorkspaceRowStyle {
+            fill: Some(crate::ui::designall::mix(
+                tokens.selected_background,
+                accent,
+                WORKSPACE_SELECTED_TINT,
+            )),
+            accent: None,
+        };
+    }
     WorkspaceRowStyle {
-        fill: crate::ui::designall::row_fill(tokens, selected, hovered),
+        fill: crate::ui::designall::row_fill(tokens, false, hovered),
         accent: None,
     }
 }
@@ -3886,6 +3886,7 @@ fn workspace_row(
     let full_rect = crate::ui::snap_rect_to_pixel(ppp, full_rect);
     let style = workspace_row_style(
         crate::ui::designall::tokens(ui.visuals()),
+        color,
         active,
         response.hovered(),
     );
@@ -3915,11 +3916,14 @@ fn workspace_row(
     // 미리 배정된 색을 받아 비활성 행과 40pt 아이콘 레일에서도 그대로 유지한다.
     let avatar = workspace_avatar_rect(full_rect);
     // 워크스페이스 마크는 별도 테두리 없이 상태색을 채운다(HTML 목업과 같은 규칙).
-    ui.painter().rect_filled(
-        avatar,
-        1.0,
-        color.gamma_multiply(if active { 0.42 } else { 0.32 }),
-    );
+    // 선택된 워크스페이스의 마크는 **제 색 그대로**(목업의 .bdg도 불투명이다).
+    // 0.42 대 0.32는 눈으로 구분되지 않는 차이였다(2026-08-11 사용자).
+    let avatar_fill = if active {
+        color
+    } else {
+        color.gamma_multiply(0.32)
+    };
+    ui.painter().rect_filled(avatar, 1.0, avatar_fill);
     // 아바타는 빠른 식별용 마크라 첫 글자를 항상 대문자로 고정한다. 반대로 실제
     // 워크스페이스 이름은 사용자가 지정한 대소문자를 그대로 보존한다.
     let initial = workspace_initial(&workspace.name);
@@ -3934,13 +3938,29 @@ fn workspace_row(
     let show_summary = summary_mode != WorkspaceSummaryMode::IconOnly;
     let show_disclosure = expanded.is_some() && rect.width() >= 56.0;
     let (_, badge_color) = workspace_primary_summary_segment(workspace.summary, catalog);
+    // 우측은 **세션 수** 하나다. 예전엔 상태색 점이었는데(2026-07-25), 점을 세션 행
+    // 앞으로 옮기고 나니 펼친 목록에서 같은 팔레트의 점이 헤더와 행에 겹쳐 같은 사실을
+    // 두 번 말했다(2026-08-11 사용자: 워크스페이스 우측 동그라미 제거).
+    // 수는 점이 못 나르는 사실이라 겹치지 않는다.
+    let count_galley = show_summary
+        .then(|| workspace_session_count(workspace.summary))
+        .filter(|count| *count > 0)
+        .map(|count| {
+            clipped_line(
+                ui,
+                &count.to_string(),
+                crate::fonts::sidebar_font(ui.ctx(), WORKSPACE_COUNT_FONT_SIZE),
+                WORKSPACE_COUNT_MAX_WIDTH,
+                None,
+            )
+        });
     if rect.width() >= 64.0 {
         // 요약 배지 자리를 **실제 폭**만큼만 예약한다 — 고정 198px는 "유휴 5"처럼
         // 짧은 요약에도 이름을 훨씬 일찍 잘라 옆 여백이 남았다(2026-07-18 사용자).
         // 우측 여백 8 + 이름/요약 간격 16 + disclosure 폭(있으면 14)을 더한다.
         let reserved_right = if show_summary {
             let disclosure = if show_disclosure { 12.0 } else { 0.0 };
-            workspace_status_dot_width() + 22.0 + disclosure
+            count_galley.as_ref().map_or(0.0, |g| g.size().x) + 22.0 + disclosure
         } else {
             7.0
         };
@@ -3964,18 +3984,25 @@ fn workspace_row(
                 .galley(name_pos, name, ui.visuals().text_color());
         }
     }
-    if show_summary {
-        // 텍스트나 세션 수 없이 상태색 점만 표시한다.
+    if let Some(count) = count_galley {
         let right = if show_disclosure {
             rect.right() - 22.0
         } else {
             rect.right() - 10.0
         };
-        paint_workspace_status_dot(ui, right, rect.center().y, badge_color);
-    } else {
-        // 40pt 아이콘 레일까지 줄였을 때는 배지 자리가 없으므로 아바타 우하단의
-        // 작은 점으로 primary state를 계속 표시한다. 이름이 보이는 폭부터는 반드시
-        // 위의 dot+카운트 배지로 바뀐다.
+        let count_pos = crate::ui::snap_pos_to_pixel(
+            ppp,
+            egui::pos2(
+                right - count.size().x,
+                rect.center().y - count.size().y / 2.0,
+            ),
+        );
+        ui.painter()
+            .galley(count_pos, count, ui.visuals().weak_text_color());
+    } else if !show_summary {
+        // 40pt 아이콘 레일까지 줄였을 때는 수를 놓을 자리가 없으므로 아바타 우하단의
+        // 작은 점으로 primary state를 계속 표시한다. 이름이 보이는 폭부터는 위의
+        // 세션 수로 바뀐다.
         ui.painter().circle_filled(
             egui::pos2(avatar.right() - 2.5, avatar.bottom() - 2.5),
             2.5,
@@ -3993,13 +4020,20 @@ fn workspace_row(
     response
 }
 
-const SIDEBAR_NAV_ROW_HEIGHT: f32 = 58.0;
+/// 레일 행 높이. 58일 땐 아이콘+라벨(약 30)이 가운데 놓여 **첫 행 위에만 13.5px**의
+/// 죽은 공간이 남았고, 그만큼 레일이 옆 워크스페이스 목록보다 아래에서 시작했다
+/// (2026-08-11 사용자: 레일 상단 여백을 없애라). 행 사이 리듬은 그대로 두고 행이
+/// 제 내용에 맞게 줄어들도록 낮춘다 — 위 6.5 / 아래 3.
+///
+/// 44가 바닥이다. 아이콘(13×12)과 라벨(12pt)을 세로로 쌓으면 내용만 30이라 더
+/// 낮추면 둘이 붙고, 44는 클릭 대상 최소 크기이기도 하다. 워크스페이스 목록처럼
+/// 여백 0으로 붙이려면 아이콘 위 라벨 아래 구성 자체를 버려야 한다.
+const SIDEBAR_NAV_ROW_HEIGHT: f32 = 44.0;
 const SIDEBAR_NAV_ITEM_SPACING: f32 = 2.0;
 const PROJECT_SECTION_MIN_HEIGHT: f32 = 84.0;
 const FILE_SECTION_MIN_HEIGHT: f32 = 50.0;
 const PROJECT_FILE_SPLIT_HEIGHT: f32 = 6.0;
 const WORKSPACE_CARD_HORIZONTAL_INSET: f32 = 6.0;
-const WORKSPACE_SESSION_INSET_LEFT: f32 = 24.0;
 
 fn project_file_section_heights(available: f32, requested_project: f32) -> (f32, f32) {
     let usable = (available - PROJECT_FILE_SPLIT_HEIGHT).max(0.0);
@@ -4140,22 +4174,25 @@ fn workspace_summary_mode(width: f32) -> WorkspaceSummaryMode {
     }
 }
 
-const WORKSPACE_STATUS_DOT_DIAMETER: f32 = 6.0;
-const WORKSPACE_STATUS_SLOT_WIDTH: f32 = WORKSPACE_STATUS_DOT_DIAMETER;
+/// 워크스페이스 헤더 우측 세션 수의 글자 크기 — 이름(14)보다 확실히 작아 헤더를
+/// 읽을 때 이름이 먼저 오고 수는 곁들여 읽힌다.
+const WORKSPACE_COUNT_FONT_SIZE: f32 = 11.0;
+/// 수 자체는 한두 자리지만, 세션이 비정상적으로 많아도 이름 자리를 잡아먹지 않게
+/// 상한을 둔다.
+const WORKSPACE_COUNT_MAX_WIDTH: f32 = 28.0;
 
-fn workspace_status_dot_width() -> f32 {
-    WORKSPACE_STATUS_SLOT_WIDTH
+/// 헤더에 표시할 세션 수. 상태별로 나뉜 요약을 다시 하나로 합친다 — 헤더가 답하는
+/// 질문은 「여기 몇 개가 있나」이고, 「무슨 상태인가」는 펼친 행의 점들이 답한다.
+fn workspace_session_count(summary: SidebarSessionSummary) -> usize {
+    summary.running
+        + summary.waiting
+        + summary.done
+        + summary.error
+        + summary.idle
+        + summary.inactive
 }
 
-fn paint_workspace_status_dot(ui: &egui::Ui, right: f32, center_y: f32, color: egui::Color32) {
-    ui.painter().circle_filled(
-        egui::pos2(right - WORKSPACE_STATUS_DOT_DIAMETER / 2.0, center_y),
-        WORKSPACE_STATUS_DOT_DIAMETER / 2.0,
-        color,
-    );
-}
-
-// workspace_row는 이제 상태색 점만 그려 이 세그먼트 목록을 쓰지
+// workspace_row는 이제 세션 수만 그려 이 세그먼트 목록을 쓰지
 // 않지만(2026-07-25 사용자), 세그먼트별 텍스트·색 우선순위 로직은 테스트가 여전히
 // 검증한다 — 프로덕션 미사용이라 cfg(test)로 경고만 제거한다.
 #[cfg(test)]
@@ -4374,15 +4411,14 @@ fn inactive_workspace_sessions(
         .id_salt(("inactive_session_list_scroll", &workspace.id))
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            // 헤더-세션 사이 여백 없음(2026-07-25 사용자) — 첫 행이 인셋 상단에
-            // 바로 붙는다.
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for (index, entry) in sessions.iter().enumerate() {
-                let is_last = index + 1 == sessions.len();
+            // 행 **사이**에만 여백을 준다 — 첫 행은 헤더에, 마지막 행은 그룹
+            // 구분선에 바로 붙는다(2026-07-25·2026-08-11 사용자).
+            ui.spacing_mut().item_spacing.y = SESSION_ROW_GAP;
+            for entry in sessions.iter() {
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
                     ui.vertical(|ui| {
-                        let response = draggable_session_row(ui, entry, is_last, accent_color);
+                        let response = draggable_session_row(ui, entry, accent_color);
                         session_rows_rect =
                             Some(session_rows_rect.map_or(response.rect, |rect: egui::Rect| {
                                 rect.union(response.rect)
@@ -4524,26 +4560,17 @@ fn active_session_close_button(
 fn session_row(
     ui: &mut egui::Ui,
     entry: &SidebarSessionRow,
-    is_last: bool,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    session_row_impl(ui, entry, None, is_last, accent_color, egui::Sense::click())
+    session_row_impl(ui, entry, None, accent_color, egui::Sense::click())
 }
 
 fn draggable_session_row(
     ui: &mut egui::Ui,
     entry: &SidebarSessionRow,
-    is_last: bool,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    session_row_impl(
-        ui,
-        entry,
-        None,
-        is_last,
-        accent_color,
-        egui::Sense::click_and_drag(),
-    )
+    session_row_impl(ui, entry, None, accent_color, egui::Sense::click_and_drag())
 }
 
 /// 이름 인라인 편집 중인 행 — 레일/보조 행(2·3행)은 그대로 유지하고 **제목 자리만**
@@ -4553,30 +4580,66 @@ fn session_row_editing(
     ui: &mut egui::Ui,
     entry: &SidebarSessionRow,
     buf: &mut String,
-    is_last: bool,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    session_row_impl(
-        ui,
-        entry,
-        Some(buf),
-        is_last,
-        accent_color,
-        egui::Sense::click(),
-    )
+    session_row_impl(ui, entry, Some(buf), accent_color, egui::Sense::click())
 }
 
 // 워크스페이스 헤더의 우측 인셋(workspace_row 내부 rect =
 // full_rect.shrink2((WORKSPACE_CARD_HORIZONTAL_INSET + 8, 0)))
 // 과 같은 6px — 8px일 땐 세션 카드 배경이 위 워크스페이스 카드보다 우측 여백이
 // 2px 더 넓어 보였다(2026-07-25 사용자).
-const SESSION_HIGHLIGHT_RIGHT_INSET: f32 = WORKSPACE_CARD_HORIZONTAL_INSET;
-const SESSION_RAIL_LEFT_INSET: f32 = 0.0;
-const SESSION_RAIL_MAX_WIDTH: f32 = 4.5;
-const SESSION_RAIL_HEIGHT: f32 = 35.0;
-fn session_text_inset(rail_width: f32) -> f32 {
-    SESSION_RAIL_LEFT_INSET + rail_width
-}
+const SESSION_HIGHLIGHT_RIGHT_INSET: f32 = SESSION_FILL_SIDE_MARGIN;
+/// 상태 점의 지름. 예전엔 세로 레일(2~4.5px × 35px)이었는데, 레일은 **행 전체를
+/// 물들이지 않으면서** 상태를 나르려다 폭이 애매했다 — 2px는 색약에서 amber/green
+/// 구분이 어렵고, 4.5px는 텍스트를 밀었다. 점은 지름 7px 하나로 같은 일을 하면서
+/// **세로로 정렬돼 훑기 좋다**(2026-08-11 사용자: 레일 빼고 점을 앞으로).
+const SESSION_DOT_DIAMETER: f32 = 7.0;
+/// 「작업 중」 점의 호흡 주기(Hz)와 최저 투명도. 0.4Hz = 2.5초에 한 번 —
+/// 시선을 끌지 않으면서 「살아 있다」가 읽히는 속도다. 최저 0.35는 완전히
+/// 사라지지 않게 해 **꺼진 것과 구분**된다.
+const SESSION_DOT_BREATH_HZ: f32 = 0.4;
+const SESSION_DOT_BREATH_MIN: f32 = 0.35;
+
+// ── 세션 행 기하 — 주안 목업의 CSS를 그대로 옮긴 값 ──────────────────────
+//
+//   .s   { margin: 0 6px 2px; padding: 6px 11px 6px 13px;
+//          grid-template-columns: 8px 1fr; gap: 0 9px; border-radius: 6px }
+//   .dot { width: 7px; height: 7px }
+//
+// 목업은 **패널** 좌표계로 적혀 있고(면 6..W-6 · 점 19..26 · 글 36..W-17),
+// 세션 행은 호출부가 add_space(16)으로 들여쓴 뒤 그린다. 그 차이를 여기서
+// 되돌려야 면·점·글이 목업과 같은 x에 선다.
+/// 호출부(session_list_scroll/inactive_workspace_sessions)의 들여쓰기.
+const SESSION_LIST_INDENT: f32 = 16.0;
+/// 면의 좌우 여백(.s margin). 우측은 워크스페이스 카드와 같은 값이라 헤더와
+/// 세션 면의 오른쪽 끝이 한 줄로 선다.
+const SESSION_FILL_SIDE_MARGIN: f32 = WORKSPACE_CARD_HORIZONTAL_INSET;
+/// 면 안쪽 좌측 여백(.s padding-left). **점은 이 안쪽에서 시작한다** — 예전엔 면이
+/// 점보다 오른쪽에서 시작해 점이 면 바깥에 떠 있었다(2026-08-11 사용자: 배경 채우는
+/// 컬러 영역이 다르다).
+const SESSION_FILL_PADDING_LEFT: f32 = 13.0;
+/// 점이 앉는 칸의 폭과 칸-글 사이 간격(.s grid-template-columns / gap).
+const SESSION_DOT_COLUMN: f32 = 8.0;
+const SESSION_DOT_TEXT_GAP: f32 = 9.0;
+/// 행 **사이** 간격(.s margin-bottom). 구분선을 없앤 자리를 이 여백이 대신한다.
+/// 행이 스스로 아래에 남기는 게 아니라 목록의 `item_spacing.y`로 준다 — 그래야
+/// 마지막 행 **아래**와 헤더 **바로 아래**에는 붙지 않는다(2026-08-11 사용자:
+/// 세션 하단·워크스페이스와 세션 사이 여백을 없애라).
+const SESSION_ROW_GAP: f32 = 2.0;
+/// 면의 좌측이 행 rect보다 얼마나 왼쪽인가.
+const SESSION_HIGHLIGHT_LEFT_EXTEND: f32 = SESSION_LIST_INDENT - SESSION_FILL_SIDE_MARGIN;
+/// 점 중심 x — 행 rect 기준. **워크스페이스 아바타의 중심과 같은 세로선**에 둔다.
+/// 목업은 아바타가 20px·좌측 11이라 점(19..26)이 자연스럽게 그 아래 왔는데, 이 앱의
+/// 아바타는 18px·좌측 10이라 중심이 19 대 22.5로 3.5px 어긋났다(2026-08-11 사용자).
+/// 목업의 절대값 대신 **아바타에서 유도**해야 아바타를 다시 손봐도 안 어긋난다.
+const SESSION_DOT_CENTER_INSET: f32 =
+    WORKSPACE_AVATAR_LEFT_INSET + WORKSPACE_AVATAR_SIZE / 2.0 - SESSION_LIST_INDENT;
+/// 글의 좌측 원점 — 행 rect 기준. 점 자리를 상시 예약해 상태가 바뀌어도 글이
+/// 좌우로 흔들리지 않는다.
+const SESSION_TEXT_INSET: f32 =
+    SESSION_FILL_PADDING_LEFT + SESSION_DOT_COLUMN + SESSION_DOT_TEXT_GAP
+        - SESSION_HIGHLIGHT_LEFT_EXTEND;
 // 폰트 기본 줄높이(CJK 포함이라 여유 있게 잡힘) 대신 폰트 크기에 곱하는 비율로
 // 세션 정보의 2~3개 행 사이에 참고 이미지 수준의 여유를 둔다.
 // 절대 px(예전엔 15.0/12.0 고정값)는 폰트 크기가 바뀌면 그대로 깨진다 —
@@ -4593,14 +4656,26 @@ fn session_text_inset(rail_width: f32) -> f32 {
 // 1.2 = AppleGothic·Apple SD Gothic Neo 공통 (ascent 0.9 + descent 0.3 em) — 두 폰트
 // 모두 hhea/OS2 기준 정확히 1.2em이라 박스가 잉크와 일치한다(2026-08-06 실측).
 const SESSION_LINE_HEIGHT_RATIO: f32 = 1.2;
+/// 글의 우측 한계. 목업은 면 안쪽 11px(= rect.right() - 17)인데, 목업에 없는
+/// 닫기(×) 버튼이 `rect.right() - 25 .. - 3`을 차지한다 — 글이 그 아래로 들어가지
+/// 않게 7px 더 물린다.
 const SESSION_CONTENT_RIGHT_INSET: f32 = 24.0;
-/// 세션 행은 호출부(session_list_scroll/inactive_workspace_sessions)가
-/// `ui.add_space(16.0)`으로 들여쓰는데, 워크스페이스 헤더는 같은 원점 기준 8px만
-/// 들여쓴다(위 SESSION_HIGHLIGHT_RIGHT_INSET 주석 참고). 배경을 그대로
-/// rect.left()에서 시작하면 워크스페이스 카드보다 12px(20-8) 더 안쪽에서
-/// 시작해 레일 왼쪽에 배경이 안 칠해진 틈이 생긴다(2026-07-25 사용자) — 그만큼
-/// 왼쪽으로 더 그린다.
-const SESSION_HIGHLIGHT_LEFT_EXTEND: f32 = 20.0 - WORKSPACE_SESSION_INSET_LEFT;
+
+// ── 세션 행 세로 기하 ────────────────────────────────────────────────────
+/// 면 안쪽 위아래 여백(.s padding 6/6).
+const SESSION_ROW_PADDING_Y: f32 = 6.0;
+/// 줄 사이(.m margin-top 1px).
+const SESSION_ROW_LINE_GAP: f32 = 1.0;
+const SESSION_TITLE_FONT_SIZE: f32 = 13.0;
+const SESSION_SUBLINE_FONT_SIZE: f32 = 10.5;
+/// 행 높이 = 면 높이. 행은 아래에 여백을 남기지 않는다(위 SESSION_ROW_GAP 참고).
+/// 목업의 CSS line-height(1.4/1.62)는 브라우저 기본값이 섞인 값이라 그대로 옮기지
+/// 않고, 이 폰트에서 실측된 비율로 **같은 구조**(여백 6 · 줄 · 간격 1 · 줄 · 여백 6)
+/// 를 만든다.
+const SESSION_ROW_HEIGHT: f32 = SESSION_ROW_PADDING_Y * 2.0
+    + SESSION_TITLE_FONT_SIZE * SESSION_LINE_HEIGHT_RATIO
+    + SESSION_ROW_LINE_GAP
+    + SESSION_SUBLINE_FONT_SIZE * SESSION_LINE_HEIGHT_RATIO;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SessionDragStyle {
@@ -4638,6 +4713,73 @@ fn session_drag_payload_matches(ctx: &egui::Context, target: &SessionRowTarget) 
         .is_some_and(|payload| payload.target() == target)
 }
 
+/// 행 배경의 모서리. 각진 면은 패널 폭을 가로지르는 띠로 보여 「이 행」이 어디서
+/// 끊기는지 흐렸다 — 둥근 면은 목록 안의 한 덩어리로 읽힌다(2026-08-11 사용자).
+const SESSION_ROW_CORNER_RADIUS: f32 = 6.0;
+/// 주목이 필요한 행에 까는 상태색 면의 알파. 색을 알아볼 만큼은 진하고, 그 위의
+/// 글자 대비를 해치지 않을 만큼은 옅다.
+const SESSION_ATTENTION_FILL_ALPHA: f32 = 0.13;
+
+/// 행 배경 — 「면은 주목이 필요할 때만」이 주안의 규칙이다. **선택은 면을 쓰지
+/// 않는다**(2026-08-11 사용자: 주안 — 면 없음으로). 면을 선택에도 내주면 승인 필요
+/// 행의 신호가 「혼자만 면을 가졌다」에서 「면 색이 다르다」로 약해진다.
+/// 선택은 `session_title_color`가 **글자 밝기**로 나른다 — 자리를 안 밀고 면과
+/// 경쟁하지도 않는다.
+///
+/// hover만 예외로 옅은 면을 쓴다. 마우스가 있는 동안만 존재하는 일시적 상태라
+/// 목록을 훑을 때 승인 신호와 다투지 않는다. attention보다 뒤에 둬서, 마우스가
+/// 지나갔다는 이유로 회색 면이 상태색을 덮지 않게 한다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SessionRowFill {
+    color: egui::Color32,
+    /// 면이 패널 폭을 다 쓰는가. hover는 **다 쓴다** — 포인터가 짚은 영역이라
+    /// 경계가 분명한 게 낫고, 워크스페이스 헤더도 같은 폭이라 리듬이 맞는다
+    /// (2026-08-11 사용자: 워크스페이스 색과 hover 색이 다르니 여백 없이 채워도 된다).
+    /// 승인 면은 목업대로 좌우 6px 물러선 **둥근 카드**로 남는다 — 모양이 다르면
+    /// 「지금 마우스가 여기」와 「이 행이 나를 기다린다」가 섞이지 않는다.
+    full_bleed: bool,
+}
+
+fn session_row_fill(
+    tokens: crate::ui::designall::Tokens,
+    hovered: bool,
+    attention: bool,
+    status: egui::Color32,
+) -> Option<SessionRowFill> {
+    if attention {
+        return Some(SessionRowFill {
+            color: status.gamma_multiply(SESSION_ATTENTION_FILL_ALPHA),
+            full_bleed: false,
+        });
+    }
+    hovered.then_some(SessionRowFill {
+        color: tokens.hover_background,
+        full_bleed: true,
+    })
+}
+
+/// hover 면이 쓰는 rect — 호출부의 들여쓰기(add_space)를 되돌려 패널 좌우 끝까지 간다.
+fn session_full_bleed_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(rect.left() - SESSION_LIST_INDENT, rect.top()),
+        rect.max,
+    )
+}
+
+/// 선택 안 된 행의 제목 밝기. 면을 못 쓰는 대신 **선택된 행만 제 밝기**로 두고
+/// 나머지를 한 단 내려 「지금 보고 있는 세션」을 읽게 한다.
+const SESSION_TITLE_DIM: f32 = 0.68;
+
+fn session_title_color(visuals: &egui::Visuals, focused: bool) -> egui::Color32 {
+    if focused {
+        visuals.text_color()
+    } else {
+        visuals.text_color().gamma_multiply(SESSION_TITLE_DIM)
+    }
+}
+
+/// 행의 **면**. 좌우로만 6px 물러선다(.s margin) — 세로는 행 전체가 면이고,
+/// 행 사이 간격은 목록의 item_spacing이 준다.
 fn session_highlight_rect(rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(rect.left() - SESSION_HIGHLIGHT_LEFT_EXTEND, rect.top()),
@@ -4645,14 +4787,6 @@ fn session_highlight_rect(rect: egui::Rect) -> egui::Rect {
             (rect.right() - SESSION_HIGHLIGHT_RIGHT_INSET).max(rect.left()),
             rect.bottom(),
         ),
-    )
-}
-
-fn session_focus_fill_rect(rect: egui::Rect) -> egui::Rect {
-    let highlight = session_highlight_rect(rect);
-    egui::Rect::from_min_max(
-        highlight.min,
-        egui::pos2(highlight.right(), highlight.bottom() - 1.0),
     )
 }
 
@@ -4666,7 +4800,7 @@ fn session_title_lines(
     std::sync::Arc<egui::Galley>,
     Option<std::sync::Arc<egui::Galley>>,
 ) {
-    let title_size = 13.0;
+    let title_size = SESSION_TITLE_FONT_SIZE;
     let title_font_id = crate::fonts::sidebar_font(ui.ctx(), title_size);
     // 제목보다 상태를 1pt 작게 두어 `폴더명 · 상태`의 시각적 위계를 분리한다.
     let status_size = 12.0;
@@ -4702,9 +4836,18 @@ fn session_title_lines(
         });
     let status_width = status_galley.as_ref().map_or(0.0, |galley| galley.size().x);
     let title_width = (max_width - status_width).max(10.0);
+    // 에이전트 행의 1행은 **지금 하는 일**(status_line)이다. 예전엔 세션 제목이었는데
+    // 그게 워크스페이스 이름과 같은 경우가 많아 정보가 0이었다(2026-08-11 사용자).
+    // status_line이 아직 없으면(막 띄운 직후) 제목으로 떨어져 빈 줄을 만들지 않는다.
+    // 셸은 제목이 유일한 식별자라 그대로 둔다.
+    let headline = entry
+        .status_line
+        .as_deref()
+        .filter(|line| entry.agent_line.is_some() && !line.trim().is_empty())
+        .unwrap_or(entry.title.as_str());
     let title_galley = clipped_line(
         ui,
-        &entry.title,
+        headline,
         title_font_id,
         title_width,
         Some(title_size * SESSION_LINE_HEIGHT_RATIO),
@@ -4716,7 +4859,6 @@ fn session_row_impl(
     ui: &mut egui::Ui,
     entry: &SidebarSessionRow,
     edit_buf: Option<&mut String>,
-    is_last: bool,
     _accent_color: egui::Color32,
     sense: egui::Sense,
 ) -> egui::Response {
@@ -4737,12 +4879,11 @@ fn session_row_impl(
     // 줄 사이 간격을 1px씩 더 좁혀서(아래 gap 계산) 남는 줄 수만큼 그대로
     // 줄인다(2026-07-25 사용자: "행간 간격을 1px 줄여도 돼") — 안 그러면 위/아래
     // 여백 대칭(SESSION_TEXT_MARGIN)이 깨진다.
-    let line_count = if agent { 3.0 } else { 2.0 };
-    let row_h = if agent {
-        51.0 - (line_count - 1.0)
-    } else {
-        36.0
-    };
+    // 에이전트도 셸도 **2줄**이다. 예전엔 에이전트만 3줄(제목/에이전트/상태)이었는데,
+    // 제목이 워크스페이스 이름과 같은 경우가 많아 정보가 0인 줄이 하나 있었다
+    // (2026-08-11 사용자: 「arteawiki 아래 arteawiki 셋」이 서로 구분이 안 된다).
+    // 그 줄을 빼고 **하는 일**을 1행으로 올린다.
+    let row_h = SESSION_ROW_HEIGHT;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), sense);
     // 제목은 painter galley로 그리므로 별도 접근성 라벨이 없으면 키보드/스크린리더와
     // kittest가 세션 행을 식별할 수 없다. 클릭 행 자체를 제목이 있는 버튼으로 노출한다.
@@ -4760,14 +4901,27 @@ fn session_row_impl(
     let dot = session_entry_status_color(entry);
     // 텍스트는 최대 레일 폭을 기준으로 고정해 attention/pulse 중에도 좌우로 흔들리지
     // 않게 한다. 포커스/hover 배경 시작점만 아래에서 실제 레일 폭에 맞춘다.
-    let (rail_w, rail_color) = if let Some((t, color)) = entry.pulse {
-        (2.0 + 2.5 * (t * std::f32::consts::PI).sin(), color)
-    } else if entry.attention {
-        (4.5, dot)
+    // 점 하나가 상태를 나른다. 크기는 고정하고 **색과 투명도**만 바꾼다 — 크기가
+    // 변하면 세로 정렬이 흔들려 훑기가 나빠진다(레일 시절의 2↔4.5px 문제).
+    let (dot_color, dot_scale) = if let Some((t, color)) = entry.pulse {
+        // 알림 1회 펄스는 기존 계약 유지 — 잠깐 커졌다 돌아온다.
+        (color, 1.0 + 0.45 * (t * std::f32::consts::PI).sin())
+    } else if entry.status == Some(runtime::SessionStatus::Running) {
+        // 「작업 중」은 숨쉬듯 페이드한다(2026-08-11 사용자). 시간은 egui가 주는
+        // 프레임 시각을 쓰므로 별도 상태가 필요 없다. 리페인트를 **요청하지 않는다** —
+        // 기존 pane 플래시(session_flash)와 같은 계약으로, 터미널 출력 등 다른
+        // 이유로 도는 프레임에 얹혀 간다. 출력이 멎으면 점도 멎지만 색은 남아
+        // 「작업 중」이라는 사실 자체는 잃지 않는다.
+        let phase = ui.input(|i| i.time) as f32 * SESSION_DOT_BREATH_HZ * std::f32::consts::TAU;
+        let breath = 0.5 + 0.5 * phase.sin();
+        (
+            dot.gamma_multiply(SESSION_DOT_BREATH_MIN + (1.0 - SESSION_DOT_BREATH_MIN) * breath),
+            1.0,
+        )
     } else {
-        (2.0, dot)
+        (dot, 1.0)
     };
-    let text_inset = session_text_inset(SESSION_RAIL_MAX_WIDTH);
+    let text_inset = SESSION_TEXT_INSET;
     // 2·3행(보조 정보): 다크는 기존 weak 톤, 라이트는 weak가 패널 위에서 너무 옅어
     // textSecondary 수준으로 진하게 (라이트 테마 회색 흐림, 2026-07-10).
     // 참조하던 #444444는 무채색이라 색상축을 통일한 사이드바에서 혼자 튀었다 — 명도는
@@ -4777,18 +4931,20 @@ fn session_row_impl(
     } else {
         egui::Color32::from_rgb(0x3f, 0x44, 0x49)
     };
-    let title_color = ui.visuals().text_color();
+    let title_color = session_title_color(ui.visuals(), entry.focused);
     // 텍스트는 행 폭(좌 11 + 우 여백 16) 안으로 잘라 '…' 처리 — 고정 글자수 truncate는
     // 좁은 사이드바에서 박스 밖으로 삐져나갔다(#91 사용자).
     let max_w = (rect.width() - text_inset - SESSION_CONTENT_RIGHT_INSET).max(10.0);
     let (title_galley, status_galley) = session_title_lines(ui, entry, dot, sub_color, max_w);
     // 2행/3행: 에이전트면 agent_line/status_line, 아니면 요약(2행)만.
+    // 에이전트: 1행 = 지금 하는 일(status_line), 2행 = 에이전트·모델·강도(agent_line).
+    // 셸: 기존대로 제목 + 요약.
     let (line2, line3) = if agent {
-        (entry.agent_line.as_deref(), entry.status_line.as_deref())
+        (entry.agent_line.as_deref(), None)
     } else {
         (Some(summary_text), None)
     };
-    let subline_size = 10.5;
+    let subline_size = SESSION_SUBLINE_FONT_SIZE;
     let subline_line_height = Some(subline_size * SESSION_LINE_HEIGHT_RATIO);
     let line2_galley = line2.map(|t| {
         clipped_line(
@@ -4829,60 +4985,61 @@ fn session_row_impl(
             drag_style.stroke,
             egui::StrokeKind::Inside,
         );
-    } else if let Some(fill) = crate::ui::designall::row_fill(tokens, entry.focused, resp.hovered())
-    {
-        let focus_rect = session_focus_fill_rect(rect);
-        let focus_rect = crate::ui::snap_rect_to_pixel(
-            ppp,
-            egui::Rect::from_min_max(
-                egui::pos2(
-                    rect.left() + SESSION_RAIL_LEFT_INSET + rail_w,
-                    focus_rect.top(),
-                ),
-                focus_rect.max,
-            ),
-        );
-        painter.rect_filled(focus_rect, 0.0, fill);
-    }
-    if !is_last && drag_style.fill.is_none() {
-        // 구분선은 선이므로 픽셀 **중심**에 맞춘다(mod.rs의 hairline과 같은 규칙) —
-        // 여기만 스냅이 빠져 있어 행마다 선 굵기가 달라 보였다.
-        painter.hline(
-            highlight_rect.x_range(),
-            crate::ui::snap_line_to_pixel(
-                highlight_rect.bottom(),
-                crate::ui::designall::SEPARATOR_WIDTH,
-                ppp,
-            ),
-            crate::ui::designall::separator_stroke(ui.visuals()),
+    } else if let Some(fill) = session_row_fill(tokens, resp.hovered(), entry.attention, dot) {
+        // 면은 **점까지 덮는다**. 예전엔 좌측 레일이 배경 위에 얹힌 별도 요소라
+        // 배경을 레일 다음부터 시작했는데, 점이 된 지금 그 규칙을 남기면 점만 면
+        // 바깥에 떠서 행이 둘로 갈라져 보인다(2026-08-11 사용자).
+        let (fill_rect, radius) = if fill.full_bleed {
+            (session_full_bleed_rect(rect), 0.0)
+        } else {
+            (highlight_rect, SESSION_ROW_CORNER_RADIUS)
+        };
+        painter.rect_filled(
+            crate::ui::snap_rect_to_pixel(ppp, fill_rect),
+            radius,
+            fill.color,
         );
     }
-    // 좌측 상태 레일 — 항상 표시, 상태 색으로 세로로 훑어 파악 (목업 §세션).
-    // 평시 2px, 미확인 완료/입력대기(attention)는 4.5px로 굵힌다. 알림 도착 시 이미
-    // 보고 있던 pane은 1회 펄스(2→4.5→2px). 자리는 최대 폭 기준으로 상시 예약한다.
-    // 레일 높이는 행 수와 분리해 35px로 고정하고 행의 세로 중앙에 배치한다.
-    let rail = crate::ui::snap_rect_to_pixel(
+    // 행 사이 구분선은 없다. 주안의 규칙은 「면은 주목이 필요할 때만」이고, 평상시
+    // 행 경계는 **여백과 점의 세로 정렬**이 만든다. 선을 남기면 면이 좌우로 6px
+    // 물러선 자리를 선이 가로질러 두 요소의 끝이 어긋나 보인다(2026-08-11 사용자:
+    // 라인 길이가 안 맞는다). 워크스페이스 그룹을 가르는 선은
+    // paint_workspace_group_separator가 따로 갖는다.
+
+    // 좌측 상태 점 — 항상 표시, 세로로 정렬돼 한 눈에 훑인다. 첫 줄 글자의 세로
+    // 중앙에 맞춰 「이 줄의 상태」로 읽히게 한다(행 중앙에 두면 두 줄 사이에 떠서
+    // 어느 줄에 붙는지 모호했다).
+    let dot_color = if drag_style.rail_multiplier > 1.0 {
+        dot_color.gamma_multiply(drag_style.rail_multiplier)
+    } else {
+        dot_color
+    };
+    let dot_center = crate::ui::snap_pos_to_pixel(
         ppp,
-        egui::Rect::from_min_size(
-            egui::pos2(
-                rect.left() + SESSION_RAIL_LEFT_INSET,
-                rect.center().y - SESSION_RAIL_HEIGHT / 2.0,
-            ),
-            egui::vec2(rail_w, SESSION_RAIL_HEIGHT),
+        egui::pos2(
+            rect.left() + SESSION_DOT_CENTER_INSET,
+            rect.top() + SESSION_ROW_PADDING_Y + title_galley.size().y / 2.0,
         ),
     );
-    let rail_color = if drag_style.rail_multiplier > 1.0 {
-        rail_color.gamma_multiply(drag_style.rail_multiplier)
-    } else {
-        rail_color
-    };
-    painter.rect_filled(rail, 0.0, rail_color);
+    painter.circle_filled(
+        dot_center,
+        SESSION_DOT_DIAMETER / 2.0 * dot_scale,
+        dot_color,
+    );
+    // 미확인 완료·입력 대기는 점 둘레에 링을 두른다. 예전엔 레일을 2→4.5px로 굵혀
+    // 표시했는데, 점은 크기를 바꾸면 세로 정렬이 흔들려 훑기가 나빠진다 — 링은
+    // **자리를 안 밀면서** 같은 세기를 낸다.
+    if entry.attention {
+        painter.circle_stroke(
+            dot_center,
+            SESSION_DOT_DIAMETER / 2.0 + 2.0,
+            egui::Stroke::new(1.5, dot_color),
+        );
+    }
     // 제목(1행) + 2행 + 3행 — 세로 위치는 행 수에 맞춰.
-    // 위/아래 여백을 2px로 대칭 맞춘다(2026-07-25 사용자: 텍스트 내리고, 아래
-    // 여백 2, 위아래 대칭). 실제 렌더된 줄 높이(galley.size().y)로 계산해야
-    // 고정 오프셋(9/23/37 등)처럼 가정한 줄 높이가 틀려서 어긋나는 일이 없다.
-    // 남는 공간은 줄 사이에 균등 배분한다.
-    const SESSION_TEXT_MARGIN: f32 = 2.25;
+    // 위/아래 여백은 면 안쪽 padding(6/6)이고, 남는 세로는 줄 사이에 배분한다.
+    // 실제 렌더된 줄 높이(galley.size().y)로 계산해야 고정 오프셋(9/23/37 등)처럼
+    // 가정한 줄 높이가 틀려서 어긋나는 일이 없다.
     let line_heights = [
         Some(title_galley.size().y),
         line2_galley.as_ref().map(|g| g.size().y),
@@ -4890,13 +5047,13 @@ fn session_row_impl(
     ];
     let heights: Vec<f32> = line_heights.into_iter().flatten().collect();
     let content_h: f32 = heights.iter().sum();
-    let available = (row_h - 2.0 * SESSION_TEXT_MARGIN).max(0.0);
+    let available = (row_h - 2.0 * SESSION_ROW_PADDING_Y).max(0.0);
     let gap = if heights.len() > 1 {
         ((available - content_h) / (heights.len() as f32 - 1.0)).max(0.0)
     } else {
         0.0
     };
-    let mut y = rect.top() + SESSION_TEXT_MARGIN;
+    let mut y = rect.top() + SESSION_ROW_PADDING_Y;
     let title_center = y + title_galley.size().y / 2.0;
     y += title_galley.size().y + gap;
     let line2_center = line2_galley.as_ref().map(|g| {
@@ -5636,7 +5793,7 @@ fn nav_row_layout(row: egui::Rect, show_label: bool) -> NavRowLayout {
     if show_label {
         NavRowLayout {
             icon_center: egui::pos2(row.center().x, row.center().y - 9.0),
-            label_anchor: egui::pos2(row.center().x, row.center().y + 15.0),
+            label_anchor: egui::pos2(row.center().x, row.center().y + 13.0),
         }
     } else {
         NavRowLayout {
@@ -6540,21 +6697,28 @@ mod tests {
     }
 
     #[test]
-    fn designall_선택워크스페이스는_배경만쓰고_좌측레일이_없다() {
+    fn designall_선택워크스페이스는_제색으로_물들고_좌측레일이_없다() {
         let tokens = crate::ui::designall::DARK;
+        let accent = egui::Color32::from_rgb(0x8b, 0x3f, 0x4a);
         assert_eq!(
-            workspace_row_style(tokens, false, false),
+            workspace_row_style(tokens, accent, false, false),
             WorkspaceRowStyle {
                 fill: None,
                 accent: None,
             }
         );
-        assert_eq!(
-            workspace_row_style(tokens, true, false),
-            WorkspaceRowStyle {
-                fill: Some(tokens.selected_background),
-                accent: None,
-            }
+        let selected = workspace_row_style(tokens, accent, true, false);
+        assert_eq!(selected.accent, None, "좌측 레일은 없다");
+        let fill = selected.fill.expect("선택 면이 없다");
+        // 회색 selected_background로 되돌아가면 패널과 구분이 안 되던 상태다.
+        assert_ne!(fill, tokens.selected_background, "면이 무채색으로 돌아갔다");
+        // 워크스페이스마다 달라야 「어느 프로젝트가 선택됐나」가 색으로 읽힌다.
+        let other = egui::Color32::from_rgb(0x3f, 0x7d, 0x52);
+        assert_ne!(
+            fill,
+            workspace_row_style(tokens, other, true, false)
+                .fill
+                .expect("선택 면이 없다")
         );
     }
 
@@ -6619,7 +6783,7 @@ mod tests {
     }
 
     #[test]
-    fn 워크스페이스_행은_상태점만_그리고_세션수는_그리지않는다() {
+    fn 워크스페이스_행은_세션수만_그리고_상태점은_그리지않는다() {
         let context = egui::Context::default();
         install_sidebar_test_fonts(&context);
         let workspace = SidebarWorkspaceEntry {
@@ -6646,28 +6810,22 @@ mod tests {
         });
 
         assert!(
-            !output.shapes.iter().any(|clipped| {
+            output.shapes.iter().any(|clipped| {
                 matches!(
                     &clipped.shape,
                     egui::Shape::Text(text) if text.galley.text() == "7"
                 )
             }),
-            "워크스페이스 행에 세션 수가 남아 있다"
+            "워크스페이스 행에 세션 수가 없다"
         );
-        assert_eq!(
-            output
+        // 이 폭에서 아바타는 rect_filled라 원은 상태 점밖에 나올 게 없다 — 하나라도
+        // 남으면 헤더와 세션 행이 같은 사실을 두 번 말하던 상태로 돌아간 것이다.
+        assert!(
+            !output
                 .shapes
                 .iter()
-                .filter(|clipped| {
-                    matches!(
-                        &clipped.shape,
-                        egui::Shape::Circle(circle)
-                            if (circle.radius - WORKSPACE_STATUS_DOT_DIAMETER / 2.0).abs() < 0.01
-                    )
-                })
-                .count(),
-            1,
-            "워크스페이스 상태 점은 하나 유지돼야 한다"
+                .any(|clipped| matches!(&clipped.shape, egui::Shape::Circle(_))),
+            "워크스페이스 우측 상태 점이 남아 있다"
         );
     }
 
@@ -6801,31 +6959,95 @@ mod tests {
     }
 
     #[test]
-    fn 세션_하이라이트는_평면경계를_쓰고_레일텍스트간격은_없다() {
-        let full = egui::Rect::from_min_max(egui::pos2(20.0, 10.0), egui::pos2(500.0, 62.0));
-        let highlight = session_highlight_rect(full);
+    fn 세션_행_기하는_주안_목업의_패널좌표와_같다() {
+        // 목업 .s { margin:0 6px 2px; padding:6px 11px 6px 13px;
+        //           grid-template-columns:8px 1fr; gap:0 9px } · .dot { 7px }
+        // → 패널 좌표로 면 6..W-6 · 점 19..26 · 글 36.
+        let panel_left = 20.0;
+        let panel_right = 220.0;
+        // 호출부가 add_space(SESSION_LIST_INDENT)로 들여쓴 뒤의 행 rect.
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(panel_left + SESSION_LIST_INDENT, 10.0),
+            egui::pos2(panel_right, 10.0 + SESSION_ROW_HEIGHT),
+        );
+
+        let fill = session_highlight_rect(rect);
+        assert_eq!(fill.left() - panel_left, 6.0, "면 좌측");
+        assert_eq!(panel_right - fill.right(), 6.0, "면 우측");
+
+        // 점의 중심은 워크스페이스 아바타의 중심과 같은 세로선에 선다 — 헤더의 마크와
+        // 그 아래 점들이 한 줄로 서야 목록이 세로로 훑인다.
+        let dot_center = rect.left() + SESSION_DOT_CENTER_INSET;
+        let header =
+            egui::Rect::from_min_max(egui::pos2(panel_left, 0.0), egui::pos2(panel_right, 29.0));
         assert_eq!(
-            highlight.left(),
-            full.left() - SESSION_HIGHLIGHT_LEFT_EXTEND
+            dot_center,
+            workspace_avatar_rect(header).center().x,
+            "점이 아바타 중심에서 벗어났다"
+        );
+        let dot_left = dot_center - SESSION_DOT_DIAMETER / 2.0;
+        // 점은 면 **안에** 있어야 한다 — 면이 점보다 오른쪽에서 시작하면 점만 면
+        // 바깥에 떠서 행이 둘로 갈라져 보인다(2026-08-11 회귀).
+        assert!(
+            fill.left() < dot_left && dot_left + SESSION_DOT_DIAMETER < fill.right(),
+            "점이 면 바깥에 있다"
+        );
+
+        assert_eq!(
+            rect.left() + SESSION_TEXT_INSET - panel_left,
+            36.0,
+            "글 좌측"
+        );
+
+        // 면은 행 세로를 다 쓴다 — 행간은 목록의 item_spacing이 **행 사이에만**
+        // 주므로 마지막 행 아래와 헤더 바로 아래에는 여백이 안 생긴다.
+        assert_eq!(fill.top(), rect.top());
+        assert_eq!(fill.bottom(), rect.bottom(), "면이 행 아래에 여백을 남겼다");
+    }
+
+    #[test]
+    fn 선택은_면을_쓰지_않고_승인만_면을_가진다() {
+        let tokens = crate::ui::designall::DARK;
+        let status =
+            crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::Waiting);
+
+        // 주안 — 면 없음: hover도 승인도 아닌 평상시 행엔 면이 없다. 선택은 이
+        // 함수에 들어오지도 않는다.
+        assert_eq!(session_row_fill(tokens, false, false, status), None);
+        // 승인·입력 대기만 면을 가진다 — 「혼자만 면을 가져」 최대로 튄다.
+        let attention_fill = Some(SessionRowFill {
+            color: status.gamma_multiply(SESSION_ATTENTION_FILL_ALPHA),
+            full_bleed: false,
+        });
+        assert_eq!(
+            session_row_fill(tokens, false, true, status),
+            attention_fill
         );
         assert_eq!(
-            highlight.right(),
-            full.right() - SESSION_HIGHLIGHT_RIGHT_INSET
+            session_row_fill(tokens, true, true, status),
+            attention_fill,
+            "hover 회색 면이 승인 상태색을 덮었다"
         );
-        let last = egui::Rect::from_min_max(egui::pos2(20.0, 62.0), egui::pos2(500.0, 100.0));
-        let focus = session_focus_fill_rect(last);
-        assert_eq!(
-            focus.top(),
-            last.top(),
-            "포커스 배경은 이전 행을 침범하지 않음"
+        // hover는 패널 폭을 다 쓰고, 승인 면은 둥근 카드로 남는다.
+        assert!(
+            session_row_fill(tokens, true, false, status)
+                .expect("hover 면이 없다")
+                .full_bleed,
+            "hover 면이 여백을 남겼다"
         );
-        assert_eq!(focus.bottom(), last.bottom() - 1.0);
-        assert_eq!(
-            session_text_inset(SESSION_RAIL_MAX_WIDTH)
-                - SESSION_RAIL_LEFT_INSET
-                - SESSION_RAIL_MAX_WIDTH,
-            0.0,
-            "레일의 실제 폭 바로 뒤에서 텍스트 시작"
+        let row = egui::Rect::from_min_max(egui::pos2(36.0, 0.0), egui::pos2(220.0, 41.0));
+        let bleed = session_full_bleed_rect(row);
+        assert_eq!(bleed.left(), row.left() - SESSION_LIST_INDENT, "hover 좌측");
+        assert_eq!(bleed.right(), row.right(), "hover 우측");
+
+        // 선택은 글자 밝기로만 나른다.
+        let mut visuals = egui::Visuals::dark();
+        visuals.override_text_color = Some(tokens.text);
+        assert_eq!(session_title_color(&visuals, true), tokens.text);
+        assert_ne!(
+            session_title_color(&visuals, false),
+            tokens.text,
+            "선택 안 된 행이 선택된 행과 같은 밝기다"
         );
     }
 
@@ -9310,12 +9532,25 @@ mod tests {
 
     #[test]
     fn designall_nav행은_아이콘위_텍스트아래_중앙정렬한다() {
-        let row = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 58.0));
+        let row = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(80.0, SIDEBAR_NAV_ROW_HEIGHT),
+        );
         let layout = nav_row_layout(row, true);
 
         assert_eq!(layout.icon_center.x, row.center().x);
         assert_eq!(layout.label_anchor.x, row.center().x);
         assert!(layout.icon_center.y < layout.label_anchor.y);
+        // 아이콘 위·라벨 아래가 행 안에 들어가야 한다 — 행을 낮추면서 넘치면
+        // 레일 첫 행이 패널 위로 잘린다(아이콘 13×12, 라벨 12pt 기준).
+        assert!(
+            layout.icon_center.y - 6.5 > row.top(),
+            "아이콘이 행 위로 넘쳤다"
+        );
+        assert!(
+            layout.label_anchor.y + 6.0 < row.bottom(),
+            "라벨이 행 아래로 넘쳤다"
+        );
     }
 
     #[test]

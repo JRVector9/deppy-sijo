@@ -2162,7 +2162,10 @@ impl FileTreeUi {
                                                                     ));
                                                             }
                                                             // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
-                                                            // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
+                                                            // 클릭 → 세션 전환.
+                                                            // 이름 변경은 **우클릭 메뉴에만** 둔다 — 더블클릭 진입은
+                                                            // 제거했다(2026-08-11 사용자). 세션 행의 주 동작은 전환인데
+                                                            // 빠르게 두 번 누르면 편집기가 열려 오조작이 됐다.
                                                             // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
                                                             if let Some(session) = entry.target.session() {
                                                                 resp.context_menu(|ui| {
@@ -2319,11 +2322,6 @@ impl FileTreeUi {
                                                                             .clone(),
                                                                     },
                                                                 );
-                                                            } else if resp.double_clicked() {
-                                                                self.session_name_edit = Some((
-                                                                    entry.target.pane().clone(),
-                                                                    entry.title.clone(),
-                                                                ));
                                                             } else if resp.clicked()
                                                                 && !entry.focused
                                                                 && let Some(tab) = entry.target.live_tab()
@@ -9101,6 +9099,40 @@ mod tests {
         }
     }
 
+    /// 세션 이름 변경은 **우클릭 메뉴에만** 있다. 더블클릭 진입은 제거했다
+    /// (2026-08-11 사용자) — 세션 행의 주 동작은 전환인데 빠르게 두 번 누르면
+    /// 편집기가 열려 오조작이 됐다. 진입점이 다시 늘면 같은 문제가 돌아온다.
+    #[test]
+    fn 세션_이름_변경은_우클릭_메뉴에만_있다() {
+        let source = include_str!("file_tree.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source");
+
+        // `= None`(편집 종료)은 진입이 아니라 해제다. 전체에서 그것만 빼고 세면
+        // 남는 것이 **편집을 여는 경로**다.
+        let assignments = production.matches("self.session_name_edit =").count();
+        let clears = production.matches("self.session_name_edit = None").count();
+        assert_eq!(
+            assignments - clears,
+            1,
+            "이름 편집 진입점이 하나가 아니다 — 우클릭 메뉴 외에 다른 경로가 생겼다 \
+             (전체 {assignments}, 해제 {clears})"
+        );
+
+        // 그 하나가 컨텍스트 메뉴 안이어야 한다.
+        let menu = production
+            .split("resp.context_menu(|ui| {")
+            .nth(1)
+            .and_then(|tail| tail.split("} else if resp.clicked()").next())
+            .expect("live session context menu");
+        assert!(
+            menu.contains("self.session_name_edit ="),
+            "이름 편집이 우클릭 메뉴 밖으로 나갔다"
+        );
+    }
+
     #[test]
     fn live_session_row_context_menu_uses_the_multi_item_renderer() {
         let source = include_str!("file_tree.rs");
@@ -9111,7 +9143,9 @@ mod tests {
         let context_menu = production
             .split("resp.context_menu(|ui| {")
             .nth(1)
-            .and_then(|tail| tail.split("if resp.double_clicked()").next())
+            // 경계: 메뉴 블록 다음에 오는 클릭 처리. 예전엔 `if resp.double_clicked()`가
+            // 그 자리였는데 더블클릭 이름 변경을 제거하며 사라졌다(2026-08-11).
+            .and_then(|tail| tail.split("} else if resp.clicked()").next())
             .expect("live session context menu");
 
         assert!(context_menu.contains("live_session_context_menu_items("));

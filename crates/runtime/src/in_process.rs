@@ -1986,6 +1986,22 @@ impl Worker {
                     self.emit_mux_snapshot();
                 }
             }
+            RuntimeCommand::RespawnArchivedAgent {
+                session,
+                extra_args,
+                cols,
+                rows,
+                scrollback_lines,
+            } => {
+                if self.suspended {
+                    self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Agent,
+                        message: MessagePayload::new("runtime.spawn_failed.suspended"),
+                    });
+                    return;
+                }
+                self.respawn_archived_agent(session, extra_args, cols, rows, scrollback_lines);
+            }
         }
     }
 
@@ -2589,6 +2605,186 @@ impl Worker {
         self.mux.panes.insert(pane_state.id.clone(), pane);
         tracing::info!(persistent_id, session = id.0, "agent pane 열람 전용 복원");
         true
+    }
+
+    /// `RespawnArchivedAgent` 실패 공통 경로 — 대상이 archived agent pane이 아니거나
+    /// (라이브 세션·미존재 세션·pane 미결속·agent 아님) 준비 단계에서 막힌 경우.
+    /// 이 시점까진 기존 상태를 전혀 건드리지 않았으므로 그냥 실패만 알리면 된다
+    /// (열람 전용 화면·pane 결속·영속 행 모두 그대로).
+    fn fail_respawn_archived_agent(&self, correlation_id: Option<AgentConfigCorrelationId>) {
+        self.emit(RuntimeEvent::SpawnFailed {
+            kind: SpawnKind::Agent,
+            message: MessagePayload::new("runtime.spawn_failed.invalid_command"),
+        });
+        self.emit_agent_spawn_resolved(correlation_id, None);
+    }
+
+    /// 열람 전용(archived)으로 복원된 agent pane을 그 자리에서 재실행한다 (PR-2).
+    /// 사용자가 명시적으로 pane의 「다시 실행」을 눌렀을 때만 온다.
+    ///
+    /// 순서가 안전의 전부다: 새 프로세스가 **성공적으로 spawn된 뒤에만** 이전 archived
+    /// 세션/아카이브/영속 행을 건드린다. 그 전에 실패하면(대상 부적합, 용량 초과, env
+    /// 준비 실패, PTY spawn 실패) 이전 상태는 한 바이트도 바뀌지 않는다 — 재실행 실패가
+    /// "열람 전용으로 복원됐던 화면"을 잃게 만드는 경로는 없다.
+    fn respawn_archived_agent(
+        &mut self,
+        session: SessionId,
+        extra_args: Vec<String>,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+    ) {
+        let Some(pane_id) = self
+            .mux
+            .panes
+            .iter()
+            .find(|(_, pane)| pane.session_id == Some(session))
+            .map(|(id, _)| id.clone())
+        else {
+            self.fail_respawn_archived_agent(None);
+            return;
+        };
+        // 재실행 대상은 라이브 프로세스가 없는(열람 전용) 세션만 — PTY가 붙어 있는
+        // 세션을 덮어쓰지 않는다. 세션이 아예 없어도(레이스로 이미 정리됨) 마찬가지.
+        let is_archived = self
+            .sessions
+            .get(&session)
+            .is_some_and(|current| !current.lifecycle().is_running());
+        if !is_archived {
+            self.fail_respawn_archived_agent(None);
+            return;
+        }
+        // 영속 행이 있어야 재실행 스펙(command/args/cwd)을 안다 — session_rebound_archived가
+        // restored_rows에서 self.rows로 이미 옮겨뒀으므로 archived agent pane이면 항상 있다
+        // (persistence.rs:196 결속 계약). kind가 agent가 아니면(레거시 shell 등) 대상이 아니다.
+        let Some((persistent_id, command, mut args, cwd_value, agent_config_id)) =
+            self.persist.as_ref().and_then(|pipe| {
+                let row = pipe.session_row(session)?;
+                (row.session_kind == "agent").then(|| {
+                    (
+                        row.id.clone(),
+                        row.command.clone(),
+                        row.args.clone(),
+                        row.cwd.clone(),
+                        row.agent_id.clone(),
+                    )
+                })
+            })
+        else {
+            self.fail_respawn_archived_agent(None);
+            return;
+        };
+        let correlation_id = agent_config_id
+            .as_ref()
+            .filter(|id| crate::command::agent_config_id_is_valid(id))
+            .cloned()
+            .map(AgentConfigCorrelationId::from_validated);
+        if !self.session_capacity_available() {
+            self.reject_session_capacity(SpawnKind::Agent, correlation_id);
+            return;
+        }
+        args.extend(extra_args);
+        let (mut env, redaction_leases) = match self.prepare_agent_env(Vec::new(), Vec::new()) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                self.emit(RuntimeEvent::SpawnFailed {
+                    kind: SpawnKind::Agent,
+                    message: MessagePayload::new("runtime.spawn_failed.agent_secret"),
+                });
+                self.emit_agent_spawn_resolved(correlation_id, None);
+                return;
+            }
+        };
+        // 저장된 cwd가 더 이상 유효한 디렉터리가 아니면(삭제/이동) 워크스페이스 기본
+        // cwd로 폴백한다 — restore_pane의 pane별 cwd 복원과 같은 규칙.
+        let cwd = Some(std::path::PathBuf::from(cwd_value))
+            .filter(|p| crate::command::validate_runtime_path(p).is_ok() && p.is_dir())
+            .or_else(|| self.shell.cwd.clone());
+        let id = SessionId(self.next_id);
+        self.next_id += 1;
+        env.push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
+        let spec = CommandSpec {
+            program: command,
+            args,
+            env,
+            cwd,
+        };
+        match Self::spawn_session(
+            id,
+            session::SessionKind::Agent,
+            &spec,
+            cols,
+            rows,
+            scrollback_lines,
+        ) {
+            Ok(mut new_session) => {
+                // 이전(열람 전용) 화면을 잃지 않는다 — 셸 respawn 복원(restore_pane)과
+                // 같은 연속성 패턴: 새 세션의 scrollback에 이전 redacted ANSI를 먼저
+                // 재생한 뒤, 이번 tick부터 도착하는 라이브 PTY 출력이 그 뒤를 잇는다.
+                Self::replay_saved_ansi(&self.logs_root, &persistent_id, &mut new_session);
+                self.sessions.insert(id, new_session);
+                self.retain_session_redaction_leases(id, redaction_leases);
+                // 저장된 regex(waiting/approval/error/done)는 영속되지 않아 복원할 수
+                // 없다 — 셸과 동일하게 idle heuristic만 설치(3단 감지는 그래도 동작).
+                self.detectors.insert(
+                    id,
+                    StatusDetector::new(StatusPatterns::compile(None, None, None, None)),
+                );
+
+                // 여기서부터는 성공이 확정됐을 때만 실행된다 — 이전 archived 상태 정리.
+                self.remove_session(session);
+                self.exited_order.retain(|s| *s != session);
+                self.archived.remove(&session);
+                self.archived_on_disk.remove(&session);
+                self.hidden_scrollback.remove(&session);
+                self.remote_viewing.remove(&session);
+                self.status_overrides.remove(&session);
+                self.detectors.remove(&session);
+
+                // 새 탭이 아니라 그 pane에 — attach_in_new_tab을 쓰면 안 된다 (새 탭 생성).
+                if let Some(pane) = self.mux.panes.get_mut(&pane_id) {
+                    pane.session_id = Some(id);
+                }
+                if let Some(pipe) = &mut self.persist {
+                    pipe.session_respawned(session, id);
+                }
+                // 오래된 디스크 스크롤백 아카이브(scrollback.zlib) 무효화 — 그대로 두면
+                // write_scrollback_archive의 exists() 가드가 "이미 있음"으로 skip해
+                // 새 세션이 종료돼도 아카이브가 영영 이전(재실행 전) 화면인 채로 남는다
+                // (exited grid 불변 가정을 재실행이 깨므로, 재실행 쪽이 명시적으로
+                // 무효화해야 한다). 실패해도 치명적이지 않다 — redacted.ansi.log tail
+                // 폴백이 다음 복원에서 그 자리를 대신한다.
+                match storage::scrollback_archive::remove(&self.logs_root, &persistent_id) {
+                    Ok(_) => {
+                        self.archive_disk_bytes =
+                            storage::scrollback_archive::ARCHIVE_DISK_USAGE_UNKNOWN;
+                    }
+                    Err(error) => trace_runtime_failure(
+                        "respawn_archive_invalidate",
+                        "scrollback_archive_remove_failed",
+                        error,
+                    ),
+                }
+
+                self.open_session_log(id);
+                self.emit_mux_snapshot();
+                self.emit(RuntimeEvent::AgentSpawned { session: id });
+                self.emit_agent_spawn_resolved(correlation_id, Some(id));
+                self.push_watched_viewports();
+            }
+            Err(error) => {
+                // 실패 — 이전 archived 세션/pane/영속 행/디스크 아카이브 전부 그대로.
+                trace_runtime_failure("respawn_archived_agent", "pty_spawn_failed", error);
+                self.emit(RuntimeEvent::SpawnFailed {
+                    kind: SpawnKind::Agent,
+                    message: sanitized_spawn_failure(
+                        "runtime.spawn_failed.agent",
+                        "pty_spawn_failed",
+                    ),
+                });
+                self.emit_agent_spawn_resolved(correlation_id, None);
+            }
+        }
     }
 
     fn split_pane(
@@ -4859,6 +5055,40 @@ mod tests {
         };
         persist::upsert_session(&conn, &row).unwrap();
         let window = persisted_single_pane_window(session_id, "restored", Some(cwd.to_owned()));
+        persist::save_window_layout(&mut conn, workspace_id, &window).unwrap();
+    }
+
+    /// `seed_persisted_session_pane`과 같은 모양이지만 command/args를 직접 지정한다 —
+    /// RespawnArchivedAgent가 저장된 launch spec을 그대로 쓰는지 관측하려면 고정된
+    /// `/bin/sh -c "echo restored"`로는 부족하다(인자 순서를 눈으로 확인할 수 없다).
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn seed_persisted_agent_session_pane(
+        db_path: &std::path::Path,
+        workspace_id: &str,
+        session_id: &str,
+        agent_id: &str,
+        command: &str,
+        args: Vec<String>,
+        status: &str,
+        cwd: &str,
+    ) {
+        let mut conn = rusqlite::Connection::open(db_path).unwrap();
+        let row = persist::SessionRow {
+            id: session_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            session_kind: "agent".to_owned(),
+            agent_id: Some(agent_id.to_owned()),
+            title: "respawn-target".to_owned(),
+            command: command.to_owned(),
+            args,
+            cwd: cwd.to_owned(),
+            status: status.to_owned(),
+            last_log_offset: 0,
+        };
+        persist::upsert_session(&conn, &row).unwrap();
+        let window =
+            persisted_single_pane_window(session_id, "respawn-target", Some(cwd.to_owned()));
         persist::save_window_layout(&mut conn, workspace_id, &window).unwrap();
     }
 
@@ -8719,6 +8949,353 @@ mod tests {
             "failed rebind must not leave a disk archive marker without a session"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PR-2: 열람 전용으로 복원된 agent pane을 사용자가 재실행하면 (1) 저장된
+    /// command/args 뒤에 extra_args가 붙고, (2) 새 탭이 아니라 그 pane 자리를
+    /// 유지하고, (3) 같은 영속 UUID를 재사용해 행이 늘지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn respawn_archived_agent_reuses_pane_persistent_id_and_appends_extra_args() {
+        init_mock_store();
+        let dir = unique_test_dir("respawn-success");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-respawn-success";
+        let persistent_id = "respawn-success-session";
+        create_persist_db(&db_path, workspace_id);
+        seed_persisted_agent_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "cfg-sf03",
+            "/bin/echo",
+            vec!["stored-arg".to_owned()],
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let restored = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(restored.tabs.len(), 1, "fixture는 tab 1개/pane 1개");
+        let pane = restored
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .find(|pane| pane.session_id.is_some())
+            .unwrap();
+        let pane_id = pane.id.clone();
+        let archived_session = pane.session_id.unwrap();
+        assert_eq!(pane.persistent_session_id.as_deref(), Some(persistent_id));
+
+        client
+            .send_command(RuntimeCommand::RespawnArchivedAgent {
+                session: archived_session,
+                extra_args: vec!["extra-arg".to_owned()],
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+
+        let new_session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        assert_ne!(
+            new_session, archived_session,
+            "재실행은 새 runtime SessionId를 할당해야 한다"
+        );
+
+        let text = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if *session == new_session => {
+                let text = snapshot_text(snapshot, 0);
+                text.contains("stored-arg").then_some(text)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            text, "stored-arg extra-arg",
+            "저장된 args 뒤에 extra_args가 그대로 붙어야 한다"
+        );
+
+        let after = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.id == pane_id && pane.session_id == Some(new_session)) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            after.tabs.len(),
+            1,
+            "새 탭이 생기면 안 된다 — 같은 pane 자리를 유지해야 한다"
+        );
+        let after_pane = after
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .find(|pane| pane.id == pane_id)
+            .unwrap();
+        assert_eq!(
+            after_pane.persistent_session_id.as_deref(),
+            Some(persistent_id),
+            "같은 영속 UUID를 재사용해 로그/아카이브 연속성을 유지해야 한다"
+        );
+
+        drop(probe);
+        drop(client);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows = persist::load_sessions(&conn, workspace_id).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "행이 늘면 안 된다 — 같은 UUID를 재사용해야 한다"
+        );
+        assert_eq!(rows[0].id, persistent_id);
+        assert_eq!(
+            rows[0].args,
+            vec!["stored-arg".to_owned()],
+            "영속 launch spec(args)에 extra_args가 누적되면 안 된다"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PR-2: 재실행이 PTY spawn 단계에서 실패하면 이전 archived pane/세션/영속 행이
+    /// 그대로 보존돼야 한다 — 「다시 실행」 실패가 열람 전용 화면을 잃게 하면 안 된다.
+    #[cfg(unix)]
+    #[test]
+    fn respawn_archived_agent_failure_preserves_previous_archived_state() {
+        init_mock_store();
+        let dir = unique_test_dir("respawn-failure");
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        let workspace_id = "ws-respawn-failure";
+        let persistent_id = "respawn-failure-session";
+        create_persist_db(&db_path, workspace_id);
+        // spawn_실패_이벤트와 같은 기법 — 존재하지 않는 실행 파일로 PTY spawn 자체를
+        // 확실히 실패시킨다(파일 부재를 exec 단계에서 검증하는 실제 실패 경로).
+        seed_persisted_agent_session_pane(
+            &db_path,
+            workspace_id,
+            persistent_id,
+            "cfg-sf03",
+            "HOSTILE_SPAWN_PATH_COMMAND_MARKER",
+            Vec::new(),
+            persist::SESSION_STATUS_EXITED,
+            "/tmp",
+        );
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let restored = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.session_id.is_some()) =>
+            {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        let pane = restored
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .find(|pane| pane.session_id.is_some())
+            .unwrap();
+        let pane_id = pane.id.clone();
+        let archived_session = pane.session_id.unwrap();
+
+        client
+            .send_command(RuntimeCommand::RespawnArchivedAgent {
+                session: archived_session,
+                extra_args: Vec::new(),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SpawnFailed {
+                kind: SpawnKind::Agent,
+                ..
+            } => Some(()),
+            _ => None,
+        });
+        // 실패 후 AgentSpawned이 뒤늦게 오지 않는지도 확인 — 조금 더 드레인한다.
+        std::thread::sleep(Duration::from_millis(150));
+        probe.seen.extend(probe.rx.drain());
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::AgentSpawned { .. })),
+            "실패한 재실행이 AgentSpawned를 내면 안 된다"
+        );
+
+        drop(probe);
+        drop(client);
+
+        // 이전 archived 세션/pane 결속이 그대로다 — 실패가 화면을 잃게 만들지 않는다.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows = persist::load_sessions(&conn, workspace_id).unwrap();
+        assert_eq!(rows.len(), 1, "행이 늘면 안 된다");
+        assert_eq!(rows[0].id, persistent_id);
+        assert_eq!(
+            rows[0].status,
+            persist::SESSION_STATUS_EXITED,
+            "실패한 재실행은 status를 running으로 바꾸면 안 된다"
+        );
+        assert_eq!(rows[0].command, "HOSTILE_SPAWN_PATH_COMMAND_MARKER");
+        let pane_session: String = conn
+            .query_row(
+                "SELECT session_id FROM mux_panes WHERE id = ?1",
+                [&pane_id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pane_session, persistent_id,
+            "실패한 재실행은 pane↔영속 세션 결속을 바꾸면 안 된다"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PR-2: archived pane이 아닌 대상(라이브 세션·미존재 세션)에는 안전하게 실패만
+    /// 하고 아무것도 건드리지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn respawn_archived_agent_ignores_non_archived_targets() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("respawn-ignore-live"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd("sleep 5", None, None))
+            .unwrap();
+        let live_session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+
+        // 1) 라이브(실행 중) 세션 — archived가 아니므로 거부돼야 한다.
+        client
+            .send_command(RuntimeCommand::RespawnArchivedAgent {
+                session: live_session,
+                extra_args: Vec::new(),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        // 2) 존재한 적 없는 session id — pane이 없으므로 거부돼야 한다.
+        client
+            .send_command(RuntimeCommand::RespawnArchivedAgent {
+                session: SessionId(999_999),
+                extra_args: Vec::new(),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        // DurableEventBarrier로 위 두 명령의 이벤트가 이미 큐에 들어왔음을 보장한 뒤
+        // 센다 — 같은 조건을 반복 wait_for하면 누적 history의 첫 매치만 보고
+        // 두 번째 실패를 놓칠 수 있다(codex 리뷰 방지 관례와 동일한 이유).
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 7 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::DurableEventBarrierReached { correlation_id: 7 } => Some(()),
+            _ => None,
+        });
+        probe.seen.extend(probe.rx.drain());
+
+        let failed_count = probe
+            .seen
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Agent,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            failed_count, 2,
+            "라이브 세션과 미존재 세션 각각 안전하게 실패해야 한다"
+        );
+        let spawned_count = probe
+            .seen
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::AgentSpawned { .. }))
+            .count();
+        assert_eq!(
+            spawned_count, 1,
+            "원래 라이브 agent 하나만 spawn된 채여야 한다 — 재실행이 끼어들면 안 된다"
+        );
+
+        drop(probe);
+        drop(client);
     }
 
     /// 복원 UX (PR-14, 설계문서 §11.1~11.5·§14): 첫 worker가 만든 셸 2개 + split

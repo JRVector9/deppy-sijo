@@ -37,7 +37,10 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - name: cargo clippy -p deppy-sijo --bin deppy-sijo -- -D warnings
-        run: cargo clippy -p deppy-sijo --bin deppy-sijo --locked -- -D warnings
+      # 프로덕션 바이너리와 **테스트 코드까지** 함께 본다. --bin만 보면 테스트에
+      # 쌓인 위반이 게이트를 통과해 계속 늘어난다(2026-08-11 정리 시점 4건이 쌓여
+      # 있었고, 그중 하나는 #[test] 중복이라 테스트가 조용히 죽을 수 있는 종류였다).
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo test --workspace
         run: cargo test --workspace --locked -- --test-threads=1

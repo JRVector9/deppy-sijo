@@ -24673,7 +24673,7 @@ mod tests {
     }
 
     #[test]
-    fn 슬래시_명령은_본문과_CR을_나눠_보낸다() {
+    fn 슬래시_명령은_본문과_cr을_나눠_보낸다() {
         let source = include_str!("app.rs");
         let body = source
             .split_once("    fn encode_slash_writes(")
@@ -24880,12 +24880,15 @@ mod tests {
     /// 백엔드 보충은 "5시간만 빠진 구멍"에만 끼운다 — 그 외에는 서버 값 그대로.
     #[test]
     fn 백엔드_보충은_5시간_구멍에만_끼운다() {
-        let cases: &[(
-            &str,
+        /// (설명, 서버 값, 백엔드 보충값, 기대 결과) — 튜플이 길어 clippy
+        /// `type_complexity`에 걸린다. 표를 그대로 두면서 이름만 붙인다.
+        type Case = (
+            &'static str,
             Option<ProviderUsage>,
             Option<u8>,
             Option<ProviderUsage>,
-        )] = &[
+        );
+        let cases: &[Case] = &[
             (
                 "구멍 + 보충값 → 접붙임",
                 Some((None, Some(91))),

@@ -1998,15 +1998,17 @@ mod tests {
         }
         let outer = catalog();
         let save = outer.t("fleet.followup.save", &[]);
-        let mut fleet = FleetUi::default();
         // 패널은 카드 우클릭으로 열린다. 여는 경로가 아니라 **보내는 계약**을 보는
         // 테스트라 열린 상태에서 시작한다.
-        fleet.followup = Some(FollowUpState {
-            workspace_id: "ws-1".to_owned(),
-            session: runtime::SessionId(7),
-            title: "session-7".to_owned(),
-            text: "테스트 돌리고 실패한 것만 고쳐".to_owned(),
-        });
+        let fleet = FleetUi {
+            followup: Some(FollowUpState {
+                workspace_id: "ws-1".to_owned(),
+                session: runtime::SessionId(7),
+                title: "session-7".to_owned(),
+                text: "테스트 돌리고 실패한 것만 고쳐".to_owned(),
+            }),
+            ..Default::default()
+        };
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1100.0, 600.0))
             .build_ui_state(

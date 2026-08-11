@@ -1088,6 +1088,10 @@ pub struct WorkspaceUi {
     /// 상한(WORKSPACE_NOTE_MAX_BYTES) 판정은 leaf가 storage 상수를 참조할 수 없어
     /// App이 한다(check-boundary: leaf UI must not access the storage crate).
     note_append_request: Option<String>,
+    /// pane 하단 「다시 실행」 클릭 요청 (PR-3). RuntimeCommand 전송은 App 몫이라
+    /// (check-boundary: leaf UI must not execute runtime protocol commands directly)
+    /// 세션만 담아 요청한다 — take_open_environment와 같은 프레임 소비 패턴.
+    respawn_archived_request: Option<SessionId>,
     /// 터미널 마우스 선택 (session, anchor 셀, head 셀 — 드래그 방향 그대로,
     /// 렌더/복사 시 정규화). 새 출력(Viewport)이 오면 그 세션의 선택은 해제한다.
     selection: Option<(SessionId, usize, usize)>,
@@ -1108,6 +1112,11 @@ pub struct WorkspaceUi {
     session_project_names: SessionProjectNameSnapshot,
     /// 세션별 에이전트 표시정보(model/effort/context — App이 병합해 set) — 3줄 행 2/3행.
     agent_info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
+    /// PR-3: 세션별로 영속된 에이전트 종류("claude"/"codex"/"kimi" — App이 pane_id
+    /// 키인 persisted_agents에서 세션 키로 바꿔 매 갱신마다 set). 「다시 실행」 버튼
+    /// 문구(이어서/새로) 판정에만 쓴다 — leaf는 agent_resume::resume_args 같은 순수
+    /// 함수는 직접 불러도 된다(check-boundary가 막는 건 storage/runtime 직접 접근).
+    resume_agent_kind: std::collections::HashMap<SessionId, String>,
     /// App host가 수행 중인 terminal clipboard 요청. completion은 operation/generation을
     /// 모두 맞춘 뒤 정확히 한 번만 적용한다. 새 요청은 이전 요청을 stale로 만든다.
     pending_paste: Option<PendingPaste>,
@@ -1426,6 +1435,11 @@ struct SessionView {
     /// 사이드바 세션 목록에 보여줄 최신 화면 요약 (마지막 비어있지 않은 행, ≤48자)
     summary: String,
     exit_code: Option<Option<u32>>,
+    /// PR-3: 이 exit_code가 `SessionExited`(실제 종료)가 아니라 `SessionRestored`(앱
+    /// 재시작 후 열람 전용 복원)로 채워졌는지. `restore_pane`(runtime)은 agent 세션만
+    /// `SessionRestored`로 복원하고 셸은 항상 새 프로세스로 재기동하므로, 이 값이
+    /// true면 곧 "에이전트 pane"이라는 뜻도 된다 — 별도 종류 판정이 필요 없다.
+    restored_readonly: bool,
     /// status detector 감지 상태 (agent만, PR-12)
     status: Option<SessionStatus>,
     status_view: Option<runtime::SessionStatusView>,
@@ -1470,6 +1484,7 @@ impl WorkspaceUi {
             new_session_requested: false,
             session_folder_request: None,
             note_append_request: None,
+            respawn_archived_request: None,
             selection: None,
             project_name: None,
             ui_scale: 1.0,
@@ -1491,6 +1506,7 @@ impl WorkspaceUi {
             session_cwds: std::collections::HashMap::new(),
             session_project_names: SessionProjectNameSnapshot::default(),
             agent_info: std::collections::HashMap::new(),
+            resume_agent_kind: std::collections::HashMap::new(),
             pending_paste: None,
             error: None,
             error_is_pressure: false,
@@ -2264,6 +2280,13 @@ impl WorkspaceUi {
         self.agent_info = info;
     }
 
+    /// PR-3: 세션별 영속 에이전트 종류를 세팅한다(App이 persisted_agents에서 매 갱신마다
+    /// 세션 키로 바꿔 밀어 넣는다). 「다시 실행」 버튼 문구 판정 전용 — agent_info와 달리
+    /// 라이브 프로세스 감지가 필요 없어 앱 재시작 직후 열람 전용 pane에도 값이 있다.
+    pub fn set_resume_agent_kind(&mut self, kinds: std::collections::HashMap<SessionId, String>) {
+        self.resume_agent_kind = kinds;
+    }
+
     /// 세션의 에이전트 요약 줄("Codex · gpt-5.6-sol · max")을 돌려준다 — 없으면 셸/미감지.
     /// 워크스페이스가 대기(warm)로 내려가도 이 맵은 마지막 감지값을 유지하므로(전환 시
     /// 안 지움), 활동 패널·PWA가 비활성 워크스페이스의 에이전트 정보를 보여줄 수 있다
@@ -2469,27 +2492,14 @@ impl WorkspaceUi {
                     }
                 }
                 // SessionExited(런타임 종료) / SessionRestored(재시작 시 아카이브 복원,
-                // PR-A2)는 UI 부기가 동일하다 — exit_code + 결과 상태 배지를 채운다.
+                // PR-A2)는 exit_code + 결과 상태 배지 부기는 동일하지만, PR-3부터는
+                // restored_readonly만 갈라 하단 배너/재실행 버튼 문구를 구분한다.
                 // 완료 알림 차이(복원은 재발화 안 함)는 process_ws_notifications 몫.
-                RuntimeEvent::SessionExited { session, exit_code }
-                | RuntimeEvent::SessionRestored { session, exit_code } => {
-                    if self.session_alive(*session) {
-                        let view = self.sessions.entry(*session).or_default();
-                        view.exit_code = Some(*exit_code);
-                        // 진행형 상태(⏳/✋)는 종료와 함께 무효. 결과 상태(✅/❌)는
-                        // 유지하고, 없으면 exit code로 채운다 — 알림(on_exit)과
-                        // tab 아이콘이 같은 결과를 보여주도록 (codex 리뷰 반영).
-                        if !matches!(
-                            view.status,
-                            Some(SessionStatus::Done) | Some(SessionStatus::Error)
-                        ) {
-                            view.status = Some(if *exit_code == Some(0) {
-                                SessionStatus::Done
-                            } else {
-                                SessionStatus::Error
-                            });
-                        }
-                    }
+                RuntimeEvent::SessionExited { session, exit_code } => {
+                    self.apply_session_exit(*session, *exit_code, false);
+                }
+                RuntimeEvent::SessionRestored { session, exit_code } => {
+                    self.apply_session_exit(*session, *exit_code, true);
                 }
                 RuntimeEvent::SpawnFailed { kind, message } => {
                     if *kind == SpawnKind::Shell {
@@ -2876,24 +2886,11 @@ impl WorkspaceUi {
                         entry.status_view = Some(view.clone());
                     }
                 }
-                RuntimeEvent::SessionExited { session, exit_code }
-                | RuntimeEvent::SessionRestored { session, exit_code }
-                    if self.session_alive(*session) =>
-                {
-                    let view = self.sessions.entry(*session).or_default();
-                    view.exit_code = Some(*exit_code);
-                    // handle_events와 같은 규칙 — 결과 상태(✅/❌)는 유지하고
-                    // 없을 때만 exit code로 채운다.
-                    if !matches!(
-                        view.status,
-                        Some(SessionStatus::Done) | Some(SessionStatus::Error)
-                    ) {
-                        view.status = Some(if *exit_code == Some(0) {
-                            SessionStatus::Done
-                        } else {
-                            SessionStatus::Error
-                        });
-                    }
+                RuntimeEvent::SessionExited { session, exit_code } => {
+                    self.apply_session_exit(*session, *exit_code, false);
+                }
+                RuntimeEvent::SessionRestored { session, exit_code } => {
+                    self.apply_session_exit(*session, *exit_code, true);
                 }
                 // warm 워크스페이스는 화면을 그리지 않으므로 snapshot·캐시는 받지
                 // 않는다. 다만 **출력이 왔다는 사실**은 기록해야 멈춤 감지가 동작한다 —
@@ -3959,7 +3956,7 @@ impl WorkspaceUi {
         self.queue_terminal_resize(session, cols, rows);
 
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
-        let (exit_code, bracketed, snapshot) = {
+        let (exit_code, bracketed, restored_readonly, snapshot) = {
             let view = self.sessions.entry(session).or_default();
             // 선택이 없으면(freeze 해제) freeze 중 보관한 최신본으로 catch-up한다 — 새
             // Viewport가 안 와도 화면이 선택 당시에 멈추지 않게(codex).
@@ -3981,7 +3978,12 @@ impl WorkspaceUi {
                 ui.label(message);
                 return render_output;
             };
-            (view.exit_code, view.bracketed_paste, snapshot)
+            (
+                view.exit_code,
+                view.bracketed_paste,
+                view.restored_readonly,
+                snapshot,
+            )
         };
 
         // 런타임의 focused pane과 현재 native UI의 논리적 키보드 소유 상태를 draw 전에
@@ -4517,18 +4519,55 @@ impl WorkspaceUi {
         }
 
         if let Some(code) = exit_code {
-            let code = code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| catalog.t("workspace.exit_unknown", &[]));
-            // renderer가 pane 최하단까지 쓰므로 상태를 새 행으로 배치하지 않고 overlay한다.
-            // 종료 표시는 유지하면서 하단에 다시 한 행짜리 빈 띠가 생기는 회귀를 막는다.
-            ui.painter().text(
-                output.response.rect.left_bottom() + egui::vec2(6.0, -4.0),
-                egui::Align2::LEFT_BOTTOM,
-                catalog.t("workspace.exited", &[("code", code.as_str())]),
-                egui::FontId::proportional(12.0),
-                ui.visuals().weak_text_color(),
-            );
+            if restored_readonly {
+                // PR-3: 앱 재시작으로 열람 전용 복원된 agent pane — "종료"가 아니라
+                // "왜 멈췄고 무엇을 할 수 있는지"를 보여준다. restored_readonly는
+                // apply_session_exit에서 SessionRestored로만 세워지고, runtime의
+                // restore_pane은 agent 세션만 SessionRestored로 복원하므로(셸은 항상
+                // 새 프로세스로 재기동) 여기 도달했다는 것 자체가 이미 agent pane임을
+                // 뜻한다 — 별도 종류 판정이 필요 없다.
+                let resume_args = self
+                    .resume_agent_kind
+                    .get(&session)
+                    .map(|kind| crate::agent_resume::resume_args(&format!("deppy-builtin-{kind}")))
+                    .unwrap_or_default();
+                let button_label = if resume_args.is_empty() {
+                    catalog.t("workspace.exited.respawn_new", &[])
+                } else {
+                    catalog.t("workspace.exited.respawn_continue", &[])
+                };
+                let row_height = 22.0;
+                let row_rect = egui::Rect::from_min_size(
+                    output.response.rect.left_bottom() + egui::vec2(6.0, -row_height - 4.0),
+                    egui::vec2(260.0, row_height),
+                );
+                let mut row_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(row_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                row_ui.label(
+                    egui::RichText::new(catalog.t("workspace.exited.app_restart", &[]))
+                        .size(12.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                if row_ui.small_button(button_label).clicked() {
+                    self.respawn_archived_request = Some(session);
+                }
+            } else {
+                let code = code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| catalog.t("workspace.exit_unknown", &[]));
+                // renderer가 pane 최하단까지 쓰므로 상태를 새 행으로 배치하지 않고 overlay한다.
+                // 종료 표시는 유지하면서 하단에 다시 한 행짜리 빈 띠가 생기는 회귀를 막는다.
+                ui.painter().text(
+                    output.response.rect.left_bottom() + egui::vec2(6.0, -4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    catalog.t("workspace.exited", &[("code", code.as_str())]),
+                    egui::FontId::proportional(12.0),
+                    ui.visuals().weak_text_color(),
+                );
+            }
         }
 
         // pane 전체 강조 플래시 — 포커스 이동(1초)·입력요청·작업완료(2초) 페이드(2026-07-12 사용자).
@@ -5040,6 +5079,13 @@ impl WorkspaceUi {
         self.note_append_request.take()
     }
 
+    /// pane 하단 「다시 실행」 클릭을 소비한다 — App이 프레임마다 확인해
+    /// RuntimeCommand::RespawnArchivedAgent를 보낸다(PR-3, 위 take_* 계열과 같은
+    /// one-shot 소비 패턴).
+    pub fn take_respawn_archived_request(&mut self) -> Option<SessionId> {
+        self.respawn_archived_request.take()
+    }
+
     /// "메모에 추가"가 상한 초과로 거부됐음을 사용자에게 알린다. 판정 자체는 App
     /// 몫이지만(leaf는 storage 상수를 못 본다) 배너 표시는 이 leaf의 self.error가
     /// 이미 하는 일이라 그대로 위임한다(PR-4).
@@ -5323,6 +5369,31 @@ impl WorkspaceUi {
                 session,
                 (std::time::Instant::now() + PANE_FLASH, PANE_FLASH),
             );
+        }
+    }
+
+    /// `SessionExited`/`SessionRestored` 공통 부기 — exit_code·결과 상태 배지를
+    /// 채우고, PR-3의 restored_readonly만 갈라 하단 배너/재실행 버튼 문구를 가른다
+    /// (호출부 두 곳: 활성 워크스페이스 handle_events, warm apply_warm_events).
+    fn apply_session_exit(&mut self, session: SessionId, exit_code: Option<u32>, restored: bool) {
+        if !self.session_alive(session) {
+            return;
+        }
+        let view = self.sessions.entry(session).or_default();
+        view.exit_code = Some(exit_code);
+        view.restored_readonly = restored;
+        // 진행형 상태(⏳/✋)는 종료와 함께 무효. 결과 상태(✅/❌)는 유지하고,
+        // 없으면 exit code로 채운다 — 알림(on_exit)과 tab 아이콘이 같은 결과를
+        // 보여주도록(codex 리뷰 반영).
+        if !matches!(
+            view.status,
+            Some(SessionStatus::Done) | Some(SessionStatus::Error)
+        ) {
+            view.status = Some(if exit_code == Some(0) {
+                SessionStatus::Done
+            } else {
+                SessionStatus::Error
+            });
         }
     }
 
@@ -10321,5 +10392,81 @@ https://example.test/login \
         assert!(filter.horizontal_arrows);
         assert!(filter.vertical_arrows);
         assert!(filter.escape);
+    }
+
+    // PR-3: SessionRestored(앱 재시작 후 열람 전용 복원)와 SessionExited(실제 종료)가
+    // exit_code 부기는 같아도 restored_readonly만 갈라야 pane 하단 배너/재실행 버튼이
+    // 올바른 세션에만 뜬다.
+
+    #[test]
+    fn session_restored는_restored_readonly를_켜고_session_exited는_켜지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let catalog = catalog();
+        let m = mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(1)), pane("pb", SessionId(2))],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        );
+        ui.handle_events(&[RuntimeEvent::MuxUpdated { snapshot: m }], &catalog);
+        ui.handle_events(
+            &[
+                RuntimeEvent::SessionRestored {
+                    session: SessionId(1),
+                    exit_code: Some(0),
+                },
+                RuntimeEvent::SessionExited {
+                    session: SessionId(2),
+                    exit_code: Some(1),
+                },
+            ],
+            &catalog,
+        );
+        assert!(ui.sessions.get(&SessionId(1)).unwrap().restored_readonly);
+        assert_eq!(
+            ui.sessions.get(&SessionId(1)).unwrap().exit_code,
+            Some(Some(0))
+        );
+        assert!(!ui.sessions.get(&SessionId(2)).unwrap().restored_readonly);
+        assert_eq!(
+            ui.sessions.get(&SessionId(2)).unwrap().exit_code,
+            Some(Some(1))
+        );
+    }
+
+    /// warm(비활성) 워크스페이스 경로(apply_warm_events)도 같은 규칙을 지킨다 — 재활성
+    /// 전까지는 이 경로로만 부기되므로, 여기서 안 갈리면 재활성 뒤에도 배너가 틀린다.
+    #[test]
+    fn apply_warm_events도_restored_readonly를_같은_규칙으로_갈라_채운다() {
+        let mut ui = WorkspaceUi::new();
+        let catalog = catalog();
+        let m = mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", SessionId(1)), pane("pb", SessionId(2))],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        );
+        ui.apply_warm_events(&[RuntimeEvent::MuxUpdated { snapshot: m }], &catalog);
+        ui.apply_warm_events(
+            &[
+                RuntimeEvent::SessionRestored {
+                    session: SessionId(1),
+                    exit_code: None,
+                },
+                RuntimeEvent::SessionExited {
+                    session: SessionId(2),
+                    exit_code: None,
+                },
+            ],
+            &catalog,
+        );
+        assert!(ui.sessions.get(&SessionId(1)).unwrap().restored_readonly);
+        assert!(!ui.sessions.get(&SessionId(2)).unwrap().restored_readonly);
     }
 }

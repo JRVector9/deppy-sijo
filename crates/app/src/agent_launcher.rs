@@ -831,7 +831,7 @@ fn detection_paths(excluded_directory: Option<&Path>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     if let Some(value) = std::env::var_os("PATH") {
         for path in std::env::split_paths(&value) {
-            push_detection_path(&mut paths, &mut seen, path);
+            push_path_env_entry(&mut paths, &mut seen, path);
         }
     }
     let home = std::env::var_os("HOME")
@@ -931,6 +931,28 @@ fn push_detection_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, pa
     if seen.insert(path.clone()) {
         paths.push(path);
     }
+}
+
+/// 프로세스가 물려받은 `PATH` 항목 전용 게이트. 홈 하위 잘 알려진 위치나 nvm/asdf 버전
+/// 스캔처럼 우리가 직접 구성하는 후보와 달리, `PATH`는 사용자 셸이나 다른 도구가 채워
+/// 넣은 값이라 신뢰 경계가 다르다 — OS 임시 디렉터리 아래는 걸러낸다.
+///
+/// 실제로 설치된 CLI가 임시 디렉터리에 살 리는 없다 — 거기 있는 건 다른 도구(cmux 등)가
+/// 터미널 세션마다 PATH 맨 앞에 까는 per-invocation hook shim뿐이다. 그런 shim을 "진짜
+/// codex/claude"로 오인해 `DEPPY_AGENT_EXECUTABLE`로 넘기면, 우리 shim이 그 위에 우리
+/// hook 인자를 얹어 exec하고 그 shim이 다시 자기 hook을 넣어 `codex`에 전달한다 — 결과
+/// `--dangerously-bypass-hook-trust` 같은 플래그가 두 번 전달돼 codex가 시작을 거부한다
+/// (실측 재현: cmux의 codex wrapper가 동일 패턴으로 hook을 주입한다).
+fn push_path_env_entry(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if is_transient_shim_directory(&path) {
+        return;
+    }
+    push_detection_path(paths, seen, path);
+}
+
+fn is_transient_shim_directory(path: &Path) -> bool {
+    let temp_dir = std::env::temp_dir();
+    !temp_dir.as_os_str().is_empty() && path.starts_with(&temp_dir)
 }
 
 fn resolve_executable(command: &str, paths: &[PathBuf]) -> Option<PathBuf> {
@@ -1556,5 +1578,26 @@ mod tests {
         exclude_detection_directory(&mut paths, &shim);
         assert_eq!(paths, [real]);
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// 다른 도구(cmux 등)가 세션마다 PATH 맨 앞에 까는 hook shim은 OS 임시 디렉터리
+    /// 아래에 산다 — 실제 설치된 CLI가 거기 있을 리 없다. 이걸 "진짜 codex"로 오인해
+    /// `DEPPY_AGENT_EXECUTABLE`로 넘기면, 우리 shim이 그 위에 우리 hook 인자를 또 얹고
+    /// 그 shim이 다시 자기 hook을 넣어 `--dangerously-bypass-hook-trust`가 두 번
+    /// 전달된다(실측 재현: cmux의 codex wrapper).
+    #[test]
+    fn 임시_디렉터리_아래_path_항목은_감지에서_제외한다() {
+        let temp_shim =
+            std::env::temp_dir().join("cmux-cli-shims/00000000-0000-0000-0000-000000000000");
+        let real = PathBuf::from("/opt/homebrew/bin");
+        let mut paths = Vec::new();
+        let mut seen = HashSet::new();
+        push_path_env_entry(&mut paths, &mut seen, temp_shim);
+        push_path_env_entry(&mut paths, &mut seen, real.clone());
+        assert_eq!(
+            paths,
+            [real],
+            "임시 디렉터리 아래 PATH 항목(다른 도구의 세션별 hook shim)은 실제 설치 위치가 아니므로 걸러야 한다"
+        );
     }
 }

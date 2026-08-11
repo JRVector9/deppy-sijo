@@ -4,6 +4,7 @@ mod agent_detect_worker;
 mod agent_hooks;
 mod agent_launcher;
 mod agent_model_catalog;
+mod agent_resume;
 mod agent_session;
 mod agent_shim;
 mod agent_state_worker;

@@ -11387,6 +11387,7 @@ impl App {
                 self.persisted_agents = rows;
                 self.restore_loaded_for = Some(self.active.id.clone());
                 self.resumed_panes.clear();
+                self.push_resume_agent_kind();
             }
             crate::agent_state_worker::AgentStateSection::BindingSync => {
                 let rows = snapshot
@@ -11397,6 +11398,7 @@ impl App {
                     .collect::<std::collections::HashMap<_, _>>();
                 self.persisted_agents = rows.clone();
                 self.restore_agents = rows;
+                self.push_resume_agent_kind();
             }
             crate::agent_state_worker::AgentStateSection::Catalog => {
                 let rows = snapshot
@@ -11833,6 +11835,53 @@ impl App {
             apply_claude_statusline(display, self.statuslines.get(sid));
         }
         self.active.workspace_ui.set_agent_info(merged);
+    }
+
+    /// PR-3: pane_id 키인 persisted_agents(agent_sessions 테이블 — 옵션2 native resume용,
+    /// process_agent_bindings가 계속 채운다)를 세션 키로 바꿔 WorkspaceUi에 밀어 넣는다.
+    /// 열람 전용 복원된 pane의 「다시 실행」 버튼 문구를 정하는 유일한 근거다.
+    ///
+    /// 원래 필요한 값은 영속 `sessions.agent_id`(runtime이 RespawnArchivedAgent 핸들러에서
+    /// 읽는 그 값, "deppy-builtin-claude" 같은 정확한 agent_configs id)인데, app은 그 값을
+    /// 모른다 — storage::Db의 커넥션은 비공개고, 그 값을 읽는 persist::load_sessions를
+    /// 부르려면 별도 커넥션을 새로 여는 방법뿐이라 이 PR 범위(persist/storage/runtime 크레인
+    /// 수정 금지) 밖이다. 대신 이미 앱이 프로세스 감지로 계속 영속해 온 agent_sessions.kind
+    /// ("claude"/"codex"/"kimi")를 쓴다 — resume_args가 기대하는 "deppy-builtin-<kind>"
+    /// 형태로 변환된다. 커스텀 에이전트 설정이 같은 바이너리를 감싼 경우 정확한
+    /// agent_configs id와 다를 수 있지만, 이어가기 플래그(-c 등)는 설정이 아니라 바이너리
+    /// 자체의 문법이라 실전에서는 대체로 여전히 맞게 동작한다 — 어긋나도 런타임이
+    /// RespawnArchivedAgent에서 재실행 자격을 다시 검증하므로 실패는 조용히 무해하다.
+    fn push_resume_agent_kind(&mut self) {
+        let Some(mux) = self.active.workspace_ui.mux().cloned() else {
+            return;
+        };
+        self.active
+            .workspace_ui
+            .set_resume_agent_kind(resume_agent_kinds_from_mux(&mux, &self.persisted_agents));
+    }
+
+    /// PR-3: pane 하단 「다시 실행」 클릭 배선. workspace.rs(leaf)는 요청만 쌓고
+    /// (check-boundary: leaf UI must not execute runtime protocol commands directly),
+    /// 실제 RuntimeCommand 전송은 여기서 한다. agent_id는 push_resume_agent_kind와 같은
+    /// 근거(persisted_agents의 kind → "deppy-builtin-<kind>")로 클릭 시점에 다시 구한다.
+    fn dispatch_respawn_archived_agent(&mut self, session: runtime::SessionId) {
+        let Some(mux) = self.active.workspace_ui.mux().cloned() else {
+            return;
+        };
+        let Some(pane_id) = pane_of_session(&mux, session) else {
+            return;
+        };
+        let Some(row) = self.persisted_agents.get(&pane_id.0) else {
+            return;
+        };
+        let command = runtime::RuntimeCommand::RespawnArchivedAgent {
+            session,
+            extra_args: resume_extra_args_for_kind(&row.kind),
+            cols: 80,
+            rows: 24,
+            scrollback_lines: self.config.terminal.scrollback_lines as usize,
+        };
+        let _ = self.active.runtime.send_command(command);
     }
 
     fn pty_agent_surfaces(
@@ -22023,6 +22072,11 @@ impl eframe::App for App {
         }
         // 「변경 보기」 diff 패널 — 매 프레임 렌더 + 백그라운드 수집 결과 poll.
         self.diff_panel_ui.show(ui.ctx(), &text);
+        // pane 하단 「다시 실행」 클릭 (PR-3) — leaf는 세션만 쌓고, 실제 RuntimeCommand
+        // 전송은 여기서 한다(check-boundary).
+        if let Some(session) = self.active.workspace_ui.take_respawn_archived_request() {
+            self.dispatch_respawn_archived_agent(session);
+        }
         // pane 우클릭 → 환경변수·API 설정 (E4 ⑥) — 프로젝트 화면에서 바로 진입.
         if self.active.workspace_ui.take_open_environment() {
             self.settings_category = ui::settings::Category::Environment;
@@ -23321,6 +23375,31 @@ fn pane_of_session(
         .flat_map(|tab| &tab.panes)
         .find(|pane| pane.session_id == Some(session))
         .map(|pane| pane.id.clone())
+}
+
+/// PR-3: mux의 pane_id → 세션 매핑에 persisted_agents(agent_sessions.kind)를 조인한다 —
+/// pane_of_session의 반대 방향(세션 전체에 대해 한 번에)이라 별도 free fn으로 뺐다.
+/// push_resume_agent_kind가 그대로 얹어 쓴다.
+fn resume_agent_kinds_from_mux(
+    mux: &runtime::MuxSnapshot,
+    persisted_agents: &std::collections::HashMap<String, storage::AgentSessionRow>,
+) -> std::collections::HashMap<runtime::SessionId, String> {
+    mux.tabs
+        .iter()
+        .flat_map(|tab| tab.panes.iter())
+        .filter_map(|pane| {
+            let session = pane.session_id?;
+            let row = persisted_agents.get(&pane.id.0)?;
+            Some((session, row.kind.clone()))
+        })
+        .collect()
+}
+
+/// PR-3: 영속된 agent 종류("claude"/"codex"/"kimi")를 resume_args가 기대하는
+/// "deppy-builtin-<kind>" agent_id로 바꿔 이어가기 인자를 구한다. 표에 없는 kind는
+/// resume_args 자체가 빈 벡터로 처리한다(agent_resume.rs 문서 참고).
+fn resume_extra_args_for_kind(kind: &str) -> Vec<String> {
+    crate::agent_resume::resume_args(&format!("deppy-builtin-{kind}"))
 }
 
 fn tab_of_agent_target(
@@ -31279,5 +31358,69 @@ mod tests {
     fn 메모_추가는_상한을_넘으면_거부한다() {
         let result = App::append_selection_to_note("", "123456", 5);
         assert_eq!(result, None);
+    }
+
+    // PR-3: 「다시 실행」 버튼 배선의 순수 함수 두 개 — kind → 이어가기 인자, mux → 세션별 kind.
+
+    /// agent_sessions.kind는 "claude"/"codex"/"kimi" 셋뿐이라 "deppy-builtin-<kind>"로
+    /// 감싸면 agent_resume.rs 표와 그대로 맞아떨어진다. 표에 없는 kind(grok·오타 등)는
+    /// resume_args 자체가 빈 벡터로 처리한다 — 이어가기 실패보다 새 대화가 낫다는 규약.
+    #[test]
+    fn resume_extra_args_for_kind은_영속된_kind를_이어가기_인자로_바꾼다() {
+        assert_eq!(resume_extra_args_for_kind("claude"), vec!["-c".to_owned()]);
+        assert_eq!(
+            resume_extra_args_for_kind("codex"),
+            vec!["resume".to_owned(), "--last".to_owned()]
+        );
+        assert_eq!(resume_extra_args_for_kind("kimi"), vec!["-c".to_owned()]);
+        assert!(resume_extra_args_for_kind("grok").is_empty());
+        assert!(resume_extra_args_for_kind("unknown-kind").is_empty());
+    }
+
+    /// mux에 있어도 persisted_agents(agent_sessions 테이블 미러)에 없는 pane은 세션
+    /// 매핑에서 빠진다 — 「다시 실행」 버튼이 영속 기록 없는 pane엔 뜨지 않아야 한다.
+    #[test]
+    fn resume_agent_kinds_from_mux는_persisted_agents가_있는_pane만_세션에_매핑한다() {
+        let tab_id = runtime::MuxTabId("tab-a".to_owned());
+        let known_pane = runtime::MuxPaneId("pane-known".to_owned());
+        let unknown_pane = runtime::MuxPaneId("pane-unknown".to_owned());
+        let mux = runtime::MuxSnapshot {
+            tabs: vec![runtime::TabSnapshot {
+                id: tab_id.clone(),
+                title: "tab".to_owned(),
+                layout: runtime::LayoutNode::Pane(known_pane.clone()),
+                panes: vec![
+                    runtime::PaneSnapshot {
+                        id: known_pane.clone(),
+                        session_id: Some(runtime::SessionId(1)),
+                        title: "known".to_owned(),
+                        persistent_session_id: None,
+                    },
+                    runtime::PaneSnapshot {
+                        id: unknown_pane.clone(),
+                        session_id: Some(runtime::SessionId(2)),
+                        title: "unknown".to_owned(),
+                        persistent_session_id: None,
+                    },
+                ],
+            }],
+            active_tab: Some(tab_id),
+            focused_pane: Some(known_pane.clone()),
+        };
+        let mut persisted_agents = HashMap::new();
+        persisted_agents.insert(
+            known_pane.0.clone(),
+            storage::AgentSessionRow {
+                pane_id: known_pane.0.clone(),
+                kind: "codex".to_owned(),
+                session_id: "agent-session-1".to_owned(),
+            },
+        );
+        let kinds = resume_agent_kinds_from_mux(&mux, &persisted_agents);
+        assert_eq!(
+            kinds.get(&runtime::SessionId(1)).map(String::as_str),
+            Some("codex")
+        );
+        assert!(!kinds.contains_key(&runtime::SessionId(2)));
     }
 }

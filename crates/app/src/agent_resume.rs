@@ -12,9 +12,6 @@
 
 /// 이 에이전트를 이전 대화를 이어받아 실행하려면 어떤 인자를 저장된 `args_json` 뒤에
 /// 덧붙여야 하나. 빈 벡터면 「이어가기 미지원」 — 새 대화로 시작한다.
-// 「다시 실행」 UI(PR-3)가 아직 이 모듈을 안 불러 clippy가 dead_code로 막는다 — UI가
-// 붙으면 이 allow는 지운다.
-#[allow(dead_code)]
 pub fn resume_args(agent_id: &str) -> Vec<String> {
     match agent_id {
         // claude 2.1.227, `claude --help` 실측: `-c, --continue  Continue the most

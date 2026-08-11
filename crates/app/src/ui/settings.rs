@@ -1,5 +1,6 @@
 use crate::config::{Config, Theme};
 use crate::shortcuts::{self, ShortcutAction, ShortcutGroup};
+use crate::ui::designall::mix;
 
 /// `SettingsDetailShell`/`SettingsRow`/control 목업이 공유하는 타이포 토큰.
 /// 참조 화면의 Settings Detail Font Map(15/14/13/14px)을 한 곳에서 강제한다.
@@ -355,18 +356,6 @@ fn is_inline_settings_category(category: Category) -> bool {
 
 fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
-}
-
-/// `from`을 `to` 쪽으로 `t`(0..=1)만큼 섞는다. 0이면 `from`, 1이면 `to`.
-/// 선택 배경을 표면 쪽으로 낮춰 그 위 글자가 읽히게 하는 데 쓴다.
-fn mix(from: egui::Color32, to: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-    egui::Color32::from_rgb(
-        lerp(from.r(), to.r()),
-        lerp(from.g(), to.g()),
-        lerp(from.b(), to.b()),
-    )
 }
 
 /// `design/.../egui.ts`의 토큰을 설정 창 local visuals에 매핑한다.

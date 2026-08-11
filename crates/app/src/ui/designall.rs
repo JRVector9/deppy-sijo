@@ -102,6 +102,19 @@ pub fn selection_text_color(accent: egui::Color32) -> egui::Color32 {
     }
 }
 
+/// `from`을 `to` 쪽으로 `t`(0..=1)만큼 섞는다. 0이면 `from`, 1이면 `to`.
+/// 선택 배경을 표면 쪽으로 낮추거나(설정 창) 표면을 강조색 쪽으로 물들이는 데
+/// (사이드바 선택 워크스페이스) 쓴다 — 두 표면이 같은 규칙을 공유해야 한다.
+pub fn mix(from: egui::Color32, to: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    egui::Color32::from_rgb(
+        lerp(from.r(), to.r()),
+        lerp(from.g(), to.g()),
+        lerp(from.b(), to.b()),
+    )
+}
+
 pub fn row_fill(tokens: Tokens, selected: bool, hovered: bool) -> Option<egui::Color32> {
     selected
         .then_some(tokens.selected_background)

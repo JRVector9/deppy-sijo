@@ -124,37 +124,6 @@ pub(crate) fn resume_plan(agent_id: &str, binding: Option<(&str, &str)>) -> Resu
     }
 }
 
-/// 레거시 호출부용 최근-directory resume 인자. 명시적 전략을 쓰는 archived-pane 경로가
-/// 연결될 때까지 기존 동작을 유지한다.
-pub fn resume_args(agent_id: &str) -> Vec<String> {
-    match agent_id {
-        // claude 2.1.227, `claude --help` 실측: `-c, --continue  Continue the most
-        // recent conversation in the current directory`. 인자를 받지 않는 불리언
-        // 플래그라 저장된 `--model`/`--effort` 뒤에 붙어도 파싱에 영향이 없다 — 실측:
-        // `claude --model opus --effort high -c --help` → exit 0.
-        "deppy-builtin-claude" | "deppy-builtin-codex" | "deppy-builtin-kimi" => {
-            resume_plan(agent_id, None).into_extra_args()
-        }
-
-        // codex-cli 0.147.0. `codex --help`에는 `--effort`가 아예 없다 — deppy가
-        // effort를 넘길 때도 `--config model_reasoning_effort="..."`를 쓴다
-        // (agent_launcher.rs build_launch_spec). resume은 서브커맨드라
-        // `codex [OPTIONS] <COMMAND>` 규칙상 전역 옵션(--model, --config) *뒤에*
-        // 와야 하는데, 저장된 인자가 바로 그 전역 옵션들이다. 실측으로 위치 규칙을
-        // 확인했다(실제 세션은 만들지 않고 --help로 파싱만 확인):
-        // `codex --model gpt-5.1-codex-max --config 'model_reasoning_effort="high"'
-        //  resume --last --help` → exit 0, `codex resume --help`와 동일한 출력.
-        // `--last`는 세션 id 없이 "가장 최근 세션"을 고른다(`codex resume --help`).
-        // Kimi CLI 0.34.0, `~/.kimi-code/bin/kimi --help` 실측: `-c, --continue
-        // Continue the previous session for the working directory.` claude와 같은
-        // 형태의 불리언 플래그. 실측: `kimi --model kimi-code/k3 -c --help` → exit 0.
-        // grok: 이 작업 환경에는 실제 xAI grok CLI가 설치돼 있지 않아 `--help`를 실행할
-        // 수 없었다(PATH의 `grok`은 다른 도구의 wrapper로, 실행하면 "grok not found in
-        // PATH"를 반환한다). 실측하지 못한 채 넣지 않는다.
-        _ => Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,24 +211,4 @@ mod tests {
         assert!(unsupported.extra_args.is_empty());
     }
 
-    #[test]
-    fn 표에_있는_에이전트는_실측된_이어가기_인자를_돌려준다() {
-        assert_eq!(resume_args("deppy-builtin-claude"), vec!["-c".to_owned()]);
-        assert_eq!(
-            resume_args("deppy-builtin-codex"),
-            vec!["resume".to_owned(), "--last".to_owned()]
-        );
-        assert_eq!(resume_args("deppy-builtin-kimi"), vec!["-c".to_owned()]);
-    }
-
-    #[test]
-    fn 실측하지_못한_grok과_미지원_agent_id는_빈_벡터다() {
-        // grok: --help를 실행할 CLI 자체가 이 환경에 없어 실측하지 못했다.
-        assert!(resume_args("deppy-builtin-grok").is_empty());
-        // 표에 아예 없는 agent_id(다른 빌트인, 오타, 빈 문자열)도 전부 빈 벡터.
-        assert!(resume_args("deppy-builtin-opencode").is_empty());
-        assert!(resume_args("deppy-builtin-gemini").is_empty());
-        assert!(resume_args("unknown-agent").is_empty());
-        assert!(resume_args("").is_empty());
-    }
 }

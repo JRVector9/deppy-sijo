@@ -1120,7 +1120,6 @@ pub struct WorkspaceUi {
     /// 키인 persisted_agents에서 세션 키로 바꿔 매 갱신마다 set). 「다시 실행」 버튼
     /// 문구(이어서/새로) 판정에만 쓴다 — leaf는 agent_resume::resume_args 같은 순수
     /// 함수는 직접 불러도 된다(check-boundary가 막는 건 storage/runtime 직접 접근).
-    resume_agent_kind: std::collections::HashMap<SessionId, String>,
     archived_resume_presentation:
         std::collections::HashMap<SessionId, crate::agent_resume::ArchivedResumePresentation>,
     /// App host가 수행 중인 terminal clipboard 요청. completion은 operation/generation을
@@ -1512,7 +1511,6 @@ impl WorkspaceUi {
             session_cwds: std::collections::HashMap::new(),
             session_project_names: SessionProjectNameSnapshot::default(),
             agent_info: std::collections::HashMap::new(),
-            resume_agent_kind: std::collections::HashMap::new(),
             archived_resume_presentation: std::collections::HashMap::new(),
             pending_paste: None,
             error: None,
@@ -2285,13 +2283,6 @@ impl WorkspaceUi {
         info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
     ) {
         self.agent_info = info;
-    }
-
-    /// PR-3: 세션별 영속 에이전트 종류를 세팅한다(App이 persisted_agents에서 매 갱신마다
-    /// 세션 키로 바꿔 밀어 넣는다). 「다시 실행」 버튼 문구 판정 전용 — agent_info와 달리
-    /// 라이브 프로세스 감지가 필요 없어 앱 재시작 직후 열람 전용 pane에도 값이 있다.
-    pub fn set_resume_agent_kind(&mut self, kinds: std::collections::HashMap<SessionId, String>) {
-        self.resume_agent_kind = kinds;
     }
 
     pub(crate) fn set_archived_resume_presentation(
@@ -4538,20 +4529,43 @@ impl WorkspaceUi {
                 // restore_pane은 agent 세션만 SessionRestored로 복원하므로(셸은 항상
                 // 새 프로세스로 재기동) 여기 도달했다는 것 자체가 이미 agent pane임을
                 // 뜻한다 — 별도 종류 판정이 필요 없다.
-                let resume_args = self
-                    .resume_agent_kind
+                let presentation = self
+                    .archived_resume_presentation
                     .get(&session)
-                    .map(|kind| crate::agent_resume::resume_args(&format!("deppy-builtin-{kind}")))
-                    .unwrap_or_default();
-                let button_label = if resume_args.is_empty() {
-                    catalog.t("workspace.exited.respawn_new", &[])
-                } else {
-                    catalog.t("workspace.exited.respawn_continue", &[])
+                    .copied()
+                    .unwrap_or(crate::agent_resume::ArchivedResumePresentation::Unsupported);
+                let (message_key, button_key, action_enabled) = match presentation {
+                    crate::agent_resume::ArchivedResumePresentation::Exact => (
+                        "workspace.exited.app_restart",
+                        "workspace.exited.respawn_continue",
+                        true,
+                    ),
+                    crate::agent_resume::ArchivedResumePresentation::RecentInCwd => (
+                        "workspace.exited.resume_recent",
+                        "workspace.exited.respawn_continue",
+                        true,
+                    ),
+                    crate::agent_resume::ArchivedResumePresentation::Unsupported => (
+                        "workspace.exited.resume_unsupported",
+                        "workspace.exited.respawn_new",
+                        true,
+                    ),
+                    crate::agent_resume::ArchivedResumePresentation::Unavailable => (
+                        "workspace.exited.resume_unavailable",
+                        "workspace.exited.respawn_new",
+                        false,
+                    ),
+                    crate::agent_resume::ArchivedResumePresentation::Checking => (
+                        "workspace.exited.resume_checking",
+                        "workspace.exited.respawn_new",
+                        false,
+                    ),
                 };
+                let button_label = catalog.t(button_key, &[]);
                 let row_height = 22.0;
                 let row_rect = egui::Rect::from_min_size(
                     output.response.rect.left_bottom() + egui::vec2(6.0, -row_height - 4.0),
-                    egui::vec2(260.0, row_height),
+                    egui::vec2((output.response.rect.width() - 12.0).max(0.0), row_height),
                 );
                 let mut row_ui = ui.new_child(
                     egui::UiBuilder::new()
@@ -4559,7 +4573,7 @@ impl WorkspaceUi {
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 row_ui.label(
-                    egui::RichText::new(catalog.t("workspace.exited.app_restart", &[]))
+                    egui::RichText::new(catalog.t(message_key, &[]))
                         .size(12.0)
                         .color(ui.visuals().weak_text_color()),
                 );
@@ -4568,7 +4582,13 @@ impl WorkspaceUi {
                 // runtime으로 보내(dispatch_respawn_archived_agent) 엉뚱한 런타임에 같은
                 // 숫자의 SessionId가 우연히 존재하면 잘못된 세션을 건드릴 수 있다. 그
                 // pane을 소유한 로컬 뷰에서만 버튼을 활성화한다.
-                if mode.is_local() && row_ui.small_button(button_label).clicked() {
+                if row_ui
+                    .add_enabled(
+                        mode.is_local() && action_enabled,
+                        egui::Button::new(button_label).small(),
+                    )
+                    .clicked()
+                {
                     self.respawn_archived_request = Some(session);
                 }
             } else {
@@ -10485,5 +10505,114 @@ https://example.test/login \
         );
         assert!(ui.sessions.get(&SessionId(1)).unwrap().restored_readonly);
         assert!(!ui.sessions.get(&SessionId(2)).unwrap().restored_readonly);
+    }
+
+    fn restored_archived_resume_harness(
+        presentation: crate::agent_resume::ArchivedResumePresentation,
+    ) -> egui_kittest::Harness<'static, WorkspaceUi> {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let session = SessionId(7);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        let view = workspace.sessions.entry(session).or_default();
+        view.snapshot = Some(snapshot("archived"));
+        view.snapshot_gen = 1;
+        view.exit_code = Some(Some(0));
+        view.restored_readonly = true;
+        workspace.set_archived_resume_presentation(std::collections::HashMap::from([(
+            session,
+            presentation,
+        )]));
+        egui_kittest::Harness::new_ui_state(
+            move |ui, workspace: &mut WorkspaceUi| {
+                workspace.show_with_input(ui, &config, &[], &catalog, true);
+            },
+            workspace,
+        )
+    }
+
+    #[test]
+    fn restored_archived_resume_exact와_recent는_서로_다른_설명으로_이어실행한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = catalog();
+        let continue_label = catalog.t("workspace.exited.respawn_continue", &[]);
+        let exact_message = catalog.t("workspace.exited.app_restart", &[]);
+        let recent_message = catalog.t("workspace.exited.resume_recent", &[]);
+
+        let mut exact = restored_archived_resume_harness(
+            crate::agent_resume::ArchivedResumePresentation::Exact,
+        );
+        exact.step();
+        assert!(exact.query_by_label(&exact_message).is_some());
+        exact.get_by_label(&continue_label).click();
+        exact.step();
+        assert_eq!(
+            exact.state_mut().take_respawn_archived_request(),
+            Some(SessionId(7))
+        );
+
+        let mut recent = restored_archived_resume_harness(
+            crate::agent_resume::ArchivedResumePresentation::RecentInCwd,
+        );
+        recent.step();
+        assert!(recent.query_by_label(&recent_message).is_some());
+        recent.get_by_label(&continue_label).click();
+        recent.step();
+        assert_eq!(
+            recent.state_mut().take_respawn_archived_request(),
+            Some(SessionId(7))
+        );
+    }
+
+    #[test]
+    fn restored_archived_resume_미지원만_새실행하고_확인중과미설치는_차단한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = catalog();
+        let new_label = catalog.t("workspace.exited.respawn_new", &[]);
+        let cases = [
+            (
+                crate::agent_resume::ArchivedResumePresentation::Unsupported,
+                "workspace.exited.resume_unsupported",
+                true,
+            ),
+            (
+                crate::agent_resume::ArchivedResumePresentation::Unavailable,
+                "workspace.exited.resume_unavailable",
+                false,
+            ),
+            (
+                crate::agent_resume::ArchivedResumePresentation::Checking,
+                "workspace.exited.resume_checking",
+                false,
+            ),
+        ];
+
+        for (presentation, message_key, dispatches) in cases {
+            let message = catalog.t(message_key, &[]);
+            let mut harness = restored_archived_resume_harness(presentation);
+            harness.step();
+            assert!(
+                harness.query_by_label(&message).is_some(),
+                "missing {message_key}"
+            );
+            harness.get_by_label(&new_label).click();
+            harness.step();
+            assert_eq!(
+                harness.state_mut().take_respawn_archived_request(),
+                dispatches.then_some(SessionId(7)),
+                "{presentation:?}"
+            );
+        }
     }
 }

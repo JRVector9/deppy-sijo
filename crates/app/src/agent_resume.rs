@@ -19,6 +19,15 @@ pub(crate) enum ResumeMode {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArchivedResumePresentation {
+    Checking,
+    Exact,
+    RecentInCwd,
+    Unsupported,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResumePlan {
     pub(crate) mode: ResumeMode,

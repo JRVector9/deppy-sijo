@@ -1121,6 +1121,8 @@ pub struct WorkspaceUi {
     /// 문구(이어서/새로) 판정에만 쓴다 — leaf는 agent_resume::resume_args 같은 순수
     /// 함수는 직접 불러도 된다(check-boundary가 막는 건 storage/runtime 직접 접근).
     resume_agent_kind: std::collections::HashMap<SessionId, String>,
+    archived_resume_presentation:
+        std::collections::HashMap<SessionId, crate::agent_resume::ArchivedResumePresentation>,
     /// App host가 수행 중인 terminal clipboard 요청. completion은 operation/generation을
     /// 모두 맞춘 뒤 정확히 한 번만 적용한다. 새 요청은 이전 요청을 stale로 만든다.
     pending_paste: Option<PendingPaste>,
@@ -1511,6 +1513,7 @@ impl WorkspaceUi {
             session_project_names: SessionProjectNameSnapshot::default(),
             agent_info: std::collections::HashMap::new(),
             resume_agent_kind: std::collections::HashMap::new(),
+            archived_resume_presentation: std::collections::HashMap::new(),
             pending_paste: None,
             error: None,
             error_is_pressure: false,
@@ -2289,6 +2292,16 @@ impl WorkspaceUi {
     /// 라이브 프로세스 감지가 필요 없어 앱 재시작 직후 열람 전용 pane에도 값이 있다.
     pub fn set_resume_agent_kind(&mut self, kinds: std::collections::HashMap<SessionId, String>) {
         self.resume_agent_kind = kinds;
+    }
+
+    pub(crate) fn set_archived_resume_presentation(
+        &mut self,
+        presentations: std::collections::HashMap<
+            SessionId,
+            crate::agent_resume::ArchivedResumePresentation,
+        >,
+    ) {
+        self.archived_resume_presentation = presentations;
     }
 
     /// 세션의 에이전트 요약 줄("Codex · gpt-5.6-sol · max")을 돌려준다 — 없으면 셸/미감지.

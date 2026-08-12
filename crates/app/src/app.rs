@@ -10,6 +10,8 @@ use crate::ui;
 use secret::KeyringSecretStore;
 use storage::Db;
 
+use crate::agent_resume::ArchivedResumePresentation;
+
 /// 커스텀 상단 타이틀바 높이 — macOS 신호등(닫기/최소화/전체화면) 수직 중앙 정렬에도
 /// 쓰인다(main.rs의 `set_traffic_light_titlebar_height`). 값이 바뀌면 신호등도 다시
 /// 어긋나므로 두 곳이 이 상수 하나만 본다.
@@ -7491,6 +7493,10 @@ pub struct App {
         std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
     persisted_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
+    /// Durable sessions.id → archived agent identity/native resume token. Runtime-local SessionId
+    /// joins to this map only through `PaneSnapshot::persistent_session_id`.
+    archived_agent_resume:
+        std::collections::HashMap<String, storage::ArchivedAgentResumeRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
     agent_needs_input: std::collections::HashSet<runtime::SessionId>,
     /// v3.9 N3: 전역(모든 워크스페이스) 입력 대기 — 벨 팝오버 PTY 카드의 소스.
@@ -10483,6 +10489,7 @@ impl App {
             last_hook_query: std::time::Instant::now(),
             hook_overrides: std::collections::HashMap::new(),
             persisted_agents: std::collections::HashMap::new(),
+            archived_agent_resume: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
             global_waiting: Vec::new(),
             blocked_since: std::collections::HashMap::new(),
@@ -11385,6 +11392,17 @@ impl App {
                     .collect::<std::collections::HashMap<_, _>>();
                 self.restore_agents = rows.clone();
                 self.persisted_agents = rows;
+                self.archived_agent_resume = snapshot
+                    .archived_agent_resume
+                    .iter()
+                    .cloned()
+                    .map(|row| (row.persistent_session_id.clone(), row))
+                    .collect();
+                if !self.archived_agent_resume.is_empty()
+                    && self.agent_launcher_snapshot.is_none()
+                {
+                    self.agent_launcher_detection_requested = true;
+                }
                 self.restore_loaded_for = Some(self.active.id.clone());
                 self.resumed_panes.clear();
                 self.push_resume_agent_kind();
@@ -11398,6 +11416,17 @@ impl App {
                     .collect::<std::collections::HashMap<_, _>>();
                 self.persisted_agents = rows.clone();
                 self.restore_agents = rows;
+                self.archived_agent_resume = snapshot
+                    .archived_agent_resume
+                    .iter()
+                    .cloned()
+                    .map(|row| (row.persistent_session_id.clone(), row))
+                    .collect();
+                if !self.archived_agent_resume.is_empty()
+                    && self.agent_launcher_snapshot.is_none()
+                {
+                    self.agent_launcher_detection_requested = true;
+                }
                 self.push_resume_agent_kind();
             }
             crate::agent_state_worker::AgentStateSection::Catalog => {
@@ -11858,12 +11887,24 @@ impl App {
         self.active
             .workspace_ui
             .set_resume_agent_kind(resume_agent_kinds_from_mux(&mux, &self.persisted_agents));
+        let presentations = archived_resume_targets_from_mux(
+            &mux,
+            &self.archived_agent_resume,
+            self.agent_launcher_snapshot.as_ref(),
+        )
+        .into_iter()
+        .map(|(session, target)| (session, target.presentation))
+        .collect();
+        self.active
+            .workspace_ui
+            .set_archived_resume_presentation(presentations);
     }
 
     /// PR-3: pane 하단 「다시 실행」 클릭 배선. workspace.rs(leaf)는 요청만 쌓고
     /// (check-boundary: leaf UI must not execute runtime protocol commands directly),
-    /// 실제 RuntimeCommand 전송은 여기서 한다. agent_id는 push_resume_agent_kind와 같은
-    /// 근거(persisted_agents의 kind → "deppy-builtin-<kind>")로 클릭 시점에 다시 구한다.
+    /// 실제 RuntimeCommand 전송은 여기서 한다. 이어가기 인자는 push_resume_agent_kind와
+    /// 같은 근거(persisted_agents의 kind → "deppy-builtin-<kind>")로 클릭 시점에 다시
+    /// 구한다. 보조 매핑이 없으면 UI의 「새로 실행」 의미대로 빈 인자로 재실행한다.
     fn dispatch_respawn_archived_agent(&mut self, session: runtime::SessionId) {
         let Some(mux) = self.active.workspace_ui.mux().cloned() else {
             return;
@@ -11871,12 +11912,24 @@ impl App {
         let Some(pane_id) = pane_of_session(&mux, session) else {
             return;
         };
-        let Some(row) = self.persisted_agents.get(&pane_id.0) else {
-            return;
+        let target = archived_resume_targets_from_mux(
+            &mux,
+            &self.archived_agent_resume,
+            self.agent_launcher_snapshot.as_ref(),
+        )
+        .remove(&session);
+        let extra_args = match target {
+            Some(target) => {
+                let Some(extra_args) = target.extra_args else {
+                    return;
+                };
+                extra_args
+            }
+            None => respawn_extra_args_for_pane(&pane_id.0, &self.persisted_agents),
         };
         let command = runtime::RuntimeCommand::RespawnArchivedAgent {
             session,
-            extra_args: resume_extra_args_for_kind(&row.kind),
+            extra_args,
             cols: 80,
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines as usize,
@@ -16085,6 +16138,7 @@ impl App {
                         };
                     }
                     self.agent_launcher_snapshot = Some(snapshot);
+                    self.push_resume_agent_kind();
                     self.agent_launcher_ui.detection_succeeded();
                 }
                 Err(_) if self.agent_launcher_ui.is_open() => self
@@ -23400,6 +23454,75 @@ fn resume_agent_kinds_from_mux(
 /// resume_args 자체가 빈 벡터로 처리한다(agent_resume.rs 문서 참고).
 fn resume_extra_args_for_kind(kind: &str) -> Vec<String> {
     crate::agent_resume::resume_args(&format!("deppy-builtin-{kind}"))
+}
+
+fn respawn_extra_args_for_pane(
+    pane_id: &str,
+    persisted_agents: &std::collections::HashMap<String, storage::AgentSessionRow>,
+) -> Vec<String> {
+    persisted_agents
+        .get(pane_id)
+        .map(|row| resume_extra_args_for_kind(&row.kind))
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArchivedResumeTarget {
+    presentation: ArchivedResumePresentation,
+    /// None means the action must not dispatch. Some(empty) is an intentional new run.
+    extra_args: Option<Vec<String>>,
+}
+
+fn archived_resume_target(
+    row: &storage::ArchivedAgentResumeRow,
+    detection: Option<&crate::agent_launcher::DetectionSnapshot>,
+) -> ArchivedResumeTarget {
+    if let Some(kind) = crate::agent_launcher::AgentKind::from_stable_config_id(&row.agent_id) {
+        let Some(detection) = detection else {
+            return ArchivedResumeTarget {
+                presentation: ArchivedResumePresentation::Checking,
+                extra_args: None,
+            };
+        };
+        if detection.find(kind).is_none() {
+            return ArchivedResumeTarget {
+                presentation: ArchivedResumePresentation::Unavailable,
+                extra_args: None,
+            };
+        }
+    }
+    let binding = row.kind.as_deref().zip(row.session_id.as_deref());
+    let plan = crate::agent_resume::resume_plan(&row.agent_id, binding);
+    let presentation = match plan.mode {
+        crate::agent_resume::ResumeMode::Exact => ArchivedResumePresentation::Exact,
+        crate::agent_resume::ResumeMode::RecentInCwd => {
+            ArchivedResumePresentation::RecentInCwd
+        }
+        crate::agent_resume::ResumeMode::Unsupported => {
+            ArchivedResumePresentation::Unsupported
+        }
+    };
+    ArchivedResumeTarget {
+        presentation,
+        extra_args: Some(plan.into_extra_args()),
+    }
+}
+
+fn archived_resume_targets_from_mux(
+    mux: &runtime::MuxSnapshot,
+    rows: &std::collections::HashMap<String, storage::ArchivedAgentResumeRow>,
+    detection: Option<&crate::agent_launcher::DetectionSnapshot>,
+) -> std::collections::HashMap<runtime::SessionId, ArchivedResumeTarget> {
+    mux.tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .filter_map(|pane| {
+            let session = pane.session_id?;
+            let persistent_id = pane.persistent_session_id.as_deref()?;
+            let row = rows.get(persistent_id)?;
+            Some((session, archived_resume_target(row, detection)))
+        })
+        .collect()
 }
 
 fn tab_of_agent_target(
@@ -31425,5 +31548,144 @@ mod tests {
             Some("codex")
         );
         assert!(!kinds.contains_key(&runtime::SessionId(2)));
+    }
+
+    #[test]
+    fn respawn_extra_args_for_pane은_보조_매핑이_없으면_새_실행_인자를_쓴다() {
+        let persisted_agents = HashMap::new();
+
+        let extra_args = respawn_extra_args_for_pane("pane-kimi", &persisted_agents);
+
+        assert!(extra_args.is_empty());
+    }
+
+    fn archived_resume_test_mux(persistent_session_id: &str) -> runtime::MuxSnapshot {
+        let pane = runtime::MuxPaneId("pane-archived".to_owned());
+        let tab = runtime::MuxTabId("tab-archived".to_owned());
+        runtime::MuxSnapshot {
+            tabs: vec![runtime::TabSnapshot {
+                id: tab.clone(),
+                title: "tab".to_owned(),
+                layout: runtime::LayoutNode::Pane(pane.clone()),
+                panes: vec![runtime::PaneSnapshot {
+                    id: pane.clone(),
+                    session_id: Some(runtime::SessionId(9)),
+                    title: "archived".to_owned(),
+                    persistent_session_id: Some(persistent_session_id.to_owned()),
+                }],
+            }],
+            active_tab: Some(tab),
+            focused_pane: Some(pane),
+        }
+    }
+
+    fn archived_resume_row(
+        persistent_session_id: &str,
+        agent_id: &str,
+        binding: Option<(&str, &str)>,
+    ) -> storage::ArchivedAgentResumeRow {
+        storage::ArchivedAgentResumeRow {
+            persistent_session_id: persistent_session_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            kind: binding.map(|(kind, _)| kind.to_owned()),
+            session_id: binding.map(|(_, session_id)| session_id.to_owned()),
+        }
+    }
+
+    #[test]
+    fn archived_resume은_persistent_session_id로_exact와_recent를_매핑한다() {
+        let mux = archived_resume_test_mux("persistent-codex");
+        let rows = HashMap::from([
+            (
+                "persistent-codex".to_owned(),
+                archived_resume_row(
+                    "persistent-codex",
+                    "deppy-builtin-codex",
+                    Some(("codex", "codex-native")),
+                ),
+            ),
+            (
+                "different-session".to_owned(),
+                archived_resume_row(
+                    "different-session",
+                    "deppy-builtin-claude",
+                    Some(("claude", "must-not-leak")),
+                ),
+            ),
+        ]);
+        let installed = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
+            crate::agent_launcher::AgentKind::Codex,
+            PathBuf::from("/opt/codex"),
+        )]);
+
+        let targets = archived_resume_targets_from_mux(&mux, &rows, Some(&installed));
+        let target = targets.get(&runtime::SessionId(9)).unwrap();
+        assert_eq!(target.presentation, ArchivedResumePresentation::Exact);
+        assert_eq!(
+            target.extra_args.as_deref(),
+            Some(["resume".to_owned(), "codex-native".to_owned()].as_slice())
+        );
+
+        let recent_rows = HashMap::from([(
+            "persistent-codex".to_owned(),
+            archived_resume_row(
+                "persistent-codex",
+                "deppy-builtin-kimi",
+                None,
+            ),
+        )]);
+        let installed = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
+            crate::agent_launcher::AgentKind::Kimi,
+            PathBuf::from("/opt/kimi"),
+        )]);
+        let recent = archived_resume_targets_from_mux(&mux, &recent_rows, Some(&installed));
+        let target = recent.get(&runtime::SessionId(9)).unwrap();
+        assert_eq!(target.presentation, ArchivedResumePresentation::RecentInCwd);
+        assert_eq!(target.extra_args.as_deref(), Some(["-c".to_owned()].as_slice()));
+    }
+
+    #[test]
+    fn archived_resume은_확인중_미설치_미지원을_dispatch와_구분한다() {
+        let mux = archived_resume_test_mux("persistent-agent");
+        let claude_rows = HashMap::from([(
+            "persistent-agent".to_owned(),
+            archived_resume_row(
+                "persistent-agent",
+                "deppy-builtin-claude",
+                None,
+            ),
+        )]);
+
+        let checking = archived_resume_targets_from_mux(&mux, &claude_rows, None);
+        let target = checking.get(&runtime::SessionId(9)).unwrap();
+        assert_eq!(target.presentation, ArchivedResumePresentation::Checking);
+        assert_eq!(target.extra_args, None);
+
+        let unavailable = archived_resume_targets_from_mux(
+            &mux,
+            &claude_rows,
+            Some(&crate::agent_launcher::DetectionSnapshot::default()),
+        );
+        let target = unavailable.get(&runtime::SessionId(9)).unwrap();
+        assert_eq!(target.presentation, ArchivedResumePresentation::Unavailable);
+        assert_eq!(target.extra_args, None);
+
+        let unsupported_rows = HashMap::from([(
+            "persistent-agent".to_owned(),
+            archived_resume_row(
+                "persistent-agent",
+                "deppy-builtin-grok",
+                None,
+            ),
+        )]);
+        let installed = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
+            crate::agent_launcher::AgentKind::Grok,
+            PathBuf::from("/opt/grok"),
+        )]);
+        let unsupported =
+            archived_resume_targets_from_mux(&mux, &unsupported_rows, Some(&installed));
+        let target = unsupported.get(&runtime::SessionId(9)).unwrap();
+        assert_eq!(target.presentation, ArchivedResumePresentation::Unsupported);
+        assert_eq!(target.extra_args, Some(Vec::new()));
     }
 }

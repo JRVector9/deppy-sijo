@@ -1,5 +1,16 @@
 # Codex handoff
 
+## Current task — Korean launcher technical labels (2026-08-12)
+
+- Current objective: show Claude's `opus[1m]` model as `Opus [1M]` and keep the launcher reasoning-effort terminology in English even when the application locale is Korean.
+- Completed work: inspected the launcher model catalog, option rendering, Korean catalog keys, existing design system, and product context. The user approved a display-only contract: Korean launcher label `Reasoning Effort` with English graded values, and `Opus [1M]` as the display label while preserving the execution value `opus[1m]`.
+- Modified files: `docs/superpowers/specs/2026-08-12-agent-launcher-technical-labels-design.md` and this handoff. No production code has been changed yet.
+- Key design decisions: scope the English terminology to the Korean launcher catalog; keep `Model` localized as `모델`; leave the separate boolean `Thinking`/`On`/`Off` concept unchanged; do not alter CLI values, agent-session screens, status rows, shortcuts, layout, colors, or non-Korean catalogs.
+- Test commands and results: no tests or builds have been run in this design phase.
+- Failed approaches: the impeccable setup's documented project-relative `.Codex/skills/impeccable/scripts/context.mjs` path did not exist, so the first Node invocation failed with `MODULE_NOT_FOUND`. The same installed script was then run successfully from `/Users/jr/.agents/skills/impeccable/scripts/context.mjs`; no repository file was affected by the failed invocation.
+- Remaining work: user reviews the written specification; then write an implementation plan, add failing display/catalog regressions, make the minimal model-label and Korean-catalog changes, verify, package, and relaunch if requested.
+- Exact next commands: `git diff --check`; `git add docs/superpowers/specs/2026-08-12-agent-launcher-technical-labels-design.md docs/CODEX_HANDOFF.md`; `git commit -m "docs: define launcher technical labels"`; after user approval, create `docs/superpowers/plans/2026-08-12-agent-launcher-technical-labels.md` and execute tests first.
+
 ## Current task — archived agent resume implementation complete (2026-08-12)
 
 - Current objective: make every restored agent pane resume its prior CLI work when the provider exposes a trustworthy continuation path, and explicitly distinguish exact continuation, recent-in-folder continuation, unsupported new execution, installation checking, and unavailable executables.

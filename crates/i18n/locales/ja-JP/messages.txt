@@ -381,9 +381,9 @@ process_storm.notification.body = {session}: {count}プロセス — ターミ�
 process_storm.unknown_session = ターミナルセッション
 
 # 메모리 압박 알림 (로드맵 C3)
-memory_pressure.notification.title = システムメモリが逼迫しています
-memory_pressure.notification.body = 最も使用中のセッション: {session} — アプリがシステムに終了される恐れがあります
-memory_pressure.notification.body_no_session = アプリがシステムに終了される恐れがあります
+memory_pressure.notification.title = macOS システム全体のメモリ圧迫が深刻です
+memory_pressure.notification.body = 使用していないアプリを終了してメモリを確保してください
+memory_pressure.notification.body_no_session = 使用していないアプリを終了してメモリを確保してください
 env.project_folder.clear = 解除
 env.add_var = 変数追加
 env.empty_value_placeholder = 値

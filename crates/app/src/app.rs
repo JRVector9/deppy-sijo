@@ -17566,30 +17566,10 @@ impl App {
         }
     }
 
-    /// 메모리 압박 격상 시 최대 사용 세션을 담아 OS 알림을 1회 발화한다 (로드맵 C3).
-    /// 표시 수치는 A1 이후 정확해진 세션별 phys_footprint 합. logic()에서만 호출.
-    fn notify_memory_pressure(&mut self) {
-        // active+warm의 세션 자원 샘플에서 rss 최댓값 세션을 찾는다(새 샘플링 없음).
-        let mut top: Option<(String, runtime::SessionId, u64)> = None;
-        for workspace in std::iter::once(&self.active).chain(self.warm.values()) {
-            for usage in &workspace.session_resource_usage {
-                if top
-                    .as_ref()
-                    .is_none_or(|(_, _, rss)| usage.rss_bytes > *rss)
-                {
-                    top = Some((workspace.id.clone(), usage.session, usage.rss_bytes));
-                }
-            }
-        }
-        let session_name = top.map(|(workspace_id, session, _rss)| {
-            let raw = std::iter::once(&self.active)
-                .chain(self.warm.values())
-                .find(|w| w.id == workspace_id)
-                .and_then(|w| w.session_titles.get(&session).cloned());
-            raw.map(|raw| self.activity_session_name(&workspace_id, &raw))
-                .unwrap_or_else(|| self.i18n.t("process_storm.unknown_session", &[]))
-        });
-        let (summary, body) = memory_pressure_notification(&self.i18n, session_name.as_deref());
+    /// macOS의 시스템 전체 메모리 압박이 Critical로 격상됐을 때 OS 알림을 발화한다.
+    /// 개별 Deppy 세션은 전역 압박의 원인으로 입증되지 않았으므로 지목하지 않는다.
+    fn notify_memory_pressure(&self) {
+        let (summary, body) = memory_pressure_notification(&self.i18n);
         platform::notify(&summary, &body);
     }
 
@@ -19772,9 +19752,11 @@ impl eframe::App for App {
                         );
                     }
                 }
-                // 압박 알림 (로드맵 C3) — 격상 에피소드당 1회. 자리를 비운 사용자에게
-                // "곧 앱이 죽을 수 있다 + 어느 세션이 원인인지"를 알린다.
-                self.notify_memory_pressure();
+                // Warn에서는 저장·메모리 반환만 수행한다. OS 알림은 실제 Critical 격상
+                // 에피소드에서만 1회 표시해 전역 Warn 출렁임을 Deppy 장애처럼 오해시키지 않는다.
+                if should_notify_memory_pressure(previous, current) {
+                    self.notify_memory_pressure();
+                }
                 // 해제됐지만 mimalloc이 보유 중인 페이지를 즉시 OS로 반환한다 —
                 // 압박 격상 순간에 phys_footprint를 낮춰 OOM-kill 여지를 줄인다.
                 // 격상 전이(드문 이벤트)에서만 호출하므로 렌더 핫패스 비용은 없다.
@@ -23603,17 +23585,20 @@ fn per_runtime_cache_budget_bytes(global_budget_mb: u32, resident_runtimes: usiz
 /// 직접 셸에서 실행한 Codex/Claude는 UI 감지 또는 같은 process group의 자식 수로 보호한다.
 /// ResourceUsage 샘플로 세션별 폭주 판정 상태를 갱신한다 (로드맵 B1).
 /// 캡처 실패 샘플은 runtime이 마지막 발행값을 유지해 여기 오지 않는다.
-/// 압박 알림 (summary, body) 문구 — 최대 사용 세션명이 있으면 지목하고, 없으면
-/// 세션 없이 압박만 알린다 (순수 — 테스트 대상).
-fn memory_pressure_notification(
-    i18n: &i18n::Catalog,
-    top_session_name: Option<&str>,
-) -> (String, String) {
+/// 시스템 압박 전이가 사용자 알림을 요구하는지 판정한다. Warn에서도 비상 저장과 purge는
+/// 수행하지만, 사용자 알림은 Critical로 새로 격상될 때만 표시한다.
+fn should_notify_memory_pressure(
+    previous: crate::mem_pressure_monitor::PressureLevel,
+    current: crate::mem_pressure_monitor::PressureLevel,
+) -> bool {
+    use crate::mem_pressure_monitor::PressureLevel::Critical;
+    current == Critical && current > previous
+}
+
+/// Critical 시스템 압박 알림 문구. 개별 세션을 원인처럼 지목하지 않는다.
+fn memory_pressure_notification(i18n: &i18n::Catalog) -> (String, String) {
     let summary = i18n.t("memory_pressure.notification.title", &[]);
-    let body = match top_session_name {
-        Some(name) => i18n.t("memory_pressure.notification.body", &[("session", name)]),
-        None => i18n.t("memory_pressure.notification.body_no_session", &[]),
-    };
+    let body = i18n.t("memory_pressure.notification.body_no_session", &[]);
     (summary, body)
 }
 
@@ -30012,14 +29997,23 @@ mod tests {
     }
 
     #[test]
-    fn 압박_알림은_세션_유무에_따라_문구가_달라진다() {
-        let i18n = load_catalog("en-US");
-        let (summary, with) = memory_pressure_notification(&i18n, Some("web-remote"));
-        assert!(!summary.is_empty());
-        assert!(with.contains("web-remote"));
-        let (_, without) = memory_pressure_notification(&i18n, None);
-        assert!(!without.contains("web-remote"));
-        assert_ne!(with, without);
+    fn 메모리_압박은_warn에서_완화만_하고_critical에서만_알린다() {
+        use crate::mem_pressure_monitor::PressureLevel::{Critical, Normal, Warn};
+
+        assert!(!should_notify_memory_pressure(Normal, Warn));
+        assert!(should_notify_memory_pressure(Normal, Critical));
+        assert!(should_notify_memory_pressure(Warn, Critical));
+        assert!(!should_notify_memory_pressure(Critical, Critical));
+        assert!(!should_notify_memory_pressure(Critical, Normal));
+    }
+
+    #[test]
+    fn critical_압박_알림은_macos_전체상태만_말하고_세션을_지목하지_않는다() {
+        let i18n = load_catalog("ko-KR");
+        let (summary, body) = memory_pressure_notification(&i18n);
+        assert_eq!(summary, "macOS 시스템 전체의 메모리 압박이 심각합니다");
+        assert!(!body.contains("세션"));
+        assert!(!body.contains("Deppy"));
     }
 
     #[test]

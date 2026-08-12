@@ -381,9 +381,9 @@ process_storm.notification.body = {session}: {count} processes — the terminal 
 process_storm.unknown_session = a terminal session
 
 # 메모리 압박 알림 (로드맵 C3)
-memory_pressure.notification.title = System memory is running low
-memory_pressure.notification.body = Heaviest session: {session} — the app may be terminated by the system
-memory_pressure.notification.body_no_session = The app may be terminated by the system
+memory_pressure.notification.title = macOS system-wide memory pressure is critical
+memory_pressure.notification.body = Close unused apps to free memory
+memory_pressure.notification.body_no_session = Close unused apps to free memory
 env.project_folder.clear = Clear
 env.add_var = Add variable
 env.empty_value_placeholder = Value

@@ -188,6 +188,12 @@ impl AgentKind {
         }
     }
 
+    pub(crate) fn from_stable_config_id(id: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.stable_config_id() == id)
+    }
+
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
@@ -440,9 +446,7 @@ impl AgentKind {
 }
 
 pub(crate) fn is_builtin_config_id(id: &str) -> bool {
-    AgentKind::ALL
-        .into_iter()
-        .any(|kind| kind.stable_config_id() == id)
+    AgentKind::from_stable_config_id(id).is_some()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1540,6 +1544,14 @@ mod tests {
             Some(binary)
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stable_config_id에서_agent_kind를_복원한다() {
+        for kind in AgentKind::ALL {
+            assert_eq!(AgentKind::from_stable_config_id(kind.stable_config_id()), Some(kind));
+        }
+        assert_eq!(AgentKind::from_stable_config_id("custom-agent"), None);
     }
 
     #[test]

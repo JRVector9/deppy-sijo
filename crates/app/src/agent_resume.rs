@@ -10,15 +10,122 @@
 //! agent_id, 그리고 실측하지 못한 CLI는 무조건 빈 벡터를 돌려준다 — 이어가기 실패보다
 //! 새 대화로 시작하는 쪽이 낫다.
 
-/// 이 에이전트를 이전 대화를 이어받아 실행하려면 어떤 인자를 저장된 `args_json` 뒤에
-/// 덧붙여야 하나. 빈 벡터면 「이어가기 미지원」 — 새 대화로 시작한다.
+const NATIVE_SESSION_ID_BYTES_MAX: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeMode {
+    Exact,
+    RecentInCwd,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResumePlan {
+    pub(crate) mode: ResumeMode,
+    pub(crate) extra_args: Vec<String>,
+}
+
+impl ResumePlan {
+    pub(crate) fn into_extra_args(self) -> Vec<String> {
+        self.extra_args
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeProvider {
+    Claude,
+    Codex,
+    Kimi,
+    QwenCode,
+}
+
+impl ResumeProvider {
+    fn from_agent_id(agent_id: &str) -> Option<Self> {
+        match agent_id {
+            "deppy-builtin-claude" => Some(Self::Claude),
+            "deppy-builtin-codex" => Some(Self::Codex),
+            "deppy-builtin-kimi" => Some(Self::Kimi),
+            "deppy-builtin-qwen-code" => Some(Self::QwenCode),
+            _ => None,
+        }
+    }
+
+    fn from_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "kimi" => Some(Self::Kimi),
+            "qwen-code" | "qwen" => Some(Self::QwenCode),
+            _ => None,
+        }
+    }
+
+    fn recent_args(self) -> Vec<String> {
+        match self {
+            Self::Claude | Self::Kimi => vec!["-c".to_owned()],
+            Self::Codex => vec!["resume".to_owned(), "--last".to_owned()],
+            Self::QwenCode => vec!["--continue".to_owned()],
+        }
+    }
+
+    fn exact_args(self, session_id: &str) -> Vec<String> {
+        match self {
+            Self::Claude | Self::QwenCode => {
+                vec!["--resume".to_owned(), session_id.to_owned()]
+            }
+            Self::Codex => vec!["resume".to_owned(), session_id.to_owned()],
+            Self::Kimi => vec!["--session".to_owned(), session_id.to_owned()],
+        }
+    }
+}
+
+fn native_session_id_is_valid(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= NATIVE_SESSION_ID_BYTES_MAX
+        && !session_id.bytes().any(|byte| byte.is_ascii_control())
+}
+
+/// 저장된 agent 설정과 선택적인 CLI-native binding으로 정확/최근 재개 계획을 만든다.
+/// built-in agent의 provider와 binding kind가 다르면 오래되거나 잘못된 binding으로 보고
+/// 무시한다. custom agent는 검증된 binding kind가 유일한 provider 근거다.
+pub(crate) fn resume_plan(agent_id: &str, binding: Option<(&str, &str)>) -> ResumePlan {
+    let persisted_provider = ResumeProvider::from_agent_id(agent_id);
+    let binding = binding.and_then(|(kind, session_id)| {
+        let provider = ResumeProvider::from_kind(kind)?;
+        native_session_id_is_valid(session_id).then_some((provider, session_id))
+    });
+    let provider = persisted_provider.or_else(|| binding.map(|(provider, _)| provider));
+    let Some(provider) = provider else {
+        return ResumePlan {
+            mode: ResumeMode::Unsupported,
+            extra_args: Vec::new(),
+        };
+    };
+    if let Some((binding_provider, session_id)) = binding
+        && binding_provider == provider
+    {
+        return ResumePlan {
+            mode: ResumeMode::Exact,
+            extra_args: provider.exact_args(session_id),
+        };
+    }
+    ResumePlan {
+        mode: ResumeMode::RecentInCwd,
+        extra_args: provider.recent_args(),
+    }
+}
+
+/// 레거시 호출부용 최근-directory resume 인자. 명시적 전략을 쓰는 archived-pane 경로가
+/// 연결될 때까지 기존 동작을 유지한다.
 pub fn resume_args(agent_id: &str) -> Vec<String> {
     match agent_id {
         // claude 2.1.227, `claude --help` 실측: `-c, --continue  Continue the most
         // recent conversation in the current directory`. 인자를 받지 않는 불리언
         // 플래그라 저장된 `--model`/`--effort` 뒤에 붙어도 파싱에 영향이 없다 — 실측:
         // `claude --model opus --effort high -c --help` → exit 0.
-        "deppy-builtin-claude" => vec!["-c".to_owned()],
+        "deppy-builtin-claude" | "deppy-builtin-codex" | "deppy-builtin-kimi" => {
+            resume_plan(agent_id, None).into_extra_args()
+        }
 
         // codex-cli 0.147.0. `codex --help`에는 `--effort`가 아예 없다 — deppy가
         // effort를 넘길 때도 `--config model_reasoning_effort="..."`를 쓴다
@@ -29,13 +136,9 @@ pub fn resume_args(agent_id: &str) -> Vec<String> {
         // `codex --model gpt-5.1-codex-max --config 'model_reasoning_effort="high"'
         //  resume --last --help` → exit 0, `codex resume --help`와 동일한 출력.
         // `--last`는 세션 id 없이 "가장 최근 세션"을 고른다(`codex resume --help`).
-        "deppy-builtin-codex" => vec!["resume".to_owned(), "--last".to_owned()],
-
         // Kimi CLI 0.34.0, `~/.kimi-code/bin/kimi --help` 실측: `-c, --continue
         // Continue the previous session for the working directory.` claude와 같은
         // 형태의 불리언 플래그. 실측: `kimi --model kimi-code/k3 -c --help` → exit 0.
-        "deppy-builtin-kimi" => vec!["-c".to_owned()],
-
         // grok: 이 작업 환경에는 실제 xAI grok CLI가 설치돼 있지 않아 `--help`를 실행할
         // 수 없었다(PATH의 `grok`은 다른 도구의 wrapper로, 실행하면 "grok not found in
         // PATH"를 반환한다). 실측하지 못한 채 넣지 않는다.
@@ -46,6 +149,89 @@ pub fn resume_args(agent_id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_resume은_검증된_provider와_native_session_id를_쓴다() {
+        let cases = [
+            (
+                "deppy-builtin-claude",
+                "claude",
+                vec!["--resume", "claude-session"],
+            ),
+            (
+                "deppy-builtin-codex",
+                "codex",
+                vec!["resume", "codex-session"],
+            ),
+            (
+                "deppy-builtin-kimi",
+                "kimi",
+                vec!["--session", "kimi-session"],
+            ),
+            (
+                "deppy-builtin-qwen-code",
+                "qwen-code",
+                vec!["--resume", "qwen-session"],
+            ),
+        ];
+
+        for (agent_id, kind, expected) in cases {
+            let plan = resume_plan(agent_id, Some((kind, expected.last().unwrap())));
+            assert_eq!(plan.mode, ResumeMode::Exact, "{agent_id}");
+            assert_eq!(
+                plan.extra_args,
+                expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                "{agent_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_token이_없으면_provider의_최근_폴더_재개로_강등한다() {
+        let cases = [
+            ("deppy-builtin-claude", vec!["-c"]),
+            ("deppy-builtin-codex", vec!["resume", "--last"]),
+            ("deppy-builtin-kimi", vec!["-c"]),
+            ("deppy-builtin-qwen-code", vec!["--continue"]),
+        ];
+
+        for (agent_id, expected) in cases {
+            let plan = resume_plan(agent_id, None);
+            assert_eq!(plan.mode, ResumeMode::RecentInCwd, "{agent_id}");
+            assert_eq!(
+                plan.extra_args,
+                expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                "{agent_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn 잘못된_exact_binding은_내장_provider의_최근_재개를_바꾸지_않는다() {
+        let mismatched = resume_plan(
+            "deppy-builtin-kimi",
+            Some(("claude", "wrong-provider-token")),
+        );
+        assert_eq!(mismatched.mode, ResumeMode::RecentInCwd);
+        assert_eq!(mismatched.extra_args, ["-c"]);
+
+        for invalid in ["", "bad\nsession", &"x".repeat(1025)] {
+            let plan = resume_plan("deppy-builtin-codex", Some(("codex", invalid)));
+            assert_eq!(plan.mode, ResumeMode::RecentInCwd);
+            assert_eq!(plan.extra_args, ["resume", "--last"]);
+        }
+    }
+
+    #[test]
+    fn custom_agent는_검증된_binding이_있을_때만_exact_resume한다() {
+        let exact = resume_plan("custom-agent", Some(("claude", "custom-session")));
+        assert_eq!(exact.mode, ResumeMode::Exact);
+        assert_eq!(exact.extra_args, ["--resume", "custom-session"]);
+
+        let unsupported = resume_plan("custom-agent", None);
+        assert_eq!(unsupported.mode, ResumeMode::Unsupported);
+        assert!(unsupported.extra_args.is_empty());
+    }
 
     #[test]
     fn 표에_있는_에이전트는_실측된_이어가기_인자를_돌려준다() {

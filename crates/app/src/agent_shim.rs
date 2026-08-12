@@ -35,6 +35,29 @@ fn write_executable(path: &std::path::Path, content: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+#[cfg(unix)]
+fn shim_header() -> &'static str {
+    r#"#!/bin/sh
+# deppy shim (자동 생성) — hook 주입 후 진짜 바이너리로 교체 실행. 상주하지 않는다.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMP_ROOT="${TMPDIR%/}"
+PATH="$(
+    printf '%s' "$PATH" | tr ':' '\n' |
+    while IFS= read -r path_entry; do
+        [ "$path_entry" = "$SELF_DIR" ] && continue
+        if [ -n "$TMP_ROOT" ] && [ "${path_entry#"$TMP_ROOT"/}" != "$path_entry" ]; then
+            continue
+        fi
+        printf '%s\n' "$path_entry"
+    done | tr '\n' ':' | sed 's/:$//'
+)"
+export PATH
+# PATH strip 실패(변형 경로 등) 시 자기 자신을 다시 exec하는 무한루프 방지 가드.
+if [ -n "${DEPPY_SHIM_GUARD:-}" ]; then echo "deppy shim: real binary not found" >&2; exit 127; fi
+export DEPPY_SHIM_GUARD=1
+"#
+}
+
 /// shim/hook 스크립트/claude 설정을 (재)생성한다. 매 시작 호출 — idempotent.
 pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()> {
     let Some(root) = root() else { return Ok(()) };
@@ -88,15 +111,7 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
     )?;
 
     // ── shim 공통 헤더: 자기 디렉터리를 PATH에서 빼고 진짜 바이너리로 exec ──
-    let strip = r#"#!/bin/sh
-# deppy shim (자동 생성) — hook 주입 후 진짜 바이너리로 교체 실행. 상주하지 않는다.
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | tr '\n' ':' | sed 's/:$//')"
-export PATH
-# PATH strip 실패(변형 경로 등) 시 자기 자신을 다시 exec하는 무한루프 방지 가드.
-if [ -n "${DEPPY_SHIM_GUARD:-}" ]; then echo "deppy shim: real binary not found" >&2; exit 127; fi
-export DEPPY_SHIM_GUARD=1
-"#;
+    let strip = shim_header();
 
     // claude shim
     let claude_shim = format!(
@@ -266,6 +281,70 @@ fn kimi_hook_entries(hooks_dir: &std::path::Path) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_cmux_shim은_건너뛰고_real_agent를_한번만_실행한다() {
+        let root = std::env::temp_dir().join(format!(
+            "deppy-transient-cmux-shim-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let tmp_root = root.join("tmp");
+        let deppy_shims = root.join("deppy-shims");
+        let transient = tmp_root.join("cmux-cli-shims/run-1");
+        let real = root.join("real-bin");
+        std::fs::create_dir_all(&deppy_shims).unwrap();
+        std::fs::create_dir_all(&transient).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        let record = root.join("record.txt");
+
+        write_executable(
+            &transient.join("codex"),
+            "#!/bin/sh\nprintf 'transient' > \"$DEPPY_TEST_RECORD\"\n",
+        )
+        .unwrap();
+        write_executable(
+            &real.join("codex"),
+            "#!/bin/sh\nprintf 'real\\n%s\\n' \"$*\" > \"$DEPPY_TEST_RECORD\"\n",
+        )
+        .unwrap();
+        let shim = deppy_shims.join("codex");
+        write_executable(
+            &shim,
+            &format!(
+                "{}exec codex --dangerously-bypass-hook-trust \"$@\"\n",
+                shim_header()
+            ),
+        )
+        .unwrap();
+
+        let path = std::env::join_paths([
+            deppy_shims.as_path(),
+            transient.as_path(),
+            real.as_path(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        let status = std::process::Command::new(&shim)
+            .arg("resume")
+            .arg("session-id")
+            .env("PATH", path)
+            .env("TMPDIR", &tmp_root)
+            .env("DEPPY_TEST_RECORD", &record)
+            .env_remove("DEPPY_AGENT_EXECUTABLE")
+            .env_remove("DEPPY_SHIM_GUARD")
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(
+            recorded,
+            "real\n--dangerously-bypass-hook-trust resume session-id\n"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// 사용자 config를 통째로 바꾸는 코드라 계약이 셋이다: 우리 것만 건드릴 것,
     /// 두 번 돌려도 늘지 않을 것, 우리가 사라져도 Kimi가 실패하지 않을 것.

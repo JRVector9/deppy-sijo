@@ -7495,8 +7495,7 @@ pub struct App {
     persisted_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
     /// Durable sessions.id → archived agent identity/native resume token. Runtime-local SessionId
     /// joins to this map only through `PaneSnapshot::persistent_session_id`.
-    archived_agent_resume:
-        std::collections::HashMap<String, storage::ArchivedAgentResumeRow>,
+    archived_agent_resume: std::collections::HashMap<String, storage::ArchivedAgentResumeRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
     agent_needs_input: std::collections::HashSet<runtime::SessionId>,
     /// v3.9 N3: 전역(모든 워크스페이스) 입력 대기 — 벨 팝오버 PTY 카드의 소스.
@@ -11398,8 +11397,7 @@ impl App {
                     .cloned()
                     .map(|row| (row.persistent_session_id.clone(), row))
                     .collect();
-                if !self.archived_agent_resume.is_empty()
-                    && self.agent_launcher_snapshot.is_none()
+                if !self.archived_agent_resume.is_empty() && self.agent_launcher_snapshot.is_none()
                 {
                     self.agent_launcher_detection_requested = true;
                 }
@@ -11422,8 +11420,7 @@ impl App {
                     .cloned()
                     .map(|row| (row.persistent_session_id.clone(), row))
                     .collect();
-                if !self.archived_agent_resume.is_empty()
-                    && self.agent_launcher_snapshot.is_none()
+                if !self.archived_agent_resume.is_empty() && self.agent_launcher_snapshot.is_none()
                 {
                     self.agent_launcher_detection_requested = true;
                 }
@@ -11866,20 +11863,10 @@ impl App {
         self.active.workspace_ui.set_agent_info(merged);
     }
 
-    /// PR-3: pane_id 키인 persisted_agents(agent_sessions 테이블 — 옵션2 native resume용,
-    /// process_agent_bindings가 계속 채운다)를 세션 키로 바꿔 WorkspaceUi에 밀어 넣는다.
-    /// 열람 전용 복원된 pane의 「다시 실행」 버튼 문구를 정하는 유일한 근거다.
-    ///
-    /// 원래 필요한 값은 영속 `sessions.agent_id`(runtime이 RespawnArchivedAgent 핸들러에서
-    /// 읽는 그 값, "deppy-builtin-claude" 같은 정확한 agent_configs id)인데, app은 그 값을
-    /// 모른다 — storage::Db의 커넥션은 비공개고, 그 값을 읽는 persist::load_sessions를
-    /// 부르려면 별도 커넥션을 새로 여는 방법뿐이라 이 PR 범위(persist/storage/runtime 크레인
-    /// 수정 금지) 밖이다. 대신 이미 앱이 프로세스 감지로 계속 영속해 온 agent_sessions.kind
-    /// ("claude"/"codex"/"kimi")를 쓴다 — resume_args가 기대하는 "deppy-builtin-<kind>"
-    /// 형태로 변환된다. 커스텀 에이전트 설정이 같은 바이너리를 감싼 경우 정확한
-    /// agent_configs id와 다를 수 있지만, 이어가기 플래그(-c 등)는 설정이 아니라 바이너리
-    /// 자체의 문법이라 실전에서는 대체로 여전히 맞게 동작한다 — 어긋나도 런타임이
-    /// RespawnArchivedAgent에서 재실행 자격을 다시 검증하므로 실패는 조용히 무해하다.
+    /// 영속 `sessions.id`로 투영된 재개 메타데이터를 현재 mux pane의
+    /// `persistent_session_id`와 결합해 WorkspaceUi에 전달한다. 이 값은 복원된 agent pane이
+    /// 정확히 이어갈 수 있는지, 같은 폴더의 최근 작업만 이어갈 수 있는지, 또는 새 실행만
+    /// 가능한지를 표시하고 실제 재실행 인자를 선택하는 단일 근거다.
     fn push_archived_resume_presentation(&mut self) {
         let Some(mux) = self.active.workspace_ui.mux().cloned() else {
             return;
@@ -23457,12 +23444,8 @@ fn archived_resume_target(
     let plan = crate::agent_resume::resume_plan(&row.agent_id, binding);
     let presentation = match plan.mode {
         crate::agent_resume::ResumeMode::Exact => ArchivedResumePresentation::Exact,
-        crate::agent_resume::ResumeMode::RecentInCwd => {
-            ArchivedResumePresentation::RecentInCwd
-        }
-        crate::agent_resume::ResumeMode::Unsupported => {
-            ArchivedResumePresentation::Unsupported
-        }
+        crate::agent_resume::ResumeMode::RecentInCwd => ArchivedResumePresentation::RecentInCwd,
+        crate::agent_resume::ResumeMode::Unsupported => ArchivedResumePresentation::Unsupported,
     };
     ArchivedResumeTarget {
         presentation,
@@ -31517,11 +31500,7 @@ mod tests {
 
         let recent_rows = HashMap::from([(
             "persistent-codex".to_owned(),
-            archived_resume_row(
-                "persistent-codex",
-                "deppy-builtin-kimi",
-                None,
-            ),
+            archived_resume_row("persistent-codex", "deppy-builtin-kimi", None),
         )]);
         let installed = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
             crate::agent_launcher::AgentKind::Kimi,
@@ -31530,7 +31509,10 @@ mod tests {
         let recent = archived_resume_targets_from_mux(&mux, &recent_rows, Some(&installed));
         let target = recent.get(&runtime::SessionId(9)).unwrap();
         assert_eq!(target.presentation, ArchivedResumePresentation::RecentInCwd);
-        assert_eq!(target.extra_args.as_deref(), Some(["-c".to_owned()].as_slice()));
+        assert_eq!(
+            target.extra_args.as_deref(),
+            Some(["-c".to_owned()].as_slice())
+        );
     }
 
     #[test]
@@ -31538,11 +31520,7 @@ mod tests {
         let mux = archived_resume_test_mux("persistent-agent");
         let claude_rows = HashMap::from([(
             "persistent-agent".to_owned(),
-            archived_resume_row(
-                "persistent-agent",
-                "deppy-builtin-claude",
-                None,
-            ),
+            archived_resume_row("persistent-agent", "deppy-builtin-claude", None),
         )]);
 
         let checking = archived_resume_targets_from_mux(&mux, &claude_rows, None);
@@ -31561,11 +31539,7 @@ mod tests {
 
         let unsupported_rows = HashMap::from([(
             "persistent-agent".to_owned(),
-            archived_resume_row(
-                "persistent-agent",
-                "deppy-builtin-grok",
-                None,
-            ),
+            archived_resume_row("persistent-agent", "deppy-builtin-grok", None),
         )]);
         let installed = crate::agent_launcher::DetectionSnapshot::from_test_agents([(
             crate::agent_launcher::AgentKind::Grok,

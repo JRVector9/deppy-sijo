@@ -210,5 +210,4 @@ mod tests {
         assert_eq!(unsupported.mode, ResumeMode::Unsupported);
         assert!(unsupported.extra_args.is_empty());
     }
-
 }

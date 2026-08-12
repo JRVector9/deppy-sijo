@@ -1549,7 +1549,10 @@ mod tests {
     #[test]
     fn stable_config_id에서_agent_kind를_복원한다() {
         for kind in AgentKind::ALL {
-            assert_eq!(AgentKind::from_stable_config_id(kind.stable_config_id()), Some(kind));
+            assert_eq!(
+                AgentKind::from_stable_config_id(kind.stable_config_id()),
+                Some(kind)
+            );
         }
         assert_eq!(AgentKind::from_stable_config_id("custom-agent"), None);
     }

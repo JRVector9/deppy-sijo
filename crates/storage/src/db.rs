@@ -7276,50 +7276,42 @@ impl Db {
         } else {
             Vec::new()
         };
-        let archived_agent_resume =
-            if let Some((probe, sql_limit)) = &archived_agent_resume_probe {
-                let mut result = Vec::with_capacity(probe.count);
-                let mut stmt = tx
-                    .prepare(ARCHIVED_AGENT_RESUME_SELECT)
-                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
-                let mut rows = stmt
-                    .query(rusqlite::params![
-                        job.workspace_id,
-                        sql_limit,
-                        BOUNDED_ID_BYTES_MAX as i64,
-                    ])
-                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
-                while let Some(row) = rows
-                    .next()
-                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
-                {
-                    result.push(ArchivedAgentResumeRow {
-                        persistent_session_id: bounded_required_text(
-                            row,
-                            0,
-                            BOUNDED_ID_BYTES_MAX,
-                            true,
-                            true,
-                        )?
+        let archived_agent_resume = if let Some((probe, sql_limit)) = &archived_agent_resume_probe {
+            let mut result = Vec::with_capacity(probe.count);
+            let mut stmt = tx
+                .prepare(ARCHIVED_AGENT_RESUME_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    job.workspace_id,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(ArchivedAgentResumeRow {
+                    persistent_session_id: bounded_required_text(
+                        row,
+                        0,
+                        BOUNDED_ID_BYTES_MAX,
+                        true,
+                        true,
+                    )?
+                    .to_owned(),
+                    agent_id: bounded_required_text(row, 1, BOUNDED_ID_BYTES_MAX, true, true)?
                         .to_owned(),
-                        agent_id: bounded_required_text(
-                            row,
-                            1,
-                            BOUNDED_ID_BYTES_MAX,
-                            true,
-                            true,
-                        )?
-                        .to_owned(),
-                        kind: bounded_optional_text(row, 2, BOUNDED_TEXT_BYTES_MAX)?
-                            .map(str::to_owned),
-                        session_id: bounded_optional_text(row, 3, BOUNDED_ID_BYTES_MAX)?
-                            .map(str::to_owned),
-                    });
-                }
-                result
-            } else {
-                Vec::new()
-            };
+                    kind: bounded_optional_text(row, 2, BOUNDED_TEXT_BYTES_MAX)?.map(str::to_owned),
+                    session_id: bounded_optional_text(row, 3, BOUNDED_ID_BYTES_MAX)?
+                        .map(str::to_owned),
+                });
+            }
+            result
+        } else {
+            Vec::new()
+        };
         let structured_threads = if let Some((structured_probe, sql_limit)) = &structured_probe {
             let mut result = Vec::with_capacity(structured_probe.count);
             let sql = agent_state_structured_scope_sql(job.structured_workspace_ids.len(), true);
@@ -11330,8 +11322,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_agent_resume_projection은_binding없이_agent_id를_보존하고_exact_token을_조인한다()
-    {
+    fn archived_agent_resume_projection은_binding없이_agent_id를_보존하고_exact_token을_조인한다() {
         let db = Db::open_in_memory().unwrap();
         let workspace_id = db.create_workspace("archived-agent-resume").unwrap();
         db.upsert_builtin_agent_config(

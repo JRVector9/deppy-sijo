@@ -716,9 +716,14 @@ fn adopt_model(kind: AgentKind, configured: &str, models: &mut Vec<ModelChoice>)
     // 강도 목록도 기본 강도도 알 수 없으므로 그 종류의 보수적 폴백을 쓴다. 기본 강도를
     // 비워 두면 UI가 목록 첫 단계(=가장 낮음)를 골라, CLI 단독 실행보다 낮은 강도로
     // 조용히 실행된다.
+    let label = if kind == AgentKind::Claude && configured == "opus[1m]" {
+        "Opus [1M]"
+    } else {
+        configured
+    };
     let Some(choice) = ModelChoice::new(
         configured,
-        configured,
+        label,
         kind.fallback_efforts().to_vec(),
         kind.fallback_default_effort(),
     ) else {
@@ -1177,6 +1182,7 @@ mod tests {
 
         assert_eq!(models.len(), known + 1);
         assert_eq!(models[0].value(), "opus[1m]");
+        assert_eq!(models[0].label(), "Opus [1M]");
         assert_eq!(models[0].efforts(), CLAUDE_EFFORTS);
         // 기본 강도가 없으면 UI가 첫 단계(Low)를 골라 CLI 단독 실행보다 낮아진다.
         assert_eq!(models[0].default_effort(), Some(ReasoningEffort::High));

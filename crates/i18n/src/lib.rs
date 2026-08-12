@@ -173,6 +173,25 @@ mod tests {
     }
 
     #[test]
+    fn korean_launcher_keeps_provider_reasoning_terms_in_english() {
+        let catalog = Catalog::load("ko-KR").unwrap();
+        for (key, expected) in [
+            ("agent_launcher.effort", "Reasoning Effort"),
+            ("agent_launcher.effort.low", "Low"),
+            ("agent_launcher.effort.medium", "Medium"),
+            ("agent_launcher.effort.high", "High"),
+            ("agent_launcher.effort.xhigh", "XHigh"),
+            ("agent_launcher.effort.max", "Max"),
+            ("agent_launcher.effort.ultra", "Ultra"),
+            ("agent_launcher.thinking", "Thinking"),
+            ("agent_launcher.effort.on", "On"),
+            ("agent_launcher.effort.off", "Off"),
+        ] {
+            assert_eq!(catalog.t(key, &[]), expected, "{key}");
+        }
+    }
+
+    #[test]
     fn layout_gate_core_ui_labels_fit_generous_budgets() {
         let samples = [
             ("top.settings", Vec::new(), 28),

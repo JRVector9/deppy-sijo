@@ -403,6 +403,30 @@ const TERMINAL_PANE_HEADER_HEIGHT: f32 = 32.0;
 const TERMINAL_STREAM_LEFT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_RIGHT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_VERTICAL_PADDING: f32 = 6.0;
+const ARCHIVED_AGENT_NOTICE_HEIGHT: f32 = 36.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ArchivedAgentNoticeStyle {
+    fill: egui::Color32,
+    separator: egui::Stroke,
+    text: egui::Color32,
+    button_fill: egui::Color32,
+    button_stroke: egui::Stroke,
+    button_height: f32,
+    button_corner_radius: u8,
+}
+
+fn archived_agent_notice_style() -> ArchivedAgentNoticeStyle {
+    ArchivedAgentNoticeStyle {
+        fill: egui::Color32::from_rgb(0x1a, 0x1d, 0x23),
+        separator: egui::Stroke::new(1.0, egui::Color32::from_rgb(0x35, 0x3b, 0x45)),
+        text: egui::Color32::from_rgb(0xb0, 0xb5, 0xbf),
+        button_fill: egui::Color32::from_rgb(0x29, 0x2e, 0x37),
+        button_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(0x48, 0x50, 0x5d)),
+        button_height: 26.0,
+        button_corner_radius: 4,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaneHeaderStyle {
@@ -610,6 +634,7 @@ struct TerminalPaneLayout {
     header: egui::Rect,
     surface: egui::Rect,
     content: egui::Rect,
+    archived_notice: Option<egui::Rect>,
 }
 
 #[cfg(test)]
@@ -617,9 +642,18 @@ fn terminal_pane_layout(rect: egui::Rect) -> TerminalPaneLayout {
     terminal_pane_layout_with_embedded_header(rect, true)
 }
 
+#[cfg(test)]
 fn terminal_pane_layout_with_embedded_header(
     rect: egui::Rect,
     embedded_header: bool,
+) -> TerminalPaneLayout {
+    terminal_pane_layout_for_state(rect, embedded_header, false)
+}
+
+fn terminal_pane_layout_for_state(
+    rect: egui::Rect,
+    embedded_header: bool,
+    show_archived_notice: bool,
 ) -> TerminalPaneLayout {
     let header_height = if embedded_header {
         TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0) * 0.5)
@@ -631,17 +665,38 @@ fn terminal_pane_layout_with_embedded_header(
         egui::pos2(rect.right(), rect.top() + header_height),
     );
     let surface = egui::Rect::from_min_max(egui::pos2(rect.left(), header.bottom()), rect.max);
-    let pad_left = TERMINAL_STREAM_LEFT_PADDING.min(surface.width().max(0.0) * 0.25);
-    let pad_right = TERMINAL_STREAM_RIGHT_PADDING.min(surface.width().max(0.0) * 0.25);
-    let pad_y = TERMINAL_STREAM_VERTICAL_PADDING.min(surface.height().max(0.0) * 0.25);
+    let archived_notice = show_archived_notice.then(|| {
+        let height = ARCHIVED_AGENT_NOTICE_HEIGHT.min(surface.height().max(0.0) * 0.5);
+        egui::Rect::from_min_max(
+            egui::pos2(surface.left(), surface.bottom() - height),
+            surface.max,
+        )
+    });
+    let terminal_surface = egui::Rect::from_min_max(
+        surface.min,
+        egui::pos2(
+            surface.right(),
+            archived_notice.map_or(surface.bottom(), |notice| notice.top()),
+        ),
+    );
+    let pad_left = TERMINAL_STREAM_LEFT_PADDING.min(terminal_surface.width().max(0.0) * 0.25);
+    let pad_right = TERMINAL_STREAM_RIGHT_PADDING.min(terminal_surface.width().max(0.0) * 0.25);
+    let pad_y = TERMINAL_STREAM_VERTICAL_PADDING.min(terminal_surface.height().max(0.0) * 0.25);
     let content = egui::Rect::from_min_max(
-        egui::pos2(surface.left() + pad_left, surface.top() + pad_y),
-        egui::pos2(surface.right() - pad_right, surface.bottom() - pad_y),
+        egui::pos2(
+            terminal_surface.left() + pad_left,
+            terminal_surface.top() + pad_y,
+        ),
+        egui::pos2(
+            terminal_surface.right() - pad_right,
+            terminal_surface.bottom() - pad_y,
+        ),
     );
     TerminalPaneLayout {
         header,
         surface,
         content,
+        archived_notice,
     }
 }
 
@@ -3849,7 +3904,12 @@ impl WorkspaceUi {
         } else {
             input_enabled
         };
-        let pane_layout = terminal_pane_layout_with_embedded_header(ui.max_rect(), embedded_header);
+        let show_archived_notice = pane
+            .session_id
+            .and_then(|session| self.sessions.get(&session))
+            .is_some_and(|view| view.restored_readonly && view.exit_code.is_some());
+        let pane_layout =
+            terminal_pane_layout_for_state(ui.max_rect(), embedded_header, show_archived_notice);
         let pane_rect = pane_layout.surface;
         let tokens = crate::ui::designall::tokens(ui.visuals());
         ui.painter()
@@ -3929,6 +3989,87 @@ impl WorkspaceUi {
         // 렌더러에서 available 폭을 그대로 쓰면 무제한 ui에서 화면 전체를 차지한다.
         ui.painter()
             .rect_filled(pane_layout.surface, 0.0, renderer_egui::TERMINAL_SURFACE_BG);
+
+        if let Some(notice_rect) = pane_layout.archived_notice
+            && let Some(session) = pane.session_id
+        {
+            let presentation = self
+                .archived_resume_presentation
+                .get(&session)
+                .copied()
+                .unwrap_or(crate::agent_resume::ArchivedResumePresentation::Unsupported);
+            let (message_key, button_key, action_enabled) = match presentation {
+                crate::agent_resume::ArchivedResumePresentation::Exact => (
+                    "workspace.exited.app_restart",
+                    "workspace.exited.respawn_continue",
+                    true,
+                ),
+                crate::agent_resume::ArchivedResumePresentation::RecentInCwd => (
+                    "workspace.exited.resume_recent",
+                    "workspace.exited.respawn_continue",
+                    true,
+                ),
+                crate::agent_resume::ArchivedResumePresentation::Unsupported => (
+                    "workspace.exited.resume_unsupported",
+                    "workspace.exited.respawn_new",
+                    true,
+                ),
+                crate::agent_resume::ArchivedResumePresentation::Unavailable => (
+                    "workspace.exited.resume_unavailable",
+                    "workspace.exited.respawn_new",
+                    false,
+                ),
+                crate::agent_resume::ArchivedResumePresentation::Checking => (
+                    "workspace.exited.resume_checking",
+                    "workspace.exited.respawn_new",
+                    false,
+                ),
+            };
+            let style = archived_agent_notice_style();
+            ui.painter().rect_filled(notice_rect, 0.0, style.fill);
+            ui.painter().hline(
+                notice_rect.x_range(),
+                notice_rect.top() + style.separator.width * 0.5,
+                style.separator,
+            );
+
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(notice_rect.left() + 14.0, notice_rect.top() + 5.0),
+                egui::pos2(notice_rect.right() - 12.0, notice_rect.bottom() - 5.0),
+            );
+            if content_rect.is_positive() {
+                let mut notice_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(content_rect)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                notice_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+                notice_ui.spacing_mut().item_spacing.x = 12.0;
+                let button =
+                    egui::Button::new(egui::RichText::new(catalog.t(button_key, &[])).size(13.0))
+                        .fill(style.button_fill)
+                        .stroke(style.button_stroke)
+                        .corner_radius(egui::CornerRadius::same(style.button_corner_radius))
+                        .min_size(egui::vec2(0.0, style.button_height));
+                if notice_ui
+                    .add_enabled(mode.is_local() && action_enabled, button)
+                    .clicked()
+                {
+                    self.respawn_archived_request = Some(session);
+                }
+                let message_width = notice_ui.available_width().max(0.0);
+                notice_ui.add_sized(
+                    egui::vec2(message_width, style.button_height),
+                    egui::Label::new(
+                        egui::RichText::new(catalog.t(message_key, &[]))
+                            .size(14.0)
+                            .color(style.text),
+                    )
+                    .truncate()
+                    .halign(egui::Align::LEFT),
+                );
+            }
+        }
         let mut terminal_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(pane_layout.content)
@@ -4521,90 +4662,21 @@ impl WorkspaceUi {
             }
         }
 
-        if let Some(code) = exit_code {
-            if restored_readonly {
-                // PR-3: 앱 재시작으로 열람 전용 복원된 agent pane — "종료"가 아니라
-                // "왜 멈췄고 무엇을 할 수 있는지"를 보여준다. restored_readonly는
-                // apply_session_exit에서 SessionRestored로만 세워지고, runtime의
-                // restore_pane은 agent 세션만 SessionRestored로 복원하므로(셸은 항상
-                // 새 프로세스로 재기동) 여기 도달했다는 것 자체가 이미 agent pane임을
-                // 뜻한다 — 별도 종류 판정이 필요 없다.
-                let presentation = self
-                    .archived_resume_presentation
-                    .get(&session)
-                    .copied()
-                    .unwrap_or(crate::agent_resume::ArchivedResumePresentation::Unsupported);
-                let (message_key, button_key, action_enabled) = match presentation {
-                    crate::agent_resume::ArchivedResumePresentation::Exact => (
-                        "workspace.exited.app_restart",
-                        "workspace.exited.respawn_continue",
-                        true,
-                    ),
-                    crate::agent_resume::ArchivedResumePresentation::RecentInCwd => (
-                        "workspace.exited.resume_recent",
-                        "workspace.exited.respawn_continue",
-                        true,
-                    ),
-                    crate::agent_resume::ArchivedResumePresentation::Unsupported => (
-                        "workspace.exited.resume_unsupported",
-                        "workspace.exited.respawn_new",
-                        true,
-                    ),
-                    crate::agent_resume::ArchivedResumePresentation::Unavailable => (
-                        "workspace.exited.resume_unavailable",
-                        "workspace.exited.respawn_new",
-                        false,
-                    ),
-                    crate::agent_resume::ArchivedResumePresentation::Checking => (
-                        "workspace.exited.resume_checking",
-                        "workspace.exited.respawn_new",
-                        false,
-                    ),
-                };
-                let button_label = catalog.t(button_key, &[]);
-                let row_height = 22.0;
-                let row_rect = egui::Rect::from_min_size(
-                    output.response.rect.left_bottom() + egui::vec2(6.0, -row_height - 4.0),
-                    egui::vec2((output.response.rect.width() - 12.0).max(0.0), row_height),
-                );
-                let mut row_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(row_rect)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                row_ui.label(
-                    egui::RichText::new(catalog.t(message_key, &[]))
-                        .size(12.0)
-                        .color(ui.visuals().weak_text_color()),
-                );
-                // cross-workspace 첨부 뷰(Attached)는 이 pane의 session이 **다른**
-                // 워크스페이스 런타임 소속이다 — 버튼을 누르면 App은 활성 워크스페이스의
-                // runtime으로 보내(dispatch_respawn_archived_agent) 엉뚱한 런타임에 같은
-                // 숫자의 SessionId가 우연히 존재하면 잘못된 세션을 건드릴 수 있다. 그
-                // pane을 소유한 로컬 뷰에서만 버튼을 활성화한다.
-                if row_ui
-                    .add_enabled(
-                        mode.is_local() && action_enabled,
-                        egui::Button::new(button_label).small(),
-                    )
-                    .clicked()
-                {
-                    self.respawn_archived_request = Some(session);
-                }
-            } else {
-                let code = code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| catalog.t("workspace.exit_unknown", &[]));
-                // renderer가 pane 최하단까지 쓰므로 상태를 새 행으로 배치하지 않고 overlay한다.
-                // 종료 표시는 유지하면서 하단에 다시 한 행짜리 빈 띠가 생기는 회귀를 막는다.
-                ui.painter().text(
-                    output.response.rect.left_bottom() + egui::vec2(6.0, -4.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    catalog.t("workspace.exited", &[("code", code.as_str())]),
-                    egui::FontId::proportional(12.0),
-                    ui.visuals().weak_text_color(),
-                );
-            }
+        if let Some(code) = exit_code
+            && !restored_readonly
+        {
+            let code = code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| catalog.t("workspace.exit_unknown", &[]));
+            // renderer가 pane 최하단까지 쓰므로 상태를 새 행으로 배치하지 않고 overlay한다.
+            // 종료 표시는 유지하면서 하단에 다시 한 행짜리 빈 띠가 생기는 회귀를 막는다.
+            ui.painter().text(
+                output.response.rect.left_bottom() + egui::vec2(6.0, -4.0),
+                egui::Align2::LEFT_BOTTOM,
+                catalog.t("workspace.exited", &[("code", code.as_str())]),
+                egui::FontId::proportional(12.0),
+                ui.visuals().weak_text_color(),
+            );
         }
 
         // pane 전체 강조 플래시 — 포커스 이동(1초)·입력요청·작업완료(2초) 페이드(2026-07-12 사용자).
@@ -6271,6 +6343,50 @@ mod tests {
             layout.content.bottom(),
             358.0 - TERMINAL_STREAM_VERTICAL_PADDING
         );
+    }
+
+    #[test]
+    fn 복원_agent_안내바는_터미널과_겹치지_않는_불투명_차콜영역이다() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(589.0, 358.0));
+        let layout = terminal_pane_layout_for_state(rect, true, true);
+        let notice = layout.archived_notice.expect("복원 안내 바가 있어야 한다");
+        let style = archived_agent_notice_style();
+
+        assert_eq!(notice.height(), ARCHIVED_AGENT_NOTICE_HEIGHT);
+        assert_eq!(notice.left(), layout.surface.left());
+        assert_eq!(notice.right(), layout.surface.right());
+        assert_eq!(notice.bottom(), layout.surface.bottom());
+        assert_eq!(
+            layout.content.bottom(),
+            notice.top() - TERMINAL_STREAM_VERTICAL_PADDING
+        );
+        assert!(!layout.content.intersects(notice));
+        assert_eq!(style.fill, egui::Color32::from_rgb(0x1a, 0x1d, 0x23));
+        assert_eq!(
+            style.separator.color,
+            egui::Color32::from_rgb(0x35, 0x3b, 0x45)
+        );
+        assert_eq!(style.text, egui::Color32::from_rgb(0xb0, 0xb5, 0xbf));
+        assert_eq!(style.button_fill, egui::Color32::from_rgb(0x29, 0x2e, 0x37));
+        assert_eq!(
+            style.button_stroke.color,
+            egui::Color32::from_rgb(0x48, 0x50, 0x5d)
+        );
+        assert_eq!(style.button_height, 26.0);
+        assert_eq!(style.button_corner_radius, 4);
+
+        let compact = terminal_pane_layout_for_state(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 42.0)),
+            true,
+            true,
+        );
+        let compact_notice = compact
+            .archived_notice
+            .expect("낮은 pane도 안내 바를 유지한다");
+        assert!(compact.surface.is_positive());
+        assert!(compact.content.is_positive());
+        assert!(compact_notice.is_positive());
+        assert!(!compact.content.intersects(compact_notice));
     }
 
     /// 상단선은 헤더 **첫 물리행부터** 덮어야 한다. 예전에는 round_to_pixel_center를

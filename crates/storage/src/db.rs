@@ -712,6 +712,16 @@ pub struct AgentSessionRow {
     pub session_id: String,
 }
 
+/// Restored read-only agent pane metadata joined by the durable `sessions.id` carried in mux
+/// snapshots. The optional pair is present only when a CLI-native conversation binding exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchivedAgentResumeRow {
+    pub persistent_session_id: String,
+    pub agent_id: String,
+    pub kind: Option<String>,
+    pub session_id: Option<String>,
+}
+
 /// Codex App Server thread의 앱 소유 복구 메타데이터. 구조화 item/turn 원문은
 /// App Server의 `thread/read`/`thread/resume`에서 다시 읽는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -973,6 +983,7 @@ pub struct AgentStateSnapshot {
     /// 기록. waiting처럼 전역(모든 워크스페이스)이며 2분 stale 창으로 자기치유된다.
     pub working_sessions: Vec<String>,
     pub agent_sessions: Vec<AgentSessionRow>,
+    pub archived_agent_resume: Vec<ArchivedAgentResumeRow>,
     pub structured_threads: Vec<StructuredThreadRow>,
     /// Complete bounded activity catalog when requested; otherwise empty without querying
     /// activity storage.
@@ -989,6 +1000,10 @@ impl std::fmt::Debug for AgentStateSnapshot {
             .field("turn_done_session_count", &self.turn_done_sessions.len())
             .field("working_session_count", &self.working_sessions.len())
             .field("agent_session_count", &self.agent_sessions.len())
+            .field(
+                "archived_agent_resume_count",
+                &self.archived_agent_resume.len(),
+            )
             .field("structured_thread_count", &self.structured_threads.len())
             .field("activity_pane_count", &self.activity_panes.len())
             .finish()
@@ -1569,6 +1584,50 @@ const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id
     FROM agent_sessions WHERE workspace_id = ?1
     ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2";
 
+const ARCHIVED_AGENT_RESUME_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT session.rowid AS session_rowid, pane.id AS pane_id
+      FROM sessions session
+      JOIN mux_panes pane
+        ON pane.workspace_id = session.workspace_id AND pane.session_id = session.id
+     WHERE session.workspace_id = ?1 AND session.session_kind = 'agent'
+     ORDER BY session.updated_at DESC,
+              substr(CAST(session.id AS BLOB), 1, ?3), session.rowid
+     LIMIT ?2
+), sized AS MATERIALIZED (
+    SELECT session.id AS persistent_session_id, session.agent_id,
+           binding.kind, binding.session_id,
+           length(CAST(session.id AS BLOB)) + length(CAST(session.agent_id AS BLOB))
+             + COALESCE(length(CAST(binding.kind AS BLOB)), 0)
+             + COALESCE(length(CAST(binding.session_id AS BLOB)), 0) AS row_bytes
+      FROM selected
+      JOIN sessions session ON session.rowid = selected.session_rowid
+      LEFT JOIN agent_sessions binding
+        ON binding.workspace_id = session.workspace_id AND binding.pane_id = selected.pane_id
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(persistent_session_id) != 'text'
+       OR length(CAST(persistent_session_id AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(agent_id) != 'text' OR length(CAST(agent_id AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(kind) NOT IN ('null', 'text')
+    OR (typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) NOT BETWEEN 1 AND ?4)
+    OR typeof(session_id) NOT IN ('null', 'text')
+    OR (typeof(session_id) = 'text'
+        AND length(CAST(session_id AS BLOB)) NOT BETWEEN 1 AND ?3)
+    OR (kind IS NULL) != (session_id IS NULL)
+    OR row_bytes > ?5 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const ARCHIVED_AGENT_RESUME_SELECT: &str = "SELECT session.id, session.agent_id,
+           binding.kind, binding.session_id
+      FROM sessions session
+      JOIN mux_panes pane
+        ON pane.workspace_id = session.workspace_id AND pane.session_id = session.id
+      LEFT JOIN agent_sessions binding
+        ON binding.workspace_id = session.workspace_id AND binding.pane_id = pane.id
+     WHERE session.workspace_id = ?1 AND session.session_kind = 'agent'
+     ORDER BY session.updated_at DESC,
+              substr(CAST(session.id AS BLOB), 1, ?3), session.rowid
+     LIMIT ?2";
+
 const ACTIVITY_PANES_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT pane.rowid FROM mux_panes pane
      ORDER BY substr(CAST(pane.workspace_id AS BLOB), 1, ?2),
@@ -2014,6 +2073,13 @@ fn agent_state_snapshot_retained_bytes(
         checked_agent_state_string_capacity(&mut total, &row.pane_id)?;
         checked_agent_state_string_capacity(&mut total, &row.kind)?;
         checked_agent_state_string_capacity(&mut total, &row.session_id)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.archived_agent_resume)?;
+    for row in &snapshot.archived_agent_resume {
+        checked_agent_state_string_capacity(&mut total, &row.persistent_session_id)?;
+        checked_agent_state_string_capacity(&mut total, &row.agent_id)?;
+        checked_agent_state_optional_string_capacity(&mut total, &row.kind)?;
+        checked_agent_state_optional_string_capacity(&mut total, &row.session_id)?;
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.structured_threads)?;
     for row in &snapshot.structured_threads {
@@ -6913,6 +6979,26 @@ impl Db {
         } else {
             None
         };
+        let archived_agent_resume_probe = if job.include_agent_sessions {
+            let sql_limit = bounded_limit_plus_one(AGENT_SESSION_ROWS_MAX, AGENT_SESSION_ROWS_MAX)?;
+            Some((
+                bounded_read_preflight(
+                    &tx,
+                    ARCHIVED_AGENT_RESUME_PREFLIGHT,
+                    rusqlite::params![
+                        job.workspace_id,
+                        sql_limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                        BOUNDED_TEXT_BYTES_MAX as i64,
+                        BOUNDED_ROW_BYTES_MAX as i64,
+                    ],
+                    AGENT_SESSION_ROWS_MAX,
+                )?,
+                sql_limit,
+            ))
+        } else {
+            None
+        };
         let structured_probe = if job.include_structured_threads {
             let sql_limit = bounded_limit_plus_one(
                 AGENT_STATE_STRUCTURED_PROJECTION_MAX,
@@ -7190,6 +7276,50 @@ impl Db {
         } else {
             Vec::new()
         };
+        let archived_agent_resume =
+            if let Some((probe, sql_limit)) = &archived_agent_resume_probe {
+                let mut result = Vec::with_capacity(probe.count);
+                let mut stmt = tx
+                    .prepare(ARCHIVED_AGENT_RESUME_SELECT)
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                let mut rows = stmt
+                    .query(rusqlite::params![
+                        job.workspace_id,
+                        sql_limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                    ])
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+                {
+                    result.push(ArchivedAgentResumeRow {
+                        persistent_session_id: bounded_required_text(
+                            row,
+                            0,
+                            BOUNDED_ID_BYTES_MAX,
+                            true,
+                            true,
+                        )?
+                        .to_owned(),
+                        agent_id: bounded_required_text(
+                            row,
+                            1,
+                            BOUNDED_ID_BYTES_MAX,
+                            true,
+                            true,
+                        )?
+                        .to_owned(),
+                        kind: bounded_optional_text(row, 2, BOUNDED_TEXT_BYTES_MAX)?
+                            .map(str::to_owned),
+                        session_id: bounded_optional_text(row, 3, BOUNDED_ID_BYTES_MAX)?
+                            .map(str::to_owned),
+                    });
+                }
+                result
+            } else {
+                Vec::new()
+            };
         let structured_threads = if let Some((structured_probe, sql_limit)) = &structured_probe {
             let mut result = Vec::with_capacity(structured_probe.count);
             let sql = agent_state_structured_scope_sql(job.structured_workspace_ids.len(), true);
@@ -7322,6 +7452,7 @@ impl Db {
             turn_done_sessions,
             working_sessions,
             agent_sessions,
+            archived_agent_resume,
             structured_threads,
             activity_panes,
         };
@@ -11138,6 +11269,157 @@ mod tests {
         job
     }
 
+    fn seed_archived_agent_resume_row(
+        db: &Db,
+        workspace_id: &str,
+        tab_id: &str,
+        pane_id: &str,
+        persistent_session_id: &str,
+        agent_id: &str,
+    ) {
+        persist::upsert_session(
+            &db.conn,
+            &persist::SessionRow {
+                id: persistent_session_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                session_kind: "agent".to_owned(),
+                agent_id: Some(agent_id.to_owned()),
+                title: "Archived agent".to_owned(),
+                command: "/bin/sh".to_owned(),
+                args: Vec::new(),
+                cwd: "/tmp".to_owned(),
+                status: persist::SESSION_STATUS_EXITED.to_owned(),
+                last_log_offset: 0,
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            },
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mux_panes
+                    (id, workspace_id, tab_id, session_id, title, pane_kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'Archived agent', 'terminal', 't', 't')",
+                (pane_id, workspace_id, tab_id, persistent_session_id),
+            )
+            .unwrap();
+    }
+
+    fn seed_archived_agent_resume_scope(db: &Db, workspace_id: &str) -> String {
+        let window_id = format!("window-{workspace_id}");
+        let tab_id = format!("tab-{workspace_id}");
+        db.conn
+            .execute(
+                "INSERT INTO mux_windows
+                    (id, workspace_id, title, active_tab_id, created_at, updated_at)
+                 VALUES (?1, ?2, 'window', NULL, 't', 't')",
+                (&window_id, workspace_id),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mux_tabs
+                    (id, window_id, workspace_id, title, tab_index, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'tab', 0, 't', 't')",
+                (&tab_id, &window_id, workspace_id),
+            )
+            .unwrap();
+        tab_id
+    }
+
+    #[test]
+    fn archived_agent_resume_projection은_binding없이_agent_id를_보존하고_exact_token을_조인한다()
+    {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("archived-agent-resume").unwrap();
+        db.upsert_builtin_agent_config(
+            "deppy-builtin-kimi",
+            "Kimi CLI",
+            "/Users/test/.kimi-code/bin/kimi",
+        )
+        .unwrap();
+        let tab_id = seed_archived_agent_resume_scope(&db, &workspace_id);
+        seed_archived_agent_resume_row(
+            &db,
+            &workspace_id,
+            &tab_id,
+            "pane-kimi",
+            "persistent-kimi",
+            "deppy-builtin-kimi",
+        );
+
+        let without_binding = db
+            .apply_agent_state_job(&AgentStateJob::projection(&workspace_id))
+            .unwrap();
+        assert_eq!(
+            without_binding.archived_agent_resume,
+            vec![ArchivedAgentResumeRow {
+                persistent_session_id: "persistent-kimi".to_owned(),
+                agent_id: "deppy-builtin-kimi".to_owned(),
+                kind: None,
+                session_id: None,
+            }]
+        );
+
+        db.upsert_agent_session(&workspace_id, "pane-kimi", "kimi", "kimi-native-session")
+            .unwrap();
+        let with_binding = db
+            .apply_agent_state_job(&AgentStateJob::projection(&workspace_id))
+            .unwrap();
+        assert_eq!(
+            with_binding.archived_agent_resume,
+            vec![ArchivedAgentResumeRow {
+                persistent_session_id: "persistent-kimi".to_owned(),
+                agent_id: "deppy-builtin-kimi".to_owned(),
+                kind: Some("kimi".to_owned()),
+                session_id: Some("kimi-native-session".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn archived_agent_resume_projection은_256행과_plus_one을_구분한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("archived-agent-resume-limit").unwrap();
+        db.upsert_builtin_agent_config("deppy-builtin-codex", "Codex", "/opt/codex")
+            .unwrap();
+        let tab_id = seed_archived_agent_resume_scope(&db, &workspace_id);
+        for index in 0..AGENT_SESSION_ROWS_MAX {
+            seed_archived_agent_resume_row(
+                &db,
+                &workspace_id,
+                &tab_id,
+                &format!("pane-{index}"),
+                &format!("persistent-{index}"),
+                "deppy-builtin-codex",
+            );
+        }
+        assert_eq!(
+            db.apply_agent_state_job(&AgentStateJob::projection(&workspace_id))
+                .unwrap()
+                .archived_agent_resume
+                .len(),
+            AGENT_SESSION_ROWS_MAX
+        );
+
+        seed_archived_agent_resume_row(
+            &db,
+            &workspace_id,
+            &tab_id,
+            "pane-plus-one",
+            "persistent-plus-one",
+            "deppy-builtin-codex",
+        );
+        assert_eq!(
+            db.apply_agent_state_job(&AgentStateJob::projection(&workspace_id))
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_LIMIT_EXCEEDED
+        );
+    }
+
     #[test]
     fn agent_state_job은_mutation뒤_complete_projection을_한_transaction에서_반환한다() {
         let db = Db::open_in_memory().unwrap();
@@ -12340,6 +12622,12 @@ mod tests {
             turn_done_sessions: vec![(marker.to_owned(), i64::MAX)],
             working_sessions: vec![marker.to_owned()],
             agent_sessions: reconcile.desired_bindings.clone(),
+            archived_agent_resume: vec![ArchivedAgentResumeRow {
+                persistent_session_id: marker.to_owned(),
+                agent_id: marker.to_owned(),
+                kind: Some(marker.to_owned()),
+                session_id: Some(marker.to_owned()),
+            }],
             structured_threads: vec![structured],
             activity_panes: vec![PersistedActivityPane {
                 workspace_id: marker.to_owned(),

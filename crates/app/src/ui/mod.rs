@@ -25,6 +25,7 @@ pub mod prompt_palette;
 pub(crate) mod resource_manager;
 pub mod settings;
 pub mod workspace;
+pub mod work_history;
 
 /// 픽셀 스냅된 1px 가로 헤어라인. egui 기본 `ui.separator()`는 좌표가 물리픽셀에
 /// 정렬되지 않아 안티에일리어싱(feathering)으로 흐릿하게 번진다 — `snap_line_to_pixel`로

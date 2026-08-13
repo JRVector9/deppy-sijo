@@ -285,6 +285,8 @@ pub enum SidebarAction {
     ShowHome,
     /// 멀티에이전트 fleet 그리드로 전환(하단 nav). 재클릭 토글은 App이 현재 view로 결정.
     ShowFleet,
+    /// 현재 워크스페이스의 에이전트 작업 이력 중앙 화면으로 전환.
+    ShowHistory,
     OpenAgents,
     OpenSettings,
     OpenHelp,
@@ -3327,9 +3329,9 @@ impl FileTreeUi {
         action
     }
 
-    /// 고정 내비게이션 레일 — 홈 / 작업함 / 플릿 / 에이전트. 작업함 행 우측에
-    /// 대기+안읽음 카운트 배지가 붙는다(0이면 숨김).
-    /// 홈/작업함 재클릭 시 터미널 복귀 토글은 App이 처리한다(view 소유자).
+    /// 고정 내비게이션 레일 — 홈 / 작업 / 이력 / 에이전트. 홈과 작업 행 우측의
+    /// 카운트 배지는 0이면 숨긴다. 정보 화면 재클릭 시 터미널 복귀 토글은 App이
+    /// 처리한다(view 소유자).
     fn navigation(
         &mut self,
         ui: &mut egui::Ui,
@@ -3359,6 +3361,17 @@ impl FileTreeUi {
         .clicked()
         {
             action = Some(SidebarAction::ShowFleet);
+        }
+        if nav_row(
+            ui,
+            NavIcon::History,
+            &catalog.t("sidebar.nav.history", &[]),
+            sidebar.view == super::agent_terminal::AgentTerminalView::History,
+            None,
+        )
+        .clicked()
+        {
+            action = Some(SidebarAction::ShowHistory);
         }
         if nav_row(
             ui,
@@ -5537,6 +5550,7 @@ fn paint_file(
 enum NavIcon {
     Home,
     Fleet,
+    History,
     Agents,
     Settings,
     Help,
@@ -5907,6 +5921,12 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
                 );
                 p.rect_stroke(cell, 1.0, stroke, egui::StrokeKind::Inside);
             }
+        }
+        // 이력 — 시간축을 뜻하는 시계. 카드 목록의 과거/현재 작업을 한눈에 구분한다.
+        NavIcon::History => {
+            p.circle_stroke(c, 6.0, stroke);
+            p.line_segment([c, egui::pos2(c.x, c.y - 3.5)], stroke);
+            p.line_segment([c, egui::pos2(c.x + 3.0, c.y + 1.5)], stroke);
         }
         // 봇 — 머리(사각) + 눈 2점 + 안테나.
         NavIcon::Agents => {
@@ -9743,6 +9763,8 @@ mod tests {
         harness.run();
         harness.get_by_label("Work").click();
         harness.run();
+        harness.get_by_label("History").click();
+        harness.run();
         harness.get_by_label("AI").click();
         harness.run();
         let kinds: Vec<&'static str> = harness
@@ -9752,14 +9774,15 @@ mod tests {
             .map(|action| match action {
                 SidebarAction::ShowHome => "home",
                 SidebarAction::ShowFleet => "work",
+                SidebarAction::ShowHistory => "history",
                 SidebarAction::OpenAgents => "agents",
                 _ => "other",
             })
             .collect();
         assert_eq!(
             kinds,
-            vec!["home", "work", "agents"],
-            "nav 3항목 클릭이 각각의 액션을 순서대로 내야 한다"
+            vec!["home", "work", "history", "agents"],
+            "nav 4항목 클릭이 각각의 액션을 순서대로 내야 한다"
         );
     }
 

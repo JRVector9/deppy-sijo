@@ -61,6 +61,8 @@ pub enum AgentTerminalView {
     /// 모은다. 2026-08-08까지 작업함(Inbox)과 플릿이 별도 페이지였는데 같은 사실을 두 번
     /// 세고 있어 합쳤다(사용자 지적).
     Fleet,
+    /// 현재 워크스페이스의 에이전트 작업을 사용자 지시 단위 카드로 보는 중앙 화면.
+    History,
     #[default]
     Terminal,
 }

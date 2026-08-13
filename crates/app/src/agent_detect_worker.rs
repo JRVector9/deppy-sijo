@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use runtime::SessionId;
 
 use crate::agent_detect::{self, AgentBinding, AgentDisplay, RunningAgent};
-use crate::agent_transcript::AgentActivity;
+use crate::agent_transcript::{AgentActivity, MAX_RECENT_TRANSCRIPT_TURNS, TranscriptTurn};
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
 const ACTIVITY_INTERVAL: Duration = Duration::from_millis(1500);
@@ -206,7 +206,7 @@ impl DetectInput {
     }
 }
 
-/// 스레드 → App 결과. bindings는 바인딩 tier에서만 Some(활동 tier는 None), activity는 매번.
+/// 스레드 → App 결과. bindings/info/work_turns는 바인딩 tier에서만 Some이고 activity는 매번.
 #[derive(PartialEq, Eq)]
 pub struct DetectOutcome {
     pub epoch: u64,
@@ -218,6 +218,8 @@ pub struct DetectOutcome {
     pub session_cwds: Option<HashMap<SessionId, String>>,
     /// 세션별 에이전트 표시 정보(model/effort/context) — 바인딩 tier에서만.
     pub agent_info: Option<HashMap<SessionId, AgentDisplay>>,
+    /// 실제 사용자 지시 단위의 최근 transcript 턴 — 바인딩 tier에서만.
+    pub work_turns: Option<HashMap<SessionId, Vec<TranscriptTurn>>>,
     /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. 방금 띄워 아직
     /// 대화를 시작하지 않은 에이전트는 `bindings`에 없으므로 이쪽으로 잡는다.
     pub agent_kinds: Option<HashMap<SessionId, RunningAgent>>,
@@ -266,7 +268,7 @@ impl OutcomeMailbox {
             if current.generation > outcome.generation {
                 return PublishResult::Unchanged;
             }
-            // 활동 tier의 partial 결과가 소비되지 않은 binding/cwd/info를
+            // 활동 tier의 partial 결과가 소비되지 않은 binding/cwd/info/work_turns를
             // 지우지 않도록 동일 snapshot에서는 완전한 스냅샷으로 merge한다.
             if current.epoch == outcome.epoch && current.generation == outcome.generation {
                 let changed = current.activity != outcome.activity
@@ -282,6 +284,10 @@ impl OutcomeMailbox {
                         .agent_info
                         .as_ref()
                         .is_some_and(|value| current.agent_info.as_ref() != Some(value))
+                    || outcome
+                        .work_turns
+                        .as_ref()
+                        .is_some_and(|value| current.work_turns.as_ref() != Some(value))
                     // 종류 tier는 이것만 바꾼다 — 검사에 없으면 Unchanged로 버려진다.
                     || outcome
                         .agent_kinds
@@ -298,6 +304,9 @@ impl OutcomeMailbox {
                 }
                 if outcome.agent_info.is_none() {
                     outcome.agent_info.clone_from(&current.agent_info);
+                }
+                if outcome.work_turns.is_none() {
+                    outcome.work_turns.clone_from(&current.work_turns);
                 }
                 if outcome.agent_kinds.is_none() {
                     outcome.agent_kinds.clone_from(&current.agent_kinds);
@@ -401,6 +410,7 @@ struct BindingPass {
     activity: HashMap<SessionId, AgentActivity>,
     session_cwds: HashMap<SessionId, String>,
     agent_info: HashMap<SessionId, AgentDisplay>,
+    work_turns: Option<HashMap<SessionId, Vec<TranscriptTurn>>>,
     agent_kinds: HashMap<SessionId, RunningAgent>,
 }
 
@@ -439,19 +449,22 @@ fn compute_activity(
         .collect()
 }
 
-/// transcript를 세션당 **한 번만** 파싱해 activity 맵 + 표시정보(model/effort/context) 맵을
-/// 함께 만든다(중복 파싱 방지). model/effort/context는 바인딩 tier에서만 필요.
+/// transcript를 세션당 **한 번만** 파싱해 activity + 표시정보 + 최근 사용자 턴을 함께
+/// 만든다(중복 파싱 방지). 표시정보와 턴은 바인딩 tier에서만 필요.
 fn compute_activity_and_info(
     bindings: &HashMap<SessionId, AgentBinding>,
 ) -> (
     HashMap<SessionId, AgentActivity>,
     HashMap<SessionId, AgentDisplay>,
+    HashMap<SessionId, Vec<TranscriptTurn>>,
 ) {
     let mut activity = HashMap::new();
     let mut info = HashMap::new();
+    let mut work_turns = HashMap::new();
     for (sid, b) in bindings {
         if let Some(state) = agent_detect::agent_state(b) {
             activity.insert(*sid, state.activity);
+            work_turns.insert(*sid, state.recent_turns);
             info.insert(
                 *sid,
                 AgentDisplay {
@@ -465,7 +478,7 @@ fn compute_activity_and_info(
             );
         }
     }
-    (activity, info)
+    (activity, info, work_turns)
 }
 
 impl DetectionBackend for ProductionBackend {
@@ -483,7 +496,7 @@ impl DetectionBackend for ProductionBackend {
             bindings,
             kinds: agent_kinds,
         } = detected;
-        let (activity, agent_info) = compute_activity_and_info(&bindings);
+        let (activity, agent_info, work_turns) = compute_activity_and_info(&bindings);
         let pids: Vec<u32> = sessions.iter().map(|(_, pid)| *pid).collect();
         let cwd_by_pid = agent_detect::session_cwds(&pids);
         let session_cwds = sessions
@@ -495,6 +508,7 @@ impl DetectionBackend for ProductionBackend {
             activity,
             session_cwds,
             agent_info,
+            work_turns: Some(work_turns),
             agent_kinds,
         }
     }
@@ -521,6 +535,11 @@ fn bound_pass(mut pass: BindingPass, sessions: &[(SessionId, u32)]) -> BindingPa
     pass.activity.retain(|sid, _| admitted.contains(sid));
     pass.session_cwds.retain(|sid, _| admitted.contains(sid));
     pass.agent_info.retain(|sid, _| admitted.contains(sid));
+    if let Some(work_turns) = pass.work_turns.as_mut() {
+        work_turns.retain(|sid, turns| {
+            admitted.contains(sid) && turns.len() <= MAX_RECENT_TRANSCRIPT_TURNS
+        });
+    }
     pass
 }
 
@@ -588,6 +607,7 @@ fn run_worker<B: DetectionBackend>(
                             activity: HashMap::new(),
                             session_cwds: Some(HashMap::new()),
                             agent_info: Some(HashMap::new()),
+                            work_turns: Some(HashMap::new()),
                             agent_kinds: Some(HashMap::new()),
                         },
                     )
@@ -640,6 +660,7 @@ fn run_worker<B: DetectionBackend>(
                     activity: pass.activity,
                     session_cwds: Some(pass.session_cwds),
                     agent_info: Some(pass.agent_info),
+                    work_turns: pass.work_turns,
                     agent_kinds: Some(pass.agent_kinds),
                 },
             ) {
@@ -665,6 +686,7 @@ fn run_worker<B: DetectionBackend>(
                     activity,
                     session_cwds: None,
                     agent_info: None,
+                    work_turns: None,
                     agent_kinds: None,
                 },
             ) {
@@ -693,6 +715,7 @@ fn run_worker<B: DetectionBackend>(
                     activity: current_activity.clone(),
                     session_cwds: None,
                     agent_info: None,
+                    work_turns: None,
                     agent_kinds: Some(kinds),
                 },
             ) {
@@ -775,6 +798,17 @@ mod tests {
         }
     }
 
+    fn work_turn(index: usize) -> TranscriptTurn {
+        TranscriptTurn {
+            turn_key: format!("codex:{index:x}"),
+            source_offset: index as u64,
+            instruction: format!("task {index}"),
+            agent_summary: None,
+            occurred_at: None,
+            activity: AgentActivity::Working,
+        }
+    }
+
     fn complete_outcome(epoch: u64, generation: u64, state: AgentActivity) -> DetectOutcome {
         let session = SessionId(1);
         DetectOutcome {
@@ -802,6 +836,7 @@ mod tests {
                     user_instruction: None,
                 },
             )])),
+            work_turns: Some(HashMap::from([(session, vec![work_turn(1)])])),
         }
     }
 
@@ -866,6 +901,10 @@ mod tests {
                     .map(|session| (*session, "/fixture".to_owned()))
                     .collect(),
                 agent_info: HashMap::new(),
+                work_turns: Some(bindings
+                    .keys()
+                    .map(|session| (*session, vec![work_turn(session.0 as usize)]))
+                    .collect()),
                 bindings,
             }
         }
@@ -927,6 +966,7 @@ mod tests {
                 activity: HashMap::from([(SessionId(1), AgentActivity::Idle)]),
                 session_cwds: None,
                 agent_info: None,
+                work_turns: None,
                 agent_kinds: Some(kimi.clone()),
             }),
             PublishResult::Changed
@@ -939,8 +979,10 @@ mod tests {
             "버려지면 손으로 띄운 에이전트가 카드에 안 뜬다"
         );
         assert!(
-            latest.bindings.is_some() && latest.agent_info.is_some(),
-            "부분 결과가 기존 bindings/agent_info를 지우면 카드가 도로 셸이 된다"
+            latest.bindings.is_some()
+                && latest.agent_info.is_some()
+                && latest.work_turns.is_some(),
+            "부분 결과가 기존 binding payload를 지우면 카드가 도로 셸이 된다"
         );
 
         // 반대 방향 — 활동 tier는 agent_kinds를 None으로 보낸다. 이월하지 않으면
@@ -953,6 +995,7 @@ mod tests {
                 activity: HashMap::from([(SessionId(1), AgentActivity::Working)]),
                 session_cwds: None,
                 agent_info: None,
+                work_turns: None,
                 agent_kinds: None,
             }),
             PublishResult::Changed
@@ -1054,6 +1097,7 @@ mod tests {
             activity: HashMap::from([(SessionId(1), AgentActivity::Working)]),
             session_cwds: None,
             agent_info: None,
+            work_turns: None,
             agent_kinds: None,
         };
         assert!(matches!(mailbox.publish(partial), PublishResult::Changed));
@@ -1062,6 +1106,7 @@ mod tests {
         assert!(merged.bindings.is_some());
         assert!(merged.session_cwds.is_some());
         assert!(merged.agent_info.is_some());
+        assert!(merged.work_turns.is_some());
 
         let unchanged = DetectOutcome {
             epoch: 1,
@@ -1070,6 +1115,7 @@ mod tests {
             activity: HashMap::from([(SessionId(1), AgentActivity::Working)]),
             session_cwds: None,
             agent_info: None,
+            work_turns: None,
             agent_kinds: None,
         };
         assert!(matches!(
@@ -1080,6 +1126,36 @@ mod tests {
             receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn 새_generation의_partial은_이전_work_turns를_이월하지_않는다() {
+        let mailbox = OutcomeMailbox::new();
+        assert!(matches!(
+            mailbox.publish(complete_outcome(1, 1, AgentActivity::Idle)),
+            PublishResult::Changed
+        ));
+
+        let fresh = DetectOutcome {
+            epoch: 2,
+            generation: 2,
+            bindings: None,
+            activity: HashMap::new(),
+            session_cwds: None,
+            agent_info: None,
+            work_turns: None,
+            agent_kinds: None,
+        };
+        assert!(matches!(mailbox.publish(fresh), PublishResult::Changed));
+
+        let state = mailbox.state.lock().expect("mailbox state");
+        let latest = state.latest.as_ref().expect("latest outcome");
+        assert_eq!(latest.epoch, 2);
+        assert_eq!(latest.generation, 2);
+        assert!(
+            latest.work_turns.is_none(),
+            "새 입력에 없는 transcript payload를 이전 generation에서 이월하면 안 된다"
+        );
     }
 
     #[test]
@@ -1171,6 +1247,9 @@ mod tests {
                 .as_ref()
                 .is_some_and(|bindings| bindings.contains_key(&SessionId(2)))
         );
+        assert!(outcome.work_turns.as_ref().is_some_and(|turns| {
+            turns.contains_key(&SessionId(2)) && !turns.contains_key(&SessionId(1))
+        }));
         assert!(calls.load(AtomicOrdering::SeqCst) >= 2);
         drop(worker);
     }
@@ -1210,6 +1289,10 @@ mod tests {
                     .map(|session| (*session, "/fixture".to_owned()))
                     .collect(),
                 agent_info: HashMap::new(),
+                work_turns: Some(bindings
+                    .keys()
+                    .map(|session| (*session, vec![work_turn(session.0 as usize)]))
+                    .collect()),
                 bindings,
             },
             &sessions,
@@ -1217,7 +1300,45 @@ mod tests {
         assert_eq!(pass.bindings.len(), MAX_DETECT_SESSIONS);
         assert_eq!(pass.activity.len(), MAX_DETECT_SESSIONS);
         assert_eq!(pass.session_cwds.len(), MAX_DETECT_SESSIONS);
+        let work_turns = pass.work_turns.as_ref().expect("work turns");
+        assert_eq!(work_turns.len(), MAX_DETECT_SESSIONS);
+        assert!(!work_turns.contains_key(&extra));
         assert!(!pass.bindings.contains_key(&extra));
+    }
+
+    #[test]
+    fn work_turns는_세션당_24개까지_허용하고_초과_payload는_거부한다() {
+        let session = SessionId(1);
+        let sessions = vec![(session, 10)];
+        let make_pass = |turns| BindingPass {
+            bindings: HashMap::from([(session, binding(session))]),
+            activity: HashMap::new(),
+            session_cwds: HashMap::new(),
+            agent_info: HashMap::new(),
+            work_turns: Some(HashMap::from([(session, turns)])),
+            agent_kinds: HashMap::new(),
+        };
+        let exact = (0..MAX_RECENT_TRANSCRIPT_TURNS)
+            .map(work_turn)
+            .collect();
+        let exact = bound_pass(make_pass(exact), &sessions);
+        assert_eq!(
+            exact.work_turns.as_ref().expect("exact turns")[&session].len(),
+            MAX_RECENT_TRANSCRIPT_TURNS
+        );
+
+        let over = (0..=MAX_RECENT_TRANSCRIPT_TURNS)
+            .map(work_turn)
+            .collect();
+        let over = bound_pass(make_pass(over), &sessions);
+        assert!(
+            !over
+                .work_turns
+                .as_ref()
+                .expect("bounded turns")
+                .contains_key(&session),
+            "초과 transcript payload 일부를 mailbox에 남기면 안 된다"
+        );
     }
 
     #[test]

@@ -21,6 +21,32 @@ pub enum AgentActivity {
     Idle,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    pub turn_key: String,
+    pub source_offset: u64,
+    pub instruction: String,
+    pub agent_summary: Option<String>,
+    pub occurred_at: Option<i64>,
+    pub activity: AgentActivity,
+}
+
+impl fmt::Debug for TranscriptTurn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TranscriptTurn")
+            .field("turn_key", &"REDACTED")
+            .field("source_offset", &self.source_offset)
+            .field("instruction", &"REDACTED")
+            .field(
+                "agent_summary",
+                &self.agent_summary.as_ref().map(|_| "REDACTED"),
+            )
+            .field("occurred_at", &self.occurred_at)
+            .field("activity", &self.activity)
+            .finish()
+    }
+}
+
 #[derive(PartialEq, Eq)]
 pub struct TranscriptState {
     /// 에이전트 자신의 세션 ID — 복원 시 `claude --resume <id>` / `codex resume <id>`에 씀.
@@ -38,6 +64,8 @@ pub struct TranscriptState {
     pub last_agent_summary: Option<String>,
     /// 현재 턴을 시작한 실제 사용자 지시의 한 줄 요약.
     pub user_instruction: Option<String>,
+    /// 실제 사용자 지시 단위의 최근 턴. 최신 순이며 최대 24개다.
+    pub recent_turns: Vec<TranscriptTurn>,
 }
 
 impl fmt::Debug for TranscriptState {
@@ -57,6 +85,7 @@ impl fmt::Debug for TranscriptState {
                 "user_instruction",
                 &self.user_instruction.as_ref().map(|_| "REDACTED"),
             )
+            .field("recent_turn_count", &self.recent_turns.len())
             .finish()
     }
 }
@@ -72,8 +101,15 @@ const MAX_FILE_NAME_BYTES: usize = 512;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_EFFORT_BYTES: usize = 64;
 const MAX_MESSAGE_CONTENT_ITEMS: usize = 256;
+pub const MAX_RECENT_TRANSCRIPT_TURNS: usize = 24;
 const AGENT_SUMMARY_CHARS: usize = 120;
 const AGENT_SUMMARY_BYTES: usize = AGENT_SUMMARY_CHARS * 4 + '…'.len_utf8();
+
+struct TailSnapshot {
+    base_offset: u64,
+    modified_at: Option<i64>,
+    text: String,
+}
 
 fn invalid_input(code: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, code)
@@ -134,17 +170,19 @@ fn open_regular_file_with_before_open(
 }
 
 /// `snapshot_len` 이후 reader가 늘어나더라도 해당 snapshot의 tail만 정확히 유지한다.
-fn tail_text_from_snapshot<R: Read + Seek>(
+fn tail_snapshot_from_reader<R: Read + Seek>(
     reader: &mut R,
     snapshot_len: u64,
     max_bytes: u64,
-) -> std::io::Result<String> {
+    modified_at: Option<i64>,
+) -> std::io::Result<TailSnapshot> {
     if max_bytes > TAIL_BYTES {
         return Err(invalid_input("tail_limit_invalid"));
     }
     let retained = snapshot_len.min(max_bytes);
     let retained = usize::try_from(retained).map_err(|_| invalid_input("tail_limit_invalid"))?;
     let start = snapshot_len.saturating_sub(max_bytes);
+    let mut base_offset = start;
     let starts_at_line_boundary = if start == 0 {
         true
     } else {
@@ -160,22 +198,39 @@ fn tail_text_from_snapshot<R: Read + Seek>(
     if !starts_at_line_boundary {
         let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') else {
             bytes.clear();
-            return Ok(String::new());
+            return Ok(TailSnapshot {
+                base_offset: snapshot_len,
+                modified_at,
+                text: String::new(),
+            });
         };
+        base_offset = base_offset.saturating_add(first_newline as u64 + 1);
         bytes.drain(..=first_newline);
     }
-    String::from_utf8(bytes).map_err(|_| invalid_input("transcript_utf8_invalid"))
+    let text = String::from_utf8(bytes).map_err(|_| invalid_input("transcript_utf8_invalid"))?;
+    Ok(TailSnapshot {
+        base_offset,
+        modified_at,
+        text,
+    })
 }
 
 /// 파일 끝 `max_bytes`만 읽는다. metadata snapshot 이후 append는 다음 poll에서 보고,
 /// 현재 poll에서는 버퍼가 상한을 넘지 않도록 정확한 snapshot 바이트만 읽는다.
-fn tail_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+fn tail_snapshot(path: &Path, max_bytes: u64) -> std::io::Result<TailSnapshot> {
     let (mut file, snapshot_len) = open_regular_file(path)?;
-    let text = tail_text_from_snapshot(&mut file, snapshot_len, max_bytes)?;
+    let modified_at = file
+        .metadata()?
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|value| i64::try_from(value.as_secs()).ok());
+    let snapshot =
+        tail_snapshot_from_reader(&mut file, snapshot_len, max_bytes, modified_at)?;
     if file.metadata()?.len() < snapshot_len {
         return Err(invalid_input("transcript_shrank_during_read"));
     }
-    Ok(text)
+    Ok(snapshot)
 }
 
 fn validate_tail_text(text: &str) -> Option<()> {
@@ -187,6 +242,184 @@ fn validate_tail_text(text: &str) -> Option<()> {
         }
     }
     Some(())
+}
+
+fn snapshot_lines(
+    snapshot: &TailSnapshot,
+) -> impl Iterator<Item = (u64, &str)> {
+    let mut offset = snapshot.base_offset;
+    snapshot.text.split_inclusive('\n').map(move |chunk| {
+        let line_offset = offset;
+        offset = offset.saturating_add(chunk.len() as u64);
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        (line_offset, line)
+    })
+}
+
+fn normalized_epoch_secs(value: &Value) -> Option<i64> {
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
+        .or_else(|| value.as_str()?.parse::<i64>().ok())?;
+    if raw < 0 {
+        return None;
+    }
+    Some(if raw >= 100_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    })
+}
+
+fn parse_iso_utc_secs(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10).copied(), Some(b'T' | b' '))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || !value.ends_with('Z')
+    {
+        return None;
+    }
+    let year: i64 = value.get(0..4)?.parse().ok()?;
+    let month: i64 = value.get(5..7)?.parse().ok()?;
+    let day: i64 = value.get(8..10)?.parse().ok()?;
+    let hour: i64 = value.get(11..13)?.parse().ok()?;
+    let minute: i64 = value.get(14..16)?.parse().ok()?;
+    let second: i64 = value.get(17..19)?.parse().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days: [i64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=month_days[(month - 1) as usize]).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let adjusted_year = year - if month <= 2 { 1 } else { 0 };
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    days.checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)
+}
+
+fn event_occurred_at(value: &Value) -> Option<i64> {
+    ["timestamp", "time"].into_iter().find_map(|key| {
+        let value = value.get(key)?;
+        normalized_epoch_secs(value)
+            .or_else(|| value.as_str().and_then(parse_iso_utc_secs))
+    })
+}
+
+fn valid_native_turn_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SESSION_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn native_turn_key(value: &Value) -> Option<String> {
+    [
+        value.get("turnId"),
+        value.get("turn_id"),
+        value.pointer("/turn/id"),
+        value.pointer("/payload/turnId"),
+        value.pointer("/payload/turn_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        let raw = value
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| value.as_u64().map(|value| value.to_string()))?;
+        valid_native_turn_key(&raw).then_some(raw)
+    })
+}
+
+struct PendingTurn {
+    turn_key: String,
+    source_offset: u64,
+    instruction: String,
+    agent_summary: Option<String>,
+    occurred_at: Option<i64>,
+    activity: AgentActivity,
+}
+
+impl PendingTurn {
+    fn new(
+        provider: &str,
+        source_offset: u64,
+        instruction: String,
+        occurred_at: Option<i64>,
+        native_key: Option<String>,
+    ) -> Self {
+        Self {
+            // 사용자 경계 이벤트에 native id가 있으면 쓰고, 없으면 절대 오프셋으로
+            // 고정한다. 뒤늦은 종료 이벤트 때문에 이미 노출된 키를 바꾸지 않는다.
+            turn_key: native_key.unwrap_or_else(|| format!("{provider}:{source_offset:x}")),
+            source_offset,
+            instruction,
+            agent_summary: None,
+            occurred_at,
+            activity: AgentActivity::Working,
+        }
+    }
+
+    fn finish(self) -> TranscriptTurn {
+        TranscriptTurn {
+            turn_key: self.turn_key,
+            source_offset: self.source_offset,
+            instruction: self.instruction,
+            agent_summary: self.agent_summary,
+            occurred_at: self.occurred_at,
+            activity: self.activity,
+        }
+    }
+}
+
+fn retain_turn(turns: &mut Vec<TranscriptTurn>, turn: PendingTurn) {
+    if turns.len() == MAX_RECENT_TRANSCRIPT_TURNS {
+        turns.remove(0);
+    }
+    turns.push(turn.finish());
+}
+
+fn complete_pending(turns: &mut Vec<TranscriptTurn>, pending: &mut Option<PendingTurn>) {
+    if let Some(mut turn) = pending.take() {
+        turn.activity = AgentActivity::Idle;
+        retain_turn(turns, turn);
+    }
+}
+
+fn finish_recent_turns(turns: &mut Vec<TranscriptTurn>, pending: Option<PendingTurn>) {
+    if let Some(turn) = pending {
+        retain_turn(turns, turn);
+    }
+    turns.reverse();
 }
 
 fn bounded_owned(value: &str, max_bytes: usize) -> Option<String> {
@@ -356,6 +589,55 @@ fn claude_synthetic_assistant_event(value: &Value, summary: Option<&str>) -> boo
         && summary == Some("No response requested.")
 }
 
+fn claude_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
+    let mut turns = Vec::with_capacity(MAX_RECENT_TRANSCRIPT_TURNS);
+    let mut pending: Option<PendingTurn> = None;
+    for (source_offset, line) in snapshot_lines(snapshot) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") if claude_user_starts_new_turn(&value) => {
+                let Some(instruction) = claude_user_instruction(&value) else {
+                    continue;
+                };
+                complete_pending(&mut turns, &mut pending);
+                pending = Some(PendingTurn::new(
+                    "claude",
+                    source_offset,
+                    instruction,
+                    event_occurred_at(&value).or(snapshot.modified_at),
+                    native_turn_key(&value),
+                ));
+            }
+            Some("assistant") => {
+                let summary = claude_assistant_summary(&value);
+                if claude_synthetic_assistant_event(&value, summary.as_deref()) {
+                    continue;
+                }
+                let Some(turn) = pending.as_mut() else {
+                    continue;
+                };
+                if summary.is_some() {
+                    turn.agent_summary = summary;
+                }
+                turn.activity = if value
+                    .pointer("/message/stop_reason")
+                    .and_then(Value::as_str)
+                    == Some("end_turn")
+                {
+                    AgentActivity::Idle
+                } else {
+                    AgentActivity::Working
+                };
+            }
+            _ => {}
+        }
+    }
+    finish_recent_turns(&mut turns, pending);
+    turns
+}
+
 /// claude transcript(`~/.claude/projects/<cwd>/<session-id>.jsonl`) 파싱.
 /// 파일명이 곧 세션 ID. 마지막 assistant/user 이벤트로 상태를 파생한다:
 /// assistant `stop_reason=end_turn` → Idle(유저 차례), 그 외(tool_use) → Working.
@@ -365,8 +647,10 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         return None;
     }
     let session_id = raw_session_id.to_owned();
-    let text = tail_text(path, TAIL_BYTES).ok()?;
-    validate_tail_text(&text)?;
+    let snapshot = tail_snapshot(path, TAIL_BYTES).ok()?;
+    validate_tail_text(&snapshot.text)?;
+    let recent_turns = claude_recent_turns(&snapshot);
+    let text = &snapshot.text;
     let mut cwd = None;
     let mut activity: Option<AgentActivity> = None;
     // 최신 assistant message.model = 현재 모델(effort/context는 statusLine→DB, Phase 2b).
@@ -444,6 +728,7 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         context_pct: None,
         last_agent_summary,
         user_instruction,
+        recent_turns,
     })
 }
 
@@ -460,11 +745,66 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
 /// - `context.append_message` — 마지막 에이전트 메시지 요약.
 ///
 /// 역순 1-pass로 필요한 것만 모으고, 다 채워지면 조기 종료한다(codex 경로와 같은 관례).
+fn kimi_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
+    let mut turns = Vec::with_capacity(MAX_RECENT_TRANSCRIPT_TURNS);
+    let mut pending: Option<PendingTurn> = None;
+    for (source_offset, line) in snapshot_lines(snapshot) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("turn.prompt") => {
+                complete_pending(&mut turns, &mut pending);
+                let Some(instruction) = kimi_user_instruction(&value) else {
+                    continue;
+                };
+                pending = Some(PendingTurn::new(
+                    "kimi",
+                    source_offset,
+                    instruction,
+                    event_occurred_at(&value).or(snapshot.modified_at),
+                    native_turn_key(&value),
+                ));
+            }
+            Some("turn.ended") => {
+                if let Some(turn) = pending.as_mut() {
+                    // 첫 관측 때 만든 키는 바꾸지 않는다. Kimi는 종료 레코드에만
+                    // turnId를 싣기도 하므로 여기서 바꾸면 실행 중/완료 카드가 중복된다.
+                    turn.activity = AgentActivity::Idle;
+                }
+            }
+            Some("context.append_message") => {
+                let role = value.pointer("/message/role").and_then(Value::as_str);
+                let origin = value
+                    .pointer("/message/origin/kind")
+                    .and_then(Value::as_str);
+                if role == Some("user") || matches!(origin, Some("hook_result" | "system")) {
+                    continue;
+                }
+                let Some(turn) = pending.as_mut() else {
+                    continue;
+                };
+                if let Some(summary) = value
+                    .pointer("/message/content")
+                    .and_then(message_content_summary)
+                {
+                    turn.agent_summary = Some(summary);
+                }
+            }
+            _ => {}
+        }
+    }
+    finish_recent_turns(&mut turns, pending);
+    turns
+}
+
 pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
     // 경로는 `<sessionDir>/agents/main/wire.jsonl`이고 sessionDir 이름이 세션 id다.
     let session_id = kimi_session_id(path)?;
-    let text = tail_text(path, TAIL_BYTES).ok()?;
-    validate_kimi_tail(&text)?;
+    let snapshot = tail_snapshot(path, TAIL_BYTES).ok()?;
+    validate_kimi_tail(&snapshot.text)?;
+    let recent_turns = kimi_recent_turns(&snapshot);
+    let text = &snapshot.text;
 
     let mut activity: Option<AgentActivity> = None;
     let mut model: Option<String> = None;
@@ -561,6 +901,7 @@ pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
         context_pct,
         last_agent_summary,
         user_instruction,
+        recent_turns,
     })
 }
 
@@ -720,6 +1061,39 @@ mod kimi_tests {
     }
 
     #[test]
+    fn kimi_recent_turns는_종료시_native_id가_생겨도_처음_key를_유지한다() {
+        let lines = [
+            r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"같은 요청"}],"time":1000}"#,
+            r#"{"type":"context.append_message","message":{"role":"assistant","content":"첫 응답"},"time":1100}"#,
+            r#"{"type":"turn.ended","reason":"completed","turnId":7,"time":1200}"#,
+            r#"{"type":"context.append_message","message":{"role":"user","content":"<hook_result>internal</hook_result>","origin":{"kind":"hook_result"}},"time":1300}"#,
+            r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"같은 요청"}],"time":2000}"#,
+            r#"{"type":"context.append_message","message":{"role":"assistant","content":"둘째 작업 중"},"time":2100}"#,
+        ];
+        let second_offset = lines[..4]
+            .iter()
+            .map(|line| line.len() as u64 + 1)
+            .sum::<u64>();
+        let path = fixture("recent-turns", &lines);
+
+        let state = parse_kimi(&path).expect("파싱돼야 한다");
+
+        assert_eq!(state.recent_turns.len(), 2);
+        assert_eq!(state.recent_turns[0].instruction, "같은 요청");
+        assert_eq!(state.recent_turns[0].agent_summary.as_deref(), Some("둘째 작업 중"));
+        assert_eq!(state.recent_turns[0].activity, AgentActivity::Working);
+        assert_eq!(state.recent_turns[0].source_offset, second_offset);
+        assert_eq!(
+            state.recent_turns[0].turn_key,
+            format!("kimi:{second_offset:x}")
+        );
+        assert_eq!(state.recent_turns[1].turn_key, "kimi:0");
+        assert_eq!(state.recent_turns[1].agent_summary.as_deref(), Some("첫 응답"));
+        assert_eq!(state.recent_turns[1].activity, AgentActivity::Idle);
+        assert_ne!(state.recent_turns[0].turn_key, state.recent_turns[1].turn_key);
+    }
+
+    #[test]
     fn kimi_system_trigger는_사용자_지시로_오인하지_않는다() {
         let path = fixture(
             "system-trigger",
@@ -803,10 +1177,74 @@ mod kimi_tests {
     }
 }
 
+fn codex_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
+    let mut turns = Vec::with_capacity(MAX_RECENT_TRANSCRIPT_TURNS);
+    let mut pending: Option<PendingTurn> = None;
+    for (source_offset, line) in snapshot_lines(snapshot) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let event_type = value.pointer("/payload/type").and_then(Value::as_str);
+        if event_type == Some("user_message") {
+            let Some(instruction) = value
+                .pointer("/payload/message")
+                .and_then(Value::as_str)
+                .and_then(clean_agent_summary)
+            else {
+                continue;
+            };
+            complete_pending(&mut turns, &mut pending);
+            pending = Some(PendingTurn::new(
+                "codex",
+                source_offset,
+                instruction,
+                event_occurred_at(&value).or(snapshot.modified_at),
+                native_turn_key(&value),
+            ));
+            continue;
+        }
+        let Some(turn) = pending.as_mut() else {
+            continue;
+        };
+        match event_type {
+            Some("agent_message") => {
+                if let Some(summary) = value
+                    .pointer("/payload/message")
+                    .and_then(Value::as_str)
+                    .and_then(clean_agent_summary)
+                {
+                    turn.agent_summary = Some(summary);
+                }
+                turn.activity = AgentActivity::Working;
+            }
+            Some("task_complete") => {
+                if let Some(summary) = value
+                    .pointer("/payload/last_agent_message")
+                    .and_then(Value::as_str)
+                    .and_then(clean_agent_summary)
+                {
+                    turn.agent_summary = Some(summary);
+                }
+                turn.activity = AgentActivity::Idle;
+            }
+            Some("turn_aborted") => turn.activity = AgentActivity::Idle,
+            Some("task_started") => turn.activity = AgentActivity::Working,
+            _ => {}
+        }
+    }
+    finish_recent_turns(&mut turns, pending);
+    turns
+}
+
 pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     let session_id = codex_session_id(path.file_name()?.to_str()?)?;
-    let (cwd, text) = codex_snapshot(path).ok()?;
-    validate_tail_text(&text)?;
+    let (cwd, snapshot) = codex_snapshot(path).ok()?;
+    validate_tail_text(&snapshot.text)?;
+    let recent_turns = codex_recent_turns(&snapshot);
+    let text = &snapshot.text;
     // 역순 1-pass로 activity(첫 event_msg) + model/effort(첫 turn_context) +
     // context%(첫 token_count)를 모은다. 셋 다 채워지면 조기 종료.
     let mut activity: Option<AgentActivity> = None;
@@ -900,6 +1338,7 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
         context_pct,
         last_agent_summary,
         user_instruction,
+        recent_turns,
     })
 }
 
@@ -943,10 +1382,16 @@ fn codex_cwd_from_head(path: &Path) -> std::io::Result<Option<String>> {
     Ok(cwd)
 }
 
-fn codex_snapshot(path: &Path) -> std::io::Result<(Option<String>, String)> {
+fn codex_snapshot(path: &Path) -> std::io::Result<(Option<String>, TailSnapshot)> {
     let (mut file, snapshot_len) = open_regular_file(path)?;
     let cwd = codex_cwd_from_head_snapshot(&mut file, snapshot_len)?;
-    let tail = tail_text_from_snapshot(&mut file, snapshot_len, TAIL_BYTES)?;
+    let modified_at = file
+        .metadata()?
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|value| i64::try_from(value.as_secs()).ok());
+    let tail = tail_snapshot_from_reader(&mut file, snapshot_len, TAIL_BYTES, modified_at)?;
     if file.metadata()?.len() < snapshot_len {
         return Err(invalid_input("transcript_shrank_during_read"));
     }
@@ -1036,7 +1481,9 @@ mod tests {
         bytes.extend_from_slice(b"-appended-after-metadata");
         let mut reader = std::io::Cursor::new(bytes);
 
-        let text = tail_text_from_snapshot(&mut reader, snapshot.len() as u64, 64).unwrap();
+        let text = tail_snapshot_from_reader(&mut reader, snapshot.len() as u64, 64, None)
+            .unwrap()
+            .text;
 
         assert_eq!(text, "snapshot");
         assert!(text.len() <= 64);
@@ -1062,16 +1509,18 @@ mod tests {
         let exact = "x".repeat(32);
         let mut exact_reader = std::io::Cursor::new(exact.as_bytes());
         assert_eq!(
-            tail_text_from_snapshot(&mut exact_reader, 32, 32).unwrap(),
+            tail_snapshot_from_reader(&mut exact_reader, 32, 32, None)
+                .unwrap()
+                .text,
             exact
         );
 
         let mut short_reader = std::io::Cursor::new(b"short".as_slice());
-        assert!(tail_text_from_snapshot(&mut short_reader, 6, 32).is_err());
+        assert!(tail_snapshot_from_reader(&mut short_reader, 6, 32, None).is_err());
 
         let mut empty_reader = std::io::Cursor::new(Vec::<u8>::new());
         assert!(
-            tail_text_from_snapshot(&mut empty_reader, 0, TAIL_BYTES + 1).is_err(),
+            tail_snapshot_from_reader(&mut empty_reader, 0, TAIL_BYTES + 1, None).is_err(),
             "configured tail cap + 1 must fail before allocation"
         );
     }
@@ -1080,13 +1529,17 @@ mod tests {
     fn tail_cut_discards_only_partial_first_line() {
         let content = b"old-partial\nnew-line\n";
         let mut reader = std::io::Cursor::new(content.as_slice());
-        let text = tail_text_from_snapshot(&mut reader, content.len() as u64, 12).unwrap();
-        assert_eq!(text, "new-line\n");
+        let snapshot =
+            tail_snapshot_from_reader(&mut reader, content.len() as u64, 12, None).unwrap();
+        assert_eq!(snapshot.text, "new-line\n");
+        assert_eq!(snapshot.base_offset, 12);
 
         let boundary = b"old\nnew-line\n";
         let mut reader = std::io::Cursor::new(boundary.as_slice());
-        let text = tail_text_from_snapshot(&mut reader, boundary.len() as u64, 9).unwrap();
-        assert_eq!(text, "new-line\n");
+        let snapshot =
+            tail_snapshot_from_reader(&mut reader, boundary.len() as u64, 9, None).unwrap();
+        assert_eq!(snapshot.text, "new-line\n");
+        assert_eq!(snapshot.base_offset, 4);
     }
 
     #[test]
@@ -1151,7 +1604,7 @@ mod tests {
         assert!(parse_claude(&invalid).is_none());
 
         let dir = invalid.parent().unwrap();
-        assert!(tail_text(dir, TAIL_BYTES).is_err());
+        assert!(tail_snapshot(dir, TAIL_BYTES).is_err());
     }
 
     #[cfg(unix)]
@@ -1163,7 +1616,7 @@ mod tests {
         let link = target.with_file_name("symlink-input.jsonl");
         let _ = std::fs::remove_file(&link);
         symlink(&target, &link).unwrap();
-        assert!(tail_text(&link, TAIL_BYTES).is_err());
+        assert!(tail_snapshot(&link, TAIL_BYTES).is_err());
         std::fs::remove_file(link).unwrap();
     }
 
@@ -1240,6 +1693,14 @@ mod tests {
             context_pct: Some(42),
             last_agent_summary: Some("private transcript text".to_owned()),
             user_instruction: Some("private user instruction".to_owned()),
+            recent_turns: vec![TranscriptTurn {
+                turn_key: "private-turn".to_owned(),
+                source_offset: 7,
+                instruction: "private turn instruction".to_owned(),
+                agent_summary: Some("private turn summary".to_owned()),
+                occurred_at: Some(1),
+                activity: AgentActivity::Working,
+            }],
         };
         let debug = format!("{state:?}");
         for raw in [
@@ -1249,6 +1710,9 @@ mod tests {
             "hidden-effort",
             "private transcript text",
             "private user instruction",
+            "private-turn",
+            "private turn instruction",
+            "private turn summary",
         ] {
             assert!(!debug.contains(raw));
         }
@@ -1303,6 +1767,37 @@ mod tests {
             s.last_agent_summary.as_deref(),
             Some("Updated the sidebar status and tests.")
         );
+    }
+
+    #[test]
+    fn claude_recent_turns는_중복지시를_offset으로_구분하고_요약을_pairing한다() {
+        let content = r#"{"type":"user","timestamp":"2026-08-13T00:00:00Z","cwd":"/proj","message":{"role":"user","content":"같은 요청"}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"첫 응답"}]}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":"<system-reminder>internal</system-reminder>"}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"No response requested."}]}}
+{"type":"user","timestamp":"2026-08-13T00:01:00Z","cwd":"/proj","message":{"role":"user","content":"같은 요청"}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"text","text":"둘째 작업 중"}]}}
+"#;
+        let second_marker = r#"{"type":"user","timestamp":"2026-08-13T00:01:00Z"#;
+        let second_offset = content.find(second_marker).unwrap() as u64;
+        let path = write_tmp("sess-recent-turns.jsonl", content);
+
+        let state = parse_claude(&path).unwrap();
+
+        assert_eq!(state.recent_turns.len(), 2);
+        assert_eq!(state.recent_turns[0].instruction, "같은 요청");
+        assert_eq!(state.recent_turns[0].agent_summary.as_deref(), Some("둘째 작업 중"));
+        assert_eq!(state.recent_turns[0].activity, AgentActivity::Working);
+        assert_eq!(state.recent_turns[0].source_offset, second_offset);
+        assert_eq!(
+            state.recent_turns[0].turn_key,
+            format!("claude:{second_offset:x}")
+        );
+        assert_eq!(state.recent_turns[1].agent_summary.as_deref(), Some("첫 응답"));
+        assert_eq!(state.recent_turns[1].activity, AgentActivity::Idle);
+        assert_ne!(state.recent_turns[0].turn_key, state.recent_turns[1].turn_key);
+        assert_eq!(state.user_instruction.as_deref(), Some("같은 요청"));
+        assert_eq!(state.last_agent_summary.as_deref(), Some("둘째 작업 중"));
     }
 
     #[test]
@@ -1430,6 +1925,86 @@ mod tests {
             s.last_agent_summary.as_deref(),
             Some("Reviewed PR #124 and found two issues")
         );
+    }
+
+    #[test]
+    fn codex_recent_turns는_내부이벤트를_무시하고_최신순으로_pairing한다() {
+        let content = r#"{"type":"session_meta","payload":{"cwd":"/proj"}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"xhigh"}}
+{"type":"event_msg","timestamp":"2026-08-13T00:00:00Z","payload":{"type":"user_message","message":"같은 요청"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"첫 작업 중"}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"첫 응답"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"<heartbeat>internal</heartbeat>"}}
+{"type":"event_msg","timestamp":"2026-08-13T00:01:00Z","payload":{"type":"user_message","message":"같은 요청"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"둘째 작업 중"}}
+"#;
+        let second_marker = r#"{"type":"event_msg","timestamp":"2026-08-13T00:01:00Z"#;
+        let second_offset = content.find(second_marker).unwrap() as u64;
+        let path = write_tmp(
+            "rollout-2026-01-01T00-00-00-12345678-1234-1234-1234-123456789abc.jsonl",
+            content,
+        );
+
+        let state = parse_codex(&path).unwrap();
+
+        assert_eq!(state.recent_turns.len(), 2);
+        assert_eq!(state.recent_turns[0].instruction, "같은 요청");
+        assert_eq!(state.recent_turns[0].agent_summary.as_deref(), Some("둘째 작업 중"));
+        assert_eq!(state.recent_turns[0].activity, AgentActivity::Working);
+        assert_eq!(state.recent_turns[0].source_offset, second_offset);
+        assert_eq!(
+            state.recent_turns[0].turn_key,
+            format!("codex:{second_offset:x}")
+        );
+        assert_eq!(state.recent_turns[1].agent_summary.as_deref(), Some("첫 응답"));
+        assert_eq!(state.recent_turns[1].activity, AgentActivity::Idle);
+        assert_ne!(state.recent_turns[0].turn_key, state.recent_turns[1].turn_key);
+        assert_eq!(state.user_instruction.as_deref(), Some("같은 요청"));
+        assert_eq!(state.last_agent_summary.as_deref(), Some("둘째 작업 중"));
+    }
+
+    #[test]
+    fn recent_turns는_24개로_제한된다() {
+        let mut content = String::from(
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/proj\"}}\n{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-sol\",\"effort\":\"high\"}}\n",
+        );
+        for index in 0..26 {
+            content.push_str(&format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"task {index}\"}}}}\n"
+            ));
+            content.push_str(&format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"last_agent_message\":\"done {index}\"}}}}\n"
+            ));
+        }
+        let path = write_tmp(
+            "rollout-2026-01-01T00-00-00-abcdefab-cdef-abcd-efab-cdefabcdefab.jsonl",
+            &content,
+        );
+
+        let state = parse_codex(&path).unwrap();
+
+        assert_eq!(state.recent_turns.len(), MAX_RECENT_TRANSCRIPT_TURNS);
+        assert_eq!(state.recent_turns.first().unwrap().instruction, "task 25");
+        assert_eq!(state.recent_turns.last().unwrap().instruction, "task 2");
+    }
+
+    #[test]
+    fn truncated_tail의_첫_partial_turn은_다음_user와_pairing되지_않는다() {
+        let orphan = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"orphan summary\"}}\n";
+        let user = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"실제 요청\"}}\n";
+        let assistant = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"실제 응답\"}}\n";
+        let snapshot = TailSnapshot {
+            base_offset: 10_000,
+            modified_at: None,
+            text: format!("{orphan}{user}{assistant}"),
+        };
+
+        let turns = codex_recent_turns(&snapshot);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].source_offset, 10_000 + orphan.len() as u64);
+        assert_eq!(turns[0].agent_summary.as_deref(), Some("실제 응답"));
+        assert_ne!(turns[0].agent_summary.as_deref(), Some("orphan summary"));
     }
 
     #[test]

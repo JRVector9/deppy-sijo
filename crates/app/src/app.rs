@@ -1315,6 +1315,10 @@ enum PendingDotenvContinuation {
         command: runtime::RuntimeCommand,
     },
     RuntimeCommand(runtime::RuntimeCommand),
+    PrimaryPaneActivation {
+        command: runtime::RuntimeCommand,
+        generation: u64,
+    },
     AgentLaunch {
         command: runtime::RuntimeCommand,
         approval_ticket: Option<u64>,
@@ -1331,12 +1335,21 @@ struct PendingDotenvOperation {
     continuation: PendingDotenvContinuation,
 }
 
+struct StartupDeferredDotenvContinuation {
+    workspace_id: String,
+    runtime_instance: u64,
+    retained_bytes: usize,
+    restore_wait_observed: bool,
+    continuation: PendingDotenvContinuation,
+}
+
 fn prepare_dotenv_continuation_retention(
     continuation: &mut PendingDotenvContinuation,
 ) -> Result<usize, runtime::RuntimeCommandPreparationErrorCode> {
     match continuation {
         PendingDotenvContinuation::WorkspaceProtocol { command, .. }
         | PendingDotenvContinuation::RuntimeCommand(command)
+        | PendingDotenvContinuation::PrimaryPaneActivation { command, .. }
         | PendingDotenvContinuation::AgentLaunch { command, .. } => {
             runtime::prepare_runtime_command_for_retention(command)
                 .map(runtime::RuntimeCommandRetention::retained_bytes)
@@ -1354,11 +1367,385 @@ fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
     ) || runtime_command_is_targeted_workspace_restore(command)
 }
 
+fn runtime_command_creates_session(command: &runtime::RuntimeCommand) -> bool {
+    matches!(
+        command,
+        runtime::RuntimeCommand::SpawnShell { .. }
+            | runtime::RuntimeCommand::SpawnAgent { .. }
+            | runtime::RuntimeCommand::SplitPane { .. }
+    )
+}
+
+fn startup_catalog_blocks_session_creation(
+    recovery: &CatalogStartupRecovery,
+    restore_lifecycle: WorkspaceRestoreLifecycle,
+    command: &runtime::RuntimeCommand,
+    bypass: bool,
+) -> bool {
+    !bypass
+        && runtime_command_creates_session(command)
+        && (!recovery.settled || restore_lifecycle == WorkspaceRestoreLifecycle::AwaitingDelivery)
+}
+
+fn dotenv_continuation_retention_has_slot(
+    admitted: usize,
+    startup_deferred: usize,
+    reserve_startup_restore: bool,
+) -> bool {
+    let limit = crate::dotenv_sync::DOTENV_WORKER_CONTINUATION_MAX
+        .saturating_sub(usize::from(reserve_startup_restore));
+    admitted
+        .checked_add(startup_deferred)
+        .is_some_and(|retained| retained < limit)
+}
+
+fn dotenv_continuation_command(
+    continuation: &PendingDotenvContinuation,
+) -> &runtime::RuntimeCommand {
+    match continuation {
+        PendingDotenvContinuation::WorkspaceProtocol { command, .. }
+        | PendingDotenvContinuation::RuntimeCommand(command)
+        | PendingDotenvContinuation::PrimaryPaneActivation { command, .. }
+        | PendingDotenvContinuation::AgentLaunch { command, .. } => command,
+    }
+}
+
 fn runtime_command_is_targeted_workspace_restore(command: &runtime::RuntimeCommand) -> bool {
     matches!(
         command,
         runtime::RuntimeCommand::RestoreWorkspacePane { .. }
     )
+}
+
+fn runtime_command_restores_workspace(command: &runtime::RuntimeCommand) -> bool {
+    matches!(command, runtime::RuntimeCommand::RestoreWorkspace)
+        || runtime_command_is_targeted_workspace_restore(command)
+}
+
+fn dotenv_continuation_restores_workspace(continuation: &PendingDotenvContinuation) -> bool {
+    match continuation {
+        PendingDotenvContinuation::WorkspaceProtocol { command, .. }
+        | PendingDotenvContinuation::RuntimeCommand(command)
+        | PendingDotenvContinuation::PrimaryPaneActivation { command, .. }
+        | PendingDotenvContinuation::AgentLaunch { command, .. } => {
+            runtime_command_restores_workspace(command)
+        }
+    }
+}
+
+fn dotenv_continuation_must_cancel_on_workspace_close(
+    continuation: &PendingDotenvContinuation,
+) -> bool {
+    dotenv_continuation_restores_workspace(continuation)
+        || runtime_command_creates_session(dotenv_continuation_command(continuation))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryPaneActivationPhase {
+    Dotenv,
+    TargetRestore,
+    Materialization,
+    Focus,
+    WorkspaceRestore,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WorkspaceRestoreLifecycle {
+    #[default]
+    Idle,
+    AwaitingDelivery,
+    Delivered,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPrimaryPaneActivation {
+    workspace_id: String,
+    runtime_instance: u64,
+    pane: runtime::MuxPaneId,
+    generation: u64,
+    phase: PrimaryPaneActivationPhase,
+    materialization_started_at: Option<std::time::Instant>,
+    delivery_retry: RuntimeDeliveryRetry,
+}
+
+const PRIMARY_PANE_MATERIALIZATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+const RUNTIME_DELIVERY_FAILURE_LIMIT: u8 = 6;
+const RUNTIME_DELIVERY_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(16);
+const RUNTIME_DELIVERY_RECOVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+// Config clamps live warm runtimes to 12. Including the active runtime makes 13 the maximum
+// number of simultaneously resident restoration owners.
+const PENDING_WORKSPACE_RESTORE_DELIVERY_CAP: usize = 13;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RuntimeDeliveryRetry {
+    failures: u8,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl RuntimeDeliveryRetry {
+    fn recovery_in(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        (self.failures >= RUNTIME_DELIVERY_FAILURE_LIMIT)
+            .then_some(self.retry_at)
+            .flatten()
+            .map(|retry_at| retry_at.saturating_duration_since(now))
+    }
+
+    fn ready_in(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        if self.failures >= RUNTIME_DELIVERY_FAILURE_LIMIT {
+            return None;
+        }
+        Some(self.retry_at.map_or(std::time::Duration::ZERO, |retry_at| {
+            retry_at.saturating_duration_since(now)
+        }))
+    }
+
+    fn record_failure(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= RUNTIME_DELIVERY_FAILURE_LIMIT {
+            self.retry_at = Some(now + RUNTIME_DELIVERY_RECOVERY_DELAY);
+            return None;
+        }
+        let shift = u32::from(self.failures.saturating_sub(1));
+        let delay = RUNTIME_DELIVERY_RETRY_BASE.saturating_mul(1_u32 << shift);
+        self.retry_at = Some(now + delay);
+        Some(delay)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Restore delivery stays recoverable after its short burst is exhausted. This does not
+    /// schedule a periodic repaint: a later runtime/UI wake may rearm one bounded burst.
+    fn restart_if_exhausted_due(&mut self, now: std::time::Instant) -> bool {
+        if self.failures < RUNTIME_DELIVERY_FAILURE_LIMIT
+            || self.retry_at.is_none_or(|retry_at| now < retry_at)
+        {
+            return false;
+        }
+        self.reset();
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPaneFocus {
+    workspace_id: String,
+    runtime_instance: u64,
+    pane: runtime::MuxPaneId,
+    materialization_started_at: Option<std::time::Instant>,
+    delivery_retry: RuntimeDeliveryRetry,
+}
+
+#[derive(Clone, Debug)]
+struct PendingWorkspaceRestoreDelivery {
+    workspace_id: String,
+    runtime_instance: u64,
+    command: runtime::RuntimeCommand,
+    delivery_retry: RuntimeDeliveryRetry,
+}
+
+impl PendingWorkspaceRestoreDelivery {
+    fn new(workspace_id: String, runtime_instance: u64) -> Self {
+        Self {
+            workspace_id,
+            runtime_instance,
+            command: runtime::RuntimeCommand::RestoreWorkspace,
+            delivery_retry: RuntimeDeliveryRetry::default(),
+        }
+    }
+
+    fn from_primary(pending: PendingPrimaryPaneActivation) -> Self {
+        Self {
+            workspace_id: pending.workspace_id,
+            runtime_instance: pending.runtime_instance,
+            command: runtime::RuntimeCommand::RestoreWorkspace,
+            delivery_retry: pending.delivery_retry,
+        }
+    }
+}
+
+fn stage_workspace_restore_delivery(
+    pending: &mut std::collections::HashMap<u64, PendingWorkspaceRestoreDelivery>,
+    delivery: PendingWorkspaceRestoreDelivery,
+) -> bool {
+    if !pending.contains_key(&delivery.runtime_instance)
+        && pending.len() >= PENDING_WORKSPACE_RESTORE_DELIVERY_CAP
+    {
+        return false;
+    }
+    pending.insert(delivery.runtime_instance, delivery);
+    true
+}
+
+impl PendingPaneFocus {
+    fn new(workspace_id: String, runtime_instance: u64, pane: runtime::MuxPaneId) -> Self {
+        Self {
+            workspace_id,
+            runtime_instance,
+            pane,
+            materialization_started_at: None,
+            delivery_retry: RuntimeDeliveryRetry::default(),
+        }
+    }
+
+    fn observe_restore_delivery(&mut self, now: std::time::Instant) {
+        self.materialization_started_at.get_or_insert(now);
+    }
+
+    fn materialization_timed_out(&self, now: std::time::Instant) -> bool {
+        self.materialization_started_at.is_some_and(|started| {
+            now.saturating_duration_since(started) >= PRIMARY_PANE_MATERIALIZATION_TIMEOUT
+        })
+    }
+}
+
+fn primary_activation_after_focus_cancel(
+    phase: PrimaryPaneActivationPhase,
+) -> Option<PrimaryPaneActivationPhase> {
+    match phase {
+        PrimaryPaneActivationPhase::Dotenv | PrimaryPaneActivationPhase::TargetRestore => None,
+        PrimaryPaneActivationPhase::Materialization
+        | PrimaryPaneActivationPhase::Focus
+        | PrimaryPaneActivationPhase::WorkspaceRestore => {
+            Some(PrimaryPaneActivationPhase::WorkspaceRestore)
+        }
+    }
+}
+
+const CATALOG_STARTUP_RETRY_LIMIT: u8 = 3;
+const CATALOG_STARTUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogStartupRecoveryAction {
+    Retry,
+    OfferLauncher,
+    Settled,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CatalogStartupRecovery {
+    failures: u8,
+    settled: bool,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl CatalogStartupRecovery {
+    fn on_success(&mut self) {
+        self.settled = true;
+        self.retry_at = None;
+    }
+
+    fn on_failure(&mut self, now: std::time::Instant) -> CatalogStartupRecoveryAction {
+        if self.settled {
+            return CatalogStartupRecoveryAction::Settled;
+        }
+        self.failures = self.failures.saturating_add(1);
+        if self.failures < CATALOG_STARTUP_RETRY_LIMIT {
+            self.retry_at = Some(now + CATALOG_STARTUP_RETRY_DELAY);
+            CatalogStartupRecoveryAction::Retry
+        } else {
+            self.settled = true;
+            self.retry_at = None;
+            CatalogStartupRecoveryAction::OfferLauncher
+        }
+    }
+
+    fn take_retry_due(&mut self, now: std::time::Instant) -> bool {
+        if self.retry_at.is_some_and(|retry_at| now >= retry_at) {
+            self.retry_at = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn primary_pane_materialization_timed_out(
+    pending: &PendingPrimaryPaneActivation,
+    now: std::time::Instant,
+) -> bool {
+    pending.phase == PrimaryPaneActivationPhase::Materialization
+        && pending.materialization_started_at.is_some_and(|started| {
+            now.saturating_duration_since(started) >= PRIMARY_PANE_MATERIALIZATION_TIMEOUT
+        })
+}
+
+fn primary_pane_activation_is_current(
+    pending: Option<&PendingPrimaryPaneActivation>,
+    workspace_id: &str,
+    runtime_instance: u64,
+    pane: &runtime::MuxPaneId,
+    generation: u64,
+) -> bool {
+    pending.is_some_and(|pending| {
+        pending.workspace_id == workspace_id
+            && pending.runtime_instance == runtime_instance
+            && pending.pane == *pane
+            && pending.generation == generation
+    })
+}
+
+fn primary_activation_needs_post_render_tick(
+    pending: Option<&PendingPrimaryPaneActivation>,
+    events: &[runtime::RuntimeEvent],
+) -> bool {
+    pending.is_some_and(|pending| pending.phase == PrimaryPaneActivationPhase::Materialization)
+        && events
+            .iter()
+            .any(|event| matches!(event, runtime::RuntimeEvent::MuxUpdated { .. }))
+}
+
+fn primary_pane_activation_command(
+    pending: &PendingPrimaryPaneActivation,
+    materialized: bool,
+) -> Option<runtime::RuntimeCommand> {
+    match pending.phase {
+        PrimaryPaneActivationPhase::TargetRestore => {
+            Some(runtime::RuntimeCommand::RestoreWorkspacePane {
+                pane: pending.pane.clone(),
+            })
+        }
+        PrimaryPaneActivationPhase::Focus if materialized => {
+            Some(runtime::RuntimeCommand::FocusPane {
+                pane: pending.pane.clone(),
+            })
+        }
+        PrimaryPaneActivationPhase::WorkspaceRestore => {
+            Some(runtime::RuntimeCommand::RestoreWorkspace)
+        }
+        PrimaryPaneActivationPhase::Dotenv
+        | PrimaryPaneActivationPhase::Materialization
+        | PrimaryPaneActivationPhase::Focus => None,
+    }
+}
+
+fn observe_primary_pane_materialized(
+    pending: &mut PendingPrimaryPaneActivation,
+    materialized: bool,
+) {
+    if materialized && pending.phase == PrimaryPaneActivationPhase::Materialization {
+        pending.phase = PrimaryPaneActivationPhase::Focus;
+    }
+}
+
+fn advance_primary_pane_activation(
+    pending: &mut PendingPrimaryPaneActivation,
+    delivered: bool,
+) -> bool {
+    if !delivered {
+        return false;
+    }
+    pending.phase = match pending.phase {
+        PrimaryPaneActivationPhase::TargetRestore => PrimaryPaneActivationPhase::Materialization,
+        PrimaryPaneActivationPhase::Focus => PrimaryPaneActivationPhase::WorkspaceRestore,
+        PrimaryPaneActivationPhase::WorkspaceRestore => return true,
+        PrimaryPaneActivationPhase::Dotenv | PrimaryPaneActivationPhase::Materialization => {
+            return false;
+        }
+    };
+    false
 }
 
 const CROSS_WORKSPACE_RESTORE_QUEUE_CAP: usize = 6;
@@ -2255,6 +2642,20 @@ fn terminal_runtime_identity_for_owner(
         FrameTerminalOwner::Attached(_) => owner_attached_target(owner, panes)
             .map(|target| (target.workspace_id.clone(), target.runtime_instance)),
         FrameTerminalOwner::None => None,
+    }
+}
+
+fn terminal_focus_claim_owner(
+    current_owner: FrameTerminalOwner,
+    primary_focus_requested: bool,
+    attached_focus_requested: Option<ui::cross_workspace::AttachmentId>,
+) -> FrameTerminalOwner {
+    if let Some(attachment_id) = attached_focus_requested {
+        FrameTerminalOwner::Attached(attachment_id)
+    } else if primary_focus_requested {
+        FrameTerminalOwner::Primary
+    } else {
+        current_owner
     }
 }
 
@@ -6438,6 +6839,10 @@ struct WorkspaceRuntime {
     runtime: InProcessRuntimeClient,
     events: RuntimeEventReceiver,
     workspace_ui: ui::workspace::WorkspaceUi,
+    /// 이 worker lifetime의 전체 저장 레이아웃 복원 수명주기. dotenv 대기와 실제 명령
+    /// 전달 완료를 구분해야, 새 포커스가 나머지 복원을 취소하거나 실패 pane 재시도를
+    /// 영구 차단하지 않는다.
+    restore_lifecycle: WorkspaceRestoreLifecycle,
     /// worker에 마지막으로 보낸 render 활성 상태 (§14.1 Active↔Warm) — 전이 시에만 전송
     render_active: bool,
     /// logic()에서 drain했지만 아직 ui()가 렌더에 소비하지 않은 이벤트 (§14.1 Warm:
@@ -7154,7 +7559,13 @@ pub struct App {
     /// Runtime commands are retained exactly once here; worker jobs contain only freshness scope.
     /// The worker independently caps accepted continuations at the same fixed eight operations.
     dotenv_pending_operations: std::collections::HashMap<u64, PendingDotenvOperation>,
+    /// Session-creating requests made before startup restoration settles. This separate bounded
+    /// queue preserves the user's action while leaving worker capacity available for the restore
+    /// that must precede it.
+    startup_deferred_dotenv_continuations:
+        std::collections::VecDeque<StartupDeferredDotenvContinuation>,
     /// Checked retained heap bytes across the same exact launch commands.
+    /// Includes both worker-admitted and startup-deferred continuations.
     dotenv_pending_bytes: usize,
     /// 프로젝트 폴더 rename 복구 확인 모달 — Some((old, new))이면 표시(2026-07-08).
     workspace_rename_prompt: Option<(String, String)>,
@@ -7571,6 +7982,18 @@ pub struct App {
     resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, u64, runtime::SessionId)>,
+    /// 저장 세션 선택 시 정확한 pane이 materialize될 때까지 유지하는 포커스 intent.
+    pending_pane_focus: Option<PendingPaneFocus>,
+    /// 저장 pane의 dotenv 완료, targeted restore, materialization, focus, full restore를
+    /// 한 명령씩 재시도하는 최신 activation. generation은 늦은 worker 완료를 차단한다.
+    pending_primary_pane_activation: Option<PendingPrimaryPaneActivation>,
+    /// 포커스 intent가 더 최신 탐색으로 취소된 뒤에도 이미 targeted restore까지 전달된
+    /// activation의 마지막 full restore는 끝까지 보낸다.
+    pending_workspace_restore_delivery:
+        std::collections::HashMap<u64, PendingWorkspaceRestoreDelivery>,
+    primary_pane_activation_generation: u64,
+    /// 최초 Catalog 실패는 유계 재시도하고 끝내 실패하면 런처로 복구한다.
+    catalog_startup_recovery: CatalogStartupRecovery,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
     pending_shutdowns: PendingShutdownRegistry,
@@ -8047,6 +8470,10 @@ enum AppControllerAction {
 enum WorkspaceControllerAction {
     OpenAgentLauncher,
     SwitchWorkspace(String),
+    ActivatePersistedSession {
+        workspace_id: String,
+        pane: runtime::MuxPaneId,
+    },
     OpenSessionBeside {
         target: ui::file_tree::SessionRowTarget,
         anchor: ui::cross_workspace::InsertAnchor,
@@ -8118,6 +8545,92 @@ fn workspace_focus_target_matches_runtime(
 ) -> bool {
     target_workspace_id == runtime_workspace_id
         && target_runtime_instance.is_none_or(|expected| expected == runtime_instance)
+}
+
+fn should_stage_catalog_restore(
+    has_panes: bool,
+    restore_lifecycle: WorkspaceRestoreLifecycle,
+) -> bool {
+    has_panes && restore_lifecycle == WorkspaceRestoreLifecycle::Idle
+}
+
+fn should_stage_primary_pane_activation(
+    materialized: bool,
+    restore_lifecycle: WorkspaceRestoreLifecycle,
+) -> bool {
+    !materialized && restore_lifecycle != WorkspaceRestoreLifecycle::AwaitingDelivery
+}
+
+fn should_restore_active_workspace(
+    closed: bool,
+    has_panes: bool,
+    restore_lifecycle: WorkspaceRestoreLifecycle,
+) -> bool {
+    !closed && should_stage_catalog_restore(has_panes, restore_lifecycle)
+}
+
+fn warm_runtime_needs_restore(
+    has_persisted_panes: bool,
+    restore_lifecycle: WorkspaceRestoreLifecycle,
+) -> bool {
+    has_persisted_panes && restore_lifecycle == WorkspaceRestoreLifecycle::Idle
+}
+
+fn restore_lifecycle_after_dotenv_delivery(
+    primary_activation: bool,
+    full_restore: bool,
+    delivered: bool,
+) -> WorkspaceRestoreLifecycle {
+    if !delivered {
+        WorkspaceRestoreLifecycle::Idle
+    } else if full_restore {
+        WorkspaceRestoreLifecycle::Delivered
+    } else if primary_activation {
+        WorkspaceRestoreLifecycle::AwaitingDelivery
+    } else {
+        WorkspaceRestoreLifecycle::Idle
+    }
+}
+
+fn persisted_pane_is_current(
+    rows: &[storage::PersistedActivityPane],
+    pane: &runtime::MuxPaneId,
+) -> bool {
+    rows.iter().any(|row| row.pane_id == pane.0)
+}
+
+fn extend_unique_pane_ids<'a>(
+    panes: &mut Vec<runtime::MuxPaneId>,
+    persisted_panes: impl IntoIterator<Item = &'a str>,
+) {
+    for pane_id in persisted_panes {
+        let pane = runtime::MuxPaneId(pane_id.to_owned());
+        if !panes.contains(&pane) {
+            panes.push(pane);
+        }
+    }
+}
+
+fn cancel_pending_focus_intents(
+    pending_session: &mut Option<(String, u64, runtime::SessionId)>,
+    pending_pane: &mut Option<PendingPaneFocus>,
+) {
+    *pending_session = None;
+    *pending_pane = None;
+}
+
+fn live_pane_target_is_current(
+    mux: &runtime::MuxSnapshot,
+    tab: &runtime::MuxTabId,
+    pane: &runtime::MuxPaneId,
+) -> bool {
+    mux.tabs.iter().any(|candidate| {
+        candidate.id == *tab
+            && candidate
+                .panes
+                .iter()
+                .any(|candidate| candidate.id == *pane && candidate.session_id.is_some())
+    })
 }
 
 fn invalidate_resource_projection(
@@ -10309,6 +10822,9 @@ impl App {
             dotenv_pending_operations: std::collections::HashMap::with_capacity(
                 crate::dotenv_sync::DOTENV_WORKER_CONTINUATION_MAX,
             ),
+            startup_deferred_dotenv_continuations: std::collections::VecDeque::with_capacity(
+                crate::dotenv_sync::DOTENV_WORKER_CONTINUATION_MAX,
+            ),
             dotenv_pending_bytes: 0,
             workspace_rename_prompt: None,
             env_project_close_confirm: None,
@@ -10511,6 +11027,13 @@ impl App {
             resumed_panes: std::collections::HashSet::new(),
             resume_probe_pending_panes: std::collections::HashSet::new(),
             pending_focus: None,
+            pending_pane_focus: None,
+            pending_primary_pane_activation: None,
+            pending_workspace_restore_delivery: std::collections::HashMap::with_capacity(
+                PENDING_WORKSPACE_RESTORE_DELIVERY_CAP,
+            ),
+            primary_pane_activation_generation: 0,
+            catalog_startup_recovery: CatalogStartupRecovery::default(),
             pending_shutdowns: PendingShutdownRegistry::default(),
             next_warm_idle_eviction_at: None,
             warm_eviction_deferred: false,
@@ -10551,18 +11074,8 @@ impl App {
         }
         // 에이전트 상태 hook 전역 설치/해제 (설정 토글에 따라, best-effort).
         app.sync_agent_hooks();
-        // The first process-capable restore is an exact dotenv continuation. Construction alone
-        // does not bypass source/keyring verification or fall back to an empty environment.
-        let persisted_restore_exists = app
-            .persisted_activity_panes
-            .get(&app.active.id)
-            .is_some_and(|panes| !panes.is_empty());
-        if persisted_restore_exists {
-            let initial_runtime_instance = app.active.runtime_instance;
-            app.stage_runtime_restore(initial_runtime_instance);
-        } else if app.bench.is_none() && app.perf_harness_next.is_none() {
-            app.offer_agent_launcher_for_active();
-        }
+        // 저장 세션 유무의 권위값은 비동기 Catalog다. Catalog 적용 뒤에만 복원/런처를
+        // 결정해, 빈 초기 projection을 보고 복원을 영원히 건너뛰는 startup race를 막는다.
         // 시작 시 config가 remote를 켜 뒀으면 best-effort로 기동한다 (실패는 log + settings 표시,
         // config는 그대로 두어 다음 실행에 재시도). 자동 시작은 config 저장을 유발하지 않는다.
         if app.config.remote.tls_enabled {
@@ -10645,6 +11158,7 @@ impl App {
             runtime,
             events: runtime_events,
             workspace_ui: ui::workspace::WorkspaceUi::new(),
+            restore_lifecycle: WorkspaceRestoreLifecycle::Idle,
             render_active: true,
             pending_events: Vec::new(),
             session_titles: std::collections::HashMap::new(),
@@ -11034,6 +11548,26 @@ impl App {
                 );
                 false
             }
+        }
+    }
+
+    fn handle_catalog_startup_failure(&mut self) {
+        match self
+            .catalog_startup_recovery
+            .on_failure(std::time::Instant::now())
+        {
+            CatalogStartupRecoveryAction::Retry => self
+                .egui_ctx
+                .request_repaint_after(CATALOG_STARTUP_RETRY_DELAY),
+            CatalogStartupRecoveryAction::OfferLauncher => {
+                if self.startup_deferred_dotenv_continuations.is_empty()
+                    && self.bench.is_none()
+                    && self.perf_harness_next.is_none()
+                {
+                    self.offer_agent_launcher_for_active();
+                }
+            }
+            CatalogStartupRecoveryAction::Settled => {}
         }
     }
 
@@ -11466,6 +12000,8 @@ impl App {
                         .push(row.clone());
                 }
                 self.persisted_activity_panes = by_workspace;
+                self.catalog_startup_recovery.on_success();
+                self.ensure_active_runtime_restore();
                 self.request_project_name_projection();
             }
             crate::agent_state_worker::AgentStateSection::ResumeProbe
@@ -11654,14 +12190,30 @@ impl App {
                         }
                     }
                     Ok(_) => {}
-                    Err(error) => tracing::warn!(
-                        kind = "agent_state",
-                        phase = "projection_complete",
-                        error_code = error.as_str(),
-                        "agent state projection failed"
-                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            kind = "agent_state",
+                            phase = "projection_complete",
+                            error_code = error.as_str(),
+                            "agent state projection failed"
+                        );
+                        if section == crate::agent_state_worker::AgentStateSection::Catalog {
+                            self.handle_catalog_startup_failure();
+                        }
+                    }
                 }
             }
+        }
+
+        if self
+            .catalog_startup_recovery
+            .take_retry_due(std::time::Instant::now())
+            && !self.stage_agent_state_projection(
+                crate::agent_state_worker::AgentStateSection::Catalog,
+                AppAgentStateProjectionKind::Catalog,
+            )
+        {
+            self.handle_catalog_startup_failure();
         }
 
         if self.pending_agent_state_scope.is_some() {
@@ -11697,10 +12249,12 @@ impl App {
                     crate::agent_state_worker::AgentStateSection::Restore,
                     AppAgentStateProjectionKind::Restore,
                 );
-                self.stage_agent_state_projection(
+                if !self.stage_agent_state_projection(
                     crate::agent_state_worker::AgentStateSection::Catalog,
                     AppAgentStateProjectionKind::Catalog,
-                );
+                ) {
+                    self.handle_catalog_startup_failure();
+                }
             }
         }
         if self.project_name_projection_dirty
@@ -12786,6 +13340,9 @@ impl App {
             WorkspaceControllerAction::SwitchWorkspace(workspace_id) => {
                 self.switch_workspace(&workspace_id);
             }
+            WorkspaceControllerAction::ActivatePersistedSession { workspace_id, pane } => {
+                self.activate_persisted_session(&workspace_id, pane);
+            }
             WorkspaceControllerAction::OpenSessionBeside { target, anchor } => {
                 self.open_session_beside(target, anchor);
             }
@@ -12801,22 +13358,26 @@ impl App {
                     self.switch_workspace(&workspace_id);
                 }
                 if workspace_id == self.active.id {
-                    let is_active_tab = self
+                    // A live-row click is newer than any retained restore/navigation intent. The
+                    // deferred action must also revalidate the exact live tab/pane before it can
+                    // become the exclusive terminal input owner.
+                    self.cancel_terminal_focus_intents();
+                    let is_current = self
                         .active
                         .workspace_ui
                         .mux()
-                        .and_then(|mux| mux.active_tab.clone())
-                        == Some(tab.clone());
-                    if !is_active_tab {
-                        let _ = self
+                        .is_some_and(|mux| live_pane_target_is_current(mux, &tab, &pane));
+                    if is_current
+                        && self
                             .active
                             .runtime
-                            .send_command(runtime::RuntimeCommand::SelectTab { tab });
+                            .send_command(runtime::RuntimeCommand::FocusPane { pane: pane.clone() })
+                            .is_ok()
+                    {
+                        self.active.workspace_ui.arm_terminal_focus(pane);
+                    } else {
+                        self.active.workspace_ui.cancel_terminal_focus();
                     }
-                    let _ = self
-                        .active
-                        .runtime
-                        .send_command(runtime::RuntimeCommand::FocusPane { pane });
                 }
             }
             WorkspaceControllerAction::Runtime(command) => {
@@ -12894,16 +13455,21 @@ impl App {
                 ) {
                     return;
                 }
+                self.cancel_terminal_focus_intents();
                 if let Some(pane) = self
                     .active
                     .workspace_ui
                     .mux()
                     .and_then(|mux| pane_of_session(mux, session))
                 {
-                    let _ = self
+                    if self
                         .active
                         .runtime
-                        .send_command(runtime::RuntimeCommand::FocusPane { pane });
+                        .send_command(runtime::RuntimeCommand::FocusPane { pane: pane.clone() })
+                        .is_ok()
+                    {
+                        self.active.workspace_ui.arm_terminal_focus(pane);
+                    }
                 } else {
                     self.pending_focus =
                         Some((workspace_id, self.active.runtime_instance, session));
@@ -12935,7 +13501,14 @@ impl App {
         {
             let operation = intent.operation();
             let generation = intent.generation();
+            let newer_local_focus = (runtime_instance == self.active.runtime_instance)
+                .then(|| intent.focus_pane().cloned())
+                .flatten();
             let command = intent.into_command();
+            if let Some(pane) = newer_local_focus.as_ref() {
+                self.cancel_terminal_focus_intents();
+                self.active.workspace_ui.arm_terminal_focus(pane.clone());
+            }
             if runtime_command_requires_dotenv(&command) {
                 let continuation = PendingDotenvContinuation::WorkspaceProtocol {
                     operation,
@@ -12968,6 +13541,7 @@ impl App {
                 .runtime
                 .send_command(command)
                 .map_err(|_| ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed);
+            let delivered = result.is_ok();
             runtime
                 .workspace_ui
                 .complete_protocol(ui::workspace::WorkspaceProtocolCompletion {
@@ -12975,6 +13549,9 @@ impl App {
                     generation,
                     result,
                 });
+            if newer_local_focus.is_some() && !delivered {
+                runtime.workspace_ui.cancel_terminal_focus();
+            }
         }
     }
 
@@ -13011,31 +13588,318 @@ impl App {
     }
 
     fn poll_pending_workspace_focus(&mut self) {
-        let Some((workspace_id, runtime_instance, session)) = self.pending_focus.clone() else {
+        if let Some((workspace_id, runtime_instance, session)) = self.pending_focus.clone() {
+            if !workspace_focus_target_matches_runtime(
+                &workspace_id,
+                Some(runtime_instance),
+                &self.active.id,
+                self.active.runtime_instance,
+            ) {
+                self.pending_focus = None;
+            } else if let Some(pane) = self
+                .active
+                .workspace_ui
+                .mux()
+                .and_then(|mux| pane_of_session(mux, session))
+            {
+                self.active.workspace_ui.arm_terminal_focus(pane.clone());
+                if self
+                    .active
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::FocusPane { pane })
+                    .is_ok()
+                {
+                    self.pending_focus = None;
+                }
+            }
+        }
+
+        if self.pending_primary_pane_activation.is_some() {
+            self.pump_primary_pane_activation();
+            return;
+        }
+
+        let Some(mut pending) = self.pending_pane_focus.take() else {
             return;
         };
         if !workspace_focus_target_matches_runtime(
-            &workspace_id,
-            Some(runtime_instance),
+            &pending.workspace_id,
+            Some(pending.runtime_instance),
             &self.active.id,
             self.active.runtime_instance,
         ) {
-            self.pending_focus = None;
+            self.active.workspace_ui.cancel_terminal_focus();
             return;
         }
-        let Some(pane) = self
-            .active
+        let materialized = self.active.workspace_ui.mux().is_some_and(|mux| {
+            mux.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|candidate| candidate.id == pending.pane && candidate.session_id.is_some())
+        });
+        if !materialized {
+            if pending.materialization_timed_out(std::time::Instant::now()) {
+                self.active.workspace_ui.cancel_terminal_focus();
+            } else {
+                self.pending_pane_focus = Some(pending);
+            }
+            return;
+        }
+        let now = std::time::Instant::now();
+        let Some(retry_in) = pending.delivery_retry.ready_in(now) else {
+            self.active.workspace_ui.cancel_terminal_focus();
+            return;
+        };
+        if !retry_in.is_zero() {
+            self.pending_pane_focus = Some(pending);
+            self.egui_ctx.request_repaint_after(retry_in);
+            return;
+        }
+        self.active
             .workspace_ui
-            .mux()
-            .and_then(|mux| pane_of_session(mux, session))
+            .arm_terminal_focus(pending.pane.clone());
+        if self
+            .active
+            .runtime
+            .send_command(runtime::RuntimeCommand::FocusPane {
+                pane: pending.pane.clone(),
+            })
+            .is_ok()
+        {
+            return;
+        }
+        if let Some(delay) = pending.delivery_retry.record_failure(now) {
+            self.pending_pane_focus = Some(pending);
+            self.egui_ctx.request_repaint_after(delay);
+        } else {
+            self.active.workspace_ui.cancel_terminal_focus();
+        }
+    }
+
+    fn cancel_terminal_focus_intents(&mut self) {
+        cancel_pending_focus_intents(&mut self.pending_focus, &mut self.pending_pane_focus);
+        if let Some(mut pending) = self.pending_primary_pane_activation.take() {
+            match primary_activation_after_focus_cancel(pending.phase) {
+                Some(PrimaryPaneActivationPhase::WorkspaceRestore) => {
+                    pending.phase = PrimaryPaneActivationPhase::WorkspaceRestore;
+                    let runtime_instance = pending.runtime_instance;
+                    if !stage_workspace_restore_delivery(
+                        &mut self.pending_workspace_restore_delivery,
+                        PendingWorkspaceRestoreDelivery::from_primary(pending),
+                    ) && let Some(runtime) = self.runtime_by_instance_mut(runtime_instance)
+                    {
+                        runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Idle;
+                    }
+                }
+                _ => {
+                    if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+                        runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Idle;
+                    }
+                }
+            }
+        }
+        self.active.workspace_ui.cancel_terminal_focus();
+    }
+
+    fn cancel_pending_pane_focus_for_restore(&mut self, workspace_id: &str, runtime_instance: u64) {
+        if self.pending_pane_focus.as_ref().is_some_and(|pending| {
+            pending.workspace_id == workspace_id && pending.runtime_instance == runtime_instance
+        }) {
+            self.pending_pane_focus = None;
+            if workspace_focus_target_matches_runtime(
+                workspace_id,
+                Some(runtime_instance),
+                &self.active.id,
+                self.active.runtime_instance,
+            ) {
+                self.active.workspace_ui.cancel_terminal_focus();
+            }
+        }
+    }
+
+    fn pump_primary_pane_activation(&mut self) {
+        let Some(mut pending) = self.pending_primary_pane_activation.take() else {
+            return;
+        };
+        if !workspace_focus_target_matches_runtime(
+            &pending.workspace_id,
+            Some(pending.runtime_instance),
+            &self.active.id,
+            self.active.runtime_instance,
+        ) {
+            if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+                runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Idle;
+            }
+            return;
+        }
+        let materialized = self.active.workspace_ui.mux().is_some_and(|mux| {
+            mux.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|candidate| candidate.id == pending.pane && candidate.session_id.is_some())
+        });
+        observe_primary_pane_materialized(&mut pending, materialized);
+        if primary_pane_materialization_timed_out(&pending, std::time::Instant::now()) {
+            // The targeted restore was processed but never produced a usable PTY. Release the
+            // exact input fence and still let the runtime restore every other valid saved pane.
+            self.pending_pane_focus = None;
+            self.active.workspace_ui.cancel_terminal_focus();
+            pending.phase = PrimaryPaneActivationPhase::WorkspaceRestore;
+        }
+        if pending.phase == PrimaryPaneActivationPhase::Materialization {
+            self.pending_primary_pane_activation = Some(pending);
+            return;
+        }
+        let now = std::time::Instant::now();
+        if pending.delivery_retry.ready_in(now).is_none()
+            && !pending.delivery_retry.restart_if_exhausted_due(now)
+        {
+            if let Some(delay) = pending.delivery_retry.recovery_in(now) {
+                self.egui_ctx.request_repaint_after(delay);
+            }
+            self.pending_primary_pane_activation = Some(pending);
+            return;
+        }
+        let retry_in = pending
+            .delivery_retry
+            .ready_in(now)
+            .expect("recovered primary restore retry is ready");
+        if !retry_in.is_zero() {
+            self.pending_primary_pane_activation = Some(pending);
+            self.egui_ctx.request_repaint_after(retry_in);
+            return;
+        }
+        let Some(command) = primary_pane_activation_command(&pending, materialized) else {
+            self.pending_primary_pane_activation = Some(pending);
+            return;
+        };
+        let was_target_restore = pending.phase == PrimaryPaneActivationPhase::TargetRestore;
+        let was_focus = pending.phase == PrimaryPaneActivationPhase::Focus;
+        let delivered = self.active.runtime.send_command(command).is_ok();
+        if !delivered {
+            if let Some(delay) = pending.delivery_retry.record_failure(now) {
+                self.pending_primary_pane_activation = Some(pending);
+                self.egui_ctx.request_repaint_after(delay);
+            } else {
+                if let Some(delay) = pending.delivery_retry.recovery_in(now) {
+                    self.egui_ctx.request_repaint_after(delay);
+                }
+                self.pending_primary_pane_activation = Some(pending);
+            }
+            return;
+        }
+        pending.delivery_retry.reset();
+        let completed = advance_primary_pane_activation(&mut pending, delivered);
+        if delivered && was_target_restore {
+            pending.materialization_started_at = Some(std::time::Instant::now());
+            self.egui_ctx
+                .request_repaint_after(PRIMARY_PANE_MATERIALIZATION_TIMEOUT);
+        }
+        if delivered && was_focus {
+            self.pending_pane_focus = None;
+        }
+        if !completed {
+            self.pending_primary_pane_activation = Some(pending);
+        } else {
+            self.active.restore_lifecycle = WorkspaceRestoreLifecycle::Delivered;
+        }
+    }
+
+    fn pump_workspace_restore_delivery(&mut self) {
+        let runtime_instances = self
+            .pending_workspace_restore_delivery
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for runtime_instance in runtime_instances {
+            self.pump_one_workspace_restore_delivery(runtime_instance);
+        }
+    }
+
+    fn pump_one_workspace_restore_delivery(&mut self, runtime_instance: u64) {
+        let Some(mut pending) = self
+            .pending_workspace_restore_delivery
+            .remove(&runtime_instance)
         else {
             return;
         };
-        let _ = self
-            .active
-            .runtime
-            .send_command(runtime::RuntimeCommand::FocusPane { pane });
-        self.pending_focus = None;
+        if self.closed_workspaces.contains_key(&pending.workspace_id) {
+            if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+                runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Idle;
+            }
+            return;
+        }
+        let target_is_current = self
+            .runtime_by_instance_mut(pending.runtime_instance)
+            .is_some_and(|runtime| runtime.id == pending.workspace_id);
+        if !target_is_current {
+            if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+                runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Idle;
+            }
+            return;
+        }
+        let now = std::time::Instant::now();
+        if pending.delivery_retry.ready_in(now).is_none()
+            && !pending.delivery_retry.restart_if_exhausted_due(now)
+        {
+            if let Some(delay) = pending.delivery_retry.recovery_in(now) {
+                self.egui_ctx.request_repaint_after(delay);
+            }
+            let _ = stage_workspace_restore_delivery(
+                &mut self.pending_workspace_restore_delivery,
+                pending,
+            );
+            return;
+        }
+        let retry_in = pending
+            .delivery_retry
+            .ready_in(now)
+            .expect("recovered workspace restore retry is ready");
+        if !retry_in.is_zero() {
+            let _ = stage_workspace_restore_delivery(
+                &mut self.pending_workspace_restore_delivery,
+                pending,
+            );
+            self.egui_ctx.request_repaint_after(retry_in);
+            return;
+        }
+        let delivered = self
+            .runtime_by_instance_mut(pending.runtime_instance)
+            .is_some_and(|runtime| {
+                runtime
+                    .runtime
+                    .send_command(pending.command.clone())
+                    .is_ok()
+            });
+        if delivered {
+            if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+                runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Delivered;
+            }
+            if let Some(focus) = self.pending_pane_focus.as_mut()
+                && focus.workspace_id == pending.workspace_id
+                && focus.runtime_instance == pending.runtime_instance
+            {
+                focus.observe_restore_delivery(now);
+                self.egui_ctx
+                    .request_repaint_after(PRIMARY_PANE_MATERIALIZATION_TIMEOUT);
+            }
+            return;
+        }
+        if let Some(delay) = pending.delivery_retry.record_failure(now) {
+            let _ = stage_workspace_restore_delivery(
+                &mut self.pending_workspace_restore_delivery,
+                pending,
+            );
+            self.egui_ctx.request_repaint_after(delay);
+        } else {
+            if let Some(delay) = pending.delivery_retry.recovery_in(now) {
+                self.egui_ctx.request_repaint_after(delay);
+            }
+            let _ = stage_workspace_restore_delivery(
+                &mut self.pending_workspace_restore_delivery,
+                pending,
+            );
+        }
     }
 
     fn poll_turn_done_clear(&mut self) {
@@ -13954,11 +14818,66 @@ impl App {
         }
     }
 
+    fn activate_persisted_session(&mut self, workspace_id: &str, pane: runtime::MuxPaneId) {
+        let is_current = self
+            .persisted_activity_panes
+            .get(workspace_id)
+            .is_some_and(|rows| persisted_pane_is_current(rows, &pane));
+        if !is_current {
+            tracing::warn!(
+                kind = "workspace",
+                phase = "persisted_pane_activation",
+                error_code = "stale_catalog_identity",
+                "persisted pane activation ignored"
+            );
+            return;
+        }
+        self.pending_focus = None;
+        self.switch_workspace_with_preferred_pane(workspace_id, Some(pane));
+    }
+
+    fn activate_active_persisted_pane(&mut self, pane: runtime::MuxPaneId) {
+        // A persisted sidebar row always targets the primary workspace surface. Move App-level
+        // ownership before arming the exact pane so an attached surface cannot retain input.
+        self.cross_workspace_pane.focus_primary();
+        self.cancel_terminal_focus_intents();
+        let runtime_instance = self.active.runtime_instance;
+        self.pending_pane_focus = Some(PendingPaneFocus::new(
+            self.active.id.clone(),
+            runtime_instance,
+            pane.clone(),
+        ));
+        self.active.workspace_ui.arm_terminal_focus(pane.clone());
+        let materialized = self.active.workspace_ui.mux().is_some_and(|mux| {
+            mux.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|candidate| candidate.id == pane && candidate.session_id.is_some())
+        });
+        if should_stage_primary_pane_activation(materialized, self.active.restore_lifecycle)
+            && !self.stage_primary_pane_activation(runtime_instance, pane)
+        {
+            self.pending_pane_focus = None;
+            self.active.workspace_ui.cancel_terminal_focus();
+        }
+    }
+
     fn switch_workspace(&mut self, target_id: &str) {
+        self.switch_workspace_with_preferred_pane(target_id, None);
+    }
+
+    fn switch_workspace_with_preferred_pane(
+        &mut self,
+        target_id: &str,
+        preferred_pane: Option<runtime::MuxPaneId>,
+    ) {
         // 명시적 전환은 종료 숨김 해제 — 사용자가 다시 연 것이다(사이드바 행 클릭·
         // 워크스페이스 순환·알림/에이전트 이동·같은 폴더 재선택 모두 이 경로).
         self.reveal_closed_workspace(target_id);
         if target_id == self.active.id {
+            if let Some(pane) = preferred_pane {
+                self.activate_active_persisted_pane(pane);
+            }
             return;
         }
         self.cancel_all_cross_workspace_restores();
@@ -13987,6 +14906,9 @@ impl App {
             self.egui_ctx.request_repaint();
             return;
         }
+        // The old WorkspaceUi is about to move into the warm pool. Clear its native input fence
+        // before replacement so a canceled persisted-pane activation cannot revive on re-entry.
+        self.cancel_terminal_focus_intents();
         // 대상이 background 정리 중이면 먼저 끝낸다 (같은 window 행 경합 방지 — codex 리뷰).
         self.join_pending_shutdown(target_id);
 
@@ -13998,7 +14920,9 @@ impl App {
         let (mut new_active, needs_restore) = match self.warm.remove(target_id) {
             Some(rt) => {
                 self.warm_order.retain(|id| id != target_id);
-                (rt, false)
+                let needs_restore =
+                    warm_runtime_needs_restore(persisted_restore_exists, rt.restore_lifecycle);
+                (rt, needs_restore)
             }
             None => {
                 // 새 워커는 SessionId를 1부터 다시 시작한다 — 이 workspace의 옛 워커
@@ -14115,7 +15039,9 @@ impl App {
             tracing::warn!("마지막 workspace 저장 실패: {e:#}");
         }
         self.refresh_file_tree_root();
-        if needs_restore {
+        if let Some(pane) = preferred_pane {
+            self.activate_active_persisted_pane(pane);
+        } else if needs_restore {
             self.stage_runtime_restore(self.active.runtime_instance);
         }
         self.egui_ctx.request_repaint();
@@ -14159,10 +15085,12 @@ impl App {
                 if workspace_id != self.active.id {
                     self.switch_workspace(&workspace_id);
                     self.refresh_workspaces();
+                    self.cancel_terminal_focus_intents();
                     self.pending_focus =
                         Some((workspace_id, self.active.runtime_instance, session_id));
                     return;
                 }
+                self.cancel_terminal_focus_intents();
                 let target = runtime::MuxPaneId(pane_id);
                 let tab = self
                     .active
@@ -14182,10 +15110,16 @@ impl App {
                             .runtime
                             .send_command(runtime::RuntimeCommand::SelectTab { tab });
                     }
-                    let _ = self
+                    if self
                         .active
                         .runtime
-                        .send_command(runtime::RuntimeCommand::FocusPane { pane: target });
+                        .send_command(runtime::RuntimeCommand::FocusPane {
+                            pane: target.clone(),
+                        })
+                        .is_ok()
+                    {
+                        self.active.workspace_ui.arm_terminal_focus(target);
+                    }
                 }
             }
             ui::agent_sessions::AgentSessionsRequest::InterruptPty(AgentSurfaceId::Pty {
@@ -15101,6 +16035,10 @@ impl App {
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
     /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
     fn close_workspace_sessions(&mut self, workspace_id: &str) {
+        // A Catalog/explicit restore can still be waiting behind dotenv or bounded command
+        // delivery while the mux is empty. Drop every local restore owner before deriving the
+        // panes to close, otherwise its late completion can recreate a just-closed workspace.
+        self.cancel_workspace_restore_intents(workspace_id);
         let sent_restore_pane = remove_workspace_cross_workspace_layouts(
             &mut self.cross_workspace_pane,
             &mut self.parked_cross_workspace_panes,
@@ -15117,9 +16055,13 @@ impl App {
             self.frame_terminal_owner = FrameTerminalOwner::None;
             self.last_multi_pane_terminal_rect = None;
             self.sync_attached_runtime_visibility();
+            // Reject UI protocol work that has not yet crossed the dotenv boundary. In
+            // particular, a queued split/spawn must not become a new session after close.
+            Self::drain_closing_workspace_protocol_intents(&mut self.active);
+            self.close_approval_workspace(workspace_id);
             // 활성: 전 pane을 확인 없이 즉시 닫는다(확인은 모달이 이미 했다). 워크스
             // 페이스는 활성인 채 빈 상태로 남는다 — 바로 새 셸을 열 수 있다.
-            let panes: Vec<runtime::MuxPaneId> = self
+            let mut panes: Vec<runtime::MuxPaneId> = self
                 .active
                 .workspace_ui
                 .mux()
@@ -15130,6 +16072,15 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
+            // A restore command can be accepted before its MuxUpdated arrives. Closing the
+            // workspace must therefore close persisted lazy panes too, not only the current
+            // snapshot, so FIFO restore/close delivery cannot leave a newly materialized shell.
+            if let Some(persisted) = self.persisted_activity_panes.get(workspace_id) {
+                extend_unique_pane_ids(
+                    &mut panes,
+                    persisted.iter().map(|row| row.pane_id.as_str()),
+                );
+            }
             tracing::info!(
                 workspace = %workspace_id,
                 panes = panes.len(),
@@ -15176,6 +16127,15 @@ impl App {
                     && !panes.contains(&pane)
                 {
                     panes.push(pane);
+                }
+                // A full RestoreWorkspace may already be accepted while this runtime's mux
+                // projection is stale. Close every persisted lazy pane after the restore in the
+                // same FIFO before shutdown so the workspace cannot be recreated behind us.
+                if let Some(persisted) = self.persisted_activity_panes.get(workspace_id) {
+                    extend_unique_pane_ids(
+                        &mut panes,
+                        persisted.iter().map(|row| row.pane_id.as_str()),
+                    );
                 }
                 tracing::info!(
                     workspace = %workspace_id,
@@ -15258,16 +16218,148 @@ impl App {
         self.request_dotenv_sync(true);
     }
 
-    fn stage_runtime_restore(&mut self, runtime_instance: u64) {
+    fn ensure_active_runtime_restore(&mut self) {
+        let has_panes = self
+            .persisted_activity_panes
+            .get(&self.active.id)
+            .is_some_and(|panes| !panes.is_empty());
+        if should_restore_active_workspace(
+            self.closed_workspaces.contains_key(&self.active.id),
+            has_panes,
+            self.active.restore_lifecycle,
+        ) {
+            self.stage_runtime_restore(self.active.runtime_instance);
+        } else if !has_panes
+            && self.bench.is_none()
+            && self.perf_harness_next.is_none()
+            && self.startup_deferred_dotenv_continuations.is_empty()
+        {
+            self.offer_agent_launcher_for_active();
+        }
+    }
+
+    fn cancel_workspace_restore_intents(&mut self, workspace_id: &str) {
+        let operation_ids = self
+            .dotenv_pending_operations
+            .iter()
+            .filter_map(|(operation_id, pending)| {
+                (pending.workspace_id == workspace_id
+                    && dotenv_continuation_must_cancel_on_workspace_close(&pending.continuation))
+                .then_some(*operation_id)
+            })
+            .collect::<Vec<_>>();
+        for operation_id in operation_ids {
+            let Some(pending) = self.dotenv_pending_operations.remove(&operation_id) else {
+                continue;
+            };
+            self.dotenv_pending_bytes = self
+                .dotenv_pending_bytes
+                .checked_sub(pending.retained_bytes)
+                .expect("dotenv pending byte ledger is balanced");
+            match pending.continuation {
+                PendingDotenvContinuation::WorkspaceProtocol {
+                    operation,
+                    generation,
+                    ..
+                } => {
+                    if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+                        runtime.workspace_ui.complete_protocol(
+                            ui::workspace::WorkspaceProtocolCompletion {
+                                operation,
+                                generation,
+                                result: Err(
+                                    ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed,
+                                ),
+                            },
+                        );
+                    }
+                }
+                PendingDotenvContinuation::AgentLaunch {
+                    approval_ticket,
+                    launcher_request_id,
+                    ..
+                } => {
+                    if let Some(ticket_id) = approval_ticket {
+                        self.approval_launch_tracker.cancel(ticket_id);
+                    }
+                    self.agents_ui
+                        .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+                    if let Some(request_id) = launcher_request_id {
+                        self.fail_agent_launcher_request(request_id);
+                    }
+                }
+                PendingDotenvContinuation::RuntimeCommand(_)
+                | PendingDotenvContinuation::PrimaryPaneActivation { .. } => {}
+            }
+        }
+
+        let mut retained = std::collections::VecDeque::with_capacity(
+            self.startup_deferred_dotenv_continuations.len(),
+        );
+        let mut canceled = Vec::new();
+        while let Some(pending) = self.startup_deferred_dotenv_continuations.pop_front() {
+            if pending.workspace_id == workspace_id {
+                self.dotenv_pending_bytes = self
+                    .dotenv_pending_bytes
+                    .checked_sub(pending.retained_bytes)
+                    .expect("dotenv pending byte ledger is balanced");
+                canceled.push((pending.runtime_instance, pending.continuation));
+            } else {
+                retained.push_back(pending);
+            }
+        }
+        self.startup_deferred_dotenv_continuations = retained;
+        for (runtime_instance, continuation) in canceled {
+            self.fail_startup_deferred_dotenv_continuation(runtime_instance, continuation);
+        }
+
         if self
+            .pending_primary_pane_activation
+            .as_ref()
+            .is_some_and(|pending| pending.workspace_id == workspace_id)
+        {
+            self.pending_primary_pane_activation = None;
+        }
+        self.pending_workspace_restore_delivery
+            .retain(|_, pending| pending.workspace_id != workspace_id);
+        if self
+            .pending_pane_focus
+            .as_ref()
+            .is_some_and(|pending| pending.workspace_id == workspace_id)
+        {
+            self.pending_pane_focus = None;
+        }
+        if self
+            .pending_focus
+            .as_ref()
+            .is_some_and(|(pending_workspace, _, _)| pending_workspace == workspace_id)
+        {
+            self.pending_focus = None;
+        }
+        if let Some(runtime) = if self.active.id == workspace_id {
+            Some(&mut self.active)
+        } else {
+            self.warm.get_mut(workspace_id)
+        } {
+            runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Idle;
+            runtime.workspace_ui.cancel_terminal_focus();
+        }
+    }
+
+    fn stage_runtime_restore(&mut self, runtime_instance: u64) -> bool {
+        let admitted = self
             .stage_dotenv_continuation(
                 runtime_instance,
                 PendingDotenvContinuation::RuntimeCommand(
                     runtime::RuntimeCommand::RestoreWorkspace,
                 ),
             )
-            .is_err()
-        {
+            .is_ok();
+        if admitted {
+            if let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) {
+                runtime.restore_lifecycle = WorkspaceRestoreLifecycle::AwaitingDelivery;
+            }
+        } else {
             tracing::warn!(
                 kind = "workspace",
                 phase = "restore_admission",
@@ -15275,6 +16367,51 @@ impl App {
                 "workspace restore failed closed"
             );
         }
+        admitted
+    }
+
+    fn stage_primary_pane_activation(
+        &mut self,
+        runtime_instance: u64,
+        pane: runtime::MuxPaneId,
+    ) -> bool {
+        self.primary_pane_activation_generation = self
+            .primary_pane_activation_generation
+            .wrapping_add(1)
+            .max(1);
+        let generation = self.primary_pane_activation_generation;
+        self.pending_primary_pane_activation = Some(PendingPrimaryPaneActivation {
+            workspace_id: self.active.id.clone(),
+            runtime_instance,
+            pane: pane.clone(),
+            generation,
+            phase: PrimaryPaneActivationPhase::Dotenv,
+            materialization_started_at: None,
+            delivery_retry: RuntimeDeliveryRetry::default(),
+        });
+        let admitted = self
+            .stage_dotenv_continuation(
+                runtime_instance,
+                PendingDotenvContinuation::PrimaryPaneActivation {
+                    command: runtime::RuntimeCommand::RestoreWorkspacePane { pane },
+                    generation,
+                },
+            )
+            .is_ok();
+        if admitted {
+            if let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) {
+                runtime.restore_lifecycle = WorkspaceRestoreLifecycle::AwaitingDelivery;
+            }
+        } else {
+            self.pending_primary_pane_activation = None;
+            tracing::warn!(
+                kind = "workspace",
+                phase = "primary_restore_admission",
+                error_code = "backpressure",
+                "primary workspace pane activation failed closed"
+            );
+        }
+        admitted
     }
 
     /// 설정 창에서 선택한 workspace의 `.env` 동기화를 bounded worker에 제출한다.
@@ -15345,9 +16482,62 @@ impl App {
         runtime_instance: u64,
         mut continuation: PendingDotenvContinuation,
     ) -> Result<(), Box<PendingDotenvContinuation>> {
-        if self.dotenv_pending_operations.len()
-            >= crate::dotenv_sync::DOTENV_WORKER_CONTINUATION_MAX
-        {
+        let restore_lifecycle = self
+            .runtime_by_instance(runtime_instance)
+            .map_or(WorkspaceRestoreLifecycle::Idle, |runtime| {
+                runtime.restore_lifecycle
+            });
+        if startup_catalog_blocks_session_creation(
+            &self.catalog_startup_recovery,
+            restore_lifecycle,
+            dotenv_continuation_command(&continuation),
+            self.bench.is_some() || self.perf_harness_next.is_some(),
+        ) {
+            if !dotenv_continuation_retention_has_slot(
+                self.dotenv_pending_operations.len(),
+                self.startup_deferred_dotenv_continuations.len(),
+                !self.catalog_startup_recovery.settled,
+            ) {
+                return Err(Box::new(continuation));
+            }
+            let Ok(retained_bytes) = prepare_dotenv_continuation_retention(&mut continuation)
+            else {
+                return Err(Box::new(continuation));
+            };
+            let Ok(pending_bytes) = runtime::checked_runtime_command_retention_total(
+                self.dotenv_pending_bytes,
+                retained_bytes,
+            ) else {
+                return Err(Box::new(continuation));
+            };
+            let Some(workspace_id) = self
+                .runtime_by_instance(runtime_instance)
+                .map(|runtime| runtime.id.clone())
+            else {
+                return Err(Box::new(continuation));
+            };
+            tracing::info!(
+                kind = "workspace",
+                phase = "startup_restore_admission",
+                "session creation deferred until startup restore decision"
+            );
+            self.startup_deferred_dotenv_continuations.push_back(
+                StartupDeferredDotenvContinuation {
+                    workspace_id,
+                    runtime_instance,
+                    retained_bytes,
+                    restore_wait_observed: false,
+                    continuation,
+                },
+            );
+            self.dotenv_pending_bytes = pending_bytes;
+            return Ok(());
+        }
+        if !dotenv_continuation_retention_has_slot(
+            self.dotenv_pending_operations.len(),
+            self.startup_deferred_dotenv_continuations.len(),
+            false,
+        ) {
             return Err(Box::new(continuation));
         }
         let Ok(retained_bytes) = prepare_dotenv_continuation_retention(&mut continuation) else {
@@ -15368,6 +16558,7 @@ impl App {
         let migrate_legacy = matches!(
             &continuation,
             PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::RestoreWorkspace)
+                | PendingDotenvContinuation::PrimaryPaneActivation { .. }
         );
         let root = self.workspace_tree_root(&workspace_id);
         self.dotenv_next_operation_id = self.dotenv_next_operation_id.wrapping_add(1).max(1);
@@ -15425,6 +16616,117 @@ impl App {
         Ok(())
     }
 
+    fn pump_startup_deferred_dotenv_continuations(&mut self) {
+        if !self.catalog_startup_recovery.settled
+            || self.dotenv_pending_operations.len()
+                >= crate::dotenv_sync::DOTENV_WORKER_CONTINUATION_MAX
+        {
+            return;
+        }
+        let Some(front) = self.startup_deferred_dotenv_continuations.front() else {
+            return;
+        };
+        let workspace_id = front.workspace_id.clone();
+        let runtime_instance = front.runtime_instance;
+        let restore_wait_observed = front.restore_wait_observed;
+        let target_lifecycle = self
+            .runtime_by_instance(runtime_instance)
+            .filter(|runtime| runtime.id == workspace_id)
+            .map(|runtime| runtime.restore_lifecycle);
+        let target_is_current =
+            !self.closed_workspaces.contains_key(&workspace_id) && target_lifecycle.is_some();
+        if target_is_current
+            && target_lifecycle == Some(WorkspaceRestoreLifecycle::AwaitingDelivery)
+        {
+            if let Some(front) = self.startup_deferred_dotenv_continuations.front_mut() {
+                front.restore_wait_observed = true;
+            }
+            return;
+        }
+        let has_persisted_panes = self
+            .persisted_activity_panes
+            .get(&workspace_id)
+            .is_some_and(|panes| !panes.is_empty());
+        if target_is_current
+            && target_lifecycle == Some(WorkspaceRestoreLifecycle::Idle)
+            && has_persisted_panes
+            && !restore_wait_observed
+        {
+            if self.stage_runtime_restore(runtime_instance)
+                && let Some(front) = self.startup_deferred_dotenv_continuations.front_mut()
+            {
+                front.restore_wait_observed = true;
+            } else {
+                // Admission can transiently lose to the bounded worker/result hand-off even
+                // though one aggregate slot is reserved. Keep the user's request and retry from
+                // a one-shot wake rather than requiring unrelated input to revive startup.
+                self.egui_ctx
+                    .request_repaint_after(CATALOG_STARTUP_RETRY_DELAY);
+            }
+            return;
+        }
+        let pending = self
+            .startup_deferred_dotenv_continuations
+            .pop_front()
+            .expect("deferred dotenv continuation front was checked above");
+        self.dotenv_pending_bytes = self
+            .dotenv_pending_bytes
+            .checked_sub(pending.retained_bytes)
+            .expect("dotenv pending byte ledger is balanced");
+        if !target_is_current {
+            self.fail_startup_deferred_dotenv_continuation(
+                pending.runtime_instance,
+                pending.continuation,
+            );
+            return;
+        }
+        if let Err(continuation) =
+            self.stage_dotenv_continuation(pending.runtime_instance, pending.continuation)
+        {
+            self.fail_startup_deferred_dotenv_continuation(pending.runtime_instance, *continuation);
+        }
+    }
+
+    fn fail_startup_deferred_dotenv_continuation(
+        &mut self,
+        runtime_instance: u64,
+        continuation: PendingDotenvContinuation,
+    ) {
+        match continuation {
+            PendingDotenvContinuation::WorkspaceProtocol {
+                operation,
+                generation,
+                ..
+            } => {
+                if let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) {
+                    runtime.workspace_ui.complete_protocol(
+                        ui::workspace::WorkspaceProtocolCompletion {
+                            operation,
+                            generation,
+                            result: Err(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed),
+                        },
+                    );
+                }
+            }
+            PendingDotenvContinuation::AgentLaunch {
+                approval_ticket,
+                launcher_request_id,
+                ..
+            } => {
+                if let Some(ticket_id) = approval_ticket {
+                    self.approval_launch_tracker.cancel(ticket_id);
+                }
+                self.agents_ui
+                    .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+                if let Some(request_id) = launcher_request_id {
+                    self.fail_agent_launcher_request(request_id);
+                }
+            }
+            PendingDotenvContinuation::RuntimeCommand(_)
+            | PendingDotenvContinuation::PrimaryPaneActivation { .. } => {}
+        }
+    }
+
     fn runtime_by_instance(&self, runtime_instance: u64) -> Option<&WorkspaceRuntime> {
         if self.active.runtime_instance == runtime_instance {
             return Some(&self.active);
@@ -15448,12 +16750,37 @@ impl App {
         pending: PendingDotenvOperation,
         outcome: Result<DotenvSyncOutcome, crate::dotenv_sync::DotenvWorkerErrorCode>,
     ) {
+        let primary_activation_current = match &pending.continuation {
+            PendingDotenvContinuation::PrimaryPaneActivation {
+                command: runtime::RuntimeCommand::RestoreWorkspacePane { pane },
+                generation,
+            } => {
+                workspace_focus_target_matches_runtime(
+                    &pending.workspace_id,
+                    Some(pending.runtime_instance),
+                    &self.active.id,
+                    self.active.runtime_instance,
+                ) && primary_pane_activation_is_current(
+                    self.pending_primary_pane_activation.as_ref(),
+                    &pending.workspace_id,
+                    pending.runtime_instance,
+                    pane,
+                    *generation,
+                )
+            }
+            _ => false,
+        };
         let restore_pane = match &pending.continuation {
             PendingDotenvContinuation::RuntimeCommand(
                 runtime::RuntimeCommand::RestoreWorkspacePane { pane },
             ) => Some(pane.clone()),
             _ => None,
         };
+        let full_restore_continuation = matches!(
+            &pending.continuation,
+            PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::RestoreWorkspace)
+        );
+        let restore_lifetime = full_restore_continuation || primary_activation_current;
         let current_root = self.workspace_tree_root(&pending.workspace_id);
         let outcome = outcome.ok().filter(|outcome| {
             outcome.workspace_id == pending.workspace_id
@@ -15480,6 +16807,22 @@ impl App {
             _ => None,
         };
         let Some(outcome) = outcome else {
+            if restore_lifetime
+                && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
+            {
+                runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Idle;
+            }
+            if primary_activation_current {
+                self.pending_primary_pane_activation = None;
+                self.pending_pane_focus = None;
+                self.active.workspace_ui.cancel_terminal_focus();
+            }
+            if full_restore_continuation {
+                self.cancel_pending_pane_focus_for_restore(
+                    &pending.workspace_id,
+                    pending.runtime_instance,
+                );
+            }
             if let PendingDotenvContinuation::WorkspaceProtocol {
                 operation,
                 generation,
@@ -15569,6 +16912,17 @@ impl App {
             .then(|| self.next_restore_barrier.allocate())
             .flatten();
         let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) else {
+            if primary_activation_current {
+                self.pending_primary_pane_activation = None;
+                self.pending_pane_focus = None;
+                self.active.workspace_ui.cancel_terminal_focus();
+            }
+            if full_restore_continuation {
+                self.cancel_pending_pane_focus_for_restore(
+                    &pending.workspace_id,
+                    pending.runtime_instance,
+                );
+            }
             if let Some(ticket_id) = agent_ticket {
                 self.approval_launch_tracker.cancel(ticket_id);
             }
@@ -15608,7 +16962,7 @@ impl App {
             runtime.dotenv_state = Some(baseline);
         }
         let policy_delivered = env_delivered && runtime.runtime.send_command(cache_policy).is_ok();
-        let (delivered, restore_delivery) = match pending.continuation {
+        let (delivered, restore_delivery, queue_full_restore) = match pending.continuation {
             PendingDotenvContinuation::WorkspaceProtocol {
                 operation,
                 generation,
@@ -15624,7 +16978,7 @@ impl App {
                             .ok_or(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed),
                     },
                 );
-                (delivered, None)
+                (delivered, None, false)
             }
             PendingDotenvContinuation::RuntimeCommand(
                 runtime::RuntimeCommand::RestoreWorkspacePane { pane },
@@ -15640,14 +16994,64 @@ impl App {
                 (
                     matches!(delivery, RestoreBarrierDelivery::BarrierArmed(_)),
                     Some(delivery),
+                    false,
                 )
+            }
+            PendingDotenvContinuation::PrimaryPaneActivation { command, .. } => {
+                let runtime::RuntimeCommand::RestoreWorkspacePane { pane } = command else {
+                    unreachable!("primary activation retains exactly one pane restore")
+                };
+                let _ = pane;
+                (policy_delivered && primary_activation_current, None, false)
+            }
+            PendingDotenvContinuation::RuntimeCommand(
+                runtime::RuntimeCommand::RestoreWorkspace,
+            ) => {
+                // Dotenv and cache policy have been delivered. The actual full restore uses the
+                // same bounded retry map as canceled targeted activations so transient command
+                // backpressure cannot permanently skip startup restore.
+                (false, None, policy_delivered)
             }
             PendingDotenvContinuation::RuntimeCommand(command)
             | PendingDotenvContinuation::AgentLaunch { command, .. } => (
                 policy_delivered && runtime.runtime.send_command(command).is_ok(),
                 None,
+                false,
             ),
         };
+        if restore_lifetime {
+            runtime.restore_lifecycle = if queue_full_restore {
+                WorkspaceRestoreLifecycle::AwaitingDelivery
+            } else {
+                restore_lifecycle_after_dotenv_delivery(
+                    primary_activation_current,
+                    full_restore_continuation,
+                    delivered,
+                )
+            };
+        }
+        let full_restore_queued = queue_full_restore
+            && stage_workspace_restore_delivery(
+                &mut self.pending_workspace_restore_delivery,
+                PendingWorkspaceRestoreDelivery::new(
+                    pending.workspace_id.clone(),
+                    pending.runtime_instance,
+                ),
+            );
+        if full_restore_queued {
+            // The dotenv worker wake is being consumed by this logic tick, after the restore
+            // delivery pump already ran. Schedule the newly queued restore for the next tick.
+            self.egui_ctx.request_repaint();
+        }
+        if queue_full_restore && !full_restore_queued {
+            if let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) {
+                runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Idle;
+            }
+            self.cancel_pending_pane_focus_for_restore(
+                &pending.workspace_id,
+                pending.runtime_instance,
+            );
+        }
         if let Some(pane) = restore_pane.as_ref() {
             self.finish_cross_workspace_restore_dotenv(
                 pending.runtime_instance,
@@ -15655,7 +17059,13 @@ impl App {
                 restore_delivery.unwrap_or(RestoreBarrierDelivery::NotSent),
             );
         }
-        if delivered {
+        if delivered
+            && primary_activation_current
+            && let Some(activation) = self.pending_primary_pane_activation.as_mut()
+        {
+            activation.phase = PrimaryPaneActivationPhase::TargetRestore;
+        }
+        if delivered || full_restore_queued {
             self.invalidate_env_profile_ui();
             self.credentials_ui.invalidate_cache();
             self.invalidate_env_api_projects();
@@ -15663,7 +17073,29 @@ impl App {
                 self.agents_ui.mark_launch_accepted();
                 self.reveal_active_workspace_for_new_session();
             }
+            if delivered && restore_lifetime && !primary_activation_current {
+                let now = std::time::Instant::now();
+                if let Some(focus) = self.pending_pane_focus.as_mut()
+                    && focus.workspace_id == pending.workspace_id
+                    && focus.runtime_instance == pending.runtime_instance
+                {
+                    focus.observe_restore_delivery(now);
+                    self.egui_ctx
+                        .request_repaint_after(PRIMARY_PANE_MATERIALIZATION_TIMEOUT);
+                }
+            }
         } else {
+            if primary_activation_current {
+                self.pending_primary_pane_activation = None;
+                self.pending_pane_focus = None;
+                self.active.workspace_ui.cancel_terminal_focus();
+            }
+            if full_restore_continuation {
+                self.cancel_pending_pane_focus_for_restore(
+                    &pending.workspace_id,
+                    pending.runtime_instance,
+                );
+            }
             if let Some(ticket_id) = agent_ticket {
                 self.approval_launch_tracker.cancel(ticket_id);
             }
@@ -17495,11 +18927,13 @@ impl App {
             tracing::warn!("삭제 워크스페이스 UI 숨김 표식 정리 저장 실패: {error:#}");
         }
         self.request_agent_state_scope();
-        if self.agent_state_scope_ready() {
-            self.stage_agent_state_projection(
+        if self.agent_state_scope_ready()
+            && !self.stage_agent_state_projection(
                 crate::agent_state_worker::AgentStateSection::Catalog,
                 AppAgentStateProjectionKind::Catalog,
-            );
+            )
+        {
+            self.handle_catalog_startup_failure();
         }
         // 워크스페이스 목록/이름/경로가 바뀌었을 수 있다 — env/API 프로젝트 행 캐시 무효화.
         self.invalidate_env_api_projects();
@@ -19774,6 +21208,8 @@ impl eframe::App for App {
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
         self.poll_agent_state_worker();
+        self.pump_workspace_restore_delivery();
+        self.pump_startup_deferred_dotenv_continuations();
         if let Some(intent) = self.pending_status_bar_intent.take() {
             self.dispatch_status_bar_intent(Some(intent), ctx);
         }
@@ -20103,6 +21539,10 @@ impl eframe::App for App {
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
+        let primary_activation_post_render_tick = primary_activation_needs_post_render_tick(
+            self.pending_primary_pane_activation.as_ref(),
+            &new_events,
+        );
         if apply_unattached_events(&mut self.unattached_counts, &self.active.id, &new_events) {
             invalidate_resource_projection(&mut self.activity_rows_cache);
         }
@@ -20178,6 +21618,11 @@ impl eframe::App for App {
             // 이미 subscribe_runtime_events의 wake로 리페인트를 요청했다. 재요청하면 이번
             // 프레임이 그리는 내용을 위해 프레임을 한 장 더 잡고, egui가 거기에 settle 프레임을
             // 하나 더 붙여 갱신 1회당 3프레임이 된다 (agenttui 실측: 페인트의 70%가 헛 프레임).
+        }
+        if primary_activation_post_render_tick {
+            // WorkspaceUi consumes MuxUpdated in ui(), after this logic pass. Wake one more tick
+            // so the activation state machine observes the materialized exact pane immediately.
+            ctx.request_repaint();
         }
         if let Some(outcome) = active_restore_barrier {
             self.apply_cross_workspace_restore_barrier(outcome);
@@ -20970,6 +22415,16 @@ impl eframe::App for App {
                         WorkspaceControllerAction::SwitchWorkspace(workspace_id),
                     );
                 }
+                Some(ui::file_tree::SidebarAction::ActivatePersistedSession {
+                    workspace_id,
+                    pane,
+                }) => {
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    self.stage_workspace_controller_action(
+                        WorkspaceControllerAction::ActivatePersistedSession { workspace_id, pane },
+                    );
+                }
                 Some(ui::file_tree::SidebarAction::ShowHome) => {
                     // 재클릭 토글 — 이미 홈이면 터미널로 복귀 (2026-07-18 확정 디자인).
                     self.agent_terminal_ui.set_view(
@@ -21417,6 +22872,7 @@ impl eframe::App for App {
             Vec::new()
         };
         let mut primary_focus_requested = false;
+        let mut primary_local_focus_claim = None;
         let mut attached_focus_requested = None;
         let mut attached_detach_requested = None;
         let mut attached_reorder_requested = None;
@@ -21782,7 +23238,7 @@ impl eframe::App for App {
                             .id_salt("cross_workspace_primary"),
                     );
                     primary.set_clip_rect(primary_rect.intersect(ui.clip_rect()));
-                    primary_focus_requested = self
+                    let primary_output = self
                         .active
                         .workspace_ui
                         .show_with_input(
@@ -21791,8 +23247,9 @@ impl eframe::App for App {
                             &events,
                             &text,
                             current_owner == FrameTerminalOwner::Primary,
-                        )
-                        .focus_requested;
+                        );
+                    primary_focus_requested = primary_output.focus_requested;
+                    primary_local_focus_claim = primary_output.local_focus_claimed;
                     if let Some(label) = session_drop_label.as_deref()
                         && dropped_session_open.is_none()
                     {
@@ -21808,9 +23265,12 @@ impl eframe::App for App {
                 } else {
                     current_owner = FrameTerminalOwner::Primary;
                     let primary_rect = ui.available_rect_before_wrap();
-                    self.active
+                    let primary_output = self
+                        .active
                         .workspace_ui
                         .show(ui, &self.config.terminal, &events, &text);
+                    primary_focus_requested = primary_output.focus_requested;
+                    primary_local_focus_claim = primary_output.local_focus_claimed;
                     if let Some(label) = session_drop_label.as_deref() {
                         dropped_session_open = session_pane_drop_interaction(
                             ui,
@@ -21853,10 +23313,21 @@ impl eframe::App for App {
                 .cross_workspace_pane
                 .reorder(reorder.attachment_id, reorder.destination_index);
         }
+        let terminal_focus_claim_owner = terminal_focus_claim_owner(
+            current_owner,
+            primary_focus_requested,
+            attached_focus_requested,
+        );
         if let Some(attachment_id) = attached_focus_requested {
             let _ = self.cross_workspace_pane.focus_attachment(attachment_id);
         } else if primary_focus_requested {
             self.cross_workspace_pane.focus_primary();
+        }
+        if let Some(pane) = primary_local_focus_claim {
+            // A click on the pane already focused by the runtime produces no FocusPane command,
+            // but it is still a newer user navigation event than an asynchronous restore.
+            self.cancel_terminal_focus_intents();
+            self.active.workspace_ui.arm_terminal_focus(pane);
         }
         if let Some(attachment_id) = attached_detach_requested {
             self.stage_workspace_controller_action(WorkspaceControllerAction::DetachWorkspacePane(
@@ -22008,11 +23479,11 @@ impl eframe::App for App {
             }
             None => {}
         }
-        let primary_terminal_focus_claimed = (self.frame_terminal_owner
+        let primary_terminal_focus_claimed = (terminal_focus_claim_owner
             == FrameTerminalOwner::Primary)
             && self.active.workspace_ui.take_terminal_focus_claimed();
         let attached_terminal_focus_claimed =
-            owner_attached_target(self.frame_terminal_owner, &self.cross_workspace_pane)
+            owner_attached_target(terminal_focus_claim_owner, &self.cross_workspace_pane)
                 .cloned()
                 .and_then(|target| {
                     self.warm.get_mut(&target.workspace_id).map(|runtime| {
@@ -24515,6 +25986,758 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    #[test]
+    fn catalog_restore_stages_only_when_needed() {
+        assert!(should_stage_catalog_restore(
+            true,
+            WorkspaceRestoreLifecycle::Idle
+        ));
+        assert!(!should_stage_catalog_restore(
+            false,
+            WorkspaceRestoreLifecycle::Idle
+        ));
+        assert!(!should_stage_catalog_restore(
+            true,
+            WorkspaceRestoreLifecycle::AwaitingDelivery
+        ));
+        assert!(!should_stage_catalog_restore(
+            true,
+            WorkspaceRestoreLifecycle::Delivered
+        ));
+    }
+
+    #[test]
+    fn startup_catalog_decision_blocks_only_session_creating_commands() {
+        let pending = CatalogStartupRecovery::default();
+        let mut settled = pending;
+        settled.on_success();
+
+        assert!(startup_catalog_blocks_session_creation(
+            &pending,
+            WorkspaceRestoreLifecycle::Idle,
+            &runtime::RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1_000,
+            },
+            false,
+        ));
+        assert!(!startup_catalog_blocks_session_creation(
+            &pending,
+            WorkspaceRestoreLifecycle::Idle,
+            &runtime::RuntimeCommand::RestoreWorkspace,
+            false,
+        ));
+        assert!(!startup_catalog_blocks_session_creation(
+            &settled,
+            WorkspaceRestoreLifecycle::Idle,
+            &runtime::RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1_000,
+            },
+            false,
+        ));
+        assert!(startup_catalog_blocks_session_creation(
+            &settled,
+            WorkspaceRestoreLifecycle::AwaitingDelivery,
+            &runtime::RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1_000,
+            },
+            false,
+        ));
+        assert!(!startup_catalog_blocks_session_creation(
+            &pending,
+            WorkspaceRestoreLifecycle::Idle,
+            &runtime::RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1_000,
+            },
+            true,
+        ));
+
+        let source = include_str!("app.rs");
+        let admission = source
+            .split_once("fn stage_dotenv_continuation")
+            .unwrap()
+            .1
+            .split_once("fn runtime_by_instance")
+            .unwrap()
+            .0;
+        assert!(admission.contains("startup_catalog_blocks_session_creation"));
+
+        let maximum = crate::dotenv_sync::DOTENV_WORKER_CONTINUATION_MAX;
+        assert!(dotenv_continuation_retention_has_slot(0, maximum - 2, true));
+        assert!(!dotenv_continuation_retention_has_slot(
+            0,
+            maximum - 1,
+            true
+        ));
+        assert!(dotenv_continuation_retention_has_slot(
+            maximum - 1,
+            0,
+            false
+        ));
+        assert!(!dotenv_continuation_retention_has_slot(maximum, 0, false));
+    }
+
+    #[test]
+    fn startup_blocked_session_creation_is_retained_and_replayed_after_restore() {
+        let deferred = StartupDeferredDotenvContinuation {
+            workspace_id: "workspace-a".to_owned(),
+            runtime_instance: 7,
+            retained_bytes: 0,
+            restore_wait_observed: false,
+            continuation: PendingDotenvContinuation::RuntimeCommand(
+                runtime::RuntimeCommand::SpawnShell {
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 1_000,
+                },
+            ),
+        };
+        assert_eq!(deferred.workspace_id, "workspace-a");
+        assert_eq!(deferred.runtime_instance, 7);
+        assert!(!deferred.restore_wait_observed);
+        assert!(runtime_command_creates_session(
+            dotenv_continuation_command(&deferred.continuation)
+        ));
+
+        let source = include_str!("app.rs");
+        let admission = source
+            .split_once("fn stage_dotenv_continuation")
+            .unwrap()
+            .1
+            .split_once("fn pump_startup_deferred_dotenv_continuations")
+            .unwrap()
+            .0;
+        assert!(admission.contains("startup_deferred_dotenv_continuations.push_back"));
+        assert!(!admission.contains("session creation deferred until startup restore decision\"\n            );\n            return Err"));
+
+        let logic = source
+            .split_once("fn logic(&mut self, ctx: &egui::Context")
+            .unwrap()
+            .1
+            .split_once("fn ui(&mut self, ctx: &egui::Context")
+            .unwrap()
+            .0;
+        let restore = logic
+            .find("self.pump_workspace_restore_delivery();")
+            .unwrap();
+        let replay = logic
+            .find("self.pump_startup_deferred_dotenv_continuations();")
+            .unwrap();
+        assert!(restore < replay);
+
+        let replay_impl = source
+            .split_once("fn pump_startup_deferred_dotenv_continuations")
+            .unwrap()
+            .1
+            .split_once("fn fail_startup_deferred_dotenv_continuation")
+            .unwrap()
+            .0;
+        assert!(replay_impl.contains("has_persisted_panes"));
+        assert!(replay_impl.contains("stage_runtime_restore(runtime_instance)"));
+        assert!(replay_impl.contains("request_repaint_after(CATALOG_STARTUP_RETRY_DELAY)"));
+        assert!(replay_impl.contains("pop_front()"));
+    }
+
+    #[test]
+    fn startup_restore_is_driven_after_catalog_apply() {
+        let source = include_str!("app.rs");
+        let constructor_tail = source
+            .split_once("app.sync_agent_hooks();")
+            .unwrap()
+            .1
+            .split_once("// 시작 시 config가 remote")
+            .unwrap()
+            .0;
+        assert!(!constructor_tail.contains("persisted_activity_panes"));
+        let catalog_arm = source
+            .split_once("AgentStateSection::Catalog =>")
+            .unwrap()
+            .1
+            .split_once("AgentStateSection::ResumeProbe")
+            .unwrap()
+            .0;
+        assert!(catalog_arm.contains("ensure_active_runtime_restore"));
+
+        let catalog_restore = source
+            .split_once("fn ensure_active_runtime_restore(&mut self)")
+            .unwrap()
+            .1
+            .split_once("fn stage_runtime_restore")
+            .unwrap()
+            .0;
+        assert!(catalog_restore.contains("stage_runtime_restore"));
+        assert!(!catalog_restore.contains("stage_primary_pane_activation"));
+    }
+
+    #[test]
+    fn newer_explicit_focus_cancels_all_older_focus_intents() {
+        let mut pending_session = Some(("workspace-a".to_owned(), 7, runtime::SessionId(9)));
+        let mut pending_pane = Some(PendingPaneFocus::new(
+            "workspace-a".to_owned(),
+            7,
+            runtime::MuxPaneId("pane-stale".to_owned()),
+        ));
+
+        cancel_pending_focus_intents(&mut pending_session, &mut pending_pane);
+
+        assert!(pending_session.is_none());
+        assert!(pending_pane.is_none());
+    }
+
+    #[test]
+    fn reused_full_restore_focus_deadline_starts_only_after_restore_delivery() {
+        let mut pending = PendingPaneFocus::new(
+            "workspace-a".to_owned(),
+            7,
+            runtime::MuxPaneId("pane-exact".to_owned()),
+        );
+        let late = std::time::Instant::now() + PRIMARY_PANE_MATERIALIZATION_TIMEOUT;
+
+        assert!(!pending.materialization_timed_out(late));
+        pending.observe_restore_delivery(late);
+        assert!(!pending.materialization_timed_out(late));
+        assert!(pending.materialization_timed_out(late + PRIMARY_PANE_MATERIALIZATION_TIMEOUT));
+    }
+
+    #[test]
+    fn superseding_focus_keeps_the_remaining_workspace_restore_phase() {
+        assert_eq!(
+            primary_activation_after_focus_cancel(PrimaryPaneActivationPhase::Dotenv),
+            None
+        );
+        assert_eq!(
+            primary_activation_after_focus_cancel(PrimaryPaneActivationPhase::TargetRestore),
+            None
+        );
+        assert_eq!(
+            primary_activation_after_focus_cancel(PrimaryPaneActivationPhase::Materialization),
+            Some(PrimaryPaneActivationPhase::WorkspaceRestore)
+        );
+        assert_eq!(
+            primary_activation_after_focus_cancel(PrimaryPaneActivationPhase::Focus),
+            Some(PrimaryPaneActivationPhase::WorkspaceRestore)
+        );
+        assert_eq!(
+            primary_activation_after_focus_cancel(PrimaryPaneActivationPhase::WorkspaceRestore),
+            Some(PrimaryPaneActivationPhase::WorkspaceRestore)
+        );
+    }
+
+    #[test]
+    fn startup_catalog_failure_retries_bounded_then_offers_launcher() {
+        let mut recovery = CatalogStartupRecovery::default();
+        let mut now = std::time::Instant::now();
+        for failure in 1..CATALOG_STARTUP_RETRY_LIMIT {
+            assert_eq!(
+                recovery.on_failure(now),
+                CatalogStartupRecoveryAction::Retry
+            );
+            assert_eq!(recovery.failures, failure);
+            now += CATALOG_STARTUP_RETRY_DELAY;
+            assert!(recovery.take_retry_due(now));
+        }
+        assert_eq!(
+            recovery.on_failure(now),
+            CatalogStartupRecoveryAction::OfferLauncher
+        );
+        assert_eq!(
+            recovery.on_failure(now),
+            CatalogStartupRecoveryAction::Settled
+        );
+    }
+
+    #[test]
+    fn startup_catalog_stage_and_completion_failures_share_the_same_recovery() {
+        let source = include_str!("app.rs");
+        let refresh = source
+            .split_once("fn refresh_workspaces(&mut self)")
+            .unwrap()
+            .1
+            .split_once("const PRESSURE_TTL")
+            .unwrap()
+            .0;
+        assert!(refresh.contains("handle_catalog_startup_failure"));
+
+        let projection_error = source
+            .split_once("fn poll_agent_state_worker(&mut self)")
+            .unwrap()
+            .1
+            .split_once("fn poll_agent_detect(&mut self)")
+            .unwrap()
+            .0;
+        assert!(projection_error.contains("handle_catalog_startup_failure"));
+        let scope_transition = projection_error
+            .split_once("self.agent_state_scope = self")
+            .unwrap()
+            .1
+            .split_once("if self.project_name_projection_dirty")
+            .unwrap()
+            .0;
+        assert!(scope_transition.contains("handle_catalog_startup_failure"));
+    }
+
+    #[test]
+    fn primary_activation_generation_rejects_a_late_dotenv_completion() {
+        let activation = PendingPrimaryPaneActivation {
+            workspace_id: "workspace-a".to_owned(),
+            runtime_instance: 7,
+            pane: runtime::MuxPaneId("pane-a".to_owned()),
+            generation: 11,
+            phase: PrimaryPaneActivationPhase::Dotenv,
+            materialization_started_at: None,
+            delivery_retry: RuntimeDeliveryRetry::default(),
+        };
+
+        assert!(primary_pane_activation_is_current(
+            Some(&activation),
+            "workspace-a",
+            7,
+            &runtime::MuxPaneId("pane-a".to_owned()),
+            11,
+        ));
+        assert!(!primary_pane_activation_is_current(
+            Some(&activation),
+            "workspace-a",
+            7,
+            &runtime::MuxPaneId("pane-a".to_owned()),
+            10,
+        ));
+    }
+
+    #[test]
+    fn already_staged_full_restore_is_reused_for_exact_pane_focus() {
+        assert!(should_stage_primary_pane_activation(
+            false,
+            WorkspaceRestoreLifecycle::Idle
+        ));
+        assert!(!should_stage_primary_pane_activation(
+            false,
+            WorkspaceRestoreLifecycle::AwaitingDelivery
+        ));
+        assert!(!should_stage_primary_pane_activation(
+            true,
+            WorkspaceRestoreLifecycle::Idle
+        ));
+        assert!(!should_stage_primary_pane_activation(
+            true,
+            WorkspaceRestoreLifecycle::Delivered
+        ));
+    }
+
+    #[test]
+    fn completed_full_restore_allows_a_failed_pane_to_be_retried() {
+        assert!(should_stage_primary_pane_activation(
+            false,
+            WorkspaceRestoreLifecycle::Delivered
+        ));
+    }
+
+    #[test]
+    fn runtime_delivery_retry_is_delayed_and_strictly_bounded() {
+        let now = std::time::Instant::now();
+        let mut retry = RuntimeDeliveryRetry::default();
+        let mut previous = std::time::Duration::ZERO;
+
+        for failure in 1..RUNTIME_DELIVERY_FAILURE_LIMIT {
+            let delay = retry.record_failure(now).expect("retry remains bounded");
+            assert!(delay >= previous);
+            assert_eq!(retry.ready_in(now), Some(delay));
+            previous = delay;
+            assert_eq!(retry.failures, failure);
+        }
+
+        assert!(retry.record_failure(now).is_none());
+        assert!(retry.ready_in(now).is_none());
+        assert_eq!(retry.failures, RUNTIME_DELIVERY_FAILURE_LIMIT);
+    }
+
+    #[test]
+    fn exhausted_restore_delivery_schedules_recovery_and_rearms_on_that_wake() {
+        let now = std::time::Instant::now();
+        let mut retry = RuntimeDeliveryRetry::default();
+
+        for _ in 0..RUNTIME_DELIVERY_FAILURE_LIMIT {
+            let _ = retry.record_failure(now);
+        }
+
+        assert_eq!(
+            retry.recovery_in(now),
+            Some(RUNTIME_DELIVERY_RECOVERY_DELAY)
+        );
+        assert!(!retry.restart_if_exhausted_due(now));
+        assert!(retry.restart_if_exhausted_due(now + RUNTIME_DELIVERY_RECOVERY_DELAY));
+        assert_eq!(retry.ready_in(now), Some(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn persisted_activation_arms_input_before_async_restore_and_workspace_switch_cancels_it() {
+        let source = include_str!("app.rs");
+        let activation = source
+            .split_once("fn activate_active_persisted_pane")
+            .unwrap()
+            .1
+            .split_once("fn switch_workspace")
+            .unwrap()
+            .0;
+        let arm = activation.find("arm_terminal_focus").unwrap();
+        let async_restore = activation.find("stage_primary_pane_activation").unwrap();
+        assert!(arm < async_restore);
+
+        let switch = source
+            .split_once("fn switch_workspace_with_preferred_pane")
+            .unwrap()
+            .1
+            .split_once("fn cycle_workspace")
+            .unwrap()
+            .0;
+        let cancel = switch.find("cancel_terminal_focus_intents").unwrap();
+        let replace = switch.find("std::mem::replace(&mut self.active").unwrap();
+        assert!(cancel < replace);
+    }
+
+    #[test]
+    fn live_focus_target_requires_the_exact_current_tab_and_materialized_pane() {
+        let tab = runtime::MuxTabId("tab-a".to_owned());
+        let pane = runtime::MuxPaneId("pane-a".to_owned());
+        let mux = runtime::MuxSnapshot {
+            active_tab: Some(tab.clone()),
+            focused_pane: Some(pane.clone()),
+            tabs: vec![runtime::TabSnapshot {
+                id: tab.clone(),
+                title: "tab".to_owned(),
+                panes: vec![runtime::PaneSnapshot {
+                    id: pane.clone(),
+                    title: "pane".to_owned(),
+                    session_id: Some(runtime::SessionId(1)),
+                    persistent_session_id: None,
+                }],
+                layout: runtime::LayoutNode::Pane(pane.clone()),
+            }],
+        };
+
+        assert!(live_pane_target_is_current(&mux, &tab, &pane));
+        assert!(!live_pane_target_is_current(
+            &mux,
+            &runtime::MuxTabId("tab-stale".to_owned()),
+            &pane
+        ));
+        assert!(!live_pane_target_is_current(
+            &mux,
+            &tab,
+            &runtime::MuxPaneId("pane-stale".to_owned())
+        ));
+    }
+
+    #[test]
+    fn every_newer_pty_focus_route_cancels_older_exact_pane_intent() {
+        let source = include_str!("app.rs");
+        let controller_focus = source
+            .split_once("WorkspaceControllerAction::FocusPty {")
+            .unwrap()
+            .1
+            .split_once("WorkspaceControllerAction::OpenStructured")
+            .unwrap()
+            .0;
+        assert!(controller_focus.contains("cancel_terminal_focus_intents"));
+
+        let agents_focus = source
+            .split_once("AgentSessionsRequest::FocusPty(AgentSurfaceId::Pty")
+            .unwrap()
+            .1
+            .split_once("AgentSessionsRequest::InterruptPty")
+            .unwrap()
+            .0;
+        assert!(agents_focus.contains("cancel_terminal_focus_intents"));
+    }
+
+    #[test]
+    fn primary_persisted_pane_activation_retries_each_unsent_command_in_order() {
+        let pane = runtime::MuxPaneId("pane-exact".to_owned());
+        let mut activation = PendingPrimaryPaneActivation {
+            workspace_id: "workspace-a".to_owned(),
+            runtime_instance: 7,
+            pane: pane.clone(),
+            generation: 11,
+            phase: PrimaryPaneActivationPhase::TargetRestore,
+            materialization_started_at: None,
+            delivery_retry: RuntimeDeliveryRetry::default(),
+        };
+
+        assert!(matches!(
+            primary_pane_activation_command(&activation, false),
+            Some(runtime::RuntimeCommand::RestoreWorkspacePane { pane: restored })
+                if restored == pane
+        ));
+        assert!(!advance_primary_pane_activation(&mut activation, false));
+        assert_eq!(
+            activation.phase,
+            PrimaryPaneActivationPhase::TargetRestore,
+            "queue backpressure must retain the exact unsent command"
+        );
+        assert!(!advance_primary_pane_activation(&mut activation, true));
+        assert_eq!(
+            activation.phase,
+            PrimaryPaneActivationPhase::Materialization
+        );
+        assert!(primary_pane_activation_command(&activation, false).is_none());
+
+        observe_primary_pane_materialized(&mut activation, true);
+        assert!(matches!(
+            primary_pane_activation_command(&activation, true),
+            Some(runtime::RuntimeCommand::FocusPane { pane: focused }) if focused == pane
+        ));
+        assert!(!advance_primary_pane_activation(&mut activation, true));
+        assert_eq!(
+            activation.phase,
+            PrimaryPaneActivationPhase::WorkspaceRestore
+        );
+        assert!(matches!(
+            primary_pane_activation_command(&activation, true),
+            Some(runtime::RuntimeCommand::RestoreWorkspace)
+        ));
+        assert!(!advance_primary_pane_activation(&mut activation, false));
+        assert_eq!(
+            activation.phase,
+            PrimaryPaneActivationPhase::WorkspaceRestore
+        );
+        assert!(advance_primary_pane_activation(&mut activation, true));
+    }
+
+    #[test]
+    fn primary_restore_lifecycle_stays_inflight_until_full_restore_delivery() {
+        assert_eq!(
+            restore_lifecycle_after_dotenv_delivery(true, false, true),
+            WorkspaceRestoreLifecycle::AwaitingDelivery
+        );
+        assert_eq!(
+            restore_lifecycle_after_dotenv_delivery(false, true, true),
+            WorkspaceRestoreLifecycle::Delivered
+        );
+        assert_eq!(
+            restore_lifecycle_after_dotenv_delivery(true, false, false),
+            WorkspaceRestoreLifecycle::Idle
+        );
+    }
+
+    #[test]
+    fn closed_workspace_never_admits_an_automatic_catalog_restore() {
+        assert!(!should_restore_active_workspace(
+            true,
+            true,
+            WorkspaceRestoreLifecycle::Idle,
+        ));
+        assert!(should_restore_active_workspace(
+            false,
+            true,
+            WorkspaceRestoreLifecycle::Idle,
+        ));
+    }
+
+    #[test]
+    fn workspace_close_cancels_every_deferred_restore_shape() {
+        assert!(dotenv_continuation_restores_workspace(
+            &PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::RestoreWorkspace,)
+        ));
+        assert!(dotenv_continuation_restores_workspace(
+            &PendingDotenvContinuation::PrimaryPaneActivation {
+                command: runtime::RuntimeCommand::RestoreWorkspacePane {
+                    pane: runtime::MuxPaneId("pane-a".to_owned()),
+                },
+                generation: 1,
+            }
+        ));
+        assert!(!dotenv_continuation_restores_workspace(
+            &PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::SetWorkspaceState(
+                runtime::WorkspaceRuntimeState::Active,
+            ),)
+        ));
+
+        let source = include_str!("app.rs");
+        let close = source
+            .split_once("fn close_workspace_sessions")
+            .unwrap()
+            .1
+            .split_once("fn reveal_closed_workspace")
+            .unwrap()
+            .0;
+        assert!(close.contains("cancel_workspace_restore_intents(workspace_id)"));
+        assert!(close.contains("self.persisted_activity_panes.get(workspace_id)"));
+    }
+
+    #[test]
+    fn workspace_close_cancels_every_deferred_session_creation_shape() {
+        let spawn_shell =
+            PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1_000,
+            });
+        let split = PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::SplitPane {
+            pane: runtime::MuxPaneId("pane-a".to_owned()),
+            direction: runtime::SplitDirection::Horizontal,
+            scrollback_lines: 1_000,
+        });
+        let agent = PendingDotenvContinuation::AgentLaunch {
+            command: runtime::RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1_000,
+                command: "agent".to_owned(),
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            },
+            approval_ticket: Some(1),
+            launcher_request_id: Some(2),
+        };
+        let restore =
+            PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::RestoreWorkspace);
+
+        assert!(dotenv_continuation_must_cancel_on_workspace_close(
+            &spawn_shell
+        ));
+        assert!(dotenv_continuation_must_cancel_on_workspace_close(&split));
+        assert!(dotenv_continuation_must_cancel_on_workspace_close(&agent));
+        assert!(dotenv_continuation_must_cancel_on_workspace_close(&restore));
+
+        let source = include_str!("app.rs");
+        let cancellation = source
+            .split_once("fn cancel_workspace_restore_intents")
+            .unwrap()
+            .1
+            .split_once("fn stage_runtime_restore")
+            .unwrap()
+            .0;
+        assert!(cancellation.contains("approval_launch_tracker.cancel"));
+        assert!(cancellation.contains("fail_agent_launcher_request"));
+        assert!(cancellation.contains("complete_protocol"));
+
+        let close = source
+            .split_once("fn close_workspace_sessions")
+            .unwrap()
+            .1
+            .split_once("fn reveal_closed_workspace")
+            .unwrap()
+            .0;
+        assert!(close.contains("drain_closing_workspace_protocol_intents(&mut self.active)"));
+        assert!(close.contains("close_approval_workspace(workspace_id)"));
+    }
+
+    #[test]
+    fn warm_workspace_close_merges_persisted_panes_missing_from_stale_mux() {
+        let mut panes = vec![runtime::MuxPaneId("pane-visible".to_owned())];
+
+        extend_unique_pane_ids(
+            &mut panes,
+            ["pane-visible", "pane-restored-behind-stale-mux"],
+        );
+
+        assert_eq!(
+            panes,
+            vec![
+                runtime::MuxPaneId("pane-visible".to_owned()),
+                runtime::MuxPaneId("pane-restored-behind-stale-mux".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_primary_materialization_is_bounded_and_allows_full_restore() {
+        let now = std::time::Instant::now();
+        let pending = PendingPrimaryPaneActivation {
+            workspace_id: "workspace-a".to_owned(),
+            runtime_instance: 7,
+            pane: runtime::MuxPaneId("pane-failed".to_owned()),
+            generation: 11,
+            phase: PrimaryPaneActivationPhase::Materialization,
+            materialization_started_at: Some(now - PRIMARY_PANE_MATERIALIZATION_TIMEOUT),
+            delivery_retry: RuntimeDeliveryRetry::default(),
+        };
+
+        assert!(primary_pane_materialization_timed_out(&pending, now));
+    }
+
+    #[test]
+    fn local_focus_protocol_invalidates_an_older_primary_activation() {
+        let source = include_str!("app.rs");
+        let drain = source
+            .split_once("fn drain_workspace_protocol_intents")
+            .unwrap()
+            .1
+            .split_once("fn poll_workspace_protocol_intents")
+            .unwrap()
+            .0;
+        assert!(drain.contains("intent.focus_pane()"));
+        assert!(drain.contains("cancel_terminal_focus_intents"));
+    }
+
+    #[test]
+    fn primary_terminal_click_cancels_restore_focus_then_rearms_the_clicked_pane() {
+        let source = include_str!("app.rs");
+        let render = source
+            .split_once("let mut primary_focus_requested")
+            .unwrap()
+            .1
+            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .unwrap()
+            .0;
+        let claim = render.find("primary_local_focus_claim").unwrap();
+        let cancel = render[claim..]
+            .find("cancel_terminal_focus_intents")
+            .unwrap();
+        let arm = render[claim..].find("arm_terminal_focus").unwrap();
+        assert!(cancel < arm);
+    }
+
+    #[test]
+    fn persisted_primary_activation_takes_cross_workspace_input_ownership_first() {
+        let source = include_str!("app.rs");
+        let activation = source
+            .split_once("fn activate_active_persisted_pane")
+            .unwrap()
+            .1
+            .split_once("fn switch_workspace")
+            .unwrap()
+            .0;
+        let focus_primary = activation
+            .find("self.cross_workspace_pane.focus_primary()")
+            .unwrap();
+        let arm_exact = activation.find("arm_terminal_focus").unwrap();
+
+        assert!(focus_primary < arm_exact);
+    }
+
+    #[test]
+    fn persisted_activation_requires_current_catalog_identity() {
+        let rows = vec![storage::PersistedActivityPane {
+            workspace_id: "workspace-b".to_owned(),
+            pane_id: "pane-exact".to_owned(),
+            title: "Saved".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+        }];
+
+        assert!(persisted_pane_is_current(
+            &rows,
+            &runtime::MuxPaneId("pane-exact".to_owned())
+        ));
+        assert!(!persisted_pane_is_current(
+            &rows,
+            &runtime::MuxPaneId("pane-stale".to_owned())
+        ));
+    }
+
     /// 신선도 계약 표. 창이 통째로 굴러가 지금과 겹치지 않게 된 슬롯만 비운다.
     #[test]
     fn 사용량_수치는_창이_통째로_굴러간_뒤에야_슬롯별로_버려진다() {
@@ -26954,6 +29177,20 @@ mod tests {
             Some(AppTerminalInputTarget::Attached(target))
                 if target == cross_workspace_test_target("workspace-b", 9)
         ));
+    }
+
+    #[test]
+    fn cross_owner_terminal_click_consumes_focus_claim_from_new_owner() {
+        let attachment_id = restoring_attachment_id("workspace-b", "pane-b");
+
+        assert_eq!(
+            terminal_focus_claim_owner(FrameTerminalOwner::Primary, false, Some(attachment_id),),
+            FrameTerminalOwner::Attached(attachment_id)
+        );
+        assert_eq!(
+            terminal_focus_claim_owner(FrameTerminalOwner::Attached(attachment_id), true, None,),
+            FrameTerminalOwner::Primary
+        );
     }
 
     #[test]
@@ -29501,6 +31738,91 @@ mod tests {
         assert!(render_active);
         assert!(!pending_replay_resync);
         assert!(deliveries.is_empty());
+    }
+
+    #[test]
+    fn warm_idle_runtime_with_persisted_panes_requires_restore_on_reactivation() {
+        assert!(warm_runtime_needs_restore(
+            true,
+            WorkspaceRestoreLifecycle::Idle,
+        ));
+        assert!(!warm_runtime_needs_restore(
+            true,
+            WorkspaceRestoreLifecycle::AwaitingDelivery,
+        ));
+        assert!(!warm_runtime_needs_restore(
+            true,
+            WorkspaceRestoreLifecycle::Delivered,
+        ));
+        assert!(!warm_runtime_needs_restore(
+            false,
+            WorkspaceRestoreLifecycle::Idle,
+        ));
+    }
+
+    #[test]
+    fn deferred_workspace_restores_are_keyed_per_runtime_and_strictly_bounded() {
+        let mut pending = std::collections::HashMap::new();
+        for runtime_instance in 1..=PENDING_WORKSPACE_RESTORE_DELIVERY_CAP as u64 {
+            assert!(stage_workspace_restore_delivery(
+                &mut pending,
+                PendingWorkspaceRestoreDelivery::new(
+                    format!("workspace-{runtime_instance}"),
+                    runtime_instance,
+                ),
+            ));
+        }
+        assert!(!stage_workspace_restore_delivery(
+            &mut pending,
+            PendingWorkspaceRestoreDelivery::new("overflow".to_owned(), 99),
+        ));
+        assert_eq!(pending.len(), PENDING_WORKSPACE_RESTORE_DELIVERY_CAP);
+
+        assert!(stage_workspace_restore_delivery(
+            &mut pending,
+            PendingWorkspaceRestoreDelivery::new("replacement".to_owned(), 1),
+        ));
+        assert_eq!(pending.get(&1).unwrap().workspace_id, "replacement");
+        assert_eq!(pending.len(), PENDING_WORKSPACE_RESTORE_DELIVERY_CAP);
+    }
+
+    #[test]
+    fn full_restore_dotenv_delivery_failure_is_routed_to_bounded_retry() {
+        let source = include_str!("app.rs");
+        let finish = source
+            .split_once("fn finish_dotenv_continuation")
+            .unwrap()
+            .1
+            .split_once("fn finish_cross_workspace_restore_dotenv")
+            .unwrap()
+            .0;
+        assert!(finish.contains("stage_workspace_restore_delivery"));
+        assert!(finish.contains("cancel_pending_pane_focus_for_restore"));
+        assert!(finish.contains("if full_restore_queued"));
+        assert!(finish.contains("self.egui_ctx.request_repaint()"));
+    }
+
+    #[test]
+    fn a_materializing_primary_pane_snapshot_schedules_the_post_render_focus_tick() {
+        let pending = PendingPrimaryPaneActivation {
+            workspace_id: "workspace-a".to_owned(),
+            runtime_instance: 7,
+            pane: runtime::MuxPaneId("pane-a".to_owned()),
+            generation: 1,
+            phase: PrimaryPaneActivationPhase::Materialization,
+            materialization_started_at: Some(std::time::Instant::now()),
+            delivery_retry: RuntimeDeliveryRetry::default(),
+        };
+        let event = mux_event("materialized");
+
+        assert!(primary_activation_needs_post_render_tick(
+            Some(&pending),
+            std::slice::from_ref(&event),
+        ));
+        assert!(!primary_activation_needs_post_render_tick(
+            Some(&pending),
+            &[],
+        ));
     }
 
     #[test]

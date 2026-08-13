@@ -249,6 +249,13 @@ impl WorkspaceProtocolIntent {
         self.generation
     }
 
+    pub fn focus_pane(&self) -> Option<&runtime::MuxPaneId> {
+        match &self.command {
+            RuntimeCommand::FocusPane { pane } => Some(pane),
+            _ => None,
+        }
+    }
+
     pub fn into_command(self) -> RuntimeCommand {
         self.command
     }
@@ -877,9 +884,10 @@ pub(crate) struct PreparedAttachedPaneOutput {
     pub(crate) reorder_requested: Option<AttachedPaneReorder>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceSurfaceOutput {
     pub focus_requested: bool,
+    pub local_focus_claimed: Option<runtime::MuxPaneId>,
 }
 
 #[derive(Clone, Copy)]
@@ -908,14 +916,18 @@ impl PaneRenderMode<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PaneRenderOutput {
     focus_requested: bool,
+    local_focus_claimed: Option<runtime::MuxPaneId>,
 }
 
 impl PaneRenderOutput {
     fn merge(&mut self, other: Self) {
         self.focus_requested |= other.focus_requested;
+        if other.local_focus_claimed.is_some() {
+            self.local_focus_claimed = other.local_focus_claimed;
+        }
     }
 }
 
@@ -1121,6 +1133,10 @@ pub struct WorkspaceUi {
     /// egui 포커스 동기화와 입력 대상 전환 대기. Runtime의 `FocusPane` 반영은 비동기라,
     /// 클릭·검색 닫힘 직후에도 이 pane을 먼저 입력 대상으로 삼아 첫 문자를 잃지 않는다.
     pending_focus: Option<runtime::MuxPaneId>,
+    /// App이 비동기 restore 전에 건 명시적 입력 fence. Runtime snapshot 기반 refocus와
+    /// 분리해야 새 runtime focus가 오래된 일반 pending을 정상적으로 교체할 수 있다.
+    explicit_pending_focus: Option<runtime::MuxPaneId>,
+    explicit_pending_focus_observed: bool,
     /// 이 프레임에 사용자가 터미널을 직접 클릭해 키보드 소유권을 요청했다. App이
     /// 뒤이어 렌더하는 Agents TextEdit의 지연 autofocus를 취소하는 one-shot 신호다.
     terminal_focus_claimed: bool,
@@ -1535,6 +1551,8 @@ impl WorkspaceUi {
             last_focused_pane: None,
             session_flash: HashMap::new(),
             pending_focus: None,
+            explicit_pending_focus: None,
+            explicit_pending_focus_observed: false,
             terminal_focus_claimed: false,
             pending_spawn_cwds: VecDeque::with_capacity(WORKSPACE_PROTOCOL_CAP),
             split_drag: None,
@@ -1588,6 +1606,44 @@ impl WorkspaceUi {
     /// workspace and can otherwise re-request its deferred TextEdit focus.
     pub fn take_terminal_focus_claimed(&mut self) -> bool {
         std::mem::take(&mut self.terminal_focus_claimed)
+    }
+
+    /// App이 저장 세션 복원/전환을 시작할 때 정확한 pane을 다음 터미널 입력 대상으로
+    /// 예약한다. 실제 egui focus 요청은 그 pane의 surface가 렌더되는 첫 프레임에 소비된다.
+    pub(crate) fn arm_terminal_focus(&mut self, pane: runtime::MuxPaneId) {
+        self.explicit_pending_focus = Some(pane.clone());
+        self.explicit_pending_focus_observed = self.mux.as_deref().is_some_and(|mux| {
+            mux.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|candidate| candidate.id == pane)
+        });
+        self.begin_terminal_refocus(pane);
+    }
+
+    /// App이 보류 중인 포커스 대상이 stale임을 확인했거나 더 최신 네비게이션을 받았을 때
+    /// 존재하지 않는 pane이 터미널 입력을 독점하지 않도록 예약을 취소한다.
+    pub(crate) fn cancel_terminal_focus(&mut self) {
+        self.pending_focus = None;
+        self.explicit_pending_focus = None;
+        self.explicit_pending_focus_observed = false;
+        self.preedit.clear();
+    }
+
+    fn reconcile_explicit_terminal_focus(&mut self) {
+        let Some(expected) = self.explicit_pending_focus.as_ref() else {
+            return;
+        };
+        let pane_present = self.mux.as_deref().is_some_and(|mux| {
+            mux.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|candidate| &candidate.id == expected)
+        });
+        self.explicit_pending_focus_observed |= pane_present;
+        if self.explicit_pending_focus_observed && !pane_present {
+            self.cancel_terminal_focus();
+        }
     }
 
     /// Drains the latest native notice for `App::logic` to execute. Empty reads
@@ -3045,8 +3101,8 @@ impl WorkspaceUi {
         config: &TerminalConfig,
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
-    ) {
-        let _ = self.show_with_input(ui, config, events, catalog, true);
+    ) -> WorkspaceSurfaceOutput {
+        self.show_with_input(ui, config, events, catalog, true)
     }
 
     pub fn show_with_input(
@@ -3058,6 +3114,7 @@ impl WorkspaceUi {
         input_enabled: bool,
     ) -> WorkspaceSurfaceOutput {
         self.prepare_frame(ui.ctx(), events, catalog, input_enabled);
+        self.reconcile_explicit_terminal_focus();
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
@@ -3085,9 +3142,12 @@ impl WorkspaceUi {
             return output;
         };
         // mux 포커스가 바뀐 프레임: stale 조합/스크롤 잔여분 리셋 (세션 간 이월 방지)
-        if self.last_focused_pane != mux.focused_pane {
-            self.last_focused_pane = mux.focused_pane.clone();
-            self.pending_focus = mux.focused_pane.clone();
+        if sync_runtime_focus_intent(
+            &mut self.last_focused_pane,
+            &mut self.pending_focus,
+            self.explicit_pending_focus.as_ref(),
+            mux.focused_pane.clone(),
+        ) {
             self.preedit.clear();
             self.scroll_residual = 0.0;
             // 포커스가 옮겨간 pane 세션을 잠깐 강조(pane 전체 2초 플래시).
@@ -3158,6 +3218,7 @@ impl WorkspaceUi {
         self.flush_command_repaint(ui.ctx());
         WorkspaceSurfaceOutput {
             focus_requested: pane_output.focus_requested,
+            local_focus_claimed: pane_output.local_focus_claimed,
         }
     }
 
@@ -3431,6 +3492,7 @@ impl WorkspaceUi {
         );
         WorkspaceSurfaceOutput {
             focus_requested: response.clicked(),
+            ..Default::default()
         }
     }
 
@@ -3444,8 +3506,8 @@ impl WorkspaceUi {
         config: &TerminalConfig,
         catalog: &i18n::Catalog,
         input_enabled: bool,
-    ) -> bool {
-        let mut focus_requested = false;
+    ) -> PaneRenderOutput {
+        let mut output = PaneRenderOutput::default();
         let osc = self.session_osc_title(pane.session_id);
         let full_title =
             self.resolve_session_title(&pane.title, pane.session_id, osc.as_deref(), catalog);
@@ -3534,11 +3596,10 @@ impl WorkspaceUi {
             egui::Sense::click(),
         );
         if header_response.clicked() {
-            if input_enabled && !focused {
-                self.request_pane_focus(pane.id.clone());
-            } else if !input_enabled {
-                focus_requested = true;
-            }
+            self.terminal_focus_claimed = true;
+            output.local_focus_claimed = Some(pane.id.clone());
+            output.focus_requested |= !input_enabled;
+            self.request_pane_focus(pane.id.clone());
         }
         if input_enabled {
             self.pane_context_menu(&header_response, &pane.id, config, catalog);
@@ -3616,7 +3677,10 @@ impl WorkspaceUi {
             if input_enabled {
                 self.request_close_pane(pane.id.clone());
             } else {
-                focus_requested = true;
+                self.terminal_focus_claimed = true;
+                output.focus_requested = true;
+                output.local_focus_claimed = Some(pane.id.clone());
+                self.request_pane_focus(pane.id.clone());
             }
         }
 
@@ -3646,11 +3710,14 @@ impl WorkspaceUi {
                     }
                     self.activate_terminal_toolbar(icon, &pane.id, config);
                 } else {
-                    focus_requested = true;
+                    self.terminal_focus_claimed = true;
+                    output.focus_requested = true;
+                    output.local_focus_claimed = Some(pane.id.clone());
+                    self.request_pane_focus(pane.id.clone());
                 }
             }
         }
-        focus_requested
+        output
     }
 
     fn activate_terminal_toolbar(
@@ -3915,7 +3982,7 @@ impl WorkspaceUi {
         ui.painter()
             .rect_filled(pane_rect, 0.0, tokens.app_background);
         if embedded_header && mode.is_local() {
-            render_output.focus_requested |= self.render_pane_header(
+            let header_output = self.render_pane_header(
                 ui,
                 pane_layout.header,
                 pane,
@@ -3924,6 +3991,7 @@ impl WorkspaceUi {
                 catalog,
                 input_enabled,
             );
+            render_output.merge(header_output);
         }
         // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
         // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
@@ -3934,9 +4002,12 @@ impl WorkspaceUi {
             egui::Sense::click(),
         );
         if pane_resp.clicked() {
-            if mode.is_local() && input_enabled && !focused {
+            if mode.is_local() {
+                self.terminal_focus_claimed = true;
+                render_output.local_focus_claimed = Some(pane_id.clone());
+                render_output.focus_requested |= !input_enabled;
                 self.request_pane_focus(pane_id.clone());
-            } else if !input_enabled || !mode.is_local() {
+            } else {
                 render_output.focus_requested = true;
             }
         }
@@ -4369,27 +4440,30 @@ impl WorkspaceUi {
             && focused
             && self.pending_focus.as_ref() == Some(pane_id)
         {
+            let app_armed = self.explicit_pending_focus.as_ref() == Some(pane_id);
             self.pending_focus = None;
+            self.explicit_pending_focus = None;
+            self.explicit_pending_focus_observed = false;
+            self.terminal_focus_claimed |= app_armed;
             request_terminal_focus(&output.response);
         }
         if terminal_primary_pointer_clicked(&output.response) {
+            // Input ownership may still belong to a sibling primary/attached surface in this
+            // frame. Report the click independently from `input_enabled` so App can surrender
+            // any deferred Agents TextEdit focus before the next key event.
+            self.terminal_focus_claimed = true;
             if !input_enabled || !mode.is_local() {
                 render_output.focus_requested = true;
             }
+            if mode.is_local() {
+                render_output.local_focus_claimed = Some(pane_id.clone());
+                // Queue the exact primary pane even while a sibling attached surface owns input.
+                // App switches the surface owner in this frame; FIFO FocusPane then selects the
+                // clicked split before its first keyboard event.
+                self.request_pane_focus(pane_id.clone());
+            }
             if input_enabled {
-                self.terminal_focus_claimed = true;
                 request_terminal_focus(&output.response);
-                if mode.is_local() {
-                    // 이미 runtime focus인 pane을 다시 클릭해도 stale TextEdit focus를 누르고
-                    // 다음 keydown부터 터미널로 받도록 refocus를 예약한다.
-                    if !terminal_refocus_pending {
-                        self.begin_terminal_refocus(pane_id.clone());
-                    }
-                    // pane 배경이 같은 클릭을 먼저 받았다면 이미 FocusPane을 보냈다.
-                    if !focused && !terminal_refocus_pending {
-                        self.request_pane_focus(pane_id.clone());
-                    }
-                }
             }
         }
 
@@ -6039,6 +6113,25 @@ fn terminal_input_owner(
         Some(pending) => pending == pane_id,
         None => runtime_focused,
     }
+}
+
+/// Runtime focus snapshots normally arm the newly focused pane for native keyboard ownership.
+/// An explicit App-side focus intent is newer, however, and must remain the exclusive input fence
+/// while its persisted pane is still materializing.
+fn sync_runtime_focus_intent(
+    last_runtime_focus: &mut Option<runtime::MuxPaneId>,
+    pending_focus: &mut Option<runtime::MuxPaneId>,
+    explicit_pending_focus: Option<&runtime::MuxPaneId>,
+    next_runtime_focus: Option<runtime::MuxPaneId>,
+) -> bool {
+    if *last_runtime_focus == next_runtime_focus {
+        return false;
+    }
+    *last_runtime_focus = next_runtime_focus.clone();
+    if explicit_pending_focus.is_none() {
+        *pending_focus = next_runtime_focus;
+    }
+    true
 }
 
 /// 후보에서 같은 문자 하나만 제거한다. 연속으로 같은 키를 누른 횟수를 보존하려면
@@ -8218,7 +8311,7 @@ mod tests {
             session,
         };
         let mut harness = egui_kittest::Harness::new_ui_state(
-            move |ui, state: &mut (WorkspaceUi, AttachedPaneOutput)| {
+            move |ui, state: &mut (WorkspaceUi, AttachedPaneOutput, bool)| {
                 let frame = state.0.show_attached_pane(
                     ui,
                     &config,
@@ -8232,8 +8325,9 @@ mod tests {
                 state.1.focus_requested |= frame.focus_requested;
                 state.1.detach_requested |= frame.detach_requested;
                 state.1.target_present |= frame.target_present;
+                state.2 |= state.0.take_terminal_focus_claimed();
             },
-            (workspace, AttachedPaneOutput::default()),
+            (workspace, AttachedPaneOutput::default(), false),
         );
         harness.run();
         let terminal_point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
@@ -8255,6 +8349,7 @@ mod tests {
         harness.run();
 
         assert!(harness.state().1.focus_requested);
+        assert!(harness.state().2);
         let commands = drain_protocol(&mut harness.state_mut().0);
         assert!(
             commands
@@ -8283,11 +8378,15 @@ mod tests {
         view.snapshot = Some(snapshot("ready"));
         view.snapshot_gen = 1;
         let mut harness = egui_kittest::Harness::new_ui_state(
-            move |ui, state: &mut (WorkspaceUi, WorkspaceSurfaceOutput)| {
+            move |ui, state: &mut (WorkspaceUi, WorkspaceSurfaceOutput, bool)| {
                 let frame = state.0.show_with_input(ui, &config, &[], &catalog, false);
                 state.1.focus_requested |= frame.focus_requested;
+                if frame.local_focus_claimed.is_some() {
+                    state.1.local_focus_claimed = frame.local_focus_claimed;
+                }
+                state.2 |= state.0.take_terminal_focus_claimed();
             },
-            (workspace, WorkspaceSurfaceOutput::default()),
+            (workspace, WorkspaceSurfaceOutput::default(), false),
         );
         harness.run();
         let terminal_point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
@@ -8309,11 +8408,13 @@ mod tests {
         harness.run();
 
         assert!(harness.state().1.focus_requested);
+        assert_eq!(harness.state().1.local_focus_claimed, Some(pane_id("pane")));
+        assert!(harness.state().2);
         let commands = drain_protocol(&mut harness.state_mut().0);
         assert!(
             commands
                 .iter()
-                .all(|command| matches!(command, RuntimeCommand::Resize { .. }))
+                .any(|command| matches!(command, RuntimeCommand::FocusPane { pane } if pane == &pane_id("pane")))
         );
     }
 
@@ -10198,6 +10299,180 @@ https://example.test/login \
         assert!(!terminal_input_owner(&old, true, Some(&next)));
         assert!(terminal_input_owner(&next, false, Some(&next)));
         assert!(terminal_input_owner(&next, true, Some(&next)));
+    }
+
+    #[test]
+    fn async_restore_runtime_snapshot_does_not_override_the_explicit_input_fence() {
+        let old = pane_id("pane-old");
+        let requested = pane_id("pane-requested");
+        let mut last_runtime_focus = None;
+        let mut pending_focus = Some(requested.clone());
+
+        assert!(sync_runtime_focus_intent(
+            &mut last_runtime_focus,
+            &mut pending_focus,
+            Some(&requested),
+            Some(old.clone()),
+        ));
+        assert_eq!(pending_focus, Some(requested.clone()));
+        assert!(!terminal_input_owner(&old, true, pending_focus.as_ref()));
+
+        pending_focus = None;
+        assert!(!sync_runtime_focus_intent(
+            &mut last_runtime_focus,
+            &mut pending_focus,
+            None,
+            Some(old.clone()),
+        ));
+        assert!(terminal_input_owner(&old, true, pending_focus.as_ref()));
+    }
+
+    #[test]
+    fn newer_runtime_focus_replaces_an_older_runtime_derived_pending_focus() {
+        let old = pane_id("pane-old");
+        let next = pane_id("pane-next");
+        let mut last_runtime_focus = Some(old.clone());
+        let mut pending_focus = Some(old);
+
+        assert!(sync_runtime_focus_intent(
+            &mut last_runtime_focus,
+            &mut pending_focus,
+            None,
+            Some(next.clone()),
+        ));
+        assert_eq!(pending_focus, Some(next));
+    }
+
+    #[test]
+    fn app_armed_terminal_focus_waits_for_exact_pane_surface() {
+        let mut workspace = WorkspaceUi::new();
+        let pane = pane_id("pane-exact");
+
+        workspace.arm_terminal_focus(pane.clone());
+
+        assert_eq!(workspace.pending_focus, Some(pane));
+        assert_eq!(workspace.explicit_pending_focus, workspace.pending_focus);
+        assert!(!workspace.take_terminal_focus_claimed());
+    }
+
+    #[test]
+    fn app_can_cancel_an_unmaterialized_terminal_focus_intent() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.arm_terminal_focus(pane_id("pane-stale"));
+
+        workspace.cancel_terminal_focus();
+
+        assert!(workspace.pending_focus.is_none());
+        assert!(workspace.explicit_pending_focus.is_none());
+    }
+
+    #[test]
+    fn explicit_focus_fence_is_released_when_its_observed_pane_disappears() {
+        let target = pane_id("pane-target");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane-target", SessionId(7))],
+                LayoutNode::Pane(target.clone()),
+            )],
+            "pane-target",
+        ));
+        workspace.arm_terminal_focus(target);
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("survivor", SessionId(8))],
+                LayoutNode::Pane(pane_id("survivor")),
+            )],
+            "survivor",
+        ));
+
+        workspace.reconcile_explicit_terminal_focus();
+
+        assert!(workspace.pending_focus.is_none());
+        assert!(workspace.explicit_pending_focus.is_none());
+    }
+
+    #[test]
+    fn unobserved_explicit_focus_fence_stays_fail_closed_until_app_cancels_it() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.arm_terminal_focus(pane_id("pane-never-acknowledged"));
+
+        workspace.reconcile_explicit_terminal_focus();
+
+        assert_eq!(
+            workspace.pending_focus,
+            Some(pane_id("pane-never-acknowledged"))
+        );
+        assert_eq!(workspace.explicit_pending_focus, workspace.pending_focus);
+    }
+
+    #[test]
+    fn focused_terminal_click_reports_its_exact_local_focus_claim() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let session = SessionId(7);
+        let clicked = pane_id("clicked");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("clicked", session)],
+                LayoutNode::Pane(clicked.clone()),
+            )],
+            "clicked",
+        ));
+        workspace.last_focused_pane = Some(clicked.clone());
+        workspace.arm_terminal_focus(clicked.clone());
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, Option<runtime::MuxPaneId>)| {
+                let frame = state.0.show_with_input(ui, &config, &[], &catalog, true);
+                if frame.local_focus_claimed.is_some() {
+                    state.1 = frame.local_focus_claimed;
+                }
+            },
+            (workspace, None),
+        );
+        harness.run();
+        let terminal_point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        harness.input_mut().events.extend([
+            egui::Event::PointerMoved(terminal_point),
+            egui::Event::PointerButton {
+                pos: terminal_point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: terminal_point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run();
+
+        assert_eq!(harness.state().1, Some(clicked));
+        assert!(drain_protocol(&mut harness.state_mut().0).iter().any(
+            |command| matches!(command, RuntimeCommand::FocusPane { pane } if pane == &pane_id("clicked"))
+        ));
+    }
+
+    #[test]
+    fn app_armed_focus_claims_terminal_ownership_when_exact_surface_appears() {
+        let session = SessionId(7);
+        let mut harness = setup_focused_local_pane_harness(session);
+        let target = pane_id("pane");
+        harness.state_mut().arm_terminal_focus(target);
+
+        harness.run();
+
+        assert!(harness.state_mut().take_terminal_focus_claimed());
     }
 
     #[test]

@@ -112,13 +112,6 @@ impl SessionRowTarget {
             Self::PersistedPane { .. } => None,
         }
     }
-
-    fn live_tab(&self) -> Option<&runtime::MuxTabId> {
-        match self {
-            Self::Live { tab, .. } => Some(tab),
-            Self::PersistedPane { .. } => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,6 +278,10 @@ pub struct SidebarSnapshot<'a> {
 /// 사이드바에서 App으로 올라가는 액션.
 pub enum SidebarAction {
     SwitchWorkspace(String),
+    ActivatePersistedSession {
+        workspace_id: String,
+        pane: runtime::MuxPaneId,
+    },
     ShowHome,
     /// 멀티에이전트 fleet 그리드로 전환(하단 nav). 재클릭 토글은 App이 현재 view로 결정.
     ShowFleet,
@@ -2314,18 +2311,14 @@ impl FileTreeUi {
                                                                     },
                                                                 );
                                                             } else if resp.clicked()
-                                                                && !entry.focused
-                                                                && let Some(tab) = entry.target.live_tab()
+                                                                && session_row_should_activate(
+                                                                    &entry.target,
+                                                                    entry.focused,
+                                                                )
                                                             {
-                                                                action = Some(
-                                                                    SidebarAction::FocusSession {
-                                                                        workspace_id: sidebar
-                                                                            .active_workspace_id
-                                                                            .to_owned(),
-                                                                        tab: tab.clone(),
-                                                                        pane: entry.target.pane().clone(),
-                                                                    },
-                                                                );
+                                                                action = Some(session_row_activation(
+                                                                    &entry.target,
+                                                                ));
                                                             }
                                                         }
                                                     });
@@ -4432,18 +4425,7 @@ fn inactive_workspace_sessions(
                             || response.dragged()
                             || response.drag_stopped();
                         if session_row_click_allowed(response.clicked(), drag_happened) {
-                            action = match &entry.target {
-                                SessionRowTarget::Live { tab, pane, .. } => {
-                                    Some(SidebarAction::FocusSession {
-                                        workspace_id: workspace.id.clone(),
-                                        tab: tab.clone(),
-                                        pane: pane.clone(),
-                                    })
-                                }
-                                SessionRowTarget::PersistedPane { .. } => {
-                                    Some(SidebarAction::SwitchWorkspace(workspace.id.clone()))
-                                }
-                            };
+                            action = Some(session_row_activation(&entry.target));
                         }
                         if ui.rect_contains_pointer(response.rect)
                             && can_open_session_beside(active_workspace_id, &entry.target)
@@ -4530,6 +4512,31 @@ fn live_session_context_menu_items<R>(
 
 fn open_beside_action(target: SessionRowTarget) -> SidebarAction {
     SidebarAction::OpenSessionBeside(target)
+}
+
+fn session_row_activation(target: &SessionRowTarget) -> SidebarAction {
+    match target {
+        SessionRowTarget::Live {
+            workspace_id,
+            tab,
+            pane,
+            ..
+        } => SidebarAction::FocusSession {
+            workspace_id: workspace_id.clone(),
+            tab: tab.clone(),
+            pane: pane.clone(),
+        },
+        SessionRowTarget::PersistedPane { workspace_id, pane } => {
+            SidebarAction::ActivatePersistedSession {
+                workspace_id: workspace_id.clone(),
+                pane: pane.clone(),
+            }
+        }
+    }
+}
+
+fn session_row_should_activate(target: &SessionRowTarget, focused: bool) -> bool {
+    !focused || target.session().is_none()
 }
 
 fn can_open_session_beside(active_workspace_id: &str, target: &SessionRowTarget) -> bool {
@@ -10013,6 +10020,51 @@ mod tests {
                 pane: runtime::MuxPaneId("pane-exact".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn persisted_session_click_carries_workspace_and_exact_pane() {
+        let action = session_row_activation(&SessionRowTarget::persisted(
+            "workspace-b",
+            runtime::MuxPaneId("pane-exact".to_owned()),
+        ));
+
+        assert!(matches!(
+            action,
+            SidebarAction::ActivatePersistedSession { workspace_id, pane }
+                if workspace_id == "workspace-b" && pane.0 == "pane-exact"
+        ));
+    }
+
+    #[test]
+    fn active_unmaterialized_session_click_uses_the_same_exact_activation_mapper() {
+        let source = include_str!("file_tree.rs");
+        let active_rows = source
+            .split_once("let close_clicked =")
+            .unwrap()
+            .1
+            .split_once("paint_workspace_group_separator")
+            .unwrap()
+            .0;
+        assert!(active_rows.contains("session_row_activation"));
+        assert!(!active_rows.contains("live_tab()"));
+    }
+
+    #[test]
+    fn focused_unmaterialized_session_remains_activatable() {
+        let persisted =
+            SessionRowTarget::persisted("workspace-b", runtime::MuxPaneId("pane-cold".to_owned()));
+        let live = SessionRowTarget::live(
+            "workspace-b",
+            41,
+            runtime::MuxTabId("tab-b".to_owned()),
+            runtime::MuxPaneId("pane-live".to_owned()),
+            runtime::SessionId(42),
+        );
+
+        assert!(session_row_should_activate(&persisted, true));
+        assert!(!session_row_should_activate(&live, true));
+        assert!(session_row_should_activate(&live, false));
     }
 
     #[test]

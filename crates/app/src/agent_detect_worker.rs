@@ -460,6 +460,7 @@ fn compute_activity_and_info(
                     effort: state.effort,
                     context_pct: state.context_pct,
                     last_agent_summary: state.last_agent_summary,
+                    user_instruction: state.user_instruction,
                 },
             );
         }
@@ -798,6 +799,7 @@ mod tests {
                     effort: None,
                     context_pct: Some(50),
                     last_agent_summary: None,
+                    user_instruction: None,
                 },
             )])),
         }

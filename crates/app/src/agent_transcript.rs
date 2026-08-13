@@ -36,6 +36,8 @@ pub struct TranscriptState {
     pub context_pct: Option<u8>,
     /// 최신 에이전트 응답/진행 메시지의 한 줄 요약. 별도 LLM 호출 없이 원문을 축약한다.
     pub last_agent_summary: Option<String>,
+    /// 현재 턴을 시작한 실제 사용자 지시의 한 줄 요약.
+    pub user_instruction: Option<String>,
 }
 
 impl fmt::Debug for TranscriptState {
@@ -50,6 +52,10 @@ impl fmt::Debug for TranscriptState {
             .field(
                 "last_agent_summary",
                 &self.last_agent_summary.as_ref().map(|_| "REDACTED"),
+            )
+            .field(
+                "user_instruction",
+                &self.user_instruction.as_ref().map(|_| "REDACTED"),
             )
             .finish()
     }
@@ -205,6 +211,8 @@ fn clean_agent_summary(text: &str) -> Option<String> {
         || visible.starts_with("<environment_context")
         || visible.starts_with("<permissions")
         || visible.starts_with("<INSTRUCTIONS")
+        || visible.starts_with("<task-notification")
+        || visible.starts_with("<heartbeat")
     {
         return None;
     }
@@ -247,8 +255,7 @@ fn clean_agent_summary(text: &str) -> Option<String> {
     Some(summary)
 }
 
-fn claude_assistant_summary(value: &Value) -> Option<String> {
-    let content = value.pointer("/message/content")?;
+fn message_content_summary(content: &Value) -> Option<String> {
     if let Some(text) = content.as_str() {
         return clean_agent_summary(text);
     }
@@ -276,14 +283,47 @@ fn claude_assistant_summary(value: &Value) -> Option<String> {
     clean_agent_summary(&text)
 }
 
+fn text_items_summary(items: &[Value]) -> Option<String> {
+    if items.len() > MAX_MESSAGE_CONTENT_ITEMS {
+        return None;
+    }
+    let text_parts = items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str));
+    let total_bytes = text_parts.clone().try_fold(0_usize, |total, text| {
+        total.checked_add(text.len())?.checked_add(1)
+    })?;
+    if total_bytes > MAX_TRANSCRIPT_LINE_BYTES {
+        return None;
+    }
+    let mut text = String::with_capacity(total_bytes.min(AGENT_SUMMARY_BYTES));
+    for part in text_parts.filter_map(clean_agent_summary) {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&part);
+    }
+    clean_agent_summary(&text)
+}
+
+fn claude_assistant_summary(value: &Value) -> Option<String> {
+    message_content_summary(value.pointer("/message/content")?)
+}
+
+fn claude_user_instruction(value: &Value) -> Option<String> {
+    let content = value.pointer("/message/content")?;
+    if let Some(text) = content.as_str() {
+        return clean_agent_summary(text);
+    }
+    text_items_summary(content.as_array()?)
+}
+
 fn claude_internal_user_event(value: &Value) -> bool {
     value
         .pointer("/message/content")
         .and_then(Value::as_str)
-        .is_some_and(|content| {
-            let content = content.trim_start();
-            content.starts_with("<local-command") || content.starts_with("<command-name")
-        })
+        .is_some_and(|_| claude_user_instruction(value).is_none())
 }
 
 fn claude_user_starts_new_turn(value: &Value) -> bool {
@@ -294,12 +334,17 @@ fn claude_user_starts_new_turn(value: &Value) -> bool {
         return !claude_internal_user_event(value);
     }
     content.as_array().is_some_and(|items| {
-        items.iter().any(|item| {
-            !matches!(
-                item.get("type").and_then(Value::as_str),
-                Some("tool_result")
-            )
-        })
+        items
+            .iter()
+            .any(|item| match item.get("type").and_then(Value::as_str) {
+                Some("tool_result") => false,
+                Some("text") => item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(clean_agent_summary)
+                    .is_some(),
+                _ => true,
+            })
     })
 }
 
@@ -327,6 +372,8 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
     // 최신 assistant message.model = 현재 모델(effort/context는 statusLine→DB, Phase 2b).
     let mut model: Option<String> = None;
     let mut last_agent_summary: Option<String> = None;
+    let mut user_instruction: Option<String> = None;
+    let mut user_turn_seen = false;
     // 최신 실제 user 입력 뒤 아직 assistant 응답이 없으면 이전 turn의 요약을 재사용하지 않는다.
     let mut summary_boundary_reached = false;
     for line in text.lines().rev() {
@@ -367,8 +414,14 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
                 if activity.is_none() {
                     activity = Some(AgentActivity::Working);
                 }
-                if last_agent_summary.is_none() && claude_user_starts_new_turn(&v) {
-                    summary_boundary_reached = true;
+                if claude_user_starts_new_turn(&v) {
+                    if !user_turn_seen {
+                        user_instruction = claude_user_instruction(&v);
+                        user_turn_seen = true;
+                    }
+                    if last_agent_summary.is_none() {
+                        summary_boundary_reached = true;
+                    }
                 }
             }
             _ => {}
@@ -377,6 +430,7 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
             && model.is_some()
             && cwd.is_some()
             && (last_agent_summary.is_some() || summary_boundary_reached)
+            && user_turn_seen
         {
             break;
         }
@@ -389,6 +443,7 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         effort: None,
         context_pct: None,
         last_agent_summary,
+        user_instruction,
     })
 }
 
@@ -417,6 +472,8 @@ pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
     let mut max_tokens: Option<u64> = None;
     let mut used_tokens: Option<u64> = None;
     let mut last_agent_summary: Option<String> = None;
+    let mut user_instruction: Option<String> = None;
+    let mut user_turn_seen = false;
     // 새 턴이 시작됐는데 아직 응답이 없으면 이전 턴 요약을 재사용하지 않는다.
     let mut summary_boundary_reached = false;
 
@@ -429,10 +486,13 @@ pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
             // 뒤(=역순에서 먼저)면 턴이 끝난 것 → 유휴.
             Some("turn.ended") => {
                 activity.get_or_insert(AgentActivity::Idle);
-                summary_boundary_reached = false;
             }
             Some("turn.prompt") => {
                 activity.get_or_insert(AgentActivity::Working);
+                if !user_turn_seen {
+                    user_instruction = kimi_user_instruction(&v);
+                    user_turn_seen = true;
+                }
                 summary_boundary_reached = true;
             }
             // 세션 중 `/thinking <level>`이 남기는 기록. llm.request보다 최신일 수
@@ -478,6 +538,7 @@ pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
             && effort.is_some()
             && used_tokens.is_some()
             && last_agent_summary.is_some()
+            && user_turn_seen
         {
             break;
         }
@@ -499,7 +560,15 @@ pub fn parse_kimi(path: &Path) -> Option<TranscriptState> {
         effort,
         context_pct,
         last_agent_summary,
+        user_instruction,
     })
+}
+
+fn kimi_user_instruction(value: &Value) -> Option<String> {
+    if value.pointer("/origin/kind").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    text_items_summary(value.get("input")?.as_array()?)
 }
 
 /// Kimi 꼬리 검증 — **줄 수만** 본다.
@@ -567,7 +636,7 @@ mod kimi_tests {
             &[
                 r#"{"type":"metadata","protocol_version":1}"#,
                 r#"{"type":"profile.bind","modelAlias":"kimi-code/k3","thinkingEffort":"high"}"#,
-                r#"{"type":"turn.prompt","origin":{"kind":"user"},"time":1}"#,
+                r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"런처 상태 표시를 수정해"}],"time":1}"#,
                 r#"{"type":"llm.request","modelAlias":"kimi-code/k3","thinkingEffort":"high","maxTokens":1000}"#,
                 r#"{"type":"usage.record","usage":{"inputOther":150,"output":50},"usageScope":"turn"}"#,
                 r#"{"type":"context.append_message","message":{"content":"작업을 마쳤습니다"}}"#,
@@ -587,6 +656,10 @@ mod kimi_tests {
             "turn.ended가 마지막이면 유휴다"
         );
         assert_eq!(state.context_pct, Some(20), "200/1000 = 20%");
+        assert_eq!(
+            state.user_instruction.as_deref(),
+            Some("런처 상태 표시를 수정해")
+        );
     }
 
     /// `/thinking <level>`은 `config.update`를 남긴다. 그게 llm.request보다 최신이면
@@ -626,6 +699,40 @@ mod kimi_tests {
             AgentActivity::Working,
             "turn.prompt 뒤에 turn.ended가 없으면 작업 중이다"
         );
+    }
+
+    #[test]
+    fn kimi는_최신_실제_사용자_지시만_작업컨텍스트로_쓴다() {
+        let path = fixture(
+            "latest-user",
+            &[
+                r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"이전 작업"}],"time":1}"#,
+                r#"{"type":"turn.ended","reason":"completed","turnId":0}"#,
+                r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"현재 작업을 보여줘"}],"time":2}"#,
+            ],
+        );
+        let state = parse_kimi(&path).expect("파싱돼야 한다");
+        assert_eq!(
+            state.user_instruction.as_deref(),
+            Some("현재 작업을 보여줘")
+        );
+        assert_eq!(state.last_agent_summary, None);
+    }
+
+    #[test]
+    fn kimi_system_trigger는_사용자_지시로_오인하지_않는다() {
+        let path = fixture(
+            "system-trigger",
+            &[
+                r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"이전 사용자 작업"}],"time":1}"#,
+                r#"{"type":"context.append_message","message":{"content":"이전 작업을 마쳤습니다"}}"#,
+                r#"{"type":"turn.ended","reason":"completed","turnId":0}"#,
+                r#"{"type":"turn.prompt","origin":{"kind":"system_trigger"},"input":[{"type":"text","text":"internal heartbeat"}],"time":2}"#,
+            ],
+        );
+        let state = parse_kimi(&path).expect("파싱돼야 한다");
+        assert_eq!(state.user_instruction, None);
+        assert_eq!(state.last_agent_summary, None);
     }
 
     /// 실측: Kimi 정상 기록에 64KiB를 넘는 줄이 있다(최대 72KiB). 공용 검증 규칙을
@@ -707,6 +814,8 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     let mut effort: Option<String> = None;
     let mut context_pct: Option<u8> = None;
     let mut last_agent_summary: Option<String> = None;
+    let mut user_instruction: Option<String> = None;
+    let mut user_turn_seen = false;
     // 새 user/task가 시작됐지만 agent 메시지가 아직 없으면 이전 turn의 설명을 표시하지 않는다.
     let mut summary_boundary_reached = false;
     for line in text.lines().rev() {
@@ -740,6 +849,13 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
                 {
                     summary_boundary_reached = true;
                 }
+                if event_type == Some("user_message") && !user_turn_seen {
+                    user_instruction = v
+                        .pointer("/payload/message")
+                        .and_then(Value::as_str)
+                        .and_then(clean_agent_summary);
+                    user_turn_seen = true;
+                }
             }
             Some("turn_context") if model.is_none() => {
                 if let Some(value) = v.pointer("/payload/model").and_then(Value::as_str) {
@@ -770,6 +886,7 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
             && model.is_some()
             && context_pct.is_some()
             && (last_agent_summary.is_some() || summary_boundary_reached)
+            && user_turn_seen
         {
             break;
         }
@@ -782,6 +899,7 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
         effort,
         context_pct,
         last_agent_summary,
+        user_instruction,
     })
 }
 
@@ -1121,6 +1239,7 @@ mod tests {
             effort: Some("hidden-effort".to_owned()),
             context_pct: Some(42),
             last_agent_summary: Some("private transcript text".to_owned()),
+            user_instruction: Some("private user instruction".to_owned()),
         };
         let debug = format!("{state:?}");
         for raw in [
@@ -1129,6 +1248,7 @@ mod tests {
             "hostile-model",
             "hidden-effort",
             "private transcript text",
+            "private user instruction",
         ] {
             assert!(!debug.contains(raw));
         }
@@ -1178,6 +1298,7 @@ mod tests {
         assert_eq!(s.session_id, "sess-abc");
         assert_eq!(s.cwd.as_deref(), Some("/proj"));
         assert_eq!(s.activity, AgentActivity::Idle);
+        assert_eq!(s.user_instruction.as_deref(), Some("Fix sidebar status"));
         assert_eq!(
             s.last_agent_summary.as_deref(),
             Some("Updated the sidebar status and tests.")
@@ -1213,6 +1334,48 @@ mod tests {
         let s = parse_claude(&p).unwrap();
         assert_eq!(s.activity, AgentActivity::Working);
         assert_eq!(s.last_agent_summary, None);
+        assert_eq!(s.user_instruction.as_deref(), Some("새 작업을 시작해"));
+    }
+
+    #[test]
+    fn claude_내부_reminder는_실제_사용자_지시를_가리지_않는다() {
+        let p = write_tmp(
+            "sess-reminder.jsonl",
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"사이드바 작업 표시를 수정해"}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":"<system-reminder>internal</system-reminder>"}}
+"#,
+        );
+        let s = parse_claude(&p).unwrap();
+        assert_eq!(s.last_agent_summary, None);
+        assert_eq!(
+            s.user_instruction.as_deref(),
+            Some("사이드바 작업 표시를 수정해")
+        );
+
+        let array_reminder = write_tmp(
+            "sess-array-reminder.jsonl",
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"현재 작업을 유지해"}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","model":"claude-opus-4-8","stop_reason":"tool_use","content":[{"type":"text","text":"코드를 확인하고 있습니다."}]}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>internal</system-reminder>"}]}}
+"#,
+        );
+        let s = parse_claude(&array_reminder).unwrap();
+        assert_eq!(
+            s.last_agent_summary.as_deref(),
+            Some("코드를 확인하고 있습니다.")
+        );
+        assert_eq!(s.user_instruction.as_deref(), Some("현재 작업을 유지해"));
+
+        let task_notification = write_tmp(
+            "sess-task-notification.jsonl",
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"실제 사용자 작업"}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","model":"claude-opus-4-8","stop_reason":"end_turn","content":[{"type":"text","text":"실제 작업 완료"}]}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":"<task-notification>internal</task-notification>"}}
+"#,
+        );
+        let s = parse_claude(&task_notification).unwrap();
+        assert_eq!(s.last_agent_summary.as_deref(), Some("실제 작업 완료"));
+        assert_eq!(s.user_instruction.as_deref(), Some("실제 사용자 작업"));
     }
 
     #[test]
@@ -1239,6 +1402,8 @@ mod tests {
             Some("사이드바 수정 완료".to_owned())
         );
         assert_eq!(clean_agent_summary("<system-reminder> internal"), None);
+        assert_eq!(clean_agent_summary("<task-notification> internal"), None);
+        assert_eq!(clean_agent_summary("<heartbeat> internal"), None);
         assert_eq!(clean_agent_summary("   \n\t"), None);
     }
 
@@ -1260,6 +1425,7 @@ mod tests {
         assert_eq!(s.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(s.effort.as_deref(), Some("xhigh"));
         assert_eq!(s.context_pct, Some(70)); // 60000/200000 = 30% used → 70% 남음
+        assert_eq!(s.user_instruction.as_deref(), Some("Review PR #124"));
         assert_eq!(
             s.last_agent_summary.as_deref(),
             Some("Reviewed PR #124 and found two issues")
@@ -1301,6 +1467,25 @@ mod tests {
         let s = parse_codex(&p).unwrap();
         assert_eq!(s.activity, AgentActivity::Working);
         assert_eq!(s.last_agent_summary, None);
+        assert_eq!(s.user_instruction.as_deref(), Some("새 작업"));
+    }
+
+    #[test]
+    fn codex_자동화_heartbeat는_사용자_지시로_오인하지_않는다() {
+        let p = write_tmp(
+            "rollout-2026-01-01T00-00-00-dddddddd-eeee-ffff-0000-111111111111.jsonl",
+            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"xhigh"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"이전 작업"}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"이전 작업 완료"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"<heartbeat>internal</heartbeat>"}}
+{"type":"token_count","payload":{"info":{"model_context_window":200000,"last_token_usage":{"input_tokens":1000}}}}
+"#,
+        );
+        let s = parse_codex(&p).unwrap();
+        assert_eq!(s.activity, AgentActivity::Working);
+        assert_eq!(s.last_agent_summary, None);
+        assert_eq!(s.user_instruction, None);
     }
 
     #[test]

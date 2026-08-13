@@ -295,6 +295,8 @@ pub struct AgentDisplay {
     pub context_pct: Option<u8>,
     /// transcript의 최신 에이전트 응답/진행 메시지 — 사이드바 작업 설명용.
     pub last_agent_summary: Option<String>,
+    /// 현재 턴의 실제 사용자 지시 — agent 메시지가 아직 없을 때의 작업 설명용.
+    pub user_instruction: Option<String>,
 }
 
 impl std::fmt::Debug for AgentDisplay {
@@ -308,6 +310,10 @@ impl std::fmt::Debug for AgentDisplay {
             .field(
                 "last_agent_summary",
                 &self.last_agent_summary.as_ref().map(|_| "REDACTED"),
+            )
+            .field(
+                "user_instruction",
+                &self.user_instruction.as_ref().map(|_| "REDACTED"),
             )
             .finish()
     }

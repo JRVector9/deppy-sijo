@@ -8139,6 +8139,7 @@ fn merge_detected_kinds(
                 effort: running.effort.clone(),
                 context_pct: None,
                 last_agent_summary: None,
+                user_instruction: None,
             });
     }
 }
@@ -12506,6 +12507,7 @@ impl App {
                         effort: None,
                         context_pct: None,
                         last_agent_summary: None,
+                        user_instruction: None,
                     },
                 );
                 apply_claude_statusline(&mut display, self.statuslines.get(&session_id));
@@ -26993,6 +26995,7 @@ mod tests {
                 effort: Some("xhigh".to_owned()),
                 context_pct: Some(42),
                 last_agent_summary: None,
+                user_instruction: None,
             },
         )]);
         let kinds = HashMap::from([

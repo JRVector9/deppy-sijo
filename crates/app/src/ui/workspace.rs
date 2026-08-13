@@ -2475,6 +2475,23 @@ impl WorkspaceUi {
         display_pane_title(raw, catalog)
     }
 
+    /// 작업 설명이 아직 없는 에이전트 행에 표시할 안정적인 프로젝트 컨텍스트.
+    /// App이 미리 계산한 프로젝트명을 우선하고, 없으면 현재 cwd의 폴더명을 쓴다.
+    fn session_project_context(&self, session: Option<SessionId>) -> Option<&str> {
+        session.and_then(|session| {
+            let cwd = self.session_cwds.get(&session)?;
+            self.session_project_names
+                .project_name(session, cwd)
+                .filter(|name| !name.trim().is_empty())
+                .or_else(|| {
+                    Path::new(cwd)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .filter(|name| !name.trim().is_empty())
+                })
+        })
+    }
+
     /// 세션의 현재 OSC 제목(있으면).
     fn session_osc_title(&self, session: Option<SessionId>) -> Option<String> {
         session
@@ -4122,6 +4139,9 @@ impl WorkspaceUi {
                         .stroke(style.button_stroke)
                         .corner_radius(egui::CornerRadius::same(style.button_corner_radius))
                         .min_size(egui::vec2(0.0, style.button_height));
+                // cross-workspace 첨부 뷰(Attached)는 이 pane의 session이 다른
+                // 워크스페이스 런타임 소속이다. 그 pane을 소유한 로컬 뷰에서만
+                // 기존과 동일하게 실행 버튼을 활성화한다.
                 if notice_ui
                     .add_enabled(mode.is_local() && action_enabled, button)
                     .clicked()
@@ -5363,13 +5383,14 @@ impl WorkspaceUi {
                     .and_then(|s| self.sessions.get(&s))
                     .and_then(|v| v.last_output_at);
                 let osc = self.session_osc_title(pane.session_id);
+                let project_context = self.session_project_context(pane.session_id);
                 // 에이전트 정보(2/3행) — 있으면 3줄 렌더. codex/claude 병합본(App).
                 let info = pane.session_id.and_then(|s| self.agent_info.get(&s));
                 let (agent_line, status_label, status_line) = match info {
                     Some(d) => (
                         Some(agent_info_line(d)),
                         Some(session_status_label(status, catalog)),
-                        Some(agent_activity_line(d, &summary, status, catalog)),
+                        Some(agent_activity_line(d, project_context, status, catalog)),
                     ),
                     None => (None, None, None),
                 };
@@ -5841,7 +5862,7 @@ fn session_status_label(status: Option<runtime::SessionStatus>, catalog: &i18n::
 
 fn agent_activity_line(
     display: &crate::agent_detect::AgentDisplay,
-    terminal_summary: &str,
+    project_context: Option<&str>,
     status: Option<runtime::SessionStatus>,
     catalog: &i18n::Catalog,
 ) -> String {
@@ -5852,8 +5873,15 @@ fn agent_activity_line(
     {
         return task.to_owned();
     }
-    if !terminal_summary.trim().is_empty() {
-        return terminal_summary.to_owned();
+    if let Some(instruction) = display
+        .user_instruction
+        .as_deref()
+        .filter(|instruction| !instruction.trim().is_empty())
+    {
+        return instruction.to_owned();
+    }
+    if let Some(project) = project_context.filter(|project| !project.trim().is_empty()) {
+        return project.to_owned();
     }
     use runtime::SessionStatus as S;
     let key = match status {
@@ -8503,6 +8531,7 @@ mod tests {
             effort: Some("high".to_owned()),
             context_pct: Some(69),
             last_agent_summary: Some("PR #124 코드 리뷰 완료".to_owned()),
+            user_instruction: Some("PR #124를 검토해".to_owned()),
         };
 
         assert_eq!(
@@ -8513,11 +8542,39 @@ mod tests {
         assert_eq!(
             agent_activity_line(
                 &display,
-                "터미널 폴백",
+                Some("deppy-sijo"),
                 Some(SessionStatus::Running),
                 &catalog
             ),
             "PR #124 코드 리뷰 완료"
+        );
+
+        let waiting_for_first_response = crate::agent_detect::AgentDisplay {
+            last_agent_summary: None,
+            ..display.clone()
+        };
+        assert_eq!(
+            agent_activity_line(
+                &waiting_for_first_response,
+                Some("deppy-sijo"),
+                Some(SessionStatus::Running),
+                &catalog
+            ),
+            "PR #124를 검토해"
+        );
+
+        let no_transcript_context = crate::agent_detect::AgentDisplay {
+            user_instruction: None,
+            ..waiting_for_first_response
+        };
+        assert_eq!(
+            agent_activity_line(
+                &no_transcript_context,
+                Some("deppy-sijo"),
+                Some(SessionStatus::Running),
+                &catalog
+            ),
+            "deppy-sijo"
         );
         assert_eq!(
             session_status_label(Some(SessionStatus::Idle), &catalog),
@@ -9159,10 +9216,15 @@ mod tests {
             ui.resolve_session_title("workspace.spawn.shell 1", Some(session), None, &catalog),
             "precomputed-repo"
         );
+        assert_eq!(
+            ui.session_project_context(Some(session)),
+            Some("precomputed-repo")
+        );
         ui.set_session_cwds(
             HashMap::from([(session, "/workspace/other".to_owned())]),
             crate::config::SessionNameStyle::Repo,
         );
+        assert_eq!(ui.session_project_context(Some(session)), Some("other"));
         assert!(ui.session_project_names.entries.is_empty());
         assert_eq!(
             ui.resolve_session_title(
@@ -9172,6 +9234,13 @@ mod tests {
                 &catalog,
             ),
             "osc-title"
+        );
+        ui.set_session_cwds(HashMap::new(), crate::config::SessionNameStyle::Repo);
+        ui.set_project_name(Some("active-workspace".to_owned()));
+        assert_eq!(
+            ui.session_project_context(Some(session)),
+            None,
+            "세션 cwd가 없으면 활성 workspace 이름을 해당 세션의 작업으로 단정하지 않는다"
         );
     }
 

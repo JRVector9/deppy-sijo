@@ -134,10 +134,9 @@ impl WorkHistoryUi {
             let shown = visible.len().to_string();
             let total = snapshot.rows.len().to_string();
             ui.label(
-                egui::RichText::new(catalog.t(
-                    "history.count",
-                    &[("shown", &shown), ("total", &total)],
-                ))
+                egui::RichText::new(
+                    catalog.t("history.count", &[("shown", &shown), ("total", &total)]),
+                )
                 .small()
                 .weak(),
             );
@@ -171,14 +170,8 @@ impl WorkHistoryUi {
                         let presentation = presentations
                             .iter()
                             .find(|candidate| candidate.identity.matches(row));
-                        let card_action = render_card(
-                            ui,
-                            row,
-                            expanded,
-                            now,
-                            presentation,
-                            catalog,
-                        );
+                        let card_action =
+                            render_card(ui, row, expanded, now, presentation, catalog);
                         if card_action.toggle {
                             self.toggle_selected(WorkTurnIdentity::from(row));
                         }
@@ -275,9 +268,11 @@ impl WorkHistoryUi {
     }
 
     fn reconcile_selection(&mut self, rows: &[storage::AgentWorkTurnRow]) {
-        if self.selected.as_ref().is_some_and(|selected| {
-            !rows.iter().any(|row| selected.matches(row))
-        }) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !rows.iter().any(|row| selected.matches(row)))
+        {
             self.selected = None;
         }
     }
@@ -375,13 +370,9 @@ fn render_card(
                     ui.set_width(ui.available_width());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new(relative_age_text(
-                                catalog,
-                                row.updated_at,
-                                now,
-                            ))
-                            .small()
-                            .weak(),
+                            egui::RichText::new(relative_age_text(catalog, row.updated_at, now))
+                                .small()
+                                .weak(),
                         );
                         ui.add(
                             egui::Label::new(
@@ -393,17 +384,16 @@ fn render_card(
                     ui.add_space(5.0);
                     ui.horizontal(|ui| {
                         status_dot(ui, row.state);
-                        let summary = row.agent_summary.as_deref().unwrap_or_else(|| {
-                            catalog_key_for_summary_fallback(row.state)
-                        });
+                        let summary = row
+                            .agent_summary
+                            .as_deref()
+                            .unwrap_or_else(|| catalog_key_for_summary_fallback(row.state));
                         let summary = if row.agent_summary.is_some() {
                             summary.to_owned()
                         } else {
                             catalog.t(summary, &[])
                         };
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(summary).weak()).truncate(),
-                        );
+                        ui.add(egui::Label::new(egui::RichText::new(summary).weak()).truncate());
                     });
                 });
             });
@@ -425,11 +415,7 @@ fn render_card(
                     .as_deref()
                     .map(str::to_owned)
                     .unwrap_or_else(|| catalog.t("history.card.no_summary", &[]));
-                expanded_text(
-                    ui,
-                    &catalog.t("history.card.latest_work", &[]),
-                    &summary,
-                );
+                expanded_text(ui, &catalog.t("history.card.latest_work", &[]), &summary);
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     if let Some(presentation) = presentation {
@@ -445,9 +431,8 @@ fn render_card(
                             .add_enabled(enabled, egui::Button::new(catalog.t(label_key, &[])))
                             .clicked()
                         {
-                            action = Some(WorkHistoryAction::Activate(
-                                presentation.identity.clone(),
-                            ));
+                            action =
+                                Some(WorkHistoryAction::Activate(presentation.identity.clone()));
                         }
                         if presentation.show_diff
                             && ui
@@ -455,9 +440,8 @@ fn render_card(
                                 .on_hover_text(catalog.t("history.action.show_diff_hint", &[]))
                                 .clicked()
                         {
-                            action = Some(WorkHistoryAction::ShowDiff(
-                                presentation.identity.clone(),
-                            ));
+                            action =
+                                Some(WorkHistoryAction::ShowDiff(presentation.identity.clone()));
                         }
                     }
                 });
@@ -467,9 +451,7 @@ fn render_card(
                 }) = presentation
                 {
                     let key = match reason {
-                        WorkHistoryDisabledReason::Checking => {
-                            "history.action.disabled.checking"
-                        }
+                        WorkHistoryDisabledReason::Checking => "history.action.disabled.checking",
                         WorkHistoryDisabledReason::AgentUnavailable => {
                             "history.action.disabled.unavailable"
                         }
@@ -532,11 +514,7 @@ fn metadata_parts(row: &storage::AgentWorkTurnRow) -> MetadataParts<'_> {
     }
 }
 
-fn render_metadata(
-    ui: &mut egui::Ui,
-    row: &storage::AgentWorkTurnRow,
-    catalog: &i18n::Catalog,
-) {
+fn render_metadata(ui: &mut egui::Ui, row: &storage::AgentWorkTurnRow, catalog: &i18n::Catalog) {
     let metadata = metadata_parts(row);
     ui.horizontal_wrapped(|ui| {
         for (index, part) in metadata.primary.iter().enumerate() {
@@ -550,10 +528,7 @@ fn render_metadata(
         }
         if let Some(count) = metadata.git_change_count {
             let count = count.to_string();
-            metadata_chip(
-                ui,
-                &catalog.t("history.card.changes", &[("count", &count)]),
-            );
+            metadata_chip(ui, &catalog.t("history.card.changes", &[("count", &count)]));
         }
         ui.label(egui::RichText::new("·").small().weak());
         ui.label(
@@ -624,10 +599,7 @@ fn status_dot(ui: &mut egui::Ui, state: storage::AgentWorkTurnState) {
         .circle_filled(rect.center(), 4.0, state_color(state, ui.visuals()));
 }
 
-fn state_color(
-    state: storage::AgentWorkTurnState,
-    visuals: &egui::Visuals,
-) -> egui::Color32 {
+fn state_color(state: storage::AgentWorkTurnState, visuals: &egui::Visuals) -> egui::Color32 {
     let tokens = crate::ui::designall::tokens(visuals);
     match state {
         storage::AgentWorkTurnState::Working => tokens.success,
@@ -744,7 +716,11 @@ mod tests {
 
     #[test]
     fn 정렬은_작업중_확인필요_완료_순이고_같은상태는_최신순이다() {
-        let mut same_second_newer = row("same-second-newer", storage::AgentWorkTurnState::Working, 20);
+        let mut same_second_newer = row(
+            "same-second-newer",
+            storage::AgentWorkTurnState::Working,
+            20,
+        );
         same_second_newer.source_offset = 21;
         let rows = vec![
             row("completed", storage::AgentWorkTurnState::Completed, 90),
@@ -815,11 +791,8 @@ mod tests {
 
     #[test]
     fn 같은카드를_다시고르면_접힌다() {
-        let identity = WorkTurnIdentity::from(&row(
-            "toggle",
-            storage::AgentWorkTurnState::Working,
-            1,
-        ));
+        let identity =
+            WorkTurnIdentity::from(&row("toggle", storage::AgentWorkTurnState::Working, 1));
         let mut ui = WorkHistoryUi::new();
 
         ui.toggle_selected(identity.clone());
@@ -874,13 +847,8 @@ mod tests {
 
         ui.query = "not-found".to_owned();
         assert!(
-            ui.visible_rows(&[row(
-                "one",
-                storage::AgentWorkTurnState::Completed,
-                1,
-            )])
-            .is_empty()
+            ui.visible_rows(&[row("one", storage::AgentWorkTurnState::Completed, 1,)])
+                .is_empty()
         );
     }
-
 }

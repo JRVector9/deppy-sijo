@@ -76,9 +76,7 @@ fn parse_branch_header(record: &str) -> Option<String> {
         .strip_prefix("No commits yet on ")
         .or_else(|| value.strip_prefix("Initial commit on "))
         .unwrap_or_else(|| value.split_once("...").map_or(value, |(name, _)| name));
-    let branch = branch
-        .split_once(" [")
-        .map_or(branch, |(name, _)| name);
+    let branch = branch.split_once(" [").map_or(branch, |(name, _)| name);
     if branch.is_empty() || branch == "HEAD" || branch.starts_with("HEAD (") {
         None
     } else {
@@ -108,8 +106,14 @@ fn parse_porcelain_status(raw: &str) -> ParsedStatus {
         records.pop();
     }
 
-    let branch = records.first().and_then(|record| parse_branch_header(record));
-    let mut index = usize::from(records.first().is_some_and(|record| record.starts_with("## ")));
+    let branch = records
+        .first()
+        .and_then(|record| parse_branch_header(record));
+    let mut index = usize::from(
+        records
+            .first()
+            .is_some_and(|record| record.starts_with("## ")),
+    );
     let mut changed_files = 0u32;
     while index < records.len() {
         let record = records[index];
@@ -298,9 +302,10 @@ impl WorkHistoryGitInput {
     }
 
     fn is_current(&self, revision: u64) -> bool {
-        self.shared.state.lock().is_ok_and(|state| {
-            !state.stopping && state.current.revision == revision
-        })
+        self.shared
+            .state
+            .lock()
+            .is_ok_and(|state| !state.stopping && state.current.revision == revision)
     }
 
     fn stop(&self) {
@@ -499,22 +504,14 @@ pub(crate) struct WorkHistoryGitWorker {
 impl WorkHistoryGitWorker {
     pub(crate) fn spawn(
         ctx: egui::Context,
-    ) -> (
-        Self,
-        WorkHistoryGitInput,
-        WorkHistoryGitOutcomeReceiver,
-    ) {
+    ) -> (Self, WorkHistoryGitInput, WorkHistoryGitOutcomeReceiver) {
         Self::spawn_with_backend(ctx, ProductionBackend)
     }
 
     fn spawn_with_backend<B: GitFactBackend>(
         ctx: egui::Context,
         backend: B,
-    ) -> (
-        Self,
-        WorkHistoryGitInput,
-        WorkHistoryGitOutcomeReceiver,
-    ) {
+    ) -> (Self, WorkHistoryGitInput, WorkHistoryGitOutcomeReceiver) {
         let mailbox = OutcomeMailbox::new();
         let input = WorkHistoryGitInput::new(Arc::clone(&mailbox));
         let worker_input = input.clone();
@@ -590,7 +587,10 @@ mod tests {
         assert_eq!(admit_cwds(exact).expect("exact limit").len(), 16);
 
         let with_duplicates = vec!["/repo/a".to_owned(); WORK_HISTORY_GIT_CWDS_MAX + 1];
-        assert_eq!(admit_cwds(with_duplicates).expect("one distinct cwd").len(), 1);
+        assert_eq!(
+            admit_cwds(with_duplicates).expect("one distinct cwd").len(),
+            1
+        );
 
         let over = (0..=WORK_HISTORY_GIT_CWDS_MAX)
             .map(|index| format!("/repo/{index}"))

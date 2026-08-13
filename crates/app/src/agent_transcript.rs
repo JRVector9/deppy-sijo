@@ -225,8 +225,7 @@ fn tail_snapshot(path: &Path, max_bytes: u64) -> std::io::Result<TailSnapshot> {
         .ok()
         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|value| i64::try_from(value.as_secs()).ok());
-    let snapshot =
-        tail_snapshot_from_reader(&mut file, snapshot_len, max_bytes, modified_at)?;
+    let snapshot = tail_snapshot_from_reader(&mut file, snapshot_len, max_bytes, modified_at)?;
     if file.metadata()?.len() < snapshot_len {
         return Err(invalid_input("transcript_shrank_during_read"));
     }
@@ -244,9 +243,7 @@ fn validate_tail_text(text: &str) -> Option<()> {
     Some(())
 }
 
-fn snapshot_lines(
-    snapshot: &TailSnapshot,
-) -> impl Iterator<Item = (u64, &str)> {
+fn snapshot_lines(snapshot: &TailSnapshot) -> impl Iterator<Item = (u64, &str)> {
     let mut offset = snapshot.base_offset;
     snapshot.text.split_inclusive('\n').map(move |chunk| {
         let line_offset = offset;
@@ -328,8 +325,7 @@ fn parse_iso_utc_secs(value: &str) -> Option<i64> {
 fn event_occurred_at(value: &Value) -> Option<i64> {
     ["timestamp", "time"].into_iter().find_map(|key| {
         let value = value.get(key)?;
-        normalized_epoch_secs(value)
-            .or_else(|| value.as_str().and_then(parse_iso_utc_secs))
+        normalized_epoch_secs(value).or_else(|| value.as_str().and_then(parse_iso_utc_secs))
     })
 }
 
@@ -1080,7 +1076,10 @@ mod kimi_tests {
 
         assert_eq!(state.recent_turns.len(), 2);
         assert_eq!(state.recent_turns[0].instruction, "같은 요청");
-        assert_eq!(state.recent_turns[0].agent_summary.as_deref(), Some("둘째 작업 중"));
+        assert_eq!(
+            state.recent_turns[0].agent_summary.as_deref(),
+            Some("둘째 작업 중")
+        );
         assert_eq!(state.recent_turns[0].activity, AgentActivity::Working);
         assert_eq!(state.recent_turns[0].source_offset, second_offset);
         assert_eq!(
@@ -1088,9 +1087,15 @@ mod kimi_tests {
             format!("kimi:{second_offset:x}")
         );
         assert_eq!(state.recent_turns[1].turn_key, "kimi:0");
-        assert_eq!(state.recent_turns[1].agent_summary.as_deref(), Some("첫 응답"));
+        assert_eq!(
+            state.recent_turns[1].agent_summary.as_deref(),
+            Some("첫 응답")
+        );
         assert_eq!(state.recent_turns[1].activity, AgentActivity::Idle);
-        assert_ne!(state.recent_turns[0].turn_key, state.recent_turns[1].turn_key);
+        assert_ne!(
+            state.recent_turns[0].turn_key,
+            state.recent_turns[1].turn_key
+        );
     }
 
     #[test]
@@ -1786,16 +1791,25 @@ mod tests {
 
         assert_eq!(state.recent_turns.len(), 2);
         assert_eq!(state.recent_turns[0].instruction, "같은 요청");
-        assert_eq!(state.recent_turns[0].agent_summary.as_deref(), Some("둘째 작업 중"));
+        assert_eq!(
+            state.recent_turns[0].agent_summary.as_deref(),
+            Some("둘째 작업 중")
+        );
         assert_eq!(state.recent_turns[0].activity, AgentActivity::Working);
         assert_eq!(state.recent_turns[0].source_offset, second_offset);
         assert_eq!(
             state.recent_turns[0].turn_key,
             format!("claude:{second_offset:x}")
         );
-        assert_eq!(state.recent_turns[1].agent_summary.as_deref(), Some("첫 응답"));
+        assert_eq!(
+            state.recent_turns[1].agent_summary.as_deref(),
+            Some("첫 응답")
+        );
         assert_eq!(state.recent_turns[1].activity, AgentActivity::Idle);
-        assert_ne!(state.recent_turns[0].turn_key, state.recent_turns[1].turn_key);
+        assert_ne!(
+            state.recent_turns[0].turn_key,
+            state.recent_turns[1].turn_key
+        );
         assert_eq!(state.user_instruction.as_deref(), Some("같은 요청"));
         assert_eq!(state.last_agent_summary.as_deref(), Some("둘째 작업 중"));
     }
@@ -1949,16 +1963,25 @@ mod tests {
 
         assert_eq!(state.recent_turns.len(), 2);
         assert_eq!(state.recent_turns[0].instruction, "같은 요청");
-        assert_eq!(state.recent_turns[0].agent_summary.as_deref(), Some("둘째 작업 중"));
+        assert_eq!(
+            state.recent_turns[0].agent_summary.as_deref(),
+            Some("둘째 작업 중")
+        );
         assert_eq!(state.recent_turns[0].activity, AgentActivity::Working);
         assert_eq!(state.recent_turns[0].source_offset, second_offset);
         assert_eq!(
             state.recent_turns[0].turn_key,
             format!("codex:{second_offset:x}")
         );
-        assert_eq!(state.recent_turns[1].agent_summary.as_deref(), Some("첫 응답"));
+        assert_eq!(
+            state.recent_turns[1].agent_summary.as_deref(),
+            Some("첫 응답")
+        );
         assert_eq!(state.recent_turns[1].activity, AgentActivity::Idle);
-        assert_ne!(state.recent_turns[0].turn_key, state.recent_turns[1].turn_key);
+        assert_ne!(
+            state.recent_turns[0].turn_key,
+            state.recent_turns[1].turn_key
+        );
         assert_eq!(state.user_instruction.as_deref(), Some("같은 요청"));
         assert_eq!(state.last_agent_summary.as_deref(), Some("둘째 작업 중"));
     }

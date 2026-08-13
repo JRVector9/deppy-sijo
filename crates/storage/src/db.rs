@@ -2147,10 +2147,7 @@ fn agent_work_turn_input_bytes(row: &AgentWorkTurnUpsert) -> anyhow::Result<usiz
                 row.effort.as_deref(),
                 AGENT_WORK_TURN_METADATA_BYTES_MAX,
             )
-            && agent_work_optional_text_is_valid(
-                row.cwd.as_deref(),
-                AGENT_WORK_TURN_CWD_BYTES_MAX,
-            )
+            && agent_work_optional_text_is_valid(row.cwd.as_deref(), AGENT_WORK_TURN_CWD_BYTES_MAX,)
             && agent_work_optional_text_is_valid(
                 row.branch.as_deref(),
                 AGENT_WORK_TURN_METADATA_BYTES_MAX,
@@ -2185,8 +2182,7 @@ fn validate_agent_work_history_query(query: &AgentWorkHistoryQuery) -> anyhow::R
     anyhow::ensure!(
         bounded_id_is_valid(&query.workspace_id)
             && query.limit <= AGENT_WORK_TURNS_PER_WORKSPACE_MAX
-            && (1..=AGENT_WORK_HISTORY_SNAPSHOT_BYTES_MAX)
-                .contains(&query.snapshot_bytes_max),
+            && (1..=AGENT_WORK_HISTORY_SNAPSHOT_BYTES_MAX).contains(&query.snapshot_bytes_max),
         AGENT_WORK_HISTORY_INPUT_INVALID
     );
     Ok(())
@@ -2243,8 +2239,7 @@ fn read_agent_work_history(
         .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_QUERY_FAILED))?
     {
         let source_offset = u64::try_from(
-            bounded_integer(row, 5)
-                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?,
+            bounded_integer(row, 5).map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?,
         )
         .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?;
         let git_change_count = bounded_optional_integer(row, 12)
@@ -2257,27 +2252,15 @@ fn read_agent_work_history(
                 .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?,
         )?;
         result.push(AgentWorkTurnRow {
-            workspace_id: bounded_required_text(
-                row,
-                0,
-                AGENT_WORK_TURN_ID_BYTES_MAX,
-                true,
-                true,
-            )
-            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
-            .to_owned(),
+            workspace_id: bounded_required_text(row, 0, AGENT_WORK_TURN_ID_BYTES_MAX, true, true)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .to_owned(),
             pane_id: bounded_required_text(row, 1, AGENT_WORK_TURN_ID_BYTES_MAX, true, true)
                 .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
                 .to_owned(),
-            kind: bounded_required_text(
-                row,
-                2,
-                AGENT_WORK_TURN_PROVIDER_BYTES_MAX,
-                true,
-                true,
-            )
-            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
-            .to_owned(),
+            kind: bounded_required_text(row, 2, AGENT_WORK_TURN_PROVIDER_BYTES_MAX, true, true)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .to_owned(),
             agent_session_id: bounded_required_text(
                 row,
                 3,
@@ -2287,15 +2270,9 @@ fn read_agent_work_history(
             )
             .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
             .to_owned(),
-            turn_key: bounded_required_text(
-                row,
-                4,
-                AGENT_WORK_TURN_ID_BYTES_MAX,
-                true,
-                true,
-            )
-            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
-            .to_owned(),
+            turn_key: bounded_required_text(row, 4, AGENT_WORK_TURN_ID_BYTES_MAX, true, true)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .to_owned(),
             source_offset,
             instruction: bounded_required_text(
                 row,
@@ -2791,7 +2768,10 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
     let mut work_turn_bytes = 0usize;
     for mutation in &job.work_turn_mutations {
         let AgentWorkHistoryMutation::Upsert(row) = mutation;
-        anyhow::ensure!(row.workspace_id == job.workspace_id, AGENT_STATE_INPUT_INVALID);
+        anyhow::ensure!(
+            row.workspace_id == job.workspace_id,
+            AGENT_STATE_INPUT_INVALID
+        );
         work_turn_bytes = work_turn_bytes
             .checked_add(
                 agent_work_turn_input_bytes(row)
@@ -11944,11 +11924,7 @@ mod tests {
         job
     }
 
-    fn agent_work_turn(
-        workspace_id: &str,
-        index: usize,
-        updated_at: i64,
-    ) -> AgentWorkTurnUpsert {
+    fn agent_work_turn(workspace_id: &str, index: usize, updated_at: i64) -> AgentWorkTurnUpsert {
         AgentWorkTurnUpsert {
             workspace_id: workspace_id.to_owned(),
             pane_id: format!("pane-{index}"),
@@ -12007,7 +11983,9 @@ mod tests {
                 .conn
                 .prepare("PRAGMA table_info(agent_work_turns)")
                 .unwrap()
-                .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?)))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+                })
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap()
@@ -12186,9 +12164,11 @@ mod tests {
             AGENT_STATE_INPUT_INVALID
         );
         assert_eq!(
-            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(workspace_id.as_str()))
-                .unwrap()
-                .len(),
+            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(
+                workspace_id.as_str()
+            ))
+            .unwrap()
+            .len(),
             AGENT_WORK_TURN_BATCH_MAX
         );
 
@@ -12203,10 +12183,12 @@ mod tests {
             AGENT_STATE_INPUT_INVALID
         );
         assert!(
-            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(workspace_id.as_str()))
-                .unwrap()
-                .iter()
-                .all(|row| row.instruction != "valid-before-invalid")
+            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(
+                workspace_id.as_str()
+            ))
+            .unwrap()
+            .iter()
+            .all(|row| row.instruction != "valid-before-invalid")
         );
     }
 
@@ -12237,9 +12219,11 @@ mod tests {
             AGENT_STATE_INPUT_INVALID
         );
         assert!(
-            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(workspace_id.as_str()))
-                .unwrap()
-                .is_empty()
+            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(
+                workspace_id.as_str()
+            ))
+            .unwrap()
+            .is_empty()
         );
     }
 

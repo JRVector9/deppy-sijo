@@ -447,8 +447,8 @@ fn retained_structured_mutations_bytes(
 fn retained_work_history_mutations_bytes(
     values: &Vec<storage::AgentWorkHistoryMutation>,
 ) -> Option<usize> {
-    let mut total = std::mem::size_of::<storage::AgentWorkHistoryMutation>()
-        .checked_mul(values.capacity())?;
+    let mut total =
+        std::mem::size_of::<storage::AgentWorkHistoryMutation>().checked_mul(values.capacity())?;
     for value in values {
         let storage::AgentWorkHistoryMutation::Upsert(row) = value;
         total = total
@@ -467,9 +467,7 @@ fn retained_work_history_mutations_bytes(
     Some(total)
 }
 
-fn work_history_key(
-    row: &storage::AgentWorkTurnUpsert,
-) -> (String, String, String) {
+fn work_history_key(row: &storage::AgentWorkTurnUpsert) -> (String, String, String) {
     (
         row.kind.clone(),
         row.agent_session_id.clone(),
@@ -7609,6 +7607,14 @@ struct ClaudeDirectDefaults {
     effort: Option<String>,
 }
 
+struct AgentDetectInputSnapshot {
+    epoch: u64,
+    sessions: Vec<(runtime::SessionId, u32)>,
+    hook_overrides:
+        std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    hidden: bool,
+}
+
 pub struct App {
     config: Config,
     config_path: PathBuf,
@@ -7996,12 +8002,7 @@ pub struct App {
     /// 워크스페이스 전환마다 증가 — 스레드가 실어 보낸 stale 결과를 폐기하는 데 쓴다.
     agent_detect_epoch: u64,
     agent_detect_generation: u64,
-    agent_detect_last_input: Option<(
-        u64,
-        Vec<(runtime::SessionId, u32)>,
-        std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
-        bool,
-    )>,
+    agent_detect_last_input: Option<AgentDetectInputSnapshot>,
     /// hook 바인딩 DB 조회 스로틀(1s) — poll_agent_detect는 매 프레임 돌아 매번 쿼리하면
     /// 렌더 중 초당 수십 회가 된다. 캐시를 워커 입력에 재사용.
     last_hook_query: std::time::Instant,
@@ -11126,12 +11127,12 @@ impl App {
             agent_detect_rx,
             agent_detect_epoch: 0,
             agent_detect_generation: 0,
-            agent_detect_last_input: Some((
-                0,
-                Vec::new(),
-                std::collections::HashMap::new(),
-                false,
-            )),
+            agent_detect_last_input: Some(AgentDetectInputSnapshot {
+                epoch: 0,
+                sessions: Vec::new(),
+                hook_overrides: std::collections::HashMap::new(),
+                hidden: false,
+            }),
             last_hook_query: std::time::Instant::now(),
             hook_overrides: std::collections::HashMap::new(),
             persisted_agents: std::collections::HashMap::new(),
@@ -11830,10 +11831,7 @@ impl App {
         true
     }
 
-    fn acknowledge_work_history_batch(
-        &mut self,
-        mutations: &[storage::AgentWorkHistoryMutation],
-    ) {
+    fn acknowledge_work_history_batch(&mut self, mutations: &[storage::AgentWorkHistoryMutation]) {
         for mutation in mutations {
             let storage::AgentWorkHistoryMutation::Upsert(row) = mutation;
             self.work_history_projection_cache
@@ -11841,8 +11839,7 @@ impl App {
         }
         self.work_history_git_force_refresh = true;
         self.work_history_pending.clear();
-        while self.work_history_projection_cache.len()
-            > storage::AGENT_WORK_TURNS_PER_WORKSPACE_MAX
+        while self.work_history_projection_cache.len() > storage::AGENT_WORK_TURNS_PER_WORKSPACE_MAX
         {
             let Some(oldest) = self
                 .work_history_projection_cache
@@ -11905,7 +11902,9 @@ impl App {
                     display.model.clone_from(&self.claude_direct_defaults.model);
                 }
                 if display.effort.is_none() {
-                    display.effort.clone_from(&self.claude_direct_defaults.effort);
+                    display
+                        .effort
+                        .clone_from(&self.claude_direct_defaults.effort);
                 }
             }
             for (index, turn) in recent.iter().take(24).enumerate() {
@@ -11928,7 +11927,11 @@ impl App {
                 } else {
                     storage::AgentWorkTurnState::Working
                 };
-                let key = (kind.clone(), binding.session_id.clone(), turn.turn_key.clone());
+                let key = (
+                    kind.clone(),
+                    binding.session_id.clone(),
+                    turn.turn_key.clone(),
+                );
                 let previous = self
                     .work_history_projection_cache
                     .get(&key)
@@ -12005,9 +12008,7 @@ impl App {
             let newest = self
                 .work_history_projection_cache
                 .values()
-                .filter(|row| {
-                    row.kind == kind && row.agent_session_id == binding.session_id
-                })
+                .filter(|row| row.kind == kind && row.agent_session_id == binding.session_id)
                 .max_by_key(|row| row.source_offset);
             if let Some(mut row) = newest.cloned()
                 && row.state != state
@@ -12049,13 +12050,10 @@ impl App {
         let mut seen = std::collections::HashSet::new();
         cwds.retain(|cwd| seen.insert(cwd.clone()));
         cwds.truncate(crate::agent_work_git::WORK_HISTORY_GIT_CWDS_MAX);
-        if cwds.is_empty()
-            || (!force_refresh && !manual && cwds == self.work_history_git_cwds)
-        {
+        if cwds.is_empty() || (!force_refresh && !manual && cwds == self.work_history_git_cwds) {
             return;
         }
-        self.work_history_git_generation =
-            self.work_history_git_generation.wrapping_add(1).max(1);
+        self.work_history_git_generation = self.work_history_git_generation.wrapping_add(1).max(1);
         let generation = self.work_history_git_generation;
         if self
             .work_history_git_input
@@ -12638,9 +12636,10 @@ impl App {
                         AppAgentStateExactKind::WorkHistoryBatch(_)
                     ) && exact_scope_current
                     {
-                        let retry_git = self.work_history_pending.values().any(|row| {
-                            row.branch.is_some() || row.git_change_count.is_some()
-                        });
+                        let retry_git = self
+                            .work_history_pending
+                            .values()
+                            .any(|row| row.branch.is_some() || row.git_change_count.is_some());
                         self.work_history_pending.clear();
                         self.work_history_git_force_refresh |= retry_git;
                         self.work_history_error =
@@ -12672,7 +12671,7 @@ impl App {
                         AppAgentStateExactKind::WorkHistoryBatch(_)
                     ) && exact_scope_current
                         && self.agent_terminal_ui.view()
-                        == ui::agent_terminal::AgentTerminalView::History
+                            == ui::agent_terminal::AgentTerminalView::History
                     {
                         let _ = self.request_work_history_projection(false);
                     }
@@ -12798,9 +12797,7 @@ impl App {
                 ) {
                     self.handle_catalog_startup_failure();
                 }
-                if self.agent_terminal_ui.view()
-                    == ui::agent_terminal::AgentTerminalView::History
-                {
+                if self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::History {
                     let _ = self.request_work_history_projection(false);
                 }
             }
@@ -12850,14 +12847,15 @@ impl App {
             );
         }
         let hidden = !self.active.render_active;
-        let input_changed = self.agent_detect_last_input.as_ref().is_none_or(
-            |(epoch, previous_sessions, previous_overrides, previous_hidden)| {
-                *epoch != self.agent_detect_epoch
-                    || previous_sessions != &sessions
-                    || previous_overrides != &self.hook_overrides
-                    || *previous_hidden != hidden
-            },
-        );
+        let input_changed = self
+            .agent_detect_last_input
+            .as_ref()
+            .is_none_or(|previous| {
+                previous.epoch != self.agent_detect_epoch
+                    || previous.sessions != sessions
+                    || previous.hook_overrides != self.hook_overrides
+                    || previous.hidden != hidden
+            });
         let _ = self.agent_detect_input.publish(
             self.agent_detect_epoch,
             sessions.clone(),
@@ -12867,12 +12865,12 @@ impl App {
         );
         if input_changed {
             self.agent_detect_generation = self.agent_detect_generation.wrapping_add(1);
-            self.agent_detect_last_input = Some((
-                self.agent_detect_epoch,
+            self.agent_detect_last_input = Some(AgentDetectInputSnapshot {
+                epoch: self.agent_detect_epoch,
                 sessions,
-                self.hook_overrides.clone(),
+                hook_overrides: self.hook_overrides.clone(),
                 hidden,
-            ));
+            });
         }
         // capacity-one 결과를 논블로킹 소비한다(epoch 불일치=전환 잔여는 폐기).
         let mut latest_bindings = None;
@@ -13029,8 +13027,7 @@ impl App {
             &self.archived_agent_resume,
             self.agent_launcher_snapshot.as_ref(),
         )
-        .remove(&session)
-        else {
+        .remove(&session) else {
             return false;
         };
         let Some(extra_args) = target.extra_args else {
@@ -13485,15 +13482,15 @@ impl App {
                         .as_ref()
                         .and_then(|targets| targets.get(&session))
                         .is_some_and(|target| match target.presentation {
-                            ArchivedResumePresentation::Exact => archived_row.is_some_and(|saved| {
-                                saved.kind.as_deref() == Some(row.kind.as_str())
-                                    && saved.session_id.as_deref()
-                                        == Some(row.agent_session_id.as_str())
-                                    && target.extra_args.is_some()
-                            }),
-                            ArchivedResumePresentation::RecentInCwd => {
-                                target.extra_args.is_some()
+                            ArchivedResumePresentation::Exact => {
+                                archived_row.is_some_and(|saved| {
+                                    saved.kind.as_deref() == Some(row.kind.as_str())
+                                        && saved.session_id.as_deref()
+                                            == Some(row.agent_session_id.as_str())
+                                        && target.extra_args.is_some()
+                                })
                             }
+                            ArchivedResumePresentation::RecentInCwd => target.extra_args.is_some(),
                             _ => false,
                         });
                     if resumable {
@@ -13515,9 +13512,7 @@ impl App {
         }
     }
 
-    fn work_history_presentations(
-        &self,
-    ) -> Vec<ui::work_history::WorkHistoryActionPresentation> {
+    fn work_history_presentations(&self) -> Vec<ui::work_history::WorkHistoryActionPresentation> {
         self.work_history_rows
             .iter()
             .map(|row| ui::work_history::WorkHistoryActionPresentation {
@@ -13565,12 +13560,8 @@ impl App {
                         Some(ui::work_history::WorkHistoryErrorCode::InvalidData);
                     return;
                 };
-                self.diff_panel_ui.open_for_path(
-                    ctx,
-                    self.active.id.clone(),
-                    cwd,
-                    row.instruction,
-                );
+                self.diff_panel_ui
+                    .open_for_path(ctx, self.active.id.clone(), cwd, row.instruction);
             }
             WorkHistoryAction::Activate(identity) => {
                 let row = self
@@ -15784,8 +15775,8 @@ impl App {
         self.work_history_error = None;
         self.work_history_git_cwds.clear();
         self.work_history_git_generation = self.work_history_git_generation.wrapping_add(1).max(1);
-        self.work_history_loading = self.agent_terminal_ui.view()
-            == ui::agent_terminal::AgentTerminalView::History;
+        self.work_history_loading =
+            self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::History;
         // 웹 대시보드가 켜져 있으면 새 활성 worker로 재구독한다(전환 후 상태 스트림 유지).
         self.rebind_web_dashboard();
         // agent 감지 워커: 전환 시 epoch을 올려 이전 워크스페이스의 잔여 결과를 폐기하고,
@@ -24192,11 +24183,11 @@ impl eframe::App for App {
         if self.active.workspace_ui.take_new_session_requested() {
             self.stage_workspace_controller_action(WorkspaceControllerAction::OpenAgentLauncher);
         }
-        if let Some(action) = work_history_action {
-            if self.pending_work_history_action.is_none() {
-                self.pending_work_history_action = Some(action);
-                ui.ctx().request_repaint();
-            }
+        if let Some(action) = work_history_action
+            && self.pending_work_history_action.is_none()
+        {
+            self.pending_work_history_action = Some(action);
+            ui.ctx().request_repaint();
         }
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
         // (아래 notif_click 합류 지점)에 태운다(사이드바 FocusSession과 같은 규칙).
@@ -25761,9 +25752,7 @@ impl AppWorkHistoryActivation {
                 ui::work_history::WorkHistoryPrimaryAction::Resume
             }
             Self::NewRun(_) => ui::work_history::WorkHistoryPrimaryAction::NewRun,
-            Self::Disabled(reason) => {
-                ui::work_history::WorkHistoryPrimaryAction::Disabled(*reason)
-            }
+            Self::Disabled(reason) => ui::work_history::WorkHistoryPrimaryAction::Disabled(*reason),
         }
     }
 }

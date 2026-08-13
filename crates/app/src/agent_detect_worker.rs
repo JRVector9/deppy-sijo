@@ -449,15 +449,17 @@ fn compute_activity(
         .collect()
 }
 
+type ActivityInfoAndWorkTurns = (
+    HashMap<SessionId, AgentActivity>,
+    HashMap<SessionId, AgentDisplay>,
+    HashMap<SessionId, Vec<TranscriptTurn>>,
+);
+
 /// transcript를 세션당 **한 번만** 파싱해 activity + 표시정보 + 최근 사용자 턴을 함께
 /// 만든다(중복 파싱 방지). 표시정보와 턴은 바인딩 tier에서만 필요.
 fn compute_activity_and_info(
     bindings: &HashMap<SessionId, AgentBinding>,
-) -> (
-    HashMap<SessionId, AgentActivity>,
-    HashMap<SessionId, AgentDisplay>,
-    HashMap<SessionId, Vec<TranscriptTurn>>,
-) {
+) -> ActivityInfoAndWorkTurns {
     let mut activity = HashMap::new();
     let mut info = HashMap::new();
     let mut work_turns = HashMap::new();
@@ -901,10 +903,12 @@ mod tests {
                     .map(|session| (*session, "/fixture".to_owned()))
                     .collect(),
                 agent_info: HashMap::new(),
-                work_turns: Some(bindings
-                    .keys()
-                    .map(|session| (*session, vec![work_turn(session.0 as usize)]))
-                    .collect()),
+                work_turns: Some(
+                    bindings
+                        .keys()
+                        .map(|session| (*session, vec![work_turn(session.0 as usize)]))
+                        .collect(),
+                ),
                 bindings,
             }
         }
@@ -979,9 +983,7 @@ mod tests {
             "버려지면 손으로 띄운 에이전트가 카드에 안 뜬다"
         );
         assert!(
-            latest.bindings.is_some()
-                && latest.agent_info.is_some()
-                && latest.work_turns.is_some(),
+            latest.bindings.is_some() && latest.agent_info.is_some() && latest.work_turns.is_some(),
             "부분 결과가 기존 binding payload를 지우면 카드가 도로 셸이 된다"
         );
 
@@ -1289,10 +1291,12 @@ mod tests {
                     .map(|session| (*session, "/fixture".to_owned()))
                     .collect(),
                 agent_info: HashMap::new(),
-                work_turns: Some(bindings
-                    .keys()
-                    .map(|session| (*session, vec![work_turn(session.0 as usize)]))
-                    .collect()),
+                work_turns: Some(
+                    bindings
+                        .keys()
+                        .map(|session| (*session, vec![work_turn(session.0 as usize)]))
+                        .collect(),
+                ),
                 bindings,
             },
             &sessions,
@@ -1318,18 +1322,14 @@ mod tests {
             work_turns: Some(HashMap::from([(session, turns)])),
             agent_kinds: HashMap::new(),
         };
-        let exact = (0..MAX_RECENT_TRANSCRIPT_TURNS)
-            .map(work_turn)
-            .collect();
+        let exact = (0..MAX_RECENT_TRANSCRIPT_TURNS).map(work_turn).collect();
         let exact = bound_pass(make_pass(exact), &sessions);
         assert_eq!(
             exact.work_turns.as_ref().expect("exact turns")[&session].len(),
             MAX_RECENT_TRANSCRIPT_TURNS
         );
 
-        let over = (0..=MAX_RECENT_TRANSCRIPT_TURNS)
-            .map(work_turn)
-            .collect();
+        let over = (0..=MAX_RECENT_TRANSCRIPT_TURNS).map(work_turn).collect();
         let over = bound_pass(make_pass(over), &sessions);
         assert!(
             !over

@@ -363,43 +363,67 @@ fn render_card(
         .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
             let mut action = None;
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                provider_badge(ui, &row.kind);
-                ui.vertical(|ui| {
+            let toggle = ui.scope_builder(
+                egui::UiBuilder::new()
+                    .id_salt((
+                        "work-history-card",
+                        &row.workspace_id,
+                        &row.kind,
+                        &row.agent_session_id,
+                        &row.turn_key,
+                    ))
+                    .sense(egui::Sense::click()),
+                |ui| {
                     ui.set_width(ui.available_width());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(relative_age_text(catalog, row.updated_at, now))
-                                .small()
-                                .weak(),
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&row.instruction).strong().size(15.0),
-                            )
-                            .truncate(),
-                        );
-                    });
-                    ui.add_space(5.0);
                     ui.horizontal(|ui| {
-                        status_dot(ui, row.state);
-                        let summary = row
-                            .agent_summary
-                            .as_deref()
-                            .unwrap_or_else(|| catalog_key_for_summary_fallback(row.state));
-                        let summary = if row.agent_summary.is_some() {
-                            summary.to_owned()
-                        } else {
-                            catalog.t(summary, &[])
-                        };
-                        ui.add(egui::Label::new(egui::RichText::new(summary).weak()).truncate());
+                        provider_badge(ui, &row.kind);
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(relative_age_text(
+                                            catalog,
+                                            row.updated_at,
+                                            now,
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&row.instruction)
+                                                .strong()
+                                                .size(15.0),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                            ui.add_space(5.0);
+                            ui.horizontal(|ui| {
+                                status_dot(ui, row.state);
+                                let summary = row
+                                    .agent_summary
+                                    .as_deref()
+                                    .unwrap_or_else(|| catalog_key_for_summary_fallback(row.state));
+                                let summary = if row.agent_summary.is_some() {
+                                    summary.to_owned()
+                                } else {
+                                    catalog.t(summary, &[])
+                                };
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(summary).weak())
+                                        .truncate(),
+                                );
+                            });
+                        });
                     });
-                });
-            });
-            ui.add_space(8.0);
-            render_metadata(ui, row, catalog);
-            let toggle_rect = ui.min_rect();
+                    ui.add_space(8.0);
+                    render_metadata(ui, row, catalog);
+                },
+            );
 
             if expanded {
                 ui.add_space(10.0);
@@ -460,20 +484,11 @@ fn render_card(
                     ui.weak(catalog.t(key, &[]));
                 }
             }
-            (action, toggle_rect)
+            (action, toggle.response)
         });
-    let response = ui
-        .interact(
-            shown.inner.1,
-            ui.id().with((
-                "work-history-card",
-                &row.workspace_id,
-                &row.kind,
-                &row.agent_session_id,
-                &row.turn_key,
-            )),
-            egui::Sense::click(),
-        )
+    let response = shown
+        .inner
+        .1
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     response.widget_info(|| {
         egui::WidgetInfo::selected(
@@ -712,6 +727,157 @@ mod tests {
             occurred_at: Some(updated_at - 1),
             updated_at,
         }
+    }
+
+    #[derive(Default)]
+    struct CardInteractionCapture {
+        toggles: usize,
+        actions: Vec<WorkHistoryAction>,
+    }
+
+    fn card_harness<'a>(
+        catalog: &'a i18n::Catalog,
+        candidate: &'a storage::AgentWorkTurnRow,
+        presentation: &'a WorkHistoryActionPresentation,
+    ) -> egui_kittest::Harness<'a, CardInteractionCapture> {
+        egui_kittest::Harness::new_ui_state(
+            move |ui, capture: &mut CardInteractionCapture| {
+                let result = render_card(ui, candidate, true, 10, Some(presentation), catalog);
+                if result.toggle {
+                    capture.toggles += 1;
+                }
+                if let Some(action) = result.action {
+                    capture.actions.push(action);
+                }
+            },
+            CardInteractionCapture::default(),
+        )
+    }
+
+    fn assert_primary_button_wins_card_hit_test(primary: WorkHistoryPrimaryAction, label: &str) {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row("button-hit-test", storage::AgentWorkTurnState::Working, 10);
+        let identity = WorkTurnIdentity::from(&candidate);
+        let presentation = WorkHistoryActionPresentation {
+            identity: identity.clone(),
+            primary,
+            show_diff: true,
+        };
+        let mut harness = card_harness(&catalog, &candidate, &presentation);
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, label)
+            .click();
+        harness.run();
+
+        assert_eq!(
+            harness.state().actions,
+            vec![WorkHistoryAction::Activate(identity)]
+        );
+        assert_eq!(harness.state().toggles, 0);
+    }
+
+    #[test]
+    fn kittest_primary_buttons_are_not_intercepted_by_card_toggle() {
+        for (primary, label) in [
+            (WorkHistoryPrimaryAction::Focus, "Go to current session"),
+            (WorkHistoryPrimaryAction::Resume, "Resume"),
+            (WorkHistoryPrimaryAction::NewRun, "New run"),
+        ] {
+            assert_primary_button_wins_card_hit_test(primary, label);
+        }
+    }
+
+    #[test]
+    fn kittest_diff_button_is_not_intercepted_by_card_toggle() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row("diff-hit-test", storage::AgentWorkTurnState::Completed, 10);
+        let identity = WorkTurnIdentity::from(&candidate);
+        let presentation = WorkHistoryActionPresentation {
+            identity: identity.clone(),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: true,
+        };
+        let mut harness = card_harness(&catalog, &candidate, &presentation);
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "View Git changes")
+            .click();
+        harness.run();
+
+        assert_eq!(
+            harness.state().actions,
+            vec![WorkHistoryAction::ShowDiff(identity)]
+        );
+        assert_eq!(harness.state().toggles, 0);
+    }
+
+    #[test]
+    fn kittest_card_toggle_does_not_contain_action_buttons() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row(
+            "accessibility-tree",
+            storage::AgentWorkTurnState::Completed,
+            10,
+        );
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: true,
+        };
+        let harness = card_harness(&catalog, &candidate, &presentation);
+        let card_toggle =
+            harness.get_by_role_and_label(egui::accesskit::Role::Button, &candidate.instruction);
+
+        for label in ["New run", "View Git changes"] {
+            assert!(
+                card_toggle
+                    .query_by_role_and_label(egui::accesskit::Role::Button, label)
+                    .is_none(),
+                "card toggle must not contain action button {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn kittest_card_background_click_only_toggles_card() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row(
+            "background-hit-test",
+            storage::AgentWorkTurnState::Completed,
+            10,
+        );
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: true,
+        };
+        let mut harness = card_harness(&catalog, &candidate, &presentation);
+        let card =
+            harness.get_by_role_and_label(egui::accesskit::Role::Button, &candidate.instruction);
+        let click_pos = card.rect().left_top() + egui::vec2(3.0, 3.0);
+
+        harness.hover_at(click_pos);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+
+        assert_eq!(harness.state().toggles, 1);
+        assert!(harness.state().actions.is_empty());
     }
 
     #[test]

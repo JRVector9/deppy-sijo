@@ -486,6 +486,15 @@ fn same_work_history_projection(
     left == right
 }
 
+type DetectedWorkHistoryFacts = (Option<String>, Option<String>, Option<u32>);
+
+fn detected_work_history_facts(
+    previous: Option<DetectedWorkHistoryFacts>,
+    first_observed_cwd: Option<&str>,
+) -> DetectedWorkHistoryFacts {
+    previous.unwrap_or_else(|| (first_observed_cwd.map(str::to_owned), None, None))
+}
+
 fn agent_kind_id(kind: crate::agent_detect::AgentKind) -> &'static str {
     match kind {
         crate::agent_detect::AgentKind::Claude => "claude",
@@ -11935,7 +11944,7 @@ impl App {
                 let previous = self
                     .work_history_projection_cache
                     .get(&key)
-                    .map(|row| (row.branch.clone(), row.git_change_count))
+                    .map(|row| (row.cwd.clone(), row.branch.clone(), row.git_change_count))
                     .or_else(|| {
                         self.work_history_rows
                             .iter()
@@ -11944,8 +11953,15 @@ impl App {
                                     && row.agent_session_id == key.1
                                     && row.turn_key == key.2
                             })
-                            .map(|row| (row.branch.clone(), row.git_change_count))
+                            .map(|row| (row.cwd.clone(), row.branch.clone(), row.git_change_count))
                     });
+                let first_observed_cwd = if index == 0 {
+                    self.session_cwds.get(session).map(String::as_str)
+                } else {
+                    None
+                };
+                let (cwd, branch, git_change_count) =
+                    detected_work_history_facts(previous, first_observed_cwd);
                 rows.push(storage::AgentWorkTurnUpsert {
                     workspace_id: self.active.id.clone(),
                     pane_id: pane.0.clone(),
@@ -11957,9 +11973,9 @@ impl App {
                     agent_summary: turn.agent_summary.clone(),
                     model: display.model.clone(),
                     effort: display.effort.clone(),
-                    cwd: self.session_cwds.get(session).cloned(),
-                    branch: previous.as_ref().and_then(|value| value.0.clone()),
-                    git_change_count: previous.and_then(|value| value.1),
+                    cwd,
+                    branch,
+                    git_change_count,
                     state,
                     occurred_at: turn.occurred_at,
                     updated_at: now,
@@ -34784,5 +34800,32 @@ mod tests {
         duplicate_prompt.turn_key = "codex:84".to_owned();
         duplicate_prompt.source_offset = 84;
         assert_ne!(work_history_key(&row), work_history_key(&duplicate_prompt));
+    }
+
+    #[test]
+    fn work_history_cwd는_newest_첫관측에만_캡처되고_duplicate_poll에서_보존된다() {
+        let first = detected_work_history_facts(None, Some("/repo/first"));
+        assert_eq!(first, (Some("/repo/first".to_owned()), None, None));
+
+        let acknowledged = (
+            Some("/repo/first".to_owned()),
+            Some("main".to_owned()),
+            Some(3),
+        );
+        let duplicate =
+            detected_work_history_facts(Some(acknowledged.clone()), Some("/repo/moved"));
+        assert_eq!(duplicate, acknowledged);
+
+        let durable = (
+            Some("/repo/durable".to_owned()),
+            Some("feature/history".to_owned()),
+            Some(7),
+        );
+        let reloaded =
+            detected_work_history_facts(Some(durable.clone()), Some("/repo/moved-again"));
+        assert_eq!(reloaded, durable);
+
+        let older_first_seen = detected_work_history_facts(None, None);
+        assert_eq!(older_first_seen, (None, None, None));
     }
 }

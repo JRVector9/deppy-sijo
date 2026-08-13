@@ -1,5 +1,16 @@
 # Codex handoff
 
+## Current task — agent work history B-layout PR plan (2026-08-13)
+
+- Current objective: plan the approved B-layout agent work history as independently reviewable PRs. The workspace/session and Files/Git/Notes sidebar remains visible; the rail `이력` entry replaces only the central terminal content with a current-workspace card list. Planning only—no application source implementation, build, package, or relaunch in this phase.
+- Completed work: inspected the existing navigation rail, `AgentTerminalView`, central render/input ownership, transcript detector, bounded agent-state worker/storage projection, native resume/new-run presentation, Git CLI helper, and `DiffPanelUi`. Recorded the approved design in `docs/superpowers/specs/2026-08-13-agent-work-history-design.md` and a five-PR TDD plan in `docs/superpowers/plans/2026-08-13-agent-work-history.md`.
+- Modified files: the design spec, implementation plan, and this handoff only. `/tmp/deppy-history-main-mockup/index.html` remains a temporary interactive B-layout mockup outside the repository; no product code was modified.
+- Key design decisions: one card represents one real user instruction turn, keyed by workspace + provider session + native turn ID or stable transcript byte offset; recent data is bounded and persisted without raw transcript/tool payloads; first-release ingestion covers the three existing transcript bindings (Claude/Codex/Kimi), while storage and UI accept a validated bounded provider ID for later Grok/other parser support; History becomes a fourth `AgentTerminalView` and keeps the workspace sidebar visible; live focus, native resume/new run, and diff reuse current App-owned authority; branch is a captured Git fact and the working-tree count is explicitly not agent attribution. PR order is storage → transcript ingest → read-only page → actions → Git context/hardening.
+- Test commands and results: no Rust tests or app build were run because this phase changed planning documents only. `git diff --check` exited 0. A focused `rg` scan found no `TODO`, `TBD`, `FIXME`, `PLACEHOLDER`, `implement later`, or `fill in details` marker in the design or implementation plan.
+- Failed approaches: none in repository code. During the temporary mockup update, one `apply_patch` failed because an expected minified CSS line did not match exactly; it made no file change and the corrected patch applied afterward.
+- Remaining work: wait for explicit implementation instruction. Implementation should start with PR 1 branch `feat/agent-work-history-store` and must not skip its storage migration/resource gates.
+- Exact next commands: after user approval, create `feat/agent-work-history-store`; execute PR 1 from `docs/superpowers/plans/2026-08-13-agent-work-history.md`; run the PR 1 focused storage tests and resource gates listed in that plan before review.
+
 ## Current task — first session activation latency and focus implementation (2026-08-13)
 
 - Current objective: remove the initial app-launch delay when selecting a persisted session and make terminal keyboard input available without a second click; preserve session, workspace, saved active-pane, warm-runtime, and dotenv safety behavior. Do not package, rebuild, or relaunch until the user explicitly requests it.

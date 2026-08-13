@@ -17,6 +17,10 @@ pub(crate) const AGENT_STATE_CONTINUATION_MAX: usize = 8;
 pub(crate) const AGENT_STATE_PENDING_BYTES_MAX: usize = 4 * 1024 * 1024;
 pub(crate) const AGENT_STATE_STRUCTURED_BATCH_MAX: usize = 16;
 pub(crate) const AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX: usize = 512 * 1024;
+// Admission mirrors storage's public work-turn mutation contract without coupling this generic
+// worker module to a concrete backend type.
+pub(crate) const AGENT_STATE_WORK_HISTORY_BATCH_MAX: usize = 24;
+pub(crate) const AGENT_STATE_WORK_HISTORY_BATCH_BYTES_MAX: usize = 256 * 1024;
 pub(crate) const AGENT_STATE_BINDING_RECONCILE_MAX: usize = 256;
 pub(crate) const AGENT_STATE_BINDING_RECONCILE_BYTES_MAX: usize = AGENT_STATE_PENDING_BYTES_MAX;
 const AGENT_STATE_SINGLE_EXACT_BYTES_MAX: usize = 32 * 1024;
@@ -106,10 +110,11 @@ pub(crate) enum AgentStateSection {
     ResumeProbe,
     Catalog,
     ProjectNames,
+    WorkHistory,
 }
 
 impl AgentStateSection {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     const fn index(self) -> usize {
         match self {
@@ -120,6 +125,7 @@ impl AgentStateSection {
             Self::ResumeProbe => 4,
             Self::Catalog => 5,
             Self::ProjectNames => 6,
+            Self::WorkHistory => 7,
         }
     }
 
@@ -132,6 +138,7 @@ impl AgentStateSection {
         Self::ResumeProbe,
         Self::Catalog,
         Self::ProjectNames,
+        Self::WorkHistory,
     ];
 }
 
@@ -145,6 +152,7 @@ impl fmt::Debug for AgentStateSection {
             Self::ResumeProbe => "resume_probe",
             Self::Catalog => "catalog",
             Self::ProjectNames => "project_names",
+            Self::WorkHistory => "work_history",
         })
     }
 }
@@ -192,6 +200,9 @@ pub(crate) enum ExactKind {
     StructuredBatch {
         items: usize,
     },
+    WorkHistoryBatch {
+        items: usize,
+    },
 }
 
 impl fmt::Debug for ExactKind {
@@ -205,6 +216,10 @@ impl fmt::Debug for ExactKind {
                 .finish(),
             Self::StructuredBatch { items } => formatter
                 .debug_struct("structured_batch")
+                .field("items", items)
+                .finish(),
+            Self::WorkHistoryBatch { items } => formatter
+                .debug_struct("work_history_batch")
                 .field("items", items)
                 .finish(),
         }
@@ -475,6 +490,14 @@ fn validate_exact_limits(kind: ExactKind, retained_bytes: usize) -> Result<(), S
             if items == 0
                 || items > AGENT_STATE_STRUCTURED_BATCH_MAX
                 || retained_bytes > AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX
+            {
+                return Err(StageError::ResourceLimit);
+            }
+        }
+        ExactKind::WorkHistoryBatch { items } => {
+            if items == 0
+                || items > AGENT_STATE_WORK_HISTORY_BATCH_MAX
+                || retained_bytes > AGENT_STATE_WORK_HISTORY_BATCH_BYTES_MAX
             {
                 return Err(StageError::ResourceLimit);
             }
@@ -1752,13 +1775,55 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(harness.worker.pending_projection_count(), 7);
+        assert_eq!(harness.worker.pending_projection_count(), 8);
         harness.worker.admit().unwrap();
         let outcome = harness.wait_outcome();
-        assert_eq!(outcome.projections().len(), 7);
+        assert_eq!(outcome.projections().len(), 8);
         let calls = lock_unpoisoned(&harness.state.calls);
         assert!(calls.contains(&("latest", AgentStateSection::Hooks)));
         assert!(!calls.iter().any(|(marker, _)| *marker == "old"));
+    }
+
+    #[test]
+    fn work_history_projection_is_latest_only_and_rejects_stale_workspace_epochs() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        harness
+            .worker
+            .stage_projection(
+                AgentStateSection::WorkHistory,
+                AgentStateRevision::new(8, 1),
+                Harness::payload("history-old"),
+            )
+            .unwrap();
+        harness
+            .worker
+            .stage_projection(
+                AgentStateSection::WorkHistory,
+                AgentStateRevision::new(8, 2),
+                Harness::payload("history-latest"),
+            )
+            .unwrap();
+        assert_eq!(
+            harness.worker.stage_projection(
+                AgentStateSection::WorkHistory,
+                AgentStateRevision::new(7, u64::MAX),
+                Harness::payload("stale-workspace"),
+            ),
+            Err(StageError::Stale)
+        );
+        assert_eq!(harness.worker.pending_projection_count(), 1);
+
+        harness.worker.admit().unwrap();
+        let outcome = harness.wait_outcome();
+        assert_eq!(outcome.projections().len(), 1);
+        assert_eq!(
+            outcome.projections()[0].section(),
+            AgentStateSection::WorkHistory
+        );
+        let calls = lock_unpoisoned(&harness.state.calls);
+        assert!(calls.contains(&("history-latest", AgentStateSection::WorkHistory)));
+        assert!(!calls.iter().any(|(marker, _)| *marker == "history-old"));
+        assert!(!calls.iter().any(|(marker, _)| *marker == "stale-workspace"));
     }
 
     #[test]
@@ -1768,7 +1833,7 @@ mod tests {
         harness
             .worker
             .stage_projection(
-                AgentStateSection::Hooks,
+                AgentStateSection::WorkHistory,
                 AgentStateRevision::new(1, 1),
                 Harness::payload("old"),
             )
@@ -1778,7 +1843,7 @@ mod tests {
         harness
             .worker
             .stage_projection(
-                AgentStateSection::Hooks,
+                AgentStateSection::WorkHistory,
                 AgentStateRevision::new(1, 2),
                 Harness::payload("new"),
             )
@@ -1927,6 +1992,72 @@ mod tests {
         harness.worker.admit().unwrap();
         let mut outcome = harness.wait_outcome();
         assert_eq!(outcome.take_exact().unwrap().result(), Ok(()));
+    }
+
+    #[test]
+    fn work_history_exact_batches_match_storage_bounds_and_preserve_fifo() {
+        let mut harness = Harness::new(Duration::from_secs(30));
+        let at_limit = Arc::new(TestPayload {
+            marker: "history-at-limit",
+            bytes: AGENT_STATE_WORK_HISTORY_BATCH_BYTES_MAX,
+        });
+        harness
+            .worker
+            .stage_exact(
+                200,
+                ExactKind::WorkHistoryBatch {
+                    items: AGENT_STATE_WORK_HISTORY_BATCH_MAX,
+                },
+                at_limit,
+            )
+            .unwrap();
+        harness
+            .worker
+            .stage_exact(
+                201,
+                ExactKind::WorkHistoryBatch { items: 1 },
+                Harness::payload("history-second"),
+            )
+            .unwrap();
+
+        for expected in [200, 201] {
+            harness.worker.admit().unwrap();
+            let mut outcome = harness.wait_outcome();
+            let exact = outcome.take_exact().unwrap();
+            assert_eq!(exact.continuation().operation_id(), expected);
+            assert_eq!(exact.result(), Ok(()));
+        }
+        assert_eq!(harness.worker.pending_exact_count(), 0);
+
+        for (operation_id, kind, bytes) in [
+            (202, ExactKind::WorkHistoryBatch { items: 0 }, 1),
+            (
+                203,
+                ExactKind::WorkHistoryBatch {
+                    items: AGENT_STATE_WORK_HISTORY_BATCH_MAX + 1,
+                },
+                1,
+            ),
+            (
+                204,
+                ExactKind::WorkHistoryBatch { items: 1 },
+                AGENT_STATE_WORK_HISTORY_BATCH_BYTES_MAX + 1,
+            ),
+        ] {
+            assert_eq!(
+                harness.worker.stage_exact(
+                    operation_id,
+                    kind,
+                    Arc::new(TestPayload {
+                        marker: "invalid-history-batch",
+                        bytes,
+                    }),
+                ),
+                Err(StageError::ResourceLimit)
+            );
+        }
+        assert_eq!(harness.worker.pending_exact_count(), 0);
+        assert_eq!(harness.worker.pending_exact_bytes(), 0);
     }
 
     #[test]

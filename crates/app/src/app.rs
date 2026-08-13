@@ -226,6 +226,7 @@ enum AppAgentStateProjectionKind {
         candidates: Vec<AppResumeCandidate>,
     },
     Catalog,
+    WorkHistory,
     ProjectNames {
         style: crate::config::SessionNameStyle,
         rows: Vec<AppProjectNameRequest>,
@@ -253,6 +254,7 @@ impl std::fmt::Debug for AppAgentStateProjection {
             AppAgentStateProjectionKind::BindingSync(_) => "binding_sync",
             AppAgentStateProjectionKind::ResumeProbe { .. } => "resume_probe",
             AppAgentStateProjectionKind::Catalog => "catalog",
+            AppAgentStateProjectionKind::WorkHistory => "work_history",
             AppAgentStateProjectionKind::ProjectNames { .. } => "project_names",
         };
         formatter
@@ -267,6 +269,7 @@ enum AppAgentStateExactKind {
     TurnDoneClear(storage::AgentTurnDoneClear),
     BindingDelete(storage::AgentSessionIdentity),
     StructuredBatch(Vec<storage::StructuredThreadMutation>),
+    WorkHistoryBatch(Vec<storage::AgentWorkHistoryMutation>),
     FinalBindingReconcile {
         binding: storage::AgentSessionBindingReconcile,
         turn_done_clears: Vec<storage::AgentTurnDoneClear>,
@@ -292,6 +295,7 @@ impl std::fmt::Debug for AppAgentStateExactRequest {
             AppAgentStateExactKind::TurnDoneClear(_) => "turn_done_clear",
             AppAgentStateExactKind::BindingDelete(_) => "binding_delete",
             AppAgentStateExactKind::StructuredBatch(_) => "structured_batch",
+            AppAgentStateExactKind::WorkHistoryBatch(_) => "work_history_batch",
             AppAgentStateExactKind::FinalBindingReconcile { .. } => "binding_reconcile",
         };
         formatter
@@ -440,6 +444,64 @@ fn retained_structured_mutations_bytes(
     Some(total)
 }
 
+fn retained_work_history_mutations_bytes(
+    values: &Vec<storage::AgentWorkHistoryMutation>,
+) -> Option<usize> {
+    let mut total = std::mem::size_of::<storage::AgentWorkHistoryMutation>()
+        .checked_mul(values.capacity())?;
+    for value in values {
+        let storage::AgentWorkHistoryMutation::Upsert(row) = value;
+        total = total
+            .checked_add(row.workspace_id.capacity())?
+            .checked_add(row.pane_id.capacity())?
+            .checked_add(row.kind.capacity())?
+            .checked_add(row.agent_session_id.capacity())?
+            .checked_add(row.turn_key.capacity())?
+            .checked_add(row.instruction.capacity())?
+            .checked_add(row.agent_summary.as_ref().map_or(0, String::capacity))?
+            .checked_add(row.model.as_ref().map_or(0, String::capacity))?
+            .checked_add(row.effort.as_ref().map_or(0, String::capacity))?
+            .checked_add(row.cwd.as_ref().map_or(0, String::capacity))?
+            .checked_add(row.branch.as_ref().map_or(0, String::capacity))?;
+    }
+    Some(total)
+}
+
+fn work_history_key(
+    row: &storage::AgentWorkTurnUpsert,
+) -> (String, String, String) {
+    (
+        row.kind.clone(),
+        row.agent_session_id.clone(),
+        row.turn_key.clone(),
+    )
+}
+
+fn same_work_history_projection(
+    left: &storage::AgentWorkTurnUpsert,
+    right: &storage::AgentWorkTurnUpsert,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.updated_at = 0;
+    right.updated_at = 0;
+    left == right
+}
+
+fn agent_kind_id(kind: crate::agent_detect::AgentKind) -> &'static str {
+    match kind {
+        crate::agent_detect::AgentKind::Claude => "claude",
+        crate::agent_detect::AgentKind::Codex => "codex",
+        crate::agent_detect::AgentKind::Kimi => "kimi",
+    }
+}
+
+fn launcher_kind_from_history(value: &str) -> Option<crate::agent_launcher::AgentKind> {
+    crate::agent_launcher::AgentKind::ALL
+        .into_iter()
+        .find(|kind| kind.id() == value)
+}
+
 fn retained_turn_done_clears_bytes(values: &Vec<storage::AgentTurnDoneClear>) -> Option<usize> {
     std::mem::size_of::<storage::AgentTurnDoneClear>()
         .checked_mul(values.capacity())?
@@ -464,7 +526,8 @@ impl AppAgentStateProjection {
             AppAgentStateProjectionKind::Hooks
             | AppAgentStateProjectionKind::Attention
             | AppAgentStateProjectionKind::Restore
-            | AppAgentStateProjectionKind::Catalog => 0,
+            | AppAgentStateProjectionKind::Catalog
+            | AppAgentStateProjectionKind::WorkHistory => 0,
             AppAgentStateProjectionKind::BindingSync(value) => {
                 retained_binding_reconcile_bytes(value)?
             }
@@ -523,6 +586,9 @@ impl AppAgentStateExactRequest {
             }
             AppAgentStateExactKind::StructuredBatch(values) => {
                 retained_structured_mutations_bytes(values)?
+            }
+            AppAgentStateExactKind::WorkHistoryBatch(values) => {
+                retained_work_history_mutations_bytes(values)?
             }
             AppAgentStateExactKind::FinalBindingReconcile {
                 binding,
@@ -641,6 +707,7 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
         storage_job.include_agent_sessions = false;
         storage_job.include_structured_threads = false;
         storage_job.include_archived_threads = false;
+        storage_job.include_work_history = false;
         let mut storage_needed = exact.is_some();
         if let Some(exact) = exact {
             match &exact.payload().kind {
@@ -652,6 +719,9 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
                 }
                 AppAgentStateExactKind::StructuredBatch(values) => {
                     storage_job.structured_mutations.clone_from(values);
+                }
+                AppAgentStateExactKind::WorkHistoryBatch(values) => {
+                    storage_job.work_turn_mutations.clone_from(values);
                 }
                 AppAgentStateExactKind::FinalBindingReconcile {
                     binding,
@@ -699,6 +769,13 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
                 ) => {
                     storage_job.include_structured_threads = true;
                     storage_job.include_activity_panes = true;
+                    storage_needed = true;
+                }
+                (
+                    crate::agent_state_worker::AgentStateSection::WorkHistory,
+                    AppAgentStateProjectionKind::WorkHistory,
+                ) => {
+                    storage_job.include_work_history = true;
                     storage_needed = true;
                 }
                 (
@@ -7666,6 +7743,27 @@ pub struct App {
     pending_agent_sessions_action: Option<ui::agent_sessions::AgentSessionsDeferredAction>,
     /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」).
     diff_panel_ui: ui::diff_panel::DiffPanelUi,
+    work_history_ui: ui::work_history::WorkHistoryUi,
+    work_history_rows: Vec<storage::AgentWorkTurnRow>,
+    work_history_workspace_id: Option<String>,
+    work_history_loading: bool,
+    work_history_error: Option<ui::work_history::WorkHistoryErrorCode>,
+    /// 이 스코프에서 durable ack를 받은 turn 본문/상태. storage 최대 행 수로 유계하여
+    /// 같은 detector 결과가 SQLite에 반복 기록되지 않게 한다.
+    work_history_projection_cache:
+        std::collections::HashMap<(String, String, String), storage::AgentWorkTurnUpsert>,
+    work_history_pending:
+        std::collections::HashMap<(String, String, String), storage::AgentWorkTurnUpsert>,
+    #[allow(dead_code)]
+    work_history_git_worker: crate::agent_work_git::WorkHistoryGitWorker,
+    work_history_git_input: crate::agent_work_git::WorkHistoryGitInput,
+    work_history_git_rx: crate::agent_work_git::WorkHistoryGitOutcomeReceiver,
+    work_history_git_generation: u64,
+    work_history_git_cwds: Vec<String>,
+    work_history_git_force_refresh: bool,
+    work_history_git_manual_refresh: bool,
+    work_history_git_manual_generation: Option<u64>,
+    pending_work_history_action: Option<ui::work_history::WorkHistoryAction>,
     /// Lazy aggregate boundary for hook/attention/restore/binding/resume/catalog/project-name
     /// persistence and filesystem projections. Construction opens no DB and starts no thread.
     agent_state_worker: crate::agent_state_worker::AgentStateWorker<AppAgentStateBackend>,
@@ -7897,6 +7995,13 @@ pub struct App {
     agent_detect_rx: crate::agent_detect_worker::DetectOutcomeReceiver,
     /// 워크스페이스 전환마다 증가 — 스레드가 실어 보낸 stale 결과를 폐기하는 데 쓴다.
     agent_detect_epoch: u64,
+    agent_detect_generation: u64,
+    agent_detect_last_input: Option<(
+        u64,
+        Vec<(runtime::SessionId, u32)>,
+        std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+        bool,
+    )>,
     /// hook 바인딩 DB 조회 스로틀(1s) — poll_agent_detect는 매 프레임 돌아 매번 쿼리하면
     /// 렌더 중 초당 수십 회가 된다. 캐시를 워커 입력에 재사용.
     last_hook_query: std::time::Instant,
@@ -10737,6 +10842,8 @@ impl App {
                 Arc::new(move || wake_ctx.request_repaint()),
             )
         };
+        let (work_history_git_worker, work_history_git_input, work_history_git_rx) =
+            crate::agent_work_git::WorkHistoryGitWorker::spawn(egui_ctx.clone());
         let status_feed_rx_channel = crate::status_feed::spawn(egui_ctx.clone());
         let port_worker = {
             let wake_ctx = egui_ctx.clone();
@@ -10891,6 +10998,22 @@ impl App {
                 })),
             pending_agent_sessions_action: None,
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
+            work_history_ui: ui::work_history::WorkHistoryUi::new(),
+            work_history_rows: Vec::new(),
+            work_history_workspace_id: None,
+            work_history_loading: false,
+            work_history_error: None,
+            work_history_projection_cache: std::collections::HashMap::new(),
+            work_history_pending: std::collections::HashMap::new(),
+            work_history_git_worker,
+            work_history_git_input,
+            work_history_git_rx,
+            work_history_git_generation: 0,
+            work_history_git_cwds: Vec::new(),
+            work_history_git_force_refresh: false,
+            work_history_git_manual_refresh: false,
+            work_history_git_manual_generation: None,
+            pending_work_history_action: None,
             agent_state_worker,
             agent_state_scope: initial_agent_state_scope,
             pending_agent_state_scope: None,
@@ -11002,6 +11125,13 @@ impl App {
             agent_detect_input,
             agent_detect_rx,
             agent_detect_epoch: 0,
+            agent_detect_generation: 0,
+            agent_detect_last_input: Some((
+                0,
+                Vec::new(),
+                std::collections::HashMap::new(),
+                false,
+            )),
             last_hook_query: std::time::Instant::now(),
             hook_overrides: std::collections::HashMap::new(),
             persisted_agents: std::collections::HashMap::new(),
@@ -11615,6 +11745,11 @@ impl App {
                     items: values.len(),
                 }
             }
+            AppAgentStateExactKind::WorkHistoryBatch(values) => {
+                crate::agent_state_worker::ExactKind::WorkHistoryBatch {
+                    items: values.len(),
+                }
+            }
             AppAgentStateExactKind::FinalBindingReconcile { binding: value, .. } => {
                 crate::agent_state_worker::ExactKind::BindingReconcile {
                     items: value.live_pane_ids.len().max(value.desired_bindings.len()),
@@ -11633,6 +11768,359 @@ impl App {
             return false;
         };
         self.stage_prepared_agent_state_exact(worker_kind, payload)
+    }
+
+    fn stage_work_history_rows(
+        &mut self,
+        rows: impl IntoIterator<Item = storage::AgentWorkTurnUpsert>,
+    ) -> bool {
+        if !self.work_history_pending.is_empty() {
+            return false;
+        }
+        let mut accepted = Vec::new();
+        for row in rows {
+            let key = work_history_key(&row);
+            if self
+                .work_history_projection_cache
+                .get(&key)
+                .is_some_and(|saved| same_work_history_projection(saved, &row))
+            {
+                continue;
+            }
+            accepted.push(row);
+            if accepted.len() == crate::agent_state_worker::AGENT_STATE_WORK_HISTORY_BATCH_MAX {
+                break;
+            }
+        }
+        if accepted.is_empty() {
+            return false;
+        }
+        let mut staged = None;
+        for items in (1..=accepted.len()).rev() {
+            let mutations = accepted[..items]
+                .iter()
+                .cloned()
+                .map(storage::AgentWorkHistoryMutation::Upsert)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .into_vec();
+            let Some(payload) = AppAgentStateExactRequest::try_new(
+                Arc::clone(&self.agent_state_scope),
+                AppAgentStateExactKind::WorkHistoryBatch(mutations),
+            ) else {
+                continue;
+            };
+            if payload.retained_bytes
+                <= crate::agent_state_worker::AGENT_STATE_WORK_HISTORY_BATCH_BYTES_MAX
+                && self.stage_prepared_agent_state_exact(
+                    crate::agent_state_worker::ExactKind::WorkHistoryBatch { items },
+                    payload,
+                )
+            {
+                staged = Some(items);
+                break;
+            }
+        }
+        let Some(items) = staged else { return false };
+        self.work_history_pending = accepted
+            .into_iter()
+            .take(items)
+            .map(|row| (work_history_key(&row), row))
+            .collect();
+        true
+    }
+
+    fn acknowledge_work_history_batch(
+        &mut self,
+        mutations: &[storage::AgentWorkHistoryMutation],
+    ) {
+        for mutation in mutations {
+            let storage::AgentWorkHistoryMutation::Upsert(row) = mutation;
+            self.work_history_projection_cache
+                .insert(work_history_key(row), row.clone());
+        }
+        self.work_history_git_force_refresh = true;
+        self.work_history_pending.clear();
+        while self.work_history_projection_cache.len()
+            > storage::AGENT_WORK_TURNS_PER_WORKSPACE_MAX
+        {
+            let Some(oldest) = self
+                .work_history_projection_cache
+                .iter()
+                .min_by_key(|(_, row)| (row.updated_at, row.source_offset))
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.work_history_projection_cache.remove(&oldest);
+        }
+    }
+
+    fn stage_detected_work_history(
+        &mut self,
+        turns: &std::collections::HashMap<
+            runtime::SessionId,
+            Vec<crate::agent_transcript::TranscriptTurn>,
+        >,
+    ) {
+        let Some(mux) = self.active.workspace_ui.mux().cloned() else {
+            return;
+        };
+        let now = deppy_core::time::unix_secs_i64();
+        let mut rows = Vec::new();
+        for (session, recent) in turns {
+            let Some(binding) = self.agent_bindings.get(session) else {
+                continue;
+            };
+            let Some(pane) = pane_of_session(&mux, *session) else {
+                continue;
+            };
+            let kind = agent_kind_id(binding.kind).to_owned();
+            self.work_history_projection_cache.retain(|_, saved| {
+                saved.pane_id != pane.0.as_str()
+                    || (saved.kind == kind.as_str()
+                        && saved.agent_session_id == binding.session_id.as_str())
+            });
+            let mut display = self.agent_info.get(session).cloned().unwrap_or(
+                crate::agent_detect::AgentDisplay {
+                    kind: binding.kind,
+                    model: None,
+                    effort: None,
+                    context_pct: None,
+                    last_agent_summary: None,
+                    user_instruction: None,
+                },
+            );
+            apply_claude_statusline(&mut display, self.statuslines.get(session));
+            if let Some(running) = self.agent_kinds.get(session) {
+                if display.model.is_none() {
+                    display.model.clone_from(&running.model);
+                }
+                if display.effort.is_none() {
+                    display.effort.clone_from(&running.effort);
+                }
+            }
+            if binding.kind == crate::agent_detect::AgentKind::Claude {
+                if display.model.is_none() {
+                    display.model.clone_from(&self.claude_direct_defaults.model);
+                }
+                if display.effort.is_none() {
+                    display.effort.clone_from(&self.claude_direct_defaults.effort);
+                }
+            }
+            for (index, turn) in recent.iter().take(24).enumerate() {
+                if rows.len() == crate::agent_state_worker::AGENT_STATE_WORK_HISTORY_BATCH_MAX {
+                    break;
+                }
+                if turn.source_offset > i64::MAX as u64 || turn.instruction.is_empty() {
+                    continue;
+                }
+                let state = if index > 0 {
+                    storage::AgentWorkTurnState::Completed
+                } else if self.agent_needs_input.contains(session) {
+                    storage::AgentWorkTurnState::Waiting
+                } else if self.agent_turn_done.contains_key(session) {
+                    storage::AgentWorkTurnState::Completed
+                } else if self.agent_working.contains(session) {
+                    storage::AgentWorkTurnState::Working
+                } else if turn.activity == crate::agent_transcript::AgentActivity::Idle {
+                    storage::AgentWorkTurnState::Completed
+                } else {
+                    storage::AgentWorkTurnState::Working
+                };
+                let key = (kind.clone(), binding.session_id.clone(), turn.turn_key.clone());
+                let previous = self
+                    .work_history_projection_cache
+                    .get(&key)
+                    .map(|row| (row.branch.clone(), row.git_change_count))
+                    .or_else(|| {
+                        self.work_history_rows
+                            .iter()
+                            .find(|row| {
+                                row.kind == key.0
+                                    && row.agent_session_id == key.1
+                                    && row.turn_key == key.2
+                            })
+                            .map(|row| (row.branch.clone(), row.git_change_count))
+                    });
+                rows.push(storage::AgentWorkTurnUpsert {
+                    workspace_id: self.active.id.clone(),
+                    pane_id: pane.0.clone(),
+                    kind: kind.clone(),
+                    agent_session_id: binding.session_id.clone(),
+                    turn_key: turn.turn_key.clone(),
+                    source_offset: turn.source_offset,
+                    instruction: turn.instruction.clone(),
+                    agent_summary: turn.agent_summary.clone(),
+                    model: display.model.clone(),
+                    effort: display.effort.clone(),
+                    cwd: self.session_cwds.get(session).cloned(),
+                    branch: previous.as_ref().and_then(|value| value.0.clone()),
+                    git_change_count: previous.and_then(|value| value.1),
+                    state,
+                    occurred_at: turn.occurred_at,
+                    updated_at: now,
+                });
+            }
+        }
+        rows.sort_by(|left, right| {
+            right
+                .source_offset
+                .cmp(&left.source_offset)
+                .then_with(|| left.pane_id.cmp(&right.pane_id))
+        });
+        let _ = self.stage_work_history_rows(rows);
+    }
+
+    fn request_work_history_projection(&mut self, manual_git_refresh: bool) -> bool {
+        self.work_history_git_manual_refresh |= manual_git_refresh;
+        self.work_history_error = None;
+        let staged = self.stage_agent_state_projection(
+            crate::agent_state_worker::AgentStateSection::WorkHistory,
+            AppAgentStateProjectionKind::WorkHistory,
+        );
+        if staged {
+            self.work_history_loading = true;
+        } else {
+            self.work_history_error = Some(ui::work_history::WorkHistoryErrorCode::Busy);
+        }
+        staged
+    }
+
+    fn stage_attention_work_history(&mut self) {
+        let now = deppy_core::time::unix_secs_i64();
+        let mut rows = Vec::new();
+        for (session, binding) in &self.agent_bindings {
+            let state = if self.agent_needs_input.contains(session) {
+                Some(storage::AgentWorkTurnState::Waiting)
+            } else if self.agent_turn_done.contains_key(session) {
+                Some(storage::AgentWorkTurnState::Completed)
+            } else if self.agent_working.contains(session) {
+                Some(storage::AgentWorkTurnState::Working)
+            } else {
+                None
+            };
+            let Some(state) = state else { continue };
+            let kind = agent_kind_id(binding.kind);
+            let newest = self
+                .work_history_projection_cache
+                .values()
+                .filter(|row| {
+                    row.kind == kind && row.agent_session_id == binding.session_id
+                })
+                .max_by_key(|row| row.source_offset);
+            if let Some(mut row) = newest.cloned()
+                && row.state != state
+            {
+                row.state = state;
+                row.updated_at = now;
+                rows.push(row);
+            }
+        }
+        let _ = self.stage_work_history_rows(rows);
+    }
+
+    fn request_work_history_git(&mut self, manual: bool) {
+        if self.work_history_rows.is_empty() {
+            return;
+        }
+        let force_refresh = std::mem::take(&mut self.work_history_git_force_refresh);
+        let manual = manual || std::mem::take(&mut self.work_history_git_manual_refresh);
+        let mut cwds = Vec::new();
+        if let Some(root) = self.active_tree_root() {
+            let root = root.to_string_lossy().into_owned();
+            if !root.is_empty() && !root.as_bytes().contains(&0) {
+                cwds.push(root);
+            }
+        }
+        let mut recent = self.work_history_rows.iter().collect::<Vec<_>>();
+        recent.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.source_offset.cmp(&left.source_offset))
+        });
+        cwds.extend(
+            recent
+                .into_iter()
+                .filter_map(|row| row.cwd.clone())
+                .filter(|cwd| !cwd.is_empty() && !cwd.as_bytes().contains(&0)),
+        );
+        let mut seen = std::collections::HashSet::new();
+        cwds.retain(|cwd| seen.insert(cwd.clone()));
+        cwds.truncate(crate::agent_work_git::WORK_HISTORY_GIT_CWDS_MAX);
+        if cwds.is_empty()
+            || (!force_refresh && !manual && cwds == self.work_history_git_cwds)
+        {
+            return;
+        }
+        self.work_history_git_generation =
+            self.work_history_git_generation.wrapping_add(1).max(1);
+        let generation = self.work_history_git_generation;
+        if self
+            .work_history_git_input
+            .publish(generation, cwds.clone())
+            .is_ok()
+        {
+            self.work_history_git_cwds = cwds;
+            self.work_history_git_manual_generation = manual.then_some(generation);
+        }
+    }
+
+    fn poll_work_history_git(&mut self) {
+        let Ok(outcome) = self.work_history_git_rx.try_recv() else {
+            return;
+        };
+        if outcome.generation != self.work_history_git_generation
+            || self.work_history_workspace_id.as_deref() != Some(self.active.id.as_str())
+        {
+            return;
+        }
+        let manual = self.work_history_git_manual_generation == Some(outcome.generation);
+        let mut changed = Vec::new();
+        for fact in outcome.facts.iter() {
+            let newest = self
+                .work_history_rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.cwd.as_deref() == Some(fact.cwd.as_str()))
+                .max_by_key(|(_, row)| (row.updated_at, row.source_offset))
+                .map(|(index, _)| index);
+            let Some(index) = newest else { continue };
+            let row = &mut self.work_history_rows[index];
+            let next_branch = if manual || row.branch.is_none() {
+                fact.branch.clone()
+            } else {
+                row.branch.clone()
+            };
+            if row.branch == next_branch && row.git_change_count == fact.changed_files {
+                continue;
+            }
+            row.branch = next_branch;
+            row.git_change_count = fact.changed_files;
+            changed.push(storage::AgentWorkTurnUpsert {
+                workspace_id: row.workspace_id.clone(),
+                pane_id: row.pane_id.clone(),
+                kind: row.kind.clone(),
+                agent_session_id: row.agent_session_id.clone(),
+                turn_key: row.turn_key.clone(),
+                source_offset: row.source_offset,
+                instruction: row.instruction.clone(),
+                agent_summary: row.agent_summary.clone(),
+                model: row.model.clone(),
+                effort: row.effort.clone(),
+                cwd: row.cwd.clone(),
+                branch: row.branch.clone(),
+                git_change_count: row.git_change_count,
+                state: row.state,
+                occurred_at: row.occurred_at,
+                updated_at: row.updated_at,
+            });
+        }
+        self.work_history_git_manual_generation = None;
+        if !changed.is_empty() && !self.stage_work_history_rows(changed) {
+            self.work_history_git_force_refresh = true;
+        }
     }
 
     fn request_project_name_projection(&mut self) {
@@ -11911,6 +12399,7 @@ impl App {
                     turn_start_transitions(&working_now, &self.global_working, &was_blocked);
                 self.global_working = working_now;
                 self.note_turn_starts(&turn_started);
+                self.stage_attention_work_history();
                 // 예약해둔 다음 단계 발사 — 뷰와 무관하게 **여기서** 판정한다.
                 // 「작업」 페이지를 떠났다고 예약이 죽으면 "맡겨두고 다른 일 하기"가
                 // 성립하지 않는다. global_* 셋은 모든 워크스페이스를 덮고 liveness도
@@ -12004,6 +12493,13 @@ impl App {
                 self.catalog_startup_recovery.on_success();
                 self.ensure_active_runtime_restore();
                 self.request_project_name_projection();
+            }
+            crate::agent_state_worker::AgentStateSection::WorkHistory => {
+                self.work_history_rows.clone_from(&snapshot.work_turns);
+                self.work_history_workspace_id = Some(self.active.id.clone());
+                self.work_history_loading = false;
+                self.work_history_error = None;
+                self.request_work_history_git(false);
             }
             crate::agent_state_worker::AgentStateSection::ResumeProbe
             | crate::agent_state_worker::AgentStateSection::ProjectNames => {}
@@ -12127,14 +12623,36 @@ impl App {
         while let Ok(mut outcome) = self.agent_state_worker.try_recv() {
             if let Some(exact) = outcome.take_exact() {
                 let (continuation, result) = exact.into_parts();
-                if let Err(error) = result {
+                let exact_scope_current = self.pending_agent_state_scope.is_none()
+                    && continuation.payload().scope.as_ref() == self.agent_state_scope.as_ref()
+                    && continuation.payload().scope.workspace_id == self.active.id;
+                if let Err(error) = &result {
                     tracing::warn!(
                         kind = "agent_state",
                         phase = "exact_complete",
                         error_code = error.as_str(),
                         "agent state exact request failed"
                     );
+                    if matches!(
+                        &continuation.payload().kind,
+                        AppAgentStateExactKind::WorkHistoryBatch(_)
+                    ) && exact_scope_current
+                    {
+                        let retry_git = self.work_history_pending.values().any(|row| {
+                            row.branch.is_some() || row.git_change_count.is_some()
+                        });
+                        self.work_history_pending.clear();
+                        self.work_history_git_force_refresh |= retry_git;
+                        self.work_history_error =
+                            Some(ui::work_history::WorkHistoryErrorCode::ReadFailed);
+                    }
                 } else {
+                    if let AppAgentStateExactKind::WorkHistoryBatch(mutations) =
+                        &continuation.payload().kind
+                        && exact_scope_current
+                    {
+                        self.acknowledge_work_history_batch(mutations);
+                    }
                     if let AppAgentStateExactKind::BindingDelete(identity) =
                         &continuation.payload().kind
                         && self
@@ -12148,6 +12666,15 @@ impl App {
                         self.restore_agents.remove(&identity.pane_id);
                         self.persisted_agents.remove(&identity.pane_id);
                         self.resumed_panes.remove(&identity.pane_id);
+                    }
+                    if matches!(
+                        &continuation.payload().kind,
+                        AppAgentStateExactKind::WorkHistoryBatch(_)
+                    ) && exact_scope_current
+                        && self.agent_terminal_ui.view()
+                        == ui::agent_terminal::AgentTerminalView::History
+                    {
+                        let _ = self.request_work_history_projection(false);
                     }
                 }
             }
@@ -12201,6 +12728,19 @@ impl App {
                         if section == crate::agent_state_worker::AgentStateSection::Catalog {
                             self.handle_catalog_startup_failure();
                         }
+                        if section == crate::agent_state_worker::AgentStateSection::WorkHistory {
+                            self.work_history_loading = false;
+                            self.work_history_error = Some(match error {
+                                crate::agent_state_worker::AgentStateErrorCode::InvalidData
+                                | crate::agent_state_worker::AgentStateErrorCode::Stale => {
+                                    ui::work_history::WorkHistoryErrorCode::InvalidData
+                                }
+                                crate::agent_state_worker::AgentStateErrorCode::ResourceLimit => {
+                                    ui::work_history::WorkHistoryErrorCode::ResourceLimit
+                                }
+                                _ => ui::work_history::WorkHistoryErrorCode::ReadFailed,
+                            });
+                        }
                     }
                 }
             }
@@ -12238,6 +12778,8 @@ impl App {
                 self.resume_probe_pending_panes.clear();
                 self.project_name_projection_pending = false;
                 self.project_name_projection_dirty = true;
+                self.work_history_projection_cache.clear();
+                self.work_history_pending.clear();
                 self.stage_agent_state_projection(
                     crate::agent_state_worker::AgentStateSection::Hooks,
                     AppAgentStateProjectionKind::Hooks,
@@ -12255,6 +12797,11 @@ impl App {
                     AppAgentStateProjectionKind::Catalog,
                 ) {
                     self.handle_catalog_startup_failure();
+                }
+                if self.agent_terminal_ui.view()
+                    == ui::agent_terminal::AgentTerminalView::History
+                {
+                    let _ = self.request_work_history_projection(false);
                 }
             }
         }
@@ -12302,21 +12849,41 @@ impl App {
                 AppAgentStateProjectionKind::Hooks,
             );
         }
+        let hidden = !self.active.render_active;
+        let input_changed = self.agent_detect_last_input.as_ref().is_none_or(
+            |(epoch, previous_sessions, previous_overrides, previous_hidden)| {
+                *epoch != self.agent_detect_epoch
+                    || previous_sessions != &sessions
+                    || previous_overrides != &self.hook_overrides
+                    || *previous_hidden != hidden
+            },
+        );
         let _ = self.agent_detect_input.publish(
             self.agent_detect_epoch,
-            sessions,
+            sessions.clone(),
             &self.hook_overrides,
             // 창 숨김(가림/최소화) — detect 스레드가 ps/lsof/transcript 폴링을 완화한다.
-            !self.active.render_active,
+            hidden,
         );
+        if input_changed {
+            self.agent_detect_generation = self.agent_detect_generation.wrapping_add(1);
+            self.agent_detect_last_input = Some((
+                self.agent_detect_epoch,
+                sessions,
+                self.hook_overrides.clone(),
+                hidden,
+            ));
+        }
         // capacity-one 결과를 논블로킹 소비한다(epoch 불일치=전환 잔여는 폐기).
         let mut latest_bindings = None;
         let mut latest_activity = None;
         let mut latest_cwds = None;
         let mut latest_info = None;
         let mut latest_kinds = None;
+        let mut latest_work_turns = None;
         if let Ok(outcome) = self.agent_detect_rx.try_recv()
             && outcome.epoch == self.agent_detect_epoch
+            && outcome.generation == self.agent_detect_generation
         {
             latest_activity = Some(outcome.activity.clone());
             if outcome.bindings.is_some() {
@@ -12330,6 +12897,9 @@ impl App {
             }
             if outcome.agent_kinds.is_some() {
                 latest_kinds = outcome.agent_kinds.clone();
+            }
+            if outcome.work_turns.is_some() {
+                latest_work_turns = outcome.work_turns.clone();
             }
         }
         if let Some(info) = latest_info {
@@ -12402,6 +12972,9 @@ impl App {
             self.agent_bindings = bindings.clone();
             self.process_agent_bindings(&bindings);
         }
+        if let Some(turns) = latest_work_turns {
+            self.stage_detected_work_history(&turns);
+        }
     }
 
     /// 워커 raw(agent_info) + claude statusLine(statuslines)을 병합해 최종 표시정보를
@@ -12444,27 +13017,24 @@ impl App {
     /// 실제 RuntimeCommand 전송은 여기서 한다. 클릭 시점의 durable session identity와
     /// 설치 감지 결과로 전략을 다시 계산한다. 메타데이터가 없는 레거시 pane은 UI의
     /// 「새로 실행」 의미대로 빈 인자로 재실행한다.
-    fn dispatch_respawn_archived_agent(&mut self, session: runtime::SessionId) {
+    fn dispatch_respawn_archived_agent(&mut self, session: runtime::SessionId) -> bool {
         let Some(mux) = self.active.workspace_ui.mux().cloned() else {
-            return;
+            return false;
         };
         if pane_of_session(&mux, session).is_none() {
-            return;
+            return false;
         }
-        let target = archived_resume_targets_from_mux(
+        let Some(target) = archived_resume_targets_from_mux(
             &mux,
             &self.archived_agent_resume,
             self.agent_launcher_snapshot.as_ref(),
         )
-        .remove(&session);
-        let extra_args = match target {
-            Some(target) => {
-                let Some(extra_args) = target.extra_args else {
-                    return;
-                };
-                extra_args
-            }
-            None => Vec::new(),
+        .remove(&session)
+        else {
+            return false;
+        };
+        let Some(extra_args) = target.extra_args else {
+            return false;
         };
         let command = runtime::RuntimeCommand::RespawnArchivedAgent {
             session,
@@ -12473,7 +13043,7 @@ impl App {
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines as usize,
         };
-        let _ = self.active.runtime.send_command(command);
+        self.active.runtime.send_command(command).is_ok()
     }
 
     fn pty_agent_surfaces(
@@ -12850,6 +13420,223 @@ impl App {
         };
         self.diff_panel_ui
             .open_for(ctx, self.active.id.clone(), session, cwd, title);
+    }
+
+    fn resolve_work_history_activation(
+        &self,
+        row: &storage::AgentWorkTurnRow,
+    ) -> AppWorkHistoryActivation {
+        use ui::work_history::WorkHistoryDisabledReason as Disabled;
+
+        if row.workspace_id != self.active.id
+            || self.work_history_workspace_id.as_deref() != Some(self.active.id.as_str())
+        {
+            return AppWorkHistoryActivation::Disabled(Disabled::Stale);
+        }
+        if let Some(mux) = self.active.workspace_ui.mux() {
+            for tab in &mux.tabs {
+                if let Some(pane) = tab.panes.iter().find(|pane| pane.id.0 == row.pane_id)
+                    && let Some(session) = pane.session_id
+                {
+                    if self.agent_bindings.get(&session).is_some_and(|binding| {
+                        agent_kind_id(binding.kind) == row.kind
+                            && binding.session_id == row.agent_session_id
+                    }) {
+                        return AppWorkHistoryActivation::Focus {
+                            tab: tab.id.clone(),
+                            pane: pane.id.clone(),
+                        };
+                    }
+                    if matches!(row.kind.as_str(), "claude" | "codex")
+                        && self
+                            .active
+                            .session_resource_usage
+                            .iter()
+                            .find(|usage| usage.session == session)
+                            .and_then(|usage| usage.pid.map(|_| usage.process_count))
+                            == Some(1)
+                        && self.restore_agents.get(&row.pane_id).is_some_and(|saved| {
+                            saved.kind == row.kind && saved.session_id == row.agent_session_id
+                        })
+                    {
+                        return AppWorkHistoryActivation::ResumeLive {
+                            pane_key: row.pane_id.clone(),
+                            title: pane.title.clone(),
+                            session,
+                        };
+                    }
+                    let archived_row = pane
+                        .persistent_session_id
+                        .as_deref()
+                        .and_then(|id| self.archived_agent_resume.get(id));
+                    let archived = archived_row.and_then(|saved| {
+                        let saved_kind = crate::agent_launcher::AgentKind::from_stable_config_id(
+                            &saved.agent_id,
+                        )?;
+                        (saved_kind.id() == row.kind).then(|| {
+                            archived_resume_targets_from_mux(
+                                mux,
+                                &self.archived_agent_resume,
+                                self.agent_launcher_snapshot.as_ref(),
+                            )
+                        })
+                    });
+                    let resumable = archived
+                        .as_ref()
+                        .and_then(|targets| targets.get(&session))
+                        .is_some_and(|target| match target.presentation {
+                            ArchivedResumePresentation::Exact => archived_row.is_some_and(|saved| {
+                                saved.kind.as_deref() == Some(row.kind.as_str())
+                                    && saved.session_id.as_deref()
+                                        == Some(row.agent_session_id.as_str())
+                                    && target.extra_args.is_some()
+                            }),
+                            ArchivedResumePresentation::RecentInCwd => {
+                                target.extra_args.is_some()
+                            }
+                            _ => false,
+                        });
+                    if resumable {
+                        return AppWorkHistoryActivation::ResumeArchived { session };
+                    }
+                }
+            }
+        }
+        let Some(kind) = launcher_kind_from_history(&row.kind) else {
+            return AppWorkHistoryActivation::Disabled(Disabled::AgentUnavailable);
+        };
+        let Some(snapshot) = self.agent_launcher_snapshot.as_ref() else {
+            return AppWorkHistoryActivation::Disabled(Disabled::Checking);
+        };
+        if snapshot.find(kind).is_some() {
+            AppWorkHistoryActivation::NewRun(kind)
+        } else {
+            AppWorkHistoryActivation::Disabled(Disabled::AgentUnavailable)
+        }
+    }
+
+    fn work_history_presentations(
+        &self,
+    ) -> Vec<ui::work_history::WorkHistoryActionPresentation> {
+        self.work_history_rows
+            .iter()
+            .map(|row| ui::work_history::WorkHistoryActionPresentation {
+                identity: ui::work_history::WorkTurnIdentity::from(row),
+                primary: self.resolve_work_history_activation(row).presentation(),
+                show_diff: row.cwd.as_deref().is_some_and(|cwd| {
+                    Path::new(cwd).is_absolute()
+                        && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                        && !cwd.as_bytes().contains(&0)
+                }),
+            })
+            .collect()
+    }
+
+    fn handle_work_history_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: ui::work_history::WorkHistoryAction,
+    ) {
+        use ui::work_history::WorkHistoryAction;
+        match action {
+            WorkHistoryAction::Refresh => {
+                let _ = self.request_work_history_projection(true);
+            }
+            WorkHistoryAction::ShowDiff(identity) => {
+                let row = self
+                    .work_history_rows
+                    .iter()
+                    .find(|row| identity.matches(row))
+                    .cloned();
+                let Some(row) = row.filter(|row| {
+                    row.workspace_id == self.active.id
+                        && self.work_history_workspace_id.as_deref()
+                            == Some(self.active.id.as_str())
+                }) else {
+                    let _ = self.request_work_history_projection(false);
+                    return;
+                };
+                let Some(cwd) = row.cwd.filter(|cwd| {
+                    Path::new(cwd).is_absolute()
+                        && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                        && !cwd.as_bytes().contains(&0)
+                }) else {
+                    self.work_history_error =
+                        Some(ui::work_history::WorkHistoryErrorCode::InvalidData);
+                    return;
+                };
+                self.diff_panel_ui.open_for_path(
+                    ctx,
+                    self.active.id.clone(),
+                    cwd,
+                    row.instruction,
+                );
+            }
+            WorkHistoryAction::Activate(identity) => {
+                let row = self
+                    .work_history_rows
+                    .iter()
+                    .find(|row| identity.matches(row))
+                    .cloned();
+                let Some(row) = row else {
+                    let _ = self.request_work_history_projection(false);
+                    return;
+                };
+                match self.resolve_work_history_activation(&row) {
+                    AppWorkHistoryActivation::Focus { tab, pane } => {
+                        let _ = self.stage_workspace_controller_action(
+                            WorkspaceControllerAction::FocusSession {
+                                workspace_id: self.active.id.clone(),
+                                tab,
+                                pane,
+                            },
+                        );
+                    }
+                    AppWorkHistoryActivation::ResumeLive {
+                        pane_key,
+                        title,
+                        session,
+                    } => {
+                        let _ = self.stage_workspace_controller_action(
+                            WorkspaceControllerAction::ResumeAgent {
+                                pane_key,
+                                title,
+                                session,
+                            },
+                        );
+                    }
+                    AppWorkHistoryActivation::ResumeArchived { session } => {
+                        if self.dispatch_respawn_archived_agent(session) {
+                            self.agent_terminal_ui
+                                .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                        }
+                    }
+                    AppWorkHistoryActivation::NewRun(kind) => {
+                        let snapshot = self.agent_launcher_snapshot.clone();
+                        let workspace_id = self.active.id.clone();
+                        let workspace_name = self.active_workspace_display_name();
+                        let opened = snapshot.as_ref().is_some_and(|snapshot| {
+                            self.agent_launcher_ui.open_for_kind(
+                                workspace_id,
+                                workspace_name,
+                                kind,
+                                snapshot,
+                            )
+                        });
+                        if opened {
+                            self.agent_launcher_seen_workspaces
+                                .insert(self.active.id.clone());
+                            self.egui_ctx.request_repaint();
+                        } else {
+                            let _ = self.request_work_history_projection(false);
+                        }
+                    }
+                    AppWorkHistoryActivation::Disabled(_) => {
+                        let _ = self.request_work_history_projection(false);
+                    }
+                }
+            }
+        }
     }
 
     /// shim PATH env — hook 토글 ON이고 shim이 설치돼 있으면 셸 PATH 앞에 주입한다.
@@ -13377,6 +14164,8 @@ impl App {
                             .is_ok()
                     {
                         self.active.workspace_ui.arm_terminal_focus(pane);
+                        self.agent_terminal_ui
+                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
                     } else {
                         self.active.workspace_ui.cancel_terminal_focus();
                     }
@@ -13422,8 +14211,11 @@ impl App {
                 title,
                 session,
             } => {
-                self.stage_agent_resume(&pane_key, &title, session);
-                self.resumed_panes.insert(pane_key);
+                if self.stage_agent_resume(&pane_key, &title, session) {
+                    self.resumed_panes.insert(pane_key);
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                }
             }
             WorkspaceControllerAction::ClosePane(pane) => {
                 self.active.workspace_ui.request_close_pane(pane);
@@ -14985,11 +15777,21 @@ impl App {
         // Retain only the pending scope metadata before any old-scope completion can be applied
         // against the new active runtime. The worker drain barrier installs the new epoch later.
         self.request_agent_state_scope();
+        self.work_history_projection_cache.clear();
+        self.work_history_pending.clear();
+        self.work_history_rows.clear();
+        self.work_history_workspace_id = None;
+        self.work_history_error = None;
+        self.work_history_git_cwds.clear();
+        self.work_history_git_generation = self.work_history_git_generation.wrapping_add(1).max(1);
+        self.work_history_loading = self.agent_terminal_ui.view()
+            == ui::agent_terminal::AgentTerminalView::History;
         // 웹 대시보드가 켜져 있으면 새 활성 worker로 재구독한다(전환 후 상태 스트림 유지).
         self.rebind_web_dashboard();
         // agent 감지 워커: 전환 시 epoch을 올려 이전 워크스페이스의 잔여 결과를 폐기하고,
         // 즉시 감지가 새 워크스페이스 기준으로 재시작되게 한다(codex #3).
         self.agent_detect_epoch += 1;
+        self.agent_detect_last_input = None;
         // 여기서 지우는 맵들은 전부 **SessionId만**을 키로 쓴다 — 워크스페이스가 바뀌면
         // 같은 id가 다른 세션을 가리키므로 반드시 비워야 한다. `blocked_since`는
         // (workspace_id, SessionId)로 네임스페이스돼 있어 여기 넣으면 안 된다: 다른
@@ -21210,6 +22012,7 @@ impl eframe::App for App {
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
         self.poll_agent_state_worker();
+        self.poll_work_history_git();
         self.pump_workspace_restore_delivery();
         self.pump_startup_deferred_dotenv_continuations();
         if let Some(intent) = self.pending_status_bar_intent.take() {
@@ -21293,6 +22096,9 @@ impl eframe::App for App {
         // move that runtime into the warm pool.
         if let Some(intent) = self.active.workspace_ui.take_notice_intent() {
             platform::notify(intent.summary(), intent.body());
+        }
+        if let Some(action) = self.pending_work_history_action.take() {
+            self.handle_work_history_action(ctx, action);
         }
         self.poll_workspace_controller();
         self.poll_pending_workspace_focus();
@@ -22411,8 +23217,12 @@ impl eframe::App for App {
             }
             match sidebar_action {
                 Some(ui::file_tree::SidebarAction::SwitchWorkspace(workspace_id)) => {
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    if self.agent_terminal_ui.view()
+                        != ui::agent_terminal::AgentTerminalView::History
+                    {
+                        self.agent_terminal_ui
+                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    }
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::SwitchWorkspace(workspace_id),
                     );
@@ -22450,6 +23260,21 @@ impl eframe::App for App {
                             ui::agent_terminal::AgentTerminalView::Fleet
                         },
                     );
+                }
+                Some(ui::file_tree::SidebarAction::ShowHistory) => {
+                    let entering = self.agent_terminal_ui.view()
+                        != ui::agent_terminal::AgentTerminalView::History;
+                    self.agent_terminal_ui.set_view(if entering {
+                        ui::agent_terminal::AgentTerminalView::History
+                    } else {
+                        ui::agent_terminal::AgentTerminalView::Terminal
+                    });
+                    if entering {
+                        let _ = self.request_work_history_projection(false);
+                        if self.agent_launcher_snapshot.is_none() {
+                            self.agent_launcher_detection_requested = true;
+                        }
+                    }
                 }
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
                     self.agent_sessions_ui.open();
@@ -22722,8 +23547,10 @@ impl eframe::App for App {
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
         let fleet_visible = central_view == ui::agent_terminal::AgentTerminalView::Fleet;
+        let history_visible = central_view == ui::agent_terminal::AgentTerminalView::History;
+        let information_visible = home_visible || fleet_visible || history_visible;
         // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
-        if home_visible || fleet_visible {
+        if information_visible {
             self.active
                 .workspace_ui
                 .update_hidden(ui.ctx(), &events, &text);
@@ -22800,7 +23627,7 @@ impl eframe::App for App {
             Default::default()
         };
 
-        let terminal_visible = !home_visible && !fleet_visible;
+        let terminal_visible = central_view == ui::agent_terminal::AgentTerminalView::Terminal;
         if terminal_visible {
             self.frame_terminal_owner = frame_terminal_owner(
                 &self.cross_workspace_pane,
@@ -22816,6 +23643,8 @@ impl eframe::App for App {
                     })
                 },
             );
+        } else {
+            self.frame_terminal_owner = FrameTerminalOwner::None;
         }
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
         if terminal_visible && self.config.ui.composer_enabled {
@@ -22836,6 +23665,17 @@ impl eframe::App for App {
         let mut home_action = None;
         let mut fleet_page_click = None;
         let mut fleet_action = None;
+        let mut work_history_action = None;
+        let work_history_presentations = if history_visible {
+            self.work_history_presentations()
+        } else {
+            Vec::new()
+        };
+        let work_history_workspace_name = self.active_workspace_display_name();
+        let work_history_current_branch = self
+            .work_history_rows
+            .iter()
+            .find_map(|row| row.branch.clone());
         // 승인 결정·대기 응답은 render 클로저 안에서 &mut self를 또 잡을 수 없어 밖으로 낸다.
         let mut fleet_page_output = None;
         let render_panes = if terminal_visible {
@@ -22931,6 +23771,19 @@ impl eframe::App for App {
                         page.structured_decision,
                     ));
                     fleet_page_click = page.goto;
+                } else if history_visible {
+                    work_history_action = self.work_history_ui.show(
+                        ui,
+                        ui::work_history::WorkHistorySnapshot {
+                            workspace_name: &work_history_workspace_name,
+                            current_branch: work_history_current_branch.as_deref(),
+                            rows: &self.work_history_rows,
+                            loading: self.work_history_loading,
+                            error: self.work_history_error,
+                        },
+                        &work_history_presentations,
+                        &text,
+                    );
                 } else if !render_panes.is_empty() {
                     let rect = ui.available_rect_before_wrap();
                     self.last_multi_pane_terminal_rect = Some(rect);
@@ -23339,6 +24192,12 @@ impl eframe::App for App {
         if self.active.workspace_ui.take_new_session_requested() {
             self.stage_workspace_controller_action(WorkspaceControllerAction::OpenAgentLauncher);
         }
+        if let Some(action) = work_history_action {
+            if self.pending_work_history_action.is_none() {
+                self.pending_work_history_action = Some(action);
+                ui.ctx().request_repaint();
+            }
+        }
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
         // (아래 notif_click 합류 지점)에 태운다(사이드바 FocusSession과 같은 규칙).
         // 「작업」 페이지의 승인 결정·대기 응답 — 옛 작업함 페이지와 같은 apply 경로다.
@@ -23568,7 +24427,7 @@ impl eframe::App for App {
         // pane 하단 「다시 실행」 클릭 (PR-3) — leaf는 세션만 쌓고, 실제 RuntimeCommand
         // 전송은 여기서 한다(check-boundary).
         if let Some(session) = self.active.workspace_ui.take_respawn_archived_request() {
-            self.dispatch_respawn_archived_agent(session);
+            let _ = self.dispatch_respawn_archived_agent(session);
         }
         // pane 우클릭 → 환경변수·API 설정 (E4 ⑥) — 프로젝트 화면에서 바로 진입.
         if self.active.workspace_ui.take_open_environment() {
@@ -24875,6 +25734,38 @@ struct ArchivedResumeTarget {
     presentation: ArchivedResumePresentation,
     /// None means the action must not dispatch. Some(empty) is an intentional new run.
     extra_args: Option<Vec<String>>,
+}
+
+enum AppWorkHistoryActivation {
+    Focus {
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+    },
+    ResumeLive {
+        pane_key: String,
+        title: String,
+        session: runtime::SessionId,
+    },
+    ResumeArchived {
+        session: runtime::SessionId,
+    },
+    NewRun(crate::agent_launcher::AgentKind),
+    Disabled(ui::work_history::WorkHistoryDisabledReason),
+}
+
+impl AppWorkHistoryActivation {
+    fn presentation(&self) -> ui::work_history::WorkHistoryPrimaryAction {
+        match self {
+            Self::Focus { .. } => ui::work_history::WorkHistoryPrimaryAction::Focus,
+            Self::ResumeLive { .. } | Self::ResumeArchived { .. } => {
+                ui::work_history::WorkHistoryPrimaryAction::Resume
+            }
+            Self::NewRun(_) => ui::work_history::WorkHistoryPrimaryAction::NewRun,
+            Self::Disabled(reason) => {
+                ui::work_history::WorkHistoryPrimaryAction::Disabled(*reason)
+            }
+        }
+    }
 }
 
 fn archived_resume_target(
@@ -33869,5 +34760,40 @@ mod tests {
         let target = unsupported.get(&runtime::SessionId(9)).unwrap();
         assert_eq!(target.presentation, ArchivedResumePresentation::Unsupported);
         assert_eq!(target.extra_args, Some(Vec::new()));
+    }
+
+    #[test]
+    fn work_history_projection은_시각만_바뀌면_중복이고_요약은_같은_identity를_갱신한다() {
+        let row = storage::AgentWorkTurnUpsert {
+            workspace_id: "workspace".to_owned(),
+            pane_id: "pane".to_owned(),
+            kind: "codex".to_owned(),
+            agent_session_id: "native".to_owned(),
+            turn_key: "codex:42".to_owned(),
+            source_offset: 42,
+            instruction: "Implement history".to_owned(),
+            agent_summary: Some("Working".to_owned()),
+            model: Some("gpt-5.6-sol".to_owned()),
+            effort: Some("xhigh".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            branch: None,
+            git_change_count: None,
+            state: storage::AgentWorkTurnState::Working,
+            occurred_at: Some(1),
+            updated_at: 10,
+        };
+        let mut later_poll = row.clone();
+        later_poll.updated_at = 20;
+        assert!(same_work_history_projection(&row, &later_poll));
+        assert_eq!(work_history_key(&row), work_history_key(&later_poll));
+
+        later_poll.agent_summary = Some("Completed".to_owned());
+        later_poll.state = storage::AgentWorkTurnState::Completed;
+        assert!(!same_work_history_projection(&row, &later_poll));
+
+        let mut duplicate_prompt = row.clone();
+        duplicate_prompt.turn_key = "codex:84".to_owned();
+        duplicate_prompt.source_offset = 84;
+        assert_ne!(work_history_key(&row), work_history_key(&duplicate_prompt));
     }
 }

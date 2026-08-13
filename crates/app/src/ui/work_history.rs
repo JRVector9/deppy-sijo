@@ -1,7 +1,7 @@
 //! 현재 워크스페이스의 durable agent work turns를 카드 목록으로 보여주는 순수 UI leaf.
 //!
 //! 저장소 조회, Git 수집, 세션 이동 같은 권한은 갖지 않는다. App이 넘긴 bounded
-//! immutable snapshot을 그리며, 이번 단계에서 밖으로 내보내는 의도는 수동 Refresh뿐이다.
+//! immutable snapshot을 그리며, 밖으로는 durable identity 기반 의도만 내보낸다.
 
 pub struct WorkHistorySnapshot<'a> {
     pub workspace_name: &'a str,
@@ -11,7 +11,7 @@ pub struct WorkHistorySnapshot<'a> {
     pub error: Option<WorkHistoryErrorCode>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WorkTurnIdentity {
     pub workspace_id: String,
     pub kind: String,
@@ -31,7 +31,7 @@ impl From<&storage::AgentWorkTurnRow> for WorkTurnIdentity {
 }
 
 impl WorkTurnIdentity {
-    fn matches(&self, row: &storage::AgentWorkTurnRow) -> bool {
+    pub(crate) fn matches(&self, row: &storage::AgentWorkTurnRow) -> bool {
         self.workspace_id == row.workspace_id
             && self.kind == row.kind
             && self.agent_session_id == row.agent_session_id
@@ -47,9 +47,33 @@ pub enum WorkHistoryErrorCode {
     ReadFailed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkHistoryAction {
     Refresh,
+    Activate(WorkTurnIdentity),
+    ShowDiff(WorkTurnIdentity),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkHistoryPrimaryAction {
+    Focus,
+    Resume,
+    NewRun,
+    Disabled(WorkHistoryDisabledReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkHistoryDisabledReason {
+    Checking,
+    AgentUnavailable,
+    Stale,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkHistoryActionPresentation {
+    pub identity: WorkTurnIdentity,
+    pub primary: WorkHistoryPrimaryAction,
+    pub show_diff: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -86,6 +110,7 @@ impl WorkHistoryUi {
         &mut self,
         ui: &mut egui::Ui,
         snapshot: WorkHistorySnapshot<'_>,
+        presentations: &[WorkHistoryActionPresentation],
         catalog: &i18n::Catalog,
     ) -> Option<WorkHistoryAction> {
         self.reconcile_selection(snapshot.rows);
@@ -143,8 +168,22 @@ impl WorkHistoryUi {
                             .selected
                             .as_ref()
                             .is_some_and(|selected| selected.matches(row));
-                        if render_card(ui, row, expanded, now, catalog) {
+                        let presentation = presentations
+                            .iter()
+                            .find(|candidate| candidate.identity.matches(row));
+                        let card_action = render_card(
+                            ui,
+                            row,
+                            expanded,
+                            now,
+                            presentation,
+                            catalog,
+                        );
+                        if card_action.toggle {
                             self.toggle_selected(WorkTurnIdentity::from(row));
+                        }
+                        if action.is_none() {
+                            action = card_action.action;
                         }
                     }
                 });
@@ -308,8 +347,9 @@ fn render_card(
     row: &storage::AgentWorkTurnRow,
     expanded: bool,
     now: i64,
+    presentation: Option<&WorkHistoryActionPresentation>,
     catalog: &i18n::Catalog,
-) -> bool {
+) -> CardAction {
     let tokens = crate::ui::designall::tokens(ui.visuals());
     let fill = if expanded {
         tokens.selected_background
@@ -327,6 +367,7 @@ fn render_card(
         .corner_radius(egui::CornerRadius::same(5))
         .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
+            let mut action = None;
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 provider_badge(ui, &row.kind);
@@ -368,6 +409,7 @@ fn render_card(
             });
             ui.add_space(8.0);
             render_metadata(ui, row, catalog);
+            let toggle_rect = ui.min_rect();
 
             if expanded {
                 ui.add_space(10.0);
@@ -388,11 +430,59 @@ fn render_card(
                     &catalog.t("history.card.latest_work", &[]),
                     &summary,
                 );
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(presentation) = presentation {
+                        let (label_key, enabled) = match presentation.primary {
+                            WorkHistoryPrimaryAction::Focus => ("history.action.focus", true),
+                            WorkHistoryPrimaryAction::Resume => ("history.action.resume", true),
+                            WorkHistoryPrimaryAction::NewRun => ("history.action.new_run", true),
+                            WorkHistoryPrimaryAction::Disabled(_) => {
+                                ("history.action.unavailable", false)
+                            }
+                        };
+                        if ui
+                            .add_enabled(enabled, egui::Button::new(catalog.t(label_key, &[])))
+                            .clicked()
+                        {
+                            action = Some(WorkHistoryAction::Activate(
+                                presentation.identity.clone(),
+                            ));
+                        }
+                        if presentation.show_diff
+                            && ui
+                                .button(catalog.t("history.action.show_diff", &[]))
+                                .on_hover_text(catalog.t("history.action.show_diff_hint", &[]))
+                                .clicked()
+                        {
+                            action = Some(WorkHistoryAction::ShowDiff(
+                                presentation.identity.clone(),
+                            ));
+                        }
+                    }
+                });
+                if let Some(WorkHistoryActionPresentation {
+                    primary: WorkHistoryPrimaryAction::Disabled(reason),
+                    ..
+                }) = presentation
+                {
+                    let key = match reason {
+                        WorkHistoryDisabledReason::Checking => {
+                            "history.action.disabled.checking"
+                        }
+                        WorkHistoryDisabledReason::AgentUnavailable => {
+                            "history.action.disabled.unavailable"
+                        }
+                        WorkHistoryDisabledReason::Stale => "history.action.disabled.stale",
+                    };
+                    ui.weak(catalog.t(key, &[]));
+                }
             }
+            (action, toggle_rect)
         });
     let response = ui
         .interact(
-            shown.response.rect,
+            shown.inner.1,
             ui.id().with((
                 "work-history-card",
                 &row.workspace_id,
@@ -411,7 +501,15 @@ fn render_card(
             &row.instruction,
         )
     });
-    response.clicked()
+    CardAction {
+        toggle: response.clicked(),
+        action: shown.inner.0,
+    }
+}
+
+struct CardAction {
+    toggle: bool,
+    action: Option<WorkHistoryAction>,
 }
 
 fn expanded_text(ui: &mut egui::Ui, label: &str, body: &str) {

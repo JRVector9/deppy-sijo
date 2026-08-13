@@ -197,6 +197,23 @@ impl AgentLauncherUi {
         self.open = true;
     }
 
+    /// 작업 이력의 `새로 실행`이 기존 런처 흐름을 그대로 사용하되,
+    /// 클릭한 제공자만 정확히 선택하도록 한다. 설치 스냅샷에 없으면 열지 않는다.
+    pub(crate) fn open_for_kind(
+        &mut self,
+        workspace_id: String,
+        workspace_name: String,
+        kind: AgentKind,
+        snapshot: &DetectionSnapshot,
+    ) -> bool {
+        let Some(agent) = snapshot.find(kind) else {
+            return false;
+        };
+        self.open_for(workspace_id, workspace_name);
+        self.select(agent);
+        true
+    }
+
     pub(crate) fn is_open(&self) -> bool {
         self.open
     }
@@ -938,6 +955,27 @@ mod tests {
         assert!(!ui.yolo);
         assert!(ui.model.is_empty());
         assert!(ui.effort.is_none());
+    }
+
+    #[test]
+    fn history_new_run_preselects_only_an_installed_provider() {
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Kimi]);
+        let mut ui = AgentLauncherUi::new();
+
+        assert!(ui.open_for_kind(
+            "workspace".to_owned(),
+            "Project".to_owned(),
+            AgentKind::Kimi,
+            &detected,
+        ));
+        assert_eq!(ui.selected, Some(AgentKind::Kimi));
+        assert!(!ui.open_for_kind(
+            "workspace".to_owned(),
+            "Project".to_owned(),
+            AgentKind::Codex,
+            &detected,
+        ));
+        assert_eq!(ui.selected, Some(AgentKind::Kimi));
     }
 
     #[test]

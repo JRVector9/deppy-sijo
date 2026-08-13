@@ -735,16 +735,39 @@ impl DiffPanelUi {
     /// cwd 미확인이면 조회 없이 열어 패널이 안내를 표시한다.
     pub fn open_for(
         &mut self,
-        _ctx: &egui::Context,
+        ctx: &egui::Context,
         workspace_id: String,
         session: runtime::SessionId,
+        cwd: Option<String>,
+        title: String,
+    ) {
+        self.open_for_target(ctx, workspace_id, Some(session), cwd, title);
+    }
+
+    /// 저장된 작업 이력의 cwd 진입점. 세션 lifecycle과 무관하지만 기존 diff 수집의
+    /// generation/capacity-one/경로 검증을 그대로 공유한다.
+    pub fn open_for_path(
+        &mut self,
+        ctx: &egui::Context,
+        workspace_id: String,
+        cwd: String,
+        title: String,
+    ) {
+        self.open_for_target(ctx, workspace_id, None, Some(cwd), title);
+    }
+
+    fn open_for_target(
+        &mut self,
+        _ctx: &egui::Context,
+        workspace_id: String,
+        session: Option<runtime::SessionId>,
         cwd: Option<String>,
         title: String,
     ) {
         self.invalidate_target();
         self.open = true;
         self.workspace_id = workspace_id;
-        self.session = Some(session);
+        self.session = session;
         self.title = title;
         match cwd {
             Some(path) => match DiffPathPayload::try_new(path) {
@@ -1070,6 +1093,32 @@ mod tests {
                 .map(|value| value.repo_root.as_str()),
             Some("/private/repo-b")
         );
+    }
+
+    #[test]
+    fn path_target은_session없이_같은_bounded_intent를_만든다() {
+        let context = egui::Context::default();
+        let mut panel = DiffPanelUi::new();
+        panel.open_for_path(
+            &context,
+            "workspace-a".to_owned(),
+            "/private/repo-a".to_owned(),
+            "History task".to_owned(),
+        );
+
+        let intent = panel.take_io_intent().expect("path target intent");
+        assert!(panel.take_io_intent().is_none(), "capacity must remain one");
+        assert_eq!(panel.session, None);
+        assert_eq!(panel.cwd.as_deref(), Some("/private/repo-a"));
+        assert_eq!(panel.title, "History task");
+
+        panel.complete_io(DiffIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Ok(snapshot("/private/repo-a", Vec::new())),
+        });
+        assert!(panel.pending.is_none());
+        assert!(panel.snapshot.is_some());
     }
 
     #[test]

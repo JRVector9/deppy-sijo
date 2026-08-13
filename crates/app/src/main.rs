@@ -10,6 +10,7 @@ mod agent_shim;
 mod agent_state_worker;
 mod agent_surface;
 mod agent_transcript;
+mod agent_work_git;
 mod alloc;
 mod app;
 mod bench;

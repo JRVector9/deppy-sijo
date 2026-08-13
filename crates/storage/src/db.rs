@@ -211,6 +211,7 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 /// 34: sessions.*_regex — RespawnArchivedAgent가 열람 전용 세션을 재실행할 때
 ///     status detector regex를 agent_configs 재조회 없이 spawn 시점 값 그대로
 ///     복원하도록 세션 행에 함께 저장(persist crate 소유 DDL, runtime PR-2 후속).
+/// 35: bounded agent work-turn history, keyed by durable provider turn identity.
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -700,6 +701,34 @@ CREATE TABLE workspace_notes (
     // idle heuristic만 동작) — 재실행이 아니라 재확인(re-run) 없이는 소급 채움이
     // 불가능하므로 이는 정상 동작이다.
     persist::MIGRATION_SESSION_REGEX,
+    // v35: transcript에서 복원한 사용자 지시 단위 작업 이력. 원문 transcript나 tool
+    // payload는 저장하지 않고 bounded 표시 필드만 보존한다. workspace 삭제와 함께
+    // 제거되며, 저장 API가 workspace당 최신 256행으로 같은 transaction에서 정리한다.
+    "
+CREATE TABLE agent_work_turns (
+    workspace_id TEXT NOT NULL,
+    pane_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    agent_session_id TEXT NOT NULL,
+    turn_key TEXT NOT NULL,
+    source_offset INTEGER NOT NULL CHECK (source_offset >= 0),
+    instruction TEXT NOT NULL,
+    agent_summary TEXT,
+    model TEXT,
+    effort TEXT,
+    cwd TEXT,
+    branch TEXT,
+    git_change_count INTEGER CHECK (git_change_count IS NULL OR git_change_count >= 0),
+    state TEXT NOT NULL CHECK (state IN ('working', 'waiting', 'completed')),
+    occurred_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, kind, agent_session_id, turn_key),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_agent_work_turns_workspace_recency
+    ON agent_work_turns(workspace_id, updated_at DESC, source_offset DESC);
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -791,6 +820,151 @@ impl std::fmt::Debug for AgentTurnDoneClear {
     }
 }
 
+pub const AGENT_WORK_TURNS_PER_WORKSPACE_MAX: usize = 256;
+pub const AGENT_WORK_TURN_BATCH_MAX: usize = 24;
+pub const AGENT_WORK_TURN_BATCH_BYTES_MAX: usize = 256 * 1024;
+pub const AGENT_WORK_HISTORY_SNAPSHOT_BYTES_MAX: usize = 4 * 1024 * 1024;
+
+const AGENT_WORK_TURN_PROVIDER_BYTES_MAX: usize = 64;
+const AGENT_WORK_TURN_ID_BYTES_MAX: usize = 1024;
+const AGENT_WORK_TURN_INSTRUCTION_BYTES_MAX: usize = 32 * 1024;
+const AGENT_WORK_TURN_SUMMARY_BYTES_MAX: usize = 32 * 1024;
+const AGENT_WORK_TURN_CWD_BYTES_MAX: usize = 4 * 1024;
+const AGENT_WORK_TURN_METADATA_BYTES_MAX: usize = 1024;
+const AGENT_WORK_TURN_ROW_BYTES_MAX: usize = 32 * 1024;
+const AGENT_WORK_HISTORY_INPUT_INVALID: &str = "agent work history input invalid";
+const AGENT_WORK_HISTORY_ROW_INVALID: &str = "agent work history row invalid";
+const AGENT_WORK_HISTORY_QUERY_FAILED: &str = "agent work history query failed";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentWorkTurnState {
+    Working,
+    Waiting,
+    Completed,
+}
+
+impl AgentWorkTurnState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "working" => Ok(Self::Working),
+            "waiting" => Ok(Self::Waiting),
+            "completed" => Ok(Self::Completed),
+            _ => anyhow::bail!(AGENT_WORK_HISTORY_ROW_INVALID),
+        }
+    }
+}
+
+/// One durable user-instruction turn. Debug deliberately reports only safe cardinality/state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentWorkTurnRow {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub kind: String,
+    pub agent_session_id: String,
+    pub turn_key: String,
+    pub source_offset: u64,
+    pub instruction: String,
+    pub agent_summary: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub git_change_count: Option<u32>,
+    pub state: AgentWorkTurnState,
+    pub occurred_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+impl std::fmt::Debug for AgentWorkTurnRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentWorkTurnRow")
+            .field("state", &self.state)
+            .field("has_summary", &self.agent_summary.is_some())
+            .field("has_git_facts", &self.cwd.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Validated replacement for one durable work-turn identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentWorkTurnUpsert {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub kind: String,
+    pub agent_session_id: String,
+    pub turn_key: String,
+    pub source_offset: u64,
+    pub instruction: String,
+    pub agent_summary: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub git_change_count: Option<u32>,
+    pub state: AgentWorkTurnState,
+    pub occurred_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+impl std::fmt::Debug for AgentWorkTurnUpsert {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentWorkTurnUpsert")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum AgentWorkHistoryMutation {
+    Upsert(AgentWorkTurnUpsert),
+}
+
+impl std::fmt::Debug for AgentWorkHistoryMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentWorkHistoryMutation")
+            .field("kind", &"upsert")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentWorkHistoryQuery {
+    pub workspace_id: String,
+    pub limit: usize,
+    pub snapshot_bytes_max: usize,
+}
+
+impl AgentWorkHistoryQuery {
+    pub fn for_workspace(workspace_id: impl Into<String>) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            limit: AGENT_WORK_TURNS_PER_WORKSPACE_MAX,
+            snapshot_bytes_max: AGENT_WORK_HISTORY_SNAPSHOT_BYTES_MAX,
+        }
+    }
+}
+
+impl std::fmt::Debug for AgentWorkHistoryQuery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentWorkHistoryQuery")
+            .field("limit", &self.limit)
+            .field("snapshot_bytes_max", &self.snapshot_bytes_max)
+            .finish()
+    }
+}
+
 /// Storage-owned structured-thread mutations accepted by [`Db::apply_agent_state_job`].
 ///
 /// The batch is validated in full before SQLite is touched and is committed atomically. Debug
@@ -841,6 +1015,7 @@ pub struct AgentStateJob {
     pub stale_binding_deletes: Vec<AgentSessionIdentity>,
     pub turn_done_clears: Vec<AgentTurnDoneClear>,
     pub structured_mutations: Vec<StructuredThreadMutation>,
+    pub work_turn_mutations: Vec<AgentWorkHistoryMutation>,
     /// Projects hook sessions and statuslines for the active workspace. False performs no query
     /// or output allocation for either section.
     pub include_hook_status: bool,
@@ -854,6 +1029,9 @@ pub struct AgentStateJob {
     /// output allocation for this section. Structured mutations remain atomic regardless.
     pub include_structured_threads: bool,
     pub include_archived_threads: bool,
+    /// Projects the active workspace's bounded work-turn catalog. False performs no query or
+    /// output allocation; mutations remain atomic regardless.
+    pub include_work_history: bool,
     /// Opt-in complete persisted activity-pane catalog. False performs no activity-pane query or
     /// allocation, keeping non-Catalog AgentState jobs free of this global projection cost.
     pub include_activity_panes: bool,
@@ -920,11 +1098,13 @@ impl AgentStateJob {
             stale_binding_deletes: Vec::new(),
             turn_done_clears: Vec::new(),
             structured_mutations: Vec::new(),
+            work_turn_mutations: Vec::new(),
             include_hook_status: true,
             include_attention: true,
             include_agent_sessions: true,
             include_structured_threads: true,
             include_archived_threads: true,
+            include_work_history: false,
             include_activity_panes: false,
         }
     }
@@ -949,6 +1129,7 @@ impl std::fmt::Debug for AgentStateJob {
                 "structured_mutation_count",
                 &self.structured_mutations.len(),
             )
+            .field("work_turn_mutation_count", &self.work_turn_mutations.len())
             .field("include_hook_status", &self.include_hook_status)
             .field("include_attention", &self.include_attention)
             .field("include_agent_sessions", &self.include_agent_sessions)
@@ -957,6 +1138,7 @@ impl std::fmt::Debug for AgentStateJob {
                 &self.include_structured_threads,
             )
             .field("include_archived_threads", &self.include_archived_threads)
+            .field("include_work_history", &self.include_work_history)
             .field("include_activity_panes", &self.include_activity_panes)
             .finish()
     }
@@ -985,6 +1167,7 @@ pub struct AgentStateSnapshot {
     pub agent_sessions: Vec<AgentSessionRow>,
     pub archived_agent_resume: Vec<ArchivedAgentResumeRow>,
     pub structured_threads: Vec<StructuredThreadRow>,
+    pub work_turns: Vec<AgentWorkTurnRow>,
     /// Complete bounded activity catalog when requested; otherwise empty without querying
     /// activity storage.
     pub activity_panes: Vec<PersistedActivityPane>,
@@ -1005,6 +1188,7 @@ impl std::fmt::Debug for AgentStateSnapshot {
                 &self.archived_agent_resume.len(),
             )
             .field("structured_thread_count", &self.structured_threads.len())
+            .field("work_turn_count", &self.work_turns.len())
             .field("activity_pane_count", &self.activity_panes.len())
             .finish()
     }
@@ -1584,6 +1768,77 @@ const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id
     FROM agent_sessions WHERE workspace_id = ?1
     ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2";
 
+const AGENT_WORK_HISTORY_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_work_turns WHERE workspace_id = ?1
+     ORDER BY updated_at DESC, source_offset DESC,
+              substr(CAST(kind AS BLOB), 1, ?3),
+              substr(CAST(agent_session_id AS BLOB), 1, ?4),
+              substr(CAST(turn_key AS BLOB), 1, ?4), rowid LIMIT ?2
+), sized AS MATERIALIZED (
+    SELECT turn.*,
+           length(CAST(turn.workspace_id AS BLOB))
+         + length(CAST(turn.pane_id AS BLOB))
+         + length(CAST(turn.kind AS BLOB))
+         + length(CAST(turn.agent_session_id AS BLOB))
+         + length(CAST(turn.turn_key AS BLOB))
+         + length(CAST(turn.instruction AS BLOB))
+         + COALESCE(length(CAST(turn.agent_summary AS BLOB)), 0)
+         + COALESCE(length(CAST(turn.model AS BLOB)), 0)
+         + COALESCE(length(CAST(turn.effort AS BLOB)), 0)
+         + COALESCE(length(CAST(turn.cwd AS BLOB)), 0)
+         + COALESCE(length(CAST(turn.branch AS BLOB)), 0) AS row_bytes
+      FROM selected JOIN agent_work_turns turn ON turn.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(workspace_id) != 'text'
+       OR length(CAST(workspace_id AS BLOB)) NOT BETWEEN 1 AND ?4
+       OR instr(workspace_id, char(0)) != 0
+    OR typeof(pane_id) != 'text' OR length(CAST(pane_id AS BLOB)) NOT BETWEEN 1 AND ?4
+       OR instr(pane_id, char(0)) != 0
+    OR typeof(kind) != 'text' OR length(CAST(kind AS BLOB)) NOT BETWEEN 1 AND ?3
+       OR kind GLOB '*[^a-z0-9_-]*'
+    OR typeof(agent_session_id) != 'text'
+       OR length(CAST(agent_session_id AS BLOB)) NOT BETWEEN 1 AND ?4
+       OR instr(agent_session_id, char(0)) != 0
+    OR typeof(turn_key) != 'text' OR length(CAST(turn_key AS BLOB)) NOT BETWEEN 1 AND ?4
+       OR instr(turn_key, char(0)) != 0
+    OR typeof(source_offset) != 'integer' OR source_offset < 0
+    OR typeof(instruction) != 'text'
+       OR length(CAST(instruction AS BLOB)) NOT BETWEEN 1 AND ?5
+       OR instr(instruction, char(0)) != 0
+    OR typeof(agent_summary) NOT IN ('null', 'text')
+       OR (typeof(agent_summary) = 'text'
+           AND (length(CAST(agent_summary AS BLOB)) > ?6 OR instr(agent_summary, char(0)) != 0))
+    OR typeof(model) NOT IN ('null', 'text')
+       OR (typeof(model) = 'text'
+           AND (length(CAST(model AS BLOB)) > ?7 OR instr(model, char(0)) != 0))
+    OR typeof(effort) NOT IN ('null', 'text')
+       OR (typeof(effort) = 'text'
+           AND (length(CAST(effort AS BLOB)) > ?7 OR instr(effort, char(0)) != 0))
+    OR typeof(cwd) NOT IN ('null', 'text')
+       OR (typeof(cwd) = 'text'
+           AND (length(CAST(cwd AS BLOB)) > ?8 OR instr(cwd, char(0)) != 0))
+    OR typeof(branch) NOT IN ('null', 'text')
+       OR (typeof(branch) = 'text'
+           AND (length(CAST(branch AS BLOB)) > ?7 OR instr(branch, char(0)) != 0))
+    OR typeof(git_change_count) NOT IN ('null', 'integer')
+       OR (typeof(git_change_count) = 'integer'
+           AND git_change_count NOT BETWEEN 0 AND 4294967295)
+    OR typeof(state) != 'text' OR state NOT IN ('working', 'waiting', 'completed')
+    OR typeof(occurred_at) NOT IN ('null', 'integer')
+    OR typeof(updated_at) != 'integer' OR updated_at < 0
+    OR row_bytes > ?9 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+
+const AGENT_WORK_HISTORY_SELECT: &str = "SELECT workspace_id, pane_id, kind,
+           agent_session_id, turn_key, source_offset, instruction, agent_summary,
+           model, effort, cwd, branch, git_change_count, state, occurred_at, updated_at
+      FROM agent_work_turns WHERE workspace_id = ?1
+     ORDER BY updated_at DESC, source_offset DESC,
+              substr(CAST(kind AS BLOB), 1, ?3),
+              substr(CAST(agent_session_id AS BLOB), 1, ?4),
+              substr(CAST(turn_key AS BLOB), 1, ?4), rowid LIMIT ?2";
+
 const ARCHIVED_AGENT_RESUME_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT session.rowid AS session_rowid, pane.id AS pane_id
       FROM sessions session
@@ -1857,6 +2112,226 @@ fn bounded_optional_integer(row: &rusqlite::Row<'_>, index: usize) -> anyhow::Re
     }
 }
 
+fn agent_work_provider_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= AGENT_WORK_TURN_PROVIDER_BYTES_MAX
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte))
+}
+
+fn agent_work_optional_text_is_valid(value: Option<&str>, max_bytes: usize) -> bool {
+    value.is_none_or(|value| value.len() <= max_bytes && !value.as_bytes().contains(&0))
+}
+
+fn agent_work_turn_input_bytes(row: &AgentWorkTurnUpsert) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        bounded_id_is_valid(&row.workspace_id)
+            && bounded_id_is_valid(&row.pane_id)
+            && agent_work_provider_is_valid(&row.kind)
+            && bounded_id_is_valid(&row.agent_session_id)
+            && bounded_id_is_valid(&row.turn_key)
+            && row.source_offset <= i64::MAX as u64
+            && !row.instruction.is_empty()
+            && row.instruction.len() <= AGENT_WORK_TURN_INSTRUCTION_BYTES_MAX
+            && !row.instruction.as_bytes().contains(&0)
+            && agent_work_optional_text_is_valid(
+                row.agent_summary.as_deref(),
+                AGENT_WORK_TURN_SUMMARY_BYTES_MAX,
+            )
+            && agent_work_optional_text_is_valid(
+                row.model.as_deref(),
+                AGENT_WORK_TURN_METADATA_BYTES_MAX,
+            )
+            && agent_work_optional_text_is_valid(
+                row.effort.as_deref(),
+                AGENT_WORK_TURN_METADATA_BYTES_MAX,
+            )
+            && agent_work_optional_text_is_valid(
+                row.cwd.as_deref(),
+                AGENT_WORK_TURN_CWD_BYTES_MAX,
+            )
+            && agent_work_optional_text_is_valid(
+                row.branch.as_deref(),
+                AGENT_WORK_TURN_METADATA_BYTES_MAX,
+            )
+            && row.updated_at >= 0,
+        AGENT_WORK_HISTORY_INPUT_INVALID
+    );
+    let bytes = [
+        row.workspace_id.len(),
+        row.pane_id.len(),
+        row.kind.len(),
+        row.agent_session_id.len(),
+        row.turn_key.len(),
+        row.instruction.len(),
+        row.agent_summary.as_deref().map_or(0, str::len),
+        row.model.as_deref().map_or(0, str::len),
+        row.effort.as_deref().map_or(0, str::len),
+        row.cwd.as_deref().map_or(0, str::len),
+        row.branch.as_deref().map_or(0, str::len),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .ok_or_else(|| anyhow::anyhow!(AGENT_WORK_HISTORY_INPUT_INVALID))?;
+    anyhow::ensure!(
+        bytes <= AGENT_WORK_TURN_ROW_BYTES_MAX,
+        AGENT_WORK_HISTORY_INPUT_INVALID
+    );
+    Ok(bytes)
+}
+
+fn validate_agent_work_history_query(query: &AgentWorkHistoryQuery) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bounded_id_is_valid(&query.workspace_id)
+            && query.limit <= AGENT_WORK_TURNS_PER_WORKSPACE_MAX
+            && (1..=AGENT_WORK_HISTORY_SNAPSHOT_BYTES_MAX)
+                .contains(&query.snapshot_bytes_max),
+        AGENT_WORK_HISTORY_INPUT_INVALID
+    );
+    Ok(())
+}
+
+fn agent_work_history_probe(
+    conn: &Connection,
+    query: &AgentWorkHistoryQuery,
+) -> anyhow::Result<(BoundedReadProbe, i64)> {
+    validate_agent_work_history_query(query)?;
+    let sql_limit = bounded_limit_plus_one(query.limit, AGENT_WORK_TURNS_PER_WORKSPACE_MAX)
+        .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_INPUT_INVALID))?;
+    let probe = bounded_read_preflight_with_budget(
+        conn,
+        AGENT_WORK_HISTORY_PREFLIGHT,
+        rusqlite::params![
+            query.workspace_id,
+            sql_limit,
+            AGENT_WORK_TURN_PROVIDER_BYTES_MAX as i64,
+            AGENT_WORK_TURN_ID_BYTES_MAX as i64,
+            AGENT_WORK_TURN_INSTRUCTION_BYTES_MAX as i64,
+            AGENT_WORK_TURN_SUMMARY_BYTES_MAX as i64,
+            AGENT_WORK_TURN_METADATA_BYTES_MAX as i64,
+            AGENT_WORK_TURN_CWD_BYTES_MAX as i64,
+            AGENT_WORK_TURN_ROW_BYTES_MAX as i64,
+        ],
+        query.limit,
+        query.snapshot_bytes_max,
+    )
+    .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?;
+    Ok((probe, sql_limit))
+}
+
+fn read_agent_work_history(
+    conn: &Connection,
+    query: &AgentWorkHistoryQuery,
+    probe: BoundedReadProbe,
+    sql_limit: i64,
+) -> anyhow::Result<Vec<AgentWorkTurnRow>> {
+    let mut result = Vec::with_capacity(probe.count);
+    let mut stmt = conn
+        .prepare(AGENT_WORK_HISTORY_SELECT)
+        .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_QUERY_FAILED))?;
+    let mut rows = stmt
+        .query(rusqlite::params![
+            query.workspace_id,
+            sql_limit,
+            AGENT_WORK_TURN_PROVIDER_BYTES_MAX as i64,
+            AGENT_WORK_TURN_ID_BYTES_MAX as i64,
+        ])
+        .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_QUERY_FAILED))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_QUERY_FAILED))?
+    {
+        let source_offset = u64::try_from(
+            bounded_integer(row, 5)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?,
+        )
+        .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?;
+        let git_change_count = bounded_optional_integer(row, 12)
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?;
+        let state = AgentWorkTurnState::from_str(
+            bounded_required_text(row, 13, 9, true, true)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?,
+        )?;
+        result.push(AgentWorkTurnRow {
+            workspace_id: bounded_required_text(
+                row,
+                0,
+                AGENT_WORK_TURN_ID_BYTES_MAX,
+                true,
+                true,
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+            .to_owned(),
+            pane_id: bounded_required_text(row, 1, AGENT_WORK_TURN_ID_BYTES_MAX, true, true)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .to_owned(),
+            kind: bounded_required_text(
+                row,
+                2,
+                AGENT_WORK_TURN_PROVIDER_BYTES_MAX,
+                true,
+                true,
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+            .to_owned(),
+            agent_session_id: bounded_required_text(
+                row,
+                3,
+                AGENT_WORK_TURN_ID_BYTES_MAX,
+                true,
+                true,
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+            .to_owned(),
+            turn_key: bounded_required_text(
+                row,
+                4,
+                AGENT_WORK_TURN_ID_BYTES_MAX,
+                true,
+                true,
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+            .to_owned(),
+            source_offset,
+            instruction: bounded_required_text(
+                row,
+                6,
+                AGENT_WORK_TURN_INSTRUCTION_BYTES_MAX,
+                true,
+                false,
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+            .to_owned(),
+            agent_summary: bounded_optional_text(row, 7, AGENT_WORK_TURN_SUMMARY_BYTES_MAX)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .map(str::to_owned),
+            model: bounded_optional_text(row, 8, AGENT_WORK_TURN_METADATA_BYTES_MAX)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .map(str::to_owned),
+            effort: bounded_optional_text(row, 9, AGENT_WORK_TURN_METADATA_BYTES_MAX)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .map(str::to_owned),
+            cwd: bounded_optional_text(row, 10, AGENT_WORK_TURN_CWD_BYTES_MAX)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .map(str::to_owned),
+            branch: bounded_optional_text(row, 11, AGENT_WORK_TURN_METADATA_BYTES_MAX)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .map(str::to_owned),
+            git_change_count,
+            state,
+            occurred_at: bounded_optional_integer(row, 14)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?,
+            updated_at: bounded_integer(row, 15)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?,
+        });
+    }
+    Ok(result)
+}
+
 fn agent_session_identity_input_bytes(
     pane_id: &str,
     kind: &str,
@@ -1906,6 +2381,20 @@ fn canonicalize_structured_thread_row(row: &mut StructuredThreadRow) {
     canonicalize_agent_state_optional_string(&mut row.model);
 }
 
+fn canonicalize_agent_work_turn_upsert(row: &mut AgentWorkTurnUpsert) {
+    canonicalize_agent_state_string(&mut row.workspace_id);
+    canonicalize_agent_state_string(&mut row.pane_id);
+    canonicalize_agent_state_string(&mut row.kind);
+    canonicalize_agent_state_string(&mut row.agent_session_id);
+    canonicalize_agent_state_string(&mut row.turn_key);
+    canonicalize_agent_state_string(&mut row.instruction);
+    canonicalize_agent_state_optional_string(&mut row.agent_summary);
+    canonicalize_agent_state_optional_string(&mut row.model);
+    canonicalize_agent_state_optional_string(&mut row.effort);
+    canonicalize_agent_state_optional_string(&mut row.cwd);
+    canonicalize_agent_state_optional_string(&mut row.branch);
+}
+
 fn canonicalize_agent_state_job(job: &mut AgentStateJob) {
     canonicalize_agent_state_string(&mut job.workspace_id);
     for workspace_id in &mut job.structured_workspace_ids {
@@ -1945,6 +2434,11 @@ fn canonicalize_agent_state_job(job: &mut AgentStateJob) {
         }
     }
     canonicalize_agent_state_vec(&mut job.structured_mutations);
+    for mutation in &mut job.work_turn_mutations {
+        let AgentWorkHistoryMutation::Upsert(row) = mutation;
+        canonicalize_agent_work_turn_upsert(row);
+    }
+    canonicalize_agent_state_vec(&mut job.work_turn_mutations);
 }
 
 fn checked_agent_state_retained_add(
@@ -1983,6 +2477,35 @@ fn checked_agent_state_optional_string_capacity(
         checked_agent_state_string_capacity(total, value)?;
     }
     Ok(())
+}
+
+fn agent_work_history_retained_bytes(
+    rows: &Vec<AgentWorkTurnRow>,
+) -> Result<usize, AgentStatePreparationErrorCode> {
+    let mut total = 0usize;
+    checked_agent_state_vec_allocation(&mut total, rows)?;
+    for row in rows {
+        for value in [
+            &row.workspace_id,
+            &row.pane_id,
+            &row.kind,
+            &row.agent_session_id,
+            &row.turn_key,
+            &row.instruction,
+        ] {
+            checked_agent_state_string_capacity(&mut total, value)?;
+        }
+        for value in [
+            &row.agent_summary,
+            &row.model,
+            &row.effort,
+            &row.cwd,
+            &row.branch,
+        ] {
+            checked_agent_state_optional_string_capacity(&mut total, value)?;
+        }
+    }
+    Ok(total)
 }
 
 fn agent_state_job_retained_bytes(
@@ -2033,6 +2556,29 @@ fn agent_state_job_retained_bytes(
             | StructuredThreadMutation::Delete { local_session_id } => {
                 checked_agent_state_string_capacity(&mut total, local_session_id)?;
             }
+        }
+    }
+    checked_agent_state_vec_allocation(&mut total, &job.work_turn_mutations)?;
+    for mutation in &job.work_turn_mutations {
+        let AgentWorkHistoryMutation::Upsert(row) = mutation;
+        for value in [
+            &row.workspace_id,
+            &row.pane_id,
+            &row.kind,
+            &row.agent_session_id,
+            &row.turn_key,
+            &row.instruction,
+        ] {
+            checked_agent_state_string_capacity(&mut total, value)?;
+        }
+        for value in [
+            &row.agent_summary,
+            &row.model,
+            &row.effort,
+            &row.cwd,
+            &row.branch,
+        ] {
+            checked_agent_state_optional_string_capacity(&mut total, value)?;
         }
     }
     Ok(total)
@@ -2090,6 +2636,10 @@ fn agent_state_snapshot_retained_bytes(
         checked_agent_state_string_capacity(&mut total, &row.cwd)?;
         checked_agent_state_optional_string_capacity(&mut total, &row.model)?;
     }
+    checked_agent_state_retained_add(
+        &mut total,
+        agent_work_history_retained_bytes(&snapshot.work_turns)?,
+    )?;
     checked_agent_state_vec_allocation(&mut total, &snapshot.activity_panes)?;
     for row in &snapshot.activity_panes {
         checked_agent_state_string_capacity(&mut total, &row.workspace_id)?;
@@ -2122,7 +2672,8 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
             && (1..=AGENT_STATE_SNAPSHOT_BYTES_MAX).contains(&job.snapshot_bytes_max)
             && job.stale_binding_deletes.len() <= AGENT_STATE_EXACT_MUTATIONS_MAX
             && job.turn_done_clears.len() <= AGENT_STATE_EXACT_MUTATIONS_MAX
-            && job.structured_mutations.len() <= AGENT_STATE_STRUCTURED_MUTATIONS_MAX,
+            && job.structured_mutations.len() <= AGENT_STATE_STRUCTURED_MUTATIONS_MAX
+            && job.work_turn_mutations.len() <= AGENT_WORK_TURN_BATCH_MAX,
         AGENT_STATE_INPUT_INVALID
     );
     let workspace_prefix = format!("{}:", job.workspace_id);
@@ -2235,6 +2786,25 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
     );
     retained_input_bytes = retained_input_bytes
         .checked_add(structured_bytes)
+        .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+
+    let mut work_turn_bytes = 0usize;
+    for mutation in &job.work_turn_mutations {
+        let AgentWorkHistoryMutation::Upsert(row) = mutation;
+        anyhow::ensure!(row.workspace_id == job.workspace_id, AGENT_STATE_INPUT_INVALID);
+        work_turn_bytes = work_turn_bytes
+            .checked_add(
+                agent_work_turn_input_bytes(row)
+                    .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+    }
+    anyhow::ensure!(
+        work_turn_bytes <= AGENT_WORK_TURN_BATCH_BYTES_MAX,
+        AGENT_STATE_INPUT_INVALID
+    );
+    retained_input_bytes = retained_input_bytes
+        .checked_add(work_turn_bytes)
         .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
     anyhow::ensure!(
         retained_input_bytes <= AGENT_STATE_JOB_BYTES_MAX,
@@ -6699,6 +7269,32 @@ impl Db {
         Ok(result)
     }
 
+    /// Reads one workspace's stable newest-first work-turn catalog under explicit row/byte caps.
+    pub fn list_agent_work_history(
+        &self,
+        query: &AgentWorkHistoryQuery,
+    ) -> anyhow::Result<Vec<AgentWorkTurnRow>> {
+        validate_agent_work_history_query(query)?;
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_QUERY_FAILED))?;
+        let (probe, sql_limit) = agent_work_history_probe(&tx, query)?;
+        let result = read_agent_work_history(&tx, query, probe, sql_limit)?;
+        let retained_bytes = agent_work_history_retained_bytes(&result)
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?;
+        anyhow::ensure!(
+            retained_bytes <= query.snapshot_bytes_max,
+            AGENT_WORK_HISTORY_ROW_INVALID
+        );
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// Applies one bounded AgentStateWorker job and returns the requested post-mutation projection
     /// from the same IMMEDIATE SQLite transaction. Row, item, and logical-byte validation happens
     /// before any output String/Vec materialization; omitted sections perform neither step. Actual
@@ -6788,6 +7384,75 @@ impl Db {
                     .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
                 }
             }
+        }
+
+        for mutation in &job.work_turn_mutations {
+            let AgentWorkHistoryMutation::Upsert(row) = mutation;
+            let source_offset = i64::try_from(row.source_offset)
+                .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+            tx.execute(
+                "INSERT INTO agent_work_turns
+                    (workspace_id, pane_id, kind, agent_session_id, turn_key, source_offset,
+                     instruction, agent_summary, model, effort, cwd, branch, git_change_count,
+                     state, occurred_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16)
+                 ON CONFLICT(workspace_id, kind, agent_session_id, turn_key) DO UPDATE SET
+                    pane_id = excluded.pane_id,
+                    source_offset = excluded.source_offset,
+                    instruction = excluded.instruction,
+                    agent_summary = excluded.agent_summary,
+                    model = excluded.model,
+                    effort = excluded.effort,
+                    cwd = excluded.cwd,
+                    branch = excluded.branch,
+                    git_change_count = excluded.git_change_count,
+                    state = excluded.state,
+                    occurred_at = excluded.occurred_at,
+                    updated_at = excluded.updated_at
+                 WHERE agent_work_turns.updated_at <= excluded.updated_at",
+                rusqlite::params![
+                    row.workspace_id,
+                    row.pane_id,
+                    row.kind,
+                    row.agent_session_id,
+                    row.turn_key,
+                    source_offset,
+                    row.instruction,
+                    row.agent_summary,
+                    row.model,
+                    row.effort,
+                    row.cwd,
+                    row.branch,
+                    row.git_change_count.map(i64::from),
+                    row.state.as_str(),
+                    row.occurred_at,
+                    row.updated_at,
+                ],
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+        }
+        if !job.work_turn_mutations.is_empty() {
+            tx.execute(
+                "DELETE FROM agent_work_turns
+                  WHERE workspace_id = ?1
+                    AND rowid IN (
+                        SELECT rowid FROM agent_work_turns
+                         WHERE workspace_id = ?1
+                         ORDER BY updated_at DESC, source_offset DESC,
+                                  substr(CAST(kind AS BLOB), 1, ?3),
+                                  substr(CAST(agent_session_id AS BLOB), 1, ?4),
+                                  substr(CAST(turn_key AS BLOB), 1, ?4), rowid
+                         LIMIT -1 OFFSET ?2
+                    )",
+                rusqlite::params![
+                    job.workspace_id,
+                    AGENT_WORK_TURNS_PER_WORKSPACE_MAX as i64,
+                    AGENT_WORK_TURN_PROVIDER_BYTES_MAX as i64,
+                    AGENT_WORK_TURN_ID_BYTES_MAX as i64,
+                ],
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
         }
 
         if let Some(reconcile) = &job.binding_reconcile {
@@ -7037,6 +7702,13 @@ impl Db {
         } else {
             None
         };
+        let work_history_query = job
+            .include_work_history
+            .then(|| AgentWorkHistoryQuery::for_workspace(job.workspace_id.clone()));
+        let work_history_probe = work_history_query
+            .as_ref()
+            .map(|query| agent_work_history_probe(&tx, query))
+            .transpose()?;
         let activity_sql_limit = job
             .include_activity_panes
             .then(|| bounded_limit_plus_one(ACTIVITY_PANE_ROWS_MAX, ACTIVITY_PANE_ROWS_MAX))
@@ -7076,6 +7748,9 @@ impl Db {
                 .as_ref()
                 .map_or(0, |(probe, _)| probe.retained_bytes),
             structured_probe
+                .as_ref()
+                .map_or(0, |(probe, _)| probe.retained_bytes),
+            work_history_probe
                 .as_ref()
                 .map_or(0, |(probe, _)| probe.retained_bytes),
             activity_probe
@@ -7403,6 +8078,13 @@ impl Db {
         } else {
             Vec::new()
         };
+        let work_turns = if let (Some(query), Some((probe, sql_limit))) =
+            (&work_history_query, work_history_probe)
+        {
+            read_agent_work_history(&tx, query, probe, sql_limit)?
+        } else {
+            Vec::new()
+        };
         let activity_panes = if let (Some(sql_limit), Some(probe)) =
             (activity_sql_limit, activity_probe)
         {
@@ -7446,6 +8128,7 @@ impl Db {
             agent_sessions,
             archived_agent_resume,
             structured_threads,
+            work_turns,
             activity_panes,
         };
         let actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
@@ -11261,6 +11944,375 @@ mod tests {
         job
     }
 
+    fn agent_work_turn(
+        workspace_id: &str,
+        index: usize,
+        updated_at: i64,
+    ) -> AgentWorkTurnUpsert {
+        AgentWorkTurnUpsert {
+            workspace_id: workspace_id.to_owned(),
+            pane_id: format!("pane-{index}"),
+            kind: "codex".to_owned(),
+            agent_session_id: "agent-session".to_owned(),
+            turn_key: format!("codex:{index:x}"),
+            source_offset: index as u64,
+            instruction: format!("instruction-{index}"),
+            agent_summary: Some(format!("summary-{index}")),
+            model: Some("gpt-5.6".to_owned()),
+            effort: Some("high".to_owned()),
+            cwd: Some("/repo".to_owned()),
+            branch: Some("main".to_owned()),
+            git_change_count: Some(index as u32),
+            state: AgentWorkTurnState::Completed,
+            occurred_at: Some(updated_at),
+            updated_at,
+        }
+    }
+
+    fn apply_agent_work_turns(
+        db: &Db,
+        workspace_id: &str,
+        rows: Vec<AgentWorkTurnUpsert>,
+    ) -> anyhow::Result<AgentStateSnapshot> {
+        let mut job = agent_state_mutation_only_job(workspace_id);
+        job.work_turn_mutations = rows
+            .into_iter()
+            .map(AgentWorkHistoryMutation::Upsert)
+            .collect();
+        job.include_work_history = true;
+        db.apply_agent_state_job(&job)
+    }
+
+    #[test]
+    fn agent_work_history_v35_migrates_and_reopens() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-work-history-v35-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..34] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 34).unwrap();
+        }
+
+        {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(Db::read_user_version(&db.conn).unwrap(), 35);
+            let primary_key = db
+                .conn
+                .prepare("PRAGMA table_info(agent_work_turns)")
+                .unwrap()
+                .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, position)| *position > 0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                primary_key,
+                [
+                    ("workspace_id".to_owned(), 1),
+                    ("kind".to_owned(), 2),
+                    ("agent_session_id".to_owned(), 3),
+                    ("turn_key".to_owned(), 4),
+                ]
+            );
+            let index_count: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type = 'index'
+                        AND name = 'idx_agent_work_turns_workspace_recency'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(index_count, 1);
+            let workspace_id = db.create_workspace("history-reopen").unwrap();
+            apply_agent_work_turns(
+                &db,
+                &workspace_id,
+                vec![agent_work_turn(&workspace_id, 0, 1)],
+            )
+            .unwrap();
+        }
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 35);
+        let workspace_id = reopened
+            .list_workspaces()
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.name == "history-reopen")
+            .unwrap()
+            .id;
+        assert_eq!(
+            reopened
+                .list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(workspace_id))
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agent_work_history_upsert_is_idempotent_by_turn_key() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("history-idempotent").unwrap();
+        let first = agent_work_turn(&workspace_id, 7, 10);
+        apply_agent_work_turns(&db, &workspace_id, vec![first]).unwrap();
+
+        let mut replacement = agent_work_turn(&workspace_id, 7, 20);
+        replacement.pane_id = "new-pane".to_owned();
+        replacement.agent_summary = Some("updated-summary".to_owned());
+        replacement.state = AgentWorkTurnState::Waiting;
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![replacement]).unwrap();
+
+        assert_eq!(snapshot.work_turns.len(), 1);
+        assert_eq!(snapshot.work_turns[0].pane_id, "new-pane");
+        assert_eq!(
+            snapshot.work_turns[0].agent_summary.as_deref(),
+            Some("updated-summary")
+        );
+        assert_eq!(snapshot.work_turns[0].state, AgentWorkTurnState::Waiting);
+        assert_eq!(snapshot.work_turns[0].updated_at, 20);
+
+        let mut stale = agent_work_turn(&workspace_id, 7, 19);
+        stale.agent_summary = Some("stale-summary".to_owned());
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![stale]).unwrap();
+        assert_eq!(
+            snapshot.work_turns[0].agent_summary.as_deref(),
+            Some("updated-summary")
+        );
+        assert_eq!(snapshot.work_turns[0].updated_at, 20);
+    }
+
+    #[test]
+    fn agent_work_history_accepts_bounded_future_provider_id() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("history-provider").unwrap();
+        let mut row = agent_work_turn(&workspace_id, 0, 1);
+        row.kind = "future_agent-2".to_owned();
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![row]).unwrap();
+        assert_eq!(snapshot.work_turns[0].kind, "future_agent-2");
+
+        let mut exact = agent_work_turn(&workspace_id, 1, 2);
+        exact.kind = "a".repeat(AGENT_WORK_TURN_PROVIDER_BYTES_MAX);
+        exact.source_offset = i64::MAX as u64;
+        assert!(apply_agent_work_turns(&db, &workspace_id, vec![exact]).is_ok());
+        for invalid in ["Future", "future.agent", "future agent"] {
+            let mut row = agent_work_turn(&workspace_id, 2, 3);
+            row.kind = invalid.to_owned();
+            assert_eq!(
+                apply_agent_work_turns(&db, &workspace_id, vec![row])
+                    .unwrap_err()
+                    .to_string(),
+                AGENT_STATE_INPUT_INVALID
+            );
+        }
+    }
+
+    #[test]
+    fn agent_work_history_debug_redacts_content() {
+        let marker = "work-history-secret-marker";
+        let mut row = agent_work_turn(marker, 0, 1);
+        row.workspace_id = marker.to_owned();
+        row.pane_id = marker.to_owned();
+        row.kind = "provider".to_owned();
+        row.agent_session_id = marker.to_owned();
+        row.turn_key = marker.to_owned();
+        row.instruction = marker.to_owned();
+        row.agent_summary = Some(marker.to_owned());
+        row.cwd = Some(marker.to_owned());
+        let durable = AgentWorkTurnRow {
+            workspace_id: row.workspace_id.clone(),
+            pane_id: row.pane_id.clone(),
+            kind: row.kind.clone(),
+            agent_session_id: row.agent_session_id.clone(),
+            turn_key: row.turn_key.clone(),
+            source_offset: row.source_offset,
+            instruction: row.instruction.clone(),
+            agent_summary: row.agent_summary.clone(),
+            model: row.model.clone(),
+            effort: row.effort.clone(),
+            cwd: row.cwd.clone(),
+            branch: row.branch.clone(),
+            git_change_count: row.git_change_count,
+            state: row.state,
+            occurred_at: row.occurred_at,
+            updated_at: row.updated_at,
+        };
+        let mutation = AgentWorkHistoryMutation::Upsert(row.clone());
+        let query = AgentWorkHistoryQuery::for_workspace(marker);
+        for debug in [
+            format!("{row:?}"),
+            format!("{durable:?}"),
+            format!("{mutation:?}"),
+            format!("{query:?}"),
+        ] {
+            assert!(!debug.contains(marker));
+        }
+    }
+
+    #[test]
+    fn agent_work_history_batch_bounds_and_atomic_rejection() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("history-batch").unwrap();
+        let exact = (0..AGENT_WORK_TURN_BATCH_MAX)
+            .map(|index| agent_work_turn(&workspace_id, index, index as i64))
+            .collect();
+        assert_eq!(
+            apply_agent_work_turns(&db, &workspace_id, exact)
+                .unwrap()
+                .work_turns
+                .len(),
+            AGENT_WORK_TURN_BATCH_MAX
+        );
+
+        let plus_one = (100..100 + AGENT_WORK_TURN_BATCH_MAX + 1)
+            .map(|index| agent_work_turn(&workspace_id, index, index as i64))
+            .collect();
+        assert_eq!(
+            apply_agent_work_turns(&db, &workspace_id, plus_one)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+        assert_eq!(
+            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(workspace_id.as_str()))
+                .unwrap()
+                .len(),
+            AGENT_WORK_TURN_BATCH_MAX
+        );
+
+        let mut valid = agent_work_turn(&workspace_id, 200, 200);
+        valid.instruction = "valid-before-invalid".to_owned();
+        let mut invalid = agent_work_turn(&workspace_id, 201, 201);
+        invalid.source_offset = i64::MAX as u64 + 1;
+        assert_eq!(
+            apply_agent_work_turns(&db, &workspace_id, vec![valid, invalid])
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+        assert!(
+            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(workspace_id.as_str()))
+                .unwrap()
+                .iter()
+                .all(|row| row.instruction != "valid-before-invalid")
+        );
+    }
+
+    #[test]
+    fn agent_work_history_rejects_oversized_row_and_aggregate() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("history-bytes").unwrap();
+        let mut oversized = agent_work_turn(&workspace_id, 0, 0);
+        oversized.instruction = "x".repeat(AGENT_WORK_TURN_INSTRUCTION_BYTES_MAX + 1);
+        assert_eq!(
+            apply_agent_work_turns(&db, &workspace_id, vec![oversized])
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        let aggregate = (0..9)
+            .map(|index| {
+                let mut row = agent_work_turn(&workspace_id, index, index as i64);
+                row.instruction = "x".repeat(30 * 1024);
+                row
+            })
+            .collect();
+        assert_eq!(
+            apply_agent_work_turns(&db, &workspace_id, aggregate)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+        assert!(
+            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(workspace_id.as_str()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn agent_work_history_query_enforces_row_and_snapshot_limits() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("history-query-bounds").unwrap();
+        apply_agent_work_turns(
+            &db,
+            &workspace_id,
+            vec![agent_work_turn(&workspace_id, 0, 0)],
+        )
+        .unwrap();
+
+        let mut query = AgentWorkHistoryQuery::for_workspace(workspace_id.as_str());
+        query.limit = 0;
+        assert!(db.list_agent_work_history(&query).unwrap().is_empty());
+        query.limit = AGENT_WORK_TURNS_PER_WORKSPACE_MAX + 1;
+        assert_eq!(
+            db.list_agent_work_history(&query).unwrap_err().to_string(),
+            AGENT_WORK_HISTORY_INPUT_INVALID
+        );
+        query.limit = AGENT_WORK_TURNS_PER_WORKSPACE_MAX;
+        query.snapshot_bytes_max = 0;
+        assert_eq!(
+            db.list_agent_work_history(&query).unwrap_err().to_string(),
+            AGENT_WORK_HISTORY_INPUT_INVALID
+        );
+        query.snapshot_bytes_max = AGENT_WORK_HISTORY_SNAPSHOT_BYTES_MAX + 1;
+        assert_eq!(
+            db.list_agent_work_history(&query).unwrap_err().to_string(),
+            AGENT_WORK_HISTORY_INPUT_INVALID
+        );
+        query.snapshot_bytes_max = AGENT_WORK_HISTORY_SNAPSHOT_BYTES_MAX;
+        assert_eq!(db.list_agent_work_history(&query).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_work_history_is_workspace_isolated_stably_ordered_and_pruned() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.create_workspace("history-first").unwrap();
+        let second = db.create_workspace("history-second").unwrap();
+        for batch_start in (0..257).step_by(AGENT_WORK_TURN_BATCH_MAX) {
+            let rows = (batch_start..(batch_start + AGENT_WORK_TURN_BATCH_MAX).min(257))
+                .map(|index| agent_work_turn(&first, index, index as i64))
+                .collect();
+            apply_agent_work_turns(&db, &first, rows).unwrap();
+        }
+        apply_agent_work_turns(&db, &second, vec![agent_work_turn(&second, 999, 999)]).unwrap();
+
+        let first_rows = db
+            .list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(first.as_str()))
+            .unwrap();
+        assert_eq!(first_rows.len(), AGENT_WORK_TURNS_PER_WORKSPACE_MAX);
+        assert_eq!(first_rows.first().unwrap().turn_key, "codex:100");
+        assert_eq!(first_rows.last().unwrap().turn_key, "codex:1");
+        let second_rows = db
+            .list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(second.as_str()))
+            .unwrap();
+        assert_eq!(second_rows.len(), 1);
+        assert_eq!(second_rows[0].turn_key, "codex:3e7");
+
+        let mut tied_a = agent_work_turn(&second, 20, 1000);
+        tied_a.source_offset = 20;
+        let mut tied_b = agent_work_turn(&second, 21, 1000);
+        tied_b.source_offset = 21;
+        let rows = apply_agent_work_turns(&db, &second, vec![tied_a, tied_b])
+            .unwrap()
+            .work_turns;
+        assert_eq!(rows[0].source_offset, 21);
+        assert_eq!(rows[1].source_offset, 20);
+    }
+
     fn seed_archived_agent_resume_row(
         db: &Db,
         workspace_id: &str,
@@ -12589,11 +13641,13 @@ mod tests {
             stale_binding_deletes: vec![identity.clone()],
             turn_done_clears: vec![clear.clone()],
             structured_mutations: vec![mutation.clone()],
+            work_turn_mutations: Vec::new(),
             include_hook_status: true,
             include_attention: true,
             include_agent_sessions: true,
             include_structured_threads: true,
             include_archived_threads: true,
+            include_work_history: true,
             include_activity_panes: true,
         };
         let snapshot = AgentStateSnapshot {
@@ -12620,6 +13674,7 @@ mod tests {
                 session_id: Some(marker.to_owned()),
             }],
             structured_threads: vec![structured],
+            work_turns: Vec::new(),
             activity_panes: vec![PersistedActivityPane {
                 workspace_id: marker.to_owned(),
                 pane_id: marker.to_owned(),

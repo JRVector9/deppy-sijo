@@ -127,10 +127,10 @@ struct CacheEntry {
     binding: AgentBinding,
     /// 에이전트 owner pid.
     owner_pid: u32,
-    /// owner_pid의 시작 시각. `pid_start_time`이 None을 준 적이 있으면(비-macOS, 권한
-    /// 부족 등) None으로 남아 `cache_entry_is_fresh`가 항상 false를 돌려준다 — fast path
-    /// 없이 기존 경로로만 동작(감지가 죽는 것보다 exec가 낫다).
-    owner_start_time: Option<u64>,
+    /// owner_pid의 시작 시각(초+마이크로초). `pid_start_time`이 None을 준 적이 있으면
+    /// (비-macOS, 권한 부족 등) None으로 남아 `cache_entry_is_fresh`가 항상 false를
+    /// 돌려준다 — fast path 없이 기존 경로로만 동작(감지가 죽는 것보다 exec가 낫다).
+    owner_start_time: Option<crate::proc_info::ProcessBirth>,
     /// 휴리스틱(cwd 매칭) 바인딩은 fast path 대상이 아니다 — 매 tick 결정적 업그레이드를
     /// 계속 시도해야 한다.
     deterministic: bool,
@@ -1888,7 +1888,7 @@ mod tests {
     fn fresh_cache_entry(
         binding: AgentBinding,
         owner_pid: u32,
-        owner_start_time: u64,
+        owner_start_time: crate::proc_info::ProcessBirth,
     ) -> CacheEntry {
         CacheEntry {
             binding,
@@ -1983,7 +1983,14 @@ mod tests {
         let _guard = COMMAND_TEST_LOCK.lock().unwrap();
         let sid = SessionId(1);
         // u32::MAX는 i32로 변환 불가 → pid_start_time이 항상 None → "죽음"으로 취급된다.
-        let entry = fresh_cache_entry(test_binding("dead-owner"), u32::MAX, 1);
+        let entry = fresh_cache_entry(
+            test_binding("dead-owner"),
+            u32::MAX,
+            crate::proc_info::ProcessBirth {
+                seconds: 1,
+                microseconds: 0,
+            },
+        );
         let mut cache = BindingCache {
             entries: HashMap::from([(sid, entry)]),
             last_full_scan: Some(Instant::now()), // 안전망 안(=최근)이어도 폴백해야 한다.
@@ -2010,7 +2017,10 @@ mod tests {
             return;
         };
         let sid = SessionId(1);
-        let wrong_start = real_start.wrapping_add(1);
+        let wrong_start = crate::proc_info::ProcessBirth {
+            seconds: real_start.seconds,
+            microseconds: real_start.microseconds.wrapping_add(1),
+        };
         let entry = fresh_cache_entry(test_binding("reused-pid"), self_pid, wrong_start);
         let mut cache = BindingCache {
             entries: HashMap::from([(sid, entry)]),

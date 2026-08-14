@@ -5,16 +5,31 @@
 //! `agent_detect`가 에이전트 감지를 위해 `ps -axo pid=,ppid=,command=`와 `lsof`를 분당 72회
 //! exec한다. macOS는 exec마다 코드서명을 검증하므로 syspolicyd 부하로 이어진다. 이 모듈은 그
 //! 중 두 가지 조회(생존+동일성 확인, cwd 조회)를 서브프로세스 없이 커널에서 직접 읽어
-//! exec 비용을 없앤다. `port_inventory.rs`의 `query_process_birth_with_operation`,
-//! `bench.rs`의 `own_task_info`가 같은 `proc_pidinfo` 계열 FFI를 이미 쓰고 있어 그 스타일을
-//! 따른다.
+//! exec 비용을 없앤다.
+//!
+//! `port_inventory.rs`의 `query_process_birth_with_operation`이 같은 `PROC_PIDTBSDINFO`
+//! 읽기를 별도 FFI 블록으로 중복 구현하고 있었다 — `pid_start_time`으로 합쳤다
+//! (2026-08-14, proc-info-consolidate). 합치면서 정밀도도 그쪽 수준으로 올렸다: 기존
+//! `pid_start_time`은 `pbi_start_tvsec`(초)만 썼는데, 같은 pid가 같은 1초 안에 재사용되면
+//! 이론상 구분하지 못한다. `port_inventory`는 이미 `pbi_start_tvusec`(마이크로초)까지 함께
+//! 검증해 이 경우를 잡고 있었으므로, 그 정밀도를 공유 헬퍼의 기본값으로 승격했다.
+//! `bench.rs`의 `own_task_info`도 같은 `proc_pidinfo` 계열 FFI를 쓰고 있어 그 스타일을 따른다.
 
-/// 프로세스 시작 시각(초 단위 epoch 등 단조 비교 가능한 값).
-/// pid만으로는 재사용을 구분할 수 없으므로 (pid, start_time) 쌍으로 동일성을 판정한다.
-/// 프로세스가 없거나 조회 실패면 None.
+/// 프로세스 시작 시각(초+마이크로초, `proc_bsdinfo.pbi_start_tvsec`/`pbi_start_tvusec` 그대로).
+/// 초 단위 비트 시프트로 하나의 `u64`에 합성하지 않고 필드 두 개짜리 struct로 둔 이유:
+/// 합성하면 오버플로/마스킹을 직접 검증해야 하는데, 초 값은 이미 `u64`라 시프트할 여유
+/// 비트가 없다. 필드별 비교가 그대로 정확하고 더 읽기 쉽다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessBirth {
+    pub(crate) seconds: u64,
+    pub(crate) microseconds: u64,
+}
+
+/// 프로세스 시작 시각. pid만으로는 재사용을 구분할 수 없으므로 (pid, start_time) 쌍으로
+/// 동일성을 판정한다. 프로세스가 없거나 조회 실패면 None.
 #[allow(dead_code)] // 생존/동일성 확인 소비자가 병렬 작업으로 붙는다.
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-pub(crate) fn pid_start_time(pid: u32) -> Option<u64> {
+pub(crate) fn pid_start_time(pid: u32) -> Option<ProcessBirth> {
     #[cfg(target_os = "macos")]
     {
         pid_start_time_macos(pid)
@@ -40,7 +55,7 @@ pub(crate) fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn pid_start_time_macos(pid: u32) -> Option<u64> {
+fn pid_start_time_macos(pid: u32) -> Option<ProcessBirth> {
     let pid_i32 = i32::try_from(pid).ok()?;
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
@@ -62,12 +77,17 @@ fn pid_start_time_macos(pid: u32) -> Option<u64> {
     }
     // SAFETY: 위에서 `written == size`를 확인했으므로 구조체 전체가 커널에 의해 채워졌다.
     let info = unsafe { info.assume_init() };
-    // pid 재확인 + 시작 시각이 0(비정상 값)이 아님을 검증한다 — port_inventory.rs의
-    // query_process_birth_with_operation과 같은 방어적 점검.
-    if info.pbi_pid != pid || info.pbi_start_tvsec == 0 {
+    // pid 재확인 + 시작 시각이 0(비정상 값)이 아님을 검증한다. `pbi_start_tvusec`이
+    // 1_000_000 이상이면 커널이 정상 채우지 않은 비정상 값이므로 함께 거른다 — 옛
+    // port_inventory.rs::query_process_birth_with_operation의 방어적 점검을 그대로 가져왔다
+    // (2026-08-14, 통합하며 정밀도를 usec까지 올림).
+    if info.pbi_pid != pid || info.pbi_start_tvsec == 0 || info.pbi_start_tvusec >= 1_000_000 {
         return None;
     }
-    Some(info.pbi_start_tvsec)
+    Some(ProcessBirth {
+        seconds: info.pbi_start_tvsec,
+        microseconds: info.pbi_start_tvusec,
+    })
 }
 
 #[cfg(target_os = "macos")]

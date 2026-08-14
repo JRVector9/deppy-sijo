@@ -27,7 +27,6 @@ pub(crate) struct ProcessBirth {
 
 /// 프로세스 시작 시각. pid만으로는 재사용을 구분할 수 없으므로 (pid, start_time) 쌍으로
 /// 동일성을 판정한다. 프로세스가 없거나 조회 실패면 None.
-#[allow(dead_code)] // 생존/동일성 확인 소비자가 병렬 작업으로 붙는다.
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 pub(crate) fn pid_start_time(pid: u32) -> Option<ProcessBirth> {
     #[cfg(target_os = "macos")]
@@ -41,7 +40,6 @@ pub(crate) fn pid_start_time(pid: u32) -> Option<ProcessBirth> {
 }
 
 /// 프로세스의 현재 작업 디렉터리. 없거나 조회 실패면 None.
-#[allow(dead_code)] // cwd 조회 소비자가 병렬 작업으로 붙는다.
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 pub(crate) fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]

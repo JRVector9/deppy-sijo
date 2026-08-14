@@ -109,13 +109,16 @@ pub struct RunningAgent {
 /// 에이전트 프로세스(owner_pid)가 여전히 ps 결과에 살아있으면 캐시를 재사용하고, 사라졌으면
 /// 다시 탐색한다. 정상 케이스(에이전트 생존)에서 세션당 O(1) pid 확인만 남는다.
 ///
-/// fast path(아래 `cache_entry_is_fresh`/`safety_net_elapsed`)는 이 pid 확인조차 `ps` 없이
+/// fast path(아래 `owner_still_alive`/`safety_net_elapsed`)는 이 pid 확인조차 `ps` 없이
 /// `pid_start_time`(커널 syscall, exec 없음) 한 번으로 대체한다(2026-08-14, 이 worktree).
 #[derive(Default)]
 pub struct BindingCache {
     entries: HashMap<SessionId, CacheEntry>,
-    /// 마지막으로 `process_rows()` 기반 전체 탐색을 돈 시각. fast path 안전망 판정에만
-    /// 쓰인다 — `detect_cached`만 갱신하고(캐시 유일한 필자), `detect_kinds`는 읽기만 한다.
+    /// 마지막으로 `process_rows()` 기반 전체 탐색을 돈 시각. fast path 안전망 판정에 쓰인다.
+    /// `detect_cached`/`detect_kinds` 둘 다 실제로 전체 탐색을 돌 때 갱신한다(P1-B, 코드리뷰
+    /// 2026-08-15) — 그래야 두 tier가 번갈아 전체 탐색하며 재탐색 주기(휴리스틱이 섞이면
+    /// `HEURISTIC_RESCAN_INTERVAL`)를 각자 따로 어기지 않는다. `entries`는 여전히
+    /// `detect_cached`만 쓴다.
     last_full_scan: Option<Instant>,
 }
 
@@ -128,11 +131,13 @@ struct CacheEntry {
     /// 에이전트 owner pid.
     owner_pid: u32,
     /// owner_pid의 시작 시각(초+마이크로초). `pid_start_time`이 None을 준 적이 있으면
-    /// (비-macOS, 권한 부족 등) None으로 남아 `cache_entry_is_fresh`가 항상 false를
+    /// (비-macOS, 권한 부족 등) None으로 남아 `owner_still_alive`가 항상 false를
     /// 돌려준다 — fast path 없이 기존 경로로만 동작(감지가 죽는 것보다 exec가 낫다).
     owner_start_time: Option<crate::proc_info::ProcessBirth>,
-    /// 휴리스틱(cwd 매칭) 바인딩은 fast path 대상이 아니다 — 매 tick 결정적 업그레이드를
-    /// 계속 시도해야 한다.
+    /// 휴리스틱(cwd 매칭) 바인딩도 owner가 살아있으면 fast path를 타지만, 배치에 이 항목이
+    /// 하나라도 있으면 재탐색 주기가 30초 안전망 대신 `HEURISTIC_RESCAN_INTERVAL`(5초)로
+    /// 짧아진다 — 결정적 업그레이드/자기교정 시도가 계속 굶지 않게(P1-B, 코드리뷰
+    /// 2026-08-15).
     deterministic: bool,
     model: Option<String>,
     effort: Option<String>,
@@ -144,22 +149,42 @@ struct CacheEntry {
 /// 때문이다(2026-08-14, deppy-liveness worktree).
 const FASTPATH_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// 캐시 항목이 재확인 없이 재사용 가능한 상태인지: 결정적 바인딩이고, owner pid가 여전히
-/// 같은 시작 시각으로 살아있어야 한다. pid 재사용(같은 pid, 다른 start_time)과 프로세스
-/// 종료를 모두 이 한 번의 syscall 비교로 잡아낸다.
-fn cache_entry_is_fresh(entry: &CacheEntry) -> bool {
-    entry.deterministic
-        && entry
-            .owner_start_time
-            .is_some_and(|start| crate::proc_info::pid_start_time(entry.owner_pid) == Some(start))
+/// 휴리스틱(비결정적) 바인딩이 배치에 하나라도 섞이면 안전망 대신 이 주기를 쓴다.
+/// 결정적 승격(`codex_open_rollout`)과 Claude 휴리스틱의 자기교정(다음 전체 탐색에서 더
+/// 정확한 transcript로 재바인딩)이 수 초 안에 여전히 일어나야 하기 때문이다 — 30초까지
+/// 굶기면 반응성 계약이 깨진다. owner pid 생존 확인 자체는 결정성과 무관하게 유효하므로
+/// (같은 pane에서 에이전트가 교체되면 owner 프로세스가 죽는 사건이라 즉시 잡힌다) 휴리스틱
+/// 항목을 fast path에서 통째로 뺄 필요는 없고, "승격/자기교정 시도" 빈도만 이 주기로
+/// 늦춘다. 세션별 분할(코드리뷰 제안)은 `process_rows()` exec 자체가 배치당 1회라 단독으로는
+/// exec를 줄이지 못해 채택하지 않았다(P1-B, 코드리뷰 2026-08-15).
+const HEURISTIC_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// owner pid가 여전히 같은 시작 시각으로 살아있는지만 본다 — 결정적/휴리스틱 여부와
+/// 무관하다. pid 재사용(같은 pid, 다른 start_time)과 프로세스 종료를 이 한 번의 syscall
+/// 비교로 잡아낸다.
+fn owner_still_alive(entry: &CacheEntry) -> bool {
+    entry
+        .owner_start_time
+        .is_some_and(|start| crate::proc_info::pid_start_time(entry.owner_pid) == Some(start))
 }
 
-/// 안전망 주기가 지나 전체 탐색을 강제해야 하는지. 캐시가 한 번도 전체 탐색을 못 돌았으면
+/// 요청된 세션 중 캐시가 비결정적(휴리스틱)으로 바인딩한 항목이 하나라도 있는지.
+fn has_heuristic_entry(sessions: &[(SessionId, u32)], cache: &BindingCache) -> bool {
+    sessions
+        .iter()
+        .any(|(sid, _)| cache.entries.get(sid).is_some_and(|entry| !entry.deterministic))
+}
+
+/// 안전망 주기가 지나 전체 탐색을 강제해야 하는지. 배치에 휴리스틱 항목이 있으면 30초
+/// 대신 `HEURISTIC_RESCAN_INTERVAL`(5초)을 쓴다. 캐시가 한 번도 전체 탐색을 못 돌았으면
 /// (None) 안전 쪽으로 "지남"으로 취급한다.
-fn safety_net_elapsed(cache: &BindingCache) -> bool {
-    cache
-        .last_full_scan
-        .is_none_or(|at| at.elapsed() >= FASTPATH_FULL_SCAN_INTERVAL)
+fn safety_net_elapsed(cache: &BindingCache, has_heuristic: bool) -> bool {
+    let interval = if has_heuristic {
+        HEURISTIC_RESCAN_INTERVAL
+    } else {
+        FASTPATH_FULL_SCAN_INTERVAL
+    };
+    cache.last_full_scan.is_none_or(|at| at.elapsed() >= interval)
 }
 
 /// 캐시에 남은 정보만으로 종류 tier 결과를 재구성한다(`process_rows` 불필요).
@@ -301,23 +326,26 @@ fn argv_flag_value(command: &str, flag: &str) -> Option<String> {
 /// 필요한 그 경우를 위해 싼 패스를 따로 연다.
 pub fn detect_kinds(
     sessions: &[(SessionId, u32)],
-    cache: &BindingCache,
+    cache: &mut BindingCache,
     process_cache: &mut ProcessRowsCache,
 ) -> HashMap<SessionId, RunningAgent> {
     if sessions.len() > MAX_SESSIONS {
         return HashMap::new();
     }
-    // fast path: 요청된 모든 세션에 결정적이고 살아있는 캐시 항목이 있고 안전망 주기도
-    // 안 지났으면, `ps` 없이 캐시된 kind/model/effort를 그대로 돌려준다. `cache`는
-    // `detect_cached`가 쓴 것을 읽기만 한다 — 이 tier는 바인딩 캐시의 필자가 아니다
-    // (2026-08-14).
-    if !safety_net_elapsed(cache)
+    // fast path: 요청된 모든 세션의 owner pid가 살아있고(결정성 무관, P1-B) 재탐색 주기도
+    // 안 지났으면, `ps` 없이 캐시된 kind/model/effort를 그대로 돌려준다. `cache.entries`는
+    // `detect_cached`가 쓴 것을 읽기만 한다 — 이 tier는 바인딩의 필자가 아니다(2026-08-14).
+    // `last_full_scan`만은 전체 탐색을 실제로 돌 때 이 tier도 함께 갱신한다 — 그래야
+    // 바인딩 tier와 번갈아 돌며 재탐색 주기를 공유한다.
+    let has_heuristic = has_heuristic_entry(sessions, cache);
+    if !safety_net_elapsed(cache, has_heuristic)
         && sessions
             .iter()
-            .all(|(sid, _)| cache.entries.get(sid).is_some_and(cache_entry_is_fresh))
+            .all(|(sid, _)| cache.entries.get(sid).is_some_and(owner_still_alive))
     {
         return kinds_from_cache(sessions, cache);
     }
+    cache.last_full_scan = Some(Instant::now());
     agent_kinds_from_rows(sessions, process_cache.get(process_rows))
 }
 
@@ -332,17 +360,19 @@ pub fn detect_cached(
         cache.last_full_scan = None;
         return DetectedAgents::default();
     }
-    // fast path: 요청된 모든 세션에 결정적이고 살아있는(pid+시작시각 일치) 캐시 항목이
-    // 있고, 오버라이드도 캐시와 같고(하나라도 다르면 hook이 새 바인딩을 보고한 것이라
-    // 재확인이 필요), 안전망 주기도 안 지났으면 `process_rows()`(= `ps` exec)를 아예
-    // 부르지 않는다. 하나라도 어긋나면 전체를 기존 탐색 경로로 폴백한다 — "표시가 덜
-    // 구체적인 값으로 퇴행하면 안 된다"는 계약을 fast path에서도 지키기 위함
-    // (2026-08-14, deppy-liveness worktree).
-    if !safety_net_elapsed(cache)
+    // fast path: 요청된 모든 세션에 살아있는(pid+시작시각 일치) 캐시 항목이 있고 —
+    // 결정적이든 휴리스틱이든 owner 생존 확인 자체는 둘 다에 유효하다(P1-B) — 오버라이드도
+    // 캐시와 같고(하나라도 다르면 hook이 새 바인딩을 보고한 것이라 재확인이 필요), 재탐색
+    // 주기도 안 지났으면 `process_rows()`(= `ps` exec)를 아예 부르지 않는다. 재탐색 주기는
+    // 휴리스틱 항목이 하나라도 있으면 안전망(30초)이 아니라 `HEURISTIC_RESCAN_INTERVAL`
+    // (5초)이라, 결정적 승격·자기교정이 굶지 않는다. 하나라도 어긋나면 전체를 기존 탐색
+    // 경로로 폴백한다 — "표시가 덜 구체적인 값으로 퇴행하면 안 된다"는 계약을 fast
+    // path에서도 지키기 위함(2026-08-14, deppy-liveness worktree; P1-B, 코드리뷰 2026-08-15).
+    let has_heuristic = has_heuristic_entry(sessions, cache);
+    if !safety_net_elapsed(cache, has_heuristic)
         && sessions.iter().all(|(sid, _)| {
             cache.entries.get(sid).is_some_and(|entry| {
-                cache_entry_is_fresh(entry)
-                    && overrides.get(sid).is_none_or(|b| *b == entry.binding)
+                owner_still_alive(entry) && overrides.get(sid).is_none_or(|b| *b == entry.binding)
             })
         })
     {
@@ -1950,7 +1980,7 @@ mod tests {
             return;
         };
         let sid = SessionId(1);
-        let cache = BindingCache {
+        let mut cache = BindingCache {
             entries: HashMap::from([(
                 sid,
                 fresh_cache_entry(test_binding("cached-session"), self_pid, start),
@@ -1960,7 +1990,7 @@ mod tests {
         let mut process_cache = sentinel_process_cache();
         let sessions = [(sid, self_pid)];
 
-        let result = detect_kinds(&sessions, &cache, &mut process_cache);
+        let result = detect_kinds(&sessions, &mut cache, &mut process_cache);
 
         assert_eq!(result.get(&sid).map(|r| r.kind), Some(AgentKind::Codex));
         assert!(
@@ -2033,10 +2063,12 @@ mod tests {
         );
     }
 
-    /// 휴리스틱(비결정적) 바인딩은 owner가 살아있어도 fast path 대상이 아니다 — 매 tick
-    /// 결정적 업그레이드를 계속 시도해야 하기 때문이다.
+    /// 휴리스틱(비결정적) 바인딩도 owner가 살아있고 재탐색 주기(`HEURISTIC_RESCAN_INTERVAL`)
+    /// 안이면 fast path를 탄다 — owner 생존 확인 자체는 결정성과 무관하게 유효하기
+    /// 때문이다. 예전엔 휴리스틱이면 무조건 매 tick 전체 탐색이라 혼합 배치가
+    /// 74 exec/분으로 복귀했다(P1-B, 코드리뷰 2026-08-15).
     #[test]
-    fn 휴리스틱_바인딩은_fast_path_대상이_아니다() {
+    fn 휴리스틱_바인딩도_재탐색_주기_안이면_fast_path를_탄다() {
         let _guard = COMMAND_TEST_LOCK.lock().unwrap();
         let self_pid = std::process::id();
         let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
@@ -2053,11 +2085,145 @@ mod tests {
         let sessions = [(sid, self_pid)];
         let overrides = HashMap::new();
 
+        let result = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert!(
+            process_rows_untouched(&process_cache),
+            "재탐색 주기 안에서는 휴리스틱 바인딩도 fast path를 타야 한다"
+        );
+        assert!(result.bindings.contains_key(&sid));
+    }
+
+    /// 혼합 배치(결정적 N + 휴리스틱 1)에서 재탐색 주기(5초)가 지나면 배치 전체가 전체
+    /// 탐색으로 돌아간다 — codex 승격/Claude 자기교정이 굶지 않게. 이 주기가 유계라
+    /// exec가 매 tick(50+/분)이 아니라 ~12/분 수준으로 준다(P1-B 최소 요구).
+    #[test]
+    fn 혼합_배치는_재탐색_주기가_지나면_전체_탐색으로_승격_기회를_준다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let deterministic_sid = SessionId(1);
+        let heuristic_sid = SessionId(2);
+        let mut heuristic_entry = fresh_cache_entry(test_binding("heuristic"), self_pid, start);
+        heuristic_entry.deterministic = false;
+        let mut cache = BindingCache {
+            entries: HashMap::from([
+                (
+                    deterministic_sid,
+                    fresh_cache_entry(test_binding("det"), self_pid, start),
+                ),
+                (heuristic_sid, heuristic_entry),
+            ]),
+            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(deterministic_sid, self_pid), (heuristic_sid, self_pid)];
+        let overrides = HashMap::new();
+
         let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
 
         assert!(
             !process_rows_untouched(&process_cache),
-            "휴리스틱 바인딩은 fast path를 타면 안 된다"
+            "재탐색 주기가 지났으면 혼합 배치도 전체 탐색해야 승격/자기교정이 굶지 않는다"
+        );
+    }
+
+    /// 결정적 배치만 있으면(휴리스틱 없음) 재탐색 주기(5초)가 지나도 원래 안전망(30초)을
+    /// 그대로 쓴다 — 휴리스틱이 하나도 없는데 재탐색 주기를 앞당길 이유가 없다. 이 테스트가
+    /// 없으면 "결정적 전용 배치의 fast path 지속시간이 30초에서 5초로 조용히 줄어드는" 회귀를
+    /// 못 잡는다.
+    #[test]
+    fn 결정적_배치만_있으면_재탐색_주기가_지나도_30초_안전망을_그대로_쓴다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let sid = SessionId(1);
+        let entry = fresh_cache_entry(test_binding("det"), self_pid, start);
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+        let overrides = HashMap::new();
+
+        let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert!(
+            process_rows_untouched(&process_cache),
+            "휴리스틱이 없으면 5초가 지나도 fast path를 유지해야 한다(30초 안전망은 그대로)"
+        );
+    }
+
+    /// owner가 죽으면 휴리스틱 바인딩도(결정적과 동일하게) 재탐색 주기와 무관하게 즉시
+    /// 전체 탐색으로 폴백한다 — owner 생존 확인은 결정성과 무관하게 게이트에 들어가기
+    /// 때문이다. 같은 pane에서 Codex 종료 → Claude 실행 같은 교체를 놓치지 않기 위한
+    /// 반응성 회귀 금지 조건.
+    #[test]
+    fn 휴리스틱_owner_사망시에도_즉시_전체_탐색으로_폴백한다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let sid = SessionId(1);
+        let mut entry = fresh_cache_entry(
+            test_binding("dead-heuristic-owner"),
+            u32::MAX,
+            crate::proc_info::ProcessBirth {
+                seconds: 1,
+                microseconds: 0,
+            },
+        );
+        entry.deterministic = false;
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(Instant::now()), // 재탐색 주기 안(=최근)이어도 폴백해야 한다.
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, 1u32)];
+        let overrides = HashMap::new();
+
+        let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "휴리스틱이라도 owner pid 사망이면 process_rows()로 전체 탐색해야 한다"
+        );
+    }
+
+    /// 종류 tier도 휴리스틱 재탐색 주기를 공유한다 — fast path 판정뿐 아니라 전체 탐색을
+    /// 실제로 돌 때 `last_full_scan` 갱신까지 바인딩 tier와 동일 정책을 따라야, 두 tier가
+    /// 번갈아 전체 탐색하며 재탐색 목표를 어기지 않는다.
+    #[test]
+    fn detect_kinds도_휴리스틱_재탐색_주기_안이면_fast_path를_타고_전체_탐색시_시각을_갱신한다()
+     {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let sid = SessionId(1);
+        let mut entry = fresh_cache_entry(test_binding("heuristic"), self_pid, start);
+        entry.deterministic = false;
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+
+        let _ = detect_kinds(&sessions, &mut cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "재탐색 주기가 지났으면 종류 tier도 전체 탐색해야 한다"
+        );
+        assert!(
+            cache
+                .last_full_scan
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(1)),
+            "종류 tier가 전체 탐색을 했으면 last_full_scan을 갱신해 바인딩 tier와 시각을 공유해야 한다"
         );
     }
 
@@ -2118,7 +2284,8 @@ mod tests {
         );
     }
 
-    /// 종류 tier도 같은 안전망을 공유한다(`BindingCache::last_full_scan`을 읽기만 함).
+    /// 종류 tier도 같은 안전망을 공유한다(`BindingCache::last_full_scan`을 읽고, 전체
+    /// 탐색을 실제로 돌 때는 함께 갱신도 한다 — P1-B).
     #[test]
     fn detect_kinds도_안전망_주기가_지나면_전체_탐색한다() {
         let _guard = COMMAND_TEST_LOCK.lock().unwrap();
@@ -2128,7 +2295,7 @@ mod tests {
         };
         let sid = SessionId(1);
         let entry = fresh_cache_entry(test_binding("stale-scan"), self_pid, start);
-        let cache = BindingCache {
+        let mut cache = BindingCache {
             entries: HashMap::from([(sid, entry)]),
             last_full_scan: Some(
                 Instant::now() - FASTPATH_FULL_SCAN_INTERVAL - Duration::from_secs(1),
@@ -2137,7 +2304,7 @@ mod tests {
         let mut process_cache = sentinel_process_cache();
         let sessions = [(sid, self_pid)];
 
-        let _ = detect_kinds(&sessions, &cache, &mut process_cache);
+        let _ = detect_kinds(&sessions, &mut cache, &mut process_cache);
 
         assert!(
             !process_rows_untouched(&process_cache),
@@ -2150,11 +2317,11 @@ mod tests {
     #[test]
     fn 캐시에_없는_세션이_있으면_detect_kinds가_전체_탐색으로_폴백한다() {
         let _guard = COMMAND_TEST_LOCK.lock().unwrap();
-        let cache = BindingCache::default();
+        let mut cache = BindingCache::default();
         let mut process_cache = sentinel_process_cache();
         let sessions = [(SessionId(1), 1u32)];
 
-        let _ = detect_kinds(&sessions, &cache, &mut process_cache);
+        let _ = detect_kinds(&sessions, &mut cache, &mut process_cache);
 
         assert!(
             !process_rows_untouched(&process_cache),

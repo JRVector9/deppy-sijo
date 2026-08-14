@@ -607,7 +607,7 @@ impl DetectionBackend for ProductionBackend {
     }
 
     fn kinds_pass(&mut self, sessions: &[(SessionId, u32)]) -> HashMap<SessionId, RunningAgent> {
-        agent_detect::detect_kinds(sessions, &self.cache, &mut self.process_rows)
+        agent_detect::detect_kinds(sessions, &mut self.cache, &mut self.process_rows)
     }
 
     fn activity_pass(

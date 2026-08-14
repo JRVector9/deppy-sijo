@@ -944,7 +944,32 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
         drop(handle);
         // 종료 후 새 연결은 거부되어야 한다 (accept 루프 종료 + 리스너 drop).
-        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+        // `accept_worker.join()`이 Drop 안에서 이미 반환했으므로 이 시점에
+        // 우리 리스너는 확실히 close()됐다(closure가 `listener`를 move해
+        // 갖고 있다가 for 루프를 break하며 스코프를 빠질 때 drop됨 — join이
+        // 반환한다는 건 그 drop까지 끝났다는 뜻).
+        //
+        // 2026-08-14 실증: 그런데도 전체 스위트를 --test-threads=32로 병렬
+        // 실행하면 1/13 정도로 이 assert가 실패했다(`connect().is_err()`가
+        // false). 진단 코드로 잡아보니 connect는 성공하지만 즉시 읽으면
+        // `ConnectionReset`이 오고, 80ms 뒤 재시도하면 다시 실패로 돌아간다.
+        // 즉 우리 리스너가 살아있는 게 아니라 — 이 프로세스의 다른 테스트들도
+        // 전부 포트 0(임시 포트) 바인드를 쓰는 통에, 우리가 막 close()해서
+        // 반납한 그 포트 번호를 무관한 다른 테스트가 그 찰나에 재사용했다가
+        // 자기 것도 곧바로 닫은 것(backlog에 있던 우리 연결이 그 리스너의
+        // close()로 RST됨). 단일 스레드/포트 경합이 적을 때는 안 잡힌다.
+        //
+        // 우리 자신의 누수라면 재시도해도 계속 성공(RST 없이) — 그래서
+        // 상한을 두고 재시도한다: 계속 열려 있으면 진짜 회귀로 잡아낸다.
+        let mut refused = false;
+        for _ in 0..20 {
+            if TcpStream::connect(("127.0.0.1", port)).is_err() {
+                refused = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(refused, "포트 {port}가 500ms 후에도 계속 연결을 허용함 — 리스너 누수 의심");
     }
 
     // ------------------------------------------------------------------

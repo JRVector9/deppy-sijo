@@ -3,10 +3,45 @@
 //! 저장소 조회, Git 수집, 세션 이동 같은 권한은 갖지 않는다. App이 넘긴 bounded
 //! immutable snapshot을 그리며, 밖으로는 durable identity 기반 의도만 내보낸다.
 
+/// 카드가 실제로 구분·정렬·검색·렌더에 쓰는 상태만 남긴 leaf 전용 상태값.
+/// 저장소 쪽 durable 상태값과 값 집합은 같지만, leaf가 그 크레이트를 직접
+/// 참조하지 않도록 App이 변환한다(`crates/app/src/app.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkHistoryState {
+    Working,
+    Waiting,
+    Completed,
+}
+
+/// 카드 한 장이 그리는 데이터의 **빌린 뷰**. 워크스페이스당 최대 256행이 이력
+/// 탭이 활성인 동안 매 프레임 렌더되므로, `String`을 복제하지 않고 App이 들고
+/// 있는 durable work-turn 행의 필드를 참조로만 넘긴다.
+///
+/// durable 행이 갖는 `pane_id`·`cwd`·`occurred_at`은 이 파일 어디에서도 읽지
+/// 않아 뺐다 — pane 매칭·git 조회·활성화 판단은 모두 App
+/// 쪽(`resolve_work_history_activation` 등)의 책임이라 leaf 뷰에 들어올 이유가
+/// 없다.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkHistoryRow<'a> {
+    pub workspace_id: &'a str,
+    pub kind: &'a str,
+    pub agent_session_id: &'a str,
+    pub turn_key: &'a str,
+    pub source_offset: u64,
+    pub instruction: &'a str,
+    pub agent_summary: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub git_change_count: Option<u32>,
+    pub state: WorkHistoryState,
+    pub updated_at: i64,
+}
+
 pub struct WorkHistorySnapshot<'a> {
     pub workspace_name: &'a str,
     pub current_branch: Option<&'a str>,
-    pub rows: &'a [storage::AgentWorkTurnRow],
+    pub rows: &'a [WorkHistoryRow<'a>],
     pub loading: bool,
     pub error: Option<WorkHistoryErrorCode>,
 }
@@ -19,19 +54,19 @@ pub struct WorkTurnIdentity {
     pub turn_key: String,
 }
 
-impl From<&storage::AgentWorkTurnRow> for WorkTurnIdentity {
-    fn from(row: &storage::AgentWorkTurnRow) -> Self {
+impl From<&WorkHistoryRow<'_>> for WorkTurnIdentity {
+    fn from(row: &WorkHistoryRow<'_>) -> Self {
         Self {
-            workspace_id: row.workspace_id.clone(),
-            kind: row.kind.clone(),
-            agent_session_id: row.agent_session_id.clone(),
-            turn_key: row.turn_key.clone(),
+            workspace_id: row.workspace_id.to_owned(),
+            kind: row.kind.to_owned(),
+            agent_session_id: row.agent_session_id.to_owned(),
+            turn_key: row.turn_key.to_owned(),
         }
     }
 }
 
 impl WorkTurnIdentity {
-    pub(crate) fn matches(&self, row: &storage::AgentWorkTurnRow) -> bool {
+    pub(crate) fn matches(&self, row: &WorkHistoryRow<'_>) -> bool {
         self.workspace_id == row.workspace_id
             && self.kind == row.kind
             && self.agent_session_id == row.agent_session_id
@@ -377,10 +412,7 @@ impl WorkHistoryUi {
         });
     }
 
-    fn visible_rows<'a>(
-        &self,
-        rows: &'a [storage::AgentWorkTurnRow],
-    ) -> Vec<&'a storage::AgentWorkTurnRow> {
+    fn visible_rows<'a>(&self, rows: &'a [WorkHistoryRow<'a>]) -> Vec<&'a WorkHistoryRow<'a>> {
         let query = self.query.trim().to_lowercase();
         let mut visible: Vec<_> = rows
             .iter()
@@ -396,7 +428,7 @@ impl WorkHistoryUi {
                     || self
                         .providers
                         .iter()
-                        .any(|provider| provider.matches(&row.kind))
+                        .any(|provider| provider.matches(row.kind))
             })
             .filter(|row| query.is_empty() || row_matches_query(row, &query))
             .collect();
@@ -405,16 +437,16 @@ impl WorkHistoryUi {
                 .cmp(&state_rank(right.state))
                 .then_with(|| right.updated_at.cmp(&left.updated_at))
                 .then_with(|| right.source_offset.cmp(&left.source_offset))
-                .then_with(|| left.kind.cmp(&right.kind))
-                .then_with(|| left.agent_session_id.cmp(&right.agent_session_id))
-                .then_with(|| left.turn_key.cmp(&right.turn_key)),
+                .then_with(|| left.kind.cmp(right.kind))
+                .then_with(|| left.agent_session_id.cmp(right.agent_session_id))
+                .then_with(|| left.turn_key.cmp(right.turn_key)),
             WorkHistorySortMode::RecentFirst => right
                 .updated_at
                 .cmp(&left.updated_at)
                 .then_with(|| right.source_offset.cmp(&left.source_offset))
-                .then_with(|| left.kind.cmp(&right.kind))
-                .then_with(|| left.agent_session_id.cmp(&right.agent_session_id))
-                .then_with(|| left.turn_key.cmp(&right.turn_key)),
+                .then_with(|| left.kind.cmp(right.kind))
+                .then_with(|| left.agent_session_id.cmp(right.agent_session_id))
+                .then_with(|| left.turn_key.cmp(right.turn_key)),
         });
         visible
     }
@@ -427,7 +459,7 @@ impl WorkHistoryUi {
         }
     }
 
-    fn reconcile_selection(&mut self, rows: &[storage::AgentWorkTurnRow]) {
+    fn reconcile_selection(&mut self, rows: &[WorkHistoryRow<'_>]) {
         if self
             .selected
             .as_ref()
@@ -445,12 +477,12 @@ impl Default for WorkHistoryUi {
 }
 
 impl WorkHistoryFilter {
-    fn matches(self, state: storage::AgentWorkTurnState) -> bool {
+    fn matches(self, state: WorkHistoryState) -> bool {
         match self {
             Self::All => true,
-            Self::Working => state == storage::AgentWorkTurnState::Working,
-            Self::Waiting => state == storage::AgentWorkTurnState::Waiting,
-            Self::Completed => state == storage::AgentWorkTurnState::Completed,
+            Self::Working => state == WorkHistoryState::Working,
+            Self::Waiting => state == WorkHistoryState::Waiting,
+            Self::Completed => state == WorkHistoryState::Completed,
         }
     }
 
@@ -464,22 +496,22 @@ impl WorkHistoryFilter {
     }
 }
 
-fn state_rank(state: storage::AgentWorkTurnState) -> u8 {
+fn state_rank(state: WorkHistoryState) -> u8 {
     match state {
-        storage::AgentWorkTurnState::Working => 0,
-        storage::AgentWorkTurnState::Waiting => 1,
-        storage::AgentWorkTurnState::Completed => 2,
+        WorkHistoryState::Working => 0,
+        WorkHistoryState::Waiting => 1,
+        WorkHistoryState::Completed => 2,
     }
 }
 
-fn row_matches_query(row: &storage::AgentWorkTurnRow, query: &str) -> bool {
+fn row_matches_query(row: &WorkHistoryRow<'_>, query: &str) -> bool {
     [
-        Some(row.instruction.as_str()),
-        row.agent_summary.as_deref(),
-        Some(row.kind.as_str()),
-        row.model.as_deref(),
-        row.effort.as_deref(),
-        row.branch.as_deref(),
+        Some(row.instruction),
+        row.agent_summary,
+        Some(row.kind),
+        row.model,
+        row.effort,
+        row.branch,
     ]
     .into_iter()
     .flatten()
@@ -515,7 +547,7 @@ fn provider_chip(
 
 fn render_card(
     ui: &mut egui::Ui,
-    row: &storage::AgentWorkTurnRow,
+    row: &WorkHistoryRow<'_>,
     expanded: bool,
     now: i64,
     presentation: Option<&WorkHistoryActionPresentation>,
@@ -543,16 +575,16 @@ fn render_card(
                 egui::UiBuilder::new()
                     .id_salt((
                         "work-history-card",
-                        &row.workspace_id,
-                        &row.kind,
-                        &row.agent_session_id,
-                        &row.turn_key,
+                        row.workspace_id,
+                        row.kind,
+                        row.agent_session_id,
+                        row.turn_key,
                     ))
                     .sense(egui::Sense::click()),
                 |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        provider_badge(ui, &row.kind);
+                        provider_badge(ui, row.kind);
                         ui.vertical(|ui| {
                             ui.set_width(ui.available_width());
                             ui.with_layout(
@@ -569,7 +601,7 @@ fn render_card(
                                     );
                                     ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(&row.instruction)
+                                            egui::RichText::new(row.instruction)
                                                 .strong()
                                                 .size(15.0),
                                         )
@@ -582,7 +614,6 @@ fn render_card(
                                 status_dot(ui, row.state);
                                 let summary = row
                                     .agent_summary
-                                    .as_deref()
                                     .unwrap_or_else(|| catalog_key_for_summary_fallback(row.state));
                                 let summary = if row.agent_summary.is_some() {
                                     summary.to_owned()
@@ -607,23 +638,22 @@ fn render_card(
                 expanded_text(
                     ui,
                     &catalog.t("history.card.instruction", &[]),
-                    &row.instruction,
+                    row.instruction,
                 );
                 copy_button(
                     ui,
                     catalog,
                     copy_feedback_id(row, "instruction"),
                     "history.action.copy_instruction",
-                    &row.instruction,
+                    row.instruction,
                 );
                 ui.add_space(8.0);
                 let summary = row
                     .agent_summary
-                    .as_deref()
                     .map(str::to_owned)
                     .unwrap_or_else(|| catalog.t("history.card.no_summary", &[]));
                 expanded_text(ui, &catalog.t("history.card.latest_work", &[]), &summary);
-                if let Some(summary_text) = row.agent_summary.as_deref() {
+                if let Some(summary_text) = row.agent_summary {
                     copy_button(
                         ui,
                         catalog,
@@ -687,7 +717,7 @@ fn render_card(
             egui::WidgetType::Button,
             ui.is_enabled(),
             expanded,
-            &row.instruction,
+            row.instruction,
         )
     });
     CardAction {
@@ -737,13 +767,13 @@ fn bounded_clipboard_text(value: &str) -> String {
 /// 카드별·버튼별로 고유한 id. egui 위젯 id가 아니라 "마지막으로 복사한 시각"을
 /// `ctx().data_mut`에 넣어두는 열쇠로만 쓴다 — `WorkHistoryUi`에 새 필드를 추가하지
 /// 않고 복사 피드백을 주기 위한 선택.
-fn copy_feedback_id(row: &storage::AgentWorkTurnRow, suffix: &str) -> egui::Id {
+fn copy_feedback_id(row: &WorkHistoryRow<'_>, suffix: &str) -> egui::Id {
     egui::Id::new((
         "work-history-card-copy",
-        &row.workspace_id,
-        &row.kind,
-        &row.agent_session_id,
-        &row.turn_key,
+        row.workspace_id,
+        row.kind,
+        row.agent_session_id,
+        row.turn_key,
         suffix,
     ))
 }
@@ -780,22 +810,22 @@ fn copy_button(
     }
 }
 
-fn metadata_parts(row: &storage::AgentWorkTurnRow) -> MetadataParts<'_> {
-    let mut primary = vec![provider_label(&row.kind)];
-    if let Some(model) = &row.model {
-        primary.push(model.as_str());
+fn metadata_parts<'a>(row: &WorkHistoryRow<'a>) -> MetadataParts<'a> {
+    let mut primary = vec![provider_label(row.kind)];
+    if let Some(model) = row.model {
+        primary.push(model);
     }
-    if let Some(effort) = &row.effort {
-        primary.push(effort.as_str());
+    if let Some(effort) = row.effort {
+        primary.push(effort);
     }
     MetadataParts {
         primary,
-        branch: row.branch.as_deref(),
+        branch: row.branch,
         git_change_count: row.git_change_count,
     }
 }
 
-fn render_metadata(ui: &mut egui::Ui, row: &storage::AgentWorkTurnRow, catalog: &i18n::Catalog) {
+fn render_metadata(ui: &mut egui::Ui, row: &WorkHistoryRow<'_>, catalog: &i18n::Catalog) {
     let metadata = metadata_parts(row);
     ui.horizontal_wrapped(|ui| {
         for (index, part) in metadata.primary.iter().enumerate() {
@@ -874,35 +904,35 @@ fn provider_badge(ui: &mut egui::Ui, kind: &str) {
     );
 }
 
-fn status_dot(ui: &mut egui::Ui, state: storage::AgentWorkTurnState) {
+fn status_dot(ui: &mut egui::Ui, state: WorkHistoryState) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
     ui.painter()
         .circle_filled(rect.center(), 4.0, state_color(state, ui.visuals()));
 }
 
-fn state_color(state: storage::AgentWorkTurnState, visuals: &egui::Visuals) -> egui::Color32 {
+fn state_color(state: WorkHistoryState, visuals: &egui::Visuals) -> egui::Color32 {
     let tokens = crate::ui::designall::tokens(visuals);
     match state {
-        storage::AgentWorkTurnState::Working => tokens.success,
-        storage::AgentWorkTurnState::Waiting => tokens.warning,
-        storage::AgentWorkTurnState::Completed => tokens.muted_text,
+        WorkHistoryState::Working => tokens.success,
+        WorkHistoryState::Waiting => tokens.warning,
+        WorkHistoryState::Completed => tokens.muted_text,
     }
 }
 
-fn state_label(state: storage::AgentWorkTurnState, catalog: &i18n::Catalog) -> String {
+fn state_label(state: WorkHistoryState, catalog: &i18n::Catalog) -> String {
     let key = match state {
-        storage::AgentWorkTurnState::Working => "history.state.working",
-        storage::AgentWorkTurnState::Waiting => "history.state.waiting",
-        storage::AgentWorkTurnState::Completed => "history.state.completed",
+        WorkHistoryState::Working => "history.state.working",
+        WorkHistoryState::Waiting => "history.state.waiting",
+        WorkHistoryState::Completed => "history.state.completed",
     };
     catalog.t(key, &[])
 }
 
-fn catalog_key_for_summary_fallback(state: storage::AgentWorkTurnState) -> &'static str {
+fn catalog_key_for_summary_fallback(state: WorkHistoryState) -> &'static str {
     match state {
-        storage::AgentWorkTurnState::Working => "history.card.no_summary.working",
-        storage::AgentWorkTurnState::Waiting => "history.card.no_summary.waiting",
-        storage::AgentWorkTurnState::Completed => "history.card.no_summary.completed",
+        WorkHistoryState::Working => "history.card.no_summary.working",
+        WorkHistoryState::Waiting => "history.card.no_summary.waiting",
+        WorkHistoryState::Completed => "history.card.no_summary.completed",
     }
 }
 
@@ -1048,6 +1078,14 @@ mod tests {
         }
     }
 
+    /// production 함수는 leaf 뷰(`WorkHistoryRow`)만 받으므로, 이 파일의 테스트가
+    /// 계속 `storage::AgentWorkTurnRow` 픽스처로 쓰기 위한 변환 헬퍼.
+    /// `WorkHistoryRow::from`은 App(`crates/app/src/app.rs`)이 정의한다 — 같은
+    /// 크레이트라 여기서도 그대로 쓸 수 있다.
+    fn views(rows: &[storage::AgentWorkTurnRow]) -> Vec<WorkHistoryRow<'_>> {
+        rows.iter().map(WorkHistoryRow::from).collect()
+    }
+
     #[derive(Default)]
     struct CardInteractionCapture {
         toggles: usize,
@@ -1060,9 +1098,10 @@ mod tests {
         candidate: &'a storage::AgentWorkTurnRow,
         presentation: &'a WorkHistoryActionPresentation,
     ) -> egui_kittest::Harness<'a, CardInteractionCapture> {
+        let view = WorkHistoryRow::from(candidate);
         egui_kittest::Harness::new_ui_state(
             move |ui, capture: &mut CardInteractionCapture| {
-                let result = render_card(ui, candidate, true, 10, Some(presentation), catalog);
+                let result = render_card(ui, &view, true, 10, Some(presentation), catalog);
                 if result.toggle {
                     capture.toggles += 1;
                 }
@@ -1370,11 +1409,12 @@ mod tests {
             same_second_newer,
         ];
         let ui = WorkHistoryUi::new();
+        let views = views(&rows);
 
         let keys: Vec<&str> = ui
-            .visible_rows(&rows)
+            .visible_rows(&views)
             .into_iter()
-            .map(|row| row.turn_key.as_str())
+            .map(|row| row.turn_key)
             .collect();
 
         assert_eq!(
@@ -1399,11 +1439,12 @@ mod tests {
         candidate.effort = Some("High".to_owned());
         candidate.branch = Some("Feature/Checkout".to_owned());
         let rows = vec![candidate];
+        let views = views(&rows);
 
         for query in ["BILLING", "oauth", "claude", "OPUS", "high", "checkout"] {
             let mut ui = WorkHistoryUi::new();
             ui.query = query.to_owned();
-            assert_eq!(ui.visible_rows(&rows).len(), 1, "query={query}");
+            assert_eq!(ui.visible_rows(&views).len(), 1, "query={query}");
         }
     }
 
@@ -1443,11 +1484,12 @@ mod tests {
         let mut ui = WorkHistoryUi::new();
         ui.providers = vec![WorkHistoryProvider::Claude];
         ui.filter = WorkHistoryFilter::Working;
+        let views = views(&rows);
 
         let keys: Vec<&str> = ui
-            .visible_rows(&rows)
+            .visible_rows(&views)
             .into_iter()
-            .map(|row| row.turn_key.as_str())
+            .map(|row| row.turn_key)
             .collect();
 
         assert_eq!(
@@ -1469,9 +1511,10 @@ mod tests {
             ui.providers.is_empty(),
             "기본값은 provider 칩이 전부 미선택이어야 한다"
         );
+        let views = views(&rows);
 
         assert_eq!(
-            ui.visible_rows(&rows).len(),
+            ui.visible_rows(&views).len(),
             3,
             "전부 해제는 빈 목록이 아니라 전체 provider 표시로 취급한다"
         );
@@ -1490,11 +1533,12 @@ mod tests {
         ];
         let mut ui = WorkHistoryUi::new();
         ui.sort_mode = WorkHistorySortMode::RecentFirst;
+        let views = views(&rows);
 
         let keys: Vec<&str> = ui
-            .visible_rows(&rows)
+            .visible_rows(&views)
             .into_iter()
-            .map(|row| row.turn_key.as_str())
+            .map(|row| row.turn_key)
             .collect();
 
         assert_eq!(
@@ -1512,7 +1556,8 @@ mod tests {
             row("completed", storage::AgentWorkTurnState::Completed, 1),
         ];
         let mut ui = WorkHistoryUi::new();
-        assert_eq!(ui.visible_rows(&rows).len(), 3);
+        let views = views(&rows);
+        assert_eq!(ui.visible_rows(&views).len(), 3);
 
         for (filter, expected) in [
             (WorkHistoryFilter::Working, "working"),
@@ -1520,7 +1565,7 @@ mod tests {
             (WorkHistoryFilter::Completed, "completed"),
         ] {
             ui.filter = filter;
-            let visible = ui.visible_rows(&rows);
+            let visible = ui.visible_rows(&views);
             assert_eq!(visible.len(), 1);
             assert_eq!(visible[0].turn_key, expected);
         }
@@ -1545,9 +1590,9 @@ mod tests {
         let mut ui = WorkHistoryUi::new();
         ui.selected = Some(WorkTurnIdentity::from(&kept));
 
-        ui.reconcile_selection(std::slice::from_ref(&kept));
+        ui.reconcile_selection(&views(std::slice::from_ref(&kept)));
         assert!(ui.selected.is_some());
-        ui.reconcile_selection(&[replacement]);
+        ui.reconcile_selection(&views(std::slice::from_ref(&replacement)));
         assert!(ui.selected.is_none());
     }
 
@@ -1570,7 +1615,8 @@ mod tests {
         candidate.branch = None;
         candidate.git_change_count = None;
 
-        let metadata = metadata_parts(&candidate);
+        let view = WorkHistoryRow::from(&candidate);
+        let metadata = metadata_parts(&view);
         assert_eq!(metadata.primary, vec!["Codex"]);
         assert!(metadata.branch.is_none());
         assert!(metadata.git_change_count.is_none());
@@ -1583,8 +1629,9 @@ mod tests {
         assert!(ui.visible_rows(&[]).is_empty());
 
         ui.query = "not-found".to_owned();
+        let single = row("one", storage::AgentWorkTurnState::Completed, 1);
         assert!(
-            ui.visible_rows(&[row("one", storage::AgentWorkTurnState::Completed, 1,)])
+            ui.visible_rows(&views(std::slice::from_ref(&single)))
                 .is_empty()
         );
     }

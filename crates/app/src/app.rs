@@ -495,6 +495,52 @@ fn detected_work_history_facts(
     previous.unwrap_or_else(|| (first_observed_cwd.map(str::to_owned), None, None))
 }
 
+/// leaf(`ui::work_history`)는 storage 크레이트를 참조할 수 없으므로, durable
+/// work-turn row → leaf 뷰모델 변환은 App이 담당한다. 렌더 직전에 호출해 빌린
+/// 뷰만 만든다 — 여기서 문자열을 복제하지 않는다.
+impl From<storage::AgentWorkTurnState> for ui::work_history::WorkHistoryState {
+    fn from(state: storage::AgentWorkTurnState) -> Self {
+        match state {
+            storage::AgentWorkTurnState::Working => Self::Working,
+            storage::AgentWorkTurnState::Waiting => Self::Waiting,
+            storage::AgentWorkTurnState::Completed => Self::Completed,
+        }
+    }
+}
+
+impl<'a> From<&'a storage::AgentWorkTurnRow> for ui::work_history::WorkHistoryRow<'a> {
+    fn from(row: &'a storage::AgentWorkTurnRow) -> Self {
+        Self {
+            workspace_id: &row.workspace_id,
+            kind: &row.kind,
+            agent_session_id: &row.agent_session_id,
+            turn_key: &row.turn_key,
+            source_offset: row.source_offset,
+            instruction: &row.instruction,
+            agent_summary: row.agent_summary.as_deref(),
+            model: row.model.as_deref(),
+            effort: row.effort.as_deref(),
+            branch: row.branch.as_deref(),
+            git_change_count: row.git_change_count,
+            state: row.state.into(),
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+/// durable identity는 프레임을 넘어 살아남아야 하는 owned 값이라(action, 카드
+/// 펼침 선택 등) 빌린 뷰와 별개로 storage row에서 직접 만든다.
+impl From<&storage::AgentWorkTurnRow> for ui::work_history::WorkTurnIdentity {
+    fn from(row: &storage::AgentWorkTurnRow) -> Self {
+        Self {
+            workspace_id: row.workspace_id.clone(),
+            kind: row.kind.clone(),
+            agent_session_id: row.agent_session_id.clone(),
+            turn_key: row.turn_key.clone(),
+        }
+    }
+}
+
 fn agent_kind_id(kind: crate::agent_detect::AgentKind) -> &'static str {
     match kind {
         crate::agent_detect::AgentKind::Claude => "claude",
@@ -13564,12 +13610,20 @@ impl App {
                 .id_salt("work_history_pane_tab"),
         );
         child.set_clip_rect(body.intersect(ui.clip_rect()));
+        // leaf는 storage 크레이트를 모른다 — 렌더 직전에 빌린 뷰만 만들어 넘긴다.
+        // `self.work_history_rows`(공유 대여)와 `self.work_history_ui`(가변 대여)는
+        // 서로 다른 필드라 아래처럼 직접 필드로 접근하는 한 동시에 빌릴 수 있다.
+        let rows: Vec<ui::work_history::WorkHistoryRow<'_>> = self
+            .work_history_rows
+            .iter()
+            .map(ui::work_history::WorkHistoryRow::from)
+            .collect();
         self.work_history_ui.show(
             &mut child,
             ui::work_history::WorkHistorySnapshot {
                 workspace_name,
                 current_branch,
-                rows: &self.work_history_rows,
+                rows: &rows,
                 loading: self.work_history_loading,
                 error: self.work_history_error,
             },
@@ -13628,7 +13682,7 @@ impl App {
                 let row = self
                     .work_history_rows
                     .iter()
-                    .find(|row| identity.matches(row))
+                    .find(|row| ui::work_history::WorkTurnIdentity::from(*row) == identity)
                     .cloned();
                 let Some(row) = row.filter(|row| {
                     row.workspace_id == self.active.id
@@ -13654,7 +13708,7 @@ impl App {
                 let row = self
                     .work_history_rows
                     .iter()
-                    .find(|row| identity.matches(row))
+                    .find(|row| ui::work_history::WorkTurnIdentity::from(*row) == identity)
                     .cloned();
                 let Some(row) = row else {
                     let _ = self.request_work_history_projection(false);

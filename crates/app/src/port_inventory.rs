@@ -1200,37 +1200,16 @@ fn query_process_birth_with_operation(
 
     #[cfg(target_os = "macos")]
     {
+        // proc_pidinfo(PROC_PIDTBSDINFO) FFI는 crate::proc_info::pid_start_time으로 옮겼다 —
+        // 이 함수가 같은 syscall을 별도 unsafe 블록으로 중복 구현하고 있었다
+        // (2026-08-14, proc-info-consolidate). 취소/타임아웃 확인 지점(FFI 앞뒤 2회)은
+        // 그대로 유지한다.
         operation.check()?;
-        let pid = i32::try_from(pid).map_err(|_| PortErrorCode::OwnershipChanged)?;
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
-            .map_err(|_| PortErrorCode::OwnershipChanged)?;
-        // SAFETY: `info` is a correctly sized writable `proc_bsdinfo` buffer. The PID and fixed
-        // flavor are range checked, and the buffer is initialized only after an exact-size return.
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if read != size {
-            return Err(PortErrorCode::OwnershipChanged);
-        }
-        // SAFETY: the exact-size `proc_pidinfo` result above initialized the complete structure.
-        let info = unsafe { info.assume_init() };
-        if info.pbi_pid != pid as u32
-            || info.pbi_start_tvsec == 0
-            || info.pbi_start_tvusec >= 1_000_000
-        {
-            return Err(PortErrorCode::OwnershipChanged);
-        }
+        let birth = crate::proc_info::pid_start_time(pid).ok_or(PortErrorCode::OwnershipChanged)?;
         operation.check()?;
         Ok(encode_process_birth_identity(
-            info.pbi_start_tvsec,
-            info.pbi_start_tvusec,
+            birth.seconds,
+            birth.microseconds,
         ))
     }
 }

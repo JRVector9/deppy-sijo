@@ -47,6 +47,59 @@ pub enum WorkHistoryErrorCode {
     ReadFailed,
 }
 
+/// 현재 세션 pane 헤더 옆에 붙는 **보조 UI 탭**의 상태.
+///
+/// runtime의 `MuxTabId`/pane과 무관하다 — 이 상태가 바뀌어도 PTY·세션·mux 탭은
+/// 생성되거나 종료되지 않는다. 세션 X와 이력 X가 서로 다른 동작인 이유다.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkHistoryTabState {
+    #[default]
+    Closed,
+    OpenInactive,
+    OpenActive,
+}
+
+impl WorkHistoryTabState {
+    /// 탭 chrome이 헤더에 존재하는지. `Closed`면 세션 헤더는 예전 그대로다.
+    pub fn is_open(self) -> bool {
+        self != Self::Closed
+    }
+
+    pub fn is_active(self) -> bool {
+        self == Self::OpenActive
+    }
+
+    /// 레일 「이력」 클릭 — 닫혀 있으면 열고 활성화, 이미 활성이면 세션으로 돌아가되
+    /// 탭은 남긴다.
+    pub fn on_rail_click(self) -> Self {
+        match self {
+            Self::Closed | Self::OpenInactive => Self::OpenActive,
+            Self::OpenActive => Self::OpenInactive,
+        }
+    }
+
+    /// 이력 탭 클릭 — 열려 있을 때만 활성화한다.
+    pub fn on_tab_click(self) -> Self {
+        match self {
+            Self::Closed => Self::Closed,
+            Self::OpenInactive | Self::OpenActive => Self::OpenActive,
+        }
+    }
+
+    /// 세션 탭 클릭 — 터미널을 보여주되 이력 탭은 유지한다.
+    pub fn on_session_tab_click(self) -> Self {
+        match self {
+            Self::Closed => Self::Closed,
+            Self::OpenInactive | Self::OpenActive => Self::OpenInactive,
+        }
+    }
+
+    /// 이력 X — UI 탭만 제거한다. 세션에는 어떤 종료 명령도 보내지 않는다.
+    pub fn on_close(self) -> Self {
+        Self::Closed
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkHistoryAction {
     Refresh,
@@ -85,6 +138,12 @@ enum WorkHistoryFilter {
     Completed,
 }
 
+/// 이력 본문 프레임의 내부 여백. 전체 페이지(22/18)가 아니라 pane body에 얹히는
+/// 값이라 좁은 split에서도 카드가 숨 쉴 만큼만 남긴다. `show`가 남은 높이를
+/// 계산할 때 같은 상수를 쓴다 — 마법값을 다시 만들지 않기 위한 단일 원천.
+const BODY_MARGIN_X: i8 = 14;
+const BODY_MARGIN_Y: i8 = 10;
+
 struct MetadataParts<'a> {
     primary: Vec<&'a str>,
     branch: Option<&'a str>,
@@ -118,29 +177,20 @@ impl WorkHistoryUi {
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let content = egui::Frame::NONE
             .fill(tokens.content_canvas)
-            .inner_margin(egui::Margin::symmetric(22, 18));
+            .inner_margin(egui::Margin::symmetric(BODY_MARGIN_X, BODY_MARGIN_Y));
+        // 넘겨받은 rect(=pane body)를 그대로 채운다. 상단 탭 스트립은 호출부가 이미
+        // 잘라내고 남긴 높이라 여기서 다시 빼지 않는다 — 프레임 자기 여백만 제한다.
         let available_height = ui.available_height();
+        let visible = self.visible_rows(snapshot.rows);
         content.show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height((available_height - 36.0).max(0.0));
-            if self.render_header(ui, &snapshot, catalog) {
+            ui.set_min_height((available_height - f32::from(BODY_MARGIN_Y) * 2.0).max(0.0));
+            if self.render_context_row(ui, &snapshot, visible.len(), catalog) {
                 action = Some(WorkHistoryAction::Refresh);
             }
-            ui.add_space(14.0);
+            ui.add_space(8.0);
             self.render_controls(ui, catalog);
-            ui.add_space(10.0);
-
-            let visible = self.visible_rows(snapshot.rows);
-            let shown = visible.len().to_string();
-            let total = snapshot.rows.len().to_string();
-            ui.label(
-                egui::RichText::new(
-                    catalog.t("history.count", &[("shown", &shown), ("total", &total)]),
-                )
-                .small()
-                .weak(),
-            );
-            ui.add_space(7.0);
+            ui.add_space(8.0);
 
             if let Some(error) = snapshot.error {
                 render_error(ui, error, catalog);
@@ -183,24 +233,25 @@ impl WorkHistoryUi {
         });
         action
     }
-    fn render_header(
+    /// 탭 아래 한 줄짜리 컨텍스트 — 워크스페이스·branch·건수는 왼쪽에서 잘리고,
+    /// 새로고침·로딩은 오른쪽에서 폭을 먼저 확보한다. pane 폭이 좁아져도 둘이
+    /// 겹치지 않고 왼쪽 텍스트만 생략된다(예전 전체 페이지의 2단 heading 대체).
+    fn render_context_row(
         &self,
         ui: &mut egui::Ui,
         snapshot: &WorkHistorySnapshot<'_>,
+        shown: usize,
         catalog: &i18n::Catalog,
     ) -> bool {
         let mut refresh = false;
+        let count = catalog.t(
+            "history.count",
+            &[
+                ("shown", &shown.to_string()),
+                ("total", &snapshot.rows.len().to_string()),
+            ],
+        );
         ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.heading(catalog.t("history.title", &[]));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(snapshot.workspace_name).strong());
-                    if let Some(branch) = snapshot.current_branch {
-                        ui.label(egui::RichText::new("·").weak());
-                        metadata_chip(ui, branch);
-                    }
-                });
-            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button(catalog.t("history.refresh", &[]))
@@ -210,9 +261,17 @@ impl WorkHistoryUi {
                     refresh = true;
                 }
                 if snapshot.loading {
-                    ui.add(egui::Spinner::new().size(14.0));
-                    ui.weak(catalog.t("history.loading", &[]));
+                    ui.add(egui::Spinner::new().size(13.0))
+                        .on_hover_text(catalog.t("history.loading", &[]));
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    ui.label(egui::RichText::new(snapshot.workspace_name).strong());
+                    if let Some(branch) = snapshot.current_branch {
+                        metadata_chip(ui, branch);
+                    }
+                    ui.label(egui::RichText::new(count).small().weak());
+                });
             });
         });
         refresh
@@ -703,6 +762,59 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 핸드오프가 고정한 상태 기계 — 레일 재클릭은 탭을 **지우지 않고** 세션으로만
+    /// 돌아가고, 탭 제거는 이력 X 전용이다.
+    #[test]
+    fn 이력탭_상태기계는_레일_탭_세션_닫기_규칙을_지킨다() {
+        use WorkHistoryTabState::{Closed, OpenActive, OpenInactive};
+
+        assert_eq!(Closed.on_rail_click(), OpenActive, "레일: 닫힘 → 열고 활성");
+        assert_eq!(
+            OpenInactive.on_rail_click(),
+            OpenActive,
+            "레일: 열림 → 활성"
+        );
+        assert_eq!(
+            OpenActive.on_rail_click(),
+            OpenInactive,
+            "레일 재클릭은 세션으로 돌아가되 탭은 남긴다"
+        );
+
+        assert_eq!(OpenInactive.on_tab_click(), OpenActive);
+        assert_eq!(OpenActive.on_tab_click(), OpenActive);
+        assert_eq!(
+            Closed.on_tab_click(),
+            Closed,
+            "없는 탭은 클릭으로 살아나지 않는다"
+        );
+
+        assert_eq!(OpenActive.on_session_tab_click(), OpenInactive);
+        assert_eq!(OpenInactive.on_session_tab_click(), OpenInactive);
+
+        for state in [Closed, OpenInactive, OpenActive] {
+            assert_eq!(state.on_close(), Closed, "이력 X는 항상 탭만 제거한다");
+        }
+
+        assert!(OpenActive.is_active());
+        assert!(
+            !OpenInactive.is_active(),
+            "열려 있어도 비활성은 레일을 켜지 않는다"
+        );
+        assert!(!Closed.is_active());
+
+        // 탭 chrome 존재 여부 — 한 번도 열지 않았거나 이력 X로 닫으면 헤더에 탭이 없다.
+        assert!(
+            !Closed.is_open(),
+            "열기 전에는 헤더에 이력 탭이 없어야 한다"
+        );
+        assert!(OpenInactive.is_open());
+        assert!(OpenActive.is_open());
+        assert!(
+            !OpenActive.on_close().is_open(),
+            "이력 X 뒤에는 탭 chrome이 사라져야 한다"
+        );
+    }
 
     fn row(
         turn_key: &str,

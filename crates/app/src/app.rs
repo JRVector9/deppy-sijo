@@ -7759,6 +7759,10 @@ pub struct App {
     /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」).
     diff_panel_ui: ui::diff_panel::DiffPanelUi,
     work_history_ui: ui::work_history::WorkHistoryUi,
+    /// 이력은 전역 중앙 페이지가 아니라 현재 세션 pane 헤더 옆의 **보조 UI 탭**이다.
+    /// 이 상태는 runtime의 mux 탭/pane과 무관하다 — 열고 닫아도 PTY·세션은 그대로다
+    /// (2026-08-14 사용자: 터미널 전체가 다른 페이지로 바뀌는 방식은 원하지 않는다).
+    work_history_tab: ui::work_history::WorkHistoryTabState,
     work_history_rows: Vec<storage::AgentWorkTurnRow>,
     work_history_workspace_id: Option<String>,
     work_history_loading: bool,
@@ -11009,6 +11013,7 @@ impl App {
             pending_agent_sessions_action: None,
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
             work_history_ui: ui::work_history::WorkHistoryUi::new(),
+            work_history_tab: ui::work_history::WorkHistoryTabState::default(),
             work_history_rows: Vec::new(),
             work_history_workspace_id: None,
             work_history_loading: false,
@@ -12686,8 +12691,7 @@ impl App {
                         &continuation.payload().kind,
                         AppAgentStateExactKind::WorkHistoryBatch(_)
                     ) && exact_scope_current
-                        && self.agent_terminal_ui.view()
-                            == ui::agent_terminal::AgentTerminalView::History
+                        && self.work_history_tab.is_active()
                     {
                         let _ = self.request_work_history_projection(false);
                     }
@@ -12813,7 +12817,7 @@ impl App {
                 ) {
                     self.handle_catalog_startup_failure();
                 }
-                if self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::History {
+                if self.work_history_tab.is_active() {
                     let _ = self.request_work_history_projection(false);
                 }
             }
@@ -13543,6 +13547,73 @@ impl App {
             .collect()
     }
 
+    /// 이력 본문을 **세션 pane의 body rect 그대로**에 그린다. 탭 스트립은 WorkspaceUi가
+    /// 이미 잘라낸 뒤 넘긴 rect라, 여기서 헤더 높이를 다시 빼지 않는다.
+    fn render_work_history_tab_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        body: egui::Rect,
+        presentations: &[ui::work_history::WorkHistoryActionPresentation],
+        workspace_name: &str,
+        current_branch: Option<&str>,
+        text: &i18n::Catalog,
+    ) -> Option<ui::work_history::WorkHistoryAction> {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body)
+                .id_salt("work_history_pane_tab"),
+        );
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        self.work_history_ui.show(
+            &mut child,
+            ui::work_history::WorkHistorySnapshot {
+                workspace_name,
+                current_branch,
+                rows: &self.work_history_rows,
+                loading: self.work_history_loading,
+                error: self.work_history_error,
+            },
+            presentations,
+            text,
+        )
+    }
+
+    /// 이력 탭이 방금 활성화됐을 때의 공통 진입 — projection을 새로 요청하고, 카드
+    /// 액션이 필요로 하는 런처 감지가 없으면 함께 예약한다.
+    fn enter_work_history_tab(&mut self) {
+        let _ = self.request_work_history_projection(false);
+        if self.agent_launcher_snapshot.is_none() {
+            self.agent_launcher_detection_requested = true;
+        }
+    }
+
+    /// 세션을 드러내는 네비게이션 — 정보 페이지에서 나오고, 이력 탭이 활성이면 세션
+    /// 탭으로 되돌린다(탭 자체는 유지한다).
+    ///
+    /// 이력이 전역 view이던 시절에는 `set_view(Terminal)` 하나가 두 일을 다 했다.
+    /// 이력이 pane 보조 탭이 된 뒤로는 view만 바꾸면 본문이 계속 이력이라, 사용자가
+    /// 「현재 세션으로 이동」·사이드바 세션·fleet 카드·알림을 눌러도 화면이 그대로여서
+    /// 클릭이 씹힌 것처럼 보인다.
+    fn reveal_terminal_session(&mut self) {
+        self.agent_terminal_ui
+            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+        self.work_history_tab = self.work_history_tab.on_session_tab_click();
+    }
+
+    /// pane 헤더 보조 탭이 올린 의도. 어떤 경로도 `RuntimeCommand`를 만들지 않는다 —
+    /// 이력 X는 UI 탭만 닫고 세션·PTY·mux 탭은 건드리지 않는다.
+    fn apply_work_history_tab_intent(&mut self, intent: ui::workspace::PaneAuxTabIntent) {
+        let previous = self.work_history_tab;
+        self.work_history_tab = match intent {
+            ui::workspace::PaneAuxTabIntent::Activate => previous.on_tab_click(),
+            ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
+            ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
+        };
+        if self.work_history_tab.is_active() && !previous.is_active() {
+            self.enter_work_history_tab();
+        }
+    }
+
     fn handle_work_history_action(
         &mut self,
         ctx: &egui::Context,
@@ -13614,8 +13685,7 @@ impl App {
                     }
                     AppWorkHistoryActivation::ResumeArchived { session } => {
                         if self.dispatch_respawn_archived_agent(session) {
-                            self.agent_terminal_ui
-                                .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                            self.reveal_terminal_session();
                         }
                     }
                     AppWorkHistoryActivation::NewRun(kind) => {
@@ -14171,8 +14241,7 @@ impl App {
                             .is_ok()
                     {
                         self.active.workspace_ui.arm_terminal_focus(pane);
-                        self.agent_terminal_ui
-                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                        self.reveal_terminal_session();
                     } else {
                         self.active.workspace_ui.cancel_terminal_focus();
                     }
@@ -14220,8 +14289,7 @@ impl App {
             } => {
                 if self.stage_agent_resume(&pane_key, &title, session) {
                     self.resumed_panes.insert(pane_key);
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    self.reveal_terminal_session();
                 }
             }
             WorkspaceControllerAction::ClosePane(pane) => {
@@ -15791,8 +15859,9 @@ impl App {
         self.work_history_error = None;
         self.work_history_git_cwds.clear();
         self.work_history_git_generation = self.work_history_git_generation.wrapping_add(1).max(1);
-        self.work_history_loading =
-            self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::History;
+        // 이력 탭은 워크스페이스를 바꿔도 유지한다 — 열려 활성인 상태였다면 새
+        // 워크스페이스 projection을 기다리는 loading으로 이어 붙인다.
+        self.work_history_loading = self.work_history_tab.is_active();
         // 웹 대시보드가 켜져 있으면 새 활성 worker로 재구독한다(전환 후 상태 스트림 유지).
         self.rebind_web_dashboard();
         // agent 감지 워커: 전환 시 epoch을 올려 이전 워크스페이스의 잔여 결과를 폐기하고,
@@ -20351,8 +20420,7 @@ impl App {
                         runtime_instance,
                         session,
                     ) {
-                        self.agent_terminal_ui
-                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                        self.reveal_terminal_session();
                         self.stage_workspace_controller_action(
                             WorkspaceControllerAction::FocusPty {
                                 workspace_id: workspace_id.to_string(),
@@ -23046,6 +23114,7 @@ impl eframe::App for App {
             // 「작업」 배지 = **나를 막고 있는 세션 수**. 벨 라벨과 같은 식이라 둘이 어긋나면
             // 안 된다. 매 프레임 build_fleet_sessions를 돌리지 않는 싼 프록시다.
             fleet_count: self.approvals_ui.pending().len() + self.global_waiting.len(),
+            history_tab_active: self.work_history_tab.is_active(),
             agents_open: self.agent_sessions_ui.is_open(),
             workspace_note: self.workspace_note.as_deref(),
         };
@@ -23224,12 +23293,8 @@ impl eframe::App for App {
             }
             match sidebar_action {
                 Some(ui::file_tree::SidebarAction::SwitchWorkspace(workspace_id)) => {
-                    if self.agent_terminal_ui.view()
-                        != ui::agent_terminal::AgentTerminalView::History
-                    {
-                        self.agent_terminal_ui
-                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-                    }
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::SwitchWorkspace(workspace_id),
                     );
@@ -23238,8 +23303,7 @@ impl eframe::App for App {
                     workspace_id,
                     pane,
                 }) => {
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    self.reveal_terminal_session();
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::ActivatePersistedSession { workspace_id, pane },
                     );
@@ -23269,18 +23333,15 @@ impl eframe::App for App {
                     );
                 }
                 Some(ui::file_tree::SidebarAction::ShowHistory) => {
-                    let entering = self.agent_terminal_ui.view()
-                        != ui::agent_terminal::AgentTerminalView::History;
-                    self.agent_terminal_ui.set_view(if entering {
-                        ui::agent_terminal::AgentTerminalView::History
-                    } else {
-                        ui::agent_terminal::AgentTerminalView::Terminal
-                    });
-                    if entering {
-                        let _ = self.request_work_history_projection(false);
-                        if self.agent_launcher_snapshot.is_none() {
-                            self.agent_launcher_detection_requested = true;
-                        }
+                    // 레일은 이제 전역 페이지가 아니라 **현재 워크스페이스의 이력 보조
+                    // 탭**을 연다/활성화한다. 재클릭은 탭을 지우지 않고 세션 탭으로만
+                    // 돌아간다(탭 제거는 이력 X 전용).
+                    self.work_history_tab = self.work_history_tab.on_rail_click();
+                    if self.work_history_tab.is_active() {
+                        // 홈/작업 페이지 위에서 눌렀다면 탭이 있는 작업면으로 먼저 돌아간다.
+                        self.agent_terminal_ui
+                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                        self.enter_work_history_tab();
                     }
                 }
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
@@ -23373,8 +23434,7 @@ impl eframe::App for App {
                     tab,
                     pane,
                 }) => {
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    self.reveal_terminal_session();
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::FocusSession {
                             workspace_id,
@@ -23384,8 +23444,7 @@ impl eframe::App for App {
                     );
                 }
                 Some(ui::file_tree::SidebarAction::OpenSessionBeside(target)) => {
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    self.reveal_terminal_session();
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::OpenSessionBeside {
                             target,
@@ -23554,8 +23613,9 @@ impl eframe::App for App {
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
         let fleet_visible = central_view == ui::agent_terminal::AgentTerminalView::Fleet;
-        let history_visible = central_view == ui::agent_terminal::AgentTerminalView::History;
-        let information_visible = home_visible || fleet_visible || history_visible;
+        let information_visible = home_visible || fleet_visible;
+        // 이력은 전역 페이지가 아니라 포커스된 세션 pane 헤더 옆의 보조 탭이다.
+        let history_tab_active = self.work_history_tab.is_active();
         // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
         if information_visible {
             self.active
@@ -23635,7 +23695,19 @@ impl eframe::App for App {
         };
 
         let terminal_visible = central_view == ui::agent_terminal::AgentTerminalView::Terminal;
-        if terminal_visible {
+        // 이력 탭 chrome은 **탭이 열려 있고** 작업면이 보일 때만 존재한다. 닫힘 상태와
+        // 홈/작업 페이지에서는 세션 헤더가 예전 그대로다 — 이력 X가 실제로 탭을 없앤다.
+        self.active.workspace_ui.set_aux_tab(
+            (terminal_visible && self.work_history_tab.is_open()).then(|| {
+                ui::workspace::PaneAuxTab {
+                    label: text.t("workspace.tab.history", &[]),
+                    active: history_tab_active,
+                }
+            }),
+        );
+        // 이력 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
+        // 타이핑·IME·붙여넣기가 숨은 PTY로 새지 않게 한다.
+        if terminal_visible && !history_tab_active {
             self.frame_terminal_owner = frame_terminal_owner(
                 &self.cross_workspace_pane,
                 true,
@@ -23654,7 +23726,8 @@ impl eframe::App for App {
             self.frame_terminal_owner = FrameTerminalOwner::None;
         }
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
-        if terminal_visible && self.config.ui.composer_enabled {
+        // 이력 탭이 활성이면 보낼 터미널이 없으므로 함께 감춘다.
+        if terminal_visible && !history_tab_active && self.config.ui.composer_enabled {
             self.render_composer_dock(ui, &text);
         }
 
@@ -23673,7 +23746,8 @@ impl eframe::App for App {
         let mut fleet_page_click = None;
         let mut fleet_action = None;
         let mut work_history_action = None;
-        let work_history_presentations = if history_visible {
+        let mut work_history_tab_intent = None;
+        let work_history_presentations = if history_tab_active {
             self.work_history_presentations()
         } else {
             Vec::new()
@@ -23732,6 +23806,7 @@ impl eframe::App for App {
         let mut current_owner = FrameTerminalOwner::None;
         let mut dropped_session_open = None;
         let session_drop_label = (terminal_visible
+            && !history_tab_active
             && egui::DragAndDrop::has_payload_of_type::<ui::file_tree::SessionRowDragPayload>(
                 ui.ctx(),
             ))
@@ -23778,19 +23853,6 @@ impl eframe::App for App {
                         page.structured_decision,
                     ));
                     fleet_page_click = page.goto;
-                } else if history_visible {
-                    work_history_action = self.work_history_ui.show(
-                        ui,
-                        ui::work_history::WorkHistorySnapshot {
-                            workspace_name: &work_history_workspace_name,
-                            current_branch: work_history_current_branch.as_deref(),
-                            rows: &self.work_history_rows,
-                            loading: self.work_history_loading,
-                            error: self.work_history_error,
-                        },
-                        &work_history_presentations,
-                        &text,
-                    );
                 } else if !render_panes.is_empty() {
                     let rect = ui.available_rect_before_wrap();
                     self.last_multi_pane_terminal_rect = Some(rect);
@@ -24108,10 +24170,21 @@ impl eframe::App for App {
                             &self.config.terminal,
                             &events,
                             &text,
-                            current_owner == FrameTerminalOwner::Primary,
+                            current_owner == FrameTerminalOwner::Primary && !history_tab_active,
                         );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
+                    work_history_tab_intent = primary_output.aux_tab_intent;
+                    if let Some(body) = primary_output.aux_body_rect {
+                        work_history_action = self.render_work_history_tab_body(
+                            &mut primary,
+                            body,
+                            &work_history_presentations,
+                            &work_history_workspace_name,
+                            work_history_current_branch.as_deref(),
+                            &text,
+                        );
+                    }
                     if let Some(label) = session_drop_label.as_deref()
                         && dropped_session_open.is_none()
                     {
@@ -24127,12 +24200,26 @@ impl eframe::App for App {
                 } else {
                     current_owner = FrameTerminalOwner::Primary;
                     let primary_rect = ui.available_rect_before_wrap();
-                    let primary_output = self
-                        .active
-                        .workspace_ui
-                        .show(ui, &self.config.terminal, &events, &text);
+                    let primary_output = self.active.workspace_ui.show_with_input(
+                        ui,
+                        &self.config.terminal,
+                        &events,
+                        &text,
+                        !history_tab_active,
+                    );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
+                    work_history_tab_intent = primary_output.aux_tab_intent;
+                    if let Some(body) = primary_output.aux_body_rect {
+                        work_history_action = self.render_work_history_tab_body(
+                            ui,
+                            body,
+                            &work_history_presentations,
+                            &work_history_workspace_name,
+                            work_history_current_branch.as_deref(),
+                            &text,
+                        );
+                    }
                     if let Some(label) = session_drop_label.as_deref() {
                         dropped_session_open = session_pane_drop_interaction(
                             ui,
@@ -24150,11 +24237,19 @@ impl eframe::App for App {
                 .into_iter()
                 .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES),
         );
-        self.frame_terminal_owner = current_owner;
+        // 이력 본문이 떠 있던 프레임은 어떤 pane도 입력 소유자가 아니다.
+        self.frame_terminal_owner = if history_tab_active {
+            FrameTerminalOwner::None
+        } else {
+            current_owner
+        };
+        if let Some(intent) = work_history_tab_intent {
+            self.apply_work_history_tab_intent(intent);
+            ui.ctx().request_repaint();
+        }
         self.sync_attached_runtime_visibility();
         if let Some((target, anchor)) = dropped_session_open {
-            self.agent_terminal_ui
-                .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+            self.reveal_terminal_session();
             self.stage_workspace_controller_action(WorkspaceControllerAction::OpenSessionBeside {
                 target,
                 anchor,
@@ -24230,8 +24325,7 @@ impl eframe::App for App {
             }
         }
         if fleet_page_click.is_some() {
-            self.agent_terminal_ui
-                .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+            self.reveal_terminal_session();
         }
         // fleet 액션 처리 — 카드 클릭은 세션 포커스, 새 에이전트는 에이전트 패널 열기.
         match fleet_action {
@@ -24241,8 +24335,7 @@ impl eframe::App for App {
                 pane,
             }) => {
                 // 터미널로 복귀 후 해당 세션 포커스(사이드바 FocusSession과 동일).
-                self.agent_terminal_ui
-                    .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                self.reveal_terminal_session();
                 self.stage_workspace_controller_action(WorkspaceControllerAction::FocusSession {
                     workspace_id,
                     tab,
@@ -29500,6 +29593,117 @@ mod tests {
                 terminal_rect,
             ),
             previous
+        );
+    }
+
+    /// 이력은 보조 UI 탭이다 — 전역 view가 아니고, 활성 중에는 입력 소유자/컴포저가
+    /// 명시적으로 없어야 하며, 본문은 WorkspaceUi가 넘긴 pane body rect에 그린다.
+    #[test]
+    fn work_history_tab은_전역view가_아니라_pane보조탭이고_입력을_닫는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+
+        assert!(
+            !production.contains("AgentTerminalView::History"),
+            "이력이 다시 전역 중앙 view가 되면 안 된다"
+        );
+
+        let render = production
+            .split_once("let terminal_visible =")
+            .unwrap()
+            .1
+            .split_once("if self.active.workspace_ui.take_new_session_requested()")
+            .unwrap()
+            .0;
+        assert!(
+            render.contains("if terminal_visible && !history_tab_active {"),
+            "이력 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
+        );
+        assert!(
+            render.contains("(terminal_visible && self.work_history_tab.is_open()).then("),
+            "이력 탭 chrome은 탭이 열려 있을 때만 붙어야 한다(이력 X가 실제로 없앤다)"
+        );
+        assert!(
+            render.contains(
+                "terminal_visible && !history_tab_active && self.config.ui.composer_enabled"
+            ),
+            "이력 활성 프레임은 컴포저를 감춰야 한다"
+        );
+        assert_eq!(
+            render.matches("render_work_history_tab_body(").count(),
+            2,
+            "이력 본문은 단일/다중 pane 두 경로 모두 pane body rect에 그린다"
+        );
+        assert_eq!(
+            render.matches("primary_output.aux_body_rect").count(),
+            2,
+            "이력 본문 rect는 WorkspaceUi가 넘긴 것만 쓴다"
+        );
+
+        let owner = production
+            .split_once("// 이력 본문이 떠 있던 프레임은 어떤 pane도 입력 소유자가 아니다.")
+            .unwrap()
+            .1
+            .split_once("self.sync_attached_runtime_visibility();")
+            .unwrap()
+            .0;
+        assert!(
+            owner.contains("FrameTerminalOwner::None"),
+            "이력 활성 프레임의 최종 입력 소유자는 None이어야 한다"
+        );
+
+        let intent = production
+            .split_once("fn apply_work_history_tab_intent")
+            .unwrap()
+            .1
+            .split_once("fn handle_work_history_action")
+            .unwrap()
+            .0;
+        for forbidden in ["ClosePane", "KillSession", "RuntimeCommand"] {
+            assert!(
+                !intent.contains(forbidden),
+                "이력 탭 의도 처리에서 {forbidden}가 파생되면 안 된다"
+            );
+        }
+    }
+
+    /// 이력이 pane 보조 탭이 된 뒤로 `set_view(Terminal)`만으로는 이력 본문이 걷히지
+    /// 않는다. 세션을 드러내는 네비게이션은 전부 `reveal_terminal_session`을 타야 하고,
+    /// 날것의 `set_view(Terminal)`은 세 곳만 남는다 — 헬퍼 본문, 워크스페이스 전환
+    /// (탭 유지 계약), 레일 이력 진입(작업면으로 먼저 복귀).
+    #[test]
+    fn 세션을_드러내는_네비게이션은_전부_이력탭을_비활성화한다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+
+        let raw = production.matches("set_view(ui::agent_terminal::AgentTerminalView::Terminal)");
+        assert_eq!(
+            raw.count(),
+            3,
+            "날것의 set_view(Terminal)이 늘었다 — 세션 이동 경로면 reveal_terminal_session을 써라"
+        );
+        assert!(
+            production
+                .matches("self.reveal_terminal_session();")
+                .count()
+                >= 10,
+            "세션 이동 경로가 헬퍼를 거치지 않는다"
+        );
+
+        let helper = production
+            .split_once("fn reveal_terminal_session(&mut self) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        assert!(
+            helper.contains("on_session_tab_click()"),
+            "세션 이동은 이력 탭을 비활성화하되 탭 자체는 남겨야 한다"
+        );
+        assert!(
+            !helper.contains("on_close()"),
+            "세션 이동이 이력 탭을 제거하면 안 된다 — 제거는 이력 X 전용이다"
         );
     }
 

@@ -480,11 +480,6 @@ pub fn agent_state(binding: &AgentBinding) -> Option<agent_transcript::Transcrip
     }
 }
 
-/// 바인딩된 transcript를 파싱해 현재 활동(working/idle)을 읽는다.
-pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivity> {
-    agent_state(binding).map(|s| s.activity)
-}
-
 /// 3줄 세션 행 2행 표시 정보 (2026-07-08). kind는 바인딩에서, model/effort/context는
 /// transcript(codex 전부 / claude는 model만 — effort/context는 statusLine→DB)에서.
 #[derive(Clone, PartialEq, Eq)]

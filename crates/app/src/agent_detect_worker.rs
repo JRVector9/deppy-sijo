@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use runtime::SessionId;
 
 use crate::agent_detect::{self, AgentBinding, AgentDisplay, RunningAgent};
-use crate::agent_transcript::{AgentActivity, MAX_RECENT_TRANSCRIPT_TURNS, TranscriptTurn};
+use crate::agent_transcript::{self, AgentActivity, MAX_RECENT_TRANSCRIPT_TURNS, TranscriptTurn};
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
 const ACTIVITY_INTERVAL: Duration = Duration::from_millis(1500);
@@ -441,14 +441,93 @@ struct ProductionBackend {
     /// 바인딩 tier와 종류 tier가 공유하는 `ps` 스냅샷 캐시(짧은 TTL). 두 tier가 근접한
     /// 시각에 각자 exec하던 걸 흡수한다 — `ProcessRowsCache` 문서 참고(2026-08-14).
     process_rows: agent_detect::ProcessRowsCache,
+    /// 바인딩 tier(`compute_activity_and_info`)와 활동 tier(`compute_activity`)가 공유하는
+    /// transcript 파싱 캐시 — 두 tier가 같은 파일을 각자 다시 파싱하던 걸 없앤다(P1-A,
+    /// 코드리뷰 2026-08-15). `TranscriptStateCache` 문서 참고.
+    transcript_cache: TranscriptStateCache,
+}
+
+/// transcript 파싱 캐시 한 항목. `len`/`modified`는 hit 판정용 stat 스냅샷이다.
+struct TranscriptCacheEntry {
+    len: u64,
+    modified: SystemTime,
+    state: Arc<agent_transcript::TranscriptState>,
+}
+
+/// transcript 파싱을 `(len, modified)` 키로 메모이즈한다. `TranscriptState`는 세션ID·cwd·
+/// transcript 발췌 등 민감 필드를 담고 있어 의도적으로 `Clone`이 아니다
+/// (`agent_transcript.rs`의 `production_transcript_reads_have_bounded_source_laws`가 이를
+/// 소스 레벨에서 강제한다) — 그래서 캐시는 파싱 결과를 `Arc`로 감싸 공유하고, hit 시
+/// `Arc::clone`(refcount 증가)만 하지 구조체 전체를 복제하지 않는다.
+///
+/// 검증 키는 `std::fs::metadata` 한 번(stat 1회)의 `len()`+`modified()`다. transcript는
+/// append-only JSONL이라 **len 변화가 주 신호**이고, mtime 해상도 문제(같은 초 안 재작성)는
+/// append만 하는 파일에서 len이 함께 늘어나므로 실질 위험이 없다. stat이 실패하면(파일
+/// 삭제/교체) 캐시를 버리고 다시 파싱한다.
+#[derive(Default)]
+struct TranscriptStateCache {
+    entries: HashMap<SessionId, TranscriptCacheEntry>,
+}
+
+impl TranscriptStateCache {
+    /// stat이 캐시와 일치하면 이전 파싱 결과를 재사용하고(재파싱 없음), 아니면(또는 stat
+    /// 실패면) `fetch`로 다시 파싱해 캐시를 갱신한다. `fetch`는 프로덕션에서 언제나
+    /// `agent_detect::agent_state`이고, 테스트는 파싱 호출 횟수를 세는 클로저를 주입한다.
+    fn get(
+        &mut self,
+        sid: SessionId,
+        binding: &AgentBinding,
+        fetch: impl FnOnce(&AgentBinding) -> Option<agent_transcript::TranscriptState>,
+    ) -> Option<Arc<agent_transcript::TranscriptState>> {
+        let stat = std::fs::metadata(&binding.transcript)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|modified| (m.len(), modified)));
+        if let Some((len, modified)) = stat
+            && let Some(entry) = self.entries.get(&sid)
+            && entry.len == len
+            && entry.modified == modified
+        {
+            return Some(Arc::clone(&entry.state));
+        }
+        let state = Arc::new(fetch(binding)?);
+        match stat {
+            Some((len, modified)) => {
+                self.entries.insert(
+                    sid,
+                    TranscriptCacheEntry {
+                        len,
+                        modified,
+                        state: Arc::clone(&state),
+                    },
+                );
+            }
+            // stat이 실패한 채로 파싱만 성공한 경우(레이스) — 다음 hit 판정을 그르치지
+            // 않도록 옛 항목이 있으면 버린다.
+            None => {
+                self.entries.remove(&sid);
+            }
+        }
+        Some(state)
+    }
+
+    /// 바인딩이 사라진 세션의 캐시 항목을 정리한다 — 유계 유지(무제한 맵 금지). 바인딩
+    /// tier가 돌 때마다(≤10초 주기) 호출되므로 항목 수는 현재 세션 수를 넘지 않는다.
+    fn retain(&mut self, bindings: &HashMap<SessionId, AgentBinding>) {
+        self.entries.retain(|sid, _| bindings.contains_key(sid));
+    }
 }
 
 fn compute_activity(
     bindings: &HashMap<SessionId, AgentBinding>,
+    transcripts: &mut TranscriptStateCache,
 ) -> HashMap<SessionId, AgentActivity> {
     bindings
         .iter()
-        .filter_map(|(sid, b)| agent_detect::activity(b).map(|a| (*sid, a)))
+        .filter_map(|(sid, b)| {
+            transcripts
+                .get(*sid, b, agent_detect::agent_state)
+                .map(|state| (*sid, state.activity))
+        })
         .collect()
 }
 
@@ -458,31 +537,34 @@ type ActivityInfoAndWorkTurns = (
     HashMap<SessionId, Vec<TranscriptTurn>>,
 );
 
-/// transcript를 세션당 **한 번만** 파싱해 activity + 표시정보 + 최근 사용자 턴을 함께
-/// 만든다(중복 파싱 방지). 표시정보와 턴은 바인딩 tier에서만 필요.
+/// transcript 파싱 결과(캐시 hit 포함)에서 activity + 표시정보 + 최근 사용자 턴을 함께
+/// 만든다. `transcripts`가 바인딩 tier·활동 tier 간 파싱을 공유하므로 파일이 안 변한
+/// tick은 어느 쪽도 재파싱하지 않는다(P1-A).
 fn compute_activity_and_info(
     bindings: &HashMap<SessionId, AgentBinding>,
+    transcripts: &mut TranscriptStateCache,
 ) -> ActivityInfoAndWorkTurns {
     let mut activity = HashMap::new();
     let mut info = HashMap::new();
     let mut work_turns = HashMap::new();
     for (sid, b) in bindings {
-        if let Some(state) = agent_detect::agent_state(b) {
+        if let Some(state) = transcripts.get(*sid, b, agent_detect::agent_state) {
             activity.insert(*sid, state.activity);
-            work_turns.insert(*sid, state.recent_turns);
+            work_turns.insert(*sid, state.recent_turns.clone());
             info.insert(
                 *sid,
                 AgentDisplay {
                     kind: b.kind,
-                    model: state.model,
-                    effort: state.effort,
+                    model: state.model.clone(),
+                    effort: state.effort.clone(),
                     context_pct: state.context_pct,
-                    last_agent_summary: state.last_agent_summary,
-                    user_instruction: state.user_instruction,
+                    last_agent_summary: state.last_agent_summary.clone(),
+                    user_instruction: state.user_instruction.clone(),
                 },
             );
         }
     }
+    transcripts.retain(bindings);
     (activity, info, work_turns)
 }
 
@@ -506,7 +588,8 @@ impl DetectionBackend for ProductionBackend {
             bindings,
             kinds: agent_kinds,
         } = detected;
-        let (activity, agent_info, work_turns) = compute_activity_and_info(&bindings);
+        let (activity, agent_info, work_turns) =
+            compute_activity_and_info(&bindings, &mut self.transcript_cache);
         let pids: Vec<u32> = sessions.iter().map(|(_, pid)| *pid).collect();
         let cwd_by_pid = agent_detect::session_cwds(&pids);
         let session_cwds = sessions
@@ -531,7 +614,7 @@ impl DetectionBackend for ProductionBackend {
         &mut self,
         bindings: &HashMap<SessionId, AgentBinding>,
     ) -> HashMap<SessionId, AgentActivity> {
-        compute_activity(bindings)
+        compute_activity(bindings, &mut self.transcript_cache)
     }
 }
 
@@ -817,6 +900,129 @@ mod tests {
             occurred_at: None,
             activity: AgentActivity::Working,
         }
+    }
+
+    fn transcript_cache_temp_dir(label: &str) -> PathBuf {
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "deppy-agent-detect-worker-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn stub_transcript_state(session_id: &str) -> agent_transcript::TranscriptState {
+        agent_transcript::TranscriptState {
+            session_id: session_id.to_owned(),
+            cwd: None,
+            activity: AgentActivity::Idle,
+            model: None,
+            effort: None,
+            context_pct: None,
+            last_agent_summary: None,
+            user_instruction: None,
+            recent_turns: Vec::new(),
+        }
+    }
+
+    /// `fetch`가 `FnOnce`라 매 호출마다 새 클로저가 필요하다 — 파싱 호출 카운터(`calls`)를
+    /// 공유하는 클로저를 그때그때 만든다.
+    fn counting_fetch(
+        calls: Arc<AtomicUsize>,
+    ) -> impl FnOnce(&AgentBinding) -> Option<agent_transcript::TranscriptState> {
+        move |_: &AgentBinding| {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Some(stub_transcript_state("s"))
+        }
+    }
+
+    /// P1-A: 파일(len+mtime)이 안 바뀐 tick은 재파싱하지 않는다 — 바인딩 tier와 활동
+    /// tier가 같은 transcript를 각자 다시 파싱하던 걸 없앤 것이 이 캐시의 핵심 효과다.
+    #[test]
+    fn transcript_cache는_파일이_안_바뀌면_재파싱을_건너뛴다() {
+        let dir = transcript_cache_temp_dir("unchanged");
+        let path = dir.join("t.jsonl");
+        std::fs::write(&path, b"line-1\n").unwrap();
+        let sid = SessionId(1);
+        let binding = AgentBinding {
+            kind: AgentKind::Codex,
+            session_id: "s".to_owned(),
+            transcript: path,
+        };
+        let mut cache = TranscriptStateCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        assert!(first.is_some());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        let second = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        assert!(second.is_some());
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "파일이 안 바뀌었으면 두 번째 호출은 재파싱하면 안 된다"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// P1-A: append로 len이 늘면 즉시 재파싱한다(append-only JSONL 신호는 len).
+    #[test]
+    fn transcript_cache는_append하면_즉시_재파싱한다() {
+        let dir = transcript_cache_temp_dir("appended");
+        let path = dir.join("t.jsonl");
+        std::fs::write(&path, b"line-1\n").unwrap();
+        let sid = SessionId(1);
+        let binding = AgentBinding {
+            kind: AgentKind::Codex,
+            session_id: "s".to_owned(),
+            transcript: path.clone(),
+        };
+        let mut cache = TranscriptStateCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let _ = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        std::fs::write(&path, b"line-1\nline-2\n").unwrap();
+        let _ = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            2,
+            "append 후에는 다음 호출이 즉시 재파싱해야 한다"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// P1-A: 바인딩이 사라진(pane 종료 등) 세션의 캐시 항목은 `retain`으로 정리된다 —
+    /// 유계 유지(무제한 맵 금지).
+    #[test]
+    fn transcript_cache_retain은_사라진_바인딩의_항목을_정리한다() {
+        let dir = transcript_cache_temp_dir("retain");
+        let path = dir.join("t.jsonl");
+        std::fs::write(&path, b"line-1\n").unwrap();
+        let sid = SessionId(1);
+        let binding = AgentBinding {
+            kind: AgentKind::Codex,
+            session_id: "s".to_owned(),
+            transcript: path,
+        };
+        let mut cache = TranscriptStateCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _ = cache.get(sid, &binding, counting_fetch(Arc::clone(&calls)));
+        assert!(cache.entries.contains_key(&sid));
+
+        cache.retain(&HashMap::new());
+
+        assert!(
+            !cache.entries.contains_key(&sid),
+            "사라진 바인딩의 캐시 항목이 정리되지 않았다"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn complete_outcome(epoch: u64, generation: u64, state: AgentActivity) -> DetectOutcome {

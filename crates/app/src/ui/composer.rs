@@ -961,6 +961,13 @@ impl ComposerUi {
     }
 
     /// OS 파일 드롭 — 포인터가 도크 위에 있을 때만 받아 @멘션으로 삽입한다.
+    ///
+    /// `i.pointer.latest_pos()`는 OS 드래그 중 갱신되지 않는다 — winit 0.30이 macOS
+    /// `draggingUpdated:`를 구현하지 않아서다(`file_tree.rs`의 `os_drag_pointer_pos`
+    /// 문서 참고). 그 결과 드래그 시작 전 마우스가 우연히 도크 위에 있었을 때만 드롭이
+    /// 들어가고, 그 외엔 조용히 버려졌다(2026-08-14 사용자: "아예 안 들어가고 있어").
+    /// file_tree.rs와 같은 패턴으로 AppKit 좌표를 우선 쓰고 실패(kittest 등)하면
+    /// egui 포인터로 폴백한다.
     fn accept_dropped_files(
         &mut self,
         egui_ctx: &egui::Context,
@@ -969,17 +976,16 @@ impl ComposerUi {
         workspace_root: Option<&Path>,
         buffer: &mut String,
     ) {
+        let has_dropped = egui_ctx.input(|i| !i.raw.dropped_files.is_empty());
+        if !has_dropped {
+            return;
+        }
+        let drop_pos = crate::ui::file_tree::os_drag_pointer_pos(egui_ctx)
+            .or_else(|| egui_ctx.input(|i| i.pointer.latest_pos()));
+        if !drop_pos.is_some_and(|pos| dock_rect.contains(pos)) {
+            return;
+        }
         let dropped: Vec<PathBuf> = egui_ctx.input(|i| {
-            if i.raw.dropped_files.is_empty() {
-                return Vec::new();
-            }
-            let over_dock = i
-                .pointer
-                .latest_pos()
-                .is_some_and(|pos| dock_rect.contains(pos));
-            if !over_dock {
-                return Vec::new();
-            }
             i.raw
                 .dropped_files
                 .iter()
@@ -2924,6 +2930,56 @@ mod tests {
             Some("/x/a.png".chars().count()),
             "드롭 프레임에 캐럿이 즉시 삽입 끝이어야 한다"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 도크 밖에서 놓은 OS 드롭은 무시한다 — 컴포저·터미널·사이드바 중 실제 마우스
+    /// 위치의 영역만 받는다는 라우팅 규칙의 컴포저 쪽 절반(2026-08-14).
+    #[test]
+    fn kittest_도크_밖_드롭은_무시된다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("drop-outside-dock");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        // 도크 캔버스 밖(멀리 떨어진 좌표) — 포인터를 여기 두고 OS 드롭 주입.
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(5000.0, 5000.0)));
+        harness.input_mut().dropped_files.push(egui::DroppedFile {
+            path: Some(PathBuf::from("/x/a.png")),
+            ..Default::default()
+        });
+        harness.step();
+        assert_eq!(
+            buffer_of(&harness),
+            "",
+            "도크 밖 드롭은 버퍼에 아무것도 넣지 않아야 한다"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 드롭 경로가 macOS NFD(자소분해)로 와도 컴포저 버퍼엔 NFC로 들어간다 —
+    /// `mention_path_는_nfd_입력을_nfc로_합성한다`가 단위 검증한 걸 드롭 경로 전체로
+    /// 확인한다(2026-08-14, 사용자: "한글 파일 드래그 드롭하면 아예 안들어가고있어").
+    #[test]
+    fn kittest_드롭된_nfd_파일명은_nfc로_삽입된다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("drop-nfd-korean");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        // "한" = ᄒ+ᅡ+ᆫ (NFD) — macOS 드래그&드롭이 넘기는 형태.
+        let nfd_han = "\u{1112}\u{1161}\u{11AB}";
+        let nfd_path = PathBuf::from(format!("/x/{nfd_han}.txt"));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(50.0, 20.0)));
+        harness.input_mut().dropped_files.push(egui::DroppedFile {
+            path: Some(nfd_path),
+            ..Default::default()
+        });
+        harness.step();
+        let expected: String = format!("/x/{nfd_han}.txt").nfc().collect();
+        assert_eq!(buffer_of(&harness), expected);
         std::fs::remove_file(&path).ok();
     }
 

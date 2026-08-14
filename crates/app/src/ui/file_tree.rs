@@ -6294,8 +6294,12 @@ fn is_tree_paste_signal(event: &egui::Event) -> bool {
 /// 전역 마우스 위치(bottom-left 스크린 좌표)를 primary 스크린 기준으로 뒤집고
 /// viewport inner_rect(모니터 공간 egui points)를 빼서 환산한다. viewport 미상
 /// (kittest 등)이면 None → 호출부가 egui 포인터로 폴백한다.
+///
+/// `pub(crate)` — composer.rs(도크 드롭 위치 판정)와 workspace.rs(터미널 pane 드롭
+/// 위치 판정)도 이 함수를 그대로 쓴다(2026-08-14, OS 드롭 라우팅 수정). 드래그 중
+/// 신뢰 가능한 포인터 위치가 필요한 자리는 이거 하나뿐이어야 한다 — 중복 구현 금지.
 #[cfg(target_os = "macos")]
-fn os_drag_pointer_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+pub(crate) fn os_drag_pointer_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
     let inner = ctx.input(|i| i.viewport().inner_rect)?;
     let mtm = objc2::MainThreadMarker::new()?;
     let location = objc2_app_kit::NSEvent::mouseLocation();
@@ -6310,7 +6314,7 @@ fn os_drag_pointer_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn os_drag_pointer_pos(_ctx: &egui::Context) -> Option<egui::Pos2> {
+pub(crate) fn os_drag_pointer_pos(_ctx: &egui::Context) -> Option<egui::Pos2> {
     None
 }
 

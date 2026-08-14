@@ -94,6 +94,7 @@ history.card.no_summary.working = The agent is working on this instruction.
 history.card.no_summary.waiting = The agent is waiting for your response.
 history.card.no_summary.completed = This turn is complete.
 history.card.changes = {count} working tree changes
+history.group.turns = {count} turns
 history.action.focus = Go to current session
 history.action.resume = Resume
 history.action.new_run = New run

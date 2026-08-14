@@ -94,6 +94,7 @@ history.card.no_summary.working = エージェントがこの指示を実行し�
 history.card.no_summary.waiting = エージェントがあなたの応答を待っています。
 history.card.no_summary.completed = この作業は完了しました。
 history.card.changes = ワーキングツリーの変更 {count}
+history.group.turns = {count}ターン
 history.action.focus = 現在のセッションへ移動
 history.action.resume = 続きから実行
 history.action.new_run = 新規実行

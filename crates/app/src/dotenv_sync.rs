@@ -35,6 +35,25 @@ const DOTENV_LINES_MAX: usize = 8_192;
 /// `.gitignore` is control text. Larger repositories keep generated ignore data elsewhere.
 const GITIGNORE_BYTES_MAX: usize = 256 * 1024;
 
+/// `.gitignore` 잠금 재시도 상한/간격 — 고전적 flock+fork 레이스를 흡수한다.
+/// flock은 파일이 아니라 **open file description**에 붙고, 그 description을 가리키는
+/// 마지막 fd가 close될 때 풀린다. std가 여는 fd는 전부 O_CLOEXEC지만 CLOEXEC는
+/// **exec 시점**에만 적용되므로, 우리가 이 잠금을 쥔 채로 프로세스의 *다른 스레드*가
+/// fork()하면(PTY spawn, git CLI, port_inventory의 pre_exec 기반 Command 등 — 앱에서
+/// 상시 일어나는 일) 그 fd가 자식에게도 복제된다. 우리가 곧바로 close해도 자식이
+/// exec/exit로 자기 사본을 닫을 때까지는 동일 open file description이 살아있어,
+/// 바로 이어지는 재-lock 시도가 일시적으로 WouldBlock을 본다.
+///
+/// 2026-08-14 실증: 전체 스위트를 `--test-threads=64`로 병렬 실행하면 테스트마다
+/// uuid로 고유한 inode인데도 `dotenv_gitignore_lock_failed`가 간헐 실패했다
+/// (`gitignore_reader_accepts_exact_and_rejects_plus_one_and_invalid_utf8`). 진단
+/// 재시도로 실측: 1회 WouldBlock 후 31ms 만에 해소(스레드 스케줄 지연 포함, 즉 자식의
+/// close 자체는 더 빠르다). 우리 자신의 누수라면 재시도해도 계속 WouldBlock으로
+/// 남으므로, 실측치의 8배 이상 여유를 두고 상한을 넘기면 기존 fail-closed 오류를
+/// 그대로 낸다.
+const GITIGNORE_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+const GITIGNORE_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 fn configure_no_follow(options: &mut std::fs::OpenOptions) {
     #[cfg(unix)]
     {
@@ -853,8 +872,22 @@ fn ensure_env_gitignored(root: &Path) -> anyhow::Result<()> {
     let mut file = options
         .open(&gitignore)
         .map_err(|_| anyhow::anyhow!("dotenv_gitignore_open_failed"))?;
-    file.try_lock()
-        .map_err(|_| anyhow::anyhow!("dotenv_gitignore_lock_failed"))?;
+    // GITIGNORE_LOCK_RETRY_BUDGET 주석 참조(flock+fork 레이스). 이 함수의 두 프로덕션
+    // 호출 경로(app.rs execute_settings_job의 SettingsWorker 스레드,
+    // execute_dotenv_sync_job의 "dotenv-sync-lazy" LazyDotenvWorker 스레드) 모두
+    // 전용 백그라운드 스레드에서만 돌고 UI/렌더 스레드를 절대 타지 않으므로, 유계
+    // 재시도로 블로킹해도 화면이 멎지 않는다. 상한을 넘기면 기존 fail-closed 오류를
+    // 그대로 낸다 — 진짜 누수/경합은 여전히 잡는다.
+    let lock_deadline = std::time::Instant::now() + GITIGNORE_LOCK_RETRY_BUDGET;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < lock_deadline => {
+                std::thread::sleep(GITIGNORE_LOCK_RETRY_INTERVAL);
+            }
+            Err(_) => anyhow::bail!("dotenv_gitignore_lock_failed"),
+        }
+    }
     let opened = file
         .metadata()
         .map_err(|_| anyhow::anyhow!("dotenv_gitignore_metadata_failed"))?;

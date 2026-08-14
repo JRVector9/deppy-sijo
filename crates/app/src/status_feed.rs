@@ -738,6 +738,11 @@ struct ProductionFeedFetcher {
     openai_incidents: Vec<IncidentNotice>,
     hugging_face_updates: Option<Vec<IncidentNotice>>,
     grok_updates: Option<Vec<IncidentNotice>>,
+    /// 조회가 실패 상태로 전이한 phase 이름만 담는다. 실패 시작·복구 시점에만
+    /// 로그를 남기려는 용도라, STATUS_INTERVAL(5분)마다 계속 실패해도 한 줄만 쌓인다
+    /// (2026-08-14 실증: debug!는 기본 로그 레벨에서 전혀 안 남아 커스텀 도메인 장애가
+    /// 552줄짜리 앱 로그에 단 한 줄도 없었다 — info 레벨인 warn/info로 올리되 폭주는 막는다).
+    failing_phases: HashSet<&'static str>,
 }
 
 impl ProductionFeedFetcher {
@@ -749,6 +754,23 @@ impl ProductionFeedFetcher {
             openai_incidents: Vec::new(),
             hugging_face_updates: None,
             grok_updates: None,
+            failing_phases: HashSet::new(),
+        }
+    }
+
+    /// 조회 성공/실패를 이전 상태와 비교해 전이(edge)에서만 로그를 남긴다.
+    fn log_fetch_edge(&mut self, phase: &'static str, ok: bool) {
+        if ok {
+            if self.failing_phases.remove(phase) {
+                tracing::info!(kind = "status_feed", phase, "status feed fetch recovered");
+            }
+        } else if self.failing_phases.insert(phase) {
+            tracing::warn!(
+                kind = "status_feed",
+                phase,
+                error_code = "fetch_failed",
+                "status feed fetch failed"
+            );
         }
     }
 
@@ -761,53 +783,33 @@ impl ProductionFeedFetcher {
                 .incidents_at
                 .is_none_or(|at| at.elapsed() >= INCIDENTS_INTERVAL);
         if incidents_due {
-            if let Ok(list) = fetch_incidents(&self.agent, CLAUDE_STATUS_URL).map_err(|_| {
-                tracing::debug!(
-                    kind = "status_feed",
-                    phase = "claude_notice",
-                    error_code = "fetch_failed",
-                    "status feed fetch failed"
-                )
-            }) {
+            let claude_notice_result = fetch_incidents(&self.agent, CLAUDE_STATUS_URL);
+            self.log_fetch_edge("claude_notice", claude_notice_result.is_ok());
+            if let Ok(list) = claude_notice_result {
                 self.claude_incidents = list;
             }
             if !control.cycle_allowed(cycle) {
                 return None;
             }
-            if let Ok(list) = fetch_incidents(&self.agent, OPENAI_STATUS_URL).map_err(|_| {
-                tracing::debug!(
-                    kind = "status_feed",
-                    phase = "openai_notice",
-                    error_code = "fetch_failed",
-                    "status feed fetch failed"
-                )
-            }) {
+            let openai_notice_result = fetch_incidents(&self.agent, OPENAI_STATUS_URL);
+            self.log_fetch_edge("openai_notice", openai_notice_result.is_ok());
+            if let Ok(list) = openai_notice_result {
                 self.openai_incidents = list;
             }
             if !control.cycle_allowed(cycle) {
                 return None;
             }
-            if let Ok(list) = fetch_hugging_face_models(&self.agent).map_err(|_| {
-                tracing::debug!(
-                    kind = "status_feed",
-                    phase = "hugging_face_notice",
-                    error_code = "fetch_failed",
-                    "status feed fetch failed"
-                )
-            }) {
+            let hugging_face_notice_result = fetch_hugging_face_models(&self.agent);
+            self.log_fetch_edge("hugging_face_notice", hugging_face_notice_result.is_ok());
+            if let Ok(list) = hugging_face_notice_result {
                 self.hugging_face_updates = Some(list);
             }
             if !control.cycle_allowed(cycle) {
                 return None;
             }
-            if let Ok(list) = fetch_grok_status(&self.agent).map_err(|_| {
-                tracing::debug!(
-                    kind = "status_feed",
-                    phase = "grok_notice",
-                    error_code = "fetch_failed",
-                    "status feed fetch failed"
-                )
-            }) {
+            let grok_notice_result = fetch_grok_status(&self.agent);
+            self.log_fetch_edge("grok_notice", grok_notice_result.is_ok());
+            if let Ok(list) = grok_notice_result {
                 self.grok_updates = Some(list);
             }
             self.incidents_at = Some(Instant::now());
@@ -816,15 +818,9 @@ impl ProductionFeedFetcher {
         if !control.cycle_allowed(cycle) {
             return None;
         }
-        let claude = fetch_status(&self.agent, CLAUDE_STATUS_URL)
-            .map_err(|_| {
-                tracing::debug!(
-                    kind = "status_feed",
-                    phase = "claude_status",
-                    error_code = "fetch_failed",
-                    "status feed fetch failed"
-                )
-            })
+        let claude_status_result = fetch_status(&self.agent, CLAUDE_STATUS_URL);
+        self.log_fetch_edge("claude_status", claude_status_result.is_ok());
+        let claude = claude_status_result
             .ok()
             .map(|(indicator, description)| ProviderStatus {
                 indicator,
@@ -834,15 +830,9 @@ impl ProductionFeedFetcher {
         if !control.cycle_allowed(cycle) {
             return None;
         }
-        let openai = fetch_status(&self.agent, OPENAI_STATUS_URL)
-            .map_err(|_| {
-                tracing::debug!(
-                    kind = "status_feed",
-                    phase = "openai_status",
-                    error_code = "fetch_failed",
-                    "status feed fetch failed"
-                )
-            })
+        let openai_status_result = fetch_status(&self.agent, OPENAI_STATUS_URL);
+        self.log_fetch_edge("openai_status", openai_status_result.is_ok());
+        let openai = openai_status_result
             .ok()
             .map(|(indicator, description)| ProviderStatus {
                 indicator,
@@ -852,15 +842,9 @@ impl ProductionFeedFetcher {
         if !control.cycle_allowed(cycle) {
             return None;
         }
-        let github = fetch_status(&self.agent, GITHUB_STATUS_URL)
-            .map_err(|_| {
-                tracing::debug!(
-                    kind = "status_feed",
-                    phase = "github_status",
-                    error_code = "fetch_failed",
-                    "status feed fetch failed"
-                )
-            })
+        let github_status_result = fetch_status(&self.agent, GITHUB_STATUS_URL);
+        self.log_fetch_edge("github_status", github_status_result.is_ok());
+        let github = github_status_result
             .ok()
             .map(|(indicator, description)| ProviderStatus {
                 indicator,

@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use unicode_normalization::UnicodeNormalization;
+
 use crate::agent_surface::AgentProvider;
 use crate::config::ComposerSendKey;
 use connector_contract::{ConnectorSnapshot, ServerId, ServerSummary, ToolPage};
@@ -1566,11 +1568,18 @@ fn is_attach_paste_shortcut(event: &egui::Event) -> bool {
 }
 
 /// 파일 경로 → 버퍼 삽입 텍스트. 워크스페이스 루트 하위면 `@상대경로`(claude @멘션 규약),
-/// 밖이면 절대경로 그대로.
+/// 밖이면 절대경로 그대로. macOS 드래그&드롭·파일 피커는 파일명을 NFD(자소분해)로
+/// 넘겨 한글이 깨져 보이므로(terminal 크레이트 alacritty_backend.rs composed_char와
+/// 동일 문제) NFC로 합성해 삽입한다.
 fn mention_path(root: Option<&Path>, path: &Path) -> String {
+    // strip_prefix 비교는 정규화 전 원본 경로끼리 해야 한다 — root도 OS가 준 그대로라
+    // NFD일 수 있고, 한쪽만 NFC로 바꾸면 같은 경로인데도 접두 판정이 어긋난다.
+    // NFC 변환은 최종 표시 문자열에만 적용한다.
     match root.and_then(|root| path.strip_prefix(root).ok()) {
-        Some(rel) if !rel.as_os_str().is_empty() => format!("@{}", rel.display()),
-        _ => path.display().to_string(),
+        Some(rel) if !rel.as_os_str().is_empty() => {
+            format!("@{}", rel.display().to_string().nfc().collect::<String>())
+        }
+        _ => path.display().to_string().nfc().collect::<String>(),
     }
 }
 
@@ -1974,6 +1983,27 @@ mod tests {
             "/etc/hosts"
         );
         assert_eq!(mention_path(None, Path::new("/etc/hosts")), "/etc/hosts");
+    }
+
+    #[test]
+    fn mention_path_는_nfd_입력을_nfc로_합성한다() {
+        // macOS 드래그&드롭/파일 피커가 넘기는 NFD(자소분해) 경로 — "한" = ᄒ+ᅡ+ᆫ.
+        let nfd_han = "\u{1112}\u{1161}\u{11AB}";
+        let root = PathBuf::from(format!("/proj/{nfd_han}"));
+        let nfd_file = format!("{nfd_han}.txt");
+        let path = root.join(&nfd_file);
+        // 루트 상대경로: root/path 양쪽 다 NFD라도 strip_prefix가 원본끼리 비교되어
+        // 정상 매칭되고, 표시 문자열만 NFC로 합성된다.
+        assert_eq!(
+            mention_path(Some(&root), &path),
+            format!("@{nfd_file}").nfc().collect::<String>()
+        );
+        // 절대경로(루트 밖): 표시 문자열도 NFC로 합성된다.
+        let outside = PathBuf::from(format!("/etc/{nfd_file}"));
+        assert_eq!(
+            mention_path(Some(&root), &outside),
+            outside.display().to_string().nfc().collect::<String>()
+        );
     }
 
     #[test]

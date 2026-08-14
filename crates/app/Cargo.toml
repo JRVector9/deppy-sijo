@@ -41,6 +41,10 @@ image = { workspace = true }
 qrcode = { workspace = true }
 # 프로젝트 폴더 선택 네이티브 다이얼로그 (환경 메뉴 — 워크스페이스 path 지정, 2026-07-08)
 rfd = "0.17"
+# macOS 드래그&드롭/파일 피커 경로가 NFD(자소분해)로 넘어오는 문제 — composer.rs
+# mention_path에서 NFC로 정규화한다 (terminal 크레이트 alacritty_backend.rs
+# composed_char와 동일 정책, 2026-08-14).
+unicode-normalization = { workspace = true }
 audit = { path = "../audit" }
 auth = { path = "../auth" }
 connector-contract = { path = "../connector-contract" }

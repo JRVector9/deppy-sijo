@@ -438,6 +438,9 @@ trait DetectionBackend: Send + 'static {
 #[derive(Default)]
 struct ProductionBackend {
     cache: agent_detect::BindingCache,
+    /// 바인딩 tier와 종류 tier가 공유하는 `ps` 스냅샷 캐시(짧은 TTL). 두 tier가 근접한
+    /// 시각에 각자 exec하던 걸 흡수한다 — `ProcessRowsCache` 문서 참고(2026-08-14).
+    process_rows: agent_detect::ProcessRowsCache,
 }
 
 fn compute_activity(
@@ -493,7 +496,8 @@ impl DetectionBackend for ProductionBackend {
         sessions: &[(SessionId, u32)],
         overrides: &HashMap<SessionId, AgentBinding>,
     ) -> BindingPass {
-        let detected = agent_detect::detect_cached(sessions, overrides, &mut self.cache);
+        let detected =
+            agent_detect::detect_cached(sessions, overrides, &mut self.cache, &mut self.process_rows);
         let agent_detect::DetectedAgents {
             bindings,
             kinds: agent_kinds,
@@ -516,7 +520,7 @@ impl DetectionBackend for ProductionBackend {
     }
 
     fn kinds_pass(&mut self, sessions: &[(SessionId, u32)]) -> HashMap<SessionId, RunningAgent> {
-        agent_detect::detect_kinds(sessions)
+        agent_detect::detect_kinds(sessions, &mut self.process_rows)
     }
 
     fn activity_pass(

@@ -127,6 +127,54 @@ impl DetectionBudget {
     }
 }
 
+/// `process_rows()`(= `ps -axo` 1회)를 짧은 TTL 동안 재사용하는 캐시. 바인딩 tier(2.5s)와
+/// 종류 tier(1.2s)는 각자 독립적으로 돌지만, 워커 스케줄을 손으로 추적해보면 두 tier가
+/// 우연히 100ms 안팎으로 근접해 도는 순간이 주기마다 발생한다 — 그 순간엔 방금 읽은
+/// 프로세스 테이블이 사실상 그대로인데도 각 tier가 따로 `ps`를 다시 exec했다
+/// (2026-08-14: spawn 비용 조사, deppy-detect-spawn worktree). TTL은 종류 tier 주기의
+/// 1/3 수준(400ms)으로 짧게 잡아, 종류 tier 스스로의 연속 두 틱(항상 1.2s 이상 떨어짐)은
+/// 절대 캐시를 공유하지 않는다 — 오직 서로 다른 tier가 겹칠 때만 흡수한다. 즉 "손으로 막
+/// 띄운 에이전트가 다음 종류 tier에서 바로 보인다"는 반응성 계약은 그대로 유지된다.
+const PROCESS_ROWS_TTL: Duration = Duration::from_millis(400);
+
+pub struct ProcessRowsCache {
+    rows: Vec<ProcRow>,
+    fetched_at: Option<Instant>,
+    ttl: Duration,
+}
+
+impl Default for ProcessRowsCache {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            fetched_at: None,
+            ttl: PROCESS_ROWS_TTL,
+        }
+    }
+}
+
+impl ProcessRowsCache {
+    #[cfg(test)]
+    fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            rows: Vec::new(),
+            fetched_at: None,
+            ttl,
+        }
+    }
+
+    /// 캐시가 TTL 안이면 그대로 재사용하고, 아니면 `fetch`(실제로는 `process_rows`)로
+    /// 새로 채운다. `fetch`는 캐시가 stale할 때만 호출되므로 신선하면 exec가 아예 없다.
+    fn get(&mut self, fetch: impl FnOnce() -> Vec<ProcRow>) -> &[ProcRow] {
+        let fresh = self.fetched_at.is_some_and(|at| at.elapsed() < self.ttl);
+        if !fresh {
+            self.rows = fetch();
+            self.fetched_at = Some(Instant::now());
+        }
+        &self.rows
+    }
+}
+
 /// 세션별로 **실행 중인 에이전트 종류**만 고른다 — transcript를 요구하지 않는다.
 ///
 /// `AgentBinding`은 정의상 transcript 경로까지 확정된 상태라, 방금 띄워 아직 대화를
@@ -175,35 +223,39 @@ fn argv_flag_value(command: &str, flag: &str) -> Option<String> {
 }
 
 /// 캐시를 활용한 detect. `cache`는 호출측(워커 스레드)이 소유·유지한다.
-/// 프로세스만 보고 세션별 에이전트 종류를 판정한다 — `ps` 한 번, lsof도 transcript도
-/// 타지 않는다.
+/// 프로세스만 보고 세션별 에이전트 종류를 판정한다 — `process_cache`가 TTL 안에서 신선하면
+/// 재사용하고, 아니면 `ps` 한 번만 새로 뜬다. lsof도 transcript도 타지 않는다.
 ///
 /// 바인딩 tier(2.5s)는 lsof·transcript까지 도는 무거운 패스라 자주 돌릴 수 없다. 그런데
 /// 「빈 터미널에서 손으로 에이전트를 띄운 경우」는 세션 목록이 그대로라 즉시 트리거도
 /// 없어, 카드가 뜨기까지 그 주기를 통째로 기다렸다(2026-08-09 사용자 신고). 종류만
 /// 필요한 그 경우를 위해 싼 패스를 따로 연다.
-pub fn detect_kinds(sessions: &[(SessionId, u32)]) -> HashMap<SessionId, RunningAgent> {
+pub fn detect_kinds(
+    sessions: &[(SessionId, u32)],
+    process_cache: &mut ProcessRowsCache,
+) -> HashMap<SessionId, RunningAgent> {
     if sessions.len() > MAX_SESSIONS {
         return HashMap::new();
     }
-    agent_kinds_from_rows(sessions, &process_rows())
+    agent_kinds_from_rows(sessions, process_cache.get(process_rows))
 }
 
 pub fn detect_cached(
     sessions: &[(SessionId, u32)],
     overrides: &HashMap<SessionId, AgentBinding>,
     cache: &mut BindingCache,
+    process_cache: &mut ProcessRowsCache,
 ) -> DetectedAgents {
     if sessions.len() > MAX_SESSIONS {
         cache.entries.clear();
         return DetectedAgents::default();
     }
-    let rows = process_rows();
+    let rows = process_cache.get(process_rows);
     let mut budget = DetectionBudget::default();
     let mut out = HashMap::new();
     // transcript와 무관하게 "이 세션에서 무슨 에이전트가 돌고 있나"만 따로 모은다.
     // 같은 ps 결과를 재사용하므로 추가 비용이 없다.
-    let kinds = agent_kinds_from_rows(sessions, &rows);
+    let kinds = agent_kinds_from_rows(sessions, rows);
     for (sid, shell_pid) in sessions {
         // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적이다. 단 같은 pane에서
         // Codex를 종료한 뒤 Claude를 실행할 수 있으므로, 살아 있는 에이전트의 종류까지 hook
@@ -211,7 +263,7 @@ pub fn detect_cached(
         // 현재 에이전트를 다시 바인딩한다(2026-07-20 실증).
         if let Some(b) = overrides.get(sid)
             && valid_binding(b)
-            && let Some(owner) = find_agent_pid(*shell_pid, &rows, b.kind)
+            && let Some(owner) = find_agent_pid(*shell_pid, rows, b.kind)
         {
             cache.entries.insert(*sid, (b.clone(), owner, true));
             out.insert(*sid, b.clone());
@@ -222,7 +274,7 @@ pub fn detect_cached(
         // 바인딩은 lsof로 결정적 업그레이드를 시도한다(작업 중 rollout이 열리면 정확한
         // 파일로 교체).
         if let Some((binding, owner_pid, det)) = cache.entries.get(sid)
-            && agent_pid_matches_kind(*owner_pid, binding.kind, &rows)
+            && agent_pid_matches_kind(*owner_pid, binding.kind, rows)
         {
             let (owner_pid, det) = (*owner_pid, *det);
             {
@@ -250,7 +302,7 @@ pub fn detect_cached(
             continue;
         }
         // 미스/종료 → 전체 탐색 후 캐시 갱신.
-        if let Some((binding, owner_pid, det)) = find_agent(*shell_pid, &rows, &mut budget) {
+        if let Some((binding, owner_pid, det)) = find_agent(*shell_pid, rows, &mut budget) {
             cache
                 .entries
                 .insert(*sid, (binding.clone(), owner_pid, det));
@@ -1548,6 +1600,38 @@ mod tests {
 
         let mut plus_one = std::io::BufReader::new(std::io::Cursor::new(vec![b'x'; 65]));
         assert_eq!(read_line_bounded(&mut plus_one, 64), Err(()));
+    }
+
+    /// TTL 안에서는 `fetch`(실제로는 `ps` exec)를 다시 부르지 않는다 — 바인딩/종류 두
+    /// tier가 근접한 시각에 도는 순간을 흡수하는 핵심 동작(2026-08-14).
+    #[test]
+    fn process_rows_cache_는_ttl_안에서_재사용하고_지나면_다시_가져온다() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let mut cache = ProcessRowsCache::with_ttl(Duration::from_millis(20));
+        let fetch = || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            vec![ProcRow {
+                pid: 1,
+                ppid: None,
+                command: "x".to_owned(),
+            }]
+        };
+
+        assert_eq!(cache.get(fetch).len(), 1);
+        assert_eq!(cache.get(fetch).len(), 1);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "TTL 안의 재호출은 exec 없이 재사용해야 한다"
+        );
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(cache.get(fetch).len(), 1);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "TTL이 지나면 다시 fetch해서 stale한 스냅샷을 쓰지 않아야 한다"
+        );
     }
 
     #[test]

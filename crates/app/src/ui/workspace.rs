@@ -707,6 +707,30 @@ fn terminal_pane_layout_for_state(
     }
 }
 
+/// layout 트리의 pane을 배치 순서대로 모은다.
+fn layout_panes<'a>(node: &'a LayoutNode, out: &mut Vec<&'a runtime::MuxPaneId>) {
+    match node {
+        LayoutNode::Pane(id) => out.push(id),
+        LayoutNode::Split { first, second, .. } => {
+            layout_panes(first, out);
+            layout_panes(second, out);
+        }
+    }
+}
+
+/// 보조 탭을 붙일 pane — focused pane이 이 layout 안에 있으면 그것, 없으면 첫 pane.
+fn aux_tab_owner_pane(
+    layout: &LayoutNode,
+    focused: Option<&runtime::MuxPaneId>,
+) -> Option<runtime::MuxPaneId> {
+    let mut panes = Vec::new();
+    layout_panes(layout, &mut panes);
+    focused
+        .filter(|id| panes.contains(id))
+        .or_else(|| panes.first().copied())
+        .cloned()
+}
+
 fn keeps_embedded_pane_header(_layout: &LayoutNode) -> bool {
     true
 }
@@ -720,6 +744,202 @@ const PANE_HEADER_TOOLBAR_GAP: f32 = 2.0;
 /// **같은 값**을 써야 닫기 버튼 위치와 제목 폭 계산이 어긋나지 않는다.
 const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
 
+/// 세션 헤더 옆에 붙는 보조 탭의 표시 상태 — App이 소유하고 매 프레임 넘긴다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneAuxTab {
+    pub label: String,
+    pub active: bool,
+}
+
+/// 보조 탭이 App으로 올려보내는 의도. 여기서 파생되는 `RuntimeCommand`는 없다 —
+/// 세션 X(`ClosePane`)와 이력 X는 끝까지 다른 동작이어야 한다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneAuxTabIntent {
+    /// 보조 탭을 눌렀다 — 보조 본문을 활성화한다.
+    Activate,
+    /// 보조 탭이 활성인 동안 세션 탭을 눌렀다 — 터미널로 돌아가되 탭은 남긴다.
+    ShowSession,
+    /// 보조 탭 X — UI 탭만 닫는다.
+    Close,
+}
+
+/// 보조 탭 라벨 좌측 여백·라벨과 닫기 중심 간격·닫기 뒤 여백. 세션 탭이 쓰는 값과
+/// 같은 규칙(제목 10pt 들여쓰기, 제목 끝 +14pt에 닫기 중심, 닫기 뒤 6pt)이라 두 탭의
+/// 리듬이 어긋나지 않는다.
+const PANE_AUX_TAB_LABEL_LEFT: f32 = 10.0;
+const PANE_AUX_TAB_CLOSE_GAP: f32 = 14.0;
+const PANE_AUX_TAB_RIGHT_PAD: f32 = 6.0;
+const PANE_AUX_TAB_CLOSE_SIZE: f32 = 20.0;
+/// 헤더가 아무리 좁아도 보조 탭 라벨에 남기는 최소 폭 — 0폭 라벨을 만들지 않는다.
+const PANE_AUX_TAB_MIN_LABEL: f32 = 14.0;
+
+/// 라벨 폭에서 보조 탭이 헤더에서 차지하는 전체 폭.
+fn pane_aux_tab_width(label_width: f32) -> f32 {
+    PANE_AUX_TAB_LABEL_LEFT
+        + label_width
+        + PANE_AUX_TAB_CLOSE_GAP
+        + PANE_AUX_TAB_CLOSE_SIZE * 0.5
+        + PANE_AUX_TAB_RIGHT_PAD
+}
+
+/// 보조 탭이 헤더 절반을 넘지 않게 라벨 폭을 자른다. 좁은 폭 우선순위 1은 **세션 제목
+/// 최소 폭**이라, 보조 탭이 먼저 양보한다.
+fn pane_aux_tab_label_width(header_width: f32, natural_label_width: f32) -> f32 {
+    let budget = (header_width * 0.5 - pane_aux_tab_width(0.0)).max(PANE_AUX_TAB_MIN_LABEL);
+    natural_label_width.max(0.0).min(budget)
+}
+
+/// 보조 탭 기하 — 탭 본체와 닫기가 각각 독립 히트박스를 갖는다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PaneAuxTabGeometry {
+    /// 탭 전체(활성화 클릭 대상). 닫기는 이 위에 **나중에** 등록해 우선권을 갖는다.
+    tab: egui::Rect,
+    label_left: f32,
+    label_width: f32,
+    /// 남은 폭이 모자라면 없다 — 라벨(=탭 전환)이 닫기보다 우선한다.
+    close: Option<egui::Rect>,
+}
+
+/// 세션 닫기(×) 오른쪽에 보조 탭을 놓는다 — 시작점은 세션 탭의 accent 경계와 같다.
+///
+/// 좁은 폭에서는 순서대로 양보한다: 닫기(×)를 먼저 버리고, 최소 라벨 폭조차 없으면
+/// 탭 자체를 만들지 않는다(레일로 계속 전환할 수 있다). 어떤 경우에도 `toolbar_left`나
+/// 헤더 오른쪽 끝을 넘지 않는다.
+fn pane_aux_tab_geometry(
+    header: egui::Rect,
+    session_close: egui::Rect,
+    toolbar_left: f32,
+    label_width: f32,
+) -> Option<PaneAuxTabGeometry> {
+    let center_y = header.center().y;
+    let left = pane_header_active_boundary(header, session_close);
+    let limit = toolbar_left.min(header.right());
+    let label_left = left + PANE_AUX_TAB_LABEL_LEFT;
+    let label_width = label_width.min(limit - PANE_AUX_TAB_RIGHT_PAD - label_left);
+    if label_width < PANE_AUX_TAB_MIN_LABEL {
+        return None;
+    }
+    let close_center_x = label_left + label_width + PANE_AUX_TAB_CLOSE_GAP;
+    let close = (close_center_x + PANE_AUX_TAB_CLOSE_SIZE * 0.5 + PANE_AUX_TAB_RIGHT_PAD <= limit)
+        .then(|| {
+            egui::Rect::from_center_size(
+                egui::pos2(close_center_x, center_y),
+                egui::vec2(PANE_AUX_TAB_CLOSE_SIZE, PANE_AUX_TAB_CLOSE_SIZE),
+            )
+        });
+    let right =
+        close.map_or(label_left + label_width, |rect| rect.right()) + PANE_AUX_TAB_RIGHT_PAD;
+    Some(PaneAuxTabGeometry {
+        tab: egui::Rect::from_min_max(
+            egui::pos2(left, header.top()),
+            egui::pos2(right.min(limit), header.bottom()),
+        ),
+        label_left,
+        label_width,
+        close,
+    })
+}
+
+/// 닫기(×) 글리프. 세션 닫기와 보조 탭 닫기가 같은 모양을 쓰되 **색만** 다르다
+/// (세션은 error 톤, 보조 탭은 중립 — 세션을 끝내지 않기 때문).
+fn paint_close_glyph(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let d = 4.0;
+    painter.line_segment(
+        [center + egui::vec2(-d, -d), center + egui::vec2(d, d)],
+        egui::Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [center + egui::vec2(-d, d), center + egui::vec2(d, -d)],
+        egui::Stroke::new(1.5, color),
+    );
+}
+
+/// 탭 라벨 한 줄 — 넘치면 '…'로 줄인다. 세션 제목과 보조 탭 라벨의 단일 원천.
+fn paint_tab_label(
+    painter: &egui::Painter,
+    clip: egui::Rect,
+    center_y: f32,
+    font: egui::FontId,
+    color: egui::Color32,
+    text: String,
+) {
+    let mut job = egui::text::LayoutJob::single_section(
+        text,
+        egui::TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: clip.width().max(0.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = painter.layout_job(job);
+    painter.with_clip_rect(clip).galley(
+        egui::pos2(clip.left(), center_y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+}
+
+/// 헤더 바탕 — 배경, 선택 탭 위의 accent 상단선, 하단 separator.
+///
+/// `accent_range`가 없으면 상단선을 그리지 않는다(비포커스 pane).
+fn paint_pane_header_base(
+    ui: &egui::Ui,
+    header: egui::Rect,
+    style: PaneHeaderStyle,
+    accent_range: Option<egui::Rangef>,
+) {
+    ui.painter().rect_filled(header, 0.0, style.background);
+    if let Some(selection_fill) = style.selection_fill {
+        ui.painter().rect_filled(header, 0.0, selection_fill);
+    }
+    if let (Some(active_stroke), Some(range)) = (style.active_stroke, accent_range) {
+        // round_to_pixel_center는 문서가 밝히듯 **홀수 물리픽셀 폭**용이다. 이 선은
+        // 1.0 **포인트**라 Retina에서 2 물리픽셀(짝수)이므로, 픽셀 중심에 맞추면
+        // 양끝이 반 픽셀씩 걸쳐 뭉개지고 header.top()이 소수일 땐 헤더 첫 행이 아예
+        // 비어 1px 여백으로 보인다(2026-08-07 사용자).
+        //
+        // 짝수 폭은 **경계**에 맞춰야 한다 — 헤더 상단을 픽셀 격자에 스냅한 뒤
+        // half-width를 더하면 선이 첫 행부터 정확히 덮는다.
+        let top_y = pane_header_top_line_y(
+            header.top(),
+            active_stroke.width,
+            ui.ctx().pixels_per_point(),
+        );
+        ui.painter().hline(range, top_y, active_stroke);
+    }
+    ui.painter().hline(
+        header.x_range(),
+        crate::ui::snap_line_to_pixel(
+            header.bottom(),
+            crate::ui::designall::SEPARATOR_WIDTH,
+            ui.ctx().pixels_per_point(),
+        ),
+        crate::ui::designall::separator_stroke(ui.visuals()),
+    );
+}
+
+/// 두 탭 사이 세로 헤어라인 — 같은 배경을 쓰는 두 영역의 경계를 읽히게 한다.
+fn paint_tab_divider(ui: &egui::Ui, header: egui::Rect, x: f32) {
+    if x <= header.left() || x >= header.right() {
+        return;
+    }
+    ui.painter().vline(
+        crate::ui::snap_line_to_pixel(
+            x,
+            crate::ui::designall::SEPARATOR_WIDTH,
+            ui.ctx().pixels_per_point(),
+        ),
+        egui::Rangef::new(header.top() + 6.0, header.bottom() - 6.0),
+        crate::ui::designall::separator_stroke(ui.visuals()),
+    );
+}
+
 /// pane 헤더 버튼 기하 — 닫기(×)는 마지막까지 남는 버튼이다.
 struct PaneHeaderButtons {
     /// 닫기(×) 히트박스. 항상 존재한다.
@@ -727,6 +947,9 @@ struct PaneHeaderButtons {
     /// 표시할 우측 도구 히트박스(왼쪽→오른쪽). 아이콘은 전체 목록의 뒤에서부터
     /// `toolbar.len()`개를 대응시킨다 (왼쪽 도구부터 숨김).
     toolbar: Vec<egui::Rect>,
+    /// 도구 영역의 왼쪽 경계 — 보조 탭이 넘으면 안 되는 선. 도구가 0개면 헤더 오른쪽
+    /// 여백(4pt) 자리다.
+    toolbar_left: f32,
 }
 
 /// 헤더 폭·제목 폭으로 닫기(×)와 우측 도구의 히트박스를 계산한다.
@@ -737,16 +960,19 @@ struct PaneHeaderButtons {
 /// 등록되므로 겹침 클릭이 닫기 대신 분할을 실행했다. 지금은 도구 0개를
 /// 허용하고, 만에 하나 기하가 어긋나 도구가 닫기를 덮으면 왼쪽 도구를 더
 /// 숨겨 닫기가 항상 우선하도록 보장한다.
+/// `aux_width`는 헤더 오른쪽 도구 앞에 보조 탭이 미리 잡아둔 폭이다. 0이면 보조 탭이
+/// 없던 시절과 정확히 같은 기하가 나온다.
 fn pane_header_buttons(
     header: egui::Rect,
     title_width: f32,
     icon_count: usize,
+    aux_width: f32,
 ) -> PaneHeaderButtons {
     let title_left = header.left() + PANE_HEADER_TITLE_LEFT;
     let center_y = header.center().y;
     // 제목과 닫기 버튼을 먼저 온전히 확보한다. 분할 pane이 좁아지면 우측 도구를
     // 왼쪽부터 단계적으로 숨겨(0개 허용) 제목 글자가 중간에서 잘리는 일을 막는다.
-    let toolbar_available = (header.width() - title_width - 61.0).max(0.0);
+    let toolbar_available = (header.width() - title_width - aux_width - 61.0).max(0.0);
     let mut visible_toolbar = (((toolbar_available + PANE_HEADER_TOOLBAR_GAP)
         / (PANE_HEADER_TOOLBAR_BUTTON + PANE_HEADER_TOOLBAR_GAP))
         .floor() as usize)
@@ -756,7 +982,7 @@ fn pane_header_buttons(
             + PANE_HEADER_TOOLBAR_GAP * visible_toolbar.saturating_sub(1) as f32;
         let toolbar_left = header.right() - 4.0 - toolbar_width;
         let close_center_x = (title_left + title_width + 14.0)
-            .min(toolbar_left - 11.0)
+            .min(toolbar_left - aux_width - 11.0)
             .max(title_left + 8.0);
         let close = egui::Rect::from_center_size(
             egui::pos2(close_center_x, center_y),
@@ -781,7 +1007,11 @@ fn pane_header_buttons(
             visible_toolbar -= 1;
             continue;
         }
-        return PaneHeaderButtons { close, toolbar };
+        return PaneHeaderButtons {
+            close,
+            toolbar,
+            toolbar_left,
+        };
     }
 }
 
@@ -888,6 +1118,11 @@ pub(crate) struct PreparedAttachedPaneOutput {
 pub struct WorkspaceSurfaceOutput {
     pub focus_requested: bool,
     pub local_focus_claimed: Option<runtime::MuxPaneId>,
+    /// 이번 프레임에 보조 탭이 올린 의도(있으면 App이 탭 상태를 옮긴다).
+    pub aux_tab_intent: Option<PaneAuxTabIntent>,
+    /// 보조 탭이 활성일 때 App이 본문을 그릴 pane body rect. 이 rect가 있으면
+    /// WorkspaceUi는 그 pane의 터미널 표면·입력을 **그리지 않았다**.
+    pub aux_body_rect: Option<egui::Rect>,
 }
 
 #[derive(Clone, Copy)]
@@ -920,6 +1155,8 @@ impl PaneRenderMode<'_> {
 struct PaneRenderOutput {
     focus_requested: bool,
     local_focus_claimed: Option<runtime::MuxPaneId>,
+    aux_tab_intent: Option<PaneAuxTabIntent>,
+    aux_body_rect: Option<egui::Rect>,
 }
 
 impl PaneRenderOutput {
@@ -927,6 +1164,12 @@ impl PaneRenderOutput {
         self.focus_requested |= other.focus_requested;
         if other.local_focus_claimed.is_some() {
             self.local_focus_claimed = other.local_focus_claimed;
+        }
+        if other.aux_tab_intent.is_some() {
+            self.aux_tab_intent = other.aux_tab_intent;
+        }
+        if other.aux_body_rect.is_some() {
+            self.aux_body_rect = other.aux_body_rect;
         }
     }
 }
@@ -1179,6 +1422,15 @@ pub struct WorkspaceUi {
     /// 활성 워크스페이스의 고유색 — 포커스된 pane 상단선에 쓴다.
     /// App이 매 프레임 밀어 넣는다(사이드바 목록 순서에 따라 배정되므로 여기서 못 만든다).
     workspace_accent: egui::Color32,
+    /// App이 소유한 보조 탭(이력) — 있으면 포커스된 로컬 pane 헤더의 **같은 32pt 행**에
+    /// 세션 탭 옆으로 그린다. runtime의 `MuxTabId`/pane이 아니므로 이 값이 바뀌어도
+    /// PTY·세션·mux 탭은 생기거나 죽지 않는다. WorkspaceUi는 클릭 의도만 돌려주고
+    /// 상태와 본문은 App이 소유한다.
+    aux_tab: Option<PaneAuxTab>,
+    /// 이번 프레임에 보조 탭을 붙일 pane. 보통 focused pane이지만, runtime이 아직
+    /// 아무 pane도 포커스하지 않은 프레임에서는 layout의 첫 pane으로 떨어진다 —
+    /// 그러지 않으면 탭도 본문도 사라져 레일만 켜진 채 화면이 반응하지 않는다.
+    aux_tab_pane: Option<runtime::MuxPaneId>,
     /// 세션별 현재 작업 폴더(App이 매 프레임 set) — 1행 제목 폴더명/프로젝트명 원천.
     session_cwds: std::collections::HashMap<SessionId, String>,
     /// App host가 filesystem 밖에서 미리 계산한 세션별 프로젝트 표시명. cwd를 함께
@@ -1567,6 +1819,8 @@ impl WorkspaceUi {
             project_name: None,
             ui_scale: 1.0,
             workspace_accent: egui::Color32::TRANSPARENT,
+            aux_tab: None,
+            aux_tab_pane: None,
             session_pids: HashMap::new(),
             path_click_cache: None,
             io_generation: 1,
@@ -2275,6 +2529,11 @@ impl WorkspaceUi {
     /// 포커스된 pane 상단선이 그 워크스페이스에 속한다는 걸 같은 색으로 잇는다.
     pub fn set_workspace_accent(&mut self, color: egui::Color32) {
         self.workspace_accent = color;
+    }
+
+    /// 포커스된 로컬 pane 헤더 옆에 붙일 보조 탭. `None`이면 헤더는 예전 그대로다.
+    pub fn set_aux_tab(&mut self, tab: Option<PaneAuxTab>) {
+        self.aux_tab = tab;
     }
 
     pub fn set_ui_scale(&mut self, scale: f32) {
@@ -3112,16 +3371,6 @@ impl WorkspaceUi {
         }
     }
 
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        config: &TerminalConfig,
-        events: &[RuntimeEvent],
-        catalog: &i18n::Catalog,
-    ) -> WorkspaceSurfaceOutput {
-        self.show_with_input(ui, config, events, catalog, true)
-    }
-
     pub fn show_with_input(
         &mut self,
         ui: &mut egui::Ui,
@@ -3149,11 +3398,15 @@ impl WorkspaceUi {
         }
 
         let Some(mux) = self.mux.clone() else {
-            let output = if input_enabled {
-                self.show_new_session_prompt(ui, catalog);
-                WorkspaceSurfaceOutput::default()
-            } else {
-                self.show_disabled_empty_surface(ui)
+            // 세션이 없어도 이력 보조 탭은 유효하다 — 탭이 열려 있으면 예전처럼
+            // 「새 셸」 프롬프트만 남기고 끝내지 않고 탭 스트립과 본문 rect를 만든다.
+            let output = match self.aux_tab.as_ref().map(|tab| tab.active) {
+                Some(active) => self.show_session_less_aux_tabs(ui, catalog, input_enabled, active),
+                None if input_enabled => {
+                    self.show_new_session_prompt(ui, catalog);
+                    WorkspaceSurfaceOutput::default()
+                }
+                None => self.show_disabled_empty_surface(ui),
             };
             self.flush_command_repaint(ui.ctx());
             return output;
@@ -3193,11 +3446,15 @@ impl WorkspaceUi {
             .as_ref()
             .and_then(|id| mux.tabs.iter().find(|tab| &tab.id == id))
         else {
-            let output = if input_enabled {
-                self.show_new_session_prompt(ui, catalog);
-                WorkspaceSurfaceOutput::default()
-            } else {
-                self.show_disabled_empty_surface(ui)
+            // 세션이 없어도 이력 보조 탭은 유효하다 — 탭이 열려 있으면 예전처럼
+            // 「새 셸」 프롬프트만 남기고 끝내지 않고 탭 스트립과 본문 rect를 만든다.
+            let output = match self.aux_tab.as_ref().map(|tab| tab.active) {
+                Some(active) => self.show_session_less_aux_tabs(ui, catalog, input_enabled, active),
+                None if input_enabled => {
+                    self.show_new_session_prompt(ui, catalog);
+                    WorkspaceSurfaceOutput::default()
+                }
+                None => self.show_disabled_empty_surface(ui),
             };
             self.flush_command_repaint(ui.ctx());
             return output;
@@ -3215,6 +3472,10 @@ impl WorkspaceUi {
 
         let rect = ui.available_rect_before_wrap();
         let layout = active_tab.layout.clone();
+        self.aux_tab_pane = self
+            .aux_tab
+            .as_ref()
+            .and_then(|_| aux_tab_owner_pane(&layout, mux.focused_pane.as_ref()));
         let embedded_headers = keeps_embedded_pane_header(&layout);
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
@@ -3236,6 +3497,8 @@ impl WorkspaceUi {
         WorkspaceSurfaceOutput {
             focus_requested: pane_output.focus_requested,
             local_focus_claimed: pane_output.local_focus_claimed,
+            aux_tab_intent: pane_output.aux_tab_intent,
+            aux_body_rect: pane_output.aux_body_rect,
         }
     }
 
@@ -3501,6 +3764,137 @@ impl WorkspaceUi {
         });
     }
 
+    /// 세션이 하나도 없는 워크스페이스에서 보조 탭이 열려 있을 때의 화면.
+    ///
+    /// 이력 데이터는 workspace-scoped라 세션이 없어도 유효하다(핸드오프 기본값 3).
+    /// 세션 탭 자리에는 「세션 없음」 탭을 두고, 그 탭을 고르면 본문이 기존 「새 셸」
+    /// 진입점으로 돌아간다 — 세션이 없다는 사실과 만드는 길이 함께 보여야 한다.
+    fn show_session_less_aux_tabs(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        input_enabled: bool,
+        active: bool,
+    ) -> WorkspaceSurfaceOutput {
+        let rect = ui.available_rect_before_wrap();
+        let header_height = TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0) * 0.5);
+        let header = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.right(), rect.top() + header_height),
+        );
+        let body = egui::Rect::from_min_max(egui::pos2(rect.left(), header.bottom()), rect.max);
+        let font = egui::FontId::proportional(13.0);
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        let empty_label = catalog.t("workspace.tab.no_session", &[]);
+        let empty_width = ui
+            .painter()
+            .layout_no_wrap(empty_label.clone(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x;
+        // 세션 탭에는 닫을 pane이 없다 — 폭 0 rect를 닫기 자리로 넘겨 보조 탭이
+        // 라벨 바로 뒤에서 시작하게 한다(같은 accent 경계 규칙 재사용).
+        let label_left = header.left() + PANE_HEADER_TITLE_LEFT;
+        let pseudo_close = egui::Rect::from_min_max(
+            egui::pos2(label_left + empty_width, header.center().y),
+            egui::pos2(label_left + empty_width, header.center().y),
+        );
+        let aux_label = self.aux_tab.as_ref().map(|tab| tab.label.clone());
+        let aux = aux_label.as_ref().and_then(|label| {
+            let natural = ui
+                .painter()
+                .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x;
+            pane_aux_tab_geometry(
+                header,
+                pseudo_close,
+                header.right() - 4.0,
+                pane_aux_tab_label_width(header.width(), natural),
+            )
+        });
+
+        let style = pane_header_style(self.workspace_accent, true);
+        let accent_range = Some(match aux {
+            Some(geometry) if active => egui::Rangef::new(
+                geometry.tab.left(),
+                geometry.tab.right().min(header.right()),
+            ),
+            _ => egui::Rangef::new(
+                header.left(),
+                pane_header_active_boundary(header, pseudo_close),
+            ),
+        });
+        paint_pane_header_base(ui, header, style, accent_range);
+        if let Some(geometry) = aux {
+            paint_tab_divider(ui, header, geometry.tab.left());
+        }
+
+        let empty_clip = egui::Rect::from_min_max(
+            egui::pos2(label_left, header.top()),
+            egui::pos2(pseudo_close.left().min(header.right()), header.bottom()),
+        );
+        let empty_response = ui.interact(
+            egui::Rect::from_min_max(
+                header.min,
+                egui::pos2(
+                    aux.map_or(header.right(), |geometry| geometry.tab.left()),
+                    header.bottom(),
+                ),
+            ),
+            ui.id().with("workspace_session_less_tab"),
+            egui::Sense::click(),
+        );
+        paint_tab_label(
+            ui.painter(),
+            empty_clip,
+            header.center().y,
+            font.clone(),
+            if active {
+                tokens.muted_text
+            } else {
+                tokens.text
+            },
+            empty_label,
+        );
+
+        let mut output = WorkspaceSurfaceOutput::default();
+        if empty_response.clicked() && active {
+            output.aux_tab_intent = Some(PaneAuxTabIntent::ShowSession);
+        }
+        if let (Some(geometry), Some(label)) = (aux, aux_label.as_ref())
+            && let Some(intent) = self.render_aux_tab(
+                ui,
+                header,
+                geometry,
+                label,
+                active,
+                ui.id().with("workspace_session_less_aux"),
+                catalog,
+                &font,
+            )
+        {
+            output.aux_tab_intent = Some(intent);
+        }
+
+        if active {
+            output.aux_body_rect = Some(body);
+        } else {
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(body)
+                    .id_salt("workspace_session_less_body"),
+            );
+            child.set_clip_rect(body.intersect(ui.clip_rect()));
+            if input_enabled {
+                self.show_new_session_prompt(&mut child, catalog);
+            } else {
+                output.focus_requested =
+                    self.show_disabled_empty_surface(&mut child).focus_requested;
+            }
+        }
+        output
+    }
+
     fn show_disabled_empty_surface(&self, ui: &mut egui::Ui) -> WorkspaceSurfaceOutput {
         let response = ui.interact(
             ui.available_rect_before_wrap(),
@@ -3542,12 +3936,33 @@ impl WorkspaceUi {
         ];
         let title_left = header.left() + PANE_HEADER_TITLE_LEFT;
 
+        // 보조 탭(이력)은 이 프레임의 **소유 pane** 헤더에만 붙는다. 라벨을 먼저 재서
+        // 세션 제목이 쓸 수 있는 폭에서 미리 빼둔다 — 뒤늦게 겹치는 일이 없게.
+        let owns_aux_tab = self
+            .aux_tab_pane
+            .as_ref()
+            .is_some_and(|owner| owner == &pane.id);
+        let aux_label = (owns_aux_tab && self.aux_tab.is_some()).then(|| {
+            let tab = self.aux_tab.as_ref().expect("aux tab checked");
+            let natural = ui
+                .painter()
+                .layout_no_wrap(tab.label.clone(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x;
+            let width = pane_aux_tab_label_width(header.width(), natural);
+            (tab.label.clone(), tab.active, width)
+        });
+        let aux_reserved_width = aux_label.as_ref().map_or(0.0, |(_, _, width)| {
+            pane_aux_tab_width(*width) + PANE_AUX_TAB_RIGHT_PAD
+        });
+
         // 우측 도구 4개를 모두 표시하던 기존 제목 폭을 기준으로 실제 글자 수를 구한 뒤
         // 10자를 더 허용한다. 추가 폭이 필요하면 기존 규칙대로 왼쪽 도구부터 숨긴다.
         let full_toolbar_width = PANE_HEADER_TOOLBAR_BUTTON * toolbar_icons.len() as f32
             + PANE_HEADER_TOOLBAR_GAP * toolbar_icons.len().saturating_sub(1) as f32;
         let original_title_width =
-            (header.right() - 4.0 - full_toolbar_width - 24.0 - title_left).max(0.0);
+            (header.right() - 4.0 - full_toolbar_width - aux_reserved_width - 24.0 - title_left)
+                .max(0.0);
         let full_char_count = full_title.chars().count();
         let original_char_capacity = if full_title_width > 0.0 {
             ((full_char_count as f32 * original_title_width / full_title_width).floor() as usize)
@@ -3569,43 +3984,29 @@ impl WorkspaceUi {
             .size()
             .x;
 
-        let buttons = pane_header_buttons(header, title_width, toolbar_icons.len());
+        let buttons =
+            pane_header_buttons(header, title_width, toolbar_icons.len(), aux_reserved_width);
         let center_y = header.center().y;
         let close = buttons.close;
+        let aux = aux_label.as_ref().and_then(|(_, _, width)| {
+            pane_aux_tab_geometry(header, close, buttons.toolbar_left, *width)
+        });
+        let aux_active = aux_label.as_ref().is_some_and(|(_, active, _)| *active);
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let style = pane_header_style(self.workspace_accent, focused);
-        ui.painter().rect_filled(header, 0.0, style.background);
-        if let Some(selection_fill) = style.selection_fill {
-            ui.painter().rect_filled(header, 0.0, selection_fill);
-        }
-        if let Some(active_stroke) = style.active_stroke {
-            let ppp = ui.ctx().pixels_per_point();
-            let painter = ui.painter();
-            let boundary_x =
-                painter.round_to_pixel_center(pane_header_active_boundary(header, close));
-            // round_to_pixel_center는 문서가 밝히듯 **홀수 물리픽셀 폭**용이다. 이 선은
-            // 1.0 **포인트**라 Retina에서 2 물리픽셀(짝수)이므로, 픽셀 중심에 맞추면
-            // 양끝이 반 픽셀씩 걸쳐 뭉개지고 header.top()이 소수일 땐 헤더 첫 행이 아예
-            // 비어 1px 여백으로 보인다(2026-08-07 사용자).
-            //
-            // 짝수 폭은 **경계**에 맞춰야 한다 — 헤더 상단을 픽셀 격자에 스냅한 뒤
-            // half-width를 더하면 선이 첫 행부터 정확히 덮는다.
-            let top_y = pane_header_top_line_y(header.top(), active_stroke.width, ppp);
-            painter.hline(
-                egui::Rangef::new(header.left(), boundary_x),
-                top_y,
-                active_stroke,
-            );
-        }
-        ui.painter().hline(
-            header.x_range(),
-            crate::ui::snap_line_to_pixel(
-                header.bottom(),
-                crate::ui::designall::SEPARATOR_WIDTH,
-                ui.ctx().pixels_per_point(),
+        // 상단 accent는 **선택된 탭**만 덮는다. 보조 탭이 붙으면 이 선의 범위가 곧
+        // 탭 선택 표시라, 별도 선택 위젯을 새로 만들지 않고 같은 chrome을 나눠 쓴다.
+        let accent_range = Some(match aux {
+            Some(geometry) if aux_active => egui::Rangef::new(
+                geometry.tab.left(),
+                geometry.tab.right().min(header.right()),
             ),
-            crate::ui::designall::separator_stroke(ui.visuals()),
-        );
+            _ => egui::Rangef::new(header.left(), pane_header_active_boundary(header, close)),
+        });
+        paint_pane_header_base(ui, header, style, accent_range);
+        if let Some(geometry) = aux {
+            paint_tab_divider(ui, header, geometry.tab.left());
+        }
 
         let header_response = ui.interact(
             header,
@@ -3617,6 +4018,11 @@ impl WorkspaceUi {
             output.local_focus_claimed = Some(pane.id.clone());
             output.focus_requested |= !input_enabled;
             self.request_pane_focus(pane.id.clone());
+            // 보조 탭이 활성인 동안 세션 탭(헤더의 남은 영역)을 누르면 터미널로 돌아간다.
+            // 보조 탭·보조 닫기는 **나중에** 등록돼 이 응답을 가져가므로 여기 오지 않는다.
+            if aux_active {
+                output.aux_tab_intent = Some(PaneAuxTabIntent::ShowSession);
+            }
         }
         if input_enabled {
             self.pane_context_menu(&header_response, &pane.id, config, catalog);
@@ -3634,30 +4040,19 @@ impl WorkspaceUi {
             egui::pos2(title_left, header.top()),
             egui::pos2(title_right, header.bottom()),
         );
-        let title_color = if focused {
+        // 보조 탭이 활성이면 세션 탭은 포커스된 pane이라도 선택 해제 상태로 읽혀야 한다.
+        let title_color = if focused && !aux_active {
             tokens.text
         } else {
             tokens.muted_text
         };
-        let mut title_job = egui::text::LayoutJob::single_section(
-            title,
-            egui::TextFormat {
-                font_id: font,
-                color: title_color,
-                ..Default::default()
-            },
-        );
-        title_job.wrap = egui::text::TextWrapping {
-            max_width: title_clip.width().max(0.0),
-            max_rows: 1,
-            break_anywhere: true,
-            overflow_character: Some('…'),
-        };
-        let title_galley = ui.painter().layout_job(title_job);
-        ui.painter().with_clip_rect(title_clip).galley(
-            egui::pos2(title_clip.left(), center_y - title_galley.size().y / 2.0),
-            title_galley,
+        paint_tab_label(
+            ui.painter(),
+            title_clip,
+            center_y,
+            font.clone(),
             title_color,
+            title,
         );
         let close_response = ui.interact(
             close,
@@ -3672,21 +4067,7 @@ impl WorkspaceUi {
         } else {
             tokens.text
         };
-        let d = 4.0;
-        ui.painter().line_segment(
-            [
-                close.center() + egui::vec2(-d, -d),
-                close.center() + egui::vec2(d, d),
-            ],
-            egui::Stroke::new(1.5, close_color),
-        );
-        ui.painter().line_segment(
-            [
-                close.center() + egui::vec2(-d, d),
-                close.center() + egui::vec2(d, -d),
-            ],
-            egui::Stroke::new(1.5, close_color),
-        );
+        paint_close_glyph(ui.painter(), close.center(), close_color);
         let close_clicked = close_response
             .on_hover_text(catalog.t("workspace.close_pane", &[]))
             .clicked();
@@ -3734,7 +4115,88 @@ impl WorkspaceUi {
                 }
             }
         }
+
+        // 보조 탭은 헤더·닫기·도구를 모두 등록한 **뒤**에 올린다. egui는 겹칠 때 나중에
+        // 등록된 위젯이 클릭을 가져가므로, 이 순서가 곧 "보조 탭 > 세션 헤더" 우선순위다.
+        if let (Some(geometry), Some((label, _, _))) = (aux, aux_label.as_ref())
+            && let Some(intent) = self.render_aux_tab(
+                ui,
+                header,
+                geometry,
+                label,
+                aux_active,
+                egui::Id::new(("terminal_pane_aux", &pane.id)),
+                catalog,
+                &font,
+            )
+        {
+            output.aux_tab_intent = Some(intent);
+        }
         output
+    }
+
+    /// 보조 탭 한 벌 — 라벨(=활성화)과 닫기(=탭 제거)를 각각 독립 히트박스로 올린다.
+    /// 닫기는 탭 뒤에 등록돼 겹칠 때 우선한다. 세션 헤더와 세션 없는 스트립이 이 하나를
+    /// 공유하므로 두 화면의 동작이 갈라지지 않는다.
+    #[allow(clippy::too_many_arguments)]
+    fn render_aux_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        header: egui::Rect,
+        geometry: PaneAuxTabGeometry,
+        label: &str,
+        active: bool,
+        id: egui::Id,
+        catalog: &i18n::Catalog,
+        font: &egui::FontId,
+    ) -> Option<PaneAuxTabIntent> {
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        let mut intent = None;
+        let tab_response = ui.interact(geometry.tab, id.with("tab"), egui::Sense::click());
+        let label_color = if active {
+            tokens.text
+        } else {
+            tokens.muted_text
+        };
+        let label_clip = egui::Rect::from_min_max(
+            egui::pos2(geometry.label_left, header.top()),
+            egui::pos2(
+                (geometry.label_left + geometry.label_width).min(header.right()),
+                header.bottom(),
+            ),
+        );
+        paint_tab_label(
+            ui.painter(),
+            label_clip,
+            header.center().y,
+            font.clone(),
+            label_color,
+            label.to_owned(),
+        );
+        if tab_response
+            .on_hover_text(catalog.t("workspace.tab.history_hint", &[]))
+            .clicked()
+        {
+            intent = Some(PaneAuxTabIntent::Activate);
+        }
+
+        if let Some(aux_close) = geometry.close {
+            let close_response = ui.interact(aux_close, id.with("close"), egui::Sense::click());
+            // 세션 X와 달리 error 톤을 쓰지 않는다 — UI 탭만 닫을 뿐 세션은 그대로다.
+            let close_color = if close_response.hovered() || close_response.has_focus() {
+                tokens.text
+            } else {
+                tokens.muted_text
+            };
+            paint_close_glyph(ui.painter(), aux_close.center(), close_color);
+            if close_response
+                .on_hover_text(catalog.t("workspace.tab.history_close", &[]))
+                .clicked()
+            {
+                intent = Some(PaneAuxTabIntent::Close);
+            }
+        }
+        intent
     }
 
     fn activate_terminal_toolbar(
@@ -4009,6 +4471,17 @@ impl WorkspaceUi {
                 input_enabled,
             );
             render_output.merge(header_output);
+            // 보조 탭이 활성이면 이 pane의 본문은 App이 그린다. 터미널 표면·입력·drop·
+            // 컨텍스트 메뉴를 전부 건너뛰어(fail-closed) 숨은 PTY로 입력이 새지 않게 한다.
+            if self
+                .aux_tab_pane
+                .as_ref()
+                .is_some_and(|owner| owner == pane_id)
+                && self.aux_tab.as_ref().is_some_and(|tab| tab.active)
+            {
+                render_output.aux_body_rect = Some(pane_layout.surface);
+                return render_output;
+            }
         }
         // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
         // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
@@ -6703,7 +7176,7 @@ mod tests {
             egui::vec2(58.9, TERMINAL_PANE_HEADER_HEIGHT),
         );
         for title_width in [0.0_f32, 13.0, 26.0, 70.0, 130.0] {
-            let buttons = pane_header_buttons(narrow, title_width, 4);
+            let buttons = pane_header_buttons(narrow, title_width, 4, 0.0);
             assert!(
                 buttons.toolbar.is_empty(),
                 "59px pane은 도구 0개가 정상 (title_width {title_width})"
@@ -6721,7 +7194,7 @@ mod tests {
                 egui::vec2(width, TERMINAL_PANE_HEADER_HEIGHT),
             );
             for title_width in [0.0_f32, 13.0, 40.0, 90.0, 200.0] {
-                let buttons = pane_header_buttons(header, title_width, 4);
+                let buttons = pane_header_buttons(header, title_width, 4, 0.0);
                 for rect in &buttons.toolbar {
                     assert!(
                         !rect.intersects(buttons.close),
@@ -6775,6 +7248,419 @@ mod tests {
 
     fn pane_id(name: &str) -> MuxPaneId {
         MuxPaneId(name.to_owned())
+    }
+
+    /// A1 회귀 — 세션이 하나도 없는 워크스페이스에서도 이력 본문 rect가 나와야 한다.
+    /// 예전에는 mux가 없으면 「새 셸」 프롬프트만 그리고 기본 output으로 조기 반환해
+    /// 레일만 켜진 채 화면이 아무 반응도 하지 않았다.
+    #[test]
+    fn 세션없는_워크스페이스에서도_활성_이력탭은_본문rect를_준다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.set_aux_tab(Some(PaneAuxTab {
+            label: "History".to_owned(),
+            active: true,
+        }));
+        assert!(ws.mux.is_none(), "세션이 없는 상태를 전제로 한다");
+
+        let context = egui::Context::default();
+        let mut output = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
+        });
+
+        let output = output.expect("렌더가 돌아야 한다");
+        let body = output
+            .aux_body_rect
+            .expect("세션이 없어도 이력 본문 rect가 있어야 한다");
+        assert!(body.height() > 0.0, "본문 높이가 0이면 안 된다");
+        assert!(
+            body.top() >= TERMINAL_PANE_HEADER_HEIGHT.min(body.bottom()),
+            "본문은 탭 스트립 아래에서 시작해야 한다"
+        );
+    }
+
+    /// 세션이 없고 이력 탭이 **비활성**이면 예전처럼 「새 셸」 진입점이 본문을 쓴다.
+    #[test]
+    fn 세션없는_워크스페이스의_비활성_이력탭은_본문rect를_주지_않는다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.set_aux_tab(Some(PaneAuxTab {
+            label: "History".to_owned(),
+            active: false,
+        }));
+
+        let context = egui::Context::default();
+        let mut output = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
+        });
+
+        assert_eq!(output.expect("렌더가 돌아야 한다").aux_body_rect, None);
+    }
+
+    /// A1 두 번째 경로 — runtime이 아직 아무 pane도 포커스하지 않은 프레임에서도
+    /// 보조 탭 주인이 정해져야 한다(없으면 탭도 본문도 사라진다).
+    #[test]
+    fn 포커스된_pane이_없어도_보조탭_주인은_첫_pane이다() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane(pane_id("left"))),
+            second: Box::new(LayoutNode::Pane(pane_id("right"))),
+        };
+
+        assert_eq!(
+            aux_tab_owner_pane(&layout, None),
+            Some(pane_id("left")),
+            "포커스가 없으면 layout의 첫 pane이 받는다"
+        );
+        assert_eq!(
+            aux_tab_owner_pane(&layout, Some(&pane_id("right"))),
+            Some(pane_id("right")),
+            "포커스된 pane이 layout 안에 있으면 그것이 받는다"
+        );
+        assert_eq!(
+            aux_tab_owner_pane(&layout, Some(&pane_id("other-tab"))),
+            Some(pane_id("left")),
+            "다른 탭의 focused pane은 이 layout의 주인이 될 수 없다"
+        );
+    }
+
+    /// 넓은 헤더: 세션 탭 → 보조 탭 → 도구 순으로 겹침 없이 놓인다.
+    #[test]
+    fn 보조탭은_세션탭_오른쪽에_겹치지_않고_도구_앞에서_끝난다() {
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let label_width = pane_aux_tab_label_width(header.width(), 26.0);
+        let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
+        let buttons = pane_header_buttons(header, 180.0, 4, aux_reserved);
+        let aux = pane_aux_tab_geometry(header, buttons.close, buttons.toolbar_left, label_width)
+            .expect("520pt 헤더에는 보조 탭이 들어간다");
+        let aux_close = aux.close.expect("넓은 헤더에서는 이력 X도 보인다");
+
+        assert!(
+            aux.label_width >= PANE_AUX_TAB_MIN_LABEL,
+            "라벨이 0폭이면 안 된다"
+        );
+        assert!(
+            aux.tab.left() >= buttons.close.right(),
+            "보조 탭은 세션 닫기 오른쪽이다"
+        );
+        assert!(
+            !aux_close.intersects(buttons.close),
+            "두 닫기가 겹치면 안 된다"
+        );
+        assert!(
+            aux.tab.right() <= buttons.toolbar_left,
+            "보조 탭이 도구를 덮으면 안 된다"
+        );
+        for rect in &buttons.toolbar {
+            assert!(
+                !aux.tab.intersects(*rect),
+                "보조 탭과 도구가 겹치면 안 된다"
+            );
+        }
+    }
+
+    /// 폭을 1pt씩 훑어도 보조 탭의 어떤 rect도 헤더/도구 경계를 넘지 않고, 라벨은
+    /// 0폭이 되지 않는다. 가장 좁은 구간에서는 탭 자체를 접는다.
+    #[test]
+    fn 좁은_헤더에서_보조탭은_경계를_넘지_않고_결국_접힌다() {
+        let mut saw_tab_dropped = false;
+        let mut width = 40.0_f32;
+        while width <= 600.0 {
+            let header = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, TERMINAL_PANE_HEADER_HEIGHT),
+            );
+            let label_width = pane_aux_tab_label_width(header.width(), 26.0);
+            let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
+            let buttons = pane_header_buttons(header, 120.0, 4, aux_reserved);
+            match pane_aux_tab_geometry(header, buttons.close, buttons.toolbar_left, label_width) {
+                None => saw_tab_dropped = true,
+                Some(aux) => {
+                    assert!(
+                        aux.label_width >= PANE_AUX_TAB_MIN_LABEL,
+                        "{width}: 라벨 0폭"
+                    );
+                    assert!(
+                        aux.tab.right() <= buttons.toolbar_left.min(header.right()) + 0.001,
+                        "{width}: 보조 탭이 도구/헤더 경계를 넘었다"
+                    );
+                    assert!(
+                        aux.tab.left() >= buttons.close.right(),
+                        "{width}: 세션 닫기와 겹침"
+                    );
+                    if let Some(close) = aux.close {
+                        assert!(close.right() <= header.right() + 0.001, "{width}: X 초과");
+                        assert!(!close.intersects(buttons.close), "{width}: 두 X가 겹침");
+                    }
+                }
+            }
+            width += 1.0;
+        }
+        assert!(
+            saw_tab_dropped,
+            "가장 좁은 폭에서는 보조 탭 자체를 접어야 한다"
+        );
+    }
+
+    /// 라벨은 들어가지만 X까지는 안 들어가는 폭에서는 **X만** 버리고 탭 전환은 남긴다.
+    #[test]
+    fn 라벨만_들어가는_폭에서는_이력_닫기만_접는다() {
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(400.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let session_close = egui::Rect::from_center_size(
+            egui::pos2(60.0, header.center().y),
+            egui::vec2(20.0, 20.0),
+        );
+        // 라벨 끝(=76+10+20=106) 뒤로 6pt만 남기면 X(중심 +14, 반폭 10, 여백 6)가 못 들어간다.
+        let toolbar_left = 112.0;
+        let aux = pane_aux_tab_geometry(header, session_close, toolbar_left, 20.0)
+            .expect("라벨은 들어가야 한다");
+
+        assert_eq!(aux.close, None, "자리가 없으면 X만 접는다");
+        assert!(aux.label_width >= PANE_AUX_TAB_MIN_LABEL);
+        assert!(aux.tab.right() <= toolbar_left + 0.001);
+    }
+
+    /// 이력 X는 **UI 탭만** 닫는다 — 세션 닫기 확인이나 ClosePane이 나가면 설계 실패다.
+    #[test]
+    fn kittest_이력탭_닫기는_세션을_닫지_않고_닫기의도만_올린다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tab(Some(PaneAuxTab {
+            label: "History".to_owned(),
+            active: true,
+        }));
+        // render_pane_header를 직접 부르는 테스트라, show_with_input이 매 프레임 정하는
+        // 보조 탭 주인을 여기서 세운다.
+        ws.aux_tab_pane = Some(pane_id("p"));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let mut intents = Vec::new();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, Vec<Option<PaneAuxTabIntent>>)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
+                state.1.push(output.aux_tab_intent);
+            },
+            (ws, std::mem::take(&mut intents)),
+        );
+        harness.run();
+        let aux_close = aux_close_center(&harness.state().0, header, &snapshot);
+        harness.state_mut().1.clear();
+
+        harness.hover_at(aux_close);
+        harness.run();
+        harness.drag_at(aux_close);
+        harness.run();
+        harness.drop_at(aux_close);
+        harness.run();
+
+        assert!(
+            harness.state().1.contains(&Some(PaneAuxTabIntent::Close)),
+            "이력 X는 Close 의도를 올려야 한다"
+        );
+        assert_eq!(
+            harness.state().0.confirm_close,
+            None,
+            "이력 X가 세션 닫기 확인을 띄우면 안 된다"
+        );
+        assert!(
+            !drain_protocol(&mut harness.state_mut().0)
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    RuntimeCommand::ClosePane { .. } | RuntimeCommand::KillSession { .. }
+                )),
+            "이력 X가 세션/pane 종료 명령을 보내면 안 된다"
+        );
+    }
+
+    /// 이력이 활성인 동안 세션 탭 영역을 누르면 터미널로 돌아가는 의도가 올라간다.
+    #[test]
+    fn kittest_이력활성중_세션탭_클릭은_터미널복귀_의도다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tab(Some(PaneAuxTab {
+            label: "History".to_owned(),
+            active: true,
+        }));
+        // render_pane_header를 직접 부르는 테스트라, show_with_input이 매 프레임 정하는
+        // 보조 탭 주인을 여기서 세운다.
+        ws.aux_tab_pane = Some(pane_id("p"));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, Vec<Option<PaneAuxTabIntent>>)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
+                state.1.push(output.aux_tab_intent);
+            },
+            (ws, Vec::new()),
+        );
+        harness.run();
+        harness.state_mut().1.clear();
+        // 제목 글자 위 — 세션 탭 영역이고 닫기/도구/보조 탭 어디에도 속하지 않는다.
+        let title = egui::pos2(14.0, TERMINAL_PANE_HEADER_HEIGHT * 0.5);
+
+        harness.hover_at(title);
+        harness.run();
+        harness.drag_at(title);
+        harness.run();
+        harness.drop_at(title);
+        harness.run();
+
+        assert!(
+            harness
+                .state()
+                .1
+                .contains(&Some(PaneAuxTabIntent::ShowSession)),
+            "세션 탭 클릭은 ShowSession 의도를 올려야 한다"
+        );
+    }
+
+    /// 이력 탭이 비활성일 때 라벨을 누르면 활성화 의도가 올라간다.
+    #[test]
+    fn kittest_비활성_이력탭_클릭은_활성화_의도다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tab(Some(PaneAuxTab {
+            label: "History".to_owned(),
+            active: false,
+        }));
+        ws.aux_tab_pane = Some(pane_id("p"));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, Vec<Option<PaneAuxTabIntent>>)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
+                state.1.push(output.aux_tab_intent);
+            },
+            (ws, Vec::new()),
+        );
+        harness.run();
+        let label = aux_label_center(&harness.state().0, header, &snapshot);
+        harness.state_mut().1.clear();
+
+        harness.hover_at(label);
+        harness.run();
+        harness.drag_at(label);
+        harness.run();
+        harness.drop_at(label);
+        harness.run();
+
+        assert!(
+            harness
+                .state()
+                .1
+                .contains(&Some(PaneAuxTabIntent::Activate)),
+            "비활성 이력 탭 클릭은 Activate 의도를 올려야 한다"
+        );
+    }
+
+    /// 헤더가 실제로 쓴 것과 같은 기하를 다시 계산해 클릭 좌표를 만든다.
+    fn aux_tab_geometry_for_test(
+        ws: &WorkspaceUi,
+        header: egui::Rect,
+        snapshot: &runtime::PaneSnapshot,
+    ) -> PaneAuxTabGeometry {
+        let context = egui::Context::default();
+        let mut geometry = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let label = &ws.aux_tab.as_ref().expect("aux tab set").label;
+            let font = egui::FontId::proportional(13.0);
+            let natural = ui
+                .painter()
+                .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x;
+            let label_width = pane_aux_tab_label_width(header.width(), natural);
+            let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
+            let title_width = ui
+                .painter()
+                .layout_no_wrap(snapshot.title.clone(), font, egui::Color32::WHITE)
+                .size()
+                .x;
+            let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
+            geometry =
+                pane_aux_tab_geometry(header, buttons.close, buttons.toolbar_left, label_width);
+        });
+        geometry.expect("테스트 헤더에는 보조 탭이 들어간다")
+    }
+
+    fn aux_close_center(
+        ws: &WorkspaceUi,
+        header: egui::Rect,
+        snapshot: &runtime::PaneSnapshot,
+    ) -> egui::Pos2 {
+        aux_tab_geometry_for_test(ws, header, snapshot)
+            .close
+            .expect("넓은 헤더에는 이력 X가 있다")
+            .center()
+    }
+
+    fn aux_label_center(
+        ws: &WorkspaceUi,
+        header: egui::Rect,
+        snapshot: &runtime::PaneSnapshot,
+    ) -> egui::Pos2 {
+        let geometry = aux_tab_geometry_for_test(ws, header, snapshot);
+        egui::pos2(
+            geometry.label_left + geometry.label_width * 0.5,
+            header.center().y,
+        )
     }
 
     #[test]
@@ -8467,7 +9353,7 @@ mod tests {
         let config = TerminalConfig::default();
         let mut harness = egui_kittest::Harness::new_ui_state(
             move |ui, workspace: &mut WorkspaceUi| {
-                workspace.show(ui, &config, &[], &catalog);
+                workspace.show_with_input(ui, &config, &[], &catalog, true);
             },
             WorkspaceUi::new(),
         );

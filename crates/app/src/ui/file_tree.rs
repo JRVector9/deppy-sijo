@@ -268,6 +268,9 @@ pub struct SidebarSnapshot<'a> {
     /// 2026-08-08까지 작업함·플릿 배지가 둘 다 global_waiting을 세어 같은 사실로 두 개가
     /// 함께 올랐다(사용자 지적). 이제 의미가 하나다.
     pub fleet_count: usize,
+    /// 현재 세션 pane 헤더 옆의 이력 보조 탭이 **활성**인지 — 레일 「이력」 선택 표시.
+    /// 탭이 열려 있어도 비활성(터미널을 보는 중)이면 false다.
+    pub history_tab_active: bool,
     /// Agents 창 열림 여부 — 하단 nav 「에이전트」 행의 선택 상태 (2026-07-18).
     pub agents_open: bool,
     /// 활성 워크스페이스에 저장된 메모 본문. 미작성이면 `None`.
@@ -285,7 +288,8 @@ pub enum SidebarAction {
     ShowHome,
     /// 멀티에이전트 fleet 그리드로 전환(하단 nav). 재클릭 토글은 App이 현재 view로 결정.
     ShowFleet,
-    /// 현재 워크스페이스의 에이전트 작업 이력 중앙 화면으로 전환.
+    /// 현재 워크스페이스의 이력 보조 탭을 연다/활성화한다. 재클릭 토글 규칙은 App이
+    /// 결정한다(탭 상태 소유자).
     ShowHistory,
     OpenAgents,
     OpenSettings,
@@ -3366,7 +3370,9 @@ impl FileTreeUi {
             ui,
             NavIcon::History,
             &catalog.t("sidebar.nav.history", &[]),
-            sidebar.view == super::agent_terminal::AgentTerminalView::History,
+            // 레일 강조는 이력 탭이 **활성**일 때만이다. 탭이 열려 있어도 세션 터미널을
+            // 보고 있으면 레일은 꺼진 상태로 둔다(중앙에 보이는 것과 일치).
+            sidebar.history_tab_active,
             None,
         )
         .clicked()
@@ -7786,6 +7792,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -7961,6 +7968,7 @@ mod tests {
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
             home_notice_count: 0,
             fleet_count: 0,
+            history_tab_active: false,
             agents_open: false,
             workspace_note: None,
         };
@@ -8382,6 +8390,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8543,6 +8552,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8662,6 +8672,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8731,6 +8742,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8850,6 +8862,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9119,6 +9132,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9520,6 +9534,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9608,6 +9623,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9650,6 +9666,7 @@ mod tests {
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
             home_notice_count: 0,
             fleet_count: 0,
+            history_tab_active: false,
             agents_open: false,
             workspace_note: None,
         };
@@ -9745,6 +9762,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 4,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9907,6 +9925,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -10342,6 +10361,7 @@ mod tests {
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         home_notice_count: 0,
                         fleet_count: 0,
+                        history_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };

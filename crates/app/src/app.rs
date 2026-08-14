@@ -8007,7 +8007,12 @@ pub struct App {
     /// PR-21 hidden load harness. Retains only the next bounded fixture index; each concrete
     /// command goes through the same exact dotenv continuation as production launches.
     perf_harness_next: Option<usize>,
-    i18n: i18n::Catalog,
+    /// Arc인 이유: ui()는 매 프레임 무조건 도는데, 본문 ~81곳에서 self.i18n을 읽으려면
+    /// self.i18n을 그대로 들고 있을 수 없어 매 프레임 clone해야 한다(&mut self를 쓰는
+    /// 렌더 헬퍼들과의 borrow 충돌 회피). 값 타입이면 로케일당 ~1,000개 항목짜리
+    /// BTreeMap 2개를 매 프레임 딥카피하게 되므로, clone 비용을 참조 카운트 증가로
+    /// 낮춘다(agent_sessions.rs의 3ecfe62와 동일 패턴, 2026-08-15).
+    i18n: Arc<i18n::Catalog>,
     /// 현재 활성(렌더되는) workspace의 런타임 상태.
     active: WorkspaceRuntime,
     /// Next concrete runtime identity; zero is never issued.
@@ -11446,7 +11451,7 @@ impl App {
             frame_stats: crate::perf::FrameStats::new(),
             bench,
             perf_harness_next: crate::perf::harness_enabled().then_some(0),
-            i18n,
+            i18n: Arc::new(i18n),
             egui_ctx,
             db_path,
             logs_base,
@@ -14539,7 +14544,8 @@ impl App {
     fn apply_settings_config(&mut self, ctx: &egui::Context) {
         self.config.i18n.locale = i18n::normalize_locale(&self.config.i18n.locale);
         if self.i18n.locale() != self.config.i18n.locale {
-            self.i18n = load_catalog(&self.config.i18n.locale);
+            // 로케일 변경은 드문 이벤트라 여기서의 재로드/재래핑 1회는 허용한다.
+            self.i18n = Arc::new(load_catalog(&self.config.i18n.locale));
             self.agent_sessions_ui.set_catalog(&self.i18n);
             self.connector_ui.set_catalog(&self.i18n);
             // 홈 공지는 로케일별 캐시 키라 언어 변경 시 새 언어로 재번역돼야 한다.
@@ -23027,6 +23033,11 @@ impl eframe::App for App {
         if let Some(bench) = self.bench.as_mut() {
             bench.frame_begin(ui.ctx());
         }
+        // self.i18n은 Arc<i18n::Catalog>라 여기서의 clone은 참조 카운트 증가일 뿐이다
+        // (로케일당 ~1,000개 항목짜리 BTreeMap 2개를 매 프레임 딥카피하던 문제를 필드
+        // 타입에서 없앴다, 2026-08-15). 본문 ~81곳이 &mut self를 쓰는 렌더 헬퍼들과
+        // 뒤섞여 text를 읽기 때문에 self.i18n을 직접 들고 있으면 borrow 충돌이 난다 —
+        // 그래서 여전히 clone한 값을 쓴다.
         let text = self.i18n.clone();
         let mut unread_before = 0;
         // 벨 팝오버의 최근 알림 클릭 — 설정→알림(notif_click)과 같은 네비게이션 경로로

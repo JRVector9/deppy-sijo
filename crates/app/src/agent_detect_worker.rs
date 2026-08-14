@@ -496,8 +496,12 @@ impl DetectionBackend for ProductionBackend {
         sessions: &[(SessionId, u32)],
         overrides: &HashMap<SessionId, AgentBinding>,
     ) -> BindingPass {
-        let detected =
-            agent_detect::detect_cached(sessions, overrides, &mut self.cache, &mut self.process_rows);
+        let detected = agent_detect::detect_cached(
+            sessions,
+            overrides,
+            &mut self.cache,
+            &mut self.process_rows,
+        );
         let agent_detect::DetectedAgents {
             bindings,
             kinds: agent_kinds,
@@ -520,7 +524,7 @@ impl DetectionBackend for ProductionBackend {
     }
 
     fn kinds_pass(&mut self, sessions: &[(SessionId, u32)]) -> HashMap<SessionId, RunningAgent> {
-        agent_detect::detect_kinds(sessions, &mut self.process_rows)
+        agent_detect::detect_kinds(sessions, &self.cache, &mut self.process_rows)
     }
 
     fn activity_pass(

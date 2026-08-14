@@ -108,11 +108,80 @@ pub struct RunningAgent {
 /// 각 세션(셸 pid)에서 실행 중인 에이전트를 감지해 transcript로 바인딩한다 — ps를 한 번
 /// 에이전트 프로세스(owner_pid)가 여전히 ps 결과에 살아있으면 캐시를 재사용하고, 사라졌으면
 /// 다시 탐색한다. 정상 케이스(에이전트 생존)에서 세션당 O(1) pid 확인만 남는다.
+///
+/// fast path(아래 `cache_entry_is_fresh`/`safety_net_elapsed`)는 이 pid 확인조차 `ps` 없이
+/// `pid_start_time`(커널 syscall, exec 없음) 한 번으로 대체한다(2026-08-14, 이 worktree).
 #[derive(Default)]
 pub struct BindingCache {
-    /// (바인딩, 에이전트 owner pid, 결정적 여부). 휴리스틱 바인딩은 매 tick lsof로
-    /// 업그레이드를 시도한다 — codex가 작업 중 rollout을 열면 정확한 것으로 교체.
-    entries: HashMap<SessionId, (AgentBinding, u32, bool)>,
+    entries: HashMap<SessionId, CacheEntry>,
+    /// 마지막으로 `process_rows()` 기반 전체 탐색을 돈 시각. fast path 안전망 판정에만
+    /// 쓰인다 — `detect_cached`만 갱신하고(캐시 유일한 필자), `detect_kinds`는 읽기만 한다.
+    last_full_scan: Option<Instant>,
+}
+
+/// 세션에 캐시된 바인딩과, fast path가 재확인 없이 재사용해도 되는지 판정하는 데 필요한
+/// 정보. `model`/`effort`는 실행 순간 argv 값이라(agent_detect.rs 상단 문서 참고) 같은
+/// (pid, start_time) 프로세스가 살아있는 한 다시 읽을 필요가 없어 함께 캐시한다.
+#[derive(Clone)]
+struct CacheEntry {
+    binding: AgentBinding,
+    /// 에이전트 owner pid.
+    owner_pid: u32,
+    /// owner_pid의 시작 시각. `pid_start_time`이 None을 준 적이 있으면(비-macOS, 권한
+    /// 부족 등) None으로 남아 `cache_entry_is_fresh`가 항상 false를 돌려준다 — fast path
+    /// 없이 기존 경로로만 동작(감지가 죽는 것보다 exec가 낫다).
+    owner_start_time: Option<u64>,
+    /// 휴리스틱(cwd 매칭) 바인딩은 fast path 대상이 아니다 — 매 tick 결정적 업그레이드를
+    /// 계속 시도해야 한다.
+    deterministic: bool,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// fast path 안전망 주기: 조건을 계속 만족해도 최소 이 주기마다 `process_rows()` 기반
+/// 전체 탐색을 강제한다. pid 생존+시작시각 일치 확인은 "이미 아는 에이전트가 그대로
+/// 있는가"만 답하고, "그 옆에 새 에이전트가 추가로 떴는가"는 원리적으로 답하지 못하기
+/// 때문이다(2026-08-14, deppy-liveness worktree).
+const FASTPATH_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 캐시 항목이 재확인 없이 재사용 가능한 상태인지: 결정적 바인딩이고, owner pid가 여전히
+/// 같은 시작 시각으로 살아있어야 한다. pid 재사용(같은 pid, 다른 start_time)과 프로세스
+/// 종료를 모두 이 한 번의 syscall 비교로 잡아낸다.
+fn cache_entry_is_fresh(entry: &CacheEntry) -> bool {
+    entry.deterministic
+        && entry
+            .owner_start_time
+            .is_some_and(|start| crate::proc_info::pid_start_time(entry.owner_pid) == Some(start))
+}
+
+/// 안전망 주기가 지나 전체 탐색을 강제해야 하는지. 캐시가 한 번도 전체 탐색을 못 돌았으면
+/// (None) 안전 쪽으로 "지남"으로 취급한다.
+fn safety_net_elapsed(cache: &BindingCache) -> bool {
+    cache
+        .last_full_scan
+        .is_none_or(|at| at.elapsed() >= FASTPATH_FULL_SCAN_INTERVAL)
+}
+
+/// 캐시에 남은 정보만으로 종류 tier 결과를 재구성한다(`process_rows` 불필요).
+fn kinds_from_cache(
+    sessions: &[(SessionId, u32)],
+    cache: &BindingCache,
+) -> HashMap<SessionId, RunningAgent> {
+    sessions
+        .iter()
+        .filter_map(|(sid, _)| {
+            cache.entries.get(sid).map(|entry| {
+                (
+                    *sid,
+                    RunningAgent {
+                        kind: entry.binding.kind,
+                        model: entry.model.clone(),
+                        effort: entry.effort.clone(),
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -232,10 +301,22 @@ fn argv_flag_value(command: &str, flag: &str) -> Option<String> {
 /// 필요한 그 경우를 위해 싼 패스를 따로 연다.
 pub fn detect_kinds(
     sessions: &[(SessionId, u32)],
+    cache: &BindingCache,
     process_cache: &mut ProcessRowsCache,
 ) -> HashMap<SessionId, RunningAgent> {
     if sessions.len() > MAX_SESSIONS {
         return HashMap::new();
+    }
+    // fast path: 요청된 모든 세션에 결정적이고 살아있는 캐시 항목이 있고 안전망 주기도
+    // 안 지났으면, `ps` 없이 캐시된 kind/model/effort를 그대로 돌려준다. `cache`는
+    // `detect_cached`가 쓴 것을 읽기만 한다 — 이 tier는 바인딩 캐시의 필자가 아니다
+    // (2026-08-14).
+    if !safety_net_elapsed(cache)
+        && sessions
+            .iter()
+            .all(|(sid, _)| cache.entries.get(sid).is_some_and(cache_entry_is_fresh))
+    {
+        return kinds_from_cache(sessions, cache);
     }
     agent_kinds_from_rows(sessions, process_cache.get(process_rows))
 }
@@ -248,13 +329,39 @@ pub fn detect_cached(
 ) -> DetectedAgents {
     if sessions.len() > MAX_SESSIONS {
         cache.entries.clear();
+        cache.last_full_scan = None;
         return DetectedAgents::default();
     }
+    // fast path: 요청된 모든 세션에 결정적이고 살아있는(pid+시작시각 일치) 캐시 항목이
+    // 있고, 오버라이드도 캐시와 같고(하나라도 다르면 hook이 새 바인딩을 보고한 것이라
+    // 재확인이 필요), 안전망 주기도 안 지났으면 `process_rows()`(= `ps` exec)를 아예
+    // 부르지 않는다. 하나라도 어긋나면 전체를 기존 탐색 경로로 폴백한다 — "표시가 덜
+    // 구체적인 값으로 퇴행하면 안 된다"는 계약을 fast path에서도 지키기 위함
+    // (2026-08-14, deppy-liveness worktree).
+    if !safety_net_elapsed(cache)
+        && sessions.iter().all(|(sid, _)| {
+            cache.entries.get(sid).is_some_and(|entry| {
+                cache_entry_is_fresh(entry)
+                    && overrides.get(sid).is_none_or(|b| *b == entry.binding)
+            })
+        })
+    {
+        let bindings = sessions
+            .iter()
+            .map(|(sid, _)| (*sid, cache.entries[sid].binding.clone()))
+            .collect();
+        let kinds = kinds_from_cache(sessions, cache);
+        return DetectedAgents { bindings, kinds };
+    }
+    // 여기 도달하면 이번 tick은 전체 탐색이다 — 안전망 시각을 갱신한다.
+    cache.last_full_scan = Some(Instant::now());
     let rows = process_cache.get(process_rows);
     let mut budget = DetectionBudget::default();
     let mut out = HashMap::new();
     // transcript와 무관하게 "이 세션에서 무슨 에이전트가 돌고 있나"만 따로 모은다.
-    // 같은 ps 결과를 재사용하므로 추가 비용이 없다.
+    // 같은 ps 결과를 재사용하므로 추가 비용이 없다. fast path 재사용을 위해 model/effort를
+    // 캐시 항목에도 함께 싣는다(같은 kind일 때만 — 세션에 에이전트가 둘 이상이면
+    // agent_kinds_from_rows가 고른 첫 후보가 find_agent의 "최적" 후보와 다를 수 있다).
     let kinds = agent_kinds_from_rows(sessions, rows);
     for (sid, shell_pid) in sessions {
         // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적이다. 단 같은 pane에서
@@ -265,7 +372,18 @@ pub fn detect_cached(
             && valid_binding(b)
             && let Some(owner) = find_agent_pid(*shell_pid, rows, b.kind)
         {
-            cache.entries.insert(*sid, (b.clone(), owner, true));
+            let running = kinds.get(sid).filter(|r| r.kind == b.kind);
+            cache.entries.insert(
+                *sid,
+                CacheEntry {
+                    binding: b.clone(),
+                    owner_pid: owner,
+                    owner_start_time: crate::proc_info::pid_start_time(owner),
+                    deterministic: true,
+                    model: running.and_then(|r| r.model.clone()),
+                    effort: running.and_then(|r| r.effort.clone()),
+                },
+            );
             out.insert(*sid, b.clone());
             continue;
         }
@@ -273,39 +391,69 @@ pub fn detect_cached(
         // Codex 바인딩에 새 Claude pid가 들어간 캐시가 계속 재사용될 수 있다. 단 휴리스틱
         // 바인딩은 lsof로 결정적 업그레이드를 시도한다(작업 중 rollout이 열리면 정확한
         // 파일로 교체).
-        if let Some((binding, owner_pid, det)) = cache.entries.get(sid)
-            && agent_pid_matches_kind(*owner_pid, binding.kind, rows)
+        if let Some(entry) = cache.entries.get(sid)
+            && agent_pid_matches_kind(entry.owner_pid, entry.binding.kind, rows)
         {
-            let (owner_pid, det) = (*owner_pid, *det);
+            let owner_pid = entry.owner_pid;
+            let det = entry.deterministic;
+            let binding = entry.binding.clone();
+            if !det
+                && binding.kind == AgentKind::Codex
+                && let Some(t) = codex_open_rollout(owner_pid, &mut budget)
+                && let Some(id) = t
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(agent_transcript::codex_session_id)
             {
-                if !det
-                    && binding.kind == AgentKind::Codex
-                    && let Some(t) = codex_open_rollout(owner_pid, &mut budget)
-                    && let Some(id) = t
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .and_then(agent_transcript::codex_session_id)
-                {
-                    let upgraded = AgentBinding {
-                        kind: AgentKind::Codex,
-                        session_id: id,
-                        transcript: t,
-                    };
-                    cache
-                        .entries
-                        .insert(*sid, (upgraded.clone(), owner_pid, true));
-                    out.insert(*sid, upgraded);
-                } else {
-                    out.insert(*sid, cache.entries[sid].0.clone());
-                }
+                let upgraded = AgentBinding {
+                    kind: AgentKind::Codex,
+                    session_id: id,
+                    transcript: t,
+                };
+                let running = kinds.get(sid).filter(|r| r.kind == AgentKind::Codex);
+                cache.entries.insert(
+                    *sid,
+                    CacheEntry {
+                        binding: upgraded.clone(),
+                        owner_pid,
+                        owner_start_time: crate::proc_info::pid_start_time(owner_pid),
+                        deterministic: true,
+                        model: running.and_then(|r| r.model.clone()),
+                        effort: running.and_then(|r| r.effort.clone()),
+                    },
+                );
+                out.insert(*sid, upgraded);
+            } else {
+                let running = kinds.get(sid).filter(|r| r.kind == binding.kind);
+                cache.entries.insert(
+                    *sid,
+                    CacheEntry {
+                        binding: binding.clone(),
+                        owner_pid,
+                        owner_start_time: crate::proc_info::pid_start_time(owner_pid),
+                        deterministic: det,
+                        model: running.and_then(|r| r.model.clone()),
+                        effort: running.and_then(|r| r.effort.clone()),
+                    },
+                );
+                out.insert(*sid, binding);
             }
             continue;
         }
         // 미스/종료 → 전체 탐색 후 캐시 갱신.
         if let Some((binding, owner_pid, det)) = find_agent(*shell_pid, rows, &mut budget) {
-            cache
-                .entries
-                .insert(*sid, (binding.clone(), owner_pid, det));
+            let running = kinds.get(sid).filter(|r| r.kind == binding.kind);
+            cache.entries.insert(
+                *sid,
+                CacheEntry {
+                    binding: binding.clone(),
+                    owner_pid,
+                    owner_start_time: crate::proc_info::pid_start_time(owner_pid),
+                    deterministic: det,
+                    model: running.and_then(|r| r.model.clone()),
+                    effort: running.and_then(|r| r.effort.clone()),
+                },
+            );
             out.insert(*sid, binding);
         } else {
             cache.entries.remove(sid);
@@ -1715,6 +1863,297 @@ mod tests {
             calls.load(Ordering::Relaxed),
             2,
             "TTL이 지나면 다시 fetch해서 stale한 스냅샷을 쓰지 않아야 한다"
+        );
+    }
+
+    /// fast path 테스트용 process rows 캐시. `fetched_at: None`으로 항상 stale 상태로
+    /// 만들어, `.get()`이 호출되기만 하면 반드시 `fetch`(=`process_rows`)가 돌아 sentinel
+    /// 커맨드가 사라진다 — TTL이 우연히 흡수해 "호출 안 됨"으로 오판하는 걸 막는다.
+    fn sentinel_process_cache() -> ProcessRowsCache {
+        ProcessRowsCache {
+            rows: vec![ProcRow {
+                pid: 999_999,
+                ppid: None,
+                command: "sentinel-do-not-refetch".to_owned(),
+            }],
+            fetched_at: None,
+            ttl: PROCESS_ROWS_TTL,
+        }
+    }
+
+    fn process_rows_untouched(cache: &ProcessRowsCache) -> bool {
+        cache.rows.len() == 1 && cache.rows[0].command == "sentinel-do-not-refetch"
+    }
+
+    fn fresh_cache_entry(
+        binding: AgentBinding,
+        owner_pid: u32,
+        owner_start_time: u64,
+    ) -> CacheEntry {
+        CacheEntry {
+            binding,
+            owner_pid,
+            owner_start_time: Some(owner_start_time),
+            deterministic: true,
+            model: Some("opus".to_owned()),
+            effort: Some("high".to_owned()),
+        }
+    }
+
+    fn test_binding(session_id: &str) -> AgentBinding {
+        AgentBinding {
+            kind: AgentKind::Codex,
+            session_id: session_id.to_owned(),
+            transcript: PathBuf::from(format!("/tmp/{session_id}.jsonl")),
+        }
+    }
+
+    /// fast path 조건(결정적 + 살아있음 + 안전망 안 지남)을 전부 만족하면 `detect_cached`가
+    /// `process_rows()`를 아예 부르지 않고 캐시된 바인딩/kinds를 그대로 돌려준다.
+    #[test]
+    fn detect_cached_fast_path는_process_rows를_다시_부르지_않는다() {
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return; // 비-macOS 등 시작 시각을 못 얻는 환경에선 fast path 자체가 성립하지 않는다.
+        };
+        let sid = SessionId(1);
+        let binding = test_binding("cached-session");
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, fresh_cache_entry(binding.clone(), self_pid, start))]),
+            last_full_scan: Some(Instant::now()),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+        let overrides = HashMap::new();
+
+        let result = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert_eq!(result.bindings.get(&sid), Some(&binding));
+        assert_eq!(
+            result
+                .kinds
+                .get(&sid)
+                .map(|r| (r.kind, r.model.clone(), r.effort.clone())),
+            Some((
+                AgentKind::Codex,
+                Some("opus".to_owned()),
+                Some("high".to_owned())
+            ))
+        );
+        assert!(
+            process_rows_untouched(&process_cache),
+            "fast path에서 process_rows()가 호출됨"
+        );
+    }
+
+    /// 종류 tier도 같은 fast path를 탄다 — `detect_cached`가 채운 캐시를 읽기만 하고
+    /// `process_rows()`는 부르지 않는다.
+    #[test]
+    fn detect_kinds_fast_path는_process_rows를_다시_부르지_않는다() {
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let sid = SessionId(1);
+        let cache = BindingCache {
+            entries: HashMap::from([(
+                sid,
+                fresh_cache_entry(test_binding("cached-session"), self_pid, start),
+            )]),
+            last_full_scan: Some(Instant::now()),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+
+        let result = detect_kinds(&sessions, &cache, &mut process_cache);
+
+        assert_eq!(result.get(&sid).map(|r| r.kind), Some(AgentKind::Codex));
+        assert!(
+            process_rows_untouched(&process_cache),
+            "fast path에서 process_rows()가 호출됨"
+        );
+    }
+
+    /// owner pid가 죽으면(시작 시각 조회 실패) 안전망 주기 안이어도 즉시 전체 탐색으로
+    /// 폴백해야 한다 — 반응성 회귀 금지 조건.
+    #[test]
+    fn owner_pid_사망시_즉시_전체_탐색으로_폴백한다() {
+        // 폴백 시 process_rows()가 실제 `ps`를 exec한다 — ACTIVE_COMMAND_READERS를 쓰는
+        // 다른 command 테스트와 경합하지 않도록 같은 락으로 직렬화한다.
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let sid = SessionId(1);
+        // u32::MAX는 i32로 변환 불가 → pid_start_time이 항상 None → "죽음"으로 취급된다.
+        let entry = fresh_cache_entry(test_binding("dead-owner"), u32::MAX, 1);
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(Instant::now()), // 안전망 안(=최근)이어도 폴백해야 한다.
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, 1u32)];
+        let overrides = HashMap::new();
+
+        let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "owner pid 사망이면 process_rows()로 전체 탐색해야 한다"
+        );
+    }
+
+    /// 같은 pid라도 캐시에 적힌 시작 시각과 실제 시작 시각이 다르면(=pid 재사용) 전체
+    /// 탐색으로 폴백해야 한다 — pid만으로는 프로세스 동일성을 판정할 수 없다.
+    #[test]
+    fn pid_재사용_감지시_전체_탐색으로_폴백한다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let self_pid = std::process::id();
+        let Some(real_start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let sid = SessionId(1);
+        let wrong_start = real_start.wrapping_add(1);
+        let entry = fresh_cache_entry(test_binding("reused-pid"), self_pid, wrong_start);
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(Instant::now()),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+        let overrides = HashMap::new();
+
+        let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "pid 재사용(시작 시각 불일치)이면 process_rows()로 전체 탐색해야 한다"
+        );
+    }
+
+    /// 휴리스틱(비결정적) 바인딩은 owner가 살아있어도 fast path 대상이 아니다 — 매 tick
+    /// 결정적 업그레이드를 계속 시도해야 하기 때문이다.
+    #[test]
+    fn 휴리스틱_바인딩은_fast_path_대상이_아니다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let sid = SessionId(1);
+        let mut entry = fresh_cache_entry(test_binding("heuristic"), self_pid, start);
+        entry.deterministic = false;
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(Instant::now()),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+        let overrides = HashMap::new();
+
+        let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "휴리스틱 바인딩은 fast path를 타면 안 된다"
+        );
+    }
+
+    /// 오버라이드(hook 바인딩)가 캐시된 값과 다르면 — 새 바인딩이 도착했다는 뜻이므로 —
+    /// fast path를 건너뛰고 전체 탐색으로 재확인해야 한다.
+    #[test]
+    fn 오버라이드가_캐시와_다르면_전체_탐색으로_폴백한다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let sid = SessionId(1);
+        let entry = fresh_cache_entry(test_binding("old"), self_pid, start);
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(Instant::now()),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+        let overrides = HashMap::from([(sid, test_binding("new-from-hook"))]);
+
+        let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "오버라이드가 캐시와 다르면 전체 탐색으로 재확인해야 한다"
+        );
+    }
+
+    /// 안전망: fast path 조건을 전부 만족해도 마지막 전체 탐색 이후 안전망 주기가
+    /// 지났으면 강제로 전체 탐색한다 — 살아있는 에이전트 옆에 새 에이전트가 추가로
+    /// 뜨는 경우를 회수하기 위함.
+    #[test]
+    fn 안전망_주기가_지나면_조건_충족해도_전체_탐색한다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let sid = SessionId(1);
+        let entry = fresh_cache_entry(test_binding("stale-scan"), self_pid, start);
+        let mut cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(
+                Instant::now() - FASTPATH_FULL_SCAN_INTERVAL - Duration::from_secs(1),
+            ),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+        let overrides = HashMap::new();
+
+        let _ = detect_cached(&sessions, &overrides, &mut cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "안전망 주기가 지났으면 fast path 조건을 만족해도 전체 탐색해야 한다"
+        );
+    }
+
+    /// 종류 tier도 같은 안전망을 공유한다(`BindingCache::last_full_scan`을 읽기만 함).
+    #[test]
+    fn detect_kinds도_안전망_주기가_지나면_전체_탐색한다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let self_pid = std::process::id();
+        let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
+            return;
+        };
+        let sid = SessionId(1);
+        let entry = fresh_cache_entry(test_binding("stale-scan"), self_pid, start);
+        let cache = BindingCache {
+            entries: HashMap::from([(sid, entry)]),
+            last_full_scan: Some(
+                Instant::now() - FASTPATH_FULL_SCAN_INTERVAL - Duration::from_secs(1),
+            ),
+        };
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(sid, self_pid)];
+
+        let _ = detect_kinds(&sessions, &cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "안전망 주기가 지났으면 detect_kinds도 전체 탐색해야 한다"
+        );
+    }
+
+    /// 캐시에 없는 세션(막 뜬 세션 등)이 하나라도 있으면 통째로 폴백한다 — 새로 뜬
+    /// 에이전트를 놓치지 않기 위해서다.
+    #[test]
+    fn 캐시에_없는_세션이_있으면_detect_kinds가_전체_탐색으로_폴백한다() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let cache = BindingCache::default();
+        let mut process_cache = sentinel_process_cache();
+        let sessions = [(SessionId(1), 1u32)];
+
+        let _ = detect_kinds(&sessions, &cache, &mut process_cache);
+
+        assert!(
+            !process_rows_untouched(&process_cache),
+            "캐시에 없는 세션이 있으면 전체 탐색해야 한다"
         );
     }
 

@@ -9241,8 +9241,12 @@ struct PendingFileTreeWatchEvents {
 
 /// 전용 스레드로 보내는 watch 계획 하나. `AppFileTreeWatcher`의 request 채널은
 /// capacity-1이고, `FileTreeUi`가 `pending_maintenance`로 in-flight 1개만 허용하므로
-/// (`file_tree.rs`의 `debug_assert_eq!(FILE_TREE_MAINTENANCE_QUEUE_CAP, 1)`) 두 번째
-/// job이 이 채널에 쌓여 기다리는 일은 없다.
+/// (`file_tree.rs`의 `debug_assert_eq!(FILE_TREE_MAINTENANCE_QUEUE_CAP, 1)`) 두 개의
+/// **서로 다른** intent가 여기 동시에 쌓이는 일은 없다. 다만 `FileTreeUi::set_root`가
+/// 워커의 recv를 기다리지 않고 이전 job의 `pending_maintenance` 게이트를 즉시 비우므로
+/// (워크스페이스 빠른 전환 등), 이전 job이 아직 채널에 남아 있는 좁은 창에서 새 job의
+/// `submit_replace`가 `Full`을 맞는 경우는 있다 — 이 경우는 폐기가 아니라 재시도로
+/// 처리한다(`AppFileTreeWatcher::retry`, 2026-08-15).
 struct AppFileTreeWatchJob {
     operation: ui::file_tree::FileTreeMaintenanceOperation,
     generation: u64,
@@ -9275,15 +9279,29 @@ struct AppFileTreeWatcherSlot {
     handle: std::thread::JoinHandle<()>,
 }
 
+/// `submit_replace`/`poll_retry`가 `Full` 재시도를 포기하는 상한. fsevents watch/unwatch
+/// 최대 256개가 실측 115ms이므로 정상 경로라면 한 프레임~수십 ms 안에 채널이 빈다. 5초를
+/// 넘겨도 여전히 Full이면 워커가 응답 없이 막힌 것으로 보고 기존 폐기(+ Drop의 blocking
+/// join) 경로로 넘어간다 — 무한 재시도로 pending maintenance가 영영 안 끝나는 것을
+/// 막는다(2026-08-15).
+const APP_FILE_TREE_WATCH_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 struct AppFileTreeWatcher {
     slot: Option<AppFileTreeWatcherSlot>,
-    /// 마지막으로 보낸 job의 operation+generation. 회신이 이 값과 정확히 일치할 때만
-    /// take_snapshot() 필터 메타데이터를 갱신한다 — 워크스페이스가 빠르게 여러 번
-    /// 전환돼 옛 job의 완료가 더 최신 job을 보낸 뒤에 도착해도, 그 stale 완료가
-    /// 메타데이터를 뒤로 되돌리지 않게 막는다. 완료 채널이 끊기면(워커 패닉 등) 이
-    /// 값으로 NativeFailure completion을 합성해 `FileTreeUi`가 영영 pending에 갇히지
-    /// 않게 한다.
+    /// 마지막으로 **실제 전송된**(try_send가 Ok였던) job의 operation+generation. 회신이
+    /// 이 값과 정확히 일치할 때만 take_snapshot() 필터 메타데이터를 갱신한다 —
+    /// 워크스페이스가 빠르게 여러 번 전환돼 옛 job의 완료가 더 최신 job을 보낸 뒤에
+    /// 도착해도, 그 stale 완료가 메타데이터를 뒤로 되돌리지 않게 막는다. `retry`에 job이
+    /// 대기 중인 동안은(아직 전송 전이므로) 이 값을 건드리지 않는다 — 여전히 채널에
+    /// 남아 있는 이전 job을 가리켜야 그 job의 완료가 정확히 매칭된다. 완료 채널이
+    /// 끊기면(워커 패닉 등) 이 값으로 NativeFailure completion을 합성해 `FileTreeUi`가
+    /// 영영 pending에 갇히지 않게 한다.
     pending_operation: Option<(ui::file_tree::FileTreeMaintenanceOperation, u64)>,
+    /// `submit_replace`의 `try_send`가 `Full`(워커 살아있음, 채널에 이전 job이 아직
+    /// 남음)로 실패했을 때 되돌려받은 job과 최초 재시도 시각. 폐기하지 않고 보관해
+    /// `poll_retry()`가 매 프레임 자연 재시도한다 — `APP_FILE_TREE_WATCH_RETRY_TIMEOUT`
+    /// 상한(2026-08-15).
+    retry: Option<(AppFileTreeWatchJob, std::time::Instant)>,
     pending: Arc<std::sync::Mutex<PendingFileTreeWatchEvents>>,
     generation: u64,
     revision: u64,
@@ -9363,6 +9381,7 @@ impl AppFileTreeWatcher {
                 handle,
             }),
             pending_operation: None,
+            retry: None,
             pending,
             generation: 0,
             revision: 0,
@@ -9398,17 +9417,73 @@ impl AppFileTreeWatcher {
         let Some(slot) = self.slot.as_ref() else {
             return Err(Error::WatchUnavailable);
         };
-        slot.request_tx
-            .try_send(AppFileTreeWatchJob {
+        let job = AppFileTreeWatchJob {
+            operation,
+            generation,
+            directories,
+            ignored_prefixes,
+            show_hidden,
+        };
+        // Full과 Disconnected를 구분한다 — 둘 다 뭉뚱그려 폐기하면(구 코드) 워커가 아직
+        // 살아있는데도 Drop이 UI 스레드에서 join()을 블로킹 대기하게 된다. Full은 채널
+        // (capacity 1)에 이전 job이 아직 recv되지 않고 남아 있을 뿐이므로 워커를 믿고
+        // job을 보관해 poll_retry()가 다음 프레임부터 자연 재시도하게 한다. Disconnected
+        // (워커 스레드 종료)만 기존처럼 즉시 에러로 폐기한다 — 이때는 join()이 즉시
+        // 반환하므로 블로킹이 없다(2026-08-15).
+        match slot.request_tx.try_send(job) {
+            Ok(()) => {
+                self.pending_operation = Some((operation, generation));
+                Ok(())
+            }
+            Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                self.retry = Some((job, std::time::Instant::now()));
+                Ok(())
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_job)) => Err(Error::WatchUnavailable),
+        }
+    }
+
+    /// `submit_replace`가 `Full`로 보관해 둔 job이 있으면 재전송을 시도한다. 매 프레임
+    /// (`poll_file_tree_maintenance`가 매 프레임 돎) 자연 재시도되며, 워커가 이전 job을
+    /// recv해 채널에 여유가 생기면 성공한다. 재시도할 게 없으면 `None`. 성공하거나 아직
+    /// Full이라 재시도 중이면(상한 이내) 완료 소식이 없으므로 `None`.
+    /// `APP_FILE_TREE_WATCH_RETRY_TIMEOUT`을 넘겨도 Full이거나 그새 워커가 죽었으면
+    /// (Disconnected) 실패 completion을 합성해 호출자가 기존 폐기 경로를 타게 한다 —
+    /// `poll_completion()`과 반환 타입이 같아 호출자가 한 분기로 같이 처리한다.
+    fn poll_retry(&mut self) -> Option<AppFileTreeWatchCompletion> {
+        let (job, started_at) = self.retry.take()?;
+        let operation = job.operation;
+        let generation = job.generation;
+        let Some(slot) = self.slot.as_ref() else {
+            return Some(AppFileTreeWatchCompletion {
                 operation,
                 generation,
-                directories,
-                ignored_prefixes,
-                show_hidden,
-            })
-            .map_err(|_| Error::WatchUnavailable)?;
-        self.pending_operation = Some((operation, generation));
-        Ok(())
+                result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
+            });
+        };
+        match slot.request_tx.try_send(job) {
+            Ok(()) => {
+                self.pending_operation = Some((operation, generation));
+                None
+            }
+            Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                if started_at.elapsed() >= APP_FILE_TREE_WATCH_RETRY_TIMEOUT {
+                    Some(AppFileTreeWatchCompletion {
+                        operation,
+                        generation,
+                        result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
+                    })
+                } else {
+                    self.retry = Some((job, started_at));
+                    None
+                }
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_job)) => Some(AppFileTreeWatchCompletion {
+                operation,
+                generation,
+                result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
+            }),
+        }
     }
 
     /// 워커의 완료 회신을 non-blocking으로 소비한다.
@@ -10730,8 +10805,12 @@ impl App {
         // show_hidden/generation을 "watch가 실제로 적용된 뒤"에만 갱신하기 때문이다 —
         // 이 순서를 지켜야 옛 watch 집합이 아직 살아있는 동안 들어온 이벤트를 새 root
         // 기준으로 잘못 걸러내는 일이 없다.
+        // poll_retry()는 이전 submit_replace가 Full로 보관해 둔 job의 재시도다 —
+        // 실제 완료가 아니라 재시도 상한 초과/Disconnected일 때만 poll_completion()과
+        // 같은 모양의 실패 completion을 반환하므로 아래 처리를 그대로 공유한다
+        // (2026-08-15).
         if let Some(watcher) = self.file_tree_watcher.as_mut()
-            && let Some(completion) = watcher.poll_completion()
+            && let Some(completion) = watcher.poll_completion().or_else(|| watcher.poll_retry())
         {
             let failed = completion.result.is_err();
             tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
@@ -10817,6 +10896,10 @@ impl App {
         // submitted == Ok(()) 인 경우 완료는 이 프레임에서 알 수 없다 — 워커가 백그라운드
         // 스레드에서 watch()/unwatch()를 처리하는 동안 다음 프레임들의 poll_completion()
         // 이 비동기로 회신을 받아 tree.complete_maintenance를 호출한다(이 함수 맨 위 블록).
+        // channel이 Full이었던 경우도 submit_replace는 Ok(())를 준다 — job을
+        // AppFileTreeWatcher::retry에 보관해 놓고 다음 프레임부터 poll_retry()가 조용히
+        // 재시도하기 때문이다. 여기서의 Err(code)는 이제 Disconnected(워커 사망)류
+        // 즉시 실패만 의미한다(2026-08-15).
         if let Err(code) = submitted {
             self.file_tree_watcher = None;
             if let Some(tree) = self.file_tree.as_mut() {
@@ -32281,6 +32364,155 @@ mod tests {
         drop(watcher);
         std::fs::remove_dir_all(&root1).ok();
         std::fs::remove_dir_all(&root2).ok();
+    }
+
+    /// P2-B 재현/회귀용: 실제 워커 스레드 대신 테스트가 `request_rx`를 직접 쥐고
+    /// recv() 시점을 통제한다 — 실제 워커는 job을 즉시(또는 워크로드에 따라 최대
+    /// 115ms 안에) 소비하므로 `Full`을 결정론적으로 재현할 수 없다. `handle`은
+    /// 아무 일도 하지 않고 즉시 끝나는 스레드라 watcher Drop의 join()이 절대
+    /// 블로킹하지 않는다.
+    fn app_file_tree_watcher_with_manual_channel() -> (
+        AppFileTreeWatcher,
+        std::sync::mpsc::Receiver<AppFileTreeWatchJob>,
+    ) {
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<AppFileTreeWatchJob>(1);
+        let (_completion_tx, completion_rx) =
+            std::sync::mpsc::sync_channel::<AppFileTreeWatchCompletion>(1);
+        let handle = std::thread::spawn(|| {});
+        let watcher = AppFileTreeWatcher {
+            slot: Some(AppFileTreeWatcherSlot {
+                request_tx,
+                completion_rx,
+                handle,
+            }),
+            pending_operation: None,
+            retry: None,
+            pending: Arc::new(std::sync::Mutex::new(PendingFileTreeWatchEvents::default())),
+            generation: 0,
+            revision: 0,
+            root: PathBuf::new(),
+            ignored_prefixes: Vec::new(),
+            show_hidden: false,
+        };
+        (watcher, request_rx)
+    }
+
+    #[test]
+    fn app_file_tree_watcher_submit_replace_full은_폐기하지_않고_재시도로_보관한다() {
+        let root = app_file_tree_watch_temp_root("full-retry");
+        let ctx = egui::Context::default();
+        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
+        let (op1, gen1, dirs1, ignored1, hidden1) = app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op2, gen2, dirs2, ignored2, hidden2) = app_file_tree_watch_intent(&mut tree, root.clone());
+
+        let (mut watcher, request_rx) = app_file_tree_watcher_with_manual_channel();
+
+        // 첫 submit: 채널(capacity 1)이 비어 있으니 성공하고 버퍼를 채운다. 아무도
+        // recv()하지 않으므로 이 job은 "아직 recv되지 않은 이전 job"으로 남는다.
+        watcher
+            .submit_replace(op1, gen1, dirs1, ignored1, hidden1)
+            .expect("first submit fills the channel");
+        assert_eq!(watcher.pending_operation, Some((op1, gen1)));
+        assert!(watcher.retry.is_none());
+
+        // 두 번째 submit: try_send가 Full을 맞는다. 구 코드라면 여기서 즉시
+        // Err(WatchUnavailable)이 나와 호출자가 watcher를 폐기했다 — 새 코드는 Ok(())를
+        // 주고 job을 retry에 보관해야 한다.
+        let result = watcher.submit_replace(op2, gen2, dirs2, ignored2, hidden2);
+        assert!(
+            result.is_ok(),
+            "Full은 즉시 실패가 아니라 재시도로 보관돼야 한다: {result:?}"
+        );
+        assert!(watcher.retry.is_some(), "job이 retry에 보관돼야 한다");
+        // pending_operation은 여전히 실제로 채널에 남아 있는 op1을 가리켜야 한다 — 아직
+        // 전송되지 않은 op2로 덮어쓰면 op1의 완료가 도착했을 때 stale-guard가 깨진다.
+        assert_eq!(watcher.pending_operation, Some((op1, gen1)));
+
+        // poll_retry(): 채널이 여전히 Full이니 재시도를 계속 보관하고(완료 소식 없음).
+        assert!(watcher.poll_retry().is_none());
+        assert!(watcher.retry.is_some());
+
+        // 실제 워커가 op1 job을 recv해 처리하기 시작한 상황을 흉내낸다 — 채널에 여유가
+        // 생긴다.
+        let drained = request_rx.recv().expect("op1 job still queued");
+        assert_eq!(drained.operation, op1);
+
+        // 다음 폴(poll_retry)에서 자연 재시도가 성공해야 한다.
+        assert!(watcher.poll_retry().is_none(), "재전송 성공 -- 아직 완료 소식은 없다");
+        assert!(watcher.retry.is_none(), "재전송에 성공했으니 retry는 비워져야 한다");
+        assert_eq!(watcher.pending_operation, Some((op2, gen2)));
+        let resent = request_rx.recv().expect("op2 job now in the channel");
+        assert_eq!(resent.operation, op2);
+
+        drop(watcher);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn app_file_tree_watcher_submit_replace_disconnected는_기존_폐기_경로_그대로다() {
+        let root = app_file_tree_watch_temp_root("disconnected");
+        let ctx = egui::Context::default();
+        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
+        let (op, generation, dirs, ignored, hidden) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
+
+        let (mut watcher, request_rx) = app_file_tree_watcher_with_manual_channel();
+        // 워커 스레드가 이미 죽어 request_rx가 드롭된 상황을 흉내낸다.
+        drop(request_rx);
+
+        let result = watcher.submit_replace(op, generation, dirs, ignored, hidden);
+        assert!(
+            matches!(
+                result,
+                Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable)
+            ),
+            "Disconnected는 기존처럼 즉시 에러여야 한다: {result:?}"
+        );
+        // Disconnected는 재시도 대상이 아니다 -- 호출자가 즉시 폐기 경로를 타야 한다.
+        assert!(watcher.retry.is_none());
+        assert!(watcher.pending_operation.is_none());
+
+        drop(watcher);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn app_file_tree_watcher_full_재시도가_상한을_넘기면_폐기_경로로_넘어간다() {
+        let root = app_file_tree_watch_temp_root("full-retry-timeout");
+        let ctx = egui::Context::default();
+        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
+        let (op1, gen1, dirs1, ignored1, hidden1) = app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op2, gen2, dirs2, ignored2, hidden2) = app_file_tree_watch_intent(&mut tree, root.clone());
+
+        let (mut watcher, _request_rx) = app_file_tree_watcher_with_manual_channel();
+        watcher
+            .submit_replace(op1, gen1, dirs1, ignored1, hidden1)
+            .expect("first submit fills the channel");
+        watcher
+            .submit_replace(op2, gen2, dirs2, ignored2, hidden2)
+            .expect("second submit is deferred to retry, not an immediate error");
+        let (job, _started_at) = watcher.retry.take().expect("op2 job stored for retry");
+
+        // 재시도 시작 시각을 상한보다 더 과거로 조작해 "오래 Full이 지속됐다"를
+        // 흉내낸다 -- _request_rx를 계속 drain하지 않으므로 채널은 여전히 Full이다.
+        let stale_started_at = std::time::Instant::now()
+            .checked_sub(APP_FILE_TREE_WATCH_RETRY_TIMEOUT + std::time::Duration::from_millis(50))
+            .expect("timeout margin fits");
+        watcher.retry = Some((job, stale_started_at));
+
+        let completion = watcher
+            .poll_retry()
+            .expect("재시도 상한을 넘기면 기존 폐기 경로로 넘어갈 실패 completion을 줘야 한다");
+        assert_eq!(completion.operation, op2);
+        assert_eq!(completion.generation, gen2);
+        assert!(matches!(
+            completion.result,
+            Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable)
+        ));
+        assert!(watcher.retry.is_none());
+
+        drop(watcher);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {

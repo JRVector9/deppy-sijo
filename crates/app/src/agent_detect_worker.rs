@@ -448,7 +448,11 @@ struct ProductionBackend {
 }
 
 /// transcript 파싱 캐시 한 항목. `len`/`modified`는 hit 판정용 stat 스냅샷이다.
+/// `transcript`는 같은 세션이 **다른 transcript로 재바인딩**된 직후, 새 파일의
+/// `(len, modified)`가 옛 파일과 우연히 일치해 낡은 파싱 결과가 나가는 것을 막는다
+/// (리뷰 후속 2026-08-15 — 확률은 낮지만 방어 비용이 경로 비교 한 번뿐).
 struct TranscriptCacheEntry {
+    transcript: std::path::PathBuf,
     len: u64,
     modified: SystemTime,
     state: Arc<agent_transcript::TranscriptState>,
@@ -484,6 +488,7 @@ impl TranscriptStateCache {
             .and_then(|m| m.modified().ok().map(|modified| (m.len(), modified)));
         if let Some((len, modified)) = stat
             && let Some(entry) = self.entries.get(&sid)
+            && entry.transcript == binding.transcript
             && entry.len == len
             && entry.modified == modified
         {
@@ -495,6 +500,7 @@ impl TranscriptStateCache {
                 self.entries.insert(
                     sid,
                     TranscriptCacheEntry {
+                        transcript: binding.transcript.clone(),
                         len,
                         modified,
                         state: Arc::clone(&state),

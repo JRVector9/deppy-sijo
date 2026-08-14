@@ -18,7 +18,14 @@ use std::{
     path::Path,
 };
 
-pub const CLAUDE_STATUS_URL: &str = "https://status.claude.com";
+/// 2026-08-14 실증: 커스텀 도메인 status.claude.com은 CNAME(tymt9n04zgry.stspg-customer.com)은
+/// 살아있지만 서버가 제시하는 인증서 CN이 `*.statuspage.io`라 호스트명이 일치하지 않아
+/// TLS 핸드셰이크가 실패한다(status.anthropic.com도 동일 증상). page id
+/// `tymt9n04zgry`가 가리키는 원래 statuspage.io 서브도메인은 인증서·API 응답 모두 정상이고,
+/// 브라우저로 이 base를 그대로 열어도 사람이 보는 상태 페이지가 뜬다 — API 베이스와 클릭
+/// 시 여는 URL을 겸용해도 된다. 인증서 검증 우회(-k 상당)는 쓰지 않았다. 커스텀 도메인이
+/// 복구됐다는 얘기가 나오면 되돌리기 전에 먼저 curl로 인증서를 다시 확인할 것.
+pub const CLAUDE_STATUS_URL: &str = "https://anthropic.statuspage.io";
 pub const OPENAI_STATUS_URL: &str = "https://status.openai.com";
 pub const GITHUB_STATUS_URL: &str = "https://www.githubstatus.com";
 const HUGGING_FACE_MODELS_API: &str =

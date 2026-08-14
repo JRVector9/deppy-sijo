@@ -8322,6 +8322,20 @@ fn merge_detected_kinds(
     }
 }
 
+/// agent_info/agent_kinds/statuslines(위 필드 주석)처럼 `(runtime_instance, K)`로
+/// 네임스페이스된 맵에서 은퇴한 runtime_instance 몫만 지운다. 그 runtime_instance는
+/// 다시 살아날 일이 없으므로(새 워커는 항상 새 번호를 받는다), 지우지 않으면 워크스페이스가
+/// 축출/재오픈될 때마다 이 맵들이 무계로 자란다 — 이 저장소의 유계 보존 원칙
+/// (`AGENT_STATE_PENDING_BYTES_MAX` 등)에 어긋난다.
+fn retain_other_runtime_instance<K, V>(
+    map: &mut std::collections::HashMap<(u64, K), V>,
+    retired_instance: u64,
+) where
+    K: Eq + std::hash::Hash,
+{
+    map.retain(|(rt, _), _| *rt != retired_instance);
+}
+
 /// 우리가 보낸 낙관값 하나 — 값과 **보낸 시각**.
 ///
 /// 시각이 있어야 CLI가 조용히 거절했을 때 빠져나올 수 있다. 값만 들고 있으면
@@ -11867,6 +11881,9 @@ impl App {
         );
         self.join_pending_shutdown(delete_id);
         if let Some(mut runtime) = self.warm.remove(delete_id) {
+            // 이 runtime_instance는 여기서 완전히 은퇴한다(다시 warm에 안 들어간다) —
+            // agent_info/agent_kinds/statuslines의 그 몫을 지운다(위 prune 함수 주석).
+            self.prune_agent_display_for_retired_instance(runtime.runtime_instance);
             self.close_approval_workspace(delete_id);
             runtime.runtime.shutdown();
         }
@@ -13356,6 +13373,17 @@ impl App {
             apply_claude_statusline(display, self.statuslines.get(&(instance, *session)));
         }
         self.active.workspace_ui.set_agent_info(merged);
+    }
+
+    /// `runtime_instance`가 은퇴할 때(그 워커가 실제로 shutdown되고 다시 warm으로 되돌아가지
+    /// 않을 때) agent_info/agent_kinds/statuslines에서 그 몫을 지운다. 호출부는 정확히
+    /// 셋 — `suspend_warm_workspace`의 실제 suspend 분기, `close_workspace_sessions`의 warm
+    /// 종료 분기, `bench_delete_workspace` (아래 와이어링 테스트가 이 셋을 고정한다). App
+    /// 전체 종료(`on_exit`)는 App 자신이 곧 드롭되므로 제외 — 정리해도 남길 자리가 없다.
+    fn prune_agent_display_for_retired_instance(&mut self, runtime_instance: u64) {
+        retain_other_runtime_instance(&mut self.agent_info, runtime_instance);
+        retain_other_runtime_instance(&mut self.agent_kinds, runtime_instance);
+        retain_other_runtime_instance(&mut self.statuslines, runtime_instance);
     }
 
     /// 영속 `sessions.id`로 투영된 재개 메타데이터를 현재 mux pane의
@@ -17270,6 +17298,10 @@ impl App {
             self.unattached_counts.remove(workspace_id);
             self.pending_resource_maintenance
                 .retain(|target| target.workspace_id != workspace_id);
+            // 이 runtime_instance는 여기서 완전히 은퇴한다(위 return 분기를 지나왔으므로
+            // warm으로 되돌아가지 않는다) — agent_info/agent_kinds/statuslines의 그 몫을
+            // 지운다(위 prune 함수 주석).
+            self.prune_agent_display_for_retired_instance(rt.runtime_instance);
             let evict_id = workspace_id.to_owned();
             let wake = self.egui_ctx.clone();
             let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -17386,6 +17418,10 @@ impl App {
             // 남아 재활성 시 fresh 셸로만 뜬다.
             self.join_pending_shutdown(workspace_id);
             if let Some(mut rt) = self.warm.remove(workspace_id) {
+                // 이 runtime_instance는 여기서 완전히 은퇴한다(아래에서 shutdown하고
+                // warm에 되돌리지 않는다) — agent_info/agent_kinds/statuslines의 그 몫을
+                // 지운다(위 prune 함수 주석).
+                self.prune_agent_display_for_retired_instance(rt.runtime_instance);
                 let mut panes: Vec<runtime::MuxPaneId> = rt
                     .workspace_ui
                     .mux()
@@ -28430,6 +28466,74 @@ mod tests {
         assert!(
             body.contains("merge_detected_kinds(&mut merged, &kinds_for_active)"),
             "병합을 부르지 않으면 프로세스로만 감지된 에이전트가 카드에서 셸로 강등된다"
+        );
+    }
+
+    /// 은퇴한 runtime_instance 몫만 지우고 다른 instance는 그대로 둔다 — instance A로
+    /// 채운 뒤 A가 은퇴하면 A의 항목만 사라지고 B는 남아야 한다(2026-08-14, 코드 리뷰:
+    /// 은퇴 정리가 통째로 없었다).
+    #[test]
+    fn retain_other_runtime_instance는_은퇴한_instance_몫만_지운다() {
+        let mut map: std::collections::HashMap<(u64, runtime::SessionId), &str> =
+            std::collections::HashMap::from([
+                ((1, runtime::SessionId(10)), "a"),
+                ((1, runtime::SessionId(11)), "b"),
+                ((2, runtime::SessionId(10)), "c"),
+            ]);
+
+        retain_other_runtime_instance(&mut map, 1);
+
+        assert_eq!(map.len(), 1, "은퇴한 instance 1의 항목은 전부 사라져야 한다");
+        assert_eq!(
+            map.get(&(2, runtime::SessionId(10))),
+            Some(&"c"),
+            "다른(살아있는) instance 2의 항목은 남아야 한다"
+        );
+    }
+
+    /// 헬퍼가 맞아도 **은퇴 지점에서 부르지 않으면** 죽은 runtime_instance의 항목이 앱
+    /// 수명 동안 무계로 쌓인다(2026-08-14 코드 리뷰: warm runtime이 shutdown되는 세 지점
+    /// 중 정리가 하나도 없었다). 세 은퇴 지점 배선을 전부 고정한다 — App::on_exit의 전체
+    /// 종료는 App 자신이 곧 드롭되므로 대상이 아니다.
+    #[test]
+    fn 은퇴하는_runtime_은_세_지점_모두에서_agent_display_prune을_부른다() {
+        let source = include_str!("app.rs");
+        const CALL: &str = "self.prune_agent_display_for_retired_instance(";
+
+        let suspend = source
+            .split_once("fn suspend_warm_workspace(")
+            .unwrap()
+            .1
+            .split_once("fn join_pending_shutdown")
+            .unwrap()
+            .0;
+        assert!(
+            suspend.contains(CALL),
+            "suspend_warm_workspace의 실제 suspend 분기가 정리를 부르지 않는다"
+        );
+
+        let close = source
+            .split_once("fn close_workspace_sessions")
+            .unwrap()
+            .1
+            .split_once("fn reveal_closed_workspace")
+            .unwrap()
+            .0;
+        assert!(
+            close.contains(CALL),
+            "close_workspace_sessions의 warm 종료 분기가 정리를 부르지 않는다"
+        );
+
+        let bench_delete = source
+            .split_once("fn bench_delete_workspace(")
+            .unwrap()
+            .1
+            .split_once("fn subscribe_runtime_events")
+            .unwrap()
+            .0;
+        assert!(
+            bench_delete.contains(CALL),
+            "bench_delete_workspace가 정리를 부르지 않는다"
         );
     }
 

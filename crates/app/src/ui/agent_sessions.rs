@@ -676,7 +676,12 @@ pub struct AgentSessionsUi {
     client_api_key_generation: u64,
     /// 비동기 poll·단축키 경로에서도 현재 UI 언어로 오류를 만들기 위한 catalog snapshot.
     /// App 생성 시 주입하고 locale 변경 시 즉시 갱신한다.
-    catalog: i18n::Catalog,
+    /// Arc인 이유: show()는 이 패널이 보이는 매 프레임 도는데, 내부에서 &mut self를
+    /// 쓰는 렌더 헬퍼들에 catalog를 넘기려면 self.catalog를 그대로 들고 있을 수 없어
+    /// 매 프레임 clone해야 한다. 값 타입이면 로케일당 ~1,000개 항목짜리 BTreeMap
+    /// 2개를 매 프레임 딥카피하게 되므로, clone 비용을 참조 카운트 증가로 낮춘다
+    /// (2026-08-14).
+    catalog: Arc<i18n::Catalog>,
     /// UI가 만든 session 오류만 원문 detail+catalog key로 보존해 locale 변경 시 재렌더한다.
     localized_session_errors: HashMap<AgentSessionId, CatalogMessage>,
     /// Latest render generation for exact stale-action rejection.
@@ -730,8 +735,10 @@ impl AgentSessionsUi {
             api_key_snapshot_revision: None,
             api_key_generation: 0,
             client_api_key_generation: 0,
-            catalog: i18n::Catalog::load(i18n::FALLBACK_LOCALE)
-                .expect("fallback locale catalog must load"),
+            catalog: Arc::new(
+                i18n::Catalog::load(i18n::FALLBACK_LOCALE)
+                    .expect("fallback locale catalog must load"),
+            ),
             localized_session_errors: HashMap::new(),
             frame_generation: 0,
         }
@@ -768,7 +775,7 @@ impl AgentSessionsUi {
 
     pub fn set_catalog(&mut self, catalog: &i18n::Catalog) {
         if self.catalog.locale() != catalog.locale() {
-            self.catalog = catalog.clone();
+            self.catalog = Arc::new(catalog.clone());
             let synthesized_titles = self
                 .persisted_threads
                 .iter()
@@ -2113,6 +2120,11 @@ impl AgentSessionsUi {
         self.frame_generation = self.frame_generation.wrapping_add(1);
         let frame_generation = self.frame_generation;
         // 렌더 도중 self를 변경하면서도 동일 frame의 locale snapshot을 유지한다.
+        // self.catalog는 Arc<i18n::Catalog>라 여기서의 clone은 참조 카운트 증가일
+        // 뿐이다(로케일당 ~1,000개 항목짜리 BTreeMap 2개를 매 프레임 딥카피하던
+        // 문제를 필드 타입에서 없앴다, 2026-08-14). show() 아래 렌더 헬퍼들이
+        // catalog를 인자로 받으며 동시에 &mut self를 쓰기 때문에, self.catalog를
+        // 직접 들고 있으면 borrow 충돌이 난다 — 그래서 여전히 clone한 값을 쓴다.
         let catalog = self.catalog.clone();
         let catalog = &catalog;
         self.pty_surfaces = pty_surfaces;

@@ -38,6 +38,7 @@ mod paths;
 mod perf;
 #[allow(dead_code)]
 mod port_inventory;
+mod proc_info;
 mod process_storm;
 mod prompt_library;
 mod pty_effort;

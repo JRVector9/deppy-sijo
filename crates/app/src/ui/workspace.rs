@@ -4512,12 +4512,38 @@ impl WorkspaceUi {
         // (2026-08-10 사용자: 테두리 말고 공간이 열려 들어가는 느낌으로).
         let mut drop_target_hovered = false;
         if mode.is_local() && input_enabled && pane.session_id.is_some() {
+            // OS 파일 드롭 — 이 pane 위에서 놓으면 ⌘V 경로 붙여넣기와 같은 바이트를
+            // 세션에 쓴다(workspace.rs의 paths_insert_paste_bytes, ⌘V 경로와 동일 규칙).
+            // winit 0.30이 macOS draggingUpdated:를 구현하지 않아 드래그 중 egui
+            // 포인터가 갱신되지 않는다 — file_tree.rs의 os_drag_pointer_pos로 신뢰
+            // 가능한 위치를 구하고, 실패(kittest 등)하면 egui 포인터로 폴백한다
+            // (2026-08-14, OS 드롭 라우팅 수정 — 이전엔 터미널 위 OS 드롭을 받는 핸들러가
+            // 아예 없었다). dock_rect(컴포저)·사이드바 패널과 이 pane_rect는 egui
+            // Panel 레이아웃으로 서로 겹치지 않으므로, 같은 포인터 위치를 각자 자기
+            // rect로만 판정해도 한 드롭이 두 곳에 들어가지 않는다.
+            let os_drag_active = ui.input(|i| !i.raw.hovered_files.is_empty());
+            let os_dropped: Vec<std::path::PathBuf> = ui.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|file| file.path.clone())
+                    .collect()
+            });
+            let os_drag_pos = (os_drag_active || !os_dropped.is_empty())
+                .then(|| {
+                    crate::ui::file_tree::os_drag_pointer_pos(ui.ctx())
+                        .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                })
+                .flatten();
+            let os_over_pane = os_drag_pos.is_some_and(|pos| pane_rect.contains(pos));
+
             drop_target_hovered = pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()
                 .is_some()
                 || pane_resp
                     .dnd_hover_payload::<TerminalTextDragPayload>()
-                    .is_some();
+                    .is_some()
+                || (os_drag_active && os_over_pane);
             if let Some(session) = pane.session_id {
                 if let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&pane_resp) {
                     let bytes = path_insert_paste_bytes(
@@ -4531,6 +4557,14 @@ impl WorkspaceUi {
                 {
                     let bytes = terminal_text_paste_bytes(
                         &text.text,
+                        self.session_bracketed_paste(session),
+                    );
+                    self.send(RuntimeCommand::WriteInput { session, bytes });
+                }
+                if !os_dropped.is_empty() && os_over_pane {
+                    let bytes = paths_insert_paste_bytes(
+                        &os_dropped,
+                        self.session_shell_kind(session),
                         self.session_bracketed_paste(session),
                     );
                     self.send(RuntimeCommand::WriteInput { session, bytes });
@@ -11437,6 +11471,130 @@ https://example.test/login \
 
         assert!(workspace.take_terminal_focus_claimed());
         assert!(!workspace.take_terminal_focus_claimed());
+    }
+
+    /// OS 파일 드롭 — 터미널 pane 위에서 놓으면 그 세션에 ⌘V 경로 붙여넣기와 같은
+    /// 바이트를 쓴다(paths_insert_paste_bytes, workspace.rs 6176행). 예전엔 터미널
+    /// 영역에서 OS dropped_files를 읽는 핸들러가 아예 없어 조용히 버려졌다
+    /// (2026-08-14 사용자: "터미널에 넣으면 터미널로 들어가야해").
+    #[test]
+    fn kittest_터미널_pane_위_os_드롭은_경로를_붙여넣는다() {
+        let session = SessionId(7);
+        let mut harness = setup_focused_local_pane_harness(session);
+        let expected_bytes = paths_insert_paste_bytes(
+            &[PathBuf::from("/x/dropped.txt")],
+            harness.state().session_shell_kind(session),
+            harness.state().session_bracketed_paste(session),
+        );
+        let pane_point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pane_point));
+        harness.input_mut().dropped_files.push(egui::DroppedFile {
+            path: Some(PathBuf::from("/x/dropped.txt")),
+            ..Default::default()
+        });
+        harness.run();
+
+        assert_eq!(
+            written_bytes(drain_protocol(harness.state_mut())),
+            expected_bytes
+        );
+    }
+
+    /// pane 헤더처럼 터미널 표면 밖에 놓인 OS 드롭은 무시한다 — dropped_files가
+    /// 있다는 사실만으로 삽입하면 안 되고, 실제 포인터 위치가 이 pane의 rect 안에
+    /// 있을 때만 받아야 한다(2026-08-14).
+    #[test]
+    fn kittest_pane_밖_os_드롭은_무시된다() {
+        let session = SessionId(7);
+        let mut harness = setup_focused_local_pane_harness(session);
+        // pane 헤더 영역(표면 rect 위) — TERMINAL_PANE_HEADER_HEIGHT보다 작은 y는
+        // pane_layout.surface(=pane_rect) 밖이다.
+        let header_point = egui::pos2(80.0, 4.0);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(header_point));
+        harness.input_mut().dropped_files.push(egui::DroppedFile {
+            path: Some(PathBuf::from("/x/dropped.txt")),
+            ..Default::default()
+        });
+        harness.run();
+
+        assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+    }
+
+    /// 분할된 두 pane 중 포인터 밑 pane에만 들어간다 — 한 번의 OS 드롭이 두 목적지로
+    /// 새면 안 된다는 요구사항의 워크스페이스 쪽 절반(컴포저/사이드바와의 배타성은
+    /// egui Panel 레이아웃이 화면을 서로 겹치지 않게 나누는 데서 나온다).
+    #[test]
+    fn kittest_분할된_pane_중_포인터_아래_pane에만_os_드롭이_들어간다() {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let left = SessionId(7);
+        let right = SessionId(8);
+        let mut workspace = WorkspaceUi::new();
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane(pane_id("left"))),
+            second: Box::new(LayoutNode::Pane(pane_id("right"))),
+        };
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("left", left), pane("right", right)],
+                layout,
+            )],
+            "left",
+        ));
+        workspace.last_focused_pane = Some(pane_id("left"));
+        workspace.pending_focus = Some(pane_id("left"));
+        workspace.sessions.entry(left).or_default().snapshot = Some(snapshot("left"));
+        workspace.sessions.entry(right).or_default().snapshot = Some(snapshot("right"));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(600.0, 400.0))
+            .build_ui_state(
+                move |ui, workspace: &mut WorkspaceUi| {
+                    workspace.show_with_input(ui, &config, &[], &catalog, true);
+                },
+                workspace,
+            );
+        harness.run();
+        drain_protocol(harness.state_mut());
+
+        let expected_bytes = paths_insert_paste_bytes(
+            &[PathBuf::from("/x/dropped.txt")],
+            harness.state().session_shell_kind(left),
+            harness.state().session_bracketed_paste(left),
+        );
+        // 왼쪽 pane(폭 300pt의 안쪽) 위에서 드롭.
+        let left_point = egui::pos2(100.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(left_point));
+        harness.input_mut().dropped_files.push(egui::DroppedFile {
+            path: Some(PathBuf::from("/x/dropped.txt")),
+            ..Default::default()
+        });
+        harness.run();
+
+        let writes = drain_protocol(harness.state_mut())
+            .into_iter()
+            .filter_map(|command| match command {
+                RuntimeCommand::WriteInput { session, bytes } => Some((session, bytes)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            writes,
+            vec![(left, expected_bytes)],
+            "포인터 아래 왼쪽 pane에만, 정확히 한 번만 들어가야 한다"
+        );
     }
 
     fn printable_key(key: egui::Key) -> egui::Event {

@@ -1387,10 +1387,48 @@ fn codex_open_rollout(_pid: u32, _budget: &mut DetectionBudget) -> Option<PathBu
     None
 }
 
-/// 여러 셸 pid의 현재 작업 디렉터리를 **한 번의 lsof**로 얻는다(세션 행 폴더명 +
-/// 워크스페이스 이름 추적, 2026-07-08). off-thread 호출. `-p pid1,pid2,...`는 lsof가
-/// 지원하는 다중 pid 형식이라 세션 수만큼 프로세스를 띄우지 않는다.
-#[cfg(unix)]
+/// 여러 셸 pid의 현재 작업 디렉터리를 얻는다(세션 행 폴더명 + 워크스페이스 이름 추적,
+/// 2026-07-08). off-thread 호출.
+///
+/// 2026-08-14: macOS는 lsof exec 대신 `proc_info::pid_cwd`(`proc_pidinfo` syscall 1회)를
+/// pid마다 호출한다. `agent_detect_worker`의 binding_pass가 이 함수를 tick마다(약 2.5초)
+/// 조건 없이 호출하는데, macOS는 exec마다 코드서명을 검증해 syspolicyd 부하로 이어지고
+/// 실측으로 이 경로만 분당 24회 exec였다. cwd는 pid당 개별 값이라 lsof의 다중 pid 배치
+/// 조회를 syscall 반복으로 바꿔도 기능상 손해가 없다. 캐시는 넣지 않는다 — 네이티브 호출은
+/// tick마다 불러도 비용이 사실상 0이고, 캐시를 두면 사용자가 `cd`한 뒤에도 옛 cwd를 보여주는
+/// 퇴행이 생긴다.
+#[cfg(target_os = "macos")]
+pub(crate) fn session_cwds(pids: &[u32]) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    if pids.is_empty() || pids.len() > MAX_SESSIONS || pids.contains(&0) {
+        return out;
+    }
+    let unique: HashSet<u32> = pids.iter().copied().collect();
+    if unique.len() != pids.len() {
+        return out;
+    }
+    for &pid in pids {
+        let Some(path) = crate::proc_info::pid_cwd(pid) else {
+            // lsof도 못 찾은 pid는 결과에서 빠졌던 것과 같은 의미 — 그 pid만 생략.
+            continue;
+        };
+        // 커널이 돌려준 cwd는 항상 절대경로이지만 PathBuf -> String 변환은 비-UTF8 바이트를
+        // 표현할 수 없다. 기존 lsof 경로도 stdout 전체를 String::from_utf8로 파싱해
+        // 비-UTF8이면 배치 전체가 실패했던 것과 같은 "비-UTF8은 버린다" 기준을 유지하되,
+        // 여기서는 pid 하나만 건너뛰어 나머지 세션 표시는 살아남는다(기존보다 더 견고함).
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        if valid_absolute_path(path_str) {
+            out.insert(pid, path_str.to_owned());
+        }
+    }
+    out
+}
+
+/// 비-macOS 폴백 — `proc_info::pid_cwd`가 항상 `None`이므로 기존 lsof exec 경로를 그대로
+/// 유지한다(감지가 죽는 것보다 exec가 낫다, 2026-08-14).
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn session_cwds(pids: &[u32]) -> HashMap<u32, String> {
     let mut out = HashMap::new();
     if pids.is_empty() || pids.len() > MAX_SESSIONS || pids.contains(&0) {
@@ -1566,6 +1604,52 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// 자기 자신의 pid가 결과에 들어오고 `std::env::current_dir()`와 일치하는지 확인한다
+    /// (2026-08-14: lsof exec를 proc_pidinfo 네이티브 호출로 교체하면서 추가).
+    /// 심볼릭 링크 차이(예: macOS의 /tmp -> /private/tmp)로 바이트 단위 비교가 깨질 수
+    /// 있어 canonicalize 후 비교한다. 어느 한쪽이 canonicalize에 실패하는 극히 드문 환경
+    /// 차이가 있을 수 있으므로 그런 경우는 통과시킨다 — 불안정한 테스트를 만들지 않기
+    /// 위함(proc_info.rs의 동급 테스트와 같은 판정 기준).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn session_cwds는_자기_자신의_cwd를_돌려준다() {
+        let me = std::process::id();
+        let result = session_cwds(&[me]);
+        let cwd = result.get(&me).expect("자기 자신의 cwd를 못 얻음");
+        let path = Path::new(cwd);
+        assert!(path.is_absolute(), "cwd가 절대경로가 아님: {cwd}");
+
+        if let (Ok(expected), Ok(actual)) = (
+            std::env::current_dir().and_then(|p| p.canonicalize()),
+            path.canonicalize(),
+        ) {
+            assert_eq!(actual, expected, "cwd가 std::env::current_dir()와 다름");
+        }
+    }
+
+    /// 존재하지 않는 pid는 결과에서 생략되고 패닉하지 않는다.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn session_cwds는_존재하지_않는_pid를_생략한다() {
+        let improbable_pid = libc::pid_t::MAX as u32;
+        let result = session_cwds(&[improbable_pid]);
+        assert!(result.is_empty());
+    }
+
+    /// 기존 가드 4종(빈 입력 / MAX_SESSIONS 초과 / pid 0 포함 / 중복 pid)이 그대로 빈 맵을
+    /// 주는지 확인한다 — lsof 구현이던 시절과 의미가 같아야 한다.
+    #[test]
+    fn session_cwds_guards는_빈_맵을_돌려준다() {
+        assert!(session_cwds(&[]).is_empty(), "빈 입력");
+
+        let too_many: Vec<u32> = (1..=(MAX_SESSIONS as u32 + 1)).collect();
+        assert!(session_cwds(&too_many).is_empty(), "MAX_SESSIONS 초과");
+
+        assert!(session_cwds(&[0, 1]).is_empty(), "pid 0 포함");
+
+        assert!(session_cwds(&[1, 1]).is_empty(), "중복 pid");
     }
 
     #[test]

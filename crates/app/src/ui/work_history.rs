@@ -237,12 +237,60 @@ struct MetadataParts<'a> {
     git_change_count: Option<u32>,
 }
 
+/// 같은 `agent_session_id`(+`kind`) 턴을 묶은 한 그룹. `rows`는 `visible_rows`가
+/// 만든 전역 정렬 순서에서 이 그룹에 속한 항목만 뽑아 원래 상대 순서를 그대로
+/// 보존한 것이다 — 그룹 내부 정렬을 다시 계산하지 않는다(아래 `grouped_rows` 문서
+/// 참고). `model`/`effort`/`branch`/`git_change_count`는 그룹 내에서 **값이 있는
+/// 가장 최신 턴**의 값이고, 아무도 값을 갖지 않으면 `None`으로 비워 둔다 — 없는
+/// 값을 지어내지 않는다(app.rs의 `stage_detected_work_history` cwd 캡처 규칙 때문에
+/// 대부분 한 턴에만 값이 실린다).
+struct WorkHistoryGroup<'a> {
+    kind: &'a str,
+    agent_session_id: &'a str,
+    rows: Vec<WorkHistoryRow<'a>>,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+    branch: Option<&'a str>,
+    git_change_count: Option<u32>,
+    /// 그룹 내 턴들의 `updated_at` 최댓값 — 헤더의 "최신 시각"이며, branch/변경
+    /// 수와 달리 값 유무와 무관하게 그룹의 모든 턴에서 구한다.
+    latest_updated_at: i64,
+}
+
+/// `rows`에서 값이 있는 항목 중 `updated_at`이 가장 큰 것의 값을 돌려준다. 동률이면
+/// `source_offset` 뒤 `turn_key`로 결정적으로 끊는다(파일 전역의 다른 정렬 tie-break와
+/// 같은 규칙). 값이 있는 항목이 하나도 없으면 `None`.
+fn latest_with_value<'a, T: Copy>(
+    rows: &[WorkHistoryRow<'a>],
+    extract: impl Fn(&WorkHistoryRow<'a>) -> Option<T>,
+) -> Option<T> {
+    rows.iter()
+        .filter_map(|row| extract(row).map(|value| (*row, value)))
+        .max_by(|(a, _), (b, _)| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.source_offset.cmp(&b.source_offset))
+                .then_with(|| a.turn_key.cmp(b.turn_key))
+        })
+        .map(|(_, value)| value)
+}
+
+/// 그룹 헤더 토글의 접근성 이름. provider만 쓰면 같은 provider의 다른 세션과 겹칠
+/// 수 있어 `agent_session_id`를 더해 유일하게 만든다 — 카드가 `row.instruction`을
+/// 그대로 쓰는 것과 같은 이유(번역이 필요 없는 raw 식별자).
+fn group_accessible_label(kind: &str, agent_session_id: &str) -> String {
+    format!("{} · {agent_session_id}", provider_label(kind))
+}
+
 pub struct WorkHistoryUi {
     query: String,
     filter: WorkHistoryFilter,
     providers: Vec<WorkHistoryProvider>,
     sort_mode: WorkHistorySortMode,
     selected: Option<WorkTurnIdentity>,
+    /// 접힌 그룹의 `(kind, agent_session_id)` 집합. 세션 내 UI 상태로만 유지하고
+    /// 설정·DB에는 저장하지 않는다 — `selected`와 같은 성격의 필드다.
+    collapsed_groups: std::collections::HashSet<(String, String)>,
 }
 
 impl WorkHistoryUi {
@@ -253,6 +301,7 @@ impl WorkHistoryUi {
             providers: Vec::new(),
             sort_mode: WorkHistorySortMode::StateFirst,
             selected: None,
+            collapsed_groups: std::collections::HashSet::new(),
         }
     }
 
@@ -272,11 +321,12 @@ impl WorkHistoryUi {
         // 넘겨받은 rect(=pane body)를 그대로 채운다. 상단 탭 스트립은 호출부가 이미
         // 잘라내고 남긴 높이라 여기서 다시 빼지 않는다 — 프레임 자기 여백만 제한다.
         let available_height = ui.available_height();
-        let visible = self.visible_rows(snapshot.rows);
+        let groups = self.grouped_rows(snapshot.rows);
+        let shown: usize = groups.iter().map(|group| group.rows.len()).sum();
         content.show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height((available_height - f32::from(BODY_MARGIN_Y) * 2.0).max(0.0));
-            if self.render_context_row(ui, &snapshot, visible.len(), catalog) {
+            if self.render_context_row(ui, &snapshot, shown, catalog) {
                 action = Some(WorkHistoryAction::Refresh);
             }
             ui.add_space(8.0);
@@ -292,7 +342,7 @@ impl WorkHistoryUi {
                 render_empty(ui, snapshot.loading, catalog);
                 return;
             }
-            if visible.is_empty() {
+            if groups.is_empty() {
                 render_centered_message(ui, catalog.t("history.no_results", &[]));
                 return;
             }
@@ -303,21 +353,34 @@ impl WorkHistoryUi {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 9.0;
-                    for row in visible {
-                        let expanded = self
-                            .selected
-                            .as_ref()
-                            .is_some_and(|selected| selected.matches(row));
-                        let presentation = presentations
-                            .iter()
-                            .find(|candidate| candidate.identity.matches(row));
-                        let card_action =
-                            render_card(ui, row, expanded, now, presentation, catalog);
-                        if card_action.toggle {
-                            self.toggle_selected(WorkTurnIdentity::from(row));
+                    for (index, group) in groups.iter().enumerate() {
+                        if index > 0 {
+                            ui.add_space(6.0);
                         }
-                        if action.is_none() {
-                            action = card_action.action;
+                        let key = (group.kind.to_owned(), group.agent_session_id.to_owned());
+                        let collapsed = self.collapsed_groups.contains(&key);
+                        if render_group_header(ui, group, collapsed, now, catalog) {
+                            self.toggle_group_collapsed(key);
+                        }
+                        if collapsed {
+                            continue;
+                        }
+                        for row in &group.rows {
+                            let expanded = self
+                                .selected
+                                .as_ref()
+                                .is_some_and(|selected| selected.matches(row));
+                            let presentation = presentations
+                                .iter()
+                                .find(|candidate| candidate.identity.matches(row));
+                            let card_action =
+                                render_card(ui, row, expanded, now, presentation, catalog);
+                            if card_action.toggle {
+                                self.toggle_selected(WorkTurnIdentity::from(row));
+                            }
+                            if action.is_none() {
+                                action = card_action.action;
+                            }
                         }
                     }
                 });
@@ -451,11 +514,65 @@ impl WorkHistoryUi {
         visible
     }
 
+    /// `visible_rows`가 만든(필터+정렬 적용된) 전역 순서를 `agent_session_id`
+    /// (+`kind`)로 묶는다.
+    ///
+    /// 그룹 순서·그룹 내부 턴 순서 둘 다 새로 계산하지 않고 "첫 등장 순서"만
+    /// 본다 — `visible_rows`의 전역 정렬 기준(예: `StateFirst`면 state_rank →
+    /// updated_at desc → …)은 행 단위로 완전한 전순서라, 어떤 그룹이 플랫
+    /// 목록에 처음 나타나는 위치는 반드시 그 그룹에서 "대표값이 가장 앞서는
+    /// 행"의 위치와 같다. 그러므로 첫 등장 순서로 그룹을 나열하면 그게 곧
+    /// 그룹 대표값(StateFirst면 그룹 내 최상위 state_rank, RecentFirst면 그룹
+    /// 내 최신 updated_at) 기준 순서이고, 그룹에 속한 행들을 만나는 순서 그대로
+    /// 모으면 그룹 내부 순서도 전역 정렬 규칙을 그대로 물려받는다. 별도 재정렬이
+    /// 필요 없다.
+    fn grouped_rows<'a>(&self, rows: &'a [WorkHistoryRow<'a>]) -> Vec<WorkHistoryGroup<'a>> {
+        let mut groups: Vec<WorkHistoryGroup<'a>> = Vec::new();
+        for row in self.visible_rows(rows) {
+            match groups.iter_mut().find(|group| {
+                group.kind == row.kind && group.agent_session_id == row.agent_session_id
+            }) {
+                Some(group) => group.rows.push(*row),
+                None => groups.push(WorkHistoryGroup {
+                    kind: row.kind,
+                    agent_session_id: row.agent_session_id,
+                    rows: vec![*row],
+                    model: None,
+                    effort: None,
+                    branch: None,
+                    git_change_count: None,
+                    latest_updated_at: row.updated_at,
+                }),
+            }
+        }
+        for group in &mut groups {
+            group.model = latest_with_value(&group.rows, |row| row.model);
+            group.effort = latest_with_value(&group.rows, |row| row.effort);
+            group.branch = latest_with_value(&group.rows, |row| row.branch);
+            group.git_change_count = latest_with_value(&group.rows, |row| row.git_change_count);
+            group.latest_updated_at = group
+                .rows
+                .iter()
+                .map(|row| row.updated_at)
+                .max()
+                .unwrap_or(group.latest_updated_at);
+        }
+        groups
+    }
+
     fn toggle_selected(&mut self, identity: WorkTurnIdentity) {
         if self.selected.as_ref() == Some(&identity) {
             self.selected = None;
         } else {
             self.selected = Some(identity);
+        }
+    }
+
+    /// 그룹 헤더 클릭 — 접혀 있으면 펴고, 펴져 있으면 접는다. `selected`(카드 펼침)와
+    /// 별개 상태라 서로 간섭하지 않는다.
+    fn toggle_group_collapsed(&mut self, key: (String, String)) {
+        if !self.collapsed_groups.remove(&key) {
+            self.collapsed_groups.insert(key);
         }
     }
 
@@ -543,6 +660,79 @@ fn provider_chip(
             selected.push(value);
         }
     }
+}
+
+/// 그룹 헤더 한 줄 — provider·model·effort·branch·작업 트리 변경 수·그룹 내 최신
+/// 시각·턴 수를 담는다. 카드 토글과 같은 트릭(`Sense::click()` 스코프 전체가
+/// 논리 버튼, 내부엔 실제 `egui::Button`을 두지 않음)으로 접기/펴기를 구현한다 —
+/// 헤더 안에 버튼을 중첩하면 카드에서 이미 고친(0e934c0) AccessKit 문제가 그대로
+/// 재발한다. 좁은 폭에서는 `horizontal_wrapped`로 다음 줄로 흘려보내 겹침을
+/// 막는다(카드의 `render_metadata`와 같은 패턴).
+fn render_group_header(
+    ui: &mut egui::Ui,
+    group: &WorkHistoryGroup<'_>,
+    collapsed: bool,
+    now: i64,
+    catalog: &i18n::Catalog,
+) -> bool {
+    let toggle = ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(("work-history-group", group.kind, group.agent_session_id))
+            .sense(egui::Sense::click()),
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(if collapsed { "▸" } else { "▾" });
+                ui.label(egui::RichText::new(provider_label(group.kind)).strong());
+                if let Some(model) = group.model {
+                    ui.label(egui::RichText::new("·").small().weak());
+                    ui.label(egui::RichText::new(model).small().weak().monospace());
+                }
+                if let Some(effort) = group.effort {
+                    ui.label(egui::RichText::new("·").small().weak());
+                    ui.label(egui::RichText::new(effort).small().weak().monospace());
+                }
+                if let Some(branch) = group.branch {
+                    metadata_chip(ui, branch);
+                }
+                if let Some(count) = group.git_change_count {
+                    let count = count.to_string();
+                    metadata_chip(ui, &catalog.t("history.card.changes", &[("count", &count)]));
+                }
+                ui.label(egui::RichText::new("·").small().weak());
+                ui.label(
+                    egui::RichText::new(relative_age_text(catalog, group.latest_updated_at, now))
+                        .small()
+                        .weak(),
+                );
+                ui.label(egui::RichText::new("·").small().weak());
+                let turns = group.rows.len().to_string();
+                ui.label(
+                    egui::RichText::new(catalog.t("history.group.turns", &[("count", &turns)]))
+                        .small()
+                        .weak(),
+                );
+            });
+        },
+    );
+    let response = toggle
+        .response
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let label = group_accessible_label(group.kind, group.agent_session_id);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            !collapsed,
+            &label,
+        )
+    });
+    // 헤더가 카드보다 상위임을 색 대신 굵은 글씨 + hairline으로 표시한다(토큰에
+    // 새 색을 추가하지 않기 위함). hairline은 click 스코프 밖(형제)이라 클릭
+    // 판정에 관여하지 않는다.
+    ui.add_space(3.0);
+    crate::ui::hairline(ui);
+    response.clicked()
 }
 
 fn render_card(
@@ -1633,6 +1823,417 @@ mod tests {
         assert!(
             ui.visible_rows(&views(std::slice::from_ref(&single)))
                 .is_empty()
+        );
+    }
+
+    // ---- 세션 그룹핑 (A2/B1) ----
+
+    #[test]
+    fn 빈_rows는_그룹이_없다() {
+        let ui = WorkHistoryUi::new();
+        assert!(ui.grouped_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn 같은_kind_같은_agent_session_id는_한_그룹으로_묶인다() {
+        let rows = vec![
+            row("turn-1", storage::AgentWorkTurnState::Working, 10),
+            row("turn-2", storage::AgentWorkTurnState::Completed, 5),
+        ];
+        let ui = WorkHistoryUi::new();
+        let views = views(&rows);
+
+        let groups = ui.grouped_rows(&views);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rows.len(), 2);
+    }
+
+    #[test]
+    fn kind이_다르면_같은_agent_session_id라도_다른_그룹이다() {
+        // provider 사이에서 같은 세션 id가 우연히 충돌할 수 있으므로 kind도 그룹
+        // 키에 들어가야 한다(작업 지시사항의 명시 요구).
+        let mut claude_turn = row("shared-id-claude", storage::AgentWorkTurnState::Working, 10);
+        claude_turn.kind = "claude".to_owned();
+        claude_turn.agent_session_id = "shared-id".to_owned();
+        let mut codex_turn = row("shared-id-codex", storage::AgentWorkTurnState::Working, 9);
+        codex_turn.kind = "codex".to_owned();
+        codex_turn.agent_session_id = "shared-id".to_owned();
+        let rows = vec![claude_turn, codex_turn];
+        let ui = WorkHistoryUi::new();
+        let views = views(&rows);
+
+        assert_eq!(
+            ui.grouped_rows(&views).len(),
+            2,
+            "kind가 다르면 같은 session id라도 별도 그룹이어야 한다"
+        );
+    }
+
+    #[test]
+    fn 다른_agent_session_id는_다른_그룹이다() {
+        let mut first = row("turn-a", storage::AgentWorkTurnState::Working, 10);
+        first.agent_session_id = "session-a".to_owned();
+        let mut second = row("turn-b", storage::AgentWorkTurnState::Working, 9);
+        second.agent_session_id = "session-b".to_owned();
+        let rows = vec![first, second];
+        let ui = WorkHistoryUi::new();
+        let views = views(&rows);
+
+        assert_eq!(ui.grouped_rows(&views).len(), 2);
+    }
+
+    /// 그룹 순서는 "그룹 내 최상위 turn"의 순위를 따르고, 그룹 내부 턴 순서도 같은
+    /// 전역 정렬 규칙을 그대로 물려받는다. session-a는 working 턴(랭크 최상위) 하나와
+    /// completed 턴(최신이지만 랭크가 낮음) 하나를 가져 이 둘을 구분한다.
+    #[test]
+    fn statefirst_그룹_순서는_그룹_내_최상위_turn_rank를_따른다() {
+        let mut a_working = row("a-working", storage::AgentWorkTurnState::Working, 1);
+        a_working.agent_session_id = "session-a".to_owned();
+        let mut a_completed = row("a-completed", storage::AgentWorkTurnState::Completed, 99);
+        a_completed.agent_session_id = "session-a".to_owned();
+        let mut b_waiting = row("b-waiting", storage::AgentWorkTurnState::Waiting, 100);
+        b_waiting.agent_session_id = "session-b".to_owned();
+        let mut c_completed = row("c-completed", storage::AgentWorkTurnState::Completed, 50);
+        c_completed.agent_session_id = "session-c".to_owned();
+        let rows = vec![a_working, a_completed, b_waiting, c_completed];
+        let ui = WorkHistoryUi::new();
+        let views = views(&rows);
+
+        let groups = ui.grouped_rows(&views);
+
+        let group_ids: Vec<&str> = groups.iter().map(|group| group.agent_session_id).collect();
+        assert_eq!(
+            group_ids,
+            ["session-a", "session-b", "session-c"],
+            "a는 working 턴을 갖고 있어 가장 앞이어야 한다"
+        );
+        let a_turn_keys: Vec<&str> = groups[0].rows.iter().map(|row| row.turn_key).collect();
+        assert_eq!(
+            a_turn_keys,
+            ["a-working", "a-completed"],
+            "그룹 내부에서도 working이 completed보다 앞이어야 한다(전역 규칙 상속)"
+        );
+    }
+
+    /// RecentFirst는 상태와 무관하게 그룹 내 최신 updated_at으로만 그룹 순서를 정한다.
+    #[test]
+    fn recentfirst_그룹_순서는_그룹_내_최신_updated_at을_따른다() {
+        let mut x = row("x-completed", storage::AgentWorkTurnState::Completed, 30);
+        x.agent_session_id = "session-x".to_owned();
+        let mut z = row("z-working", storage::AgentWorkTurnState::Working, 20);
+        z.agent_session_id = "session-z".to_owned();
+        let mut y_working = row("y-working", storage::AgentWorkTurnState::Working, 10);
+        y_working.agent_session_id = "session-y".to_owned();
+        let mut y_waiting = row("y-waiting", storage::AgentWorkTurnState::Waiting, 5);
+        y_waiting.agent_session_id = "session-y".to_owned();
+        let rows = vec![x, z, y_working, y_waiting];
+        let mut ui = WorkHistoryUi::new();
+        ui.sort_mode = WorkHistorySortMode::RecentFirst;
+        let views = views(&rows);
+
+        let groups = ui.grouped_rows(&views);
+
+        let group_ids: Vec<&str> = groups.iter().map(|group| group.agent_session_id).collect();
+        assert_eq!(group_ids, ["session-x", "session-z", "session-y"]);
+        let y_turn_keys: Vec<&str> = groups[2].rows.iter().map(|row| row.turn_key).collect();
+        assert_eq!(y_turn_keys, ["y-working", "y-waiting"]);
+    }
+
+    #[test]
+    fn 상태필터가_그룹의_일부턴만_남기면_그룹은_남은턴만_담는다() {
+        let mut working = row("s-working", storage::AgentWorkTurnState::Working, 10);
+        working.agent_session_id = "session-s".to_owned();
+        let mut waiting = row("s-waiting", storage::AgentWorkTurnState::Waiting, 9);
+        waiting.agent_session_id = "session-s".to_owned();
+        let rows = vec![working, waiting];
+        let mut ui = WorkHistoryUi::new();
+        ui.filter = WorkHistoryFilter::Working;
+        let views = views(&rows);
+
+        let groups = ui.grouped_rows(&views);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].rows.len(),
+            1,
+            "헤더 턴 수도 남은 턴만 반영해야 한다"
+        );
+        assert_eq!(groups[0].rows[0].turn_key, "s-working");
+    }
+
+    #[test]
+    fn 필터로_그룹의_모든턴이_사라지면_그룹자체가_사라진다() {
+        let mut only_completed = row("s1-completed", storage::AgentWorkTurnState::Completed, 10);
+        only_completed.agent_session_id = "session-s1".to_owned();
+        let mut has_working = row("s2-working", storage::AgentWorkTurnState::Working, 9);
+        has_working.agent_session_id = "session-s2".to_owned();
+        let rows = vec![only_completed, has_working];
+        let mut ui = WorkHistoryUi::new();
+        ui.filter = WorkHistoryFilter::Working;
+        let views = views(&rows);
+
+        let groups = ui.grouped_rows(&views);
+
+        assert_eq!(
+            groups.len(),
+            1,
+            "필터에 남는 턴이 없는 세션은 그룹째로 사라져야 한다"
+        );
+        assert_eq!(groups[0].agent_session_id, "session-s2");
+    }
+
+    /// A2 결함 재현 시나리오 — 최신 턴은 cwd 파생 사실(branch/변경 수)이 없고, 더
+    /// 오래된 턴에만 있다. 헤더는 "값이 있는 가장 최신 턴"을 찾아야 하며, 그냥
+    /// 가장 최신 턴(newer)의 빈 값을 그대로 쓰면 안 된다.
+    #[test]
+    fn 헤더_branch와_변경수는_값이_있는_가장_최신턴에서_가져온다() {
+        let mut older_with_value = row("s-older", storage::AgentWorkTurnState::Completed, 5);
+        older_with_value.agent_session_id = "session-s".to_owned();
+        older_with_value.branch = Some("main".to_owned());
+        older_with_value.git_change_count = Some(2);
+        older_with_value.model = Some("model-old".to_owned());
+        older_with_value.effort = Some("low".to_owned());
+        let mut newer_without_value = row("s-newer", storage::AgentWorkTurnState::Working, 50);
+        newer_without_value.agent_session_id = "session-s".to_owned();
+        newer_without_value.branch = None;
+        newer_without_value.git_change_count = None;
+        newer_without_value.model = None;
+        newer_without_value.effort = None;
+        let rows = vec![older_with_value, newer_without_value];
+        let ui = WorkHistoryUi::new();
+        let views = views(&rows);
+
+        let groups = ui.grouped_rows(&views);
+
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.branch, Some("main"));
+        assert_eq!(group.git_change_count, Some(2));
+        assert_eq!(group.model, Some("model-old"));
+        assert_eq!(group.effort, Some("low"));
+        assert_eq!(
+            group.latest_updated_at, 50,
+            "헤더의 '최신 시각'은 값 유무와 무관하게 그룹의 진짜 최신 턴을 따른다"
+        );
+    }
+
+    #[test]
+    fn 값이_아예없으면_헤더_필드를_비운다() {
+        let mut first = row("s-a", storage::AgentWorkTurnState::Working, 10);
+        first.agent_session_id = "session-s".to_owned();
+        first.branch = None;
+        first.git_change_count = None;
+        let mut second = row("s-b", storage::AgentWorkTurnState::Completed, 5);
+        second.agent_session_id = "session-s".to_owned();
+        second.branch = None;
+        second.git_change_count = None;
+        let rows = vec![first, second];
+        let ui = WorkHistoryUi::new();
+        let views = views(&rows);
+
+        let groups = ui.grouped_rows(&views);
+
+        assert!(groups[0].branch.is_none(), "없는 값을 지어내면 안 된다");
+        assert!(groups[0].git_change_count.is_none());
+    }
+
+    #[test]
+    fn 그룹_토글은_접기_펴기를_전환하고_기본값은_펼침이다() {
+        let mut ui = WorkHistoryUi::new();
+        let key = ("codex".to_owned(), "agent-session-a".to_owned());
+        assert!(
+            !ui.collapsed_groups.contains(&key),
+            "기본값은 펼침이어야 한다"
+        );
+
+        ui.toggle_group_collapsed(key.clone());
+        assert!(ui.collapsed_groups.contains(&key));
+
+        ui.toggle_group_collapsed(key.clone());
+        assert!(!ui.collapsed_groups.contains(&key));
+    }
+
+    fn full_harness<'a>(
+        catalog: &'a i18n::Catalog,
+        rows: &'a [WorkHistoryRow<'a>],
+        presentations: &'a [WorkHistoryActionPresentation],
+    ) -> egui_kittest::Harness<'a, WorkHistoryUi> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(
+                move |ui, state: &mut WorkHistoryUi| {
+                    state.show(
+                        ui,
+                        WorkHistorySnapshot {
+                            workspace_name: "workspace",
+                            current_branch: None,
+                            rows,
+                            loading: false,
+                            error: None,
+                        },
+                        presentations,
+                        catalog,
+                    );
+                },
+                WorkHistoryUi::new(),
+            )
+    }
+
+    #[test]
+    fn kittest_group_header_click_toggles_card_visibility() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row(
+            "group-toggle-hit-test",
+            storage::AgentWorkTurnState::Working,
+            10,
+        );
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: false,
+        };
+        let header_label = group_accessible_label(&candidate.kind, &candidate.agent_session_id);
+        let instruction = candidate.instruction.clone();
+        let rows = vec![candidate];
+        let views = views(&rows);
+        let presentations = vec![presentation];
+        let mut harness = full_harness(&catalog, &views, &presentations);
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, &instruction)
+                .is_some(),
+            "접기 전에는 턴 카드가 보여야 한다"
+        );
+
+        // `ScrollArea` claims raw pointer press/release for its own drag-to-scroll
+        // sensing before nested `Sense::click()` scopes see them, so a simulated
+        // `.click()` (raw pointer events) never reaches the header inside the
+        // history list's scroll area. `click_accesskit()` drives the same
+        // `Response` through AccessKit's `Action::Click` instead and reliably
+        // reaches it.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, &header_label)
+            .click_accesskit();
+        // 클릭을 처리하는 프레임은 `collapsed` 값을 헤더를 그리기 **전에** 이미
+        // 읽어 뒀으므로 그 프레임의 카드 렌더링에는 아직 반영되지 않는다(egui
+        // 즉시모드의 흔한 1프레임 지연). 구조 변화를 확인하려면 한 프레임 더
+        // 돌려야 한다.
+        harness.run();
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, &instruction)
+                .is_none(),
+            "그룹 헤더를 접으면 턴 카드가 숨어야 한다"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, &header_label)
+            .click_accesskit();
+        harness.run();
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, &instruction)
+                .is_some(),
+            "다시 클릭하면 펼쳐져야 한다"
+        );
+    }
+
+    /// 카드 토글(`kittest_card_toggle_does_not_contain_action_buttons`)과 같은
+    /// 회귀 방지 — 그룹 헤더도 접기/펴기 토글이라 같은 함정(토글 스코프 안에
+    /// 실제 버튼을 두는 것)이 있다. 헤더는 라벨만 그리므로 지금은 버튼이 없어야
+    /// 하고, 나중에 실수로 버튼을 넣으면 이 테스트가 먼저 깨진다.
+    #[test]
+    fn kittest_group_header_toggle_does_not_contain_buttons() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row(
+            "group-header-a11y-tree",
+            storage::AgentWorkTurnState::Completed,
+            10,
+        );
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: true,
+        };
+        let header_label = group_accessible_label(&candidate.kind, &candidate.agent_session_id);
+        let rows = vec![candidate];
+        let views = views(&rows);
+        let presentations = vec![presentation];
+        let mut harness = full_harness(&catalog, &views, &presentations);
+        harness.run();
+
+        let header = harness.get_by_role_and_label(egui::accesskit::Role::Button, &header_label);
+        assert!(
+            header
+                .query_by_role(egui::accesskit::Role::Button)
+                .is_none(),
+            "group header toggle must not contain nested button widgets"
+        );
+    }
+
+    #[test]
+    fn 좁은_폭에서도_그룹_헤더_요소가_화면_안에_머문다() {
+        use egui_kittest::kittest::Queryable;
+
+        const NARROW: f32 = 260.0;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut candidate = row(
+            "narrow-header-wrap",
+            storage::AgentWorkTurnState::Working,
+            10,
+        );
+        candidate.model = Some("gpt-5.6-sol-extended-reasoning".to_owned());
+        candidate.branch = Some("feature/very-long-branch-name-for-wrapping".to_owned());
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: false,
+        };
+        // `catalog`가 아래 `move` 클로저로 소유권째 넘어가므로, 클로저 구성 전에
+        // 미리 라벨 문자열을 뽑아 둔다(이동 뒤에는 `catalog`를 다시 쓸 수 없다).
+        let turn_count_label = catalog.t("history.group.turns", &[("count", "1")]);
+        let rows = vec![candidate];
+        let views = views(&rows);
+        let presentations = vec![presentation];
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(NARROW, 500.0))
+            .build_ui_state(
+                move |ui, state: &mut WorkHistoryUi| {
+                    state.show(
+                        ui,
+                        WorkHistorySnapshot {
+                            workspace_name: "workspace",
+                            current_branch: None,
+                            rows: &views,
+                            loading: false,
+                            error: None,
+                        },
+                        &presentations,
+                        &catalog,
+                    );
+                },
+                WorkHistoryUi::new(),
+            );
+        harness.run();
+
+        let element = harness
+            .query_by_label(&turn_count_label)
+            .expect("좁은 폭에서 턴 수 라벨이 사라졌다");
+        assert!(
+            element.rect().right() <= NARROW,
+            "턴 수 라벨이 캔버스 밖으로 넘친다: {}",
+            element.rect().right()
         );
     }
 }

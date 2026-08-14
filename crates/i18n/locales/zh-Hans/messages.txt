@@ -94,6 +94,7 @@ history.card.no_summary.working = 智能体正在执行此指令。
 history.card.no_summary.waiting = 智能体正在等待你的回复。
 history.card.no_summary.completed = 此工作已完成。
 history.card.changes = 工作树更改 {count}
+history.group.turns = {count} 轮
 history.action.focus = 前往当前会话
 history.action.resume = 继续运行
 history.action.new_run = 新建运行

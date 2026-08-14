@@ -9207,9 +9207,51 @@ struct PendingFileTreeWatchEvents {
     overflowed: bool,
 }
 
+/// 전용 스레드로 보내는 watch 계획 하나. `AppFileTreeWatcher`의 request 채널은
+/// capacity-1이고, `FileTreeUi`가 `pending_maintenance`로 in-flight 1개만 허용하므로
+/// (`file_tree.rs`의 `debug_assert_eq!(FILE_TREE_MAINTENANCE_QUEUE_CAP, 1)`) 두 번째
+/// job이 이 채널에 쌓여 기다리는 일은 없다.
+struct AppFileTreeWatchJob {
+    operation: ui::file_tree::FileTreeMaintenanceOperation,
+    generation: u64,
+    directories: Vec<PathBuf>,
+    ignored_prefixes: Vec<PathBuf>,
+    show_hidden: bool,
+}
+
+/// watch/unwatch가 실제로 적용된 뒤의 root/필터 메타데이터. `take_snapshot()`의 이벤트
+/// 필터는 이 값이 갱신된 뒤에만(=완료 회신 시점에만) 바뀌어야 한다 — 전송 시점에
+/// 갱신하면 옛 watch 집합이 아직 살아있는 동안 들어온 이벤트를 새 root 기준으로 잘못
+/// 걸러낸다.
+struct AppFileTreeWatchApplied {
+    root: PathBuf,
+    ignored_prefixes: Vec<PathBuf>,
+    show_hidden: bool,
+}
+
+struct AppFileTreeWatchCompletion {
+    operation: ui::file_tree::FileTreeMaintenanceOperation,
+    generation: u64,
+    result: Result<AppFileTreeWatchApplied, ui::file_tree::FileTreeMaintenanceErrorCode>,
+}
+
+/// 전용 스레드 slot. `Option`으로 감싸 Drop에서 `.take()`로 분해한 뒤 채널을 먼저
+/// 닫고 join할 수 있게 한다 (`lazy_worker.rs`의 `WorkerSlot` Drop 관례와 동일).
+struct AppFileTreeWatcherSlot {
+    request_tx: std::sync::mpsc::SyncSender<AppFileTreeWatchJob>,
+    completion_rx: std::sync::mpsc::Receiver<AppFileTreeWatchCompletion>,
+    handle: std::thread::JoinHandle<()>,
+}
+
 struct AppFileTreeWatcher {
-    watcher: notify::RecommendedWatcher,
-    watched: std::collections::HashSet<PathBuf>,
+    slot: Option<AppFileTreeWatcherSlot>,
+    /// 마지막으로 보낸 job의 operation+generation. 회신이 이 값과 정확히 일치할 때만
+    /// take_snapshot() 필터 메타데이터를 갱신한다 — 워크스페이스가 빠르게 여러 번
+    /// 전환돼 옛 job의 완료가 더 최신 job을 보낸 뒤에 도착해도, 그 stale 완료가
+    /// 메타데이터를 뒤로 되돌리지 않게 막는다. 완료 채널이 끊기면(워커 패닉 등) 이
+    /// 값으로 NativeFailure completion을 합성해 `FileTreeUi`가 영영 pending에 갇히지
+    /// 않게 한다.
+    pending_operation: Option<(ui::file_tree::FileTreeMaintenanceOperation, u64)>,
     pending: Arc<std::sync::Mutex<PendingFileTreeWatchEvents>>,
     generation: u64,
     revision: u64,
@@ -9262,9 +9304,33 @@ impl AppFileTreeWatcher {
                 }
             })
             .map_err(|_| ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable)?;
+
+        // notify의 fsevent 백엔드는 watch()/unwatch() 호출마다 run-loop 스레드와 채널로
+        // 동기 왕복하며 블로킹한다 (실측: 워크스페이스 전환 1회당 UI 스레드 115ms 블로킹
+        // — sample(1) 프로파일에서 `AppFileTreeWatcher::replace` -> `watch_inner` ->
+        // `Receiver::recv`로 확인). watcher와 watched 집합을 이 전용 스레드로 옮겨 그
+        // 블로킹이 UI 스레드가 아니라 여기서 일어나게 한다. idle-timeout으로 스레드를
+        // 접는 `LazyBoundedWorker`류 워커는 쓰지 않는다 — file watching은 유휴 중에도
+        // 이벤트를 받아야 하므로, 워커가 idle-exit하며 notify watcher를 드롭하면 그
+        // 사이의 fs 변경을 통째로 놓친다. 대신 request 채널이 끊길 때까지(=이
+        // `AppFileTreeWatcher`가 drop될 때까지) 사는 장수 스레드 하나만 둔다.
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<AppFileTreeWatchJob>(1);
+        let (completion_tx, completion_rx) =
+            std::sync::mpsc::sync_channel::<AppFileTreeWatchCompletion>(1);
+        let handle = std::thread::Builder::new()
+            .name("file-tree-watch".to_owned())
+            .spawn(move || {
+                run_app_file_tree_watch_worker(watcher, request_rx, completion_tx);
+            })
+            .map_err(|_| ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable)?;
+
         Ok(Self {
-            watcher,
-            watched: std::collections::HashSet::new(),
+            slot: Some(AppFileTreeWatcherSlot {
+                request_tx,
+                completion_rx,
+                handle,
+            }),
+            pending_operation: None,
             pending,
             generation: 0,
             revision: 0,
@@ -9274,46 +9340,95 @@ impl AppFileTreeWatcher {
         })
     }
 
-    fn replace(
+    /// plan을 워커 스레드로 보내고 **즉시** 반환한다. watch()/unwatch() 호출은 이 함수
+    /// 안에서 절대 일어나지 않는다 — 그게 이 구조의 핵심이다. 적용 완료는
+    /// `poll_completion()`으로 이후 프레임에 비동기로 도착한다.
+    fn submit_replace(
         &mut self,
+        operation: ui::file_tree::FileTreeMaintenanceOperation,
         generation: u64,
         directories: Vec<PathBuf>,
         ignored_prefixes: Vec<PathBuf>,
         show_hidden: bool,
     ) -> Result<(), ui::file_tree::FileTreeMaintenanceErrorCode> {
-        use notify::Watcher as _;
+        use ui::file_tree::FileTreeMaintenanceErrorCode as Error;
 
         let Some(root) = directories.first().cloned() else {
-            return Err(ui::file_tree::FileTreeMaintenanceErrorCode::InvalidSnapshot);
+            return Err(Error::InvalidSnapshot);
         };
         if directories.len() > ui::file_tree::FILE_TREE_WATCH_MAX_DIRECTORIES
             || directories
                 .iter()
                 .any(|directory| !directory.starts_with(&root))
         {
-            return Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchPlanTooLarge);
+            return Err(Error::WatchPlanTooLarge);
         }
-        let desired = directories
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-        for directory in desired.difference(&self.watched) {
-            self.watcher
-                .watch(directory, notify::RecursiveMode::NonRecursive)
-                .map_err(|_| ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable)?;
+        let Some(slot) = self.slot.as_ref() else {
+            return Err(Error::WatchUnavailable);
+        };
+        slot.request_tx
+            .try_send(AppFileTreeWatchJob {
+                operation,
+                generation,
+                directories,
+                ignored_prefixes,
+                show_hidden,
+            })
+            .map_err(|_| Error::WatchUnavailable)?;
+        self.pending_operation = Some((operation, generation));
+        Ok(())
+    }
+
+    /// 워커의 완료 회신을 non-blocking으로 소비한다.
+    fn poll_completion(&mut self) -> Option<AppFileTreeWatchCompletion> {
+        let slot = self.slot.as_ref()?;
+        match slot.completion_rx.try_recv() {
+            Ok(completion) => {
+                self.apply_completion_metadata(&completion);
+                Some(completion)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // 워커가 회신 없이 죽었다(패닉 등). in-flight로 기록해 둔 operation/
+                // generation으로 실패 completion을 합성해 상위(FileTreeUi)가 pending
+                // maintenance에 영영 갇히지 않게 한다 — 실제 워커 구현은 job 처리
+                // 실패 시에도 항상 completion을 보내고 나서 스레드를 접으므로, 이
+                // 분기는 정상 경로에서는 거의 발생하지 않는 방어적 처리다.
+                self.pending_operation
+                    .take()
+                    .map(|(operation, generation)| AppFileTreeWatchCompletion {
+                        operation,
+                        generation,
+                        result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure),
+                    })
+            }
         }
-        for directory in self.watched.difference(&desired) {
-            let _ = self.watcher.unwatch(directory);
+    }
+
+    fn apply_completion_metadata(&mut self, completion: &AppFileTreeWatchCompletion) {
+        let is_current = self.pending_operation == Some((completion.operation, completion.generation));
+        if is_current {
+            self.pending_operation = None;
         }
-        self.watched = desired;
-        self.generation = generation;
-        self.root = root;
-        self.ignored_prefixes = ignored_prefixes;
-        self.show_hidden = show_hidden;
+        let Ok(applied) = completion.result.as_ref() else {
+            return;
+        };
+        if !is_current {
+            // 이미 더 최신 요청으로 대체된 옛 요청의 회신이다. FileTreeUi::complete_maintenance의
+            // exact operation+generation 매칭이 화면 반영은 막아주지만, 이 필터
+            // 메타데이터(root/ignored_prefixes/show_hidden/generation)는 그 보호막
+            // 밖에 있으므로 여기서 직접 무시해야 최신 요청의 root보다 뒤로 되돌아가지
+            // 않는다.
+            return;
+        }
+        self.generation = completion.generation;
+        self.root = applied.root.clone();
+        self.ignored_prefixes = applied.ignored_prefixes.clone();
+        self.show_hidden = applied.show_hidden;
         *self
             .pending
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = PendingFileTreeWatchEvents::default();
-        Ok(())
     }
 
     fn take_snapshot(
@@ -9378,6 +9493,104 @@ impl AppFileTreeWatcher {
         )
         .map(Some)
     }
+}
+
+impl Drop for AppFileTreeWatcher {
+    fn drop(&mut self) {
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        let AppFileTreeWatcherSlot {
+            request_tx,
+            completion_rx,
+            handle,
+        } = slot;
+        // request_tx를 닫으면 워커의 blocking recv()가 즉시 Err로 풀린다. completion_rx도
+        // 먼저 닫아 워커가 마지막 completion을 bounded send하다 막혀 있어도 풀려나게
+        // 한다 (lazy_worker.rs의 WorkerSlot Drop과 동일한 순서).
+        drop(completion_rx);
+        drop(request_tx);
+        let _ = handle.join();
+    }
+}
+
+/// `AppFileTreeWatcher` 전용 장수 스레드 본체. notify::RecommendedWatcher와 watched
+/// 집합을 여기서 소유하며, request_rx가 끊길 때까지(=AppFileTreeWatcher drop) idle-
+/// timeout 없이 계속 산다.
+fn run_app_file_tree_watch_worker(
+    mut watcher: notify::RecommendedWatcher,
+    request_rx: std::sync::mpsc::Receiver<AppFileTreeWatchJob>,
+    completion_tx: std::sync::mpsc::SyncSender<AppFileTreeWatchCompletion>,
+) {
+    let mut watched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    while let Ok(job) = request_rx.recv() {
+        let AppFileTreeWatchJob {
+            operation,
+            generation,
+            directories,
+            ignored_prefixes,
+            show_hidden,
+        } = job;
+        let root = directories.first().cloned();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            app_file_tree_apply_watch_diff(&mut watcher, &mut watched, directories)
+        }));
+        let result = match (outcome, root) {
+            (Ok(Ok(())), Some(root)) => Ok(AppFileTreeWatchApplied {
+                root,
+                ignored_prefixes,
+                show_hidden,
+            }),
+            // submit_replace가 빈 directories를 이미 걸러내므로 root == None은 실제로는
+            // 도달하지 않는다 — 방어적 분기.
+            (Ok(Ok(())), None) => Err(ui::file_tree::FileTreeMaintenanceErrorCode::InvalidSnapshot),
+            (Ok(Err(code)), _) => Err(code),
+            (Err(_), _) => Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure),
+        };
+        let is_native_failure = matches!(
+            result,
+            Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure)
+        );
+        if completion_tx
+            .send(AppFileTreeWatchCompletion {
+                operation,
+                generation,
+                result,
+            })
+            .is_err()
+        {
+            return;
+        }
+        if is_native_failure {
+            // catch_unwind가 잡은 패닉은 watcher/watched 내부 상태를 불확실하게 만든다.
+            // lazy_worker.rs의 관례를 따라 이 job 실패를 보고한 뒤 스레드를 접는다 —
+            // 재시도는 상위(app.rs)가 file_tree_watcher를 통째로 None으로 떨어뜨리고
+            // 다음 필요 시 새 워커를 만드는 경로로 처리한다.
+            return;
+        }
+    }
+}
+
+fn app_file_tree_apply_watch_diff(
+    watcher: &mut notify::RecommendedWatcher,
+    watched: &mut std::collections::HashSet<PathBuf>,
+    directories: Vec<PathBuf>,
+) -> Result<(), ui::file_tree::FileTreeMaintenanceErrorCode> {
+    use notify::Watcher as _;
+
+    let desired = directories
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    for directory in desired.difference(watched) {
+        watcher
+            .watch(directory, notify::RecursiveMode::NonRecursive)
+            .map_err(|_| ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable)?;
+    }
+    for directory in watched.difference(&desired) {
+        let _ = watcher.unwatch(directory);
+    }
+    *watched = desired;
+    Ok(())
 }
 
 fn app_file_tree_env_candidate(path: &Path) -> bool {
@@ -10480,6 +10693,27 @@ impl App {
             self.file_tree_watcher = None;
             return;
         };
+        // watch 적용 완료를 먼저 반영한다. take_snapshot()보다 앞에 둬야 하는 이유는
+        // AppFileTreeWatcher::apply_completion_metadata가 root/ignored_prefixes/
+        // show_hidden/generation을 "watch가 실제로 적용된 뒤"에만 갱신하기 때문이다 —
+        // 이 순서를 지켜야 옛 watch 집합이 아직 살아있는 동안 들어온 이벤트를 새 root
+        // 기준으로 잘못 걸러내는 일이 없다.
+        if let Some(watcher) = self.file_tree_watcher.as_mut()
+            && let Some(completion) = watcher.poll_completion()
+        {
+            let failed = completion.result.is_err();
+            tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+                operation: completion.operation,
+                generation: completion.generation,
+                result: completion
+                    .result
+                    .map(|_applied| ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
+            });
+            ctx.request_repaint();
+            if failed {
+                self.file_tree_watcher = None;
+            }
+        }
         if let Some(watcher) = self.file_tree_watcher.as_mut() {
             match watcher.take_snapshot() {
                 Ok(Some(snapshot)) => {
@@ -10524,31 +10758,44 @@ impl App {
             unreachable!("watch plan checked")
         };
         let (directories, ignored_prefixes, show_hidden) = plan.into_parts();
-        let result = if directories.is_empty() {
+        if directories.is_empty() {
+            // 감시할 디렉터리가 없다 — watcher 전체를 버린다. Drop이 워커 스레드에
+            // 정리(=fsevent run-loop stop 1회, O(n) watch/unwatch 루프가 아니다)를
+            // 맡기므로 UI 스레드에서 이 경로는 짧게 끝난다.
             self.file_tree_watcher = None;
-            Ok(ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied)
-        } else {
-            if self.file_tree_watcher.is_none() {
-                self.file_tree_watcher = AppFileTreeWatcher::new(ctx.clone()).ok();
+            if let Some(tree) = self.file_tree.as_mut() {
+                tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+                    operation,
+                    generation,
+                    result: Ok(ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
+                });
             }
-            match self.file_tree_watcher.as_mut() {
-                Some(watcher) => watcher
-                    .replace(generation, directories, ignored_prefixes, show_hidden)
-                    .map(|()| ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
-                None => Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
+            ctx.request_repaint();
+            return;
+        }
+        if self.file_tree_watcher.is_none() {
+            self.file_tree_watcher = AppFileTreeWatcher::new(ctx.clone()).ok();
+        }
+        let submitted = match self.file_tree_watcher.as_mut() {
+            Some(watcher) => {
+                watcher.submit_replace(operation, generation, directories, ignored_prefixes, show_hidden)
             }
+            None => Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
         };
-        if result.is_err() {
+        // submitted == Ok(()) 인 경우 완료는 이 프레임에서 알 수 없다 — 워커가 백그라운드
+        // 스레드에서 watch()/unwatch()를 처리하는 동안 다음 프레임들의 poll_completion()
+        // 이 비동기로 회신을 받아 tree.complete_maintenance를 호출한다(이 함수 맨 위 블록).
+        if let Err(code) = submitted {
             self.file_tree_watcher = None;
+            if let Some(tree) = self.file_tree.as_mut() {
+                tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+                    operation,
+                    generation,
+                    result: Err(code),
+                });
+            }
+            ctx.request_repaint();
         }
-        if let Some(tree) = self.file_tree.as_mut() {
-            tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
-                operation,
-                generation,
-                result,
-            });
-        }
-        ctx.request_repaint();
     }
 
     fn poll_app_host_io(&mut self, ctx: &egui::Context) {
@@ -31675,6 +31922,158 @@ mod tests {
             "deppy-sijo-{name}-{}-{nanos}.sqlite3",
             std::process::id()
         ))
+    }
+
+    fn app_file_tree_watch_temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-app-file-tree-watch-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `ui::file_tree::FileTreeMaintenanceOperation`의 내부 필드는 `file_tree` 모듈
+    /// 밖에서 만들 수 없다 — 그래서 실제 `FileTreeUi` 왕복(set_root → listing 완료 →
+    /// watch plan)을 그대로 밟아 유효한 (operation, generation, plan) 값을 얻는다.
+    fn app_file_tree_watch_intent(
+        tree: &mut ui::file_tree::FileTreeUi,
+        root: PathBuf,
+    ) -> (
+        ui::file_tree::FileTreeMaintenanceOperation,
+        u64,
+        Vec<PathBuf>,
+        Vec<PathBuf>,
+        bool,
+    ) {
+        tree.set_root(Some(root));
+        let listing_intent = tree
+            .take_maintenance_intent()
+            .expect("set_root produces a listing intent first");
+        tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+            operation: listing_intent.operation,
+            generation: listing_intent.generation,
+            result: Ok(ui::file_tree::FileTreeMaintenanceResult::Listing(
+                ui::file_tree::FileTreeListingSnapshot::try_new(Vec::new()).unwrap(),
+            )),
+        });
+        let watch_intent = tree
+            .take_maintenance_intent()
+            .expect("an empty listing completion drives a watch plan intent next");
+        let operation = watch_intent.operation;
+        let generation = watch_intent.generation;
+        let ui::file_tree::FileTreeMaintenanceRequest::ReplaceWatchSet(plan) = watch_intent.request
+        else {
+            panic!("expected a ReplaceWatchSet intent");
+        };
+        let (directories, ignored_prefixes, show_hidden) = plan.into_parts();
+        (operation, generation, directories, ignored_prefixes, show_hidden)
+    }
+
+    #[test]
+    fn app_file_tree_watcher_submit_replace는_즉시_반환하고_완료는_나중에_도착한다() {
+        let root = app_file_tree_watch_temp_root("submit-replace");
+        let ctx = egui::Context::default();
+        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
+        let (operation, generation, directories, ignored_prefixes, show_hidden) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
+
+        let mut watcher = AppFileTreeWatcher::new(ctx).expect("watcher spawns");
+        let submitted_at = std::time::Instant::now();
+        watcher
+            .submit_replace(
+                operation,
+                generation,
+                directories,
+                ignored_prefixes,
+                show_hidden,
+            )
+            .expect("submit accepted");
+        // submit_replace는 watch()/unwatch()를 직접 호출하지 않는다 — 그 증거로 반환
+        // 직후에는 아직 필터 메타데이터가 갱신돼 있지 않다. 적용은 워커의 비동기
+        // 완료(poll_completion) 이후에만 일어난다.
+        assert!(submitted_at.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(watcher.root, PathBuf::new());
+        assert_eq!(watcher.generation, 0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let completion = loop {
+            if let Some(completion) = watcher.poll_completion() {
+                break completion;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watch completion timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.generation, generation);
+        assert!(
+            completion.result.is_ok(),
+            "watch apply failed: {:?}",
+            completion.result.err()
+        );
+        assert_eq!(watcher.root, root);
+        assert_eq!(watcher.generation, generation);
+
+        drop(watcher);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn app_file_tree_watcher_stale_generation_완료는_메타데이터를_되돌리지_않는다() {
+        let root1 = app_file_tree_watch_temp_root("stale-root1");
+        let root2 = app_file_tree_watch_temp_root("stale-root2");
+        let ctx = egui::Context::default();
+        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
+        let (op1, gen1, _dirs1, _ignored1, _hidden1) =
+            app_file_tree_watch_intent(&mut tree, root1.clone());
+        let (op2, gen2, _dirs2, ignored2, hidden2) =
+            app_file_tree_watch_intent(&mut tree, root2.clone());
+        assert_ne!((op1, gen1), (op2, gen2));
+
+        let mut watcher = AppFileTreeWatcher::new(ctx).expect("watcher spawns");
+        // 실제로는 submit_replace가 이 값을 세팅하지만, 여기서는 stale-guard 로직만
+        // 직접 검증하기 위해 "op2/gen2가 현재 in-flight" 상태를 미리 만들어 둔다.
+        watcher.pending_operation = Some((op2, gen2));
+
+        // 더 이전(op1,gen1) 요청의 완료가 op2를 보낸 뒤 뒤늦게 도착한 상황을 흉내낸다.
+        let stale = AppFileTreeWatchCompletion {
+            operation: op1,
+            generation: gen1,
+            result: Ok(AppFileTreeWatchApplied {
+                root: root1.clone(),
+                ignored_prefixes: Vec::new(),
+                show_hidden: false,
+            }),
+        };
+        watcher.apply_completion_metadata(&stale);
+        // stale 완료는 무시된다 — root/generation은 여전히 초기값이고, op2가 아직
+        // in-flight로 남아 있어야 한다(최신 요청의 root보다 뒤로 되돌아가면 안 된다).
+        assert_eq!(watcher.root, PathBuf::new());
+        assert_eq!(watcher.generation, 0);
+        assert_eq!(watcher.pending_operation, Some((op2, gen2)));
+
+        // 진짜 in-flight 요청(op2,gen2)의 완료가 도착하면 그때는 반영된다.
+        let current = AppFileTreeWatchCompletion {
+            operation: op2,
+            generation: gen2,
+            result: Ok(AppFileTreeWatchApplied {
+                root: root2.clone(),
+                ignored_prefixes: ignored2,
+                show_hidden: hidden2,
+            }),
+        };
+        watcher.apply_completion_metadata(&current);
+        assert_eq!(watcher.root, root2);
+        assert_eq!(watcher.generation, gen2);
+        assert!(watcher.pending_operation.is_none());
+
+        drop(watcher);
+        std::fs::remove_dir_all(&root1).ok();
+        std::fs::remove_dir_all(&root2).ok();
     }
 
     fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {

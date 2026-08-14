@@ -609,6 +609,13 @@ fn render_card(
                     &catalog.t("history.card.instruction", &[]),
                     &row.instruction,
                 );
+                copy_button(
+                    ui,
+                    catalog,
+                    copy_feedback_id(row, "instruction"),
+                    "history.action.copy_instruction",
+                    &row.instruction,
+                );
                 ui.add_space(8.0);
                 let summary = row
                     .agent_summary
@@ -616,6 +623,15 @@ fn render_card(
                     .map(str::to_owned)
                     .unwrap_or_else(|| catalog.t("history.card.no_summary", &[]));
                 expanded_text(ui, &catalog.t("history.card.latest_work", &[]), &summary);
+                if let Some(summary_text) = row.agent_summary.as_deref() {
+                    copy_button(
+                        ui,
+                        catalog,
+                        copy_feedback_id(row, "summary"),
+                        "history.action.copy_summary",
+                        summary_text,
+                    );
+                }
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     if let Some(presentation) = presentation {
@@ -688,6 +704,80 @@ struct CardAction {
 fn expanded_text(ui: &mut egui::Ui, label: &str, body: &str) {
     ui.label(egui::RichText::new(label).small().weak());
     ui.add(egui::Label::new(body).wrap());
+}
+
+/// storage가 `agent_work_turn.instruction`/`agent_summary`에 적용하는 저장 상한
+/// (`AGENT_WORK_TURN_INSTRUCTION_BYTES_MAX`/`AGENT_WORK_TURN_SUMMARY_BYTES_MAX`, 각
+/// 32KB, storage 크레이트의 db 모듈)과 같은 값이다. 두 상수는 그 크레이트에서 `pub`이
+/// 아니라 여기서 재사용할 수 없어 값만 복제해 로컬 상한으로 둔다. 저장 시점에 이미
+/// 이 크기로 잘리므로 정상 경로에서는 항상 이 안쪽이지만, 클립보드로 나가는 텍스트도
+/// 방어적으로 다시 한 번 상한을 건다.
+const WORK_HISTORY_CLIPBOARD_BYTES_MAX: usize = 32 * 1024;
+
+/// 복사 직후 버튼 라벨을 "복사됨"으로 잠깐 바꿔 보여주는 시간.
+const COPY_FEEDBACK_SECONDS: f64 = 1.5;
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+fn bounded_clipboard_text(value: &str) -> String {
+    let mut bounded = value.to_owned();
+    truncate_utf8(&mut bounded, WORK_HISTORY_CLIPBOARD_BYTES_MAX);
+    bounded
+}
+
+/// 카드별·버튼별로 고유한 id. egui 위젯 id가 아니라 "마지막으로 복사한 시각"을
+/// `ctx().data_mut`에 넣어두는 열쇠로만 쓴다 — `WorkHistoryUi`에 새 필드를 추가하지
+/// 않고 복사 피드백을 주기 위한 선택.
+fn copy_feedback_id(row: &storage::AgentWorkTurnRow, suffix: &str) -> egui::Id {
+    egui::Id::new((
+        "work-history-card-copy",
+        &row.workspace_id,
+        &row.kind,
+        &row.agent_session_id,
+        &row.turn_key,
+        suffix,
+    ))
+}
+
+/// 카드 토글의 접근성 자손이 아니라, `if expanded` 블록 안에서 토글과 형제로만
+/// 호출해야 한다 — 토글 안에 버튼을 중첩하면 0e934c0에서 고친 AccessKit 문제가
+/// 재발한다.
+fn copy_button(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    id: egui::Id,
+    label_key: &str,
+    text: &str,
+) {
+    let now = ui.input(|input| input.time);
+    let copied_at = ui.ctx().data(|data| data.get_temp::<f64>(id));
+    let feedback_remaining = copied_at
+        .map(|at| COPY_FEEDBACK_SECONDS - (now - at))
+        .filter(|remaining| *remaining > 0.0);
+
+    let label = if feedback_remaining.is_some() {
+        catalog.t("history.action.copied", &[])
+    } else {
+        catalog.t(label_key, &[])
+    };
+    if ui.small_button(label).clicked() {
+        ui.ctx().copy_text(bounded_clipboard_text(text));
+        ui.ctx().data_mut(|data| data.insert_temp(id, now));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(COPY_FEEDBACK_SECONDS));
+    } else if let Some(remaining) = feedback_remaining {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+    }
 }
 
 fn metadata_parts(row: &storage::AgentWorkTurnRow) -> MetadataParts<'_> {
@@ -962,6 +1052,7 @@ mod tests {
     struct CardInteractionCapture {
         toggles: usize,
         actions: Vec<WorkHistoryAction>,
+        copied_text: Vec<String>,
     }
 
     fn card_harness<'a>(
@@ -978,6 +1069,13 @@ mod tests {
                 if let Some(action) = result.action {
                     capture.actions.push(action);
                 }
+                ui.ctx().output(|output| {
+                    for command in &output.commands {
+                        if let egui::OutputCommand::CopyText(text) = command {
+                            capture.copied_text.push(text.clone());
+                        }
+                    }
+                });
             },
             CardInteractionCapture::default(),
         )
@@ -1107,6 +1205,153 @@ mod tests {
 
         assert_eq!(harness.state().toggles, 1);
         assert!(harness.state().actions.is_empty());
+    }
+
+    #[test]
+    fn kittest_copy_instruction_button_is_not_intercepted_by_card_toggle() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row(
+            "copy-instruction-hit-test",
+            storage::AgentWorkTurnState::Completed,
+            10,
+        );
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: true,
+        };
+        let mut harness = card_harness(&catalog, &candidate, &presentation);
+        let label = catalog.t("history.action.copy_instruction", &[]);
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, &label)
+            .click();
+        harness.run();
+
+        assert_eq!(harness.state().toggles, 0);
+        assert!(harness.state().actions.is_empty());
+        assert_eq!(
+            harness.state().copied_text,
+            vec![candidate.instruction.clone()]
+        );
+    }
+
+    #[test]
+    fn kittest_copy_summary_button_is_not_intercepted_by_card_toggle() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row(
+            "copy-summary-hit-test",
+            storage::AgentWorkTurnState::Completed,
+            10,
+        );
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: true,
+        };
+        let mut harness = card_harness(&catalog, &candidate, &presentation);
+        let label = catalog.t("history.action.copy_summary", &[]);
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, &label)
+            .click();
+        harness.run();
+
+        assert_eq!(harness.state().toggles, 0);
+        assert!(harness.state().actions.is_empty());
+        assert_eq!(
+            harness.state().copied_text,
+            vec![candidate.agent_summary.clone().unwrap()]
+        );
+    }
+
+    #[test]
+    fn kittest_card_toggle_does_not_contain_copy_buttons() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row(
+            "copy-accessibility-tree",
+            storage::AgentWorkTurnState::Completed,
+            10,
+        );
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: true,
+        };
+        let harness = card_harness(&catalog, &candidate, &presentation);
+        let card_toggle =
+            harness.get_by_role_and_label(egui::accesskit::Role::Button, &candidate.instruction);
+
+        for label in [
+            catalog.t("history.action.copy_instruction", &[]),
+            catalog.t("history.action.copy_summary", &[]),
+        ] {
+            assert!(
+                card_toggle
+                    .query_by_role_and_label(egui::accesskit::Role::Button, &label)
+                    .is_none(),
+                "card toggle must not contain copy button {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn kittest_card_without_agent_summary_has_no_copy_summary_button() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut candidate = row(
+            "copy-summary-absent",
+            storage::AgentWorkTurnState::Working,
+            10,
+        );
+        candidate.agent_summary = None;
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: false,
+        };
+        let harness = card_harness(&catalog, &candidate, &presentation);
+
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    &catalog.t("history.action.copy_summary", &[])
+                )
+                .is_none(),
+            "no agent_summary must not render a copy-summary button"
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    &catalog.t("history.action.copy_instruction", &[])
+                )
+                .is_some(),
+            "instruction copy button must still render regardless of summary presence"
+        );
+    }
+
+    #[test]
+    fn bounded_clipboard_text_stays_within_storage_cap_and_char_boundary() {
+        let mut oversized = "x".repeat(WORK_HISTORY_CLIPBOARD_BYTES_MAX);
+        oversized.push('한');
+
+        let bounded = bounded_clipboard_text(&oversized);
+
+        assert!(bounded.len() <= WORK_HISTORY_CLIPBOARD_BYTES_MAX);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert_eq!(bounded, "x".repeat(WORK_HISTORY_CLIPBOARD_BYTES_MAX));
+
+        let within_cap = "short instruction";
+        assert_eq!(bounded_clipboard_text(within_cap), within_cap);
     }
 
     #[test]

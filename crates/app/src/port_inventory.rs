@@ -172,7 +172,18 @@ mod tests {
         let _process_guard = test_process_guard();
         reset_test_process_group();
         let before = test_reader_thread_count();
-        let operation = OperationContext::new(Duration::from_millis(120));
+        // `--test-threads=64` 과다구독(18 logical core) 아래서 간헐 실패 관측
+        // (2026-08-15, 전체 스위트 64스레드 반복 캡처 fail64_25/52 — 둘 다 이 assert에서
+        // panic, 즉 아래 run_test_clean_parent_descendant가 Err를 반환). 120ms 예산은
+        // 스폰+파이프+리더 스레드 준비 지연을 못 견뎌 첫 폴에 Timeout으로 진다. 정상
+        // 실행은 동일 조건 39회 실측 median 19.4ms/max 24.9ms로 120ms에 크게 못
+        // 미치지만, 스케줄러 지연이 이 여유를 가끔 잡아먹는다. 예산을 2s로 키운다 —
+        // 같은 파일의 operation_deadline_is_shared_across_multiple_commands가 동일한
+        // 원인으로 이미 2s로 키워진 전례(e42ad7e, 2026-08-04)를 따른다. 이 예산은 실제
+        // 회귀 탐지와 무관하다 — descendant(900ms)가 파이프를 붙잡는 회귀는
+        // kill_process_group 이후의 join_reader에서 발생하고 거긴 deadline을 보지
+        // 않으므로, 회귀 탐지는 전적으로 아래 elapsed<500ms assert가 담당한다.
+        let operation = OperationContext::new(Duration::from_secs(2));
         let started = std::time::Instant::now();
 
         assert!(run_test_clean_parent_descendant(&operation, Duration::from_millis(900)).is_ok());

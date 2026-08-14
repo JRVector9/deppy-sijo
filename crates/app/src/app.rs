@@ -8113,10 +8113,22 @@ pub struct App {
     session_cwds: std::collections::HashMap<runtime::SessionId, String>,
     /// 세션별 에이전트 표시 정보(model/effort/context) — 워커 raw(transcript). claude는
     /// effort/context를 statusLine DB(아래)에서 병합해 최종본을 WorkspaceUi로 넘긴다.
-    agent_info: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
+    /// 키가 (runtime_instance, SessionId)인 이유: 이 캐시는 워크스페이스 전환 시 비우지
+    /// 않는다(push_agent_display가 WorkspaceUi의 마지막 감지값을 빈 값으로 덮어쓰는 걸
+    /// 막기 위해서, 2026-08-14). SessionId만으로 키를 잡으면 워커가 재생성될 때(새
+    /// runtime_instance, SessionId가 1부터 재시작) 재사용된 id가 옛 세션의 값을 물려받는
+    /// 사고가 나서, 반드시 runtime_instance로 네임스페이스한다.
+    agent_info: std::collections::HashMap<
+        (u64, runtime::SessionId),
+        crate::agent_detect::AgentDisplay,
+    >,
     /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. `agent_bindings`는
     /// transcript가 확정돼야 생겨서, 방금 띄운 에이전트는 여기에만 있다.
-    agent_kinds: std::collections::HashMap<runtime::SessionId, crate::agent_detect::RunningAgent>,
+    /// 키 구조는 `agent_info`와 같은 이유(runtime_instance 네임스페이스)다.
+    agent_kinds: std::collections::HashMap<
+        (u64, runtime::SessionId),
+        crate::agent_detect::RunningAgent,
+    >,
     /// 방금 우리가 PTY에 보낸 강도/모델. statusLine(→DB)은 다음 턴에야 갱신돼서,
     /// 이게 없으면 연속으로 눌러도 매번 같은 낡은 값에서 한 칸 움직여 같은 명령을
     /// 반복한다 (2026-08-02 실증: 강도를 올렸는데 계속 같은 단계가 적용됐다).
@@ -8135,7 +8147,8 @@ pub struct App {
     /// pane은 포커스돼 있는데 `pty_surfaces=0`이라 강도 단축키가 패널만 열었다).
     pty_agent_surfaces_cache: Vec<crate::agent_surface::AgentSurfaceSnapshot>,
     /// claude statusLine이 보고한 effort/model/context% — 1s 스로틀로 DB에서 읽어 병합.
-    statuslines: std::collections::HashMap<runtime::SessionId, storage::StatuslineRow>,
+    /// 키 구조는 `agent_info`와 같은 이유(runtime_instance 네임스페이스)다.
+    statuslines: std::collections::HashMap<(u64, runtime::SessionId), storage::StatuslineRow>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
     restore_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
@@ -12171,6 +12184,7 @@ impl App {
             return;
         };
         let now = deppy_core::time::unix_secs_i64();
+        let instance = self.active.runtime_instance;
         let mut rows = Vec::new();
         for (session, recent) in turns {
             let Some(binding) = self.agent_bindings.get(session) else {
@@ -12185,7 +12199,7 @@ impl App {
                     || (saved.kind == kind.as_str()
                         && saved.agent_session_id == binding.session_id.as_str())
             });
-            let mut display = self.agent_info.get(session).cloned().unwrap_or(
+            let mut display = self.agent_info.get(&(instance, *session)).cloned().unwrap_or(
                 crate::agent_detect::AgentDisplay {
                     kind: binding.kind,
                     model: None,
@@ -12195,8 +12209,8 @@ impl App {
                     user_instruction: None,
                 },
             );
-            apply_claude_statusline(&mut display, self.statuslines.get(session));
-            if let Some(running) = self.agent_kinds.get(session) {
+            apply_claude_statusline(&mut display, self.statuslines.get(&(instance, *session)));
+            if let Some(running) = self.agent_kinds.get(&(instance, *session)) {
                 if display.model.is_none() {
                     display.model.clone_from(&running.model);
                 }
@@ -12632,11 +12646,15 @@ impl App {
                         ))
                     })
                     .collect();
-                self.statuslines = snapshot
-                    .statuslines
-                    .iter()
-                    .filter_map(|row| Some((session_id(&row.session_key)?, row.clone())))
-                    .collect();
+                // statuslines는 (runtime_instance, SessionId)로 네임스페이스돼 있어(위
+                // agent_info 필드 주석) 전체 교체가 아니라 현재 active instance 몫만
+                // 갈아끼운다 — 통째로 교체하면 warm으로 물러난 다른 workspace의 보존값이
+                // 매 폴마다 지워진다.
+                let instance = self.active.runtime_instance;
+                self.statuslines.retain(|(rt, _), _| *rt != instance);
+                self.statuslines.extend(snapshot.statuslines.iter().filter_map(|row| {
+                    Some(((instance, session_id(&row.session_key)?), row.clone()))
+                }));
                 self.push_agent_display();
             }
             crate::agent_state_worker::AgentStateSection::Attention => {
@@ -13151,7 +13169,9 @@ impl App {
             agent_hook_query_due(sessions.len(), self.last_hook_query.elapsed());
         if sessions.is_empty() {
             self.hook_overrides.clear();
-            self.statuslines.clear();
+            // 활성 instance 몫만 지운다 — 통째 clear는 warm 워크스페이스의 보존값을 지운다.
+            let instance = self.active.runtime_instance;
+            self.statuslines.retain(|(rt, _), _| *rt != instance);
         } else if bounded_refresh_due {
             self.last_hook_query = std::time::Instant::now();
             self.stage_agent_state_projection(
@@ -13213,11 +13233,27 @@ impl App {
                 latest_work_turns = outcome.work_turns.clone();
             }
         }
+        // agent_info/agent_kinds는 (runtime_instance, SessionId)로 네임스페이스돼 있어(위
+        // 필드 주석) 결과가 도착해도 통째 교체하지 않는다 — 활성 instance 몫만 갈아끼워
+        // 다른(warm) instance의 보존값을 건드리지 않는다. 이 outcome은 epoch 검사를
+        // 통과했으므로 항상 현재 self.active의 세션 집합을 가리킨다.
+        let instance = self.active.runtime_instance;
         if let Some(info) = latest_info {
-            self.agent_info = info;
+            self.agent_info.retain(|(rt, _), _| *rt != instance);
+            self.agent_info
+                .extend(info.into_iter().map(|(session, display)| ((instance, session), display)));
         }
         if let Some(kinds) = latest_kinds {
-            if claude_defaults_refresh_needed(&self.agent_kinds, &kinds) {
+            let previous_for_instance: std::collections::HashMap<
+                runtime::SessionId,
+                crate::agent_detect::RunningAgent,
+            > = self
+                .agent_kinds
+                .iter()
+                .filter(|((rt, _), _)| *rt == instance)
+                .map(|((_, session), running)| (*session, running.clone()))
+                .collect();
+            if claude_defaults_refresh_needed(&previous_for_instance, &kinds) {
                 // 새 직접-실행 Claude 세션은 직전 런처 스냅샷을 재사용하면
                 // 설정 변경 전 값으로 단축키를 보낼 수 있다. 먼저 무효화하고 worker
                 // 재감지를 요청해, 완료 전에는 "현재값 확인 중"으로 안전하게 멈춘다.
@@ -13226,7 +13262,9 @@ impl App {
                     self.agent_launcher_detection_in_flight;
                 self.agent_launcher_detection_requested = true;
             }
-            self.agent_kinds = kinds;
+            self.agent_kinds.retain(|(rt, _), _| *rt != instance);
+            self.agent_kinds
+                .extend(kinds.into_iter().map(|(session, running)| ((instance, session), running)));
         }
         // 에이전트 표시정보 최종본(claude는 statusLine으로 effort/model/context 병합) →
         // WorkspaceUi. statuslines가 매 1s 갱신되므로 매 poll에서 병합해 최신을 반영한다.
@@ -13293,11 +13331,29 @@ impl App {
     /// 없으면 transcript 값. codex는 raw 그대로.
     fn push_agent_display(&mut self) {
         use crate::agent_detect::AgentDisplay;
-        let mut merged: std::collections::HashMap<runtime::SessionId, AgentDisplay> =
-            self.agent_info.clone();
-        merge_detected_kinds(&mut merged, &self.agent_kinds);
-        for (sid, display) in merged.iter_mut() {
-            apply_claude_statusline(display, self.statuslines.get(sid));
+        // agent_info/agent_kinds/statuslines는 (runtime_instance, SessionId)로 네임스페이스돼
+        // 있다 — 활성 instance 몫만 걸러 WorkspaceUi로 넘긴다. 이렇게 해야 워크스페이스
+        // 전환 직후에도(App 쪽 캐시를 지우지 않으므로) WorkspaceUi.agent_info의 마지막
+        // 감지값을 빈 값으로 덮어쓰지 않는다(2026-08-14, 증상 2).
+        let instance = self.active.runtime_instance;
+        let mut merged: std::collections::HashMap<runtime::SessionId, AgentDisplay> = self
+            .agent_info
+            .iter()
+            .filter(|((rt, _), _)| *rt == instance)
+            .map(|((_, session), display)| (*session, display.clone()))
+            .collect();
+        let kinds_for_active: std::collections::HashMap<
+            runtime::SessionId,
+            crate::agent_detect::RunningAgent,
+        > = self
+            .agent_kinds
+            .iter()
+            .filter(|((rt, _), _)| *rt == instance)
+            .map(|((_, session), running)| (*session, running.clone()))
+            .collect();
+        merge_detected_kinds(&mut merged, &kinds_for_active);
+        for (session, display) in merged.iter_mut() {
+            apply_claude_statusline(display, self.statuslines.get(&(instance, *session)));
         }
         self.active.workspace_ui.set_agent_info(merged);
     }
@@ -13360,6 +13416,9 @@ impl App {
         &self,
         entries: &[ui::file_tree::SessionEntry],
     ) -> Vec<crate::agent_surface::AgentSurfaceSnapshot> {
+        // agent_info/agent_kinds/statuslines가 (runtime_instance, SessionId)로
+        // 네임스페이스돼 있어(위 필드 주석) 활성 instance로 고정해 조회한다.
+        let instance = self.active.runtime_instance;
         entries
             .iter()
             .filter_map(|entry| {
@@ -13373,14 +13432,14 @@ impl App {
                 // 프로세스 감지 결과를 먼저 본다 — 방금 띄워 아직 대화를 시작하지
                 // 않은 에이전트는 transcript가 없어 `agent_bindings`에 없다. 강도/모델
                 // 단축키는 바로 그 시점에 쓰고 싶은 기능이라 여기서 막히면 안 된다.
-                let running = self.agent_kinds.get(&session_id);
+                let running = self.agent_kinds.get(&(instance, session_id));
                 let kind = running
                     .map(|agent| agent.kind)
                     .or_else(|| self.agent_bindings.get(&session_id).map(|b| b.kind))?;
                 // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. claude는
                 // transcript에 effort가 아예 없고 statusLine에만 있어서, 병합을 건너뛰면
                 // effort가 영영 None이고 강도 단축키가 조용히 아무것도 안 한다.
-                let mut display = self.agent_info.get(&session_id).cloned().unwrap_or(
+                let mut display = self.agent_info.get(&(instance, session_id)).cloned().unwrap_or(
                     crate::agent_detect::AgentDisplay {
                         kind,
                         model: None,
@@ -13390,7 +13449,7 @@ impl App {
                         user_instruction: None,
                     },
                 );
-                apply_claude_statusline(&mut display, self.statuslines.get(&session_id));
+                apply_claude_statusline(&mut display, self.statuslines.get(&(instance, session_id)));
                 // statusLine은 1시간 창으로 만료된다(STATUSLINES_PREFIX_PREFLIGHT).
                 // 오래 유휴한 세션에서는 값이 통째로 사라져 강도·모델 단축키가 "현재
                 // 값을 몰라" 아무것도 못 한다(2026-08-03 실증: 7시간 전 행이 걸러짐).
@@ -16174,21 +16233,48 @@ impl App {
         // (workspace_id, SessionId)로 네임스페이스돼 있어 여기 넣으면 안 된다: 다른
         // 워크스페이스에서 계속 막혀 있는 세션의 타이머가 전환할 때마다 0으로 돌아간다.
         // 죽은 항목은 다음 Attention 스냅샷의 update_blocked_since가 정리한다.
+        //
+        // agent_info/agent_kinds/statuslines는 이제 (runtime_instance, SessionId)로
+        // 네임스페이스돼 있어 여기서 지우지 않는다 — 재사용된 SessionId는 항상 새
+        // runtime_instance를 받으므로 충돌이 없고(같은 이유로 blocked_since도 안 지운다),
+        // push_agent_display()가 매 프레임 활성 instance 몫만 걸러 WorkspaceUi로 넘긴다.
+        // 지웠다가 다음 감지 폴(최대 수 초)을 기다리면 그 사이 push_agent_display()가 빈
+        // 값으로 WorkspaceUi의 마지막 감지값을 덮어써 사이드바 활동 문구가 잠깐 폴더명으로
+        // 강등된다(2026-08-14 실제 신고 — 증상 2).
         self.agent_bindings.clear();
         self.agent_activity.clear();
-        self.agent_needs_input.clear();
-        self.agent_turn_done.clear();
+        // needs_input/turn_done/working도 SessionId만 키인 활성 전용 캐시라 지워야 하지만,
+        // 같은 정보가 이미 (workspace_id, SessionId)로 네임스페이스된
+        // global_waiting/global_turn_done/global_working에 안전하게 보존돼 있다(전환에
+        // 영향 없음). 비우고 다음 Attention 폴을 기다리면 대기/완료/실행 중이던 세션이
+        // 잠깐 "감지 중"으로 보인다(증상 1) — 새 활성 워크스페이스 몫만 걸러 즉시
+        // 재구성한다(사이드바 warm 표시부·21200번대와 같은 필터).
+        self.agent_needs_input = self
+            .global_waiting
+            .iter()
+            .filter(|(ws, _, _)| ws == target_id)
+            .map(|(_, session, _)| *session)
+            .collect();
+        self.agent_turn_done = self
+            .global_turn_done
+            .iter()
+            .filter(|((ws, _), _)| ws == target_id)
+            .map(|((_, session), at)| (*session, *at))
+            .collect();
+        self.agent_working = self
+            .global_working
+            .iter()
+            .filter(|(ws, _)| ws == target_id)
+            .map(|(_, session)| *session)
+            .collect();
         self.pending_turn_done_clear = None;
         self.session_alerts.clear();
         self.session_cwds.clear();
         self.workspace_rename_prompt = None; // 워크스페이스 전환 시 옛 rename 제안 폐기
-        self.agent_info.clear();
-        self.agent_kinds.clear();
         self.pty_agent_pending.clear();
         self.pty_agent_queued.clear();
         // 이전 워크스페이스의 표면이 남아 있으면 단축키가 그쪽 세션에 입력을 쓴다.
         self.pty_agent_surfaces_cache.clear();
-        self.statuslines.clear();
         let _ = old
             .runtime
             .send_command(runtime::RuntimeCommand::SetWorkspaceState(
@@ -16522,7 +16608,8 @@ impl App {
                         .map(|row| row.pid.is_some())
                 });
                 let agent_detected = session.is_some_and(|session| {
-                    self.agent_kinds.contains_key(&session)
+                    self.agent_kinds
+                        .contains_key(&(self.active.runtime_instance, session))
                         || self.agent_bindings.contains_key(&session)
                 });
                 missing_pty_feedback = Some(pty_shortcut_missing_feedback(
@@ -16933,7 +17020,9 @@ impl App {
                     effort = ?surface.effort,
                     model = ?surface.model,
                     statuslines = self.statuslines.len(),
-                    has_row = self.statuslines.contains_key(session_id),
+                    has_row = self
+                        .statuslines
+                        .contains_key(&(self.active.runtime_instance, *session_id)),
                     scope = %self.agent_state_scope.workspace_id,
                     active = %self.active.id,
                     "PTY 조정: 현재 값을 몰라 다음 단계를 못 정한다"
@@ -28336,7 +28425,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("push_agent_display 본문을 찾지 못했다");
         assert!(
-            body.contains("merge_detected_kinds(&mut merged, &self.agent_kinds)"),
+            body.contains("merge_detected_kinds(&mut merged, &kinds_for_active)"),
             "병합을 부르지 않으면 프로세스로만 감지된 에이전트가 카드에서 셸로 강등된다"
         );
     }

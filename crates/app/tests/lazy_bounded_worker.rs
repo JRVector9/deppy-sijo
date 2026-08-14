@@ -8,10 +8,46 @@ use lazy_worker::{
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(2);
 const PANIC_CHILD_ENV: &str = "DEPPY_TEST_SANITIZED_PANIC_CHILD";
+
+/// `Publishing` 창(결과는 이미 보냈고 wake 콜백이 아직 도는 중)에서 `try_request`가
+/// `Full`을 돌려주는 것은 **계약대로**다 — `lazy_worker.rs`의 `try_admit_once` 주석이
+/// "plain backpressure로 취급한다. 호출자는 다음 폴에서 재시도하며 그때쯤엔 워커가
+/// 스스로 `Running`으로 돌아와 있다"고 명시한다. wake/결과를 관측한 직후 제출하는
+/// 테스트는 그 창을 그대로 밟으므로, 프로덕션 호출자와 같은 규칙으로 재시도해야 한다.
+///
+/// 2026-08-14 실증: 이 재시도가 없어 전체 스위트를 병렬로 돌릴 때 간헐 실패했다
+/// (`active_job_returns_exact_full_payload_until_outcome_is_consumed` 등,
+/// `Result::unwrap()` on `LazyWorkerSubmitError { status: "full" }`). 프로덕션 동작은
+/// 정상이고 테스트가 계약을 어긴 경우였다.
+fn request_until_admitted<J: Send + 'static, O: Send + 'static>(
+    worker: &mut LazyBoundedWorker<J, O>,
+    job: J,
+) {
+    let deadline = Instant::now() + WAIT;
+    let mut job = job;
+    loop {
+        match worker.try_request(job) {
+            Ok(()) => return,
+            Err(error) => {
+                assert_eq!(
+                    error.error_code(),
+                    None,
+                    "Full 외의 오류는 재시도 대상이 아니다"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "Publishing 창은 wake 콜백이 반환하면 끝난다 — WAIT 안에 admit돼야 한다"
+                );
+                job = error.into_job();
+                std::thread::yield_now();
+            }
+        }
+    }
+}
 
 fn receive_after_wake<J: Send + 'static, O: Send + 'static>(
     worker: &mut LazyBoundedWorker<J, O>,
@@ -108,7 +144,7 @@ fn first_request_starts_one_persistent_fn_mut_executor() {
         receive_after_wake(&mut worker, &wake_rx).into_result(),
         Ok((10, 1, Some("test-persistent-executor".to_owned())))
     );
-    worker.try_request(20).unwrap();
+    request_until_admitted(&mut worker, 20);
     assert_eq!(
         receive_after_wake(&mut worker, &wake_rx).into_result(),
         Ok((20, 2, Some("test-persistent-executor".to_owned())))
@@ -156,7 +192,7 @@ fn active_job_returns_exact_full_payload_until_outcome_is_consumed() {
         receive_after_wake(&mut worker, &wake_rx).into_result(),
         Ok(1)
     );
-    worker.try_request(2).unwrap();
+    request_until_admitted(&mut worker, 2);
     assert_eq!(
         receive_after_wake(&mut worker, &wake_rx).into_result(),
         Ok(2)
@@ -182,7 +218,7 @@ fn published_unread_outcome_keeps_aggregate_result_bound_at_one() {
     assert_eq!(full.into_job(), 2);
     assert_eq!(worker.try_recv().unwrap().into_result(), Ok(11));
 
-    worker.try_request(2).unwrap();
+    request_until_admitted(&mut worker, 2);
     assert_eq!(
         receive_after_wake(&mut worker, &wake_rx).into_result(),
         Ok(12)
@@ -407,7 +443,7 @@ fn repeated_idle_exit_and_restart_races_never_lose_or_duplicate_jobs() {
     );
 
     for job in 0_u64..64 {
-        worker.try_request(job).unwrap();
+        request_until_admitted(&mut worker, job);
         assert_eq!(
             receive_after_wake(&mut worker, &wake_rx).into_result(),
             Ok(job)
@@ -515,7 +551,7 @@ fn worker_panic_publishes_static_error_and_waits_for_explicit_restart() {
         "panic must not spin/restart"
     );
 
-    worker.try_request(2).unwrap();
+    request_until_admitted(&mut worker, 2);
     assert_eq!(
         receive_after_wake(&mut worker, &wake_rx).into_result(),
         Ok(4)

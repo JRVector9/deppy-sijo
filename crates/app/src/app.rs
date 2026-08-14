@@ -15357,7 +15357,10 @@ impl App {
     }
 
     fn poll_worktree_jobs(&mut self) {
-        let text = self.i18n.clone();
+        // i18n 카탈로그 전체를 복사하지 않는다 — 매 프레임 도는 함수인데 알림 문구는
+        // 아래 조건부 분기 6곳에서만 쓰인다. self.i18n.t(...)는 그때그때 짧게 빌려
+        // 문자열 하나만 뽑으므로, 그 사이에 낀 &mut self 변경들과도 겹치지 않는다
+        // (평상시 채널이 비어 있으면 self.i18n을 아예 건드리지 않는다, 2026-08-14).
         if let Some((requested_workspace, receiver)) = &self.worktree_rx {
             let same_workspace = *requested_workspace == self.active.id;
             let spawn_busy = self.active.workspace_ui.pending_spawns() > 0;
@@ -15373,7 +15376,7 @@ impl App {
                                 Some(path.to_string_lossy().into_owned()),
                             );
                         } else {
-                            platform::notify(&text.t("worktree.created_elsewhere", &[]), "");
+                            platform::notify(&self.i18n.t("worktree.created_elsewhere", &[]), "");
                         }
                     }
                     Ok(Err(_)) => {
@@ -15384,7 +15387,7 @@ impl App {
                             error_code = "create_failed",
                             "worktree create failed"
                         );
-                        platform::notify(&text.t("worktree.create_failed", &[]), "");
+                        platform::notify(&self.i18n.t("worktree.create_failed", &[]), "");
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -15460,15 +15463,15 @@ impl App {
                         }
                     }
                     let branch_note = (branch == crate::worktree::BranchCleanup::PreservedUnmerged)
-                        .then(|| text.t("worktree.branch_preserved", &[]));
+                        .then(|| self.i18n.t("worktree.branch_preserved", &[]));
                     if requested_workspace == self.active.id {
                         platform::notify(
-                            &text.t("worktree.removed", &[]),
+                            &self.i18n.t("worktree.removed", &[]),
                             branch_note.as_deref().unwrap_or(""),
                         );
                     } else {
                         platform::notify(
-                            &text.t("worktree.removed_elsewhere", &[]),
+                            &self.i18n.t("worktree.removed_elsewhere", &[]),
                             branch_note.as_deref().unwrap_or(""),
                         );
                     }
@@ -15482,7 +15485,7 @@ impl App {
                         error_code = "remove_failed",
                         "worktree remove failed"
                     );
-                    platform::notify(&text.t("worktree.remove_failed", &[]), "");
+                    platform::notify(&self.i18n.t("worktree.remove_failed", &[]), "");
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {

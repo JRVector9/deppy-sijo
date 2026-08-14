@@ -138,6 +138,58 @@ enum WorkHistoryFilter {
     Completed,
 }
 
+/// provider 다중 선택 칩 값. 상태 필터(`WorkHistoryFilter`)와 달리 배타적 단일
+/// 선택이 아니라 `WorkHistoryUi::providers`에 여러 개가 동시에 담길 수 있다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkHistoryProvider {
+    Claude,
+    Codex,
+    Kimi,
+}
+
+impl WorkHistoryProvider {
+    const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Kimi];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Claude => "history.filter.provider.claude",
+            Self::Codex => "history.filter.provider.codex",
+            Self::Kimi => "history.filter.provider.kimi",
+        }
+    }
+
+    /// `row.kind`는 storage 쪽 `agent_work_provider_is_valid`가 소문자 ascii·숫자·
+    /// `-`·`_`만 허용하도록 이미 검증해 두므로 대소문자 비교만으로 충분하다.
+    /// 목록에 없는 provider(예: grok)는 어떤 칩과도 매치되지 않는다 — provider
+    /// 칩이 하나라도 선택된 상태라면 그런 row는 걸러진다.
+    fn matches(self, kind: &str) -> bool {
+        let expected = match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Kimi => "kimi",
+        };
+        kind.eq_ignore_ascii_case(expected)
+    }
+}
+
+/// 카드 정렬 기준. 기본값 `StateFirst`는 기존 동작(state_rank → updated_at desc →
+/// source_offset desc)을 그대로 유지한다.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WorkHistorySortMode {
+    #[default]
+    StateFirst,
+    RecentFirst,
+}
+
+impl WorkHistorySortMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::StateFirst => "history.sort.state_first",
+            Self::RecentFirst => "history.sort.recent_first",
+        }
+    }
+}
+
 /// 이력 본문 프레임의 내부 여백. 전체 페이지(22/18)가 아니라 pane body에 얹히는
 /// 값이라 좁은 split에서도 카드가 숨 쉴 만큼만 남긴다. `show`가 남은 높이를
 /// 계산할 때 같은 상수를 쓴다 — 마법값을 다시 만들지 않기 위한 단일 원천.
@@ -153,6 +205,8 @@ struct MetadataParts<'a> {
 pub struct WorkHistoryUi {
     query: String,
     filter: WorkHistoryFilter,
+    providers: Vec<WorkHistoryProvider>,
+    sort_mode: WorkHistorySortMode,
     selected: Option<WorkTurnIdentity>,
 }
 
@@ -161,6 +215,8 @@ impl WorkHistoryUi {
         Self {
             query: String::new(),
             filter: WorkHistoryFilter::All,
+            providers: Vec::new(),
+            sort_mode: WorkHistorySortMode::StateFirst,
             selected: None,
         }
     }
@@ -294,6 +350,31 @@ impl WorkHistoryUi {
                 filter_chip(ui, &mut self.filter, filter, &catalog.t(filter.key(), &[]));
             }
         });
+        ui.add_space(7.0);
+        ui.horizontal_wrapped(|ui| {
+            for provider in WorkHistoryProvider::ALL {
+                provider_chip(
+                    ui,
+                    &mut self.providers,
+                    provider,
+                    &catalog.t(provider.key(), &[]),
+                );
+            }
+        });
+        ui.add_space(7.0);
+        ui.horizontal_wrapped(|ui| {
+            for sort_mode in [
+                WorkHistorySortMode::StateFirst,
+                WorkHistorySortMode::RecentFirst,
+            ] {
+                filter_chip(
+                    ui,
+                    &mut self.sort_mode,
+                    sort_mode,
+                    &catalog.t(sort_mode.key(), &[]),
+                );
+            }
+        });
     }
 
     fn visible_rows<'a>(
@@ -304,16 +385,36 @@ impl WorkHistoryUi {
         let mut visible: Vec<_> = rows
             .iter()
             .filter(|row| self.filter.matches(row.state))
+            // provider 칩을 전부 해제한 상태는 "빈 목록"이 아니라 "전체 provider
+            // 표시"로 취급한다. 세션 시작 시 아무 칩도 선택돼 있지 않은 기본값이
+            // 기존 동작(필터 없음)과 동일해야 하고, 사용자가 마지막 칩을 끄는
+            // 순간 카드가 통째로 사라지면 "무필터"가 아니라 "빈 화면"이라는
+            // 오해를 준다. 하나라도 선택되면 그때부터 선택된 provider와 매치하는
+            // row만 남기며, 상태 필터와는 AND로 결합된다(별도 `.filter()` 체인).
+            .filter(|row| {
+                self.providers.is_empty()
+                    || self
+                        .providers
+                        .iter()
+                        .any(|provider| provider.matches(&row.kind))
+            })
             .filter(|row| query.is_empty() || row_matches_query(row, &query))
             .collect();
-        visible.sort_by(|left, right| {
-            state_rank(left.state)
+        visible.sort_by(|left, right| match self.sort_mode {
+            WorkHistorySortMode::StateFirst => state_rank(left.state)
                 .cmp(&state_rank(right.state))
                 .then_with(|| right.updated_at.cmp(&left.updated_at))
                 .then_with(|| right.source_offset.cmp(&left.source_offset))
                 .then_with(|| left.kind.cmp(&right.kind))
                 .then_with(|| left.agent_session_id.cmp(&right.agent_session_id))
-                .then_with(|| left.turn_key.cmp(&right.turn_key))
+                .then_with(|| left.turn_key.cmp(&right.turn_key)),
+            WorkHistorySortMode::RecentFirst => right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.source_offset.cmp(&left.source_offset))
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.agent_session_id.cmp(&right.agent_session_id))
+                .then_with(|| left.turn_key.cmp(&right.turn_key)),
         });
         visible
     }
@@ -385,14 +486,30 @@ fn row_matches_query(row: &storage::AgentWorkTurnRow, query: &str) -> bool {
     .any(|value| value.to_lowercase().contains(query))
 }
 
-fn filter_chip(
-    ui: &mut egui::Ui,
-    selected: &mut WorkHistoryFilter,
-    value: WorkHistoryFilter,
-    label: &str,
-) {
+/// 배타적 단일 선택 칩. 상태 필터와 정렬 모드 둘 다 "값 하나만 켜져 있다"는
+/// 같은 모양이라 제네릭 하나로 공유한다.
+fn filter_chip<T: Copy + PartialEq>(ui: &mut egui::Ui, selected: &mut T, value: T, label: &str) {
     if ui.selectable_label(*selected == value, label).clicked() {
         *selected = value;
+    }
+}
+
+/// provider 칩은 배타적 선택이 아니라 토글이다 — 이미 켜져 있으면 끄고, 꺼져
+/// 있으면 켠다. 여러 개를 동시에 켤 수 있어 대입만 하는 `filter_chip`과는
+/// 다른 헬퍼가 필요하다.
+fn provider_chip(
+    ui: &mut egui::Ui,
+    selected: &mut Vec<WorkHistoryProvider>,
+    value: WorkHistoryProvider,
+    label: &str,
+) {
+    let active = selected.contains(&value);
+    if ui.selectable_label(active, label).clicked() {
+        if active {
+            selected.retain(|provider| *provider != value);
+        } else {
+            selected.push(value);
+        }
     }
 }
 
@@ -1043,6 +1160,103 @@ mod tests {
             ui.query = query.to_owned();
             assert_eq!(ui.visible_rows(&rows).len(), 1, "query={query}");
         }
+    }
+
+    fn row_with_kind(
+        turn_key: &str,
+        kind: &str,
+        state: storage::AgentWorkTurnState,
+        updated_at: i64,
+    ) -> storage::AgentWorkTurnRow {
+        let mut candidate = row(turn_key, state, updated_at);
+        candidate.kind = kind.to_owned();
+        candidate
+    }
+
+    #[test]
+    fn provider_필터는_상태_필터와_and로_결합한다() {
+        let rows = vec![
+            row_with_kind(
+                "claude-working",
+                "claude",
+                storage::AgentWorkTurnState::Working,
+                3,
+            ),
+            row_with_kind(
+                "claude-completed",
+                "claude",
+                storage::AgentWorkTurnState::Completed,
+                2,
+            ),
+            row_with_kind(
+                "codex-working",
+                "codex",
+                storage::AgentWorkTurnState::Working,
+                1,
+            ),
+        ];
+        let mut ui = WorkHistoryUi::new();
+        ui.providers = vec![WorkHistoryProvider::Claude];
+        ui.filter = WorkHistoryFilter::Working;
+
+        let keys: Vec<&str> = ui
+            .visible_rows(&rows)
+            .into_iter()
+            .map(|row| row.turn_key.as_str())
+            .collect();
+
+        assert_eq!(
+            keys,
+            ["claude-working"],
+            "claude만 선택 + working 필터는 claude이면서 working인 row만 남겨야 한다"
+        );
+    }
+
+    #[test]
+    fn provider_칩을_전부_해제하면_전체_provider가_보인다() {
+        let rows = vec![
+            row_with_kind("claude", "claude", storage::AgentWorkTurnState::Working, 3),
+            row_with_kind("codex", "codex", storage::AgentWorkTurnState::Working, 2),
+            row_with_kind("kimi", "kimi", storage::AgentWorkTurnState::Working, 1),
+        ];
+        let ui = WorkHistoryUi::new();
+        assert!(
+            ui.providers.is_empty(),
+            "기본값은 provider 칩이 전부 미선택이어야 한다"
+        );
+
+        assert_eq!(
+            ui.visible_rows(&rows).len(),
+            3,
+            "전부 해제는 빈 목록이 아니라 전체 provider 표시로 취급한다"
+        );
+    }
+
+    #[test]
+    fn 정렬모드_최신순은_상태와_무관하게_updated_at_desc다() {
+        let rows = vec![
+            row(
+                "completed-newest",
+                storage::AgentWorkTurnState::Completed,
+                30,
+            ),
+            row("working-oldest", storage::AgentWorkTurnState::Working, 10),
+            row("waiting-mid", storage::AgentWorkTurnState::Waiting, 20),
+        ];
+        let mut ui = WorkHistoryUi::new();
+        ui.sort_mode = WorkHistorySortMode::RecentFirst;
+
+        let keys: Vec<&str> = ui
+            .visible_rows(&rows)
+            .into_iter()
+            .map(|row| row.turn_key.as_str())
+            .collect();
+
+        assert_eq!(
+            keys,
+            ["completed-newest", "waiting-mid", "working-oldest"],
+            "최신순은 state_rank를 무시하고 updated_at desc만 본다"
+        );
     }
 
     #[test]

@@ -1,9 +1,14 @@
 # Git 패널 (orca 스타일) 설계
 
 날짜: 2026-08-15
-상태: 사용자 설계 승인 완료 (A안), 스펙 검토 대기
+상태: 1차 구현 완료, **2차(배치 변경) 사용자 승인 완료 — §8 참조**
 롤백 지점: 태그 `pre-git-panel-2026-08-15` (= main `4ad0cf4`, origin에 푸시됨)
 참조: stablyai/orca의 source-control 패널 (사용자 제공 스크린샷 2장 기준)
+
+> **먼저 §8을 읽는다.** 1차 구현(사이드바 인라인 탭 + 전면 diff 뷰)을 화면에서 확인한
+> 결과 사이드바가 너무 좁아 파일 경로가 전부 `crates/…`로 잘렸다. 2차에서 배치를
+> **pane 보조 탭(이력 탭과 같은 기구)** 으로 옮기고 워크트리 섹션을 더한다. §1과 §4는
+> 1차 기록이고, 충돌하는 부분은 §8이 최신이다.
 
 ## 목적과 범위
 
@@ -162,9 +167,142 @@ feat/session-row-dot-first          ← 브랜치명 (한 줄, 말줄임)
 - 게이트: `cargo test -p deppy-sijo` 전체 + clippy `-D warnings` 0건.
   UI 확인은 CLAUDE.md 워크플로대로 빌드·재기동 후 화면으로.
 
+## 8. [2026-08-15 2차] 배치를 pane 보조 탭으로 + 워크트리 섹션
+
+1차 구현을 화면에서 확인한 결과 **사이드바 폭(약 220pt)이 목록에 모자랐다** — 파일
+행의 디렉터리가 전부 `crates/…`로 잘려 서로 구분되지 않았고, 목록과 diff가 창의 양
+끝으로 갈라져 시선이 왕복했다. 사용자 결정(A안 + 워크트리 포함 + 워크트리 클릭 동작):
+
+### 8-1. 진입: 사이드바 도구 탭 → 내비게이션 레일
+
+- `SIDEBAR_TOOLS`는 `[Files, Notes]`가 된다. `SidebarTool::Git` 변형과
+  `sidebar_tool_action`의 Git 분기, `FileTreeUi::select_git_tool`,
+  `FileTreeUi`가 들고 있던 `git_panel` 필드를 **제거**한다. 사이드바 본문은 다시
+  파일/메모 둘 뿐이다.
+- 레일(`FileTreeUi::navigation`)에 **Git 행**을 「이력」과 「AI」 사이에 넣는다.
+  아이콘은 `NavIcon::Git`(가지 글리프: 점 두 개 + 연결선). 레일 강조 규칙은 이력과
+  같다 — **보조 탭이 활성일 때만** 켠다.
+- 새 intent `SidebarAction::ShowGit`. App은 이력과 같은 상태 전이를 돌린다.
+- i18n: `sidebar.nav.git` 추가, `sidebar.tool.git` 제거(5로케일).
+
+### 8-2. pane 보조 탭 다중화 (workspace.rs)
+
+지금 보조 탭 슬롯은 하나뿐(`set_aux_tab(Option<PaneAuxTab>)`)이라 이력과 Git이 같은
+자리를 다툰다. 슬롯을 **목록**으로 넓힌다.
+
+```rust
+pub enum PaneAuxTabKind { History, Git }
+
+pub struct PaneAuxTab {
+    pub kind: PaneAuxTabKind,
+    pub label: String,
+    pub active: bool,
+}
+
+pub fn set_aux_tabs(&mut self, tabs: Vec<PaneAuxTab>);   // set_aux_tab 대체
+// 출력
+pub aux_tab_intent: Option<(PaneAuxTabKind, PaneAuxTabIntent)>,
+pub aux_body_rect: Option<egui::Rect>,   // 활성 탭이 있을 때만 — 그대로 하나
+```
+
+- 상한: 보조 탭은 **최대 2개**(`PANE_AUX_TAB_MAX = 2`). 넘으면 잘라 버린다.
+- 기하: 세션 ×의 accent 경계에서 시작해 왼→오로 이어 붙인다. 폭이 모자라면 **뒤 탭부터**
+  통째로 생략한다(기존 규칙 — 닫기(×) 먼저 버리고, 최소 라벨 폭조차 없으면 탭을 만들지
+  않는다 — 은 탭마다 그대로 적용). 어떤 탭도 `toolbar_left`를 넘지 않는다.
+- hover 문구는 `kind`에서 고른다: 이력은 기존 `workspace.tab.history_hint` /
+  `workspace.tab.history_close`, Git은 `workspace.tab.git_hint` /
+  `workspace.tab.git_close`.
+- 상태 기계 `WorkHistoryTabState`(Closed/OpenInactive/OpenActive)는 이력 전용이 아니다.
+  `ui::workspace::PaneAuxTabState`로 **옮겨 이름만 바꾸고** 두 탭이 각자 하나씩 갖는다.
+  전이 규칙(레일 재클릭 = 세션 복귀, X = 탭만 제거)은 손대지 않는다.
+- **동시 활성은 없다** — 본문이 하나뿐이기 때문이다. 한쪽이 활성이 되면 다른 쪽은
+  `on_session_tab_click()`으로 물러난다(탭 자체는 남는다).
+
+### 8-3. Git 보조 본문 = 마스터-디테일
+
+보조 본문 rect를 좌우로 나눈다.
+
+- 좌(목록): `GIT_PANEL_LIST_WIDTH = 300.0`. 본문이 좁으면 `body.width() * 0.4`로
+  클램프하고, `GIT_PANEL_LIST_MIN = 180.0` 밑으로는 내려가지 않는다.
+- 우(diff): 나머지 전부. 파일이 선택되지 않았으면 `git.diff.empty` 안내 한 줄.
+- 사이에 기존 `designall::vertical_separator` 관례의 선 하나.
+- **전면 뷰 `AgentTerminalView::Diff`는 은퇴한다.** diff는 이제 보조 본문 안에서만
+  산다. 따라서 `DiffViewerAction::BackToTerminal`과 그 버튼, i18n
+  `git.back_to_terminal`도 함께 제거한다 — 터미널 복귀는 **세션 탭 클릭**이 한다.
+- 입력 소유권: 이력과 같다. Git 보조 본문이 떠 있는 프레임은
+  `frame_terminal_owner = None`(fail-closed), 컴포저도 감춘다.
+- 세션 우클릭 「변경 보기」(`SidebarAction::ShowDiff { session }`)는 **Git 보조 탭을
+  열고 활성화**한 뒤 그 세션 cwd로 스냅샷을 요청한다. cwd는 계속
+  `cached_session_cwd(session)` — 포커스 세션이 아니다(2026-08-15 회귀 수정 유지).
+
+### 8-4. 워크트리 섹션
+
+git 패널의 **세 번째 섹션**. 이 저장소만 해도 워크트리가 4개인데 앱에서 볼 방법이
+없었다.
+
+```rust
+pub struct GitWorktreeRow {
+    pub path: String,        // 절대 경로
+    pub name: String,        // 표시용 마지막 경로 요소
+    pub branch: Option<String>,  // None = detached
+    pub current: bool,       // path == snapshot.repo_root
+}
+```
+
+- 수집: 스냅샷과 **같은 IO 왕복**에서 `git worktree list --porcelain` 한 번.
+  별도 요청도, 폴링도 없다.
+- 파싱: `worktree <path>` 줄이 새 항목을 연다. `branch refs/heads/<name>` → 브랜치,
+  `detached` → `None`, `bare` 항목은 **건너뛴다**(체크아웃이 없어 셸을 열 수 없다).
+  `locked`/`prunable` 줄은 무시한다.
+- 상한: `MAX_WORKTREE_ROWS = 32`. 초과분은 버리고 잘림 플래그로 표시한다
+  (`worktrees_truncated`).
+- 현재 워크트리는 `path == repo_root`로 판정한다 — `repo_root`는 이미 세션 cwd에서
+  `rev-parse --show-toplevel`로 받아 둔 값이고, 그게 곧 "지금 보고 있는 워크트리"다.
+- 행 표시: 폴더명(본문색) · 브랜치(회색, 말줄임) · 현재면 `git.worktree.current` 배지.
+- 워크트리가 1개뿐(=메인만)이면 섹션을 **숨긴다** — 정보가 0이다.
+
+### 8-5. 워크트리 클릭 = 그 워크트리에서 세션 열기
+
+사용자 결정: "워크트리 클릭하고 에이전트로 수정 가능하게".
+
+- 행 클릭 → `GitPanelAction::OpenWorktreeShell { path }`.
+- App: `reveal_active_workspace_for_new_session()` → 세션 탭으로 복귀(Git 탭은 남긴다)
+  → `workspace_ui.spawn_shell_at(scrollback_lines, Some(path))`.
+- 이것은 새 경로가 아니라 「새 워크트리에서 셸」(PR-W)이 워크트리 생성 직후 부르는
+  **바로 그 호출**이다(app.rs `poll_worktree_jobs`). 그 셸에서 에이전트를 띄우면 그
+  워크트리를 수정한다.
+- 워크트리를 **만들지도 지우지도 않는다** — 이번 범위는 기존 워크트리로 들어가는
+  것뿐이다. 생성/삭제는 계속 세션 우클릭 메뉴가 한다.
+- 유계: 경로 바이트 상한·NUL 검사는 `spawn_shell_at`이 이미 하지만, leaf도 상한을 넘는
+  행은 클릭 intent를 만들지 않는다.
+
+### 8-6. i18n 추가·제거 (5로케일 전부)
+
+추가: `sidebar.nav.git`, `workspace.tab.git`, `workspace.tab.git_hint`,
+`workspace.tab.git_close`, `git.section.worktrees`, `git.worktree.current`,
+`git.worktree.detached`, `git.worktree.open_hint`, `git.worktrees_truncated`,
+`git.diff.empty`.
+
+제거: `sidebar.tool.git`, `git.back_to_terminal`.
+
+### 8-7. 테스트
+
+- `parse_worktree_list`: 브랜치/detached/bare/locked, 현재 판정, 32행 상한·잘림 플래그.
+- 워크트리 1개면 섹션 없음.
+- kittest: 워크트리 행 클릭 → `OpenWorktreeShell` intent, 경로 상한 초과 행은 무시.
+- workspace 기하: 탭 2개가 겹치지 않고 순서대로 놓인다 / 좁으면 뒤 탭이 사라진다 /
+  각 탭의 클릭·× 가 자기 `kind`를 실어 올린다.
+- 상호배타: Git 활성화 → 이력은 `OpenInactive`, 반대도 같다.
+- 소스 계약 테스트(기존 `work_history_tab은_전역view가_아니라…` 관례)로 Git 본문이
+  뜬 프레임에 컴포저·터미널 입력이 없음을 고정한다.
+- 게이트: `cargo test -p deppy-sijo` 전체 + `cargo clippy -D warnings` 0건 +
+  i18n 5로케일 키 정합성.
+
 ## 범위 외 (다음 단계 후보)
 
 - 스테이지/언스테이지·커밋 메시지 입력·커밋 실행·PR 만들기 버튼
 - 문법 강조·단어 단위 인트라라인 하이라이트·우측 미니맵·접힌 문맥 클릭 펼침
 - 파일별 스테이지/되돌리기 hover 액션
 - 자동 새로고침(파일 감시 연동)
+- 패널에서 워크트리 **생성·삭제**(지금은 세션 우클릭 메뉴가 담당)
+- 작업 이력의 「변경 보기」를 새 뷰어로 라우팅(끝나면 `diff_panel.rs` 완전 은퇴)

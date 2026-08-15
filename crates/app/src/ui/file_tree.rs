@@ -346,10 +346,14 @@ pub enum SidebarAction {
     ClosePane {
         pane: runtime::MuxPaneId,
     },
-    /// 사이드바 Git 탭으로 이동해 변경분(diff)을 본다 (「변경 보기」 메뉴). 대상은
-    /// 포커스 세션 기준으로 App이 고른다 — 2026-08-15부터 세션별 payload가 없다
-    /// (Task 10 Step 9).
-    ShowDiff,
+    /// 이 세션 cwd 레포의 변경분(diff)을 본다 (세션 행 컨텍스트 메뉴의 「변경 보기」).
+    /// 세션별 payload를 유지한다 — 2026-08-15 한때 유닛 variant로 단순화했었는데
+    /// (포커스 세션 기준으로 일원화, Task 10 Step 9) 회귀였다: 이 메뉴는 특정 세션
+    /// 행의 컨텍스트 메뉴인데 포커스가 다른 세션에 있으면 엉뚱한 repo가 떴다. App은
+    /// `cached_session_cwd(session)`으로 이 세션의 cwd를 찾아 스냅샷을 요청한다.
+    ShowDiff {
+        session: runtime::SessionId,
+    },
     /// 이 세션 레포의 새 git worktree를 만들고 그 폴더에서 셸을 연다 (PR-W).
     NewWorktreeCell {
         session: runtime::SessionId,
@@ -2258,8 +2262,10 @@ impl FileTreeUi {
                                                             );
                                                                 ui.close();
                                                             }
-                                                                    // 변경 보기 — 사이드바 Git 탭으로 이동한다(PR-D,
-                                                                    // 2026-08-15부터 포커스 세션 기준 패널로 수렴 — Task 10 Step 9).
+                                                                    // 변경 보기 — 이 세션 cwd 레포의 diff를 사이드바 Git
+                                                                    // 탭에 연다(PR-D). session payload를 실어 보낸다 — App이
+                                                                    // 포커스 세션이 아니라 **이** 세션의 cwd로 수집해야 한다
+                                                                    // (2026-08-15 회귀 수정, Task 10 Step 9 되돌림).
                                                                     if ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.show_diff",
@@ -2267,7 +2273,9 @@ impl FileTreeUi {
                                                                 ))
                                                                 .clicked()
                                                             {
-                                                                action = Some(SidebarAction::ShowDiff);
+                                                                action = Some(SidebarAction::ShowDiff {
+                                                                    session,
+                                                                });
                                                                 ui.close();
                                                             }
                                                                     // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
@@ -9213,6 +9221,125 @@ mod tests {
         assert!(matches!(
             harness.state().1.as_slice(),
             [SidebarAction::ClosePane { pane }] if pane.0 == "pane-a"
+        ));
+    }
+
+    /// 회귀 고정(2026-08-15): 세션 행 컨텍스트 메뉴의 「변경 보기」는 **그 세션**의
+    /// ShowDiff{session}을 낸다 — 포커스 세션이 아니라 클릭한 행 기준이어야 한다.
+    /// 한때 payload 없는 유닛 variant로 단순화됐다가(포커스 세션 기준으로 App이
+    /// 일원화) 세션 B 행을 눌러도 세션 A(포커스)의 repo가 뜨는 회귀가 났다. 세션 A·B
+    /// 둘 다 초점(focused) 없이 두고 세션 B 행을 우클릭·클릭해, 액션이 세션 A가
+    /// 아니라 세션 B의 id를 담는지로 "포커스 아님, 클릭한 행"을 고정한다.
+    #[test]
+    fn kittest_세션_행_변경_보기는_그_세션의_showdiff_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let sessions = std::collections::HashMap::from([(
+            "workspace-a".to_owned(),
+            vec![
+                SidebarSessionRow::from_live(
+                    "workspace-a",
+                    7,
+                    SessionEntry {
+                        tab: runtime::MuxTabId("tab-a".to_owned()),
+                        pane: runtime::MuxPaneId("pane-a".to_owned()),
+                        session: Some(runtime::SessionId(1)),
+                        title: "Session A".to_owned(),
+                        status: None,
+                        summary: String::new(),
+                        focused: false,
+                        attention: false,
+                        pulse: None,
+                        agent_line: None,
+                        status_label: None,
+                        resumable: false,
+                        has_cwd: false,
+                        in_worktree: false,
+                        status_line: None,
+                        last_output_at: None,
+                    },
+                ),
+                SidebarSessionRow::from_live(
+                    "workspace-a",
+                    7,
+                    SessionEntry {
+                        tab: runtime::MuxTabId("tab-b".to_owned()),
+                        pane: runtime::MuxPaneId("pane-b".to_owned()),
+                        session: Some(runtime::SessionId(2)),
+                        title: "Session B".to_owned(),
+                        status: None,
+                        summary: String::new(),
+                        focused: false,
+                        attention: false,
+                        pulse: None,
+                        agent_line: None,
+                        status_label: None,
+                        resumable: false,
+                        has_cwd: false,
+                        in_worktree: false,
+                        status_line: None,
+                        last_output_at: None,
+                    },
+                ),
+            ],
+        )]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>, bool)| {
+                    if !state.2 {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "workspace-a",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_count: 0,
+                        history_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    if let Some(action) = state.0.panel(ui, &sessions, &snapshot, &catalog) {
+                        state.1.push(action);
+                    }
+                },
+                (FileTreeUi::new(egui::Context::default()), Vec::new(), false),
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().2 = true;
+
+        harness.run();
+        let row_rect = harness.get_by_label("Session B").rect();
+        harness.event(egui::Event::PointerMoved(row_rect.center()));
+        harness.event(egui::Event::PointerButton {
+            pos: row_rect.center(),
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: row_rect.center(),
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run();
+        harness
+            .get_by_label(&catalog.t("sidebar.menu.show_diff", &[]))
+            .click();
+        harness.run();
+
+        assert!(matches!(
+            harness.state().1.as_slice(),
+            [SidebarAction::ShowDiff { session }] if *session == runtime::SessionId(2)
         ));
     }
 

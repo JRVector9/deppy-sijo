@@ -14047,14 +14047,27 @@ impl App {
     }
 
     /// git 패널 IO를 기존 `pending_app_host_action` capacity-1 큐(2026-08-15 Task 10)에
-    /// 태운다. cwd를 못 찾으면(repo 미감지) IO 없이 바로 NoRepo 스냅샷을 밀어넣는다 —
-    /// 조용한 실패 금지(패널은 항상 무언가를 보여준다).
+    /// 태운다. 포커스 세션 기준 cwd로 요청한다(Git 탭 새로고침/원격 열기/파일 diff).
+    /// 특정 세션의 cwd를 써야 하는 호출부(세션 행 「변경 보기」 메뉴)는
+    /// `request_git_panel_io_at`을 직접 쓴다(2026-08-15 회귀 수정).
     fn request_git_panel_io(
         &mut self,
         ctx: &egui::Context,
         request: ui::git_panel::GitPanelIoRequest,
     ) {
-        let Some(cwd) = self.focused_session_repo_cwd() else {
+        let cwd = self.focused_session_repo_cwd();
+        self.request_git_panel_io_at(ctx, cwd, request);
+    }
+
+    /// `request_git_panel_io`의 cwd 인자 버전 — cwd를 못 찾으면(repo 미감지) IO 없이
+    /// 바로 NoRepo 스냅샷을 밀어넣는다(조용한 실패 금지, 패널은 항상 무언가를 보여준다).
+    fn request_git_panel_io_at(
+        &mut self,
+        ctx: &egui::Context,
+        cwd: Option<PathBuf>,
+        request: ui::git_panel::GitPanelIoRequest,
+    ) {
+        let Some(cwd) = cwd else {
             if let Some(tree) = self.file_tree.as_mut() {
                 tree.git_panel_set_snapshot(Err(ui::git_panel::GitPanelErrorCode::NoRepo));
             }
@@ -24229,15 +24242,21 @@ impl eframe::App for App {
                         None => tracing::warn!("세션 cwd 미확인 — 경로 복사 생략"),
                     }
                 }
-                // 변경 보기 — 사이드바 Git 탭으로 이동해 최신 스냅샷을 연다. 이전엔
-                // 이 세션 전용 플로팅 diff 창을 열었는데, Git이 사이드바 인라인 탭이
-                // 된 뒤로는 포커스 세션 기준 패널로 수렴한다(2026-08-15, Task 10
-                // Step 9 — 세션별 diff 대신 "현재 작업 폴더의 git 상태" 화면 하나).
-                Some(ui::file_tree::SidebarAction::ShowDiff) => {
+                // 변경 보기 — 세션 행 컨텍스트 메뉴. 사이드바 Git 탭으로 이동해 **그
+                // 세션의** repo 스냅샷을 연다. 한때 포커스 세션 기준으로 일원화했었는데
+                // (Task 10 Step 9) 회귀였다 — 포커스가 다른 세션에 있으면 엉뚱한 repo가
+                // 떴다. select_git_tool()은 유지하되 cwd는 이 세션 기준으로 고정한다
+                // (2026-08-15 회귀 수정).
+                Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
                     if let Some(tree) = self.file_tree.as_mut() {
                         tree.select_git_tool();
                     }
-                    self.request_git_panel_io(ui.ctx(), ui::git_panel::GitPanelIoRequest::Snapshot);
+                    let cwd = self.cached_session_cwd(session).map(PathBuf::from);
+                    self.request_git_panel_io_at(
+                        ui.ctx(),
+                        cwd,
+                        ui::git_panel::GitPanelIoRequest::Snapshot,
+                    );
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
                 // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.

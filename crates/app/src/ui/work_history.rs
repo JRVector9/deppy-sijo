@@ -30,6 +30,8 @@ pub struct WorkHistoryRow<'a> {
     pub source_offset: u64,
     pub instruction: &'a str,
     pub agent_summary: Option<&'a str>,
+    #[allow(dead_code)] // Task 6이 부른다
+    pub messages_json: Option<&'a str>,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub branch: Option<&'a str>,

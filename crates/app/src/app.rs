@@ -518,6 +518,7 @@ impl<'a> From<&'a storage::AgentWorkTurnRow> for ui::work_history::WorkHistoryRo
             source_offset: row.source_offset,
             instruction: &row.instruction,
             agent_summary: row.agent_summary.as_deref(),
+            messages_json: row.messages_json.as_deref(),
             model: row.model.as_deref(),
             effort: row.effort.as_deref(),
             branch: row.branch.as_deref(),
@@ -12576,6 +12577,7 @@ impl App {
                     source_offset: turn.source_offset,
                     instruction: turn.instruction.clone(),
                     agent_summary: turn.agent_summary.clone(),
+                    messages_json: turn.messages_json(),
                     model: display.model.clone(),
                     effort: display.effort.clone(),
                     cwd,
@@ -12726,6 +12728,7 @@ impl App {
                 source_offset: row.source_offset,
                 instruction: row.instruction.clone(),
                 agent_summary: row.agent_summary.clone(),
+                messages_json: row.messages_json.clone(),
                 model: row.model.clone(),
                 effort: row.effort.clone(),
                 cwd: row.cwd.clone(),
@@ -30773,6 +30776,18 @@ mod tests {
         }
     }
 
+    /// 턴 프로젝션이 `messages_json: None`으로 되돌아가면 저장된 메시지 배열이 조용히
+    /// 사라진다 — upsert 리터럴이 `turn.messages_json()`을 싣고 있는지 소스로 고정한다.
+    #[test]
+    fn 프로젝션은_턴_메시지를_그대로_올린다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            production.contains("messages_json: turn.messages_json()"),
+            "턴 메시지가 upsert에 실려야 한다"
+        );
+    }
+
     /// 이력이 pane 보조 탭이 된 뒤로 `set_view(Terminal)`만으로는 이력 본문이 걷히지
     /// 않는다. 세션을 드러내는 네비게이션은 전부 `reveal_terminal_session`을 타야 하고,
     /// 날것의 `set_view(Terminal)`은 세 곳만 남는다 — 헬퍼 본문, 워크스페이스 전환
@@ -36389,6 +36404,7 @@ mod tests {
             source_offset: 42,
             instruction: "Implement history".to_owned(),
             agent_summary: Some("Working".to_owned()),
+            messages_json: None,
             model: Some("gpt-5.6-sol".to_owned()),
             effort: Some("xhigh".to_owned()),
             cwd: Some("/tmp/project".to_owned()),

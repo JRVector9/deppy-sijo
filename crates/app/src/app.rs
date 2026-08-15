@@ -8791,6 +8791,9 @@ enum AppHostIoAction {
         generation: u64,
         path: PathBuf,
         kind: crate::agent_detect::AgentKind,
+        /// 카드가 가리키는 턴을 연 레코드 줄의 절대 파일 오프셋(스펙 §6-1). 뷰어가
+        /// 그 턴을 강조·스크롤하는 데 쓴다.
+        focus_offset: u64,
     },
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
@@ -9167,6 +9170,7 @@ enum AppHostIoCompletion {
     GitPanel(ui::git_panel::GitPanelIoCompletion),
     Transcript {
         generation: u64,
+        focus_offset: u64,
         result: Result<
             crate::agent_transcript::TranscriptConversation,
             crate::agent_transcript::TranscriptViewError,
@@ -9232,6 +9236,7 @@ enum AppHostIoFallback {
     },
     Transcript {
         generation: u64,
+        focus_offset: u64,
     },
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
@@ -9310,8 +9315,13 @@ impl AppHostIoFallback {
                     ui::git_panel::GitPanelIoRequest::FileDiff { .. }
                 ),
             },
-            AppHostIoAction::Transcript { generation, .. } => Self::Transcript {
+            AppHostIoAction::Transcript {
+                generation,
+                focus_offset,
+                ..
+            } => Self::Transcript {
                 generation: *generation,
+                focus_offset: *focus_offset,
             },
             AppHostIoAction::ComposerContextFile(request) => {
                 Self::ComposerContextFile(request.clone())
@@ -9416,8 +9426,12 @@ impl AppHostIoFallback {
                     ))
                 },
             }),
-            Self::Transcript { generation } => AppHostIoCompletion::Transcript {
+            Self::Transcript {
                 generation,
+                focus_offset,
+            } => AppHostIoCompletion::Transcript {
+                generation,
+                focus_offset,
                 result: Err(crate::agent_transcript::TranscriptViewError::ReadFailed),
             },
             Self::ComposerContextFile(request) => AppHostIoCompletion::ComposerContextFile {
@@ -10725,8 +10739,10 @@ fn run_app_host_io(
             generation,
             path,
             kind,
+            focus_offset,
         } => AppHostIoCompletion::Transcript {
             generation,
+            focus_offset,
             result: crate::agent_transcript::read_conversation(&path, kind),
         },
         AppHostIoAction::PersistComposerHistory { path, history } => {
@@ -10981,13 +10997,15 @@ impl App {
                     self.egui_ctx.request_repaint();
                 }
             }
-            AppHostIoCompletion::Transcript { generation, result } => {
+            AppHostIoCompletion::Transcript {
+                generation,
+                focus_offset,
+                result,
+            } => {
                 // stale(세대 불일치)은 조용히 버린다 — git 패널 IO와 같은 규칙.
                 if generation == self.transcript_generation {
-                    // TODO(다음 Task): focus_offset을 AppHostIoCompletion::Transcript에
-                    // 실어 여기로 되돌려 받아야 한다 — 지금은 크레이트 컴파일을 위한
-                    // 최소 수정으로 None을 넘긴다(강조 없이 맨 아래에서 시작).
-                    self.transcript_viewer_ui.set_conversation(result, None);
+                    self.transcript_viewer_ui
+                        .set_conversation(result, Some(focus_offset));
                     self.egui_ctx.request_repaint();
                 }
             }
@@ -14546,7 +14564,7 @@ impl App {
                     return;
                 };
                 let Some(kind) = crate::agent_detect::kind_from_str(&row.kind) else {
-                    // 최소 수정: 크레이트 컴파일을 위해 None을 넘긴다(위 TODO와 같음).
+                    // 원문 자체를 못 찾은 경로라 초점도 의미가 없다 — None.
                     self.transcript_viewer_ui.set_conversation(
                         Err(crate::agent_transcript::TranscriptViewError::NotFound),
                         None,
@@ -14558,7 +14576,7 @@ impl App {
                     &row.agent_session_id,
                     row.cwd.as_deref(),
                 ) else {
-                    // 최소 수정: 크레이트 컴파일을 위해 None을 넘긴다(위 TODO와 같음).
+                    // 원문 자체를 못 찾은 경로라 초점도 의미가 없다 — None.
                     self.transcript_viewer_ui.set_conversation(
                         Err(crate::agent_transcript::TranscriptViewError::NotFound),
                         None,
@@ -14570,6 +14588,7 @@ impl App {
                     generation: self.transcript_generation,
                     path,
                     kind,
+                    focus_offset: row.source_offset,
                 };
                 // git 패널 IO와 capacity-1 슬롯을 공유한다. 차 있을 때 그냥 버리면
                 // 사용자가 「원문 보기」를 눌러도 아무 일도 안 일어난 것처럼 보인다
@@ -30853,6 +30872,18 @@ mod tests {
         assert!(
             production.contains("self.pending_transcript_request.take()"),
             "대기 슬롯을 다음 프레임에 태우는 배수 지점이 있어야 한다"
+        );
+    }
+
+    /// 「원문 보기」는 카드가 가리키는 그 턴이 원문에서 선택돼야 한다(스펙 §6) — 그러려면
+    /// IO 요청에 그 턴의 오프셋이 실려야 한다.
+    #[test]
+    fn 원문_보기는_그_턴의_오프셋을_함께_넘긴다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            production.contains("focus_offset: row.source_offset"),
+            "카드가 가리키는 턴의 오프셋이 IO 요청에 실려야 한다"
         );
     }
 

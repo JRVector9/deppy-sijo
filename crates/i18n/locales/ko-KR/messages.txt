@@ -133,6 +133,7 @@ history.transcript.empty = 카드에서 「원문 보기」를 누르면 대화�
 history.transcript.not_found = transcript 파일을 찾지 못했습니다
 history.transcript.error = 대화를 읽지 못했습니다
 history.transcript.truncated = 앞부분이 잘렸습니다 — 최근 대화만 표시합니다
+history.transcript.focus_missing = 이 작업의 대화는 원문 창 밖으로 밀렸습니다 — 최근 대화만 표시합니다
 history.time.just_now = 방금
 history.time.minutes = {count}분 전
 history.time.hours = {count}시간 전

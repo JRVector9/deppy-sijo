@@ -133,6 +133,7 @@ history.transcript.empty = カードの「会話記録を表示」を選択す�
 history.transcript.not_found = 会話記録ファイルが見つかりません
 history.transcript.error = 会話を読み込めませんでした
 history.transcript.truncated = 前の部分は省略されています — 最新の会話のみ表示しています
+history.transcript.focus_missing = このターンの会話は読み込み範囲外です — 最新の会話のみ表示しています
 history.time.just_now = たった今
 history.time.minutes = {count}分前
 history.time.hours = {count}時間前

@@ -133,6 +133,7 @@ history.transcript.empty = Select "View transcript" on a card to read the conver
 history.transcript.not_found = Transcript file not found
 history.transcript.error = Could not read the conversation
 history.transcript.truncated = Earlier messages were trimmed — showing the most recent
+history.transcript.focus_missing = This turn is outside the loaded window — showing the most recent conversation
 history.time.just_now = just now
 history.time.minutes = {count}m ago
 history.time.hours = {count}h ago

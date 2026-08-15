@@ -133,6 +133,7 @@ history.transcript.empty = 在卡片上选择「查看对话记录」即可在�
 history.transcript.not_found = 未找到对话记录文件
 history.transcript.error = 无法读取对话
 history.transcript.truncated = 前面部分已省略 — 仅显示最近的对话
+history.transcript.focus_missing = 这一轮对话已超出加载范围 — 仅显示最近的对话
 history.time.just_now = 刚刚
 history.time.minutes = {count} 分钟前
 history.time.hours = {count} 小时前

@@ -14,6 +14,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::agent_detect;
+
 /// transcript에서 파생한 에이전트 활동. needsInput은 여기 없다(regex fallback 담당).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentActivity {
@@ -119,6 +121,11 @@ impl fmt::Debug for TranscriptState {
 }
 
 const TAIL_BYTES: u64 = 256 * 1024;
+/// `tail_snapshot` 계열이 받아들이는 절대 상한 — 이 값을 넘는 `max_bytes` 요청은 호출자
+/// 버그로 보고 버퍼 할당 전에 거부한다. 상태 판정용 `TAIL_BYTES`(256KB)가 가장 컸는데,
+/// 원문 읽기(`read_conversation`, 2026-08-15)가 사람이 읽는 용도로 `CONVERSATION_TAIL_BYTES`
+/// (4MB)를 요구해 그 값으로 올렸다.
+const MAX_TAIL_SNAPSHOT_BYTES: u64 = CONVERSATION_TAIL_BYTES;
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 64 * 1024;
 const MAX_TAIL_LINES: usize = 4_096;
 const MAX_CODEX_HEAD_LINES: usize = 3;
@@ -215,7 +222,7 @@ fn tail_snapshot_from_reader<R: Read + Seek>(
     max_bytes: u64,
     modified_at: Option<i64>,
 ) -> std::io::Result<TailSnapshot> {
-    if max_bytes > TAIL_BYTES {
+    if max_bytes > MAX_TAIL_SNAPSHOT_BYTES {
         return Err(invalid_input("tail_limit_invalid"));
     }
     let retained = snapshot_len.min(max_bytes);
@@ -508,22 +515,28 @@ fn bounded_path_owned(value: &str) -> Option<String> {
         .then(|| value.to_owned())
 }
 
+/// 노이즈로 보고 거부할 접두 목록 — 요약(`clean_agent_summary`)과 원문 읽기
+/// (`read_conversation`)가 이 판정을 공유한다(2026-08-15 리팩터). 목록 자체는 상한이
+/// 바뀌어도 그대로 둔다 — 정확도를 올리는 규칙이라 상한과 무관하다.
+fn is_noise_prefix(text: &str) -> bool {
+    text.is_empty()
+        || text.starts_with("<system-reminder")
+        || text.starts_with("<local-command")
+        || text.starts_with("<command-name")
+        || text.starts_with("<environment_context")
+        || text.starts_with("<permissions")
+        || text.starts_with("<INSTRUCTIONS")
+        || text.starts_with("<task-notification")
+        || text.starts_with("<heartbeat")
+}
+
 fn clean_agent_summary(text: &str) -> Option<String> {
     let mut visible = text.trim_start();
     // 렌더링용 이미지 첨부 표식이 앞에 붙은 메시지는 경로 표식만 걷어낸다.
     while visible.starts_with("<image ") {
         visible = visible.split_once('>')?.1.trim_start();
     }
-    if visible.is_empty()
-        || visible.starts_with("<system-reminder")
-        || visible.starts_with("<local-command")
-        || visible.starts_with("<command-name")
-        || visible.starts_with("<environment_context")
-        || visible.starts_with("<permissions")
-        || visible.starts_with("<INSTRUCTIONS")
-        || visible.starts_with("<task-notification")
-        || visible.starts_with("<heartbeat")
-    {
+    if is_noise_prefix(visible) {
         return None;
     }
 
@@ -1563,6 +1576,279 @@ fn codex_cwd_from_head_snapshot<R: Read + Seek>(
     Ok(None)
 }
 
+// ── 원문 보기(Task 7) ──────────────────────────────────────────────────────
+//
+// 이력 카드의 「원문 보기」가 부르는 읽기 전용 파서. 상태 판정용 tail 파서(위)와 상한이
+// **다르다** — 그쪽은 "지금 무슨 상태인가"를 싸게 알아내는 것이고, 이쪽은 사람이 읽는
+// 것이 목적이라 훨씬 크다. 아무것도 저장하지 않는다(스펙 §2) — 볼 때만 읽고 닫으면 버린다.
+
+/// 원문 보기 전용 tail 상한 — 긴 세션도 최근 대화는 충분히 담긴다.
+const CONVERSATION_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+/// 메시지 하나가 담는 최대 바이트. 넘으면 UTF-8 경계로 자르고 `…`를 붙인다.
+pub const CONVERSATION_MESSAGE_BYTES_MAX: usize = 8 * 1024;
+/// 대화가 담는 최대 메시지 수. 넘으면 오래된 쪽부터 버린다(최신이 남는다).
+pub const CONVERSATION_MESSAGES_MAX: usize = 200;
+/// 대화 전체의 총 바이트 상한 — 위 둘의 곱보다 낮은 실효 상한이다.
+const CONVERSATION_TOTAL_BYTES_MAX: usize = 1024 * 1024;
+
+/// 대화 메시지 한 개의 화자. 턴 메시지(`TurnRole`)와 별개 타입이다 — 이쪽은 파일에서
+/// 매번 새로 읽어 화면에만 쓰고 저장하지 않는다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConversationRole {
+    User,
+    Assistant,
+}
+
+/// 원문 보기가 그리는 메시지 한 개.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConversationMessage {
+    pub role: ConversationRole,
+    pub text: String,
+    pub at: Option<i64>,
+}
+
+impl fmt::Debug for ConversationMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConversationMessage")
+            .field("role", &self.role)
+            .field("text", &"REDACTED")
+            .field("at", &self.at)
+            .finish()
+    }
+}
+
+/// `read_conversation`의 결과. 저장하지 않는다 — 뷰어가 닫히면 버린다.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct TranscriptConversation {
+    pub messages: Vec<ConversationMessage>,
+    /// 앞부분(오래된 메시지)이 상한에 밀려 창 밖으로 나갔다.
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscriptViewError {
+    NotFound,
+    ReadFailed,
+}
+
+/// 노이즈 접두만 걸러내는 원문 추출 — `clean_agent_summary`와 달리 길이를 자르지 않는다
+/// (자르는 것은 `bound_conversation_text`가 별도 상한으로 한다).
+fn conversation_raw_text(text: &str) -> Option<&str> {
+    let mut visible = text.trim_start();
+    // 렌더링용 이미지 첨부 표식이 앞에 붙은 메시지는 경로 표식만 걷어낸다(요약과 동일 규칙).
+    while visible.starts_with("<image ") {
+        visible = visible.split_once('>')?.1.trim_start();
+    }
+    (!is_noise_prefix(visible)).then_some(visible)
+}
+
+/// claude/kimi의 `content`(문자열 또는 `{"type":"text",...}` 배열)에서 원문을 뽑는다.
+/// `message_content_summary`/`text_items_summary`와 같은 모양이지만 길이를 자르지 않는다.
+fn conversation_content_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return conversation_raw_text(text).map(str::to_owned);
+    }
+    let items = content.as_array()?;
+    if items.len() > MAX_MESSAGE_CONTENT_ITEMS {
+        return None;
+    }
+    let mut text = String::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(part) = item
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(conversation_raw_text)
+        else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(part);
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// 메시지 하나를 `CONVERSATION_MESSAGE_BYTES_MAX`에서 UTF-8 경계로 자르고 말줄임을 붙인다.
+fn bound_conversation_text(mut text: String) -> String {
+    if text.len() <= CONVERSATION_MESSAGE_BYTES_MAX {
+        return text;
+    }
+    let mut cut = CONVERSATION_MESSAGE_BYTES_MAX - '…'.len_utf8();
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push('…');
+    text
+}
+
+/// `read_conversation` 결과를 유계로 쌓는다. 메시지 수·총 바이트 상한을 넘으면 **앞에서
+/// (오래된 쪽부터) 버리고** truncated를 세운다 — 최신이 남는다.
+struct ConversationBuilder {
+    messages: Vec<ConversationMessage>,
+    total_bytes: usize,
+    truncated: bool,
+}
+
+impl ConversationBuilder {
+    fn new() -> Self {
+        Self {
+            messages: Vec::with_capacity(CONVERSATION_MESSAGES_MAX),
+            total_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, role: ConversationRole, text: String, at: Option<i64>) {
+        if text.is_empty() {
+            return;
+        }
+        let text = bound_conversation_text(text);
+        while self.messages.len() >= CONVERSATION_MESSAGES_MAX {
+            self.evict_oldest();
+        }
+        while !self.messages.is_empty()
+            && self.total_bytes.saturating_add(text.len()) > CONVERSATION_TOTAL_BYTES_MAX
+        {
+            self.evict_oldest();
+        }
+        self.total_bytes = self.total_bytes.saturating_add(text.len());
+        self.messages.push(ConversationMessage { role, text, at });
+    }
+
+    fn evict_oldest(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let removed = self.messages.remove(0);
+        self.total_bytes = self.total_bytes.saturating_sub(removed.text.len());
+        self.truncated = true;
+    }
+
+    fn finish(self) -> (Vec<ConversationMessage>, bool) {
+        (self.messages, self.truncated)
+    }
+}
+
+/// claude transcript에서 user/assistant 메시지만 뽑는다. tool_use·thinking·tool_result는
+/// `content` 배열에서 `type == "text"`가 아니라 자연히 버려진다.
+fn claude_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
+    for (_, line) in snapshot_lines(snapshot) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let role = match value.get("type").and_then(Value::as_str) {
+            Some("user") => ConversationRole::User,
+            Some("assistant") => ConversationRole::Assistant,
+            _ => continue,
+        };
+        let Some(content) = value.pointer("/message/content") else {
+            continue;
+        };
+        let Some(text) = conversation_content_text(content) else {
+            continue;
+        };
+        builder.push(role, text, event_occurred_at(&value));
+    }
+}
+
+/// codex rollout에서 user/assistant 메시지만 뽑는다. `event_msg` 외 레코드(turn_context,
+/// token_count 등)와 task_started/task_complete/turn_aborted는 텍스트가 아니라 버려진다.
+fn codex_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
+    for (_, line) in snapshot_lines(snapshot) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let role = match value.pointer("/payload/type").and_then(Value::as_str) {
+            Some("user_message") => ConversationRole::User,
+            Some("agent_message") => ConversationRole::Assistant,
+            _ => continue,
+        };
+        let Some(text) = value
+            .pointer("/payload/message")
+            .and_then(Value::as_str)
+            .and_then(conversation_raw_text)
+        else {
+            continue;
+        };
+        builder.push(role, text.to_owned(), event_occurred_at(&value));
+    }
+}
+
+/// kimi `wire.jsonl`에서 user/assistant 메시지만 뽑는다. `turn.prompt`가 사용자,
+/// `context.append_message`가 에이전트다 — hook_result/system 기원과 user role은 버린다
+/// (`kimi_recent_turns`와 같은 판정).
+fn kimi_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
+    for (_, line) in snapshot_lines(snapshot) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("turn.prompt") => {
+                if value.pointer("/origin/kind").and_then(Value::as_str) != Some("user") {
+                    continue;
+                }
+                let Some(input) = value.get("input") else {
+                    continue;
+                };
+                let Some(text) = conversation_content_text(input) else {
+                    continue;
+                };
+                builder.push(ConversationRole::User, text, event_occurred_at(&value));
+            }
+            Some("context.append_message") => {
+                let role = value.pointer("/message/role").and_then(Value::as_str);
+                let origin = value
+                    .pointer("/message/origin/kind")
+                    .and_then(Value::as_str);
+                if role == Some("user") || matches!(origin, Some("hook_result" | "system")) {
+                    continue;
+                }
+                let Some(content) = value.pointer("/message/content") else {
+                    continue;
+                };
+                let Some(text) = conversation_content_text(content) else {
+                    continue;
+                };
+                builder.push(ConversationRole::Assistant, text, event_occurred_at(&value));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 카드에서 「원문 보기」를 누르면 부른다. **App host 스레드에서만**(blocking IO) 부른다.
+/// 아무것도 저장하지 않는다 — 볼 때만 읽고 닫으면 버린다(스펙 §2).
+#[allow(dead_code)] // Task 9·10이 부른다
+pub fn read_conversation(
+    path: &Path,
+    kind: agent_detect::AgentKind,
+) -> Result<TranscriptConversation, TranscriptViewError> {
+    let snapshot = tail_snapshot(path, CONVERSATION_TAIL_BYTES).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            TranscriptViewError::NotFound
+        } else {
+            TranscriptViewError::ReadFailed
+        }
+    })?;
+    let mut builder = ConversationBuilder::new();
+    builder.truncated = snapshot.base_offset != 0;
+    match kind {
+        agent_detect::AgentKind::Claude => claude_conversation_messages(&snapshot, &mut builder),
+        agent_detect::AgentKind::Codex => codex_conversation_messages(&snapshot, &mut builder),
+        agent_detect::AgentKind::Kimi => kimi_conversation_messages(&snapshot, &mut builder),
+    }
+    let (messages, truncated) = builder.finish();
+    Ok(TranscriptConversation { messages, truncated })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1580,6 +1866,75 @@ mod tests {
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(content).unwrap();
         p
+    }
+
+    /// `read_conversation` 테스트용 claude 모양 jsonl. 파일마다 이름이 겹치지 않게
+    /// 카운터를 쓴다 — 같은 프로세스 안에서 여러 테스트가 병렬로 돈다.
+    fn 임시_transcript(lines: &[&str]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut content = String::new();
+        for line in lines {
+            content.push_str(line);
+            content.push('\n');
+        }
+        write_tmp(&format!("read-conversation-{id}.jsonl"), &content)
+    }
+
+    #[test]
+    fn 대화_읽기는_역할_두_개만_남긴다() {
+        let path = 임시_transcript(&[
+            r#"{"type":"user","message":{"role":"user","content":"물음"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"답"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}"#,
+        ]);
+        let view = read_conversation(&path, agent_detect::AgentKind::Claude).unwrap();
+        assert_eq!(view.messages.len(), 2, "tool_use는 제외한다");
+        assert_eq!(view.messages[0].role, ConversationRole::User);
+        assert_eq!(view.messages[1].text, "답");
+    }
+
+    #[test]
+    fn 대화_읽기는_메시지당_상한에서_자른다() {
+        let long = "가".repeat(CONVERSATION_MESSAGE_BYTES_MAX);
+        let path = 임시_transcript(&[&format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"{long}"}}}}"#
+        )]);
+        let view = read_conversation(&path, agent_detect::AgentKind::Claude).unwrap();
+        assert!(view.messages[0].text.len() <= CONVERSATION_MESSAGE_BYTES_MAX);
+        assert!(view.messages[0].text.ends_with('…'));
+    }
+
+    #[test]
+    fn 대화_읽기는_손상된_줄을_건너뛴다() {
+        let path = 임시_transcript(&[
+            "{ 망가진 줄",
+            r#"{"type":"user","message":{"role":"user","content":"살아남는다"}}"#,
+        ]);
+        let view = read_conversation(&path, agent_detect::AgentKind::Claude).unwrap();
+        assert_eq!(view.messages.len(), 1, "한 줄이 깨져도 파일 전체를 버리지 않는다");
+    }
+
+    #[test]
+    fn 대화_읽기는_메시지_수_상한에서_잘림을_표시한다() {
+        let count = CONVERSATION_MESSAGES_MAX + 10;
+        let mut lines: Vec<String> = Vec::with_capacity(count);
+        for index in 0..count {
+            lines.push(format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"m{index}"}}}}"#
+            ));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let view = read_conversation(&임시_transcript(&refs), agent_detect::AgentKind::Claude)
+            .unwrap();
+        assert_eq!(view.messages.len(), CONVERSATION_MESSAGES_MAX);
+        assert!(view.truncated);
+        assert_eq!(
+            view.messages.last().unwrap().text,
+            format!("m{}", count - 1),
+            "최신이 남는다"
+        );
     }
 
     #[test]
@@ -1628,7 +1983,8 @@ mod tests {
 
         let mut empty_reader = std::io::Cursor::new(Vec::<u8>::new());
         assert!(
-            tail_snapshot_from_reader(&mut empty_reader, 0, TAIL_BYTES + 1, None).is_err(),
+            tail_snapshot_from_reader(&mut empty_reader, 0, MAX_TAIL_SNAPSHOT_BYTES + 1, None)
+                .is_err(),
             "configured tail cap + 1 must fail before allocation"
         );
     }

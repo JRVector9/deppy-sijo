@@ -61,6 +61,9 @@ pub enum AgentTerminalView {
     /// 모은다. 2026-08-08까지 작업함(Inbox)과 플릿이 별도 페이지였는데 같은 사실을 두 번
     /// 세고 있어 합쳤다(사용자 지적).
     Fleet,
+    /// git 패널 행 클릭으로 여는 파일 diff — 터미널 자리를 전면 교체한다
+    /// (Home/Fleet과 같은 패턴, 2026-08-15 스펙 §1).
+    Diff,
     #[default]
     Terminal,
 }

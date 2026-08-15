@@ -1826,7 +1826,6 @@ fn kimi_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversatio
 
 /// 카드에서 「원문 보기」를 누르면 부른다. **App host 스레드에서만**(blocking IO) 부른다.
 /// 아무것도 저장하지 않는다 — 볼 때만 읽고 닫으면 버린다(스펙 §2).
-#[allow(dead_code)] // Task 9·10이 부른다
 pub fn read_conversation(
     path: &Path,
     kind: agent_detect::AgentKind,

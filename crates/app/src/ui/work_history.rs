@@ -88,6 +88,9 @@ pub enum WorkHistoryAction {
     Refresh,
     Activate(WorkTurnIdentity),
     ShowDiff(WorkTurnIdentity),
+    /// 카드 「원문 보기」— App이 identity로 행을 찾아 transcript 경로를 해석하고
+    /// off-thread로 읽는다(2026-08-15 Task 10, 스펙 §2-1).
+    ShowTranscript(WorkTurnIdentity),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -852,6 +855,16 @@ fn render_card(
                                 Some(WorkHistoryAction::ShowDiff(presentation.identity.clone()));
                         }
                     }
+                    // presentation과 무관하게 항상 켜져 있다 — 원문은 런처 가용성이나
+                    // 활성 워크스페이스와 상관없이 세션이 끝난 뒤에도 열 수 있어야 한다.
+                    if ui
+                        .button(catalog.t("history.action.show_transcript", &[]))
+                        .clicked()
+                    {
+                        action = Some(WorkHistoryAction::ShowTranscript(WorkTurnIdentity::from(
+                            row,
+                        )));
+                    }
                 });
                 if let Some(WorkHistoryActionPresentation {
                     primary: WorkHistoryPrimaryAction::Disabled(reason),
@@ -1361,6 +1374,47 @@ mod tests {
         assert_eq!(
             harness.state().actions,
             vec![WorkHistoryAction::ShowDiff(identity)]
+        );
+        assert_eq!(harness.state().toggles, 0);
+    }
+
+    #[test]
+    fn kittest_원문_보기_버튼은_intent를_올린다() {
+        // 카드 펼침 토글이 클릭을 삼키지 않는다 — 「변경 보기」와 같은 위치(toggle
+        // 스코프 밖)에 둔 버튼이라 같은 방식으로 검증한다. locale 문구는 다음
+        // Task가 채우므로 아직은 키 문자열 그대로가 라벨이다.
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let candidate = row(
+            "transcript-hit-test",
+            storage::AgentWorkTurnState::Completed,
+            10,
+        );
+        let identity = WorkTurnIdentity::from(&candidate);
+        let presentation = WorkHistoryActionPresentation {
+            identity: identity.clone(),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: true,
+        };
+        let mut harness = card_harness(&catalog, &candidate, &presentation);
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                "history.action.show_transcript",
+            )
+            .click();
+        harness.run();
+
+        assert!(
+            harness
+                .state()
+                .actions
+                .iter()
+                .any(|action| matches!(action, WorkHistoryAction::ShowTranscript(_))),
+            "actions: {:?}",
+            harness.state().actions
         );
         assert_eq!(harness.state().toggles, 0);
     }

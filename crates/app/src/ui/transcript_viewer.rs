@@ -7,11 +7,9 @@
 /// 전에는 알 수 없어 근사치를 쓴다 — 추정이 빗나가도 스크롤 위치가 살짝
 /// 흔들릴 뿐, "화면 밖 메시지는 프레임마다 다시 레이아웃하지 않는다"는
 /// 가상화의 목적(프레임 비용 유계) 자체는 항상 지켜진다.
-#[allow(dead_code)] // Task 10이 부른다
 const ROW_CHARS_ESTIMATE: usize = 56;
 /// 메시지 한 개가 차지하는 여백 추정치 — `render_message`의 `inner_margin`
 /// 상하(4+4)와 다음 메시지 앞의 `add_space(4.0)`을 합친 값.
-#[allow(dead_code)] // Task 10이 부른다
 const MESSAGE_ROW_EXTRA: f32 = 12.0;
 
 /// leaf 상태. IO도 파일 경로 해석도 하지 않는다 — App이 `agent_detect::transcript_path_for`로
@@ -28,14 +26,12 @@ pub struct TranscriptViewerUi {
 
 impl TranscriptViewerUi {
     /// App이 원문 IO를 시작할 때 부른다(2026-08-15, Task 10이 배선한다).
-    #[allow(dead_code)] // Task 10이 부른다
     pub fn set_loading(&mut self) {
         self.loading = true;
     }
 
     /// App이 원문 IO를 끝내면 부른다. 성공이든 실패든 결과를 그대로 담는다 —
     /// 카드 하나의 대화가 이상해도 뷰어 자체는 죽지 않는다(fail-soft).
-    #[allow(dead_code)] // Task 10이 부른다
     pub fn set_conversation(
         &mut self,
         result: Result<
@@ -51,12 +47,10 @@ impl TranscriptViewerUi {
     /// 아직 아무것도 열지 않은 초기 상태인가. App이 이걸로 좌측 목록에서 아무
     /// 카드도 고르지 않은 상태인지 물을 수 있다. 대화가 0건이어도 한 번
     /// 열렸으면(로딩 포함) false다 — "열림"과 "내용 있음"은 별개다.
-    #[allow(dead_code)] // Task 10이 부른다
     pub fn is_empty(&self) -> bool {
         !self.loading && self.conversation.is_none()
     }
 
-    #[allow(dead_code)] // Task 10이 부른다
     pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
         if self.loading {
             ui.weak(catalog.t("history.transcript.loading", &[]));
@@ -103,7 +97,6 @@ impl TranscriptViewerUi {
     }
 }
 
-#[allow(dead_code)] // Task 10이 부른다(render를 통해)
 fn render_message(
     ui: &mut egui::Ui,
     message: &crate::agent_transcript::ConversationMessage,
@@ -125,7 +118,6 @@ fn render_message(
 /// 사용자 발화는 액센트를 옅게 섞은 면, 에이전트 발화는 페이지 바닥
 /// (`content_canvas`)으로 구분한다 — 둘 다 `designall::Tokens`에서 고른 값이라
 /// 라이트/다크 모두 자동으로 성립한다(하드코딩 색 없음).
-#[allow(dead_code)] // Task 10이 부른다(render를 통해)
 fn role_background(
     tokens: crate::ui::designall::Tokens,
     role: crate::agent_transcript::ConversationRole,
@@ -140,7 +132,6 @@ fn role_background(
 
 /// 메시지 하나가 차지할 표시 줄 수 추정 — 역할 라벨 한 줄 + 본문 줄들(명시적
 /// 개행 기준, [`ROW_CHARS_ESTIMATE`]로 소프트 랩까지 근사).
-#[allow(dead_code)] // Task 10이 부른다(render를 통해)
 fn estimate_message_lines(text: &str) -> usize {
     let body_lines: usize = text
         .lines()
@@ -152,7 +143,6 @@ fn estimate_message_lines(text: &str) -> usize {
 /// `show_rows`에 넘길 단일 행 높이 — 대화 전체 메시지의 평균 추정 줄 수.
 /// `show_rows`는 모든 행에 같은 높이를 가정하므로(egui 0.35 API), 메시지마다
 /// 실제 높이가 달라도 평균으로 근사한다 — 가상화의 통상 트레이드오프다.
-#[allow(dead_code)] // Task 10이 부른다(render를 통해)
 fn average_row_height(messages: &[crate::agent_transcript::ConversationMessage], line_height: f32) -> f32 {
     if messages.is_empty() {
         return line_height + MESSAGE_ROW_EXTRA;

@@ -1160,7 +1160,6 @@ fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
 /// Codex는 `TranscriptFinder::find`가 이미 `~/.codex/sessions`를 역순(최신 먼저) 스캔해
 /// 세션ID로 직접 매칭한다(위 `TranscriptFinder` 문서 참고) — 그걸 그대로 우선 쓰고,
 /// 스캔 상한에 걸리는 등 못 찾을 때만 행의 cwd로 `find_codex_transcript`에 폴백한다.
-#[allow(dead_code)] // Task 10이 부른다
 pub(crate) fn transcript_path_for(
     kind: AgentKind,
     session_id: &str,

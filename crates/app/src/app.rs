@@ -7907,6 +7907,11 @@ pub struct App {
     work_history_git_manual_refresh: bool,
     work_history_git_manual_generation: Option<u64>,
     pending_work_history_action: Option<ui::work_history::WorkHistoryAction>,
+    /// 이력 보조 본문 우측(마스터-디테일) 원문 뷰어 — 카드 「원문 보기」가 연다
+    /// (2026-08-15 Task 10, 스펙 §2). 아무것도 저장하지 않는다.
+    transcript_viewer_ui: ui::transcript_viewer::TranscriptViewerUi,
+    /// 원문 IO 완료의 stale 폐기용 세대 — `git_panel_generation`과 같은 관례.
+    transcript_generation: u64,
     /// Lazy aggregate boundary for hook/attention/restore/binding/resume/catalog/project-name
     /// persistence and filesystem projections. Construction opens no DB and starts no thread.
     agent_state_worker: crate::agent_state_worker::AgentStateWorker<AppAgentStateBackend>,
@@ -8757,6 +8762,14 @@ fn git_tab_list_width(body_width: f32) -> f32 {
     (body_width * 0.4).clamp(MIN, FIXED)
 }
 
+/// 이력 보조 본문 좌측 카드 목록 폭 — `git_tab_list_width`와 같은 규칙(스펙 §2-1)이지만
+/// 카드가 git 파일 행보다 정보가 많아 하한을 조금 크게 잡는다(220 vs 180).
+fn history_tab_list_width(body_width: f32) -> f32 {
+    const FIXED: f32 = 360.0;
+    const MIN: f32 = 220.0;
+    (body_width * 0.4).clamp(MIN, FIXED)
+}
+
 enum AppHostIoAction {
     Connector(connector_service::HostAction),
     Workspace {
@@ -8769,6 +8782,13 @@ enum AppHostIoAction {
     InboxPreview(ui::inbox_waiting::LogPreviewIntent),
     Diff(ui::diff_panel::DiffIoIntent),
     GitPanel(ui::git_panel::GitPanelIoIntent),
+    /// 이력 카드 「원문 보기」 — transcript 파일을 blocking으로 읽는다(2026-08-15
+    /// Task 10, 스펙 §2-3). git 패널 IO와 같은 latest-only·in-flight 1개 규칙.
+    Transcript {
+        generation: u64,
+        path: PathBuf,
+        kind: crate::agent_detect::AgentKind,
+    },
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
     PersistComposerHistory {
@@ -9142,6 +9162,13 @@ enum AppHostIoCompletion {
     InboxPreview(ui::inbox_waiting::LogPreviewCompletion),
     Diff(ui::diff_panel::DiffIoCompletion),
     GitPanel(ui::git_panel::GitPanelIoCompletion),
+    Transcript {
+        generation: u64,
+        result: Result<
+            crate::agent_transcript::TranscriptConversation,
+            crate::agent_transcript::TranscriptViewError,
+        >,
+    },
     ComposerContextFile {
         request: ui::composer::ContextFileRequest,
         selected_path: Option<PathBuf>,
@@ -9199,6 +9226,9 @@ enum AppHostIoFallback {
         /// 원 요청이 FileDiff였는지 — 폴백 완료를 같은 결과 변형(Snapshot/FileDiff)으로
         /// 되돌려야 App이 올바른 화면(사이드바 스냅샷 vs diff 뷰어)에 오류를 반영한다.
         is_file_diff: bool,
+    },
+    Transcript {
+        generation: u64,
     },
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
@@ -9276,6 +9306,9 @@ impl AppHostIoFallback {
                     intent.request,
                     ui::git_panel::GitPanelIoRequest::FileDiff { .. }
                 ),
+            },
+            AppHostIoAction::Transcript { generation, .. } => Self::Transcript {
+                generation: *generation,
             },
             AppHostIoAction::ComposerContextFile(request) => {
                 Self::ComposerContextFile(request.clone())
@@ -9380,6 +9413,10 @@ impl AppHostIoFallback {
                     ))
                 },
             }),
+            Self::Transcript { generation } => AppHostIoCompletion::Transcript {
+                generation,
+                result: Err(crate::agent_transcript::TranscriptViewError::ReadFailed),
+            },
             Self::ComposerContextFile(request) => AppHostIoCompletion::ComposerContextFile {
                 request,
                 selected_path: None,
@@ -10681,6 +10718,14 @@ fn run_app_host_io(
         AppHostIoAction::GitPanel(intent) => {
             AppHostIoCompletion::GitPanel(ui::git_panel::execute_io(intent))
         }
+        AppHostIoAction::Transcript {
+            generation,
+            path,
+            kind,
+        } => AppHostIoCompletion::Transcript {
+            generation,
+            result: crate::agent_transcript::read_conversation(&path, kind),
+        },
         AppHostIoAction::PersistComposerHistory { path, history } => {
             if write_composer_history(&path, &history) {
                 AppHostIoCompletion::Complete
@@ -10930,6 +10975,13 @@ impl App {
                                 .set_view(ui::diff_viewer::FileDiffView::default()),
                         },
                     }
+                    self.egui_ctx.request_repaint();
+                }
+            }
+            AppHostIoCompletion::Transcript { generation, result } => {
+                // stale(세대 불일치)은 조용히 버린다 — git 패널 IO와 같은 규칙.
+                if generation == self.transcript_generation {
+                    self.transcript_viewer_ui.set_conversation(result);
                     self.egui_ctx.request_repaint();
                 }
             }
@@ -11626,6 +11678,8 @@ impl App {
             work_history_git_manual_refresh: false,
             work_history_git_manual_generation: None,
             pending_work_history_action: None,
+            transcript_viewer_ui: ui::transcript_viewer::TranscriptViewerUi::default(),
+            transcript_generation: 0,
             agent_state_worker,
             agent_state_scope: initial_agent_state_scope,
             pending_agent_state_scope: None,
@@ -14258,8 +14312,11 @@ impl App {
             .collect()
     }
 
-    /// 이력 본문을 **세션 pane의 body rect 그대로**에 그린다. 탭 스트립은 WorkspaceUi가
-    /// 이미 잘라낸 뒤 넘긴 rect라, 여기서 헤더 높이를 다시 빼지 않는다.
+    /// 이력 본문 — 좌 카드 목록 / 우 원문 마스터-디테일(2026-08-15 Task 10, 스펙 §2-1).
+    /// **세션 pane의 body rect 그대로**에 그린다. 탭 스트립은 WorkspaceUi가 이미 잘라낸
+    /// 뒤 넘긴 rect라, 여기서 헤더 높이를 다시 빼지 않는다. 폭 규칙·구분선 관례는
+    /// `render_git_tab_body`와 같다 — 카드가 git 파일 행보다 정보가 많아 하한만 다르다
+    /// (`history_tab_list_width`).
     fn render_work_history_tab_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -14269,12 +14326,15 @@ impl App {
         current_branch: Option<&str>,
         text: &i18n::Catalog,
     ) -> Option<ui::work_history::WorkHistoryAction> {
+        let list_width = history_tab_list_width(body.width());
+        let (list_rect, transcript_rect) = body.split_left_right_at_x(body.left() + list_width);
+
         let mut child = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(body)
+                .max_rect(list_rect)
                 .id_salt("work_history_pane_tab"),
         );
-        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        child.set_clip_rect(list_rect.intersect(ui.clip_rect()));
         // leaf는 storage 크레이트를 모른다 — 렌더 직전에 빌린 뷰만 만들어 넘긴다.
         // `self.work_history_rows`(공유 대여)와 `self.work_history_ui`(가변 대여)는
         // 서로 다른 필드라 아래처럼 직접 필드로 접근하는 한 동시에 빌릴 수 있다.
@@ -14283,7 +14343,7 @@ impl App {
             .iter()
             .map(ui::work_history::WorkHistoryRow::from)
             .collect();
-        self.work_history_ui.show(
+        let action = self.work_history_ui.show(
             &mut child,
             ui::work_history::WorkHistorySnapshot {
                 workspace_name,
@@ -14294,7 +14354,27 @@ impl App {
             },
             presentations,
             text,
-        )
+        );
+
+        // 목록/원문 경계 세로 구분선 — git 패널과 같은 관례(render_git_tab_body 참고).
+        let separator = ui::designall::separator_stroke(ui.visuals());
+        let ppp = ui.ctx().pixels_per_point();
+        let sep_x = ui::snap_line_to_pixel(
+            ui::designall::panel_edge_separator_x(list_rect.right(), ppp),
+            separator.width,
+            ppp,
+        );
+        ui.painter().vline(sep_x, body.y_range(), separator);
+
+        let mut transcript = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(transcript_rect.shrink2(egui::vec2(6.0, 0.0)))
+                .id_salt("work_history_transcript_pane_tab"),
+        );
+        transcript.set_clip_rect(transcript_rect.intersect(ui.clip_rect()));
+        self.transcript_viewer_ui.render(&mut transcript, text);
+
+        action
     }
 
     /// Git 보조 탭 본문 — 좌 목록 / 우 diff 마스터-디테일(스펙 §8-3). 이력 본문
@@ -14440,6 +14520,46 @@ impl App {
                 };
                 self.diff_panel_ui
                     .open_for_path(ctx, self.active.id.clone(), cwd, row.instruction);
+            }
+            WorkHistoryAction::ShowTranscript(identity) => {
+                let row = self
+                    .work_history_rows
+                    .iter()
+                    .find(|row| ui::work_history::WorkTurnIdentity::from(*row) == identity)
+                    .cloned();
+                let Some(row) = row else {
+                    let _ = self.request_work_history_projection(false);
+                    return;
+                };
+                let Some(kind) = crate::agent_detect::kind_from_str(&row.kind) else {
+                    self.transcript_viewer_ui.set_conversation(Err(
+                        crate::agent_transcript::TranscriptViewError::NotFound,
+                    ));
+                    return;
+                };
+                let Some(path) = crate::agent_detect::transcript_path_for(
+                    kind,
+                    &row.agent_session_id,
+                    row.cwd.as_deref(),
+                ) else {
+                    self.transcript_viewer_ui.set_conversation(Err(
+                        crate::agent_transcript::TranscriptViewError::NotFound,
+                    ));
+                    return;
+                };
+                if self.pending_app_host_action.is_some() {
+                    // capacity-1 큐가 이미 차 있다 — 조용히 건너뛴다
+                    // (`request_git_panel_io_at`과 같은 규칙).
+                    return;
+                }
+                self.transcript_generation = self.transcript_generation.wrapping_add(1).max(1);
+                self.pending_app_host_action = Some(AppHostIoAction::Transcript {
+                    generation: self.transcript_generation,
+                    path,
+                    kind,
+                });
+                ctx.request_repaint();
+                self.transcript_viewer_ui.set_loading();
             }
             WorkHistoryAction::Activate(identity) => {
                 let row = self
@@ -16658,6 +16778,11 @@ impl App {
         self.work_history_error = None;
         self.work_history_git_cwds.clear();
         self.work_history_git_generation = self.work_history_git_generation.wrapping_add(1).max(1);
+        if !self.transcript_viewer_ui.is_empty() {
+            // 열려 있던 원문은 이전 워크스페이스 턴의 것이라 더 이상 유효하지 않다 —
+            // 닫힌 상태로 되돌린다(2026-08-15 Task 10).
+            self.transcript_viewer_ui = ui::transcript_viewer::TranscriptViewerUi::default();
+        }
         // 이력 탭은 워크스페이스를 바꿔도 유지한다 — 열려 활성인 상태였다면 새
         // 워크스페이스 projection을 기다리는 loading으로 이어 붙인다.
         self.work_history_loading = self.work_history_tab.is_active();
@@ -30665,6 +30790,15 @@ mod tests {
         assert_eq!(git_tab_list_width(1200.0), 300.0);
         assert_eq!(git_tab_list_width(600.0), 240.0, "좁으면 40%");
         assert_eq!(git_tab_list_width(300.0), 180.0, "최소 폭 밑으로는 안 내려간다");
+    }
+
+    /// 이력 보조 본문 좌측 카드 목록 폭 — git과 같은 규칙이지만 카드 정보량 때문에
+    /// 하한이 220pt로 조금 더 크다(2026-08-15 Task 10, 스펙 §2-1).
+    #[test]
+    fn 이력_본문은_목록_360에_원문_나머지다() {
+        assert_eq!(history_tab_list_width(1400.0), 360.0);
+        assert_eq!(history_tab_list_width(700.0), 280.0, "좁으면 40%");
+        assert_eq!(history_tab_list_width(400.0), 220.0, "최소 폭 밑으로는 안 내려간다");
     }
 
     /// 워크트리 행 클릭은 **이미 있는** 워크트리에서 셸을 열 뿐이다 — 생성·삭제는

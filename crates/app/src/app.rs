@@ -7946,6 +7946,9 @@ pub struct App {
     /// Render가 반환한 native-host intent. 다음 logic tick에서만 host task로 넘기며
     /// latest-only 한 건만 보존한다.
     pending_app_host_action: Option<AppHostIoAction>,
+    /// 위 슬롯이 차 있어 밀려난 「원문 보기」 요청. 사용자 클릭이라 버리지 않고 다음
+    /// 프레임에 태운다. 여기도 latest-only 한 건이다(2026-08-16).
+    pending_transcript_request: Option<AppHostIoAction>,
     pending_file_tree_maintenance: Option<ui::file_tree::FileTreeMaintenanceIntent>,
     file_tree_watcher: Option<AppFileTreeWatcher>,
     /// Settings가 반환한 lifecycle action 한 건. 다음 logic tick에서만 실행한다.
@@ -11173,6 +11176,13 @@ impl App {
         if !self.try_apply_pending_folder_picker_completion() {
             return;
         }
+        // 슬롯이 차 있어 밀려났던 원문 보기 요청을 먼저 태운다 — 사용자 클릭이라
+        // 버리지 않는다(WorkHistoryAction::ShowTranscript 참조).
+        if self.pending_app_host_action.is_none()
+            && let Some(request) = self.pending_transcript_request.take()
+        {
+            self.pending_app_host_action = Some(request);
+        }
         let action = self
             .connector_coordinator
             .try_take_host_action()
@@ -11697,6 +11707,7 @@ impl App {
             pending_connector_dispatch: None,
             app_host_io: None,
             pending_app_host_action: None,
+            pending_transcript_request: None,
             pending_file_tree_maintenance: None,
             file_tree_watcher: None,
             pending_app_controller_action: None,
@@ -14547,17 +14558,22 @@ impl App {
                     ));
                     return;
                 };
-                if self.pending_app_host_action.is_some() {
-                    // capacity-1 큐가 이미 차 있다 — 조용히 건너뛴다
-                    // (`request_git_panel_io_at`과 같은 규칙).
-                    return;
-                }
                 self.transcript_generation = self.transcript_generation.wrapping_add(1).max(1);
-                self.pending_app_host_action = Some(AppHostIoAction::Transcript {
+                let request = AppHostIoAction::Transcript {
                     generation: self.transcript_generation,
                     path,
                     kind,
-                });
+                };
+                // git 패널 IO와 capacity-1 슬롯을 공유한다. 차 있을 때 그냥 버리면
+                // 사용자가 「원문 보기」를 눌러도 아무 일도 안 일어난 것처럼 보인다
+                // (갱신을 스스로 다시 시도하는 패널 새로고침과 달리, 이건 **사용자
+                // 클릭**이라 되살릴 사람이 없다). 대기 슬롯에 얹어 두고 다음 프레임에
+                // 태운다 — 슬롯도 최신 하나만 유지한다(latest-only).
+                if self.pending_app_host_action.is_none() {
+                    self.pending_app_host_action = Some(request);
+                } else {
+                    self.pending_transcript_request = Some(request);
+                }
                 ctx.request_repaint();
                 self.transcript_viewer_ui.set_loading();
             }
@@ -30799,6 +30815,38 @@ mod tests {
         assert_eq!(history_tab_list_width(1400.0), 360.0);
         assert_eq!(history_tab_list_width(700.0), 280.0, "좁으면 40%");
         assert_eq!(history_tab_list_width(400.0), 220.0, "최소 폭 밑으로는 안 내려간다");
+    }
+
+    /// 「원문 보기」는 사용자 클릭이다. git 패널 IO와 capacity-1 슬롯을 공유하는데,
+    /// 차 있다고 그냥 반환하면 클릭이 아무 반응 없이 죽는다(패널 새로고침처럼 스스로
+    /// 다시 시도하는 주체가 없다). 대기 슬롯에 얹어 다음 프레임에 태운다.
+    #[test]
+    fn 원문_보기_클릭은_슬롯이_차_있어도_버려지지_않는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let handler = production
+            .split_once("WorkHistoryAction::ShowTranscript(identity)")
+            .expect("원문 보기 핸들러가 있어야 한다")
+            .1;
+        let cut = handler
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 4000)
+            .last()
+            .unwrap_or(0);
+        let handler = &handler[..cut];
+        assert!(
+            handler.contains("pending_transcript_request = Some(request)"),
+            "슬롯이 차 있으면 대기 슬롯에 얹어야 한다"
+        );
+        assert!(
+            handler.contains("set_loading()"),
+            "어느 경로로 가든 로딩 표시는 세운다 — 클릭이 먹혔다는 신호다"
+        );
+        assert!(
+            production.contains("self.pending_transcript_request.take()"),
+            "대기 슬롯을 다음 프레임에 태우는 배수 지점이 있어야 한다"
+        );
     }
 
     /// 워크트리 행 클릭은 **이미 있는** 워크트리에서 셸을 열 뿐이다 — 생성·삭제는

@@ -35,6 +35,21 @@ git 상태 패널을 사이드바 본문에 보여준다. 파일 행을 클릭�
   단 `diff_panel.rs`의 off-thread 실행 유틸(`execute_io`와 git 수집 헬퍼)은 신규 수집
   코드의 기반으로 **이관**한다 — 버리는 것은 플로팅 창 UI뿐이다.
 
+> **[2026-08-15 구현 중 정정] 플로팅 창은 유지한다.**
+> 구현 단계에서 `DiffPanelUi::open_for_path`를 **작업 이력의 「변경 보기」**가 계속
+> 쓰고 있는 것이 확인됐다(app.rs의 work-history 행 핸들러. `ui/workspace.rs`의
+> `diff_window_id()` z-order 검사 2곳도 그 창에 딸려 있다). 이 기능은 이번 스펙의
+> 범위 밖이라 창을 지우면 살아 있는 기능이 깨진다.
+>
+> 따라서 이번 범위에서 새 UI로 옮기는 진입점은 **사이드바 Git 탭**과 **세션 우클릭
+> 「변경 보기」** 둘뿐이고, `diff_panel.rs`와 그 창은 그대로 둔다. repo 전체 진입점
+> `open_for`는 프로덕션 호출자를 잃었지만, 그 파일 테스트 6곳이 그것으로 repo 전체
+> 수집 경로(status+staged+unstaged+untracked 병합, 상한)를 커버하고 남은
+> `open_for_path`는 경로 한정이라 대체하지 못하므로 제거하지 않고 문서화한다.
+>
+> **완전 은퇴 조건**: work-history의 diff를 `diff_viewer.rs`로 라우팅하는 후속 작업이
+> 끝나면 그때 `diff_panel.rs`와 `diff_window_id()` 참조를 함께 제거한다.
+
 ## 2. 데이터 모델 (전부 유계)
 
 ```rust

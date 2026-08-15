@@ -25217,7 +25217,7 @@ impl eframe::App for App {
             ui.ctx().request_repaint();
         }
         // Git 보조 본문 intent — 새로고침/원격 열기/파일 diff는 IO 왕복이 필요해 바로
-        // 처리하고, 워크트리 셸 열기는 Task 7이 채운다(스펙 §8-3·§8-5).
+        // 처리한다(스펙 §8-3·§8-5).
         match git_panel_action {
             Some(ui::git_panel::GitPanelAction::Refresh) => {
                 self.request_git_panel_io(ui.ctx(), ui::git_panel::GitPanelIoRequest::Snapshot);
@@ -25232,8 +25232,16 @@ impl eframe::App for App {
                     ui::git_panel::GitPanelIoRequest::FileDiff { rel_path, mode },
                 );
             }
-            Some(ui::git_panel::GitPanelAction::OpenWorktreeShell { .. }) => {
-                // Task 7
+            Some(ui::git_panel::GitPanelAction::OpenWorktreeShell { path }) => {
+                // 「새 워크트리에서 셸」(PR-W)이 워크트리 생성 직후 부르는 **바로 그
+                // 호출**이다(poll_worktree_jobs). 이 경로는 워크트리를 만들지도 지우지도
+                // 않는다 — 이미 있는 워크트리로 들어갈 뿐이다(스펙 §8-5). 셸이 뜨는 곳을
+                // 봐야 하므로 Git 탭은 세션 탭으로 물러난다(탭 자체는 남는다).
+                self.reveal_active_workspace_for_new_session();
+                self.git_tab = self.git_tab.on_session_tab_click();
+                self.active
+                    .workspace_ui
+                    .spawn_shell_at(self.config.terminal.scrollback_lines as usize, Some(path));
             }
             None => {}
         }
@@ -30654,6 +30662,32 @@ mod tests {
         assert_eq!(git_tab_list_width(1200.0), 300.0);
         assert_eq!(git_tab_list_width(600.0), 240.0, "좁으면 40%");
         assert_eq!(git_tab_list_width(300.0), 180.0, "최소 폭 밑으로는 안 내려간다");
+    }
+
+    /// 워크트리 행 클릭은 **이미 있는** 워크트리에서 셸을 열 뿐이다 — 생성·삭제는
+    /// 계속 세션 우클릭 메뉴가 담당한다(스펙 §8-5).
+    #[test]
+    fn 워크트리_클릭은_그_경로에서_셸을_연다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let handler = production
+            .split_once("GitPanelAction::OpenWorktreeShell { path }")
+            .expect("워크트리 클릭 핸들러가 있어야 한다")
+            .1;
+        // 한국어 주석이 길어 바이트 창을 넉넉히 잡고, 멀티바이트 경계에서 잘리지 않게
+        // char 경계로 자른다.
+        let cut = handler
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 1200)
+            .last()
+            .unwrap_or(0);
+        let handler = &handler[..cut];
+        assert!(handler.contains("spawn_shell_at"), "새 셸을 그 경로에서 연다");
+        assert!(
+            !handler.contains("CreateWorktree") && !handler.contains("RemoveWorktree"),
+            "이번 범위는 기존 워크트리로 들어가는 것뿐이다"
+        );
     }
 
     /// 전면 diff 전용 view는 2026-08-15 2차에서 은퇴했다 — diff는 이제 Git 보조 본문

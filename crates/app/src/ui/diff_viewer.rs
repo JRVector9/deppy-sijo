@@ -170,11 +170,6 @@ pub fn hunk_start_indices(rows: &[DisplayRow]) -> Vec<usize> {
     out
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DiffViewerAction {
-    BackToTerminal,
-}
-
 /// 추가/삭제 행 배경색 — 이 저장소의 theme.rs/designall.rs에는 diff 전용 색이
 /// 없다(2026-08-15 확인, Task 7 Step 3). designall::Tokens.success/error는 "그
 /// 체계 밖의 일반 성공 표시가 생길 때" 용도로 예약돼 있어(designall.rs:14-16
@@ -211,9 +206,7 @@ pub struct DiffViewerUi {
 }
 
 impl DiffViewerUi {
-    /// Git 보조 본문에서 파일 행을 클릭했을 때 App이 부른다 — 그 배선은 Task 6이 한다
-    /// (2026-08-15 2차, 스펙 §8-3). 그 전까지는 호출부가 없어 dead_code를 허용한다.
-    #[allow(dead_code)]
+    /// Git 보조 본문에서 파일 행을 클릭했을 때 App이 부른다(2026-08-15 2차, 스펙 §8-3).
     pub fn open(&mut self, rel_path: String, mode: DiffMode) {
         self.rel_path = rel_path;
         self.mode = Some(mode);
@@ -228,17 +221,20 @@ impl DiffViewerUi {
         self.view = Some(view);
     }
 
-    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<DiffViewerAction> {
-        let mut action = None;
-        // ── 헤더: 터미널 복귀 · 경로 · 모드 라벨 · hunk ↑↓ ──────────────
+    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
+        // 파일이 한 번도 선택되지 않았으면(Git 보조 본문이 방금 열렸거나 목록에서 아직
+        // 아무 행도 클릭하지 않았으면) 안내 한 줄만 보인다 — 헤더·hunk 이동은 파일이
+        // 선택된 뒤에나 의미가 있다(스펙 §8-3).
+        let Some(mode) = self.mode else {
+            ui.weak(catalog.t("git.diff.empty", &[]));
+            return;
+        };
+        // ── 헤더: 경로 · 모드 라벨 · hunk ↑↓ ────────────────────────────
         ui.horizontal(|ui| {
-            if ui.button(catalog.t("git.back_to_terminal", &[])).clicked() {
-                action = Some(DiffViewerAction::BackToTerminal);
-            }
             ui.monospace(&self.rel_path);
-            let mode_key = match self.mode {
-                Some(DiffMode::Branch) => "git.mode.branch",
-                _ => "git.mode.working",
+            let mode_key = match mode {
+                DiffMode::Branch => "git.mode.branch",
+                DiffMode::Working => "git.mode.working",
             };
             ui.weak(format!("({})", catalog.t(mode_key, &[])));
             let Some(view) = self.view.as_ref() else { return };
@@ -263,11 +259,11 @@ impl DiffViewerUi {
 
         let Some(view) = self.view.clone() else {
             ui.weak(catalog.t("diff.loading", &[]));
-            return action;
+            return;
         };
         if view.binary {
             ui.weak(catalog.t("git.binary", &[]));
-            return action;
+            return;
         }
         let rows = flatten_display_rows(&view);
         let dark_mode = ui.visuals().dark_mode;
@@ -305,7 +301,6 @@ impl DiffViewerUi {
         if view.truncated {
             ui.weak(catalog.t("diff.truncated", &[]));
         }
-        action
     }
 }
 

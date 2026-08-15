@@ -7869,7 +7869,8 @@ pub struct App {
     /// 2026-08-15부터 사이드바 Git 탭 + `diff_viewer_ui`로 옮겨갔다 — 이 필드는
     /// work history의 「변경 보기」(`open_for_path`)가 계속 쓴다(Task 11에서 은퇴 검토).
     diff_panel_ui: ui::diff_panel::DiffPanelUi,
-    /// 메인 영역 실용형 diff 뷰어 — git 패널 행 클릭이 연다(`AgentTerminalView::Diff`).
+    /// Git 보조 본문 우측(마스터-디테일) 실용형 diff 뷰어 — git 패널 행 클릭이 연다
+    /// (2026-08-15 2차, 스펙 §8-3). 전면 뷰가 아니라 `render_git_tab_body`가 그린다.
     diff_viewer_ui: ui::diff_viewer::DiffViewerUi,
     /// git 패널 IO 완료의 stale 폐기용 세대. 요청마다 증가하며, 완료 시점에 이 값과
     /// 다르면 조용히 버린다(기존 Diff IO의 generation 관례, 2026-08-15).
@@ -8744,6 +8745,15 @@ fn resolve_aux_tab_exclusivity(
         AuxTabWinner::Git if history.is_active() => (history.on_session_tab_click(), git),
         _ => (history, git),
     }
+}
+
+/// Git 보조 본문 좌측 목록 폭 — 목록은 경로가 읽히는 최소 폭이 있고, diff는 넓을수록
+/// 좋다. 넓은 창에서는 300pt 고정, 좁아지면 40%로 따라 줄되 180pt 밑으로는 내려가지
+/// 않는다(스펙 §8-3).
+fn git_tab_list_width(body_width: f32) -> f32 {
+    const FIXED: f32 = 300.0;
+    const MIN: f32 = 180.0;
+    (body_width * 0.4).clamp(MIN, FIXED)
 }
 
 enum AppHostIoAction {
@@ -14125,9 +14135,6 @@ impl App {
     /// ↗ 클릭 — upstream이 GitHub remote면 브랜치 페이지를 연다. remote 조회는 이미
     /// 스냅샷 수집 시점에 끝나 있어(`GitPanelSnapshot::remote_https_base`) 여기서는
     /// IO 없이 즉시 URL을 구성한다(스펙 §4, Task 10 Step 7).
-    /// Git 보조 본문의 `GitPanelAction::OpenRemoteBranch` 처리는 Task 6이 배선한다 —
-    /// 그 전까지는 호출부가 없어 dead_code를 허용한다.
-    #[allow(dead_code)]
     fn open_git_panel_remote(&mut self, ctx: &egui::Context) {
         let Some((base, branch)) = self.git_panel_ui.remote_target() else {
             tracing::info!(kind = "git_panel", "non-github remote — open skipped");
@@ -14285,6 +14292,44 @@ impl App {
             presentations,
             text,
         )
+    }
+
+    /// Git 보조 탭 본문 — 좌 목록 / 우 diff 마스터-디테일(스펙 §8-3). 이력 본문
+    /// (`render_work_history_tab_body`)과 같은 자리에 같은 규칙으로 그린다.
+    fn render_git_tab_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        body: egui::Rect,
+        text: &i18n::Catalog,
+    ) -> Option<ui::git_panel::GitPanelAction> {
+        let list_width = git_tab_list_width(body.width());
+        let (list_rect, diff_rect) = body.split_left_right_at_x(body.left() + list_width);
+
+        let mut list = ui.new_child(
+            egui::UiBuilder::new().max_rect(list_rect).id_salt("git_panel_pane_tab"),
+        );
+        list.set_clip_rect(list_rect.intersect(ui.clip_rect()));
+        let action = self.git_panel_ui.render(&mut list, text);
+
+        // 목록/diff 경계 세로 구분선 — 상단바 세로선과 같은 관례
+        // (designall::panel_edge_separator_x, app.rs 상단바 배선 참고).
+        let separator = ui::designall::separator_stroke(ui.visuals());
+        let ppp = ui.ctx().pixels_per_point();
+        let sep_x = ui::snap_line_to_pixel(
+            ui::designall::panel_edge_separator_x(list_rect.right(), ppp),
+            separator.width,
+            ppp,
+        );
+        ui.painter().vline(sep_x, body.y_range(), separator);
+
+        let mut detail = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(diff_rect.shrink2(egui::vec2(6.0, 0.0)))
+                .id_salt("git_diff_pane_tab"),
+        );
+        detail.set_clip_rect(diff_rect.intersect(ui.clip_rect()));
+        self.diff_viewer_ui.render(&mut detail, text);
+        action
     }
 
     /// 보조 본문(이력·Git)이 보이려면 중앙이 Terminal 뷰여야 한다 — 홈/작업 페이지
@@ -24461,10 +24506,7 @@ impl eframe::App for App {
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
         let fleet_visible = central_view == ui::agent_terminal::AgentTerminalView::Fleet;
-        // git 패널 행 클릭으로 여는 파일 diff — Home/Fleet과 같은 전면 뷰 패턴
-        // (2026-08-15 스펙 §1). 터미널을 교체하므로 아래 information_visible에도 합류한다.
-        let diff_visible = central_view == ui::agent_terminal::AgentTerminalView::Diff;
-        let information_visible = home_visible || fleet_visible || diff_visible;
+        let information_visible = home_visible || fleet_visible;
         // 이력은 전역 페이지가 아니라 포커스된 세션 pane 헤더 옆의 보조 탭이다.
         let history_tab_active = self.work_history_tab.is_active();
         // Git도 이력과 같은 보조 탭이다 — 동시 활성은 없다(스펙 §8-2).
@@ -24605,10 +24647,10 @@ impl eframe::App for App {
             ui::designall::content_canvas_frame(ui.visuals())
         };
         let mut home_action = None;
-        let mut diff_viewer_action = None;
         let mut fleet_page_click = None;
         let mut fleet_action = None;
         let mut work_history_action = None;
+        let mut git_panel_action = None;
         let mut aux_tab_intent = None;
         let work_history_presentations = if history_tab_active {
             self.work_history_presentations()
@@ -24716,10 +24758,6 @@ impl eframe::App for App {
                         page.structured_decision,
                     ));
                     fleet_page_click = page.goto;
-                } else if diff_visible {
-                    // git 패널 행 클릭이 연 파일 diff — 전면 뷰. 「터미널로 돌아가기」는
-                    // 이 프레임 끝의 home_action과 같은 위치에서 처리한다(2026-08-15).
-                    diff_viewer_action = self.diff_viewer_ui.render(ui, &text);
                 } else if !render_panes.is_empty() {
                     let rect = ui.available_rect_before_wrap();
                     self.last_multi_pane_terminal_rect = Some(rect);
@@ -25042,15 +25080,7 @@ impl eframe::App for App {
                     aux_tab_intent = primary_output.aux_tab_intent;
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
-                            // 좌 목록 + 우 diff 마스터-디테일 레이아웃은 Task 6이 채운다 —
-                            // 지금은 탭이 붙고 활성 전환이 되는 자리만 만든다.
-                            let mut git_body = primary.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(body)
-                                    .id_salt("git_panel_pane_tab"),
-                            );
-                            git_body.set_clip_rect(body.intersect(primary.clip_rect()));
-                            let _ = self.git_panel_ui.render(&mut git_body, &text);
+                            git_panel_action = self.render_git_tab_body(&mut primary, body, &text);
                         } else {
                             work_history_action = self.render_work_history_tab_body(
                                 &mut primary,
@@ -25089,15 +25119,7 @@ impl eframe::App for App {
                     aux_tab_intent = primary_output.aux_tab_intent;
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
-                            // 좌 목록 + 우 diff 마스터-디테일 레이아웃은 Task 6이 채운다 —
-                            // 지금은 탭이 붙고 활성 전환이 되는 자리만 만든다.
-                            let mut git_body = ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(body)
-                                    .id_salt("git_panel_pane_tab"),
-                            );
-                            git_body.set_clip_rect(body.intersect(ui.clip_rect()));
-                            let _ = self.git_panel_ui.render(&mut git_body, &text);
+                            git_panel_action = self.render_git_tab_body(ui, body, &text);
                         } else {
                             work_history_action = self.render_work_history_tab_body(
                                 ui,
@@ -25193,6 +25215,27 @@ impl eframe::App for App {
         {
             self.pending_work_history_action = Some(action);
             ui.ctx().request_repaint();
+        }
+        // Git 보조 본문 intent — 새로고침/원격 열기/파일 diff는 IO 왕복이 필요해 바로
+        // 처리하고, 워크트리 셸 열기는 Task 7이 채운다(스펙 §8-3·§8-5).
+        match git_panel_action {
+            Some(ui::git_panel::GitPanelAction::Refresh) => {
+                self.request_git_panel_io(ui.ctx(), ui::git_panel::GitPanelIoRequest::Snapshot);
+            }
+            Some(ui::git_panel::GitPanelAction::OpenRemoteBranch) => {
+                self.open_git_panel_remote(ui.ctx());
+            }
+            Some(ui::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode }) => {
+                self.diff_viewer_ui.open(rel_path.clone(), mode);
+                self.request_git_panel_io(
+                    ui.ctx(),
+                    ui::git_panel::GitPanelIoRequest::FileDiff { rel_path, mode },
+                );
+            }
+            Some(ui::git_panel::GitPanelAction::OpenWorktreeShell { .. }) => {
+                // Task 7
+            }
+            None => {}
         }
         // 작업함 페이지에서 세션 점프 — 터미널로 복귀한 뒤 기존 알림 네비게이션 경로
         // (아래 notif_click 합류 지점)에 태운다(사이드바 FocusSession과 같은 규칙).
@@ -25331,15 +25374,6 @@ impl eframe::App for App {
                 // 워커를 즉시 깨워 상태+공지 강제 재조회 — 결과는 기존 스냅샷
                 // 채널로 돌아온다(추가 상태 불필요).
                 let _ = self.status_feed_refresh.send(());
-            }
-            None => {}
-        }
-        match diff_viewer_action {
-            // 세션으로 돌아가는 네비게이션이라 reveal_terminal_session을 쓴다 — 날것의
-            // set_view(Terminal)은 헬퍼 본문·워크스페이스 전환·레일 이력 진입 세 곳
-            // 전용이다(app.rs 테스트 `세션을_드러내는_네비게이션은_전부_이력탭을_비활성화한다`).
-            Some(ui::diff_viewer::DiffViewerAction::BackToTerminal) => {
-                self.reveal_terminal_session();
             }
             None => {}
         }
@@ -30611,6 +30645,27 @@ mod tests {
             resolve_aux_tab_exclusivity(OpenActive, OpenActive, AuxTabWinner::History);
         assert_eq!(history, OpenActive);
         assert_eq!(git, OpenInactive);
+    }
+
+    /// Git 보조 본문 좌측 목록 폭 — 넓은 창은 300pt 고정, 좁아지면 40%로 따라
+    /// 줄되 180pt 밑으로는 내려가지 않는다(스펙 §8-3).
+    #[test]
+    fn git_본문은_목록_300에_diff_나머지다() {
+        assert_eq!(git_tab_list_width(1200.0), 300.0);
+        assert_eq!(git_tab_list_width(600.0), 240.0, "좁으면 40%");
+        assert_eq!(git_tab_list_width(300.0), 180.0, "최소 폭 밑으로는 안 내려간다");
+    }
+
+    /// 전면 diff 전용 view는 2026-08-15 2차에서 은퇴했다 — diff는 이제 Git 보조 본문
+    /// (`render_git_tab_body`) 안에서만 산다(스펙 §8-3).
+    #[test]
+    fn diff는_전면_뷰가_아니라_보조_본문에서만_산다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            !production.contains("AgentTerminalView::Diff"),
+            "전면 diff 뷰는 2026-08-15 2차에서 은퇴했다(스펙 §8-3)"
+        );
     }
 
     /// 이력은 보조 UI 탭이다 — 전역 view가 아니고, 활성 중에는 입력 소유자/컴포저가

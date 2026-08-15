@@ -738,9 +738,11 @@ fn render_card(
                                     );
                                     ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(row.instruction)
-                                                .strong()
-                                                .size(15.0),
+                                            egui::RichText::new(collapsed_summary_line(
+                                                row.instruction,
+                                            ))
+                                            .strong()
+                                            .size(15.0),
                                         )
                                         .truncate(),
                                     );
@@ -751,6 +753,7 @@ fn render_card(
                                 status_dot(ui, row.state);
                                 let summary = row
                                     .agent_summary
+                                    .map(collapsed_summary_line)
                                     .unwrap_or_else(|| catalog_key_for_summary_fallback(row.state));
                                 let summary = if row.agent_summary.is_some() {
                                     summary.to_owned()
@@ -871,6 +874,14 @@ struct CardAction {
 fn expanded_text(ui: &mut egui::Ui, label: &str, body: &str) {
     ui.label(egui::RichText::new(label).small().weak());
     ui.add(egui::Label::new(body).wrap());
+}
+
+/// 접힌 카드에 쓸 한 줄 — 요약이 여러 줄이어도 첫 줄만 보여준다(2026-08-15).
+/// 목록의 스캔성이 우선이라, 접힘 상태에서 카드 높이가 요약 줄 수마다
+/// 달라지면 목록이 들쭉날쭉해진다. 한 줄 안에서 폭이 모자랄 때 쓰는 기존
+/// `.truncate()`는 이 함수와 별개로 그대로 남는다.
+fn collapsed_summary_line(summary: &str) -> &str {
+    summary.lines().next().unwrap_or("")
 }
 
 /// storage가 `agent_work_turn.instruction`/`agent_summary`에 적용하는 저장 상한
@@ -1151,6 +1162,7 @@ mod tests {
             source_offset: updated_at as u64,
             instruction: format!("Instruction {turn_key}"),
             agent_summary: Some(format!("Summary {turn_key}")),
+            messages_json: None,
             model: Some("gpt-5.6-sol".to_owned()),
             effort: Some("xhigh".to_owned()),
             cwd: Some("/private/project".to_owned()),
@@ -1475,6 +1487,15 @@ mod tests {
 
         let within_cap = "short instruction";
         assert_eq!(bounded_clipboard_text(within_cap), within_cap);
+    }
+
+    #[test]
+    fn 접힌_카드_요약은_첫_줄만_쓴다() {
+        // 목록의 스캔성이 우선 — 접힘 상태에서 카드 높이가 요약 줄 수마다
+        // 달라지면 목록이 들쭉날쭉해진다.
+        assert_eq!(collapsed_summary_line("첫 줄\n둘째 줄"), "첫 줄");
+        assert_eq!(collapsed_summary_line("한 줄뿐"), "한 줄뿐");
+        assert_eq!(collapsed_summary_line(""), "");
     }
 
     #[test]

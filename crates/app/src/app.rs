@@ -7865,8 +7865,15 @@ pub struct App {
     /// Render가 반환한 controller action 한 건. 다음 logic tick에서만 실행해 process와
     /// protocol I/O가 render call graph에 들어오지 않게 한다.
     pending_agent_sessions_action: Option<ui::agent_sessions::AgentSessionsDeferredAction>,
-    /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」).
+    /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」). 진입점은
+    /// 2026-08-15부터 사이드바 Git 탭 + `diff_viewer_ui`로 옮겨갔다 — 이 필드는
+    /// work history의 「변경 보기」(`open_for_path`)가 계속 쓴다(Task 11에서 은퇴 검토).
     diff_panel_ui: ui::diff_panel::DiffPanelUi,
+    /// 메인 영역 실용형 diff 뷰어 — git 패널 행 클릭이 연다(`AgentTerminalView::Diff`).
+    diff_viewer_ui: ui::diff_viewer::DiffViewerUi,
+    /// git 패널 IO 완료의 stale 폐기용 세대. 요청마다 증가하며, 완료 시점에 이 값과
+    /// 다르면 조용히 버린다(기존 Diff IO의 generation 관례, 2026-08-15).
+    git_panel_generation: u64,
     work_history_ui: ui::work_history::WorkHistoryUi,
     /// 이력은 전역 중앙 페이지가 아니라 현재 세션 pane 헤더 옆의 **보조 UI 탭**이다.
     /// 이 상태는 runtime의 mux 탭/pane과 무관하다 — 열고 닫아도 PTY·세션은 그대로다
@@ -8685,6 +8692,30 @@ fn is_bounded_https_url(url: &str) -> bool {
         && url.starts_with("https://")
 }
 
+/// git 브랜치명을 GitHub `/tree/<path>` URL 세그먼트로 만든다. "/"는 세그먼트
+/// 구분자로 그대로 둔다(예: "feat/git-panel" 같은 중첩 브랜치명이 GitHub에서 그대로
+/// 라우팅된다) — 그 외 예약/비ASCII 문자만 퍼센트 인코딩한다. git 브랜치명은
+/// 공백을 허용하지 않지만 "#"·"?"·유니코드는 허용해 URL에서 깨질 수 있다(2026-08-15,
+/// git 패널 ↗ 버튼).
+fn github_branch_url_path(branch: &str) -> String {
+    branch
+        .split('/')
+        .map(|segment| {
+            let mut out = String::with_capacity(segment.len());
+            for byte in segment.bytes() {
+                match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                        out.push(byte as char);
+                    }
+                    _ => out.push_str(&format!("%{byte:02X}")),
+                }
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 enum AppHostIoAction {
     Connector(connector_service::HostAction),
     Workspace {
@@ -8696,6 +8727,7 @@ enum AppHostIoAction {
     FileTreeMaintenance(ui::file_tree::FileTreeMaintenanceIntent),
     InboxPreview(ui::inbox_waiting::LogPreviewIntent),
     Diff(ui::diff_panel::DiffIoIntent),
+    GitPanel(ui::git_panel::GitPanelIoIntent),
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
     PersistComposerHistory {
@@ -9068,6 +9100,7 @@ enum AppHostIoCompletion {
     FileTreeMaintenance(ui::file_tree::FileTreeMaintenanceCompletion),
     InboxPreview(ui::inbox_waiting::LogPreviewCompletion),
     Diff(ui::diff_panel::DiffIoCompletion),
+    GitPanel(ui::git_panel::GitPanelIoCompletion),
     ComposerContextFile {
         request: ui::composer::ContextFileRequest,
         selected_path: Option<PathBuf>,
@@ -9119,6 +9152,12 @@ enum AppHostIoFallback {
     Diff {
         operation: ui::diff_panel::DiffIoOperation,
         generation: u64,
+    },
+    GitPanel {
+        generation: u64,
+        /// 원 요청이 FileDiff였는지 — 폴백 완료를 같은 결과 변형(Snapshot/FileDiff)으로
+        /// 되돌려야 App이 올바른 화면(사이드바 스냅샷 vs diff 뷰어)에 오류를 반영한다.
+        is_file_diff: bool,
     },
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
@@ -9189,6 +9228,13 @@ impl AppHostIoFallback {
             AppHostIoAction::Diff(intent) => Self::Diff {
                 operation: intent.operation,
                 generation: intent.generation,
+            },
+            AppHostIoAction::GitPanel(intent) => Self::GitPanel {
+                generation: intent.generation,
+                is_file_diff: matches!(
+                    intent.request,
+                    ui::git_panel::GitPanelIoRequest::FileDiff { .. }
+                ),
             },
             AppHostIoAction::ComposerContextFile(request) => {
                 Self::ComposerContextFile(request.clone())
@@ -9277,6 +9323,21 @@ impl AppHostIoFallback {
                 operation,
                 generation,
                 result: Err(ui::diff_panel::DiffIoErrorCode::CollectionFailed),
+            }),
+            Self::GitPanel {
+                generation,
+                is_file_diff,
+            } => AppHostIoCompletion::GitPanel(ui::git_panel::GitPanelIoCompletion {
+                generation,
+                result: if is_file_diff {
+                    ui::git_panel::GitPanelIoResult::FileDiff(Err(
+                        ui::git_panel::GitPanelErrorCode::CollectionFailed,
+                    ))
+                } else {
+                    ui::git_panel::GitPanelIoResult::Snapshot(Err(
+                        ui::git_panel::GitPanelErrorCode::CollectionFailed,
+                    ))
+                },
             }),
             Self::ComposerContextFile(request) => AppHostIoCompletion::ComposerContextFile {
                 request,
@@ -10576,6 +10637,9 @@ fn run_app_host_io(
         AppHostIoAction::Diff(intent) => {
             AppHostIoCompletion::Diff(ui::diff_panel::execute_io(intent))
         }
+        AppHostIoAction::GitPanel(intent) => {
+            AppHostIoCompletion::GitPanel(ui::git_panel::execute_io(intent))
+        }
         AppHostIoAction::PersistComposerHistory { path, history } => {
             if write_composer_history(&path, &history) {
                 AppHostIoCompletion::Complete
@@ -10810,6 +10874,25 @@ impl App {
             AppHostIoCompletion::Diff(completion) => {
                 self.diff_panel_ui.complete_io(completion);
                 self.egui_ctx.request_repaint();
+            }
+            AppHostIoCompletion::GitPanel(completion) => {
+                // stale(세대 불일치)은 조용히 버린다 — 최신 요청의 완료만 반영한다.
+                if completion.generation == self.git_panel_generation {
+                    match completion.result {
+                        ui::git_panel::GitPanelIoResult::Snapshot(result) => {
+                            if let Some(tree) = self.file_tree.as_mut() {
+                                tree.git_panel_set_snapshot(result);
+                            }
+                        }
+                        ui::git_panel::GitPanelIoResult::FileDiff(result) => match result {
+                            Ok(view) => self.diff_viewer_ui.set_view(view),
+                            Err(_) => self
+                                .diff_viewer_ui
+                                .set_view(ui::diff_viewer::FileDiffView::default()),
+                        },
+                    }
+                    self.egui_ctx.request_repaint();
+                }
             }
             AppHostIoCompletion::ComposerContextFile {
                 request,
@@ -11483,6 +11566,8 @@ impl App {
                 })),
             pending_agent_sessions_action: None,
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
+            diff_viewer_ui: ui::diff_viewer::DiffViewerUi::default(),
+            git_panel_generation: 0,
             work_history_ui: ui::work_history::WorkHistoryUi::new(),
             work_history_tab: ui::work_history::WorkHistoryTabState::default(),
             work_history_rows: Vec::new(),
@@ -13952,22 +14037,67 @@ impl App {
         self.session_cwds.get(&session).cloned()
     }
 
-    fn open_session_diff(&mut self, ctx: &egui::Context, session: runtime::SessionId) {
-        let cwd = self.cached_session_cwd(session);
-        let workspace_name = self
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == self.active.id)
-            .map(Self::workspace_display_name);
-        let session_label = self.inbox_session_label(&self.active.id, session);
-        let title = match (workspace_name, session_label) {
-            (Some(workspace), Some(session)) => format!("{workspace} · {session}"),
-            (Some(workspace), None) => workspace,
-            (None, Some(session)) => session,
-            (None, None) => String::new(),
+    /// 사이드바 Git 탭이 다루는 repo의 cwd — 포커스된 세션 기준(2026-08-15, Task 10
+    /// Step 6). `ShowFocusedDiff`(Git 탭)와 `ShowDiff{session}`(세션 메뉴 「변경 보기」)
+    /// 둘 다 이 값으로 수렴한다 — 패널은 "이 세션의 변경분"이 아니라 "현재 포커스된
+    /// 작업 폴더의 git 상태"를 보여주는 화면이라 특정 세션 id를 들고 다니지 않는다.
+    fn focused_session_repo_cwd(&self) -> Option<PathBuf> {
+        let session = self.active.workspace_ui.focused_session()?;
+        self.cached_session_cwd(session).map(PathBuf::from)
+    }
+
+    /// git 패널 IO를 기존 `pending_app_host_action` capacity-1 큐(2026-08-15 Task 10)에
+    /// 태운다. cwd를 못 찾으면(repo 미감지) IO 없이 바로 NoRepo 스냅샷을 밀어넣는다 —
+    /// 조용한 실패 금지(패널은 항상 무언가를 보여준다).
+    fn request_git_panel_io(
+        &mut self,
+        ctx: &egui::Context,
+        request: ui::git_panel::GitPanelIoRequest,
+    ) {
+        let Some(cwd) = self.focused_session_repo_cwd() else {
+            if let Some(tree) = self.file_tree.as_mut() {
+                tree.git_panel_set_snapshot(Err(ui::git_panel::GitPanelErrorCode::NoRepo));
+            }
+            return;
         };
-        self.diff_panel_ui
-            .open_for(ctx, self.active.id.clone(), session, cwd, title);
+        if self.pending_app_host_action.is_some() {
+            // capacity-1 큐가 이미 차 있다 — 조용히 건너뛴다(다른
+            // pending_app_host_action 호출부와 같은 규칙). loading을 여기서 세우면
+            // 이 요청의 완료가 영영 오지 않아 패널이 멈춘 것처럼 보인다 —
+            // GitPanelUi::render는 snapshot==None && !loading일 때만 자동
+            // 재요청하므로, loading을 건드리지 않아야 다음 프레임에 스스로
+            // 재시도한다(2026-08-15).
+            return;
+        }
+        self.git_panel_generation = self.git_panel_generation.wrapping_add(1).max(1);
+        let intent = ui::git_panel::GitPanelIoIntent {
+            generation: self.git_panel_generation,
+            cwd,
+            request,
+        };
+        self.pending_app_host_action = Some(AppHostIoAction::GitPanel(intent));
+        ctx.request_repaint();
+        if let Some(tree) = self.file_tree.as_mut() {
+            tree.git_panel_set_loading();
+        }
+    }
+
+    /// ↗ 클릭 — upstream이 GitHub remote면 브랜치 페이지를 연다. remote 조회는 이미
+    /// 스냅샷 수집 시점에 끝나 있어(`GitPanelSnapshot::remote_https_base`) 여기서는
+    /// IO 없이 즉시 URL을 구성한다(스펙 §4, Task 10 Step 7).
+    fn open_git_panel_remote(&mut self, ctx: &egui::Context) {
+        let Some(tree) = self.file_tree.as_ref() else {
+            return;
+        };
+        let Some((base, branch)) = tree.git_panel_remote_target() else {
+            tracing::info!(kind = "git_panel", "non-github remote — open skipped");
+            return;
+        };
+        let url = format!("{base}/tree/{}", github_branch_url_path(&branch));
+        if self.pending_app_host_action.is_none() && is_bounded_https_url(&url) {
+            self.pending_app_host_action = Some(AppHostIoAction::ExternalHttpsUrl(url));
+            ctx.request_repaint();
+        }
     }
 
     fn resolve_work_history_activation(
@@ -23964,10 +24094,23 @@ impl eframe::App for App {
                         "https://github.com/JRVector9/deppy-sijo",
                     ));
                 }
-                Some(ui::file_tree::SidebarAction::ShowFocusedDiff) => {
-                    if let Some(session) = self.active.workspace_ui.focused_session() {
-                        self.open_session_diff(ui.ctx(), session);
-                    }
+                // Git은 2026-08-15부터 사이드바 인라인 탭 — 탭 선택 자체는 file_tree의
+                // 탭 클릭 처리가 맡고, 여기서는 새로고침/원격 열기/파일 diff 세 IO
+                // intent만 받는다(스펙 §1, Task 10).
+                Some(ui::file_tree::SidebarAction::GitPanelRefresh) => {
+                    self.request_git_panel_io(ui.ctx(), ui::git_panel::GitPanelIoRequest::Snapshot);
+                }
+                Some(ui::file_tree::SidebarAction::GitPanelOpenRemote) => {
+                    self.open_git_panel_remote(ui.ctx());
+                }
+                Some(ui::file_tree::SidebarAction::ShowFileDiff { rel_path, mode }) => {
+                    self.diff_viewer_ui.open(rel_path.clone(), mode);
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Diff);
+                    self.request_git_panel_io(
+                        ui.ctx(),
+                        ui::git_panel::GitPanelIoRequest::FileDiff { rel_path, mode },
+                    );
                 }
                 Some(ui::file_tree::SidebarAction::NoteEdited(body)) => {
                     // 기록은 여기서 하지 않는다 — 디바운스 만료와 깨우기는 logic()이
@@ -24086,12 +24229,15 @@ impl eframe::App for App {
                         None => tracing::warn!("세션 cwd 미확인 — 경로 복사 생략"),
                     }
                 }
-                // 변경 보기 — 세션 cwd 레포의 diff 패널(독립 창)을 연다.
-                // cwd 미확인이어도 패널은 열어 안내를 표시한다 (조용한 실패 금지).
-                // 제목은 인박스와 같은 관례로 해석 — "세션 #2"보다 "SKRT · Claude"가
-                // 무엇의 변경분인지 바로 판단된다(2026-07-18 사용자: 가독성 개선 요청).
-                Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
-                    self.open_session_diff(ui.ctx(), session);
+                // 변경 보기 — 사이드바 Git 탭으로 이동해 최신 스냅샷을 연다. 이전엔
+                // 이 세션 전용 플로팅 diff 창을 열었는데, Git이 사이드바 인라인 탭이
+                // 된 뒤로는 포커스 세션 기준 패널로 수렴한다(2026-08-15, Task 10
+                // Step 9 — 세션별 diff 대신 "현재 작업 폴더의 git 상태" 화면 하나).
+                Some(ui::file_tree::SidebarAction::ShowDiff) => {
+                    if let Some(tree) = self.file_tree.as_mut() {
+                        tree.select_git_tool();
+                    }
+                    self.request_git_panel_io(ui.ctx(), ui::git_panel::GitPanelIoRequest::Snapshot);
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
                 // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.
@@ -24222,7 +24368,10 @@ impl eframe::App for App {
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
         let fleet_visible = central_view == ui::agent_terminal::AgentTerminalView::Fleet;
-        let information_visible = home_visible || fleet_visible;
+        // git 패널 행 클릭으로 여는 파일 diff — Home/Fleet과 같은 전면 뷰 패턴
+        // (2026-08-15 스펙 §1). 터미널을 교체하므로 아래 information_visible에도 합류한다.
+        let diff_visible = central_view == ui::agent_terminal::AgentTerminalView::Diff;
+        let information_visible = home_visible || fleet_visible || diff_visible;
         // 이력은 전역 페이지가 아니라 포커스된 세션 pane 헤더 옆의 보조 탭이다.
         let history_tab_active = self.work_history_tab.is_active();
         // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
@@ -24352,6 +24501,7 @@ impl eframe::App for App {
             ui::designall::content_canvas_frame(ui.visuals())
         };
         let mut home_action = None;
+        let mut diff_viewer_action = None;
         let mut fleet_page_click = None;
         let mut fleet_action = None;
         let mut work_history_action = None;
@@ -24462,6 +24612,10 @@ impl eframe::App for App {
                         page.structured_decision,
                     ));
                     fleet_page_click = page.goto;
+                } else if diff_visible {
+                    // git 패널 행 클릭이 연 파일 diff — 전면 뷰. 「터미널로 돌아가기」는
+                    // 이 프레임 끝의 home_action과 같은 위치에서 처리한다(2026-08-15).
+                    diff_viewer_action = self.diff_viewer_ui.render(ui, &text);
                 } else if !render_panes.is_empty() {
                     let rect = ui.available_rect_before_wrap();
                     self.last_multi_pane_terminal_rect = Some(rect);
@@ -25046,6 +25200,15 @@ impl eframe::App for App {
                 // 워커를 즉시 깨워 상태+공지 강제 재조회 — 결과는 기존 스냅샷
                 // 채널로 돌아온다(추가 상태 불필요).
                 let _ = self.status_feed_refresh.send(());
+            }
+            None => {}
+        }
+        match diff_viewer_action {
+            // 세션으로 돌아가는 네비게이션이라 reveal_terminal_session을 쓴다 — 날것의
+            // set_view(Terminal)은 헬퍼 본문·워크스페이스 전환·레일 이력 진입 세 곳
+            // 전용이다(app.rs 테스트 `세션을_드러내는_네비게이션은_전부_이력탭을_비활성화한다`).
+            Some(ui::diff_viewer::DiffViewerAction::BackToTerminal) => {
+                self.reveal_terminal_session();
             }
             None => {}
         }

@@ -2,11 +2,6 @@
 //! docs/superpowers/specs/2026-08-15-git-panel-design.md).
 //! leaf는 intent(GitPanelAction)만 반환하고 git 실행·뷰 전환은 App이 소유한다.
 
-// Task 2·3은 데이터 모델·파서·수집만 구현한다. UI 렌더(Task 6)와 app.rs 배선
-// (Task 10)이 아직 이 모듈을 소비하지 않아 전부 dead_code로 잡힌다 —
-// agent_surface.rs:7-9와 같은 관례. 렌더/배선 태스크가 끝나면 이 allow를 제거한다.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,6 +23,11 @@ pub struct GitFileRow {
 
 #[derive(Clone, Debug, Default)]
 pub struct GitPanelSnapshot {
+    // 스펙 §2 데이터 모델의 일부 — 수집 시점의 `git_cli::repo_root` 결과를 그대로
+    // 담아 둔다. 렌더는 상대 경로(rel_path)만 쓰고, 파일 diff 수집은 App이 넘긴
+    // cwd로 repo_root를 다시 구해(collect_file_diff) 이 필드를 재사용하지 않는다.
+    // 소비자가 없어도 스냅샷 모델의 일부로 유지한다 — 2026-08-15.
+    #[allow(dead_code)]
     pub repo_root: PathBuf,
     pub branch: String,
     pub upstream: Option<String>,
@@ -236,6 +236,94 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
     })
 }
 
+/// App host 스레드에서 실행할 git 패널 IO. capacity-1 — App이 in-flight 1개만 유지
+/// (기존 `pending_app_host_action` 큐 규칙, 2026-08-15 Task 10).
+#[derive(Debug)]
+pub enum GitPanelIoRequest {
+    Snapshot,
+    FileDiff {
+        rel_path: String,
+        mode: crate::ui::diff_viewer::DiffMode,
+    },
+}
+
+#[derive(Debug)]
+pub struct GitPanelIoIntent {
+    pub generation: u64,
+    pub cwd: PathBuf,
+    pub request: GitPanelIoRequest,
+}
+
+#[derive(Debug)]
+pub enum GitPanelIoResult {
+    Snapshot(Result<GitPanelSnapshot, GitPanelErrorCode>),
+    FileDiff(Result<crate::ui::diff_viewer::FileDiffView, GitPanelErrorCode>),
+}
+
+#[derive(Debug)]
+pub struct GitPanelIoCompletion {
+    pub generation: u64,
+    pub result: GitPanelIoResult,
+}
+
+/// host 스레드 실행 — collect_snapshot 또는 파일 diff 수집(스펙 §3).
+pub fn execute_io(intent: GitPanelIoIntent) -> GitPanelIoCompletion {
+    let result = match &intent.request {
+        GitPanelIoRequest::Snapshot => GitPanelIoResult::Snapshot(collect_snapshot(&intent.cwd)),
+        GitPanelIoRequest::FileDiff { rel_path, mode } => {
+            GitPanelIoResult::FileDiff(collect_file_diff(&intent.cwd, rel_path, *mode))
+        }
+    };
+    GitPanelIoCompletion {
+        generation: intent.generation,
+        result,
+    }
+}
+
+/// 파일 하나의 diff를 수집한다 — Working은 워킹트리(untracked는 파일 전량 추가로
+/// 합성), Branch는 upstream과의 merge-base 기준(스펙 §3).
+fn collect_file_diff(
+    cwd: &Path,
+    rel_path: &str,
+    mode: crate::ui::diff_viewer::DiffMode,
+) -> Result<crate::ui::diff_viewer::FileDiffView, GitPanelErrorCode> {
+    use crate::ui::diff_viewer::{parse_unified, synth_added, DiffMode};
+    let repo_root =
+        crate::git_cli::repo_root(cwd, GIT_TIMEOUT).map_err(|_| GitPanelErrorCode::NoRepo)?;
+    // 경로 인젝션 방어: rel_path는 스냅샷의 porcelain 출력에서 온 값이지만,
+    // "--" 뒤에 둬 옵션 해석을 차단하고 NUL/절대경로는 거부한다.
+    if rel_path.is_empty() || rel_path.contains('\0') || rel_path.starts_with('/') {
+        return Err(GitPanelErrorCode::CollectionFailed);
+    }
+    let run = |args: &[&str]| {
+        crate::git_cli::run_git_limited(&repo_root, args, GIT_TIMEOUT, MAX_LIST_BYTES)
+            .map_err(|_| GitPanelErrorCode::CollectionFailed)
+    };
+    match mode {
+        DiffMode::Working => {
+            let (text, truncated) = run(&["diff", "--no-ext-diff", "HEAD", "--", rel_path])?;
+            if text.trim().is_empty() {
+                // untracked — 파일 내용을 전량 추가로(유계: MAX_LIST_BYTES).
+                let bytes = std::fs::read(repo_root.join(rel_path))
+                    .map_err(|_| GitPanelErrorCode::CollectionFailed)?;
+                let truncated = bytes.len() > MAX_LIST_BYTES;
+                let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_LIST_BYTES)])
+                    .into_owned();
+                return Ok(synth_added(&text, truncated));
+            }
+            Ok(parse_unified(&text, truncated))
+        }
+        DiffMode::Branch => {
+            let (upstream, _) =
+                run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])?;
+            let (base, _) = run(&["merge-base", upstream.trim(), "HEAD"])?;
+            let range = format!("{}..HEAD", base.trim());
+            let (text, truncated) = run(&["diff", "--no-ext-diff", &range, "--", rel_path])?;
+            Ok(parse_unified(&text, truncated))
+        }
+    }
+}
+
 /// 패널이 App에 요청하는 intent — leaf는 git도 뷰 전환도 직접 하지 않는다.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitPanelAction {
@@ -263,6 +351,15 @@ impl GitPanelUi {
     pub fn set_snapshot(&mut self, result: Result<GitPanelSnapshot, GitPanelErrorCode>) {
         self.loading = false;
         self.snapshot = Some(result);
+    }
+
+    /// ↗ 버튼이 쓸 (remote_https_base, branch) — 둘 다 있어야 Some. 스냅샷이 이미
+    /// remote를 정규화해 담아 두므로 App이 IO 없이 즉시 URL을 구성할 수 있다
+    /// (스펙 §4, Task 10 Step 7).
+    pub fn remote_target(&self) -> Option<(String, String)> {
+        let snap = self.snapshot.as_ref()?.as_ref().ok()?;
+        let base = snap.remote_https_base.clone()?;
+        Some((base, snap.branch.clone()))
     }
 
     pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<GitPanelAction> {

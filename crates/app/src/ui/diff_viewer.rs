@@ -1,11 +1,6 @@
 //! 메인 영역 실용형 diff 뷰어 — 행번호 + hunk 색 배경 + 접힌 문맥 + hunk 이동
 //! (2026-08-15 스펙 §5). 문법 강조·인트라라인·미니맵은 의도적으로 범위 외.
 
-// Task 4는 파서만 구현한다. 렌더(Task 7)와 app.rs 배선(Task 10)이 아직 이 모듈을
-// 소비하지 않아 전부 dead_code로 잡힌다 — git_panel.rs와 같은 관례(git_panel.rs:6-8
-// 참고). 렌더/배선 태스크가 끝나면 이 allow를 제거한다.
-#![allow(dead_code)]
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
     Context,
@@ -23,7 +18,13 @@ pub struct DiffLine {
 
 #[derive(Clone, Debug)]
 pub struct DiffHunk {
+    // 스펙 §2 데이터 모델의 일부(hunk 헤더 시작 행번호) — gap 계산은 파싱 시점에
+    // 이미 끝나 저장값을 다시 읽지 않는다. 렌더는 라인별 old_no/new_no만 쓰고 hunk
+    // 헤더 자체는 표시하지 않는다(스펙 §5, "⋯ N행" 접힘 표시만 요구). 소비자가
+    // 없어도 unified diff 모델의 일부로 필드는 유지한다 — 2026-08-15.
+    #[allow(dead_code)]
     pub old_start: u32,
+    #[allow(dead_code)]
     pub new_start: u32,
     pub lines: Vec<DiffLine>,
 }

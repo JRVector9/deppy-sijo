@@ -733,6 +733,13 @@ impl DiffPanelUi {
 
     /// 사이드바 「변경 보기」 진입점 — 대상 세팅 + 창 열기 + 자동 1회 조회.
     /// cwd 미확인이면 조회 없이 열어 패널이 안내를 표시한다.
+    ///
+    /// 2026-08-15부터 프로덕션 호출자가 없다 — 「변경 보기」/Git 탭이 사이드바 Git
+    /// 패널(git_panel.rs) + 메인 영역 diff 뷰어(diff_viewer.rs)로 옮겨갔다(app.rs
+    /// `ShowFocusedDiff`/`ShowDiff` 핸들러 참고). 이 파일의 자체 테스트가 계속
+    /// 호출하므로(포팅된 파서 커버리지) 완전히 죽이지 않았고, `DiffPanelUi` 자체의
+    /// 은퇴는 Task 11에서 한다.
+    #[allow(dead_code)]
     pub fn open_for(
         &mut self,
         ctx: &egui::Context,

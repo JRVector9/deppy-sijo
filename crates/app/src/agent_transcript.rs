@@ -102,8 +102,14 @@ const MAX_MODEL_BYTES: usize = 256;
 const MAX_EFFORT_BYTES: usize = 64;
 const MAX_MESSAGE_CONTENT_ITEMS: usize = 256;
 pub const MAX_RECENT_TRANSCRIPT_TURNS: usize = 24;
-const AGENT_SUMMARY_CHARS: usize = 120;
-const AGENT_SUMMARY_BYTES: usize = AGENT_SUMMARY_CHARS * 4 + '…'.len_utf8();
+/// 카드 한 장이 담는 요약 길이. 120자 한 줄이던 것을 2026-08-15에 늘렸다 — orca의
+/// preview 상한(220자)보다 크게 잡되, 카드가 세로로 무한정 자라지 않게 줄 수로도 막는다.
+const AGENT_SUMMARY_CHARS: usize = 400;
+/// 보존하는 최대 줄 수.
+const AGENT_SUMMARY_LINES: usize = 4;
+/// 최악의 경우(4바이트 문자 400개) + 말줄임 + 줄바꿈 3개.
+const AGENT_SUMMARY_BYTES: usize =
+    AGENT_SUMMARY_CHARS * 4 + '…'.len_utf8() + (AGENT_SUMMARY_LINES - 1);
 
 struct TailSnapshot {
     base_offset: u64,
@@ -448,12 +454,30 @@ fn clean_agent_summary(text: &str) -> Option<String> {
 
     let mut summary = String::with_capacity(text.len().min(AGENT_SUMMARY_BYTES));
     let mut summary_chars = 0_usize;
+    let mut lines = 1_usize;
     let mut pending_space = false;
+    let mut pending_newline = false;
     let mut truncated = false;
     for ch in visible.chars() {
-        if ch.is_whitespace() || ch.is_control() {
-            pending_space |= !summary.is_empty();
+        // 줄바꿈은 보존한다(연속 개행은 하나로). 줄 안의 공백·제어문자만 접는다.
+        if ch == '\n' || ch == '\r' {
+            pending_newline |= !summary.is_empty();
+            pending_space = false;
             continue;
+        }
+        if ch.is_whitespace() || ch.is_control() {
+            pending_space |= !summary.is_empty() && !pending_newline;
+            continue;
+        }
+        if pending_newline {
+            if lines == AGENT_SUMMARY_LINES {
+                truncated = true;
+                break;
+            }
+            summary.push('\n');
+            lines += 1;
+            pending_newline = false;
+            pending_space = false;
         }
         if pending_space {
             if summary_chars + 2 > AGENT_SUMMARY_CHARS {
@@ -1914,6 +1938,53 @@ mod tests {
         assert_eq!(clean_agent_summary("<task-notification> internal"), None);
         assert_eq!(clean_agent_summary("<heartbeat> internal"), None);
         assert_eq!(clean_agent_summary("   \n\t"), None);
+    }
+
+    #[test]
+    fn 요약은_줄바꿈을_보존한다() {
+        let text = "첫 줄\n둘째 줄\n셋째 줄";
+        assert_eq!(clean_agent_summary(text).unwrap(), "첫 줄\n둘째 줄\n셋째 줄");
+    }
+
+    #[test]
+    fn 요약은_줄_안의_연속_공백만_접는다() {
+        let text = "앞     뒤\n다음  줄";
+        assert_eq!(clean_agent_summary(text).unwrap(), "앞 뒤\n다음 줄");
+    }
+
+    #[test]
+    fn 요약은_연속_개행을_하나로_접는다() {
+        let text = "위\n\n\n아래";
+        assert_eq!(clean_agent_summary(text).unwrap(), "위\n아래");
+    }
+
+    #[test]
+    fn 요약은_네_줄에서_자른다() {
+        let text = "1\n2\n3\n4\n5\n6";
+        let summary = clean_agent_summary(text).unwrap();
+        assert_eq!(summary.lines().count(), AGENT_SUMMARY_LINES);
+        assert!(summary.ends_with('…'), "잘렸으면 말줄임을 붙인다: {summary:?}");
+    }
+
+    #[test]
+    fn 요약은_사백자에서_자른다() {
+        let text = "가".repeat(AGENT_SUMMARY_CHARS + 50);
+        let summary = clean_agent_summary(&text).unwrap();
+        assert_eq!(summary.chars().count(), AGENT_SUMMARY_CHARS + 1, "본문 + 말줄임");
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn 요약은_노이즈_접두를_계속_거부한다() {
+        // 이 규칙은 정확도를 올리는 것이라 상한 변경과 무관하게 유지된다.
+        for noise in [
+            "<system-reminder>x</system-reminder>",
+            "<local-command-stdout>x",
+            "<command-name>x",
+            "<task-notification>x",
+        ] {
+            assert!(clean_agent_summary(noise).is_none(), "{noise}");
+        }
     }
 
     #[test]

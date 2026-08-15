@@ -2,6 +2,11 @@
 //! docs/superpowers/specs/2026-08-15-git-panel-design.md).
 //! leaf는 intent(GitPanelAction)만 반환하고 git 실행·뷰 전환은 App이 소유한다.
 
+// Task 2·3은 데이터 모델·파서·수집만 구현한다. UI 렌더(Task 6)와 app.rs 배선
+// (Task 10)이 아직 이 모듈을 소비하지 않아 전부 dead_code로 잡힌다 —
+// agent_surface.rs:7-9와 같은 관례. 렌더/배선 태스크가 끝나면 이 allow를 제거한다.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -32,6 +37,11 @@ pub struct GitPanelSnapshot {
     pub committed: Vec<GitFileRow>,
     pub changes_truncated: bool,
     pub committed_truncated: bool,
+    /// `origin` remote가 GitHub면 `https://github.com/OWNER/REPO`로 정규화한 값.
+    /// GitHub가 아니거나 remote 조회 실패 시 None(스펙 §4 — ↗ 아이콘 숨김 조건).
+    /// (Task 10 Step 7 소급 요구 — collect_snapshot에서 remote 조회 실패해도
+    /// 스냅샷 전체를 죽이지 않고 None으로만 담는다.)
+    pub remote_https_base: Option<String>,
 }
 
 /// `status --porcelain -z -uall` + `diff --numstat HEAD`를 경로로 병합한다.
@@ -120,6 +130,112 @@ fn split_row_path(rel_path: &str) -> (&str, &str) {
     }
 }
 
+/// `git remote get-url origin` 출력을 OWNER/REPO 기준 GitHub HTTPS URL로 정규화한다.
+/// 지원 형식: `https://github.com/OWNER/REPO(.git)`, `git@github.com:OWNER/REPO(.git)`.
+/// github.com이 아니거나 OWNER/REPO 형태가 아니면 None(스펙 §4 — ↗ 아이콘 숨김 조건).
+fn normalize_github_remote(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("git@github.com:"))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let rest = rest.trim_matches('/');
+    let mut parts = rest.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return None; // OWNER/REPO 정확히 2세그먼트가 아니면(빈 값 포함) 거부.
+    };
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("https://github.com/{owner}/{repo}"))
+}
+
+/// git 수집 타임아웃/바이트 상한 — diff_panel과 동일 정책(2026-08-15 스펙 §3).
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_LIST_BYTES: usize = 200 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitPanelErrorCode {
+    NoRepo,
+    CollectionFailed,
+}
+
+/// 세션 cwd에서 패널 스냅샷을 수집한다. **App host 스레드에서만 부른다**(blocking git).
+pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCode> {
+    let repo_root =
+        crate::git_cli::repo_root(cwd, GIT_TIMEOUT).map_err(|_| GitPanelErrorCode::NoRepo)?;
+    let run = |args: &[&str]| -> Result<(String, bool), GitPanelErrorCode> {
+        crate::git_cli::run_git_limited(&repo_root, args, GIT_TIMEOUT, MAX_LIST_BYTES)
+            .map_err(|_| GitPanelErrorCode::CollectionFailed)
+    };
+
+    // 빈 repo(커밋 0개)는 여기서 CollectionFailed로 떨어진다(HEAD가 없어 rev-parse 실패).
+    // 빈 repo에서 status만이라도 보여주는 건 범위 외(스펙 §6 "섹션 단위 오류" 대상, 2026-08-15).
+    let (branch_raw, _) = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = if branch_raw.trim() == "HEAD" {
+        // detached — 짧은 SHA로 표시.
+        run(&["rev-parse", "--short", "HEAD"])?.0.trim().to_owned()
+    } else {
+        branch_raw.trim().to_owned()
+    };
+
+    // 업스트림: 추적 브랜치 → origin/HEAD 폴백 → None(스펙 §3).
+    let upstream = run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .ok()
+        .map(|(s, _)| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            run(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+                .ok()
+                .map(|(s, _)| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        });
+
+    let (mut ahead, mut behind) = (0, 0);
+    let mut committed = Vec::new();
+    let mut committed_truncated = false;
+    if let Some(upstream) = upstream.as_deref() {
+        let range = format!("{upstream}...HEAD");
+        if let Ok((counts, _)) = run(&["rev-list", "--left-right", "--count", &range])
+            && let Some((a, b)) = parse_ahead_behind(&counts)
+        {
+            (ahead, behind) = (a, b);
+        }
+        if let Ok((base, _)) = run(&["merge-base", upstream, "HEAD"]) {
+            let base = base.trim().to_owned();
+            let range = format!("{base}..HEAD");
+            let (numstat, t1) = run(&["diff", "--no-ext-diff", "--numstat", &range])?;
+            let (names, t2) = run(&["diff", "--no-ext-diff", "--name-status", &range])?;
+            committed = merge_committed_rows(&numstat, &names);
+            committed_truncated = t1 || t2 || committed.len() >= MAX_PANEL_FILES;
+        }
+    }
+
+    let (porcelain, t3) = run(&["status", "--porcelain", "-z", "-uall"])?;
+    let (numstat, t4) = run(&["diff", "--no-ext-diff", "--numstat", "HEAD"])?;
+    let changes = merge_status_rows(&porcelain, &numstat);
+    let changes_truncated = t3 || t4 || changes.len() >= MAX_PANEL_FILES;
+
+    // origin remote → GitHub HTTPS 정규화. 실패(원격 없음/비GitHub)해도 None만 담고
+    // 스냅샷 전체는 죽이지 않는다(Task 10 Step 7 소급 요구, 2026-08-15).
+    let remote_https_base = run(&["remote", "get-url", "origin"])
+        .ok()
+        .and_then(|(s, _)| normalize_github_remote(s.trim()));
+
+    Ok(GitPanelSnapshot {
+        repo_root,
+        branch,
+        upstream,
+        ahead,
+        behind,
+        changes,
+        committed,
+        changes_truncated,
+        committed_truncated,
+        remote_https_base,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +294,118 @@ mod tests {
     fn 파일명과_디렉터리를_분리한다() {
         assert_eq!(split_row_path("crates/app/src/app.rs"), ("app.rs", "crates/app/src"));
         assert_eq!(split_row_path("Cargo.toml"), ("Cargo.toml", ""));
+    }
+
+    use std::time::Duration;
+    const T: Duration = Duration::from_secs(10);
+
+    fn temp_repo(tag: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("deppy-gitpanel-{tag}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::git_cli::run_git(&dir, &["init", "-q", "-b", "main"], T).unwrap();
+        crate::git_cli::run_git(&dir, &["config", "user.email", "t@t"], T).unwrap();
+        crate::git_cli::run_git(&dir, &["config", "user.name", "t"], T).unwrap();
+        dir
+    }
+
+    fn commit_all(repo: &std::path::Path, msg: &str) {
+        crate::git_cli::run_git(repo, &["add", "-A"], T).unwrap();
+        crate::git_cli::run_git(repo, &["commit", "-q", "-m", msg], T).unwrap();
+    }
+
+    #[test]
+    fn collect_snapshot은_브랜치와_변경_목록을_수집한다() {
+        let repo = temp_repo("snap");
+        std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+        commit_all(&repo, "base");
+        // 워킹트리 변경 1 + untracked 1
+        std::fs::write(repo.join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "hi\n").unwrap();
+
+        let snap = collect_snapshot(&repo).expect("collect");
+        assert_eq!(snap.branch, "main");
+        // upstream이 없는 로컬 repo: committed 섹션은 비고 ahead/behind는 0.
+        assert_eq!(snap.upstream, None);
+        assert_eq!(snap.committed.len(), 0);
+        let paths: Vec<&str> = snap.changes.iter().map(|r| r.rel_path.as_str()).collect();
+        assert!(paths.contains(&"a.rs") && paths.contains(&"new.txt"));
+        let a = snap.changes.iter().find(|r| r.rel_path == "a.rs").unwrap();
+        assert_eq!((a.status, a.adds), ('M', Some(1)));
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn collect_snapshot은_upstream이_있으면_committed와_ahead_behind를_채운다() {
+        // "원격"을 흉내내는 로컬 클론: origin = 다른 로컬 repo.
+        let origin = temp_repo("origin");
+        std::fs::write(origin.join("f.rs"), "one\n").unwrap();
+        commit_all(&origin, "c1");
+        let clone_dir = std::env::temp_dir().join(format!(
+            "deppy-gitpanel-clone-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_nanos()));
+        crate::git_cli::run_git(
+            origin.parent().unwrap(),
+            &["clone", "-q", origin.to_str().unwrap(), clone_dir.to_str().unwrap()],
+            T,
+        ).unwrap();
+        crate::git_cli::run_git(&clone_dir, &["config", "user.email", "t@t"], T).unwrap();
+        crate::git_cli::run_git(&clone_dir, &["config", "user.name", "t"], T).unwrap();
+        // 로컬 커밋 1개 → ahead=1, behind=0, committed에 f.rs.
+        std::fs::write(clone_dir.join("f.rs"), "one\ntwo\n").unwrap();
+        commit_all(&clone_dir, "local work");
+
+        let snap = collect_snapshot(&clone_dir).expect("collect");
+        assert!(snap.upstream.as_deref().unwrap_or("").contains("origin/"));
+        assert_eq!((snap.ahead, snap.behind), (1, 0));
+        assert_eq!(snap.committed.len(), 1);
+        assert_eq!(snap.committed[0].rel_path, "f.rs");
+        // origin이 로컬 경로(비GitHub)이므로 remote_https_base는 None이어야 한다.
+        assert_eq!(snap.remote_https_base, None);
+        std::fs::remove_dir_all(&origin).ok();
+        std::fs::remove_dir_all(&clone_dir).ok();
+    }
+
+    #[test]
+    fn repo가_아니면_no_repo_오류다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-gitpanel-norepo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(collect_snapshot(&dir).unwrap_err(), GitPanelErrorCode::NoRepo);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_github_remote_https는_git_접미사를_떼고_정규화한다() {
+        assert_eq!(
+            normalize_github_remote("https://github.com/rust-lang/rust.git"),
+            Some("https://github.com/rust-lang/rust".to_string())
+        );
+        assert_eq!(
+            normalize_github_remote("https://github.com/rust-lang/rust"),
+            Some("https://github.com/rust-lang/rust".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_github_remote_ssh_형식도_https로_정규화한다() {
+        assert_eq!(
+            normalize_github_remote("git@github.com:rust-lang/rust.git"),
+            Some("https://github.com/rust-lang/rust".to_string())
+        );
+        assert_eq!(
+            normalize_github_remote("git@github.com:rust-lang/rust"),
+            Some("https://github.com/rust-lang/rust".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_github_remote_비github_remote는_none이다() {
+        assert_eq!(normalize_github_remote("https://gitlab.com/foo/bar.git"), None);
+        assert_eq!(normalize_github_remote("git@bitbucket.org:foo/bar.git"), None);
+        assert_eq!(normalize_github_remote("/Users/t/tmp/some-local-repo"), None);
     }
 }

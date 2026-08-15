@@ -2585,15 +2585,18 @@ impl FileTreeUi {
         // Git 탭도 본문을 통째로 쓴다 — Notes와 같은 인라인 패턴(2026-08-15 스펙 §1).
         if self.selected_tool == SidebarTool::Git {
             if let Some(git_action) = self.git_panel.render(ui, catalog) {
-                action = Some(match git_action {
-                    super::git_panel::GitPanelAction::Refresh => SidebarAction::GitPanelRefresh,
+                action = match git_action {
+                    super::git_panel::GitPanelAction::Refresh => Some(SidebarAction::GitPanelRefresh),
                     super::git_panel::GitPanelAction::OpenRemoteBranch => {
-                        SidebarAction::GitPanelOpenRemote
+                        Some(SidebarAction::GitPanelOpenRemote)
                     }
                     super::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode } => {
-                        SidebarAction::ShowFileDiff { rel_path, mode }
+                        Some(SidebarAction::ShowFileDiff { rel_path, mode })
                     }
-                });
+                    // 워크트리 셸 열기는 사이드바 경로가 아니다 — Git 패널이 pane 보조 탭으로
+                    // 옮겨가는 Task 5에서 이 블록 전체가 사라진다(스펙 §8-1).
+                    super::git_panel::GitPanelAction::OpenWorktreeShell { .. } => None,
+                };
             }
             return action;
         }

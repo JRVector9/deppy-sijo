@@ -12,6 +12,8 @@ pub const MAX_PANEL_FILES: usize = 512;
 pub const SECTION_COLLAPSED_ROWS: usize = 10;
 /// 워크트리 목록 상한 — 목록은 사람이 훑는 것이라 32면 충분하고, 초과분은 잘림 표시만 한다.
 pub const MAX_WORKTREE_ROWS: usize = 32;
+/// 셸 스폰 경로 상한 — App의 `spawn_shell_at`이 같은 검사를 하지만 leaf도 넘기지 않는다.
+pub const WORKTREE_PATH_MAX_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitFileRow {
@@ -56,11 +58,7 @@ pub struct GitPanelSnapshot {
     /// (Task 10 Step 7 소급 요구 — collect_snapshot에서 remote 조회 실패해도
     /// 스냅샷 전체를 죽이지 않고 None으로만 담는다.)
     pub remote_https_base: Option<String>,
-    // 렌더(목록·잘림 표시)는 Task 2에서 붙는다 — 그때까지는 소비자가 없어도 스냅샷
-    // 모델의 일부로 유지한다(repo_root와 같은 이유, 위 주석 참고).
-    #[allow(dead_code)]
     pub worktrees: Vec<GitWorktreeRow>,
-    #[allow(dead_code)]
     pub worktrees_truncated: bool,
 }
 
@@ -169,6 +167,16 @@ fn parse_worktree_list(porcelain: &str, repo_root: &Path) -> Vec<GitWorktreeRow>
     }
     flush(&mut path, &mut branch, &mut bare);
     rows
+}
+
+/// 셸을 열 수 있는 경로인가 — 빈 값·상한 초과·NUL은 클릭 intent를 만들지 않는다.
+fn worktree_path_is_spawnable(path: &str) -> bool {
+    !path.is_empty() && path.len() <= WORKTREE_PATH_MAX_BYTES && !path.as_bytes().contains(&0)
+}
+
+/// 워크트리가 메인 하나뿐이면 섹션을 그리지 않는다 — 정보가 0이다.
+fn worktree_section_visible(snapshot: &GitPanelSnapshot) -> bool {
+    snapshot.worktrees.len() > 1
 }
 
 /// `rev-list --left-right --count upstream...HEAD` → (ahead, behind).
@@ -402,6 +410,8 @@ pub enum GitPanelAction {
     /// upstream의 GitHub 브랜치 페이지 열기 — URL 구성은 App이 remote를 보고 한다.
     OpenRemoteBranch,
     ShowFileDiff { rel_path: String, mode: crate::ui::diff_viewer::DiffMode },
+    /// 워크트리 행 클릭 — App이 그 경로에서 새 셸을 연다(워크트리를 만들지도 지우지도 않는다).
+    OpenWorktreeShell { path: String },
 }
 
 #[derive(Default)]
@@ -412,6 +422,7 @@ pub struct GitPanelUi {
     committed_show_all: bool,
     changes_collapsed: bool,
     committed_collapsed: bool,
+    worktrees_collapsed: bool,
 }
 
 impl GitPanelUi {
@@ -596,7 +607,11 @@ impl GitPanelUi {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if snap.changes.is_empty() && snap.committed.is_empty() {
                 ui.weak(catalog.t("diff.clean", &[]));
-                return;
+                // 워크트리 섹션에는 clean과 무관하게 정보가 있을 수 있다 — 여기서
+                // 돌아가면 그 섹션까지 감춘다(스펙 §8-4).
+                if !worktree_section_visible(&snap) {
+                    return;
+                }
             }
             section(
                 ui,
@@ -622,6 +637,73 @@ impl GitPanelUi {
             );
             if snap.committed_truncated {
                 ui.weak(catalog.t("diff.truncated", &[]));
+            }
+
+            // ── 섹션 3: 워크트리 ─────────────────────────────────────────
+            if worktree_section_visible(&snap) {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let arrow = if self.worktrees_collapsed { "›" } else { "∨" };
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!(
+                                "{arrow} {} {}",
+                                catalog.t("git.section.worktrees", &[]),
+                                snap.worktrees.len()
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.worktrees_collapsed = !self.worktrees_collapsed;
+                    }
+                });
+                if !self.worktrees_collapsed {
+                    for row in &snap.worktrees {
+                        // 파일 행과 같은 패턴 — 자식 Label이 클릭을 삼키지 않도록
+                        // 스코프 자체를 하나의 논리 위젯으로 만든다(위 file row 주석 참고).
+                        let scope = ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id_salt(("git-panel-worktree", row.path.as_str()))
+                                .sense(egui::Sense::click()),
+                            |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(&row.name);
+                                    match row.branch.as_deref() {
+                                        Some(branch) => ui.weak(branch),
+                                        None => ui.weak(catalog.t("git.worktree.detached", &[])),
+                                    };
+                                    if row.current {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| ui.weak(catalog.t("git.worktree.current", &[])),
+                                        );
+                                    }
+                                });
+                            },
+                        );
+                        let response = scope
+                            .response
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(catalog.t("git.worktree.open_hint", &[]));
+                        // 접근성 이름을 경로로 명시한다 — kittest가 Role::Button + 이
+                        // 라벨로 행 전체를 정확히 겨냥할 수 있다(위 file row 주석과 동일 이유).
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                row.path.as_str(),
+                            )
+                        });
+                        if response.clicked() && worktree_path_is_spawnable(&row.path) {
+                            action = Some(GitPanelAction::OpenWorktreeShell { path: row.path.clone() });
+                        }
+                    }
+                    if snap.worktrees_truncated {
+                        ui.weak(catalog.t("git.worktrees_truncated", &[]));
+                    }
+                }
             }
         });
         action
@@ -917,5 +999,86 @@ bare
             }),
             "변경 사항 행 클릭은 Working 모드 ShowFileDiff를 내야 한다"
         );
+    }
+
+    #[test]
+    fn kittest_워크트리_행_클릭은_셸_열기를_올린다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            panel: GitPanelUi,
+            action: Option<GitPanelAction>,
+        }
+
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            worktrees: vec![
+                GitWorktreeRow {
+                    path: "/repo".into(),
+                    name: "repo".into(),
+                    branch: Some("main".into()),
+                    current: true,
+                },
+                GitWorktreeRow {
+                    path: "/repo/wt".into(),
+                    name: "wt".into(),
+                    branch: Some("feat/x".into()),
+                    current: false,
+                },
+            ],
+            ..Default::default()
+        }));
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut State| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                if let Some(action) = state.panel.render(ui, &catalog) {
+                    state.action = Some(action);
+                }
+            },
+            State { panel, action: None },
+        );
+        harness.run();
+        // 파일 행 테스트와 같은 질의 방식 — 접근성 이름(Role::Button + path)으로
+        // 행 전체를 겨냥한다(자식 Label 클릭은 부모로 새지 않는다).
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "/repo/wt")
+            .click();
+        harness.run();
+
+        assert_eq!(
+            harness.state().action,
+            Some(GitPanelAction::OpenWorktreeShell { path: "/repo/wt".to_owned() }),
+            "워크트리 행 클릭은 OpenWorktreeShell을 내야 한다"
+        );
+    }
+
+    #[test]
+    fn 워크트리가_하나면_섹션을_숨긴다() {
+        // 정보가 0인 섹션은 그리지 않는다(스펙 §8-4).
+        let mut snap = GitPanelSnapshot { branch: "main".into(), ..Default::default() };
+        snap.worktrees = vec![GitWorktreeRow {
+            path: "/repo".into(),
+            name: "repo".into(),
+            branch: Some("main".into()),
+            current: true,
+        }];
+        assert!(!worktree_section_visible(&snap));
+        snap.worktrees.push(GitWorktreeRow {
+            path: "/repo/wt".into(),
+            name: "wt".into(),
+            branch: None,
+            current: false,
+        });
+        assert!(worktree_section_visible(&snap));
+    }
+
+    #[test]
+    fn 상한을_넘는_경로는_클릭_대상이_아니다() {
+        let long = "/".repeat(WORKTREE_PATH_MAX_BYTES + 1);
+        assert!(!worktree_path_is_spawnable(&long));
+        assert!(!worktree_path_is_spawnable("/repo/\0bad"));
+        assert!(worktree_path_is_spawnable("/repo/wt"));
     }
 }

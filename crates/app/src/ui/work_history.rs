@@ -82,59 +82,6 @@ pub enum WorkHistoryErrorCode {
     ReadFailed,
 }
 
-/// 현재 세션 pane 헤더 옆에 붙는 **보조 UI 탭**의 상태.
-///
-/// runtime의 `MuxTabId`/pane과 무관하다 — 이 상태가 바뀌어도 PTY·세션·mux 탭은
-/// 생성되거나 종료되지 않는다. 세션 X와 이력 X가 서로 다른 동작인 이유다.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum WorkHistoryTabState {
-    #[default]
-    Closed,
-    OpenInactive,
-    OpenActive,
-}
-
-impl WorkHistoryTabState {
-    /// 탭 chrome이 헤더에 존재하는지. `Closed`면 세션 헤더는 예전 그대로다.
-    pub fn is_open(self) -> bool {
-        self != Self::Closed
-    }
-
-    pub fn is_active(self) -> bool {
-        self == Self::OpenActive
-    }
-
-    /// 레일 「이력」 클릭 — 닫혀 있으면 열고 활성화, 이미 활성이면 세션으로 돌아가되
-    /// 탭은 남긴다.
-    pub fn on_rail_click(self) -> Self {
-        match self {
-            Self::Closed | Self::OpenInactive => Self::OpenActive,
-            Self::OpenActive => Self::OpenInactive,
-        }
-    }
-
-    /// 이력 탭 클릭 — 열려 있을 때만 활성화한다.
-    pub fn on_tab_click(self) -> Self {
-        match self {
-            Self::Closed => Self::Closed,
-            Self::OpenInactive | Self::OpenActive => Self::OpenActive,
-        }
-    }
-
-    /// 세션 탭 클릭 — 터미널을 보여주되 이력 탭은 유지한다.
-    pub fn on_session_tab_click(self) -> Self {
-        match self {
-            Self::Closed => Self::Closed,
-            Self::OpenInactive | Self::OpenActive => Self::OpenInactive,
-        }
-    }
-
-    /// 이력 X — UI 탭만 제거한다. 세션에는 어떤 종료 명령도 보내지 않는다.
-    pub fn on_close(self) -> Self {
-        Self::Closed
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkHistoryAction {
     Refresh,
@@ -1189,59 +1136,6 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 핸드오프가 고정한 상태 기계 — 레일 재클릭은 탭을 **지우지 않고** 세션으로만
-    /// 돌아가고, 탭 제거는 이력 X 전용이다.
-    #[test]
-    fn 이력탭_상태기계는_레일_탭_세션_닫기_규칙을_지킨다() {
-        use WorkHistoryTabState::{Closed, OpenActive, OpenInactive};
-
-        assert_eq!(Closed.on_rail_click(), OpenActive, "레일: 닫힘 → 열고 활성");
-        assert_eq!(
-            OpenInactive.on_rail_click(),
-            OpenActive,
-            "레일: 열림 → 활성"
-        );
-        assert_eq!(
-            OpenActive.on_rail_click(),
-            OpenInactive,
-            "레일 재클릭은 세션으로 돌아가되 탭은 남긴다"
-        );
-
-        assert_eq!(OpenInactive.on_tab_click(), OpenActive);
-        assert_eq!(OpenActive.on_tab_click(), OpenActive);
-        assert_eq!(
-            Closed.on_tab_click(),
-            Closed,
-            "없는 탭은 클릭으로 살아나지 않는다"
-        );
-
-        assert_eq!(OpenActive.on_session_tab_click(), OpenInactive);
-        assert_eq!(OpenInactive.on_session_tab_click(), OpenInactive);
-
-        for state in [Closed, OpenInactive, OpenActive] {
-            assert_eq!(state.on_close(), Closed, "이력 X는 항상 탭만 제거한다");
-        }
-
-        assert!(OpenActive.is_active());
-        assert!(
-            !OpenInactive.is_active(),
-            "열려 있어도 비활성은 레일을 켜지 않는다"
-        );
-        assert!(!Closed.is_active());
-
-        // 탭 chrome 존재 여부 — 한 번도 열지 않았거나 이력 X로 닫으면 헤더에 탭이 없다.
-        assert!(
-            !Closed.is_open(),
-            "열기 전에는 헤더에 이력 탭이 없어야 한다"
-        );
-        assert!(OpenInactive.is_open());
-        assert!(OpenActive.is_open());
-        assert!(
-            !OpenActive.on_close().is_open(),
-            "이력 X 뒤에는 탭 chrome이 사라져야 한다"
-        );
-    }
 
     fn row(
         turn_key: &str,

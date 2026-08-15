@@ -7878,7 +7878,7 @@ pub struct App {
     /// 이력은 전역 중앙 페이지가 아니라 현재 세션 pane 헤더 옆의 **보조 UI 탭**이다.
     /// 이 상태는 runtime의 mux 탭/pane과 무관하다 — 열고 닫아도 PTY·세션은 그대로다
     /// (2026-08-14 사용자: 터미널 전체가 다른 페이지로 바뀌는 방식은 원하지 않는다).
-    work_history_tab: ui::work_history::WorkHistoryTabState,
+    work_history_tab: ui::workspace::PaneAuxTabState,
     work_history_rows: Vec<storage::AgentWorkTurnRow>,
     work_history_workspace_id: Option<String>,
     work_history_loading: bool,
@@ -11569,7 +11569,7 @@ impl App {
             diff_viewer_ui: ui::diff_viewer::DiffViewerUi::default(),
             git_panel_generation: 0,
             work_history_ui: ui::work_history::WorkHistoryUi::new(),
-            work_history_tab: ui::work_history::WorkHistoryTabState::default(),
+            work_history_tab: ui::workspace::PaneAuxTabState::default(),
             work_history_rows: Vec::new(),
             work_history_workspace_id: None,
             work_history_loading: false,

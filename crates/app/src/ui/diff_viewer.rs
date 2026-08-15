@@ -133,6 +133,178 @@ pub fn synth_added(content: &str, truncated: bool) -> FileDiffView {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum DisplayRow {
+    Line { hunk: usize, line: usize },
+    Gap { lines: u32 },
+}
+
+/// 렌더는 이 평탄 목록 위에서 show_rows 가상화로 돈다 — 대형 diff에서도 프레임 유계.
+pub fn flatten_display_rows(view: &FileDiffView) -> Vec<DisplayRow> {
+    let mut rows = Vec::new();
+    for (h, hunk) in view.hunks.iter().enumerate() {
+        if h > 0
+            && let Some(gap) = view.gaps.get(h - 1).copied().filter(|g| *g > 0)
+        {
+            rows.push(DisplayRow::Gap { lines: gap });
+        }
+        for l in 0..hunk.lines.len() {
+            rows.push(DisplayRow::Line { hunk: h, line: l });
+        }
+    }
+    rows
+}
+
+pub fn hunk_start_indices(rows: &[DisplayRow]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut last_hunk = usize::MAX;
+    for (i, row) in rows.iter().enumerate() {
+        if let DisplayRow::Line { hunk, .. } = row
+            && *hunk != last_hunk
+        {
+            out.push(i);
+            last_hunk = *hunk;
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffViewerAction {
+    BackToTerminal,
+}
+
+/// 추가/삭제 행 배경색 — 이 저장소의 theme.rs/designall.rs에는 diff 전용 색이
+/// 없다(2026-08-15 확인, Task 7 Step 3). designall::Tokens.success/error는 "그
+/// 체계 밖의 일반 성공 표시가 생길 때" 용도로 예약돼 있어(designall.rs:14-16
+/// 주석) 새로 끌어쓰지 말라는 경고가 있고, 애초에 라이트/다크 전용 diff 색도
+/// 아니다 — 그래서 GitHub diff 배색을 참고해 라이트/다크 각각 하드코딩하고
+/// `dark_mode`로 분기한다.
+fn diff_line_bg(dark_mode: bool, kind: LineKind) -> egui::Color32 {
+    match kind {
+        LineKind::Add if dark_mode => egui::Color32::from_rgb(0x03, 0x3a, 0x16),
+        LineKind::Add => egui::Color32::from_rgb(0xe6, 0xff, 0xec),
+        LineKind::Del if dark_mode => egui::Color32::from_rgb(0x67, 0x06, 0x0c),
+        LineKind::Del => egui::Color32::from_rgb(0xff, 0xeb, 0xe9),
+        LineKind::Context => egui::Color32::TRANSPARENT,
+    }
+}
+
+fn diff_line_sign(kind: LineKind) -> &'static str {
+    match kind {
+        LineKind::Add => "+",
+        LineKind::Del => "-",
+        LineKind::Context => " ",
+    }
+}
+
+#[derive(Default)]
+pub struct DiffViewerUi {
+    view: Option<FileDiffView>,
+    rel_path: String,
+    mode: Option<DiffMode>,
+    loading: bool,
+    /// 다음 프레임에 이 표시 행으로 스크롤 — hunk ↑↓가 세팅한다.
+    scroll_to_row: Option<usize>,
+    current_hunk: usize,
+}
+
+impl DiffViewerUi {
+    pub fn open(&mut self, rel_path: String, mode: DiffMode) {
+        self.rel_path = rel_path;
+        self.mode = Some(mode);
+        self.view = None;
+        self.loading = true;
+        self.current_hunk = 0;
+        self.scroll_to_row = None;
+    }
+
+    pub fn set_view(&mut self, view: FileDiffView) {
+        self.loading = false;
+        self.view = Some(view);
+    }
+
+    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<DiffViewerAction> {
+        let mut action = None;
+        // ── 헤더: 터미널 복귀 · 경로 · 모드 라벨 · hunk ↑↓ ──────────────
+        ui.horizontal(|ui| {
+            if ui.button(catalog.t("git.back_to_terminal", &[])).clicked() {
+                action = Some(DiffViewerAction::BackToTerminal);
+            }
+            ui.monospace(&self.rel_path);
+            let mode_key = match self.mode {
+                Some(DiffMode::Branch) => "git.mode.branch",
+                _ => "git.mode.working",
+            };
+            ui.weak(format!("({})", catalog.t(mode_key, &[])));
+            let Some(view) = self.view.as_ref() else { return };
+            let rows = flatten_display_rows(view);
+            let starts = hunk_start_indices(&rows);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("↓").on_hover_text(catalog.t("git.hunk.next", &[])).clicked()
+                    && self.current_hunk + 1 < starts.len()
+                {
+                    self.current_hunk += 1;
+                    self.scroll_to_row = starts.get(self.current_hunk).copied();
+                }
+                if ui.small_button("↑").on_hover_text(catalog.t("git.hunk.prev", &[])).clicked()
+                    && self.current_hunk > 0
+                {
+                    self.current_hunk -= 1;
+                    self.scroll_to_row = starts.get(self.current_hunk).copied();
+                }
+            });
+        });
+        ui.separator();
+
+        let Some(view) = self.view.clone() else {
+            ui.weak(catalog.t("diff.loading", &[]));
+            return action;
+        };
+        if view.binary {
+            ui.weak(catalog.t("git.binary", &[]));
+            return action;
+        }
+        let rows = flatten_display_rows(&view);
+        let dark_mode = ui.visuals().dark_mode;
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+        let mut scroll = egui::ScrollArea::both().auto_shrink([false, false]);
+        if let Some(target) = self.scroll_to_row.take() {
+            scroll = scroll.vertical_scroll_offset(target as f32 * row_h);
+        }
+        scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
+            for index in range {
+                match rows[index] {
+                    DisplayRow::Gap { lines } => {
+                        let lines = lines.to_string();
+                        ui.weak(catalog.t("git.gap_lines", &[("count", &lines)]));
+                    }
+                    DisplayRow::Line { hunk, line } => {
+                        let l = &view.hunks[hunk].lines[line];
+                        let bg = diff_line_bg(dark_mode, l.kind);
+                        let sign = diff_line_sign(l.kind);
+                        let no = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
+                        egui::Frame::NONE.fill(bg).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.monospace(format!(
+                                    "{:>5} {:>5} {sign} {}",
+                                    no(l.old_no),
+                                    no(l.new_no),
+                                    l.text
+                                ));
+                            });
+                        });
+                    }
+                }
+            }
+        });
+        if view.truncated {
+            ui.weak(catalog.t("diff.truncated", &[]));
+        }
+        action
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +359,17 @@ index 111..222 100644
         assert_eq!(view.hunks.len(), 1);
         assert!(view.hunks[0].lines.iter().all(|l| l.kind == LineKind::Add));
         assert_eq!(view.hunks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn 표시_행은_hunk와_gap을_순서대로_평탄화한다() {
+        let view = parse_unified(SAMPLE, false);
+        let rows = flatten_display_rows(&view);
+        // hunk1(5행) + gap(1행) + hunk2(3행) = 9행. gap 행은 접힌 26행을 담는다.
+        assert_eq!(rows.len(), 9);
+        assert!(matches!(rows[5], DisplayRow::Gap { lines: 26 }));
+        assert!(matches!(rows[0], DisplayRow::Line { hunk: 0, .. }));
+        // hunk 시작 인덱스: hunk 이동 버튼이 이 인덱스로 스크롤한다.
+        assert_eq!(hunk_start_indices(&rows), vec![0, 6]);
     }
 }

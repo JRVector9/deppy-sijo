@@ -1381,8 +1381,7 @@ mod tests {
     #[test]
     fn kittest_원문_보기_버튼은_intent를_올린다() {
         // 카드 펼침 토글이 클릭을 삼키지 않는다 — 「변경 보기」와 같은 위치(toggle
-        // 스코프 밖)에 둔 버튼이라 같은 방식으로 검증한다. locale 문구는 다음
-        // Task가 채우므로 아직은 키 문자열 그대로가 라벨이다.
+        // 스코프 밖)에 둔 버튼이라 같은 방식으로 검증한다.
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -1402,7 +1401,7 @@ mod tests {
         harness
             .get_by_role_and_label(
                 egui::accesskit::Role::Button,
-                "history.action.show_transcript",
+                &catalog.t("history.action.show_transcript", &[]),
             )
             .click();
         harness.run();

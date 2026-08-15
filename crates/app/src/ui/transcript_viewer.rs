@@ -195,7 +195,8 @@ mod tests {
         let mut harness = harness_for(TranscriptViewerUi::default());
         harness.run();
 
-        harness.get_by_label("history.transcript.empty");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        harness.get_by_label(&catalog.t("history.transcript.empty", &[]));
     }
 
     #[test]
@@ -207,7 +208,8 @@ mod tests {
         let mut harness = harness_for(viewer);
         harness.run();
 
-        harness.get_by_label("history.transcript.loading");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        harness.get_by_label(&catalog.t("history.transcript.loading", &[]));
     }
 
     #[test]
@@ -219,7 +221,8 @@ mod tests {
         let mut harness = harness_for(viewer);
         harness.run();
 
-        harness.get_by_label("history.transcript.not_found");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        harness.get_by_label(&catalog.t("history.transcript.not_found", &[]));
     }
 
     #[test]
@@ -231,7 +234,8 @@ mod tests {
         let mut harness = harness_for(viewer);
         harness.run();
 
-        harness.get_by_label("history.transcript.error");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        harness.get_by_label(&catalog.t("history.transcript.error", &[]));
     }
 
     #[test]
@@ -246,7 +250,8 @@ mod tests {
         let mut harness = harness_for(viewer);
         harness.run();
 
-        harness.get_by_label("history.transcript.truncated");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        harness.get_by_label(&catalog.t("history.transcript.truncated", &[]));
     }
 
     #[test]
@@ -264,8 +269,9 @@ mod tests {
         let mut harness = harness_for(viewer);
         harness.run();
 
-        harness.get_by_label("history.role.user");
-        harness.get_by_label("history.role.agent");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        harness.get_by_label(&catalog.t("history.role.user", &[]));
+        harness.get_by_label(&catalog.t("history.role.agent", &[]));
         harness.get_by_label("질문입니다");
         harness.get_by_label("답변입니다");
     }

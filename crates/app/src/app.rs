@@ -24474,14 +24474,16 @@ impl eframe::App for App {
         let terminal_visible = central_view == ui::agent_terminal::AgentTerminalView::Terminal;
         // 이력 탭 chrome은 **탭이 열려 있고** 작업면이 보일 때만 존재한다. 닫힘 상태와
         // 홈/작업 페이지에서는 세션 헤더가 예전 그대로다 — 이력 X가 실제로 탭을 없앤다.
-        self.active.workspace_ui.set_aux_tab(
-            (terminal_visible && self.work_history_tab.is_open()).then(|| {
-                ui::workspace::PaneAuxTab {
-                    label: text.t("workspace.tab.history", &[]),
-                    active: history_tab_active,
-                }
-            }),
-        );
+        // (Git 탭은 아직 이 목록에 없다 — 레일 진입·상태 배선은 다음 Task 몫이다.)
+        let mut aux_tabs = Vec::new();
+        if terminal_visible && self.work_history_tab.is_open() {
+            aux_tabs.push(ui::workspace::PaneAuxTab {
+                kind: ui::workspace::PaneAuxTabKind::History,
+                label: text.t("workspace.tab.history", &[]),
+                active: history_tab_active,
+            });
+        }
+        self.active.workspace_ui.set_aux_tabs(aux_tabs);
         // 이력 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
         // 타이핑·IME·붙여넣기가 숨은 PTY로 새지 않게 한다.
         if terminal_visible && !history_tab_active {
@@ -24956,7 +24958,7 @@ impl eframe::App for App {
                         );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
-                    work_history_tab_intent = primary_output.aux_tab_intent;
+                    work_history_tab_intent = primary_output.aux_tab_intent.map(|(_, intent)| intent);
                     if let Some(body) = primary_output.aux_body_rect {
                         work_history_action = self.render_work_history_tab_body(
                             &mut primary,
@@ -24991,7 +24993,7 @@ impl eframe::App for App {
                     );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
-                    work_history_tab_intent = primary_output.aux_tab_intent;
+                    work_history_tab_intent = primary_output.aux_tab_intent.map(|(_, intent)| intent);
                     if let Some(body) = primary_output.aux_body_rect {
                         work_history_action = self.render_work_history_tab_body(
                             ui,
@@ -30511,7 +30513,7 @@ mod tests {
             "이력 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
         );
         assert!(
-            render.contains("(terminal_visible && self.work_history_tab.is_open()).then("),
+            render.contains("if terminal_visible && self.work_history_tab.is_open() {"),
             "이력 탭 chrome은 탭이 열려 있을 때만 붙어야 한다(이력 X가 실제로 없앤다)"
         );
         assert!(

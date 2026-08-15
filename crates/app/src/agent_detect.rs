@@ -1154,6 +1154,27 @@ fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
     None
 }
 
+/// 저장된 이력 행(kind + 세션ID [+ cwd])에서 transcript 파일을 찾는다. 세션이 이미
+/// 끝났어도 파일은 남으므로 원문 보기가 이걸 쓴다(2026-08-15).
+///
+/// Codex는 `TranscriptFinder::find`가 이미 `~/.codex/sessions`를 역순(최신 먼저) 스캔해
+/// 세션ID로 직접 매칭한다(위 `TranscriptFinder` 문서 참고) — 그걸 그대로 우선 쓰고,
+/// 스캔 상한에 걸리는 등 못 찾을 때만 행의 cwd로 `find_codex_transcript`에 폴백한다.
+#[allow(dead_code)] // Task 10이 부른다
+pub(crate) fn transcript_path_for(
+    kind: AgentKind,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> Option<PathBuf> {
+    match kind {
+        AgentKind::Claude => find_claude_transcript(session_id),
+        AgentKind::Codex => TranscriptFinder::new()
+            .find(AgentKind::Codex, session_id)
+            .or_else(|| cwd.and_then(|cwd| find_codex_transcript(cwd).map(|(_, path)| path))),
+        AgentKind::Kimi => None,
+    }
+}
+
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
     let mut budget = ScanBudget::default();
     if collect_jsonl_bounded(dir, out, 0, &mut budget) {
@@ -2503,6 +2524,21 @@ mod tests {
         assert!(!request_debug.contains("valid"));
         assert!(!result_debug.contains(valid_cwd.to_str().unwrap()));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 세션id로_transcript_경로를_찾는_함수가_공개돼_있다() {
+        // 세션이 죽어도 파일은 남는다 — 이력에서 원문을 열려면 이 해석기가 필요하다.
+        let missing = transcript_path_for(
+            AgentKind::Claude,
+            "00000000-0000-0000-0000-000000000000",
+            None,
+        );
+        assert!(missing.is_none(), "없는 세션은 None이다");
+        assert!(
+            transcript_path_for(AgentKind::Claude, "../탈출", None).is_none(),
+            "잘못된 id 거부"
+        );
     }
 
     #[test]

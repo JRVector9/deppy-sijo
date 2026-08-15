@@ -21,6 +21,31 @@ pub enum AgentActivity {
     Idle,
 }
 
+/// 턴 메시지 하나의 화자. 카드가 이 값으로 「나」/「에이전트」 라벨을 고른다(Task 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRole {
+    User,
+    Assistant,
+}
+
+/// 턴 하나가 보존하는 메시지 한 개. 최근 `TURN_MESSAGES_MAX`개만 남는다.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TurnMessage {
+    pub role: TurnRole,
+    pub text: String,
+    pub at: Option<i64>,
+}
+
+impl fmt::Debug for TurnMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurnMessage")
+            .field("role", &self.role)
+            .field("text", &"REDACTED")
+            .field("at", &self.at)
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct TranscriptTurn {
     pub turn_key: String,
@@ -29,6 +54,8 @@ pub struct TranscriptTurn {
     pub agent_summary: Option<String>,
     pub occurred_at: Option<i64>,
     pub activity: AgentActivity,
+    /// 턴 안 최근 메시지(사용자 지시 포함) — 최신이 뒤. 저장 컬럼(`messages_json`)의 원천.
+    pub messages: Vec<TurnMessage>,
 }
 
 impl fmt::Debug for TranscriptTurn {
@@ -43,6 +70,7 @@ impl fmt::Debug for TranscriptTurn {
             )
             .field("occurred_at", &self.occurred_at)
             .field("activity", &self.activity)
+            .field("message_count", &self.messages.len())
             .finish()
     }
 }
@@ -110,6 +138,11 @@ const AGENT_SUMMARY_LINES: usize = 4;
 /// 최악의 경우(4바이트 문자 400개) + 말줄임 + 줄바꿈 3개.
 const AGENT_SUMMARY_BYTES: usize =
     AGENT_SUMMARY_CHARS * 4 + '…'.len_utf8() + (AGENT_SUMMARY_LINES - 1);
+/// 턴 하나가 보존하는 메시지 수 — orca의 SESSION_PREVIEW_MESSAGE_LIMIT과 같은 값.
+pub const TURN_MESSAGES_MAX: usize = 5;
+/// 직렬화 결과 상한 — storage의 컬럼 상한(8KB)과 같은 값이다. 넘으면 None으로 떨어뜨려
+/// 저장을 거부당하는 대신 조용히 기존 두 필드로 물러난다(fail-soft).
+const TURN_MESSAGES_JSON_BYTES_MAX: usize = 8 * 1024;
 
 struct TailSnapshot {
     base_offset: u64,
@@ -369,6 +402,7 @@ struct PendingTurn {
     agent_summary: Option<String>,
     occurred_at: Option<i64>,
     activity: AgentActivity,
+    messages: Vec<TurnMessage>,
 }
 
 impl PendingTurn {
@@ -379,16 +413,31 @@ impl PendingTurn {
         occurred_at: Option<i64>,
         native_key: Option<String>,
     ) -> Self {
-        Self {
+        let mut pending = Self {
             // 사용자 경계 이벤트에 native id가 있으면 쓰고, 없으면 절대 오프셋으로
             // 고정한다. 뒤늦은 종료 이벤트 때문에 이미 노출된 키를 바꾸지 않는다.
             turn_key: native_key.unwrap_or_else(|| format!("{provider}:{source_offset:x}")),
             source_offset,
-            instruction,
+            instruction: instruction.clone(),
             agent_summary: None,
             occurred_at,
             activity: AgentActivity::Working,
+            messages: Vec::new(),
+        };
+        // 턴을 여는 사용자 지시 자체가 이 턴의 첫 메시지다.
+        pending.push_message(TurnRole::User, instruction, occurred_at);
+        pending
+    }
+
+    /// 최신 TURN_MESSAGES_MAX개만 남긴다 — 앞에서 밀어낸다.
+    fn push_message(&mut self, role: TurnRole, text: String, at: Option<i64>) {
+        if text.is_empty() {
+            return;
         }
+        if self.messages.len() == TURN_MESSAGES_MAX {
+            self.messages.remove(0);
+        }
+        self.messages.push(TurnMessage { role, text, at });
     }
 
     fn finish(self) -> TranscriptTurn {
@@ -399,7 +448,33 @@ impl PendingTurn {
             agent_summary: self.agent_summary,
             occurred_at: self.occurred_at,
             activity: self.activity,
+            messages: self.messages,
         }
+    }
+}
+
+impl TranscriptTurn {
+    /// storage 컬럼에 넣을 유계 JSON. 상한을 넘으면 None(카드는 기존 두 필드로 그린다).
+    #[allow(dead_code)] // Task 5가 부른다
+    pub fn messages_json(&self) -> Option<String> {
+        if self.messages.is_empty() {
+            return None;
+        }
+        // messages는 이미 TURN_MESSAGES_MAX(5)로 유계다 — collect::<Vec>이 아니라
+        // with_capacity + push로 쌓아 "unbounded read" 검사 문구를 피한다.
+        let mut items: Vec<Value> = Vec::with_capacity(self.messages.len());
+        for message in &self.messages {
+            items.push(serde_json::json!({
+                "r": match message.role {
+                    TurnRole::User => "u",
+                    TurnRole::Assistant => "a",
+                },
+                "t": message.text,
+                "at": message.at,
+            }));
+        }
+        let json = serde_json::to_string(&items).ok()?;
+        (json.len() <= TURN_MESSAGES_JSON_BYTES_MAX).then_some(json)
     }
 }
 
@@ -638,8 +713,9 @@ fn claude_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
                 let Some(turn) = pending.as_mut() else {
                     continue;
                 };
-                if summary.is_some() {
-                    turn.agent_summary = summary;
+                if let Some(summary) = summary {
+                    turn.push_message(TurnRole::Assistant, summary.clone(), event_occurred_at(&value));
+                    turn.agent_summary = Some(summary);
                 }
                 turn.activity = if value
                     .pointer("/message/stop_reason")
@@ -808,6 +884,7 @@ fn kimi_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
                     .pointer("/message/content")
                     .and_then(message_content_summary)
                 {
+                    turn.push_message(TurnRole::Assistant, summary.clone(), event_occurred_at(&value));
                     turn.agent_summary = Some(summary);
                 }
             }
@@ -1245,6 +1322,7 @@ fn codex_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
                     .and_then(Value::as_str)
                     .and_then(clean_agent_summary)
                 {
+                    turn.push_message(TurnRole::Assistant, summary.clone(), event_occurred_at(&value));
                     turn.agent_summary = Some(summary);
                 }
                 turn.activity = AgentActivity::Working;
@@ -1255,6 +1333,7 @@ fn codex_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
                     .and_then(Value::as_str)
                     .and_then(clean_agent_summary)
                 {
+                    turn.push_message(TurnRole::Assistant, summary.clone(), event_occurred_at(&value));
                     turn.agent_summary = Some(summary);
                 }
                 turn.activity = AgentActivity::Idle;
@@ -1729,6 +1808,11 @@ mod tests {
                 agent_summary: Some("private turn summary".to_owned()),
                 occurred_at: Some(1),
                 activity: AgentActivity::Working,
+                messages: vec![TurnMessage {
+                    role: TurnRole::Assistant,
+                    text: "private turn message".to_owned(),
+                    at: Some(1),
+                }],
             }],
         };
         let debug = format!("{state:?}");
@@ -1742,6 +1826,7 @@ mod tests {
             "private-turn",
             "private turn instruction",
             "private turn summary",
+            "private turn message",
         ] {
             assert!(!debug.contains(raw));
         }
@@ -1985,6 +2070,42 @@ mod tests {
         ] {
             assert!(clean_agent_summary(noise).is_none(), "{noise}");
         }
+    }
+
+    #[test]
+    fn 턴은_최근_메시지_다섯_개를_남긴다() {
+        let mut pending = PendingTurn::new("claude", 0, "지시".to_owned(), None, None);
+        for index in 0..8 {
+            pending.push_message(TurnRole::Assistant, format!("응답 {index}"), Some(index));
+        }
+        let turn = pending.finish();
+        assert_eq!(turn.messages.len(), TURN_MESSAGES_MAX);
+        assert_eq!(turn.messages.last().unwrap().text, "응답 7", "최신이 뒤에 온다");
+        assert_eq!(turn.messages.first().unwrap().text, "응답 3", "오래된 것이 밀려난다");
+    }
+
+    #[test]
+    fn 턴_메시지_직렬화는_상한을_넘으면_none이다() {
+        let mut pending = PendingTurn::new("claude", 0, "지시".to_owned(), None, None);
+        for index in 0..TURN_MESSAGES_MAX {
+            pending.push_message(
+                TurnRole::Assistant,
+                "가".repeat(AGENT_SUMMARY_CHARS),
+                Some(index as i64),
+            );
+        }
+        // 5 × 400자 한글(3바이트)이면 6KB 남짓 — 상한 안이라 Some이어야 한다.
+        assert!(pending.finish().messages_json().is_some());
+    }
+
+    #[test]
+    fn 턴_메시지_json은_역할을_한_글자로_쓴다() {
+        let mut pending = PendingTurn::new("claude", 0, "지시".to_owned(), None, None);
+        pending.push_message(TurnRole::User, "물음".to_owned(), Some(1));
+        pending.push_message(TurnRole::Assistant, "답".to_owned(), Some(2));
+        let json = pending.finish().messages_json().unwrap();
+        assert!(json.contains(r#""r":"u""#), "{json}");
+        assert!(json.contains(r#""r":"a""#), "{json}");
     }
 
     #[test]

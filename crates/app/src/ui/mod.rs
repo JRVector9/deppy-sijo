@@ -16,6 +16,7 @@ pub mod env_project_list;
 pub mod file_drop;
 pub mod file_tree;
 pub mod fleet;
+pub mod git_panel;
 pub mod inbox_approvals;
 pub mod inbox_waiting;
 pub mod notes;

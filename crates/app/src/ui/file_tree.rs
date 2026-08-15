@@ -294,7 +294,15 @@ pub enum SidebarAction {
     OpenAgents,
     OpenSettings,
     OpenHelp,
-    ShowFocusedDiff,
+    /// Git 패널 새로고침 — App이 스냅샷 수집 IO를 스케줄한다.
+    GitPanelRefresh,
+    /// Git 패널의 upstream 브랜치를 GitHub에서 연다 (URL 구성은 App).
+    GitPanelOpenRemote,
+    /// Git 패널 행 클릭 — 메인 영역에 파일 diff를 연다.
+    ShowFileDiff {
+        rel_path: String,
+        mode: crate::ui::diff_viewer::DiffMode,
+    },
     /// 메모 본문이 바뀌었다. App이 디바운스해 DB에 쓴다(leaf는 IO를 하지 않는다).
     NoteEdited(String),
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
@@ -338,10 +346,10 @@ pub enum SidebarAction {
     ClosePane {
         pane: runtime::MuxPaneId,
     },
-    /// 이 세션 cwd 레포의 변경분(diff)을 본다 (「변경 보기」 메뉴).
-    ShowDiff {
-        session: runtime::SessionId,
-    },
+    /// 사이드바 Git 탭으로 이동해 변경분(diff)을 본다 (「변경 보기」 메뉴). 대상은
+    /// 포커스 세션 기준으로 App이 고른다 — 2026-08-15부터 세션별 payload가 없다
+    /// (Task 10 Step 9).
+    ShowDiff,
     /// 이 세션 레포의 새 git worktree를 만들고 그 폴더에서 셸을 연다 (PR-W).
     NewWorktreeCell {
         session: runtime::SessionId,
@@ -391,8 +399,9 @@ fn sidebar_tool_label_key(tool: SidebarTool) -> &'static str {
 /// `Some`은 "다른 화면에 작용한다"는 뜻이다.
 fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
     match tool {
-        SidebarTool::Files | SidebarTool::Notes => None,
-        SidebarTool::Git => Some(SidebarAction::ShowFocusedDiff),
+        // Git은 2026-08-15부터 인라인 탭 — 본문을 git 패널로 교체한다(스펙 §1).
+        // 이전의 ShowFocusedDiff(플로팅 창)는 은퇴.
+        SidebarTool::Files | SidebarTool::Notes | SidebarTool::Git => None,
     }
 }
 
@@ -949,6 +958,9 @@ pub struct FileTreeUi {
     selected_tool: SidebarTool,
     /// 메모 탭 편집 상태. leaf라 DB를 만지지 않고 편집만 소유한다.
     notes: super::notes::NotesUi,
+    /// Git 탭 편집 상태 — 읽기 전용 orca 스타일 패널. leaf라 git도 IO도 직접 하지
+    /// 않는다(App이 수집해 `git_panel_set_snapshot`으로 밀어넣는다, 2026-08-15).
+    git_panel: super::git_panel::GitPanelUi,
     /// workspace 루트. None = path 미설정 → 안내 표시(§9-2).
     root: Option<PathBuf>,
     /// 루트 나열 실패 사유 (invalid root — 에러 라벨 + 트리 비활성, §9-2).
@@ -1060,6 +1072,7 @@ impl FileTreeUi {
             collapsed: false,
             selected_tool: SidebarTool::Files,
             notes: super::notes::NotesUi::new(),
+            git_panel: super::git_panel::GitPanelUi::default(),
             sidebar_width: 200.0,
             navigation_rail_width: crate::ui::designall::NAV_RAIL_WIDTH,
             service_statuses: RailServiceStatus::defaults(),
@@ -1658,6 +1671,30 @@ impl FileTreeUi {
         self.notes.apply_external_edit(workspace_id, body);
     }
 
+    /// App이 스냅샷 수집 IO를 보내기 직전에 부른다 — leaf는 IO를 하지 않는다.
+    pub fn git_panel_set_loading(&mut self) {
+        self.git_panel.set_loading();
+    }
+
+    /// App이 수집 완료를 밀어넣는다 (leaf는 IO를 하지 않는다).
+    pub fn git_panel_set_snapshot(
+        &mut self,
+        result: Result<super::git_panel::GitPanelSnapshot, super::git_panel::GitPanelErrorCode>,
+    ) {
+        self.git_panel.set_snapshot(result);
+    }
+
+    /// 사이드바 Git 탭을 선택한다 — 세션 컨텍스트 메뉴 「변경 보기」 등 기존 diff
+    /// 진입점이 여기로 라우팅한다(2026-08-15, Task 10 Step 9).
+    pub fn select_git_tool(&mut self) {
+        self.selected_tool = SidebarTool::Git;
+    }
+
+    /// git 패널의 ↗ 대상 — (remote_https_base, branch). App이 URL 구성에 쓴다.
+    pub fn git_panel_remote_target(&self) -> Option<(String, String)> {
+        self.git_panel.remote_target()
+    }
+
     pub fn panel(
         &mut self,
         ui: &mut egui::Ui,
@@ -2221,7 +2258,8 @@ impl FileTreeUi {
                                                             );
                                                                 ui.close();
                                                             }
-                                                                    // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
+                                                                    // 변경 보기 — 사이드바 Git 탭으로 이동한다(PR-D,
+                                                                    // 2026-08-15부터 포커스 세션 기준 패널로 수렴 — Task 10 Step 9).
                                                                     if ui
                                                                 .button(catalog.t(
                                                                     "sidebar.menu.show_diff",
@@ -2229,10 +2267,7 @@ impl FileTreeUi {
                                                                 ))
                                                                 .clicked()
                                                             {
-                                                                action =
-                                                                    Some(SidebarAction::ShowDiff {
-                                                                        session,
-                                                                    });
+                                                                action = Some(SidebarAction::ShowDiff);
                                                                 ui.close();
                                                             }
                                                                     // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
@@ -2496,6 +2531,10 @@ impl FileTreeUi {
                     // 인라인 탭 — 본문을 바꾼다. 메모로 들어가면 커서를 바로 잡는다.
                     None => {
                         self.selected_tool = *tool;
+                        if *tool == SidebarTool::Git {
+                            // Git 탭 선택 직후 최신화 — 스펙 §3 갱신 시점(2026-08-15).
+                            action = Some(SidebarAction::GitPanelRefresh);
+                        }
                         if *tool == SidebarTool::Notes {
                             self.notes.request_focus();
                         }
@@ -2531,6 +2570,22 @@ impl FileTreeUi {
             );
             if let Some(super::notes::NotesAction::Edited(body)) = note_action {
                 action = Some(SidebarAction::NoteEdited(body));
+            }
+            return action;
+        }
+
+        // Git 탭도 본문을 통째로 쓴다 — Notes와 같은 인라인 패턴(2026-08-15 스펙 §1).
+        if self.selected_tool == SidebarTool::Git {
+            if let Some(git_action) = self.git_panel.render(ui, catalog) {
+                action = Some(match git_action {
+                    super::git_panel::GitPanelAction::Refresh => SidebarAction::GitPanelRefresh,
+                    super::git_panel::GitPanelAction::OpenRemoteBranch => {
+                        SidebarAction::GitPanelOpenRemote
+                    }
+                    super::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode } => {
+                        SidebarAction::ShowFileDiff { rel_path, mode }
+                    }
+                });
             }
             return action;
         }
@@ -6767,19 +6822,18 @@ mod tests {
     }
 
     #[test]
-    fn designall_사이드바도구는_기존기능으로만_연결된다() {
+    fn designall_사이드바도구는_전부_인라인_탭이다() {
         assert_eq!(
             SIDEBAR_TOOLS,
             [SidebarTool::Files, SidebarTool::Git, SidebarTool::Notes]
         );
-        // 인라인 탭은 액션이 없다 — 탭 선택만 바꾼다.
+        // 셋 다 본문을 교체하는 인라인 탭이다 — 액션 없이 탭 선택만 바뀐다. Git은
+        // 2026-08-15부터 플로팅 diff 창(ShowFocusedDiff) 대신 본문을 git 패널로
+        // 교체하는 쪽으로 바뀌었다(스펙 §1) — 탭 클릭 자체는 selected_tool==Git만
+        // 세우고, 새로고침 intent는 조건부로 별도 배선한다(panel() 호출부).
         assert!(sidebar_tool_action(SidebarTool::Files).is_none());
         assert!(sidebar_tool_action(SidebarTool::Notes).is_none());
-        // 다른 화면에 작용하는 탭만 액션을 낸다.
-        assert!(matches!(
-            sidebar_tool_action(SidebarTool::Git),
-            Some(SidebarAction::ShowFocusedDiff)
-        ));
+        assert!(sidebar_tool_action(SidebarTool::Git).is_none());
     }
 
     #[test]

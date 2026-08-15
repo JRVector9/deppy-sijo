@@ -9870,8 +9870,15 @@ mod tests {
 
         assert!(harness.query_by_label("Files").is_some());
         assert!(harness.query_by_label("Notes").is_some());
-        // Git은 2026-08-15 2차에서 레일로 옮겼다 — 사이드바 도구 탭에는 더 이상 없다.
-        assert!(harness.query_by_label("Git").is_none());
+        // Git은 2026-08-15 2차에서 레일로 옮겼다(스펙 §8-1). 이 하네스는 레일까지 같이
+        // 그리므로 "Git 라벨이 아예 없다"로는 확인할 수 없다 — **도구 탭 줄에는 없고
+        // 레일에만 있다**를 좌표로 고정한다.
+        let files_rect = harness.get_by_label("Files").rect();
+        let git_rect = harness.get_by_label("Git").rect();
+        assert!(
+            git_rect.right() <= files_rect.left(),
+            "Git이 도구 탭 줄에 남아 있다 — 레일(좌측)에만 있어야 한다: git={git_rect:?} files={files_rect:?}"
+        );
         // MCP 탭은 뺐다(2026-08-10) — 혼자 설정(별도 OS 창)을 열어 레벨이 달랐다.
         // 연결 설정은 설정 → 관리 → 「연결」이 계속 담당한다.
         assert!(harness.query_by_label("MCP").is_none());

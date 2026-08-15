@@ -7882,11 +7882,19 @@ pub struct App {
     git_panel_ui: ui::git_panel::GitPanelUi,
     /// 이력과 같은 보조 UI 탭 상태 기계 — runtime의 mux 탭/pane과 무관하다.
     git_tab: ui::workspace::PaneAuxTabState,
+    /// Git 본문 좌(목록)/우(diff) 분할 폭 — 사용자가 구분선을 한 번도 안 끌었으면
+    /// `None`(자동 계산), 끌고 나면 `Some(px)`로 그 값을 기억한다. 이력과는 따로 기억한다
+    /// (2026-08-16 사용자: 가로 폭을 조절할 수 없다). 재시작 시 유지하지 않는다(사이드바
+    /// 폭도 그렇다).
+    git_tab_split_width: Option<f32>,
     work_history_ui: ui::work_history::WorkHistoryUi,
     /// 이력은 전역 중앙 페이지가 아니라 현재 세션 pane 헤더 옆의 **보조 UI 탭**이다.
     /// 이 상태는 runtime의 mux 탭/pane과 무관하다 — 열고 닫아도 PTY·세션은 그대로다
     /// (2026-08-14 사용자: 터미널 전체가 다른 페이지로 바뀌는 방식은 원하지 않는다).
     work_history_tab: ui::workspace::PaneAuxTabState,
+    /// 이력 본문 좌(카드)/우(원문) 분할 폭 — `git_tab_split_width`와 같은 규칙, Git과는
+    /// 따로 기억한다.
+    work_history_tab_split_width: Option<f32>,
     work_history_rows: Vec<storage::AgentWorkTurnRow>,
     work_history_workspace_id: Option<String>,
     work_history_loading: bool,
@@ -8771,6 +8779,23 @@ fn history_tab_list_width(body_width: f32) -> f32 {
     const FIXED: f32 = 360.0;
     const MIN: f32 = 220.0;
     (body_width * 0.4).clamp(MIN, FIXED)
+}
+
+/// 이력·Git 우측 상세(원문/diff)가 완전히 가려지지 않게 남겨두는 최소 폭 — 사용자가
+/// 구분선을 끝까지 끌어도 상세가 0폭이 되면 안 된다(2026-08-16 사용자 보고: 우측이
+/// 잘려 읽기 힘들다).
+const AUX_DETAIL_MIN_WIDTH: f32 = 240.0;
+
+/// 이력·Git 본문의 좌우 분할 폭 — 사용자가 구분선을 끌기 전(`stored: None`)에는 `auto`
+/// (`git_tab_list_width`/`history_tab_list_width`가 계산한 기존 자동값)를 쓰고, 한 번
+/// 끌고 나면(`Some(px)`) 그 값을 쓴다. 매 프레임 좌측 최소(`min_list`)·우측 최소
+/// (`AUX_DETAIL_MIN_WIDTH`)로 다시 clamp해, 저장된 폭이 이전 프레임 창 크기 기준이어도
+/// 창을 줄였다 늘렸을 때 항상 유효한 값이 나온다.
+fn aux_split_width(stored: Option<f32>, auto: f32, body_width: f32, min_list: f32) -> f32 {
+    let requested = stored.unwrap_or(auto);
+    let upper = (body_width - AUX_DETAIL_MIN_WIDTH).max(0.0);
+    let lower = min_list.min(upper);
+    requested.clamp(lower, upper)
 }
 
 enum AppHostIoAction {
@@ -11692,8 +11717,10 @@ impl App {
             git_panel_generation: 0,
             git_panel_ui: ui::git_panel::GitPanelUi::default(),
             git_tab: ui::workspace::PaneAuxTabState::default(),
+            git_tab_split_width: None,
             work_history_ui: ui::work_history::WorkHistoryUi::new(),
             work_history_tab: ui::workspace::PaneAuxTabState::default(),
+            work_history_tab_split_width: None,
             work_history_rows: Vec::new(),
             work_history_workspace_id: None,
             work_history_loading: false,
@@ -14358,7 +14385,14 @@ impl App {
         current_branch: Option<&str>,
         text: &i18n::Catalog,
     ) -> Option<ui::work_history::WorkHistoryAction> {
-        let list_width = history_tab_list_width(body.width());
+        let auto_list_width = history_tab_list_width(body.width());
+        // 220.0 = history_tab_list_width의 MIN과 같은 값(카드 목록 좌측 최소 폭).
+        let list_width = aux_split_width(
+            self.work_history_tab_split_width,
+            auto_list_width,
+            body.width(),
+            220.0,
+        );
         let (list_rect, transcript_rect) = body.split_left_right_at_x(body.left() + list_width);
 
         let mut child = ui.new_child(
@@ -14388,8 +14422,45 @@ impl App {
             text,
         );
 
-        // 목록/원문 경계 세로 구분선 — git 패널과 같은 관례(render_git_tab_body 참고).
-        let separator = ui::designall::separator_stroke(ui.visuals());
+        // 목록/원문 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
+        // 조절할 수 없다). 드래그 누적은 cross-workspace 분할선과 같은 패턴이다 —
+        // `drag_started()`에서 시작 폭을 `ctx.data_mut`에 저장하고 `total_drag_delta()`로
+        // 시작 폭 기준 절대 계산한다(`primary_divider_requested_width` 참고: 매 프레임
+        // `pointer.delta()`를 누적하면 드리프트가 생긴다).
+        let divider_hit_rect = egui::Rect::from_min_max(
+            egui::pos2(list_rect.right() - 3.0, body.top()),
+            egui::pos2(list_rect.right() + 3.0, body.bottom()),
+        );
+        let resize_id = ui.id().with("work_history_tab_split_resize");
+        let resize_response = ui
+            .interact(divider_hit_rect, resize_id, egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        let resize_start_id = resize_id.with("drag_start_width");
+        if resize_response.drag_started() {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(resize_start_id, list_width));
+        }
+        if let Some(total_drag_delta) = resize_response.total_drag_delta() {
+            let start_width = ui
+                .ctx()
+                .data(|data| data.get_temp::<f32>(resize_start_id))
+                .unwrap_or(list_width);
+            self.work_history_tab_split_width = Some(start_width + total_drag_delta.x);
+            ui.ctx().request_repaint();
+        }
+        if resize_response.drag_stopped() {
+            ui.ctx()
+                .data_mut(|data| data.remove::<f32>(resize_start_id));
+        }
+        // 구분선 색 — 기본은 designall::separator_stroke, hover/drag는 사이드바 리사이즈와
+        // 같은 규칙(file_tree.rs의 file_tree_sidebar_resize 참고).
+        let separator = if resize_response.dragged() {
+            ui.visuals().widgets.active.bg_stroke
+        } else if resize_response.hovered() {
+            ui.visuals().widgets.hovered.bg_stroke
+        } else {
+            ui::designall::separator_stroke(ui.visuals())
+        };
         let ppp = ui.ctx().pixels_per_point();
         let sep_x = ui::snap_line_to_pixel(
             ui::designall::panel_edge_separator_x(list_rect.right(), ppp),
@@ -14417,7 +14488,10 @@ impl App {
         body: egui::Rect,
         text: &i18n::Catalog,
     ) -> Option<ui::git_panel::GitPanelAction> {
-        let list_width = git_tab_list_width(body.width());
+        let auto_list_width = git_tab_list_width(body.width());
+        // 180.0 = git_tab_list_width의 MIN과 같은 값(파일 목록 좌측 최소 폭).
+        let list_width =
+            aux_split_width(self.git_tab_split_width, auto_list_width, body.width(), 180.0);
         let (list_rect, diff_rect) = body.split_left_right_at_x(body.left() + list_width);
 
         let mut list = ui.new_child(
@@ -14426,9 +14500,45 @@ impl App {
         list.set_clip_rect(list_rect.intersect(ui.clip_rect()));
         let action = self.git_panel_ui.render(&mut list, text);
 
-        // 목록/diff 경계 세로 구분선 — 상단바 세로선과 같은 관례
-        // (designall::panel_edge_separator_x, app.rs 상단바 배선 참고).
-        let separator = ui::designall::separator_stroke(ui.visuals());
+        // 목록/diff 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
+        // 조절할 수 없다). 드래그 누적은 cross-workspace 분할선과 같은 패턴이다 —
+        // `drag_started()`에서 시작 폭을 `ctx.data_mut`에 저장하고 `total_drag_delta()`로
+        // 시작 폭 기준 절대 계산한다(`primary_divider_requested_width` 참고: 매 프레임
+        // `pointer.delta()`를 누적하면 드리프트가 생긴다).
+        let divider_hit_rect = egui::Rect::from_min_max(
+            egui::pos2(list_rect.right() - 3.0, body.top()),
+            egui::pos2(list_rect.right() + 3.0, body.bottom()),
+        );
+        let resize_id = ui.id().with("git_tab_split_resize");
+        let resize_response = ui
+            .interact(divider_hit_rect, resize_id, egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        let resize_start_id = resize_id.with("drag_start_width");
+        if resize_response.drag_started() {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(resize_start_id, list_width));
+        }
+        if let Some(total_drag_delta) = resize_response.total_drag_delta() {
+            let start_width = ui
+                .ctx()
+                .data(|data| data.get_temp::<f32>(resize_start_id))
+                .unwrap_or(list_width);
+            self.git_tab_split_width = Some(start_width + total_drag_delta.x);
+            ui.ctx().request_repaint();
+        }
+        if resize_response.drag_stopped() {
+            ui.ctx()
+                .data_mut(|data| data.remove::<f32>(resize_start_id));
+        }
+        // 구분선 색 — 기본은 designall::separator_stroke, hover/drag는 사이드바 리사이즈와
+        // 같은 규칙(file_tree.rs의 file_tree_sidebar_resize 참고).
+        let separator = if resize_response.dragged() {
+            ui.visuals().widgets.active.bg_stroke
+        } else if resize_response.hovered() {
+            ui.visuals().widgets.hovered.bg_stroke
+        } else {
+            ui::designall::separator_stroke(ui.visuals())
+        };
         let ppp = ui.ctx().pixels_per_point();
         let sep_x = ui::snap_line_to_pixel(
             ui::designall::panel_edge_separator_x(list_rect.right(), ppp),
@@ -30841,6 +30951,84 @@ mod tests {
         assert_eq!(history_tab_list_width(1400.0), 360.0);
         assert_eq!(history_tab_list_width(700.0), 280.0, "좁으면 40%");
         assert_eq!(history_tab_list_width(400.0), 220.0, "최소 폭 밑으로는 안 내려간다");
+    }
+
+    /// 사용자가 구분선을 한 번도 안 끌었으면(`stored: None`) 기존 자동 계산값을 그대로
+    /// 쓴다(2026-08-16 사용자: 가로 폭을 조절할 수 없다 — 드래그 기능 추가).
+    #[test]
+    fn aux_split_width는_저장값_없으면_자동_계산값을_쓴다() {
+        let auto = git_tab_list_width(1200.0);
+        assert_eq!(aux_split_width(None, auto, 1200.0, 180.0), 300.0);
+    }
+
+    /// 한 번 끌고 나면(`Some(px)`) 자동 계산값 대신 저장된 값을 쓴다.
+    #[test]
+    fn aux_split_width는_저장값_있으면_그_값을_쓴다() {
+        let auto = git_tab_list_width(1200.0);
+        assert_eq!(aux_split_width(Some(250.0), auto, 1200.0, 180.0), 250.0);
+    }
+
+    /// 저장값이 좌측 최소 밑이거나 우측 최소(`AUX_DETAIL_MIN_WIDTH`)를 침범하면 매
+    /// 프레임 다시 clamp한다 — 상세(diff/원문)가 0폭이 되면 안 된다.
+    #[test]
+    fn aux_split_width는_좌우_최소_폭으로_clamp한다() {
+        let auto = git_tab_list_width(1200.0);
+        assert_eq!(
+            aux_split_width(Some(50.0), auto, 1200.0, 180.0),
+            180.0,
+            "좌측 최소 밑으로는 안 내려간다"
+        );
+        assert_eq!(
+            aux_split_width(Some(2000.0), auto, 1200.0, 180.0),
+            1200.0 - AUX_DETAIL_MIN_WIDTH,
+            "우측 최소를 침범하지 않는다"
+        );
+    }
+
+    /// 창이 아주 좁아 좌우 최소를 동시에 만족 못 해도(180 + 240 > 300) 항상
+    /// `0..=body_width` 범위의 유효한 값이 나온다 — 창을 줄였다 늘려도 값이 안 망가진다.
+    #[test]
+    fn aux_split_width는_창이_아주_좁아도_유효한_값을_돌려준다() {
+        let auto = history_tab_list_width(300.0);
+        let width = aux_split_width(Some(9999.0), auto, 300.0, 220.0);
+        assert!((0.0..=300.0).contains(&width), "값: {width}");
+        assert_eq!(width, 300.0 - AUX_DETAIL_MIN_WIDTH);
+
+        let width = aux_split_width(None, auto, 0.0, 220.0);
+        assert_eq!(width, 0.0, "창 폭이 0이어도 패닉 없이 0을 돌려준다");
+    }
+
+    /// Git 본문 구분선의 드래그 누적이 `total_drag_delta()` 기반인지 고정한다 —
+    /// `drag_delta().x`를 매 프레임 더하면 드리프트가 생긴다(cross-workspace 분할선의
+    /// `primary_resize` 테스트와 같은 형태, `primary_divider_requested_width` 참고).
+    #[test]
+    fn git_tab_divider는_total_drag_delta_기반으로_폭을_누적한다() {
+        let source = include_str!("app.rs");
+        let divider = source
+            .split_once("let resize_id = ui.id().with(\"git_tab_split_resize\")")
+            .unwrap()
+            .1
+            .split_once("let mut detail = ui.new_child(")
+            .unwrap()
+            .0;
+        assert!(divider.contains("resize_response.total_drag_delta()"));
+        assert!(!divider.contains("resize_response.drag_delta().x"));
+    }
+
+    /// 이력 본문 구분선도 같은 계약 — `git_tab_divider는_total_drag_delta_기반으로_폭을_누적한다`
+    /// 참고.
+    #[test]
+    fn history_tab_divider는_total_drag_delta_기반으로_폭을_누적한다() {
+        let source = include_str!("app.rs");
+        let divider = source
+            .split_once("let resize_id = ui.id().with(\"work_history_tab_split_resize\")")
+            .unwrap()
+            .1
+            .split_once("let mut transcript = ui.new_child(")
+            .unwrap()
+            .0;
+        assert!(divider.contains("resize_response.total_drag_delta()"));
+        assert!(!divider.contains("resize_response.drag_delta().x"));
     }
 
     /// 「원문 보기」는 사용자 클릭이다. git 패널 IO와 capacity-1 슬롯을 공유하는데,

@@ -31,6 +31,11 @@ pub struct TranscriptViewerUi {
     /// 이번 대화가 열린 뒤 아직 적용하지 않은 스크롤 목표(강조 시작 인덱스). `render`가
     /// 한 프레임 소비하면 비운다 — 이후 프레임은 사용자가 스크롤해도 되돌리지 않는다.
     pending_scroll_to: Option<usize>,
+    /// `messages` 전체를 `estimate_message_lines`로 훑어 얻는 평균 줄 수(`average_lines`).
+    /// 대화는 `set_conversation`에서만 바뀌므로 거기서 한 번만 계산해 캐싱한다 — `render`가
+    /// 매 프레임 최대 200개·1MB 메시지를 다시 훑지 않게 한다. `render`는 이 값에 그
+    /// 프레임의 `line_height`만 곱해 쓴다(O(1)).
+    cached_avg_lines: f32,
 }
 
 impl TranscriptViewerUi {
@@ -57,8 +62,9 @@ impl TranscriptViewerUi {
         self.focus_range = None;
         self.focus_missing = false;
         self.pending_scroll_to = None;
+        self.cached_avg_lines = result.as_ref().map_or(1.0, |conversation| average_lines(&conversation.messages));
         if let (Some(offset), Ok(conversation)) = (focus_offset, result.as_ref()) {
-            match focus_range(&conversation.messages, offset) {
+            match focus_range(&conversation.messages, conversation.truncated, offset) {
                 Some(range) => {
                     self.pending_scroll_to = Some(range.start);
                     self.focus_range = Some(range);
@@ -109,7 +115,7 @@ impl TranscriptViewerUi {
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let line_height = ui.text_style_height(&egui::TextStyle::Body);
         let messages = &conversation.messages;
-        let row_height = average_row_height(messages, line_height);
+        let row_height = average_row_height(self.cached_avg_lines, line_height);
 
         // 스티키 하단: 강조할 턴이 없을 때(처음 열 때, 또는 그 턴을 못 찾았을 때)
         // 최신 메시지가 보이는 맨 아래에서 시작한다. 강조할 턴이 있으면 그 시작
@@ -200,13 +206,24 @@ fn role_background(
 
 /// 강조할 메시지 인덱스 범위(스펙 §6-3). 찾지 못하면 `None`.
 ///
-/// 시작은 `offset >= focus_offset`인 **첫** 메시지 — 정확히 일치하는 것이 정상이지만,
-/// 턴을 연 줄이 노이즈 규칙으로 걸러졌을 수 있어 부등호로 잡는다. 끝은 시작 다음에
-/// 오는 **첫 User 메시지 직전**(그게 다음 턴의 시작이다) — 없으면 대화 끝까지.
+/// `truncated`(스냅샷이 파일 시작을 못 담았다)이고 `focus_offset`이 창의 **첫**
+/// 메시지 offset보다 앞이면 그 턴은 창 밖(더 앞)으로 밀려난 것이다 — 이때
+/// `offset >= focus_offset`을 그대로 적용하면 가장 오래된(하지만 엉뚱한) 메시지에
+/// 걸려 버리므로 먼저 `None`으로 끊는다. 잘리지 않았다면(파일 전체가 창 안) 이
+/// 관용을 적용하지 않는다.
+///
+/// 그 관문을 통과하면 시작은 `offset >= focus_offset`인 **첫** 메시지 — 정확히
+/// 일치하는 것이 정상이지만, 턴을 연 줄이 노이즈 규칙으로 걸러졌을 수 있어
+/// 부등호로 잡는다. 끝은 시작 다음에 오는 **첫 User 메시지 직전**(그게 다음
+/// 턴의 시작이다) — 없으면 대화 끝까지.
 fn focus_range(
     messages: &[crate::agent_transcript::ConversationMessage],
+    truncated: bool,
     focus_offset: u64,
 ) -> Option<std::ops::Range<usize>> {
+    if truncated && messages.first().is_some_and(|first| focus_offset < first.offset) {
+        return None;
+    }
     let start = messages.iter().position(|m| m.offset >= focus_offset)?;
     let end = messages[start + 1..]
         .iter()
@@ -225,15 +242,21 @@ fn estimate_message_lines(text: &str) -> usize {
     1 + body_lines.max(1)
 }
 
-/// `show_rows`에 넘길 단일 행 높이 — 대화 전체 메시지의 평균 추정 줄 수.
-/// `show_rows`는 모든 행에 같은 높이를 가정하므로(egui 0.35 API), 메시지마다
-/// 실제 높이가 달라도 평균으로 근사한다 — 가상화의 통상 트레이드오프다.
-fn average_row_height(messages: &[crate::agent_transcript::ConversationMessage], line_height: f32) -> f32 {
+/// 대화 전체 메시지의 평균 추정 줄 수 — `messages`를 훑는 O(n) 비용은 여기에만
+/// 있다. `set_conversation`이 대화가 바뀔 때 한 번만 불러 `cached_avg_lines`에
+/// 담아 두고, `render`는 매 프레임 이 값을 다시 계산하지 않는다.
+fn average_lines(messages: &[crate::agent_transcript::ConversationMessage]) -> f32 {
     if messages.is_empty() {
-        return line_height + MESSAGE_ROW_EXTRA;
+        return 1.0;
     }
     let total_lines: usize = messages.iter().map(|m| estimate_message_lines(&m.text)).sum();
-    let avg_lines = total_lines as f32 / messages.len() as f32;
+    total_lines as f32 / messages.len() as f32
+}
+
+/// `show_rows`에 넘길 단일 행 높이 — 평균 추정 줄 수(`average_lines`)에 이번 프레임의
+/// `line_height`를 곱한다. `show_rows`는 모든 행에 같은 높이를 가정하므로(egui 0.35
+/// API), 메시지마다 실제 높이가 달라도 평균으로 근사한다 — 가상화의 통상 트레이드오프다.
+fn average_row_height(avg_lines: f32, line_height: f32) -> f32 {
     avg_lines * line_height + MESSAGE_ROW_EXTRA
 }
 
@@ -410,7 +433,7 @@ mod tests {
 
     #[test]
     fn 평균_행_높이는_메시지가_없으면_한_줄_높이다() {
-        assert_eq!(average_row_height(&[], 20.0), 20.0 + MESSAGE_ROW_EXTRA);
+        assert_eq!(average_row_height(average_lines(&[]), 20.0), 20.0 + MESSAGE_ROW_EXTRA);
     }
 
     #[test]
@@ -421,8 +444,8 @@ mod tests {
             &"가".repeat(ROW_CHARS_ESTIMATE * 10),
             100,
         );
-        let short_only = average_row_height(std::slice::from_ref(&short), 20.0);
-        let mixed = average_row_height(&[short, long], 20.0);
+        let short_only = average_row_height(average_lines(std::slice::from_ref(&short)), 20.0);
+        let mixed = average_row_height(average_lines(&[short, long]), 20.0);
         assert!(mixed > short_only, "긴 메시지가 섞이면 평균 높이가 커져야 한다");
     }
 
@@ -459,25 +482,33 @@ mod tests {
             message(crate::agent_transcript::ConversationRole::User, "턴2 지시", 200),
             message(crate::agent_transcript::ConversationRole::Assistant, "턴2 답", 300),
         ];
-        assert_eq!(focus_range(&messages, 0), Some(0..2), "다음 User 직전까지");
-        assert_eq!(focus_range(&messages, 200), Some(2..4), "마지막 턴은 끝까지");
+        assert_eq!(focus_range(&messages, false, 0), Some(0..2), "다음 User 직전까지");
+        assert_eq!(focus_range(&messages, false, 200), Some(2..4), "마지막 턴은 끝까지");
     }
 
     #[test]
     fn 초점_범위는_정확히_일치하지_않아도_다음_메시지를_잡는다() {
-        // 턴을 연 줄이 노이즈 규칙으로 걸러졌을 수 있다 — 부등호로 잡는다.
+        // 턴을 연 줄이 노이즈 규칙으로 걸러졌을 수 있다 — 부등호로 잡는다. 잘리지
+        // 않았다면(파일 전체가 창 안) 이 관용을 적용하는 게 옳다.
         let messages = vec![
             message(crate::agent_transcript::ConversationRole::User, "턴1", 0),
             message(crate::agent_transcript::ConversationRole::User, "턴2", 200),
         ];
-        assert_eq!(focus_range(&messages, 150), Some(1..2));
+        assert_eq!(focus_range(&messages, false, 150), Some(1..2));
     }
 
     #[test]
     fn 창_밖의_턴은_초점을_잡지_못한다() {
         let messages = vec![message(crate::agent_transcript::ConversationRole::User, "최근", 900)];
-        assert_eq!(focus_range(&messages, 100), Some(0..1), "뒤쪽은 잡는다");
-        assert_eq!(focus_range(&messages, 1_000), None, "그보다 뒤는 없다");
+        // 잘리지 않았다면(파일 전체가 창 안) `offset >= focus_offset`으로 뒤쪽
+        // 메시지를 잡는 게 옳다 — 턴을 연 줄이 노이즈 규칙으로 걸러졌을 수 있어서다.
+        assert_eq!(focus_range(&messages, false, 100), Some(0..1), "안 잘렸으면 뒤쪽을 잡는다");
+        assert_eq!(focus_range(&messages, false, 1_000), None, "그보다 뒤는 없다");
+        // 잘렸다면(스냅샷 창이 파일 시작을 못 담았다) `focus_offset`이 창의 첫
+        // 메시지보다 앞이라는 건 그 턴이 창 밖(더 앞)으로 밀려났다는 뜻이다 — 엉뚱한
+        // (더 최근) 메시지를 그 턴인 것처럼 강조하면 안 되므로 못 찾은 것으로 취급한다.
+        assert_eq!(focus_range(&messages, true, 100), None, "잘렸으면 창 앞의 턴은 못 찾는다");
+        assert_eq!(focus_range(&messages, true, 1_000), None, "그보다 뒤는 잘렸어도 여전히 없다");
     }
 
     #[test]

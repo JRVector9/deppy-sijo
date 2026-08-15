@@ -10984,7 +10984,10 @@ impl App {
             AppHostIoCompletion::Transcript { generation, result } => {
                 // stale(세대 불일치)은 조용히 버린다 — git 패널 IO와 같은 규칙.
                 if generation == self.transcript_generation {
-                    self.transcript_viewer_ui.set_conversation(result);
+                    // TODO(다음 Task): focus_offset을 AppHostIoCompletion::Transcript에
+                    // 실어 여기로 되돌려 받아야 한다 — 지금은 크레이트 컴파일을 위한
+                    // 최소 수정으로 None을 넘긴다(강조 없이 맨 아래에서 시작).
+                    self.transcript_viewer_ui.set_conversation(result, None);
                     self.egui_ctx.request_repaint();
                 }
             }
@@ -14543,9 +14546,11 @@ impl App {
                     return;
                 };
                 let Some(kind) = crate::agent_detect::kind_from_str(&row.kind) else {
-                    self.transcript_viewer_ui.set_conversation(Err(
-                        crate::agent_transcript::TranscriptViewError::NotFound,
-                    ));
+                    // 최소 수정: 크레이트 컴파일을 위해 None을 넘긴다(위 TODO와 같음).
+                    self.transcript_viewer_ui.set_conversation(
+                        Err(crate::agent_transcript::TranscriptViewError::NotFound),
+                        None,
+                    );
                     return;
                 };
                 let Some(path) = crate::agent_detect::transcript_path_for(
@@ -14553,9 +14558,11 @@ impl App {
                     &row.agent_session_id,
                     row.cwd.as_deref(),
                 ) else {
-                    self.transcript_viewer_ui.set_conversation(Err(
-                        crate::agent_transcript::TranscriptViewError::NotFound,
-                    ));
+                    // 최소 수정: 크레이트 컴파일을 위해 None을 넘긴다(위 TODO와 같음).
+                    self.transcript_viewer_ui.set_conversation(
+                        Err(crate::agent_transcript::TranscriptViewError::NotFound),
+                        None,
+                    );
                     return;
                 };
                 self.transcript_generation = self.transcript_generation.wrapping_add(1).max(1);

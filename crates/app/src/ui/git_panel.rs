@@ -236,6 +236,230 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
     })
 }
 
+/// 패널이 App에 요청하는 intent — leaf는 git도 뷰 전환도 직접 하지 않는다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitPanelAction {
+    Refresh,
+    /// upstream의 GitHub 브랜치 페이지 열기 — URL 구성은 App이 remote를 보고 한다.
+    OpenRemoteBranch,
+    ShowFileDiff { rel_path: String, mode: crate::ui::diff_viewer::DiffMode },
+}
+
+#[derive(Default)]
+pub struct GitPanelUi {
+    snapshot: Option<Result<GitPanelSnapshot, GitPanelErrorCode>>,
+    loading: bool,
+    changes_show_all: bool,
+    committed_show_all: bool,
+    changes_collapsed: bool,
+    committed_collapsed: bool,
+}
+
+impl GitPanelUi {
+    pub fn set_loading(&mut self) {
+        self.loading = true;
+    }
+
+    pub fn set_snapshot(&mut self, result: Result<GitPanelSnapshot, GitPanelErrorCode>) {
+        self.loading = false;
+        self.snapshot = Some(result);
+    }
+
+    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<GitPanelAction> {
+        // self.snapshot을 절제한다 — 아래에서 self.changes_collapsed 등을 동시에
+        // mut borrow해야 해서 Option<Result<..>>를 들고 있는 채로는 borrow가 충돌한다.
+        let snap = match self.snapshot.clone() {
+            None => {
+                ui.weak(catalog.t("diff.loading", &[]));
+                return if self.loading { None } else { Some(GitPanelAction::Refresh) };
+            }
+            Some(Err(GitPanelErrorCode::NoRepo)) => {
+                ui.weak(catalog.t("diff.no_cwd", &[]));
+                return None;
+            }
+            Some(Err(GitPanelErrorCode::CollectionFailed)) => {
+                ui.weak(catalog.t("git.error.snapshot", &[]));
+                return None;
+            }
+            Some(Ok(snap)) => snap,
+        };
+
+        let mut action = None;
+
+        // ── 헤더: 브랜치 / → upstream ↑a ↓b ↗ ──────────────────────────
+        ui.strong(&snap.branch);
+        ui.horizontal(|ui| {
+            match snap.upstream.as_deref() {
+                Some(upstream) => {
+                    ui.weak("→");
+                    ui.monospace(upstream);
+                    if snap.ahead > 0 {
+                        ui.colored_label(
+                            crate::ui::agent_visuals::status_color(
+                                crate::agent_surface::AgentVisualState::Complete,
+                            ),
+                            format!("↑{}", snap.ahead),
+                        );
+                    }
+                    if snap.behind > 0 {
+                        ui.colored_label(
+                            crate::ui::agent_visuals::status_color(
+                                crate::agent_surface::AgentVisualState::Error,
+                            ),
+                            format!("↓{}", snap.behind),
+                        );
+                    }
+                    // remote가 GitHub일 때만 보인다(스펙 §4 숨김 조건). 계획서 원안은
+                    // upstream만으로 항상 그렸는데, collect_snapshot이 이미
+                    // remote_https_base로 이 조건을 계산해 두므로 그걸 쓴다
+                    // (2026-08-15, Task 6 조정 — 타입 계약은 그대로, 렌더 조건만 보강).
+                    if snap.remote_https_base.is_some()
+                        && ui
+                            .small_button("↗")
+                            .on_hover_text(catalog.t("git.open_remote", &[]))
+                            .clicked()
+                    {
+                        action = Some(GitPanelAction::OpenRemoteBranch);
+                    }
+                }
+                None => {
+                    ui.weak(catalog.t("git.upstream_none", &[]));
+                }
+            }
+            if ui.small_button("⟳").on_hover_text(catalog.t("diff.refresh", &[])).clicked() {
+                action = Some(GitPanelAction::Refresh);
+            }
+        });
+        ui.separator();
+
+        // ── 섹션 2개 ─────────────────────────────────────────────────
+        let section = |ui: &mut egui::Ui,
+                        title_key: &str,
+                        rows: &[GitFileRow],
+                        collapsed: &mut bool,
+                        show_all: &mut bool,
+                        mode: crate::ui::diff_viewer::DiffMode,
+                        action: &mut Option<GitPanelAction>| {
+            ui.horizontal(|ui| {
+                let arrow = if *collapsed { "›" } else { "∨" };
+                if ui
+                    .selectable_label(
+                        false,
+                        format!("{arrow} {} {}", catalog.t(title_key, &[]), rows.len()),
+                    )
+                    .clicked()
+                {
+                    *collapsed = !*collapsed;
+                }
+                if !*collapsed && rows.len() > SECTION_COLLAPSED_ROWS {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = catalog.t("git.show_all", &[]);
+                        if ui.selectable_label(*show_all, label).clicked() {
+                            *show_all = !*show_all;
+                        }
+                    });
+                }
+            });
+            if *collapsed {
+                return;
+            }
+            let visible = if *show_all { rows.len() } else { rows.len().min(SECTION_COLLAPSED_ROWS) };
+            for row in &rows[..visible] {
+                let (name, dir) = split_row_path(&row.rel_path);
+                // 계획서 원안은 `ui.horizontal(..).response.interact(Sense::click())`로
+                // 행 전체를 클릭 가능하게 했는데, kittest로 돌려보면 자식 Label의
+                // 텍스트 자체를 클릭했을 때 부모로 새지 않는다 — egui는 포인터 아래
+                // "가장 안쪽" 위젯을 hit-test로 고르고, 그 위젯이 Sense::hover뿐이라도
+                // 부모로 폴백하지 않는다(빈 여백을 클릭하면 잡히는 것으로 실측
+                // 확인). 이 저장소는 이미 같은 문제를 겪었고(work_history.rs 카드/
+                // 헤더 토글, 커밋 0e934c0) `scope_builder(UiBuilder::sense(click))` +
+                // 명시적 `widget_info(Role::Button)`로 스코프 자체를 하나의 논리
+                // 위젯으로 만드는 패턴을 쓴다 — 그 관례로 맞춘다
+                // (2026-08-15, Task 6 Step 3 조정).
+                let toggle = ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .id_salt(("git-panel-row", title_key, row.rel_path.as_str()))
+                        .sense(egui::Sense::click()),
+                    |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(name);
+                            if !dir.is_empty() {
+                                ui.weak(dir);
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.monospace(row.status.to_string());
+                                if let Some(d) = row.dels.filter(|d| *d > 0) {
+                                    ui.colored_label(
+                                        crate::ui::agent_visuals::status_color(
+                                            crate::agent_surface::AgentVisualState::Error,
+                                        ),
+                                        format!("−{d}"),
+                                    );
+                                }
+                                if let Some(a) = row.adds.filter(|a| *a > 0) {
+                                    ui.colored_label(
+                                        crate::ui::agent_visuals::status_color(
+                                            crate::agent_surface::AgentVisualState::Complete,
+                                        ),
+                                        format!("+{a}"),
+                                    );
+                                }
+                            });
+                        });
+                    },
+                );
+                let response = toggle.response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                // 접근성 이름을 rel_path로 명시한다 — kittest가 Role::Button + 이
+                // 라벨로 행 전체(자식 Label이 아니라)를 정확히 겨냥할 수 있다.
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        ui.is_enabled(),
+                        row.rel_path.as_str(),
+                    )
+                });
+                if response.clicked() {
+                    *action = Some(GitPanelAction::ShowFileDiff { rel_path: row.rel_path.clone(), mode });
+                }
+            }
+        };
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if snap.changes.is_empty() && snap.committed.is_empty() {
+                ui.weak(catalog.t("diff.clean", &[]));
+                return;
+            }
+            section(
+                ui,
+                "git.section.changes",
+                &snap.changes,
+                &mut self.changes_collapsed,
+                &mut self.changes_show_all,
+                crate::ui::diff_viewer::DiffMode::Working,
+                &mut action,
+            );
+            if snap.changes_truncated {
+                ui.weak(catalog.t("diff.truncated", &[]));
+            }
+            ui.add_space(6.0);
+            section(
+                ui,
+                "git.section.committed",
+                &snap.committed,
+                &mut self.committed_collapsed,
+                &mut self.committed_show_all,
+                crate::ui::diff_viewer::DiffMode::Branch,
+                &mut action,
+            );
+            if snap.committed_truncated {
+                ui.weak(catalog.t("diff.truncated", &[]));
+            }
+        });
+        action
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +631,60 @@ mod tests {
         assert_eq!(normalize_github_remote("https://gitlab.com/foo/bar.git"), None);
         assert_eq!(normalize_github_remote("git@bitbucket.org:foo/bar.git"), None);
         assert_eq!(normalize_github_remote("/Users/t/tmp/some-local-repo"), None);
+    }
+
+    // 계획서 원안은 harness 통신에 `ui.ctx().memory_mut(..).insert_temp`와
+    // `get_by_label_contains`를 썼는데, 이 저장소의 기존 kittest 관례
+    // (fleet.rs `건너뛰기는_다음_항목을_히어로로_올린다`, workspace.rs의 `new_ui_state`
+    // 테스트들)는 렌더 결과를 State 구조체 필드에 담아 `harness.state()`로 읽는다.
+    // 관례 쪽이 정답이라 그 패턴으로 다시 썼다(2026-08-15, Task 6 Step 1 조정).
+    #[test]
+    fn kittest_행_클릭은_show_file_diff_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            panel: GitPanelUi,
+            action: Option<GitPanelAction>,
+        }
+
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![GitFileRow {
+                rel_path: "src/a.rs".into(),
+                status: 'M',
+                adds: Some(3),
+                dels: Some(1),
+            }],
+            ..Default::default()
+        }));
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut State| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                if let Some(action) = state.panel.render(ui, &catalog) {
+                    state.action = Some(action);
+                }
+            },
+            State { panel, action: None },
+        );
+        harness.run();
+        // 자식 Label("a.rs") 자체를 클릭하면 부모 스코프로 이벤트가 새지 않는다
+        // (egui hit-test는 포인터 아래 가장 안쪽 위젯을 고른다) — 그래서 행에
+        // 명시적으로 심어 둔 accessible 이름(Role::Button + rel_path)으로 행 전체를
+        // 겨냥한다. work_history.rs 카드 클릭 테스트와 같은 질의 방식(2026-08-15).
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "src/a.rs")
+            .click();
+        harness.run();
+
+        assert_eq!(
+            harness.state().action,
+            Some(GitPanelAction::ShowFileDiff {
+                rel_path: "src/a.rs".to_owned(),
+                mode: crate::ui::diff_viewer::DiffMode::Working,
+            }),
+            "변경 사항 행 클릭은 Working 모드 ShowFileDiff를 내야 한다"
+        );
     }
 }

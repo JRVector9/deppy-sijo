@@ -26,6 +26,7 @@ pub(crate) mod ports;
 pub mod prompt_palette;
 pub(crate) mod resource_manager;
 pub mod settings;
+pub mod transcript_viewer;
 pub mod work_history;
 pub mod workspace;
 

@@ -10,6 +10,8 @@ use std::time::Duration;
 pub const MAX_PANEL_FILES: usize = 512;
 /// 접힘 상태에서 섹션당 보여주는 행 수 — orca 스크린샷 기준 한 화면 분량.
 pub const SECTION_COLLAPSED_ROWS: usize = 10;
+/// 워크트리 목록 상한 — 목록은 사람이 훑는 것이라 32면 충분하고, 초과분은 잘림 표시만 한다.
+pub const MAX_WORKTREE_ROWS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitFileRow {
@@ -19,6 +21,18 @@ pub struct GitFileRow {
     /// None = 바이너리 또는 untracked(numstat 없음).
     pub adds: Option<u32>,
     pub dels: Option<u32>,
+}
+
+/// `git worktree list --porcelain` 한 항목. 클릭하면 App이 이 경로에서 셸을 연다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitWorktreeRow {
+    pub path: String,
+    /// 표시용 마지막 경로 요소. 경로가 루트라 요소가 없으면 경로 전체를 쓴다.
+    pub name: String,
+    /// None = detached HEAD.
+    pub branch: Option<String>,
+    /// 지금 보고 있는 워크트리(= snapshot.repo_root)인가.
+    pub current: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -42,6 +56,12 @@ pub struct GitPanelSnapshot {
     /// (Task 10 Step 7 소급 요구 — collect_snapshot에서 remote 조회 실패해도
     /// 스냅샷 전체를 죽이지 않고 None으로만 담는다.)
     pub remote_https_base: Option<String>,
+    // 렌더(목록·잘림 표시)는 Task 2에서 붙는다 — 그때까지는 소비자가 없어도 스냅샷
+    // 모델의 일부로 유지한다(repo_root와 같은 이유, 위 주석 참고).
+    #[allow(dead_code)]
+    pub worktrees: Vec<GitWorktreeRow>,
+    #[allow(dead_code)]
+    pub worktrees_truncated: bool,
 }
 
 /// `status --porcelain -z -uall` + `diff --numstat HEAD`를 경로로 병합한다.
@@ -110,6 +130,44 @@ fn merge_committed_rows(numstat: &str, name_status: &str) -> Vec<GitFileRow> {
             break;
         }
     }
+    rows
+}
+
+/// `git worktree list --porcelain` 파싱. `worktree <path>` 줄이 새 항목을 열고,
+/// `branch refs/heads/<name>`이 브랜치, `detached`는 None, `bare`는 **버린다**
+/// (체크아웃이 없어 셸을 열 수 없다). `locked`/`prunable` 줄은 무시한다.
+fn parse_worktree_list(porcelain: &str, repo_root: &Path) -> Vec<GitWorktreeRow> {
+    let mut rows: Vec<GitWorktreeRow> = Vec::new();
+    let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut bare = false;
+    let mut flush = |path: &mut Option<String>, branch: &mut Option<String>, bare: &mut bool| {
+        let taken = path.take();
+        let taken_branch = branch.take();
+        let was_bare = std::mem::replace(bare, false);
+        let Some(taken) = taken else { return };
+        if was_bare || rows.len() >= MAX_WORKTREE_ROWS {
+            return;
+        }
+        let as_path = Path::new(&taken);
+        let name = as_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| taken.clone());
+        let current = as_path == repo_root;
+        rows.push(GitWorktreeRow { path: taken, name, branch: taken_branch, current });
+    };
+    for line in porcelain.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            flush(&mut path, &mut branch, &mut bare);
+            path = Some(rest.trim().to_owned());
+        } else if let Some(rest) = line.strip_prefix("branch refs/heads/") {
+            branch = Some(rest.trim().to_owned());
+        } else if line.trim() == "bare" {
+            bare = true;
+        }
+    }
+    flush(&mut path, &mut branch, &mut bare);
     rows
 }
 
@@ -222,6 +280,17 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
         .ok()
         .and_then(|(s, _)| normalize_github_remote(s.trim()));
 
+    // 워크트리 목록 — 스냅샷과 같은 IO 왕복에서 한 번만 부른다(스펙 §8-4).
+    // 실패해도 스냅샷 전체를 죽이지 않는다(섹션 단위 오류 원칙, §6).
+    let (worktrees, worktrees_truncated) = match run(&["worktree", "list", "--porcelain"]) {
+        Ok((listing, truncated)) => {
+            let rows = parse_worktree_list(&listing, &repo_root);
+            let hit_cap = rows.len() >= MAX_WORKTREE_ROWS;
+            (rows, truncated || hit_cap)
+        }
+        Err(_) => (Vec::new(), false),
+    };
+
     Ok(GitPanelSnapshot {
         repo_root,
         branch,
@@ -233,6 +302,8 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
         changes_truncated,
         committed_truncated,
         remote_https_base,
+        worktrees,
+        worktrees_truncated,
     })
 }
 
@@ -617,6 +688,57 @@ mod tests {
         assert_eq!(split_row_path("Cargo.toml"), ("Cargo.toml", ""));
     }
 
+    const WORKTREE_PORCELAIN: &str = "\
+worktree /repo
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /repo/.deppy/worktrees/alpha
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/deppy/alpha
+
+worktree /repo/detached
+HEAD 3333333333333333333333333333333333333333
+detached
+
+worktree /repo/bare
+bare
+";
+
+    #[test]
+    fn 워크트리_목록은_브랜치와_현재를_구분한다() {
+        let rows = parse_worktree_list(WORKTREE_PORCELAIN, Path::new("/repo/.deppy/worktrees/alpha"));
+        // bare 항목은 체크아웃이 없어 셸을 열 수 없다 — 목록에서 뺀다.
+        assert_eq!(rows.len(), 3, "bare는 제외한다: {rows:?}");
+        assert_eq!(rows[0].name, "repo");
+        assert_eq!(rows[0].branch.as_deref(), Some("main"));
+        assert!(!rows[0].current);
+        assert_eq!(rows[1].name, "alpha");
+        assert_eq!(rows[1].branch.as_deref(), Some("deppy/alpha"));
+        assert!(rows[1].current, "repo_root와 같은 경로가 현재 워크트리다");
+        assert_eq!(rows[2].branch, None, "detached는 브랜치가 없다");
+    }
+
+    #[test]
+    fn 워크트리_목록은_상한에서_잘린다() {
+        let mut porcelain = String::new();
+        for index in 0..(MAX_WORKTREE_ROWS + 5) {
+            porcelain.push_str(&format!(
+                "worktree /repo/w{index}\nHEAD {index:040}\nbranch refs/heads/b{index}\n\n"
+            ));
+        }
+        let rows = parse_worktree_list(&porcelain, Path::new("/repo"));
+        assert_eq!(rows.len(), MAX_WORKTREE_ROWS);
+    }
+
+    #[test]
+    fn 워크트리_잠금_줄은_무시한다() {
+        let porcelain = "worktree /repo\nHEAD 1111\nbranch refs/heads/main\nlocked\nprunable gone\n";
+        let rows = parse_worktree_list(porcelain, Path::new("/repo"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].branch.as_deref(), Some("main"));
+    }
+
     use std::time::Duration;
     const T: Duration = Duration::from_secs(10);
 
@@ -697,6 +819,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(collect_snapshot(&dir).unwrap_err(), GitPanelErrorCode::NoRepo);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 스냅샷은_자기_워크트리를_현재로_표시한다() {
+        let repo = temp_repo("worktree_self");
+        std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+        commit_all(&repo, "base");
+
+        let snap = collect_snapshot(&repo).expect("스냅샷");
+        assert_eq!(snap.worktrees.len(), 1, "새 repo는 메인 워크트리 하나뿐");
+        assert!(snap.worktrees[0].current);
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

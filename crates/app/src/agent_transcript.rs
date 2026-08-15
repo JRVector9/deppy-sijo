@@ -1605,6 +1605,9 @@ pub struct ConversationMessage {
     pub role: ConversationRole,
     pub text: String,
     pub at: Option<i64>,
+    /// 이 메시지 레코드 줄의 **절대 파일 오프셋**. `AgentWorkTurnRow.source_offset`과
+    /// 같은 좌표계다(둘 다 `snapshot_lines`에서 나온다) — 뷰어가 이 값으로 그 턴을 찾는다.
+    pub offset: u64,
 }
 
 impl fmt::Debug for ConversationMessage {
@@ -1613,6 +1616,7 @@ impl fmt::Debug for ConversationMessage {
             .field("role", &self.role)
             .field("text", &"REDACTED")
             .field("at", &self.at)
+            .field("offset", &self.offset)
             .finish()
     }
 }
@@ -1703,7 +1707,7 @@ impl ConversationBuilder {
         }
     }
 
-    fn push(&mut self, role: ConversationRole, text: String, at: Option<i64>) {
+    fn push(&mut self, role: ConversationRole, text: String, at: Option<i64>, offset: u64) {
         if text.is_empty() {
             return;
         }
@@ -1717,7 +1721,7 @@ impl ConversationBuilder {
             self.evict_oldest();
         }
         self.total_bytes = self.total_bytes.saturating_add(text.len());
-        self.messages.push(ConversationMessage { role, text, at });
+        self.messages.push(ConversationMessage { role, text, at, offset });
     }
 
     fn evict_oldest(&mut self) {
@@ -1737,7 +1741,7 @@ impl ConversationBuilder {
 /// claude transcript에서 user/assistant 메시지만 뽑는다. tool_use·thinking·tool_result는
 /// `content` 배열에서 `type == "text"`가 아니라 자연히 버려진다.
 fn claude_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
-    for (_, line) in snapshot_lines(snapshot) {
+    for (offset, line) in snapshot_lines(snapshot) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -1752,14 +1756,14 @@ fn claude_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversat
         let Some(text) = conversation_content_text(content) else {
             continue;
         };
-        builder.push(role, text, event_occurred_at(&value));
+        builder.push(role, text, event_occurred_at(&value), offset);
     }
 }
 
 /// codex rollout에서 user/assistant 메시지만 뽑는다. `event_msg` 외 레코드(turn_context,
 /// token_count 등)와 task_started/task_complete/turn_aborted는 텍스트가 아니라 버려진다.
 fn codex_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
-    for (_, line) in snapshot_lines(snapshot) {
+    for (offset, line) in snapshot_lines(snapshot) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -1778,7 +1782,7 @@ fn codex_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversati
         else {
             continue;
         };
-        builder.push(role, text.to_owned(), event_occurred_at(&value));
+        builder.push(role, text.to_owned(), event_occurred_at(&value), offset);
     }
 }
 
@@ -1786,7 +1790,7 @@ fn codex_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversati
 /// `context.append_message`가 에이전트다 — hook_result/system 기원과 user role은 버린다
 /// (`kimi_recent_turns`와 같은 판정).
 fn kimi_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
-    for (_, line) in snapshot_lines(snapshot) {
+    for (offset, line) in snapshot_lines(snapshot) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -1801,7 +1805,7 @@ fn kimi_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversatio
                 let Some(text) = conversation_content_text(input) else {
                     continue;
                 };
-                builder.push(ConversationRole::User, text, event_occurred_at(&value));
+                builder.push(ConversationRole::User, text, event_occurred_at(&value), offset);
             }
             Some("context.append_message") => {
                 let role = value.pointer("/message/role").and_then(Value::as_str);
@@ -1817,7 +1821,12 @@ fn kimi_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversatio
                 let Some(text) = conversation_content_text(content) else {
                     continue;
                 };
-                builder.push(ConversationRole::Assistant, text, event_occurred_at(&value));
+                builder.push(
+                    ConversationRole::Assistant,
+                    text,
+                    event_occurred_at(&value),
+                    offset,
+                );
             }
             _ => {}
         }
@@ -1933,6 +1942,22 @@ mod tests {
             view.messages.last().unwrap().text,
             format!("m{}", count - 1),
             "최신이 남는다"
+        );
+    }
+
+    #[test]
+    fn 대화_메시지는_레코드_오프셋을_싣는다() {
+        let path = 임시_transcript(&[
+            r#"{"type":"user","message":{"role":"user","content":"첫"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"답"}]}}"#,
+        ]);
+        let view = read_conversation(&path, agent_detect::AgentKind::Claude).unwrap();
+        assert_eq!(view.messages[0].offset, 0, "첫 줄은 0에서 시작한다");
+        assert!(
+            view.messages[1].offset > view.messages[0].offset,
+            "다음 줄은 뒤에 온다: {:?} vs {:?}",
+            view.messages[0].offset,
+            view.messages[1].offset
         );
     }
 

@@ -271,6 +271,9 @@ pub struct SidebarSnapshot<'a> {
     /// 현재 세션 pane 헤더 옆의 이력 보조 탭이 **활성**인지 — 레일 「이력」 선택 표시.
     /// 탭이 열려 있어도 비활성(터미널을 보는 중)이면 false다.
     pub history_tab_active: bool,
+    /// 현재 세션 pane 헤더 옆의 Git 보조 탭이 **활성**인지 — 레일 「Git」 선택 표시.
+    /// 이력과 같은 규칙(2026-08-15 2차, 스펙 §8-1).
+    pub git_tab_active: bool,
     /// Agents 창 열림 여부 — 하단 nav 「에이전트」 행의 선택 상태 (2026-07-18).
     pub agents_open: bool,
     /// 활성 워크스페이스에 저장된 메모 본문. 미작성이면 `None`.
@@ -291,18 +294,12 @@ pub enum SidebarAction {
     /// 현재 워크스페이스의 이력 보조 탭을 연다/활성화한다. 재클릭 토글 규칙은 App이
     /// 결정한다(탭 상태 소유자).
     ShowHistory,
+    /// 현재 워크스페이스의 Git 보조 탭을 연다/활성화한다 — 이력과 같은 규칙
+    /// (2026-08-15 2차, 스펙 §8-1).
+    ShowGit,
     OpenAgents,
     OpenSettings,
     OpenHelp,
-    /// Git 패널 새로고침 — App이 스냅샷 수집 IO를 스케줄한다.
-    GitPanelRefresh,
-    /// Git 패널의 upstream 브랜치를 GitHub에서 연다 (URL 구성은 App).
-    GitPanelOpenRemote,
-    /// Git 패널 행 클릭 — 메인 영역에 파일 diff를 연다.
-    ShowFileDiff {
-        rel_path: String,
-        mode: crate::ui::diff_viewer::DiffMode,
-    },
     /// 메모 본문이 바뀌었다. App이 디바운스해 DB에 쓴다(leaf는 IO를 하지 않는다).
     NoteEdited(String),
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
@@ -381,20 +378,19 @@ pub enum SidebarAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarTool {
     Files,
-    Git,
     /// 워크스페이스 스크래치패드. 「파일」과 같이 사이드바 본문을 차지하는 **인라인** 탭이다.
     Notes,
 }
 
-/// MCP 탭은 2026-08-10에 뺐다 — 다른 둘은 사이드바/메인 창 안에서 끝나는데 혼자
-/// **설정(별도 OS 창)** 을 열어 레벨이 달랐다. 연결 설정은 설정 → 관리 → 「연결」이
-/// 계속 담당한다.
-const SIDEBAR_TOOLS: [SidebarTool; 3] = [SidebarTool::Files, SidebarTool::Git, SidebarTool::Notes];
+/// Git은 2026-08-15 2차에서 내비게이션 레일로 옮겼다 — 사이드바 폭(약 220pt)이 목록에
+/// 모자랐다(스펙 §8-1). MCP 탭은 2026-08-10에 뺐다 — 다른 둘은 사이드바/메인 창 안에서
+/// 끝나는데 혼자 **설정(별도 OS 창)** 을 열어 레벨이 달랐다. 연결 설정은 설정 → 관리 →
+/// 「연결」이 계속 담당한다.
+const SIDEBAR_TOOLS: [SidebarTool; 2] = [SidebarTool::Files, SidebarTool::Notes];
 
 fn sidebar_tool_label_key(tool: SidebarTool) -> &'static str {
     match tool {
         SidebarTool::Files => "sidebar.tool.files",
-        SidebarTool::Git => "sidebar.tool.git",
         SidebarTool::Notes => "sidebar.tool.notes",
     }
 }
@@ -403,9 +399,7 @@ fn sidebar_tool_label_key(tool: SidebarTool) -> &'static str {
 /// `Some`은 "다른 화면에 작용한다"는 뜻이다.
 fn sidebar_tool_action(tool: SidebarTool) -> Option<SidebarAction> {
     match tool {
-        // Git은 2026-08-15부터 인라인 탭 — 본문을 git 패널로 교체한다(스펙 §1).
-        // 이전의 ShowFocusedDiff(플로팅 창)는 은퇴.
-        SidebarTool::Files | SidebarTool::Notes | SidebarTool::Git => None,
+        SidebarTool::Files | SidebarTool::Notes => None,
     }
 }
 
@@ -957,14 +951,11 @@ enum RootListingError {
 }
 
 pub struct FileTreeUi {
-    /// 사이드바 본문을 차지하는 인라인 탭(파일 / 메모). Git은 다른 화면에 작용하므로
-    /// 여기 남지 않는다 — 눌러도 선택이 바뀌지 않고 diff만 열린다.
+    /// 사이드바 본문을 차지하는 인라인 탭(파일 / 메모). Git은 2026-08-15 2차부터 레일
+    /// 진입 + pane 보조 탭이라 여기 남지 않는다(App이 `GitPanelUi`를 직접 소유한다, §8-1).
     selected_tool: SidebarTool,
     /// 메모 탭 편집 상태. leaf라 DB를 만지지 않고 편집만 소유한다.
     notes: super::notes::NotesUi,
-    /// Git 탭 편집 상태 — 읽기 전용 orca 스타일 패널. leaf라 git도 IO도 직접 하지
-    /// 않는다(App이 수집해 `git_panel_set_snapshot`으로 밀어넣는다, 2026-08-15).
-    git_panel: super::git_panel::GitPanelUi,
     /// workspace 루트. None = path 미설정 → 안내 표시(§9-2).
     root: Option<PathBuf>,
     /// 루트 나열 실패 사유 (invalid root — 에러 라벨 + 트리 비활성, §9-2).
@@ -1076,7 +1067,6 @@ impl FileTreeUi {
             collapsed: false,
             selected_tool: SidebarTool::Files,
             notes: super::notes::NotesUi::new(),
-            git_panel: super::git_panel::GitPanelUi::default(),
             sidebar_width: 200.0,
             navigation_rail_width: crate::ui::designall::NAV_RAIL_WIDTH,
             service_statuses: RailServiceStatus::defaults(),
@@ -1673,30 +1663,6 @@ impl FileTreeUi {
     /// 다음에 열면 바로 보인다.
     pub fn apply_note_append(&mut self, workspace_id: &str, body: String) {
         self.notes.apply_external_edit(workspace_id, body);
-    }
-
-    /// App이 스냅샷 수집 IO를 보내기 직전에 부른다 — leaf는 IO를 하지 않는다.
-    pub fn git_panel_set_loading(&mut self) {
-        self.git_panel.set_loading();
-    }
-
-    /// App이 수집 완료를 밀어넣는다 (leaf는 IO를 하지 않는다).
-    pub fn git_panel_set_snapshot(
-        &mut self,
-        result: Result<super::git_panel::GitPanelSnapshot, super::git_panel::GitPanelErrorCode>,
-    ) {
-        self.git_panel.set_snapshot(result);
-    }
-
-    /// 사이드바 Git 탭을 선택한다 — 세션 컨텍스트 메뉴 「변경 보기」 등 기존 diff
-    /// 진입점이 여기로 라우팅한다(2026-08-15, Task 10 Step 9).
-    pub fn select_git_tool(&mut self) {
-        self.selected_tool = SidebarTool::Git;
-    }
-
-    /// git 패널의 ↗ 대상 — (remote_https_base, branch). App이 URL 구성에 쓴다.
-    pub fn git_panel_remote_target(&self) -> Option<(String, String)> {
-        self.git_panel.remote_target()
     }
 
     pub fn panel(
@@ -2539,10 +2505,6 @@ impl FileTreeUi {
                     // 인라인 탭 — 본문을 바꾼다. 메모로 들어가면 커서를 바로 잡는다.
                     None => {
                         self.selected_tool = *tool;
-                        if *tool == SidebarTool::Git {
-                            // Git 탭 선택 직후 최신화 — 스펙 §3 갱신 시점(2026-08-15).
-                            action = Some(SidebarAction::GitPanelRefresh);
-                        }
                         if *tool == SidebarTool::Notes {
                             self.notes.request_focus();
                         }
@@ -2578,25 +2540,6 @@ impl FileTreeUi {
             );
             if let Some(super::notes::NotesAction::Edited(body)) = note_action {
                 action = Some(SidebarAction::NoteEdited(body));
-            }
-            return action;
-        }
-
-        // Git 탭도 본문을 통째로 쓴다 — Notes와 같은 인라인 패턴(2026-08-15 스펙 §1).
-        if self.selected_tool == SidebarTool::Git {
-            if let Some(git_action) = self.git_panel.render(ui, catalog) {
-                action = match git_action {
-                    super::git_panel::GitPanelAction::Refresh => Some(SidebarAction::GitPanelRefresh),
-                    super::git_panel::GitPanelAction::OpenRemoteBranch => {
-                        Some(SidebarAction::GitPanelOpenRemote)
-                    }
-                    super::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode } => {
-                        Some(SidebarAction::ShowFileDiff { rel_path, mode })
-                    }
-                    // 워크트리 셸 열기는 사이드바 경로가 아니다 — Git 패널이 pane 보조 탭으로
-                    // 옮겨가는 Task 5에서 이 블록 전체가 사라진다(스펙 §8-1).
-                    super::git_panel::GitPanelAction::OpenWorktreeShell { .. } => None,
-                };
             }
             return action;
         }
@@ -3399,7 +3342,7 @@ impl FileTreeUi {
         action
     }
 
-    /// 고정 내비게이션 레일 — 홈 / 작업 / 이력 / 에이전트. 홈과 작업 행 우측의
+    /// 고정 내비게이션 레일 — 홈 / 작업 / 이력 / Git / 에이전트. 홈과 작업 행 우측의
     /// 카운트 배지는 0이면 숨긴다. 정보 화면 재클릭 시 터미널 복귀 토글은 App이
     /// 처리한다(view 소유자).
     fn navigation(
@@ -3444,6 +3387,18 @@ impl FileTreeUi {
         .clicked()
         {
             action = Some(SidebarAction::ShowHistory);
+        }
+        if nav_row(
+            ui,
+            NavIcon::Git,
+            &catalog.t("sidebar.nav.git", &[]),
+            // 이력과 같은 규칙 — 보조 탭이 **활성**일 때만 켠다.
+            sidebar.git_tab_active,
+            None,
+        )
+        .clicked()
+        {
+            action = Some(SidebarAction::ShowGit);
         }
         if nav_row(
             ui,
@@ -5623,6 +5578,7 @@ enum NavIcon {
     Home,
     Fleet,
     History,
+    Git,
     Agents,
     Settings,
     Help,
@@ -5999,6 +5955,26 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
             p.circle_stroke(c, 6.0, stroke);
             p.line_segment([c, egui::pos2(c.x, c.y - 3.5)], stroke);
             p.line_segment([c, egui::pos2(c.x + 3.0, c.y + 1.5)], stroke);
+        }
+        // Git — 가지: 위 점에서 아래 점으로 내려오는 줄기 + 오른쪽으로 갈라지는 가지.
+        NavIcon::Git => {
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 3.5, c.y - 5.0),
+                    egui::pos2(c.x - 3.5, c.y + 5.0),
+                ],
+                stroke,
+            );
+            p.circle_stroke(egui::pos2(c.x - 3.5, c.y - 5.0), 1.8, stroke);
+            p.circle_stroke(egui::pos2(c.x - 3.5, c.y + 5.0), 1.8, stroke);
+            p.circle_stroke(egui::pos2(c.x + 4.0, c.y - 1.0), 1.8, stroke);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 3.5, c.y + 1.5),
+                    egui::pos2(c.x + 4.0, c.y - 1.0),
+                ],
+                stroke,
+            );
         }
         // 봇 — 머리(사각) + 눈 2점 + 안테나.
         NavIcon::Agents => {
@@ -6833,18 +6809,12 @@ mod tests {
     }
 
     #[test]
-    fn designall_사이드바도구는_전부_인라인_탭이다() {
-        assert_eq!(
-            SIDEBAR_TOOLS,
-            [SidebarTool::Files, SidebarTool::Git, SidebarTool::Notes]
-        );
-        // 셋 다 본문을 교체하는 인라인 탭이다 — 액션 없이 탭 선택만 바뀐다. Git은
-        // 2026-08-15부터 플로팅 diff 창(ShowFocusedDiff) 대신 본문을 git 패널로
-        // 교체하는 쪽으로 바뀌었다(스펙 §1) — 탭 클릭 자체는 selected_tool==Git만
-        // 세우고, 새로고침 intent는 조건부로 별도 배선한다(panel() 호출부).
+    fn 사이드바_도구는_파일과_메모_둘뿐이다() {
+        // Git은 2026-08-15 2차에서 레일로 옮겼다 — 사이드바 폭이 목록에 모자랐다(스펙 §8-1).
+        assert_eq!(SIDEBAR_TOOLS, [SidebarTool::Files, SidebarTool::Notes]);
+        // 둘 다 본문을 교체하는 인라인 탭이다 — 액션 없이 탭 선택만 바뀐다.
         assert!(sidebar_tool_action(SidebarTool::Files).is_none());
         assert!(sidebar_tool_action(SidebarTool::Notes).is_none());
-        assert!(sidebar_tool_action(SidebarTool::Git).is_none());
     }
 
     #[test]
@@ -7862,6 +7832,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8038,6 +8009,7 @@ mod tests {
             home_notice_count: 0,
             fleet_count: 0,
             history_tab_active: false,
+            git_tab_active: false,
             agents_open: false,
             workspace_note: None,
         };
@@ -8460,6 +8432,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8622,6 +8595,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8742,6 +8716,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8812,6 +8787,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -8932,6 +8908,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9202,6 +9179,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9307,6 +9285,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9723,6 +9702,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9812,6 +9792,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -9855,6 +9836,7 @@ mod tests {
             home_notice_count: 0,
             fleet_count: 0,
             history_tab_active: false,
+            git_tab_active: false,
             agents_open: false,
             workspace_note: None,
         };
@@ -9877,7 +9859,7 @@ mod tests {
     }
 
     #[test]
-    fn kittest_파일헤더는_파일_git_메모탭만_표시한다() {
+    fn kittest_파일헤더는_파일_메모탭만_표시한다() {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -9887,8 +9869,9 @@ mod tests {
         harness.run();
 
         assert!(harness.query_by_label("Files").is_some());
-        assert!(harness.query_by_label("Git").is_some());
         assert!(harness.query_by_label("Notes").is_some());
+        // Git은 2026-08-15 2차에서 레일로 옮겼다 — 사이드바 도구 탭에는 더 이상 없다.
+        assert!(harness.query_by_label("Git").is_none());
         // MCP 탭은 뺐다(2026-08-10) — 혼자 설정(별도 OS 창)을 열어 레벨이 달랐다.
         // 연결 설정은 설정 → 관리 → 「연결」이 계속 담당한다.
         assert!(harness.query_by_label("MCP").is_none());
@@ -9951,6 +9934,7 @@ mod tests {
                         home_notice_count: 4,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -10114,6 +10098,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };
@@ -10550,6 +10535,7 @@ mod tests {
                         home_notice_count: 0,
                         fleet_count: 0,
                         history_tab_active: false,
+                        git_tab_active: false,
                         agents_open: false,
                         workspace_note: None,
                     };

@@ -7874,6 +7874,12 @@ pub struct App {
     /// git 패널 IO 완료의 stale 폐기용 세대. 요청마다 증가하며, 완료 시점에 이 값과
     /// 다르면 조용히 버린다(기존 Diff IO의 generation 관례, 2026-08-15).
     git_panel_generation: u64,
+    /// Git 패널 렌더 상태 — 2026-08-15 2차부터 file_tree(사이드바)가 아니라 App이 직접
+    /// 소유한다. Git이 사이드바 인라인 탭에서 pane 보조 탭으로 옮겨가면서, 사이드바
+    /// leaf가 더는 git IO 결과를 들고 있을 이유가 없어졌다(§8-1).
+    git_panel_ui: ui::git_panel::GitPanelUi,
+    /// 이력과 같은 보조 UI 탭 상태 기계 — runtime의 mux 탭/pane과 무관하다.
+    git_tab: ui::workspace::PaneAuxTabState,
     work_history_ui: ui::work_history::WorkHistoryUi,
     /// 이력은 전역 중앙 페이지가 아니라 현재 세션 pane 헤더 옆의 **보조 UI 탭**이다.
     /// 이 상태는 runtime의 mux 탭/pane과 무관하다 — 열고 닫아도 PTY·세션은 그대로다
@@ -8714,6 +8720,30 @@ fn github_branch_url_path(branch: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// 어느 보조 탭이 방금 활성이 됐는지.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuxTabWinner {
+    History,
+    Git,
+}
+
+/// 보조 본문은 하나뿐이라 두 탭이 동시에 활성일 수 없다. 진 쪽은 세션 탭으로 물러나되
+/// 탭 자체는 남는다(`on_session_tab_click`).
+fn resolve_aux_tab_exclusivity(
+    history: ui::workspace::PaneAuxTabState,
+    git: ui::workspace::PaneAuxTabState,
+    winner: AuxTabWinner,
+) -> (
+    ui::workspace::PaneAuxTabState,
+    ui::workspace::PaneAuxTabState,
+) {
+    match winner {
+        AuxTabWinner::History if git.is_active() => (history, git.on_session_tab_click()),
+        AuxTabWinner::Git if history.is_active() => (history.on_session_tab_click(), git),
+        _ => (history, git),
+    }
 }
 
 enum AppHostIoAction {
@@ -10880,9 +10910,7 @@ impl App {
                 if completion.generation == self.git_panel_generation {
                     match completion.result {
                         ui::git_panel::GitPanelIoResult::Snapshot(result) => {
-                            if let Some(tree) = self.file_tree.as_mut() {
-                                tree.git_panel_set_snapshot(result);
-                            }
+                            self.git_panel_ui.set_snapshot(result);
                         }
                         ui::git_panel::GitPanelIoResult::FileDiff(result) => match result {
                             Ok(view) => self.diff_viewer_ui.set_view(view),
@@ -11568,6 +11596,8 @@ impl App {
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
             diff_viewer_ui: ui::diff_viewer::DiffViewerUi::default(),
             git_panel_generation: 0,
+            git_panel_ui: ui::git_panel::GitPanelUi::default(),
+            git_tab: ui::workspace::PaneAuxTabState::default(),
             work_history_ui: ui::work_history::WorkHistoryUi::new(),
             work_history_tab: ui::workspace::PaneAuxTabState::default(),
             work_history_rows: Vec::new(),
@@ -14068,9 +14098,8 @@ impl App {
         request: ui::git_panel::GitPanelIoRequest,
     ) {
         let Some(cwd) = cwd else {
-            if let Some(tree) = self.file_tree.as_mut() {
-                tree.git_panel_set_snapshot(Err(ui::git_panel::GitPanelErrorCode::NoRepo));
-            }
+            self.git_panel_ui
+                .set_snapshot(Err(ui::git_panel::GitPanelErrorCode::NoRepo));
             return;
         };
         if self.pending_app_host_action.is_some() {
@@ -14090,19 +14119,17 @@ impl App {
         };
         self.pending_app_host_action = Some(AppHostIoAction::GitPanel(intent));
         ctx.request_repaint();
-        if let Some(tree) = self.file_tree.as_mut() {
-            tree.git_panel_set_loading();
-        }
+        self.git_panel_ui.set_loading();
     }
 
     /// ↗ 클릭 — upstream이 GitHub remote면 브랜치 페이지를 연다. remote 조회는 이미
     /// 스냅샷 수집 시점에 끝나 있어(`GitPanelSnapshot::remote_https_base`) 여기서는
     /// IO 없이 즉시 URL을 구성한다(스펙 §4, Task 10 Step 7).
+    /// Git 보조 본문의 `GitPanelAction::OpenRemoteBranch` 처리는 Task 6이 배선한다 —
+    /// 그 전까지는 호출부가 없어 dead_code를 허용한다.
+    #[allow(dead_code)]
     fn open_git_panel_remote(&mut self, ctx: &egui::Context) {
-        let Some(tree) = self.file_tree.as_ref() else {
-            return;
-        };
-        let Some((base, branch)) = tree.git_panel_remote_target() else {
+        let Some((base, branch)) = self.git_panel_ui.remote_target() else {
             tracing::info!(kind = "git_panel", "non-github remote — open skipped");
             return;
         };
@@ -14260,6 +14287,13 @@ impl App {
         )
     }
 
+    /// 보조 본문(이력·Git)이 보이려면 중앙이 Terminal 뷰여야 한다 — 홈/작업 페이지
+    /// 위에서 레일을 눌러도 탭이 있는 작업면으로 먼저 돌아온다.
+    fn reveal_terminal_view_for_aux_tab(&mut self) {
+        self.agent_terminal_ui
+            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+    }
+
     /// 이력 탭이 방금 활성화됐을 때의 공통 진입 — projection을 새로 요청하고, 카드
     /// 액션이 필요로 하는 런처 감지가 없으면 함께 예약한다.
     fn enter_work_history_tab(&mut self) {
@@ -14292,7 +14326,34 @@ impl App {
             ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
         };
         if self.work_history_tab.is_active() && !previous.is_active() {
+            // 헤더에서 이력 탭을 직접 눌러 활성화하는 경로 — Git이 활성이었다면 물러난다
+            // (보조 본문은 하나뿐이다, 스펙 §8-2).
+            (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
+                self.work_history_tab,
+                self.git_tab,
+                AuxTabWinner::History,
+            );
             self.enter_work_history_tab();
+        }
+    }
+
+    /// Git 보조 탭이 올린 의도 — `apply_work_history_tab_intent`와 같은 모양이다.
+    /// 활성화되는 순간 상호배타를 걸고(스펙 §8-2), 캐시 없이 최신 스냅샷을 요청한다.
+    fn apply_git_tab_intent(
+        &mut self,
+        ctx: &egui::Context,
+        intent: ui::workspace::PaneAuxTabIntent,
+    ) {
+        let previous = self.git_tab;
+        self.git_tab = match intent {
+            ui::workspace::PaneAuxTabIntent::Activate => previous.on_tab_click(),
+            ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
+            ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
+        };
+        if self.git_tab.is_active() && !previous.is_active() {
+            (self.work_history_tab, self.git_tab) =
+                resolve_aux_tab_exclusivity(self.work_history_tab, self.git_tab, AuxTabWinner::Git);
+            self.request_git_panel_io(ctx, ui::git_panel::GitPanelIoRequest::Snapshot);
         }
     }
 
@@ -23858,6 +23919,7 @@ impl eframe::App for App {
             // 안 된다. 매 프레임 build_fleet_sessions를 돌리지 않는 싼 프록시다.
             fleet_count: self.approvals_ui.pending().len() + self.global_waiting.len(),
             history_tab_active: self.work_history_tab.is_active(),
+            git_tab_active: self.git_tab.is_active(),
             agents_open: self.agent_sessions_ui.is_open(),
             workspace_note: self.workspace_note.as_deref(),
         };
@@ -24090,10 +24152,34 @@ impl eframe::App for App {
                     // 돌아간다(탭 제거는 이력 X 전용).
                     self.work_history_tab = self.work_history_tab.on_rail_click();
                     if self.work_history_tab.is_active() {
+                        // Git이 활성이었다면 물러난다 — 보조 본문은 하나뿐이다(스펙 §8-2).
+                        (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
+                            self.work_history_tab,
+                            self.git_tab,
+                            AuxTabWinner::History,
+                        );
                         // 홈/작업 페이지 위에서 눌렀다면 탭이 있는 작업면으로 먼저 돌아간다.
-                        self.agent_terminal_ui
-                            .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                        self.reveal_terminal_view_for_aux_tab();
                         self.enter_work_history_tab();
+                    }
+                }
+                Some(ui::file_tree::SidebarAction::ShowGit) => {
+                    // 레일 「Git」 — 이력과 같은 재클릭 규칙(활성 재클릭 시 세션으로 복귀,
+                    // 탭 자체는 남는다).
+                    let previous = self.git_tab;
+                    self.git_tab = previous.on_rail_click();
+                    if self.git_tab.is_active() {
+                        // 이력과 같은 진입 — 활성이 될 때만 스냅샷을 새로 받는다(폴링 없음).
+                        (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
+                            self.work_history_tab,
+                            self.git_tab,
+                            AuxTabWinner::Git,
+                        );
+                        self.reveal_terminal_view_for_aux_tab();
+                        self.request_git_panel_io(
+                            ui.ctx(),
+                            ui::git_panel::GitPanelIoRequest::Snapshot,
+                        );
                     }
                 }
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
@@ -24107,24 +24193,8 @@ impl eframe::App for App {
                         "https://github.com/JRVector9/deppy-sijo",
                     ));
                 }
-                // Git은 2026-08-15부터 사이드바 인라인 탭 — 탭 선택 자체는 file_tree의
-                // 탭 클릭 처리가 맡고, 여기서는 새로고침/원격 열기/파일 diff 세 IO
-                // intent만 받는다(스펙 §1, Task 10).
-                Some(ui::file_tree::SidebarAction::GitPanelRefresh) => {
-                    self.request_git_panel_io(ui.ctx(), ui::git_panel::GitPanelIoRequest::Snapshot);
-                }
-                Some(ui::file_tree::SidebarAction::GitPanelOpenRemote) => {
-                    self.open_git_panel_remote(ui.ctx());
-                }
-                Some(ui::file_tree::SidebarAction::ShowFileDiff { rel_path, mode }) => {
-                    self.diff_viewer_ui.open(rel_path.clone(), mode);
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Diff);
-                    self.request_git_panel_io(
-                        ui.ctx(),
-                        ui::git_panel::GitPanelIoRequest::FileDiff { rel_path, mode },
-                    );
-                }
+                // Git은 2026-08-15 2차부터 pane 보조 탭이다 — 새로고침/원격 열기/파일
+                // diff는 이제 git 패널이 보조 본문 안에서 App에 직접 올린다(Task 6).
                 Some(ui::file_tree::SidebarAction::NoteEdited(body)) => {
                     // 기록은 여기서 하지 않는다 — 디바운스 만료와 깨우기는 logic()이
                     // 소유한다(check-boundary: App::ui는 repaint 타이머를 설치하지 않는다).
@@ -24242,15 +24312,19 @@ impl eframe::App for App {
                         None => tracing::warn!("세션 cwd 미확인 — 경로 복사 생략"),
                     }
                 }
-                // 변경 보기 — 세션 행 컨텍스트 메뉴. 사이드바 Git 탭으로 이동해 **그
+                // 변경 보기 — 세션 행 컨텍스트 메뉴. Git 보조 탭을 열고 활성화해 **그
                 // 세션의** repo 스냅샷을 연다. 한때 포커스 세션 기준으로 일원화했었는데
                 // (Task 10 Step 9) 회귀였다 — 포커스가 다른 세션에 있으면 엉뚱한 repo가
-                // 떴다. select_git_tool()은 유지하되 cwd는 이 세션 기준으로 고정한다
-                // (2026-08-15 회귀 수정).
+                // 떴다. Git 탭 진입은 유지하되 cwd는 이 세션 기준으로 고정한다
+                // (2026-08-15 회귀 수정 유지, 2차에서 사이드바 탭 → 보조 탭으로 갱신).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
-                    if let Some(tree) = self.file_tree.as_mut() {
-                        tree.select_git_tool();
-                    }
+                    self.git_tab = ui::workspace::PaneAuxTabState::OpenActive;
+                    (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
+                        self.work_history_tab,
+                        self.git_tab,
+                        AuxTabWinner::Git,
+                    );
+                    self.reveal_terminal_view_for_aux_tab();
                     let cwd = self.cached_session_cwd(session).map(PathBuf::from);
                     self.request_git_panel_io_at(
                         ui.ctx(),
@@ -24393,6 +24467,8 @@ impl eframe::App for App {
         let information_visible = home_visible || fleet_visible || diff_visible;
         // 이력은 전역 페이지가 아니라 포커스된 세션 pane 헤더 옆의 보조 탭이다.
         let history_tab_active = self.work_history_tab.is_active();
+        // Git도 이력과 같은 보조 탭이다 — 동시 활성은 없다(스펙 §8-2).
+        let git_tab_active = self.git_tab.is_active();
         // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
         if information_visible {
             self.active
@@ -24472,9 +24548,9 @@ impl eframe::App for App {
         };
 
         let terminal_visible = central_view == ui::agent_terminal::AgentTerminalView::Terminal;
-        // 이력 탭 chrome은 **탭이 열려 있고** 작업면이 보일 때만 존재한다. 닫힘 상태와
-        // 홈/작업 페이지에서는 세션 헤더가 예전 그대로다 — 이력 X가 실제로 탭을 없앤다.
-        // (Git 탭은 아직 이 목록에 없다 — 레일 진입·상태 배선은 다음 Task 몫이다.)
+        // 보조 탭(이력·Git) chrome은 **탭이 열려 있고** 작업면이 보일 때만 존재한다.
+        // 닫힘 상태와 홈/작업 페이지에서는 세션 헤더가 예전 그대로다 — X가 실제로
+        // 탭을 없앤다.
         let mut aux_tabs = Vec::new();
         if terminal_visible && self.work_history_tab.is_open() {
             aux_tabs.push(ui::workspace::PaneAuxTab {
@@ -24483,10 +24559,17 @@ impl eframe::App for App {
                 active: history_tab_active,
             });
         }
+        if terminal_visible && self.git_tab.is_open() {
+            aux_tabs.push(ui::workspace::PaneAuxTab {
+                kind: ui::workspace::PaneAuxTabKind::Git,
+                label: text.t("workspace.tab.git", &[]),
+                active: git_tab_active,
+            });
+        }
         self.active.workspace_ui.set_aux_tabs(aux_tabs);
-        // 이력 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
+        // 이력·Git 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
         // 타이핑·IME·붙여넣기가 숨은 PTY로 새지 않게 한다.
-        if terminal_visible && !history_tab_active {
+        if terminal_visible && !(history_tab_active || git_tab_active) {
             self.frame_terminal_owner = frame_terminal_owner(
                 &self.cross_workspace_pane,
                 true,
@@ -24505,8 +24588,8 @@ impl eframe::App for App {
             self.frame_terminal_owner = FrameTerminalOwner::None;
         }
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
-        // 이력 탭이 활성이면 보낼 터미널이 없으므로 함께 감춘다.
-        if terminal_visible && !history_tab_active && self.config.ui.composer_enabled {
+        // 이력·Git 탭이 활성이면 보낼 터미널이 없으므로 함께 감춘다.
+        if terminal_visible && !(history_tab_active || git_tab_active) && self.config.ui.composer_enabled {
             self.render_composer_dock(ui, &text);
         }
 
@@ -24526,7 +24609,7 @@ impl eframe::App for App {
         let mut fleet_page_click = None;
         let mut fleet_action = None;
         let mut work_history_action = None;
-        let mut work_history_tab_intent = None;
+        let mut aux_tab_intent = None;
         let work_history_presentations = if history_tab_active {
             self.work_history_presentations()
         } else {
@@ -24586,7 +24669,7 @@ impl eframe::App for App {
         let mut current_owner = FrameTerminalOwner::None;
         let mut dropped_session_open = None;
         let session_drop_label = (terminal_visible
-            && !history_tab_active
+            && !(history_tab_active || git_tab_active)
             && egui::DragAndDrop::has_payload_of_type::<ui::file_tree::SessionRowDragPayload>(
                 ui.ctx(),
             ))
@@ -24946,28 +25029,38 @@ impl eframe::App for App {
                             .id_salt("cross_workspace_primary"),
                     );
                     primary.set_clip_rect(primary_rect.intersect(ui.clip_rect()));
-                    let primary_output = self
-                        .active
-                        .workspace_ui
-                        .show_with_input(
-                            &mut primary,
-                            &self.config.terminal,
-                            &events,
-                            &text,
-                            current_owner == FrameTerminalOwner::Primary && !history_tab_active,
-                        );
+                    let primary_output = self.active.workspace_ui.show_with_input(
+                        &mut primary,
+                        &self.config.terminal,
+                        &events,
+                        &text,
+                        current_owner == FrameTerminalOwner::Primary
+                            && !(history_tab_active || git_tab_active),
+                    );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
-                    work_history_tab_intent = primary_output.aux_tab_intent.map(|(_, intent)| intent);
+                    aux_tab_intent = primary_output.aux_tab_intent;
                     if let Some(body) = primary_output.aux_body_rect {
-                        work_history_action = self.render_work_history_tab_body(
-                            &mut primary,
-                            body,
-                            &work_history_presentations,
-                            &work_history_workspace_name,
-                            work_history_current_branch.as_deref(),
-                            &text,
-                        );
+                        if git_tab_active {
+                            // 좌 목록 + 우 diff 마스터-디테일 레이아웃은 Task 6이 채운다 —
+                            // 지금은 탭이 붙고 활성 전환이 되는 자리만 만든다.
+                            let mut git_body = primary.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(body)
+                                    .id_salt("git_panel_pane_tab"),
+                            );
+                            git_body.set_clip_rect(body.intersect(primary.clip_rect()));
+                            let _ = self.git_panel_ui.render(&mut git_body, &text);
+                        } else {
+                            work_history_action = self.render_work_history_tab_body(
+                                &mut primary,
+                                body,
+                                &work_history_presentations,
+                                &work_history_workspace_name,
+                                work_history_current_branch.as_deref(),
+                                &text,
+                            );
+                        }
                     }
                     if let Some(label) = session_drop_label.as_deref()
                         && dropped_session_open.is_none()
@@ -24989,20 +25082,32 @@ impl eframe::App for App {
                         &self.config.terminal,
                         &events,
                         &text,
-                        !history_tab_active,
+                        !(history_tab_active || git_tab_active),
                     );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
-                    work_history_tab_intent = primary_output.aux_tab_intent.map(|(_, intent)| intent);
+                    aux_tab_intent = primary_output.aux_tab_intent;
                     if let Some(body) = primary_output.aux_body_rect {
-                        work_history_action = self.render_work_history_tab_body(
-                            ui,
-                            body,
-                            &work_history_presentations,
-                            &work_history_workspace_name,
-                            work_history_current_branch.as_deref(),
-                            &text,
-                        );
+                        if git_tab_active {
+                            // 좌 목록 + 우 diff 마스터-디테일 레이아웃은 Task 6이 채운다 —
+                            // 지금은 탭이 붙고 활성 전환이 되는 자리만 만든다.
+                            let mut git_body = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(body)
+                                    .id_salt("git_panel_pane_tab"),
+                            );
+                            git_body.set_clip_rect(body.intersect(ui.clip_rect()));
+                            let _ = self.git_panel_ui.render(&mut git_body, &text);
+                        } else {
+                            work_history_action = self.render_work_history_tab_body(
+                                ui,
+                                body,
+                                &work_history_presentations,
+                                &work_history_workspace_name,
+                                work_history_current_branch.as_deref(),
+                                &text,
+                            );
+                        }
                     }
                     if let Some(label) = session_drop_label.as_deref() {
                         dropped_session_open = session_pane_drop_interaction(
@@ -25022,13 +25127,18 @@ impl eframe::App for App {
                 .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES),
         );
         // 이력 본문이 떠 있던 프레임은 어떤 pane도 입력 소유자가 아니다.
-        self.frame_terminal_owner = if history_tab_active {
+        self.frame_terminal_owner = if history_tab_active || git_tab_active {
             FrameTerminalOwner::None
         } else {
             current_owner
         };
-        if let Some(intent) = work_history_tab_intent {
-            self.apply_work_history_tab_intent(intent);
+        if let Some((kind, intent)) = aux_tab_intent {
+            match kind {
+                ui::workspace::PaneAuxTabKind::History => {
+                    self.apply_work_history_tab_intent(intent);
+                }
+                ui::workspace::PaneAuxTabKind::Git => self.apply_git_tab_intent(ui.ctx(), intent),
+            }
             ui.ctx().request_repaint();
         }
         self.sync_attached_runtime_visibility();
@@ -30489,6 +30599,20 @@ mod tests {
         );
     }
 
+    /// 보조 본문은 하나뿐이라 이력·Git이 동시에 활성일 수 없다 — 새로 활성된 쪽이
+    /// 이기고, 진 쪽은 세션 탭으로 물러나되 탭 자체는 남는다(스펙 §8-2).
+    #[test]
+    fn 보조_탭은_동시에_활성되지_않는다() {
+        use ui::workspace::PaneAuxTabState::{OpenActive, OpenInactive};
+        let (history, git) = resolve_aux_tab_exclusivity(OpenActive, OpenActive, AuxTabWinner::Git);
+        assert_eq!(git, OpenActive);
+        assert_eq!(history, OpenInactive, "본문은 하나뿐이라 진 쪽은 물러난다");
+        let (history, git) =
+            resolve_aux_tab_exclusivity(OpenActive, OpenActive, AuxTabWinner::History);
+        assert_eq!(history, OpenActive);
+        assert_eq!(git, OpenInactive);
+    }
+
     /// 이력은 보조 UI 탭이다 — 전역 view가 아니고, 활성 중에는 입력 소유자/컴포저가
     /// 명시적으로 없어야 하며, 본문은 WorkspaceUi가 넘긴 pane body rect에 그린다.
     #[test]
@@ -30509,8 +30633,8 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            render.contains("if terminal_visible && !history_tab_active {"),
-            "이력 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
+            render.contains("if terminal_visible && !(history_tab_active || git_tab_active) {"),
+            "이력·Git 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
         );
         assert!(
             render.contains("if terminal_visible && self.work_history_tab.is_open() {"),
@@ -30518,9 +30642,9 @@ mod tests {
         );
         assert!(
             render.contains(
-                "terminal_visible && !history_tab_active && self.config.ui.composer_enabled"
+                "terminal_visible && !(history_tab_active || git_tab_active) && self.config.ui.composer_enabled"
             ),
-            "이력 활성 프레임은 컴포저를 감춰야 한다"
+            "이력·Git 활성 프레임은 컴포저를 감춰야 한다"
         );
         assert_eq!(
             render.matches("render_work_history_tab_body(").count(),

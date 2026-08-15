@@ -755,9 +755,6 @@ const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneAuxTabKind {
     History,
-    // App은 다음 Task(레일 진입·Git 탭 배선)부터 이 변형을 만든다 — 지금은 기하·상태
-    // 기계 계약만 갖춘다. 그 전까지는 non-test 빌드에서 아무도 만들지 않는다.
-    #[allow(dead_code)]
     Git,
 }
 

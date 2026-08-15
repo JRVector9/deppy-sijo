@@ -320,6 +320,9 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
 #[derive(Debug)]
 pub enum GitPanelIoRequest {
     Snapshot,
+    /// Git 보조 본문의 파일 행 클릭이 요청한다 — 그 배선은 Task 6이 한다(2026-08-15
+    /// 2차, 스펙 §8-3). 그 전까지는 아무도 만들지 않아 dead_code를 허용한다.
+    #[allow(dead_code)]
     FileDiff {
         rel_path: String,
         mode: crate::ui::diff_viewer::DiffMode,

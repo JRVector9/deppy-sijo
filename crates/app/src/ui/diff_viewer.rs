@@ -211,6 +211,9 @@ pub struct DiffViewerUi {
 }
 
 impl DiffViewerUi {
+    /// Git 보조 본문에서 파일 행을 클릭했을 때 App이 부른다 — 그 배선은 Task 6이 한다
+    /// (2026-08-15 2차, 스펙 §8-3). 그 전까지는 호출부가 없어 dead_code를 허용한다.
+    #[allow(dead_code)]
     pub fn open(&mut self, rel_path: String, mode: DiffMode) {
         self.rel_path = rel_path;
         self.mode = Some(mode);

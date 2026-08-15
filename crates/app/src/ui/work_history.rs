@@ -30,7 +30,6 @@ pub struct WorkHistoryRow<'a> {
     pub source_offset: u64,
     pub instruction: &'a str,
     pub agent_summary: Option<&'a str>,
-    #[allow(dead_code)] // Task 6이 부른다
     pub messages_json: Option<&'a str>,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
@@ -790,11 +789,32 @@ fn render_card(
                     row.instruction,
                 );
                 ui.add_space(8.0);
-                let summary = row
-                    .agent_summary
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| catalog.t("history.card.no_summary", &[]));
-                expanded_text(ui, &catalog.t("history.card.latest_work", &[]), &summary);
+                let messages = row
+                    .messages_json
+                    .map(|json| parse_turn_messages(json, row.instruction))
+                    .unwrap_or_default();
+                if messages.is_empty() {
+                    // messages_json이 없거나(구버전 행) 신뢰할 수 없으면 기존 경로 —
+                    // agent_summary 한 덩이.
+                    let summary = row
+                        .agent_summary
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| catalog.t("history.card.no_summary", &[]));
+                    expanded_text(ui, &catalog.t("history.card.latest_work", &[]), &summary);
+                } else {
+                    for message in &messages {
+                        let label = match message.role {
+                            crate::agent_transcript::TurnRole::User => {
+                                catalog.t("history.role.user", &[])
+                            }
+                            crate::agent_transcript::TurnRole::Assistant => {
+                                catalog.t("history.role.agent", &[])
+                            }
+                        };
+                        expanded_text(ui, &label, &message.text);
+                        ui.add_space(4.0);
+                    }
+                }
                 if let Some(summary_text) = row.agent_summary {
                     copy_button(
                         ui,
@@ -884,6 +904,71 @@ fn expanded_text(ui: &mut egui::Ui, label: &str, body: &str) {
 /// `.truncate()`는 이 함수와 별개로 그대로 남는다.
 fn collapsed_summary_line(summary: &str) -> &str {
     summary.lines().next().unwrap_or("")
+}
+
+/// 카드가 그릴 턴 메시지 하나. `role`은 `agent_transcript`의 것을 재사용해 라벨
+/// 매핑이 한 곳(`TurnRole`)에서만 정의되게 한다.
+pub struct CardMessage {
+    pub role: crate::agent_transcript::TurnRole,
+    pub text: String,
+}
+
+/// `messages_json`을 카드용으로 푼다. 어떤 이유로든 신뢰할 수 없으면 **빈 벡터**를
+/// 돌려주고, 호출부는 기존 `agent_summary` 경로로 물러난다(fail-soft) — 이력 카드
+/// 하나가 이상해도 패널 전체가 죽지 않는다.
+///
+/// - 파싱 실패, 배열 길이가 `TURN_MESSAGES_MAX` 초과, `r`이 `"u"`/`"a"`가 아닌 항목이
+///   하나라도 있으면 통째로 거부한다(저장 측이 5개·두 역할을 보장하므로, 그걸 벗어나면
+///   신뢰할 수 없는 입력이다 — 잘라 쓰지 않는다).
+/// - `instruction`과 정규화 비교(트림 + 연속 공백 접기 + 소문자)해 같은 항목은 지운다
+///   (제목이 본문에 두 번 나오는 것 방지, orca의 `turnTextMatchesSessionTitle` 차용).
+/// - 인접한 같은 역할·같은 정규화 텍스트는 하나로 줄인다(orca의
+///   `dedupeAdjacentConversationTurns` 차용).
+fn parse_turn_messages(json: &str, instruction: &str) -> Vec<CardMessage> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return Vec::new();
+    };
+    if items.len() > crate::agent_transcript::TURN_MESSAGES_MAX {
+        return Vec::new();
+    }
+
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in &items {
+        let role = match item.get("r").and_then(serde_json::Value::as_str) {
+            Some("u") => crate::agent_transcript::TurnRole::User,
+            Some("a") => crate::agent_transcript::TurnRole::Assistant,
+            _ => return Vec::new(),
+        };
+        let Some(text) = item.get("t").and_then(serde_json::Value::as_str) else {
+            return Vec::new();
+        };
+        parsed.push(CardMessage {
+            role,
+            text: text.to_owned(),
+        });
+    }
+
+    let normalized_instruction = normalize_for_dedupe(instruction);
+    parsed.retain(|message| normalize_for_dedupe(&message.text) != normalized_instruction);
+
+    let mut deduped: Vec<CardMessage> = Vec::with_capacity(parsed.len());
+    for message in parsed {
+        let is_adjacent_duplicate = deduped.last().is_some_and(|previous: &CardMessage| {
+            previous.role == message.role
+                && normalize_for_dedupe(&previous.text) == normalize_for_dedupe(&message.text)
+        });
+        if !is_adjacent_duplicate {
+            deduped.push(message);
+        }
+    }
+    deduped
+}
+
+/// 트림 + 연속 공백 접기 + 소문자 — orca가 제목·본문 중복 판정에 쓰는 비교 규칙과
+/// 같다. 원문을 바꾸지 않고 비교용으로만 쓴다.
+fn normalize_for_dedupe(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 /// storage가 `agent_work_turn.instruction`/`agent_summary`에 적용하는 저장 상한
@@ -1498,6 +1583,38 @@ mod tests {
         assert_eq!(collapsed_summary_line("첫 줄\n둘째 줄"), "첫 줄");
         assert_eq!(collapsed_summary_line("한 줄뿐"), "한 줄뿐");
         assert_eq!(collapsed_summary_line(""), "");
+    }
+
+    #[test]
+    fn 카드_메시지는_인접_중복을_지운다() {
+        // orca의 dedupeAdjacentConversationTurns와 같은 규칙 — 같은 역할이 같은 말을
+        // 연달아 하면 한 번만 보여준다.
+        let parsed = parse_turn_messages(
+            r#"[{"r":"a","t":"같은 말"},{"r":"a","t":"같은 말"},{"r":"u","t":"다른 말"}]"#,
+            "지시",
+        );
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn 카드_메시지는_지시와_같은_턴을_지운다() {
+        // 제목(instruction)이 본문에 한 번 더 나오는 것을 막는다.
+        let parsed = parse_turn_messages(r#"[{"r":"u","t":"지시"},{"r":"a","t":"답"}]"#, "지시");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].text, "답");
+    }
+
+    #[test]
+    fn 카드_메시지는_손상된_json을_비워서_돌려준다() {
+        assert!(parse_turn_messages("{ 망가짐", "지시").is_empty());
+        assert!(parse_turn_messages(r#"[{"r":"x","t":"모를 역할"}]"#, "지시").is_empty());
+        assert!(
+            parse_turn_messages(
+                &format!("[{}]", r#"{"r":"a","t":"x"},"#.repeat(9)),
+                "지시"
+            )
+            .is_empty()
+        );
     }
 
     #[test]

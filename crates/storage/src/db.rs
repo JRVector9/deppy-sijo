@@ -212,6 +212,8 @@ impl std::fmt::Debug for ActivePendingApprovalOwner {
 ///     status detector regex를 agent_configs 재조회 없이 spawn 시점 값 그대로
 ///     복원하도록 세션 행에 함께 저장(persist crate 소유 DDL, runtime PR-2 후속).
 /// 35: bounded agent work-turn history, keyed by durable provider turn identity.
+/// 36: agent_work_turns.messages_json — 턴 안 최근 메시지 배열(유계 JSON). additive라
+///     기존 행은 NULL이고 NULL이면 instruction+agent_summary만 보여주는 기존 렌더로 떨어진다.
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -729,6 +731,10 @@ CREATE TABLE agent_work_turns (
 CREATE INDEX idx_agent_work_turns_workspace_recency
     ON agent_work_turns(workspace_id, updated_at DESC, source_offset DESC);
 ",
+    // v36: 턴 하나가 남기는 마지막 요약 하나로는 에이전트가 무엇을 했는지 읽히지
+    // 않았다. 턴 안 최신 메시지 5개를 유계 JSON으로 함께 보존한다(2026-08-15).
+    // 기존 행은 NULL이고, NULL이면 예전대로 instruction+agent_summary만 보여준다.
+    "ALTER TABLE agent_work_turns ADD COLUMN messages_json TEXT;",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -829,6 +835,8 @@ const AGENT_WORK_TURN_PROVIDER_BYTES_MAX: usize = 64;
 const AGENT_WORK_TURN_ID_BYTES_MAX: usize = 1024;
 const AGENT_WORK_TURN_INSTRUCTION_BYTES_MAX: usize = 32 * 1024;
 const AGENT_WORK_TURN_SUMMARY_BYTES_MAX: usize = 32 * 1024;
+/// 턴 메시지 배열 컬럼 상한. 행 전체 상한(32KB) 안에서 나머지 필드에 자리를 남긴다.
+const AGENT_WORK_TURN_MESSAGES_BYTES_MAX: usize = 8 * 1024;
 const AGENT_WORK_TURN_CWD_BYTES_MAX: usize = 4 * 1024;
 const AGENT_WORK_TURN_METADATA_BYTES_MAX: usize = 1024;
 const AGENT_WORK_TURN_ROW_BYTES_MAX: usize = 32 * 1024;
@@ -873,6 +881,9 @@ pub struct AgentWorkTurnRow {
     pub source_offset: u64,
     pub instruction: String,
     pub agent_summary: Option<String>,
+    /// 턴 안 최신 메시지 5개를 담은 유계 JSON. 컬럼이 없던 시절 행이나 상한을 넘겨
+    /// 저장이 거부된 행은 NULL이고, 그때는 기존 instruction+agent_summary만 그린다.
+    pub messages_json: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub cwd: Option<String>,
@@ -889,6 +900,7 @@ impl std::fmt::Debug for AgentWorkTurnRow {
             .debug_struct("AgentWorkTurnRow")
             .field("state", &self.state)
             .field("has_summary", &self.agent_summary.is_some())
+            .field("has_messages", &self.messages_json.is_some())
             .field("has_git_facts", &self.cwd.is_some())
             .finish_non_exhaustive()
     }
@@ -905,6 +917,7 @@ pub struct AgentWorkTurnUpsert {
     pub source_offset: u64,
     pub instruction: String,
     pub agent_summary: Option<String>,
+    pub messages_json: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub cwd: Option<String>,
@@ -1783,6 +1796,7 @@ const AGENT_WORK_HISTORY_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
          + length(CAST(turn.turn_key AS BLOB))
          + length(CAST(turn.instruction AS BLOB))
          + COALESCE(length(CAST(turn.agent_summary AS BLOB)), 0)
+         + COALESCE(length(CAST(turn.messages_json AS BLOB)), 0)
          + COALESCE(length(CAST(turn.model AS BLOB)), 0)
          + COALESCE(length(CAST(turn.effort AS BLOB)), 0)
          + COALESCE(length(CAST(turn.cwd AS BLOB)), 0)
@@ -1809,6 +1823,9 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR typeof(agent_summary) NOT IN ('null', 'text')
        OR (typeof(agent_summary) = 'text'
            AND (length(CAST(agent_summary AS BLOB)) > ?6 OR instr(agent_summary, char(0)) != 0))
+    OR typeof(messages_json) NOT IN ('null', 'text')
+       OR (typeof(messages_json) = 'text'
+           AND (length(CAST(messages_json AS BLOB)) > ?10 OR instr(messages_json, char(0)) != 0))
     OR typeof(model) NOT IN ('null', 'text')
        OR (typeof(model) = 'text'
            AND (length(CAST(model AS BLOB)) > ?7 OR instr(model, char(0)) != 0))
@@ -1832,7 +1849,8 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
 
 const AGENT_WORK_HISTORY_SELECT: &str = "SELECT workspace_id, pane_id, kind,
            agent_session_id, turn_key, source_offset, instruction, agent_summary,
-           model, effort, cwd, branch, git_change_count, state, occurred_at, updated_at
+           model, effort, cwd, branch, git_change_count, state, occurred_at, updated_at,
+           messages_json
       FROM agent_work_turns WHERE workspace_id = ?1
      ORDER BY updated_at DESC, source_offset DESC,
               substr(CAST(kind AS BLOB), 1, ?3),
@@ -2140,6 +2158,10 @@ fn agent_work_turn_input_bytes(row: &AgentWorkTurnUpsert) -> anyhow::Result<usiz
                 AGENT_WORK_TURN_SUMMARY_BYTES_MAX,
             )
             && agent_work_optional_text_is_valid(
+                row.messages_json.as_deref(),
+                AGENT_WORK_TURN_MESSAGES_BYTES_MAX,
+            )
+            && agent_work_optional_text_is_valid(
                 row.model.as_deref(),
                 AGENT_WORK_TURN_METADATA_BYTES_MAX,
             )
@@ -2163,6 +2185,7 @@ fn agent_work_turn_input_bytes(row: &AgentWorkTurnUpsert) -> anyhow::Result<usiz
         row.turn_key.len(),
         row.instruction.len(),
         row.agent_summary.as_deref().map_or(0, str::len),
+        row.messages_json.as_deref().map_or(0, str::len),
         row.model.as_deref().map_or(0, str::len),
         row.effort.as_deref().map_or(0, str::len),
         row.cwd.as_deref().map_or(0, str::len),
@@ -2208,6 +2231,7 @@ fn agent_work_history_probe(
             AGENT_WORK_TURN_METADATA_BYTES_MAX as i64,
             AGENT_WORK_TURN_CWD_BYTES_MAX as i64,
             AGENT_WORK_TURN_ROW_BYTES_MAX as i64,
+            AGENT_WORK_TURN_MESSAGES_BYTES_MAX as i64,
         ],
         query.limit,
         query.snapshot_bytes_max,
@@ -2284,6 +2308,9 @@ fn read_agent_work_history(
             .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
             .to_owned(),
             agent_summary: bounded_optional_text(row, 7, AGENT_WORK_TURN_SUMMARY_BYTES_MAX)
+                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
+                .map(str::to_owned),
+            messages_json: bounded_optional_text(row, 16, AGENT_WORK_TURN_MESSAGES_BYTES_MAX)
                 .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
                 .map(str::to_owned),
             model: bounded_optional_text(row, 8, AGENT_WORK_TURN_METADATA_BYTES_MAX)
@@ -7374,9 +7401,9 @@ impl Db {
                 "INSERT INTO agent_work_turns
                     (workspace_id, pane_id, kind, agent_session_id, turn_key, source_offset,
                      instruction, agent_summary, model, effort, cwd, branch, git_change_count,
-                     state, occurred_at, updated_at)
+                     state, occurred_at, updated_at, messages_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                         ?15, ?16)
+                         ?15, ?16, ?17)
                  ON CONFLICT(workspace_id, kind, agent_session_id, turn_key) DO UPDATE SET
                     pane_id = excluded.pane_id,
                     source_offset = excluded.source_offset,
@@ -7389,7 +7416,8 @@ impl Db {
                     git_change_count = excluded.git_change_count,
                     state = excluded.state,
                     occurred_at = excluded.occurred_at,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    messages_json = excluded.messages_json
                  WHERE agent_work_turns.updated_at <= excluded.updated_at",
                 rusqlite::params![
                     row.workspace_id,
@@ -7408,6 +7436,7 @@ impl Db {
                     row.state.as_str(),
                     row.occurred_at,
                     row.updated_at,
+                    row.messages_json,
                 ],
             )
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
@@ -11934,6 +11963,7 @@ mod tests {
             source_offset: index as u64,
             instruction: format!("instruction-{index}"),
             agent_summary: Some(format!("summary-{index}")),
+            messages_json: None,
             model: Some("gpt-5.6".to_owned()),
             effort: Some("high".to_owned()),
             cwd: Some("/repo".to_owned()),
@@ -11978,7 +12008,7 @@ mod tests {
 
         {
             let db = Db::open(&path).unwrap();
-            assert_eq!(Db::read_user_version(&db.conn).unwrap(), 35);
+            assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
             let primary_key = db
                 .conn
                 .prepare("PRAGMA table_info(agent_work_turns)")
@@ -12021,7 +12051,7 @@ mod tests {
             .unwrap();
         }
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), 35);
+        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), MIGRATIONS.len());
         let workspace_id = reopened
             .list_workspaces()
             .unwrap()
@@ -12073,6 +12103,71 @@ mod tests {
     }
 
     #[test]
+    fn agent_work_turn_messages_json은_왕복한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("history-messages").unwrap();
+        let mut row = agent_work_turn(&workspace_id, 0, 1);
+        row.messages_json = Some(r#"[{"r":"u","t":"물어봤다","at":1}]"#.to_owned());
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![row]).unwrap();
+        assert_eq!(
+            snapshot.work_turns[0].messages_json.as_deref(),
+            Some(r#"[{"r":"u","t":"물어봤다","at":1}]"#)
+        );
+        assert_eq!(
+            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(
+                workspace_id.as_str()
+            ))
+            .unwrap()[0]
+                .messages_json
+                .as_deref(),
+            Some(r#"[{"r":"u","t":"물어봤다","at":1}]"#)
+        );
+    }
+
+    #[test]
+    fn agent_work_turn_messages_json은_기존_행에서_null이다() {
+        // additive 마이그레이션 — 컬럼이 없던 시절 행은 NULL로 읽히고 카드는 기존 두
+        // 필드(instruction+agent_summary)만 쓰는 경로로 떨어진다.
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("history-messages-null").unwrap();
+        let row = agent_work_turn(&workspace_id, 0, 1);
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![row]).unwrap();
+        assert_eq!(snapshot.work_turns[0].messages_json, None);
+    }
+
+    #[test]
+    fn agent_work_turn_messages_json은_상한_초과와_nul을_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("history-messages-invalid").unwrap();
+
+        let mut oversized = agent_work_turn(&workspace_id, 0, 0);
+        oversized.messages_json = Some("x".repeat(AGENT_WORK_TURN_MESSAGES_BYTES_MAX + 1));
+        assert_eq!(
+            apply_agent_work_turns(&db, &workspace_id, vec![oversized])
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        let mut has_nul = agent_work_turn(&workspace_id, 1, 1);
+        has_nul.messages_json = Some("no-nul\0".to_owned());
+        assert_eq!(
+            apply_agent_work_turns(&db, &workspace_id, vec![has_nul])
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        assert!(
+            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(
+                workspace_id.as_str()
+            ))
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn agent_work_history_accepts_bounded_future_provider_id() {
         let db = Db::open_in_memory().unwrap();
         let workspace_id = db.create_workspace("history-provider").unwrap();
@@ -12108,6 +12203,7 @@ mod tests {
         row.turn_key = marker.to_owned();
         row.instruction = marker.to_owned();
         row.agent_summary = Some(marker.to_owned());
+        row.messages_json = Some(marker.to_owned());
         row.cwd = Some(marker.to_owned());
         let durable = AgentWorkTurnRow {
             workspace_id: row.workspace_id.clone(),
@@ -12118,6 +12214,7 @@ mod tests {
             source_offset: row.source_offset,
             instruction: row.instruction.clone(),
             agent_summary: row.agent_summary.clone(),
+            messages_json: row.messages_json.clone(),
             model: row.model.clone(),
             effort: row.effort.clone(),
             cwd: row.cwd.clone(),

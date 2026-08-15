@@ -209,6 +209,46 @@ JSON 파싱 성공, 배열 길이 ≤ 5.
 - 게이트: `cargo test -p deppy-sijo` + `cargo test -p storage` + `cargo test -p i18n` +
   `cargo clippy --workspace --all-targets -- -D warnings` 0건.
 
+## 6. [2026-08-16 추가] 원문에서 그 턴을 선택해 보여준다
+
+1차 구현은 원문을 열면 **항상 최신(맨 아래)**에서 시작한다. 그런데 카드는 특정 **턴**이다 —
+오래된 카드를 눌러도 그 턴이 아니라 대화 끝이 뜬다. 사용자 요구: 「원문 보기」를 하면
+**그 카드가 가리키는 턴이 원문에서 선택돼** 보여야 한다.
+
+### 6-1. 앵커
+
+`AgentWorkTurnRow.source_offset`은 **그 턴을 연 레코드 줄의 절대 파일 오프셋**이다
+(`PendingTurn::new`가 `snapshot_lines`의 오프셋을 그대로 받는다). `read_conversation`도
+같은 `snapshot_lines`를 돌므로 **좌표계가 같다** — 별도 인덱스나 재파싱이 필요 없다.
+
+### 6-2. 데이터
+
+`ConversationMessage`에 `pub offset: u64`를 더한다(그 메시지 레코드 줄의 절대 오프셋).
+`Debug`는 지금처럼 텍스트만 가린다 — 오프셋은 위치 정보라 가릴 필요가 없다.
+
+### 6-3. 선택 범위
+
+`focus_offset`(= 행의 `source_offset`)이 주어지면:
+
+- **시작** = `offset >= focus_offset`인 **첫** 메시지. 정확히 일치하는 것이 정상이지만,
+  턴을 연 줄이 노이즈 규칙으로 걸러졌을 수 있어 부등호로 잡는다.
+- **끝** = 시작 다음에 나오는 **첫 User 메시지 직전**(그게 다음 턴의 시작이다). 없으면 끝까지.
+- 그 범위 전체를 선택 배경으로 강조하고, **시작 메시지가 화면 위쪽**에 오도록 스크롤한다.
+- `focus_offset`이 스냅샷 창(꼬리 4MB)보다 앞이면 찾을 수 없다 → 강조 없이 맨 아래에서
+  시작하고 `history.transcript.focus_missing` 안내를 상단에 띄운다. **조용히 최신을
+  보여주면 사용자는 그게 그 턴인 줄 안다** — 그래서 반드시 말해 준다.
+- `focus_offset`이 없으면(향후 다른 진입점) 지금처럼 맨 아래에서 시작한다.
+
+### 6-4. 상태
+
+`set_conversation(result, focus_offset: Option<u64>)`로 시그니처를 넓힌다. 뷰어는 세대
+번호를 이미 올리고 있으므로 `ScrollArea` 상태는 새 대화마다 새로 잡힌다 — 강조 위치로의
+스크롤도 그 위에서 한 번만 적용된다.
+
+### 6-5. i18n 추가 (5로케일)
+
+`history.transcript.focus_missing`.
+
 ## 범위 외
 
 - 이미 끝난 세션의 요약을 소급 재파싱해 DB를 다시 채우는 일(원문 보기가 대신한다)

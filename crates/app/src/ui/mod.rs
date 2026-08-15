@@ -11,6 +11,7 @@ pub mod credentials;
 pub(crate) mod cross_workspace;
 pub mod designall;
 pub mod diff_panel;
+pub mod diff_viewer;
 pub mod env_profiles;
 pub mod env_project_list;
 pub mod file_drop;

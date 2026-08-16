@@ -114,26 +114,6 @@ pub fn parse_unified(text: &str, truncated: bool) -> FileDiffView {
     view
 }
 
-/// untracked 파일 — diff가 없으므로 파일 내용 전체를 추가로 합성한다(스펙 §3).
-pub fn synth_added(content: &str, truncated: bool) -> FileDiffView {
-    let lines: Vec<DiffLine> = content
-        .lines()
-        .enumerate()
-        .map(|(i, text)| DiffLine {
-            kind: LineKind::Add,
-            old_no: None,
-            new_no: Some(i as u32 + 1),
-            text: text.to_owned(),
-        })
-        .collect();
-    FileDiffView {
-        hunks: vec![DiffHunk { old_start: 0, new_start: 1, lines }],
-        gaps: Vec::new(),
-        binary: false,
-        truncated,
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum DisplayRow {
     Line { hunk: usize, line: usize },
@@ -203,6 +183,12 @@ pub struct DiffViewerUi {
     /// 다음 프레임에 이 표시 행으로 스크롤 — hunk ↑↓가 세팅한다.
     scroll_to_row: Option<usize>,
     current_hunk: usize,
+    /// `flatten_display_rows(view)` 캐시 — view가 바뀔 때(open/set_view)만
+    /// 재계산한다. render()가 매 프레임 이 무거운 재구성을 반복하면 스크롤과
+    /// 무관하게 전체 diff를 매번 훑게 된다(2026-08-16 코드 리뷰 대응).
+    display_rows: Vec<DisplayRow>,
+    /// `hunk_start_indices(&display_rows)` 캐시 — display_rows와 같은 시점에 갱신한다.
+    hunk_starts: Vec<usize>,
 }
 
 impl DiffViewerUi {
@@ -214,10 +200,14 @@ impl DiffViewerUi {
         self.loading = true;
         self.current_hunk = 0;
         self.scroll_to_row = None;
+        self.display_rows = Vec::new();
+        self.hunk_starts = Vec::new();
     }
 
     pub fn set_view(&mut self, view: FileDiffView) {
         self.loading = false;
+        self.display_rows = flatten_display_rows(&view);
+        self.hunk_starts = hunk_start_indices(&self.display_rows);
         self.view = Some(view);
     }
 
@@ -237,27 +227,27 @@ impl DiffViewerUi {
                 DiffMode::Working => "git.mode.working",
             };
             ui.weak(format!("({})", catalog.t(mode_key, &[])));
-            let Some(view) = self.view.as_ref() else { return };
-            let rows = flatten_display_rows(view);
-            let starts = hunk_start_indices(&rows);
+            if self.view.is_none() {
+                return;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("↓").on_hover_text(catalog.t("git.hunk.next", &[])).clicked()
-                    && self.current_hunk + 1 < starts.len()
+                    && self.current_hunk + 1 < self.hunk_starts.len()
                 {
                     self.current_hunk += 1;
-                    self.scroll_to_row = starts.get(self.current_hunk).copied();
+                    self.scroll_to_row = self.hunk_starts.get(self.current_hunk).copied();
                 }
                 if ui.small_button("↑").on_hover_text(catalog.t("git.hunk.prev", &[])).clicked()
                     && self.current_hunk > 0
                 {
                     self.current_hunk -= 1;
-                    self.scroll_to_row = starts.get(self.current_hunk).copied();
+                    self.scroll_to_row = self.hunk_starts.get(self.current_hunk).copied();
                 }
             });
         });
         ui.separator();
 
-        let Some(view) = self.view.clone() else {
+        let Some(view) = self.view.as_ref() else {
             ui.weak(catalog.t("diff.loading", &[]));
             return;
         };
@@ -265,7 +255,7 @@ impl DiffViewerUi {
             ui.weak(catalog.t("git.binary", &[]));
             return;
         }
-        let rows = flatten_display_rows(&view);
+        let rows = &self.display_rows;
         let dark_mode = ui.visuals().dark_mode;
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
         let mut scroll = egui::ScrollArea::both().auto_shrink([false, false]);
@@ -353,14 +343,6 @@ index 111..222 100644
     }
 
     #[test]
-    fn untracked_파일_내용은_전량_추가로_합성한다() {
-        let view = synth_added("line1\nline2\n", false);
-        assert_eq!(view.hunks.len(), 1);
-        assert!(view.hunks[0].lines.iter().all(|l| l.kind == LineKind::Add));
-        assert_eq!(view.hunks[0].lines.len(), 2);
-    }
-
-    #[test]
     fn 표시_행은_hunk와_gap을_순서대로_평탄화한다() {
         let view = parse_unified(SAMPLE, false);
         let rows = flatten_display_rows(&view);
@@ -370,5 +352,117 @@ index 111..222 100644
         assert!(matches!(rows[0], DisplayRow::Line { hunk: 0, .. }));
         // hunk 시작 인덱스: hunk 이동 버튼이 이 인덱스로 스크롤한다.
         assert_eq!(hunk_start_indices(&rows), vec![0, 6]);
+    }
+
+    #[test]
+    fn view_교체시_flatten_캐시가_새_내용으로_갱신된다() {
+        // set_view가 display_rows/hunk_starts를 즉시 재계산하지 않으면 옛 뷰의
+        // flatten 결과가 새 diff 화면에 그대로 쓰인다 — 캐싱 도입 회귀 방지용.
+        let mut viewer = DiffViewerUi::default();
+        viewer.set_view(parse_unified(SAMPLE, false));
+        assert_eq!(viewer.display_rows.len(), 9, "hunk1(5)+gap(1)+hunk2(3)");
+        assert_eq!(viewer.hunk_starts, vec![0, 6]);
+
+        // 단일 hunk·3행짜리 별개 뷰로 교체 — 이전 뷰(9행)의 캐시가 남으면 안 된다.
+        let second = FileDiffView {
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    DiffLine { kind: LineKind::Add, old_no: None, new_no: Some(1), text: "line1".into() },
+                    DiffLine { kind: LineKind::Add, old_no: None, new_no: Some(2), text: "line2".into() },
+                    DiffLine { kind: LineKind::Add, old_no: None, new_no: Some(3), text: "line3".into() },
+                ],
+            }],
+            gaps: Vec::new(),
+            binary: false,
+            truncated: false,
+        };
+        viewer.set_view(second);
+        assert_eq!(
+            viewer.display_rows.len(),
+            3,
+            "옛 뷰(9행)가 아니라 새 뷰(3행) 기준으로 갱신돼야 한다"
+        );
+        assert_eq!(viewer.hunk_starts, vec![0]);
+    }
+
+    /// 두 번째 hunk를 초기 스크롤 밖(가상화로 안 그려지는 위치)에 두고, hunk
+    /// 이동 버튼이 실제로 그 hunk를 화면에 끌어오는지(=스크롤 대상 이동)와
+    /// 경계에서 멈추는지(=클램프)를 함께 검증한다. 필러 50줄은 일부러 적당히
+    /// 잡았다 — 너무 적으면 뷰 밖으로 안 나가고, 너무 많으면 scroll_to_row가
+    /// 쓰는 row_h(spacing 미포함)와 실제 행 간격(spacing 포함) 오차가 누적돼
+    /// show_rows가 목표 행을 창 안에 못 넣는다(2026-08-16, 300줄로 처음 시도했다가
+    /// 확인).
+    fn 큰_두_hunk_뷰() -> FileDiffView {
+        let hunk1: Vec<DiffLine> = (0..50)
+            .map(|i| DiffLine {
+                kind: LineKind::Context,
+                old_no: Some(i + 1),
+                new_no: Some(i + 1),
+                text: format!("채움 {i}"),
+            })
+            .collect();
+        let hunk2 = vec![DiffLine {
+            kind: LineKind::Context,
+            old_no: Some(500),
+            new_no: Some(500),
+            text: "둘째_hunk_고유_행".to_owned(),
+        }];
+        FileDiffView {
+            hunks: vec![
+                DiffHunk { old_start: 1, new_start: 1, lines: hunk1 },
+                DiffHunk { old_start: 500, new_start: 500, lines: hunk2 },
+            ],
+            gaps: Vec::new(),
+            binary: false,
+            truncated: false,
+        }
+    }
+
+    fn harness_for(viewer: DiffViewerUi) -> egui_kittest::Harness<'static, DiffViewerUi> {
+        egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut DiffViewerUi| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                state.render(ui, &catalog);
+            },
+            viewer,
+        )
+    }
+
+    #[test]
+    fn kittest_hunk_이동_버튼은_스크롤_대상을_옮기고_경계에서_클램프된다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/big.rs".to_owned(), DiffMode::Working);
+        viewer.set_view(큰_두_hunk_뷰());
+        let mut harness = harness_for(viewer);
+        harness.run();
+
+        assert!(
+            harness.query_by_label_contains("둘째_hunk_고유_행").is_none(),
+            "초기 스크롤은 맨 위라 둘째 hunk는 가상화로 아직 그려지지 않아야 한다"
+        );
+
+        // ↑: 이미 첫 hunk(0)이라 하한에서 멈춘다 — 화면도 그대로다.
+        harness.get_by_label("↑").click();
+        harness.run();
+        assert_eq!(harness.state().current_hunk, 0);
+        assert!(harness.query_by_label_contains("둘째_hunk_고유_행").is_none());
+
+        // ↓: 둘째 hunk로 스크롤 대상이 옮겨져 실제로 화면에 그려진다.
+        harness.get_by_label("↓").click();
+        harness.run();
+        assert_eq!(harness.state().current_hunk, 1);
+        assert!(
+            harness.query_by_label_contains("둘째_hunk_고유_행").is_some(),
+            "hunk 이동 버튼은 실제로 스크롤 위치를 옮겨야 한다"
+        );
+
+        // 다시 ↓: 이미 마지막 hunk(1)라 상한에서 멈춘다.
+        harness.get_by_label("↓").click();
+        harness.run();
+        assert_eq!(harness.state().current_hunk, 1);
     }
 }

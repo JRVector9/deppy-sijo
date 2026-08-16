@@ -7880,6 +7880,12 @@ pub struct App {
     /// 소유한다. Git이 사이드바 인라인 탭에서 pane 보조 탭으로 옮겨가면서, 사이드바
     /// leaf가 더는 git IO 결과를 들고 있을 이유가 없어졌다(§8-1).
     git_panel_ui: ui::git_panel::GitPanelUi,
+    /// 지금 Git 패널이 보여주는(요청 중인) repo cwd — `request_git_panel_io_at`이 요청마다
+    /// 갱신한다. ⟳ 새로고침·파일 diff는 포커스 세션을 다시 묻지 않고 이 값을 그대로
+    /// 써서, 패널이 열려 있는 동안 포커스가 다른 세션으로 옮겨가도 다른 repo로 갈아타지
+    /// 않는다(2026-08-16, 「변경 보기」로 세션에 고정한 뒤 ⟳를 누르면 포커스 세션으로
+    /// 조용히 바뀌던 결함 수정).
+    git_panel_cwd: Option<PathBuf>,
     /// 이력과 같은 보조 UI 탭 상태 기계 — runtime의 mux 탭/pane과 무관하다.
     git_tab: ui::workspace::PaneAuxTabState,
     /// Git 본문 좌(목록)/우(diff) 분할 폭 — 사용자가 구분선을 한 번도 안 끌었으면
@@ -8829,6 +8835,47 @@ enum AppHostIoAction {
     FolderPicker(FolderPickerPurpose),
     OpenPath(PathBuf),
     ExternalHttpsUrl(String),
+}
+
+/// 워크스페이스 전환 시 Git 보조 본문 표면을 무효화한다(2026-08-16, 코드 리뷰 항목 1) —
+/// `git_tab` 자체는 건드리지 않는다(이력 탭과 대칭으로 열린 채 유지). 스냅샷을 `None`으로
+/// 되돌리면 `GitPanelUi::render`가 다음 프레임에 스스로 `GitPanelAction::Refresh`를 반환해
+/// 새 워크스페이스 기준으로 다시 채운다. `diff_viewer_ui`도 함께 비워 선택돼 있던 파일
+/// diff가 이전 워크스페이스 것으로 남지 않게 하고, `git_panel_generation`을 올려 이미
+/// in-flight이던 이전 워크스페이스 IO의 완료가 새 화면에 반영되지 않게 막는다.
+fn reset_git_surfaces(
+    git_panel_ui: &mut ui::git_panel::GitPanelUi,
+    diff_viewer_ui: &mut ui::diff_viewer::DiffViewerUi,
+    git_panel_generation: &mut u64,
+    git_panel_cwd: &mut Option<PathBuf>,
+) {
+    *git_panel_ui = ui::git_panel::GitPanelUi::default();
+    *diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();
+    *git_panel_generation = git_panel_generation.wrapping_add(1).max(1);
+    *git_panel_cwd = None;
+}
+
+/// 워크스페이스 전환 시 원문 뷰어 IO 요청을 무효화한다(항목 2) — `transcript_generation`을
+/// 올려, 이미 in-flight이거나 `pending_app_host_action` 슬롯에 들어간 이전 워크스페이스의
+/// 원문 읽기가 완료돼도 세대 검사(`generation == self.transcript_generation`)에 걸려
+/// 버려지게 한다. 슬롯이 차 있어 대기 중이던 `pending_transcript_request`는 아직 어떤
+/// IO도 시작하지 않았으므로 세대 검사로 걸러지지 않는다 — 여기서 직접 비워, 슬롯이
+/// 빌 때 이전 워크스페이스 요청이 다시 실행되지 않게 한다.
+fn invalidate_transcript_requests(
+    transcript_generation: &mut u64,
+    pending_transcript_request: &mut Option<AppHostIoAction>,
+) {
+    *transcript_generation = transcript_generation.wrapping_add(1).max(1);
+    *pending_transcript_request = None;
+}
+
+/// `GitPanelAction::Refresh`가 쓸 cwd(항목 3) — 패널이 이미 어떤 repo를 보여주고 있으면
+/// (`pinned`, ⟳ 클릭·파일 diff 재요청) 포커스가 다른 세션으로 옮겨가 있어도 그 repo를
+/// 그대로 유지한다. 아직 보여줄 repo가 없으면(방금 탭이 열렸거나 워크스페이스 전환
+/// 직후 `reset_git_surfaces`가 비운 자리를 `GitPanelUi::render`가 자동으로 다시 채우는
+/// 경우) 포커스 세션 기준으로 새로 고른다.
+fn resolve_git_refresh_cwd(pinned: Option<PathBuf>, focused: Option<PathBuf>) -> Option<PathBuf> {
+    pinned.or(focused)
 }
 
 /// Root-owned lifecycle mutations emitted by Settings. The UI keeps at most one action and
@@ -11716,6 +11763,7 @@ impl App {
             diff_viewer_ui: ui::diff_viewer::DiffViewerUi::default(),
             git_panel_generation: 0,
             git_panel_ui: ui::git_panel::GitPanelUi::default(),
+            git_panel_cwd: None,
             git_tab: ui::workspace::PaneAuxTabState::default(),
             git_tab_split_width: None,
             work_history_ui: ui::work_history::WorkHistoryUi::new(),
@@ -14193,10 +14241,13 @@ impl App {
         self.session_cwds.get(&session).cloned()
     }
 
-    /// 사이드바 Git 탭이 다루는 repo의 cwd — 포커스된 세션 기준(2026-08-15, Task 10
-    /// Step 6). `ShowFocusedDiff`(Git 탭)와 `ShowDiff{session}`(세션 메뉴 「변경 보기」)
-    /// 둘 다 이 값으로 수렴한다 — 패널은 "이 세션의 변경분"이 아니라 "현재 포커스된
-    /// 작업 폴더의 git 상태"를 보여주는 화면이라 특정 세션 id를 들고 다니지 않는다.
+    /// Git 보조 탭을 **새로** 여는 경로(레일 「Git」·pane 헤더 탭 클릭)가 쓰는 cwd —
+    /// 포커스된 세션 기준(2026-08-15, Task 10 Step 6). `ShowDiff{session}`(세션 메뉴
+    /// 「변경 보기」)은 더 이상 이 값으로 수렴하지 않는다 — 포커스가 다른 세션에 있으면
+    /// 엉뚱한 repo가 뜨는 회귀가 있어 그 세션 고유 cwd로 고정하게 바뀌었다(2026-08-15
+    /// 회귀 수정). ⟳ 새로고침·파일 diff처럼 **이미 열린** 패널을 다루는 경로는 이 값을
+    /// 다시 묻지 않고 `git_panel_cwd`(패널이 지금 보여주는 repo)를 쓴다(2026-08-16,
+    /// 항목 3 — 안 그러면 ⟳가 포커스 세션 쪽으로 조용히 갈아탄다).
     fn focused_session_repo_cwd(&self) -> Option<PathBuf> {
         let session = self.active.workspace_ui.focused_session()?;
         self.cached_session_cwd(session).map(PathBuf::from)
@@ -14223,6 +14274,10 @@ impl App {
         cwd: Option<PathBuf>,
         request: ui::git_panel::GitPanelIoRequest,
     ) {
+        // 패널이 지금 보여주는(요청 중인) repo cwd를 기록한다 — ⟳ 새로고침·파일 diff
+        // 재요청이 포커스 세션을 다시 묻지 않고 이 값을 그대로 쓰게 한다(항목 3,
+        // `resolve_git_refresh_cwd` 참고).
+        self.git_panel_cwd = cwd.clone();
         let Some(cwd) = cwd else {
             self.git_panel_ui
                 .set_snapshot(Err(ui::git_panel::GitPanelErrorCode::NoRepo));
@@ -16935,6 +16990,21 @@ impl App {
             // 닫힌 상태로 되돌린다(2026-08-15 Task 10).
             self.transcript_viewer_ui = ui::transcript_viewer::TranscriptViewerUi::default();
         }
+        // 원문 IO 세대도 올린다 — 뷰어를 방금 비웠어도 in-flight이거나 큐 대기 중이던
+        // 이전 워크스페이스의 원문 읽기가 완료되면 세대 검사 없이는 방금 비운 뷰어를
+        // 되살릴 수 있었다(2026-08-16, 코드 리뷰 항목 2).
+        invalidate_transcript_requests(
+            &mut self.transcript_generation,
+            &mut self.pending_transcript_request,
+        );
+        // Git 보조 본문도 이력과 같은 자리에서 무효화한다 — `git_tab`은 열린 채 유지하되
+        // 스냅샷·diff·cwd·세대는 새 워크스페이스 기준으로 다시 채워야 한다(항목 1).
+        reset_git_surfaces(
+            &mut self.git_panel_ui,
+            &mut self.diff_viewer_ui,
+            &mut self.git_panel_generation,
+            &mut self.git_panel_cwd,
+        );
         // 이력 탭은 워크스페이스를 바꿔도 유지한다 — 열려 활성인 상태였다면 새
         // 워크스페이스 projection을 기다리는 loading으로 이어 붙인다.
         self.work_history_loading = self.work_history_tab.is_active();
@@ -25500,15 +25570,26 @@ impl eframe::App for App {
         // 처리한다(스펙 §8-3·§8-5).
         match git_panel_action {
             Some(ui::git_panel::GitPanelAction::Refresh) => {
-                self.request_git_panel_io(ui.ctx(), ui::git_panel::GitPanelIoRequest::Snapshot);
+                // 포커스 세션을 다시 묻지 않는다 — 패널이 이미 보여주고 있는 repo가
+                // 있으면(⟳ 클릭) 그 repo를 유지한다. 아직 없으면(워크스페이스 전환
+                // 직후 `reset_git_surfaces`가 비운 자리를 렌더가 자동으로 다시 채우는
+                // 경우) 포커스 세션 기준으로 새로 고른다(항목 3).
+                let cwd = resolve_git_refresh_cwd(
+                    self.git_panel_cwd.clone(),
+                    self.focused_session_repo_cwd(),
+                );
+                self.request_git_panel_io_at(ui.ctx(), cwd, ui::git_panel::GitPanelIoRequest::Snapshot);
             }
             Some(ui::git_panel::GitPanelAction::OpenRemoteBranch) => {
                 self.open_git_panel_remote(ui.ctx());
             }
             Some(ui::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode }) => {
                 self.diff_viewer_ui.open(rel_path.clone(), mode);
-                self.request_git_panel_io(
+                // 지금 패널이 보여주는 repo(`git_panel_cwd`)의 파일이다 — 포커스 세션을
+                // 다시 묻지 않는다(항목 3, Refresh와 같은 규칙).
+                self.request_git_panel_io_at(
                     ui.ctx(),
+                    self.git_panel_cwd.clone(),
                     ui::git_panel::GitPanelIoRequest::FileDiff { rel_path, mode },
                 );
             }
@@ -31029,6 +31110,206 @@ mod tests {
             .0;
         assert!(divider.contains("resize_response.total_drag_delta()"));
         assert!(!divider.contains("resize_response.drag_delta().x"));
+    }
+
+    /// 워크스페이스 전환은 Git 보조 본문을 무효화해야 한다(2026-08-16 코드 리뷰 항목 1) —
+    /// 스냅샷을 비우면 `GitPanelUi::render`가 다음 프레임에 스스로 다시 채우고, 세대를
+    /// 올려 이전 워크스페이스의 in-flight 완료가 새 화면에 반영되지 않게 막는다.
+    /// 문자열 존재만 보는 소스 스캔이 아니라 `remote_target()` 같은 실제 공개 동작으로
+    /// 검증한다 — 리셋 전에는 remote 정보가 있고, 리셋 후에는 없어야 한다.
+    #[test]
+    fn reset_git_surfaces는_스냅샷_diff_세대_cwd를_모두_비운다() {
+        let mut git_panel_ui = ui::git_panel::GitPanelUi::default();
+        git_panel_ui.set_snapshot(Ok(ui::git_panel::GitPanelSnapshot {
+            repo_root: PathBuf::from("/repo/a"),
+            branch: "main".to_owned(),
+            upstream: Some("origin/main".to_owned()),
+            ahead: 1,
+            behind: 0,
+            changes: Vec::new(),
+            committed: Vec::new(),
+            changes_truncated: false,
+            committed_truncated: false,
+            remote_https_base: Some("https://github.com/o/r".to_owned()),
+            worktrees: Vec::new(),
+            worktrees_truncated: false,
+        }));
+        assert!(
+            git_panel_ui.remote_target().is_some(),
+            "리셋 전에는 스냅샷이 채워져 있어야 한다"
+        );
+
+        let mut diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();
+        diff_viewer_ui.open("src/lib.rs".to_owned(), ui::diff_viewer::DiffMode::Working);
+
+        let mut generation = 41u64;
+        let mut cwd = Some(PathBuf::from("/repo/a"));
+
+        reset_git_surfaces(&mut git_panel_ui, &mut diff_viewer_ui, &mut generation, &mut cwd);
+
+        assert!(
+            git_panel_ui.remote_target().is_none(),
+            "리셋 후에는 스냅샷이 비어 remote_target도 None이어야 한다"
+        );
+        assert_eq!(generation, 42, "세대를 올려 이전 in-flight 완료를 stale로 만든다");
+        assert_eq!(cwd, None, "cwd도 함께 비워 새 워크스페이스 기준으로 다시 잡게 한다");
+    }
+
+    /// 세대 증가는 다른 generation 필드들과 같은 관례(`wrapping_add(1).max(1)`)를
+    /// 따라야 한다 — `u64::MAX`에서 넘어가면 0이 아니라 1이어야 한다(0은 "아직 아무
+    /// 요청도 없었다"는 미요청 상태와 겹친다).
+    #[test]
+    fn reset_git_surfaces의_세대_증가는_wrap_한다() {
+        let mut git_panel_ui = ui::git_panel::GitPanelUi::default();
+        let mut diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();
+        let mut generation = u64::MAX;
+        let mut cwd = None;
+        reset_git_surfaces(&mut git_panel_ui, &mut diff_viewer_ui, &mut generation, &mut cwd);
+        assert_eq!(generation, 1);
+    }
+
+    /// 워크스페이스 전환 시 `switch_workspace_with_preferred_pane`가 실제로
+    /// `reset_git_surfaces`를 부르는지 — 순수 함수 자체는 위 두 테스트로 동작을
+    /// 검증했으니, 여기서는 배선(호출) 여부만 소스로 확인한다(보조 용도).
+    #[test]
+    fn 워크스페이스_전환은_reset_git_surfaces를_부른다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let body = production
+            .split_once("fn switch_workspace_with_preferred_pane(")
+            .expect("전환 함수가 있어야 한다")
+            .1
+            .split_once("fn cycle_workspace(")
+            .expect("다음 함수 경계가 있어야 한다")
+            .0;
+        assert!(
+            body.contains("reset_git_surfaces("),
+            "전환 시 Git 보조 본문을 무효화해야 한다"
+        );
+        assert!(
+            body.contains("invalidate_transcript_requests("),
+            "전환 시 원문 IO 세대도 무효화해야 한다(항목 2)"
+        );
+        assert!(
+            !body.contains("self.git_tab = "),
+            "git_tab 자체는 건드리지 않는다 — 이력 탭과 같은 규칙으로 열린 채 유지한다"
+        );
+    }
+
+    /// 원문 IO 세대 무효화(항목 2) — in-flight이거나 슬롯 대기 중이던 이전 워크스페이스의
+    /// 원문 읽기가 완료돼도 세대 검사에 걸려 버려져야 하고, 대기 슬롯 자체도 비워야
+    /// 슬롯이 빌 때 그 요청이 다시 실행되지 않는다.
+    #[test]
+    fn invalidate_transcript_requests는_세대를_올리고_대기_요청을_비운다() {
+        let mut generation = 7u64;
+        let mut pending = Some(AppHostIoAction::Transcript {
+            generation: 7,
+            path: PathBuf::from("/tmp/session.jsonl"),
+            kind: crate::agent_detect::AgentKind::Claude,
+            focus_offset: 0,
+        });
+        invalidate_transcript_requests(&mut generation, &mut pending);
+        assert_eq!(generation, 8);
+        assert!(
+            pending.is_none(),
+            "슬롯 대기 중이던 이전 워크스페이스 요청은 버려야 한다"
+        );
+    }
+
+    #[test]
+    fn invalidate_transcript_requests의_세대_증가도_wrap_한다() {
+        let mut generation = u64::MAX;
+        let mut pending = None;
+        invalidate_transcript_requests(&mut generation, &mut pending);
+        assert_eq!(generation, 1);
+    }
+
+    /// ⟳ 새로고침은 패널이 이미 보여주는 repo가 있으면 포커스 세션이 다른 곳으로
+    /// 옮겨가 있어도 그 repo를 유지해야 한다(항목 3 — 세션1 「변경 보기」로 repo A에
+    /// 고정한 뒤 세션2로 포커스가 옮겨가도 ⟳는 repo A를 유지해야 한다. 재현: 세션1
+    /// (repo A)·세션2(repo B, 포커스) → 세션1 우클릭 「변경 보기」 → repo A 표시 → ⟳
+    /// → 안내 없이 repo B로 바뀌던 결함).
+    #[test]
+    fn resolve_git_refresh_cwd는_고정된_repo가_있으면_포커스보다_그것을_우선한다() {
+        let pinned = Some(PathBuf::from("/repo/a"));
+        let focused = Some(PathBuf::from("/repo/b"));
+        assert_eq!(
+            resolve_git_refresh_cwd(pinned, focused),
+            Some(PathBuf::from("/repo/a"))
+        );
+    }
+
+    /// 아직 보여줄 repo가 없으면(방금 탭을 열었거나 워크스페이스 전환 직후
+    /// `reset_git_surfaces`가 비운 자리를 렌더가 자동으로 다시 채우는 경우) 포커스
+    /// 세션 기준으로 새로 고른다.
+    #[test]
+    fn resolve_git_refresh_cwd는_고정된_repo가_없으면_포커스_세션으로_새로_고른다() {
+        let focused = Some(PathBuf::from("/repo/b"));
+        assert_eq!(resolve_git_refresh_cwd(None, focused.clone()), focused);
+    }
+
+    #[test]
+    fn resolve_git_refresh_cwd는_둘_다_없으면_none이다() {
+        assert_eq!(resolve_git_refresh_cwd(None, None), None);
+    }
+
+    /// `GitPanelAction::Refresh`·`ShowFileDiff` 핸들러가 포커스 세션 기준 헬퍼
+    /// (`request_git_panel_io`)가 아니라 `git_panel_cwd`/`resolve_git_refresh_cwd`를
+    /// 쓰는지 — 순수 함수 자체는 위 테스트로 검증했으니 여기서는 배선만 확인한다.
+    #[test]
+    fn git_panel의_새로고침_파일diff는_포커스_세션이_아니라_고정된_cwd를_쓴다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let refresh = production
+            .split_once("Some(ui::git_panel::GitPanelAction::Refresh) => {")
+            .expect("Refresh 핸들러가 있어야 한다")
+            .1
+            .split_once("Some(ui::git_panel::GitPanelAction::OpenRemoteBranch)")
+            .expect("다음 액션 경계가 있어야 한다")
+            .0;
+        assert!(
+            refresh.contains("resolve_git_refresh_cwd("),
+            "⟳는 고정된 cwd를 우선하고 없을 때만 포커스 세션으로 새로 고른다"
+        );
+        let show_file_diff = production
+            .split_once("Some(ui::git_panel::GitPanelAction::ShowFileDiff { rel_path, mode }) => {")
+            .expect("ShowFileDiff 핸들러가 있어야 한다")
+            .1
+            .split_once("Some(ui::git_panel::GitPanelAction::OpenWorktreeShell")
+            .expect("다음 액션 경계가 있어야 한다")
+            .0;
+        assert!(
+            show_file_diff.contains("self.git_panel_cwd.clone()"),
+            "파일 diff 재요청도 포커스 세션이 아니라 지금 보여주는 repo cwd를 써야 한다"
+        );
+        assert!(
+            !show_file_diff.contains("self.focused_session_repo_cwd()")
+                && !show_file_diff.contains("self.request_git_panel_io(ui.ctx()"),
+            "파일 diff 재요청이 포커스 세션 기준 헬퍼로 되돌아가면 안 된다"
+        );
+    }
+
+    /// `focused_session_repo_cwd`의 doc은 한때 "ShowFocusedDiff·ShowDiff{session} 둘 다
+    /// 이 값으로 수렴한다"고 적었는데, 회귀 수정으로 `ShowDiff{session}`은 세션별 cwd를
+    /// 쓰게 바뀌어 문서가 거짓이 됐다(항목 4). 문서만 보고 그 회귀를 되살리지 않도록
+    /// 실제 동작에 맞는 문구인지 확인한다.
+    #[test]
+    fn focused_session_repo_cwd_문서는_showdiff_세션이_수렴한다고_주장하지_않는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let doc = production
+            .split_once("fn focused_session_repo_cwd(&self)")
+            .expect("문서 대상 함수가 있어야 한다")
+            .0;
+        let doc = &doc[doc.len().saturating_sub(1200)..];
+        assert!(
+            !doc.contains("`ShowFocusedDiff`(Git 탭)와 `ShowDiff{session}`(세션 메뉴 「변경 보기」)\n    /// 둘 다 이 값으로 수렴한다"),
+            "ShowDiff{{session}}이 이 값으로 수렴한다는 거짓 문서가 남아있으면 안 된다"
+        );
+        assert!(
+            doc.contains("git_panel_cwd"),
+            "새 문서는 이미 열린 패널이 git_panel_cwd를 쓴다는 점을 설명해야 한다"
+        );
     }
 
     /// 「원문 보기」는 사용자 클릭이다. git 패널 IO와 capacity-1 슬롯을 공유하는데,

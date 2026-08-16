@@ -881,8 +881,9 @@ pub struct AgentWorkTurnRow {
     pub source_offset: u64,
     pub instruction: String,
     pub agent_summary: Option<String>,
-    /// 턴 안 최신 메시지 5개를 담은 유계 JSON. 컬럼이 없던 시절 행이나 상한을 넘겨
-    /// 저장이 거부된 행은 NULL이고, 그때는 기존 instruction+agent_summary만 그린다.
+    /// 턴 안 최신 메시지 5개를 담은 유계 JSON. 컬럼이 없던 시절 행이거나, 상한(8KB) 초과나
+    /// NUL로 이 컬럼만 fail-soft로 떨어진 경우 NULL이다(행 자체는 거부되지 않는다) — 그때는
+    /// 기존 instruction+agent_summary만 그린다.
     pub messages_json: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -1796,7 +1797,10 @@ const AGENT_WORK_HISTORY_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
          + length(CAST(turn.turn_key AS BLOB))
          + length(CAST(turn.instruction AS BLOB))
          + COALESCE(length(CAST(turn.agent_summary AS BLOB)), 0)
-         + COALESCE(length(CAST(turn.messages_json AS BLOB)), 0)
+         + (CASE WHEN typeof(turn.messages_json) = 'text'
+                  AND length(CAST(turn.messages_json AS BLOB)) <= ?10
+                  AND instr(turn.messages_json, char(0)) = 0
+                 THEN length(CAST(turn.messages_json AS BLOB)) ELSE 0 END)
          + COALESCE(length(CAST(turn.model AS BLOB)), 0)
          + COALESCE(length(CAST(turn.effort AS BLOB)), 0)
          + COALESCE(length(CAST(turn.cwd AS BLOB)), 0)
@@ -1823,9 +1827,8 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
     OR typeof(agent_summary) NOT IN ('null', 'text')
        OR (typeof(agent_summary) = 'text'
            AND (length(CAST(agent_summary AS BLOB)) > ?6 OR instr(agent_summary, char(0)) != 0))
-    OR typeof(messages_json) NOT IN ('null', 'text')
-       OR (typeof(messages_json) = 'text'
-           AND (length(CAST(messages_json AS BLOB)) > ?10 OR instr(messages_json, char(0)) != 0))
+    -- messages_json은 여기서 행을 무효화하지 않는다 — 상한 초과·NUL·미지 타입은 컬럼만
+    -- None으로 떨어뜨린다(아래 read_agent_work_history의 관대한 읽기, 스펙 §3-2 fail-soft).
     OR typeof(model) NOT IN ('null', 'text')
        OR (typeof(model) = 'text'
            AND (length(CAST(model AS BLOB)) > ?7 OR instr(model, char(0)) != 0))
@@ -2109,6 +2112,20 @@ fn bounded_optional_text<'row>(
     }
 }
 
+/// `messages_json` 전용 관대한 읽기. 다른 선택 필드가 쓰는 `bounded_optional_text`와 달리
+/// 상한 초과·NUL 포함·비UTF-8·예상 밖 타입을 만나도 행을 버리지 않고 이 컬럼만 None으로
+/// 낮춘다 — 이력 하나가 패널을 죽이지 않는다는 스펙 §3-2 fail-soft 계약을 지킨다.
+fn agent_work_turn_messages_json_lenient(row: &rusqlite::Row<'_>, index: usize) -> Option<String> {
+    match row.get_ref(index).ok()? {
+        rusqlite::types::ValueRef::Text(bytes)
+            if bytes.len() <= AGENT_WORK_TURN_MESSAGES_BYTES_MAX && !bytes.contains(&0) =>
+        {
+            std::str::from_utf8(bytes).ok().map(str::to_owned)
+        }
+        _ => None,
+    }
+}
+
 fn bounded_integer(row: &rusqlite::Row<'_>, index: usize) -> anyhow::Result<i64> {
     match row
         .get_ref(index)
@@ -2142,6 +2159,16 @@ fn agent_work_optional_text_is_valid(value: Option<&str>, max_bytes: usize) -> b
     value.is_none_or(|value| value.len() <= max_bytes && !value.as_bytes().contains(&0))
 }
 
+/// `messages_json`은 스펙 §3-2가 fail-soft를 못박은 유일한 선택 필드다 — 상한(8KB) 초과나 NUL은
+/// 행 전체를 거부하지 않고 이 컬럼만 저장 시점에 None으로 낮춘다("이력 하나가 패널을 죽이지
+/// 않는다"). 다른 선택 필드(agent_summary 등)는 여전히 `agent_work_optional_text_is_valid`로
+/// 행 전체를 거부하는 기존 동작을 유지한다.
+fn agent_work_turn_messages_json_effective(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| {
+        value.len() <= AGENT_WORK_TURN_MESSAGES_BYTES_MAX && !value.as_bytes().contains(&0)
+    })
+}
+
 fn agent_work_turn_input_bytes(row: &AgentWorkTurnUpsert) -> anyhow::Result<usize> {
     anyhow::ensure!(
         bounded_id_is_valid(&row.workspace_id)
@@ -2157,10 +2184,8 @@ fn agent_work_turn_input_bytes(row: &AgentWorkTurnUpsert) -> anyhow::Result<usiz
                 row.agent_summary.as_deref(),
                 AGENT_WORK_TURN_SUMMARY_BYTES_MAX,
             )
-            && agent_work_optional_text_is_valid(
-                row.messages_json.as_deref(),
-                AGENT_WORK_TURN_MESSAGES_BYTES_MAX,
-            )
+            // messages_json은 여기서 검증하지 않는다 — 상한 초과·NUL은 행을 거부하는 대신
+            // agent_work_turn_messages_json_effective가 쓰기 시점에 컬럼만 None으로 낮춘다.
             && agent_work_optional_text_is_valid(
                 row.model.as_deref(),
                 AGENT_WORK_TURN_METADATA_BYTES_MAX,
@@ -2185,7 +2210,7 @@ fn agent_work_turn_input_bytes(row: &AgentWorkTurnUpsert) -> anyhow::Result<usiz
         row.turn_key.len(),
         row.instruction.len(),
         row.agent_summary.as_deref().map_or(0, str::len),
-        row.messages_json.as_deref().map_or(0, str::len),
+        agent_work_turn_messages_json_effective(row.messages_json.as_deref()).map_or(0, str::len),
         row.model.as_deref().map_or(0, str::len),
         row.effort.as_deref().map_or(0, str::len),
         row.cwd.as_deref().map_or(0, str::len),
@@ -2310,9 +2335,7 @@ fn read_agent_work_history(
             agent_summary: bounded_optional_text(row, 7, AGENT_WORK_TURN_SUMMARY_BYTES_MAX)
                 .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
                 .map(str::to_owned),
-            messages_json: bounded_optional_text(row, 16, AGENT_WORK_TURN_MESSAGES_BYTES_MAX)
-                .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
-                .map(str::to_owned),
+            messages_json: agent_work_turn_messages_json_lenient(row, 16),
             model: bounded_optional_text(row, 8, AGENT_WORK_TURN_METADATA_BYTES_MAX)
                 .map_err(|_| anyhow::anyhow!(AGENT_WORK_HISTORY_ROW_INVALID))?
                 .map(str::to_owned),
@@ -7397,6 +7420,9 @@ impl Db {
             let AgentWorkHistoryMutation::Upsert(row) = mutation;
             let source_offset = i64::try_from(row.source_offset)
                 .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+            // 상한 초과·NUL 포함 messages_json은 행을 거부하지 않고 이 컬럼만 NULL로 쓴다
+            // (fail-soft, 스펙 §3-2).
+            let messages_json = agent_work_turn_messages_json_effective(row.messages_json.as_deref());
             tx.execute(
                 "INSERT INTO agent_work_turns
                     (workspace_id, pane_id, kind, agent_session_id, turn_key, source_offset,
@@ -7417,7 +7443,7 @@ impl Db {
                     state = excluded.state,
                     occurred_at = excluded.occurred_at,
                     updated_at = excluded.updated_at,
-                    messages_json = excluded.messages_json
+                    messages_json = COALESCE(excluded.messages_json, agent_work_turns.messages_json)
                  WHERE agent_work_turns.updated_at <= excluded.updated_at",
                 rusqlite::params![
                     row.workspace_id,
@@ -7436,7 +7462,7 @@ impl Db {
                     row.state.as_str(),
                     row.occurred_at,
                     row.updated_at,
-                    row.messages_json,
+                    messages_json,
                 ],
             )
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
@@ -12136,34 +12162,83 @@ mod tests {
     }
 
     #[test]
-    fn agent_work_turn_messages_json은_상한_초과와_nul을_거부한다() {
+    fn agent_work_turn_messages_json은_상한_초과와_nul이면_컬럼만_none으로_떨어진다() {
+        // 스펙 §3-2: 8KB 초과·NUL 포함은 행 전체를 거부하지 않고 messages_json 컬럼만
+        // fail-soft로 NULL로 낮춘다 — 이력 하나 때문에 패널이 죽지 않는다. instruction 등
+        // 나머지 필드는 온전히 저장·복원된다.
         let db = Db::open_in_memory().unwrap();
         let workspace_id = db.create_workspace("history-messages-invalid").unwrap();
 
         let mut oversized = agent_work_turn(&workspace_id, 0, 0);
+        oversized.instruction = "instruction-oversized".to_owned();
         oversized.messages_json = Some("x".repeat(AGENT_WORK_TURN_MESSAGES_BYTES_MAX + 1));
-        assert_eq!(
-            apply_agent_work_turns(&db, &workspace_id, vec![oversized])
-                .unwrap_err()
-                .to_string(),
-            AGENT_STATE_INPUT_INVALID
-        );
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![oversized]).unwrap();
+        assert_eq!(snapshot.work_turns.len(), 1);
+        assert_eq!(snapshot.work_turns[0].messages_json, None);
+        assert_eq!(snapshot.work_turns[0].instruction, "instruction-oversized");
 
         let mut has_nul = agent_work_turn(&workspace_id, 1, 1);
+        has_nul.instruction = "instruction-has-nul".to_owned();
         has_nul.messages_json = Some("no-nul\0".to_owned());
-        assert_eq!(
-            apply_agent_work_turns(&db, &workspace_id, vec![has_nul])
-                .unwrap_err()
-                .to_string(),
-            AGENT_STATE_INPUT_INVALID
-        );
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![has_nul]).unwrap();
+        let with_nul_row = snapshot
+            .work_turns
+            .iter()
+            .find(|row| row.instruction == "instruction-has-nul")
+            .unwrap();
+        assert_eq!(with_nul_row.messages_json, None);
 
-        assert!(
-            db.list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(
-                workspace_id.as_str()
+        let read_back = db
+            .list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(
+                workspace_id.as_str(),
             ))
-            .unwrap()
-            .is_empty()
+            .unwrap();
+        assert_eq!(read_back.len(), 2);
+        assert!(read_back.iter().all(|row| row.messages_json.is_none()));
+        assert!(read_back
+            .iter()
+            .any(|row| row.instruction == "instruction-oversized"));
+        assert!(read_back
+            .iter()
+            .any(|row| row.instruction == "instruction-has-nul"));
+    }
+
+    #[test]
+    fn agent_work_turn_messages_json은_같은_초의_빈_값에_덮이지_않는다() {
+        // stage_detected_work_history가 방금 쓴 새 messages_json을, updated_at이 바뀌지 않은
+        // git-facts 백필(poll_work_history_git)이 같은 초에 뒤따라 덮지 못해야 한다.
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db
+            .create_workspace("history-messages-same-second")
+            .unwrap();
+
+        let mut fresh = agent_work_turn(&workspace_id, 0, 5);
+        fresh.messages_json = Some(r#"[{"r":"a","t":"방금 답했다","at":5}]"#.to_owned());
+        apply_agent_work_turns(&db, &workspace_id, vec![fresh]).unwrap();
+
+        // git-facts 백필: 같은 turn_key, 같은 updated_at(=5)로 캐시 스냅샷을 그대로
+        // 재-upsert한다 — 캐시가 메시지 갱신 전에 떴다면 messages_json은 None이다.
+        let mut backfill = agent_work_turn(&workspace_id, 0, 5);
+        backfill.messages_json = None;
+        backfill.branch = Some("feature/x".to_owned());
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![backfill]).unwrap();
+
+        assert_eq!(snapshot.work_turns.len(), 1);
+        assert_eq!(
+            snapshot.work_turns[0].messages_json.as_deref(),
+            Some(r#"[{"r":"a","t":"방금 답했다","at":5}]"#)
+        );
+        // 다른 컬럼은 기존 동작대로 여전히 excluded 값으로 갱신된다.
+        assert_eq!(snapshot.work_turns[0].branch.as_deref(), Some("feature/x"));
+
+        // stage_detected_work_history의 정상 경로: 같은 초라도 새 Some(...) 값은 여전히
+        // 갱신되어야 한다.
+        let mut updated = agent_work_turn(&workspace_id, 0, 5);
+        updated.messages_json = Some(r#"[{"r":"a","t":"이어서 답했다","at":6}]"#.to_owned());
+        let snapshot = apply_agent_work_turns(&db, &workspace_id, vec![updated]).unwrap();
+        assert_eq!(
+            snapshot.work_turns[0].messages_json.as_deref(),
+            Some(r#"[{"r":"a","t":"이어서 답했다","at":6}]"#)
         );
     }
 

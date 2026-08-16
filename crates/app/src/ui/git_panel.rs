@@ -63,10 +63,13 @@ pub struct GitPanelSnapshot {
 }
 
 /// `status --porcelain -z -uall` + `diff --numstat HEAD`를 경로로 병합한다.
-/// porcelain 등장 순서를 유지한다(사용자가 보는 안정된 순서).
-fn merge_status_rows(porcelain_z: &str, numstat: &str) -> Vec<GitFileRow> {
+/// porcelain 등장 순서를 유지한다(사용자가 보는 안정된 순서). 반환하는 bool은
+/// 상한(MAX_PANEL_FILES) 때문에 항목을 실제로 버렸는지다 — 딱 상한만큼만 있고
+/// 더는 없으면 false(diff_panel::build_file_rows와 같은 패턴, 중요 리뷰 지적 3번).
+fn merge_status_rows(porcelain_z: &str, numstat: &str) -> (Vec<GitFileRow>, bool) {
     let counts = parse_numstat(numstat);
     let mut rows = Vec::new();
+    let mut truncated = false;
     let mut fields = porcelain_z.split('\0').filter(|s| !s.is_empty());
     while let Some(entry) = fields.next() {
         if entry.len() < 4 {
@@ -87,13 +90,16 @@ fn merge_status_rows(porcelain_z: &str, numstat: &str) -> Vec<GitFileRow> {
         } else {
             x
         };
-        let (adds, dels) = counts.get(path).copied().unwrap_or((None, None));
-        rows.push(GitFileRow { rel_path: path.to_owned(), status, adds, dels });
+        // 새 항목을 담기 *전에* 상한을 검사한다 — 이미 상한만큼 담은 뒤에 검사하면
+        // 정확히 상한일 때와 넘칠 때를 구분할 수 없다.
         if rows.len() >= MAX_PANEL_FILES {
+            truncated = true;
             break;
         }
+        let (adds, dels) = counts.get(path).copied().unwrap_or((None, None));
+        rows.push(GitFileRow { rel_path: path.to_owned(), status, adds, dels });
     }
-    rows
+    (rows, truncated)
 }
 
 /// `diff --numstat` 한 줄 = "adds\tdels\tpath" (바이너리는 "-\t-").
@@ -110,10 +116,12 @@ fn parse_numstat(numstat: &str) -> std::collections::HashMap<String, (Option<u32
 }
 
 /// committed 섹션: `diff --numstat base..HEAD` + `diff --name-status base..HEAD` 병합.
-/// name-status 등장 순서를 유지한다.
-fn merge_committed_rows(numstat: &str, name_status: &str) -> Vec<GitFileRow> {
+/// name-status 등장 순서를 유지한다. 반환하는 bool의 의미는 merge_status_rows와
+/// 같다 — 정확히 상한만큼이면 false, 하나라도 더 버렸으면 true.
+fn merge_committed_rows(numstat: &str, name_status: &str) -> (Vec<GitFileRow>, bool) {
     let counts = parse_numstat(numstat);
     let mut rows = Vec::new();
+    let mut truncated = false;
     for line in name_status.lines() {
         let mut parts = line.splitn(2, '\t');
         let (Some(status), Some(path)) = (parts.next(), parts.next()) else {
@@ -122,20 +130,26 @@ fn merge_committed_rows(numstat: &str, name_status: &str) -> Vec<GitFileRow> {
         // rename 라인("R100\told\tnew")은 마지막 필드가 새 경로다.
         let path = path.rsplit('\t').next().unwrap_or(path);
         let status = status.chars().next().unwrap_or('M');
-        let (adds, dels) = counts.get(path).copied().unwrap_or((None, None));
-        rows.push(GitFileRow { rel_path: path.to_owned(), status, adds, dels });
         if rows.len() >= MAX_PANEL_FILES {
+            truncated = true;
             break;
         }
+        let (adds, dels) = counts.get(path).copied().unwrap_or((None, None));
+        rows.push(GitFileRow { rel_path: path.to_owned(), status, adds, dels });
     }
-    rows
+    (rows, truncated)
 }
 
-/// `git worktree list --porcelain` 파싱. `worktree <path>` 줄이 새 항목을 열고,
+/// `git worktree list --porcelain -z` 파싱. `-z`는 git-worktree(1) 표현으로 "경로에
+/// 개행이 있을 때 출력을 파싱할 수 있게 한다" — 필드가 줄바꿈이 아니라 NUL로
+/// 끝난다(빈 줄 대신 빈 필드가 항목 경계). `worktree <path>` 필드가 새 항목을 열고,
 /// `branch refs/heads/<name>`이 브랜치, `detached`는 None, `bare`는 **버린다**
-/// (체크아웃이 없어 셸을 열 수 없다). `locked`/`prunable` 줄은 무시한다.
-fn parse_worktree_list(porcelain: &str, repo_root: &Path) -> Vec<GitWorktreeRow> {
+/// (체크아웃이 없어 셸을 열 수 없다). `locked`/`prunable` 필드는 무시한다.
+/// 반환하는 bool은 상한(MAX_WORKTREE_ROWS) 때문에 항목을 실제로 버렸는지다 —
+/// bare로 버린 항목은 잘림이 아니라 애초에 표시 대상이 아니므로 포함하지 않는다.
+fn parse_worktree_list(porcelain: &str, repo_root: &Path) -> (Vec<GitWorktreeRow>, bool) {
     let mut rows: Vec<GitWorktreeRow> = Vec::new();
+    let mut truncated = false;
     let mut path: Option<String> = None;
     let mut branch: Option<String> = None;
     let mut bare = false;
@@ -144,7 +158,12 @@ fn parse_worktree_list(porcelain: &str, repo_root: &Path) -> Vec<GitWorktreeRow>
         let taken_branch = branch.take();
         let was_bare = std::mem::replace(bare, false);
         let Some(taken) = taken else { return };
-        if was_bare || rows.len() >= MAX_WORKTREE_ROWS {
+        if was_bare {
+            return;
+        }
+        // 새 항목을 담기 *전에* 상한을 검사한다 — merge_status_rows와 같은 이유.
+        if rows.len() >= MAX_WORKTREE_ROWS {
+            truncated = true;
             return;
         }
         let as_path = Path::new(&taken);
@@ -155,18 +174,20 @@ fn parse_worktree_list(porcelain: &str, repo_root: &Path) -> Vec<GitWorktreeRow>
         let current = as_path == repo_root;
         rows.push(GitWorktreeRow { path: taken, name, branch: taken_branch, current });
     };
-    for line in porcelain.lines() {
-        if let Some(rest) = line.strip_prefix("worktree ") {
+    // NUL 구분 필드 — 경로에 개행이 있어도 안 잘린다(빈 문자열 필터는 안 쓴다: 빈
+    // 필드 자체가 non-z의 빈 줄과 같은 항목 경계 신호라 flush 판단에 쓰인다).
+    for field in porcelain.split('\0') {
+        if let Some(rest) = field.strip_prefix("worktree ") {
             flush(&mut path, &mut branch, &mut bare);
-            path = Some(rest.trim().to_owned());
-        } else if let Some(rest) = line.strip_prefix("branch refs/heads/") {
-            branch = Some(rest.trim().to_owned());
-        } else if line.trim() == "bare" {
+            path = Some(rest.to_owned()); // trim 금지 — 경로 끝 공백도 유효한 경로다.
+        } else if let Some(rest) = field.strip_prefix("branch refs/heads/") {
+            branch = Some(rest.to_owned());
+        } else if field == "bare" {
             bare = true;
         }
     }
     flush(&mut path, &mut branch, &mut bare);
-    rows
+    (rows, truncated)
 }
 
 /// 셸을 열 수 있는 경로인가 — 빈 값·상한 초과·NUL은 클릭 intent를 만들지 않는다.
@@ -194,6 +215,16 @@ fn split_row_path(rel_path: &str) -> (&str, &str) {
         Some((dir, name)) => (name, dir),
         None => (rel_path, ""),
     }
+}
+
+/// ahead/추가는 성공색, behind/삭제는 에러색 — 세션/에이전트 진행 상태가 아니라
+/// 일반 git 통계라 `agent_visuals::status_color`가 아니라 designall 토큰을 쓴다.
+/// `agent_visuals::status_color`는 dark_mode 분기가 없는 다크 전용 파스텔이라
+/// 라이트 테마에서 대비가 낮았다(중요 리뷰 지적 4번) — designall.rs의
+/// `Tokens::success`/`error`는 정확히 이 "체계 밖의 일반 성공/실패 표시" 용도로
+/// 예약돼 있다(그 파일 상단 주석 참고).
+fn stat_color(tokens: crate::ui::designall::Tokens, positive: bool) -> egui::Color32 {
+    if positive { tokens.success } else { tokens.error }
 }
 
 /// `git remote get-url origin` 출력을 OWNER/REPO 기준 GitHub HTTPS URL로 정규화한다.
@@ -272,15 +303,16 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
             let range = format!("{base}..HEAD");
             let (numstat, t1) = run(&["diff", "--no-ext-diff", "--numstat", &range])?;
             let (names, t2) = run(&["diff", "--no-ext-diff", "--name-status", &range])?;
-            committed = merge_committed_rows(&numstat, &names);
-            committed_truncated = t1 || t2 || committed.len() >= MAX_PANEL_FILES;
+            let (rows, rows_truncated) = merge_committed_rows(&numstat, &names);
+            committed = rows;
+            committed_truncated = t1 || t2 || rows_truncated;
         }
     }
 
     let (porcelain, t3) = run(&["status", "--porcelain", "-z", "-uall"])?;
     let (numstat, t4) = run(&["diff", "--no-ext-diff", "--numstat", "HEAD"])?;
-    let changes = merge_status_rows(&porcelain, &numstat);
-    let changes_truncated = t3 || t4 || changes.len() >= MAX_PANEL_FILES;
+    let (changes, changes_rows_truncated) = merge_status_rows(&porcelain, &numstat);
+    let changes_truncated = t3 || t4 || changes_rows_truncated;
 
     // origin remote → GitHub HTTPS 정규화. 실패(원격 없음/비GitHub)해도 None만 담고
     // 스냅샷 전체는 죽이지 않는다(Task 10 Step 7 소급 요구, 2026-08-15).
@@ -289,12 +321,12 @@ pub fn collect_snapshot(cwd: &Path) -> Result<GitPanelSnapshot, GitPanelErrorCod
         .and_then(|(s, _)| normalize_github_remote(s.trim()));
 
     // 워크트리 목록 — 스냅샷과 같은 IO 왕복에서 한 번만 부른다(스펙 §8-4).
-    // 실패해도 스냅샷 전체를 죽이지 않는다(섹션 단위 오류 원칙, §6).
-    let (worktrees, worktrees_truncated) = match run(&["worktree", "list", "--porcelain"]) {
+    // 실패해도 스냅샷 전체를 죽이지 않는다(섹션 단위 오류 원칙, §6). -z: 경로에
+    // 개행이 있어도 항목이 안 잘리게(중요 리뷰 지적 2번).
+    let (worktrees, worktrees_truncated) = match run(&["worktree", "list", "--porcelain", "-z"]) {
         Ok((listing, truncated)) => {
-            let rows = parse_worktree_list(&listing, &repo_root);
-            let hit_cap = rows.len() >= MAX_WORKTREE_ROWS;
-            (rows, truncated || hit_cap)
+            let (rows, parse_truncated) = parse_worktree_list(&listing, &repo_root);
+            (rows, truncated || parse_truncated)
         }
         Err(_) => (Vec::new(), false),
     };
@@ -367,7 +399,7 @@ fn collect_file_diff(
     rel_path: &str,
     mode: crate::ui::diff_viewer::DiffMode,
 ) -> Result<crate::ui::diff_viewer::FileDiffView, GitPanelErrorCode> {
-    use crate::ui::diff_viewer::{parse_unified, synth_added, DiffMode};
+    use crate::ui::diff_viewer::{parse_unified, DiffMode};
     let repo_root =
         crate::git_cli::repo_root(cwd, GIT_TIMEOUT).map_err(|_| GitPanelErrorCode::NoRepo)?;
     // 경로 인젝션 방어: rel_path는 스냅샷의 porcelain 출력에서 온 값이지만,
@@ -383,13 +415,21 @@ fn collect_file_diff(
         DiffMode::Working => {
             let (text, truncated) = run(&["diff", "--no-ext-diff", "HEAD", "--", rel_path])?;
             if text.trim().is_empty() {
-                // untracked — 파일 내용을 전량 추가로(유계: MAX_LIST_BYTES).
-                let bytes = std::fs::read(repo_root.join(rel_path))
-                    .map_err(|_| GitPanelErrorCode::CollectionFailed)?;
-                let truncated = bytes.len() > MAX_LIST_BYTES;
-                let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_LIST_BYTES)])
-                    .into_owned();
-                return Ok(synth_added(&text, truncated));
+                // untracked — `git diff HEAD`는 untracked를 보여주지 않는다. 예전엔
+                // std::fs::read로 파일 전체를 무계 메모리에 올린 뒤 MAX_LIST_BYTES로
+                // 잘랐다(치명 리뷰 지적 — 읽기 자체가 무계). diff_panel의
+                // append_untracked_section과 같은 방식으로 `--no-index /dev/null`을
+                // 유계 실행기(run_git_limited)로 돌려 이미 unified diff 형태의
+                // 전량 추가 출력을 받는다. `--`로 옵션 오인을 막는다.
+                let (untracked, untracked_truncated) = run(&[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    rel_path,
+                ])?;
+                return Ok(parse_unified(&untracked, untracked_truncated));
             }
             Ok(parse_unified(&text, truncated))
         }
@@ -446,12 +486,23 @@ impl GitPanelUi {
     }
 
     pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<GitPanelAction> {
-        // self.snapshot을 절제한다 — 아래에서 self.changes_collapsed 등을 동시에
-        // mut borrow해야 해서 Option<Result<..>>를 들고 있는 채로는 borrow가 충돌한다.
-        let snap = match self.snapshot.clone() {
+        // 필드별로 분해해 빌린다 — snapshot은 &만 필요하고 changes_collapsed 등은
+        // 동시에 &mut가 필요해, self를 통째로 들고 있으면(예전엔 self.snapshot을
+        // clone()해 이 충돌을 피했다) 프레임마다 최대 ~1056개 String을 복제했다
+        // (중요 리뷰 지적 5번). 필드마다 서로 다른 경로라 disjoint borrow로 풀린다.
+        let Self {
+            snapshot,
+            loading,
+            changes_show_all,
+            committed_show_all,
+            changes_collapsed,
+            committed_collapsed,
+            worktrees_collapsed,
+        } = self;
+        let snap = match snapshot.as_ref() {
             None => {
                 ui.weak(catalog.t("diff.loading", &[]));
-                return if self.loading { None } else { Some(GitPanelAction::Refresh) };
+                return if *loading { None } else { Some(GitPanelAction::Refresh) };
             }
             Some(Err(GitPanelErrorCode::NoRepo)) => {
                 ui.weak(catalog.t("diff.no_cwd", &[]));
@@ -464,6 +515,7 @@ impl GitPanelUi {
             Some(Ok(snap)) => snap,
         };
 
+        let tokens = crate::ui::designall::tokens(ui.visuals());
         let mut action = None;
 
         // ── 헤더: 브랜치 / → upstream ↑a ↓b ↗ ──────────────────────────
@@ -474,20 +526,10 @@ impl GitPanelUi {
                     ui.weak("→");
                     ui.monospace(upstream);
                     if snap.ahead > 0 {
-                        ui.colored_label(
-                            crate::ui::agent_visuals::status_color(
-                                crate::agent_surface::AgentVisualState::Complete,
-                            ),
-                            format!("↑{}", snap.ahead),
-                        );
+                        ui.colored_label(stat_color(tokens, true), format!("↑{}", snap.ahead));
                     }
                     if snap.behind > 0 {
-                        ui.colored_label(
-                            crate::ui::agent_visuals::status_color(
-                                crate::agent_surface::AgentVisualState::Error,
-                            ),
-                            format!("↓{}", snap.behind),
-                        );
+                        ui.colored_label(stat_color(tokens, false), format!("↓{}", snap.behind));
                     }
                     // remote가 GitHub일 때만 보인다(스펙 §4 숨김 조건). 계획서 원안은
                     // upstream만으로 항상 그렸는데, collect_snapshot이 이미
@@ -570,20 +612,10 @@ impl GitPanelUi {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.monospace(row.status.to_string());
                                 if let Some(d) = row.dels.filter(|d| *d > 0) {
-                                    ui.colored_label(
-                                        crate::ui::agent_visuals::status_color(
-                                            crate::agent_surface::AgentVisualState::Error,
-                                        ),
-                                        format!("−{d}"),
-                                    );
+                                    ui.colored_label(stat_color(tokens, false), format!("−{d}"));
                                 }
                                 if let Some(a) = row.adds.filter(|a| *a > 0) {
-                                    ui.colored_label(
-                                        crate::ui::agent_visuals::status_color(
-                                            crate::agent_surface::AgentVisualState::Complete,
-                                        ),
-                                        format!("+{a}"),
-                                    );
+                                    ui.colored_label(stat_color(tokens, true), format!("+{a}"));
                                 }
                             });
                         });
@@ -610,7 +642,7 @@ impl GitPanelUi {
                 ui.weak(catalog.t("diff.clean", &[]));
                 // 워크트리 섹션에는 clean과 무관하게 정보가 있을 수 있다 — 여기서
                 // 돌아가면 그 섹션까지 감춘다(스펙 §8-4).
-                if !worktree_section_visible(&snap) {
+                if !worktree_section_visible(snap) {
                     return;
                 }
             }
@@ -618,8 +650,8 @@ impl GitPanelUi {
                 ui,
                 "git.section.changes",
                 &snap.changes,
-                &mut self.changes_collapsed,
-                &mut self.changes_show_all,
+                changes_collapsed,
+                changes_show_all,
                 crate::ui::diff_viewer::DiffMode::Working,
                 &mut action,
             );
@@ -631,8 +663,8 @@ impl GitPanelUi {
                 ui,
                 "git.section.committed",
                 &snap.committed,
-                &mut self.committed_collapsed,
-                &mut self.committed_show_all,
+                committed_collapsed,
+                committed_show_all,
                 crate::ui::diff_viewer::DiffMode::Branch,
                 &mut action,
             );
@@ -641,10 +673,10 @@ impl GitPanelUi {
             }
 
             // ── 섹션 3: 워크트리 ─────────────────────────────────────────
-            if worktree_section_visible(&snap) {
+            if worktree_section_visible(snap) {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let arrow = if self.worktrees_collapsed { "›" } else { "∨" };
+                    let arrow = if *worktrees_collapsed { "›" } else { "∨" };
                     if ui
                         .selectable_label(
                             false,
@@ -656,10 +688,10 @@ impl GitPanelUi {
                         )
                         .clicked()
                     {
-                        self.worktrees_collapsed = !self.worktrees_collapsed;
+                        *worktrees_collapsed = !*worktrees_collapsed;
                     }
                 });
-                if !self.worktrees_collapsed {
+                if !*worktrees_collapsed {
                     for row in &snap.worktrees {
                         // 파일 행과 같은 패턴 — 자식 Label이 클릭을 삼키지 않도록
                         // 스코프 자체를 하나의 논리 위젯으로 만든다(위 file row 주석 참고).
@@ -720,9 +752,10 @@ mod tests {
         // porcelain -z: "XY path\0" 반복. rename은 "R  new\0old\0".
         let porcelain = " M a.rs\0?? new.txt\0R  moved.rs\0old.rs\0MM both.rs\0";
         let numstat = "3\t1\ta.rs\n456\t221\tmoved.rs\n-\t-\tbin.png\n2\t0\tboth.rs\n";
-        let rows = merge_status_rows(porcelain, numstat);
+        let (rows, truncated) = merge_status_rows(porcelain, numstat);
         // 순서는 porcelain 등장 순서를 유지한다.
         assert_eq!(rows.len(), 4);
+        assert!(!truncated);
         assert_eq!(
             (rows[0].rel_path.as_str(), rows[0].status, rows[0].adds, rows[0].dels),
             ("a.rs", 'M', Some(3), Some(1))
@@ -746,8 +779,9 @@ mod tests {
         // committed 섹션: numstat + name-status 병합. 바이너리는 "-\t-".
         let numstat = "12\t13\tsrc/ui/workspace.rs\n-\t-\tassets/logo.png\n";
         let name_status = "M\tsrc/ui/workspace.rs\nA\tassets/logo.png\n";
-        let rows = merge_committed_rows(numstat, name_status);
+        let (rows, truncated) = merge_committed_rows(numstat, name_status);
         assert_eq!(rows.len(), 2);
+        assert!(!truncated);
         assert_eq!(
             (rows[0].rel_path.as_str(), rows[0].status, rows[0].adds, rows[0].dels),
             ("src/ui/workspace.rs", 'M', Some(12), Some(13))
@@ -756,6 +790,53 @@ mod tests {
             (rows[1].rel_path.as_str(), rows[1].status, rows[1].adds, rows[1].dels),
             ("assets/logo.png", 'A', None, None)
         );
+    }
+
+    // 중요 리뷰 지적 3번 회귀 — 벡터가 이미 상한으로 잘린 뒤에 len() >= 상한을
+    // 검사하면 "딱 상한이라 안 잘림"과 "넘쳐서 버림"을 구분 못 한다. 정확히
+    // 상한이면 false, 하나 더 있으면 true를 고정한다.
+    #[test]
+    fn merge_status_rows는_상한에_정확히_닿으면_잘림이_아니다() {
+        let mut porcelain = String::new();
+        for i in 0..MAX_PANEL_FILES {
+            porcelain.push_str(&format!(" M f{i}.rs\0"));
+        }
+        let (rows, truncated) = merge_status_rows(&porcelain, "");
+        assert_eq!(rows.len(), MAX_PANEL_FILES);
+        assert!(!truncated, "정확히 상한이면 잃은 항목이 없다");
+    }
+
+    #[test]
+    fn merge_status_rows는_상한을_하나_넘으면_잘린다() {
+        let mut porcelain = String::new();
+        for i in 0..(MAX_PANEL_FILES + 1) {
+            porcelain.push_str(&format!(" M f{i}.rs\0"));
+        }
+        let (rows, truncated) = merge_status_rows(&porcelain, "");
+        assert_eq!(rows.len(), MAX_PANEL_FILES);
+        assert!(truncated, "하나라도 넘치면 잘림 표시가 있어야 한다");
+    }
+
+    #[test]
+    fn merge_committed_rows는_상한에_정확히_닿으면_잘림이_아니다() {
+        let mut name_status = String::new();
+        for i in 0..MAX_PANEL_FILES {
+            name_status.push_str(&format!("M\tf{i}.rs\n"));
+        }
+        let (rows, truncated) = merge_committed_rows("", &name_status);
+        assert_eq!(rows.len(), MAX_PANEL_FILES);
+        assert!(!truncated, "정확히 상한이면 잃은 항목이 없다");
+    }
+
+    #[test]
+    fn merge_committed_rows는_상한을_하나_넘으면_잘린다() {
+        let mut name_status = String::new();
+        for i in 0..(MAX_PANEL_FILES + 1) {
+            name_status.push_str(&format!("M\tf{i}.rs\n"));
+        }
+        let (rows, truncated) = merge_committed_rows("", &name_status);
+        assert_eq!(rows.len(), MAX_PANEL_FILES);
+        assert!(truncated, "하나라도 넘치면 잘림 표시가 있어야 한다");
     }
 
     #[test]
@@ -771,26 +852,43 @@ mod tests {
         assert_eq!(split_row_path("Cargo.toml"), ("Cargo.toml", ""));
     }
 
-    const WORKTREE_PORCELAIN: &str = "\
-worktree /repo
-HEAD 1111111111111111111111111111111111111111
-branch refs/heads/main
+    // 중요 리뷰 지적 4번 회귀 — ahead/behind·+/− 색은 designall::tokens에서만
+    // 고른 값이라 라이트/다크 둘 다 자동으로 성립해야 한다(transcript_viewer.rs
+    // 역할별_배경_테스트와 같은 관례). agent_visuals::status_color는 dark_mode
+    // 분기가 없어 라이트 테마에서 대비가 낮았다.
+    #[test]
+    fn stat_color는_ahead_added는_성공색_behind_dels는_에러색이다() {
+        for tokens in [crate::ui::designall::DARK, crate::ui::designall::LIGHT] {
+            assert_eq!(stat_color(tokens, true), tokens.success);
+            assert_eq!(stat_color(tokens, false), tokens.error);
+            assert_ne!(tokens.success, tokens.error, "성공/에러 색은 서로 달라야 한다");
+            assert_ne!(
+                tokens.success, tokens.app_background,
+                "성공색은 배경과 구분돼야 한다"
+            );
+            assert_ne!(tokens.error, tokens.app_background, "에러색은 배경과 구분돼야 한다");
+        }
+        assert_ne!(
+            crate::ui::designall::DARK.success,
+            crate::ui::designall::LIGHT.success,
+            "다크/라이트 팔레트는 서로 달라야 한다"
+        );
+        assert_ne!(
+            crate::ui::designall::DARK.error,
+            crate::ui::designall::LIGHT.error,
+            "다크/라이트 팔레트는 서로 달라야 한다"
+        );
+    }
 
-worktree /repo/.deppy/worktrees/alpha
-HEAD 2222222222222222222222222222222222222222
-branch refs/heads/deppy/alpha
-
-worktree /repo/detached
-HEAD 3333333333333333333333333333333333333333
-detached
-
-worktree /repo/bare
-bare
-";
+    // `git worktree list --porcelain -z` 실물 출력(2026-08-16, `xxd`로 실측)과 같은
+    // 형식 — 필드가 NUL로 끝나고, 빈 필드(연속 NUL)가 항목 경계다.
+    const WORKTREE_PORCELAIN: &str = "worktree /repo\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0worktree /repo/.deppy/worktrees/alpha\0HEAD 2222222222222222222222222222222222222222\0branch refs/heads/deppy/alpha\0\0worktree /repo/detached\0HEAD 3333333333333333333333333333333333333333\0detached\0\0worktree /repo/bare\0bare\0\0";
 
     #[test]
     fn 워크트리_목록은_브랜치와_현재를_구분한다() {
-        let rows = parse_worktree_list(WORKTREE_PORCELAIN, Path::new("/repo/.deppy/worktrees/alpha"));
+        let (rows, truncated) =
+            parse_worktree_list(WORKTREE_PORCELAIN, Path::new("/repo/.deppy/worktrees/alpha"));
+        assert!(!truncated);
         // bare 항목은 체크아웃이 없어 셸을 열 수 없다 — 목록에서 뺀다.
         assert_eq!(rows.len(), 3, "bare는 제외한다: {rows:?}");
         assert_eq!(rows[0].name, "repo");
@@ -803,23 +901,60 @@ bare
     }
 
     #[test]
-    fn 워크트리_목록은_상한에서_잘린다() {
+    fn 워크트리_목록은_상한을_하나_넘으면_잘린다() {
         let mut porcelain = String::new();
         for index in 0..(MAX_WORKTREE_ROWS + 5) {
             porcelain.push_str(&format!(
-                "worktree /repo/w{index}\nHEAD {index:040}\nbranch refs/heads/b{index}\n\n"
+                "worktree /repo/w{index}\0HEAD {index:040}\0branch refs/heads/b{index}\0\0"
             ));
         }
-        let rows = parse_worktree_list(&porcelain, Path::new("/repo"));
+        let (rows, truncated) = parse_worktree_list(&porcelain, Path::new("/repo"));
         assert_eq!(rows.len(), MAX_WORKTREE_ROWS);
+        assert!(truncated, "5개 넘치면 잘림 표시가 있어야 한다");
+    }
+
+    // 중요 리뷰 지적 3번 회귀 — 딱 상한만큼이면 아무것도 안 잃었으니 잘림이 아니다.
+    #[test]
+    fn 워크트리_목록은_상한에_정확히_닿으면_잘림이_아니다() {
+        let mut porcelain = String::new();
+        for index in 0..MAX_WORKTREE_ROWS {
+            porcelain.push_str(&format!(
+                "worktree /repo/w{index}\0HEAD {index:040}\0branch refs/heads/b{index}\0\0"
+            ));
+        }
+        let (rows, truncated) = parse_worktree_list(&porcelain, Path::new("/repo"));
+        assert_eq!(rows.len(), MAX_WORKTREE_ROWS);
+        assert!(!truncated, "정확히 상한이면 잃은 항목이 없다");
     }
 
     #[test]
     fn 워크트리_잠금_줄은_무시한다() {
-        let porcelain = "worktree /repo\nHEAD 1111\nbranch refs/heads/main\nlocked\nprunable gone\n";
-        let rows = parse_worktree_list(porcelain, Path::new("/repo"));
+        let porcelain = "worktree /repo\0HEAD 1111\0branch refs/heads/main\0locked\0prunable gone\0\0";
+        let (rows, truncated) = parse_worktree_list(porcelain, Path::new("/repo"));
+        assert!(!truncated);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].branch.as_deref(), Some("main"));
+    }
+
+    // 중요 리뷰 지적 2번 회귀 — trim()이 경로 끝 공백까지 지워 존재하지 않는
+    // 경로를 만들었다. trim을 없앤 뒤에도 실제로 보존되는지 고정한다.
+    #[test]
+    fn 워크트리_경로_끝_공백은_보존된다() {
+        let porcelain = "worktree /repo/trailing \0HEAD 1111\0branch refs/heads/main\0\0";
+        let (rows, _truncated) = parse_worktree_list(porcelain, Path::new("/repo"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/repo/trailing ", "경로 끝 공백이 지워지면 안 된다");
+    }
+
+    // 중요 리뷰 지적 2번 회귀 — `-z` 없이는 `.lines()`가 경로 내부 개행에서 항목을
+    // 둘로 쪼갰다. git-worktree(1): "-z ... makes it possible to parse the output
+    // when the entry contains a newline". NUL 구분이라 개행이 있어도 필드 하나로 남는다.
+    #[test]
+    fn 워크트리_경로에_개행이_있어도_안_잘린다() {
+        let porcelain = "worktree /repo/weird\nname\0HEAD 1111\0branch refs/heads/main\0\0";
+        let (rows, _truncated) = parse_worktree_list(porcelain, Path::new("/repo"));
+        assert_eq!(rows.len(), 1, "개행이 있어도 항목 하나로 남아야 한다: {rows:?}");
+        assert_eq!(rows[0].path, "/repo/weird\nname");
     }
 
     use std::time::Duration;
@@ -902,6 +1037,57 @@ bare
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(collect_snapshot(&dir).unwrap_err(), GitPanelErrorCode::NoRepo);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 치명 리뷰 지적 1번 회귀 — 예전엔 untracked 파일을 std::fs::read로 전량
+    // 메모리에 올린 뒤 MAX_LIST_BYTES로 잘랐다(읽기 자체가 무계). 지금은
+    // diff_panel::append_untracked_section과 같은 `--no-index /dev/null` 유계
+    // 실행기를 쓰고, 결과가 이미 unified diff라 parse_unified로 해석된다.
+    #[test]
+    fn collect_file_diff는_untracked_파일_내용을_git_no_index로_수집한다() {
+        let repo = temp_repo("filediff-untracked");
+        std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+        commit_all(&repo, "base");
+        std::fs::write(repo.join("new.txt"), "hello\nworld\n").unwrap();
+
+        let view = collect_file_diff(&repo, "new.txt", crate::ui::diff_viewer::DiffMode::Working)
+            .expect("collect");
+        assert!(!view.truncated);
+        assert!(!view.binary);
+        let lines: Vec<&str> =
+            view.hunks.iter().flat_map(|h| h.lines.iter()).map(|l| l.text.as_str()).collect();
+        assert_eq!(lines, vec!["hello", "world"]);
+        assert!(
+            view.hunks.iter().all(|h| h
+                .lines
+                .iter()
+                .all(|l| matches!(l.kind, crate::ui::diff_viewer::LineKind::Add))),
+            "untracked는 전량 추가로 보여야 한다"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn collect_file_diff는_거대_untracked_파일도_상한에서_잘린다() {
+        // fs::read 시절엔 파일 전체(수백MB 가능)를 읽고 나서야 잘랐다 — 읽기
+        // 자체가 무계였다. 지금은 run_git_limited가 MAX_LIST_BYTES에서 git
+        // 프로세스를 죽이므로 수집 바이트 자체가 유계다.
+        let repo = temp_repo("filediff-untracked-huge");
+        std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+        commit_all(&repo, "base");
+        let huge = "x".repeat(MAX_LIST_BYTES * 2);
+        std::fs::write(repo.join("big.txt"), &huge).unwrap();
+
+        let view = collect_file_diff(&repo, "big.txt", crate::ui::diff_viewer::DiffMode::Working)
+            .expect("collect");
+        assert!(view.truncated, "상한을 넘는 파일은 잘림 표시가 있어야 한다");
+        let collected_len: usize =
+            view.hunks.iter().flat_map(|h| h.lines.iter()).map(|l| l.text.len()).sum();
+        assert!(
+            collected_len < huge.len(),
+            "전량이 아니라 상한만큼만 수집돼야 한다: {collected_len}"
+        );
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

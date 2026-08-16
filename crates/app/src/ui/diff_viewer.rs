@@ -136,6 +136,13 @@ pub fn flatten_display_rows(view: &FileDiffView) -> Vec<DisplayRow> {
     rows
 }
 
+/// `ScrollArea::show_rows`가 행 하나에 쓰는 실제 세로 간격. egui는 행 높이에
+/// `item_spacing.y`를 더해 배치하므로, 특정 행으로 스크롤할 때도 같은 값을 곱해야
+/// 어긋나지 않는다.
+fn scroll_row_pitch(row_height: f32, spacing: &egui::style::Spacing) -> f32 {
+    row_height + spacing.item_spacing.y
+}
+
 pub fn hunk_start_indices(rows: &[DisplayRow]) -> Vec<usize> {
     let mut out = Vec::new();
     let mut last_hunk = usize::MAX;
@@ -260,7 +267,12 @@ impl DiffViewerUi {
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
         let mut scroll = egui::ScrollArea::both().auto_shrink([false, false]);
         if let Some(target) = self.scroll_to_row.take() {
-            scroll = scroll.vertical_scroll_offset(target as f32 * row_h);
+            // `show_rows`가 실제로 쓰는 행 간격은 `row_h + item_spacing.y`다. 간격을 빼고
+            // 계산하면 행마다 몇 px씩 어긋난 것이 누적돼, 긴 diff에서 hunk ↑↓가 목표를
+            // 지나쳐 엉뚱한 곳에 멈춘다(2026-08-16 실측: 300행에서 약 900px 어긋남).
+            // 원문 뷰어(transcript_viewer.rs)는 같은 자리에서 이미 간격을 더하고 있다.
+            scroll = scroll
+                .vertical_scroll_offset(target as f32 * scroll_row_pitch(row_h, ui.spacing()));
         }
         scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
             for index in range {
@@ -352,6 +364,24 @@ index 111..222 100644
         assert!(matches!(rows[0], DisplayRow::Line { hunk: 0, .. }));
         // hunk 시작 인덱스: hunk 이동 버튼이 이 인덱스로 스크롤한다.
         assert_eq!(hunk_start_indices(&rows), vec![0, 6]);
+    }
+
+    /// hunk ↑↓가 목표 행에 정확히 서려면 `show_rows`가 쓰는 간격과 **같은 값**을 곱해야
+    /// 한다. 간격을 빼먹으면 행마다 어긋난 것이 누적돼 긴 diff에서 목표를 지나친다
+    /// (2026-08-16 실측: 300행에서 약 900px).
+    #[test]
+    fn 스크롤_행_간격은_item_spacing을_포함한다() {
+        let mut spacing = egui::style::Spacing::default();
+        spacing.item_spacing.y = 4.0;
+        assert_eq!(scroll_row_pitch(12.0, &spacing), 16.0);
+
+        spacing.item_spacing.y = 0.0;
+        assert_eq!(scroll_row_pitch(12.0, &spacing), 12.0, "간격이 0이면 행 높이 그대로");
+
+        // 300행쯤 내려가면 간격을 뺀 계산과 눈에 띄게 벌어진다.
+        spacing.item_spacing.y = 3.0;
+        let with_spacing = 300.0 * scroll_row_pitch(12.0, &spacing);
+        assert_eq!(with_spacing - 300.0 * 12.0, 900.0);
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod agent_terminal;
 pub mod agent_visuals;
 pub mod agents;
 pub mod approvals;
+pub mod aux_search;
 pub mod clipboard_image;
 pub mod composer;
 pub mod credentials;

@@ -23,7 +23,7 @@ pub enum AgentActivity {
     Idle,
 }
 
-/// 턴 메시지 하나의 화자. 카드가 이 값으로 「나」/「에이전트」 라벨을 고른다(Task 6).
+/// 턴 메시지 하나의 화자. 카드가 이 값으로 「나」/「에이전트」 라벨을 고른다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnRole {
     User,

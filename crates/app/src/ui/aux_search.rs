@@ -6,12 +6,6 @@
 //! 실제 좌측 목록 필터·우측 강조·이동은 소비자(work_history·git_panel·transcript_viewer·
 //! diff_viewer)가 이 모듈의 순수 함수(`find_matches`/`contains_match`/`highlighted_job`)로
 //! 직접 그린다. `AuxSearchState`는 App이 소유한다(탭 전환·워크스페이스 전환 시 `reset()`).
-//!
-//! 아직 호출자가 없다 — Task 2~6(work_history·git_panel·diff_viewer·transcript_viewer·App
-//! 배선)이 이 모듈의 공개 API를 부른다. 그 전까지는 모듈 전체가 clippy `dead_code`
-//! 대상이라 파일 전체에 한 번만 허용해 둔다(항목마다 달면 14곳 모두 똑같은 이유를
-//! 반복해야 한다).
-#![allow(dead_code)]
 
 /// 본문당 세는 일치 상한 — 거대 diff에서 매 프레임 전수 스캔하지 않는다. 넘으면
 /// [`Matches::truncated`]만 세우고 더 찾지 않는다(스펙 "매칭 규칙").

@@ -556,7 +556,7 @@ impl GitPanelUi {
                     // remote가 GitHub일 때만 보인다(스펙 §4 숨김 조건). 계획서 원안은
                     // upstream만으로 항상 그렸는데, collect_snapshot이 이미
                     // remote_https_base로 이 조건을 계산해 두므로 그걸 쓴다
-                    // (2026-08-15, Task 6 조정 — 타입 계약은 그대로, 렌더 조건만 보강).
+                    // (2026-08-15 조정 — 타입 계약은 그대로, 렌더 조건만 보강).
                     if snap.remote_https_base.is_some()
                         && ui
                             .small_button("↗")
@@ -619,7 +619,7 @@ impl GitPanelUi {
                 // 헤더 토글, 커밋 0e934c0) `scope_builder(UiBuilder::sense(click))` +
                 // 명시적 `widget_info(Role::Button)`로 스코프 자체를 하나의 논리
                 // 위젯으로 만드는 패턴을 쓴다 — 그 관례로 맞춘다
-                // (2026-08-15, Task 6 Step 3 조정).
+                // (2026-08-15 조정).
                 let toggle = ui.scope_builder(
                     egui::UiBuilder::new()
                         .id_salt(("git-panel-row", title_key, row.rel_path.as_str()))
@@ -1170,7 +1170,7 @@ mod tests {
     // `get_by_label_contains`를 썼는데, 이 저장소의 기존 kittest 관례
     // (fleet.rs `건너뛰기는_다음_항목을_히어로로_올린다`, workspace.rs의 `new_ui_state`
     // 테스트들)는 렌더 결과를 State 구조체 필드에 담아 `harness.state()`로 읽는다.
-    // 관례 쪽이 정답이라 그 패턴으로 다시 썼다(2026-08-15, Task 6 Step 1 조정).
+    // 관례 쪽이 정답이라 그 패턴으로 다시 썼다(2026-08-15 조정).
     #[test]
     fn kittest_행_클릭은_show_file_diff_액션을_낸다() {
         use egui_kittest::kittest::Queryable;
@@ -1436,9 +1436,8 @@ mod tests {
         );
         harness.run();
 
-        // i18n 5로케일 배선은 Task 6 몫이라 아직 키가 없다 — catalog.t가 미등록 키를
-        // 그대로 돌려주므로(i18n/src/lib.rs `Catalog::t`) 리터럴로 검증한다.
-        harness.get_by_label("search.no_match");
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        harness.get_by_label(&catalog.t("search.no_match", &[]));
         assert!(
             harness.query_by_label("src/a.rs").is_none(),
             "걸러진 행은 보이면 안 된다"

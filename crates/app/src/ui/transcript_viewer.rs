@@ -59,14 +59,10 @@ struct SearchCache {
     /// `messages.len() + 1`(마지막 원소는 총계 `total`인 sentinel) — 메시지 i의
     /// 일치 개수는 `message_match_start[i + 1] - message_match_start[i]`로 구한다.
     message_match_start: Vec<usize>,
-    // `total`·`truncated`는 `TranscriptViewerUi::search_summary`로만 읽는다 — 그
-    // 메서드의 실제 호출부(App의 `{active}/{total}` 카운터)는 계획 Task 6이 붙인다.
-    // 그 전까지는 clippy dead_code 대상이라 허용해 둔다(diff_viewer.rs `SearchCache`와
-    // 같은 임시 조치, 2026-08-18).
+    // `total`·`truncated`는 `TranscriptViewerUi::search_summary`로만 읽는다(App의
+    // `{active}/{total}` 카운터, diff_viewer.rs `SearchCache`와 같은 관례).
     /// 대화 전체 일치 수([`crate::ui::aux_search::MAX_AUX_MATCHES`]에서 멈췄으면 그 이하).
-    #[allow(dead_code)]
     total: usize,
-    #[allow(dead_code)]
     truncated: bool,
 }
 
@@ -128,15 +124,12 @@ impl TranscriptViewerUi {
     /// 그 프레임에 보여주는 카운트가 `render`가 방금 그린 강조와 같은 질의 기준이다
     /// (질의가 막 바뀐 프레임에는 `render` 호출 전이라 직전 질의의 값이 잠깐 보일
     /// 수 있다 — 1프레임 지연, diff_viewer.rs `search_summary`와 같은 계약).
-    // Task 6(App 배선)이 붙기 전까지는 production 호출부가 없어 clippy dead_code
-    // 대상이다 — diff_viewer.rs `search_summary`와 같은 임시 허용.
-    #[allow(dead_code)]
     pub fn search_summary(&self) -> (usize, bool) {
         (self.search_cache.total, self.search_cache.truncated)
     }
 
-    /// `search`는 (질의, 대화 전체 기준 활성 일치 인덱스) — App(2026-08-18 계획
-    /// Task 6)이 소유한 `AuxSearchState`에서 뽑아 넘긴다. `None`이면 보조 검색이
+    /// `search`는 (질의, 대화 전체 기준 활성 일치 인덱스) — App이 소유한
+    /// `AuxSearchState`에서 뽑아 넘긴다. `None`이면 보조 검색이
     /// 꺼져 있거나 이 원문 뷰어가 대상이 아니라는 뜻이라 강조 없이 예전처럼 그린다.
     /// diff_viewer.rs `render`의 `search` 인자와 같은 형태다(2026-08-18 계획 Task 4·5
     /// — 소비자 둘 다 같은 모양을 쓰기로 함).

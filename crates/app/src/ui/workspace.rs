@@ -4864,10 +4864,13 @@ impl WorkspaceUi {
             if output.response.double_clicked()
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
-                // 더블클릭 → 커서 아래 단어(공백 구분) 선택 (복사용). URL 열기는 단일
-                // 클릭(위 hover/click 블록)으로 이동 — 여기서도 열면 이중 발화된다
-                // (2026-07-17). 파일 열기는 우클릭 메뉴, 폴더 진입은 단일 클릭 담당.
-                if let Some((s, e)) = word_range_at(&snapshot, cell_at(pos)) {
+                // 더블클릭 → 커서가 놓인 **행 전체** 선택 (2026-08-17 사용자 요청).
+                // 예전에는 단어를 잡았는데, 터미널에서 복사하고 싶은 단위는 명령 한 줄이나
+                // 출력 한 줄인 경우가 압도적이라 행으로 바꿨다. 단어 단위가 필요하면
+                // 드래그로 잡는다. URL 열기는 단일 클릭(위 hover/click 블록)이 담당한다 —
+                // 여기서도 열면 이중 발화된다(2026-07-17). 파일 열기는 우클릭 메뉴,
+                // 폴더 진입은 단일 클릭.
+                if let Some((s, e)) = line_range_at(&snapshot, cell_at(pos)) {
                     self.selection = Some((session, s, e));
                 }
             } else if output.response.drag_started()
@@ -6508,6 +6511,39 @@ enum PathClick {
     OpenFile(std::path::PathBuf),
 }
 
+/// 셀이 "내용"인가 — 공백·NUL은 아니고, wide char 뒤 자리 채움은 앞 글자의 일부다.
+/// 단어 선택과 행 선택이 같은 판정을 써야 한글로 끝나는 경우가 갈리지 않는다.
+fn cell_has_content(snapshot: &terminal::TerminalViewportSnapshot, idx: usize) -> bool {
+    snapshot
+        .visible_cells
+        .get(idx)
+        .is_some_and(|cell| cell.wide_spacer || (!cell.c.is_whitespace() && cell.c != '\0'))
+}
+
+/// 더블클릭이 잡는 **화면 행 전체** 범위 (2026-08-17 사용자 요청).
+///
+/// 스냅샷은 평면 그리드라 wrap 정보가 없다 — 접힌 논리 줄을 이어 붙일 방법이 없으므로
+/// 단위는 "보이는 행 하나"다. 시작은 0열(앞 들여쓰기도 행의 일부), 끝은 마지막 내용
+/// 셀이다. 끝의 빈 칸을 넣으면 선택 강조만 화면 끝까지 늘어나고 복사 결과는 어차피
+/// 같다(`selection_text`가 행 끝 공백을 자른다).
+///
+/// 행이 통째로 비어 있으면 `None` — 빈 줄을 더블클릭해도 아무 일도 일어나지 않는다
+/// (공백 위 단어 선택이 `None`이던 것과 같은 감각).
+fn line_range_at(
+    snapshot: &terminal::TerminalViewportSnapshot,
+    idx: usize,
+) -> Option<(usize, usize)> {
+    let cols = snapshot.cols as usize;
+    if cols == 0 {
+        return None;
+    }
+    let base = (idx / cols) * cols;
+    let last = (0..cols)
+        .rev()
+        .find(|offset| cell_has_content(snapshot, base + offset))?;
+    Some((base, base + last))
+}
+
 fn word_range_at(
     snapshot: &terminal::TerminalViewportSnapshot,
     idx: usize,
@@ -6519,13 +6555,10 @@ fn word_range_at(
     let row = idx / cols;
     let col = idx % cols;
     let base = row * cols;
-    let is_word = |c: usize| -> bool {
-        snapshot.visible_cells.get(base + c).is_some_and(|cell| {
-            // wide char(한글 등) 뒤의 자리 채움 셀은 c==' '지만 단어의 일부다 —
-            // 공백으로 취급하면 "nant-성과분석.pdf"가 첫 한글에서 끊긴다 (2026-07-14).
-            cell.wide_spacer || (!cell.c.is_whitespace() && cell.c != '\0')
-        })
-    };
+    // wide char(한글 등) 뒤의 자리 채움 셀은 c==' '지만 단어의 일부다 — 공백으로
+    // 취급하면 "nant-성과분석.pdf"가 첫 한글에서 끊긴다 (2026-07-14). 판정은
+    // `cell_has_content`가 행 선택과 공유한다.
+    let is_word = |c: usize| -> bool { cell_has_content(snapshot, base + c) };
     if !is_word(col) {
         return None;
     }
@@ -9551,6 +9584,101 @@ mod tests {
         assert_eq!(renderer_egui::selection_text(&snap, s, e), "nant-성과.pdf");
         // 공백(idx 1)은 여전히 단어가 아니다
         assert!(word_range_at(&snap, 1).is_none());
+    }
+
+    /// 행 문자열 목록으로 스냅샷 하나 — 부족한 칸은 공백으로 채운다.
+    fn line_snap(cols: usize, lines: &[&str]) -> TerminalViewportSnapshot {
+        let mut cells = Vec::new();
+        for line in lines {
+            let mut width = 0usize;
+            for c in line.chars() {
+                // 픽스처에서는 비ASCII를 2칸(wide)으로 본다 — 한글 검증에 충분하다.
+                let wide = !c.is_ascii();
+                cells.push(TerminalCell {
+                    c,
+                    fg: [255; 3],
+                    bg: [0; 3],
+                    wide,
+                    wide_spacer: false,
+                    attrs: Default::default(),
+                });
+                width += 1;
+                if wide {
+                    cells.push(TerminalCell {
+                        c: ' ',
+                        fg: [255; 3],
+                        bg: [0; 3],
+                        wide: false,
+                        wide_spacer: true,
+                        attrs: Default::default(),
+                    });
+                    width += 1;
+                }
+            }
+            while width < cols {
+                cells.push(TerminalCell {
+                    c: ' ',
+                    fg: [255; 3],
+                    bg: [0; 3],
+                    wide: false,
+                    wide_spacer: false,
+                    attrs: Default::default(),
+                });
+                width += 1;
+            }
+        }
+        TerminalViewportSnapshot {
+            cols: cols as u16,
+            rows: lines.len() as u16,
+            cursor: CursorSnapshot {
+                col: 0,
+                row: 0,
+                shape: CursorShape::Block,
+                visible: true,
+            },
+            visible_cells: cells.into(),
+            dirty_ranges: Vec::new(),
+            title: None,
+            scroll_offset: 0,
+            is_alt_screen: false,
+        }
+    }
+
+    #[test]
+    fn 행_선택은_행_전체를_잡고_끝_공백은_뺀다() {
+        let snap = line_snap(12, &["ls -la", "second row"]);
+        let (s, e) = line_range_at(&snap, 3).expect("행");
+        assert_eq!(s, 0, "행 시작(0열)부터다 — 앞 들여쓰기도 행의 일부다");
+        assert_eq!(
+            renderer_egui::selection_text(&snap, s, e),
+            "ls -la",
+            "끝의 빈 칸은 선택에 넣지 않는다"
+        );
+    }
+
+    #[test]
+    fn 행_선택은_클릭한_행만_잡는다() {
+        let snap = line_snap(12, &["first", "second row"]);
+        // 두 번째 행(base 12)의 아무 칸이나
+        let (s, e) = line_range_at(&snap, 12 + 4).expect("행");
+        assert_eq!(s, 12);
+        assert_eq!(renderer_egui::selection_text(&snap, s, e), "second row");
+    }
+
+    #[test]
+    fn 빈_행은_선택하지_않는다() {
+        // 빈 줄을 더블클릭해도 아무 일도 일어나지 않는다(공백 위 단어 선택과 같은 감각).
+        let snap = line_snap(12, &["", "   "]);
+        assert!(line_range_at(&snap, 3).is_none());
+        assert!(line_range_at(&snap, 12 + 1).is_none());
+    }
+
+    #[test]
+    fn 행_선택은_wide_문자로_끝나도_자리_채움까지_포함한다() {
+        // 한글로 끝나는 행에서 자리 채움 셀을 빼면 마지막 글자가 잘려 보인다.
+        let snap = line_snap(12, &["ok 한글"]);
+        let (s, e) = line_range_at(&snap, 0).expect("행");
+        assert_eq!(renderer_egui::selection_text(&snap, s, e), "ok 한글");
     }
 
     #[test]

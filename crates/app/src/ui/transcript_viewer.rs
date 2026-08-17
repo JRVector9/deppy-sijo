@@ -22,6 +22,17 @@ pub struct TranscriptViewerUi {
     /// 이번 대화가 열린 뒤 아직 적용하지 않은 스크롤 목표(강조 시작 인덱스). `render`가
     /// 한 프레임 소비하면 비운다 — 이후 프레임은 사용자가 스크롤해도 되돌리지 않는다.
     pending_scroll_to: Option<usize>,
+    /// 메시지별로 실제로 배치해서 잰 프레임 높이(간격·add_space 제외, 순수 프레임
+    /// 높이만). 아직 한 번도 배치 안 된 메시지는 `None`이다. `set_conversation`에서
+    /// 대화가 바뀌면 통째로 비운다 — 옛 대화의 높이가 남으면 스크롤이 통째로 어긋난다.
+    heights: Vec<Option<f32>>,
+    /// 이 대화를 연 뒤 아직 한 번도 "전부 배치"를 하지 않았다. 첫 프레임은 가상화
+    /// 없이 지금까지 해오던 대로 전부 배치한다 — 모든 메시지의 높이를 실측하는
+    /// 동시에, stick_to_bottom과 focus scroll_to_rect를 **실제로 배치된 rect**로
+    /// 정확히 착지시킨다(2026-08-18 사용자가 겪은 깜빡임은 착지가 어긋나서
+    /// 생겼다 — 여기서 타협하지 않는다). 두 번째 프레임부터는 이미 모든 높이를
+    /// 실측해 뒀으므로 가상화해도 흔들리지 않는다.
+    initial_pass_done: bool,
 }
 
 impl TranscriptViewerUi {
@@ -48,6 +59,8 @@ impl TranscriptViewerUi {
         self.focus_range = None;
         self.focus_missing = false;
         self.pending_scroll_to = None;
+        self.heights.clear();
+        self.initial_pass_done = false;
         if let (Some(offset), Ok(conversation)) = (focus_offset, result.as_ref()) {
             match focus_range(&conversation.messages, conversation.truncated, offset) {
                 Some(range) => {
@@ -99,39 +112,146 @@ impl TranscriptViewerUi {
 
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let messages = &conversation.messages;
+        // 대화 길이와 캐시 길이가 안 맞으면(주로 방금 set_conversation 직후) 새로
+        // 비운 크기로 맞춘다 — set_conversation은 이미 `heights.clear()`로 비웠지만,
+        // 여기서 실제 메시지 수만큼 `None`으로 채워야 아래 인덱싱이 안전하다.
+        if self.heights.len() != messages.len() {
+            self.heights = vec![None; messages.len()];
+        }
 
         // 스티키 하단: 강조할 턴이 없을 때(처음 열 때, 또는 그 턴을 못 찾았을 때)
         // 최신 메시지가 보이는 맨 아래에서 시작한다. 강조할 턴이 있으면 그 시작
         // 인덱스로 직접 스크롤하므로 하단에 붙지 않는다.
         let stick_to_bottom = self.focus_range.is_none();
-        // **`show_rows`를 쓰지 않는다.** 그건 모든 행이 같은 높이라고 가정하는데(egui
-        // 0.35 scroll_area.rs), 대화는 한 줄짜리 「나」와 수십 줄짜리 에이전트 응답이
-        // 섞여 평균이 어느 행과도 맞지 않는다. 그러면 egui가 스크롤 오프셋에서 뽑은
-        // 인덱스와 실제로 그려진 높이가 매 프레임 어긋나 화면이 깜빡이고 위로 바로
-        // 올라가지 않는다(2026-08-18 사용자 보고).
-        //
-        // 메시지는 200개·총 1MB 상한 안이고(agent_transcript의 read_conversation),
-        // egui는 galley를 텍스트·폭 기준으로 캐시하므로 전부 배치해도 프레임 비용이
-        // 유계다. 정확한 스크롤을 위해 가상화를 포기한 맞바꿈이다.
         let highlight_range = self.focus_range.clone();
         let scroll_to = self.pending_scroll_to.take();
+        let heights = &mut self.heights;
+        let initial_pass_done = &mut self.initial_pass_done;
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(stick_to_bottom)
             .id_salt(("transcript-viewer-scroll", self.generation))
-            .show(ui, |ui| {
-                for (index, message) in messages.iter().enumerate() {
-                    let highlighted =
-                        highlight_range.as_ref().is_some_and(|r| r.contains(&index));
-                    let rect = render_message(ui, message, tokens, catalog, highlighted);
-                    // 강조 시작 메시지를 화면 위쪽에 세운다. 오프셋을 손으로 계산하는
-                    // 대신 실제로 배치된 rect를 쓰므로 높이가 제각각이어도 정확하다.
-                    if scroll_to == Some(index) {
-                        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+            .show_viewport(ui, |ui, viewport| {
+                if !*initial_pass_done {
+                    // 이 대화를 연 뒤 첫 프레임: **가상화하지 않고 지금까지 해오던
+                    // 대로 전부 배치한다.** 높이를 하나도 안 잰 상태에서 잠정 평균으로
+                    // stick_to_bottom·focus scroll_to_rect의 착지 지점을 계산하면,
+                    // 실제 높이가 드러나는 대로 착지가 여러 프레임에 걸쳐 움직이는
+                    // 꼴이 된다 — 그게 바로 사용자가 겪은 깜빡임이다(2026-08-18
+                    // 보고). 여기서는 타협하지 않는다: 착지는 항상 실제로 배치된
+                    // rect로만 한다. 대신 그 대가로 모든 메시지 높이를 이 한
+                    // 프레임에서 실측해 캐시에 채워 두고, 다음 프레임부터는 그
+                    // 캐시가 이미 정확하므로 가상화해도 흔들리지 않는다.
+                    for (index, message) in messages.iter().enumerate() {
+                        let highlighted =
+                            highlight_range.as_ref().is_some_and(|r| r.contains(&index));
+                        let rect = render_message(ui, message, tokens, catalog, highlighted);
+                        heights[index] = Some(rect.height());
+                        if scroll_to == Some(index) {
+                            ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                        }
                     }
+                    *initial_pass_done = true;
+                    return;
                 }
+
+                // 두 번째 프레임부터: 캐시된 높이의 누적합으로 뷰포트에 걸치는
+                // 구간만 배치한다(+ overscan). 잠정 높이(미측정 평균)는 방어적으로
+                // 남겨 둘 뿐 — 첫 프레임에서 이미 전부 실측했으므로 실전에서는
+                // 거의 쓰이지 않는다.
+                let row_fallback = ui.text_style_height(&egui::TextStyle::Body);
+                let provisional = provisional_height(heights, row_fallback);
+                let extra_per_message = ui.spacing().item_spacing.y + MESSAGE_GAP;
+                let offsets = slot_offsets(heights, provisional, extra_per_message);
+                let total_height = offsets.last().copied().unwrap_or(0.0);
+                ui.set_height(total_height);
+
+                let range =
+                    visible_range(&offsets, viewport.min.y..viewport.max.y, OVERSCAN_MESSAGES);
+                if range.is_empty() {
+                    return;
+                }
+
+                let y_min = ui.max_rect().top() + offsets[range.start];
+                let y_max = ui.max_rect().top() + offsets[range.end];
+                let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |viewport_ui| {
+                    // 배치 안 하는 앞뒤 메시지도 "widget이 있었다"고 셈해야 스크롤
+                    // 도중 같은 메시지의 auto id가 프레임마다 안 바뀐다(show_rows와
+                    // 같은 관례) — 선택 가능 텍스트의 커서/선택 상태가 그 위에 걸려
+                    // 있다.
+                    viewport_ui.skip_ahead_auto_ids(range.start);
+                    for index in range.clone() {
+                        let message = &messages[index];
+                        let highlighted =
+                            highlight_range.as_ref().is_some_and(|r| r.contains(&index));
+                        let measured =
+                            render_message(viewport_ui, message, tokens, catalog, highlighted)
+                                .height();
+                        if heights[index] != Some(measured) {
+                            heights[index] = Some(measured);
+                            // 값이 바뀌었으니(예: 폭이 바뀌어 줄바꿈이 달라졌다) 다음
+                            // 프레임에 새 누적합을 반영한다.
+                            viewport_ui.ctx().request_repaint();
+                        }
+                    }
+                });
             });
     }
+}
+
+/// 메시지 프레임과 다음 메시지 사이에 두는 여백. `render_message`의 `ui.add_space`
+/// 호출과 누적합 계산이 이 상수를 공유해야 어긋나지 않는다.
+const MESSAGE_GAP: f32 = 4.0;
+
+/// 뷰포트 앞뒤로 이만큼 메시지를 더 배치해 스크롤 중 빈칸이 보이지 않게 한다.
+const OVERSCAN_MESSAGES: usize = 4;
+
+/// 아직 안 잰 메시지의 잠정 높이 — 이미 측정된 높이들의 평균, 하나도 없으면
+/// `fallback`(한 줄 높이). 측정되는 대로 이 평균도 실측값 쪽으로 수렴한다.
+fn provisional_height(heights: &[Option<f32>], fallback: f32) -> f32 {
+    let (sum, count) = heights
+        .iter()
+        .flatten()
+        .fold((0.0_f32, 0usize), |(sum, count), height| (sum + height, count + 1));
+    if count == 0 { fallback } else { sum / count as f32 }
+}
+
+/// 메시지별 "슬롯 높이"(프레임 높이 + 항목 간격 + [`MESSAGE_GAP`])의 누적합. 길이는
+/// `heights.len() + 1`이고 `offsets[k]`는 메시지 0..k를 배치했을 때 소비하는 전체
+/// 높이(egui의 자동 item_spacing까지 포함) — 이 값으로 각 메시지의 절대 y 오프셋과
+/// 전체 콘텐츠 높이를 정확히 맞춘다.
+fn slot_offsets(heights: &[Option<f32>], provisional: f32, extra_per_message: f32) -> Vec<f32> {
+    let mut offsets = Vec::with_capacity(heights.len() + 1);
+    offsets.push(0.0);
+    let mut acc = 0.0;
+    for height in heights {
+        acc += height.unwrap_or(provisional) + extra_per_message;
+        offsets.push(acc);
+    }
+    offsets
+}
+
+/// 뷰포트 y범위(overscan 포함)와 겹치는 메시지 인덱스 구간을 누적합에서 찾는다.
+/// `offsets[i]..offsets[i+1]`이 메시지 i가 차지하는 구간이라는 전제로 이분 탐색한다.
+fn visible_range(
+    offsets: &[f32],
+    viewport: std::ops::Range<f32>,
+    overscan: usize,
+) -> std::ops::Range<usize> {
+    let total = offsets.len().saturating_sub(1);
+    if total == 0 || viewport.end <= viewport.start {
+        return 0..0;
+    }
+    let tight_start =
+        offsets.partition_point(|offset| *offset <= viewport.start).saturating_sub(1).min(total - 1);
+    let tight_end =
+        offsets.partition_point(|offset| *offset < viewport.end).clamp(tight_start + 1, total);
+    let start = tight_start.saturating_sub(overscan);
+    let end = (tight_end + overscan).min(total);
+    start..end
 }
 
 fn render_message(
@@ -158,7 +278,7 @@ fn render_message(
         ui.label(egui::RichText::new(label).small().weak());
         ui.add(egui::Label::new(message.text.as_str()).wrap().selectable(true));
     });
-    ui.add_space(4.0);
+    ui.add_space(MESSAGE_GAP);
     response.response.rect
 }
 
@@ -353,13 +473,17 @@ mod tests {
         harness.get_by_label("답변입니다");
     }
 
-    /// 예전에는 `show_rows` 가상화라 화면 밖 메시지를 아예 만들지 않았다. 그런데 그건
-    /// **모든 행이 같은 높이**라는 가정 위에서만 성립하고, 대화는 한 줄짜리와 수십 줄짜리가
-    /// 섞여 그 가정이 깨진다 — 스크롤이 깜빡이고 위로 바로 안 올라갔다(2026-08-18 사용자
-    /// 보고). 정확한 스크롤을 위해 전부 배치하는 쪽으로 바꿨고, 그 계약을 여기서 고정한다.
-    /// 비용 상한은 가상화가 아니라 **수집 단계의 200개·1MB 상한**이 지킨다.
+    /// 예전에는 `show_rows` 가상화라 화면 밖 메시지를 아예 만들지 않았는데, 그건
+    /// **모든 행이 같은 높이**라는 가정 위에서만 성립해서 깨졌다(2026-08-18 사용자
+    /// 보고 — 스크롤이 깜빡이고 위로 바로 안 올라갔다). 그 다음 커밋은 정확성을 위해
+    /// 가상화를 버리고 전부 배치했다. 이번 계약은 그 둘을 합친다: 측정 높이 캐시 +
+    /// 누적합으로 뷰포트에 걸치는 구간만 배치하되(2프레임째부터), 값은 **실측**이라
+    /// 어긋나지 않는다. 첫 프레임(부트스트랩)은 여전히 전부 배치해 모든 높이를 재고
+    /// stick_to_bottom을 정확히 착지시키므로, 그 프레임에서 실행을 멈추면(harness를
+    /// 한 번만 돌리면) 가상화가 시작되기 전 상태만 보게 된다 — 그래서 `run()`을 두 번
+    /// 불러 가상화된 두 번째 프레임의 결과를 확인한다.
     #[test]
-    fn kittest_모든_메시지가_배치되어_스크롤이_정확하다() {
+    fn kittest_뷰포트_밖_메시지는_배치되지_않고_최신_메시지는_보인다() {
         use egui_kittest::kittest::Queryable;
 
         let mut viewer = TranscriptViewerUi::default();
@@ -377,22 +501,27 @@ mod tests {
             None,
         );
         let mut harness = harness_for(viewer);
-        harness.run();
+        harness.run(); // 부트스트랩: 전부 배치해 높이를 재고 stick_to_bottom을 착지시킨다.
+        harness.run(); // 가상화 프레임: 착지된 뷰포트 기준으로 걸치는 구간만 배치한다.
 
         assert!(
             harness.query_by_label("메시지 199").is_some(),
-            "스티키 하단이라 가장 최근 메시지는 보여야 한다"
+            "스티키 하단이라 가장 최근 메시지는 계속 보여야 한다"
         );
         assert!(
-            harness.query_by_label("메시지 0").is_some(),
-            "화면 밖이어도 배치는 된다 — 높이를 실제로 재야 스크롤이 어긋나지 않는다"
+            harness.query_by_label("메시지 0").is_none(),
+            "가상화되면 뷰포트에서 한참 벗어난(overscan 밖) 메시지는 배치되지 않는다 — \
+             그래야 스크롤 프레임 비용이 대화 길이가 아니라 뷰포트 크기로 유계가 된다"
         );
     }
 
-    /// 상한이 가상화가 아니라 수집 단계에 있다는 것을 못박는다 — 이 상한이 무너지면
-    /// 전부 배치하는 이 뷰어의 프레임 비용도 함께 무너진다.
+    /// 이 상한은 더 이상 "매 스크롤 프레임" 비용을 지키지 않는다 — 가상화가 그건
+    /// 뷰포트+overscan으로 이미 유계로 만든다. 다만 대화를 처음 여는 **부트스트랩
+    /// 프레임**(아직 높이를 하나도 못 잰 첫 프레임, `initial_pass_done == false`)은
+    /// 착지 정확성을 위해 지금도 전부 배치한다 — 그 한 프레임의 비용은 여전히 이
+    /// 상한에 걸려 있다.
     #[test]
-    fn 메시지_수_상한이_프레임_비용을_막는다() {
+    fn 메시지_수_상한이_부트스트랩_프레임_비용을_막는다() {
         assert_eq!(crate::agent_transcript::CONVERSATION_MESSAGES_MAX, 200);
     }
 
@@ -510,5 +639,78 @@ mod tests {
         );
         harness.get_by_label("턴2 지시");
         harness.get_by_label("턴2 답");
+    }
+
+    #[test]
+    fn 대화가_바뀌면_높이_캐시와_배치_상태가_초기화된다() {
+        let mut viewer = TranscriptViewerUi::default();
+        viewer.set_conversation(Ok(crate::agent_transcript::TranscriptConversation::default()), None);
+        // 이전 대화에서 이미 부트스트랩(전부 배치)을 마치고 높이를 재 뒀다고 가정한다.
+        viewer.heights = vec![Some(10.0), Some(20.0)];
+        viewer.initial_pass_done = true;
+
+        viewer.set_conversation(Ok(crate::agent_transcript::TranscriptConversation::default()), None);
+
+        assert!(viewer.heights.is_empty(), "옛 대화의 높이가 남으면 새 대화에서 스크롤이 통째로 어긋난다");
+        assert!(!viewer.initial_pass_done, "새 대화는 다시 부트스트랩부터 시작해야 착지가 정확하다");
+    }
+
+    #[test]
+    fn 잠정_높이는_측정된_것들의_평균이고_없으면_한_줄_높이다() {
+        assert_eq!(provisional_height(&[None, None], 12.0), 12.0, "하나도 안 쟀으면 폴백");
+        assert_eq!(provisional_height(&[Some(10.0), None, Some(20.0)], 12.0), 15.0, "측정된 것만 평균");
+        assert_eq!(provisional_height(&[], 12.0), 12.0, "메시지가 없어도 폴백");
+    }
+
+    #[test]
+    fn 누적합은_측정_높이와_잠정_높이를_섞어_계산한다() {
+        // 메시지 0·2는 실측(10, 20), 메시지 1은 미측정(잠정 5) — extra_per_message=1.
+        let offsets = slot_offsets(&[Some(10.0), None, Some(20.0)], 5.0, 1.0);
+        assert_eq!(offsets, vec![0.0, 11.0, 17.0, 38.0]);
+    }
+
+    #[test]
+    fn 뷰포트에_걸치는_구간만_찾는다() {
+        // 메시지 5개, 각각 높이 10 (간격 없음): 경계가 0,10,20,30,40,50.
+        let offsets: Vec<f32> = (0u16..=5).map(|i| f32::from(i) * 10.0).collect();
+        // 뷰포트 [12,28)은 메시지1([10,20))과 메시지2([20,30))에 걸친다.
+        assert_eq!(visible_range(&offsets, 12.0..28.0, 0), 1..3);
+    }
+
+    #[test]
+    fn overscan은_앞뒤로_더_배치하되_경계를_벗어나지_않는다() {
+        let offsets: Vec<f32> = (0u16..=5).map(|i| f32::from(i) * 10.0).collect();
+        assert_eq!(visible_range(&offsets, 12.0..28.0, 1), 0..4, "overscan 1이면 앞뒤로 하나씩 더");
+        assert_eq!(
+            visible_range(&offsets, 12.0..28.0, 10),
+            0..5,
+            "overscan이 아무리 커도 [0, 메시지_수)를 못 벗어난다"
+        );
+    }
+
+    #[test]
+    fn 미측정_메시지가_섞여도_배치_구간을_정확히_찾는다() {
+        // 메시지 0·2는 실측 20, 메시지 1은 미측정(잠정 10) — offsets = [0,20,30,50].
+        let offsets = slot_offsets(&[Some(20.0), None, Some(20.0)], 10.0, 0.0);
+        assert_eq!(offsets, vec![0.0, 20.0, 30.0, 50.0]);
+        // 뷰포트가 잠정 높이 구간([20,30))만 걸치면 그 메시지 하나만 잡혀야 한다.
+        assert_eq!(visible_range(&offsets, 22.0..28.0, 0), 1..2);
+    }
+
+    #[test]
+    fn 빈_대화의_배치_구간은_비어_있다() {
+        let offsets = slot_offsets(&[], 12.0, 4.0);
+        assert_eq!(visible_range(&offsets, 0.0..100.0, 4), 0..0);
+    }
+
+    #[test]
+    fn 메시지가_하나면_구간은_항상_그_메시지_하나다() {
+        let offsets = slot_offsets(&[Some(10.0)], 12.0, 4.0);
+        assert_eq!(visible_range(&offsets, 0.0..5.0, 0), 0..1);
+        assert_eq!(
+            visible_range(&offsets, 200.0..300.0, 0),
+            0..1,
+            "뷰포트가 콘텐츠보다 훨씬 아래라도 마지막(=유일한) 메시지로 클램프된다"
+        );
     }
 }

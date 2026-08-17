@@ -6514,10 +6514,16 @@ enum PathClick {
 /// 셀이 "내용"인가 — 공백·NUL은 아니고, wide char 뒤 자리 채움은 앞 글자의 일부다.
 /// 단어 선택과 행 선택이 같은 판정을 써야 한글로 끝나는 경우가 갈리지 않는다.
 fn cell_has_content(snapshot: &terminal::TerminalViewportSnapshot, idx: usize) -> bool {
+    // wide 글자의 **뒷칸**은 글자의 일부라 내용이다. 반면 2칸 글자가 행 끝에 안 들어가
+    // 다음 줄로 밀릴 때 남는 **행 끝 필러**는 같은 `wide_spacer` 비트를 쓰지만 이 행에는
+    // 아무 글자도 없다 — 내용으로 세면 눈에 빈 행이 더블클릭에 강조된다(2026-08-18 리뷰).
+    if snapshot.is_trailing_wide_spacer(idx) {
+        return true;
+    }
     snapshot
         .visible_cells
         .get(idx)
-        .is_some_and(|cell| cell.wide_spacer || (!cell.c.is_whitespace() && cell.c != '\0'))
+        .is_some_and(|cell| !cell.wide_spacer && !cell.c.is_whitespace() && cell.c != '\0')
 }
 
 /// 더블클릭이 잡는 **화면 행 전체** 범위 (2026-08-17 사용자 요청).
@@ -9671,6 +9677,28 @@ mod tests {
         let snap = line_snap(12, &["", "   "]);
         assert!(line_range_at(&snap, 3).is_none());
         assert!(line_range_at(&snap, 12 + 1).is_none());
+    }
+
+    /// 2칸 글자가 행 끝에 안 들어가 다음 줄로 밀리면 그 행 마지막 칸에 **필러**가 남는다
+    /// (alacritty `LEADING_WIDE_CHAR_SPACER` / ghostty `SpacerHead`). 눈에는 빈 행인데
+    /// `wide_spacer` 비트만 서 있어서, 구분하지 않으면 더블클릭에 강조 막대가 생긴다
+    /// (2026-08-18 리뷰가 실제 백엔드로 실측).
+    #[test]
+    fn 행_끝_wrap_필러만_있는_행은_선택하지_않는다() {
+        let mut snap = line_snap(6, &[""]);
+        let cells: &mut Vec<TerminalCell> = &mut snap.visible_cells.to_vec();
+        // 마지막 칸만 필러로 만든다 — 앞 칸은 소유자(wide)가 아니라 그냥 공백이다.
+        cells[5].wide_spacer = true;
+        snap.visible_cells = cells.clone().into();
+
+        assert!(
+            !snap.is_trailing_wide_spacer(5),
+            "앞 칸이 소유자가 아니면 진짜 뒷칸이 아니다"
+        );
+        assert!(
+            line_range_at(&snap, 2).is_none(),
+            "눈에 빈 행은 더블클릭해도 선택하지 않는다"
+        );
     }
 
     #[test]

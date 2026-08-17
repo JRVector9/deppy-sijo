@@ -17,6 +17,34 @@ pub struct TerminalViewportSnapshot {
     pub is_alt_screen: bool,
 }
 
+impl TerminalViewportSnapshot {
+    /// 이 셀이 **진짜 wide 글자의 뒷칸**인가.
+    ///
+    /// 백엔드는 성질이 다른 둘을 같은 `wide_spacer` 비트로 평탄화한다:
+    /// - **뒷칸** (alacritty `WIDE_CHAR_SPACER`, ghostty `SpacerTail`) — 같은 행 **앞 칸**의
+    ///   2칸 글자가 소유한다. 글자의 일부다.
+    /// - **행 끝 필러** (alacritty `LEADING_WIDE_CHAR_SPACER`, ghostty `SpacerHead`) — 2칸
+    ///   글자가 행 끝에 들어가지 못해 다음 줄로 밀릴 때 그 행 마지막 칸에 남는 빈 자리다.
+    ///   소유자는 **다음 줄 0열**이라 이 행에는 아무 글자도 없다.
+    ///
+    /// 둘을 구분하지 않으면 ① 눈에는 빈 행인데 "내용 있음"으로 판정되어 더블클릭에 강조
+    /// 막대가 생기고 ② 선택 강조가 끝점보다 한 칸 더 칠해진다(2026-08-18 리뷰가 alacritty
+    /// 백엔드로 실측). 구분 기준은 **같은 행의 앞 칸이 실제 소유자(`wide`)인가**다.
+    pub fn is_trailing_wide_spacer(&self, index: usize) -> bool {
+        let cols = self.cols as usize;
+        if cols == 0 || !self.visible_cells.get(index).is_some_and(|cell| cell.wide_spacer) {
+            return false;
+        }
+        if index.is_multiple_of(cols) {
+            // 행 0열 — 앞 칸이 같은 행에 없다(행 끝 필러의 소유자가 여기 온다).
+            return false;
+        }
+        self.visible_cells
+            .get(index - 1)
+            .is_some_and(|owner| owner.wide)
+    }
+}
+
 /// 색상은 backend에서 RGB로 해석을 끝낸다 — UI는 팔레트를 모른다.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalCell {

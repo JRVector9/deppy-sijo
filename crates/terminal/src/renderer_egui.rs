@@ -613,7 +613,16 @@ fn selection_covers_cell(
     previous_selected: bool,
 ) -> bool {
     match snapshot.visible_cells.get(index) {
-        Some(cell) if cell.wide_spacer => previous_selected,
+        // 행 끝 필러(`LEADING_WIDE_CHAR_SPACER`)는 앞 글자의 뒷칸이 **아니다** — 소유자가
+        // 다음 줄에 있으므로 `end` 상한을 그대로 적용한다. 구분하지 않으면 CJK로 wrap되는
+        // 행에서 강조가 한 칸 더 칠해진다(2026-08-18 리뷰 실측).
+        Some(cell) if cell.wide_spacer => {
+            if snapshot.is_trailing_wide_spacer(index) {
+                previous_selected
+            } else {
+                index >= start && index <= end
+            }
+        }
         Some(_) => index >= start && index <= end,
         None => false,
     }
@@ -1314,6 +1323,37 @@ mod tests {
 
         let ascii = backend_snap("src/main.rs");
         assert_eq!(selection_text(&ascii, 4, 7), "main");
+    }
+
+    /// 2칸 글자가 행 끝에 안 들어가 다음 줄로 밀리면 그 행 마지막 칸에 **필러**가 남는다
+    /// (alacritty `LEADING_WIDE_CHAR_SPACER`). 이건 앞 글자의 뒷칸이 아니므로 `end` 상한을
+    /// 지켜야 한다 — 구분하지 않으면 강조가 한 칸 더 칠해진다(2026-08-18 리뷰 실측).
+    #[test]
+    fn 행_끝_wrap_필러는_end를_넘어_칠하지_않는다() {
+        // cols=6에 "abcde"(5칸) 뒤 "가"(2칸) → row0 마지막 칸이 필러, "가"는 row1 0열.
+        let mut backend = crate::alacritty_backend::AlacrittyBackend::new(6, 3, 100);
+        backend.feed("abcde가".as_bytes()).unwrap();
+        let snapshot = backend.viewport_snapshot().unwrap();
+
+        let filler = 5; // row0의 마지막 칸
+        assert!(
+            snapshot.visible_cells[filler].wide_spacer,
+            "백엔드가 필러도 wide_spacer로 평탄화한다(이 테스트의 전제)"
+        );
+        assert!(
+            !snapshot.is_trailing_wide_spacer(filler),
+            "필러는 앞 칸이 소유자가 아니라 진짜 뒷칸이 아니다"
+        );
+        // 끝점이 마지막 실제 글자 'e'(idx 4)일 때 필러(5)는 칠하지 않는다.
+        assert!(
+            !selection_covers_cell(&snapshot, filler, 0, 4, true),
+            "end 밖의 필러를 칠하면 강조가 한 칸 더 나간다"
+        );
+        // "가"의 뒷칸은 여전히 소유자와 함께 칠한다(회귀 방지).
+        let owner = snapshot.cols as usize; // row1 0열
+        assert!(snapshot.visible_cells[owner].wide);
+        assert!(snapshot.is_trailing_wide_spacer(owner + 1));
+        assert!(selection_covers_cell(&snapshot, owner + 1, owner, owner, true));
     }
 
     /// 행 끝이 wide 글자(한글 등)일 때 **강조가 글자 전체**를 덮어야 한다. 끝점이

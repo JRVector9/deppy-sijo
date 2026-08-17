@@ -7926,6 +7926,11 @@ pub struct App {
     transcript_viewer_ui: ui::transcript_viewer::TranscriptViewerUi,
     /// 원문 IO 완료의 stale 폐기용 세대 — `git_panel_generation`과 같은 관례.
     transcript_generation: u64,
+    /// 보조 본문(이력·Git) 검색 상태 — App이 소유하고 leaf는 읽기만 한다(2026-08-18
+    /// 스펙 `docs/superpowers/specs/2026-08-18-aux-search-design.md`).
+    /// 활성 보조 탭이 바뀌거나(`apply_work_history_tab_intent`/`apply_git_tab_intent`)
+    /// 워크스페이스가 바뀌면(`reset_git_surfaces` 옆) `reset()`한다.
+    aux_search: ui::aux_search::AuxSearchState,
     /// Lazy aggregate boundary for hook/attention/restore/binding/resume/catalog/project-name
     /// persistence and filesystem projections. Construction opens no DB and starts no thread.
     agent_state_worker: crate::agent_state_worker::AgentStateWorker<AppAgentStateBackend>,
@@ -8807,6 +8812,50 @@ fn aux_split_width(stored: Option<f32>, auto: f32, body_width: f32, min_list: f3
     let upper = (body_width - AUX_DETAIL_MIN_WIDTH).max(0.0);
     let lower = min_list.min(upper);
     requested.clamp(lower, upper)
+}
+
+/// 보조 검색 ↑↓ — 활성 일치 인덱스를 총 일치 수 기준으로 순환 이동한다(스펙: 마지막
+/// 다음은 처음, 처음 이전은 마지막). `total == 0`이면 옮길 데가 없으므로 그대로 `0`을
+/// 돌려준다 — 호출부가 "아무 일도 안 한다"를 별도로 분기하지 않아도 된다.
+fn aux_search_step_active(current: usize, total: usize, forward: bool) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % total
+    } else {
+        (current + total - 1) % total
+    }
+}
+
+/// 검색 바(`ui::aux_search::search_bar`)가 올린 intent를 `state`에 반영한다. `total`은
+/// 호출부가 검색 바를 그리기 **전에** 읽은 그 본문의 일치 수 — ↑↓ 순환
+/// (`aux_search_step_active`)의 상한이다. Esc는 `search_bar` 내부가 입력창 포커스일
+/// 때만 `Close`로 소비하므로(워크스페이스 터미널 검색 바와 같은 관례) 여기서 따로
+/// Esc를 가로챌 필요가 없다 — `Close` 처리 하나로 충분하다. 순수 함수로 뽑아 App
+/// 없이 값으로 검증한다.
+fn apply_aux_search_action(
+    state: &mut ui::aux_search::AuxSearchState,
+    action: ui::aux_search::AuxSearchAction,
+    total: usize,
+) {
+    use ui::aux_search::AuxSearchAction;
+    match action {
+        AuxSearchAction::QueryChanged(query) => {
+            state.query = query;
+            // 질의가 바뀌면 일치 위치가 전부 달라진다 — 옛 활성 인덱스를 그대로
+            // 두면 새 질의의 엉뚱한 일치를 가리키거나 범위 밖일 수 있어 처음으로
+            // 되돌린다.
+            state.active = 0;
+        }
+        AuxSearchAction::Prev => {
+            state.active = aux_search_step_active(state.active, total, false);
+        }
+        AuxSearchAction::Next => {
+            state.active = aux_search_step_active(state.active, total, true);
+        }
+        AuxSearchAction::Close => state.close(),
+    }
 }
 
 enum AppHostIoAction {
@@ -11801,6 +11850,7 @@ impl App {
             pending_work_history_action: None,
             transcript_viewer_ui: ui::transcript_viewer::TranscriptViewerUi::default(),
             transcript_generation: 0,
+            aux_search: ui::aux_search::AuxSearchState::default(),
             agent_state_worker,
             agent_state_scope: initial_agent_state_scope,
             pending_agent_state_scope: None,
@@ -14456,6 +14506,36 @@ impl App {
         current_branch: Option<&str>,
         text: &i18n::Catalog,
     ) -> Option<ui::work_history::WorkHistoryAction> {
+        // 보조 검색 바 — 열려 있을 때만 본문 상단 전폭에 그리고, 그 아래 남은 rect를
+        // 기존 좌우 마스터-디테일에 넘긴다. total/truncated는 우측 원문 뷰어의
+        // `search_summary()`에서 가져온다 — 그 값은 **직전 프레임** 캐시라(질의가 막
+        // 바뀐 프레임만 1프레임 지연) 반드시 검색 바를 먼저 그린 뒤에 그 결과로
+        // `render`를 불러야 한다(transcript_viewer.rs `search_summary` 문서의 계약).
+        let (search_total, search_truncated) = self.transcript_viewer_ui.search_summary();
+        let body = if self.aux_search.open {
+            let mut bar = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(body)
+                    .id_salt("work_history_aux_search_bar"),
+            );
+            bar.set_clip_rect(body.intersect(ui.clip_rect()));
+            if let Some(action) = ui::aux_search::search_bar(
+                &mut bar,
+                &self.aux_search,
+                search_total,
+                search_truncated,
+                text,
+            ) {
+                apply_aux_search_action(&mut self.aux_search, action, search_total);
+            }
+            // `bar`는 body 안에 고정된 max_rect의 child라 검색 바가 소비한 세로
+            // 공간만큼 커서가 내려가 있다 — 남은 영역이 곧 마스터-디테일에 넘길 rect다.
+            bar.available_rect_before_wrap()
+        } else {
+            body
+        };
+        let filter = if self.aux_search.is_active() { self.aux_search.query.as_str() } else { "" };
+
         let auto_list_width = history_tab_list_width(body.width());
         let list_width = aux_split_width(
             self.work_history_tab_split_width,
@@ -14490,9 +14570,7 @@ impl App {
             },
             presentations,
             text,
-            // 실제 질의 배선은 Task 6(App aux_search 배선)이 한다 — 지금은 항상
-            // 필터 없음.
-            "",
+            filter,
         );
 
         // 목록/원문 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
@@ -14549,9 +14627,11 @@ impl App {
                 .id_salt("work_history_transcript_pane_tab"),
         );
         transcript.set_clip_rect(transcript_rect.intersect(ui.clip_rect()));
-        // 검색 없음("None")으로 최소 수정 — 인자 추가로 컴파일이 깨지는 것만 막는다.
-        // 실제 질의 배선은 Task 6(App aux_search 배선).
-        self.transcript_viewer_ui.render(&mut transcript, text, None);
+        let search = self
+            .aux_search
+            .is_active()
+            .then_some((self.aux_search.query.as_str(), self.aux_search.active));
+        self.transcript_viewer_ui.render(&mut transcript, text, search);
 
         action
     }
@@ -14564,6 +14644,31 @@ impl App {
         body: egui::Rect,
         text: &i18n::Catalog,
     ) -> Option<ui::git_panel::GitPanelAction> {
+        // 보조 검색 바 — render_work_history_tab_body와 같은 규칙. total/truncated는
+        // 우측 diff 뷰어의 `search_summary()`(직전 프레임 캐시)에서 가져온다.
+        let (search_total, search_truncated) = self.diff_viewer_ui.search_summary();
+        let body = if self.aux_search.open {
+            let mut bar = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(body)
+                    .id_salt("git_tab_aux_search_bar"),
+            );
+            bar.set_clip_rect(body.intersect(ui.clip_rect()));
+            if let Some(action) = ui::aux_search::search_bar(
+                &mut bar,
+                &self.aux_search,
+                search_total,
+                search_truncated,
+                text,
+            ) {
+                apply_aux_search_action(&mut self.aux_search, action, search_total);
+            }
+            bar.available_rect_before_wrap()
+        } else {
+            body
+        };
+        let filter = if self.aux_search.is_active() { self.aux_search.query.as_str() } else { "" };
+
         let auto_list_width = git_tab_list_width(body.width());
         // 180.0 = git_tab_list_width의 MIN과 같은 값(파일 목록 좌측 최소 폭).
         let list_width =
@@ -14579,9 +14684,7 @@ impl App {
             egui::UiBuilder::new().max_rect(list_rect).id_salt("git_panel_pane_tab"),
         );
         list.set_clip_rect(list_rect.intersect(ui.clip_rect()));
-        // filter: "" = 필터 없음. 실제 질의 배선은 Task 6(App 보조 검색 상태)이 한다
-        // (2026-08-18 계획 Task 2 — GitPanelUi::render 시그니처 변경에 따른 최소 수정).
-        let action = self.git_panel_ui.render(&mut list, text, "");
+        let action = self.git_panel_ui.render(&mut list, text, filter);
 
         // 목록/diff 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
         // 조절할 수 없다). 드래그 누적은 cross-workspace 분할선과 같은 패턴이다 —
@@ -14637,9 +14740,11 @@ impl App {
                 .id_salt("git_diff_pane_tab"),
         );
         detail.set_clip_rect(diff_rect.intersect(ui.clip_rect()));
-        // search: None = 강조 없음. 실제 질의 배선은 Task 6(App 보조 검색 상태)이 한다
-        // (2026-08-18 계획 Task 4 — DiffViewerUi::render 시그니처 변경에 따른 최소 수정).
-        self.diff_viewer_ui.render(&mut detail, text, None);
+        let search = self
+            .aux_search
+            .is_active()
+            .then_some((self.aux_search.query.as_str(), self.aux_search.active));
+        self.diff_viewer_ui.render(&mut detail, text, search);
         action
     }
 
@@ -14681,6 +14786,11 @@ impl App {
             ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
             ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
         };
+        if self.work_history_tab.is_active() != previous.is_active() {
+            // 활성 보조 탭이 바뀌었다(켜졌거나 꺼졌거나) — 이력에서 찾던 문구가 남아
+            // 있으면 다음에 뭘 보든 "왜 안 보이지"가 된다(스펙).
+            self.aux_search.reset();
+        }
         if self.work_history_tab.is_active() && !previous.is_active() {
             // 헤더에서 이력 탭을 직접 눌러 활성화하는 경로 — Git이 활성이었다면 물러난다
             // (보조 본문은 하나뿐이다, 스펙 §8-2).
@@ -14706,6 +14816,10 @@ impl App {
             ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
             ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
         };
+        if self.git_tab.is_active() != previous.is_active() {
+            // apply_work_history_tab_intent와 같은 이유로 비운다.
+            self.aux_search.reset();
+        }
         if self.git_tab.is_active() && !previous.is_active() {
             (self.work_history_tab, self.git_tab) =
                 resolve_aux_tab_exclusivity(self.work_history_tab, self.git_tab, AuxTabWinner::Git);
@@ -17036,6 +17150,9 @@ impl App {
             &mut self.git_panel_generation,
             &mut self.git_panel_cwd,
         );
+        // 보조 검색도 같은 자리에서 비운다 — 이전 워크스페이스에서 찾던 문구가 새
+        // 워크스페이스의 이력/Git 목록을 걸러 놓으면 "왜 안 보이지"가 된다(스펙).
+        self.aux_search.reset();
         // 이력 탭은 워크스페이스를 바꿔도 유지한다 — 열려 활성인 상태였다면 새
         // 워크스페이스 projection을 기다리는 loading으로 이어 붙인다.
         self.work_history_loading = self.work_history_tab.is_active();
@@ -17329,7 +17446,16 @@ impl App {
                     tracing::warn!("터미널 글꼴 크기 저장 실패: {error:#}");
                 }
             }
-            A::TerminalSearch => self.active.workspace_ui.open_search(),
+            // 보조 본문(이력·Git)이 활성이면 이 단축키는 터미널 검색이 아니라 보조
+            // 검색을 토글한다 — 세션 헤더 검색 버튼(workspace.rs
+            // `search_click_targets_aux_search`)과 같은 규칙(스펙 "진입").
+            A::TerminalSearch => {
+                if self.work_history_tab.is_active() || self.git_tab.is_active() {
+                    self.aux_search.toggle();
+                } else {
+                    self.active.workspace_ui.open_search();
+                }
+            }
             // 컴포저 포커스+펼침. 이미 포커스면 이 경로는 오지 않는다(text_edit_focused
             // 조기 반환) — 접기는 컴포저가 ⌘J를 직접 소비해 처리한다.
             // 설정 OFF면 무시 — 숨겨진(미생성) 도크에 포커스를 줄 수 없다.
@@ -24576,7 +24702,13 @@ impl eframe::App for App {
                     // 레일은 이제 전역 페이지가 아니라 **현재 워크스페이스의 이력 보조
                     // 탭**을 연다/활성화한다. 재클릭은 탭을 지우지 않고 세션 탭으로만
                     // 돌아간다(탭 제거는 이력 X 전용).
+                    let previous_history_active = self.work_history_tab.is_active();
                     self.work_history_tab = self.work_history_tab.on_rail_click();
+                    if self.work_history_tab.is_active() != previous_history_active {
+                        // 헤더 탭 클릭(apply_work_history_tab_intent)과 같은 이유로
+                        // 비운다 — 레일도 활성 보조 탭을 바꾸는 또 다른 진입점이다.
+                        self.aux_search.reset();
+                    }
                     if self.work_history_tab.is_active() {
                         // Git이 활성이었다면 물러난다 — 보조 본문은 하나뿐이다(스펙 §8-2).
                         (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
@@ -24594,6 +24726,11 @@ impl eframe::App for App {
                     // 탭 자체는 남는다).
                     let previous = self.git_tab;
                     self.git_tab = previous.on_rail_click();
+                    if self.git_tab.is_active() != previous.is_active() {
+                        // 레일도 활성 보조 탭을 바꾸는 진입점이다(apply_git_tab_intent와
+                        // 같은 이유).
+                        self.aux_search.reset();
+                    }
                     if self.git_tab.is_active() {
                         // 이력과 같은 진입 — 활성이 될 때만 스냅샷을 새로 받는다(폴링 없음).
                         (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
@@ -24620,7 +24757,7 @@ impl eframe::App for App {
                     ));
                 }
                 // Git은 2026-08-15 2차부터 pane 보조 탭이다 — 새로고침/원격 열기/파일
-                // diff는 이제 git 패널이 보조 본문 안에서 App에 직접 올린다(Task 6).
+                // diff는 이제 git 패널이 보조 본문 안에서 App에 직접 올린다.
                 Some(ui::file_tree::SidebarAction::NoteEdited(body)) => {
                     // 기록은 여기서 하지 않는다 — 디바운스 만료와 깨우기는 logic()이
                     // 소유한다(check-boundary: App::ui는 repaint 타이머를 설치하지 않는다).
@@ -25459,6 +25596,9 @@ impl eframe::App for App {
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
                     aux_tab_intent = primary_output.aux_tab_intent;
+                    if primary_output.aux_search_toggle_requested {
+                        self.aux_search.toggle();
+                    }
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
                             git_panel_action = self.render_git_tab_body(&mut primary, body, &text);
@@ -25498,6 +25638,9 @@ impl eframe::App for App {
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
                     aux_tab_intent = primary_output.aux_tab_intent;
+                    if primary_output.aux_search_toggle_requested {
+                        self.aux_search.toggle();
+                    }
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
                             git_panel_action = self.render_git_tab_body(ui, body, &text);
@@ -31129,6 +31272,70 @@ mod tests {
         assert_eq!(width, 0.0, "창 폭이 0이어도 패닉 없이 0을 돌려준다");
     }
 
+    /// 보조 검색 ↑↓는 총 일치 수 기준으로 순환한다 — 마지막 다음은 처음, 처음
+    /// 이전은 마지막(스펙 "우측 본문 강조·이동").
+    #[test]
+    fn aux_search_step_active는_양_끝에서_순환한다() {
+        assert_eq!(aux_search_step_active(4, 5, true), 0, "마지막 다음은 처음");
+        assert_eq!(aux_search_step_active(0, 5, false), 4, "처음 이전은 마지막");
+        assert_eq!(aux_search_step_active(2, 5, true), 3, "중간은 +1");
+        assert_eq!(aux_search_step_active(2, 5, false), 1, "중간은 -1");
+    }
+
+    /// 총 일치 수가 0이면 옮길 데가 없다 — "아무 일도 안 한다"를 그대로 0으로
+    /// 표현한다(호출부가 별도 분기를 두지 않아도 되게).
+    #[test]
+    fn aux_search_step_active는_총계가_0이면_그대로_0이다() {
+        assert_eq!(aux_search_step_active(0, 0, true), 0);
+        assert_eq!(
+            aux_search_step_active(3, 0, false),
+            0,
+            "옛 활성 인덱스가 남아 있어도 총계가 0이면 0"
+        );
+    }
+
+    /// `QueryChanged`는 질의를 반영하고 활성 인덱스를 처음으로 되돌린다 — 옛 질의의
+    /// 활성 인덱스가 새 질의의 엉뚱한 일치(또는 범위 밖)를 가리키면 안 된다.
+    #[test]
+    fn apply_aux_search_action은_질의가_바뀌면_활성_인덱스를_처음으로_되돌린다() {
+        let mut state = ui::aux_search::AuxSearchState {
+            query: "old".into(),
+            open: true,
+            active: 3,
+        };
+        apply_aux_search_action(
+            &mut state,
+            ui::aux_search::AuxSearchAction::QueryChanged("new".into()),
+            0,
+        );
+        assert_eq!(state.query, "new");
+        assert_eq!(state.active, 0);
+    }
+
+    /// `Prev`/`Next`는 `aux_search_step_active`로 활성 인덱스를 옮긴다(순환 포함).
+    #[test]
+    fn apply_aux_search_action은_prev_next로_활성_인덱스를_순환한다() {
+        let mut state =
+            ui::aux_search::AuxSearchState { query: "q".into(), open: true, active: 0 };
+        apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Prev, 3);
+        assert_eq!(state.active, 2, "처음에서 이전은 마지막으로 순환한다");
+        apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Next, 3);
+        assert_eq!(state.active, 0);
+        apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Next, 3);
+        assert_eq!(state.active, 1);
+    }
+
+    /// `Close`는 검색 바를 닫되 질의는 남긴다(`AuxSearchState::close`와 같은 계약) —
+    /// 다시 열면 하던 검색이 이어진다.
+    #[test]
+    fn apply_aux_search_action은_close로_질의를_남긴_채_닫는다() {
+        let mut state =
+            ui::aux_search::AuxSearchState { query: "q".into(), open: true, active: 2 };
+        apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Close, 5);
+        assert!(!state.open);
+        assert_eq!(state.query, "q", "닫아도 질의는 남아야 다시 열 때 이어진다");
+    }
+
     /// 분할선 드래그의 **부호와 수치**를 고정한다. 소스 문자열 스캔만으로는
     /// `start_width + delta`를 `- delta`로 뒤집는 회귀(드래그 방향이 반대로 도는)를
     /// 잡지 못한다 — 사람이 직접 끌어봐야 드러난다(2026-08-17 리뷰).
@@ -31262,6 +31469,12 @@ mod tests {
         assert!(
             !body.contains("self.git_tab = "),
             "git_tab 자체는 건드리지 않는다 — 이력 탭과 같은 규칙으로 열린 채 유지한다"
+        );
+        assert!(
+            body.contains("self.aux_search.reset()"),
+            "워크스페이스 전환 시 보조 검색도 비워야 한다 — \
+             안 그러면 이전 워크스페이스에서 찾던 문구가 새 워크스페이스의 이력/Git \
+             목록을 걸러 놓는다"
         );
     }
 
@@ -31552,6 +31765,112 @@ mod tests {
                 "이력 탭 의도 처리에서 {forbidden}가 파생되면 안 된다"
             );
         }
+        assert_eq!(
+            intent.matches("self.aux_search.reset()").count(),
+            2,
+            "activation apply_work_history_tab_intent·apply_git_tab_intent 둘 다 활성 \
+             보조 탭이 바뀌면 보조 검색을 비워야 한다"
+        );
+    }
+
+    /// ⌘F(`A::TerminalSearch`)는 보조 본문이 활성이면 보조 검색을 토글하고, 아니면
+    /// 기존 터미널 검색을 그대로 연다 — 세션 헤더 검색 버튼과 같은 진입 규칙(스펙
+    /// "진입"), 보조 본문 비활성일 때 기존 동작이 회귀하지 않는다는 계약.
+    #[test]
+    fn 터미널서치_단축키는_보조_본문_활성_여부로_갈라진다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let arm = production
+            .split_once("A::TerminalSearch => {")
+            .expect("A::TerminalSearch 분기가 있어야 한다")
+            .1
+            .split_once("A::FocusComposer =>")
+            .expect("다음 분기 경계가 있어야 한다")
+            .0;
+        assert!(
+            arm.contains("self.work_history_tab.is_active() || self.git_tab.is_active()"),
+            "보조 본문 활성 여부로 갈라야 한다"
+        );
+        assert!(
+            arm.contains("self.aux_search.toggle()"),
+            "활성이면 보조 검색을 토글해야 한다"
+        );
+        assert!(
+            arm.contains("self.active.workspace_ui.open_search()"),
+            "비활성이면 기존 터미널 검색을 그대로 열어야 한다(회귀 방지)"
+        );
+    }
+
+    /// 레일 「이력」·「Git」 클릭도 헤더 탭 클릭(`apply_work_history_tab_intent`/
+    /// `apply_git_tab_intent`)과 같은 진입점이다 — 활성 보조 탭을 바꾸면서
+    /// `aux_search.reset()`을 빠뜨리면 레일로 들어올 때만 이전 검색이 새 목록에
+    /// 조용히 남는다.
+    #[test]
+    fn 레일_이력_git_클릭도_보조_검색을_비운다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let history = production
+            .split_once("Some(ui::file_tree::SidebarAction::ShowHistory) => {")
+            .expect("레일 이력 분기가 있어야 한다")
+            .1
+            .split_once("Some(ui::file_tree::SidebarAction::ShowGit) => {")
+            .expect("다음 분기 경계가 있어야 한다");
+        assert!(
+            history.0.contains("self.aux_search.reset()"),
+            "레일 이력 클릭도 활성 탭이 바뀌면 보조 검색을 비워야 한다"
+        );
+        let git = history
+            .1
+            .split_once("Some(ui::file_tree::SidebarAction::OpenAgents) => {")
+            .expect("다음 분기 경계가 있어야 한다")
+            .0;
+        assert!(
+            git.contains("self.aux_search.reset()"),
+            "레일 Git 클릭도 활성 탭이 바뀌면 보조 검색을 비워야 한다"
+        );
+    }
+
+    /// 이력/Git 본문 렌더가 `""`/`None` 고정 리터럴이 아니라 실제 `aux_search` 상태를
+    /// 조달하는지 소스로 고정한다(순수 함수 검증은 `apply_aux_search_action`/
+    /// `aux_search_step_active` 테스트가 맡는다).
+    #[test]
+    fn 이력_git_본문은_고정_리터럴이_아니라_aux_search_상태를_넘긴다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let history_body = production
+            .split_once("fn render_work_history_tab_body(")
+            .expect("이력 본문 렌더가 있어야 한다")
+            .1
+            .split_once("fn render_git_tab_body(")
+            .expect("다음 함수 경계가 있어야 한다")
+            .0;
+        assert!(
+            history_body.contains("self.work_history_ui.show("),
+            "이력 카드 목록 렌더 호출이 있어야 한다"
+        );
+        assert!(
+            history_body.contains("presentations,\n            text,\n            filter,\n        );"),
+            "카드 목록 필터는 aux_search에서 뽑은 filter를 써야 한다(고정 빈 문자열이면 안 된다)"
+        );
+        assert!(
+            history_body.contains("self.transcript_viewer_ui.render(&mut transcript, text, search);"),
+            "원문 뷰어는 aux_search에서 뽑은 search를 써야 한다"
+        );
+        let git_body = production
+            .split_once("fn render_git_tab_body(")
+            .unwrap()
+            .1
+            .split_once("fn reveal_terminal_view_for_aux_tab(")
+            .expect("다음 함수 경계가 있어야 한다")
+            .0;
+        assert!(
+            git_body.contains("self.git_panel_ui.render(&mut list, text, filter);"),
+            "Git 파일 목록 필터는 aux_search에서 뽑은 filter를 써야 한다"
+        );
+        assert!(
+            git_body.contains("self.diff_viewer_ui.render(&mut detail, text, search);"),
+            "diff 뷰어는 aux_search에서 뽑은 search를 써야 한다"
+        );
     }
 
     /// 턴 프로젝션이 `messages_json: None`으로 되돌아가면 저장된 메시지 배열이 조용히

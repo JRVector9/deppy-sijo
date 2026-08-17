@@ -1149,6 +1149,15 @@ enum TerminalToolbarIcon {
     SplitRows,
 }
 
+/// 세션 헤더 Search 버튼 클릭이 보조 검색(이력·Git) 토글로 가야 하는지 —
+/// 그 pane의 보조 본문이 활성일 때만 그렇다(2026-08-18 스펙 "진입").
+/// 다른 도구(새 셸·분할)나 보조 본문이 비활성인 Search는 항상 기존 경로
+/// (`activate_terminal_toolbar`/입력 소유권 없을 때의 포커스 클레임)로 간다 —
+/// 그 경로의 `input_enabled` 게이트는 그대로 두고 이 조건이 그 앞에 별도로 얹힌다.
+fn search_click_targets_aux_search(icon: TerminalToolbarIcon, aux_active: bool) -> bool {
+    matches!(icon, TerminalToolbarIcon::Search) && aux_active
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct AttachedPaneTarget {
@@ -1249,6 +1258,10 @@ pub struct WorkspaceSurfaceOutput {
     /// 보조 탭이 활성일 때 App이 본문을 그릴 pane body rect. 이 rect가 있으면
     /// WorkspaceUi는 그 pane의 터미널 표면·입력을 **그리지 않았다**.
     pub aux_body_rect: Option<egui::Rect>,
+    /// 보조 본문이 활성인 세션 헤더에서 Search 버튼이 눌렸다 — App이 이번 프레임에
+    /// `aux_search.toggle()`을 부른다(스펙 "진입"). `input_enabled` 게이트는 그대로
+    /// 두고 그 앞에 얹은 별도 경로라, 이 값이 참이어도 터미널 검색은 열리지 않는다.
+    pub aux_search_toggle_requested: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1283,6 +1296,7 @@ struct PaneRenderOutput {
     local_focus_claimed: Option<runtime::MuxPaneId>,
     aux_tab_intent: Option<(PaneAuxTabKind, PaneAuxTabIntent)>,
     aux_body_rect: Option<egui::Rect>,
+    aux_search_toggle_requested: bool,
 }
 
 impl PaneRenderOutput {
@@ -1297,6 +1311,7 @@ impl PaneRenderOutput {
         if other.aux_body_rect.is_some() {
             self.aux_body_rect = other.aux_body_rect;
         }
+        self.aux_search_toggle_requested |= other.aux_search_toggle_requested;
     }
 }
 
@@ -3766,6 +3781,7 @@ impl WorkspaceUi {
             local_focus_claimed: pane_output.local_focus_claimed,
             aux_tab_intent: pane_output.aux_tab_intent,
             aux_body_rect: pane_output.aux_body_rect,
+            aux_search_toggle_requested: pane_output.aux_search_toggle_requested,
         }
     }
 
@@ -4385,7 +4401,13 @@ impl WorkspaceUi {
                 TerminalToolbarIcon::SplitRows => catalog.t("workspace.split_vertical", &[]),
             };
             if response.on_hover_text(tooltip).clicked() {
-                if input_enabled {
+                if search_click_targets_aux_search(icon, aux_active) {
+                    // 보조 본문(이력·Git)이 활성이면 Search는 터미널 검색이 아니라
+                    // 보조 검색을 토글한다 — `input_enabled` 게이트는 건드리지 않고
+                    // (입력 소유권 fail-closed 계약 유지) 그 앞에 별도 경로만 더한다.
+                    // 실제 토글은 App(`aux_search.toggle()`)이 한다.
+                    output.aux_search_toggle_requested = true;
+                } else if input_enabled {
                     if !focused {
                         self.request_pane_focus(pane.id.clone());
                     }
@@ -9988,6 +10010,174 @@ mod tests {
                 ..
             } if pane == &target
         ));
+    }
+
+    /// 세션 헤더 Search 버튼의 갈래 조건(2026-08-18 스펙) — Search 아이콘이면서
+    /// 보조 본문이 활성일 때만 보조 검색으로 간다. 다른 도구는 보조 본문이 활성이어도
+    /// 항상 기존 경로(`activate_terminal_toolbar`)로 간다.
+    #[test]
+    fn search_click_targets_aux_search는_search_아이콘이면서_보조본문_활성일_때만_참이다() {
+        assert!(search_click_targets_aux_search(TerminalToolbarIcon::Search, true));
+        assert!(!search_click_targets_aux_search(TerminalToolbarIcon::Search, false));
+        assert!(!search_click_targets_aux_search(TerminalToolbarIcon::NewTerminal, true));
+        assert!(!search_click_targets_aux_search(TerminalToolbarIcon::SplitColumns, true));
+        assert!(!search_click_targets_aux_search(TerminalToolbarIcon::SplitRows, true));
+    }
+
+    /// 헤더가 실제로 배치한 것과 같은 기하로 Search 버튼(도구 4개 중 첫 번째) 중심을
+    /// 다시 계산한다. `aux_tab_geometry_for_test`와 같은 관례 — 테스트 헤더(520pt)는
+    /// 항상 도구 4개가 다 보여야 한다(좁아지면 왼쪽 도구부터 숨는데, Search가 바로
+    /// 그 왼쪽 끝이라 좁은 헤더에서는 이 헬퍼를 쓰면 안 된다).
+    fn search_toolbar_button_center(
+        ws: &WorkspaceUi,
+        header: egui::Rect,
+        snapshot: &runtime::PaneSnapshot,
+    ) -> egui::Pos2 {
+        let context = egui::Context::default();
+        let mut center = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::FontId::proportional(13.0);
+            let aux_reserved: f32 = ws
+                .aux_tabs
+                .iter()
+                .map(|tab| {
+                    let natural = ui
+                        .painter()
+                        .layout_no_wrap(tab.label.clone(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x;
+                    pane_aux_tab_width(pane_aux_tab_label_width(
+                        header.width(),
+                        natural,
+                        ws.aux_tabs.len(),
+                    )) + PANE_AUX_TAB_RIGHT_PAD
+                })
+                .sum();
+            let title_width = ui
+                .painter()
+                .layout_no_wrap(snapshot.title.clone(), font, egui::Color32::WHITE)
+                .size()
+                .x;
+            let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
+            assert_eq!(buttons.toolbar.len(), 4, "테스트 헤더는 도구 4개가 모두 보여야 한다");
+            center = Some(buttons.toolbar[0].center());
+        });
+        center.expect("Search 버튼 rect를 계산해야 한다")
+    }
+
+    /// 회귀 방지 계약: 보조 본문(이력·Git)이 비활성이면 Search 버튼은 지금까지처럼
+    /// 터미널 검색을 연다 — `aux_search_toggle_requested`가 오르면 안 된다.
+    #[test]
+    fn kittest_보조본문_비활성이면_검색버튼은_기존_터미널검색을_연다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let search_center = search_toolbar_button_center(&ws, header, &snapshot);
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, bool)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
+                // `aux_search_toggle_requested`는 프레임마다 새로 계산되는 값이라
+                // `clicked()`가 참인 한 프레임에만 켜진다 — harness가 한 `run()`
+                // 안에서 내부적으로 여러 번 그릴 수 있어 `|=`로 누적한다(덮어쓰면
+                // 클릭 프레임 다음 그리기에서 다시 꺼진다).
+                state.1 |= output.aux_search_toggle_requested;
+            },
+            (ws, false),
+        );
+        harness.run();
+
+        harness.hover_at(search_center);
+        harness.run();
+        harness.drag_at(search_center);
+        harness.run();
+        harness.drop_at(search_center);
+        harness.run();
+
+        assert!(
+            !harness.state().1,
+            "보조 본문이 비활성이면 aux_search_toggle_requested가 오르면 안 된다"
+        );
+        assert_eq!(
+            harness.state().0.search.as_ref().map(|search| search.session),
+            Some(SessionId(7)),
+            "보조 본문이 비활성이면 Search 버튼은 여전히 기존 터미널 검색을 연다(회귀 방지)"
+        );
+    }
+
+    /// 보조 본문이 활성인 헤더에서는 Search 버튼이 `aux_search_toggle_requested`를
+    /// 올리고, 기존 터미널 검색(`ws.search`)은 열지 않는다 — App이 그 intent로
+    /// `aux_search.toggle()`을 부른다(스펙 "진입"). `input_enabled: false`로 App이
+    /// 이 프레임에 실제로 넘기는 값(입력 소유권 fail-closed)을 재현한다.
+    #[test]
+    fn kittest_보조본문_활성이면_검색버튼은_보조검색_토글_의도를_올린다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::History,
+            label: "History".to_owned(),
+            active: true,
+        }]);
+        ws.aux_tab_pane = Some(pane_id("p"));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let search_center = search_toolbar_button_center(&ws, header, &snapshot);
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, bool)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, false);
+                state.1 |= output.aux_search_toggle_requested;
+            },
+            (ws, false),
+        );
+        harness.run();
+
+        harness.hover_at(search_center);
+        harness.run();
+        harness.drag_at(search_center);
+        harness.run();
+        harness.drop_at(search_center);
+        harness.run();
+
+        assert!(
+            harness.state().1,
+            "보조 본문이 활성이면 Search 버튼은 aux_search_toggle_requested를 올려야 한다"
+        );
+        assert!(
+            harness.state().0.search.is_none(),
+            "보조 검색으로 갈 때는 기존 터미널 검색을 열면 안 된다"
+        );
     }
 
     #[test]

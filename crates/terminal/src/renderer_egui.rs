@@ -597,6 +597,28 @@ fn range_intersects_row(range: &CellRange, row_start: usize, row_end: usize) -> 
 }
 
 /// 선택 배경을 그리고 **발행한 rect 수**를 돌려준다 (shapes 카운터용).
+/// 이 셀이 선택 **강조**(칠하기) 대상인가. `previous_selected`는 같은 행의 직전 열이
+/// 선택됐는지다.
+///
+/// wide 글자(한글·CJK)는 2칸을 쓰고, 뒷칸은 `wide_spacer`다. 끝점은
+/// [`normalize_selection_endpoint`]가 자리 채움을 **앞 글자로 되돌리므로**, 자리 채움을
+/// `end`로 판정하면 행 끝 wide 글자가 절반만 칠해진다 — 복사는 정상인데 선택이 끝까지
+/// 안 된 것처럼 보인다(2026-08-17 사용자 보고). 자리 채움은 앞 칸이 선택됐는지로만
+/// 판정해 글자 하나가 반쪽으로 칠해지는 일이 없게 한다.
+fn selection_covers_cell(
+    snapshot: &TerminalViewportSnapshot,
+    index: usize,
+    start: usize,
+    end: usize,
+    previous_selected: bool,
+) -> bool {
+    match snapshot.visible_cells.get(index) {
+        Some(cell) if cell.wide_spacer => previous_selected,
+        Some(_) => index >= start && index <= end,
+        None => false,
+    }
+}
+
 fn paint_selection_row(
     painter: &egui::Painter,
     snapshot: &TerminalViewportSnapshot,
@@ -637,12 +659,7 @@ fn paint_selection_row(
     };
     for col in 0..cols {
         let index = row_start + col;
-        let selected = index >= start
-            && index <= end
-            && snapshot
-                .visible_cells
-                .get(index)
-                .is_some_and(|cell| !cell.wide_spacer || run_start.is_some());
+        let selected = selection_covers_cell(snapshot, index, start, end, run_start.is_some());
         if selected {
             if run_start.is_none() {
                 run_start = Some(col);
@@ -1297,6 +1314,32 @@ mod tests {
 
         let ascii = backend_snap("src/main.rs");
         assert_eq!(selection_text(&ascii, 4, 7), "main");
+    }
+
+    /// 행 끝이 wide 글자(한글 등)일 때 **강조가 글자 전체**를 덮어야 한다. 끝점이
+    /// 자리 채움에서 앞 글자로 정규화되므로, 칠하기를 `end`로만 판정하면 마지막 글자가
+    /// 반쪽만 칠해진다 — 복사는 정상이라 더 헷갈린다(2026-08-17 사용자 보고).
+    #[test]
+    fn wide_글자로_끝나는_선택은_자리_채움까지_칠한다() {
+        for fixture in ["프로젝트", "設定", "项目"] {
+            let snapshot = backend_snap(fixture);
+            let spacer = first_wide_spacer(&snapshot);
+            let owner = owning_wide_cell(&snapshot, spacer).expect("wide spacer owner");
+            // 끝점을 owner로 준다 — normalize가 자리 채움을 이렇게 되돌린 결과와 같다.
+            assert!(
+                selection_covers_cell(&snapshot, owner, 0, owner, false),
+                "{fixture}: wide 글자 자체는 선택 대상이다"
+            );
+            assert!(
+                selection_covers_cell(&snapshot, spacer, 0, owner, true),
+                "{fixture}: 앞 칸이 선택됐으면 자리 채움도 칠한다(end 밖이라도)"
+            );
+            // 앞 칸이 선택되지 않았으면 자리 채움만 홀로 칠하지 않는다.
+            assert!(
+                !selection_covers_cell(&snapshot, spacer, 0, owner, false),
+                "{fixture}: 고아 자리 채움은 칠하지 않는다"
+            );
+        }
     }
 
     #[test]

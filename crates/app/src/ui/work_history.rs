@@ -256,12 +256,17 @@ impl WorkHistoryUi {
         }
     }
 
+    /// `filter`는 보조 검색(App이 소유한 `AuxSearchState`)이 넘기는 질의다 — 빈
+    /// 문자열이면 필터 없음. 카드 자체의 정렬·상태 필터·provider 칩·내부 검색창
+    /// (`self.query`)과는 별개로 AND 결합되며, 걸리지 않은 카드는 그룹에서 빠진다
+    /// (Task 3, 스펙 "좌측 목록 필터").
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: WorkHistorySnapshot<'_>,
         presentations: &[WorkHistoryActionPresentation],
         catalog: &i18n::Catalog,
+        filter: &str,
     ) -> Option<WorkHistoryAction> {
         self.reconcile_selection(snapshot.rows);
         let mut action = None;
@@ -272,7 +277,7 @@ impl WorkHistoryUi {
         // 넘겨받은 rect(=pane body)를 그대로 채운다. 상단 탭 스트립은 호출부가 이미
         // 잘라내고 남긴 높이라 여기서 다시 빼지 않는다 — 프레임 자기 여백만 제한다.
         let available_height = ui.available_height();
-        let groups = self.grouped_rows(snapshot.rows);
+        let groups = apply_aux_filter(self.grouped_rows(snapshot.rows), filter);
         let shown: usize = groups.iter().map(|group| group.rows.len()).sum();
         content.show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -294,7 +299,15 @@ impl WorkHistoryUi {
                 return;
             }
             if groups.is_empty() {
-                render_centered_message(ui, catalog.t("history.no_results", &[]));
+                // 보조 검색(filter)이 걸려 있으면 "이 검색어로는 없다"는 전용 안내가
+                // 기존 "history.no_results"(내부 검색창·상태·provider 필터가 만든
+                // 빈 결과)보다 정확하다 — 스펙 "좌측 목록 필터".
+                let message = if filter.is_empty() {
+                    catalog.t("history.no_results", &[])
+                } else {
+                    catalog.t("search.no_match", &[])
+                };
+                render_centered_message(ui, message);
                 return;
             }
 
@@ -584,6 +597,47 @@ fn row_matches_query(row: &WorkHistoryRow<'_>, query: &str) -> bool {
     .into_iter()
     .flatten()
     .any(|value| value.to_lowercase().contains(query))
+}
+
+/// 보조 검색(`WorkHistoryUi::show`의 `filter` 인자, 스펙 "좌측 목록 필터") 카드
+/// 판정 — `instruction`·`agent_summary`·`messages_json`을 편 메시지 텍스트 중
+/// 하나라도 걸리면 남긴다. `messages_json`은 파싱 비용이 있어 앞의 두 필드에서
+/// 이미 걸리면 시도하지 않는다.
+fn row_matches_aux_filter(row: &WorkHistoryRow<'_>, filter: &str) -> bool {
+    if crate::ui::aux_search::contains_match(row.instruction, filter) {
+        return true;
+    }
+    if row
+        .agent_summary
+        .is_some_and(|summary| crate::ui::aux_search::contains_match(summary, filter))
+    {
+        return true;
+    }
+    row.messages_json.is_some_and(|json| {
+        parse_turn_messages(json, row.instruction)
+            .iter()
+            .any(|message| crate::ui::aux_search::contains_match(&message.text, filter))
+    })
+}
+
+/// 그룹 목록에 보조 검색 필터를 적용한다. `filter`가 비어 있으면 "검색 안 함"과
+/// 같아 **즉시 원본을 그대로 돌려준다** — `row_matches_aux_filter`(→
+/// `messages_json` 파싱)를 단 한 번도 호출하지 않으므로, 필터가 꺼져 있는 평상시
+/// 프레임 비용은 이 Task 이전과 동일하다. 필터가 걸리면 그룹 안에서 걸리지 않는
+/// 카드를 빼고, 카드가 하나도 안 남은 그룹은 통째로 지운다(빈 그룹 헤더만 남는
+/// 것을 막는다).
+fn apply_aux_filter<'a>(
+    mut groups: Vec<WorkHistoryGroup<'a>>,
+    filter: &str,
+) -> Vec<WorkHistoryGroup<'a>> {
+    if filter.is_empty() {
+        return groups;
+    }
+    for group in &mut groups {
+        group.rows.retain(|row| row_matches_aux_filter(row, filter));
+    }
+    groups.retain(|group| !group.rows.is_empty());
+    groups
 }
 
 /// 배타적 단일 선택 칩. 상태 필터와 정렬 모드 둘 다 "값 하나만 켜져 있다"는
@@ -1913,6 +1967,120 @@ mod tests {
         );
     }
 
+    // ---- 보조 검색 목록 필터 (Task 3) ----
+
+    fn row_with_messages(
+        turn_key: &str,
+        state: storage::AgentWorkTurnState,
+        updated_at: i64,
+        messages_json: &str,
+    ) -> storage::AgentWorkTurnRow {
+        let mut candidate = row(turn_key, state, updated_at);
+        candidate.messages_json = Some(messages_json.to_owned());
+        candidate
+    }
+
+    #[test]
+    fn 보조_필터는_instruction_agent_summary_messages_중_하나라도_걸리면_남긴다() {
+        let mut by_instruction = row("by-instruction", storage::AgentWorkTurnState::Working, 3);
+        by_instruction.instruction = "Fix the billing widget".to_owned();
+        by_instruction.agent_summary = Some("unrelated".to_owned());
+
+        let mut by_summary = row("by-summary", storage::AgentWorkTurnState::Working, 2);
+        by_summary.instruction = "unrelated".to_owned();
+        by_summary.agent_summary = Some("Reviewed the billing widget".to_owned());
+
+        let by_message = row_with_messages(
+            "by-message",
+            storage::AgentWorkTurnState::Working,
+            1,
+            r#"[{"r":"u","t":"unrelated"},{"r":"a","t":"the billing widget is fixed"}]"#,
+        );
+
+        let no_match = row("no-match", storage::AgentWorkTurnState::Working, 0);
+
+        let rows = vec![by_instruction, by_summary, by_message, no_match];
+        let views = views(&rows);
+        let ui = WorkHistoryUi::new();
+
+        let groups = apply_aux_filter(ui.grouped_rows(&views), "billing widget");
+        let keys: Vec<&str> = groups
+            .iter()
+            .flat_map(|group| group.rows.iter().map(|row| row.turn_key))
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            3,
+            "instruction·agent_summary·messages_json 세 필드 중 하나라도 걸린 카드만 남아야 한다: {keys:?}"
+        );
+        assert!(keys.contains(&"by-instruction"));
+        assert!(keys.contains(&"by-summary"));
+        assert!(keys.contains(&"by-message"));
+        assert!(!keys.contains(&"no-match"), "어느 필드에도 안 걸리면 빠져야 한다");
+    }
+
+    #[test]
+    fn 보조_필터는_대소문자를_구분하지않는다() {
+        let mut candidate = row("case-insensitive", storage::AgentWorkTurnState::Working, 1);
+        candidate.instruction = "Implement Billing Widget".to_owned();
+        let views = views(std::slice::from_ref(&candidate));
+        let ui = WorkHistoryUi::new();
+
+        let groups = apply_aux_filter(ui.grouped_rows(&views), "billing WIDGET");
+
+        assert_eq!(groups.iter().map(|group| group.rows.len()).sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn 보조_필터가_비어있으면_모든_카드를_그대로_남긴다() {
+        // messages_json이 손상돼 있어도(파싱 불가) 필터가 비어 있으면 아예 건드리지
+        // 않는다 — `apply_aux_filter`는 `filter.is_empty()`에서 원본 groups를 그대로
+        // 돌려주고 `row_matches_aux_filter`(→ 매 카드 JSON 파싱)를 호출하지 않는다.
+        // 평상시(필터 없음) 프레임 비용이 이 Task 이전과 같아야 한다는 요구사항의
+        // 회귀 방지 테스트.
+        let broken = row_with_messages(
+            "broken-json",
+            storage::AgentWorkTurnState::Working,
+            1,
+            "{ 이건 파싱되면 안 된다",
+        );
+        let views = views(std::slice::from_ref(&broken));
+        let ui = WorkHistoryUi::new();
+
+        let groups = apply_aux_filter(ui.grouped_rows(&views), "");
+
+        assert_eq!(groups.iter().map(|group| group.rows.len()).sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn kittest_보조_필터에_걸리는_카드가_없으면_안내문구를_보여준다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let no_match_label = catalog.t("search.no_match", &[]);
+        let candidate = row(
+            "aux-filter-empty-result",
+            storage::AgentWorkTurnState::Working,
+            10,
+        );
+        let presentation = WorkHistoryActionPresentation {
+            identity: WorkTurnIdentity::from(&candidate),
+            primary: WorkHistoryPrimaryAction::NewRun,
+            show_diff: false,
+        };
+        let rows = vec![candidate];
+        let views = views(&rows);
+        let presentations = vec![presentation];
+        let mut harness = full_harness(&catalog, &views, &presentations, "no-such-text-anywhere");
+        harness.run();
+
+        assert!(
+            harness.query_by_label(&no_match_label).is_some(),
+            "필터에 걸리는 카드가 없으면 안내 문구가 보여야 한다"
+        );
+    }
+
     // ---- 세션 그룹핑 (A2/B1) ----
 
     #[test]
@@ -2145,6 +2313,7 @@ mod tests {
         catalog: &'a i18n::Catalog,
         rows: &'a [WorkHistoryRow<'a>],
         presentations: &'a [WorkHistoryActionPresentation],
+        filter: &'a str,
     ) -> egui_kittest::Harness<'a, WorkHistoryUi> {
         egui_kittest::Harness::builder()
             .with_size(egui::vec2(900.0, 700.0))
@@ -2161,6 +2330,7 @@ mod tests {
                         },
                         presentations,
                         catalog,
+                        filter,
                     );
                 },
                 WorkHistoryUi::new(),
@@ -2187,7 +2357,7 @@ mod tests {
         let rows = vec![candidate];
         let views = views(&rows);
         let presentations = vec![presentation];
-        let mut harness = full_harness(&catalog, &views, &presentations);
+        let mut harness = full_harness(&catalog, &views, &presentations, "");
         harness.run();
 
         assert!(
@@ -2257,7 +2427,7 @@ mod tests {
         let rows = vec![candidate];
         let views = views(&rows);
         let presentations = vec![presentation];
-        let mut harness = full_harness(&catalog, &views, &presentations);
+        let mut harness = full_harness(&catalog, &views, &presentations, "");
         harness.run();
 
         let header = harness.get_by_role_and_label(egui::accesskit::Role::Button, &header_label);
@@ -2308,6 +2478,7 @@ mod tests {
                         },
                         &presentations,
                         &catalog,
+                        "",
                     );
                 },
                 WorkHistoryUi::new(),

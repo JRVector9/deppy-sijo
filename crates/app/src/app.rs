@@ -14490,6 +14490,9 @@ impl App {
             },
             presentations,
             text,
+            // 실제 질의 배선은 Task 6(App aux_search 배선)이 한다 — 지금은 항상
+            // 필터 없음.
+            "",
         );
 
         // 목록/원문 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
@@ -14574,7 +14577,9 @@ impl App {
             egui::UiBuilder::new().max_rect(list_rect).id_salt("git_panel_pane_tab"),
         );
         list.set_clip_rect(list_rect.intersect(ui.clip_rect()));
-        let action = self.git_panel_ui.render(&mut list, text);
+        // filter: "" = 필터 없음. 실제 질의 배선은 Task 6(App 보조 검색 상태)이 한다
+        // (2026-08-18 계획 Task 2 — GitPanelUi::render 시그니처 변경에 따른 최소 수정).
+        let action = self.git_panel_ui.render(&mut list, text, "");
 
         // 목록/diff 경계 세로 구분선 — 드래그로 폭 조절(2026-08-16 사용자: 가로 폭을
         // 조절할 수 없다). 드래그 누적은 cross-workspace 분할선과 같은 패턴이다 —

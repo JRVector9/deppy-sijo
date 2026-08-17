@@ -3,15 +3,6 @@
 //! 저장하지 않는다(볼 때만 읽고 닫으면 버린다). leaf는 IO를 하지 않는다: 파일을
 //! 읽거나 경로를 해석하지 않고, App이 `set_conversation`으로 결과를 넣어 준다.
 
-/// 가상화 행 높이 추정에 쓰는 한 줄당 문자 수. 실제 소프트 랩 폭은 레이아웃
-/// 전에는 알 수 없어 근사치를 쓴다 — 추정이 빗나가도 스크롤 위치가 살짝
-/// 흔들릴 뿐, "화면 밖 메시지는 프레임마다 다시 레이아웃하지 않는다"는
-/// 가상화의 목적(프레임 비용 유계) 자체는 항상 지켜진다.
-const ROW_CHARS_ESTIMATE: usize = 56;
-/// 메시지 한 개가 차지하는 여백 추정치 — `render_message`의 `inner_margin`
-/// 상하(4+4)와 다음 메시지 앞의 `add_space(4.0)`을 합친 값.
-const MESSAGE_ROW_EXTRA: f32 = 12.0;
-
 /// leaf 상태. IO도 파일 경로 해석도 하지 않는다 — App이 `agent_detect::transcript_path_for`로
 /// 찾은 경로를 `agent_transcript::read_conversation`으로 읽어 그 결과만 넣어 준다.
 #[derive(Default)]
@@ -31,11 +22,6 @@ pub struct TranscriptViewerUi {
     /// 이번 대화가 열린 뒤 아직 적용하지 않은 스크롤 목표(강조 시작 인덱스). `render`가
     /// 한 프레임 소비하면 비운다 — 이후 프레임은 사용자가 스크롤해도 되돌리지 않는다.
     pending_scroll_to: Option<usize>,
-    /// `messages` 전체를 `estimate_message_lines`로 훑어 얻는 평균 줄 수(`average_lines`).
-    /// 대화는 `set_conversation`에서만 바뀌므로 거기서 한 번만 계산해 캐싱한다 — `render`가
-    /// 매 프레임 최대 200개·1MB 메시지를 다시 훑지 않게 한다. `render`는 이 값에 그
-    /// 프레임의 `line_height`만 곱해 쓴다(O(1)).
-    cached_avg_lines: f32,
 }
 
 impl TranscriptViewerUi {
@@ -62,7 +48,6 @@ impl TranscriptViewerUi {
         self.focus_range = None;
         self.focus_missing = false;
         self.pending_scroll_to = None;
-        self.cached_avg_lines = result.as_ref().map_or(1.0, |conversation| average_lines(&conversation.messages));
         if let (Some(offset), Ok(conversation)) = (focus_offset, result.as_ref()) {
             match focus_range(&conversation.messages, conversation.truncated, offset) {
                 Some(range) => {
@@ -113,35 +98,39 @@ impl TranscriptViewerUi {
         }
 
         let tokens = crate::ui::designall::tokens(ui.visuals());
-        let line_height = ui.text_style_height(&egui::TextStyle::Body);
         let messages = &conversation.messages;
-        let row_height = average_row_height(self.cached_avg_lines, line_height);
 
         // 스티키 하단: 강조할 턴이 없을 때(처음 열 때, 또는 그 턴을 못 찾았을 때)
         // 최신 메시지가 보이는 맨 아래에서 시작한다. 강조할 턴이 있으면 그 시작
         // 인덱스로 직접 스크롤하므로 하단에 붙지 않는다.
         let stick_to_bottom = self.focus_range.is_none();
-        // 새 대화(제너레이션이 바뀐 프레임)에서만, 그리고 그 프레임 단 한 번만
-        // 강조 시작 인덱스로 스크롤한다 — hunk 점프하는 diff_viewer.rs와 같은
-        // `.take()` 관례. `show_rows`는 행 높이가 균일하다고 가정하므로 egui가
-        // 내부적으로 쓰는 `row_height + item_spacing.y`(scroll_area.rs의
-        // `row_height_with_spacing`)를 그대로 곱해야 실제 레이아웃과 스크롤
-        // 목표가 어긋나지 않는다.
-        let mut scroll = egui::ScrollArea::vertical()
+        // **`show_rows`를 쓰지 않는다.** 그건 모든 행이 같은 높이라고 가정하는데(egui
+        // 0.35 scroll_area.rs), 대화는 한 줄짜리 「나」와 수십 줄짜리 에이전트 응답이
+        // 섞여 평균이 어느 행과도 맞지 않는다. 그러면 egui가 스크롤 오프셋에서 뽑은
+        // 인덱스와 실제로 그려진 높이가 매 프레임 어긋나 화면이 깜빡이고 위로 바로
+        // 올라가지 않는다(2026-08-18 사용자 보고).
+        //
+        // 메시지는 200개·총 1MB 상한 안이고(agent_transcript의 read_conversation),
+        // egui는 galley를 텍스트·폭 기준으로 캐시하므로 전부 배치해도 프레임 비용이
+        // 유계다. 정확한 스크롤을 위해 가상화를 포기한 맞바꿈이다.
+        let highlight_range = self.focus_range.clone();
+        let scroll_to = self.pending_scroll_to.take();
+        egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(stick_to_bottom)
-            .id_salt(("transcript-viewer-scroll", self.generation));
-        if let Some(start) = self.pending_scroll_to.take() {
-            let row_height_with_spacing = row_height + ui.spacing().item_spacing.y;
-            scroll = scroll.vertical_scroll_offset(start as f32 * row_height_with_spacing);
-        }
-        let highlight_range = self.focus_range.clone();
-        scroll.show_rows(ui, row_height, messages.len(), |ui, range| {
-            for index in range {
-                let highlighted = highlight_range.as_ref().is_some_and(|r| r.contains(&index));
-                render_message(ui, &messages[index], tokens, catalog, highlighted);
-            }
-        });
+            .id_salt(("transcript-viewer-scroll", self.generation))
+            .show(ui, |ui| {
+                for (index, message) in messages.iter().enumerate() {
+                    let highlighted =
+                        highlight_range.as_ref().is_some_and(|r| r.contains(&index));
+                    let rect = render_message(ui, message, tokens, catalog, highlighted);
+                    // 강조 시작 메시지를 화면 위쪽에 세운다. 오프셋을 손으로 계산하는
+                    // 대신 실제로 배치된 rect를 쓰므로 높이가 제각각이어도 정확하다.
+                    if scroll_to == Some(index) {
+                        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                    }
+                }
+            });
     }
 }
 
@@ -151,7 +140,7 @@ fn render_message(
     tokens: crate::ui::designall::Tokens,
     catalog: &i18n::Catalog,
     highlighted: bool,
-) {
+) -> egui::Rect {
     let mut frame =
         egui::Frame::NONE.fill(message_background(tokens, message.role, highlighted)).inner_margin(egui::Margin::symmetric(8, 4));
     if highlighted {
@@ -161,7 +150,7 @@ fn render_message(
         // 메운다. 그러면 라이트/다크 어느 쪽이든 테두리가 강조를 확실히 보여준다.
         frame = frame.stroke(egui::Stroke::new(1.0, tokens.accent));
     }
-    frame.show(ui, |ui| {
+    let response = frame.show(ui, |ui| {
         let label = match message.role {
             crate::agent_transcript::ConversationRole::User => catalog.t("history.role.user", &[]),
             crate::agent_transcript::ConversationRole::Assistant => catalog.t("history.role.agent", &[]),
@@ -170,6 +159,7 @@ fn render_message(
         ui.add(egui::Label::new(message.text.as_str()).wrap().selectable(true));
     });
     ui.add_space(4.0);
+    response.response.rect
 }
 
 /// 강조 여부까지 반영한 메시지 배경. 강조되면 역할별 배경을 `selected_background`
@@ -230,34 +220,6 @@ fn focus_range(
         .position(|m| m.role == crate::agent_transcript::ConversationRole::User)
         .map_or(messages.len(), |relative| start + 1 + relative);
     Some(start..end)
-}
-
-/// 메시지 하나가 차지할 표시 줄 수 추정 — 역할 라벨 한 줄 + 본문 줄들(명시적
-/// 개행 기준, [`ROW_CHARS_ESTIMATE`]로 소프트 랩까지 근사).
-fn estimate_message_lines(text: &str) -> usize {
-    let body_lines: usize = text
-        .lines()
-        .map(|line| line.chars().count().div_ceil(ROW_CHARS_ESTIMATE).max(1))
-        .sum();
-    1 + body_lines.max(1)
-}
-
-/// 대화 전체 메시지의 평균 추정 줄 수 — `messages`를 훑는 O(n) 비용은 여기에만
-/// 있다. `set_conversation`이 대화가 바뀔 때 한 번만 불러 `cached_avg_lines`에
-/// 담아 두고, `render`는 매 프레임 이 값을 다시 계산하지 않는다.
-fn average_lines(messages: &[crate::agent_transcript::ConversationMessage]) -> f32 {
-    if messages.is_empty() {
-        return 1.0;
-    }
-    let total_lines: usize = messages.iter().map(|m| estimate_message_lines(&m.text)).sum();
-    total_lines as f32 / messages.len() as f32
-}
-
-/// `show_rows`에 넘길 단일 행 높이 — 평균 추정 줄 수(`average_lines`)에 이번 프레임의
-/// `line_height`를 곱한다. `show_rows`는 모든 행에 같은 높이를 가정하므로(egui 0.35
-/// API), 메시지마다 실제 높이가 달라도 평균으로 근사한다 — 가상화의 통상 트레이드오프다.
-fn average_row_height(avg_lines: f32, line_height: f32) -> f32 {
-    avg_lines * line_height + MESSAGE_ROW_EXTRA
 }
 
 #[cfg(test)]
@@ -391,8 +353,13 @@ mod tests {
         harness.get_by_label("답변입니다");
     }
 
+    /// 예전에는 `show_rows` 가상화라 화면 밖 메시지를 아예 만들지 않았다. 그런데 그건
+    /// **모든 행이 같은 높이**라는 가정 위에서만 성립하고, 대화는 한 줄짜리와 수십 줄짜리가
+    /// 섞여 그 가정이 깨진다 — 스크롤이 깜빡이고 위로 바로 안 올라갔다(2026-08-18 사용자
+    /// 보고). 정확한 스크롤을 위해 전부 배치하는 쪽으로 바꿨고, 그 계약을 여기서 고정한다.
+    /// 비용 상한은 가상화가 아니라 **수집 단계의 200개·1MB 상한**이 지킨다.
     #[test]
-    fn kittest_가상화는_화면_밖_메시지를_그리지_않는다() {
+    fn kittest_모든_메시지가_배치되어_스크롤이_정확하다() {
         use egui_kittest::kittest::Queryable;
 
         let mut viewer = TranscriptViewerUi::default();
@@ -417,36 +384,16 @@ mod tests {
             "스티키 하단이라 가장 최근 메시지는 보여야 한다"
         );
         assert!(
-            harness.query_by_label("메시지 0").is_none(),
-            "가상화되면 맨 처음 메시지는 화면 밖이라 그려지지 않는다 — 200개를 매 프레임 \
-             전부 그리면 프레임 비용이 메시지 수에 비례해 유계가 아니게 된다"
+            harness.query_by_label("메시지 0").is_some(),
+            "화면 밖이어도 배치는 된다 — 높이를 실제로 재야 스크롤이 어긋나지 않는다"
         );
     }
 
+    /// 상한이 가상화가 아니라 수집 단계에 있다는 것을 못박는다 — 이 상한이 무너지면
+    /// 전부 배치하는 이 뷰어의 프레임 비용도 함께 무너진다.
     #[test]
-    fn 추정_줄_수는_개행과_긴_줄_모두_반영한다() {
-        assert_eq!(estimate_message_lines("한 줄"), 2, "역할 라벨 1줄 + 본문 1줄");
-        assert_eq!(estimate_message_lines("첫 줄\n둘째 줄\n셋째 줄"), 4, "라벨 1줄 + 본문 3줄");
-        let long = "가".repeat(ROW_CHARS_ESTIMATE * 3);
-        assert_eq!(estimate_message_lines(&long), 4, "개행 없이 길어도 추정 폭만큼 나눠 센다");
-    }
-
-    #[test]
-    fn 평균_행_높이는_메시지가_없으면_한_줄_높이다() {
-        assert_eq!(average_row_height(average_lines(&[]), 20.0), 20.0 + MESSAGE_ROW_EXTRA);
-    }
-
-    #[test]
-    fn 평균_행_높이는_긴_메시지가_섞이면_커진다() {
-        let short = message(crate::agent_transcript::ConversationRole::User, "짧다", 0);
-        let long = message(
-            crate::agent_transcript::ConversationRole::Assistant,
-            &"가".repeat(ROW_CHARS_ESTIMATE * 10),
-            100,
-        );
-        let short_only = average_row_height(average_lines(std::slice::from_ref(&short)), 20.0);
-        let mixed = average_row_height(average_lines(&[short, long]), 20.0);
-        assert!(mixed > short_only, "긴 메시지가 섞이면 평균 높이가 커져야 한다");
+    fn 메시지_수_상한이_프레임_비용을_막는다() {
+        assert_eq!(crate::agent_transcript::CONVERSATION_MESSAGES_MAX, 200);
     }
 
     #[test]

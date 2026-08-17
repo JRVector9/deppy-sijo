@@ -14549,7 +14549,9 @@ impl App {
                 .id_salt("work_history_transcript_pane_tab"),
         );
         transcript.set_clip_rect(transcript_rect.intersect(ui.clip_rect()));
-        self.transcript_viewer_ui.render(&mut transcript, text);
+        // 검색 없음("None")으로 최소 수정 — 인자 추가로 컴파일이 깨지는 것만 막는다.
+        // 실제 질의 배선은 Task 6(App aux_search 배선).
+        self.transcript_viewer_ui.render(&mut transcript, text, None);
 
         action
     }

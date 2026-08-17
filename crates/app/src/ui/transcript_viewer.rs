@@ -33,6 +33,41 @@ pub struct TranscriptViewerUi {
     /// 생겼다 — 여기서 타협하지 않는다). 두 번째 프레임부터는 이미 모든 높이를
     /// 실측해 뒀으므로 가상화해도 흔들리지 않는다.
     initial_pass_done: bool,
+    /// 보조 검색 캐시 — 질의가 바뀔 때만 다시 채운다(diff_viewer.rs `SearchCache`와
+    /// 같은 관례, 2026-08-18 계획 Task 5: 매 프레임 200개 전수 스캔 회피).
+    search_cache: SearchCache,
+    /// 직전 프레임에 스크롤을 트리거한 (질의, 활성 인덱스) — 같은 값이 반복되는
+    /// 프레임엔 다시 스크롤하지 않는다(diff_viewer.rs `search_scroll_key`와 같은
+    /// 관례). 검색이 꺼지면(빈 질의) `None`으로 돌아간다.
+    search_scroll_key: Option<(String, usize)>,
+    /// `search_scroll_key`가 이번에 바뀌어 스크롤이 필요하다고 표시한 메시지
+    /// 인덱스. 부트스트랩 프레임(`initial_pass_done == false`, 모든 메시지를 배치해
+    /// 실측하는 중)이면 여기서 소비하지 않고 다음 프레임으로 넘긴다 — 아직 실측
+    /// 전인 잠정 높이로 오프셋을 계산하면 다음 프레임에 다시 어긋나 튄다(위
+    /// `initial_pass_done` 문서가 설명하는 깜빡임과 같은 종류의 문제). 턴 초점
+    /// (`pending_scroll_to`)과 별개 필드로 둔 이유도 같다 — 초점은 항상 부트스트랩
+    /// 프레임에서만 소비되는 rect 기반 스크롤이라 이 필드와 소비 시점이 다르다.
+    pending_search_scroll_to: Option<usize>,
+}
+
+/// 질의별 검색 캐시 — [`TranscriptViewerUi::render`]가 질의가 바뀔 때만
+/// [`build_search_cache`]로 다시 채운다(대화가 길어도 매 프레임 전수 스캔 회피).
+#[derive(Default)]
+struct SearchCache {
+    query: String,
+    /// 메시지 i에서 시작하는 전역(대화 전체 기준) 일치 인덱스. 길이는 항상
+    /// `messages.len() + 1`(마지막 원소는 총계 `total`인 sentinel) — 메시지 i의
+    /// 일치 개수는 `message_match_start[i + 1] - message_match_start[i]`로 구한다.
+    message_match_start: Vec<usize>,
+    // `total`·`truncated`는 `TranscriptViewerUi::search_summary`로만 읽는다 — 그
+    // 메서드의 실제 호출부(App의 `{active}/{total}` 카운터)는 계획 Task 6이 붙인다.
+    // 그 전까지는 clippy dead_code 대상이라 허용해 둔다(diff_viewer.rs `SearchCache`와
+    // 같은 임시 조치, 2026-08-18).
+    /// 대화 전체 일치 수([`crate::ui::aux_search::MAX_AUX_MATCHES`]에서 멈췄으면 그 이하).
+    #[allow(dead_code)]
+    total: usize,
+    #[allow(dead_code)]
+    truncated: bool,
 }
 
 impl TranscriptViewerUi {
@@ -61,6 +96,11 @@ impl TranscriptViewerUi {
         self.pending_scroll_to = None;
         self.heights.clear();
         self.initial_pass_done = false;
+        // 검색 캐시는 이 대화의 메시지 인덱스를 전제로 한다 — 대화가 바뀌면 그
+        // 전제가 깨지므로 함께 비운다(2026-08-18 계획 Task 5).
+        self.search_cache = SearchCache::default();
+        self.search_scroll_key = None;
+        self.pending_search_scroll_to = None;
         if let (Some(offset), Ok(conversation)) = (focus_offset, result.as_ref()) {
             match focus_range(&conversation.messages, conversation.truncated, offset) {
                 Some(range) => {
@@ -81,7 +121,26 @@ impl TranscriptViewerUi {
         !self.loading && self.conversation.is_none()
     }
 
-    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
+    /// 대화 전체 일치 수·잘림 여부 — App이 `{active}/{total}` 카운터를 그릴 때 쓴다.
+    /// [`Self::render`] 호출 시 질의가 바뀔 때만 갱신되는 캐시를 그대로 돌려준다(매
+    /// 프레임 전수 스캔 없음). App은 이 순서를 지켜야 한다: 이 값을 읽어 검색 바를
+    /// 그린 뒤, (바뀐 질의가 있으면 반영한) `render`를 호출한다 — 그래야 검색 바가
+    /// 그 프레임에 보여주는 카운트가 `render`가 방금 그린 강조와 같은 질의 기준이다
+    /// (질의가 막 바뀐 프레임에는 `render` 호출 전이라 직전 질의의 값이 잠깐 보일
+    /// 수 있다 — 1프레임 지연, diff_viewer.rs `search_summary`와 같은 계약).
+    // Task 6(App 배선)이 붙기 전까지는 production 호출부가 없어 clippy dead_code
+    // 대상이다 — diff_viewer.rs `search_summary`와 같은 임시 허용.
+    #[allow(dead_code)]
+    pub fn search_summary(&self) -> (usize, bool) {
+        (self.search_cache.total, self.search_cache.truncated)
+    }
+
+    /// `search`는 (질의, 대화 전체 기준 활성 일치 인덱스) — App(2026-08-18 계획
+    /// Task 6)이 소유한 `AuxSearchState`에서 뽑아 넘긴다. `None`이면 보조 검색이
+    /// 꺼져 있거나 이 원문 뷰어가 대상이 아니라는 뜻이라 강조 없이 예전처럼 그린다.
+    /// diff_viewer.rs `render`의 `search` 인자와 같은 형태다(2026-08-18 계획 Task 4·5
+    /// — 소비자 둘 다 같은 모양을 쓰기로 함).
+    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog, search: Option<(&str, usize)>) {
         if self.loading {
             ui.weak(catalog.t("history.transcript.loading", &[]));
             return;
@@ -119,86 +178,148 @@ impl TranscriptViewerUi {
             self.heights = vec![None; messages.len()];
         }
 
-        // 스티키 하단: 강조할 턴이 없을 때(처음 열 때, 또는 그 턴을 못 찾았을 때)
-        // 최신 메시지가 보이는 맨 아래에서 시작한다. 강조할 턴이 있으면 그 시작
-        // 인덱스로 직접 스크롤하므로 하단에 붙지 않는다.
-        let stick_to_bottom = self.focus_range.is_none();
+        // ── 보조 검색: 질의가 바뀔 때만 캐시를 다시 채운다(diff_viewer.rs와 같은
+        // 관례, 매 프레임 전수 스캔 회피). 빈 질의는 검색 안 함과 같다(aux_search
+        // 관례) — `active_search`로 한 번에 접어 이후 코드가 "검색 없음"과 "빈
+        // 질의"를 따로 취급하지 않는다.
+        let active_search = search.filter(|(query, _)| !query.is_empty());
+        let query = active_search.map_or("", |(query, _)| query);
+        let active = active_search.map(|(_, active)| active);
+        if self.search_cache.query != query {
+            self.search_cache = build_search_cache(messages, query);
+        }
+        // 전역 활성 인덱스가 속한 메시지 — 있으면 스크롤 대상이자 stick_to_bottom을
+        // 끄는 근거다(아래). 캐시 조회라 매 프레임 다시 계산해도 전수 스캔이 아니다.
+        let search_target_message = active.and_then(|active| {
+            message_for_active_match(&self.search_cache.message_match_start, active)
+        });
+        // 활성 일치가 바뀌었거나(또는 검색이 새로 열렸거나 닫혔거나) 질의가 바뀐
+        // 프레임에만 스크롤 대상을 세팅한다 — 매 프레임 세팅하면 검색이 열린 동안
+        // 사용자가 본문을 자유롭게 스크롤할 수 없다(hunk 이동·턴 초점과 같은
+        // 문제의식).
+        let scroll_key = active.map(|active| (query.to_owned(), active));
+        if scroll_key != self.search_scroll_key {
+            self.search_scroll_key = scroll_key;
+            self.pending_search_scroll_to = search_target_message;
+        }
+
+        // 스티키 하단: 강조할 턴도 없고 스크롤할 활성 검색 일치도 없을 때만(처음 열
+        // 때, 또는 그 턴/일치를 못 찾았을 때) 최신 메시지가 보이는 맨 아래에서
+        // 시작한다. 둘 중 하나라도 있으면 그 위치로 직접 스크롤하므로 하단에 붙지
+        // 않는다 — 여기서 검색 쪽을 빼먹으면 stick_to_bottom이 매 프레임 검색
+        // 스크롤 오프셋을 도로 덮어써 버린다(2026-08-18 kittest로 실제로 잡힌 회귀).
+        let stick_to_bottom = self.focus_range.is_none() && search_target_message.is_none();
         let highlight_range = self.focus_range.clone();
         let scroll_to = self.pending_scroll_to.take();
+
+        // 검색 스크롤은 실측 높이가 이미 다 있을 때만 `slot_offsets` 기반 오프셋이
+        // 정확하다. 아직 부트스트랩 전이면(대화가 막 열렸는데 검색이 이미 켜져
+        // 있던 경우 — 카드를 바꿔도 검색은 안 닫힌다, 스펙) 여기서 소비하지 않고
+        // 다음 프레임(부트스트랩이 실측을 끝낸 뒤)으로 넘긴다 — 안 그러면 미실측
+        // 잠정 높이로 계산한 오프셋이 실제 높이가 드러나는 대로 다시 어긋나 튄다
+        // (위 `initial_pass_done` 문서가 설명하는 깜빡임과 같은 종류의 문제라 여기서
+        // 도 타협하지 않는다). 그 한 프레임을 놓치지 않도록 명시적으로 다시 그리길
+        // 요청한다.
+        let search_scroll_offset = if !self.initial_pass_done {
+            if self.pending_search_scroll_to.is_some() {
+                ui.ctx().request_repaint();
+            }
+            None
+        } else if let Some(target) = self.pending_search_scroll_to.take() {
+            let row_fallback = ui.text_style_height(&egui::TextStyle::Body);
+            let provisional = provisional_height(&self.heights, row_fallback);
+            let extra_per_message = ui.spacing().item_spacing.y + MESSAGE_GAP;
+            slot_offsets(&self.heights, provisional, extra_per_message).get(target).copied()
+        } else {
+            None
+        };
+
         let heights = &mut self.heights;
         let initial_pass_done = &mut self.initial_pass_done;
+        let message_match_start = &self.search_cache.message_match_start;
 
-        egui::ScrollArea::vertical()
+        let mut scroll_area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(stick_to_bottom)
-            .id_salt(("transcript-viewer-scroll", self.generation))
-            .show_viewport(ui, |ui, viewport| {
-                if !*initial_pass_done {
-                    // 이 대화를 연 뒤 첫 프레임: **가상화하지 않고 지금까지 해오던
-                    // 대로 전부 배치한다.** 높이를 하나도 안 잰 상태에서 잠정 평균으로
-                    // stick_to_bottom·focus scroll_to_rect의 착지 지점을 계산하면,
-                    // 실제 높이가 드러나는 대로 착지가 여러 프레임에 걸쳐 움직이는
-                    // 꼴이 된다 — 그게 바로 사용자가 겪은 깜빡임이다(2026-08-18
-                    // 보고). 여기서는 타협하지 않는다: 착지는 항상 실제로 배치된
-                    // rect로만 한다. 대신 그 대가로 모든 메시지 높이를 이 한
-                    // 프레임에서 실측해 캐시에 채워 두고, 다음 프레임부터는 그
-                    // 캐시가 이미 정확하므로 가상화해도 흔들리지 않는다.
-                    for (index, message) in messages.iter().enumerate() {
-                        let highlighted =
-                            highlight_range.as_ref().is_some_and(|r| r.contains(&index));
-                        let rect = render_message(ui, message, tokens, catalog, highlighted);
-                        heights[index] = Some(rect.height());
-                        if scroll_to == Some(index) {
-                            ui.scroll_to_rect(rect, Some(egui::Align::TOP));
-                        }
+            .id_salt(("transcript-viewer-scroll", self.generation));
+        if let Some(offset) = search_scroll_offset {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        }
+        scroll_area.show_viewport(ui, |ui, viewport| {
+            if !*initial_pass_done {
+                // 이 대화를 연 뒤 첫 프레임: **가상화하지 않고 지금까지 해오던
+                // 대로 전부 배치한다.** 높이를 하나도 안 잰 상태에서 잠정 평균으로
+                // stick_to_bottom·focus scroll_to_rect의 착지 지점을 계산하면,
+                // 실제 높이가 드러나는 대로 착지가 여러 프레임에 걸쳐 움직이는
+                // 꼴이 된다 — 그게 바로 사용자가 겪은 깜빡임이다(2026-08-18
+                // 보고). 여기서는 타협하지 않는다: 착지는 항상 실제로 배치된
+                // rect로만 한다. 대신 그 대가로 모든 메시지 높이를 이 한
+                // 프레임에서 실측해 캐시에 채워 두고, 다음 프레임부터는 그
+                // 캐시가 이미 정확하므로 가상화해도 흔들리지 않는다.
+                for (index, message) in messages.iter().enumerate() {
+                    let highlighted =
+                        highlight_range.as_ref().is_some_and(|r| r.contains(&index));
+                    let local_active =
+                        local_active_in_message(message_match_start, index, active);
+                    let rect = render_message(
+                        ui, message, tokens, catalog, highlighted, query, local_active,
+                    );
+                    heights[index] = Some(rect.height());
+                    if scroll_to == Some(index) {
+                        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
                     }
-                    *initial_pass_done = true;
-                    return;
                 }
+                *initial_pass_done = true;
+                return;
+            }
 
-                // 두 번째 프레임부터: 캐시된 높이의 누적합으로 뷰포트에 걸치는
-                // 구간만 배치한다(+ overscan). 잠정 높이(미측정 평균)는 방어적으로
-                // 남겨 둘 뿐 — 첫 프레임에서 이미 전부 실측했으므로 실전에서는
-                // 거의 쓰이지 않는다.
-                let row_fallback = ui.text_style_height(&egui::TextStyle::Body);
-                let provisional = provisional_height(heights, row_fallback);
-                let extra_per_message = ui.spacing().item_spacing.y + MESSAGE_GAP;
-                let offsets = slot_offsets(heights, provisional, extra_per_message);
-                let total_height = offsets.last().copied().unwrap_or(0.0);
-                ui.set_height(total_height);
+            // 두 번째 프레임부터: 캐시된 높이의 누적합으로 뷰포트에 걸치는
+            // 구간만 배치한다(+ overscan). 잠정 높이(미측정 평균)는 방어적으로
+            // 남겨 둘 뿐 — 첫 프레임에서 이미 전부 실측했으므로 실전에서는
+            // 거의 쓰이지 않는다.
+            let row_fallback = ui.text_style_height(&egui::TextStyle::Body);
+            let provisional = provisional_height(heights, row_fallback);
+            let extra_per_message = ui.spacing().item_spacing.y + MESSAGE_GAP;
+            let offsets = slot_offsets(heights, provisional, extra_per_message);
+            let total_height = offsets.last().copied().unwrap_or(0.0);
+            ui.set_height(total_height);
 
-                let range =
-                    visible_range(&offsets, viewport.min.y..viewport.max.y, OVERSCAN_MESSAGES);
-                if range.is_empty() {
-                    return;
-                }
+            let range =
+                visible_range(&offsets, viewport.min.y..viewport.max.y, OVERSCAN_MESSAGES);
+            if range.is_empty() {
+                return;
+            }
 
-                let y_min = ui.max_rect().top() + offsets[range.start];
-                let y_max = ui.max_rect().top() + offsets[range.end];
-                let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+            let y_min = ui.max_rect().top() + offsets[range.start];
+            let y_max = ui.max_rect().top() + offsets[range.end];
+            let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
 
-                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |viewport_ui| {
-                    // 배치 안 하는 앞뒤 메시지도 "widget이 있었다"고 셈해야 스크롤
-                    // 도중 같은 메시지의 auto id가 프레임마다 안 바뀐다(show_rows와
-                    // 같은 관례) — 선택 가능 텍스트의 커서/선택 상태가 그 위에 걸려
-                    // 있다.
-                    viewport_ui.skip_ahead_auto_ids(range.start);
-                    for index in range.clone() {
-                        let message = &messages[index];
-                        let highlighted =
-                            highlight_range.as_ref().is_some_and(|r| r.contains(&index));
-                        let measured =
-                            render_message(viewport_ui, message, tokens, catalog, highlighted)
-                                .height();
-                        if heights[index] != Some(measured) {
-                            heights[index] = Some(measured);
-                            // 값이 바뀌었으니(예: 폭이 바뀌어 줄바꿈이 달라졌다) 다음
-                            // 프레임에 새 누적합을 반영한다.
-                            viewport_ui.ctx().request_repaint();
-                        }
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |viewport_ui| {
+                // 배치 안 하는 앞뒤 메시지도 "widget이 있었다"고 셈해야 스크롤
+                // 도중 같은 메시지의 auto id가 프레임마다 안 바뀐다(show_rows와
+                // 같은 관례) — 선택 가능 텍스트의 커서/선택 상태가 그 위에 걸려
+                // 있다.
+                viewport_ui.skip_ahead_auto_ids(range.start);
+                for index in range.clone() {
+                    let message = &messages[index];
+                    let highlighted =
+                        highlight_range.as_ref().is_some_and(|r| r.contains(&index));
+                    let local_active =
+                        local_active_in_message(message_match_start, index, active);
+                    let measured = render_message(
+                        viewport_ui, message, tokens, catalog, highlighted, query,
+                        local_active,
+                    )
+                    .height();
+                    if heights[index] != Some(measured) {
+                        heights[index] = Some(measured);
+                        // 값이 바뀌었으니(예: 폭이 바뀌어 줄바꿈이 달라졌다) 다음
+                        // 프레임에 새 누적합을 반영한다.
+                        viewport_ui.ctx().request_repaint();
                     }
-                });
+                }
             });
+        });
     }
 }
 
@@ -254,12 +375,86 @@ fn visible_range(
     start..end
 }
 
+/// `query`로 `messages` 전체를 한 번 훑어 메시지별 일치 시작 인덱스·총 일치 수·
+/// 잘림 여부를 센다. [`crate::ui::aux_search::MAX_AUX_MATCHES`]에 닿으면 그 뒤
+/// 메시지는 더 스캔하지 않는다(스펙 "매칭 규칙", diff_viewer.rs `build_search_cache`와
+/// 같은 관례). 빈 질의는 일치 없음과 같다(`find_matches`가 그렇게 처리해 여기서
+/// 따로 분기하지 않는다).
+fn build_search_cache(
+    messages: &[crate::agent_transcript::ConversationMessage],
+    query: &str,
+) -> SearchCache {
+    let mut message_match_start = Vec::with_capacity(messages.len() + 1);
+    let mut total = 0usize;
+    let mut truncated = false;
+    for message in messages {
+        message_match_start.push(total);
+        if truncated {
+            continue;
+        }
+        let m = crate::ui::aux_search::find_matches(&message.text, query);
+        let remaining = crate::ui::aux_search::MAX_AUX_MATCHES - total;
+        total += m.ranges.len().min(remaining);
+        if total >= crate::ui::aux_search::MAX_AUX_MATCHES {
+            truncated = true;
+        }
+    }
+    message_match_start.push(total);
+    SearchCache { query: query.to_owned(), message_match_start, total, truncated }
+}
+
+/// `message_match_start`(길이 `messages.len() + 1`, [`build_search_cache`] 산출물)에서
+/// 전역 일치 인덱스 `active`를 담은 메시지를 찾는다. `active`가 총 일치 수 밖이면
+/// `None`(예: 캐시가 아직 새 활성 인덱스를 못 따라온 경계 프레임).
+fn message_for_active_match(message_match_start: &[usize], active: usize) -> Option<usize> {
+    let &total = message_match_start.last()?;
+    if active >= total {
+        return None;
+    }
+    let starts = &message_match_start[..message_match_start.len() - 1];
+    let idx = starts.partition_point(|&start| start <= active);
+    Some(idx.saturating_sub(1))
+}
+
+/// 메시지 `index` 안에서 전역 활성 일치 `active`가 로컬로 몇 번째 일치인지. 그
+/// 메시지 안에 없으면(다른 메시지 소관이거나 애초에 일치가 없으면) `None` —
+/// [`highlighted_job`](crate::ui::aux_search::highlighted_job)의 `active` 인자에
+/// 그대로 넘긴다. 부트스트랩·가상화 두 렌더 경로가 같은 계산을 반복하므로 여기
+/// 하나로 뽑아 뒀다(diff_viewer.rs는 렌더 경로가 하나뿐이라 인라인으로 충분했다).
+fn local_active_in_message(
+    message_match_start: &[usize],
+    index: usize,
+    active: Option<usize>,
+) -> Option<usize> {
+    let start = message_match_start.get(index).copied()?;
+    let end = message_match_start.get(index + 1).copied().unwrap_or(start);
+    active.filter(|a| *a >= start && *a < end).map(|a| a - start)
+}
+
+/// 검색 일치 배경 — designall::tokens에서만 고른다(하드코딩 금지, 라이트/다크 둘 다
+/// 성립). diff_viewer.rs의 같은 이름 함수와 같은 공식이다(warning·accent, 반투명
+/// gamma_multiply) — 이력·Git 두 본문의 검색 강조가 같은 "느낌"이어야 한다.
+/// 반투명이라 밑에 깔린 역할별 배경(`role_background`)·초점 강조
+/// (`message_background`)가 그대로 비쳐 세 겹이 서로 지우지 않는다.
+fn search_match_bg(tokens: crate::ui::designall::Tokens) -> egui::Color32 {
+    tokens.warning.gamma_multiply(0.4)
+}
+
+/// 활성 일치 배경 — 나머지 일치([`search_match_bg`])와 다른 색이어야 ↑↓가 어디로
+/// 갔는지 눈에 띈다(스펙 "우측 본문 강조·이동"). 불투명도를 더 높여 확실히
+/// 두드러지게 — diff_viewer.rs와 같은 공식.
+fn search_active_match_bg(tokens: crate::ui::designall::Tokens) -> egui::Color32 {
+    tokens.accent.gamma_multiply(0.6)
+}
+
 fn render_message(
     ui: &mut egui::Ui,
     message: &crate::agent_transcript::ConversationMessage,
     tokens: crate::ui::designall::Tokens,
     catalog: &i18n::Catalog,
     highlighted: bool,
+    search_query: &str,
+    search_active_local: Option<usize>,
 ) -> egui::Rect {
     let mut frame =
         egui::Frame::NONE.fill(message_background(tokens, message.role, highlighted)).inner_margin(egui::Margin::symmetric(8, 4));
@@ -276,7 +471,38 @@ fn render_message(
             crate::agent_transcript::ConversationRole::Assistant => catalog.t("history.role.agent", &[]),
         };
         ui.label(egui::RichText::new(label).small().weak());
-        ui.add(egui::Label::new(message.text.as_str()).wrap().selectable(true));
+        // 검색은 메시지 본문(message.text)에서만 찾는다 — 역할 라벨은 검색 대상이
+        // 아니다. 빈 질의(검색 안 함)나 이 메시지에 일치가 없으면 예전처럼 그린다
+        // (매 프레임 LayoutJob을 새로 짓지 않는다, diff_viewer.rs의 `row_matches`와
+        // 같은 관례).
+        let text_matches = (!search_query.is_empty())
+            .then(|| crate::ui::aux_search::find_matches(&message.text, search_query))
+            .filter(|m| !m.ranges.is_empty());
+        match text_matches {
+            None => {
+                ui.add(egui::Label::new(message.text.as_str()).wrap().selectable(true));
+            }
+            Some(matches) => {
+                // color는 PLACEHOLDER — 위젯이 그릴 때 현재 텍스트 색으로
+                // 바꿔치기한다(diff_viewer.rs `diff_row_job`과 같은 관례,
+                // TextFormat::default().color는 GRAY라 그대로 두면 다른 라벨과
+                // 색이 어긋난다).
+                let base = egui::TextFormat {
+                    font_id: egui::TextStyle::Body.resolve(ui.style()),
+                    color: egui::Color32::PLACEHOLDER,
+                    ..Default::default()
+                };
+                let job = crate::ui::aux_search::highlighted_job(
+                    message.text.as_str(),
+                    &matches,
+                    search_active_local,
+                    base,
+                    search_match_bg(tokens),
+                    search_active_match_bg(tokens),
+                );
+                ui.add(egui::Label::new(job).wrap().selectable(true));
+            }
+        }
     });
     ui.add_space(MESSAGE_GAP);
     response.response.rect
@@ -365,7 +591,22 @@ mod tests {
         egui_kittest::Harness::new_ui_state(
             |ui, state: &mut TranscriptViewerUi| {
                 let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-                state.render(ui, &catalog);
+                state.render(ui, &catalog, None);
+            },
+            viewer,
+        )
+    }
+
+    /// 보조 검색이 켜진 채 렌더하는 하네스 — `search`는 (질의, 활성 인덱스).
+    fn harness_with_search(
+        viewer: TranscriptViewerUi,
+        query: &'static str,
+        active: usize,
+    ) -> egui_kittest::Harness<'static, TranscriptViewerUi> {
+        egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut TranscriptViewerUi| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                state.render(ui, &catalog, Some((query, active)));
             },
             viewer,
         )
@@ -711,6 +952,167 @@ mod tests {
             visible_range(&offsets, 200.0..300.0, 0),
             0..1,
             "뷰포트가 콘텐츠보다 훨씬 아래라도 마지막(=유일한) 메시지로 클램프된다"
+        );
+    }
+
+    // ── 보조 검색(2026-08-18 계획 Task 5) ──────────────────────────────────
+
+    #[test]
+    fn 검색_캐시는_메시지별_누적_일치수를_센다() {
+        let messages = vec![
+            message(crate::agent_transcript::ConversationRole::User, "cab cab", 0),
+            message(crate::agent_transcript::ConversationRole::Assistant, "no match", 100),
+            message(crate::agent_transcript::ConversationRole::User, "cab cab cab", 200),
+        ];
+        let cache = build_search_cache(&messages, "cab");
+        assert_eq!(cache.message_match_start, vec![0, 2, 2, 5], "2 + 0 + 3, sentinel 포함");
+        assert_eq!(cache.total, 5);
+        assert!(!cache.truncated);
+    }
+
+    #[test]
+    fn 검색_캐시는_상한에서_멈추고_잘림을_표시한다() {
+        let messages = vec![
+            message(crate::agent_transcript::ConversationRole::Assistant, &"a".repeat(400), 0),
+            message(crate::agent_transcript::ConversationRole::Assistant, &"a".repeat(400), 100),
+        ];
+        let cache = build_search_cache(&messages, "a");
+        // 메시지 0에서 400개를 다 세고, 메시지 1은 남은 100개(500 - 400)만 세고 멈춘다.
+        assert_eq!(cache.message_match_start, vec![0, 400, 500]);
+        assert_eq!(cache.total, crate::ui::aux_search::MAX_AUX_MATCHES);
+        assert!(cache.truncated);
+    }
+
+    #[test]
+    fn 전역_활성_인덱스로_메시지를_찾는다() {
+        let starts = vec![0, 2, 2, 5];
+        assert_eq!(message_for_active_match(&starts, 0), Some(0));
+        assert_eq!(message_for_active_match(&starts, 1), Some(0));
+        assert_eq!(message_for_active_match(&starts, 2), Some(2), "메시지 1은 일치가 없어 건너뛴다");
+        assert_eq!(message_for_active_match(&starts, 4), Some(2));
+        assert_eq!(message_for_active_match(&starts, 5), None, "총계 밖은 못 찾는다(캐시가 못 따라온 경계 프레임)");
+        assert_eq!(message_for_active_match(&starts, 100), None);
+    }
+
+    #[test]
+    fn 메시지_안의_로컬_활성_인덱스를_계산한다() {
+        let starts = vec![0, 2, 2, 5];
+        assert_eq!(local_active_in_message(&starts, 0, Some(0)), Some(0));
+        assert_eq!(local_active_in_message(&starts, 0, Some(1)), Some(1));
+        assert_eq!(
+            local_active_in_message(&starts, 0, Some(2)),
+            None,
+            "전역 인덱스 2는 메시지 2 소관이라 메시지 0에서는 없다"
+        );
+        assert_eq!(local_active_in_message(&starts, 2, Some(2)), Some(0));
+        assert_eq!(local_active_in_message(&starts, 2, Some(4)), Some(2));
+        assert_eq!(local_active_in_message(&starts, 0, None), None, "활성 일치 자체가 없으면 없다");
+        assert_eq!(local_active_in_message(&starts, 99, Some(0)), None, "범위 밖 메시지 인덱스");
+    }
+
+    #[test]
+    fn 검색_강조_배경은_서로_다르고_역할_배경과도_구분된다() {
+        // designall::tokens에서만 고른 값이라 라이트/다크 둘 다 자동으로 성립해야
+        // 한다(하드코딩 금지). 역할 배경·활성 일치 배경과도 구분돼야 세 겹이 겹칠
+        // 때 뭉개지지 않는다.
+        for tokens in [crate::ui::designall::DARK, crate::ui::designall::LIGHT] {
+            let match_bg = search_match_bg(tokens);
+            let active_bg = search_active_match_bg(tokens);
+            assert_ne!(match_bg, active_bg, "활성 일치는 나머지와 다른 색이어야 ↑↓가 보인다");
+            for role in [
+                crate::agent_transcript::ConversationRole::User,
+                crate::agent_transcript::ConversationRole::Assistant,
+            ] {
+                let role_bg = role_background(tokens, role);
+                assert_ne!(match_bg, role_bg, "검색 강조가 역할 배경에 묻히면 안 된다");
+                assert_ne!(active_bg, role_bg, "활성 검색 강조가 역할 배경에 묻히면 안 된다");
+            }
+        }
+    }
+
+    #[test]
+    fn kittest_검색_총계는_render_이후_캐시에서_읽힌다() {
+        let mut viewer = TranscriptViewerUi::default();
+        viewer.set_conversation(
+            Ok(crate::agent_transcript::TranscriptConversation {
+                messages: vec![
+                    message(crate::agent_transcript::ConversationRole::User, "cab cab", 0),
+                    message(crate::agent_transcript::ConversationRole::Assistant, "no match", 100),
+                    message(crate::agent_transcript::ConversationRole::User, "cab cab cab", 200),
+                ],
+                truncated: false,
+            }),
+            None,
+        );
+        assert_eq!(viewer.search_summary(), (0, false), "render 전에는 아직 캐시가 없다");
+
+        let mut harness = harness_with_search(viewer, "cab", 0);
+        harness.run();
+        assert_eq!(harness.state().search_summary(), (5, false), "2 + 0 + 3 = 5, 안 잘림");
+    }
+
+    #[test]
+    fn kittest_검색_강조는_메시지_라벨을_그대로_유지한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut viewer = TranscriptViewerUi::default();
+        viewer.set_conversation(
+            Ok(crate::agent_transcript::TranscriptConversation {
+                messages: vec![message(
+                    crate::agent_transcript::ConversationRole::Assistant,
+                    "billing widget 안내",
+                    0,
+                )],
+                truncated: false,
+            }),
+            None,
+        );
+        let mut harness = harness_with_search(viewer, "widget", 0);
+        harness.run();
+
+        // LayoutJob으로 강조를 그려도 접근성 라벨(=보이는 전체 글자)은 그대로다 —
+        // 일치 구간만 배경이 다를 뿐 글자 자체는 안 바뀐다.
+        harness.get_by_label("billing widget 안내");
+    }
+
+    /// 활성 검색 일치가 있는 메시지가 초기 뷰포트(stick_to_bottom이 착지시키는
+    /// 맨 아래) 밖에 있으면, 그 메시지로 스크롤이 실제로 옮겨져야 한다. 이 검증은
+    /// `slot_offsets` 기반 오프셋 스크롤(부트스트랩 다음 프레임에 적용)이 실제로
+    /// 동작하는지 확인한다 — rect 기반 `scroll_to_rect`만으로는 아직 배치되지 않은
+    /// 메시지를 못 겨냥한다(2026-08-18 계획 Task 5 지침).
+    #[test]
+    fn kittest_활성_검색_일치로_스크롤한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut viewer = TranscriptViewerUi::default();
+        let messages = (0..200)
+            .map(|index| {
+                let text = if index == 50 {
+                    "고유표식".to_owned()
+                } else {
+                    format!("메시지 {index}")
+                };
+                message(crate::agent_transcript::ConversationRole::Assistant, &text, index as u64 * 100)
+            })
+            .collect();
+        viewer.set_conversation(
+            Ok(crate::agent_transcript::TranscriptConversation { messages, truncated: false }),
+            None,
+        );
+        let mut harness = harness_with_search(viewer, "고유표식", 0);
+        harness.run(); // 부트스트랩: 전부 배치해 높이를 재고, 검색 스크롤 대상을
+                        // 계산해 둔다 — 이 프레임에서는 아직 소비하지 않는다(위
+                        // `pending_search_scroll_to` 문서 참고).
+        harness.run(); // 가상화 프레임: 이제 슬롯 오프셋 기반으로 그 메시지까지
+                        // 스크롤한다.
+
+        assert!(
+            harness.query_by_label("고유표식").is_some(),
+            "활성 검색 일치가 있는 메시지로 스크롤해야 한다"
+        );
+        assert!(
+            harness.query_by_label("메시지 199").is_none(),
+            "검색 스크롤이 stick_to_bottom 착지 위치를 밀어내고 그 메시지 쪽으로 옮겨야 한다"
         );
     }
 }

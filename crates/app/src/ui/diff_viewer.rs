@@ -181,6 +181,110 @@ fn diff_line_sign(kind: LineKind) -> &'static str {
     }
 }
 
+/// 검색 일치 배경 — designall::tokens에서만 고른다(하드코딩 금지, 라이트/다크 둘 다
+/// 성립). diff 행 배경(add=초록/del=빨강, [`diff_line_bg`])과 색 계열이 겹치면 두
+/// 배경이 싸우는지 눈으로 구분하기 어려워지므로 warning(호박)·accent(청록)를 쓴다 —
+/// 반투명(gamma_multiply, work_history.rs의 배지 채움과 같은 관례)이라 밑에 깔린 행
+/// 배경이 비쳐 보인다.
+fn search_match_bg(tokens: crate::ui::designall::Tokens) -> egui::Color32 {
+    tokens.warning.gamma_multiply(0.4)
+}
+
+/// 활성 일치 배경 — 나머지 일치([`search_match_bg`])와 다른 색이어야 ↑↓가 어디로
+/// 갔는지 눈에 띈다(스펙 "우측 본문 강조·이동"). 불투명도를 더 높여 확실히 두드러지게.
+fn search_active_match_bg(tokens: crate::ui::designall::Tokens) -> egui::Color32 {
+    tokens.accent.gamma_multiply(0.6)
+}
+
+/// 한 diff 행을 강조 포함 하나의 `LayoutJob`으로 만든다. `matches`는 `text`(diff
+/// 본문, 행번호 접두어 제외) 기준 바이트 범위여야 한다 — 접두어 길이만큼 이 함수가
+/// 옮겨 붙인다. `active`는 그 행 기준(로컬) 일치 인덱스. 접두어와 본문을 하나의
+/// job으로 합쳐야(별도 위젯 두 개로 나누지 않아야) `ui.horizontal`의 item_spacing이
+/// 접두어와 본문 사이에 끼어들지 않는다.
+fn diff_row_job(
+    prefix: &str,
+    text: &str,
+    matches: &crate::ui::aux_search::Matches,
+    active: Option<usize>,
+    font_id: egui::FontId,
+    match_bg: egui::Color32,
+    active_bg: egui::Color32,
+) -> egui::text::LayoutJob {
+    let shift = prefix.len();
+    let shifted = crate::ui::aux_search::Matches {
+        ranges: matches.ranges.iter().map(|r| r.start + shift..r.end + shift).collect(),
+        truncated: matches.truncated,
+    };
+    // color는 PLACEHOLDER — 위젯이 그릴 때 현재 텍스트 색으로 바꿔치기한다
+    // (TextFormat::default().color는 GRAY라 그대로 두면 ui.monospace와 색이 달라진다).
+    // background는 기본값(TRANSPARENT)으로 둬 일치하지 않는 구간은 행을 감싼 Frame의
+    // 배경(add/del/context)이 그대로 비친다 — 강조가 기존 행 배경을 지우지 않는다.
+    let base =
+        egui::TextFormat { font_id, color: egui::Color32::PLACEHOLDER, ..Default::default() };
+    let full = format!("{prefix}{text}");
+    crate::ui::aux_search::highlighted_job(&full, &shifted, active, base, match_bg, active_bg)
+}
+
+/// 질의별 검색 캐시 — [`DiffViewerUi::render`]가 질의가 바뀔 때만
+/// [`build_search_cache`]로 다시 채운다(거대 diff에서 매 프레임 전수 스캔 회피).
+#[derive(Default)]
+struct SearchCache {
+    query: String,
+    /// `display_rows[i]`에서 시작하는 전역(본문 전체) 일치 인덱스. 길이는 항상
+    /// `display_rows.len() + 1`(마지막 원소는 총계 `total`인 sentinel) — 행 i의
+    /// 일치 개수는 `row_match_start[i + 1] - row_match_start[i]`로 구한다.
+    row_match_start: Vec<usize>,
+    // `total`·`truncated`는 `DiffViewerUi::search_summary`로만 읽는다 — 그 메서드의
+    // 실제 호출부(App의 `{active}/{total}` 카운터)는 계획 Task 6이 붙인다. 그 전까지는
+    // clippy dead_code 대상이라 허용해 둔다(aux_search.rs가 자기 공개 API에 쓰는 것과
+    // 같은 임시 조치, 2026-08-18).
+    /// 본문 전체 일치 수([`crate::ui::aux_search::MAX_AUX_MATCHES`]에서 멈췄으면 그 이하).
+    #[allow(dead_code)]
+    total: usize,
+    #[allow(dead_code)]
+    truncated: bool,
+}
+
+/// `query`로 `rows` 전체를 한 번 훑어 행별 일치 시작 인덱스·총 일치 수·잘림 여부를
+/// 센다. [`crate::ui::aux_search::MAX_AUX_MATCHES`]에 닿으면 그 뒤 행은 더 스캔하지 않는다
+/// (스펙 "매칭 규칙"). 빈 질의는 일치 없음과 같다(`crate::ui::aux_search::find_matches`가
+/// 그렇게 처리해 여기서 따로 분기하지 않는다).
+fn build_search_cache(view: &FileDiffView, rows: &[DisplayRow], query: &str) -> SearchCache {
+    let mut row_match_start = Vec::with_capacity(rows.len() + 1);
+    let mut total = 0usize;
+    let mut truncated = false;
+    for row in rows {
+        row_match_start.push(total);
+        if truncated {
+            continue;
+        }
+        if let DisplayRow::Line { hunk, line } = row {
+            let text = &view.hunks[*hunk].lines[*line].text;
+            let m = crate::ui::aux_search::find_matches(text, query);
+            let remaining = crate::ui::aux_search::MAX_AUX_MATCHES - total;
+            total += m.ranges.len().min(remaining);
+            if total >= crate::ui::aux_search::MAX_AUX_MATCHES {
+                truncated = true;
+            }
+        }
+    }
+    row_match_start.push(total);
+    SearchCache { query: query.to_owned(), row_match_start, total, truncated }
+}
+
+/// `row_match_start`(길이 `rows.len() + 1`, [`build_search_cache`] 산출물)에서 전역
+/// 일치 인덱스 `active`를 담은 표시 행을 찾는다. `active`가 총 일치 수 밖이면
+/// `None`(예: 캐시가 아직 새 활성 인덱스를 못 따라온 경계 프레임).
+fn row_for_active_match(row_match_start: &[usize], active: usize) -> Option<usize> {
+    let &total = row_match_start.last()?;
+    if active >= total {
+        return None;
+    }
+    let starts = &row_match_start[..row_match_start.len() - 1];
+    let idx = starts.partition_point(|&start| start <= active);
+    Some(idx.saturating_sub(1))
+}
+
 #[derive(Default)]
 pub struct DiffViewerUi {
     view: Option<FileDiffView>,
@@ -196,6 +300,14 @@ pub struct DiffViewerUi {
     display_rows: Vec<DisplayRow>,
     /// `hunk_start_indices(&display_rows)` 캐시 — display_rows와 같은 시점에 갱신한다.
     hunk_starts: Vec<usize>,
+    /// 보조 검색 캐시 — 질의가 바뀔 때만 다시 채운다([`build_search_cache`], 스펙
+    /// "우측 본문 강조·이동", 계획 Task 4: 거대 diff에서 매 프레임 전수 스캔 금지).
+    search_cache: SearchCache,
+    /// 직전 프레임에 스크롤을 트리거한 (질의, 활성 인덱스). 같은 값이 반복되는
+    /// 프레임엔 다시 스크롤하지 않는다 — 매 프레임 강제하면 검색이 열린 동안
+    /// 사용자가 본문을 자유롭게 스크롤할 수 없다(hunk ↑↓의 `scroll_to_row`와 같은
+    /// 문제의식).
+    search_scroll_key: Option<(String, usize)>,
 }
 
 impl DiffViewerUi {
@@ -209,6 +321,10 @@ impl DiffViewerUi {
         self.scroll_to_row = None;
         self.display_rows = Vec::new();
         self.hunk_starts = Vec::new();
+        // 검색 캐시는 display_rows 인덱스를 전제로 한다 — 파일이 바뀌면 그 전제가
+        // 깨지므로 함께 비운다.
+        self.search_cache = SearchCache::default();
+        self.search_scroll_key = None;
     }
 
     pub fn set_view(&mut self, view: FileDiffView) {
@@ -216,9 +332,33 @@ impl DiffViewerUi {
         self.display_rows = flatten_display_rows(&view);
         self.hunk_starts = hunk_start_indices(&self.display_rows);
         self.view = Some(view);
+        self.search_cache = SearchCache::default();
+        self.search_scroll_key = None;
     }
 
-    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
+    /// 본문 전체 일치 수·잘림 여부 — App이 `{active}/{total}` 카운터를 그릴 때 쓴다.
+    /// [`Self::render`] 호출 시 질의가 바뀔 때만 갱신되는 캐시를 그대로 돌려준다(매
+    /// 프레임 전수 스캔 없음). App은 이 순서를 지켜야 한다: 이 값을 읽어 검색 바를
+    /// 그린 뒤, (바뀐 질의가 있으면 반영한) `render`를 호출한다 — 그래야 검색 바가
+    /// 그 프레임에 보여주는 카운트가 `render`가 방금 그린 강조와 같은 질의 기준이다
+    /// (질의가 막 바뀐 프레임에는 `render` 호출 전이라 직전 질의의 값이 잠깐
+    /// 보일 수 있다 — 1프레임 지연, 계획 Task 4 보고 참고).
+    // Task 6(App 배선)이 붙기 전까지는 production 호출부가 없어 clippy dead_code
+    // 대상이다 — aux_search.rs가 자기 공개 API에 쓰는 것과 같은 임시 허용.
+    #[allow(dead_code)]
+    pub fn search_summary(&self) -> (usize, bool) {
+        (self.search_cache.total, self.search_cache.truncated)
+    }
+
+    /// `search`는 (질의, 그 본문 기준 활성 일치 인덱스) — App(계획 Task 6)이 소유한
+    /// `AuxSearchState`에서 뽑아 넘긴다. `None`이면 보조 검색이 꺼져 있거나 이 diff
+    /// 본문이 대상이 아니라는 뜻이라 강조 없이 예전처럼 그린다.
+    pub fn render(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        search: Option<(&str, usize)>,
+    ) {
         // 파일이 한 번도 선택되지 않았으면(Git 보조 본문이 방금 열렸거나 목록에서 아직
         // 아무 행도 클릭하지 않았으면) 안내 한 줄만 보인다 — 헤더·hunk 이동은 파일이
         // 선택된 뒤에나 의미가 있다(스펙 §8-3).
@@ -262,9 +402,38 @@ impl DiffViewerUi {
             ui.weak(catalog.t("git.binary", &[]));
             return;
         }
+
+        // ── 보조 검색: 질의가 바뀔 때만 캐시를 다시 채운다(매 프레임 전수 스캔
+        // 회피). 빈 질의는 검색 안 함과 같다(aux_search 관례) — `active_search`로
+        // 한 번에 접어 이후 코드가 "검색 없음"과 "빈 질의"를 따로 취급하지 않는다.
+        let active_search = search.filter(|(query, _)| !query.is_empty());
+        let query = active_search.map_or("", |(query, _)| query);
+        let active = active_search.map(|(_, active)| active);
+        if self.search_cache.query != query {
+            self.search_cache = build_search_cache(view, &self.display_rows, query);
+        }
+        // 활성 일치가 바뀌었거나(또는 검색이 새로 열렸거나) 질의가 바뀐 프레임에만
+        // 스크롤 대상을 세팅한다 — 매 프레임 세팅하면 검색이 열린 동안 사용자가
+        // 본문을 자유롭게 스크롤할 수 없다(아래에서 소비하는 hunk ↑↓의
+        // `scroll_to_row`와 같은 문제의식).
+        let scroll_key = active.map(|active| (query.to_owned(), active));
+        if scroll_key != self.search_scroll_key {
+            self.search_scroll_key = scroll_key.clone();
+            if let Some((_, active)) = scroll_key
+                && let Some(row) = row_for_active_match(&self.search_cache.row_match_start, active)
+            {
+                self.scroll_to_row = Some(row);
+            }
+        }
+
         let rows = &self.display_rows;
+        let row_match_start = &self.search_cache.row_match_start;
         let dark_mode = ui.visuals().dark_mode;
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+        let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
+        let tokens = crate::ui::designall::tokens(ui.visuals());
+        let match_bg = search_match_bg(tokens);
+        let active_bg = search_active_match_bg(tokens);
         let mut scroll = egui::ScrollArea::both().auto_shrink([false, false]);
         if let Some(target) = self.scroll_to_row.take() {
             // `show_rows`가 실제로 쓰는 행 간격은 `row_h + item_spacing.y`다. 간격을 빼고
@@ -286,14 +455,47 @@ impl DiffViewerUi {
                         let bg = diff_line_bg(dark_mode, l.kind);
                         let sign = diff_line_sign(l.kind);
                         let no = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
+                        let prefix = format!("{:>5} {:>5} {sign} ", no(l.old_no), no(l.new_no));
                         egui::Frame::NONE.fill(bg).show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.monospace(format!(
-                                    "{:>5} {:>5} {sign} {}",
-                                    no(l.old_no),
-                                    no(l.new_no),
-                                    l.text
-                                ));
+                                // 검색은 diff 본문 텍스트(l.text)에서만 찾는다 — 행번호
+                                // 접두어는 검색 대상이 아니다. 보이는 행만 훑으므로
+                                // (show_rows 가상화) 거대 diff에서도 비용이 유계다.
+                                let row_matches = (!query.is_empty())
+                                    .then(|| crate::ui::aux_search::find_matches(&l.text, query))
+                                    .filter(|m| !m.ranges.is_empty());
+                                match row_matches {
+                                    None => {
+                                        ui.monospace(format!("{prefix}{}", l.text));
+                                    }
+                                    Some(m) => {
+                                        let row_start = row_match_start
+                                            .get(index)
+                                            .copied()
+                                            .unwrap_or(0);
+                                        let row_end = row_match_start
+                                            .get(index + 1)
+                                            .copied()
+                                            .unwrap_or(row_start);
+                                        let local_active = active.and_then(|active| {
+                                            // then_some은 인자를 즉시 계산하므로
+                                            // active < row_start일 때 뺄셈이 오버플로한다
+                                            // — then(||..)으로 지연 평가한다.
+                                            (active >= row_start && active < row_end)
+                                                .then(|| active - row_start)
+                                        });
+                                        let job = diff_row_job(
+                                            &prefix,
+                                            &l.text,
+                                            &m,
+                                            local_active,
+                                            mono_font.clone(),
+                                            match_bg,
+                                            active_bg,
+                                        );
+                                        ui.label(job);
+                                    }
+                                }
                             });
                         });
                     }
@@ -454,7 +656,7 @@ index 111..222 100644
         egui_kittest::Harness::new_ui_state(
             |ui, state: &mut DiffViewerUi| {
                 let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-                state.render(ui, &catalog);
+                state.render(ui, &catalog, None);
             },
             viewer,
         )
@@ -494,5 +696,126 @@ index 111..222 100644
         harness.get_by_label("↓").click();
         harness.run();
         assert_eq!(harness.state().current_hunk, 1);
+    }
+
+    /// [`diff_row_job`]이 프리픽스(행번호)와 본문을 하나의 job으로 합칠 때, 일치하지
+    /// 않는 구간(프리픽스 포함)의 배경은 `TextFormat` 기본값(TRANSPARENT)이어야 그
+    /// 행을 감싼 Frame의 add/del/context 배경이 그대로 비친다 — "강조가 기존 행
+    /// 배경을 지우지 않는다"는 요구의 직접 증거. 동시에 일치 구간마다 섹션이
+    /// 갈라지는지("일치 강조 섹션")도 함께 본다.
+    #[test]
+    fn diff_row_job은_일치_구간만_배경을_칠하고_나머지는_투명하다() {
+        let prefix = "PRE ";
+        let text = "hello world hello";
+        let matches = crate::ui::aux_search::find_matches(text, "hello");
+        assert_eq!(matches.ranges.len(), 2, "hello가 두 번 나온다");
+
+        let font_id = egui::FontId::monospace(12.0);
+        let match_bg = egui::Color32::from_rgb(1, 2, 3);
+        let active_bg = egui::Color32::from_rgb(4, 5, 6);
+        let job = diff_row_job(prefix, text, &matches, None, font_id, match_bg, active_bg);
+
+        // 프리픽스 + 본문이 하나의 job으로 합쳐져야 한다 — 위젯 두 개로 쪼개면
+        // ui.horizontal의 item_spacing이 둘 사이에 끼어든다.
+        assert_eq!(job.text, format!("{prefix}{text}"));
+
+        let bgs: Vec<_> = job.sections.iter().map(|s| s.format.background).collect();
+        assert_eq!(
+            bgs,
+            vec![
+                egui::Color32::TRANSPARENT, // "PRE " — 일치 아님, 행 배경이 비쳐야 한다.
+                match_bg,                   // 첫 "hello"
+                egui::Color32::TRANSPARENT, // " world " — 일치 아님.
+                match_bg,                   // 둘째 "hello"
+            ],
+            "일치 구간만 배경이 칠해지고 나머지는 투명해야 한다"
+        );
+    }
+
+    /// 활성 일치는 나머지 일치와 다른 색을 받아야 ↑↓가 어디로 갔는지 보인다.
+    #[test]
+    fn diff_row_job은_활성_일치만_다른_색을_쓴다() {
+        let text = "hello world hello";
+        let matches = crate::ui::aux_search::find_matches(text, "hello");
+        let font_id = egui::FontId::monospace(12.0);
+        let match_bg = egui::Color32::from_rgb(1, 2, 3);
+        let active_bg = egui::Color32::from_rgb(4, 5, 6);
+        assert_ne!(match_bg, active_bg);
+
+        // 로컬 인덱스 1(두 번째 "hello")이 활성.
+        let job = diff_row_job("", text, &matches, Some(1), font_id, match_bg, active_bg);
+        let bgs: Vec<_> = job.sections.iter().map(|s| s.format.background).collect();
+        assert_eq!(
+            bgs,
+            vec![match_bg, egui::Color32::TRANSPARENT, active_bg],
+            "활성 일치(둘째)만 active_bg, 나머지는 match_bg여야 한다"
+        );
+    }
+
+    /// `render`가 매 프레임 본문 전체를 재스캔하지 않도록, 질의가 바뀔 때만
+    /// [`build_search_cache`]가 다시 채운다. 같은 질의로 다시 그려도 총계는
+    /// 그대로다(캐시 재사용) — 질의를 바꾸면 그 질의 기준으로 갱신돼야 한다.
+    #[test]
+    fn 검색_캐시는_질의가_바뀔_때만_다시_채워진다() {
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/a.rs".to_owned(), DiffMode::Working);
+        viewer.set_view(parse_unified(SAMPLE, false));
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let ctx = egui::Context::default();
+
+        // SAMPLE: "context1"·"context2"가 한 줄씩(질의 "context" 2건),
+        // "old line"·"new line"·"added line"에 "line"이 한 번씩(질의 "line" 3건).
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            viewer.render(ui, &catalog, Some(("context", 0)));
+        });
+        assert_eq!(viewer.search_summary(), (2, false));
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            viewer.render(ui, &catalog, Some(("line", 0)));
+        });
+        assert_eq!(
+            viewer.search_summary(),
+            (3, false),
+            "질의가 바뀌었으니 캐시가 새 질의 기준으로 다시 채워져야 한다"
+        );
+
+        // 같은 질의를 반복해도(캐시 재사용) 총계는 그대로다.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            viewer.render(ui, &catalog, Some(("line", 0)));
+        });
+        assert_eq!(viewer.search_summary(), (3, false));
+    }
+
+    fn harness_with_search(
+        viewer: DiffViewerUi,
+        query: &str,
+    ) -> egui_kittest::Harness<'static, (DiffViewerUi, String)> {
+        egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (DiffViewerUi, String)| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                let (viewer, query) = state;
+                viewer.render(ui, &catalog, Some((query.as_str(), 0)));
+            },
+            (viewer, query.to_owned()),
+        )
+    }
+
+    /// 활성 일치(기본 인덱스 0)가 초기 스크롤 밖(가상화로 안 그려지는 위치)에 있으면
+    /// `render`가 그 행으로 스크롤해야 한다 — hunk ↑↓의 `scroll_to_row`/
+    /// `scroll_row_pitch` 관례를 그대로 재사용한다는 것의 증거.
+    #[test]
+    fn kittest_활성_일치가_있는_행으로_스크롤한다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut viewer = DiffViewerUi::default();
+        viewer.open("src/big.rs".to_owned(), DiffMode::Working);
+        viewer.set_view(큰_두_hunk_뷰());
+        let mut harness = harness_with_search(viewer, "둘째_hunk_고유_행");
+        harness.run();
+
+        assert!(
+            harness.query_by_label_contains("둘째_hunk_고유_행").is_some(),
+            "일치가 있는(가상화로 초기엔 안 보이던) 행으로 첫 렌더에서 스크롤돼야 한다"
+        );
     }
 }

@@ -14635,7 +14635,9 @@ impl App {
                 .id_salt("git_diff_pane_tab"),
         );
         detail.set_clip_rect(diff_rect.intersect(ui.clip_rect()));
-        self.diff_viewer_ui.render(&mut detail, text);
+        // search: None = 강조 없음. 실제 질의 배선은 Task 6(App 보조 검색 상태)이 한다
+        // (2026-08-18 계획 Task 4 — DiffViewerUi::render 시그니처 변경에 따른 최소 수정).
+        self.diff_viewer_ui.render(&mut detail, text, None);
         action
     }
 

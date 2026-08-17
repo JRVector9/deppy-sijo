@@ -217,6 +217,17 @@ fn split_row_path(rel_path: &str) -> (&str, &str) {
     }
 }
 
+/// 좌측 목록 필터 — `rel_path`가 `filter`에 대소문자 무시로 걸리는 행만 남긴다
+/// (2026-08-18 스펙 §좌측 목록 필터). 빈 `filter`는 필터 없음과 같아 전부 통과시킨다
+/// — `aux_search::contains_match`는 빈 needle이면 항상 거짓을 돌려주므로 이 분기가
+/// 없으면 필터가 없을 때도 전부 걸러진다. `changes`/`committed` 섹션에만 쓰고
+/// 워크트리 섹션에는 쓰지 않는다(경로 목록이라 검색 대상이 아니다).
+fn filter_file_rows<'a>(rows: &'a [GitFileRow], filter: &str) -> Vec<&'a GitFileRow> {
+    rows.iter()
+        .filter(|row| filter.is_empty() || crate::ui::aux_search::contains_match(&row.rel_path, filter))
+        .collect()
+}
+
 /// ahead/추가는 성공색, behind/삭제는 에러색 — 세션/에이전트 진행 상태가 아니라
 /// 일반 git 통계라 `agent_visuals::status_color`가 아니라 designall 토큰을 쓴다.
 /// `agent_visuals::status_color`는 dark_mode 분기가 없는 다크 전용 파스텔이라
@@ -485,7 +496,15 @@ impl GitPanelUi {
         Some((base, snap.branch.clone()))
     }
 
-    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<GitPanelAction> {
+    /// `filter`: 보조 검색 좌측 목록 필터(2026-08-18 스펙) — 빈 문자열이면 필터 없음.
+    /// `changes`/`committed` 행만 `rel_path` 기준으로 거르고, 워크트리 섹션은 그대로
+    /// 둔다(경로 목록이라 검색 대상이 아니고, 통째로 사라지면 혼란스럽다).
+    pub fn render(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        filter: &str,
+    ) -> Option<GitPanelAction> {
         // 필드별로 분해해 빌린다 — snapshot은 &만 필요하고 changes_collapsed 등은
         // 동시에 &mut가 필요해, self를 통째로 들고 있으면(예전엔 self.snapshot을
         // clone()해 이 충돌을 피했다) 프레임마다 최대 ~1056개 String을 복제했다
@@ -517,6 +536,9 @@ impl GitPanelUi {
 
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let mut action = None;
+        let filter_active = !filter.is_empty();
+        let filtered_changes = filter_file_rows(&snap.changes, filter);
+        let filtered_committed = filter_file_rows(&snap.committed, filter);
 
         // ── 헤더: 브랜치 / → upstream ↑a ↓b ↗ ──────────────────────────
         ui.strong(&snap.branch);
@@ -557,7 +579,7 @@ impl GitPanelUi {
         // ── 섹션 2개 ─────────────────────────────────────────────────
         let section = |ui: &mut egui::Ui,
                         title_key: &str,
-                        rows: &[GitFileRow],
+                        rows: &[&GitFileRow],
                         collapsed: &mut bool,
                         show_all: &mut bool,
                         mode: crate::ui::diff_viewer::DiffMode,
@@ -638,7 +660,18 @@ impl GitPanelUi {
         };
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if snap.changes.is_empty() && snap.committed.is_empty() {
+            if filter_active {
+                // 필터가 걸려 있는데 두 섹션 모두 0행이면 안내 한 줄(2026-08-18 스펙
+                // §좌측 목록 필터) — "왜 안 보이지"가 되지 않게.
+                if filtered_changes.is_empty() && filtered_committed.is_empty() {
+                    ui.weak(catalog.t("search.no_match", &[]));
+                    // 워크트리 섹션에는 필터와 무관하게 정보가 있을 수 있다 — 여기서
+                    // 돌아가면 그 섹션까지 감춘다(diff.clean과 같은 처리, 스펙 §8-4).
+                    if !worktree_section_visible(snap) {
+                        return;
+                    }
+                }
+            } else if snap.changes.is_empty() && snap.committed.is_empty() {
                 ui.weak(catalog.t("diff.clean", &[]));
                 // 워크트리 섹션에는 clean과 무관하게 정보가 있을 수 있다 — 여기서
                 // 돌아가면 그 섹션까지 감춘다(스펙 §8-4).
@@ -649,7 +682,7 @@ impl GitPanelUi {
             section(
                 ui,
                 "git.section.changes",
-                &snap.changes,
+                &filtered_changes,
                 changes_collapsed,
                 changes_show_all,
                 crate::ui::diff_viewer::DiffMode::Working,
@@ -662,7 +695,7 @@ impl GitPanelUi {
             section(
                 ui,
                 "git.section.committed",
-                &snap.committed,
+                &filtered_committed,
                 committed_collapsed,
                 committed_show_all,
                 crate::ui::diff_viewer::DiffMode::Branch,
@@ -1162,7 +1195,7 @@ mod tests {
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, state: &mut State| {
                 let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-                if let Some(action) = state.panel.render(ui, &catalog) {
+                if let Some(action) = state.panel.render(ui, &catalog, "") {
                     state.action = Some(action);
                 }
             },
@@ -1220,7 +1253,7 @@ mod tests {
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, state: &mut State| {
                 let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-                if let Some(action) = state.panel.render(ui, &catalog) {
+                if let Some(action) = state.panel.render(ui, &catalog, "") {
                     state.action = Some(action);
                 }
             },
@@ -1267,5 +1300,194 @@ mod tests {
         assert!(!worktree_path_is_spawnable(&long));
         assert!(!worktree_path_is_spawnable("/repo/\0bad"));
         assert!(worktree_path_is_spawnable("/repo/wt"));
+    }
+
+    // ── Task 2: 좌측 목록 필터(2026-08-18 계획) ─────────────────────────
+
+    fn filter_test_rows() -> Vec<GitFileRow> {
+        vec![
+            GitFileRow { rel_path: "src/app.rs".into(), status: 'M', adds: Some(1), dels: None },
+            GitFileRow { rel_path: "README.md".into(), status: 'M', adds: None, dels: Some(2) },
+            GitFileRow {
+                rel_path: "src/ui/git_panel.rs".into(),
+                status: 'A',
+                adds: Some(5),
+                dels: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn filter_file_rows는_경로에_대소문자_무시로_걸리는_행만_남긴다() {
+        let rows = filter_test_rows();
+        let filtered = filter_file_rows(&rows, "SRC");
+        let paths: Vec<&str> = filtered.iter().map(|r| r.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["src/app.rs", "src/ui/git_panel.rs"]);
+    }
+
+    #[test]
+    fn filter_file_rows는_빈_필터면_모든_행을_순서_그대로_남긴다() {
+        let rows = filter_test_rows();
+        let filtered = filter_file_rows(&rows, "");
+        assert_eq!(filtered.len(), rows.len());
+        assert!(filtered.iter().zip(rows.iter()).all(|(a, b)| *a == b));
+    }
+
+    #[test]
+    fn filter_file_rows는_걸리는_행이_없으면_빈_목록이다() {
+        let rows = filter_test_rows();
+        assert!(filter_file_rows(&rows, "zzz-no-match").is_empty());
+    }
+
+    #[test]
+    fn kittest_필터는_변경_사항_행과_헤더_개수를_거른_뒤_기준으로_보여준다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![
+                GitFileRow { rel_path: "src/app.rs".into(), status: 'M', adds: Some(1), dels: None },
+                GitFileRow {
+                    rel_path: "README.md".into(),
+                    status: 'M',
+                    adds: None,
+                    dels: Some(2),
+                },
+            ],
+            ..Default::default()
+        }));
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, panel: &mut GitPanelUi| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                panel.render(ui, &catalog, "readme");
+            },
+            panel,
+        );
+        harness.run();
+
+        harness.get_by_label("README.md");
+        assert!(
+            harness.query_by_label("src/app.rs").is_none(),
+            "필터에 걸리지 않는 행은 보이면 안 된다"
+        );
+        // 섹션 헤더 개수는 거른 뒤(1) 기준이어야 한다 — 원래 2행 중 1행만 남았다.
+        harness.get_by_label("∨ Changes 1");
+    }
+
+    #[test]
+    fn kittest_모두_보기_버튼은_거른_뒤_행_수_기준으로_나타난다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut rows: Vec<GitFileRow> = (0..(SECTION_COLLAPSED_ROWS + 1))
+            .map(|i| GitFileRow {
+                rel_path: format!("keep{i}.rs"),
+                status: 'M',
+                adds: Some(1),
+                dels: None,
+            })
+            .collect();
+        // 필터에 걸리는 행을 하나만 남겨 둔다 — 거르기 전(11) 기준이면 여전히
+        // 「모두 보기」가 보일 상한(10)을 넘지만, 거른 뒤(1) 기준이면 안 보여야 한다.
+        rows[0].rel_path = "only-match.rs".into();
+
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot { branch: "main".into(), changes: rows, ..Default::default() }));
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, panel: &mut GitPanelUi| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                panel.render(ui, &catalog, "only-match");
+            },
+            panel,
+        );
+        harness.run();
+
+        harness.get_by_label("only-match.rs");
+        assert!(
+            harness.query_by_label("Show all").is_none(),
+            "거른 뒤 1행뿐이면 「모두 보기」가 보이면 안 된다"
+        );
+    }
+
+    #[test]
+    fn kittest_필터가_두_섹션_모두_걸러내면_안내_한_줄만_보인다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![GitFileRow {
+                rel_path: "src/a.rs".into(),
+                status: 'M',
+                adds: Some(1),
+                dels: None,
+            }],
+            ..Default::default()
+        }));
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, panel: &mut GitPanelUi| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                panel.render(ui, &catalog, "zzz-no-match");
+            },
+            panel,
+        );
+        harness.run();
+
+        // i18n 5로케일 배선은 Task 6 몫이라 아직 키가 없다 — catalog.t가 미등록 키를
+        // 그대로 돌려주므로(i18n/src/lib.rs `Catalog::t`) 리터럴로 검증한다.
+        harness.get_by_label("search.no_match");
+        assert!(
+            harness.query_by_label("src/a.rs").is_none(),
+            "걸러진 행은 보이면 안 된다"
+        );
+    }
+
+    #[test]
+    fn kittest_필터는_워크트리_행을_거르지_않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut panel = GitPanelUi::default();
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: vec![GitFileRow {
+                rel_path: "src/a.rs".into(),
+                status: 'M',
+                adds: Some(1),
+                dels: None,
+            }],
+            worktrees: vec![
+                GitWorktreeRow {
+                    path: "/repo".into(),
+                    name: "repo".into(),
+                    branch: Some("main".into()),
+                    current: true,
+                },
+                GitWorktreeRow {
+                    path: "/repo/wt".into(),
+                    name: "wt".into(),
+                    branch: Some("feat/x".into()),
+                    current: false,
+                },
+            ],
+            ..Default::default()
+        }));
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, panel: &mut GitPanelUi| {
+                let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+                panel.render(ui, &catalog, "zzz-no-match");
+            },
+            panel,
+        );
+        harness.run();
+
+        // 필터가 걸려도 워크트리 섹션은 필터하지 않는다(2026-08-18 스펙 §좌측 목록
+        // 필터) — 경로 목록이라 검색 대상이 아니고, 통째로 사라지면 혼란스럽다.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "/repo/wt")
+            .click();
     }
 }

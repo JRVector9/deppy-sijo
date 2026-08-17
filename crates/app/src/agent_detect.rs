@@ -1160,6 +1160,10 @@ fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
 /// Codex는 `TranscriptFinder::find`가 이미 `~/.codex/sessions`를 역순(최신 먼저) 스캔해
 /// 세션ID로 직접 매칭한다(위 `TranscriptFinder` 문서 참고) — 그걸 그대로 우선 쓰고,
 /// 스캔 상한에 걸리는 등 못 찾을 때만 행의 cwd로 `find_codex_transcript`에 폴백한다.
+///
+/// **세 kind를 모두 덮어야 한다.** 하나라도 `None`으로 두면 그 에이전트로 돌린 이력은
+/// 원문 보기가 통째로 죽는데, 화면에는 「파일을 찾지 못했습니다」만 떠서 원인이
+/// 드러나지 않는다(2026-08-18: kimi가 그 상태였다).
 pub(crate) fn transcript_path_for(
     kind: AgentKind,
     session_id: &str,
@@ -1170,8 +1174,43 @@ pub(crate) fn transcript_path_for(
         AgentKind::Codex => TranscriptFinder::new()
             .find(AgentKind::Codex, session_id)
             .or_else(|| cwd.and_then(|cwd| find_codex_transcript(cwd).map(|(_, path)| path))),
-        AgentKind::Kimi => None,
+        AgentKind::Kimi => find_kimi_transcript(session_id),
     }
+}
+
+/// 세션ID로 kimi transcript를 찾는다 — `~/.kimi-code/sessions/<작업폴더>/<sid>/agents/main/
+/// wire.jsonl`. 작업폴더 이름(`wd_<슬러그>_<해시>`)은 세션ID만으로는 알 수 없어 한 겹
+/// 훑는다. 상한은 다른 스캐너와 같은 `MAX_DIRECTORY_ENTRIES`다.
+///
+/// 이 해석기가 없던 동안 kimi 이력은 원문 보기가 **전부** 「파일을 찾지 못했습니다」로
+/// 떨어졌다(2026-08-18 사용자 보고, 실측: claude 10/10 정상 · kimi 3/3 실패). 파서
+/// (`agent_transcript::parse_kimi`)는 이미 있었고 경로 해석만 빠져 있었다.
+fn find_kimi_transcript(session_id: &str) -> Option<PathBuf> {
+    if !valid_session_id(session_id) {
+        return None;
+    }
+    let sessions = crate::paths::home_dir()?.join(".kimi-code/sessions");
+    let mut entries = std::fs::read_dir(sessions).ok()?;
+    for _ in 0..MAX_DIRECTORY_ENTRIES {
+        let Some(workdir) = entries.next() else {
+            break;
+        };
+        let Ok(workdir) = workdir else { return None };
+        if !workdir.file_type().ok().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let candidate = workdir
+            .path()
+            .join(session_id)
+            .join("agents/main/wire.jsonl");
+        if std::fs::symlink_metadata(&candidate)
+            .ok()
+            .is_some_and(|meta| meta.file_type().is_file())
+        {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
@@ -2538,6 +2577,38 @@ mod tests {
             transcript_path_for(AgentKind::Claude, "../탈출", None).is_none(),
             "잘못된 id 거부"
         );
+    }
+
+    /// **모든 kind가 실제 해석기를 가져야 한다.** kimi가 `None`으로 남아 있던 동안
+    /// kimi 이력은 원문 보기가 전부 「파일을 찾지 못했습니다」였고, 화면만 봐서는
+    /// 원인을 알 수 없었다(2026-08-18 사용자 보고). 새 에이전트를 더할 때 같은 구멍이
+    /// 생기지 않게 소스로 고정한다.
+    #[test]
+    fn transcript_경로_해석은_모든_kind를_덮는다() {
+        let source = include_str!("agent_detect.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let body = production
+            .split_once("pub(crate) fn transcript_path_for(")
+            .expect("해석기가 있어야 한다")
+            .1;
+        let body = body.split_once("\n}\n").expect("함수 끝").0;
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Kimi] {
+            let arm = format!("AgentKind::{kind:?} =>");
+            assert!(body.contains(&arm), "{kind:?} 분기가 없다");
+        }
+        assert!(
+            !body.contains("=> None,"),
+            "어떤 kind도 해석기 없이 None으로 두지 않는다 — 그 에이전트 이력이 통째로 죽는다"
+        );
+    }
+
+    /// kimi transcript는 `~/.kimi-code/sessions/<작업폴더>/<sid>/agents/main/wire.jsonl`
+    /// 이다. 없는 세션·잘못된 id는 안전하게 None으로 떨어진다.
+    #[test]
+    fn kimi_경로_해석은_없는_세션을_안전하게_거른다() {
+        assert!(find_kimi_transcript("session_00000000-0000-0000-0000-000000000000").is_none());
+        assert!(find_kimi_transcript("../탈출").is_none(), "경로 탈출 거부");
+        assert!(find_kimi_transcript("").is_none(), "빈 id 거부");
     }
 
     #[test]

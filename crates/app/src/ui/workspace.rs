@@ -4861,15 +4861,27 @@ impl WorkspaceUi {
                     }
                 }
             }
-            if output.response.double_clicked()
+            if (output.response.double_clicked() || output.response.triple_clicked())
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
                 // 더블클릭 → 커서가 놓인 **행 전체** 선택 (2026-08-17 사용자 요청).
                 // 예전에는 단어를 잡았는데, 터미널에서 복사하고 싶은 단위는 명령 한 줄이나
-                // 출력 한 줄인 경우가 압도적이라 행으로 바꿨다. 단어 단위가 필요하면
-                // 드래그로 잡는다. URL 열기는 단일 클릭(위 hover/click 블록)이 담당한다 —
-                // 여기서도 열면 이중 발화된다(2026-07-17). 파일 열기는 우클릭 메뉴,
-                // 폴더 진입은 단일 클릭.
+                // 출력 한 줄인 경우가 압도적이라 행으로 바꿨다.
+                //
+                // 트리플클릭도 **같은 행 선택**으로 받는다(멱등). egui의
+                // `double_clicked()`는 count==2일 때만 참이라, 3연클릭은 아래 else-if
+                // 사슬 끝의 `terminal_primary_pointer_clicked` 분기로 떨어져 **방금 만든
+                // 선택을 지웠다**. 다른 터미널(iTerm2 등)이 트리플클릭=행 선택이라 이어
+                // 클릭하는 사용자가 많다(2026-08-18 리뷰). 창 안에서 4번째 이상 연타해도
+                // egui가 count를 3으로 유지하므로 선택이 계속 살아 있다.
+                //
+                // 선택 위에서 드래그하면 행 전체가 DnD 페이로드가 된다(다른 pane에 끌어다
+                // 놓으면 그 세션 입력으로 들어간다). 그래서 더블클릭 직후 드래그로 **일부만
+                // 다시 잡을 수는 없다** — 먼저 한 번 클릭해 선택을 지워야 한다. DnD를
+                // 살리기로 한 사용자 결정이다(2026-08-18).
+                //
+                // URL 열기는 단일 클릭(위 hover/click 블록)이 담당한다 — 여기서도 열면
+                // 이중 발화된다(2026-07-17). 파일 열기는 우클릭 메뉴, 폴더 진입은 단일 클릭.
                 if let Some((s, e)) = line_range_at(&snapshot, cell_at(pos)) {
                     self.selection = Some((session, s, e));
                 }
@@ -9585,7 +9597,8 @@ mod tests {
             scroll_offset: 0,
             is_alt_screen: false,
         };
-        // '성'(idx 7) 위를 더블클릭 — 파일명 전체가 한 단어여야 한다
+        // '성'(idx 7) 위 hover — 파일명 전체가 한 단어여야 한다(폴더 cd·URL 열기 판정용).
+        // 더블클릭은 2026-08-17부터 `line_range_at`(행 전체)을 쓴다.
         let (s, e) = word_range_at(&snap, 7).expect("단어");
         assert_eq!(renderer_egui::selection_text(&snap, s, e), "nant-성과.pdf");
         // 공백(idx 1)은 여전히 단어가 아니다
@@ -9659,6 +9672,32 @@ mod tests {
             renderer_egui::selection_text(&snap, s, e),
             "ls -la",
             "끝의 빈 칸은 선택에 넣지 않는다"
+        );
+    }
+
+    /// 3연클릭이 방금 만든 행 선택을 지우면 안 된다. egui `double_clicked()`는 count==2
+    /// 에서만 참이라, 트리플을 함께 받지 않으면 else-if 사슬 끝의 단일 클릭 분기가
+    /// `selection = None`을 실행한다(2026-08-18 리뷰).
+    ///
+    /// 제스처 배선은 렌더 안에 있어 순수 함수로 뽑을 수 없다 — 소스 계약으로 고정한다.
+    /// 이 테스트가 지키는 것은 **배선**이고, 행 범위 계산 자체는 위 `line_range_at`
+    /// 테스트들이 값으로 검증한다.
+    #[test]
+    fn 트리플클릭도_행_선택으로_받는다() {
+        let source = include_str!("workspace.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let branch = production
+            .split_once("line_range_at(&snapshot, cell_at(pos))")
+            .expect("행 선택 분기가 있어야 한다")
+            .0;
+        // 분기 조건은 그 호출 **직전**에 온다 — 뒤에서부터 가장 가까운 조건을 본다.
+        let condition = branch
+            .rsplit_once("if (")
+            .expect("더블/트리플을 함께 받는 조건이어야 한다")
+            .1;
+        assert!(
+            condition.contains("double_clicked()") && condition.contains("triple_clicked()"),
+            "더블·트리플 둘 다 받아야 3연클릭이 선택을 지우지 않는다: {condition:?}"
         );
     }
 

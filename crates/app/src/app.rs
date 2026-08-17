@@ -7962,7 +7962,7 @@ pub struct App {
     pending_app_host_action: Option<AppHostIoAction>,
     /// 위 슬롯이 차 있어 밀려난 「원문 보기」 요청. 사용자 클릭이라 버리지 않고 다음
     /// 프레임에 태운다. 여기도 latest-only 한 건이다(2026-08-16).
-    pending_transcript_request: Option<AppHostIoAction>,
+    pending_app_host_retry: Option<AppHostIoAction>,
     pending_file_tree_maintenance: Option<ui::file_tree::FileTreeMaintenanceIntent>,
     file_tree_watcher: Option<AppFileTreeWatcher>,
     /// Settings가 반환한 lifecycle action 한 건. 다음 logic tick에서만 실행한다.
@@ -8773,18 +8773,23 @@ fn resolve_aux_tab_exclusivity(
 /// Git 보조 본문 좌측 목록 폭 — 목록은 경로가 읽히는 최소 폭이 있고, diff는 넓을수록
 /// 좋다. 넓은 창에서는 300pt 고정, 좁아지면 40%로 따라 줄되 180pt 밑으로는 내려가지
 /// 않는다(스펙 §8-3).
+/// Git 보조 본문 좌측 목록의 최소 폭. 자동 계산(`git_tab_list_width`)과 드래그 clamp
+/// (`aux_split_width`)가 **같은 값**을 써야 한쪽만 바뀌어 조용히 어긋나지 않는다
+/// (2026-08-17 리뷰).
+const GIT_TAB_LIST_MIN_WIDTH: f32 = 180.0;
+/// 이력 보조 본문 좌측 목록의 최소 폭 — 카드가 git 파일 행보다 정보가 많아 더 크다.
+const HISTORY_TAB_LIST_MIN_WIDTH: f32 = 220.0;
+
 fn git_tab_list_width(body_width: f32) -> f32 {
     const FIXED: f32 = 300.0;
-    const MIN: f32 = 180.0;
-    (body_width * 0.4).clamp(MIN, FIXED)
+    (body_width * 0.4).clamp(GIT_TAB_LIST_MIN_WIDTH, FIXED)
 }
 
 /// 이력 보조 본문 좌측 카드 목록 폭 — `git_tab_list_width`와 같은 규칙(스펙 §2-1)이지만
 /// 카드가 git 파일 행보다 정보가 많아 하한을 조금 크게 잡는다(220 vs 180).
 fn history_tab_list_width(body_width: f32) -> f32 {
     const FIXED: f32 = 360.0;
-    const MIN: f32 = 220.0;
-    (body_width * 0.4).clamp(MIN, FIXED)
+    (body_width * 0.4).clamp(HISTORY_TAB_LIST_MIN_WIDTH, FIXED)
 }
 
 /// 이력·Git 우측 상세(원문/diff)가 완전히 가려지지 않게 남겨두는 최소 폭 — 사용자가
@@ -8858,15 +8863,15 @@ fn reset_git_surfaces(
 /// 워크스페이스 전환 시 원문 뷰어 IO 요청을 무효화한다(항목 2) — `transcript_generation`을
 /// 올려, 이미 in-flight이거나 `pending_app_host_action` 슬롯에 들어간 이전 워크스페이스의
 /// 원문 읽기가 완료돼도 세대 검사(`generation == self.transcript_generation`)에 걸려
-/// 버려지게 한다. 슬롯이 차 있어 대기 중이던 `pending_transcript_request`는 아직 어떤
+/// 버려지게 한다. 슬롯이 차 있어 대기 중이던 `pending_app_host_retry`는 아직 어떤
 /// IO도 시작하지 않았으므로 세대 검사로 걸러지지 않는다 — 여기서 직접 비워, 슬롯이
 /// 빌 때 이전 워크스페이스 요청이 다시 실행되지 않게 한다.
 fn invalidate_transcript_requests(
     transcript_generation: &mut u64,
-    pending_transcript_request: &mut Option<AppHostIoAction>,
+    pending_app_host_retry: &mut Option<AppHostIoAction>,
 ) {
     *transcript_generation = transcript_generation.wrapping_add(1).max(1);
-    *pending_transcript_request = None;
+    *pending_app_host_retry = None;
 }
 
 /// `GitPanelAction::Refresh`가 쓸 cwd(항목 3) — 패널이 이미 어떤 repo를 보여주고 있으면
@@ -8874,8 +8879,18 @@ fn invalidate_transcript_requests(
 /// 그대로 유지한다. 아직 보여줄 repo가 없으면(방금 탭이 열렸거나 워크스페이스 전환
 /// 직후 `reset_git_surfaces`가 비운 자리를 `GitPanelUi::render`가 자동으로 다시 채우는
 /// 경우) 포커스 세션 기준으로 새로 고른다.
-fn resolve_git_refresh_cwd(pinned: Option<PathBuf>, focused: Option<PathBuf>) -> Option<PathBuf> {
-    pinned.or(focused)
+///
+/// 두 후보를 **이름 있는 필드**로 받는다. 둘 다 `Option<PathBuf>`라 위치 인자로 두면
+/// 호출부에서 순서를 바꿔도 컴파일이 통과하고, 소스 문자열 스캔 테스트도
+/// `resolve_git_refresh_cwd(`를 그대로 찾아내 통과한다 — 그러면 포커스 세션이 고정된
+/// repo를 덮어써 이 함수가 막으려던 결함이 그대로 되살아난다(2026-08-17 리뷰).
+struct GitRefreshCwd {
+    pinned: Option<PathBuf>,
+    focused: Option<PathBuf>,
+}
+
+fn resolve_git_refresh_cwd(cwd: GitRefreshCwd) -> Option<PathBuf> {
+    cwd.pinned.or(cwd.focused)
 }
 
 /// Root-owned lifecycle mutations emitted by Settings. The UI keeps at most one action and
@@ -11272,7 +11287,7 @@ impl App {
         // 슬롯이 차 있어 밀려났던 원문 보기 요청을 먼저 태운다 — 사용자 클릭이라
         // 버리지 않는다(WorkHistoryAction::ShowTranscript 참조).
         if self.pending_app_host_action.is_none()
-            && let Some(request) = self.pending_transcript_request.take()
+            && let Some(request) = self.pending_app_host_retry.take()
         {
             self.pending_app_host_action = Some(request);
         }
@@ -11803,7 +11818,7 @@ impl App {
             pending_connector_dispatch: None,
             app_host_io: None,
             pending_app_host_action: None,
-            pending_transcript_request: None,
+            pending_app_host_retry: None,
             pending_file_tree_maintenance: None,
             file_tree_watcher: None,
             pending_app_controller_action: None,
@@ -14274,31 +14289,32 @@ impl App {
         cwd: Option<PathBuf>,
         request: ui::git_panel::GitPanelIoRequest,
     ) {
-        // 패널이 지금 보여주는(요청 중인) repo cwd를 기록한다 — ⟳ 새로고침·파일 diff
-        // 재요청이 포커스 세션을 다시 묻지 않고 이 값을 그대로 쓰게 한다(항목 3,
-        // `resolve_git_refresh_cwd` 참고).
-        self.git_panel_cwd = cwd.clone();
         let Some(cwd) = cwd else {
+            // repo를 못 찾았다 — 고정도 함께 푼다(옛 repo에 붙잡히지 않게).
+            self.git_panel_cwd = None;
             self.git_panel_ui
                 .set_snapshot(Err(ui::git_panel::GitPanelErrorCode::NoRepo));
             return;
         };
-        if self.pending_app_host_action.is_some() {
-            // capacity-1 큐가 이미 차 있다 — 조용히 건너뛴다(다른
-            // pending_app_host_action 호출부와 같은 규칙). loading을 여기서 세우면
-            // 이 요청의 완료가 영영 오지 않아 패널이 멈춘 것처럼 보인다 —
-            // GitPanelUi::render는 snapshot==None && !loading일 때만 자동
-            // 재요청하므로, loading을 건드리지 않아야 다음 프레임에 스스로
-            // 재시도한다(2026-08-15).
-            return;
-        }
         self.git_panel_generation = self.git_panel_generation.wrapping_add(1).max(1);
-        let intent = ui::git_panel::GitPanelIoIntent {
+        let action = AppHostIoAction::GitPanel(ui::git_panel::GitPanelIoIntent {
             generation: self.git_panel_generation,
-            cwd,
+            cwd: cwd.clone(),
             request,
-        };
-        self.pending_app_host_action = Some(AppHostIoAction::GitPanel(intent));
+        });
+        // 공유 capacity-1 슬롯이 차 있어도 **버리지 않는다**. 「변경 보기」·⟳·파일 diff는
+        // 전부 사용자 클릭이라 되살릴 주체가 없고, 예전처럼 조용히 건너뛰면 화면은 옛
+        // repo인데 고정 cwd만 새 repo로 바뀌어 ⟳가 설명 없이 튀었다(2026-08-17 리뷰).
+        // 대기 슬롯에 얹어 다음 프레임에 태운다(원문 보기와 같은 규칙, latest-only).
+        if self.pending_app_host_action.is_none() {
+            self.pending_app_host_action = Some(action);
+        } else {
+            self.pending_app_host_retry = Some(action);
+        }
+        // 패널이 지금 보여주는(요청 중인) repo cwd — ⟳·파일 diff 재요청이 포커스 세션을
+        // 다시 묻지 않고 이 값을 쓴다(`resolve_git_refresh_cwd`). **요청이 실제로 큐나
+        // 대기 슬롯에 올라간 뒤에만** 갱신한다.
+        self.git_panel_cwd = Some(cwd);
         ctx.request_repaint();
         self.git_panel_ui.set_loading();
     }
@@ -14441,12 +14457,11 @@ impl App {
         text: &i18n::Catalog,
     ) -> Option<ui::work_history::WorkHistoryAction> {
         let auto_list_width = history_tab_list_width(body.width());
-        // 220.0 = history_tab_list_width의 MIN과 같은 값(카드 목록 좌측 최소 폭).
         let list_width = aux_split_width(
             self.work_history_tab_split_width,
             auto_list_width,
             body.width(),
-            220.0,
+            HISTORY_TAB_LIST_MIN_WIDTH,
         );
         let (list_rect, transcript_rect) = body.split_left_right_at_x(body.left() + list_width);
 
@@ -14500,7 +14515,8 @@ impl App {
                 .ctx()
                 .data(|data| data.get_temp::<f32>(resize_start_id))
                 .unwrap_or(list_width);
-            self.work_history_tab_split_width = Some(start_width + total_drag_delta.x);
+            self.work_history_tab_split_width =
+                aux_divider_requested_width(start_width, total_drag_delta.x);
             ui.ctx().request_repaint();
         }
         if resize_response.drag_stopped() {
@@ -14546,7 +14562,12 @@ impl App {
         let auto_list_width = git_tab_list_width(body.width());
         // 180.0 = git_tab_list_width의 MIN과 같은 값(파일 목록 좌측 최소 폭).
         let list_width =
-            aux_split_width(self.git_tab_split_width, auto_list_width, body.width(), 180.0);
+        aux_split_width(
+            self.git_tab_split_width,
+            auto_list_width,
+            body.width(),
+            GIT_TAB_LIST_MIN_WIDTH,
+        );
         let (list_rect, diff_rect) = body.split_left_right_at_x(body.left() + list_width);
 
         let mut list = ui.new_child(
@@ -14578,7 +14599,8 @@ impl App {
                 .ctx()
                 .data(|data| data.get_temp::<f32>(resize_start_id))
                 .unwrap_or(list_width);
-            self.git_tab_split_width = Some(start_width + total_drag_delta.x);
+            self.git_tab_split_width =
+                aux_divider_requested_width(start_width, total_drag_delta.x);
             ui.ctx().request_repaint();
         }
         if resize_response.drag_stopped() {
@@ -14763,7 +14785,7 @@ impl App {
                 if self.pending_app_host_action.is_none() {
                     self.pending_app_host_action = Some(request);
                 } else {
-                    self.pending_transcript_request = Some(request);
+                    self.pending_app_host_retry = Some(request);
                 }
                 ctx.request_repaint();
                 self.transcript_viewer_ui.set_loading();
@@ -16995,7 +17017,7 @@ impl App {
         // 되살릴 수 있었다(2026-08-16, 코드 리뷰 항목 2).
         invalidate_transcript_requests(
             &mut self.transcript_generation,
-            &mut self.pending_transcript_request,
+            &mut self.pending_app_host_retry,
         );
         // Git 보조 본문도 이력과 같은 자리에서 무효화한다 — `git_tab`은 열린 채 유지하되
         // 스냅샷·diff·cwd·세대는 새 워크스페이스 기준으로 다시 채워야 한다(항목 1).
@@ -25574,10 +25596,10 @@ impl eframe::App for App {
                 // 있으면(⟳ 클릭) 그 repo를 유지한다. 아직 없으면(워크스페이스 전환
                 // 직후 `reset_git_surfaces`가 비운 자리를 렌더가 자동으로 다시 채우는
                 // 경우) 포커스 세션 기준으로 새로 고른다(항목 3).
-                let cwd = resolve_git_refresh_cwd(
-                    self.git_panel_cwd.clone(),
-                    self.focused_session_repo_cwd(),
-                );
+                let cwd = resolve_git_refresh_cwd(GitRefreshCwd {
+                    pinned: self.git_panel_cwd.clone(),
+                    focused: self.focused_session_repo_cwd(),
+                });
                 self.request_git_panel_io_at(ui.ctx(), cwd, ui::git_panel::GitPanelIoRequest::Snapshot);
             }
             Some(ui::git_panel::GitPanelAction::OpenRemoteBranch) => {
@@ -25594,15 +25616,18 @@ impl eframe::App for App {
                 );
             }
             Some(ui::git_panel::GitPanelAction::OpenWorktreeShell { path }) => {
-                // 「새 워크트리에서 셸」(PR-W)이 워크트리 생성 직후 부르는 **바로 그
-                // 호출**이다(poll_worktree_jobs). 이 경로는 워크트리를 만들지도 지우지도
-                // 않는다 — 이미 있는 워크트리로 들어갈 뿐이다(스펙 §8-5). 셸이 뜨는 곳을
-                // 봐야 하므로 Git 탭은 세션 탭으로 물러난다(탭 자체는 남는다).
-                self.reveal_active_workspace_for_new_session();
+                // 「새 워크트리에서 셸」(PR-W)과 **같은 스폰 경로**다 — 워크트리를 만들지도
+                // 지우지도 않고, 이미 있는 워크트리로 들어갈 뿐이다(스펙 §8-5).
+                //
+                // 렌더 안에서 `reveal_active_workspace_for_new_session`을 직접 부르면
+                // `xtask check-boundary`가 막는다(렌더는 워크스페이스 수명 상태를 쓰지
+                // 않는다). 이미 있는 `SpawnShellAt` 액션으로 올려 다음 logic tick이
+                // 처리하게 한다 — 그 핸들러가 reveal + spawn_shell_at을 함께 한다.
+                // 셸이 뜨는 곳을 봐야 하므로 Git 탭은 세션 탭으로 물러난다(탭은 남는다).
                 self.git_tab = self.git_tab.on_session_tab_click();
-                self.active
-                    .workspace_ui
-                    .spawn_shell_at(self.config.terminal.scrollback_lines as usize, Some(path));
+                self.stage_workspace_controller_action(
+                    WorkspaceControllerAction::SpawnShellAt { cwd: Some(path) },
+                );
             }
             None => {}
         }
@@ -27620,6 +27645,22 @@ fn fluid_cross_workspace_layout(
         divider,
         foreign,
     }
+}
+
+/// 보조 본문(이력·Git) 좌우 분할선을 끌었을 때의 새 좌측 폭.
+///
+/// 분할선은 목록의 **오른쪽** 경계라 포인터가 오른쪽으로 가면 목록이 넓어진다 —
+/// 부호가 `+`인 이유다(왼쪽에 붙은 cross-workspace 분할선의
+/// [`primary_divider_requested_width`]는 반대로 `-`다). 인라인으로 두면 부호를 뒤집어도
+/// 어떤 테스트도 잡지 못해(소스 문자열 스캔은 통과한다) 함수로 뽑아 수치로 고정한다
+/// (2026-08-17 리뷰).
+///
+/// NaN/무한대는 `None` — 그 값을 폭에 넣으면 이후 clamp가 전부 오염된다.
+fn aux_divider_requested_width(start_width: f32, total_drag_delta_x: f32) -> Option<f32> {
+    if !start_width.is_finite() || !total_drag_delta_x.is_finite() {
+        return None;
+    }
+    Some((start_width + total_drag_delta_x).max(0.0))
 }
 
 fn primary_divider_requested_width(start_width: f32, total_drag_delta_x: f32) -> Option<f32> {
@@ -31079,6 +31120,25 @@ mod tests {
         assert_eq!(width, 0.0, "창 폭이 0이어도 패닉 없이 0을 돌려준다");
     }
 
+    /// 분할선 드래그의 **부호와 수치**를 고정한다. 소스 문자열 스캔만으로는
+    /// `start_width + delta`를 `- delta`로 뒤집는 회귀(드래그 방향이 반대로 도는)를
+    /// 잡지 못한다 — 사람이 직접 끌어봐야 드러난다(2026-08-17 리뷰).
+    #[test]
+    fn aux_divider는_오른쪽으로_끌면_목록이_넓어진다() {
+        // 목록의 **오른쪽** 경계라 포인터가 오른쪽(+x)으로 가면 목록이 넓어진다.
+        assert_eq!(aux_divider_requested_width(300.0, 50.0), Some(350.0));
+        assert_eq!(aux_divider_requested_width(300.0, -50.0), Some(250.0));
+        // 왼쪽에 붙은 cross-workspace 분할선은 부호가 반대다 — 둘을 헷갈리면 안 된다.
+        assert_eq!(primary_divider_requested_width(300.0, 50.0), Some(250.0));
+    }
+
+    #[test]
+    fn aux_divider는_음수_폭을_만들지_않고_비정상_값을_거른다() {
+        assert_eq!(aux_divider_requested_width(100.0, -400.0), Some(0.0));
+        assert_eq!(aux_divider_requested_width(f32::NAN, 10.0), None);
+        assert_eq!(aux_divider_requested_width(100.0, f32::INFINITY), None);
+    }
+
     /// Git 본문 구분선의 드래그 누적이 `total_drag_delta()` 기반인지 고정한다 —
     /// `drag_delta().x`를 매 프레임 더하면 드리프트가 생긴다(cross-workspace 분할선의
     /// `primary_resize` 테스트와 같은 형태, `primary_divider_requested_width` 참고).
@@ -31234,7 +31294,7 @@ mod tests {
         let pinned = Some(PathBuf::from("/repo/a"));
         let focused = Some(PathBuf::from("/repo/b"));
         assert_eq!(
-            resolve_git_refresh_cwd(pinned, focused),
+            resolve_git_refresh_cwd(GitRefreshCwd { pinned, focused }),
             Some(PathBuf::from("/repo/a"))
         );
     }
@@ -31245,12 +31305,24 @@ mod tests {
     #[test]
     fn resolve_git_refresh_cwd는_고정된_repo가_없으면_포커스_세션으로_새로_고른다() {
         let focused = Some(PathBuf::from("/repo/b"));
-        assert_eq!(resolve_git_refresh_cwd(None, focused.clone()), focused);
+        assert_eq!(
+            resolve_git_refresh_cwd(GitRefreshCwd {
+                pinned: None,
+                focused: focused.clone()
+            }),
+            focused
+        );
     }
 
     #[test]
     fn resolve_git_refresh_cwd는_둘_다_없으면_none이다() {
-        assert_eq!(resolve_git_refresh_cwd(None, None), None);
+        assert_eq!(
+            resolve_git_refresh_cwd(GitRefreshCwd {
+                pinned: None,
+                focused: None
+            }),
+            None
+        );
     }
 
     /// `GitPanelAction::Refresh`·`ShowFileDiff` 핸들러가 포커스 세션 기준 헬퍼
@@ -31331,7 +31403,7 @@ mod tests {
             .unwrap_or(0);
         let handler = &handler[..cut];
         assert!(
-            handler.contains("pending_transcript_request = Some(request)"),
+            handler.contains("pending_app_host_retry = Some(request)"),
             "슬롯이 차 있으면 대기 슬롯에 얹어야 한다"
         );
         assert!(
@@ -31339,7 +31411,7 @@ mod tests {
             "어느 경로로 가든 로딩 표시는 세운다 — 클릭이 먹혔다는 신호다"
         );
         assert!(
-            production.contains("self.pending_transcript_request.take()"),
+            production.contains("self.pending_app_host_retry.take()"),
             "대기 슬롯을 다음 프레임에 태우는 배수 지점이 있어야 한다"
         );
     }
@@ -31366,16 +31438,24 @@ mod tests {
             .split_once("GitPanelAction::OpenWorktreeShell { path }")
             .expect("워크트리 클릭 핸들러가 있어야 한다")
             .1;
-        // 한국어 주석이 길어 바이트 창을 넉넉히 잡고, 멀티바이트 경계에서 잘리지 않게
-        // char 경계로 자른다.
-        let cut = handler
-            .char_indices()
-            .map(|(index, _)| index)
-            .take_while(|index| *index <= 1200)
-            .last()
-            .unwrap_or(0);
-        let handler = &handler[..cut];
-        assert!(handler.contains("spawn_shell_at"), "새 셸을 그 경로에서 연다");
+        // 바이트 창 대신 **match arm 끝**에서 자른다 — 창을 넉넉히 잡으면 뒤따르는
+        // 다른 코드가 딸려 들어와 부정 단언이 엉뚱하게 깨진다(2026-08-17 실측).
+        let handler = handler
+            .split_once("\n            None => {}")
+            .expect("match arm이 None으로 끝나야 한다")
+            .0;
+        // 렌더는 워크스페이스 수명 상태를 직접 쓰지 않는다(xtask check-boundary) —
+        // 스폰은 SpawnShellAt 액션으로 올려 다음 logic tick이 처리한다.
+        assert!(
+            handler.contains("WorkspaceControllerAction::SpawnShellAt"),
+            "스폰을 액션으로 올려야 한다"
+        );
+        // 이름이 아니라 **호출 형태**를 본다 — 주석이 심볼을 언급하는 것까지 걸리면
+        // 근거를 적을 수 없다. `xtask check-boundary`도 같은 형태를 찾는다.
+        assert!(
+            !handler.contains("self.reveal_active_workspace_for_new_session("),
+            "렌더에서 워크스페이스 수명 상태를 직접 쓰면 check-boundary가 막는다"
+        );
         assert!(
             !handler.contains("CreateWorktree") && !handler.contains("RemoveWorktree"),
             "이번 범위는 기존 워크트리로 들어가는 것뿐이다"

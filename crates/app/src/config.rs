@@ -148,7 +148,6 @@ pub struct AgentsConfig {
     /// 기준). 탐지 결과가 아니라 취향이다 — 설치돼 있어도 여기 있으면 목록·사용량에 권하지
     /// 않는다. 미지 id는 로드 시 버린다(이전/이후 버전 config와 호환, `codex_llm_provider`와
     /// 같은 로드 정규화 관례).
-    #[serde(default)]
     pub disabled: Vec<String>,
 }
 

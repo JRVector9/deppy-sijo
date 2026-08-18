@@ -7193,30 +7193,14 @@ fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
     })
 }
 
-/// 런처에서 끈 에이전트의 사용량을 `None`으로 가린다 — `top_provider_usage`가 그 칸을
-/// 그리지 않게 만드는 순수 표시 규칙이다. claude·codex·kimi 셋 다 같은 규칙을 적용한다
-/// (지금 실제로 칸이 사라지는 건 kimi_usage뿐이지만 — claude/codex는 「1급 provider라
-/// 값이 없어도 —로 자리를 지킨다」는 별도의 기존 결정이라 여기서 건드리지 않는다 —
-/// 걸러진 값이 아래로 그대로 흘러가므로 나중에 그 결정이 바뀌어도 이 함수는 손댈 필요가
-/// 없다). 탐지·이력과는 무관하다 — 여기서 거른 값은 표시용일 뿐 상태 감지에는 안 쓰인다.
-/// 폭 계산(`top_provider_usage`의 `kimi_usage.is_some()`)은 이 함수가 걸러준 값을
-/// 그대로 받으므로 별도 손질 없이 따라간다.
-fn mask_disabled_provider_usage(
-    disabled: &[String],
-    claude_usage: Option<ProviderUsage>,
-    codex_usage: Option<ProviderUsage>,
-    kimi_usage: Option<ProviderUsage>,
-) -> (
-    Option<ProviderUsage>,
-    Option<ProviderUsage>,
-    Option<ProviderUsage>,
-) {
-    use crate::agent_launcher::{agent_is_enabled, AgentKind};
-    (
-        claude_usage.filter(|_| agent_is_enabled(disabled, AgentKind::Claude)),
-        codex_usage.filter(|_| agent_is_enabled(disabled, AgentKind::Codex)),
-        kimi_usage.filter(|_| agent_is_enabled(disabled, AgentKind::Kimi)),
-    )
+/// 사용량 바 폭 — 실제로 그려지는 provider 칸 수에 따라 정해진다. 원래 코드는 칸이
+/// Claude·Codex(항상 표시) + Kimi(값 있을 때만) 두 경우뿐이라 상수 두 개(430/620)로
+/// 충분했다. 이제 셋 다 꺼질 수 있어 칸 수가 0~3까지 늘었으므로, 그 두 상수(칸 2개→430,
+/// 칸 3개→620, 칸당 +190)를 그대로 외삽해 순수 함수로 뽑았다 — 폭은 egui 컨테이너의
+/// 크기 힌트일 뿐이라 정확한 픽셀보다 "칸 수에 비례해 줄어든다"가 중요하다. 값으로
+/// 테스트한다(0·1·2·3칸).
+fn provider_usage_bar_width(visible_count: usize) -> f32 {
+    50.0 + 190.0 * visible_count as f32
 }
 
 /// 런처 카드 스위치 토글 결과로 새 거부 목록을 만든다 — 정규화까지 마친 상태로 돌려주므로
@@ -7236,12 +7220,17 @@ fn toggled_disabled_agents(
     crate::agent_launcher::normalize_disabled_agents(&disabled)
 }
 
+/// 하단 사용량 바의 provider 칸들. `disabled`는 usage 값과 분리된 신호다 — 「켜짐인데
+/// 값 없음」(Claude·Codex는 「—」로 자리를 지킨다, 1급 provider 규칙)과 「꺼짐」(셋 다
+/// 칸 자체가 없다)을 usage 값 하나로는 구분할 수 없어서 나눴다. usage를 미리
+/// `None`으로 지워 두 상태를 뭉개는 대신, 여기서 `agent_is_enabled`로 직접 갈라 그린다.
 pub(crate) fn top_provider_usage(
     ui: &mut egui::Ui,
     claude_usage: Option<ProviderUsage>,
     codex_usage: Option<ProviderUsage>,
     codex_meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
     kimi_usage: Option<ProviderUsage>,
+    disabled: &[String],
 ) {
     let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
@@ -7348,38 +7337,54 @@ pub(crate) fn top_provider_usage(
         }
     }
 
-    // Kimi 칸은 값이 있을 때만 자리를 차지한다 — 없는 provider 몫으로 폭을 비워두면
-    // 나머지가 왼쪽으로 몰려 보인다.
-    let width = if kimi_usage.is_some() { 620.0 } else { 430.0 };
+    use crate::agent_launcher::{agent_is_enabled, AgentKind};
+    // 꺼진 provider는 칸 자체가 사라진다(사용자 요청) — claude·codex·kimi 셋 다 같은
+    // 규칙이다. Claude/Codex는 이 앱의 1급 provider라 켜져 있으면 값이 없어도 「—」로
+    // 자리를 지키지만, Kimi는 **쓰는 사람에게만** 보여야 한다(2026-08-10 사용자 요구)는
+    // 별도 규칙이 여전히 얹혀서, 켜져 있어도 값이 없으면 칸 자체를 안 그린다.
+    let claude_shown = agent_is_enabled(disabled, AgentKind::Claude);
+    let codex_shown = agent_is_enabled(disabled, AgentKind::Codex);
+    let kimi_shown = agent_is_enabled(disabled, AgentKind::Kimi) && kimi_usage.is_some();
+    let visible_count =
+        usize::from(claude_shown) + usize::from(codex_shown) + usize::from(kimi_shown);
+    let width = provider_usage_bar_width(visible_count);
     ui.allocate_ui_with_layout(
         egui::vec2(width, 20.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
-            provider(
-                ui,
-                "Claude",
-                egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-                claude_usage,
-                None,
-            );
-            ui.add_space(4.0);
-            separator(ui, 18.0);
-            ui.add_space(4.0);
-            provider(
-                ui,
-                "Codex",
-                ui.visuals().hyperlink_color,
-                codex_usage,
-                codex_meta,
-            );
-            // Claude/Codex는 이 앱의 1급 provider라 값이 없어도 「—」로 자리를 지키지만,
-            // Kimi는 **쓰는 사람에게만** 보여야 한다(2026-08-10 사용자 요구). 값이 없으면
-            // 로고조차 그리지 않는다 — 안 쓰는 사용자에게 빈 칸을 남기지 않는다.
-            if kimi_usage.is_some() {
-                ui.add_space(4.0);
-                separator(ui, 18.0);
-                ui.add_space(4.0);
+            let mut drawn = false;
+            if claude_shown {
+                provider(
+                    ui,
+                    "Claude",
+                    egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+                    claude_usage,
+                    None,
+                );
+                drawn = true;
+            }
+            if codex_shown {
+                if drawn {
+                    ui.add_space(4.0);
+                    separator(ui, 18.0);
+                    ui.add_space(4.0);
+                }
+                provider(
+                    ui,
+                    "Codex",
+                    ui.visuals().hyperlink_color,
+                    codex_usage,
+                    codex_meta,
+                );
+                drawn = true;
+            }
+            if kimi_shown {
+                if drawn {
+                    ui.add_space(4.0);
+                    separator(ui, 18.0);
+                    ui.add_space(4.0);
+                }
                 provider(
                     ui,
                     "Kimi",
@@ -23805,20 +23810,17 @@ impl eframe::App for App {
                     claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx()));
                 let codex_usage =
                     supplement_codex_five_hour(codex_server_usage, codex_backend_five_hour);
-                // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — 거부 목록은
-                // 표시 규칙일 뿐이라 탐지·이력에는 손대지 않는다(mask_disabled_provider_usage).
-                let (claude_usage, codex_usage, kimi_usage) = mask_disabled_provider_usage(
-                    &self.config.agents.disabled,
-                    claude_usage,
-                    codex_usage,
-                    kimi_usage,
-                );
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage,
                     codex_usage,
                     self.agent_sessions_ui.codex_usage_meta(),
                     kimi_usage,
+                    // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — usage 값은
+                    // 그대로 넘기고 「꺼짐」만 별도 신호로 보내, top_provider_usage가
+                    // "켜짐인데 값 없음"(—로 자리 유지)과 "꺼짐"(칸 자체 없음)을
+                    // 구분하게 한다. 표시 규칙일 뿐이라 탐지·이력에는 손대지 않는다.
+                    &self.config.agents.disabled,
                     activity_rows.rows(),
                     approval_count,
                     &waiting_sessions,
@@ -36029,47 +36031,47 @@ mod tests {
     // --- Task 3: 런처 거부 목록 App 배선 + 사용량 바 ---
 
     #[test]
-    fn 거부_목록에_있으면_그_에이전트의_usage만_none이_된다() {
-        let claude = Some((Some(1), Some(2)));
-        let codex = Some((Some(3), Some(4)));
-        let kimi = Some((Some(5), Some(6)));
-
-        // 빈 거부 목록 — 셋 다 그대로 통과한다.
-        assert_eq!(
-            mask_disabled_provider_usage(&[], claude, codex, kimi),
-            (claude, codex, kimi)
-        );
-
-        // kimi만 거부 — kimi만 None, claude·codex는 그대로.
-        let (c, x, k) =
-            mask_disabled_provider_usage(&["kimi".to_owned()], claude, codex, kimi);
-        assert_eq!((c, x), (claude, codex));
-        assert!(k.is_none());
-
-        // 셋 다 거부 — 셋 다 None(claude·codex·kimi가 같은 규칙을 따른다).
-        let all_disabled = vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()];
-        let (c, x, k) = mask_disabled_provider_usage(&all_disabled, claude, codex, kimi);
-        assert!(c.is_none() && x.is_none() && k.is_none());
-
-        // 원래도 None인 usage는 거부 목록과 무관하게 계속 None이다.
-        let (c, _, _) = mask_disabled_provider_usage(&[], None, codex, kimi);
-        assert!(c.is_none());
+    fn 사용량_바_폭은_그려지는_칸_수에_비례한다() {
+        // 원래 상수 두 개(칸 2개→430, 칸 3개→620, 칸당 +190)를 0·1칸으로 외삽한
+        // 값을 고정한다 — claude·codex·kimi가 각각 꺼질 수 있게 되면서 칸 수가
+        // 0~3 전 구간을 오갈 수 있다(예전엔 kimi만 빠질 수 있어 2·3만 있었다).
+        assert_eq!(provider_usage_bar_width(0), 50.0);
+        assert_eq!(provider_usage_bar_width(1), 240.0);
+        assert_eq!(provider_usage_bar_width(2), 430.0);
+        assert_eq!(provider_usage_bar_width(3), 620.0);
     }
 
     #[test]
-    fn kimi를_끄면_사용량_바_폭_분기가_기본값으로_따라간다() {
-        let kimi = Some((Some(10), Some(20)));
+    fn 거부_목록은_kimi의_값_유무_규칙과_별개로_칸_표시를_결정한다() {
+        // top_provider_usage가 칸을 그릴지 정하는 조건을 값으로 고정한다.
+        // claude·codex는 값과 무관하게 "켜짐"만 보고, kimi는 "켜짐 AND 값 있음"을
+        // 본다 — 꺼짐이 kimi의 기존 "값 있으면 보인다" 규칙보다 항상 우선해야
+        // "꺼짐"과 "켜짐인데 값 없음"이 값 하나로 뭉개지지 않는다.
+        use crate::agent_launcher::{agent_is_enabled, AgentKind};
 
-        let (_, _, masked) = mask_disabled_provider_usage(&["kimi".to_owned()], None, None, kimi);
-        // top_provider_usage의 `if kimi_usage.is_some() { 620.0 } else { 430.0 }` 분기가
-        // 이 필터링된 값을 그대로 받는다 — 칸이 빠지면 폭도 저절로 줄어든다는 것을 값으로
-        // 고정한다(별도 폭 계산 손질은 필요 없다).
-        let width = if masked.is_some() { 620.0 } else { 430.0 };
-        assert_eq!(width, 430.0);
+        let none: &[String] = &[];
+        assert!(agent_is_enabled(none, AgentKind::Claude));
+        assert!(agent_is_enabled(none, AgentKind::Codex));
+        assert!(agent_is_enabled(none, AgentKind::Kimi));
 
-        let (_, _, kept) = mask_disabled_provider_usage(&[], None, None, kimi);
-        let width = if kept.is_some() { 620.0 } else { 430.0 };
-        assert_eq!(width, 620.0);
+        let all_disabled = vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()];
+        assert!(!agent_is_enabled(&all_disabled, AgentKind::Claude));
+        assert!(!agent_is_enabled(&all_disabled, AgentKind::Codex));
+        assert!(!agent_is_enabled(&all_disabled, AgentKind::Kimi));
+
+        // kimi만 거부해도 claude·codex는 영향을 받지 않는다.
+        let kimi_only = vec!["kimi".to_owned()];
+        assert!(agent_is_enabled(&kimi_only, AgentKind::Claude));
+        assert!(agent_is_enabled(&kimi_only, AgentKind::Codex));
+        assert!(!agent_is_enabled(&kimi_only, AgentKind::Kimi));
+
+        // kimi_shown = enabled && usage.is_some() — 값이 있어도 꺼져 있으면 안 보인다는
+        // 조합을 여기서 직접 고정한다(top_provider_usage 안의 계산과 동일한 식).
+        let kimi_usage: Option<ProviderUsage> = Some((Some(10), Some(20)));
+        let kimi_shown = agent_is_enabled(&kimi_only, AgentKind::Kimi) && kimi_usage.is_some();
+        assert!(!kimi_shown, "꺼졌으면 값이 있어도 칸을 그리면 안 된다");
+        let kimi_shown = agent_is_enabled(none, AgentKind::Kimi) && kimi_usage.is_some();
+        assert!(kimi_shown, "켜져 있고 값도 있으면 칸을 그려야 한다");
     }
 
     #[test]

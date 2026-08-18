@@ -298,8 +298,14 @@ impl AgentTerminalUi {
         claude_usage: Option<crate::app::ProviderUsage>,
         codex_usage: Option<crate::app::ProviderUsage>,
         codex_meta: Option<crate::ui::agent_sessions::CodexUsageMeta>,
-        // `kimi_usage`: Kimi를 쓰는 사용자에게만 Some. None이면 칸 자체를 안 그린다.
+        // `kimi_usage`: 값이 없으면(설치 안 했거나 안 씀) 켜져 있어도 칸 자체를 안
+        // 그린다 — Kimi 전용 규칙(2026-08-10)이라 `disabled_agents`와는 별개다.
         kimi_usage: Option<crate::app::ProviderUsage>,
+        // `disabled_agents`: 런처 카드 스위치로 끈 에이전트 id 목록. usage 값과는
+        // 분리된 신호다 — "켜짐인데 값 없음"(Claude·Codex는 「—」로 자리를 지킨다)과
+        // "꺼짐"(셋 다 칸 자체가 없다)을 값 하나로는 구분할 수 없기 때문이다
+        // (`crate::app::top_provider_usage`가 이 둘을 여기서 갈라 그린다).
+        disabled_agents: &[String],
         rows: &[ActivityWorkspaceRow],
         approvals: usize,
         // `waiting_sessions`: 입력 대기 세션 — (표시 라벨, 이동 대상). 칩으로 직접 노출한다.
@@ -336,6 +342,7 @@ impl AgentTerminalUi {
                     codex_usage,
                     codex_meta.as_ref(),
                     kimi_usage,
+                    disabled_agents,
                 );
                 crate::ui::designall::vertical_separator(ui, 14.0);
                 ui.weak(catalog.t(
@@ -1319,6 +1326,7 @@ mod tests {
                     None,
                     None,
                     &[],
+                    &[],
                     2,
                     &[],
                     &[],
@@ -1358,6 +1366,92 @@ mod tests {
         harness.get_by_label("Ports —");
     }
 
+    /// 표: 켜짐+값 있음 → 값, 켜짐+값 없음 → Claude·Codex는 "—"로 자리 유지(1급
+    /// provider 규칙)/Kimi는 칸 없음(기존 규칙, 2026-08-10), 꺼짐 → 셋 다 칸 없음.
+    /// 로고는 `paint_announcement_provider_logo`가 "{provider} logo"로 라벨을 다는
+    /// `Image` 위젯이라, 칸이 그려졌는지를 클릭 없이도 값으로 확인할 수 있다.
+    #[test]
+    fn kittest_사용량_바_칸은_켜짐_값없음과_꺼짐을_구분해_그린다() {
+        use egui_kittest::kittest::Queryable;
+
+        let some_usage: Option<crate::app::ProviderUsage> = Some((Some(10), Some(20)));
+
+        fn run(
+            claude: Option<crate::app::ProviderUsage>,
+            codex: Option<crate::app::ProviderUsage>,
+            kimi: Option<crate::app::ProviderUsage>,
+            disabled: Vec<String>,
+        ) -> egui_kittest::Harness<'static, bool> {
+            let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                move |ui, fonts_ready| {
+                    if !*fonts_ready {
+                        return;
+                    }
+                    AgentTerminalUi::new().status_bar_with_managers(
+                        ui,
+                        claude,
+                        codex,
+                        None,
+                        kimi,
+                        &disabled,
+                        &[],
+                        0,
+                        &[],
+                        &[],
+                        StatusBarApprovals {
+                            pending: &[],
+                            workspace_names: &HashMap::new(),
+                            session_titles: &HashMap::new(),
+                        },
+                        0,
+                        None,
+                        &HashMap::new(),
+                        None,
+                        0,
+                        &catalog,
+                    );
+                },
+                false,
+            );
+            harness.set_size(egui::vec2(1400.0, 100.0));
+            install_sidebar_test_fonts(&harness.ctx);
+            *harness.state_mut() = true;
+            harness.run();
+            harness
+        }
+
+        // 켜짐+값 없음(Claude) / 켜짐+값 있음(Codex) / 값 없어서 칸 없음(Kimi, 기존 규칙).
+        let harness = run(None, some_usage, None, Vec::new());
+        assert!(
+            harness.query_by_label("Anthropic logo").is_some(),
+            "값이 없어도 켜져 있으면 Claude 칸은 남아야 한다"
+        );
+        assert!(
+            harness.query_by_label("Codex logo").is_some(),
+            "값이 있으면 Codex 칸이 그려져야 한다"
+        );
+        assert!(
+            harness.query_by_label("Kimi logo").is_none(),
+            "Kimi는 값이 없으면 켜져 있어도 칸을 안 그린다(기존 규칙)"
+        );
+
+        // 꺼짐이 "값 있음"보다 우선한다 — Claude를 꺼도 값은 여전히 있다.
+        let harness = run(some_usage, some_usage, None, vec!["claude".to_owned()]);
+        assert!(
+            harness.query_by_label("Anthropic logo").is_none(),
+            "꺼진 Claude는 값이 있어도 칸이 사라져야 한다"
+        );
+        assert!(harness.query_by_label("Codex logo").is_some());
+
+        // 꺼짐이 Kimi의 "값 있으면 보인다" 규칙보다도 우선한다.
+        let harness = run(None, some_usage, some_usage, vec!["kimi".to_owned()]);
+        assert!(
+            harness.query_by_label("Kimi logo").is_none(),
+            "꺼진 Kimi는 값이 있어도 칸이 사라져야 한다"
+        );
+    }
+
     #[test]
     fn kittest_에이전트_단축키_실패가_상태바에_보인다() {
         use egui_kittest::kittest::Queryable;
@@ -1376,6 +1470,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &[],
                     &[],
                     0,
                     &[],
@@ -1431,6 +1526,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &[],
                     &[],
                     2,
                     &[],
@@ -1512,6 +1608,7 @@ mod tests {
                         None,
                         None,
                         &[],
+                        &[],
                         approvals,
                         &[],
                         &[],
@@ -1566,6 +1663,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &[],
                     &[],
                     // 승인이 0건 — 마지막 건을 방금 처리한 상황이다.
                     0,
@@ -1627,6 +1725,7 @@ mod tests {
                     None,
                     None,
                     &[],
+                    &[],
                     0,
                     &waiting,
                     &[],
@@ -1686,6 +1785,7 @@ mod tests {
                     None,
                     None,
                     &[],
+                    &[],
                     0,
                     &[],
                     &[],
@@ -1739,6 +1839,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        &[],
                         &[],
                         0,
                         &[],
@@ -1818,6 +1919,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &[],
                     &[],
                     0,
                     &[],

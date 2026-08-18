@@ -7198,9 +7198,14 @@ fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
 /// 충분했다. 이제 셋 다 꺼질 수 있어 칸 수가 0~3까지 늘었으므로, 그 두 상수(칸 2개→430,
 /// 칸 3개→620, 칸당 +190)를 그대로 외삽해 순수 함수로 뽑았다 — 폭은 egui 컨테이너의
 /// 크기 힌트일 뿐이라 정확한 픽셀보다 "칸 수에 비례해 줄어든다"가 중요하다. 값으로
-/// 테스트한다(0·1·2·3칸).
+/// 테스트한다(0·1·2·3칸). 0칸은 상자 자체를 그리지 않으므로(`top_provider_usage`) 0.0 —
+/// 50.0을 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
 fn provider_usage_bar_width(visible_count: usize) -> f32 {
-    50.0 + 190.0 * visible_count as f32
+    if visible_count == 0 {
+        0.0
+    } else {
+        50.0 + 190.0 * visible_count as f32
+    }
 }
 
 /// 런처 카드 스위치 토글 결과로 새 거부 목록을 만든다 — 정규화까지 마친 상태로 돌려주므로
@@ -7224,6 +7229,10 @@ fn toggled_disabled_agents(
 /// 값 없음」(Claude·Codex는 「—」로 자리를 지킨다, 1급 provider 규칙)과 「꺼짐」(셋 다
 /// 칸 자체가 없다)을 usage 값 하나로는 구분할 수 없어서 나눴다. usage를 미리
 /// `None`으로 지워 두 상태를 뭉개는 대신, 여기서 `agent_is_enabled`로 직접 갈라 그린다.
+///
+/// 칸을 하나라도 그렸으면 `true`를 돌려준다 — 호출부(`agent_terminal.rs`)가 이 값으로
+/// 뒤이은 구분선을 그릴지 정한다. 셋 다 꺼져 칸이 0개면 상자도 안 그리고 `false`를
+/// 돌려줘, "빈 50px 상자 + 오른쪽에 아무것도 안 나누는 구분선"이 남지 않게 한다.
 pub(crate) fn top_provider_usage(
     ui: &mut egui::Ui,
     claude_usage: Option<ProviderUsage>,
@@ -7231,7 +7240,7 @@ pub(crate) fn top_provider_usage(
     codex_meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
     kimi_usage: Option<ProviderUsage>,
     disabled: &[String],
-) {
+) -> bool {
     let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
         egui::TextStyle::Body,
@@ -7347,6 +7356,11 @@ pub(crate) fn top_provider_usage(
     let kimi_shown = agent_is_enabled(disabled, AgentKind::Kimi) && kimi_usage.is_some();
     let visible_count =
         usize::from(claude_shown) + usize::from(codex_shown) + usize::from(kimi_shown);
+    if visible_count == 0 {
+        // 그릴 칸이 없으면 상자 자체를 할당하지 않는다 — 빈 50px 상자가 남으면
+        // 호출부가 그 오른쪽에 붙이는 구분선도 아무것도 안 나누는 채로 남는다.
+        return false;
+    }
     let width = provider_usage_bar_width(visible_count);
     ui.allocate_ui_with_layout(
         egui::vec2(width, 20.0),
@@ -7395,6 +7409,7 @@ pub(crate) fn top_provider_usage(
             }
         },
     );
+    true
 }
 
 impl WorkspaceRuntime {
@@ -36032,13 +36047,40 @@ mod tests {
 
     #[test]
     fn 사용량_바_폭은_그려지는_칸_수에_비례한다() {
-        // 원래 상수 두 개(칸 2개→430, 칸 3개→620, 칸당 +190)를 0·1칸으로 외삽한
+        // 원래 상수 두 개(칸 2개→430, 칸 3개→620, 칸당 +190)를 1칸으로 외삽한
         // 값을 고정한다 — claude·codex·kimi가 각각 꺼질 수 있게 되면서 칸 수가
         // 0~3 전 구간을 오갈 수 있다(예전엔 kimi만 빠질 수 있어 2·3만 있었다).
-        assert_eq!(provider_usage_bar_width(0), 50.0);
+        // 0칸은 `top_provider_usage`가 상자 자체를 안 그리므로 0.0 — 50.0을
+        // 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
+        assert_eq!(provider_usage_bar_width(0), 0.0);
         assert_eq!(provider_usage_bar_width(1), 240.0);
         assert_eq!(provider_usage_bar_width(2), 430.0);
         assert_eq!(provider_usage_bar_width(3), 620.0);
+    }
+
+    #[test]
+    fn 칸이_없으면_top_provider_usage는_아무것도_그리지_않았다고_보고한다() {
+        // 반환값이 호출부(`agent_terminal.rs`)가 뒤이은 구분선을 그릴지 정하는
+        // 신호다 — 셋 다 꺼지면 상자도 구분선도 남지 않아야 한다.
+        let all_disabled = vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()];
+        let ctx = egui::Context::default();
+        let mut drew_nothing = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            drew_nothing = top_provider_usage(ui, None, None, None, None, &all_disabled);
+        });
+        assert!(
+            !drew_nothing,
+            "칸이 하나도 없으면 top_provider_usage는 false를 돌려줘야 한다"
+        );
+
+        let mut drew_something = false;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            drew_something = top_provider_usage(ui, None, None, None, None, &[]);
+        });
+        assert!(
+            drew_something,
+            "Claude가 켜져 있으면(값이 없어도) 칸이 그려져 true여야 한다"
+        );
     }
 
     #[test]

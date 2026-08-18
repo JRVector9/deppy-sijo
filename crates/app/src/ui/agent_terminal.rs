@@ -336,7 +336,9 @@ impl AgentTerminalUi {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
-                crate::app::top_provider_usage(
+                // 칸이 하나도 없으면(claude·codex·kimi 셋 다 꺼짐) 상자도 이 뒤의
+                // 구분선도 그리지 않는다 — 반환값이 그 신호다(app.rs 주석 참고).
+                let usage_shown = crate::app::top_provider_usage(
                     ui,
                     claude_usage,
                     codex_usage,
@@ -344,7 +346,9 @@ impl AgentTerminalUi {
                     kimi_usage,
                     disabled_agents,
                 );
-                crate::ui::designall::vertical_separator(ui, 14.0);
+                if usage_shown {
+                    crate::ui::designall::vertical_separator(ui, 14.0);
+                }
                 ui.weak(catalog.t(
                     "status_bar.sessions",
                     &[("count", &totals.sessions.to_string())],
@@ -1450,6 +1454,20 @@ mod tests {
             harness.query_by_label("Kimi logo").is_none(),
             "꺼진 Kimi는 값이 있어도 칸이 사라져야 한다"
         );
+
+        // 셋 다 꺼지면(재현 시나리오) 로고가 하나도 안 남는다 — 칸이 0개일 때
+        // 빈 상자·구분선이 남지 않는지는 app.rs의
+        // `칸이_없으면_top_provider_usage는_아무것도_그리지_않았다고_보고한다`가
+        // 반환값으로 고정한다.
+        let harness = run(
+            some_usage,
+            some_usage,
+            some_usage,
+            vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()],
+        );
+        assert!(harness.query_by_label("Anthropic logo").is_none());
+        assert!(harness.query_by_label("Codex logo").is_none());
+        assert!(harness.query_by_label("Kimi logo").is_none());
     }
 
     #[test]

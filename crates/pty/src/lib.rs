@@ -1063,9 +1063,17 @@ fn wait_for_fd_or_cancel(fd: RawFd, events: libc::c_short, cancel: RawFd) -> std
 /// 코얼레싱 대기 — EAGAIN(지금 당장은 더 없음) 시 이만큼만 더 기다려 프로듀서가
 /// 다음 1KB를 쓸 여유를 준다. macOS pty가 1KB씩 트리클하고 우리 read 루프가 그보다
 /// 빨라 read 사이에 즉시 EAGAIN이 뜨므로, 이 짧은 대기 없이는 합쳐지지 않는다.
-/// 프레임 예산(16ms) 대비 무시할 수준이라 상호작용 지연은 체감되지 않는다.
+///
+/// **고립된 상호작용 echo(키 입력 1개)는 뒤에 더 올 데이터가 없어 이 대기를 매번
+/// 타임아웃까지 그대로 지불한다** — 원래 값 2ms에서는 실측(2026-08-18,
+/// docs/performance/2026-08-18-input-latency.md) `/bin/cat` echo 왕복이 30샘플
+/// 전부 2.18~2.33ms(중앙값 2.28ms)였다. `libc::poll`의 timeout은 ms 단위 정수라
+/// 더 잘게(예: 0.x ms) 쪼갤 수 없어, 이 상수를 poll이 허용하는 최소 유의미값인 1로
+/// 낮췄다 — 같은 실측 절차에서 중앙값이 1.19ms로 절반 가까이 줄고(48% 감소),
+/// 200,000B 대량 출력 코얼레싱은 청크 4개로 유지된다(WAIT_MS=2일 때 2개 — 사실상
+/// 동일). 프레임 예산(16ms) 대비 여전히 무시할 수준.
 #[cfg(unix)]
-const PTY_COALESCE_WAIT_MS: libc::c_int = 2;
+const PTY_COALESCE_WAIT_MS: libc::c_int = 1;
 
 /// 한 배치를 코얼레싱하며 기다리는 **누적** 상한(ms). 2ms 미만 간격으로 끊임없이
 /// 트리클하는 흐름(cap도 못 채우는)이 무한정 버퍼링되지 않도록, 첫 바이트 이후 이
@@ -2868,5 +2876,77 @@ mod tests {
 
         session.kill().unwrap();
         assert!(wait_exit(&mut session, Duration::from_secs(5)).is_some());
+    }
+
+    /// 고립된 1바이트 echo 왕복(`unix_reader_loop`의 coalesce wait 포함)이 옛 2ms 대기
+    /// 만큼 지연되지 않는지 고정한다. `/bin/cat`은 stdin을 그대로 stdout에 흘려보내므로
+    /// 셸 프롬프트/readline 지연 없이 reader loop 자체의 지연만 잰다.
+    ///
+    /// 실측(2026-08-18, docs/performance/2026-08-18-input-latency.md): `PTY_COALESCE_WAIT_MS`
+    /// 2ms일 때 30샘플 전부 2.18~2.33ms(중앙값 2.28ms) — 뒤에 더 올 데이터가 없는데도
+    /// 코얼레싱 대기를 매번 타임아웃까지 그대로 지불했다. 1ms로 낮춘 뒤 중앙값 1.19ms.
+    /// 이 테스트는 중앙값이 옛 동작(2ms 이상)으로 되돌아가지 않는지만 고정한다 — CI
+    /// 스케줄링 지터를 흡수하도록 널널한 상한(1.9ms)을 쓴다.
+    #[test]
+    fn 고립된_1바이트_echo는_coalesce_대기_전체를_지불하지_않는다() {
+        let mut session = spawn("/bin/cat", &[]);
+        let rx = session.take_output().unwrap();
+        // 시작 노이즈 배출.
+        std::thread::sleep(Duration::from_millis(100));
+        while rx.try_recv().is_ok() {}
+
+        let mut latencies: Vec<Duration> = Vec::new();
+        for i in 0..10 {
+            let byte = [b'a' + (i % 26) as u8];
+            let start = Instant::now();
+            session.write_input(&byte).unwrap();
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(chunk) => {
+                    let elapsed = start.elapsed();
+                    assert_eq!(chunk, byte.to_vec());
+                    latencies.push(elapsed);
+                }
+                Err(e) => panic!("echo timeout: {e:?}"),
+            }
+            // 다음 반복의 배치와 섞이지 않도록 완전히 idle해질 시간을 준다.
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        latencies.sort();
+        let median = latencies[latencies.len() / 2];
+        assert!(
+            median < Duration::from_millis(1_900),
+            "고립 echo 중앙값이 옛 coalesce 대기(2ms)만큼 지연됨: {latencies:?}",
+        );
+        session.kill().unwrap();
+    }
+
+    /// `PTY_COALESCE_WAIT_MS`를 2ms→1ms로 낮춘 뒤에도 대량 출력 coalescing이 살아있는지
+    /// 고정한다 — 청크 수가 "read당 1송신"에 가까운 수백~수천 개로 되돌아가지 않아야 한다.
+    /// 실측(2026-08-18): WAIT_MS=1에서 200,000B가 청크 4개로 도착(WAIT_MS=2는 2개).
+    #[test]
+    fn 대량_출력은_coalesce_wait을_1ms로_낮춰도_소수_청크로_뭉친다() {
+        let mut session = spawn("/bin/sh", &["-c", "yes 0123456789 | head -c 200000"]);
+        let rx = session.take_output().unwrap();
+        let mut total = 0usize;
+        let mut chunks = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while total < 200_000 && Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(chunk) => {
+                    total += chunk.len();
+                    chunks += 1;
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(total >= 200_000, "200000B를 다 받지 못함: {total}B");
+        // 코얼레싱이 무너지면(=read당 1송신) 200000B/~1KB ≈ 200개를 훌쩍 넘는다.
+        // 실측 4개 대비 널널한 상한.
+        assert!(
+            chunks < 50,
+            "coalescing 효과가 사라진 것으로 보임: {total}B가 청크 {chunks}개로 도착",
+        );
+        session.kill().unwrap();
     }
 }

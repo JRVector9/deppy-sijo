@@ -1009,7 +1009,7 @@ fn agent_card(
     } else {
         "launcher.agent.disabled_hint"
     };
-    let hint = catalog.t(hint_key, &[]);
+    let hint = catalog.t(hint_key, &[("agent", kind.label())]);
     let track = if enabled {
         tokens.accent
     } else {
@@ -1372,8 +1372,10 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let enabled_hint = catalog.t("launcher.agent.enabled_hint", &[]);
-        let disabled_hint = catalog.t("launcher.agent.disabled_hint", &[]);
+        let enabled_hint =
+            catalog.t("launcher.agent.enabled_hint", &[("agent", AgentKind::Kimi.label())]);
+        let disabled_hint =
+            catalog.t("launcher.agent.disabled_hint", &[("agent", AgentKind::Kimi.label())]);
         let detected = snapshot(&[AgentKind::Kimi]);
 
         // 켜짐 → 꺼짐
@@ -1411,7 +1413,8 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let enabled_hint = catalog.t("launcher.agent.enabled_hint", &[]);
+        let enabled_hint =
+            catalog.t("launcher.agent.enabled_hint", &[("agent", AgentKind::Kimi.label())]);
         let detected = snapshot(&[AgentKind::Kimi]);
         let mut harness =
             agent_list_harness(&catalog, &detected, Vec::new(), Some(AgentKind::Kimi));
@@ -1430,6 +1433,54 @@ mod tests {
             }
             _ => panic!("expected exactly one SetAgentEnabled(false) intent"),
         }
+    }
+
+    #[test]
+    fn 스위치_접근성_이름은_에이전트별로_구분된다() {
+        use egui_kittest::kittest::Queryable;
+
+        // 힌트에 `{agent}`가 안 박히면 켜진 카드끼리, 꺼진 카드끼리 접근성 이름이
+        // 전부 같아져 스크린리더로는 어느 스위치가 누구 것인지 구분할 수 없다.
+        // 에이전트 둘(Claude·Codex)을 동시에 띄우고 **이름만으로** 각 스위치를
+        // 찾아 클릭해, 이름이 실제로 에이전트를 구분해내는지 확인한다 — 기존
+        // 테스트들이 단일 에이전트 스냅샷을 쓰거나(위 두 테스트) 픽셀 좌표로
+        // 스위치를 찾은(아래 `다른_카드의_스위치를_꺼도` 테스트) 것도 이 결함을
+        // 못 잡았기 때문이다.
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let claude_hint =
+            catalog.t("launcher.agent.enabled_hint", &[("agent", AgentKind::Claude.label())]);
+        let codex_hint =
+            catalog.t("launcher.agent.enabled_hint", &[("agent", AgentKind::Codex.label())]);
+        assert_ne!(
+            claude_hint, codex_hint,
+            "두 에이전트의 스위치 접근성 이름이 같으면 안 된다"
+        );
+
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Codex]);
+        let mut harness = agent_list_harness(&catalog, &detected, Vec::new(), None);
+
+        // Codex 스위치를 Claude와 헷갈리지 않고 이름만으로 정확히 찾아 클릭한다.
+        let codex_switch =
+            harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &codex_hint);
+        let pos = codex_switch.rect().center();
+        click_at(&mut harness, pos);
+
+        match harness.state().intents.as_slice() {
+            [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
+                assert_eq!(*kind, AgentKind::Codex, "이름으로 찾은 스위치가 Codex여야 한다");
+                assert!(!enabled);
+            }
+            _ => panic!("expected exactly one SetAgentEnabled(false) intent for codex"),
+        }
+
+        // Claude 스위치는 그대로 남아 이름으로 계속 찾아진다 — Codex 클릭이
+        // Claude의 접근성 이름을 건드리지 않았다는 뜻이다.
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::CheckBox, &claude_hint)
+                .is_some(),
+            "Claude 스위치는 이름으로 계속 찾아져야 한다"
+        );
     }
 
     #[test]

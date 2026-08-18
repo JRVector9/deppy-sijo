@@ -5271,10 +5271,20 @@ impl WorkspaceUi {
             let whole_rows = self.scroll_residual.trunc() as i32;
             if whole_rows != 0 {
                 self.scroll_residual -= whole_rows as f32;
-                self.send(RuntimeCommand::Scroll {
-                    session,
-                    delta: whole_rows,
-                });
+                // 드래그 중이면 선택을 보존한 채 스크롤한다 — 한 화면을 넘는 범위를 휠로
+                // 이어 잡을 수 있어야 한다(`wheel_scroll_keeps_selection` 참고). 선택
+                // 앵커는 아래 `dragged()` 분기가 스냅샷 도착 시 `shift_selection_cell`로
+                // 보정하므로, 여기서는 해제만 피하면 된다.
+                let keep = wheel_scroll_keeps_selection(
+                    ui.input(|i| i.pointer.primary_down()),
+                    self.selection.is_some_and(|(s, _, _)| s == session),
+                );
+                let command = RuntimeCommand::Scroll { session, delta: whole_rows };
+                if keep {
+                    self.send_keep_selection(command);
+                } else {
+                    self.send(command);
+                }
             }
         }
 
@@ -6301,6 +6311,23 @@ fn drag_autoscroll_rate(pointer_y: f32, top: f32, bottom: f32, cell_h: f32) -> f
         return 0.0;
     };
     (overshoot / cell_h.max(1.0) * 8.0).clamp(-60.0, 60.0)
+}
+
+/// 휠 스크롤이 선택을 **보존**해야 하는가.
+///
+/// 평상시 휠은 선택을 해제한다(`send`) — 선택 중엔 화면이 freeze돼 있어서, 안 지우면
+/// 스크롤해도 화면이 멈춘 듯 보이기 때문이다(2026-07 사용자 보고).
+///
+/// 그런데 **드래그하는 도중에는** 반대다. 한 화면에 안 들어오는 범위를 잡으려면 버튼을
+/// 누른 채 휠로 화면을 옮기며 계속 끌 수 있어야 하는데, 여기서 선택이 풀리면 매번
+/// 처음부터 다시 잡아야 한다(2026-08-18 사용자 요청). 포인터를 pane 밖으로 밀어내는
+/// 기존 오토스크롤(`drag_autoscroll_rate`)과 같은 목적이고, 휠은 그보다 정밀하다.
+///
+/// 판정은 **버튼이 눌린 상태 + 그 세션의 선택이 살아 있음**이다. `Response::dragged()`를
+/// 쓰지 않는 이유는 포인터가 멈춰 있는 프레임에 false가 되어, 가만히 둔 채 휠만 굴리는
+/// 바로 그 동작에서 선택이 풀리기 때문이다.
+fn wheel_scroll_keeps_selection(primary_down: bool, selection_on_session: bool) -> bool {
+    primary_down && selection_on_session
 }
 
 /// 스크롤로 화면이 delta_rows행 이동했을 때(양수=과거로 → 내용이 아래로 이동)
@@ -11288,6 +11315,19 @@ https://example.test/login \
         // 많이 벗어나면 빠르게, 최대 60행/초로 clamp
         assert_eq!(drag_autoscroll_rate(2000.0, 100.0, 500.0, 16.0), -60.0);
         assert_eq!(drag_autoscroll_rate(-2000.0, 100.0, 500.0, 16.0), 60.0);
+    }
+
+    /// 휠은 평상시 선택을 해제하지만(화면 freeze 때문), **드래그 중에는 보존**해야
+    /// 한 화면을 넘는 범위를 이어 잡을 수 있다(2026-08-18 사용자 요청).
+    #[test]
+    fn 휠은_드래그_중에만_선택을_보존한다() {
+        // 버튼을 누른 채 그 세션의 선택이 살아 있을 때만 보존한다.
+        assert!(wheel_scroll_keeps_selection(true, true), "드래그 중이면 보존");
+        // 버튼을 뗀 뒤의 휠은 기존대로 해제한다 — 안 그러면 선택이 남아 화면이 멈춘 듯 보인다.
+        assert!(!wheel_scroll_keeps_selection(false, true), "드래그가 아니면 해제");
+        // 선택이 없으면 보존할 것도 없다(다른 세션의 선택이어도 마찬가지).
+        assert!(!wheel_scroll_keeps_selection(true, false), "그 세션 선택이 없으면 해제");
+        assert!(!wheel_scroll_keeps_selection(false, false));
     }
 
     #[test]

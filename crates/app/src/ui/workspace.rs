@@ -1464,6 +1464,13 @@ pub struct WorkspaceUi {
     /// 현재 error 배너가 input backpressure 경고인지 — 해소 이벤트(queued=0)가
     /// 무관한 오류(spawn 실패 등)를 지우지 않게 구분한다(codex 2026-07-09).
     error_is_pressure: bool,
+    /// 프로토콜 요청이 실제로 유실됐음을 표시하는 플래그(2026-08-18, "terminal protocol
+    /// request rejected" 배너 버그 수정). send/send_keep_selection/spawn_shell_at은 catalog가
+    /// 없어 문구를 미리 만들 수 없다 — 여기 플래그만 세우고 show_with_input이 렌더 시점에
+    /// catalog로 채운다. Busy(큐 포화)·InvalidCommand(내부 계약 위반)는 사용자가 어찌할 수
+    /// 없는 신호라 이 플래그를 쓰지 않고 tracing으로만 남긴다 — PayloadTooLarge/DeliveryFailed
+    /// 처럼 정말 되돌릴 수 없이 사라진 요청만 여기로 온다.
+    protocol_request_lost: bool,
     /// 터미널 텍스트 검색 상태 (T3). Cmd+F로 열리고, 열려 있으면 focused pane 우상단에
     /// 검색 바를 그린다. 한 번에 한 세션만 검색한다.
     search: Option<TerminalSearch>,
@@ -1855,6 +1862,7 @@ impl WorkspaceUi {
             pending_paste: None,
             error: None,
             error_is_pressure: false,
+            protocol_request_lost: false,
             search: None,
             last_output_copy_pending: HashSet::new(),
             pending_copy: None,
@@ -2230,9 +2238,20 @@ impl WorkspaceUi {
                         });
                 }
             }
-            Err(_) => {
-                self.error_is_pressure = false;
-                self.error = Some("terminal protocol delivery failed".to_owned());
+            Err(code) => {
+                // 운영 코드에서 app.rs가 여기로 넘기는 값은 Busy(dotenv 승인 상한)와
+                // DeliveryFailed 둘뿐이다 — 그리고 DeliveryFailed의 절대다수는 실제 전송
+                // 실패가 아니라 "느지막이 도착한 결과가 이미 한물간 상태"(워크스페이스
+                // 전환/종료, dotenv 계속 처리가 stale로 판정됨 등 반납 경로)다. 세션이
+                // 정말 죽어서 벌어진 소수 사례도 종료 배지 등 별도 신호가 이미 있어, 여기서
+                // 또 배너를 띄우면 "이유 모를 배너가 가끔 뜬다"(2026-08-18 사용자 보고)는
+                // 원래 버그를 그대로 재현한다. 화면은 건드리지 않고 진단용 tracing만 남긴다.
+                tracing::warn!(
+                    kind = "workspace",
+                    phase = "protocol_completion",
+                    error_code = ?code,
+                    "protocol intent completed with error"
+                );
             }
         }
         self.flush_pending_spawn_cd_writes();
@@ -3474,10 +3493,12 @@ impl WorkspaceUi {
                     self.pending_spawn_cwds.remove(index);
                 }
                 Err(WorkspaceProtocolErrorCode::Busy) => return,
-                Err(_) => {
+                Err(code) => {
+                    // spawn 자체는 이미 끝났으니 여기서 밀리면 재시도 여지가 없다 — Busy를
+                    // 뺀 나머지는 report_protocol_queue_rejection 공통 규칙(진짜 유실만
+                    // 배너)을 그대로 따른다.
                     self.pending_spawn_cwds.remove(index);
-                    self.error_is_pressure = false;
-                    self.error = Some("terminal spawn path delivery failed".to_owned());
+                    self.report_protocol_queue_rejection(code, "spawn_cd_write");
                 }
             }
         }
@@ -3499,7 +3520,21 @@ impl WorkspaceUi {
         // 상단이 넘치던 문제 해소.
         // 에러 바가 있을 때만 pane과 분리하는 헤어라인을 둔다 — 평소엔 top_bar 하단
         // 헤어라인이 이미 구분선이라 여기 무조건 그리면 라인이 두 줄로 겹쳤다(#64 사용자).
-        if let Some(error) = self.error.clone() {
+        // protocol_request_lost는 catalog 없는 지점(send_keep_selection 등)에서 세운 플래그다
+        // — 여기서만 catalog가 있어 렌더 시점에 한국어(등 로케일) 문구로 채운다. self.error와
+        // 동시에 있을 순 있지만 배너 한 줄만 그리면 충분해 우선순위만 준다(2026-08-18).
+        if self.protocol_request_lost {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    catalog.t("workspace.protocol_request_lost", &[]),
+                );
+                if ui.small_button("×").clicked() {
+                    self.protocol_request_lost = false;
+                }
+            });
+            crate::ui::hairline(ui);
+        } else if let Some(error) = self.error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, error);
                 if ui.small_button("×").clicked() {
@@ -6092,23 +6127,26 @@ impl WorkspaceUi {
         if cwd.as_ref().is_some_and(|cwd| {
             cwd.is_empty() || cwd.len() > WORKSPACE_PATH_MAX_BYTES || cwd.as_bytes().contains(&0)
         }) {
-            self.error_is_pressure = false;
-            self.error = Some("terminal spawn path rejected".to_owned());
+            // cwd는 항상 앱이 자체 추적하는 실제 경로에서 오므로 이 분기는 사실상 도달
+            // 불가한 내부 불변식 방어다 — 사용자가 직접 만든 값이 아니라 배너로 보여줘도
+            // 이해도 대응도 못 한다. 진단용 로그만 남긴다.
+            tracing::warn!(
+                kind = "workspace",
+                phase = "spawn_admission",
+                error_code = "invalid_cwd",
+                "spawn cwd failed validation"
+            );
             return;
         }
-        if self
-            .queue_protocol_intent_with_spawn_cwd(
-                RuntimeCommand::SpawnShell {
-                    cols: 80,
-                    rows: 24,
-                    scrollback_lines,
-                },
-                cwd,
-            )
-            .is_err()
-        {
-            self.error_is_pressure = false;
-            self.error = Some("terminal protocol request rejected".to_owned());
+        if let Err(code) = self.queue_protocol_intent_with_spawn_cwd(
+            RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines,
+            },
+            cwd,
+        ) {
+            self.report_protocol_queue_rejection(code, "spawn_admission");
         }
     }
 
@@ -6306,12 +6344,53 @@ impl WorkspaceUi {
     /// 선택을 해제하지 않는 send — 드래그 오토스크롤 전용(선택을 유지·확장하며
     /// 스크롤해야 한다). 휠/타이핑은 반드시 [`Self::send`]를 쓴다.
     fn send_keep_selection(&mut self, command: RuntimeCommand) -> bool {
-        if self.queue_protocol_intent(command).is_err() {
-            self.error_is_pressure = false;
-            self.error = Some("terminal protocol request rejected".to_owned());
-            false
-        } else {
-            true
+        match self.queue_protocol_intent(command) {
+            Ok(()) => true,
+            Err(code) => {
+                self.report_protocol_queue_rejection(code, "protocol_queue");
+                false
+            }
+        }
+    }
+
+    /// queue_protocol_intent*의 동기 거부(2026-08-18, "terminal protocol request rejected"
+    /// 배너 버그 수정)를 공통 처리한다. Busy(자연히 풀리는 큐 포화)와 InvalidCommand(사용자가
+    /// 만들 수 없는 내부 계약 위반)는 배너를 띄워도 대응할 수 없어 tracing만 남긴다.
+    /// PayloadTooLarge/DeliveryFailed만 정말 되돌릴 수 없이 사라진 요청이라
+    /// protocol_request_lost를 세워 show_with_input이 catalog로 배너를 채우게 한다.
+    fn report_protocol_queue_rejection(
+        &mut self,
+        code: WorkspaceProtocolErrorCode,
+        phase: &'static str,
+    ) {
+        match code {
+            WorkspaceProtocolErrorCode::Busy => {
+                tracing::debug!(
+                    kind = "workspace",
+                    phase = phase,
+                    error_code = "busy",
+                    "protocol queue saturated; caller may retry"
+                );
+            }
+            WorkspaceProtocolErrorCode::InvalidCommand => {
+                tracing::warn!(
+                    kind = "workspace",
+                    phase = phase,
+                    error_code = "invalid_command",
+                    "internal protocol command failed validation"
+                );
+            }
+            WorkspaceProtocolErrorCode::PayloadTooLarge
+            | WorkspaceProtocolErrorCode::DeliveryFailed => {
+                self.error_is_pressure = false;
+                self.protocol_request_lost = true;
+                tracing::warn!(
+                    kind = "workspace",
+                    phase = phase,
+                    error_code = ?code,
+                    "terminal request was dropped"
+                );
+            }
         }
     }
 }
@@ -10998,6 +11077,102 @@ mod tests {
                 rows: 40,
             } if *queued_session == session
         )));
+    }
+
+    /// 회귀 — 큐/inflight 8칸이 그냥 꽉 찬 것(Busy)은 자연히 풀리는 내부
+    /// 백프레셔라 배너를 띄우면 안 된다("terminal protocol request rejected" 버그).
+    #[test]
+    fn send_keep_selection이_큐_포화만으로는_배너를_띄우지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(index as u64 + 1),
+                delta: 1,
+            })
+            .unwrap();
+        }
+
+        let delivered = ui.send_keep_selection(RuntimeCommand::Scroll {
+            session: SessionId(99),
+            delta: 1,
+        });
+
+        assert!(!delivered);
+        assert_eq!(ui.error, None, "큐 포화는 배너를 띄우지 않아야 한다");
+        assert!(!ui.protocol_request_lost);
+    }
+
+    /// spawn_shell_at도 동일 원칙 — spawn 상한 포화는 배너 없이 조용히 거부된다.
+    #[test]
+    fn spawn_shell_at이_큐_포화만으로는_배너를_띄우지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            ui.spawn_shell_at(1_000, Some(format!("/tmp/deppy-{index}")));
+        }
+        assert_eq!(ui.error, None, "정상 spawn 8개는 배너를 띄우면 안 된다");
+
+        ui.spawn_shell_at(1_000, Some("/tmp/deppy-overflow".to_owned()));
+
+        assert_eq!(ui.error, None, "spawn 상한 포화도 배너를 띄우면 안 된다");
+        assert!(!ui.protocol_request_lost);
+    }
+
+    /// 회귀 — complete_protocol의 Err(Busy)/Err(DeliveryFailed)는 대부분 stale/종료
+    /// 레이스라 배너를 띄우면 "이유 모를 배너가 가끔 뜬다"는 원래 버그를 재현한다.
+    /// 진단은 tracing으로만 남긴다("terminal protocol delivery failed" 버그).
+    #[test]
+    fn complete_protocol의_busy와_delivery_failed는_배너를_띄우지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        ui.queue_protocol_intent(RuntimeCommand::Scroll {
+            session: SessionId(1),
+            delta: 1,
+        })
+        .unwrap();
+        let intent = ui.take_protocol_intent().unwrap();
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+        assert_eq!(ui.error, None);
+
+        ui.queue_protocol_intent(RuntimeCommand::Scroll {
+            session: SessionId(2),
+            delta: 1,
+        })
+        .unwrap();
+        let intent = ui.take_protocol_intent().unwrap();
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+        assert_eq!(ui.error, None);
+        assert!(!ui.protocol_request_lost);
+    }
+
+    /// 진짜 유실(PayloadTooLarge)만 protocol_request_lost 플래그를 세운다 — send_keep_selection
+    /// 은 catalog가 없어 문구를 못 만들므로 플래그만 세우고 show_with_input이 렌더 시점에
+    /// catalog로 채운다. 이 키는 5개 로케일 모두에서 실제 한국어/현지어 문구로 존재해야 한다.
+    #[test]
+    fn send_keep_selection의_payload_too_large는_유실_플래그를_세운다() {
+        let mut ui = WorkspaceUi::new();
+
+        let delivered = ui.send_keep_selection(RuntimeCommand::WriteInput {
+            session: SessionId(1),
+            bytes: vec![b'x'; WORKSPACE_PROTOCOL_INPUT_MAX_BYTES + 1],
+        });
+
+        assert!(!delivered);
+        assert!(ui.protocol_request_lost, "실제 유실은 플래그로 남아야 한다");
+
+        let ko = i18n::Catalog::load("ko-KR").unwrap();
+        let message = ko.t("workspace.protocol_request_lost", &[]);
+        assert_ne!(message, "workspace.protocol_request_lost", "키가 아니라 실제 문구여야 한다");
+        assert!(
+            !message.is_ascii(),
+            "한국어 배너여야 한다 (영어 원문 그대로 노출 금지): {message}"
+        );
     }
 
     #[test]

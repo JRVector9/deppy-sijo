@@ -623,6 +623,7 @@ activity.clear_caches = Clear render caches
 activity.session_count = {count} sessions
 activity.clear_caches_hint = Clears terminal render caches for all workspaces. Running tasks, processes, and scrollback are unaffected.
 workspace.input_pressure = PTY input pressure: queued {queued} / {max}
+workspace.protocol_request_lost = A terminal request could not be delivered and was dropped.
 workspace.warm_limit.title = Live workspace limit reached
 workspace.warm_limit.body = Cannot open {target}: {limit} background workspaces already have running sessions. Switch to one of them and close or stop a session, then try again.
 workspace.wake.restoring = Waking “{name}” — restoring sessions…

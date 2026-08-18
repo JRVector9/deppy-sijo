@@ -623,6 +623,7 @@ activity.clear_caches = レンダーキャッシュをクリア
 activity.session_count = セッション {count} 個
 activity.clear_caches_hint = 全ワークスペースの端末レンダーキャッシュをクリアします。実行中の作業・プロセス・スクロール履歴には影響しません。
 workspace.input_pressure = PTY 入力圧迫: 待機 {queued} / {max}
+workspace.protocol_request_lost = ターミナルへのリクエストを配信できず、破棄されました。
 workspace.warm_limit.title = 実行中ワークスペースの上限
 workspace.warm_limit.body = {target}を開けません。バックグラウンドでセッションを実行中のワークスペースがすでに{limit}個あります。既存のワークスペースでセッションを閉じるか停止してから再試行してください。
 workspace.wake.restoring = 「{name}」を休止から復帰中 — セッションを復元しています…

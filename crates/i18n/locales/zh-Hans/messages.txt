@@ -623,6 +623,7 @@ activity.clear_caches = 清除渲染缓存
 activity.session_count = {count} 个会话
 activity.clear_caches_hint = 清除所有工作区的终端渲染缓存。不影响正在运行的任务、进程和回滚记录。
 workspace.input_pressure = PTY 输入压力：排队 {queued} / {max}
+workspace.protocol_request_lost = 终端请求未能送达，已丢失。
 workspace.warm_limit.title = 已达到运行中工作区上限
 workspace.warm_limit.body = 无法打开 {target}：已有 {limit} 个后台工作区正在运行会话。请切换到其中一个并关闭或停止会话后重试。
 workspace.wake.restoring = 正在唤醒“{name}”— 恢复会话中…

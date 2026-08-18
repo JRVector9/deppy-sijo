@@ -623,6 +623,7 @@ activity.clear_caches = 렌더 캐시 비우기
 activity.session_count = 세션 {count}개
 activity.clear_caches_hint = 모든 워크스페이스의 터미널 렌더 캐시를 비웁니다. 실행 중인 작업·프로세스·스크롤 기록에는 영향이 없습니다.
 workspace.input_pressure = PTY 입력 압박: 대기 {queued} / {max}
+workspace.protocol_request_lost = 터미널 요청이 전달되지 못해 유실되었습니다.
 workspace.warm_limit.title = 실행 중 workspace 한도 도달
 workspace.warm_limit.body = {target}을(를) 열 수 없습니다. 백그라운드에서 세션이 실행 중인 workspace가 이미 {limit}개입니다. 기존 workspace로 전환해 세션을 닫거나 중지한 뒤 다시 시도하세요.
 workspace.wake.restoring = 「{name}」 절전 해제 중 — 세션을 복원합니다…

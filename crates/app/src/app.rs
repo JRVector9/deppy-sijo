@@ -7193,6 +7193,49 @@ fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
     })
 }
 
+/// 런처에서 끈 에이전트의 사용량을 `None`으로 가린다 — `top_provider_usage`가 그 칸을
+/// 그리지 않게 만드는 순수 표시 규칙이다. claude·codex·kimi 셋 다 같은 규칙을 적용한다
+/// (지금 실제로 칸이 사라지는 건 kimi_usage뿐이지만 — claude/codex는 「1급 provider라
+/// 값이 없어도 —로 자리를 지킨다」는 별도의 기존 결정이라 여기서 건드리지 않는다 —
+/// 걸러진 값이 아래로 그대로 흘러가므로 나중에 그 결정이 바뀌어도 이 함수는 손댈 필요가
+/// 없다). 탐지·이력과는 무관하다 — 여기서 거른 값은 표시용일 뿐 상태 감지에는 안 쓰인다.
+/// 폭 계산(`top_provider_usage`의 `kimi_usage.is_some()`)은 이 함수가 걸러준 값을
+/// 그대로 받으므로 별도 손질 없이 따라간다.
+fn mask_disabled_provider_usage(
+    disabled: &[String],
+    claude_usage: Option<ProviderUsage>,
+    codex_usage: Option<ProviderUsage>,
+    kimi_usage: Option<ProviderUsage>,
+) -> (
+    Option<ProviderUsage>,
+    Option<ProviderUsage>,
+    Option<ProviderUsage>,
+) {
+    use crate::agent_launcher::{agent_is_enabled, AgentKind};
+    (
+        claude_usage.filter(|_| agent_is_enabled(disabled, AgentKind::Claude)),
+        codex_usage.filter(|_| agent_is_enabled(disabled, AgentKind::Codex)),
+        kimi_usage.filter(|_| agent_is_enabled(disabled, AgentKind::Kimi)),
+    )
+}
+
+/// 런처 카드 스위치 토글 결과로 새 거부 목록을 만든다 — 정규화까지 마친 상태로 돌려주므로
+/// 호출부(`handle_agent_launcher_intent`)는 그대로 `config.agents.disabled`에 대입하면
+/// 된다. 저장은 호출부 책임(config는 여기서 건드리지 않는다 — 순수 함수라 값으로 테스트한다).
+fn toggled_disabled_agents(
+    current: &[String],
+    kind: crate::agent_launcher::AgentKind,
+    enabled: bool,
+) -> Vec<String> {
+    let mut disabled = current.to_vec();
+    if enabled {
+        disabled.retain(|id| id != kind.id());
+    } else {
+        disabled.push(kind.id().to_owned());
+    }
+    crate::agent_launcher::normalize_disabled_agents(&disabled)
+}
+
 pub(crate) fn top_provider_usage(
     ui: &mut egui::Ui,
     claude_usage: Option<ProviderUsage>,
@@ -19052,9 +19095,16 @@ impl App {
                         .report_error(ui::agent_launcher::LauncherErrorCode::LaunchBusy);
                 }
             }
-            // 실제 배선(거부 목록 갱신·config 저장·사용량 바 필터링)은 Task 3.
-            // 지금은 컴파일을 지키는 최소 no-op이다.
-            ui::agent_launcher::AgentLauncherIntent::SetAgentEnabled { .. } => {}
+            // 카드 스위치 → 거부 목록 갱신 + config 저장. leaf는 config를 직접 쓰지
+            // 않으므로(저장소 관례) 여기 App(logic 경로, render 아님)이 맡는다 —
+            // A::ToggleSidebar 등 기존 단축키 핸들러와 같은 자리·같은 방식.
+            ui::agent_launcher::AgentLauncherIntent::SetAgentEnabled { kind, enabled } => {
+                self.config.agents.disabled =
+                    toggled_disabled_agents(&self.config.agents.disabled, kind, enabled);
+                if let Err(error) = self.config.save(&self.config_path) {
+                    tracing::warn!("에이전트 거부 목록 저장 실패: {error:#}");
+                }
+            }
         }
     }
 
@@ -23751,10 +23801,22 @@ impl eframe::App for App {
                 // Kimi를 쓰면 게이트가 조용히 막았다(2026-08-10 실증: 프로브가 한 번도
                 // 안 돌았다). claude 경로와 같은 모양으로 무조건 부른다.
                 let kimi_usage = crate::kimi_usage::current(ui.ctx());
+                let claude_usage =
+                    claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx()));
+                let codex_usage =
+                    supplement_codex_five_hour(codex_server_usage, codex_backend_five_hour);
+                // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — 거부 목록은
+                // 표시 규칙일 뿐이라 탐지·이력에는 손대지 않는다(mask_disabled_provider_usage).
+                let (claude_usage, codex_usage, kimi_usage) = mask_disabled_provider_usage(
+                    &self.config.agents.disabled,
+                    claude_usage,
+                    codex_usage,
+                    kimi_usage,
+                );
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
-                    claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx())),
-                    supplement_codex_five_hour(codex_server_usage, codex_backend_five_hour),
+                    claude_usage,
+                    codex_usage,
                     self.agent_sessions_ui.codex_usage_meta(),
                     kimi_usage,
                     activity_rows.rows(),
@@ -26268,8 +26330,9 @@ impl eframe::App for App {
                 self.agent_launcher_snapshot.as_ref(),
                 self.agent_launcher_detection_in_flight,
                 &text,
-                // Task 2는 카드 토글 leaf만 만든다 — 거부 목록 배선(저장·필터링)은 Task 3.
-                &[],
+                // 꺼진 카드도 화면에는 남는다(B안) — leaf가 흐리게 그리고 선택을 막는
+                // 판단 재료로만 거부 목록을 받는다. 탐지 결과 자체는 여기서 거르지 않는다.
+                &self.config.agents.disabled,
             )
         {
             self.pending_agent_launcher_intent = Some(intent);
@@ -35961,5 +36024,136 @@ mod tests {
 
         let older_first_seen = detected_work_history_facts(None, None);
         assert_eq!(older_first_seen, (None, None, None));
+    }
+
+    // --- Task 3: 런처 거부 목록 App 배선 + 사용량 바 ---
+
+    #[test]
+    fn 거부_목록에_있으면_그_에이전트의_usage만_none이_된다() {
+        let claude = Some((Some(1), Some(2)));
+        let codex = Some((Some(3), Some(4)));
+        let kimi = Some((Some(5), Some(6)));
+
+        // 빈 거부 목록 — 셋 다 그대로 통과한다.
+        assert_eq!(
+            mask_disabled_provider_usage(&[], claude, codex, kimi),
+            (claude, codex, kimi)
+        );
+
+        // kimi만 거부 — kimi만 None, claude·codex는 그대로.
+        let (c, x, k) =
+            mask_disabled_provider_usage(&["kimi".to_owned()], claude, codex, kimi);
+        assert_eq!((c, x), (claude, codex));
+        assert!(k.is_none());
+
+        // 셋 다 거부 — 셋 다 None(claude·codex·kimi가 같은 규칙을 따른다).
+        let all_disabled = vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()];
+        let (c, x, k) = mask_disabled_provider_usage(&all_disabled, claude, codex, kimi);
+        assert!(c.is_none() && x.is_none() && k.is_none());
+
+        // 원래도 None인 usage는 거부 목록과 무관하게 계속 None이다.
+        let (c, _, _) = mask_disabled_provider_usage(&[], None, codex, kimi);
+        assert!(c.is_none());
+    }
+
+    #[test]
+    fn kimi를_끄면_사용량_바_폭_분기가_기본값으로_따라간다() {
+        let kimi = Some((Some(10), Some(20)));
+
+        let (_, _, masked) = mask_disabled_provider_usage(&["kimi".to_owned()], None, None, kimi);
+        // top_provider_usage의 `if kimi_usage.is_some() { 620.0 } else { 430.0 }` 분기가
+        // 이 필터링된 값을 그대로 받는다 — 칸이 빠지면 폭도 저절로 줄어든다는 것을 값으로
+        // 고정한다(별도 폭 계산 손질은 필요 없다).
+        let width = if masked.is_some() { 620.0 } else { 430.0 };
+        assert_eq!(width, 430.0);
+
+        let (_, _, kept) = mask_disabled_provider_usage(&[], None, None, kimi);
+        let width = if kept.is_some() { 620.0 } else { 430.0 };
+        assert_eq!(width, 620.0);
+    }
+
+    #[test]
+    fn 토글은_거부_목록을_정규화된_상태로_갱신한다() {
+        use crate::agent_launcher::AgentKind;
+
+        // 켜짐 → 꺼짐: id가 추가된다.
+        let off = toggled_disabled_agents(&[], AgentKind::Kimi, false);
+        assert_eq!(off, vec!["kimi".to_owned()]);
+
+        // 꺼짐 → 켜짐: id가 빠진다.
+        let on = toggled_disabled_agents(&off, AgentKind::Kimi, true);
+        assert!(on.is_empty());
+
+        // 이미 꺼진 걸 다시 꺼도(중복) 미지 id가 섞여 있어도(구버전 config) 정규화된
+        // 상태(미지 id 제거·중복 제거·정렬)로 남는다.
+        let dirty = vec!["kimi".to_owned(), "없는에이전트".to_owned()];
+        let still_off = toggled_disabled_agents(&dirty, AgentKind::Kimi, false);
+        assert_eq!(still_off, vec!["kimi".to_owned()]);
+
+        let both_off = toggled_disabled_agents(&dirty, AgentKind::Claude, false);
+        assert_eq!(both_off, vec!["claude".to_owned(), "kimi".to_owned()]);
+    }
+
+    /// 경계(스펙 §넣지 않는 것): 숨김은 표시·선택 규칙일 뿐이다. 토글 처리가 탐지
+    /// 스냅샷을 고치거나, 떠 있는 세션을 종료하거나, 이력·상태 감지를 건드리면
+    /// "숨겼더니 이력이 사라졌다"가 된다 — 여기서는 config.agents.disabled 갱신과
+    /// 저장만 해야 한다.
+    #[test]
+    fn 거부_목록_토글_처리는_탐지_스냅샷과_세션_이력을_건드리지_않는다() {
+        let source = include_str!("app.rs");
+        let arm = source
+            .split_once(
+                "ui::agent_launcher::AgentLauncherIntent::SetAgentEnabled { kind, enabled } => {",
+            )
+            .and_then(|(_, tail)| tail.split_once("\n    fn fail_agent_launcher_request"))
+            .map(|(body, _)| body)
+            .expect("SetAgentEnabled 처리부를 찾지 못했다");
+        for forbidden in [
+            "agent_launcher_snapshot",
+            "close_workspace_sessions",
+            "work_history",
+            "agent_detect",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "SetAgentEnabled 처리가 '{forbidden}'을 건드린다 — 표시 규칙 밖으로 나갔다: {arm}"
+            );
+        }
+    }
+
+    /// 경계: 탐지(`detect_installed_agents`)는 "그 호스트가 띄울 수 있는 것"을 전부
+    /// 돌려줘야 한다 — 거부 목록으로 걸러지면 꺼진 카드가 화면에서 아예 사라져
+    /// B안 계약(꺼진 카드도 목록에 남는다)이 깨진다. 호출부에 인자가 추가되면 이
+    /// 정확한 문자열이 깨져 실패한다.
+    #[test]
+    fn 탐지_호출은_거부_목록_인자를_받지_않는다() {
+        let source = include_str!("app.rs");
+        assert!(
+            source.contains(
+                "crate::agent_launcher::detect_installed_agents(excluded_directory.as_deref())"
+            ),
+            "탐지 호출 시그니처가 바뀌었다 — 거부 목록을 넘기게 되지 않았는지 확인하라"
+        );
+    }
+
+    /// 경계: 런처 `show`는 탐지 스냅샷을 가공 없이 그대로 넘기고, 거부 목록은 별개
+    /// 인자로만 넘긴다 — 스냅샷을 거부 목록으로 걸러 넘기면 꺼진 카드가 화면에서
+    /// 사라져 B안 계약이 깨진다.
+    #[test]
+    fn 런처_show_호출은_탐지_스냅샷과_거부_목록을_각각_그대로_넘긴다() {
+        let source = include_str!("app.rs");
+        let call = source
+            .split_once("self.agent_launcher_ui.show(")
+            .and_then(|(_, tail)| tail.split_once("\n            )\n        {"))
+            .map(|(body, _)| body)
+            .expect("agent_launcher_ui.show 호출부를 찾지 못했다");
+        assert!(
+            call.contains("self.agent_launcher_snapshot.as_ref(),"),
+            "탐지 스냅샷은 가공 없이 그대로 전달돼야 한다: {call}"
+        );
+        assert!(
+            call.contains("&self.config.agents.disabled,"),
+            "거부 목록은 스냅샷과 별개 인자로 전달돼야 한다: {call}"
+        );
     }
 }

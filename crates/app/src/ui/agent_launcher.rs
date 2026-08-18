@@ -159,7 +159,6 @@ pub(crate) enum AgentLauncherIntent {
     },
     /// 카드 상시 토글 스위치가 올린다. leaf는 config를 직접 쓰지 않으므로 거부
     /// 목록 갱신·저장은 App(`crates/app/src/app.rs`)이 맡는다.
-    #[allow(dead_code)] // Task 3이 필드를 읽는다(거부 목록 갱신·config 저장) — 지금은 `{ .. }`로만 받는다
     SetAgentEnabled {
         kind: AgentKind,
         enabled: bool,
@@ -1427,6 +1426,47 @@ mod tests {
         match harness.state().intents.as_slice() {
             [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
                 assert_eq!(*kind, AgentKind::Kimi);
+                assert!(!enabled);
+            }
+            _ => panic!("expected exactly one SetAgentEnabled(false) intent"),
+        }
+    }
+
+    #[test]
+    fn kittest_다른_카드의_스위치를_꺼도_기존_선택은_유지된다() {
+        use egui_kittest::kittest::Queryable;
+
+        // 스위치 클릭이 카드 본문 클릭도 함께 발화시키는 회귀가 생기면, 꺼지는 카드가
+        // `select(kind)`로 먼저 선택됐다가 곧바로 토글 분기가 그 선택을 지운다. 그런데
+        // 위 두 테스트 — (선택 안 된 카드를 끄기) · (지금 선택된 카드를 끄기) — 는 둘 다
+        // 최종 상태가 우연히 일치해 이 회귀를 못 잡는다. 여기서는 A가 선택된 채로
+        // **다른, 켜져 있는** B의 스위치를 꺼서 — 우선순위가 깨지면 B가 잠깐 선택됐다가
+        // 토글 분기가 그걸 지워 `selected`가 `None`이 되고, 우선순위가 정상이면 A 선택은
+        // 전혀 손대지 않는다.
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let detected = snapshot(&[AgentKind::Claude, AgentKind::Codex]);
+        let mut harness =
+            agent_list_harness(&catalog, &detected, Vec::new(), Some(AgentKind::Claude));
+
+        let card_b = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, AgentKind::Codex.label());
+        // 스위치 위치는 `agent_card`의 `switch_rect` 계산과 같다 — 카드 오른쪽 끝에서
+        // 12px 안쪽, 폭 31px 스위치의 중심.
+        let pos = egui::pos2(
+            card_b.rect().right() - 12.0 - 31.0 / 2.0,
+            card_b.rect().center().y,
+        );
+
+        click_at(&mut harness, pos);
+
+        assert_eq!(
+            harness.state().ui.selected,
+            Some(AgentKind::Claude),
+            "다른 카드의 스위치를 꺼도 기존 선택(A)이 유지돼야 한다"
+        );
+        match harness.state().intents.as_slice() {
+            [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
+                assert_eq!(*kind, AgentKind::Codex);
                 assert!(!enabled);
             }
             _ => panic!("expected exactly one SetAgentEnabled(false) intent"),

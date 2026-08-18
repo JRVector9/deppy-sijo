@@ -5276,7 +5276,7 @@ impl WorkspaceUi {
                 // 앵커는 아래 `dragged()` 분기가 스냅샷 도착 시 `shift_selection_cell`로
                 // 보정하므로, 여기서는 해제만 피하면 된다.
                 let keep = wheel_scroll_keeps_selection(
-                    ui.input(|i| i.pointer.primary_down()),
+                    output.response.dragged(),
                     self.selection.is_some_and(|(s, _, _)| s == session),
                 );
                 let command = RuntimeCommand::Scroll { session, delta: whole_rows };
@@ -6323,11 +6323,19 @@ fn drag_autoscroll_rate(pointer_y: f32, top: f32, bottom: f32, cell_h: f32) -> f
 /// 처음부터 다시 잡아야 한다(2026-08-18 사용자 요청). 포인터를 pane 밖으로 밀어내는
 /// 기존 오토스크롤(`drag_autoscroll_rate`)과 같은 목적이고, 휠은 그보다 정밀하다.
 ///
-/// 판정은 **버튼이 눌린 상태 + 그 세션의 선택이 살아 있음**이다. `Response::dragged()`를
-/// 쓰지 않는 이유는 포인터가 멈춰 있는 프레임에 false가 되어, 가만히 둔 채 휠만 굴리는
-/// 바로 그 동작에서 선택이 풀리기 때문이다.
-fn wheel_scroll_keeps_selection(primary_down: bool, selection_on_session: bool) -> bool {
-    primary_down && selection_on_session
+/// 판정은 **드래그 중 + 그 세션의 선택이 살아 있음**이다.
+///
+/// `Response::dragged()`를 쓴다. 처음엔 "포인터가 멈춘 프레임엔 false가 된다"고 보고
+/// `pointer.primary_down()`을 썼는데 **그건 사실이 아니다** — egui 0.35의
+/// `interaction.rs`는 이전 프레임 값을 물려받고 릴리즈/Escape에서만 초기화하므로,
+/// 버튼을 누른 채 가만히 있어도 `dragged()`는 계속 true다(2026-08-18 리뷰가 egui 단독
+/// 프로젝트로 실측). 오히려 `primary_down`이 **더 넓어서** 문제였다 — 누른 직후
+/// 클릭/드래그 판정 유예 구간에도 참이라, 아래 `dragged()` 분기(앵커를 보정하는 그
+/// 분기)가 아직 안 도는데 스크롤만 나가 한 순간 화면이 안 따라오는 창이 생긴다.
+///
+/// 즉 **스크롤을 보존해 보내는 조건과 앵커를 보정하는 조건이 같아야** 어긋나지 않는다.
+fn wheel_scroll_keeps_selection(dragging: bool, selection_on_session: bool) -> bool {
+    dragging && selection_on_session
 }
 
 /// 스크롤로 화면이 delta_rows행 이동했을 때(양수=과거로 → 내용이 아래로 이동)
@@ -11321,7 +11329,8 @@ https://example.test/login \
     /// 한 화면을 넘는 범위를 이어 잡을 수 있다(2026-08-18 사용자 요청).
     #[test]
     fn 휠은_드래그_중에만_선택을_보존한다() {
-        // 버튼을 누른 채 그 세션의 선택이 살아 있을 때만 보존한다.
+        // 드래그 중이고 그 세션의 선택이 살아 있을 때만 보존한다. 조건이 앵커를 보정하는
+        // `dragged()` 분기와 **같아야** 스크롤과 선택이 어긋나지 않는다.
         assert!(wheel_scroll_keeps_selection(true, true), "드래그 중이면 보존");
         // 버튼을 뗀 뒤의 휠은 기존대로 해제한다 — 안 그러면 선택이 남아 화면이 멈춘 듯 보인다.
         assert!(!wheel_scroll_keeps_selection(false, true), "드래그가 아니면 해제");

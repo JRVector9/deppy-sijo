@@ -465,7 +465,6 @@ pub(crate) fn normalize_disabled_agents(raw: &[String]) -> Vec<String> {
 }
 
 /// 거부 목록에 없으면 켜진 것이다 — 빈 목록이면 전부 켜짐.
-#[allow(dead_code)] // Task 2~3이 부른다(런처 카드 표시·사용량 바 필터링)
 pub(crate) fn agent_is_enabled(disabled: &[String], kind: AgentKind) -> bool {
     !disabled.iter().any(|id| id == kind.id())
 }

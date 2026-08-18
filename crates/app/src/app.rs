@@ -19052,6 +19052,9 @@ impl App {
                         .report_error(ui::agent_launcher::LauncherErrorCode::LaunchBusy);
                 }
             }
+            // 실제 배선(거부 목록 갱신·config 저장·사용량 바 필터링)은 Task 3.
+            // 지금은 컴파일을 지키는 최소 no-op이다.
+            ui::agent_launcher::AgentLauncherIntent::SetAgentEnabled { .. } => {}
         }
     }
 
@@ -26265,6 +26268,8 @@ impl eframe::App for App {
                 self.agent_launcher_snapshot.as_ref(),
                 self.agent_launcher_detection_in_flight,
                 &text,
+                // Task 2는 카드 토글 leaf만 만든다 — 거부 목록 배선(저장·필터링)은 Task 3.
+                &[],
             )
         {
             self.pending_agent_launcher_intent = Some(intent);

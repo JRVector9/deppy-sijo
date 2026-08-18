@@ -1469,6 +1469,18 @@ fn signal_target(process_group: Option<libc::pid_t>, own: libc::pid_t) -> Option
     process_group.filter(|pgid| *pgid > 0 && *pgid != own)
 }
 
+/// `killpg` 실패가 **정상 종료의 흔적**인지 가른다.
+///
+/// `ESRCH`("No such process")는 그 프로세스 그룹이 이미 사라졌다는 뜻이다 — 자식이
+/// 스스로 끝난 뒤 Drop이 도는 흔한 경로에서 **항상** 나온다. 이걸 경고로 남기면
+/// 정상 동작이 장애처럼 보인다: `claude_usage`·`kimi_usage`가 60초마다 짧은 PTY로
+/// CLI를 읽고 버리므로 하루 1,440줄의 가짜 경고가 쌓였다(2026-08-19 사용자 로그).
+/// 나머지 errno(권한 문제인 `EPERM` 등)는 진짜 이상이라 경고로 남긴다.
+#[cfg(unix)]
+fn signal_failure_is_already_gone(errno: Option<i32>) -> bool {
+    errno == Some(libc::ESRCH)
+}
+
 impl PortablePtySession {
     /// Stop both workers without timers. The output queue cancellation covers a reader waiting for
     /// bounded capacity even when its receiver has been moved to the session crate; Unix self-pipes
@@ -1548,7 +1560,13 @@ impl PortablePtySession {
         // pgid는 식별자일 뿐 비밀이 아니라 로그에 남겨도 된다.
         if unsafe { libc::killpg(pgid, signal) } != 0 {
             let error = std::io::Error::last_os_error();
-            tracing::warn!(pgid, signal, "프로세스 그룹 신호 실패: {error}");
+            // 이미 사라진 그룹은 정상 경로다 — 등급만 낮추고 기록은 남긴다(2026-08-02의
+            // "성공 여부를 몰라 추적이 막혔다"를 되돌리지 않기 위해).
+            if signal_failure_is_already_gone(error.raw_os_error()) {
+                tracing::debug!(pgid, signal, "프로세스 그룹이 이미 종료됨: {error}");
+            } else {
+                tracing::warn!(pgid, signal, "프로세스 그룹 신호 실패: {error}");
+            }
         }
     }
 
@@ -2620,6 +2638,55 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         None
+    }
+
+    /// ESRCH만 "이미 사라진 그룹"으로 가른다 — 나머지 errno는 진짜 이상이라 경고를
+    /// 유지해야 한다(권한 문제인 EPERM을 조용히 삼키면 freeze 조사가 다시 막힌다).
+    #[test]
+    fn 이미_사라진_그룹만_경고에서_내린다() {
+        assert!(signal_failure_is_already_gone(Some(libc::ESRCH)));
+        assert!(!signal_failure_is_already_gone(Some(libc::EPERM)));
+        assert!(!signal_failure_is_already_gone(Some(libc::EINVAL)));
+        assert!(
+            !signal_failure_is_already_gone(None),
+            "errno가 없으면 알 수 없다"
+        );
+    }
+
+    /// 회귀 — 자식이 스스로 끝난 뒤 Drop이 도는 흔한 경로에서 killpg가 실제로 ESRCH를
+    /// 돌려주는지 고정한다. 이게 참이라야 위 분류가 "가짜 경고"를 정확히 겨냥한 것이다
+    /// (60초마다 도는 usage PTY가 하루 1,440줄을 남겼다, 2026-08-19 사용자 로그).
+    #[test]
+    fn 정상_종료한_세션의_그룹은_esrch를_돌려준다() {
+        let mut session = spawn("/bin/sh", &["-c", "exit 0"]);
+        let pgid = session
+            .process_identity()
+            .process_group
+            .expect("spawn 시점에 프로세스 그룹을 잡아야 한다");
+        assert_eq!(
+            wait_exit(&mut session, Duration::from_secs(5)),
+            Some(0),
+            "자식이 스스로 끝나야 한다"
+        );
+        // 자식이 reap될 때까지 잠깐 기다린다 — 좀비인 동안은 그룹이 아직 살아 있다.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut errno = None;
+        while Instant::now() < deadline {
+            if unsafe { libc::killpg(pgid as libc::pid_t, 0) } != 0 {
+                errno = std::io::Error::last_os_error().raw_os_error();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            errno,
+            Some(libc::ESRCH),
+            "정상 종료한 그룹은 ESRCH여야 한다"
+        );
+        assert!(
+            signal_failure_is_already_gone(errno),
+            "이 경로가 경고가 아니라 debug로 내려가야 한다"
+        );
     }
 
     #[test]

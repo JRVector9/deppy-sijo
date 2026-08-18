@@ -2914,7 +2914,7 @@ mod tests {
         latencies.sort();
         let median = latencies[latencies.len() / 2];
         assert!(
-            median < Duration::from_millis(1_900),
+            median < Duration::from_micros(1_900),
             "고립 echo 중앙값이 옛 coalesce 대기(2ms)만큼 지연됨: {latencies:?}",
         );
         session.kill().unwrap();

@@ -18,6 +18,13 @@ use crate::config::TerminalConfig;
 
 /// 경로 해석 캐시 TTL. 실제 filesystem/process 조회는 App host가 수행한다.
 const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// 창(pane) 리사이즈 드래그 중 PTY resize를 보내기 전에 목표 크기가 안정될 때까지
+/// 기다리는 디바운스 시간. 드래그 중에는 매 프레임 avail 크기가 바뀌어 목표 cols/rows도
+/// 계속 바뀌는데, 그때마다 그대로 PTY에 보내면 alacritty가 매번 실제로 grid를 reflow하고
+/// 자식 프로세스에 SIGWINCH를 보내 화면을 다시 그리게 만든다 — 드래그 중 화면이 계속
+/// 다시 그려지는 것이 사용자에게 깜빡임으로 보인다(2026-08-18 사용자 보고). 목표가 이
+/// 시간만큼 안 바뀌어야 그 순간의 최종 목표를 정확히 한 번 보낸다.
+const RESIZE_DRAG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 const WORKSPACE_IO_QUEUE_CAP: usize = 1;
 const WORKSPACE_PATH_MAX_BYTES: usize = 32 * 1024;
 const WORKSPACE_URL_MAX_BYTES: usize = 32 * 1024;
@@ -1361,6 +1368,11 @@ pub struct WorkspaceUi {
     last_native_paste: Option<std::time::Instant>,
     /// 세션별 마지막 전송한 (cols, rows) — 변화 시에만 Resize 전송
     sent_sizes: HashMap<SessionId, (u16, u16)>,
+    /// 세션별 「아직 확정되지 않은」 resize 목표 — (cols, rows, 그 목표가 안정되기 시작한 시각).
+    /// 창 드래그로 pane 크기가 프레임마다 바뀌는 동안 목표도 프레임마다 바뀌므로 계속
+    /// 갱신되고, RESIZE_DRAG_DEBOUNCE만큼 같은 목표가 유지돼야 비로소 전송된다
+    /// (queue_terminal_resize_debounced 참고).
+    pending_resize_target: HashMap<SessionId, (u16, u16, std::time::Instant)>,
     /// 트랙패드 미세 스크롤 누적 (focused pane 기준)
     scroll_residual: f32,
     /// 드래그 선택 오토스크롤 행 누적 — 경계 초과 속도(행/초)×dt의 소수부 보관 (T4)
@@ -1797,6 +1809,7 @@ impl WorkspaceUi {
             paste_suppressed: false,
             copy_suppressed: false,
             sent_sizes: HashMap::new(),
+            pending_resize_target: HashMap::new(),
             scroll_residual: 0.0,
             drag_autoscroll_residual: 0.0,
             command_sent: false,
@@ -2002,6 +2015,57 @@ impl WorkspaceUi {
             .is_ok()
         {
             self.sent_sizes.insert(session, (cols, rows));
+        }
+    }
+
+    /// `queue_terminal_resize`의 디바운스 래퍼 — pane 렌더 호출부는 매 프레임 이걸 부른다.
+    ///
+    /// 이 세션에 대한 **첫 mismatch**(세션 생성, split 등 1회성 변경)는 지연 없이 즉시
+    /// 보낸다 — 기존 동작과 동일하고, 이 경로에 걸리는 대다수 테스트/시나리오가 지연을
+    /// 겪지 않는다. 그 뒤 **연속으로 목표가 또 바뀌면**(=창 드래그로 avail이 프레임마다
+    /// 바뀌는 중) 그때부터 전송을 미루고 `pending_resize_target`에 목표만 갱신한다 —
+    /// 그러지 않으면 매 중간 크기마다 PTY가 실제로 reflow하고 자식 프로세스가 SIGWINCH로
+    /// 화면을 다시 그려 드래그 내내 깜빡인다. 같은 목표가 `RESIZE_DRAG_DEBOUNCE`만큼
+    /// 유지되면(=드래그가 그 크기에서 멈췄다) 그제서야 한 번 더 보낸다.
+    ///
+    /// 드래그가 끝나 더 이상 새 프레임이 오지 않아도 최종 목표가 유실되지 않도록, 목표를
+    /// 갱신할 때마다 `request_repaint_after`로 debounce 만료 시점에 다시 확인하러 오는
+    /// repaint를 예약한다 — 그 시점에 다른 입력이 전혀 없어도 이 경로가 다시 실행된다.
+    fn queue_terminal_resize_debounced(
+        &mut self,
+        ctx: &egui::Context,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    ) {
+        if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
+            self.pending_resize_target.remove(&session);
+            return;
+        }
+        let now = std::time::Instant::now();
+        match self.pending_resize_target.get(&session).copied() {
+            None => {
+                // 첫 mismatch — 지연 없이 즉시 보낸다. 이후 프레임에서 목표가 또 바뀌면
+                // (아래 Some(_) 분기) 그때부터 디바운스가 걸린다.
+                self.pending_resize_target.insert(session, (cols, rows, now));
+                self.queue_terminal_resize(session, cols, rows);
+            }
+            Some((pending_cols, pending_rows, since)) if (pending_cols, pending_rows) == (cols, rows) => {
+                // 직전과 같은 목표 — 안정 여부만 판정한다.
+                let elapsed = now.duration_since(since);
+                if elapsed < RESIZE_DRAG_DEBOUNCE {
+                    ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE - elapsed);
+                    return;
+                }
+                self.pending_resize_target.remove(&session);
+                self.queue_terminal_resize(session, cols, rows);
+            }
+            Some(_) => {
+                // 목표가 직전 프레임과 또 달라졌다 — 드래그가 계속되는 중. 디바운스
+                // 시계를 새로 시작한다(전송하지 않는다).
+                self.pending_resize_target.insert(session, (cols, rows, now));
+                ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE);
+            }
         }
     }
 
@@ -2827,6 +2891,7 @@ impl WorkspaceUi {
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
+                    self.pending_resize_target.retain(|id, _| alive.contains(id));
                     self.session_project_names =
                         self.session_project_names.retain_live_sessions(&alive);
                     self.last_output_copy_pending
@@ -4728,7 +4793,10 @@ impl WorkspaceUi {
         let cols =
             ((renderer_egui::grid_width_for_available(avail.x) / cell.x) as u16).clamp(10, 500);
         let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y);
-        self.queue_terminal_resize(session, cols, rows);
+        // 창 드래그로 avail이 프레임마다 바뀌는 동안 cols/rows도 매 프레임 바뀐다 — 그대로
+        // 보내면 드래그 내내 PTY가 매번 reflow하며 화면이 깜빡인다. 디바운스 래퍼가 목표가
+        // 안정될 때까지 기다렸다가 한 번만 보낸다(최종 크기는 request_repaint_after로 보장).
+        self.queue_terminal_resize_debounced(ui.ctx(), session, cols, rows);
 
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
         let (exit_code, bracketed, restored_readonly, snapshot) = {
@@ -10724,6 +10792,74 @@ mod tests {
             RuntimeCommand::WriteInput { bytes, .. }
                 if bytes.len() == WORKSPACE_PROTOCOL_INPUT_MAX_BYTES
                     && bytes.last() == Some(&b'b')
+        ));
+    }
+
+    /// 창 드래그 재현 — 세션의 첫 크기는 지연 없이 즉시 나가지만(세션 생성/split과 동일
+    /// 취급), 그 뒤로 목표가 프레임마다 계속 바뀌는 동안(=드래그 진행 중)은 어떤 중간
+    /// 크기도 PTY에 전송되면 안 된다(전송되면 매 중간 크기마다 alacritty가 reflow하며
+    /// 화면이 깜빡인다). 목표가 안정된 뒤 debounce가 지나야 그 최종 크기 하나만 더
+    /// 전송된다.
+    #[test]
+    fn 리사이즈_드래그_중_중간_크기는_보내지_않고_안정된_최종크기만_한번_보낸다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(11);
+        let ctx = egui::Context::default();
+
+        // pane이 처음 나타날 때의 크기 — 첫 mismatch는 지연 없이 바로 나간다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        drain_protocol(&mut ui);
+
+        // 드래그 시작 — 프레임마다 다른 목표. 직전 전송값(80,24)과 달라 mismatch지만,
+        // 이미 한 번 보낸 뒤이므로 여기서부터는 debounce가 걸려야 한다(전송 안 됨).
+        for (cols, rows) in [(100u16, 30u16), (101, 30), (105, 32), (110, 33)] {
+            ui.queue_terminal_resize_debounced(&ctx, session, cols, rows);
+            assert_eq!(
+                ui.sent_sizes.get(&session),
+                Some(&(80, 24)),
+                "드래그가 안정되기 전에는 새 크기가 전송되면 안 된다"
+            );
+            assert!(
+                ui.protocol_intents.is_empty(),
+                "중간 크기가 큐에 들어가면 안 된다"
+            );
+        }
+
+        // 드래그 종료 — 마지막 목표(110, 33)로 안정된다. debounce가 지나기 전엔 여전히 보류.
+        ui.queue_terminal_resize_debounced(&ctx, session, 110, 33);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+
+        std::thread::sleep(RESIZE_DRAG_DEBOUNCE + std::time::Duration::from_millis(30));
+        // 실제 앱에서는 request_repaint_after가 예약한 repaint가 이 시점에 App::ui()를
+        // 다시 불러 이 경로를 재실행시킨다 — 여기서는 그 프레임을 직접 흉내낸다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 110, 33);
+
+        assert_eq!(
+            ui.sent_sizes.get(&session),
+            Some(&(110, 33)),
+            "드래그가 끝나면 최종 크기가 반드시 전달돼야 한다"
+        );
+        assert!(matches!(
+            &drain_protocol(&mut ui)[0],
+            RuntimeCommand::Resize { session: s, cols: 110, rows: 33 } if *s == session
+        ));
+    }
+
+    /// 세션이 막 생기거나 split 직후처럼 크기가 한 번만 바뀌는 경우(드래그가 아님)는
+    /// 지연 없이 즉시 전송돼야 한다 — 모든 resize에 디바운스 지연을 강제하지 않는다.
+    #[test]
+    fn 세션_생성같은_단일_리사이즈는_지연_없이_즉시_전송된다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(12);
+        let ctx = egui::Context::default();
+
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        assert!(matches!(
+            &drain_protocol(&mut ui)[0],
+            RuntimeCommand::Resize { session: s, cols: 80, rows: 24 } if *s == session
         ));
     }
 

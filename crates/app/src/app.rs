@@ -14717,6 +14717,10 @@ impl App {
                             .send_command(runtime::RuntimeCommand::FocusPane { pane: pane.clone() })
                             .is_ok()
                     {
+                        // 어디로 갔는지 보이게 그 pane을 잠깐 강조한다(2026-08-18 사용자
+                        // 요청). **포커스에 성공한 이 분기에서만** — 아무 데도 안 갔는데
+                        // 번쩍이면 거짓말이다. 아래 else(실패)에서는 세우지 않는다.
+                        self.active.workspace_ui.flash_pane(&pane);
                         self.active.workspace_ui.arm_terminal_focus(pane);
                         self.reveal_terminal_session();
                     } else {
@@ -30184,6 +30188,35 @@ mod tests {
                 terminal_rect,
             ),
             previous
+        );
+    }
+
+    /// 세션 점프 강조는 **포커스에 성공한 분기에서만** 세운다 — 아무 데도 안 갔는데
+    /// 번쩍이면 거짓말이다(2026-08-18). 배선이라 순수 함수로 뽑을 수 없어 소스로 고정한다.
+    #[test]
+    fn 세션_점프_강조는_포커스_성공_경로에서만_세운다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        // `FocusSession {`은 **액션을 만드는 자리**에도 나온다 — 핸들러 본문의 고유한
+        // 첫 줄로 앵커를 잡는다(2026-08-18 실측).
+        let handler = production
+            .split_once("if workspace_id != self.active.id {")
+            .expect("FocusSession 핸들러가 있어야 한다")
+            .1;
+        let handler = handler
+            .split_once("\n            WorkspaceControllerAction::")
+            .expect("다음 arm이 있어야 한다")
+            .0;
+        let (success, failure) = handler
+            .split_once("} else {")
+            .expect("실패 분기(else)가 있어야 한다");
+        assert!(
+            success.contains("flash_pane("),
+            "성공 분기에서 강조를 세워야 한다"
+        );
+        assert!(
+            !failure.contains("flash_pane("),
+            "실패 분기에서는 강조하지 않는다 — 이동하지 않았는데 번쩍이면 안 된다"
         );
     }
 

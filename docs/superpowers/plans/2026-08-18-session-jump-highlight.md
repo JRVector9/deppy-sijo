@@ -30,7 +30,21 @@
 
 ---
 
-## 설계
+## 설계 — [2026-08-18 정정] 새 기구를 만들지 않는다
+
+**최초 계획은 새 강조 기구(`pane_highlight` + 세기 계산 + 렌더)를 만드는 것이었다. 그건
+잘못된 조사였다.** 이 저장소에는 이미 `WorkspaceUi::session_flash`가 있고, 포커스 이동
+(`FOCUS_FLASH`, 1.2초)과 상태 전이(`PANE_FLASH`)가 그걸 쓴다 — 만료 정리·렌더·repaint 예약이
+전부 갖춰져 있다. 새 기구를 두면 여러 pane 사이를 점프하는 **흔한 경우에 같은 pane에 같은
+길이의 테두리가 두 겹**으로 그려진다.
+
+진짜 공백은 하나였다 — `FOCUS_FLASH`는 `mux.focused_pane`이 **바뀔 때만** 뜨므로, 이미 보고
+있던 세션(특히 pane이 하나뿐인 워크스페이스)을 다시 눌러도 확인 신호가 없었다.
+
+**그래서 `WorkspaceUi::flash_pane(&pane)` 하나를 더해 기존 기구에 얹는다.** 아래 원래 설계는
+기록으로 남긴다.
+
+### 원래 설계 (폐기)
 
 - App이 `pane_highlight: Option<(runtime::MuxPaneId, std::time::Instant)>`를 소유한다.
   `WorkspaceControllerAction::FocusSession`이 **실제로 포커스에 성공한 경로**에서만 세운다

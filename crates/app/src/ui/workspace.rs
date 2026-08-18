@@ -1862,6 +1862,39 @@ impl WorkspaceUi {
         std::mem::take(&mut self.terminal_focus_claimed)
     }
 
+    /// 사이드바에서 세션 행을 눌러 그 pane으로 점프했을 때 **그 pane을 잠깐 강조**한다
+    /// (2026-08-18 사용자 요청: 어디로 갔는지 보이게).
+    ///
+    /// 새 강조 기구를 만들지 않고 이미 있는 `session_flash`에 얹는다 — 포커스 이동
+    /// (`FOCUS_FLASH`)과 상태 전이(`PANE_FLASH`)가 쓰는 바로 그 기구라 만료 정리·렌더·
+    /// repaint 예약이 전부 갖춰져 있다. 별도 기구를 두면 흔한 경우(여러 pane 사이 점프)에
+    /// **같은 pane에 같은 길이의 테두리가 두 겹**으로 그려진다.
+    ///
+    /// 이 진입점이 메우는 공백은 하나다 — `FOCUS_FLASH`는 `mux.focused_pane`이 **바뀔 때만**
+    /// 뜨므로, 이미 보고 있던 세션(특히 pane이 하나뿐인 워크스페이스)을 다시 누르면 아무
+    /// 확인 신호가 없었다. 여기서는 포커스가 바뀌든 말든 눌렀다는 사실 자체를 보여준다.
+    ///
+    /// pane에 세션이 없거나(연결 중) mux를 아직 못 받았으면 아무 일도 하지 않는다.
+    pub(crate) fn flash_pane(&mut self, pane: &runtime::MuxPaneId) {
+        let Some(session) = self
+            .mux
+            .as_ref()
+            .and_then(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .find(|candidate| &candidate.id == pane)
+            })
+            .and_then(|pane| pane.session_id)
+        else {
+            return;
+        };
+        self.session_flash.insert(
+            session,
+            (std::time::Instant::now() + FOCUS_FLASH, FOCUS_FLASH),
+        );
+    }
+
     /// App이 저장 세션 복원/전환을 시작할 때 정확한 pane을 다음 터미널 입력 대상으로
     /// 예약한다. 실제 egui focus 요청은 그 pane의 surface가 렌더되는 첫 프레임에 소비된다.
     pub(crate) fn arm_terminal_focus(&mut self, pane: runtime::MuxPaneId) {
@@ -9830,6 +9863,55 @@ mod tests {
                 Some(old),
             ));
         }
+    }
+
+    /// 세션 행 점프 강조는 **새 기구를 만들지 않고** 기존 `session_flash`에 얹는다.
+    /// 그래야 여러 pane 사이를 점프할 때 `FOCUS_FLASH`와 같은 pane에 테두리가 두 겹으로
+    /// 그려지지 않는다(2026-08-18).
+    #[test]
+    fn flash_pane은_그_pane의_세션을_기존_플래시_기구에_넣는다() {
+        let mut ws = WorkspaceUi::new();
+        let session = SessionId(7);
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        ws.apply_warm_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: mux(
+                    "t1",
+                    vec![tab("t1", vec![pane("p1", session)], LayoutNode::Pane(pane_id("p1")))],
+                    "p1",
+                ),
+            }],
+            &catalog,
+        );
+
+        // 포커스 변경으로 들어간 플래시가 있으면 이 테스트의 전제가 흐려진다 — 비우고 시작한다.
+        ws.session_flash.clear();
+        ws.flash_pane(&pane_id("p1"));
+        assert!(
+            ws.session_flash.contains_key(&session),
+            "점프한 pane의 세션에 플래시가 들어가야 한다"
+        );
+    }
+
+    #[test]
+    fn flash_pane은_모르는_pane이면_아무것도_하지_않는다() {
+        let mut ws = WorkspaceUi::new();
+        let session = SessionId(7);
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        ws.apply_warm_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: mux(
+                    "t1",
+                    vec![tab("t1", vec![pane("p1", session)], LayoutNode::Pane(pane_id("p1")))],
+                    "p1",
+                ),
+            }],
+            &catalog,
+        );
+
+        ws.session_flash.clear();
+        ws.flash_pane(&pane_id("없는pane"));
+        assert!(ws.session_flash.is_empty(), "모르는 pane은 무시한다");
     }
 
     fn tab_id(name: &str) -> MuxTabId {

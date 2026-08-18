@@ -4198,12 +4198,14 @@ mod tests {
             codex_llm_provider: Some("oss".to_owned()),
             codex_llm_base_url: None,
             codex_llm_wire: None,
+            disabled: Vec::new(),
         });
         assert_eq!(ui.llm_override, Ok(Some(CodexLlmOverride::Oss)));
         ui.sync_controller_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
             codex_llm_wire: None,
+            disabled: Vec::new(),
         });
         assert_eq!(
             ui.llm_override,
@@ -4217,6 +4219,7 @@ mod tests {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
             codex_llm_wire: Some("responses".to_owned()),
+            disabled: Vec::new(),
         });
         assert_eq!(
             ui.llm_override,
@@ -4230,6 +4233,7 @@ mod tests {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: None,
             codex_llm_wire: None,
+            disabled: Vec::new(),
         });
         assert!(ui.llm_override.is_err());
     }
@@ -4241,6 +4245,7 @@ mod tests {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: None,
             codex_llm_wire: None,
+            disabled: Vec::new(),
         });
         let ctx = egui::Context::default();
         let error = ui.ensure_client(&ctx).unwrap_err();
@@ -4421,6 +4426,7 @@ mod tests {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
             codex_llm_wire: None,
+            disabled: Vec::new(),
         });
         let ctx = egui::Context::default();
         let error = ui.ensure_client(&ctx).unwrap_err();

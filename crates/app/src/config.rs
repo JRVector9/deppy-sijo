@@ -144,6 +144,12 @@ pub struct AgentsConfig {
     /// (내장 변환 프록시 경유, 기본), "responses" = /v1/responses 직결.
     /// 미지값은 로드 시 None으로 정규화.
     pub codex_llm_wire: Option<String>,
+    /// 사용자가 런처에서 끈 에이전트 id("claude"|"codex"|"kimi" 등, `agent_launcher::AgentKind::id`
+    /// 기준). 탐지 결과가 아니라 취향이다 — 설치돼 있어도 여기 있으면 목록·사용량에 권하지
+    /// 않는다. 미지 id는 로드 시 버린다(이전/이후 버전 config와 호환, `codex_llm_provider`와
+    /// 같은 로드 정규화 관례).
+    #[serde(default)]
+    pub disabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -537,6 +543,8 @@ impl Config {
         {
             self.agents.codex_llm_wire = None;
         }
+        // 거부 목록도 같은 관례: TOML을 손으로 고쳐 넣은 미지 id·중복을 로드 경계에서 버린다.
+        self.agents.disabled = crate::agent_launcher::normalize_disabled_agents(&self.agents.disabled);
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -973,6 +981,32 @@ mod tests {
             Some("http://localhost:11434/v1")
         );
         assert_eq!(c.agents.codex_llm_wire.as_deref(), Some("chat"));
+    }
+
+    #[test]
+    fn agents_거부_목록은_비어있는_기본값이고_roundtrip된다() {
+        assert!(Config::default().agents.disabled.is_empty());
+        let mut c = Config::default();
+        c.agents.disabled = vec!["claude".to_owned(), "kimi".to_owned()];
+        let text = toml::to_string_pretty(&c).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, c);
+    }
+
+    #[test]
+    fn agents_거부_목록의_미지_id와_중복은_로드_정규화에서_버려진다() {
+        let mut c = Config::default();
+        c.agents.disabled = vec![
+            "kimi".to_owned(),
+            "kimi".to_owned(),
+            "없는에이전트".to_owned(),
+            "claude".to_owned(),
+        ];
+        c.normalize();
+        assert_eq!(
+            c.agents.disabled,
+            vec!["claude".to_owned(), "kimi".to_owned()]
+        );
     }
 
     #[test]

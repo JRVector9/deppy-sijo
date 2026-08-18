@@ -449,6 +449,27 @@ pub(crate) fn is_builtin_config_id(id: &str) -> bool {
     AgentKind::from_stable_config_id(id).is_some()
 }
 
+/// 사용자가 런처에서 끈 에이전트 거부 목록을 정규화한다: 미지 id 제거 + 중복 제거 +
+/// 안정 정렬(id 문자열 오름차순). 미지 id를 걸러내고 중복을 접으므로 결과 길이는
+/// `AgentKind::ALL` 개수를 자연히 넘지 않는다. `config::Config::normalize`(로드 경계)와
+/// 저장 양쪽에서 쓴다.
+pub(crate) fn normalize_disabled_agents(raw: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = raw
+        .iter()
+        .filter(|id| AgentKind::ALL.into_iter().any(|kind| kind.id() == id.as_str()))
+        .cloned()
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// 거부 목록에 없으면 켜진 것이다 — 빈 목록이면 전부 켜짐.
+#[allow(dead_code)] // Task 2~3이 부른다(런처 카드 표시·사용량 바 필터링)
+pub(crate) fn agent_is_enabled(disabled: &[String], kind: AgentKind) -> bool {
+    !disabled.iter().any(|id| id == kind.id())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReasoningEffort {
     Low,
@@ -1026,6 +1047,29 @@ fn valid_executable_string(path: &Path) -> Result<String, LaunchSpecErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 거부_목록은_미지_id와_중복을_버린다() {
+        let raw = vec![
+            "kimi".into(),
+            "kimi".into(),
+            "없는에이전트".into(),
+            "claude".into(),
+        ];
+        assert_eq!(
+            normalize_disabled_agents(&raw),
+            vec!["claude".to_owned(), "kimi".to_owned()]
+        );
+        assert!(normalize_disabled_agents(&[]).is_empty());
+    }
+
+    #[test]
+    fn 거부_목록에_없으면_켜진_것이다() {
+        let disabled = vec!["kimi".to_owned()];
+        assert!(!agent_is_enabled(&disabled, AgentKind::Kimi));
+        assert!(agent_is_enabled(&disabled, AgentKind::Claude));
+        assert!(agent_is_enabled(&[], AgentKind::Kimi), "빈 목록이면 전부 켜짐");
+    }
 
     fn detected(kind: AgentKind) -> DetectedAgent {
         DetectedAgent {

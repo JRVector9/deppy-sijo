@@ -11168,7 +11168,10 @@ mod tests {
 
         let ko = i18n::Catalog::load("ko-KR").unwrap();
         let message = ko.t("workspace.protocol_request_lost", &[]);
-        assert_ne!(message, "workspace.protocol_request_lost", "키가 아니라 실제 문구여야 한다");
+        assert_ne!(
+            message, "workspace.protocol_request_lost",
+            "키가 아니라 실제 문구여야 한다"
+        );
         assert!(
             !message.is_ascii(),
             "한국어 배너여야 한다 (영어 원문 그대로 노출 금지): {message}"

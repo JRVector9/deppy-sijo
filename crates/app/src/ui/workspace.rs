@@ -2047,23 +2047,36 @@ impl WorkspaceUi {
             None => {
                 // 첫 mismatch — 지연 없이 즉시 보낸다. 이후 프레임에서 목표가 또 바뀌면
                 // (아래 Some(_) 분기) 그때부터 디바운스가 걸린다.
-                self.pending_resize_target.insert(session, (cols, rows, now));
+                self.pending_resize_target
+                    .insert(session, (cols, rows, now));
                 self.queue_terminal_resize(session, cols, rows);
             }
-            Some((pending_cols, pending_rows, since)) if (pending_cols, pending_rows) == (cols, rows) => {
+            Some((pending_cols, pending_rows, since))
+                if (pending_cols, pending_rows) == (cols, rows) =>
+            {
                 // 직전과 같은 목표 — 안정 여부만 판정한다.
                 let elapsed = now.duration_since(since);
                 if elapsed < RESIZE_DRAG_DEBOUNCE {
                     ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE - elapsed);
                     return;
                 }
-                self.pending_resize_target.remove(&session);
                 self.queue_terminal_resize(session, cols, rows);
+                // 전송이 **성사됐을 때만** 보류를 지운다. 프로토콜 큐가 가득 차
+                // queue_terminal_resize가 삼켜버린 경우 보류를 지우면 다음 프레임이
+                // None 분기로 떨어져 즉시 재전송하고, 그 실패가 다시 이 분기로 와서
+                // 120ms짜리 repaint 예약을 무한히 갱신한다 — 큐가 계속 막혀 있으면
+                // 앱이 영영 유휴 상태로 못 내려간다. 보류를 남겨 두면 elapsed가 계속
+                // 만료 상태라 repaint를 예약하지 않고, 자연히 발생하는 프레임에서만
+                // 재시도한다(디바운스 도입 전과 같은 재시도 성격).
+                if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
+                    self.pending_resize_target.remove(&session);
+                }
             }
             Some(_) => {
                 // 목표가 직전 프레임과 또 달라졌다 — 드래그가 계속되는 중. 디바운스
                 // 시계를 새로 시작한다(전송하지 않는다).
-                self.pending_resize_target.insert(session, (cols, rows, now));
+                self.pending_resize_target
+                    .insert(session, (cols, rows, now));
                 ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE);
             }
         }
@@ -2891,7 +2904,8 @@ impl WorkspaceUi {
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
-                    self.pending_resize_target.retain(|id, _| alive.contains(id));
+                    self.pending_resize_target
+                        .retain(|id, _| alive.contains(id));
                     self.session_project_names =
                         self.session_project_names.retain_live_sessions(&alive);
                     self.last_output_copy_pending
@@ -10861,6 +10875,63 @@ mod tests {
             &drain_protocol(&mut ui)[0],
             RuntimeCommand::Resize { session: s, cols: 80, rows: 24 } if *s == session
         ));
+    }
+
+    /// 디바운스 만료 시점에 프로토콜 큐가 가득 차 전송이 삼켜지면 **보류를 지우면 안 된다**.
+    /// 지우면 다음 프레임이 None 분기로 떨어져 즉시 재전송하고, 그 실패가 다시 디바운스
+    /// 분기로 와서 repaint 예약을 무한히 갱신한다 — 큐가 계속 막혀 있는 동안 앱이 영영
+    /// 유휴로 못 내려간다. 보류가 남아 있으면 elapsed가 만료 상태로 고정돼 repaint를
+    /// 예약하지 않고, 자연히 오는 프레임에서만 재시도한다.
+    #[test]
+    fn 큐가_막혀_전송이_삼켜지면_보류를_남겨_repaint_루프를_만들지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(13);
+        let ctx = egui::Context::default();
+
+        // 첫 크기는 즉시 나간다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        drain_protocol(&mut ui);
+
+        // 목표가 바뀐다 — 여기서부터 디바운스가 걸린다(전송 안 됨).
+        ui.queue_terminal_resize_debounced(&ctx, session, 100, 30);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+
+        // 디바운스가 만료되기 전에 큐를 가득 채운다.
+        for delta in 1..=WORKSPACE_PROTOCOL_CAP {
+            assert_eq!(
+                ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                    session: SessionId(1000 + delta as u64),
+                    delta: 1,
+                }),
+                Ok(())
+            );
+        }
+        std::thread::sleep(RESIZE_DRAG_DEBOUNCE + std::time::Duration::from_millis(30));
+
+        // 만료 후 전송 시도 — 큐가 가득 차 삼켜진다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 100, 30);
+        assert_eq!(
+            ui.sent_sizes.get(&session),
+            Some(&(80, 24)),
+            "큐가 가득 차면 전송되지 않는다"
+        );
+        assert_eq!(
+            ui.pending_resize_target
+                .get(&session)
+                .map(|(cols, rows, _)| (*cols, *rows)),
+            Some((100, 30)),
+            "전송이 삼켜졌으면 보류가 남아야 한다"
+        );
+
+        // 큐가 풀리면 자연히 오는 다음 프레임에서 최종 크기가 전달된다.
+        drain_protocol(&mut ui);
+        ui.queue_terminal_resize_debounced(&ctx, session, 100, 30);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(100, 30)));
+        assert!(
+            !ui.pending_resize_target.contains_key(&session),
+            "전송이 성사되면 보류가 사라진다"
+        );
     }
 
     #[test]

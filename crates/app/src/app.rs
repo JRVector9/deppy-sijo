@@ -31950,6 +31950,13 @@ mod tests {
             squeeze_ws(history_body).contains("presentations, text, filter"),
             "카드 목록 필터는 aux_search에서 뽑은 filter를 써야 한다(고정 빈 문자열이면 안 된다)"
         );
+        // 수신자와 인자를 나눠 본다 — 한 덩어리로 붙이면 rustfmt가 `self.x` 다음에서
+        // 접을 때 사이에 공백이 끼어 접힘 여부에 따라 매치가 갈린다. 나누면 접히든
+        // 펴지든 둘 다 통과하면서 "그 뷰어가 그 인자로 불린다"는 계약은 그대로 지킨다.
+        assert!(
+            squeeze_ws(history_body).contains("self.transcript_viewer_ui"),
+            "원문 뷰어를 그리는 주체가 transcript_viewer_ui여야 한다"
+        );
         assert!(
             squeeze_ws(history_body).contains(".render(&mut transcript, text, search);"),
             "원문 뷰어는 aux_search에서 뽑은 search를 써야 한다"

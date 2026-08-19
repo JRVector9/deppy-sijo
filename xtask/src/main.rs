@@ -537,6 +537,13 @@ fn check_i18n_key_coverage() -> anyhow::Result<()> {
 
     for path in rust_files_under(&root.join("crates"))? {
         let rel = rel_path(&root, &path)?;
+        // `crates/*/tests/` 아래는 통합 테스트 바이너리다 — 관례상 `#[cfg(test)]` 없이
+        // 맨 `#[test]`를 쓰므로 `top_level_item_is_test_only` 제외에 걸리지 않는다.
+        // 지금은 i18n 키를 쓰는 파일이 없지만, 가짜 키를 쓰는 통합 테스트가 하나라도
+        // 생기면 그 즉시 오탐으로 게이트가 무너진다(2026-08-19 코드 리뷰).
+        if rel.contains("/tests/") {
+            continue;
+        }
         let source = std::fs::read_to_string(&path).with_context(|| format!("{rel} 읽기 실패"))?;
         let (literal, dynamic) =
             check_i18n_key_coverage_source(&rel, &source, &locales, &mut violations)?;
@@ -616,7 +623,11 @@ struct ExtractedI18nKeys {
 fn extract_i18n_key_calls(compact: &str) -> ExtractedI18nKeys {
     let mut literal = Vec::new();
     let mut dynamic = 0usize;
-    for prefix in [".t(", "MessagePayload::new("] {
+    // 키를 **인자로 받는** 헬퍼도 여기 등록해야 한다. 등록하지 않으면 그 키는 리터럴로도
+    // 동적으로도 세지 않아 **가드에서 통째로 보이지 않는다** — "OK"라고 말하면서 놓친다
+    // (2026-08-19 코드 리뷰: `sanitized_spawn_failure`가 정확히 그랬다). 새 헬퍼를 만들면
+    // 여기 추가하거나, 키를 `MessagePayload::new(` 옆에 그대로 두어라.
+    for prefix in [".t(", "MessagePayload::new(", "sanitized_spawn_failure("] {
         let mut rest = compact;
         while let Some(idx) = rest.find(prefix) {
             let after = &rest[idx + prefix.len()..];

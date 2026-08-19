@@ -22,7 +22,10 @@
 //!   Connector failure taxonomy 전체를 deterministic exact test에 1:1로 연결한다.
 //!
 //! `cargo run -p xtask -- i18n-check`
-//!   필수 locale key completeness, fallback, CJK path, layout smoke tests를 실행한다.
+//!   필수 locale key completeness, fallback, CJK path, layout smoke tests를 실행하고,
+//!   `crates/` 전역에서 코드가 참조하는 리터럴 i18n 키가 5개 로케일 전부에 있는지도
+//!   대조한다(로케일 "간" 짝맞춤만으로는 5개 로케일 모두에 없는 키를 못 잡는다 —
+//!   docs/superpowers/specs/2026-08-19-i18n-key-guard.md 참고).
 //!
 //! `cargo run -p xtask -- bg01-deterministic-gate`
 //!   하드웨어 실측, trusted-signing 실행, 실제 외부 계정 smoke를 제외한 BG01 production
@@ -499,8 +502,181 @@ fn i18n_check() -> anyhow::Result<()> {
         "deppy-sijo",
         "status_알림은_message_id를_저장한다",
     ])?;
+    // `cargo test -p i18n`의 `required_locales_have_complete_keys`는 로케일 "간" 키
+    // 짝맞춤만 본다 — 5개 로케일 모두에 똑같이 없는 키(예: 코드가 쓰는데 어느 로케일
+    // 파일에도 안 채워진 키)는 "일치"라서 통과해 버린다. 그 결과 화면에 키 문자열이
+    // 그대로 노출되는 사고가 났다(runtime.spawn_failed.invalid_command 등). 아래 검사가
+    // "코드가 실제로 참조하는 키가 로케일에 있는지"를 직접 대조해 그 구멍을 메운다.
+    check_i18n_key_coverage()?;
     println!("i18n-check OK");
     Ok(())
+}
+
+/// `crates/` 전역에서 `catalog.t("key", ...)` / `MessagePayload::new("key")`로 참조하는
+/// **리터럴** 키가 5개 로케일(`crates/i18n/locales/*`) 전부에 실제로 있는지 대조한다.
+///
+/// 정적으로 못 잡는 범위(`extract_i18n_key_calls` 문서 참고): `format!()`로 조립한 키,
+/// `xxx_key()` 헬퍼가 반환하는 키, match 팔에서 고른 상수 키. 그런 호출은 "dynamic"으로
+/// 개수만 센다 — 못 잡는다는 사실을 숨기지 않는다. 실측치와 상세는
+/// `docs/superpowers/specs/2026-08-19-i18n-key-guard.md` 참고.
+///
+/// 테스트 코드의 가짜 키(예: 워크스페이스 spawn 재현용 `"shell.failed"`, `format!("agent.failed.{idx}")`)가
+/// 오탐을 만들지 않도록, `check_leaf_semantic_boundary`와 같은 규칙으로 최상위 아이템의
+/// `#[cfg(test)]`를 그대로 제외한다.
+fn check_i18n_key_coverage() -> anyhow::Result<()> {
+    let root = workspace_root()?;
+    let locales = locale_key_sets(&root)?;
+    anyhow::ensure!(
+        !locales.is_empty(),
+        "crates/i18n/locales 아래에 로케일이 없습니다"
+    );
+
+    let mut violations = Vec::new();
+    let mut literal_total = 0usize;
+    let mut dynamic_total = 0usize;
+
+    for path in rust_files_under(&root.join("crates"))? {
+        let rel = rel_path(&root, &path)?;
+        let source = std::fs::read_to_string(&path).with_context(|| format!("{rel} 읽기 실패"))?;
+        let (literal, dynamic) =
+            check_i18n_key_coverage_source(&rel, &source, &locales, &mut violations)?;
+        literal_total += literal;
+        dynamic_total += dynamic;
+    }
+
+    if violations.is_empty() {
+        println!(
+            "i18n key coverage OK — 리터럴 키 호출 {literal_total}건을 로케일 {}개와 대조; \
+             정적으로 못 잡는 동적 키 호출 {dynamic_total}건(docs/superpowers/specs/2026-08-19-i18n-key-guard.md 참고)",
+            locales.len()
+        );
+        Ok(())
+    } else {
+        violations.sort();
+        violations.dedup();
+        for violation in &violations {
+            eprintln!("VIOLATION: {violation}");
+        }
+        bail!("i18n key coverage 실패: {}건", violations.len());
+    }
+}
+
+/// 소스 하나의 production 영역(`#[cfg(test)]` 최상위 아이템 제외)에서 i18n 키 호출을
+/// 추출해 로케일과 대조하고, 못 찾은 (파일, 키) 조합을 `violations`에 남긴다.
+/// 반환값은 (리터럴 키 호출 수, 정적으로 못 잡은 동적 키 호출 수).
+fn check_i18n_key_coverage_source(
+    rel: &str,
+    source: &str,
+    locales: &[(String, std::collections::BTreeSet<String>)],
+    violations: &mut Vec<String>,
+) -> anyhow::Result<(usize, usize)> {
+    let syntax = syn::parse_file(source).with_context(|| format!("{rel} Rust syntax 파싱 실패"))?;
+    let mut literal_count = 0usize;
+    let mut dynamic_count = 0usize;
+    for item in syntax.items {
+        let compact = item
+            .into_token_stream()
+            .to_string()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if top_level_item_is_test_only(&compact) {
+            continue;
+        }
+        let extracted = extract_i18n_key_calls(&compact);
+        dynamic_count += extracted.dynamic;
+        for key in extracted.literal {
+            literal_count += 1;
+            let missing_locales: Vec<&str> = locales
+                .iter()
+                .filter(|(_, keys)| !keys.contains(&key))
+                .map(|(locale, _)| locale.as_str())
+                .collect();
+            if !missing_locales.is_empty() {
+                violations.push(format!(
+                    "{rel}: key '{key}' missing from locale(s): {}",
+                    missing_locales.join(", ")
+                ));
+            }
+        }
+    }
+    Ok((literal_count, dynamic_count))
+}
+
+struct ExtractedI18nKeys {
+    literal: Vec<String>,
+    dynamic: usize,
+}
+
+/// 공백을 다 지운 토큰 문자열에서 `catalog.t("key"` / `MessagePayload::new("key"` 바로
+/// 뒤의 **문자열 리터럴**만 키로 추출한다. 인자가 문자열 리터럴이 아니면(변수, `format!()`,
+/// 헬퍼 함수 호출 등) 컴파일타임에 값을 알 수 없어 정적으로 못 잡는다 — dynamic 카운트로만
+/// 집계하고 넘어간다. 이 정직한 한계는 의도된 것이다(거짓 안심을 주는 게이트가 없는
+/// 게이트보다 나쁘다).
+fn extract_i18n_key_calls(compact: &str) -> ExtractedI18nKeys {
+    let mut literal = Vec::new();
+    let mut dynamic = 0usize;
+    for prefix in [".t(", "MessagePayload::new("] {
+        let mut rest = compact;
+        while let Some(idx) = rest.find(prefix) {
+            let after = &rest[idx + prefix.len()..];
+            match after.strip_prefix('"') {
+                Some(stripped) => {
+                    if let Some(end) = stripped.find('"') {
+                        literal.push(stripped[..end].to_owned());
+                    }
+                }
+                None if !after.is_empty() => dynamic += 1,
+                None => {}
+            }
+            rest = after;
+        }
+    }
+    ExtractedI18nKeys { literal, dynamic }
+}
+
+/// `crates/i18n/locales/*` 아래 로케일 디렉터리마다 `messages.txt`를 파싱해 키 집합을
+/// 만든다. `crates/i18n::parse_locale_file`은 private이라 재사용할 수 없어 같은 포맷
+/// (`key = value`, `#` 주석/빈 줄 무시)을 최소 형태로 다시 파싱한다 — 포맷이 바뀌면
+/// `cargo test -p i18n`이 먼저 깨지므로 drift는 그쪽에서 드러난다.
+fn locale_key_sets(
+    root: &Path,
+) -> anyhow::Result<Vec<(String, std::collections::BTreeSet<String>)>> {
+    let locales_dir = root.join("crates/i18n/locales");
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&locales_dir)
+        .with_context(|| format!("{} 읽기 실패", locales_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    names
+        .into_iter()
+        .map(|locale| {
+            let keys = locale_key_set(root, &locale)?;
+            Ok((locale, keys))
+        })
+        .collect()
+}
+
+fn locale_key_set(root: &Path, locale: &str) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let path = root.join(format!("crates/i18n/locales/{locale}/messages.txt"));
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("{} 읽기 실패", path.display()))?;
+    let mut keys = std::collections::BTreeSet::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, _)) = line.split_once('=') {
+            keys.insert(key.trim().to_owned());
+        }
+    }
+    Ok(keys)
 }
 
 fn run_cargo(args: &[&str]) -> anyhow::Result<()> {
@@ -1275,6 +1451,66 @@ mod tests {
     #[test]
     fn 현재_boundary는_허용된_예외만_남는다() {
         check_boundary().unwrap();
+    }
+
+    /// 실제 저장소가 이 gate를 통과하는지 고정한다 — 코드가 참조하는 리터럴 i18n 키가
+    /// 5개 로케일 전부에 있는지 재발 방지로 남긴다(runtime.spawn_failed.invalid_command
+    /// 사고의 회귀 테스트).
+    #[test]
+    fn 현재_i18n_key_coverage는_5개_로케일에_모두_있다() {
+        check_i18n_key_coverage().unwrap();
+    }
+
+    #[test]
+    fn key_coverage는_리터럴_키_누락은_잡고_동적_키와_test_모듈은_건너뛴다() {
+        let locales = vec![
+            (
+                "en-US".to_owned(),
+                std::collections::BTreeSet::from(["real.key".to_owned()]),
+            ),
+            (
+                "ko-KR".to_owned(),
+                std::collections::BTreeSet::from(["real.key".to_owned()]),
+            ),
+        ];
+        let source = r#"
+fn render(catalog: &Catalog, dynamic_key: &str) -> String {
+    let _ = catalog.t("real.key", &[]);
+    let _ = catalog.t("missing.key", &[]);
+    let _ = catalog.t(dynamic_key, &[]);
+    MessagePayload::new("real.key");
+    catalog.t("real.key", &[])
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture(catalog: &Catalog) -> String {
+        catalog.t("test.only.fake.key", &[])
+    }
+}
+"#;
+        let mut violations = Vec::new();
+        let (literal, dynamic) =
+            check_i18n_key_coverage_source("fixture.rs", source, &locales, &mut violations)
+                .unwrap();
+        assert_eq!(
+            literal, 4,
+            "real.key 3번 + MessagePayload::new(real.key) 1번 = 4건 (test 모듈의 가짜 키는 제외)"
+        );
+        assert_eq!(dynamic, 1, "dynamic_key 변수 호출 1건만 dynamic으로 집계");
+        assert_eq!(violations.len(), 1, "missing.key 하나만 위반이어야 한다");
+        assert!(violations[0].contains("fixture.rs"));
+        assert!(violations[0].contains("missing.key"));
+        assert!(violations[0].contains("en-US"));
+        assert!(violations[0].contains("ko-KR"));
+        assert!(
+            !violations[0].contains("real.key"),
+            "실제로 있는 키는 위반 목록에 없어야 한다"
+        );
+        assert!(
+            !violations[0].contains("test.only.fake.key"),
+            "test 모듈의 가짜 키는 애초에 추출되지 않아야 한다"
+        );
     }
 
     #[test]

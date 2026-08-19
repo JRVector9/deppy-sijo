@@ -8429,6 +8429,13 @@ fn carry_forward_agent_activity(
     next: &mut crate::agent_detect::AgentDisplay,
     previous: &crate::agent_detect::AgentDisplay,
 ) {
+    // **에이전트가 바뀌었으면 이어받지 않는다.** 에이전트가 끝나면 shim이 같은 pane에
+    // 폴백 셸을 얹으므로(wrap_agent_then_shell) SessionId가 그대로다 — 사용자가 그
+    // 셸에서 다른 에이전트를 직접 띄우면 같은 키에 새 종류가 들어온다. 그때 이어받으면
+    // **옛 에이전트가 한 말이 새 대화의 것처럼** 보인다(2026-08-19 코드 리뷰).
+    if next.kind != previous.kind {
+        return;
+    }
     fn is_blank(value: &Option<String>) -> bool {
         value.as_deref().is_none_or(|text| text.trim().is_empty())
     }
@@ -14051,7 +14058,26 @@ impl App {
         &mut self,
         kind: crate::agent_launcher::AgentKind,
         extra_args: Vec<String>,
+        native_session_id: &str,
     ) -> bool {
+        // 살아 있는 pane 경로(dispatch_respawn_archived_agent)와 **같은 판정**을 먼저
+        // 거친다. App Server가 그 codex thread를 이미 writer로 쥐고 있으면 새 PTY로
+        // `codex resume`을 또 띄워봐야 rollout 파일의 writer가 하나뿐이라
+        // `-32600 already has an active writer`로 거부된다 — pane이 없다고 해서
+        // 그 제약이 사라지지는 않는다(2026-08-19 코드 리뷰에서 이 경로의 누락 발견).
+        if kind.id() == "codex"
+            && let Some(local_session_id) = self
+                .agent_sessions_ui
+                .attached_local_session_for_thread(native_session_id)
+                .map(str::to_owned)
+        {
+            if self.agent_sessions_ui.open_session(&local_session_id) {
+                self.egui_ctx.request_repaint();
+            } else {
+                self.agent_sessions_ui.report_thread_attached_elsewhere();
+            }
+            return true;
+        }
         let Some(agent) = self
             .agent_launcher_snapshot
             .as_ref()
@@ -14632,9 +14658,16 @@ impl App {
             .restore_agents
             .get(&row.pane_id)
             .map(|saved| (saved.kind.as_str(), saved.session_id.as_str()));
-        match resume_without_pane_plan(kind, binding) {
-            Some(extra_args) => AppWorkHistoryActivation::ResumeArchivedNoPane { kind, extra_args },
-            None => AppWorkHistoryActivation::NewRun(kind),
+        let native_session_id = binding.map(|(_, session_id)| session_id.to_owned());
+        match (resume_without_pane_plan(kind, binding), native_session_id) {
+            (Some(extra_args), Some(native_session_id)) => {
+                AppWorkHistoryActivation::ResumeArchivedNoPane {
+                    kind,
+                    extra_args,
+                    native_session_id,
+                }
+            }
+            _ => AppWorkHistoryActivation::NewRun(kind),
         }
     }
 
@@ -15129,8 +15162,16 @@ impl App {
                             self.reveal_terminal_session();
                         }
                     }
-                    AppWorkHistoryActivation::ResumeArchivedNoPane { kind, extra_args } => {
-                        if self.dispatch_resume_archived_agent_new_pane(kind, extra_args) {
+                    AppWorkHistoryActivation::ResumeArchivedNoPane {
+                        kind,
+                        extra_args,
+                        native_session_id,
+                    } => {
+                        if self.dispatch_resume_archived_agent_new_pane(
+                            kind,
+                            extra_args,
+                            &native_session_id,
+                        ) {
                             self.reveal_terminal_session();
                         }
                     }
@@ -27577,6 +27618,11 @@ enum AppWorkHistoryActivation {
     ResumeArchivedNoPane {
         kind: crate::agent_launcher::AgentKind,
         extra_args: Vec<String>,
+        /// 에이전트 자신의 native 세션 id(codex면 thread id). 실행 직전에 App Server가
+        /// 그 thread를 이미 writer로 쥐고 있는지 판정하는 데 쓴다 — 살아 있는 pane
+        /// 경로가 `attached_app_server_conflict`로 막는 그 충돌을 이 경로도 막아야
+        /// 한다(2026-08-19 코드 리뷰: 새 경로에 가드가 빠져 있었다).
+        native_session_id: String,
     },
     NewRun(crate::agent_launcher::AgentKind),
     Disabled(ui::work_history::WorkHistoryDisabledReason),
@@ -28803,6 +28849,25 @@ mod tests {
 
         assert_eq!(next.last_agent_summary.as_deref(), Some("새 작업"));
         assert_eq!(next.user_instruction.as_deref(), Some("새 지시"));
+    }
+
+    /// 같은 pane에서 **다른 에이전트**를 띄우면 이어받지 않는다 — shim이 폴백 셸을
+    /// 얹어 SessionId가 그대로라, 이어받으면 옛 에이전트의 말이 새 대화 것처럼 보인다.
+    #[test]
+    fn 에이전트_종류가_다르면_직전_값을_이어받지_않는다() {
+        let previous = display_with(Some("codex가 한 말"), Some("codex에게 준 지시"));
+        let mut next = crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Claude,
+            ..display_with(None, None)
+        };
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert!(
+            next.last_agent_summary.is_none(),
+            "다른 에이전트의 말을 물려받으면 안 된다"
+        );
+        assert!(next.user_instruction.is_none());
     }
 
     /// model/effort/context는 **이어받지 않는다** — 사라졌으면 사라진 게 맞고, 옛 값을

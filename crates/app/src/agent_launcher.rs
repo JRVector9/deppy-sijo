@@ -70,9 +70,15 @@ const GROK_EFFORTS: &[ReasoningEffort] = &[
 /// 화면 출력 없음). `stty`가 없거나 실패하면 `&&`로 건너뛰어 기존 동작 그대로다.
 /// 남은 터미널 질의 응답을 버리는 조각. 스크립트와 테스트가 **같은 문자열**을 쓰도록
 /// 상수로 둔다 — 한쪽만 고치면 회귀를 못 잡는다.
+///
+/// `time 0`(기다리지 않음)인 이유: 이 드레인은 **이미 버퍼에 있는 것만** 버려야 한다.
+/// `time 1`(0.1초 대기)로 두면 그 사이에 사용자가 친 글자까지 함께 삼킨다 — 실측으로
+/// 확인했다(에이전트 종료 50ms 뒤 타이핑: `time 1`은 삼킴, `time 0`은 살아남음).
+/// 질의 응답은 우리 터미널이 질의를 파싱하는 즉시(= 에이전트가 살아 있을 때) 써 넣으므로
+/// 이 시점엔 이미 버퍼에 있고, `time 0`으로도 그대로 걸린다(실측: 잔여 입력 없음).
 #[cfg(unix)]
 const DRAIN_PENDING_TTY_INPUT: &str =
-    "stty -icanon -echo min 0 time 1 2>/dev/null && dd of=/dev/null bs=4096 count=1 2>/dev/null";
+    "stty -icanon -echo min 0 time 0 2>/dev/null && dd of=/dev/null bs=4096 count=1 2>/dev/null";
 
 #[cfg(unix)]
 fn agent_then_shell_script() -> String {

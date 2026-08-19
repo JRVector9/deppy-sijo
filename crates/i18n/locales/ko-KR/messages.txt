@@ -626,6 +626,7 @@ agent_sessions.error.archive_attached_thread = 복원된 APP 스레드를 보관
 agent_sessions.error.delete_attached_thread = 복원된 APP 스레드의 로컬 기록을 삭제하려면 먼저 그 APP 스레드를 보관하거나 연결을 끊어야 합니다.
 agent_sessions.error.workspace_has_attached_thread = 워크스페이스에 연결된 APP 스레드가 있어 삭제할 수 없습니다.
 agent_sessions.error.workspace_has_pending_thread = 워크스페이스에 APP 스레드 요청이 대기 중이어서 삭제할 수 없습니다.
+agent_sessions.error.thread_attached_elsewhere = 이 codex 대화는 이미 Agent Sessions에서 재개되어 있어 지금은 다시 열 수 없습니다. Agent Sessions 목록에서 이어가세요.
 activity.summary.workspaces = 워크스페이스
 activity.summary.workspace_detail = 활성 {active} · 대기 {warm} · 비활성 {idle}
 activity.summary.sessions = 세션

@@ -108,7 +108,10 @@ fn find_one(haystack: &str, start: usize, needle_lower: &[char]) -> Option<std::
 /// 멈추고(더 찾지 않는다), 멈췄으면 `truncated = true`. 빈 `needle`은 일치 없음.
 pub fn find_matches(haystack: &str, needle: &str) -> Matches {
     let Some(needle_lower) = folded_needle(needle) else {
-        return Matches { ranges: Vec::new(), truncated: false };
+        return Matches {
+            ranges: Vec::new(),
+            truncated: false,
+        };
     };
     let mut ranges = Vec::new();
     let mut truncated = false;
@@ -160,7 +163,11 @@ pub fn highlighted_job(
             job.append(&text[cursor..range.start], 0.0, base.clone());
         }
         let mut format = base.clone();
-        format.background = if active == Some(idx) { active_bg } else { match_bg };
+        format.background = if active == Some(idx) {
+            active_bg
+        } else {
+            match_bg
+        };
         job.append(&text[range.clone()], 0.0, format);
         cursor = range.end;
     }
@@ -195,7 +202,8 @@ pub fn search_bar(
 ) -> Option<AuxSearchAction> {
     if !state.open {
         // 닫힌 동안 플래그를 지워야 다음에 열릴 때 다시 자동 포커스된다.
-        ui.ctx().data_mut(|data| data.remove::<bool>(focused_once_id()));
+        ui.ctx()
+            .data_mut(|data| data.remove::<bool>(focused_once_id()));
         return None;
     }
 
@@ -224,12 +232,19 @@ pub fn search_bar(
                 .data_mut(|data| data.insert_temp(focused_once_id(), true));
         }
 
-        let shown_active = if total == 0 { 0 } else { state.active.min(total - 1) + 1 };
+        let shown_active = if total == 0 {
+            0
+        } else {
+            state.active.min(total - 1) + 1
+        };
         let active_text = shown_active.to_string();
         let total_text = total.to_string();
         ui.label(catalog.t(
             "search.count",
-            &[("active", active_text.as_str()), ("total", total_text.as_str())],
+            &[
+                ("active", active_text.as_str()),
+                ("total", total_text.as_str()),
+            ],
         ));
         if truncated {
             ui.label(catalog.t("search.truncated", &[]));
@@ -270,7 +285,11 @@ pub fn search_bar(
             if esc {
                 action = Some(AuxSearchAction::Close);
             } else if enter {
-                action = Some(if shift { AuxSearchAction::Prev } else { AuxSearchAction::Next });
+                action = Some(if shift {
+                    AuxSearchAction::Prev
+                } else {
+                    AuxSearchAction::Next
+                });
             }
         }
     });
@@ -331,7 +350,10 @@ mod tests {
             egui::Color32::GREEN,
         );
         let bgs: Vec<_> = job.sections.iter().map(|s| s.format.background).collect();
-        assert!(bgs.contains(&egui::Color32::GREEN), "활성 일치가 있어야 한다");
+        assert!(
+            bgs.contains(&egui::Color32::GREEN),
+            "활성 일치가 있어야 한다"
+        );
         assert_eq!(
             bgs.iter().filter(|c| **c == egui::Color32::GREEN).count(),
             1
@@ -371,19 +393,29 @@ mod tests {
 
     #[test]
     fn toggle은_열림_상태를_뒤집고_질의는_건드리지_않는다() {
-        let mut state = AuxSearchState { query: "abc".into(), ..Default::default() };
+        let mut state = AuxSearchState {
+            query: "abc".into(),
+            ..Default::default()
+        };
         assert!(!state.open);
         state.toggle();
         assert!(state.open);
         assert_eq!(state.query, "abc");
         state.toggle();
         assert!(!state.open);
-        assert_eq!(state.query, "abc", "닫아도 질의는 남아야 다시 열 때 이어진다");
+        assert_eq!(
+            state.query, "abc",
+            "닫아도 질의는 남아야 다시 열 때 이어진다"
+        );
     }
 
     #[test]
     fn reset은_모든_필드를_기본값으로_되돌린다() {
-        let mut state = AuxSearchState { query: "abc".into(), open: true, active: 3 };
+        let mut state = AuxSearchState {
+            query: "abc".into(),
+            open: true,
+            active: 3,
+        };
         state.reset();
         assert!(!state.open);
         assert!(state.query.is_empty());
@@ -405,7 +437,10 @@ mod tests {
     #[test]
     fn kittest_검색바가_열리면_입력에_포커스가_잡힌다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let state = AuxSearchState { open: true, ..Default::default() };
+        let state = AuxSearchState {
+            open: true,
+            ..Default::default()
+        };
         let mut harness = egui_kittest::Harness::new_ui_state(
             move |ui, state: &mut AuxSearchState| {
                 search_bar(ui, state, 0, false, &catalog);
@@ -435,7 +470,13 @@ mod tests {
                     state.action = Some(action);
                 }
             },
-            State { search: AuxSearchState { open: true, ..Default::default() }, action: None },
+            State {
+                search: AuxSearchState {
+                    open: true,
+                    ..Default::default()
+                },
+                action: None,
+            },
         );
         harness.run();
         harness
@@ -464,7 +505,13 @@ mod tests {
                     state.action = Some(action);
                 }
             },
-            State { search: AuxSearchState { open: true, ..Default::default() }, action: None },
+            State {
+                search: AuxSearchState {
+                    open: true,
+                    ..Default::default()
+                },
+                action: None,
+            },
         );
         harness.run();
         // 버튼의 접근성 라벨은 hover text가 아니라 보이는 글자("✕") 자체다
@@ -473,7 +520,10 @@ mod tests {
             .get_by_role_and_label(egui::accesskit::Role::Button, "✕")
             .click();
         harness.run();
-        assert!(matches!(harness.state().action, Some(AuxSearchAction::Close)));
+        assert!(matches!(
+            harness.state().action,
+            Some(AuxSearchAction::Close)
+        ));
     }
 
     #[test]

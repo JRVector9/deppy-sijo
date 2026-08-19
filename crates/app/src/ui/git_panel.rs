@@ -97,7 +97,12 @@ fn merge_status_rows(porcelain_z: &str, numstat: &str) -> (Vec<GitFileRow>, bool
             break;
         }
         let (adds, dels) = counts.get(path).copied().unwrap_or((None, None));
-        rows.push(GitFileRow { rel_path: path.to_owned(), status, adds, dels });
+        rows.push(GitFileRow {
+            rel_path: path.to_owned(),
+            status,
+            adds,
+            dels,
+        });
     }
     (rows, truncated)
 }
@@ -135,7 +140,12 @@ fn merge_committed_rows(numstat: &str, name_status: &str) -> (Vec<GitFileRow>, b
             break;
         }
         let (adds, dels) = counts.get(path).copied().unwrap_or((None, None));
-        rows.push(GitFileRow { rel_path: path.to_owned(), status, adds, dels });
+        rows.push(GitFileRow {
+            rel_path: path.to_owned(),
+            status,
+            adds,
+            dels,
+        });
     }
     (rows, truncated)
 }
@@ -172,7 +182,12 @@ fn parse_worktree_list(porcelain: &str, repo_root: &Path) -> (Vec<GitWorktreeRow
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| taken.clone());
         let current = as_path == repo_root;
-        rows.push(GitWorktreeRow { path: taken, name, branch: taken_branch, current });
+        rows.push(GitWorktreeRow {
+            path: taken,
+            name,
+            branch: taken_branch,
+            current,
+        });
     };
     // NUL 구분 필드 — 경로에 개행이 있어도 안 잘린다(빈 문자열 필터는 안 쓴다: 빈
     // 필드 자체가 non-z의 빈 줄과 같은 항목 경계 신호라 flush 판단에 쓰인다).
@@ -224,7 +239,9 @@ fn split_row_path(rel_path: &str) -> (&str, &str) {
 /// 워크트리 섹션에는 쓰지 않는다(경로 목록이라 검색 대상이 아니다).
 fn filter_file_rows<'a>(rows: &'a [GitFileRow], filter: &str) -> Vec<&'a GitFileRow> {
     rows.iter()
-        .filter(|row| filter.is_empty() || crate::ui::aux_search::contains_match(&row.rel_path, filter))
+        .filter(|row| {
+            filter.is_empty() || crate::ui::aux_search::contains_match(&row.rel_path, filter)
+        })
         .collect()
 }
 
@@ -235,7 +252,11 @@ fn filter_file_rows<'a>(rows: &'a [GitFileRow], filter: &str) -> Vec<&'a GitFile
 /// `Tokens::success`/`error`는 정확히 이 "체계 밖의 일반 성공/실패 표시" 용도로
 /// 예약돼 있다(그 파일 상단 주석 참고).
 fn stat_color(tokens: crate::ui::designall::Tokens, positive: bool) -> egui::Color32 {
-    if positive { tokens.success } else { tokens.error }
+    if positive {
+        tokens.success
+    } else {
+        tokens.error
+    }
 }
 
 /// `git remote get-url origin` 출력을 OWNER/REPO 기준 GitHub HTTPS URL로 정규화한다.
@@ -410,7 +431,7 @@ fn collect_file_diff(
     rel_path: &str,
     mode: crate::ui::diff_viewer::DiffMode,
 ) -> Result<crate::ui::diff_viewer::FileDiffView, GitPanelErrorCode> {
-    use crate::ui::diff_viewer::{parse_unified, DiffMode};
+    use crate::ui::diff_viewer::{DiffMode, parse_unified};
     let repo_root =
         crate::git_cli::repo_root(cwd, GIT_TIMEOUT).map_err(|_| GitPanelErrorCode::NoRepo)?;
     // 경로 인젝션 방어: rel_path는 스냅샷의 porcelain 출력에서 온 값이지만,
@@ -461,9 +482,14 @@ pub enum GitPanelAction {
     Refresh,
     /// upstream의 GitHub 브랜치 페이지 열기 — URL 구성은 App이 remote를 보고 한다.
     OpenRemoteBranch,
-    ShowFileDiff { rel_path: String, mode: crate::ui::diff_viewer::DiffMode },
+    ShowFileDiff {
+        rel_path: String,
+        mode: crate::ui::diff_viewer::DiffMode,
+    },
     /// 워크트리 행 클릭 — App이 그 경로에서 새 셸을 연다(워크트리를 만들지도 지우지도 않는다).
-    OpenWorktreeShell { path: String },
+    OpenWorktreeShell {
+        path: String,
+    },
 }
 
 #[derive(Default)]
@@ -521,7 +547,11 @@ impl GitPanelUi {
         let snap = match snapshot.as_ref() {
             None => {
                 ui.weak(catalog.t("diff.loading", &[]));
-                return if *loading { None } else { Some(GitPanelAction::Refresh) };
+                return if *loading {
+                    None
+                } else {
+                    Some(GitPanelAction::Refresh)
+                };
             }
             Some(Err(GitPanelErrorCode::NoRepo)) => {
                 ui.weak(catalog.t("diff.no_cwd", &[]));
@@ -570,7 +600,11 @@ impl GitPanelUi {
                     ui.weak(catalog.t("git.upstream_none", &[]));
                 }
             }
-            if ui.small_button("⟳").on_hover_text(catalog.t("diff.refresh", &[])).clicked() {
+            if ui
+                .small_button("⟳")
+                .on_hover_text(catalog.t("diff.refresh", &[]))
+                .clicked()
+            {
                 action = Some(GitPanelAction::Refresh);
             }
         });
@@ -578,12 +612,12 @@ impl GitPanelUi {
 
         // ── 섹션 2개 ─────────────────────────────────────────────────
         let section = |ui: &mut egui::Ui,
-                        title_key: &str,
-                        rows: &[&GitFileRow],
-                        collapsed: &mut bool,
-                        show_all: &mut bool,
-                        mode: crate::ui::diff_viewer::DiffMode,
-                        action: &mut Option<GitPanelAction>| {
+                       title_key: &str,
+                       rows: &[&GitFileRow],
+                       collapsed: &mut bool,
+                       show_all: &mut bool,
+                       mode: crate::ui::diff_viewer::DiffMode,
+                       action: &mut Option<GitPanelAction>| {
             ui.horizontal(|ui| {
                 let arrow = if *collapsed { "›" } else { "∨" };
                 if ui
@@ -607,7 +641,11 @@ impl GitPanelUi {
             if *collapsed {
                 return;
             }
-            let visible = if *show_all { rows.len() } else { rows.len().min(SECTION_COLLAPSED_ROWS) };
+            let visible = if *show_all {
+                rows.len()
+            } else {
+                rows.len().min(SECTION_COLLAPSED_ROWS)
+            };
             for row in &rows[..visible] {
                 let (name, dir) = split_row_path(&row.rel_path);
                 // 계획서 원안은 `ui.horizontal(..).response.interact(Sense::click())`로
@@ -631,19 +669,27 @@ impl GitPanelUi {
                             if !dir.is_empty() {
                                 ui.weak(dir);
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.monospace(row.status.to_string());
-                                if let Some(d) = row.dels.filter(|d| *d > 0) {
-                                    ui.colored_label(stat_color(tokens, false), format!("−{d}"));
-                                }
-                                if let Some(a) = row.adds.filter(|a| *a > 0) {
-                                    ui.colored_label(stat_color(tokens, true), format!("+{a}"));
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.monospace(row.status.to_string());
+                                    if let Some(d) = row.dels.filter(|d| *d > 0) {
+                                        ui.colored_label(
+                                            stat_color(tokens, false),
+                                            format!("−{d}"),
+                                        );
+                                    }
+                                    if let Some(a) = row.adds.filter(|a| *a > 0) {
+                                        ui.colored_label(stat_color(tokens, true), format!("+{a}"));
+                                    }
+                                },
+                            );
                         });
                     },
                 );
-                let response = toggle.response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let response = toggle
+                    .response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 // 접근성 이름을 rel_path로 명시한다 — kittest가 Role::Button + 이
                 // 라벨로 행 전체(자식 Label이 아니라)를 정확히 겨냥할 수 있다.
                 response.widget_info(|| {
@@ -654,124 +700,135 @@ impl GitPanelUi {
                     )
                 });
                 if response.clicked() {
-                    *action = Some(GitPanelAction::ShowFileDiff { rel_path: row.rel_path.clone(), mode });
+                    *action = Some(GitPanelAction::ShowFileDiff {
+                        rel_path: row.rel_path.clone(),
+                        mode,
+                    });
                 }
             }
         };
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if filter_active {
-                // 필터가 걸려 있는데 두 섹션 모두 0행이면 안내 한 줄(2026-08-18 스펙
-                // §좌측 목록 필터) — "왜 안 보이지"가 되지 않게.
-                if filtered_changes.is_empty() && filtered_committed.is_empty() {
-                    ui.weak(catalog.t("search.no_match", &[]));
-                    // 워크트리 섹션에는 필터와 무관하게 정보가 있을 수 있다 — 여기서
-                    // 돌아가면 그 섹션까지 감춘다(diff.clean과 같은 처리, 스펙 §8-4).
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if filter_active {
+                    // 필터가 걸려 있는데 두 섹션 모두 0행이면 안내 한 줄(2026-08-18 스펙
+                    // §좌측 목록 필터) — "왜 안 보이지"가 되지 않게.
+                    if filtered_changes.is_empty() && filtered_committed.is_empty() {
+                        ui.weak(catalog.t("search.no_match", &[]));
+                        // 워크트리 섹션에는 필터와 무관하게 정보가 있을 수 있다 — 여기서
+                        // 돌아가면 그 섹션까지 감춘다(diff.clean과 같은 처리, 스펙 §8-4).
+                        if !worktree_section_visible(snap) {
+                            return;
+                        }
+                    }
+                } else if snap.changes.is_empty() && snap.committed.is_empty() {
+                    ui.weak(catalog.t("diff.clean", &[]));
+                    // 워크트리 섹션에는 clean과 무관하게 정보가 있을 수 있다 — 여기서
+                    // 돌아가면 그 섹션까지 감춘다(스펙 §8-4).
                     if !worktree_section_visible(snap) {
                         return;
                     }
                 }
-            } else if snap.changes.is_empty() && snap.committed.is_empty() {
-                ui.weak(catalog.t("diff.clean", &[]));
-                // 워크트리 섹션에는 clean과 무관하게 정보가 있을 수 있다 — 여기서
-                // 돌아가면 그 섹션까지 감춘다(스펙 §8-4).
-                if !worktree_section_visible(snap) {
-                    return;
+                section(
+                    ui,
+                    "git.section.changes",
+                    &filtered_changes,
+                    changes_collapsed,
+                    changes_show_all,
+                    crate::ui::diff_viewer::DiffMode::Working,
+                    &mut action,
+                );
+                if snap.changes_truncated {
+                    ui.weak(catalog.t("diff.truncated", &[]));
                 }
-            }
-            section(
-                ui,
-                "git.section.changes",
-                &filtered_changes,
-                changes_collapsed,
-                changes_show_all,
-                crate::ui::diff_viewer::DiffMode::Working,
-                &mut action,
-            );
-            if snap.changes_truncated {
-                ui.weak(catalog.t("diff.truncated", &[]));
-            }
-            ui.add_space(6.0);
-            section(
-                ui,
-                "git.section.committed",
-                &filtered_committed,
-                committed_collapsed,
-                committed_show_all,
-                crate::ui::diff_viewer::DiffMode::Branch,
-                &mut action,
-            );
-            if snap.committed_truncated {
-                ui.weak(catalog.t("diff.truncated", &[]));
-            }
-
-            // ── 섹션 3: 워크트리 ─────────────────────────────────────────
-            if worktree_section_visible(snap) {
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let arrow = if *worktrees_collapsed { "›" } else { "∨" };
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!(
-                                "{arrow} {} {}",
-                                catalog.t("git.section.worktrees", &[]),
-                                snap.worktrees.len()
-                            ),
-                        )
-                        .clicked()
-                    {
-                        *worktrees_collapsed = !*worktrees_collapsed;
-                    }
-                });
-                if !*worktrees_collapsed {
-                    for row in &snap.worktrees {
-                        // 파일 행과 같은 패턴 — 자식 Label이 클릭을 삼키지 않도록
-                        // 스코프 자체를 하나의 논리 위젯으로 만든다(위 file row 주석 참고).
-                        let scope = ui.scope_builder(
-                            egui::UiBuilder::new()
-                                .id_salt(("git-panel-worktree", row.path.as_str()))
-                                .sense(egui::Sense::click()),
-                            |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.label(&row.name);
-                                    match row.branch.as_deref() {
-                                        Some(branch) => ui.weak(branch),
-                                        None => ui.weak(catalog.t("git.worktree.detached", &[])),
-                                    };
-                                    if row.current {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| ui.weak(catalog.t("git.worktree.current", &[])),
-                                        );
-                                    }
-                                });
-                            },
-                        );
-                        let response = scope
-                            .response
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(catalog.t("git.worktree.open_hint", &[]));
-                        // 접근성 이름을 경로로 명시한다 — kittest가 Role::Button + 이
-                        // 라벨로 행 전체를 정확히 겨냥할 수 있다(위 file row 주석과 동일 이유).
-                        response.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                ui.is_enabled(),
-                                row.path.as_str(),
+                section(
+                    ui,
+                    "git.section.committed",
+                    &filtered_committed,
+                    committed_collapsed,
+                    committed_show_all,
+                    crate::ui::diff_viewer::DiffMode::Branch,
+                    &mut action,
+                );
+                if snap.committed_truncated {
+                    ui.weak(catalog.t("diff.truncated", &[]));
+                }
+
+                // ── 섹션 3: 워크트리 ─────────────────────────────────────────
+                if worktree_section_visible(snap) {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let arrow = if *worktrees_collapsed { "›" } else { "∨" };
+                        if ui
+                            .selectable_label(
+                                false,
+                                format!(
+                                    "{arrow} {} {}",
+                                    catalog.t("git.section.worktrees", &[]),
+                                    snap.worktrees.len()
+                                ),
                             )
-                        });
-                        if response.clicked() && worktree_path_is_spawnable(&row.path) {
-                            action = Some(GitPanelAction::OpenWorktreeShell { path: row.path.clone() });
+                            .clicked()
+                        {
+                            *worktrees_collapsed = !*worktrees_collapsed;
+                        }
+                    });
+                    if !*worktrees_collapsed {
+                        for row in &snap.worktrees {
+                            // 파일 행과 같은 패턴 — 자식 Label이 클릭을 삼키지 않도록
+                            // 스코프 자체를 하나의 논리 위젯으로 만든다(위 file row 주석 참고).
+                            let scope = ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .id_salt(("git-panel-worktree", row.path.as_str()))
+                                    .sense(egui::Sense::click()),
+                                |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(&row.name);
+                                        match row.branch.as_deref() {
+                                            Some(branch) => ui.weak(branch),
+                                            None => {
+                                                ui.weak(catalog.t("git.worktree.detached", &[]))
+                                            }
+                                        };
+                                        if row.current {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.weak(catalog.t("git.worktree.current", &[]))
+                                                },
+                                            );
+                                        }
+                                    });
+                                },
+                            );
+                            let response = scope
+                                .response
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(catalog.t("git.worktree.open_hint", &[]));
+                            // 접근성 이름을 경로로 명시한다 — kittest가 Role::Button + 이
+                            // 라벨로 행 전체를 정확히 겨냥할 수 있다(위 file row 주석과 동일 이유).
+                            response.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    ui.is_enabled(),
+                                    row.path.as_str(),
+                                )
+                            });
+                            if response.clicked() && worktree_path_is_spawnable(&row.path) {
+                                action = Some(GitPanelAction::OpenWorktreeShell {
+                                    path: row.path.clone(),
+                                });
+                            }
+                        }
+                        if snap.worktrees_truncated {
+                            ui.weak(catalog.t("git.worktrees_truncated", &[]));
                         }
                     }
-                    if snap.worktrees_truncated {
-                        ui.weak(catalog.t("git.worktrees_truncated", &[]));
-                    }
                 }
-            }
-        });
+            });
         action
     }
 }
@@ -790,7 +847,12 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert!(!truncated);
         assert_eq!(
-            (rows[0].rel_path.as_str(), rows[0].status, rows[0].adds, rows[0].dels),
+            (
+                rows[0].rel_path.as_str(),
+                rows[0].status,
+                rows[0].adds,
+                rows[0].dels
+            ),
             ("a.rs", 'M', Some(3), Some(1))
         );
         // untracked: numstat 없음 → 수치 None, 상태 '?'
@@ -804,7 +866,10 @@ mod tests {
             ("moved.rs", 'R', Some(456))
         );
         // staged+unstaged 겹침(XY="MM"): 워킹트리(Y) 우선 → 'M'.
-        assert_eq!((rows[3].rel_path.as_str(), rows[3].status), ("both.rs", 'M'));
+        assert_eq!(
+            (rows[3].rel_path.as_str(), rows[3].status),
+            ("both.rs", 'M')
+        );
     }
 
     #[test]
@@ -816,11 +881,21 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(!truncated);
         assert_eq!(
-            (rows[0].rel_path.as_str(), rows[0].status, rows[0].adds, rows[0].dels),
+            (
+                rows[0].rel_path.as_str(),
+                rows[0].status,
+                rows[0].adds,
+                rows[0].dels
+            ),
             ("src/ui/workspace.rs", 'M', Some(12), Some(13))
         );
         assert_eq!(
-            (rows[1].rel_path.as_str(), rows[1].status, rows[1].adds, rows[1].dels),
+            (
+                rows[1].rel_path.as_str(),
+                rows[1].status,
+                rows[1].adds,
+                rows[1].dels
+            ),
             ("assets/logo.png", 'A', None, None)
         );
     }
@@ -881,7 +956,10 @@ mod tests {
 
     #[test]
     fn 파일명과_디렉터리를_분리한다() {
-        assert_eq!(split_row_path("crates/app/src/app.rs"), ("app.rs", "crates/app/src"));
+        assert_eq!(
+            split_row_path("crates/app/src/app.rs"),
+            ("app.rs", "crates/app/src")
+        );
         assert_eq!(split_row_path("Cargo.toml"), ("Cargo.toml", ""));
     }
 
@@ -894,12 +972,18 @@ mod tests {
         for tokens in [crate::ui::designall::DARK, crate::ui::designall::LIGHT] {
             assert_eq!(stat_color(tokens, true), tokens.success);
             assert_eq!(stat_color(tokens, false), tokens.error);
-            assert_ne!(tokens.success, tokens.error, "성공/에러 색은 서로 달라야 한다");
+            assert_ne!(
+                tokens.success, tokens.error,
+                "성공/에러 색은 서로 달라야 한다"
+            );
             assert_ne!(
                 tokens.success, tokens.app_background,
                 "성공색은 배경과 구분돼야 한다"
             );
-            assert_ne!(tokens.error, tokens.app_background, "에러색은 배경과 구분돼야 한다");
+            assert_ne!(
+                tokens.error, tokens.app_background,
+                "에러색은 배경과 구분돼야 한다"
+            );
         }
         assert_ne!(
             crate::ui::designall::DARK.success,
@@ -919,8 +1003,10 @@ mod tests {
 
     #[test]
     fn 워크트리_목록은_브랜치와_현재를_구분한다() {
-        let (rows, truncated) =
-            parse_worktree_list(WORKTREE_PORCELAIN, Path::new("/repo/.deppy/worktrees/alpha"));
+        let (rows, truncated) = parse_worktree_list(
+            WORKTREE_PORCELAIN,
+            Path::new("/repo/.deppy/worktrees/alpha"),
+        );
         assert!(!truncated);
         // bare 항목은 체크아웃이 없어 셸을 열 수 없다 — 목록에서 뺀다.
         assert_eq!(rows.len(), 3, "bare는 제외한다: {rows:?}");
@@ -962,7 +1048,8 @@ mod tests {
 
     #[test]
     fn 워크트리_잠금_줄은_무시한다() {
-        let porcelain = "worktree /repo\0HEAD 1111\0branch refs/heads/main\0locked\0prunable gone\0\0";
+        let porcelain =
+            "worktree /repo\0HEAD 1111\0branch refs/heads/main\0locked\0prunable gone\0\0";
         let (rows, truncated) = parse_worktree_list(porcelain, Path::new("/repo"));
         assert!(!truncated);
         assert_eq!(rows.len(), 1);
@@ -976,7 +1063,10 @@ mod tests {
         let porcelain = "worktree /repo/trailing \0HEAD 1111\0branch refs/heads/main\0\0";
         let (rows, _truncated) = parse_worktree_list(porcelain, Path::new("/repo"));
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].path, "/repo/trailing ", "경로 끝 공백이 지워지면 안 된다");
+        assert_eq!(
+            rows[0].path, "/repo/trailing ",
+            "경로 끝 공백이 지워지면 안 된다"
+        );
     }
 
     // 중요 리뷰 지적 2번 회귀 — `-z` 없이는 `.lines()`가 경로 내부 개행에서 항목을
@@ -986,7 +1076,11 @@ mod tests {
     fn 워크트리_경로에_개행이_있어도_안_잘린다() {
         let porcelain = "worktree /repo/weird\nname\0HEAD 1111\0branch refs/heads/main\0\0";
         let (rows, _truncated) = parse_worktree_list(porcelain, Path::new("/repo"));
-        assert_eq!(rows.len(), 1, "개행이 있어도 항목 하나로 남아야 한다: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "개행이 있어도 항목 하나로 남아야 한다: {rows:?}"
+        );
         assert_eq!(rows[0].path, "/repo/weird\nname");
     }
 
@@ -995,9 +1089,13 @@ mod tests {
 
     fn temp_repo(tag: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir()
-            .join(format!("deppy-gitpanel-{tag}-{}-{nonce}", std::process::id()));
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-gitpanel-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         crate::git_cli::run_git(&dir, &["init", "-q", "-b", "main"], T).unwrap();
         crate::git_cli::run_git(&dir, &["config", "user.email", "t@t"], T).unwrap();
@@ -1038,14 +1136,24 @@ mod tests {
         std::fs::write(origin.join("f.rs"), "one\n").unwrap();
         commit_all(&origin, "c1");
         let clone_dir = std::env::temp_dir().join(format!(
-            "deppy-gitpanel-clone-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap().as_nanos()));
+            "deppy-gitpanel-clone-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         crate::git_cli::run_git(
             origin.parent().unwrap(),
-            &["clone", "-q", origin.to_str().unwrap(), clone_dir.to_str().unwrap()],
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                clone_dir.to_str().unwrap(),
+            ],
             T,
-        ).unwrap();
+        )
+        .unwrap();
         crate::git_cli::run_git(&clone_dir, &["config", "user.email", "t@t"], T).unwrap();
         crate::git_cli::run_git(&clone_dir, &["config", "user.name", "t"], T).unwrap();
         // 로컬 커밋 1개 → ahead=1, behind=0, committed에 f.rs.
@@ -1065,10 +1173,13 @@ mod tests {
 
     #[test]
     fn repo가_아니면_no_repo_오류다() {
-        let dir = std::env::temp_dir().join(format!(
-            "deppy-gitpanel-norepo-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("deppy-gitpanel-norepo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(collect_snapshot(&dir).unwrap_err(), GitPanelErrorCode::NoRepo);
+        assert_eq!(
+            collect_snapshot(&dir).unwrap_err(),
+            GitPanelErrorCode::NoRepo
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1087,8 +1198,12 @@ mod tests {
             .expect("collect");
         assert!(!view.truncated);
         assert!(!view.binary);
-        let lines: Vec<&str> =
-            view.hunks.iter().flat_map(|h| h.lines.iter()).map(|l| l.text.as_str()).collect();
+        let lines: Vec<&str> = view
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .map(|l| l.text.as_str())
+            .collect();
         assert_eq!(lines, vec!["hello", "world"]);
         assert!(
             view.hunks.iter().all(|h| h
@@ -1114,8 +1229,12 @@ mod tests {
         let view = collect_file_diff(&repo, "big.txt", crate::ui::diff_viewer::DiffMode::Working)
             .expect("collect");
         assert!(view.truncated, "상한을 넘는 파일은 잘림 표시가 있어야 한다");
-        let collected_len: usize =
-            view.hunks.iter().flat_map(|h| h.lines.iter()).map(|l| l.text.len()).sum();
+        let collected_len: usize = view
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .map(|l| l.text.len())
+            .sum();
         assert!(
             collected_len < huge.len(),
             "전량이 아니라 상한만큼만 수집돼야 한다: {collected_len}"
@@ -1161,9 +1280,18 @@ mod tests {
 
     #[test]
     fn normalize_github_remote_비github_remote는_none이다() {
-        assert_eq!(normalize_github_remote("https://gitlab.com/foo/bar.git"), None);
-        assert_eq!(normalize_github_remote("git@bitbucket.org:foo/bar.git"), None);
-        assert_eq!(normalize_github_remote("/Users/t/tmp/some-local-repo"), None);
+        assert_eq!(
+            normalize_github_remote("https://gitlab.com/foo/bar.git"),
+            None
+        );
+        assert_eq!(
+            normalize_github_remote("git@bitbucket.org:foo/bar.git"),
+            None
+        );
+        assert_eq!(
+            normalize_github_remote("/Users/t/tmp/some-local-repo"),
+            None
+        );
     }
 
     // 계획서 원안은 harness 통신에 `ui.ctx().memory_mut(..).insert_temp`와
@@ -1199,7 +1327,10 @@ mod tests {
                     state.action = Some(action);
                 }
             },
-            State { panel, action: None },
+            State {
+                panel,
+                action: None,
+            },
         );
         harness.run();
         // 자식 Label("a.rs") 자체를 클릭하면 부모 스코프로 이벤트가 새지 않는다
@@ -1257,7 +1388,10 @@ mod tests {
                     state.action = Some(action);
                 }
             },
-            State { panel, action: None },
+            State {
+                panel,
+                action: None,
+            },
         );
         harness.run();
         // 파일 행 테스트와 같은 질의 방식 — 접근성 이름(Role::Button + path)으로
@@ -1269,7 +1403,9 @@ mod tests {
 
         assert_eq!(
             harness.state().action,
-            Some(GitPanelAction::OpenWorktreeShell { path: "/repo/wt".to_owned() }),
+            Some(GitPanelAction::OpenWorktreeShell {
+                path: "/repo/wt".to_owned()
+            }),
             "워크트리 행 클릭은 OpenWorktreeShell을 내야 한다"
         );
     }
@@ -1277,7 +1413,10 @@ mod tests {
     #[test]
     fn 워크트리가_하나면_섹션을_숨긴다() {
         // 정보가 0인 섹션은 그리지 않는다(스펙 §8-4).
-        let mut snap = GitPanelSnapshot { branch: "main".into(), ..Default::default() };
+        let mut snap = GitPanelSnapshot {
+            branch: "main".into(),
+            ..Default::default()
+        };
         snap.worktrees = vec![GitWorktreeRow {
             path: "/repo".into(),
             name: "repo".into(),
@@ -1306,8 +1445,18 @@ mod tests {
 
     fn filter_test_rows() -> Vec<GitFileRow> {
         vec![
-            GitFileRow { rel_path: "src/app.rs".into(), status: 'M', adds: Some(1), dels: None },
-            GitFileRow { rel_path: "README.md".into(), status: 'M', adds: None, dels: Some(2) },
+            GitFileRow {
+                rel_path: "src/app.rs".into(),
+                status: 'M',
+                adds: Some(1),
+                dels: None,
+            },
+            GitFileRow {
+                rel_path: "README.md".into(),
+                status: 'M',
+                adds: None,
+                dels: Some(2),
+            },
             GitFileRow {
                 rel_path: "src/ui/git_panel.rs".into(),
                 status: 'A',
@@ -1347,7 +1496,12 @@ mod tests {
         panel.set_snapshot(Ok(GitPanelSnapshot {
             branch: "main".into(),
             changes: vec![
-                GitFileRow { rel_path: "src/app.rs".into(), status: 'M', adds: Some(1), dels: None },
+                GitFileRow {
+                    rel_path: "src/app.rs".into(),
+                    status: 'M',
+                    adds: Some(1),
+                    dels: None,
+                },
                 GitFileRow {
                     rel_path: "README.md".into(),
                     status: 'M',
@@ -1393,7 +1547,11 @@ mod tests {
         rows[0].rel_path = "only-match.rs".into();
 
         let mut panel = GitPanelUi::default();
-        panel.set_snapshot(Ok(GitPanelSnapshot { branch: "main".into(), changes: rows, ..Default::default() }));
+        panel.set_snapshot(Ok(GitPanelSnapshot {
+            branch: "main".into(),
+            changes: rows,
+            ..Default::default()
+        }));
 
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, panel: &mut GitPanelUi| {

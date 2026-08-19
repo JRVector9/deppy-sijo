@@ -5589,7 +5589,10 @@ impl WorkspaceUi {
                     output.response.dragged(),
                     self.selection.is_some_and(|(s, _, _)| s == session),
                 );
-                let command = RuntimeCommand::Scroll { session, delta: whole_rows };
+                let command = RuntimeCommand::Scroll {
+                    session,
+                    delta: whole_rows,
+                };
                 if keep {
                     self.send_keep_selection(command);
                 } else {
@@ -10017,11 +10020,26 @@ mod tests {
     /// 항상 기존 경로(`activate_terminal_toolbar`)로 간다.
     #[test]
     fn search_click_targets_aux_search는_search_아이콘이면서_보조본문_활성일_때만_참이다() {
-        assert!(search_click_targets_aux_search(TerminalToolbarIcon::Search, true));
-        assert!(!search_click_targets_aux_search(TerminalToolbarIcon::Search, false));
-        assert!(!search_click_targets_aux_search(TerminalToolbarIcon::NewTerminal, true));
-        assert!(!search_click_targets_aux_search(TerminalToolbarIcon::SplitColumns, true));
-        assert!(!search_click_targets_aux_search(TerminalToolbarIcon::SplitRows, true));
+        assert!(search_click_targets_aux_search(
+            TerminalToolbarIcon::Search,
+            true
+        ));
+        assert!(!search_click_targets_aux_search(
+            TerminalToolbarIcon::Search,
+            false
+        ));
+        assert!(!search_click_targets_aux_search(
+            TerminalToolbarIcon::NewTerminal,
+            true
+        ));
+        assert!(!search_click_targets_aux_search(
+            TerminalToolbarIcon::SplitColumns,
+            true
+        ));
+        assert!(!search_click_targets_aux_search(
+            TerminalToolbarIcon::SplitRows,
+            true
+        ));
     }
 
     /// 헤더가 실제로 배치한 것과 같은 기하로 Search 버튼(도구 4개 중 첫 번째) 중심을
@@ -10059,7 +10077,11 @@ mod tests {
                 .size()
                 .x;
             let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
-            assert_eq!(buttons.toolbar.len(), 4, "테스트 헤더는 도구 4개가 모두 보여야 한다");
+            assert_eq!(
+                buttons.toolbar.len(),
+                4,
+                "테스트 헤더는 도구 4개가 모두 보여야 한다"
+            );
             center = Some(buttons.toolbar[0].center());
         });
         center.expect("Search 버튼 rect를 계산해야 한다")
@@ -10115,7 +10137,12 @@ mod tests {
             "보조 본문이 비활성이면 aux_search_toggle_requested가 오르면 안 된다"
         );
         assert_eq!(
-            harness.state().0.search.as_ref().map(|search| search.session),
+            harness
+                .state()
+                .0
+                .search
+                .as_ref()
+                .map(|search| search.session),
             Some(SessionId(7)),
             "보조 본문이 비활성이면 Search 버튼은 여전히 기존 터미널 검색을 연다(회귀 방지)"
         );
@@ -10495,7 +10522,11 @@ mod tests {
             &[RuntimeEvent::MuxUpdated {
                 snapshot: mux(
                     "t1",
-                    vec![tab("t1", vec![pane("p1", session)], LayoutNode::Pane(pane_id("p1")))],
+                    vec![tab(
+                        "t1",
+                        vec![pane("p1", session)],
+                        LayoutNode::Pane(pane_id("p1")),
+                    )],
                     "p1",
                 ),
             }],
@@ -10520,7 +10551,11 @@ mod tests {
             &[RuntimeEvent::MuxUpdated {
                 snapshot: mux(
                     "t1",
-                    vec![tab("t1", vec![pane("p1", session)], LayoutNode::Pane(pane_id("p1")))],
+                    vec![tab(
+                        "t1",
+                        vec![pane("p1", session)],
+                        LayoutNode::Pane(pane_id("p1")),
+                    )],
                     "p1",
                 ),
             }],
@@ -12255,11 +12290,20 @@ https://example.test/login \
     fn 휠은_드래그_중에만_선택을_보존한다() {
         // 드래그 중이고 그 세션의 선택이 살아 있을 때만 보존한다. 조건이 앵커를 보정하는
         // `dragged()` 분기와 **같아야** 스크롤과 선택이 어긋나지 않는다.
-        assert!(wheel_scroll_keeps_selection(true, true), "드래그 중이면 보존");
+        assert!(
+            wheel_scroll_keeps_selection(true, true),
+            "드래그 중이면 보존"
+        );
         // 버튼을 뗀 뒤의 휠은 기존대로 해제한다 — 안 그러면 선택이 남아 화면이 멈춘 듯 보인다.
-        assert!(!wheel_scroll_keeps_selection(false, true), "드래그가 아니면 해제");
+        assert!(
+            !wheel_scroll_keeps_selection(false, true),
+            "드래그가 아니면 해제"
+        );
         // 선택이 없으면 보존할 것도 없다(다른 세션의 선택이어도 마찬가지).
-        assert!(!wheel_scroll_keeps_selection(true, false), "그 세션 선택이 없으면 해제");
+        assert!(
+            !wheel_scroll_keeps_selection(true, false),
+            "그 세션 선택이 없으면 해제"
+        );
         assert!(!wheel_scroll_keeps_selection(false, false));
     }
 

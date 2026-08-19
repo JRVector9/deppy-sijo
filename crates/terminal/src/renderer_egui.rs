@@ -1353,7 +1353,13 @@ mod tests {
         let owner = snapshot.cols as usize; // row1 0열
         assert!(snapshot.visible_cells[owner].wide);
         assert!(snapshot.is_trailing_wide_spacer(owner + 1));
-        assert!(selection_covers_cell(&snapshot, owner + 1, owner, owner, true));
+        assert!(selection_covers_cell(
+            &snapshot,
+            owner + 1,
+            owner,
+            owner,
+            true
+        ));
     }
 
     /// 행 끝이 wide 글자(한글 등)일 때 **강조가 글자 전체**를 덮어야 한다. 끝점이

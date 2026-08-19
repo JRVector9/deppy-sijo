@@ -543,7 +543,8 @@ impl Config {
             self.agents.codex_llm_wire = None;
         }
         // 거부 목록도 같은 관례: TOML을 손으로 고쳐 넣은 미지 id·중복을 로드 경계에서 버린다.
-        self.agents.disabled = crate::agent_launcher::normalize_disabled_agents(&self.agents.disabled);
+        self.agents.disabled =
+            crate::agent_launcher::normalize_disabled_agents(&self.agents.disabled);
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {

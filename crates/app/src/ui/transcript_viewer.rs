@@ -8,8 +8,12 @@
 #[derive(Default)]
 pub struct TranscriptViewerUi {
     loading: bool,
-    conversation:
-        Option<Result<crate::agent_transcript::TranscriptConversation, crate::agent_transcript::TranscriptViewError>>,
+    conversation: Option<
+        Result<
+            crate::agent_transcript::TranscriptConversation,
+            crate::agent_transcript::TranscriptViewError,
+        >,
+    >,
     /// 새 대화가 열릴 때마다 올라간다 — ScrollArea의 `id_salt`에 섞어, 대화가
     /// 바뀌면 이전 스크롤 위치(스티키 하단 포함)를 이어받지 않고 새로 시작하게 한다.
     generation: u64,
@@ -133,7 +137,12 @@ impl TranscriptViewerUi {
     /// 꺼져 있거나 이 원문 뷰어가 대상이 아니라는 뜻이라 강조 없이 예전처럼 그린다.
     /// diff_viewer.rs `render`의 `search` 인자와 같은 형태다(2026-08-18 계획 Task 4·5
     /// — 소비자 둘 다 같은 모양을 쓰기로 함).
-    pub fn render(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog, search: Option<(&str, usize)>) {
+    pub fn render(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        search: Option<(&str, usize)>,
+    ) {
         if self.loading {
             ui.weak(catalog.t("history.transcript.loading", &[]));
             return;
@@ -222,7 +231,9 @@ impl TranscriptViewerUi {
             let row_fallback = ui.text_style_height(&egui::TextStyle::Body);
             let provisional = provisional_height(&self.heights, row_fallback);
             let extra_per_message = ui.spacing().item_spacing.y + MESSAGE_GAP;
-            slot_offsets(&self.heights, provisional, extra_per_message).get(target).copied()
+            slot_offsets(&self.heights, provisional, extra_per_message)
+                .get(target)
+                .copied()
         } else {
             None
         };
@@ -250,12 +261,16 @@ impl TranscriptViewerUi {
                 // 프레임에서 실측해 캐시에 채워 두고, 다음 프레임부터는 그
                 // 캐시가 이미 정확하므로 가상화해도 흔들리지 않는다.
                 for (index, message) in messages.iter().enumerate() {
-                    let highlighted =
-                        highlight_range.as_ref().is_some_and(|r| r.contains(&index));
-                    let local_active =
-                        local_active_in_message(message_match_start, index, active);
+                    let highlighted = highlight_range.as_ref().is_some_and(|r| r.contains(&index));
+                    let local_active = local_active_in_message(message_match_start, index, active);
                     let rect = render_message(
-                        ui, message, tokens, catalog, highlighted, query, local_active,
+                        ui,
+                        message,
+                        tokens,
+                        catalog,
+                        highlighted,
+                        query,
+                        local_active,
                     );
                     heights[index] = Some(rect.height());
                     if scroll_to == Some(index) {
@@ -277,8 +292,7 @@ impl TranscriptViewerUi {
             let total_height = offsets.last().copied().unwrap_or(0.0);
             ui.set_height(total_height);
 
-            let range =
-                visible_range(&offsets, viewport.min.y..viewport.max.y, OVERSCAN_MESSAGES);
+            let range = visible_range(&offsets, viewport.min.y..viewport.max.y, OVERSCAN_MESSAGES);
             if range.is_empty() {
                 return;
             }
@@ -295,12 +309,15 @@ impl TranscriptViewerUi {
                 viewport_ui.skip_ahead_auto_ids(range.start);
                 for index in range.clone() {
                     let message = &messages[index];
-                    let highlighted =
-                        highlight_range.as_ref().is_some_and(|r| r.contains(&index));
-                    let local_active =
-                        local_active_in_message(message_match_start, index, active);
+                    let highlighted = highlight_range.as_ref().is_some_and(|r| r.contains(&index));
+                    let local_active = local_active_in_message(message_match_start, index, active);
                     let measured = render_message(
-                        viewport_ui, message, tokens, catalog, highlighted, query,
+                        viewport_ui,
+                        message,
+                        tokens,
+                        catalog,
+                        highlighted,
+                        query,
                         local_active,
                     )
                     .height();
@@ -329,8 +346,14 @@ fn provisional_height(heights: &[Option<f32>], fallback: f32) -> f32 {
     let (sum, count) = heights
         .iter()
         .flatten()
-        .fold((0.0_f32, 0usize), |(sum, count), height| (sum + height, count + 1));
-    if count == 0 { fallback } else { sum / count as f32 }
+        .fold((0.0_f32, 0usize), |(sum, count), height| {
+            (sum + height, count + 1)
+        });
+    if count == 0 {
+        fallback
+    } else {
+        sum / count as f32
+    }
 }
 
 /// 메시지별 "슬롯 높이"(프레임 높이 + 항목 간격 + [`MESSAGE_GAP`])의 누적합. 길이는
@@ -359,10 +382,13 @@ fn visible_range(
     if total == 0 || viewport.end <= viewport.start {
         return 0..0;
     }
-    let tight_start =
-        offsets.partition_point(|offset| *offset <= viewport.start).saturating_sub(1).min(total - 1);
-    let tight_end =
-        offsets.partition_point(|offset| *offset < viewport.end).clamp(tight_start + 1, total);
+    let tight_start = offsets
+        .partition_point(|offset| *offset <= viewport.start)
+        .saturating_sub(1)
+        .min(total - 1);
+    let tight_end = offsets
+        .partition_point(|offset| *offset < viewport.end)
+        .clamp(tight_start + 1, total);
     let start = tight_start.saturating_sub(overscan);
     let end = (tight_end + overscan).min(total);
     start..end
@@ -393,7 +419,12 @@ fn build_search_cache(
         }
     }
     message_match_start.push(total);
-    SearchCache { query: query.to_owned(), message_match_start, total, truncated }
+    SearchCache {
+        query: query.to_owned(),
+        message_match_start,
+        total,
+        truncated,
+    }
 }
 
 /// `message_match_start`(길이 `messages.len() + 1`, [`build_search_cache`] 산출물)에서
@@ -421,7 +452,9 @@ fn local_active_in_message(
 ) -> Option<usize> {
     let start = message_match_start.get(index).copied()?;
     let end = message_match_start.get(index + 1).copied().unwrap_or(start);
-    active.filter(|a| *a >= start && *a < end).map(|a| a - start)
+    active
+        .filter(|a| *a >= start && *a < end)
+        .map(|a| a - start)
 }
 
 /// 검색 일치 배경 — designall::tokens에서만 고른다(하드코딩 금지, 라이트/다크 둘 다
@@ -449,8 +482,9 @@ fn render_message(
     search_query: &str,
     search_active_local: Option<usize>,
 ) -> egui::Rect {
-    let mut frame =
-        egui::Frame::NONE.fill(message_background(tokens, message.role, highlighted)).inner_margin(egui::Margin::symmetric(8, 4));
+    let mut frame = egui::Frame::NONE
+        .fill(message_background(tokens, message.role, highlighted))
+        .inner_margin(egui::Margin::symmetric(8, 4));
     if highlighted {
         // 배경 섞기만으로는 라이트 테마에서 `content_canvas`와 `selected_background`가
         // 원래 가깝다(두 표면 다 "물러난 면"이라 채도 차이가 작다) — 그 자리는
@@ -461,7 +495,9 @@ fn render_message(
     let response = frame.show(ui, |ui| {
         let label = match message.role {
             crate::agent_transcript::ConversationRole::User => catalog.t("history.role.user", &[]),
-            crate::agent_transcript::ConversationRole::Assistant => catalog.t("history.role.agent", &[]),
+            crate::agent_transcript::ConversationRole::Assistant => {
+                catalog.t("history.role.agent", &[])
+            }
         };
         ui.label(egui::RichText::new(label).small().weak());
         // 검색은 메시지 본문(message.text)에서만 찾는다 — 역할 라벨은 검색 대상이
@@ -473,7 +509,11 @@ fn render_message(
             .filter(|m| !m.ranges.is_empty());
         match text_matches {
             None => {
-                ui.add(egui::Label::new(message.text.as_str()).wrap().selectable(true));
+                ui.add(
+                    egui::Label::new(message.text.as_str())
+                        .wrap()
+                        .selectable(true),
+                );
             }
             Some(matches) => {
                 // color는 PLACEHOLDER — 위젯이 그릴 때 현재 텍스트 색으로
@@ -550,7 +590,11 @@ fn focus_range(
     truncated: bool,
     focus_offset: u64,
 ) -> Option<std::ops::Range<usize>> {
-    if truncated && messages.first().is_some_and(|first| focus_offset < first.offset) {
+    if truncated
+        && messages
+            .first()
+            .is_some_and(|first| focus_offset < first.offset)
+    {
         return None;
     }
     let start = messages.iter().position(|m| m.offset >= focus_offset)?;
@@ -569,18 +613,29 @@ mod tests {
     fn 빈_뷰어는_안내_문구를_보여준다() {
         let mut ui = TranscriptViewerUi::default();
         assert!(ui.is_empty());
-        ui.set_conversation(Ok(crate::agent_transcript::TranscriptConversation::default()), None);
-        assert!(!ui.is_empty(), "열었으면 비어 있지 않다 — 대화가 0건이어도 상태는 열림이다");
+        ui.set_conversation(
+            Ok(crate::agent_transcript::TranscriptConversation::default()),
+            None,
+        );
+        assert!(
+            !ui.is_empty(),
+            "열었으면 비어 있지 않다 — 대화가 0건이어도 상태는 열림이다"
+        );
     }
 
     #[test]
     fn 로딩_중이면_빈_상태가_아니다() {
         let mut ui = TranscriptViewerUi::default();
         ui.set_loading();
-        assert!(!ui.is_empty(), "로딩도 열림이다 — 대화가 아직 안 왔을 뿐이다");
+        assert!(
+            !ui.is_empty(),
+            "로딩도 열림이다 — 대화가 아직 안 왔을 뿐이다"
+        );
     }
 
-    fn harness_for(viewer: TranscriptViewerUi) -> egui_kittest::Harness<'static, TranscriptViewerUi> {
+    fn harness_for(
+        viewer: TranscriptViewerUi,
+    ) -> egui_kittest::Harness<'static, TranscriptViewerUi> {
         egui_kittest::Harness::new_ui_state(
             |ui, state: &mut TranscriptViewerUi| {
                 let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -610,7 +665,12 @@ mod tests {
         text: &str,
         offset: u64,
     ) -> crate::agent_transcript::ConversationMessage {
-        crate::agent_transcript::ConversationMessage { role, text: text.to_owned(), at: None, offset }
+        crate::agent_transcript::ConversationMessage {
+            role,
+            text: text.to_owned(),
+            at: None,
+            offset,
+        }
     }
 
     #[test]
@@ -642,7 +702,10 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let mut viewer = TranscriptViewerUi::default();
-        viewer.set_conversation(Err(crate::agent_transcript::TranscriptViewError::NotFound), None);
+        viewer.set_conversation(
+            Err(crate::agent_transcript::TranscriptViewError::NotFound),
+            None,
+        );
         let mut harness = harness_for(viewer);
         harness.run();
 
@@ -655,7 +718,10 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let mut viewer = TranscriptViewerUi::default();
-        viewer.set_conversation(Err(crate::agent_transcript::TranscriptViewError::ReadFailed), None);
+        viewer.set_conversation(
+            Err(crate::agent_transcript::TranscriptViewError::ReadFailed),
+            None,
+        );
         let mut harness = harness_for(viewer);
         harness.run();
 
@@ -670,7 +736,11 @@ mod tests {
         let mut viewer = TranscriptViewerUi::default();
         viewer.set_conversation(
             Ok(crate::agent_transcript::TranscriptConversation {
-                messages: vec![message(crate::agent_transcript::ConversationRole::User, "안녕", 0)],
+                messages: vec![message(
+                    crate::agent_transcript::ConversationRole::User,
+                    "안녕",
+                    0,
+                )],
                 truncated: true,
             }),
             None,
@@ -690,8 +760,16 @@ mod tests {
         viewer.set_conversation(
             Ok(crate::agent_transcript::TranscriptConversation {
                 messages: vec![
-                    message(crate::agent_transcript::ConversationRole::User, "질문입니다", 0),
-                    message(crate::agent_transcript::ConversationRole::Assistant, "답변입니다", 100),
+                    message(
+                        crate::agent_transcript::ConversationRole::User,
+                        "질문입니다",
+                        0,
+                    ),
+                    message(
+                        crate::agent_transcript::ConversationRole::Assistant,
+                        "답변입니다",
+                        100,
+                    ),
                 ],
                 truncated: false,
             }),
@@ -731,7 +809,10 @@ mod tests {
             })
             .collect();
         viewer.set_conversation(
-            Ok(crate::agent_transcript::TranscriptConversation { messages, truncated: false }),
+            Ok(crate::agent_transcript::TranscriptConversation {
+                messages,
+                truncated: false,
+            }),
             None,
         );
         let mut harness = harness_for(viewer);
@@ -763,9 +844,13 @@ mod tests {
     fn 역할별_배경은_서로_다르고_토큰에서만_고른다() {
         let tokens = crate::ui::designall::DARK;
         let user_bg = role_background(tokens, crate::agent_transcript::ConversationRole::User);
-        let agent_bg = role_background(tokens, crate::agent_transcript::ConversationRole::Assistant);
+        let agent_bg =
+            role_background(tokens, crate::agent_transcript::ConversationRole::Assistant);
         assert_ne!(user_bg, agent_bg);
-        assert_eq!(agent_bg, tokens.content_canvas, "에이전트는 페이지 바닥 톤을 그대로 쓴다");
+        assert_eq!(
+            agent_bg, tokens.content_canvas,
+            "에이전트는 페이지 바닥 톤을 그대로 쓴다"
+        );
     }
 
     #[test]
@@ -787,13 +872,37 @@ mod tests {
     #[test]
     fn 초점_범위는_그_턴만_잡는다() {
         let messages = vec![
-            message(crate::agent_transcript::ConversationRole::User, "턴1 지시", 0),
-            message(crate::agent_transcript::ConversationRole::Assistant, "턴1 답", 100),
-            message(crate::agent_transcript::ConversationRole::User, "턴2 지시", 200),
-            message(crate::agent_transcript::ConversationRole::Assistant, "턴2 답", 300),
+            message(
+                crate::agent_transcript::ConversationRole::User,
+                "턴1 지시",
+                0,
+            ),
+            message(
+                crate::agent_transcript::ConversationRole::Assistant,
+                "턴1 답",
+                100,
+            ),
+            message(
+                crate::agent_transcript::ConversationRole::User,
+                "턴2 지시",
+                200,
+            ),
+            message(
+                crate::agent_transcript::ConversationRole::Assistant,
+                "턴2 답",
+                300,
+            ),
         ];
-        assert_eq!(focus_range(&messages, false, 0), Some(0..2), "다음 User 직전까지");
-        assert_eq!(focus_range(&messages, false, 200), Some(2..4), "마지막 턴은 끝까지");
+        assert_eq!(
+            focus_range(&messages, false, 0),
+            Some(0..2),
+            "다음 User 직전까지"
+        );
+        assert_eq!(
+            focus_range(&messages, false, 200),
+            Some(2..4),
+            "마지막 턴은 끝까지"
+        );
     }
 
     #[test]
@@ -809,16 +918,36 @@ mod tests {
 
     #[test]
     fn 창_밖의_턴은_초점을_잡지_못한다() {
-        let messages = vec![message(crate::agent_transcript::ConversationRole::User, "최근", 900)];
+        let messages = vec![message(
+            crate::agent_transcript::ConversationRole::User,
+            "최근",
+            900,
+        )];
         // 잘리지 않았다면(파일 전체가 창 안) `offset >= focus_offset`으로 뒤쪽
         // 메시지를 잡는 게 옳다 — 턴을 연 줄이 노이즈 규칙으로 걸러졌을 수 있어서다.
-        assert_eq!(focus_range(&messages, false, 100), Some(0..1), "안 잘렸으면 뒤쪽을 잡는다");
-        assert_eq!(focus_range(&messages, false, 1_000), None, "그보다 뒤는 없다");
+        assert_eq!(
+            focus_range(&messages, false, 100),
+            Some(0..1),
+            "안 잘렸으면 뒤쪽을 잡는다"
+        );
+        assert_eq!(
+            focus_range(&messages, false, 1_000),
+            None,
+            "그보다 뒤는 없다"
+        );
         // 잘렸다면(스냅샷 창이 파일 시작을 못 담았다) `focus_offset`이 창의 첫
         // 메시지보다 앞이라는 건 그 턴이 창 밖(더 앞)으로 밀려났다는 뜻이다 — 엉뚱한
         // (더 최근) 메시지를 그 턴인 것처럼 강조하면 안 되므로 못 찾은 것으로 취급한다.
-        assert_eq!(focus_range(&messages, true, 100), None, "잘렸으면 창 앞의 턴은 못 찾는다");
-        assert_eq!(focus_range(&messages, true, 1_000), None, "그보다 뒤는 잘렸어도 여전히 없다");
+        assert_eq!(
+            focus_range(&messages, true, 100),
+            None,
+            "잘렸으면 창 앞의 턴은 못 찾는다"
+        );
+        assert_eq!(
+            focus_range(&messages, true, 1_000),
+            None,
+            "그보다 뒤는 잘렸어도 여전히 없다"
+        );
     }
 
     #[test]
@@ -830,7 +959,11 @@ mod tests {
         // 보여주면 사용자는 그게 그 턴인 줄 안다.
         viewer.set_conversation(
             Ok(crate::agent_transcript::TranscriptConversation {
-                messages: vec![message(crate::agent_transcript::ConversationRole::User, "최근", 900)],
+                messages: vec![message(
+                    crate::agent_transcript::ConversationRole::User,
+                    "최근",
+                    900,
+                )],
                 truncated: false,
             }),
             Some(1_000),
@@ -850,10 +983,26 @@ mod tests {
         viewer.set_conversation(
             Ok(crate::agent_transcript::TranscriptConversation {
                 messages: vec![
-                    message(crate::agent_transcript::ConversationRole::User, "턴1 지시", 0),
-                    message(crate::agent_transcript::ConversationRole::Assistant, "턴1 답", 100),
-                    message(crate::agent_transcript::ConversationRole::User, "턴2 지시", 200),
-                    message(crate::agent_transcript::ConversationRole::Assistant, "턴2 답", 300),
+                    message(
+                        crate::agent_transcript::ConversationRole::User,
+                        "턴1 지시",
+                        0,
+                    ),
+                    message(
+                        crate::agent_transcript::ConversationRole::Assistant,
+                        "턴1 답",
+                        100,
+                    ),
+                    message(
+                        crate::agent_transcript::ConversationRole::User,
+                        "턴2 지시",
+                        200,
+                    ),
+                    message(
+                        crate::agent_transcript::ConversationRole::Assistant,
+                        "턴2 답",
+                        300,
+                    ),
                 ],
                 truncated: false,
             }),
@@ -868,7 +1017,9 @@ mod tests {
         // 범위 안 메시지를 가리거나 죽이지 않고 그대로 보여주는지 확인한다.
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         assert!(
-            harness.query_by_label(&catalog.t("history.transcript.focus_missing", &[])).is_none(),
+            harness
+                .query_by_label(&catalog.t("history.transcript.focus_missing", &[]))
+                .is_none(),
             "찾은 턴이니 안내가 없어야 한다"
         );
         harness.get_by_label("턴2 지시");
@@ -878,21 +1029,41 @@ mod tests {
     #[test]
     fn 대화가_바뀌면_높이_캐시와_배치_상태가_초기화된다() {
         let mut viewer = TranscriptViewerUi::default();
-        viewer.set_conversation(Ok(crate::agent_transcript::TranscriptConversation::default()), None);
+        viewer.set_conversation(
+            Ok(crate::agent_transcript::TranscriptConversation::default()),
+            None,
+        );
         // 이전 대화에서 이미 부트스트랩(전부 배치)을 마치고 높이를 재 뒀다고 가정한다.
         viewer.heights = vec![Some(10.0), Some(20.0)];
         viewer.initial_pass_done = true;
 
-        viewer.set_conversation(Ok(crate::agent_transcript::TranscriptConversation::default()), None);
+        viewer.set_conversation(
+            Ok(crate::agent_transcript::TranscriptConversation::default()),
+            None,
+        );
 
-        assert!(viewer.heights.is_empty(), "옛 대화의 높이가 남으면 새 대화에서 스크롤이 통째로 어긋난다");
-        assert!(!viewer.initial_pass_done, "새 대화는 다시 부트스트랩부터 시작해야 착지가 정확하다");
+        assert!(
+            viewer.heights.is_empty(),
+            "옛 대화의 높이가 남으면 새 대화에서 스크롤이 통째로 어긋난다"
+        );
+        assert!(
+            !viewer.initial_pass_done,
+            "새 대화는 다시 부트스트랩부터 시작해야 착지가 정확하다"
+        );
     }
 
     #[test]
     fn 잠정_높이는_측정된_것들의_평균이고_없으면_한_줄_높이다() {
-        assert_eq!(provisional_height(&[None, None], 12.0), 12.0, "하나도 안 쟀으면 폴백");
-        assert_eq!(provisional_height(&[Some(10.0), None, Some(20.0)], 12.0), 15.0, "측정된 것만 평균");
+        assert_eq!(
+            provisional_height(&[None, None], 12.0),
+            12.0,
+            "하나도 안 쟀으면 폴백"
+        );
+        assert_eq!(
+            provisional_height(&[Some(10.0), None, Some(20.0)], 12.0),
+            15.0,
+            "측정된 것만 평균"
+        );
         assert_eq!(provisional_height(&[], 12.0), 12.0, "메시지가 없어도 폴백");
     }
 
@@ -914,7 +1085,11 @@ mod tests {
     #[test]
     fn overscan은_앞뒤로_더_배치하되_경계를_벗어나지_않는다() {
         let offsets: Vec<f32> = (0u16..=5).map(|i| f32::from(i) * 10.0).collect();
-        assert_eq!(visible_range(&offsets, 12.0..28.0, 1), 0..4, "overscan 1이면 앞뒤로 하나씩 더");
+        assert_eq!(
+            visible_range(&offsets, 12.0..28.0, 1),
+            0..4,
+            "overscan 1이면 앞뒤로 하나씩 더"
+        );
         assert_eq!(
             visible_range(&offsets, 12.0..28.0, 10),
             0..5,
@@ -953,12 +1128,28 @@ mod tests {
     #[test]
     fn 검색_캐시는_메시지별_누적_일치수를_센다() {
         let messages = vec![
-            message(crate::agent_transcript::ConversationRole::User, "cab cab", 0),
-            message(crate::agent_transcript::ConversationRole::Assistant, "no match", 100),
-            message(crate::agent_transcript::ConversationRole::User, "cab cab cab", 200),
+            message(
+                crate::agent_transcript::ConversationRole::User,
+                "cab cab",
+                0,
+            ),
+            message(
+                crate::agent_transcript::ConversationRole::Assistant,
+                "no match",
+                100,
+            ),
+            message(
+                crate::agent_transcript::ConversationRole::User,
+                "cab cab cab",
+                200,
+            ),
         ];
         let cache = build_search_cache(&messages, "cab");
-        assert_eq!(cache.message_match_start, vec![0, 2, 2, 5], "2 + 0 + 3, sentinel 포함");
+        assert_eq!(
+            cache.message_match_start,
+            vec![0, 2, 2, 5],
+            "2 + 0 + 3, sentinel 포함"
+        );
         assert_eq!(cache.total, 5);
         assert!(!cache.truncated);
     }
@@ -966,8 +1157,16 @@ mod tests {
     #[test]
     fn 검색_캐시는_상한에서_멈추고_잘림을_표시한다() {
         let messages = vec![
-            message(crate::agent_transcript::ConversationRole::Assistant, &"a".repeat(400), 0),
-            message(crate::agent_transcript::ConversationRole::Assistant, &"a".repeat(400), 100),
+            message(
+                crate::agent_transcript::ConversationRole::Assistant,
+                &"a".repeat(400),
+                0,
+            ),
+            message(
+                crate::agent_transcript::ConversationRole::Assistant,
+                &"a".repeat(400),
+                100,
+            ),
         ];
         let cache = build_search_cache(&messages, "a");
         // 메시지 0에서 400개를 다 세고, 메시지 1은 남은 100개(500 - 400)만 세고 멈춘다.
@@ -981,9 +1180,17 @@ mod tests {
         let starts = vec![0, 2, 2, 5];
         assert_eq!(message_for_active_match(&starts, 0), Some(0));
         assert_eq!(message_for_active_match(&starts, 1), Some(0));
-        assert_eq!(message_for_active_match(&starts, 2), Some(2), "메시지 1은 일치가 없어 건너뛴다");
+        assert_eq!(
+            message_for_active_match(&starts, 2),
+            Some(2),
+            "메시지 1은 일치가 없어 건너뛴다"
+        );
         assert_eq!(message_for_active_match(&starts, 4), Some(2));
-        assert_eq!(message_for_active_match(&starts, 5), None, "총계 밖은 못 찾는다(캐시가 못 따라온 경계 프레임)");
+        assert_eq!(
+            message_for_active_match(&starts, 5),
+            None,
+            "총계 밖은 못 찾는다(캐시가 못 따라온 경계 프레임)"
+        );
         assert_eq!(message_for_active_match(&starts, 100), None);
     }
 
@@ -999,8 +1206,16 @@ mod tests {
         );
         assert_eq!(local_active_in_message(&starts, 2, Some(2)), Some(0));
         assert_eq!(local_active_in_message(&starts, 2, Some(4)), Some(2));
-        assert_eq!(local_active_in_message(&starts, 0, None), None, "활성 일치 자체가 없으면 없다");
-        assert_eq!(local_active_in_message(&starts, 99, Some(0)), None, "범위 밖 메시지 인덱스");
+        assert_eq!(
+            local_active_in_message(&starts, 0, None),
+            None,
+            "활성 일치 자체가 없으면 없다"
+        );
+        assert_eq!(
+            local_active_in_message(&starts, 99, Some(0)),
+            None,
+            "범위 밖 메시지 인덱스"
+        );
     }
 
     #[test]
@@ -1011,14 +1226,20 @@ mod tests {
         for tokens in [crate::ui::designall::DARK, crate::ui::designall::LIGHT] {
             let match_bg = search_match_bg(tokens);
             let active_bg = search_active_match_bg(tokens);
-            assert_ne!(match_bg, active_bg, "활성 일치는 나머지와 다른 색이어야 ↑↓가 보인다");
+            assert_ne!(
+                match_bg, active_bg,
+                "활성 일치는 나머지와 다른 색이어야 ↑↓가 보인다"
+            );
             for role in [
                 crate::agent_transcript::ConversationRole::User,
                 crate::agent_transcript::ConversationRole::Assistant,
             ] {
                 let role_bg = role_background(tokens, role);
                 assert_ne!(match_bg, role_bg, "검색 강조가 역할 배경에 묻히면 안 된다");
-                assert_ne!(active_bg, role_bg, "활성 검색 강조가 역할 배경에 묻히면 안 된다");
+                assert_ne!(
+                    active_bg, role_bg,
+                    "활성 검색 강조가 역할 배경에 묻히면 안 된다"
+                );
             }
         }
     }
@@ -1029,19 +1250,39 @@ mod tests {
         viewer.set_conversation(
             Ok(crate::agent_transcript::TranscriptConversation {
                 messages: vec![
-                    message(crate::agent_transcript::ConversationRole::User, "cab cab", 0),
-                    message(crate::agent_transcript::ConversationRole::Assistant, "no match", 100),
-                    message(crate::agent_transcript::ConversationRole::User, "cab cab cab", 200),
+                    message(
+                        crate::agent_transcript::ConversationRole::User,
+                        "cab cab",
+                        0,
+                    ),
+                    message(
+                        crate::agent_transcript::ConversationRole::Assistant,
+                        "no match",
+                        100,
+                    ),
+                    message(
+                        crate::agent_transcript::ConversationRole::User,
+                        "cab cab cab",
+                        200,
+                    ),
                 ],
                 truncated: false,
             }),
             None,
         );
-        assert_eq!(viewer.search_summary(), (0, false), "render 전에는 아직 캐시가 없다");
+        assert_eq!(
+            viewer.search_summary(),
+            (0, false),
+            "render 전에는 아직 캐시가 없다"
+        );
 
         let mut harness = harness_with_search(viewer, "cab", 0);
         harness.run();
-        assert_eq!(harness.state().search_summary(), (5, false), "2 + 0 + 3 = 5, 안 잘림");
+        assert_eq!(
+            harness.state().search_summary(),
+            (5, false),
+            "2 + 0 + 3 = 5, 안 잘림"
+        );
     }
 
     #[test]
@@ -1085,19 +1326,26 @@ mod tests {
                 } else {
                     format!("메시지 {index}")
                 };
-                message(crate::agent_transcript::ConversationRole::Assistant, &text, index as u64 * 100)
+                message(
+                    crate::agent_transcript::ConversationRole::Assistant,
+                    &text,
+                    index as u64 * 100,
+                )
             })
             .collect();
         viewer.set_conversation(
-            Ok(crate::agent_transcript::TranscriptConversation { messages, truncated: false }),
+            Ok(crate::agent_transcript::TranscriptConversation {
+                messages,
+                truncated: false,
+            }),
             None,
         );
         let mut harness = harness_with_search(viewer, "고유표식", 0);
         harness.run(); // 부트스트랩: 전부 배치해 높이를 재고, 검색 스크롤 대상을
-                        // 계산해 둔다 — 이 프레임에서는 아직 소비하지 않는다(위
-                        // `pending_search_scroll_to` 문서 참고).
+        // 계산해 둔다 — 이 프레임에서는 아직 소비하지 않는다(위
+        // `pending_search_scroll_to` 문서 참고).
         harness.run(); // 가상화 프레임: 이제 슬롯 오프셋 기반으로 그 메시지까지
-                        // 스크롤한다.
+        // 스크롤한다.
 
         assert!(
             harness.query_by_label("고유표식").is_some(),

@@ -13954,6 +13954,25 @@ impl App {
         let Some(extra_args) = target.extra_args else {
             return false;
         };
+        // App Server(구조화 Agent Sessions 패널)가 같은 codex thread를 이미 writer로
+        // 붙잡고 있으면 PTY에서 `codex resume`을 또 실행하지 않는다 — codex의 rollout
+        // 파일은 writer 하나만 허용해 -32600으로 거부한다. 대신 이미 열려 있는 구조화
+        // 세션으로 옮겨 대화가 실제로 이어지게 한다.
+        let row = archived_agent_row_for_session(&mux, &self.archived_agent_resume, session);
+        if let Some(local_session_id) = attached_app_server_conflict(row, |thread_id| {
+            self.agent_sessions_ui
+                .attached_local_session_for_thread(thread_id)
+                .map(str::to_owned)
+        }) {
+            if self.agent_sessions_ui.open_session(&local_session_id) {
+                self.egui_ctx.request_repaint();
+            } else {
+                // 거의 발생하지 않는 레이스(attach는 됐는데 로컬 세션 항목이 사라짐) —
+                // 원문 codex 에러 대신 이해할 수 있는 안내를 보여준다.
+                self.agent_sessions_ui.report_thread_attached_elsewhere();
+            }
+            return true;
+        }
         let command = runtime::RuntimeCommand::RespawnArchivedAgent {
             session,
             extra_args,
@@ -27336,6 +27355,42 @@ fn pane_of_session(
         .map(|pane| pane.id.clone())
 }
 
+/// `session`이 앉은 pane의 durable `sessions.id`로 PTY-native resume 바인딩 행을 찾는다.
+/// `dispatch_respawn_archived_agent`가 이 행의 `kind`/`session_id`(에이전트 자신의 native
+/// 세션 id — codex면 thread id)로 App Server writer 충돌 여부를 판정한다.
+fn archived_agent_row_for_session<'a>(
+    mux: &runtime::MuxSnapshot,
+    rows: &'a std::collections::HashMap<String, storage::ArchivedAgentResumeRow>,
+    session: runtime::SessionId,
+) -> Option<&'a storage::ArchivedAgentResumeRow> {
+    mux.tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .find(|pane| pane.session_id == Some(session))
+        .and_then(|pane| pane.persistent_session_id.as_deref())
+        .and_then(|persistent_id| rows.get(persistent_id))
+}
+
+/// PTY 「이어서 하기」가 만들려는 codex resume이 App Server가 이미 writer로 붙잡고 있는
+/// thread와 같은 대상인지 판정한다. 같으면 그 local(App 소유, `agent_sessions_ui`) 세션
+/// id를 돌려준다 — dispatch가 PTY `codex resume`을 만드는 대신 그 세션으로 이어간다.
+///
+/// codex만 대상이다: App Server가 다루는 provider가 codex뿐이라(claude/kimi/qwen-code는
+/// PTY로만 실행된다) 다른 provider의 native binding은 애초에 App Server와 겹칠 수 없다.
+/// 겹치는데도 놓치면 codex가 rollout 파일당 writer 하나만 허용해 -32600("already has an
+/// active writer")으로 거부한다(2026-08-19 재현).
+fn attached_app_server_conflict(
+    row: Option<&storage::ArchivedAgentResumeRow>,
+    attached_local_session_for_thread: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    let row = row?;
+    if row.kind.as_deref() != Some("codex") {
+        return None;
+    }
+    let thread_id = row.session_id.as_deref()?;
+    attached_local_session_for_thread(thread_id)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArchivedResumeTarget {
     presentation: ArchivedResumePresentation,
@@ -37509,6 +37564,71 @@ mod tests {
         let target = unsupported.get(&runtime::SessionId(9)).unwrap();
         assert_eq!(target.presentation, ArchivedResumePresentation::Unsupported);
         assert_eq!(target.extra_args, Some(Vec::new()));
+    }
+
+    #[test]
+    fn archived_agent_row_for_session은_persistent_session_id로_찾는다() {
+        let mux = archived_resume_test_mux("persistent-codex");
+        let rows = HashMap::from([(
+            "persistent-codex".to_owned(),
+            archived_resume_row(
+                "persistent-codex",
+                "deppy-builtin-codex",
+                Some(("codex", "thread-x")),
+            ),
+        )]);
+
+        let row = archived_agent_row_for_session(&mux, &rows, runtime::SessionId(9))
+            .expect("row must be found via persistent_session_id");
+        assert_eq!(row.session_id.as_deref(), Some("thread-x"));
+
+        // 알 수 없는 session에는 아무 것도 못 찾는다(다른 pane/mux 상태).
+        assert!(archived_agent_row_for_session(&mux, &rows, runtime::SessionId(404)).is_none());
+    }
+
+    /// dispatch_respawn_archived_agent가 기대는 판정 — App Server writer 충돌은
+    /// **codex** provider + **같은 thread id**가 attach돼 있을 때만 성립한다.
+    #[test]
+    fn attached_app_server_conflict은_codex_thread가_attach됐을_때만_잡는다() {
+        let codex_row = archived_resume_row(
+            "p",
+            "deppy-builtin-codex",
+            Some(("codex", "codex-thread-1")),
+        );
+        let claude_row = archived_resume_row(
+            "p",
+            "deppy-builtin-claude",
+            Some(("claude", "codex-thread-1")),
+        );
+
+        // codex + 같은 thread가 attach돼 있으면 그 local session id를 돌려준다.
+        assert_eq!(
+            attached_app_server_conflict(Some(&codex_row), |thread_id| {
+                (thread_id == "codex-thread-1").then(|| "local-1".to_owned())
+            }),
+            Some("local-1".to_owned())
+        );
+
+        // provider가 codex가 아니면 App Server가 다루는 대상이 아니므로 절대 충돌하지
+        // 않는다(같은 문자열이 우연히 겹쳐도 마찬가지).
+        assert_eq!(
+            attached_app_server_conflict(Some(&claude_row), |thread_id| {
+                (thread_id == "codex-thread-1").then(|| "local-1".to_owned())
+            }),
+            None
+        );
+
+        // 그 thread가 App Server에 attach돼 있지 않으면 충돌 없음 — 평소의(다수) 경로.
+        assert_eq!(
+            attached_app_server_conflict(Some(&codex_row), |_| None),
+            None
+        );
+
+        // PTY 바인딩 자체가 없는 pane(row: None)은 판정 대상이 아니다.
+        assert_eq!(
+            attached_app_server_conflict(None, |_| Some("x".to_owned())),
+            None
+        );
     }
 
     #[test]

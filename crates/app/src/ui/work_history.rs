@@ -43,6 +43,14 @@ pub struct WorkHistorySnapshot<'a> {
     pub workspace_name: &'a str,
     pub current_branch: Option<&'a str>,
     pub rows: &'a [WorkHistoryRow<'a>],
+    /// App이 `self.work_history_rows`를 실제로 수정할 때마다(교체·부분 갱신·비움)
+    /// 올리는 리비전. `rows`의 내용이 바뀔 수 있는 지점(App: `poll_work_history_git`
+    /// in-place 갱신, `apply_agent_state_projection_result`의 WorkHistory 스냅샷
+    /// 교체, 워크스페이스 이탈 시 clear)마다 반드시 함께 올라간다는 게 계약이다 —
+    /// 이 값이 그대로면 `rows`가 그대로라고 믿고 필터·정렬·그룹핑 결과를 재사용한다
+    /// (`WorkHistoryUi::cached_grouped_rows`). 이 계약이 깨지면(리비전 갱신을
+    /// 빠뜨리면) 화면이 옛 데이터를 계속 보여주는 사고가 난다.
+    pub rows_revision: u64,
     pub loading: bool,
     pub error: Option<WorkHistoryErrorCode>,
 }
@@ -108,9 +116,22 @@ pub enum WorkHistoryDisabledReason {
     Stale,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// 카드 하나가 그릴 프레젠테이션. **`identity`를 담지 않는다** — 예전에는 담았지만
+/// 그러면 App이 256행 전부에 대해 매 프레임 `WorkTurnIdentity::from(row)`(String
+/// 4개 할당)를 불러야 했다(2026-08-19 계측: 프레임당 1,024개). `primary`/`show_diff`
+/// 버튼은 카드가 펼쳐졌을 때만 읽히고(`render_card`의 `if expanded` 블록 안), 눌렸을
+/// 때 올리는 액션의 identity는 그 자리에서 들고 있는 `row`로 즉석에서 만든다
+/// (`WorkTurnIdentity::from(row)`, 「원문 보기」가 이미 하던 방식과 같다) — 클릭은
+/// 프레임당 최대 한 번이라 이 할당은 문제가 되지 않는다.
+///
+/// **행-프레젠테이션 대응은 App이 순서로 보장한다.** `App::render_work_history_tab_body`가
+/// `self.work_history_rows`를 한 번만 순회하며 `WorkHistoryRow`와 이 값을 같은 자리에서
+/// 함께 만들어, `show()`에 넘기는 `rows`와 `presentations` 두 슬라이스가 항상 같은
+/// 길이·같은 순서를 이룬다. 이 leaf는 필터·정렬·그룹핑 과정에서도 원본 인덱스
+/// (`WorkHistoryGroup::row_indices`)를 그대로 들고 다녀 그 인덱스로 `presentations`를
+/// 직접 찾는다 — 문자열 4개를 비교하는 선형 탐색이 없다(2026-08-19, 스펙 이슈 #2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkHistoryActionPresentation {
-    pub identity: WorkTurnIdentity,
     pub primary: WorkHistoryPrimaryAction,
     pub show_diff: bool,
 }
@@ -199,6 +220,12 @@ struct WorkHistoryGroup<'a> {
     kind: &'a str,
     agent_session_id: &'a str,
     rows: Vec<WorkHistoryRow<'a>>,
+    /// `rows[k]`가 원본 `rows`(이 그룹을 만든 `show()`의 `snapshot.rows`) 슬라이스
+    /// 에서 몇 번째였는지 — `rows`와 항상 같은 길이·같은 순서로 나란히 간다.
+    /// presentation 조회(App이 같은 순서로 만들어 넘긴 `presentations`)와 캐시
+    /// 재조립(`WorkHistoryUi::cached_grouped_rows`)이 이 인덱스로 원본을 O(1)
+    /// 역참조한다 — `WorkTurnIdentity::matches` 문자열 비교 선형 탐색을 없앤다.
+    row_indices: Vec<usize>,
     model: Option<&'a str>,
     effort: Option<&'a str>,
     branch: Option<&'a str>,
@@ -226,6 +253,261 @@ fn latest_with_value<'a, T: Copy>(
         .map(|(_, value)| value)
 }
 
+/// `WorkHistoryUi::visible_row_indices`가 쓰는 정렬 비교자. `visible_rows`(캐시 없는
+/// 경로)와 캐시 계획을 만드는 인덱스 경로가 이 함수 하나를 공유해 정렬 규칙이 두
+/// 곳에서 갈라지지 않는다.
+fn compare_rows(
+    left: &WorkHistoryRow<'_>,
+    right: &WorkHistoryRow<'_>,
+    sort_mode: WorkHistorySortMode,
+) -> std::cmp::Ordering {
+    match sort_mode {
+        WorkHistorySortMode::StateFirst => state_rank(left.state)
+            .cmp(&state_rank(right.state))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| right.source_offset.cmp(&left.source_offset))
+            .then_with(|| left.kind.cmp(right.kind))
+            .then_with(|| left.agent_session_id.cmp(right.agent_session_id))
+            .then_with(|| left.turn_key.cmp(right.turn_key)),
+        WorkHistorySortMode::RecentFirst => right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.source_offset.cmp(&left.source_offset))
+            .then_with(|| left.kind.cmp(right.kind))
+            .then_with(|| left.agent_session_id.cmp(right.agent_session_id))
+            .then_with(|| left.turn_key.cmp(right.turn_key)),
+    }
+}
+
+/// 그룹 하나를 원본 `rows`와 인덱스 목록에서 조립한다. `grouped_rows`(캐시 없이
+/// 매번)와 `cached_grouped_rows`(캐시된 인덱스 재사용) 둘 다 이 함수 하나로
+/// model/effort/branch/git_change_count/latest_updated_at을 계산해, 두 경로의 결과가
+/// 갈라질 수 없다.
+fn materialize_group<'a>(
+    rows: &'a [WorkHistoryRow<'a>],
+    indices: &[usize],
+) -> WorkHistoryGroup<'a> {
+    let group_rows: Vec<WorkHistoryRow<'a>> = indices.iter().map(|&index| rows[index]).collect();
+    let kind = group_rows[0].kind;
+    let agent_session_id = group_rows[0].agent_session_id;
+    let model = latest_with_value(&group_rows, |row| row.model);
+    let effort = latest_with_value(&group_rows, |row| row.effort);
+    let branch = latest_with_value(&group_rows, |row| row.branch);
+    let git_change_count = latest_with_value(&group_rows, |row| row.git_change_count);
+    let latest_updated_at = group_rows
+        .iter()
+        .map(|row| row.updated_at)
+        .max()
+        .unwrap_or(0);
+    WorkHistoryGroup {
+        kind,
+        agent_session_id,
+        row_indices: indices.to_vec(),
+        rows: group_rows,
+        model,
+        effort,
+        branch,
+        git_change_count,
+        latest_updated_at,
+    }
+}
+
+/// `WorkHistoryUi::cached_grouped_rows`의 캐시 키. 이 값이 이전 프레임과 같으면
+/// `rows`가 가리키는 실제 데이터도 그대로라고 App이 보장한다(`rows_revision` 계약,
+/// `WorkHistorySnapshot::rows_revision` 문서 참고) — 그러면 필터·정렬·그룹핑(인덱스
+/// 계획)을 다시 계산하지 않는다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkHistoryGroupedCacheKey {
+    rows_revision: u64,
+    query: String,
+    filter: WorkHistoryFilter,
+    providers: Vec<WorkHistoryProvider>,
+    sort_mode: WorkHistorySortMode,
+}
+
+/// 목록 가상화 높이 캐시(`WorkHistoryUi::list_heights`)가 유효한 슬롯 구성인지
+/// 판단하는 서명. `WorkHistoryGroupedCacheKey`가 커버하는 것(리비전·질의·필터·
+/// provider·정렬 모드) 외에도 보조 검색 필터(`apply_aux_filter`, 캐시 범위 밖)와
+/// 그룹 접기 상태(슬롯 개수를 바꾼다)까지 더해야 "화면에 그려질 슬롯의 순서·개수"를
+/// 완전히 결정한다. 카드 선택(펼침)은 슬롯 개수를 바꾸지 않고 한 슬롯의 높이만
+/// 바꾸므로 여기 넣지 않는다 — 가상화 렌더 루프의 자기보정(실측값이 캐시와 다르면
+/// 그 자리에서 갱신)이 알아서 따라잡는다.
+#[derive(Clone, PartialEq, Eq)]
+struct WorkHistoryListShape {
+    grouped_key: WorkHistoryGroupedCacheKey,
+    aux_filter: String,
+    collapsed_generation: u64,
+}
+
+/// 목록 가상화의 슬롯 하나 — 그룹 헤더 또는 그 그룹의 카드 한 장.
+enum WorkHistorySlotKind {
+    Header { collapsed: bool },
+    Card { row_in_group: usize },
+}
+
+struct WorkHistorySlot {
+    group_index: usize,
+    kind: WorkHistorySlotKind,
+    /// 이 슬롯이 자기 그룹의 마지막 슬롯이면 true. 그룹 사이 여백(`GROUP_GAP`,
+    /// 예전엔 `if index > 0 { ui.add_space(6.0) }`로 다음 그룹 헤더 앞에 뒀다)을
+    /// 이 슬롯 자신의 렌더에 트레일링 `ui.add_space`로 포함시켜 측정 높이에 자연히
+    /// 녹인다 — 그래야 가상화 오프셋 계산이 슬롯 종류(헤더/카드)나 그룹 경계 여부를
+    /// 따로 안 가리는 단일 공식(`extra_per_slot = item_spacing.y`)으로 성립한다.
+    /// 맨 마지막 그룹 뒤에도 여백이 남지만 스크롤 영역 바닥의 빈 공간일 뿐이라
+    /// 무해하다(transcript_viewer.rs `MESSAGE_GAP`이 마지막 메시지 뒤에도 붙는 것과
+    /// 같은 관례).
+    is_group_end: bool,
+}
+
+/// `groups`(이미 필터·정렬·그룹핑·보조 검색까지 적용된 결과)와 접기 상태로부터
+/// 슬롯 목록을 만든다. 접힌 그룹은 헤더 슬롯 하나뿐이다 — "접힌 그룹 헤더도 목록의
+/// 일부"라 가상화 대상에서 빠지면 안 된다.
+fn build_slots(
+    groups: &[WorkHistoryGroup<'_>],
+    collapsed_groups: &std::collections::HashSet<(String, String)>,
+) -> Vec<WorkHistorySlot> {
+    let mut slots = Vec::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        let key = (group.kind.to_owned(), group.agent_session_id.to_owned());
+        let collapsed = collapsed_groups.contains(&key);
+        if collapsed {
+            slots.push(WorkHistorySlot {
+                group_index,
+                kind: WorkHistorySlotKind::Header { collapsed: true },
+                is_group_end: true,
+            });
+            continue;
+        }
+        slots.push(WorkHistorySlot {
+            group_index,
+            kind: WorkHistorySlotKind::Header { collapsed: false },
+            is_group_end: false,
+        });
+        let last = group.rows.len().saturating_sub(1);
+        for row_in_group in 0..group.rows.len() {
+            slots.push(WorkHistorySlot {
+                group_index,
+                kind: WorkHistorySlotKind::Card { row_in_group },
+                is_group_end: row_in_group == last,
+            });
+        }
+    }
+    slots
+}
+
+/// 슬롯 하나를 그리고 실측 rect를 함께 돌려준다. `render_group_header`/`render_card`
+/// 내부는 바꾸지 않고 감싸기만 한다 — `Frame::NONE`(여백 없음)이 안에서 그린 모든 것
+/// (카드 프레임, 헤더의 hairline, 그룹 끝이면 트레일링 간격까지)을 정확히 감싼
+/// rect를 돌려준다(transcript_viewer.rs `render_message`가 프레임 rect를 재는 것과
+/// 같은 방식).
+fn render_slot(
+    ui: &mut egui::Ui,
+    slot: &WorkHistorySlot,
+    groups: &[WorkHistoryGroup<'_>],
+    presentations: &[WorkHistoryActionPresentation],
+    selected: Option<&WorkTurnIdentity>,
+    now: i64,
+    catalog: &i18n::Catalog,
+) -> (SlotOutcome, egui::Rect) {
+    let mut outcome = SlotOutcome::default();
+    let response = egui::Frame::NONE.show(ui, |ui| {
+        let group = &groups[slot.group_index];
+        match slot.kind {
+            WorkHistorySlotKind::Header { collapsed } => {
+                if render_group_header(ui, group, collapsed, now, catalog) {
+                    outcome.toggled_group =
+                        Some((group.kind.to_owned(), group.agent_session_id.to_owned()));
+                }
+            }
+            WorkHistorySlotKind::Card { row_in_group } => {
+                let row = &group.rows[row_in_group];
+                let presentation = group
+                    .row_indices
+                    .get(row_in_group)
+                    .and_then(|&index| presentations.get(index));
+                let expanded = selected.is_some_and(|identity| identity.matches(row));
+                let card_action = render_card(ui, row, expanded, now, presentation, catalog);
+                if card_action.toggle {
+                    outcome.toggled_card = Some(WorkTurnIdentity::from(row));
+                }
+                outcome.action = card_action.action;
+            }
+        }
+        if slot.is_group_end {
+            ui.add_space(GROUP_GAP);
+        }
+    });
+    (outcome, response.response.rect)
+}
+
+#[derive(Default)]
+struct SlotOutcome {
+    toggled_group: Option<(String, String)>,
+    toggled_card: Option<WorkTurnIdentity>,
+    action: Option<WorkHistoryAction>,
+}
+
+/// 그룹과 다음 그룹 사이 여백(예전 `ui.add_space(6.0)`와 같은 값). `WorkHistorySlot`
+/// 문서 참고 — 그룹 앞이 아니라 그 그룹 마지막 슬롯 뒤에 붙인다.
+const GROUP_GAP: f32 = 6.0;
+
+/// 뷰포트 앞뒤로 이만큼 슬롯을 더 배치해 스크롤 중 빈칸이 보이지 않게 한다.
+/// transcript_viewer.rs `OVERSCAN_MESSAGES`와 같은 값·같은 이유.
+const OVERSCAN_SLOTS: usize = 4;
+
+/// 아직 실측 못 한 슬롯의 잠정 높이 — 이미 측정된 높이들의 평균, 하나도 없으면
+/// `fallback`(한 줄 높이). transcript_viewer.rs `provisional_height`와 같다.
+fn provisional_slot_height(heights: &[Option<f32>], fallback: f32) -> f32 {
+    let (sum, count) = heights
+        .iter()
+        .flatten()
+        .fold((0.0_f32, 0usize), |(sum, count), height| {
+            (sum + height, count + 1)
+        });
+    if count == 0 {
+        fallback
+    } else {
+        sum / count as f32
+    }
+}
+
+/// 슬롯별 "슬롯 높이"(프레임 높이 + item_spacing)의 누적합. 길이는 `heights.len() + 1`
+/// 이고 `offsets[k]`는 슬롯 0..k를 배치했을 때 소비하는 전체 높이 —
+/// transcript_viewer.rs `slot_offsets`와 같은 계약.
+fn slot_offsets(heights: &[Option<f32>], provisional: f32, extra_per_slot: f32) -> Vec<f32> {
+    let mut offsets = Vec::with_capacity(heights.len() + 1);
+    offsets.push(0.0);
+    let mut acc = 0.0;
+    for height in heights {
+        acc += height.unwrap_or(provisional) + extra_per_slot;
+        offsets.push(acc);
+    }
+    offsets
+}
+
+/// 뷰포트 y범위(overscan 포함)와 겹치는 슬롯 인덱스 구간을 누적합에서 찾는다 —
+/// transcript_viewer.rs `visible_range`와 같다.
+fn visible_slot_range(
+    offsets: &[f32],
+    viewport: std::ops::Range<f32>,
+    overscan: usize,
+) -> std::ops::Range<usize> {
+    let total = offsets.len().saturating_sub(1);
+    if total == 0 || viewport.end <= viewport.start {
+        return 0..0;
+    }
+    let tight_start = offsets
+        .partition_point(|offset| *offset <= viewport.start)
+        .saturating_sub(1)
+        .min(total - 1);
+    let tight_end = offsets
+        .partition_point(|offset| *offset < viewport.end)
+        .clamp(tight_start + 1, total);
+    let start = tight_start.saturating_sub(overscan);
+    let end = (tight_end + overscan).min(total);
+    start..end
+}
+
 /// 그룹 헤더 토글의 접근성 이름. provider만 쓰면 같은 provider의 다른 세션과 겹칠
 /// 수 있어 `agent_session_id`를 더해 유일하게 만든다 — 카드가 `row.instruction`을
 /// 그대로 쓰는 것과 같은 이유(번역이 필요 없는 raw 식별자).
@@ -242,6 +524,28 @@ pub struct WorkHistoryUi {
     /// 접힌 그룹의 `(kind, agent_session_id)` 집합. 세션 내 UI 상태로만 유지하고
     /// 설정·DB에는 저장하지 않는다 — `selected`와 같은 성격의 필드다.
     collapsed_groups: std::collections::HashSet<(String, String)>,
+    /// `collapsed_groups`가 바뀔 때마다 올라간다. 집합 자체(String 여러 개를 담은
+    /// `HashSet`)를 매 프레임 복제해 이전 값과 비교하는 대신, 값 하나 비교로 "접기
+    /// 상태가 바뀌었는가"를 싸게 묻기 위한 세대 번호다(`WorkHistoryListShape`가 쓴다).
+    collapsed_generation: u64,
+    /// 필터·정렬·그룹핑(“행 인덱스 계획”)을 재사용하기 위한 캐시. 키가 이전 프레임과
+    /// 같으면(`WorkHistoryGroupedCacheKey`) `grouped_row_indices`를 다시 부르지 않고
+    /// 캐시된 인덱스만 `materialize_group`으로 얕게 재조립한다 — `'a` 대여가 프레임을
+    /// 못 넘기므로 캐시엔 참조가 아니라 `usize` 인덱스만 담는다(2026-08-19, 스펙
+    /// 이슈 #4).
+    grouped_cache: Option<(WorkHistoryGroupedCacheKey, Vec<Vec<usize>>)>,
+    /// 카드 목록 가상화(`show_viewport`, transcript_viewer.rs와 같은 계약)가 슬롯별로
+    /// 실측한 높이. 슬롯 하나 = 그룹 헤더 한 줄 또는 카드 한 장. `list_shape`가
+    /// 바뀌면(슬롯 구성이 달라질 수 있으므로) 통째로 비운다.
+    list_heights: Vec<Option<f32>>,
+    /// 이번 슬롯 구성을 연 뒤 아직 "전부 배치"를 하지 않았다. transcript_viewer.rs
+    /// `initial_pass_done`과 같은 이유 — 착지 정확성을 위해 슬롯 구성이 바뀐 첫
+    /// 프레임은 가상화 없이 전부 배치해 모든 높이를 실측한다.
+    list_bootstrap_done: bool,
+    /// 마지막으로 `list_heights`를 채운 슬롯 구성의 서명. 이게 바뀌면(리비전·질의·
+    /// 필터·provider·정렬 모드·보조 검색·접기 상태 중 하나라도) 슬롯 순서·개수가
+    /// 달라졌을 수 있어 높이 캐시를 버리고 다시 부트스트랩한다.
+    list_shape: Option<WorkHistoryListShape>,
 }
 
 impl WorkHistoryUi {
@@ -253,6 +557,11 @@ impl WorkHistoryUi {
             sort_mode: WorkHistorySortMode::StateFirst,
             selected: None,
             collapsed_groups: std::collections::HashSet::new(),
+            collapsed_generation: 0,
+            grouped_cache: None,
+            list_heights: Vec::new(),
+            list_bootstrap_done: false,
+            list_shape: None,
         }
     }
 
@@ -277,8 +586,38 @@ impl WorkHistoryUi {
         // 넘겨받은 rect(=pane body)를 그대로 채운다. 상단 탭 스트립은 호출부가 이미
         // 잘라내고 남긴 높이라 여기서 다시 빼지 않는다 — 프레임 자기 여백만 제한다.
         let available_height = ui.available_height();
-        let groups = apply_aux_filter(self.grouped_rows(snapshot.rows), filter);
+        let grouped_key = WorkHistoryGroupedCacheKey {
+            rows_revision: snapshot.rows_revision,
+            query: self.query.trim().to_lowercase(),
+            filter: self.filter,
+            providers: self.providers.clone(),
+            sort_mode: self.sort_mode,
+        };
+        let groups = apply_aux_filter(
+            self.cached_grouped_rows(snapshot.rows, &grouped_key),
+            filter,
+        );
         let shown: usize = groups.iter().map(|group| group.rows.len()).sum();
+
+        // 목록 가상화(`show_viewport`) 슬롯 구성 — 그룹 헤더 한 줄 또는 카드 한 장이
+        // 슬롯 하나다(접힌 그룹 헤더도 슬롯이다). 이번 프레임의 슬롯 구성 서명이
+        // 직전 프레임과 같으면 실측 높이 캐시를 그대로 쓰고, 다르면(리비전·질의·
+        // 필터·provider·정렬 모드·보조 검색·접기 상태 중 하나라도 바뀌었으면) 버리고
+        // 이번 프레임에 전부 다시 배치해 재측정한다(transcript_viewer.rs
+        // `initial_pass_done`과 같은 부트스트랩 계약 — 착지 정확성이 우선이라 여기서도
+        // 타협하지 않는다).
+        let slots = build_slots(&groups, &self.collapsed_groups);
+        let shape = WorkHistoryListShape {
+            grouped_key,
+            aux_filter: filter.to_owned(),
+            collapsed_generation: self.collapsed_generation,
+        };
+        if self.list_shape.as_ref() != Some(&shape) || self.list_heights.len() != slots.len() {
+            self.list_heights = vec![None; slots.len()];
+            self.list_bootstrap_done = false;
+            self.list_shape = Some(shape);
+        }
+
         content.show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height((available_height - f32::from(BODY_MARGIN_Y) * 2.0).max(0.0));
@@ -312,42 +651,116 @@ impl WorkHistoryUi {
             }
 
             let now = unix_now();
+            let selected = self.selected.as_ref();
+            let list_heights = &mut self.list_heights;
+            let list_bootstrap_done = &mut self.list_bootstrap_done;
+            let mut toggled_group = None;
+            let mut toggled_card = None;
+            let mut list_action = None;
+
             egui::ScrollArea::vertical()
                 .id_salt("work-history-cards")
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
+                .show_viewport(ui, |ui, viewport| {
                     ui.spacing_mut().item_spacing.y = 9.0;
-                    for (index, group) in groups.iter().enumerate() {
-                        if index > 0 {
-                            ui.add_space(6.0);
-                        }
-                        let key = (group.kind.to_owned(), group.agent_session_id.to_owned());
-                        let collapsed = self.collapsed_groups.contains(&key);
-                        if render_group_header(ui, group, collapsed, now, catalog) {
-                            self.toggle_group_collapsed(key);
-                        }
-                        if collapsed {
-                            continue;
-                        }
-                        for row in &group.rows {
-                            let expanded = self
-                                .selected
-                                .as_ref()
-                                .is_some_and(|selected| selected.matches(row));
-                            let presentation = presentations
-                                .iter()
-                                .find(|candidate| candidate.identity.matches(row));
-                            let card_action =
-                                render_card(ui, row, expanded, now, presentation, catalog);
-                            if card_action.toggle {
-                                self.toggle_selected(WorkTurnIdentity::from(row));
+                    if !*list_bootstrap_done {
+                        // 부트스트랩: 슬롯 구성이 바뀐 첫 프레임은 가상화 없이 전부
+                        // 배치해 모든 슬롯 높이를 실측한다.
+                        for (index, slot) in slots.iter().enumerate() {
+                            let (outcome, rect) = render_slot(
+                                ui,
+                                slot,
+                                &groups,
+                                presentations,
+                                selected,
+                                now,
+                                catalog,
+                            );
+                            list_heights[index] = Some(rect.height());
+                            if let Some(key) = outcome.toggled_group {
+                                toggled_group = Some(key);
                             }
-                            if action.is_none() {
-                                action = card_action.action;
+                            if let Some(identity) = outcome.toggled_card {
+                                toggled_card = Some(identity);
+                            }
+                            if list_action.is_none() {
+                                list_action = outcome.action;
                             }
                         }
+                        *list_bootstrap_done = true;
+                        return;
                     }
+
+                    // 두 번째 프레임부터: 캐시된 높이의 누적합으로 뷰포트에 걸치는
+                    // 구간만 배치한다(+ overscan). transcript_viewer.rs와 같은 패턴을
+                    // 그대로 따른다 — 카드 높이가 균일하지 않고(펼침 여부에 따라
+                    // 크게 달라진다) 헤더·카드 높이도 서로 달라, `show_rows`의 "모든
+                    // 행이 같은 높이" 계약을 쓸 수 없다(transcript_viewer.rs가 예전에
+                    // `show_rows`를 쓰다 겪은 것과 같은 문제).
+                    let row_fallback = ui.text_style_height(&egui::TextStyle::Body);
+                    let provisional = provisional_slot_height(list_heights, row_fallback);
+                    let extra_per_slot = ui.spacing().item_spacing.y;
+                    let offsets = slot_offsets(list_heights, provisional, extra_per_slot);
+                    let total_height = offsets.last().copied().unwrap_or(0.0);
+                    ui.set_height(total_height);
+
+                    let range = visible_slot_range(
+                        &offsets,
+                        viewport.min.y..viewport.max.y,
+                        OVERSCAN_SLOTS,
+                    );
+                    if range.is_empty() {
+                        return;
+                    }
+
+                    let y_min = ui.max_rect().top() + offsets[range.start];
+                    let y_max = ui.max_rect().top() + offsets[range.end];
+                    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |viewport_ui| {
+                        // 배치 안 하는 앞뒤 슬롯도 "widget이 있었다"고 셈해야 스크롤
+                        // 도중 같은 슬롯의 auto id가 프레임마다 안 바뀐다
+                        // (transcript_viewer.rs와 같은 관례).
+                        viewport_ui.skip_ahead_auto_ids(range.start);
+                        for index in range.clone() {
+                            let (outcome, rect) = render_slot(
+                                viewport_ui,
+                                &slots[index],
+                                &groups,
+                                presentations,
+                                selected,
+                                now,
+                                catalog,
+                            );
+                            let measured = rect.height();
+                            if list_heights[index] != Some(measured) {
+                                list_heights[index] = Some(measured);
+                                // 값이 바뀌었으니(예: 카드를 펼치거나 접었다) 다음
+                                // 프레임에 새 누적합을 반영한다.
+                                viewport_ui.ctx().request_repaint();
+                            }
+                            if let Some(key) = outcome.toggled_group {
+                                toggled_group = Some(key);
+                            }
+                            if let Some(identity) = outcome.toggled_card {
+                                toggled_card = Some(identity);
+                            }
+                            if list_action.is_none() {
+                                list_action = outcome.action;
+                            }
+                        }
+                    });
                 });
+
+            if let Some(key) = toggled_group {
+                self.toggle_group_collapsed(key);
+            }
+            if let Some(identity) = toggled_card {
+                self.toggle_selected(identity);
+            }
+            if action.is_none() {
+                action = list_action;
+            }
         });
         action
     }
@@ -439,42 +852,44 @@ impl WorkHistoryUi {
         });
     }
 
-    fn visible_rows<'a>(&self, rows: &'a [WorkHistoryRow<'a>]) -> Vec<&'a WorkHistoryRow<'a>> {
-        let query = self.query.trim().to_lowercase();
-        let mut visible: Vec<_> = rows
-            .iter()
-            .filter(|row| self.filter.matches(row.state))
+    /// 상태 필터·provider 칩·내부 검색창을 모두 통과하는가. `visible_row_indices`와
+    /// (그래서 `visible_rows`도) 이 판정 하나를 공유한다 — 판정 로직이 두 곳에서
+    /// 갈라지면 캐시가 화면과 다른 결과를 보여주는 사고가 난다.
+    fn passes_filters(&self, row: &WorkHistoryRow<'_>, query: &str) -> bool {
+        self.filter.matches(row.state)
             // provider 칩을 전부 해제한 상태는 "빈 목록"이 아니라 "전체 provider
             // 표시"로 취급한다. 세션 시작 시 아무 칩도 선택돼 있지 않은 기본값이
             // 기존 동작(필터 없음)과 동일해야 하고, 사용자가 마지막 칩을 끄는
             // 순간 카드가 통째로 사라지면 "무필터"가 아니라 "빈 화면"이라는
             // 오해를 준다. 하나라도 선택되면 그때부터 선택된 provider와 매치하는
-            // row만 남기며, 상태 필터와는 AND로 결합된다(별도 `.filter()` 체인).
-            .filter(|row| {
-                self.providers.is_empty()
-                    || self
-                        .providers
-                        .iter()
-                        .any(|provider| provider.matches(row.kind))
-            })
-            .filter(|row| query.is_empty() || row_matches_query(row, &query))
+            // row만 남기며, 상태 필터와는 AND로 결합된다.
+            && (self.providers.is_empty()
+                || self.providers.iter().any(|provider| provider.matches(row.kind)))
+            && (query.is_empty() || row_matches_query(row, query))
+    }
+
+    /// `visible_row_indices`의 값-반환 버전. 실제 렌더 경로(`show`)는 캐시가 필요해
+    /// `cached_grouped_rows`(→ `grouped_row_indices` → `visible_row_indices`)를 직접
+    /// 쓰므로 이 메서드는 프로덕션에서 호출되지 않는다 — 인덱스를 신경 쓰지 않고
+    /// 필터+정렬 결과만 검증하는 테스트 전용 얇은 래퍼로 남겨 뒀다.
+    #[cfg(test)]
+    fn visible_rows<'a>(&self, rows: &'a [WorkHistoryRow<'a>]) -> Vec<&'a WorkHistoryRow<'a>> {
+        self.visible_row_indices(rows)
+            .into_iter()
+            .map(|index| &rows[index])
+            .collect()
+    }
+
+    /// `visible_rows`가 실제로 쓰는 인덱스 버전 — 원본 `rows` 슬라이스에서의 위치를
+    /// 그대로 들고 다닌다. `grouped_row_indices`(캐시 계획, `cached_grouped_rows`가
+    /// 재사용)와 `visible_rows`가 이 함수 하나를 공유해서 필터·정렬 로직이 두 곳에서
+    /// 갈라지는 사고를 막는다.
+    fn visible_row_indices(&self, rows: &[WorkHistoryRow<'_>]) -> Vec<usize> {
+        let query = self.query.trim().to_lowercase();
+        let mut visible: Vec<usize> = (0..rows.len())
+            .filter(|&index| self.passes_filters(&rows[index], &query))
             .collect();
-        visible.sort_by(|left, right| match self.sort_mode {
-            WorkHistorySortMode::StateFirst => state_rank(left.state)
-                .cmp(&state_rank(right.state))
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-                .then_with(|| right.source_offset.cmp(&left.source_offset))
-                .then_with(|| left.kind.cmp(right.kind))
-                .then_with(|| left.agent_session_id.cmp(right.agent_session_id))
-                .then_with(|| left.turn_key.cmp(right.turn_key)),
-            WorkHistorySortMode::RecentFirst => right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| right.source_offset.cmp(&left.source_offset))
-                .then_with(|| left.kind.cmp(right.kind))
-                .then_with(|| left.agent_session_id.cmp(right.agent_session_id))
-                .then_with(|| left.turn_key.cmp(right.turn_key)),
-        });
+        visible.sort_by(|&left, &right| compare_rows(&rows[left], &rows[right], self.sort_mode));
         visible
     }
 
@@ -490,38 +905,63 @@ impl WorkHistoryUi {
     /// 내 최신 updated_at) 기준 순서이고, 그룹에 속한 행들을 만나는 순서 그대로
     /// 모으면 그룹 내부 순서도 전역 정렬 규칙을 그대로 물려받는다. 별도 재정렬이
     /// 필요 없다.
+    ///
+    /// `grouped_row_indices`(→ `materialize_group`)의 캐시 없는 버전. 실제 렌더
+    /// 경로는 `cached_grouped_rows`를 쓰므로(리비전이 그대로면 재계산을 건너뛴다,
+    /// 스펙 이슈 #4) 이 메서드 자체는 프로덕션에서 호출되지 않는다 — 그룹핑 로직
+    /// 자체(캐시와 무관하게 옳은가)를 검증하는 테스트 전용 얇은 래퍼다.
+    #[cfg(test)]
     fn grouped_rows<'a>(&self, rows: &'a [WorkHistoryRow<'a>]) -> Vec<WorkHistoryGroup<'a>> {
-        let mut groups: Vec<WorkHistoryGroup<'a>> = Vec::new();
-        for row in self.visible_rows(rows) {
+        self.grouped_row_indices(rows)
+            .iter()
+            .map(|indices| materialize_group(rows, indices))
+            .collect()
+    }
+
+    /// `grouped_rows`가 실제로 쓰는 인덱스 버전 — usize만 담겨 있어 `'a` 대여 없이
+    /// `self`에 프레임을 넘겨 캐시할 수 있다(`cached_grouped_rows`).
+    fn grouped_row_indices(&self, rows: &[WorkHistoryRow<'_>]) -> Vec<Vec<usize>> {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for index in self.visible_row_indices(rows) {
+            let row = &rows[index];
             match groups.iter_mut().find(|group| {
-                group.kind == row.kind && group.agent_session_id == row.agent_session_id
+                let first = &rows[group[0]];
+                first.kind == row.kind && first.agent_session_id == row.agent_session_id
             }) {
-                Some(group) => group.rows.push(*row),
-                None => groups.push(WorkHistoryGroup {
-                    kind: row.kind,
-                    agent_session_id: row.agent_session_id,
-                    rows: vec![*row],
-                    model: None,
-                    effort: None,
-                    branch: None,
-                    git_change_count: None,
-                    latest_updated_at: row.updated_at,
-                }),
+                Some(group) => group.push(index),
+                None => groups.push(vec![index]),
             }
         }
-        for group in &mut groups {
-            group.model = latest_with_value(&group.rows, |row| row.model);
-            group.effort = latest_with_value(&group.rows, |row| row.effort);
-            group.branch = latest_with_value(&group.rows, |row| row.branch);
-            group.git_change_count = latest_with_value(&group.rows, |row| row.git_change_count);
-            group.latest_updated_at = group
-                .rows
-                .iter()
-                .map(|row| row.updated_at)
-                .max()
-                .unwrap_or(group.latest_updated_at);
-        }
         groups
+    }
+
+    /// `grouped_rows(rows)`와 같은 결과를 리비전·질의·필터·provider·정렬 모드가
+    /// `key`로 넘어온 값과 이전 프레임에서 그대로면 다시 계산하지 않고 돌려준다
+    /// (스펙 이슈 #4). 캐시가 담는 건 usize 인덱스뿐이라 `rows`(매 프레임 새로 빌린
+    /// 뷰)의 수명과 무관하게 `self`에 보관할 수 있다 — `key`가 다르면(즉 `rows`가
+    /// 가리키는 실제 데이터나 필터·정렬 조건이 바뀌었으면) `grouped_row_indices`를
+    /// 다시 불러 새 계획으로 덮어쓴다.
+    fn cached_grouped_rows<'a>(
+        &mut self,
+        rows: &'a [WorkHistoryRow<'a>],
+        key: &WorkHistoryGroupedCacheKey,
+    ) -> Vec<WorkHistoryGroup<'a>> {
+        let stale = match &self.grouped_cache {
+            Some((cached_key, _)) => cached_key != key,
+            None => true,
+        };
+        if stale {
+            let indices = self.grouped_row_indices(rows);
+            self.grouped_cache = Some((key.clone(), indices));
+        }
+        let (_, indices) = self
+            .grouped_cache
+            .as_ref()
+            .expect("stale 분기가 방금 Some으로 채웠다");
+        indices
+            .iter()
+            .map(|group_indices| materialize_group(rows, group_indices))
+            .collect()
     }
 
     fn toggle_selected(&mut self, identity: WorkTurnIdentity) {
@@ -538,6 +978,9 @@ impl WorkHistoryUi {
         if !self.collapsed_groups.remove(&key) {
             self.collapsed_groups.insert(key);
         }
+        // 슬롯 구성(카드가 몇 장 보이는가)이 바뀔 수 있으니 목록 가상화 높이 캐시가
+        // 이번 프레임에 다시 부트스트랩하도록 세대를 올린다(`WorkHistoryListShape`).
+        self.collapsed_generation = self.collapsed_generation.wrapping_add(1);
     }
 
     fn reconcile_selection(&mut self, rows: &[WorkHistoryRow<'_>]) {
@@ -896,8 +1339,14 @@ fn render_card(
                             .add_enabled(enabled, egui::Button::new(catalog.t(label_key, &[])))
                             .clicked()
                         {
-                            action =
-                                Some(WorkHistoryAction::Activate(presentation.identity.clone()));
+                            // `presentation`은 identity를 담지 않는다(카드당 String 4개
+                            // 할당을 없애려고 App이 더 이상 만들지 않는다) — 지금 그리고
+                            // 있는 `row`에서 즉석으로 만든다. 이 카드가 가리키는 행과
+                            // `presentation`은 App이 같은 인덱스로 대응시켜 넘긴 값이라
+                            // 항상 같은 턴을 가리킨다(`WorkHistoryActionPresentation` 문서
+                            // 참고). 클릭은 프레임당 최대 한 번이라 이 할당은 무해하다 —
+                            // 「원문 보기」가 이미 같은 방식을 쓴다(아래).
+                            action = Some(WorkHistoryAction::Activate(WorkTurnIdentity::from(row)));
                         }
                         if presentation.show_diff
                             && ui
@@ -905,8 +1354,7 @@ fn render_card(
                                 .on_hover_text(catalog.t("history.action.show_diff_hint", &[]))
                                 .clicked()
                         {
-                            action =
-                                Some(WorkHistoryAction::ShowDiff(presentation.identity.clone()));
+                            action = Some(WorkHistoryAction::ShowDiff(WorkTurnIdentity::from(row)));
                         }
                     }
                     // presentation과 무관하게 항상 켜져 있다 — 원문은 런처 가용성이나
@@ -1035,7 +1483,10 @@ fn parse_turn_messages(json: &str, instruction: &str) -> Vec<CardMessage> {
 /// 트림 + 연속 공백 접기 + 소문자 — orca가 제목·본문 중복 판정에 쓰는 비교 규칙과
 /// 같다. 원문을 바꾸지 않고 비교용으로만 쓴다.
 fn normalize_for_dedupe(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// storage가 `agent_work_turn.instruction`/`agent_summary`에 적용하는 저장 상한
@@ -1176,7 +1627,10 @@ fn provider_label(kind: &str) -> &str {
 
 fn provider_badge(ui: &mut egui::Ui, kind: &str) {
     let label = provider_label(kind);
-    let badge = match kind.trim().to_ascii_lowercase().as_str() {
+    // 배지 텍스트·색 판정이 각각 `kind.trim().to_ascii_lowercase()`를 새로 할당하던
+    // 것을 하나로 합쳤다(카드당 힙 alloc 2회 → 1회, 2026-08-19).
+    let normalized = kind.trim().to_ascii_lowercase();
+    let badge = match normalized.as_str() {
         "claude" | "claude code" => "CL".to_owned(),
         "codex" => "CX".to_owned(),
         "kimi" | "kimi cli" => "KI".to_owned(),
@@ -1188,7 +1642,7 @@ fn provider_badge(ui: &mut egui::Ui, kind: &str) {
             .flat_map(|ch| ch.to_uppercase())
             .collect(),
     };
-    let color = match kind.trim().to_ascii_lowercase().as_str() {
+    let color = match normalized.as_str() {
         "claude" | "claude code" => egui::Color32::from_rgb(0xd9, 0x70, 0x4e),
         "codex" => egui::Color32::from_rgb(0x10, 0xa3, 0x7f),
         "kimi" | "kimi cli" => egui::Color32::from_rgb(0x42, 0x73, 0xda),
@@ -1377,7 +1831,6 @@ mod tests {
         let candidate = row("button-hit-test", storage::AgentWorkTurnState::Working, 10);
         let identity = WorkTurnIdentity::from(&candidate);
         let presentation = WorkHistoryActionPresentation {
-            identity: identity.clone(),
             primary,
             show_diff: true,
         };
@@ -1414,7 +1867,6 @@ mod tests {
         let candidate = row("diff-hit-test", storage::AgentWorkTurnState::Completed, 10);
         let identity = WorkTurnIdentity::from(&candidate);
         let presentation = WorkHistoryActionPresentation {
-            identity: identity.clone(),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: true,
         };
@@ -1444,9 +1896,7 @@ mod tests {
             storage::AgentWorkTurnState::Completed,
             10,
         );
-        let identity = WorkTurnIdentity::from(&candidate);
         let presentation = WorkHistoryActionPresentation {
-            identity: identity.clone(),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: true,
         };
@@ -1483,7 +1933,6 @@ mod tests {
             10,
         );
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: true,
         };
@@ -1512,7 +1961,6 @@ mod tests {
             10,
         );
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: true,
         };
@@ -1547,7 +1995,6 @@ mod tests {
             10,
         );
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: true,
         };
@@ -1578,7 +2025,6 @@ mod tests {
             10,
         );
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: true,
         };
@@ -1609,7 +2055,6 @@ mod tests {
             10,
         );
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: true,
         };
@@ -1642,7 +2087,6 @@ mod tests {
         );
         candidate.agent_summary = None;
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: false,
         };
@@ -1716,11 +2160,8 @@ mod tests {
         assert!(parse_turn_messages("{ 망가짐", "지시").is_empty());
         assert!(parse_turn_messages(r#"[{"r":"x","t":"모를 역할"}]"#, "지시").is_empty());
         assert!(
-            parse_turn_messages(
-                &format!("[{}]", r#"{"r":"a","t":"x"},"#.repeat(9)),
-                "지시"
-            )
-            .is_empty()
+            parse_turn_messages(&format!("[{}]", r#"{"r":"a","t":"x"},"#.repeat(9)), "지시")
+                .is_empty()
         );
     }
 
@@ -2017,7 +2458,10 @@ mod tests {
         assert!(keys.contains(&"by-instruction"));
         assert!(keys.contains(&"by-summary"));
         assert!(keys.contains(&"by-message"));
-        assert!(!keys.contains(&"no-match"), "어느 필드에도 안 걸리면 빠져야 한다");
+        assert!(
+            !keys.contains(&"no-match"),
+            "어느 필드에도 안 걸리면 빠져야 한다"
+        );
     }
 
     #[test]
@@ -2029,7 +2473,10 @@ mod tests {
 
         let groups = apply_aux_filter(ui.grouped_rows(&views), "billing WIDGET");
 
-        assert_eq!(groups.iter().map(|group| group.rows.len()).sum::<usize>(), 1);
+        assert_eq!(
+            groups.iter().map(|group| group.rows.len()).sum::<usize>(),
+            1
+        );
     }
 
     #[test]
@@ -2050,7 +2497,10 @@ mod tests {
 
         let groups = apply_aux_filter(ui.grouped_rows(&views), "");
 
-        assert_eq!(groups.iter().map(|group| group.rows.len()).sum::<usize>(), 1);
+        assert_eq!(
+            groups.iter().map(|group| group.rows.len()).sum::<usize>(),
+            1
+        );
     }
 
     #[test]
@@ -2065,7 +2515,6 @@ mod tests {
             10,
         );
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: false,
         };
@@ -2325,6 +2774,10 @@ mod tests {
                             workspace_name: "workspace",
                             current_branch: None,
                             rows,
+                            // 이 하니스로 여러 프레임(`harness.run()`을 두 번 이상)을
+                            // 도는 테스트가 없으므로 고정값 1이면 충분하다 — 캐시
+                            // 무효화 자체는 `WorkHistoryUi` 단위 테스트가 별도로 잰다.
+                            rows_revision: 1,
                             loading: false,
                             error: None,
                         },
@@ -2348,7 +2801,6 @@ mod tests {
             10,
         );
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: false,
         };
@@ -2419,7 +2871,6 @@ mod tests {
             10,
         );
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: true,
         };
@@ -2453,7 +2904,6 @@ mod tests {
         candidate.model = Some("gpt-5.6-sol-extended-reasoning".to_owned());
         candidate.branch = Some("feature/very-long-branch-name-for-wrapping".to_owned());
         let presentation = WorkHistoryActionPresentation {
-            identity: WorkTurnIdentity::from(&candidate),
             primary: WorkHistoryPrimaryAction::NewRun,
             show_diff: false,
         };
@@ -2473,6 +2923,7 @@ mod tests {
                             workspace_name: "workspace",
                             current_branch: None,
                             rows: &views,
+                            rows_revision: 1,
                             loading: false,
                             error: None,
                         },
@@ -2492,6 +2943,340 @@ mod tests {
             element.rect().right() <= NARROW,
             "턴 수 라벨이 캔버스 밖으로 넘친다: {}",
             element.rect().right()
+        );
+    }
+
+    // ---- 필터·정렬·그룹핑 캐시 (스펙 이슈 #4) ----
+
+    fn base_grouped_key() -> WorkHistoryGroupedCacheKey {
+        WorkHistoryGroupedCacheKey {
+            rows_revision: 1,
+            query: String::new(),
+            filter: WorkHistoryFilter::All,
+            providers: Vec::new(),
+            sort_mode: WorkHistorySortMode::StateFirst,
+        }
+    }
+
+    #[test]
+    fn 캐시된_그룹핑은_캐시_없는_그룹핑과_같은_결과를_돌려준다() {
+        let rows = vec![
+            row("a", storage::AgentWorkTurnState::Working, 3),
+            row("b", storage::AgentWorkTurnState::Completed, 2),
+        ];
+        let views = views(&rows);
+        let mut ui = WorkHistoryUi::new();
+        let key = base_grouped_key();
+
+        let cached = ui.cached_grouped_rows(&views, &key);
+        let direct = ui.grouped_rows(&views);
+
+        let cached_keys: Vec<&str> = cached
+            .iter()
+            .flat_map(|group| group.rows.iter().map(|row| row.turn_key))
+            .collect();
+        let direct_keys: Vec<&str> = direct
+            .iter()
+            .flat_map(|group| group.rows.iter().map(|row| row.turn_key))
+            .collect();
+        assert_eq!(cached_keys, direct_keys);
+    }
+
+    #[test]
+    fn 캐시_키가_같으면_저장된_계획을_다시_계산하지_않고_그대로_쓴다() {
+        let rows = vec![row("a", storage::AgentWorkTurnState::Working, 1)];
+        let views = views(&rows);
+        let mut ui = WorkHistoryUi::new();
+        let key = base_grouped_key();
+
+        let _ = ui.cached_grouped_rows(&views, &key); // 캐시를 채운다(진짜 계획: [[0]]).
+        // 캐시된 계획을 일부러 틀리게 바꾼다 — 키가 같은데도 진짜로 다시 계산했다면
+        // 이 조작은 무시되고 원래 계획(그룹 1개)으로 되돌아올 것이다. 조작한 값이
+        // 그대로 나오면 재계산을 건너뛰고 캐시를 재사용했다는 뜻이다.
+        ui.grouped_cache.as_mut().unwrap().1 = vec![];
+
+        let reused = ui.cached_grouped_rows(&views, &key);
+        assert!(
+            reused.is_empty(),
+            "리비전·질의·필터·provider·정렬 모드가 그대로면 캐시를 다시 계산하면 안 된다"
+        );
+    }
+
+    #[test]
+    fn 캐시_키가_하나라도_바뀌면_저장된_계획을_버리고_다시_계산한다() {
+        let rows = vec![row("a", storage::AgentWorkTurnState::Working, 1)];
+        let views = views(&rows);
+        let base = base_grouped_key();
+        let variants = [
+            WorkHistoryGroupedCacheKey {
+                rows_revision: 2,
+                ..base.clone()
+            },
+            WorkHistoryGroupedCacheKey {
+                query: "billing".to_owned(),
+                ..base.clone()
+            },
+            WorkHistoryGroupedCacheKey {
+                filter: WorkHistoryFilter::Waiting,
+                ..base.clone()
+            },
+            WorkHistoryGroupedCacheKey {
+                providers: vec![WorkHistoryProvider::Claude],
+                ..base.clone()
+            },
+            WorkHistoryGroupedCacheKey {
+                sort_mode: WorkHistorySortMode::RecentFirst,
+                ..base.clone()
+            },
+        ];
+
+        for variant in variants {
+            let mut ui = WorkHistoryUi::new();
+            let _ = ui.cached_grouped_rows(&views, &base);
+            let _ = ui.cached_grouped_rows(&views, &variant);
+            assert_eq!(
+                ui.grouped_cache.as_ref().map(|(key, _)| key),
+                Some(&variant),
+                "입력이 바뀌면 캐시 키를 새 값으로 갱신해야 한다(재계산이 실제로 일어났다는 뜻)"
+            );
+        }
+    }
+
+    #[test]
+    fn 접힌_그룹은_헤더_슬롯_하나만_만든다() {
+        let rows = vec![
+            row("a", storage::AgentWorkTurnState::Working, 1),
+            row("b", storage::AgentWorkTurnState::Working, 2),
+        ];
+        let views = views(&rows);
+        let ui = WorkHistoryUi::new();
+        let groups = ui.grouped_rows(&views);
+        assert_eq!(
+            groups.len(),
+            1,
+            "같은 kind/session_id 두 턴은 한 그룹이어야 한다"
+        );
+
+        let mut collapsed = std::collections::HashSet::new();
+        collapsed.insert((
+            groups[0].kind.to_owned(),
+            groups[0].agent_session_id.to_owned(),
+        ));
+        let slots = build_slots(&groups, &collapsed);
+
+        assert_eq!(
+            slots.len(),
+            1,
+            "접힌 그룹은 헤더 슬롯 하나만 남아야 한다 — 카드는 슬롯이 아니다"
+        );
+        assert!(matches!(
+            slots[0].kind,
+            WorkHistorySlotKind::Header { collapsed: true }
+        ));
+    }
+
+    #[test]
+    fn 펼친_그룹은_헤더_다음에_카드_슬롯이_행_수만큼_있고_마지막만_그룹_끝이다() {
+        let rows = vec![
+            row("a", storage::AgentWorkTurnState::Working, 1),
+            row("b", storage::AgentWorkTurnState::Working, 2),
+            row("c", storage::AgentWorkTurnState::Working, 3),
+        ];
+        let views = views(&rows);
+        let ui = WorkHistoryUi::new();
+        let groups = ui.grouped_rows(&views);
+        let slots = build_slots(&groups, &std::collections::HashSet::new());
+
+        assert_eq!(slots.len(), 4, "헤더 1 + 카드 3");
+        assert!(matches!(
+            slots[0].kind,
+            WorkHistorySlotKind::Header { collapsed: false }
+        ));
+        assert!(!slots[0].is_group_end);
+        for (offset, slot) in slots[1..].iter().enumerate() {
+            assert!(matches!(slot.kind, WorkHistorySlotKind::Card { .. }));
+            assert_eq!(
+                slot.is_group_end,
+                offset == 2,
+                "그룹의 마지막 카드만 그룹 끝이어야 한다"
+            );
+        }
+    }
+
+    // ---- 목록 가상화(스펙 이슈 #1) ----
+
+    fn presentations_for<'a>(rows: &[WorkHistoryRow<'a>]) -> Vec<WorkHistoryActionPresentation> {
+        rows.iter()
+            .map(|_| WorkHistoryActionPresentation {
+                primary: WorkHistoryPrimaryAction::NewRun,
+                show_diff: false,
+            })
+            .collect()
+    }
+
+    /// transcript_viewer.rs `kittest_뷰포트_밖_메시지는_배치되지_않고_최신_메시지는_보인다`
+    /// 와 같은 계약 — 부트스트랩 프레임(1번째 `run()`)은 전부 배치해 높이를 재고,
+    /// 가상화 프레임(2번째 `run()`)부터 뷰포트에 걸치는 슬롯만 배치한다.
+    #[test]
+    fn kittest_뷰포트_밖_카드는_배치되지_않고_최근_카드는_보인다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let rows: Vec<storage::AgentWorkTurnRow> = (0..200)
+            .map(|i| {
+                row(
+                    &format!("turn-{i}"),
+                    storage::AgentWorkTurnState::Working,
+                    i as i64,
+                )
+            })
+            .collect();
+        let views = views(&rows);
+        let presentations = presentations_for(&views);
+        let mut harness = full_harness(&catalog, &views, &presentations, "");
+
+        harness.run(); // 부트스트랩: 전부 배치해 높이를 잰다.
+        harness.run(); // 가상화 프레임: 뷰포트 걸치는 구간만 배치한다.
+
+        // StateFirst 정렬은 같은 상태(Working)에서 updated_at desc라 turn-199(가장
+        // 최신)가 맨 위에 온다.
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, "Instruction turn-199")
+                .is_some(),
+            "가장 최근 카드는 스크롤 맨 위 뷰포트 안이라 배치돼야 한다"
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, "Instruction turn-0")
+                .is_none(),
+            "뷰포트에서 한참 벗어난(overscan 밖) 카드는 배치되지 않아야 한다 — 그래야 \
+             스크롤 프레임 비용이 행 수가 아니라 뷰포트 크기로 유계가 된다"
+        );
+    }
+
+    /// 작업 지시의 "절대 지켜야 할 것" — 화면 밖 카드를 선택한 상태로 스크롤(=가상화
+    /// 프레임을 지남)해도 선택이 풀리면 안 된다. `selected`는 슬롯 렌더 여부와
+    /// 무관한 별도 상태라 가상화 로직이 건드리지 않는다는 걸 고정한다.
+    #[test]
+    fn kittest_화면_밖으로_스크롤해도_선택한_카드_상태는_유지된다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let rows: Vec<storage::AgentWorkTurnRow> = (0..200)
+            .map(|i| {
+                row(
+                    &format!("turn-{i}"),
+                    storage::AgentWorkTurnState::Working,
+                    i as i64,
+                )
+            })
+            .collect();
+        // turn-0은 StateFirst 정렬(같은 Working끼리는 updated_at desc)에서 맨 아래로
+        // 밀려나 뷰포트 밖이다.
+        let identity_turn_0 = WorkTurnIdentity::from(&rows[0]);
+        let views = views(&rows);
+        let presentations = presentations_for(&views);
+
+        let mut initial = WorkHistoryUi::new();
+        initial.selected = Some(identity_turn_0.clone());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(
+                move |ui, state: &mut WorkHistoryUi| {
+                    state.show(
+                        ui,
+                        WorkHistorySnapshot {
+                            workspace_name: "workspace",
+                            current_branch: None,
+                            rows: &views,
+                            rows_revision: 1,
+                            loading: false,
+                            error: None,
+                        },
+                        &presentations,
+                        &catalog,
+                        "",
+                    );
+                },
+                initial,
+            );
+
+        harness.run(); // 부트스트랩
+        harness.run(); // 가상화 — turn-0 카드는 화면 밖이라 배치되지 않는다
+
+        assert_eq!(
+            harness.state().selected,
+            Some(identity_turn_0),
+            "화면 밖 카드를 선택한 채 가상화 프레임을 지나도 선택 상태가 남아야 한다"
+        );
+    }
+
+    // ---- presentation 인덱스 대응(스펙 이슈 #2·#3) ----
+
+    /// `App`은 `rows`와 `presentations`를 같은 순회에서 함께 만들어 인덱스로
+    /// 대응시킨다(문서 참고) — 이 leaf는 필터·정렬로 순서가 바뀌어도 원본 인덱스
+    /// (`WorkHistoryGroup::row_indices`)로 각 카드에 맞는 presentation을 찾는다.
+    /// 인덱스 대응이 깨지면 카드가 이웃의 버튼을 보여주는 사고가 나므로, 입력 배열
+    /// 순서와 화면 순서가 다르게(정렬이 뒤집게) 일부러 구성해 검증한다.
+    #[test]
+    fn kittest_정렬로_순서가_바뀌어도_각_카드는_자기_프레젠테이션을_보여준다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        // StateFirst 정렬에서 Working이 Completed보다 앞선다 — 입력 배열 순서
+        // (old, new)와 화면 순서(new, old)가 뒤집힌다.
+        let row_old = row("row-old", storage::AgentWorkTurnState::Completed, 1);
+        let row_new = row("row-new", storage::AgentWorkTurnState::Working, 2);
+        let identity_old = WorkTurnIdentity::from(&row_old);
+        let rows = vec![row_old, row_new];
+        let views = views(&rows);
+        // presentations는 rows와 같은 순서(App이 보장하는 인덱스 정렬 계약)로 둔다.
+        let presentations = vec![
+            WorkHistoryActionPresentation {
+                primary: WorkHistoryPrimaryAction::Resume,
+                show_diff: false,
+            },
+            WorkHistoryActionPresentation {
+                primary: WorkHistoryPrimaryAction::Focus,
+                show_diff: false,
+            },
+        ];
+
+        let mut initial = WorkHistoryUi::new();
+        initial.selected = Some(identity_old);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(
+                move |ui, state: &mut WorkHistoryUi| {
+                    state.show(
+                        ui,
+                        WorkHistorySnapshot {
+                            workspace_name: "workspace",
+                            current_branch: None,
+                            rows: &views,
+                            rows_revision: 1,
+                            loading: false,
+                            error: None,
+                        },
+                        &presentations,
+                        &catalog,
+                        "",
+                    );
+                },
+                initial,
+            );
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, "Resume")
+                .is_some(),
+            "화면 아래쪽(row-old)이 펼쳐졌을 때 자기 presentation(Resume)을 보여줘야 한다"
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, "Go to current session")
+                .is_none(),
+            "row-old가 펼쳐진 동안 이웃 row-new의 Focus 버튼이 보이면 안 된다"
         );
     }
 }

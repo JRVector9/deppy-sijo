@@ -7902,6 +7902,13 @@ pub struct App {
     /// 따로 기억한다.
     work_history_tab_split_width: Option<f32>,
     work_history_rows: Vec<storage::AgentWorkTurnRow>,
+    /// `work_history_rows`를 실제로 수정할 때마다(교체·in-place 갱신·비움) 올린다.
+    /// leaf(`ui::work_history::WorkHistorySnapshot::rows_revision`)가 이 값으로
+    /// "행 목록이 그대로인가"를 판단해 필터·정렬·그룹핑 캐시를 재사용한다 — 이 필드를
+    /// 만지는 자리마다 함께 올려야 한다(놓치면 leaf가 옛 그룹핑 결과를 계속 보여주는
+    /// 사고가 난다). `wrapping_add(1)`은 이 크레이트의 다른 세대 카운터
+    /// (`transcript_generation` 등)와 같은 관례.
+    work_history_rows_revision: u64,
     work_history_workspace_id: Option<String>,
     work_history_loading: bool,
     work_history_error: Option<ui::work_history::WorkHistoryErrorCode>,
@@ -11834,6 +11841,7 @@ impl App {
             work_history_tab: ui::workspace::PaneAuxTabState::default(),
             work_history_tab_split_width: None,
             work_history_rows: Vec::new(),
+            work_history_rows_revision: 0,
             work_history_workspace_id: None,
             work_history_loading: false,
             work_history_error: None,
@@ -12966,8 +12974,14 @@ impl App {
             });
         }
         self.work_history_git_manual_generation = None;
-        if !changed.is_empty() && !self.stage_work_history_rows(changed) {
-            self.work_history_git_force_refresh = true;
+        if !changed.is_empty() {
+            // `self.work_history_rows[index]`를 in-place로 고쳤다(branch/변경 수) —
+            // leaf 캐시가 이번 프레임에 새 값을 반영하도록 리비전을 올린다.
+            self.work_history_rows_revision =
+                self.work_history_rows_revision.wrapping_add(1).max(1);
+            if !self.stage_work_history_rows(changed) {
+                self.work_history_git_force_refresh = true;
+            }
         }
     }
 
@@ -13348,6 +13362,11 @@ impl App {
             }
             crate::agent_state_worker::AgentStateSection::WorkHistory => {
                 self.work_history_rows.clone_from(&snapshot.work_turns);
+                // 통째로 새 스냅샷으로 갈아 끼웠다 — 내용이 실제로 같아도(드물지만
+                // 가능) 비교 없이 항상 올린다. 캐시가 가끔 불필요하게 무효화되는 건
+                // 무해하지만, 놓치면 leaf가 옛 카드 목록을 계속 보여주는 사고가 된다.
+                self.work_history_rows_revision =
+                    self.work_history_rows_revision.wrapping_add(1).max(1);
                 self.work_history_workspace_id = Some(self.active.id.clone());
                 self.work_history_loading = false;
                 self.work_history_error = None;
@@ -14477,21 +14496,6 @@ impl App {
         }
     }
 
-    fn work_history_presentations(&self) -> Vec<ui::work_history::WorkHistoryActionPresentation> {
-        self.work_history_rows
-            .iter()
-            .map(|row| ui::work_history::WorkHistoryActionPresentation {
-                identity: ui::work_history::WorkTurnIdentity::from(row),
-                primary: self.resolve_work_history_activation(row).presentation(),
-                show_diff: row.cwd.as_deref().is_some_and(|cwd| {
-                    Path::new(cwd).is_absolute()
-                        && cwd.len() <= APP_HOST_PATH_MAX_BYTES
-                        && !cwd.as_bytes().contains(&0)
-                }),
-            })
-            .collect()
-    }
-
     /// 이력 본문 — 좌 카드 목록 / 우 원문 마스터-디테일(2026-08-15 Task 10, 스펙 §2-1).
     /// **세션 pane의 body rect 그대로**에 그린다. 탭 스트립은 WorkspaceUi가 이미 잘라낸
     /// 뒤 넘긴 rect라, 여기서 헤더 높이를 다시 빼지 않는다. 폭 규칙·구분선 관례는
@@ -14501,7 +14505,6 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         body: egui::Rect,
-        presentations: &[ui::work_history::WorkHistoryActionPresentation],
         workspace_name: &str,
         current_branch: Option<&str>,
         text: &i18n::Catalog,
@@ -14554,10 +14557,33 @@ impl App {
         // leaf는 storage 크레이트를 모른다 — 렌더 직전에 빌린 뷰만 만들어 넘긴다.
         // `self.work_history_rows`(공유 대여)와 `self.work_history_ui`(가변 대여)는
         // 서로 다른 필드라 아래처럼 직접 필드로 접근하는 한 동시에 빌릴 수 있다.
+        //
+        // `rows`와 `presentations`를 **한 번의 순회에서 같이** 만든다 — 예전에는
+        // `work_history_presentations()`가 별도로 전체 행을 순회하며 매 행마다
+        // `WorkTurnIdentity::from(row)`(String 4개)를 할당해 프레임당 1,024개
+        // (256행 × 4)를 만들었다(2026-08-19 계측). presentation은 카드가 펼쳐졌을
+        // 때만 읽히고(`render_card`의 `if expanded` 블록), 눌렸을 때 필요한 identity는
+        // 그 자리에서 들고 있는 row로 즉석에서 만들면 되므로 여기선 identity를 아예
+        // 담지 않는다(`WorkHistoryActionPresentation` 문서 참고). 대신 `rows[i]`와
+        // `presentations[i]`가 항상 같은 턴을 가리키도록 **같은 순회에서 함께**
+        // 만들어 인덱스 정합을 자명하게 보장한다 — leaf는 이 인덱스로 O(1) 조회한다
+        // (문자열 4개를 비교하는 선형 탐색이 없다, 스펙 이슈 #2).
+        let mut presentations: Vec<ui::work_history::WorkHistoryActionPresentation> =
+            Vec::with_capacity(self.work_history_rows.len());
         let rows: Vec<ui::work_history::WorkHistoryRow<'_>> = self
             .work_history_rows
             .iter()
-            .map(ui::work_history::WorkHistoryRow::from)
+            .map(|row| {
+                presentations.push(ui::work_history::WorkHistoryActionPresentation {
+                    primary: self.resolve_work_history_activation(row).presentation(),
+                    show_diff: row.cwd.as_deref().is_some_and(|cwd| {
+                        Path::new(cwd).is_absolute()
+                            && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                            && !cwd.as_bytes().contains(&0)
+                    }),
+                });
+                ui::work_history::WorkHistoryRow::from(row)
+            })
             .collect();
         let action = self.work_history_ui.show(
             &mut child,
@@ -14565,10 +14591,11 @@ impl App {
                 workspace_name,
                 current_branch,
                 rows: &rows,
+                rows_revision: self.work_history_rows_revision,
                 loading: self.work_history_loading,
                 error: self.work_history_error,
             },
-            presentations,
+            &presentations,
             text,
             filter,
         );
@@ -17126,6 +17153,7 @@ impl App {
         self.work_history_projection_cache.clear();
         self.work_history_pending.clear();
         self.work_history_rows.clear();
+        self.work_history_rows_revision = self.work_history_rows_revision.wrapping_add(1).max(1);
         self.work_history_workspace_id = None;
         self.work_history_error = None;
         self.work_history_git_cwds.clear();
@@ -25170,11 +25198,6 @@ impl eframe::App for App {
         let mut work_history_action = None;
         let mut git_panel_action = None;
         let mut aux_tab_intent = None;
-        let work_history_presentations = if history_tab_active {
-            self.work_history_presentations()
-        } else {
-            Vec::new()
-        };
         let work_history_workspace_name = self.active_workspace_display_name();
         let work_history_current_branch = self
             .work_history_rows
@@ -25606,7 +25629,6 @@ impl eframe::App for App {
                             work_history_action = self.render_work_history_tab_body(
                                 &mut primary,
                                 body,
-                                &work_history_presentations,
                                 &work_history_workspace_name,
                                 work_history_current_branch.as_deref(),
                                 &text,
@@ -25648,7 +25670,6 @@ impl eframe::App for App {
                             work_history_action = self.render_work_history_tab_body(
                                 ui,
                                 body,
-                                &work_history_presentations,
                                 &work_history_workspace_name,
                                 work_history_current_branch.as_deref(),
                                 &text,

@@ -6790,14 +6790,13 @@ fn clean_terminal_selection_for_copy(text: &str) -> String {
 
 /// 세션 행 2행: "[PTY] Codex · gpt-5.5 · xhigh · ctx 69%" (빈 부분은 생략).
 fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
-    use crate::agent_surface::{AgentProvider, AgentTransport};
+    use crate::agent_surface::AgentProvider;
 
     let provider = AgentProvider::from(d.kind);
-    let mut parts = vec![format!(
-        "[{}] {}",
-        AgentTransport::Pty.badge(),
-        provider.label()
-    )];
+    // 전송 방식 배지([PTY])는 뺀다(2026-08-19 사용자) — 이 앱의 에이전트 행은 전부 PTY라
+    // 모든 행에 같은 글자가 붙어 구분에 기여하지 않았다. AgentTransport 자체는 다른
+    // 표면(구조화 세션 목록)이 계속 쓴다.
+    let mut parts = vec![provider.label().to_owned()];
     if let Some(m) = d.model.as_deref().filter(|s| !s.is_empty()) {
         parts.push(m.to_owned());
     }
@@ -10259,7 +10258,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_info_line_distinguishes_pty_transport() {
+    fn agent_info_line은_전송배지_없이_provider와_모델을_보여준다() {
         let display = crate::agent_detect::AgentDisplay {
             kind: crate::agent_detect::AgentKind::Codex,
             model: Some("gpt-test".to_owned()),
@@ -10271,7 +10270,7 @@ mod tests {
 
         assert_eq!(
             agent_info_line(&display),
-            "[PTY] Codex · gpt-test · high · ctx 69%"
+            "Codex · gpt-test · high · ctx 69%"
         );
         let catalog = catalog();
         assert_eq!(

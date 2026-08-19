@@ -47,7 +47,10 @@ pub struct FileDiffView {
 /// `git diff --no-ext-diff` 출력 하나(파일 1개)를 분해한다. 잘린 입력(truncated)도
 /// 마지막 완성 라인까지 파싱한다 — 상한은 수집 쪽(run_git_limited)이 이미 보장.
 pub fn parse_unified(text: &str, truncated: bool) -> FileDiffView {
-    let mut view = FileDiffView { truncated, ..Default::default() };
+    let mut view = FileDiffView {
+        truncated,
+        ..Default::default()
+    };
     let mut old_no = 0u32;
     let mut new_no = 0u32;
     // 이전 hunk의 헤더 선언 old-range 끝(one-past, 즉 다음 미표시 구 행번호).
@@ -77,7 +80,11 @@ pub fn parse_unified(text: &str, truncated: bool) -> FileDiffView {
                 view.gaps.push(old_start.saturating_sub(prev_end));
             }
             prev_old_end = Some(old_start + old_count);
-            view.hunks.push(DiffHunk { old_start, new_start, lines: Vec::new() });
+            view.hunks.push(DiffHunk {
+                old_start,
+                new_start,
+                lines: Vec::new(),
+            });
             old_no = old_start;
             new_no = new_start;
             continue;
@@ -109,7 +116,12 @@ pub fn parse_unified(text: &str, truncated: bool) -> FileDiffView {
                 pair
             }
         };
-        hunk.lines.push(DiffLine { kind, old_no: o, new_no: n, text: text.to_owned() });
+        hunk.lines.push(DiffLine {
+            kind,
+            old_no: o,
+            new_no: n,
+            text: text.to_owned(),
+        });
     }
     view
 }
@@ -212,15 +224,22 @@ fn diff_row_job(
 ) -> egui::text::LayoutJob {
     let shift = prefix.len();
     let shifted = crate::ui::aux_search::Matches {
-        ranges: matches.ranges.iter().map(|r| r.start + shift..r.end + shift).collect(),
+        ranges: matches
+            .ranges
+            .iter()
+            .map(|r| r.start + shift..r.end + shift)
+            .collect(),
         truncated: matches.truncated,
     };
     // color는 PLACEHOLDER — 위젯이 그릴 때 현재 텍스트 색으로 바꿔치기한다
     // (TextFormat::default().color는 GRAY라 그대로 두면 ui.monospace와 색이 달라진다).
     // background는 기본값(TRANSPARENT)으로 둬 일치하지 않는 구간은 행을 감싼 Frame의
     // 배경(add/del/context)이 그대로 비친다 — 강조가 기존 행 배경을 지우지 않는다.
-    let base =
-        egui::TextFormat { font_id, color: egui::Color32::PLACEHOLDER, ..Default::default() };
+    let base = egui::TextFormat {
+        font_id,
+        color: egui::Color32::PLACEHOLDER,
+        ..Default::default()
+    };
     let full = format!("{prefix}{text}");
     crate::ui::aux_search::highlighted_job(&full, &shifted, active, base, match_bg, active_bg)
 }
@@ -265,7 +284,12 @@ fn build_search_cache(view: &FileDiffView, rows: &[DisplayRow], query: &str) -> 
         }
     }
     row_match_start.push(total);
-    SearchCache { query: query.to_owned(), row_match_start, total, truncated }
+    SearchCache {
+        query: query.to_owned(),
+        row_match_start,
+        total,
+        truncated,
+    }
 }
 
 /// `row_match_start`(길이 `rows.len() + 1`, [`build_search_cache`] 산출물)에서 전역
@@ -371,13 +395,19 @@ impl DiffViewerUi {
                 return;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("↓").on_hover_text(catalog.t("git.hunk.next", &[])).clicked()
+                if ui
+                    .small_button("↓")
+                    .on_hover_text(catalog.t("git.hunk.next", &[]))
+                    .clicked()
                     && self.current_hunk + 1 < self.hunk_starts.len()
                 {
                     self.current_hunk += 1;
                     self.scroll_to_row = self.hunk_starts.get(self.current_hunk).copied();
                 }
-                if ui.small_button("↑").on_hover_text(catalog.t("git.hunk.prev", &[])).clicked()
+                if ui
+                    .small_button("↑")
+                    .on_hover_text(catalog.t("git.hunk.prev", &[]))
+                    .clicked()
                     && self.current_hunk > 0
                 {
                     self.current_hunk -= 1;
@@ -462,10 +492,8 @@ impl DiffViewerUi {
                                         ui.monospace(format!("{prefix}{}", l.text));
                                     }
                                     Some(m) => {
-                                        let row_start = row_match_start
-                                            .get(index)
-                                            .copied()
-                                            .unwrap_or(0);
+                                        let row_start =
+                                            row_match_start.get(index).copied().unwrap_or(0);
                                         let row_end = row_match_start
                                             .get(index + 1)
                                             .copied()
@@ -533,7 +561,13 @@ index 111..222 100644
         let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
         assert_eq!(
             kinds,
-            vec![LineKind::Context, LineKind::Del, LineKind::Add, LineKind::Add, LineKind::Context]
+            vec![
+                LineKind::Context,
+                LineKind::Del,
+                LineKind::Add,
+                LineKind::Add,
+                LineKind::Context
+            ]
         );
         // 표시 행번호: Del은 구(10..), Add는 신(11..) 번호를 쓴다.
         assert_eq!(h.lines[1].old_no, Some(11));
@@ -571,7 +605,11 @@ index 111..222 100644
         assert_eq!(scroll_row_pitch(12.0, &spacing), 16.0);
 
         spacing.item_spacing.y = 0.0;
-        assert_eq!(scroll_row_pitch(12.0, &spacing), 12.0, "간격이 0이면 행 높이 그대로");
+        assert_eq!(
+            scroll_row_pitch(12.0, &spacing),
+            12.0,
+            "간격이 0이면 행 높이 그대로"
+        );
 
         // 300행쯤 내려가면 간격을 뺀 계산과 눈에 띄게 벌어진다.
         spacing.item_spacing.y = 3.0;
@@ -594,9 +632,24 @@ index 111..222 100644
                 old_start: 1,
                 new_start: 1,
                 lines: vec![
-                    DiffLine { kind: LineKind::Add, old_no: None, new_no: Some(1), text: "line1".into() },
-                    DiffLine { kind: LineKind::Add, old_no: None, new_no: Some(2), text: "line2".into() },
-                    DiffLine { kind: LineKind::Add, old_no: None, new_no: Some(3), text: "line3".into() },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(1),
+                        text: "line1".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(2),
+                        text: "line2".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(3),
+                        text: "line3".into(),
+                    },
                 ],
             }],
             gaps: Vec::new(),
@@ -636,8 +689,16 @@ index 111..222 100644
         }];
         FileDiffView {
             hunks: vec![
-                DiffHunk { old_start: 1, new_start: 1, lines: hunk1 },
-                DiffHunk { old_start: 500, new_start: 500, lines: hunk2 },
+                DiffHunk {
+                    old_start: 1,
+                    new_start: 1,
+                    lines: hunk1,
+                },
+                DiffHunk {
+                    old_start: 500,
+                    new_start: 500,
+                    lines: hunk2,
+                },
             ],
             gaps: Vec::new(),
             binary: false,
@@ -666,7 +727,9 @@ index 111..222 100644
         harness.run();
 
         assert!(
-            harness.query_by_label_contains("둘째_hunk_고유_행").is_none(),
+            harness
+                .query_by_label_contains("둘째_hunk_고유_행")
+                .is_none(),
             "초기 스크롤은 맨 위라 둘째 hunk는 가상화로 아직 그려지지 않아야 한다"
         );
 
@@ -674,14 +737,20 @@ index 111..222 100644
         harness.get_by_label("↑").click();
         harness.run();
         assert_eq!(harness.state().current_hunk, 0);
-        assert!(harness.query_by_label_contains("둘째_hunk_고유_행").is_none());
+        assert!(
+            harness
+                .query_by_label_contains("둘째_hunk_고유_행")
+                .is_none()
+        );
 
         // ↓: 둘째 hunk로 스크롤 대상이 옮겨져 실제로 화면에 그려진다.
         harness.get_by_label("↓").click();
         harness.run();
         assert_eq!(harness.state().current_hunk, 1);
         assert!(
-            harness.query_by_label_contains("둘째_hunk_고유_행").is_some(),
+            harness
+                .query_by_label_contains("둘째_hunk_고유_행")
+                .is_some(),
             "hunk 이동 버튼은 실제로 스크롤 위치를 옮겨야 한다"
         );
 
@@ -807,7 +876,9 @@ index 111..222 100644
         harness.run();
 
         assert!(
-            harness.query_by_label_contains("둘째_hunk_고유_행").is_some(),
+            harness
+                .query_by_label_contains("둘째_hunk_고유_행")
+                .is_some(),
             "일치가 있는(가상화로 초기엔 안 보이던) 행으로 첫 렌더에서 스크롤돼야 한다"
         );
     }

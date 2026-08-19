@@ -32,7 +32,12 @@ impl TerminalViewportSnapshot {
     /// 백엔드로 실측). 구분 기준은 **같은 행의 앞 칸이 실제 소유자(`wide`)인가**다.
     pub fn is_trailing_wide_spacer(&self, index: usize) -> bool {
         let cols = self.cols as usize;
-        if cols == 0 || !self.visible_cells.get(index).is_some_and(|cell| cell.wide_spacer) {
+        if cols == 0
+            || !self
+                .visible_cells
+                .get(index)
+                .is_some_and(|cell| cell.wide_spacer)
+        {
             return false;
         }
         if index.is_multiple_of(cols) {

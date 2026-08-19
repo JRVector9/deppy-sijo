@@ -1372,16 +1372,19 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let enabled_hint =
-            catalog.t("launcher.agent.enabled_hint", &[("agent", AgentKind::Kimi.label())]);
-        let disabled_hint =
-            catalog.t("launcher.agent.disabled_hint", &[("agent", AgentKind::Kimi.label())]);
+        let enabled_hint = catalog.t(
+            "launcher.agent.enabled_hint",
+            &[("agent", AgentKind::Kimi.label())],
+        );
+        let disabled_hint = catalog.t(
+            "launcher.agent.disabled_hint",
+            &[("agent", AgentKind::Kimi.label())],
+        );
         let detected = snapshot(&[AgentKind::Kimi]);
 
         // 켜짐 → 꺼짐
         let mut harness = agent_list_harness(&catalog, &detected, Vec::new(), None);
-        let switch =
-            harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &enabled_hint);
+        let switch = harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &enabled_hint);
         let pos = switch.rect().center();
         click_at(&mut harness, pos);
         match harness.state().intents.as_slice() {
@@ -1393,10 +1396,8 @@ mod tests {
         }
 
         // 꺼짐 → 켜짐
-        let mut harness =
-            agent_list_harness(&catalog, &detected, vec!["kimi".to_owned()], None);
-        let switch =
-            harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &disabled_hint);
+        let mut harness = agent_list_harness(&catalog, &detected, vec!["kimi".to_owned()], None);
+        let switch = harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &disabled_hint);
         let pos = switch.rect().center();
         click_at(&mut harness, pos);
         match harness.state().intents.as_slice() {
@@ -1413,15 +1414,16 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let enabled_hint =
-            catalog.t("launcher.agent.enabled_hint", &[("agent", AgentKind::Kimi.label())]);
+        let enabled_hint = catalog.t(
+            "launcher.agent.enabled_hint",
+            &[("agent", AgentKind::Kimi.label())],
+        );
         let detected = snapshot(&[AgentKind::Kimi]);
         let mut harness =
             agent_list_harness(&catalog, &detected, Vec::new(), Some(AgentKind::Kimi));
         assert_eq!(harness.state().ui.selected, Some(AgentKind::Kimi));
 
-        let switch =
-            harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &enabled_hint);
+        let switch = harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, &enabled_hint);
         let pos = switch.rect().center();
         click_at(&mut harness, pos);
 
@@ -1447,10 +1449,14 @@ mod tests {
         // 스위치를 찾은(아래 `다른_카드의_스위치를_꺼도` 테스트) 것도 이 결함을
         // 못 잡았기 때문이다.
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let claude_hint =
-            catalog.t("launcher.agent.enabled_hint", &[("agent", AgentKind::Claude.label())]);
-        let codex_hint =
-            catalog.t("launcher.agent.enabled_hint", &[("agent", AgentKind::Codex.label())]);
+        let claude_hint = catalog.t(
+            "launcher.agent.enabled_hint",
+            &[("agent", AgentKind::Claude.label())],
+        );
+        let codex_hint = catalog.t(
+            "launcher.agent.enabled_hint",
+            &[("agent", AgentKind::Codex.label())],
+        );
         assert_ne!(
             claude_hint, codex_hint,
             "두 에이전트의 스위치 접근성 이름이 같으면 안 된다"
@@ -1467,7 +1473,11 @@ mod tests {
 
         match harness.state().intents.as_slice() {
             [AgentLauncherIntent::SetAgentEnabled { kind, enabled }] => {
-                assert_eq!(*kind, AgentKind::Codex, "이름으로 찾은 스위치가 Codex여야 한다");
+                assert_eq!(
+                    *kind,
+                    AgentKind::Codex,
+                    "이름으로 찾은 스위치가 Codex여야 한다"
+                );
                 assert!(!enabled);
             }
             _ => panic!("expected exactly one SetAgentEnabled(false) intent for codex"),
@@ -1499,8 +1509,8 @@ mod tests {
         let mut harness =
             agent_list_harness(&catalog, &detected, Vec::new(), Some(AgentKind::Claude));
 
-        let card_b = harness
-            .get_by_role_and_label(egui::accesskit::Role::Button, AgentKind::Codex.label());
+        let card_b =
+            harness.get_by_role_and_label(egui::accesskit::Role::Button, AgentKind::Codex.label());
         // 스위치 위치는 `agent_card`의 `switch_rect` 계산과 같다 — 카드 오른쪽 끝에서
         // 12px 안쪽, 폭 31px 스위치의 중심.
         let pos = egui::pos2(

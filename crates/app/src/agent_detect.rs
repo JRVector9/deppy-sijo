@@ -170,9 +170,12 @@ fn owner_still_alive(entry: &CacheEntry) -> bool {
 
 /// 요청된 세션 중 캐시가 비결정적(휴리스틱)으로 바인딩한 항목이 하나라도 있는지.
 fn has_heuristic_entry(sessions: &[(SessionId, u32)], cache: &BindingCache) -> bool {
-    sessions
-        .iter()
-        .any(|(sid, _)| cache.entries.get(sid).is_some_and(|entry| !entry.deterministic))
+    sessions.iter().any(|(sid, _)| {
+        cache
+            .entries
+            .get(sid)
+            .is_some_and(|entry| !entry.deterministic)
+    })
 }
 
 /// 안전망 주기가 지나 전체 탐색을 강제해야 하는지. 배치에 휴리스틱 항목이 있으면 30초
@@ -184,7 +187,9 @@ fn safety_net_elapsed(cache: &BindingCache, has_heuristic: bool) -> bool {
     } else {
         FASTPATH_FULL_SCAN_INTERVAL
     };
-    cache.last_full_scan.is_none_or(|at| at.elapsed() >= interval)
+    cache
+        .last_full_scan
+        .is_none_or(|at| at.elapsed() >= interval)
 }
 
 /// 캐시에 남은 정보만으로 종류 tier 결과를 재구성한다(`process_rows` 불필요).
@@ -2175,7 +2180,9 @@ mod tests {
                 ),
                 (heuristic_sid, heuristic_entry),
             ]),
-            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+            last_full_scan: Some(
+                Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1),
+            ),
         };
         let mut process_cache = sentinel_process_cache();
         let sessions = [(deterministic_sid, self_pid), (heuristic_sid, self_pid)];
@@ -2204,7 +2211,9 @@ mod tests {
         let entry = fresh_cache_entry(test_binding("det"), self_pid, start);
         let mut cache = BindingCache {
             entries: HashMap::from([(sid, entry)]),
-            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+            last_full_scan: Some(
+                Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1),
+            ),
         };
         let mut process_cache = sentinel_process_cache();
         let sessions = [(sid, self_pid)];
@@ -2255,8 +2264,7 @@ mod tests {
     /// 실제로 돌 때 `last_full_scan` 갱신까지 바인딩 tier와 동일 정책을 따라야, 두 tier가
     /// 번갈아 전체 탐색하며 재탐색 목표를 어기지 않는다.
     #[test]
-    fn detect_kinds도_휴리스틱_재탐색_주기_안이면_fast_path를_타고_전체_탐색시_시각을_갱신한다()
-     {
+    fn detect_kinds도_휴리스틱_재탐색_주기_안이면_fast_path를_타고_전체_탐색시_시각을_갱신한다() {
         let _guard = COMMAND_TEST_LOCK.lock().unwrap();
         let self_pid = std::process::id();
         let Some(start) = crate::proc_info::pid_start_time(self_pid) else {
@@ -2267,7 +2275,9 @@ mod tests {
         entry.deterministic = false;
         let mut cache = BindingCache {
             entries: HashMap::from([(sid, entry)]),
-            last_full_scan: Some(Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1)),
+            last_full_scan: Some(
+                Instant::now() - HEURISTIC_RESCAN_INTERVAL - Duration::from_secs(1),
+            ),
         };
         let mut process_cache = sentinel_process_cache();
         let sessions = [(sid, self_pid)];

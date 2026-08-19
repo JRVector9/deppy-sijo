@@ -456,7 +456,11 @@ pub(crate) fn is_builtin_config_id(id: &str) -> bool {
 pub(crate) fn normalize_disabled_agents(raw: &[String]) -> Vec<String> {
     let mut ids: Vec<String> = raw
         .iter()
-        .filter(|id| AgentKind::ALL.into_iter().any(|kind| kind.id() == id.as_str()))
+        .filter(|id| {
+            AgentKind::ALL
+                .into_iter()
+                .any(|kind| kind.id() == id.as_str())
+        })
         .cloned()
         .collect();
     ids.sort();
@@ -1067,7 +1071,10 @@ mod tests {
         let disabled = vec!["kimi".to_owned()];
         assert!(!agent_is_enabled(&disabled, AgentKind::Kimi));
         assert!(agent_is_enabled(&disabled, AgentKind::Claude));
-        assert!(agent_is_enabled(&[], AgentKind::Kimi), "빈 목록이면 전부 켜짐");
+        assert!(
+            agent_is_enabled(&[], AgentKind::Kimi),
+            "빈 목록이면 전부 켜짐"
+        );
     }
 
     fn detected(kind: AgentKind) -> DetectedAgent {

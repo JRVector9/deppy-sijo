@@ -7347,7 +7347,7 @@ pub(crate) fn top_provider_usage(
         }
     }
 
-    use crate::agent_launcher::{agent_is_enabled, AgentKind};
+    use crate::agent_launcher::{AgentKind, agent_is_enabled};
     // 꺼진 provider는 칸 자체가 사라진다(사용자 요청) — claude·codex·kimi 셋 다 같은
     // 규칙이다. Claude/Codex는 이 앱의 1급 provider라 켜져 있으면 값이 없어도 「—」로
     // 자리를 지키지만, Kimi는 **쓰는 사람에게만** 보여야 한다(2026-08-10 사용자 요구)는
@@ -8235,17 +8235,13 @@ pub struct App {
     /// 막기 위해서, 2026-08-14). SessionId만으로 키를 잡으면 워커가 재생성될 때(새
     /// runtime_instance, SessionId가 1부터 재시작) 재사용된 id가 옛 세션의 값을 물려받는
     /// 사고가 나서, 반드시 runtime_instance로 네임스페이스한다.
-    agent_info: std::collections::HashMap<
-        (u64, runtime::SessionId),
-        crate::agent_detect::AgentDisplay,
-    >,
+    agent_info:
+        std::collections::HashMap<(u64, runtime::SessionId), crate::agent_detect::AgentDisplay>,
     /// transcript 없이 프로세스만으로 판정한 세션별 에이전트 종류. `agent_bindings`는
     /// transcript가 확정돼야 생겨서, 방금 띄운 에이전트는 여기에만 있다.
     /// 키 구조는 `agent_info`와 같은 이유(runtime_instance 네임스페이스)다.
-    agent_kinds: std::collections::HashMap<
-        (u64, runtime::SessionId),
-        crate::agent_detect::RunningAgent,
-    >,
+    agent_kinds:
+        std::collections::HashMap<(u64, runtime::SessionId), crate::agent_detect::RunningAgent>,
     /// 방금 우리가 PTY에 보낸 강도/모델. statusLine(→DB)은 다음 턴에야 갱신돼서,
     /// 이게 없으면 연속으로 눌러도 매번 같은 낡은 값에서 한 칸 움직여 같은 명령을
     /// 반복한다 (2026-08-02 실증: 강도를 올렸는데 계속 같은 단계가 적용됐다).
@@ -9840,11 +9836,13 @@ impl AppFileTreeWatcher {
                     None
                 }
             }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_job)) => Some(AppFileTreeWatchCompletion {
-                operation,
-                generation,
-                result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
-            }),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_job)) => {
+                Some(AppFileTreeWatchCompletion {
+                    operation,
+                    generation,
+                    result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
+                })
+            }
         }
     }
 
@@ -9875,7 +9873,8 @@ impl AppFileTreeWatcher {
     }
 
     fn apply_completion_metadata(&mut self, completion: &AppFileTreeWatchCompletion) {
-        let is_current = self.pending_operation == Some((completion.operation, completion.generation));
+        let is_current =
+            self.pending_operation == Some((completion.operation, completion.generation));
         if is_current {
             self.pending_operation = None;
         }
@@ -11292,9 +11291,13 @@ impl App {
             self.file_tree_watcher = AppFileTreeWatcher::new(ctx.clone()).ok();
         }
         let submitted = match self.file_tree_watcher.as_mut() {
-            Some(watcher) => {
-                watcher.submit_replace(operation, generation, directories, ignored_prefixes, show_hidden)
-            }
+            Some(watcher) => watcher.submit_replace(
+                operation,
+                generation,
+                directories,
+                ignored_prefixes,
+                show_hidden,
+            ),
             None => Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
         };
         // submitted == Ok(()) 인 경우 완료는 이 프레임에서 알 수 없다 — 워커가 백그라운드
@@ -12727,16 +12730,18 @@ impl App {
                     || (saved.kind == kind.as_str()
                         && saved.agent_session_id == binding.session_id.as_str())
             });
-            let mut display = self.agent_info.get(&(instance, *session)).cloned().unwrap_or(
-                crate::agent_detect::AgentDisplay {
+            let mut display = self
+                .agent_info
+                .get(&(instance, *session))
+                .cloned()
+                .unwrap_or(crate::agent_detect::AgentDisplay {
                     kind: binding.kind,
                     model: None,
                     effort: None,
                     context_pct: None,
                     last_agent_summary: None,
                     user_instruction: None,
-                },
-            );
+                });
             apply_claude_statusline(&mut display, self.statuslines.get(&(instance, *session)));
             if let Some(running) = self.agent_kinds.get(&(instance, *session)) {
                 if display.model.is_none() {
@@ -13188,9 +13193,10 @@ impl App {
                 // 매 폴마다 지워진다.
                 let instance = self.active.runtime_instance;
                 self.statuslines.retain(|(rt, _), _| *rt != instance);
-                self.statuslines.extend(snapshot.statuslines.iter().filter_map(|row| {
-                    Some(((instance, session_id(&row.session_key)?), row.clone()))
-                }));
+                self.statuslines
+                    .extend(snapshot.statuslines.iter().filter_map(|row| {
+                        Some(((instance, session_id(&row.session_key)?), row.clone()))
+                    }));
                 self.push_agent_display();
             }
             crate::agent_state_worker::AgentStateSection::Attention => {
@@ -13781,8 +13787,10 @@ impl App {
         let instance = self.active.runtime_instance;
         if let Some(info) = latest_info {
             self.agent_info.retain(|(rt, _), _| *rt != instance);
-            self.agent_info
-                .extend(info.into_iter().map(|(session, display)| ((instance, session), display)));
+            self.agent_info.extend(
+                info.into_iter()
+                    .map(|(session, display)| ((instance, session), display)),
+            );
         }
         if let Some(kinds) = latest_kinds {
             let previous_for_instance: std::collections::HashMap<
@@ -13804,8 +13812,11 @@ impl App {
                 self.agent_launcher_detection_requested = true;
             }
             self.agent_kinds.retain(|(rt, _), _| *rt != instance);
-            self.agent_kinds
-                .extend(kinds.into_iter().map(|(session, running)| ((instance, session), running)));
+            self.agent_kinds.extend(
+                kinds
+                    .into_iter()
+                    .map(|(session, running)| ((instance, session), running)),
+            );
         }
         // 에이전트 표시정보 최종본(claude는 statusLine으로 effort/model/context 병합) →
         // WorkspaceUi. statuslines가 매 1s 갱신되므로 매 poll에서 병합해 최신을 반영한다.
@@ -14010,17 +14021,22 @@ impl App {
                 // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. claude는
                 // transcript에 effort가 아예 없고 statusLine에만 있어서, 병합을 건너뛰면
                 // effort가 영영 None이고 강도 단축키가 조용히 아무것도 안 한다.
-                let mut display = self.agent_info.get(&(instance, session_id)).cloned().unwrap_or(
-                    crate::agent_detect::AgentDisplay {
+                let mut display = self
+                    .agent_info
+                    .get(&(instance, session_id))
+                    .cloned()
+                    .unwrap_or(crate::agent_detect::AgentDisplay {
                         kind,
                         model: None,
                         effort: None,
                         context_pct: None,
                         last_agent_summary: None,
                         user_instruction: None,
-                    },
+                    });
+                apply_claude_statusline(
+                    &mut display,
+                    self.statuslines.get(&(instance, session_id)),
                 );
-                apply_claude_statusline(&mut display, self.statuslines.get(&(instance, session_id)));
                 // statusLine은 1시간 창으로 만료된다(STATUSLINES_PREFIX_PREFLIGHT).
                 // 오래 유휴한 세션에서는 값이 통째로 사라져 강도·모델 단축키가 "현재
                 // 값을 몰라" 아무것도 못 한다(2026-08-03 실증: 7시간 전 행이 걸러짐).
@@ -14556,7 +14572,11 @@ impl App {
         } else {
             body
         };
-        let filter = if self.aux_search.is_active() { self.aux_search.query.as_str() } else { "" };
+        let filter = if self.aux_search.is_active() {
+            self.aux_search.query.as_str()
+        } else {
+            ""
+        };
 
         let auto_list_width = history_tab_list_width(body.width());
         let list_width = aux_split_width(
@@ -14677,7 +14697,8 @@ impl App {
             .aux_search
             .is_active()
             .then_some((self.aux_search.query.as_str(), self.aux_search.active));
-        self.transcript_viewer_ui.render(&mut transcript, text, search);
+        self.transcript_viewer_ui
+            .render(&mut transcript, text, search);
 
         action
     }
@@ -14713,12 +14734,15 @@ impl App {
         } else {
             body
         };
-        let filter = if self.aux_search.is_active() { self.aux_search.query.as_str() } else { "" };
+        let filter = if self.aux_search.is_active() {
+            self.aux_search.query.as_str()
+        } else {
+            ""
+        };
 
         let auto_list_width = git_tab_list_width(body.width());
         // 180.0 = git_tab_list_width의 MIN과 같은 값(파일 목록 좌측 최소 폭).
-        let list_width =
-        aux_split_width(
+        let list_width = aux_split_width(
             self.git_tab_split_width,
             auto_list_width,
             body.width(),
@@ -14727,7 +14751,9 @@ impl App {
         let (list_rect, diff_rect) = body.split_left_right_at_x(body.left() + list_width);
 
         let mut list = ui.new_child(
-            egui::UiBuilder::new().max_rect(list_rect).id_salt("git_panel_pane_tab"),
+            egui::UiBuilder::new()
+                .max_rect(list_rect)
+                .id_salt("git_panel_pane_tab"),
         );
         list.set_clip_rect(list_rect.intersect(ui.clip_rect()));
         let action = self.git_panel_ui.render(&mut list, text, filter);
@@ -14755,8 +14781,7 @@ impl App {
                 .ctx()
                 .data(|data| data.get_temp::<f32>(resize_start_id))
                 .unwrap_or(list_width);
-            self.git_tab_split_width =
-                aux_divider_requested_width(start_width, total_drag_delta.x);
+            self.git_tab_split_width = aux_divider_requested_width(start_width, total_drag_delta.x);
             ui.ctx().request_repaint();
         }
         if resize_response.drag_stopped() {
@@ -25210,7 +25235,10 @@ impl eframe::App for App {
         }
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
         // 이력·Git 탭이 활성이면 보낼 터미널이 없으므로 함께 감춘다.
-        if terminal_visible && !(history_tab_active || git_tab_active) && self.config.ui.composer_enabled {
+        if terminal_visible
+            && !(history_tab_active || git_tab_active)
+            && self.config.ui.composer_enabled
+        {
             self.render_composer_dock(ui, &text);
         }
 
@@ -25806,7 +25834,11 @@ impl eframe::App for App {
                     pinned: self.git_panel_cwd.clone(),
                     focused: self.focused_session_repo_cwd(),
                 });
-                self.request_git_panel_io_at(ui.ctx(), cwd, ui::git_panel::GitPanelIoRequest::Snapshot);
+                self.request_git_panel_io_at(
+                    ui.ctx(),
+                    cwd,
+                    ui::git_panel::GitPanelIoRequest::Snapshot,
+                );
             }
             Some(ui::git_panel::GitPanelAction::OpenRemoteBranch) => {
                 self.open_git_panel_remote(ui.ctx());
@@ -25831,9 +25863,9 @@ impl eframe::App for App {
                 // 처리하게 한다 — 그 핸들러가 reveal + spawn_shell_at을 함께 한다.
                 // 셸이 뜨는 곳을 봐야 하므로 Git 탭은 세션 탭으로 물러난다(탭은 남는다).
                 self.git_tab = self.git_tab.on_session_tab_click();
-                self.stage_workspace_controller_action(
-                    WorkspaceControllerAction::SpawnShellAt { cwd: Some(path) },
-                );
+                self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellAt {
+                    cwd: Some(path),
+                });
             }
             None => {}
         }
@@ -28573,6 +28605,17 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    /// 소스 스캔 계약 테스트용 — 연속된 공백(줄바꿈·들여쓰기 포함)을 한 칸으로 접는다.
+    ///
+    /// 이 파일을 `include_str!`로 읽어 코드 조각을 찾는 테스트들은 원래 **줄바꿈 위치까지**
+    /// 앵커에 박아 뒀다. 그러면 rustfmt가 한 줄을 접기만 해도 계약과 무관하게 깨진다 —
+    /// 실제로 2026-08-19 저장소 전체 rustfmt 정리에서 두 건이 그렇게 깨졌고, 이 결합이
+    /// 그동안 fmt 정리를 막아 어긋남이 쌓인 원인이었다. 지키려는 건 "이 호출이 이 인자로
+    /// 존재한다"이지 "이 줄에 이렇게 적혀 있다"가 아니므로, 양쪽을 접어 비교한다.
+    fn squeeze_ws(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn catalog_restore_stages_only_when_needed() {
         assert!(should_stage_catalog_restore(
@@ -29650,7 +29693,11 @@ mod tests {
 
         retain_other_runtime_instance(&mut map, 1);
 
-        assert_eq!(map.len(), 1, "은퇴한 instance 1의 항목은 전부 사라져야 한다");
+        assert_eq!(
+            map.len(),
+            1,
+            "은퇴한 instance 1의 항목은 전부 사라져야 한다"
+        );
         assert_eq!(
             map.get(&(2, runtime::SessionId(10))),
             Some(&"c"),
@@ -31309,7 +31356,11 @@ mod tests {
     fn git_본문은_목록_300에_diff_나머지다() {
         assert_eq!(git_tab_list_width(1200.0), 300.0);
         assert_eq!(git_tab_list_width(600.0), 240.0, "좁으면 40%");
-        assert_eq!(git_tab_list_width(300.0), 180.0, "최소 폭 밑으로는 안 내려간다");
+        assert_eq!(
+            git_tab_list_width(300.0),
+            180.0,
+            "최소 폭 밑으로는 안 내려간다"
+        );
     }
 
     /// 이력 보조 본문 좌측 카드 목록 폭 — git과 같은 규칙이지만 카드 정보량 때문에
@@ -31318,7 +31369,11 @@ mod tests {
     fn 이력_본문은_목록_360에_원문_나머지다() {
         assert_eq!(history_tab_list_width(1400.0), 360.0);
         assert_eq!(history_tab_list_width(700.0), 280.0, "좁으면 40%");
-        assert_eq!(history_tab_list_width(400.0), 220.0, "최소 폭 밑으로는 안 내려간다");
+        assert_eq!(
+            history_tab_list_width(400.0),
+            220.0,
+            "최소 폭 밑으로는 안 내려간다"
+        );
     }
 
     /// 사용자가 구분선을 한 번도 안 끌었으면(`stored: None`) 기존 자동 계산값을 그대로
@@ -31409,8 +31464,11 @@ mod tests {
     /// `Prev`/`Next`는 `aux_search_step_active`로 활성 인덱스를 옮긴다(순환 포함).
     #[test]
     fn apply_aux_search_action은_prev_next로_활성_인덱스를_순환한다() {
-        let mut state =
-            ui::aux_search::AuxSearchState { query: "q".into(), open: true, active: 0 };
+        let mut state = ui::aux_search::AuxSearchState {
+            query: "q".into(),
+            open: true,
+            active: 0,
+        };
         apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Prev, 3);
         assert_eq!(state.active, 2, "처음에서 이전은 마지막으로 순환한다");
         apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Next, 3);
@@ -31423,8 +31481,11 @@ mod tests {
     /// 다시 열면 하던 검색이 이어진다.
     #[test]
     fn apply_aux_search_action은_close로_질의를_남긴_채_닫는다() {
-        let mut state =
-            ui::aux_search::AuxSearchState { query: "q".into(), open: true, active: 2 };
+        let mut state = ui::aux_search::AuxSearchState {
+            query: "q".into(),
+            open: true,
+            active: 2,
+        };
         apply_aux_search_action(&mut state, ui::aux_search::AuxSearchAction::Close, 5);
         assert!(!state.open);
         assert_eq!(state.query, "q", "닫아도 질의는 남아야 다시 열 때 이어진다");
@@ -31515,14 +31576,25 @@ mod tests {
         let mut generation = 41u64;
         let mut cwd = Some(PathBuf::from("/repo/a"));
 
-        reset_git_surfaces(&mut git_panel_ui, &mut diff_viewer_ui, &mut generation, &mut cwd);
+        reset_git_surfaces(
+            &mut git_panel_ui,
+            &mut diff_viewer_ui,
+            &mut generation,
+            &mut cwd,
+        );
 
         assert!(
             git_panel_ui.remote_target().is_none(),
             "리셋 후에는 스냅샷이 비어 remote_target도 None이어야 한다"
         );
-        assert_eq!(generation, 42, "세대를 올려 이전 in-flight 완료를 stale로 만든다");
-        assert_eq!(cwd, None, "cwd도 함께 비워 새 워크스페이스 기준으로 다시 잡게 한다");
+        assert_eq!(
+            generation, 42,
+            "세대를 올려 이전 in-flight 완료를 stale로 만든다"
+        );
+        assert_eq!(
+            cwd, None,
+            "cwd도 함께 비워 새 워크스페이스 기준으로 다시 잡게 한다"
+        );
     }
 
     /// 세대 증가는 다른 generation 필드들과 같은 관례(`wrapping_add(1).max(1)`)를
@@ -31534,7 +31606,12 @@ mod tests {
         let mut diff_viewer_ui = ui::diff_viewer::DiffViewerUi::default();
         let mut generation = u64::MAX;
         let mut cwd = None;
-        reset_git_surfaces(&mut git_panel_ui, &mut diff_viewer_ui, &mut generation, &mut cwd);
+        reset_git_surfaces(
+            &mut git_panel_ui,
+            &mut diff_viewer_ui,
+            &mut generation,
+            &mut cwd,
+        );
         assert_eq!(generation, 1);
     }
 
@@ -31818,7 +31895,7 @@ mod tests {
             "이력 탭 chrome은 탭이 열려 있을 때만 붙어야 한다(이력 X가 실제로 없앤다)"
         );
         assert!(
-            render.contains(
+            squeeze_ws(render).contains(
                 "terminal_visible && !(history_tab_active || git_tab_active) && self.config.ui.composer_enabled"
             ),
             "이력·Git 활성 프레임은 컴포저를 감춰야 한다"
@@ -31943,11 +32020,18 @@ mod tests {
             "이력 카드 목록 렌더 호출이 있어야 한다"
         );
         assert!(
-            history_body.contains("presentations,\n            text,\n            filter,\n        );"),
+            squeeze_ws(history_body).contains("presentations, text, filter"),
             "카드 목록 필터는 aux_search에서 뽑은 filter를 써야 한다(고정 빈 문자열이면 안 된다)"
         );
+        // 수신자와 인자를 나눠 본다 — 한 덩어리로 붙이면 rustfmt가 `self.x` 다음에서
+        // 접을 때 사이에 공백이 끼어 접힘 여부에 따라 매치가 갈린다. 나누면 접히든
+        // 펴지든 둘 다 통과하면서 "그 뷰어가 그 인자로 불린다"는 계약은 그대로 지킨다.
         assert!(
-            history_body.contains("self.transcript_viewer_ui.render(&mut transcript, text, search);"),
+            squeeze_ws(history_body).contains("self.transcript_viewer_ui"),
+            "원문 뷰어를 그리는 주체가 transcript_viewer_ui여야 한다"
+        );
+        assert!(
+            squeeze_ws(history_body).contains(".render(&mut transcript, text, search);"),
             "원문 뷰어는 aux_search에서 뽑은 search를 써야 한다"
         );
         let git_body = production
@@ -34023,7 +34107,13 @@ mod tests {
             panic!("expected a ReplaceWatchSet intent");
         };
         let (directories, ignored_prefixes, show_hidden) = plan.into_parts();
-        (operation, generation, directories, ignored_prefixes, show_hidden)
+        (
+            operation,
+            generation,
+            directories,
+            ignored_prefixes,
+            show_hidden,
+        )
     }
 
     #[test]
@@ -34167,8 +34257,10 @@ mod tests {
         let root = app_file_tree_watch_temp_root("full-retry");
         let ctx = egui::Context::default();
         let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
-        let (op1, gen1, dirs1, ignored1, hidden1) = app_file_tree_watch_intent(&mut tree, root.clone());
-        let (op2, gen2, dirs2, ignored2, hidden2) = app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op1, gen1, dirs1, ignored1, hidden1) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op2, gen2, dirs2, ignored2, hidden2) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
 
         let (mut watcher, request_rx) = app_file_tree_watcher_with_manual_channel();
 
@@ -34203,8 +34295,14 @@ mod tests {
         assert_eq!(drained.operation, op1);
 
         // 다음 폴(poll_retry)에서 자연 재시도가 성공해야 한다.
-        assert!(watcher.poll_retry().is_none(), "재전송 성공 -- 아직 완료 소식은 없다");
-        assert!(watcher.retry.is_none(), "재전송에 성공했으니 retry는 비워져야 한다");
+        assert!(
+            watcher.poll_retry().is_none(),
+            "재전송 성공 -- 아직 완료 소식은 없다"
+        );
+        assert!(
+            watcher.retry.is_none(),
+            "재전송에 성공했으니 retry는 비워져야 한다"
+        );
         assert_eq!(watcher.pending_operation, Some((op2, gen2)));
         let resent = request_rx.recv().expect("op2 job now in the channel");
         assert_eq!(resent.operation, op2);
@@ -34246,8 +34344,10 @@ mod tests {
         let root = app_file_tree_watch_temp_root("full-retry-timeout");
         let ctx = egui::Context::default();
         let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
-        let (op1, gen1, dirs1, ignored1, hidden1) = app_file_tree_watch_intent(&mut tree, root.clone());
-        let (op2, gen2, dirs2, ignored2, hidden2) = app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op1, gen1, dirs1, ignored1, hidden1) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
+        let (op2, gen2, dirs2, ignored2, hidden2) =
+            app_file_tree_watch_intent(&mut tree, root.clone());
 
         let (mut watcher, _request_rx) = app_file_tree_watcher_with_manual_channel();
         watcher
@@ -37802,7 +37902,7 @@ mod tests {
         // claude·codex는 값과 무관하게 "켜짐"만 보고, kimi는 "켜짐 AND 값 있음"을
         // 본다 — 꺼짐이 kimi의 기존 "값 있으면 보인다" 규칙보다 항상 우선해야
         // "꺼짐"과 "켜짐인데 값 없음"이 값 하나로 뭉개지지 않는다.
-        use crate::agent_launcher::{agent_is_enabled, AgentKind};
+        use crate::agent_launcher::{AgentKind, agent_is_enabled};
 
         let none: &[String] = &[];
         assert!(agent_is_enabled(none, AgentKind::Claude));

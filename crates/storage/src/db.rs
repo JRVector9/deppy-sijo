@@ -7422,7 +7422,8 @@ impl Db {
                 .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
             // 상한 초과·NUL 포함 messages_json은 행을 거부하지 않고 이 컬럼만 NULL로 쓴다
             // (fail-soft, 스펙 §3-2).
-            let messages_json = agent_work_turn_messages_json_effective(row.messages_json.as_deref());
+            let messages_json =
+                agent_work_turn_messages_json_effective(row.messages_json.as_deref());
             tx.execute(
                 "INSERT INTO agent_work_turns
                     (workspace_id, pane_id, kind, agent_session_id, turn_key, source_offset,
@@ -12077,7 +12078,10 @@ mod tests {
             .unwrap();
         }
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(Db::read_user_version(&reopened.conn).unwrap(), MIGRATIONS.len());
+        assert_eq!(
+            Db::read_user_version(&reopened.conn).unwrap(),
+            MIGRATIONS.len()
+        );
         let workspace_id = reopened
             .list_workspaces()
             .unwrap()
@@ -12189,18 +12193,20 @@ mod tests {
         assert_eq!(with_nul_row.messages_json, None);
 
         let read_back = db
-            .list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(
-                workspace_id.as_str(),
-            ))
+            .list_agent_work_history(&AgentWorkHistoryQuery::for_workspace(workspace_id.as_str()))
             .unwrap();
         assert_eq!(read_back.len(), 2);
         assert!(read_back.iter().all(|row| row.messages_json.is_none()));
-        assert!(read_back
-            .iter()
-            .any(|row| row.instruction == "instruction-oversized"));
-        assert!(read_back
-            .iter()
-            .any(|row| row.instruction == "instruction-has-nul"));
+        assert!(
+            read_back
+                .iter()
+                .any(|row| row.instruction == "instruction-oversized")
+        );
+        assert!(
+            read_back
+                .iter()
+                .any(|row| row.instruction == "instruction-has-nul")
+        );
     }
 
     #[test]
@@ -12208,9 +12214,7 @@ mod tests {
         // stage_detected_work_history가 방금 쓴 새 messages_json을, updated_at이 바뀌지 않은
         // git-facts 백필(poll_work_history_git)이 같은 초에 뒤따라 덮지 못해야 한다.
         let db = Db::open_in_memory().unwrap();
-        let workspace_id = db
-            .create_workspace("history-messages-same-second")
-            .unwrap();
+        let workspace_id = db.create_workspace("history-messages-same-second").unwrap();
 
         let mut fresh = agent_work_turn(&workspace_id, 0, 5);
         fresh.messages_json = Some(r#"[{"r":"a","t":"방금 답했다","at":5}]"#.to_owned());

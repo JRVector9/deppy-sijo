@@ -727,7 +727,11 @@ fn claude_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
                     continue;
                 };
                 if let Some(summary) = summary {
-                    turn.push_message(TurnRole::Assistant, summary.clone(), event_occurred_at(&value));
+                    turn.push_message(
+                        TurnRole::Assistant,
+                        summary.clone(),
+                        event_occurred_at(&value),
+                    );
                     turn.agent_summary = Some(summary);
                 }
                 turn.activity = if value
@@ -897,7 +901,11 @@ fn kimi_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
                     .pointer("/message/content")
                     .and_then(message_content_summary)
                 {
-                    turn.push_message(TurnRole::Assistant, summary.clone(), event_occurred_at(&value));
+                    turn.push_message(
+                        TurnRole::Assistant,
+                        summary.clone(),
+                        event_occurred_at(&value),
+                    );
                     turn.agent_summary = Some(summary);
                 }
             }
@@ -1335,7 +1343,11 @@ fn codex_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
                     .and_then(Value::as_str)
                     .and_then(clean_agent_summary)
                 {
-                    turn.push_message(TurnRole::Assistant, summary.clone(), event_occurred_at(&value));
+                    turn.push_message(
+                        TurnRole::Assistant,
+                        summary.clone(),
+                        event_occurred_at(&value),
+                    );
                     turn.agent_summary = Some(summary);
                 }
                 turn.activity = AgentActivity::Working;
@@ -1346,7 +1358,11 @@ fn codex_recent_turns(snapshot: &TailSnapshot) -> Vec<TranscriptTurn> {
                     .and_then(Value::as_str)
                     .and_then(clean_agent_summary)
                 {
-                    turn.push_message(TurnRole::Assistant, summary.clone(), event_occurred_at(&value));
+                    turn.push_message(
+                        TurnRole::Assistant,
+                        summary.clone(),
+                        event_occurred_at(&value),
+                    );
                     turn.agent_summary = Some(summary);
                 }
                 turn.activity = AgentActivity::Idle;
@@ -1721,7 +1737,12 @@ impl ConversationBuilder {
             self.evict_oldest();
         }
         self.total_bytes = self.total_bytes.saturating_add(text.len());
-        self.messages.push(ConversationMessage { role, text, at, offset });
+        self.messages.push(ConversationMessage {
+            role,
+            text,
+            at,
+            offset,
+        });
     }
 
     fn evict_oldest(&mut self) {
@@ -1805,7 +1826,12 @@ fn kimi_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversatio
                 let Some(text) = conversation_content_text(input) else {
                     continue;
                 };
-                builder.push(ConversationRole::User, text, event_occurred_at(&value), offset);
+                builder.push(
+                    ConversationRole::User,
+                    text,
+                    event_occurred_at(&value),
+                    offset,
+                );
             }
             Some("context.append_message") => {
                 let role = value.pointer("/message/role").and_then(Value::as_str);
@@ -1854,7 +1880,10 @@ pub fn read_conversation(
         agent_detect::AgentKind::Kimi => kimi_conversation_messages(&snapshot, &mut builder),
     }
     let (messages, truncated) = builder.finish();
-    Ok(TranscriptConversation { messages, truncated })
+    Ok(TranscriptConversation {
+        messages,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -1921,7 +1950,11 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":"살아남는다"}}"#,
         ]);
         let view = read_conversation(&path, agent_detect::AgentKind::Claude).unwrap();
-        assert_eq!(view.messages.len(), 1, "한 줄이 깨져도 파일 전체를 버리지 않는다");
+        assert_eq!(
+            view.messages.len(),
+            1,
+            "한 줄이 깨져도 파일 전체를 버리지 않는다"
+        );
     }
 
     #[test]
@@ -1934,8 +1967,8 @@ mod tests {
             ));
         }
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let view = read_conversation(&임시_transcript(&refs), agent_detect::AgentKind::Claude)
-            .unwrap();
+        let view =
+            read_conversation(&임시_transcript(&refs), agent_detect::AgentKind::Claude).unwrap();
         assert_eq!(view.messages.len(), CONVERSATION_MESSAGES_MAX);
         assert!(view.truncated);
         assert_eq!(
@@ -2408,7 +2441,10 @@ mod tests {
     #[test]
     fn 요약은_줄바꿈을_보존한다() {
         let text = "첫 줄\n둘째 줄\n셋째 줄";
-        assert_eq!(clean_agent_summary(text).unwrap(), "첫 줄\n둘째 줄\n셋째 줄");
+        assert_eq!(
+            clean_agent_summary(text).unwrap(),
+            "첫 줄\n둘째 줄\n셋째 줄"
+        );
     }
 
     #[test]
@@ -2428,14 +2464,21 @@ mod tests {
         let text = "1\n2\n3\n4\n5\n6";
         let summary = clean_agent_summary(text).unwrap();
         assert_eq!(summary.lines().count(), AGENT_SUMMARY_LINES);
-        assert!(summary.ends_with('…'), "잘렸으면 말줄임을 붙인다: {summary:?}");
+        assert!(
+            summary.ends_with('…'),
+            "잘렸으면 말줄임을 붙인다: {summary:?}"
+        );
     }
 
     #[test]
     fn 요약은_사백자에서_자른다() {
         let text = "가".repeat(AGENT_SUMMARY_CHARS + 50);
         let summary = clean_agent_summary(&text).unwrap();
-        assert_eq!(summary.chars().count(), AGENT_SUMMARY_CHARS + 1, "본문 + 말줄임");
+        assert_eq!(
+            summary.chars().count(),
+            AGENT_SUMMARY_CHARS + 1,
+            "본문 + 말줄임"
+        );
         assert!(summary.ends_with('…'));
     }
 
@@ -2460,8 +2503,16 @@ mod tests {
         }
         let turn = pending.finish();
         assert_eq!(turn.messages.len(), TURN_MESSAGES_MAX);
-        assert_eq!(turn.messages.last().unwrap().text, "응답 7", "최신이 뒤에 온다");
-        assert_eq!(turn.messages.first().unwrap().text, "응답 3", "오래된 것이 밀려난다");
+        assert_eq!(
+            turn.messages.last().unwrap().text,
+            "응답 7",
+            "최신이 뒤에 온다"
+        );
+        assert_eq!(
+            turn.messages.first().unwrap().text,
+            "응답 3",
+            "오래된 것이 밀려난다"
+        );
     }
 
     #[test]

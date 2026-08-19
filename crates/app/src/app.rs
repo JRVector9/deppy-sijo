@@ -8415,6 +8415,31 @@ type PtyAdjustWrites = Vec<Vec<u8>>;
 /// 종류만 먼저 뜬다(빈 줄보다 낫다).
 ///
 /// 이미 있는 항목은 덮지 않는다. transcript에서 온 model/effort/context가 더 풍부하다.
+/// 새 감지값에 **작업 설명이 비어 있으면 직전 값을 그대로 이어받는다**.
+///
+/// transcript 스캔은 최근 구간만 본다 — 에이전트가 말을 멈추고 대기 상태로 오래 있으면
+/// 그 구간에서 요약/지시가 사라져 `None`이 되고, 사이드바 활동 줄이 프로젝트 폴더명으로
+/// 떨어진다(`agent_activity_line`의 폴백 순서). 사용자가 원하는 건 **마지막으로 한 일이
+/// 그대로 남아 있는 것**이므로(2026-08-19 확인), 새 값이 비었을 때만 옛 값을 유지한다.
+/// 새 값이 있으면 언제나 새 값이 이긴다 — 오래된 문구가 최신 활동을 가리면 안 된다.
+///
+/// model/effort/context_pct는 **이어받지 않는다**. 그건 "지금 이 에이전트가 무엇인가"라
+/// 사라졌다면 사라진 게 맞고, 옛 값을 남기면 실제와 어긋난 정보를 보여주게 된다.
+fn carry_forward_agent_activity(
+    next: &mut crate::agent_detect::AgentDisplay,
+    previous: &crate::agent_detect::AgentDisplay,
+) {
+    fn is_blank(value: &Option<String>) -> bool {
+        value.as_deref().is_none_or(|text| text.trim().is_empty())
+    }
+    if is_blank(&next.last_agent_summary) && !is_blank(&previous.last_agent_summary) {
+        next.last_agent_summary = previous.last_agent_summary.clone();
+    }
+    if is_blank(&next.user_instruction) && !is_blank(&previous.user_instruction) {
+        next.user_instruction = previous.user_instruction.clone();
+    }
+}
+
 /// 새로 넣는 항목은 `RunningAgent`가 **argv에서 뽑아둔** model/effort를 그대로 쓴다 —
 /// 런처가 넘긴 값이라 실행 순간의 진실이고, `--model`/`--effort` 파싱은 provider와
 /// 무관하게 일반적이라 Kimi의 `--model kimi-code/k3`도 그대로 잡힌다.
@@ -13710,6 +13735,10 @@ impl App {
             .collect();
         // 터미널 경로 더블클릭의 상대경로 해석용 — 같은 목록을 workspace UI에도 나른다.
         self.active.workspace_ui.set_session_pids(&sessions);
+        // 감지 결과 병합에서 "아직 살아 있는 세션"을 판정할 집합 — 결과에 빠진 세션의
+        // 마지막 표시값을 남길지, 죽은 세션이라 정리할지 가른다(아래 latest_info 병합).
+        let live_detect_sessions: std::collections::HashSet<runtime::SessionId> =
+            sessions.iter().map(|(session, _)| *session).collect();
         // 감지할 세션이 없으면 hook/statusline DB에도 접근하지 않는다. 캐시를 비워 두면
         // empty input의 latest-only worker가 thread/backend/repaint 모두 유휴 상태로 남는다.
         let bounded_refresh_due =
@@ -13786,11 +13815,21 @@ impl App {
         // 통과했으므로 항상 현재 self.active의 세션 집합을 가리킨다.
         let instance = self.active.runtime_instance;
         if let Some(info) = latest_info {
-            self.agent_info.retain(|(rt, _), _| *rt != instance);
-            self.agent_info.extend(
-                info.into_iter()
-                    .map(|(session, display)| ((instance, session), display)),
-            );
+            // 감지 결과에 없는 세션의 마지막 표시값을 **지우지 않는다**. 워커의 pass는
+            // MAX_DETECT_SESSIONS로 잘리고(agent_detect_worker::bound_pass) 대기 세션은
+            // 갱신 대상에서 빠질 수 있어서, 통째로 갈아끼우면 그 세션의 활동 문구가
+            // 사라진다 — 그러면 사이드바 헤드라인이 폴더명으로 떨어져 "대기 상태로
+            // 두고 다른 세션에 갔다 오면 이름이 폴더명으로 바뀐다"가 된다
+            // (2026-08-19 사용자). 살아 있는 세션이 아닐 때만 정리해 무한정 쌓이는 것도 막는다.
+            self.agent_info.retain(|(rt, session), _| {
+                *rt != instance || live_detect_sessions.contains(session)
+            });
+            for (session, mut display) in info {
+                if let Some(previous) = self.agent_info.get(&(instance, session)) {
+                    carry_forward_agent_activity(&mut display, previous);
+                }
+                self.agent_info.insert((instance, session), display);
+            }
         }
         if let Some(kinds) = latest_kinds {
             let previous_for_instance: std::collections::HashMap<
@@ -28604,6 +28643,80 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    fn display_with(
+        summary: Option<&str>,
+        instruction: Option<&str>,
+    ) -> crate::agent_detect::AgentDisplay {
+        crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Codex,
+            model: Some("gpt-test".to_owned()),
+            effort: Some("high".to_owned()),
+            context_pct: Some(40),
+            last_agent_summary: summary.map(str::to_owned),
+            user_instruction: instruction.map(str::to_owned),
+        }
+    }
+
+    /// 2026-08-19 사용자: 대기 상태로 두고 다른 세션에 갔다 오면 활동 문구가 폴더명으로
+    /// 바뀐다. transcript 스캔 구간에서 요약이 빠지면 새 감지값이 비는데, 그때 옛 값을
+    /// 이어받지 않으면 `agent_activity_line`이 프로젝트명까지 폴백하기 때문이다.
+    #[test]
+    fn 감지값이_비면_직전_작업설명을_이어받는다() {
+        let previous = display_with(Some("PR #124 코드 리뷰 완료"), Some("PR #124를 검토해"));
+        let mut next = display_with(None, None);
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert_eq!(
+            next.last_agent_summary.as_deref(),
+            Some("PR #124 코드 리뷰 완료")
+        );
+        assert_eq!(next.user_instruction.as_deref(), Some("PR #124를 검토해"));
+    }
+
+    /// 공백만 있는 값도 "비었다"로 본다 — 그러지 않으면 빈 줄이 옛 문구를 덮는다.
+    #[test]
+    fn 공백뿐인_감지값도_직전_값을_이어받는다() {
+        let previous = display_with(Some("이전 작업"), None);
+        let mut next = display_with(Some("   "), None);
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert_eq!(next.last_agent_summary.as_deref(), Some("이전 작업"));
+    }
+
+    /// 새 값이 있으면 언제나 새 값이 이긴다 — 옛 문구가 최신 활동을 가리면 안 된다.
+    #[test]
+    fn 새_감지값이_있으면_직전_값을_덮어쓰지_않는다() {
+        let previous = display_with(Some("옛 작업"), Some("옛 지시"));
+        let mut next = display_with(Some("새 작업"), Some("새 지시"));
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert_eq!(next.last_agent_summary.as_deref(), Some("새 작업"));
+        assert_eq!(next.user_instruction.as_deref(), Some("새 지시"));
+    }
+
+    /// model/effort/context는 **이어받지 않는다** — 사라졌으면 사라진 게 맞고, 옛 값을
+    /// 남기면 실제와 어긋난 정보를 보여준다.
+    #[test]
+    fn 모델과_추론강도_컨텍스트는_이어받지_않는다() {
+        let previous = display_with(Some("이전 작업"), None);
+        let mut next = crate::agent_detect::AgentDisplay {
+            model: None,
+            effort: None,
+            context_pct: None,
+            ..display_with(None, None)
+        };
+
+        carry_forward_agent_activity(&mut next, &previous);
+
+        assert!(next.model.is_none(), "모델은 이어받지 않는다");
+        assert!(next.effort.is_none(), "추론 강도는 이어받지 않는다");
+        assert!(next.context_pct.is_none(), "컨텍스트는 이어받지 않는다");
+        assert_eq!(next.last_agent_summary.as_deref(), Some("이전 작업"));
+    }
 
     /// 소스 스캔 계약 테스트용 — 연속된 공백(줄바꿈·들여쓰기 포함)을 한 칸으로 접는다.
     ///

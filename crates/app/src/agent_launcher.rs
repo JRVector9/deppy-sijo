@@ -54,8 +54,32 @@ const GROK_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::High,
 ];
 
+/// 에이전트가 끝나면 그 자리에 평범한 셸을 얹는 래퍼.
+///
+/// `stty sane` 뒤의 드레인 한 줄이 핵심이다. 에이전트 TUI는 터미널에 커서 위치(CPR
+/// `ESC[2;1R`), 전경·배경색(OSC 10/11), 장치 속성(DA `ESC[?6c`)을 **질의**하고, 우리
+/// 터미널이 그 **응답을 PTY 입력 쪽으로 되돌려 쓴다**. 에이전트가 응답을 읽기 전에
+/// 끝나면 그 바이트가 입력 버퍼에 남아, 뒤이어 뜬 셸이 사용자가 타이핑한 것으로
+/// 읽는다 — 실제로 `zsh: command not found: 1R10`처럼 깨진 명령이 실행됐다
+/// (2026-08-19 사용자 보고).
+///
+/// `stty sane`은 **모드만 되돌릴 뿐 남은 입력을 버리지 않는다**. 그래서 비정규 모드로
+/// 잠깐 두고(`min 0 time 1` = 최대 0.1초, 없으면 즉시 반환) 남은 바이트를 `dd`로 읽어
+/// 버린다. 그동안 `-echo`라 그 바이트가 화면에 얼룩으로 찍히지도 않는다. 실측으로
+/// 두 효과를 모두 확인했다(실제 CPR/OSC/DA 시퀀스를 PTY에 주입 → 잔여 입력 없음,
+/// 화면 출력 없음). `stty`가 없거나 실패하면 `&&`로 건너뛰어 기존 동작 그대로다.
+/// 남은 터미널 질의 응답을 버리는 조각. 스크립트와 테스트가 **같은 문자열**을 쓰도록
+/// 상수로 둔다 — 한쪽만 고치면 회귀를 못 잡는다.
 #[cfg(unix)]
-const AGENT_THEN_SHELL_SCRIPT: &str = r#""$@"; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${SHELL:-/bin/sh}""#;
+const DRAIN_PENDING_TTY_INPUT: &str =
+    "stty -icanon -echo min 0 time 1 2>/dev/null && dd of=/dev/null bs=4096 count=1 2>/dev/null";
+
+#[cfg(unix)]
+fn agent_then_shell_script() -> String {
+    format!(
+        r#""$@"; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${{SHELL:-/bin/sh}}""#
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AgentKind {
@@ -655,7 +679,7 @@ impl LaunchSpec {
 pub(crate) fn wrap_agent_then_shell(command: String, args: Vec<String>) -> (String, Vec<String>) {
     let mut wrapped_args = Vec::with_capacity(args.len() + 4);
     wrapped_args.push("-c".to_owned());
-    wrapped_args.push(AGENT_THEN_SHELL_SCRIPT.to_owned());
+    wrapped_args.push(agent_then_shell_script());
     wrapped_args.push("deppy-agent-session".to_owned());
     wrapped_args.push(command);
     wrapped_args.extend(args);
@@ -1553,7 +1577,7 @@ mod tests {
         );
         assert_eq!(command, "/bin/sh");
         assert_eq!(args[0], "-c");
-        assert_eq!(args[1], AGENT_THEN_SHELL_SCRIPT);
+        assert_eq!(args[1], agent_then_shell_script());
         assert_eq!(args[2], "deppy-agent-session");
         assert_eq!(args[3], "/bin/sh");
         assert_eq!(args[4..], ["-c", "printf 'agent-done\\n'"]);
@@ -1577,6 +1601,75 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("agent-done\n"), "{stdout:?}");
         assert!(stdout.contains("shell-ready\n"), "{stdout:?}");
+    }
+
+    /// 2026-08-19 사용자 보고 — 에이전트 TUI가 던진 터미널 질의의 **응답**(CPR·OSC
+    /// 10/11·DA)이 늦게 도착해 뒤이어 뜬 셸의 입력으로 들어가면 깨진 명령이 실행된다
+    /// (`zsh: command not found: 1R10`).
+    ///
+    /// **`stty sane`은 모드만 되돌릴 뿐 남은 입력을 버리지 않는다** — 이 테스트가 그
+    /// 사실과 드레인의 효과를 진짜 PTY로 함께 고정한다. `DRAIN_PENDING_TTY_INPUT`을
+    /// 빼면 `LEFT:` 줄에 질의 응답이 그대로 남아 실패한다.
+    #[cfg(unix)]
+    #[test]
+    fn 드레인은_stty_sane이_못_버리는_터미널_질의_응답을_없앤다() {
+        use pty::PtyBackend as _;
+
+        fn leftover_after(script: &str) -> String {
+            let mut session = pty::PortablePtyBackend
+                .spawn(
+                    &pty::CommandSpec {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), script.into()],
+                        env: Vec::new(),
+                        cwd: None,
+                    },
+                    80,
+                    24,
+                )
+                .unwrap();
+            let rx = session.take_output().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // 실제로 우리 터미널이 되돌려 쓰는 바이트 그대로.
+            session.write_input(b"\x1b[2;1R\x1b[?6c\n").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut out = String::new();
+            while std::time::Instant::now() < deadline {
+                if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    out.push_str(&String::from_utf8_lossy(&chunk));
+                }
+                if out.contains("LEFT:") {
+                    break;
+                }
+            }
+            let _ = session.kill();
+            out
+        }
+
+        // ① stty sane만으로는 남는다 — 이게 사용자가 겪은 상황이다.
+        let sane_only = leftover_after(
+            "sleep 0.4; stty sane 2>/dev/null || true; if read -t 2 x 2>/dev/null; then printf 'LEFT:[%s]\\n' \"$x\"; else printf 'LEFT:none\\n'; fi",
+        );
+        assert!(
+            sane_only.contains("LEFT:[") && !sane_only.contains("LEFT:none"),
+            "stty sane만으로 입력이 비워지면 이 수정의 전제가 무너진다: {sane_only:?}"
+        );
+
+        // ② 드레인을 붙이면 사라진다.
+        let drained = leftover_after(&format!(
+            "sleep 0.4; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; if read -t 2 x 2>/dev/null; then printf 'LEFT:[%s]\\n' \"$x\"; else printf 'LEFT:none\\n'; fi",
+        ));
+        assert!(
+            drained.contains("LEFT:none"),
+            "드레인 뒤에도 질의 응답이 남았다: {drained:?}"
+        );
+
+        // ③ 그 드레인이 실제 래퍼 스크립트에 배선돼 있어야 한다 — ①②만으로는
+        //    "조각은 잘 도는데 아무도 안 쓴다"를 못 잡는다.
+        assert!(
+            agent_then_shell_script().contains(DRAIN_PENDING_TTY_INPUT),
+            "에이전트→셸 래퍼가 드레인을 쓰지 않는다"
+        );
     }
 
     #[cfg(unix)]

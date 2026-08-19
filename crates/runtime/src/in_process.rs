@@ -9696,6 +9696,147 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 셸 세션 화면 복원(2026-08-19): SSH로 원격에 붙어 vim·htop·tmux 같은
+    /// alt-screen 프로그램을 보던 중 앱이 재시작돼도 그 화면이 통째로 사라지면
+    /// 안 된다. restore_pane의 셸 respawn 경로가 alt-screen을 그냥 finish_ansi_replay로
+    /// 끝내버리면(§ finish_ansi_replay 원래 동작) 이 내용을 되찾을 길이 없다 —
+    /// scrollback 검색으로 보존을 확인하고, 동시에 fresh 셸이 즉시 입력 가능한지도
+    /// 같이 검증한다("화면 보존"과 "셸 재사용성" 둘 다).
+    #[cfg(unix)]
+    #[test]
+    fn 재시작시_alt_screen이었던_셸_pane도_화면이_보존된다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-rt-altscreen-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-alt');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+            conn.execute_batch(persist::MIGRATION_SESSION_REGEX)
+                .unwrap();
+        }
+        let persist_config = || crate::persistence::PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id: "ws-alt".into(),
+        };
+
+        {
+            // 원격 TUI를 흉내: alt-screen에 들어가 마커 텍스트를 찍고, exit 없이(연결이
+            // 끊긴 채) 그대로 둔다 — 앱이 재시작될 때 흔한 "TUI 화면에 멈춰있던" 상태.
+            let client = InProcessRuntimeClient::with_shell(
+                5,
+                test_store(),
+                logs_root.clone(),
+                RedactionService::new(),
+                spec(
+                    "/bin/sh",
+                    &[
+                        "-c",
+                        r"printf '\033[?1049hREMOTE-VIM-BUFFER'; exec /bin/cat",
+                    ],
+                ),
+                Some(persist_config()),
+            );
+            let mut probe = Probe::new(client.subscribe());
+            client
+                .send_command(RuntimeCommand::SpawnShell {
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                })
+                .unwrap();
+            probe.wait_for(Duration::from_secs(15), |event| match event {
+                RuntimeEvent::Viewport { snapshot, .. }
+                    if snapshot.is_alt_screen
+                        && snapshot.visible_cells.iter().any(|cell| cell.c == 'R') =>
+                {
+                    Some(())
+                }
+                _ => None,
+            });
+        }
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(persist_config()),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let restored_session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if !snapshot.is_alt_screen => Some(*session),
+            _ => None,
+        });
+
+        // 1) 화면 보존 — alt-screen 내용이 scrollback에서 찾아져야 한다(위로 스크롤하면 보임).
+        client
+            .send_command(RuntimeCommand::SearchScrollback {
+                session: restored_session,
+                query: "REMOTE-VIM-BUFFER".into(),
+                max_matches: 10,
+            })
+            .unwrap();
+        let found = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::ScrollbackSearchResult {
+                session, result, ..
+            } if *session == restored_session => Some(!result.matches.is_empty()),
+            _ => None,
+        });
+        assert!(found, "alt-screen 화면이 scrollback에 보존돼야 함");
+
+        // 2) 셸 재사용성 — fresh 셸(/bin/cat)이 살아있어 입력이 그대로 에코된다.
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session: restored_session,
+                bytes: b"FRESH-INPUT-ECHO\n".to_vec(),
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if *session == restored_session
+                && snapshot
+                    .visible_cells
+                    .iter()
+                    .any(|cell| cell.c == 'E' && !cell.wide_spacer) =>
+            {
+                snapshot
+                    .visible_cells
+                    .iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .contains("FRESH-INPUT-ECHO")
+                    .then_some(())
+            }
+            _ => None,
+        });
+
+        drop(client);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 회귀 (codex 리뷰 P2): RestoreWorkspace가 "빈 상태"에서만 복원한다.
     /// SpawnShell이 먼저 처리돼 세션이 생긴 뒤 온 RestoreWorkspace는 skip돼야
     /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.

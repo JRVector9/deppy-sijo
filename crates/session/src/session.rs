@@ -25,6 +25,13 @@ const LAST_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// (worker를 sleep으로 막지 않는다), 이 상한을 넘으면 exit_code=None으로 마감한다.
 const EXIT_WAIT_TICK_CAP: u32 = 40;
 
+/// [`Session::finish_ansi_replay`]가 보존된 alt-screen 내용 앞에 붙이는 구분선.
+/// UI 카탈로그를 거치지 않는 터미널 본문 바이트라 특정 UI 로케일에 묶이지 않게
+/// 영어로 고정한다(레포의 기본/필수 로케일도 en-US) — 다른 상태 마커(예: 셸 프롬프트
+/// 자체)도 로케일 무관 텍스트다.
+const RESTORED_ALT_SCREEN_MARKER: &[u8] =
+    b"\x1b[2m-- restored screen (connection ended) --\x1b[0m\r\n";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
     Shell,
@@ -382,10 +389,31 @@ impl Session {
     /// 이전 agent가 alternate screen·mouse tracking·좁은 scroll region을 남긴 채 앱이
     /// 종료됐어도 새 셸 출력은 main screen의 새 줄에서 시작해야 한다. 이 바이트는
     /// 복원용 parser에만 적용되고 append-only 세션 로그에는 기록되지 않는다.
+    ///
+    /// alt-screen이 활성인 채로 남았다면(예: SSH 세션에서 vim·htop·tmux를 보던 중
+    /// 재시작) 그냥 primary로 복귀시키면 그 화면은 통째로 사라진다 — alt-screen에는
+    /// scrollback이 없어 나중에 되찾을 방법이 없다. 복귀 직전에 alt 화면을 색 보존
+    /// ANSI로 떠서(serialize_scrollback) primary 쪽에 구분선과 함께 다시 흘려보낸다.
+    /// 이러면 위로 스크롤하면 마지막으로 보던 화면이 그대로 보이고, 그 아래에 fresh
+    /// 셸이 새 줄에서 시작한다. 캡처가 이미 redaction을 거친 replay 결과에서만
+    /// 나오므로 이 경로로 새로 노출되는 raw secret은 없다. 백엔드가 직렬화를
+    /// 지원하지 않으면(None) 기존처럼 그 화면은 버려진다.
     pub fn finish_ansi_replay(&mut self) -> anyhow::Result<()> {
+        let preserved_alt_screen = self
+            .backend
+            .viewport_snapshot()
+            .is_some_and(|snapshot| snapshot.is_alt_screen)
+            .then(|| self.backend.serialize_scrollback())
+            .flatten()
+            .filter(|dump| !dump.is_empty());
         self.backend.feed(
             b"\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[r\x1b[?6l\x1b[?7h\x1b[4l\x1b[0m\x1b[?25h\r\n",
         )?;
+        if let Some(dump) = preserved_alt_screen {
+            self.backend.feed(RESTORED_ALT_SCREEN_MARKER)?;
+            self.backend.feed(&dump)?;
+            self.backend.feed(b"\r\n\r\n")?;
+        }
         self.mark_full_dirty();
         Ok(())
     }
@@ -809,6 +837,11 @@ mod tests {
         );
     }
 
+    /// 2026-08-19 갱신 (셸 세션 화면 복원): alt-screen에는 scrollback이 없어, 예전처럼
+    /// 그냥 버리면 SSH로 vim·htop·tmux를 보던 화면이 재시작 후 통째로 사라진다.
+    /// 이제 finish_ansi_replay가 exit 직전에 alt 화면을 primary로 옮겨 보존한다 —
+    /// alt-screen 종료·fresh PTY 경계는 그대로 유지하면서, "화면이 사라진다"는
+    /// 원래 이 테스트가 지키려던 회귀를 alt-screen 케이스까지 넓힌다.
     #[test]
     #[cfg(unix)]
     fn ansi_replay_경계는_alt_screen을_끝내고_fresh_출력을_새줄에_둔다() {
@@ -833,11 +866,22 @@ mod tests {
             .replay_ansi(&mut std::io::Cursor::new(b"FRESH-PROMPT"))
             .unwrap();
         let snapshot = session.take_snapshot().unwrap();
-        assert!(!snapshot.is_alt_screen);
+        assert!(!snapshot.is_alt_screen, "복귀 후엔 alt-screen이면 안 됨");
+        // 6행짜리 좁은 화면이라 marker+dump+spacer가 OLD-HISTORY까지 스크롤백으로
+        // 밀어낸다 — 이는 기대 동작(위로 스크롤하면 보임)이라 screen_text() 대신
+        // scrollback 검색으로 "사라지지 않았음"을 확인한다.
+        let found = session.search_scrollback("ALT-SCREEN", 10);
+        assert!(
+            !found.matches.is_empty(),
+            "alt-screen 내용이 scrollback에 보존돼야 함"
+        );
+        // fresh 셸 출력은 지금 당장 보이는 화면에 있어야 한다(입력 즉시 가능).
         let text = session.screen_text();
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].starts_with("OLD-HISTORY"), "{text:?}");
-        assert!(lines[1].starts_with("FRESH-PROMPT"), "{text:?}");
+        assert!(text.contains("FRESH-PROMPT"), "{text:?}");
+        assert!(
+            !text.contains("ALT-SCREEN"),
+            "이 화면 크기에선 보존 내용이 스크롤백으로 밀려나 있어야 함: {text:?}"
+        );
     }
 
     #[test]

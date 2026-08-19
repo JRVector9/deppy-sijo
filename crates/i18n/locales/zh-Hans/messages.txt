@@ -118,6 +118,7 @@ history.role.agent = 智能体
 history.action.focus = 前往当前会话
 history.action.resume = 继续运行
 history.action.new_run = 新建运行
+history.action.new_run_hint = 此对话无法精确续接，将作为新对话开始。
 history.action.unavailable = 无法运行
 history.action.show_diff = 查看 Git 更改
 history.action.show_diff_hint = 这是当前工作文件夹的更改，不代表智能体归因。

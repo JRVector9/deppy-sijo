@@ -13994,6 +13994,64 @@ impl App {
         self.active.runtime.send_command(command).is_ok()
     }
 
+    /// PR-resume-without-pane(2026-08-19): work history 카드에서 「이어서 하기」를
+    /// 눌렀는데 살아 있는 pane이 없는 archived 대화를 **새 pane**에서 이어간다.
+    /// `resolve_work_history_activation`이 이미 `agent_resume::resume_plan`으로
+    /// `extra_args`를 확정해 넘긴다 — 여기서 CLI 플래그를 다시 판정하지 않는다
+    /// (`dispatch_respawn_archived_agent`와 규칙 공유, 두 벌 방지).
+    ///
+    /// 명령 조립은 Agent Launcher의 새 실행 파이프라인이 쓰는 `build_launch_spec`을
+    /// 그대로 탄다(`handle_agent_launcher_intent`의 `Launch` 분기와 동일한 executable
+    /// 감지·shim 배선) — 그 뒤 이어가기 플래그만 덧붙인다. 모델/강도는 재지정하지
+    /// 않는다(빈 model, effort 없음): 이어갈 대화가 이미 자기 모델을 알고 있어 CLI
+    /// 기본값으로 충분하고, 원래 세션의 정확한 model/effort는 이력 행에 없다(단순화).
+    /// cwd도 지정하지 않는다 — `RuntimeCommand::SpawnAgent`는 항상 워크스페이스
+    /// 현재 cwd에서 뜬다(「새로 실행」과 동일한 기존 제약, PreparedAgentLaunch에도
+    /// cwd 필드가 없다).
+    fn dispatch_resume_archived_agent_new_pane(
+        &mut self,
+        kind: crate::agent_launcher::AgentKind,
+        extra_args: Vec<String>,
+    ) -> bool {
+        let Some(agent) = self
+            .agent_launcher_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.find(kind))
+        else {
+            return false;
+        };
+        let shim = (self.config.ui.agent_status_hooks && kind.supports_deppy_shim())
+            .then(crate::agent_shim::shim_dir)
+            .flatten()
+            .map(|directory| directory.join(kind.id()));
+        let options = crate::agent_launcher::LaunchOptions {
+            model: String::new(),
+            effort: None,
+            yolo: false,
+        };
+        let Ok(spec) = crate::agent_launcher::build_launch_spec(agent, options, shim.as_deref())
+        else {
+            return false;
+        };
+        let (_, command, mut args, env_plain) = spec.into_parts();
+        args.extend(extra_args);
+        let runtime_command = runtime::RuntimeCommand::SpawnAgent {
+            agent_config_id: Some(kind.stable_config_id().to_owned()),
+            cols: 80,
+            rows: 24,
+            scrollback_lines: self.config.terminal.scrollback_lines as usize,
+            command,
+            args,
+            env_plain,
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        self.active.runtime.send_command(runtime_command).is_ok()
+    }
+
     fn pty_agent_surfaces(
         &self,
         entries: &[ui::file_tree::SessionEntry],
@@ -14524,10 +14582,20 @@ impl App {
         let Some(snapshot) = self.agent_launcher_snapshot.as_ref() else {
             return AppWorkHistoryActivation::Disabled(Disabled::Checking);
         };
-        if snapshot.find(kind).is_some() {
-            AppWorkHistoryActivation::NewRun(kind)
-        } else {
-            AppWorkHistoryActivation::Disabled(Disabled::AgentUnavailable)
+        if snapshot.find(kind).is_none() {
+            return AppWorkHistoryActivation::Disabled(Disabled::AgentUnavailable);
+        }
+        // 살아 있는 pane이 없다(위 mux 루프가 아무것도 못 찾았거나 mux 자체가 없다) —
+        // PR-resume-without-pane: 이력 행의 kind + agent_sessions 바인딩만으로 정확한
+        // 재개가 가능한지 마지막으로 확인한다. pane_id는 mux 존재와 무관하게 워크스페이스
+        // 전체에서 로드된 값이라(§resume_without_pane_plan 문서) 여기까지 와도 유효하다.
+        let binding = self
+            .restore_agents
+            .get(&row.pane_id)
+            .map(|saved| (saved.kind.as_str(), saved.session_id.as_str()));
+        match resume_without_pane_plan(kind, binding) {
+            Some(extra_args) => AppWorkHistoryActivation::ResumeArchivedNoPane { kind, extra_args },
+            None => AppWorkHistoryActivation::NewRun(kind),
         }
     }
 
@@ -15019,6 +15087,11 @@ impl App {
                     }
                     AppWorkHistoryActivation::ResumeArchived { session } => {
                         if self.dispatch_respawn_archived_agent(session) {
+                            self.reveal_terminal_session();
+                        }
+                    }
+                    AppWorkHistoryActivation::ResumeArchivedNoPane { kind, extra_args } => {
+                        if self.dispatch_resume_archived_agent_new_pane(kind, extra_args) {
                             self.reveal_terminal_session();
                         }
                     }
@@ -27457,6 +27530,15 @@ enum AppWorkHistoryActivation {
     ResumeArchived {
         session: runtime::SessionId,
     },
+    /// PR-resume-without-pane(2026-08-19): 살아 있는 pane이 없어도 이력 행 자체
+    /// (kind + `agent_sessions` 바인딩)만으로 정확한 재개가 가능하다. 판정
+    /// (`resolve_work_history_activation`)과 실행(`dispatch_resume_archived_agent_
+    /// without_pane`)이 서로 다른 프레임/호출에서 어긋나지 않도록 `extra_args`를
+    /// 여기서 확정해 들고 다닌다 — 실행 시점에 다시 계산하지 않는다.
+    ResumeArchivedNoPane {
+        kind: crate::agent_launcher::AgentKind,
+        extra_args: Vec<String>,
+    },
     NewRun(crate::agent_launcher::AgentKind),
     Disabled(ui::work_history::WorkHistoryDisabledReason),
 }
@@ -27465,13 +27547,38 @@ impl AppWorkHistoryActivation {
     fn presentation(&self) -> ui::work_history::WorkHistoryPrimaryAction {
         match self {
             Self::Focus { .. } => ui::work_history::WorkHistoryPrimaryAction::Focus,
-            Self::ResumeLive { .. } | Self::ResumeArchived { .. } => {
+            Self::ResumeLive { .. }
+            | Self::ResumeArchived { .. }
+            | Self::ResumeArchivedNoPane { .. } => {
                 ui::work_history::WorkHistoryPrimaryAction::Resume
             }
             Self::NewRun(_) => ui::work_history::WorkHistoryPrimaryAction::NewRun,
             Self::Disabled(reason) => ui::work_history::WorkHistoryPrimaryAction::Disabled(*reason),
         }
     }
+}
+
+/// PR-resume-without-pane(2026-08-19): 살아 있는 pane/mux 없이도 「이어서 하기」가
+/// 가능한지 순수하게 판정한다. 근거는 딱 둘 — 이력 행의 `kind`(agent 종류)와
+/// `agent_sessions` 바인딩(native provider kind + native session id)뿐이다. 둘 다
+/// pane 존재 여부와 무관하게 이미 App에 로드돼 있다(`launcher_kind_from_history`,
+/// `self.restore_agents` — agent_sessions는 mux_panes JOIN 없이 workspace 전체를
+/// 읽는다, `AGENT_SESSIONS_BOUNDED_SELECT` 참고). CLI 플래그 자체는
+/// `agent_resume::resume_plan`에 위임한다 — `dispatch_respawn_archived_agent`(살아
+/// 있는 pane 경로)와 같은 함수를 공유해 같은 규칙이 두 벌로 갈라지지 않게 한다.
+///
+/// `ResumeMode::Exact`만 인정한다. `agent_id`로 항상 인식되는 built-in
+/// `stable_config_id()`를 넘기므로 `resume_plan`은 `Unsupported`를 절대 반환하지
+/// 않고(바인딩이 없거나 무효면) `RecentInCwd`로 강등한다 — `resume --last`/`-c`류는
+/// "이 turn을 이어간다"는 약속을 못 지킨다(정확한 native session id 없이 가장 최근
+/// 대화로 뭉뚱그리면 사용자가 클릭한 턴과 다른 대화가 열릴 수 있다). 그래서 여기서는
+/// Exact만 「이어서 하기」로 인정하고, 나머지는 호출측이 「새로 실행」으로 떨어뜨린다.
+fn resume_without_pane_plan(
+    kind: crate::agent_launcher::AgentKind,
+    binding: Option<(&str, &str)>,
+) -> Option<Vec<String>> {
+    let plan = crate::agent_resume::resume_plan(kind.stable_config_id(), binding);
+    (plan.mode == crate::agent_resume::ResumeMode::Exact).then(|| plan.into_extra_args())
 }
 
 fn archived_resume_target(
@@ -37726,6 +37833,92 @@ mod tests {
         let target = unsupported.get(&runtime::SessionId(9)).unwrap();
         assert_eq!(target.presentation, ArchivedResumePresentation::Unsupported);
         assert_eq!(target.extra_args, Some(Vec::new()));
+    }
+
+    // resume_without_pane_plan (PR-resume-without-pane) — 살아 있는 pane 없이도
+    // 「이어서 하기」가 가능한지 판정하는 순수 함수. mux/pane 상태를 받지 않는다는
+    // 점이 위 archived_resume_targets_from_mux 계열과의 핵심 차이다.
+
+    #[test]
+    fn resume_without_pane_plan은_정확한_native_session_id가_있으면_exact_인자를_돌려준다() {
+        let extra_args = resume_without_pane_plan(
+            crate::agent_launcher::AgentKind::Codex,
+            Some(("codex", "codex-native-1")),
+        );
+        assert_eq!(
+            extra_args,
+            Some(vec!["resume".to_owned(), "codex-native-1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn resume_without_pane_plan은_바인딩이_없으면_none이다() {
+        // resume_plan은 이 경우 RecentInCwd("resume --last")로 강등하지만, 이
+        // 함수는 Exact만 인정한다 — 클릭한 턴과 다른 대화가 열릴 수 있어서다.
+        assert_eq!(
+            resume_without_pane_plan(crate::agent_launcher::AgentKind::Codex, None),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_without_pane_plan은_provider가_다른_바인딩을_무시하고_none이다() {
+        // agent_sessions 바인딩의 kind가 claude인데 이력 행은 codex — 오래되었거나
+        // 잘못 결속된 바인딩으로 보고 RecentInCwd로 강등, 결국 None.
+        assert_eq!(
+            resume_without_pane_plan(
+                crate::agent_launcher::AgentKind::Codex,
+                Some(("claude", "wrong-provider-token")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_without_pane_plan은_무효한_native_session_id를_none으로_떨어뜨린다() {
+        for invalid in ["", "bad\nsession", &"x".repeat(1025)] {
+            assert_eq!(
+                resume_without_pane_plan(
+                    crate::agent_launcher::AgentKind::Claude,
+                    Some(("claude", invalid)),
+                ),
+                None,
+                "invalid session id {invalid:?} must not resume"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_without_pane_plan은_builtin_kind별로_올바른_exact_플래그를_고른다() {
+        // agent_resume::resume_plan의 provider별 exact_args 표를 그대로 위임하는지
+        // 확인한다 — 여기서 새로 만들지 않는다(dispatch_respawn_archived_agent와
+        // 규칙 공유 요구사항).
+        let cases: [(crate::agent_launcher::AgentKind, &str, &[&str]); 3] = [
+            (
+                crate::agent_launcher::AgentKind::Claude,
+                "claude",
+                &["--resume", "claude-native"],
+            ),
+            (
+                crate::agent_launcher::AgentKind::Codex,
+                "codex",
+                &["resume", "codex-native"],
+            ),
+            (
+                crate::agent_launcher::AgentKind::Kimi,
+                "kimi",
+                &["--session", "kimi-native"],
+            ),
+        ];
+        for (kind, native_kind, expected) in cases {
+            let native_id = format!("{native_kind}-native");
+            let extra_args = resume_without_pane_plan(kind, Some((native_kind, &native_id)));
+            assert_eq!(
+                extra_args,
+                Some(expected.iter().map(|s| (*s).to_owned()).collect()),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

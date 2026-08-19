@@ -118,6 +118,7 @@ history.role.agent = エージェント
 history.action.focus = 現在のセッションへ移動
 history.action.resume = 続きから実行
 history.action.new_run = 新規実行
+history.action.new_run_hint = この作業は正確には続行できないため、新しい会話として開始します。
 history.action.unavailable = 実行できません
 history.action.show_diff = Git 変更を表示
 history.action.show_diff_hint = エージェントの寄与ではなく、現在の作業フォルダの変更です。

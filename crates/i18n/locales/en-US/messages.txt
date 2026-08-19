@@ -118,6 +118,7 @@ history.role.agent = Agent
 history.action.focus = Go to current session
 history.action.resume = Resume
 history.action.new_run = New run
+history.action.new_run_hint = This turn can't be continued exactly, so it starts as a new conversation.
 history.action.unavailable = Unavailable
 history.action.show_diff = View Git changes
 history.action.show_diff_hint = Current working-folder changes, not agent attribution.

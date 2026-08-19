@@ -21218,15 +21218,29 @@ impl App {
     /// `resolve_session_title`과 같은 규칙: 사용자가 rename했으면 그대로, 기본 제목
     /// ("셸 N")이면 세션 cwd의 프로젝트명으로 대체한다. 감지 워커는 활성 워크스페이스만
     /// 돌지만 cwd는 worker가 DB에 영속하므로(UpdateSessionCwd) 여기서 재사용한다.
-    /// cwd를 못 찾으면 기본 제목을 i18n 렌더한 값("셸 1")으로 폴백.
+    /// cwd를 못 찾으면 기본 제목을 i18n 렌더한 값("셸 1")으로 폴백. 대체한 프로젝트명이
+    /// 이 워크스페이스 자체 이름과 다르면 소속을 함께 밝힌다(`ui::workspace::
+    /// qualify_project_name` — `resolve_session_title`/`session_project_context`와
+    /// 규칙을 공유해, 사이드바·활동 패널·폰 대시보드·OS 알림 어디서 봐도 표기가 갈리지
+    /// 않는다. 2026-08-19 코드 리뷰: 이 호출부(warm/유휴 행)가 실제로 사용자가 본 화면
+    /// 이었다).
     fn activity_session_name(&self, workspace_id: &str, raw_title: &str) -> String {
         let cwd = self
             .persisted_activity_panes
             .get(workspace_id)
             .and_then(|panes| pane_cwd(panes, raw_title));
-        activity_session_name(raw_title, cwd, &self.i18n, |cwd| {
-            self.activity_project_names.get(cwd).cloned().flatten()
-        })
+        let workspace_name = self
+            .workspaces
+            .iter()
+            .find(|row| row.id == workspace_id)
+            .map(Self::workspace_display_name);
+        activity_session_name(
+            raw_title,
+            cwd,
+            &self.i18n,
+            workspace_name.as_deref(),
+            |cwd| self.activity_project_names.get(cwd).cloned().flatten(),
+        )
     }
 
     /// 폭주 확정 알림 큐(active+warm)를 비워 OS 알림을 1회씩 발화한다 (로드맵 B2).
@@ -28444,11 +28458,14 @@ fn pane_cwd<'a>(panes: &'a [storage::PersistedActivityPane], raw_title: &str) ->
 /// 비활성(warm/유휴) 워크스페이스 pane의 표시명 (순수 — 테스트 대상).
 /// 활성 워크스페이스의 `resolve_session_title`과 같은 규칙: 사용자가 rename했으면
 /// 그대로, 기본 제목("셸 N")이면 세션 cwd의 프로젝트명으로 대체, cwd가 없거나 판별
-/// 불가면 기본 제목을 i18n 렌더한 값으로 폴백.
+/// 불가면 기본 제목을 i18n 렌더한 값으로 폴백. 대체한 프로젝트명이 `workspace_name`과
+/// 다르면 `ui::workspace::qualify_project_name`으로 소속을 함께 밝힌다 — 규칙 정의는
+/// 그쪽 leaf에 있다(App이 leaf를 참조하는 방향은 허용, 반대는 금지).
 fn activity_session_name(
     raw_title: &str,
     cwd: Option<&str>,
     catalog: &i18n::Catalog,
+    workspace_name: Option<&str>,
     resolve_project: impl Fn(&str) -> Option<String>,
 ) -> String {
     if !ui::workspace::is_default_session_title(raw_title) {
@@ -28457,6 +28474,7 @@ fn activity_session_name(
     cwd.filter(|cwd| !cwd.is_empty())
         .and_then(resolve_project)
         .filter(|name| !name.trim().is_empty())
+        .map(|name| ui::workspace::qualify_project_name(&name, workspace_name))
         .unwrap_or_else(|| ui::workspace::display_pane_title(raw_title, catalog))
 }
 
@@ -33655,12 +33673,13 @@ mod tests {
     #[test]
     fn 활동_pane_이름은_기본제목이면_프로젝트명으로_표시된다() {
         let catalog = load_catalog("ko-KR");
-        // 기본 제목 + cwd → 프로젝트(폴더)명
+        // 기본 제목 + cwd → 프로젝트(폴더)명. workspace_name=None(비교 대상 없음) → 그대로.
         assert_eq!(
             activity_session_name(
                 "workspace.spawn.shell 1",
                 Some("/Users/jr/Desktop/Projects/deppy-sijo"),
                 &catalog,
+                None,
                 |cwd| crate::agent_detect::project_display_name(
                     cwd,
                     crate::config::SessionNameStyle::Folder
@@ -33670,18 +33689,24 @@ mod tests {
         );
         // 사용자 rename은 cwd와 무관하게 그대로
         assert_eq!(
-            activity_session_name("배포 작업", Some("/tmp/whatever"), &catalog, |cwd| {
-                crate::agent_detect::project_display_name(
-                    cwd,
-                    crate::config::SessionNameStyle::Folder,
-                )
-            }),
+            activity_session_name(
+                "배포 작업",
+                Some("/tmp/whatever"),
+                &catalog,
+                None,
+                |cwd| {
+                    crate::agent_detect::project_display_name(
+                        cwd,
+                        crate::config::SessionNameStyle::Folder,
+                    )
+                }
+            ),
             "배포 작업"
         );
         // cwd 없음/빈 값 → 기본 제목 i18n 렌더로 폴백(기존 동작)
         let fallback = ui::workspace::display_pane_title("workspace.spawn.shell 3", &catalog);
         assert_eq!(
-            activity_session_name("workspace.spawn.shell 3", None, &catalog, |cwd| {
+            activity_session_name("workspace.spawn.shell 3", None, &catalog, None, |cwd| {
                 crate::agent_detect::project_display_name(
                     cwd,
                     crate::config::SessionNameStyle::Folder,
@@ -33690,7 +33715,7 @@ mod tests {
             fallback
         );
         assert_eq!(
-            activity_session_name("workspace.spawn.shell 3", Some(""), &catalog, |cwd| {
+            activity_session_name("workspace.spawn.shell 3", Some(""), &catalog, None, |cwd| {
                 crate::agent_detect::project_display_name(
                     cwd,
                     crate::config::SessionNameStyle::Folder,
@@ -33704,12 +33729,49 @@ mod tests {
                 "workspace.spawn.shell 3",
                 Some("relative/path"),
                 &catalog,
+                None,
                 |cwd| crate::agent_detect::project_display_name(
                     cwd,
                     crate::config::SessionNameStyle::Folder
                 )
             ),
             fallback
+        );
+    }
+
+    /// 2026-08-19 코드 리뷰 재현: warm/유휴 워크스페이스 행(activity_rows/
+    /// web_workspace_seed/사이드바 절전 목록이 전부 이 자유 함수를 거친다)에서도
+    /// cwd 프로젝트명이 워크스페이스 자체 이름과 다르면 소속을 함께 밝혀야 한다 —
+    /// 이게 사용자가 실제로 본 화면이었다(활성 경로만 고친 1차 수정에서 빠졌던 곳).
+    #[test]
+    fn 활동_pane_이름은_워크스페이스_자체_이름과_다르면_소속을_함께_보여준다() {
+        let catalog = load_catalog("ko-KR");
+        assert_eq!(
+            activity_session_name(
+                "workspace.spawn.shell 1",
+                Some("/projects/colon35/Design"),
+                &catalog,
+                Some("Crawler"),
+                |cwd| crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder
+                ),
+            ),
+            "Design (Crawler)"
+        );
+        // 워크스페이스 루트 그대로면(가장 흔한 경우) 정보 중복 없이 그대로.
+        assert_eq!(
+            activity_session_name(
+                "workspace.spawn.shell 1",
+                Some("/projects/Crawler"),
+                &catalog,
+                Some("Crawler"),
+                |cwd| crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder
+                ),
+            ),
+            "Crawler"
         );
     }
 

@@ -2962,6 +2962,15 @@ impl WorkspaceUi {
             .collect()
     }
 
+    /// cwd에서 뽑은 프로젝트명이 이 워크스페이스 자신의 이름과 다르면 소속을 함께
+    /// 밝힌다 — 규칙 본문·근거는 모듈 자유 함수 `qualify_project_name` 주석 참고.
+    /// App도 warm/유휴 워크스페이스 표시(`App::activity_session_name`, app.rs)에 같은
+    /// 자유 함수를 쓴다 — 규칙이 두 곳에 따로 구현되면 같은 화면 안에서 표기가 갈릴 수
+    /// 있다(2026-08-19 코드 리뷰).
+    fn qualify_cwd_project_name(&self, project_name: &str) -> String {
+        qualify_project_name(project_name, self.project_name.as_deref())
+    }
+
     /// 세션 표시 제목. 우선순위: ① 사용자 rename(기본 제목이 아니면) → 그대로,
     /// ② OSC 0/2 동적 제목(프로그램이 설정, 예: cwd/명령) → 그 제목, ③ 프로젝트 폴더명(≈깃
     /// 레포명), ④ 원 표기. osc는 이 세션 터미널의 현재 OSC 제목.
@@ -2987,7 +2996,7 @@ impl WorkspaceUi {
             })
             .filter(|t| !t.trim().is_empty())
         {
-            return n.to_owned();
+            return self.qualify_cwd_project_name(n);
         }
         // cwd 미탐지(pid 없음/lsof 지연) 폴백: OSC 타이틀 > 프로젝트명 > 기본.
         if let Some(t) = osc.map(str::trim).filter(|t| !t.is_empty()) {
@@ -3001,10 +3010,14 @@ impl WorkspaceUi {
 
     /// 작업 설명이 아직 없는 에이전트 행에 표시할 안정적인 프로젝트 컨텍스트.
     /// App이 미리 계산한 프로젝트명을 우선하고, 없으면 현재 cwd의 폴더명을 쓴다.
-    fn session_project_context(&self, session: Option<SessionId>) -> Option<&str> {
+    /// resolve_session_title과 같은 이유로 워크스페이스 자체 이름과 다르면 함께 밝힌다
+    /// (qualify_cwd_project_name 주석 참고) — 이 값이 실제로 에이전트 행 1행(헤드라인)에
+    /// 쓰이므로(session_title_lines의 status_line 우선 규칙) 착각은 주로 여기서 보인다.
+    fn session_project_context(&self, session: Option<SessionId>) -> Option<String> {
         session.and_then(|session| {
             let cwd = self.session_cwds.get(&session)?;
-            self.session_project_names
+            let name = self
+                .session_project_names
                 .project_name(session, cwd)
                 .filter(|name| !name.trim().is_empty())
                 .or_else(|| {
@@ -3012,7 +3025,8 @@ impl WorkspaceUi {
                         .file_name()
                         .and_then(|name| name.to_str())
                         .filter(|name| !name.trim().is_empty())
-                })
+                })?;
+            Some(self.qualify_cwd_project_name(name))
         })
     }
 
@@ -6232,7 +6246,12 @@ impl WorkspaceUi {
                     Some(d) => (
                         Some(agent_info_line(d)),
                         Some(session_status_label(status, catalog)),
-                        Some(agent_activity_line(d, project_context, status, catalog)),
+                        Some(agent_activity_line(
+                            d,
+                            project_context.as_deref(),
+                            status,
+                            catalog,
+                        )),
                     ),
                     None => (None, None, None),
                 };
@@ -6632,6 +6651,38 @@ pub(crate) fn display_pane_title(raw: &str, catalog: &i18n::Catalog) -> String {
         return format!("{} {suffix}", catalog.t(key, &[]));
     }
     raw.to_owned()
+}
+
+/// cwd에서 뽑은 프로젝트명이 이 프로젝트명이 속한 워크스페이스 **자신의** 이름과 다를
+/// 때 그 프로젝트명만 단독으로 보여주면, 세션이 실제로는 그대로인데도 "다른
+/// 워크스페이스의 세션이 섞여 들어왔다"는 착각을 준다(2026-08-19 사용자 보고 —
+/// Crawler 워크스페이스를 펼쳤더니 그 안의 세션이 「Design」으로 보였다. 실제로는
+/// Crawler 세션이 cwd만 다른 프로젝트(Design이라는 이름의 다른 폴더)를 가리켰을 뿐
+/// 세션이 섞인 게 아니었다 — 하필 그 폴더명이 다른 실제 워크스페이스 이름과 같아서
+/// 착각이 생겼다). 두 이름이 같으면(가장 흔한 경우 — 워크스페이스 루트에서 그대로
+/// 작업 중) 프로젝트명 그대로 보여 정보 중복이 없게 하고, 다르면 "프로젝트명
+/// (워크스페이스명)"으로 소속을 함께 밝힌다 — 다른 워크스페이스 세션을 옆에 열 때 쓰는
+/// attached_workspace_title(app.rs)과 같은 표기 관례라 사용자가 이미 본 패턴이다. cwd
+/// 기반 프로젝트명 자체는 다른 폴더에서 띄운 세션을 구분하는 원래 목적대로 계속
+/// 보여준다 — 워크스페이스 이름으로 완전히 대체하면 그 값어치가 없어진다.
+/// (주의: 이 함수는 "작업 워크스페이스 목록"과 "환경 및 API 프로젝트 목록"의 독립을
+/// 다루지 않는다 — 그건 closed_workspace_ids/hidden_env_project_ids의 별개 문제다.
+/// 여기서 섞이는 건 같은 세션 표시줄 안의 두 이름(워크스페이스 자체 이름 vs cwd
+/// 프로젝트명)일 뿐이다.)
+///
+/// 활성 워크스페이스(`WorkspaceUi::resolve_session_title`/`session_project_context`)와
+/// warm·유휴 워크스페이스(`App::activity_session_name`, app.rs)가 **같은 화면
+/// 문법**(사이드바 트리, 활동 패널, 폰 대시보드, OS 알림 모두 같은 세션 표시줄
+/// 규칙을 공유한다)을 쓰므로 이 규칙을 leaf(workspace.rs)의 순수 자유 함수로 뽑아
+/// 두 쪽이 같이 쓴다 — App은 leaf를 참조해도 되지만 leaf는 App을 참조하면 안 되므로
+/// (「App::ui 안에서 IO 직접 호출 금지」와 같은 leaf/App 경계 방향) 위치는 leaf쪽이다.
+/// App은 이미 계산해 갖고 있는 workspace_name 문자열만 넘기면 되는 순수 함수라
+/// app.rs에서 가져다 쓰기도 쉽다.
+pub(crate) fn qualify_project_name(project_name: &str, workspace_name: Option<&str>) -> String {
+    match workspace_name.map(str::trim).filter(|own| !own.is_empty()) {
+        Some(own) if own != project_name => format!("{project_name} ({own})"),
+        _ => project_name.to_owned(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11068,13 +11119,16 @@ mod tests {
         );
         assert_eq!(
             ui.session_project_context(Some(session)),
-            Some("precomputed-repo")
+            Some("precomputed-repo".to_owned())
         );
         ui.set_session_cwds(
             HashMap::from([(session, "/workspace/other".to_owned())]),
             crate::config::SessionNameStyle::Repo,
         );
-        assert_eq!(ui.session_project_context(Some(session)), Some("other"));
+        assert_eq!(
+            ui.session_project_context(Some(session)),
+            Some("other".to_owned())
+        );
         assert!(ui.session_project_names.entries.is_empty());
         assert_eq!(
             ui.resolve_session_title(
@@ -11091,6 +11145,76 @@ mod tests {
             ui.session_project_context(Some(session)),
             None,
             "세션 cwd가 없으면 활성 workspace 이름을 해당 세션의 작업으로 단정하지 않는다"
+        );
+    }
+
+    /// 2026-08-19 사용자 보고 재현: Crawler 워크스페이스의 세션인데 cwd가 우연히 다른
+    /// 이름(Design)의 폴더를 가리켜, 프로젝트명만 단독으로 보이면 "다른 워크스페이스의
+    /// 세션이 섞여 들어왔다"는 착각을 준다. 워크스페이스 자체 이름과 cwd 프로젝트명이
+    /// 다르면 "프로젝트명 (워크스페이스명)"으로 소속을 함께 밝혀야 한다.
+    #[test]
+    fn cwd_project_name이_워크스페이스_자체_이름과_다르면_소속을_함께_보여준다() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let session = SessionId(20);
+        let mut ui = WorkspaceUi::new();
+        ui.set_project_name(Some("Crawler".to_owned()));
+        ui.set_session_cwds(
+            HashMap::from([(session, "/projects/colon35/Design".to_owned())]),
+            crate::config::SessionNameStyle::Folder,
+        );
+        let snapshot = SessionProjectNameSnapshot::try_new(
+            1,
+            vec![(
+                session,
+                "/projects/colon35/Design".to_owned(),
+                "Design".to_owned(),
+            )],
+        )
+        .unwrap();
+        ui.set_session_project_names(snapshot);
+
+        assert_eq!(
+            ui.resolve_session_title("workspace.spawn.shell 1", Some(session), None, &catalog),
+            "Design (Crawler)",
+            "세션 제목이 다른 워크스페이스 이름과 같은 단어로만 보이면 세션이 섞였다고 오해한다"
+        );
+        assert_eq!(
+            ui.session_project_context(Some(session)),
+            Some("Design (Crawler)".to_owned()),
+            "에이전트 행 1행(headline)에 쓰이는 project_context도 같은 규칙을 따라야 한다"
+        );
+    }
+
+    /// 워크스페이스 루트 그대로 작업 중이라 cwd 프로젝트명이 워크스페이스 자체 이름과
+    /// 같은, 가장 흔한 경우는 지금처럼 프로젝트명만 보여준다 — 정보 중복이 없다.
+    #[test]
+    fn cwd_project_name이_워크스페이스_자체_이름과_같으면_그대로_보여준다() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let session = SessionId(21);
+        let mut ui = WorkspaceUi::new();
+        ui.set_project_name(Some("Crawler".to_owned()));
+        ui.set_session_cwds(
+            HashMap::from([(session, "/projects/Crawler".to_owned())]),
+            crate::config::SessionNameStyle::Folder,
+        );
+        let snapshot = SessionProjectNameSnapshot::try_new(
+            1,
+            vec![(
+                session,
+                "/projects/Crawler".to_owned(),
+                "Crawler".to_owned(),
+            )],
+        )
+        .unwrap();
+        ui.set_session_project_names(snapshot);
+
+        assert_eq!(
+            ui.resolve_session_title("workspace.spawn.shell 1", Some(session), None, &catalog),
+            "Crawler"
+        );
+        assert_eq!(
+            ui.session_project_context(Some(session)),
+            Some("Crawler".to_owned())
         );
     }
 

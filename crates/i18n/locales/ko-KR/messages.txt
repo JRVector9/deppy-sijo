@@ -118,6 +118,7 @@ history.role.agent = 에이전트
 history.action.focus = 현재 세션으로 이동
 history.action.resume = 이어서 실행
 history.action.new_run = 새로 실행
+history.action.new_run_hint = 이 작업은 정확히 이어갈 수 없어 새 대화로 시작합니다.
 history.action.unavailable = 실행할 수 없음
 history.action.show_diff = Git 변경 보기
 history.action.show_diff_hint = 에이전트 기여도가 아닌 현재 작업 폴더의 변경입니다.

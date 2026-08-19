@@ -1335,10 +1335,21 @@ fn render_card(
                                 ("history.action.unavailable", false)
                             }
                         };
-                        if ui
-                            .add_enabled(enabled, egui::Button::new(catalog.t(label_key, &[])))
-                            .clicked()
-                        {
+                        let primary_button =
+                            ui.add_enabled(enabled, egui::Button::new(catalog.t(label_key, &[])));
+                        // PR-resume-without-pane(2026-08-19): pane 없이도 이력만으로
+                        // 정확히 이어갈 수 있으면 App이 Resume으로 올린다 — 그래서
+                        // 이 카드가 NewRun에 도달했다는 것 자체가 "정확히 이어갈 근거가
+                        // 없다"는 뜻이 됐다. 왜 「이어서 하기」 대신 「새로 실행」인지
+                        // 말없이 남기지 않고 짧게 알려준다.
+                        let primary_button =
+                            if presentation.primary == WorkHistoryPrimaryAction::NewRun {
+                                primary_button
+                                    .on_hover_text(catalog.t("history.action.new_run_hint", &[]))
+                            } else {
+                                primary_button
+                            };
+                        if primary_button.clicked() {
                             // `presentation`은 identity를 담지 않는다(카드당 String 4개
                             // 할당을 없애려고 App이 더 이상 만들지 않는다) — 지금 그리고
                             // 있는 `row`에서 즉석으로 만든다. 이 카드가 가리키는 행과

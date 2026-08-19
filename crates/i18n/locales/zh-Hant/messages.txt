@@ -118,6 +118,7 @@ history.role.agent = 代理
 history.action.focus = 前往目前工作階段
 history.action.resume = 繼續執行
 history.action.new_run = 新建執行
+history.action.new_run_hint = 此對話無法精確續接，將作為新對話開始。
 history.action.unavailable = 無法執行
 history.action.show_diff = 檢視 Git 變更
 history.action.show_diff_hint = 這是目前工作資料夾的變更，不代表代理歸因。

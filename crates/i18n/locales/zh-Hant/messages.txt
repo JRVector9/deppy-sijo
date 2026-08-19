@@ -629,6 +629,7 @@ agent_sessions.error.archive_attached_thread = 請先中斷已恢復的 APP 執�
 agent_sessions.error.delete_attached_thread = 刪除其本機記錄前，請先歸檔或中斷已恢復的 APP 執行緒。
 agent_sessions.error.workspace_has_attached_thread = 工作區目前附帶 APP 執行緒，無法刪除。
 agent_sessions.error.workspace_has_pending_thread = 工作區有待處理 APP 執行緒請求，無法刪除。
+agent_sessions.error.thread_attached_elsewhere = 此 codex 對話已在 Agent Sessions 中恢復，此處無法重新開啟。請在 Agent Sessions 清單中繼續。
 activity.summary.workspaces = 工作區
 activity.summary.workspace_detail = 活躍 {active} · 待機 {warm} · 休眠 {idle}
 activity.summary.sessions = 會話

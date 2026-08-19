@@ -629,6 +629,7 @@ agent_sessions.error.archive_attached_thread = 再開中の APP スレッドを�
 agent_sessions.error.delete_attached_thread = ローカルレコードを削除する前に、再開中の APP スレッドをアーカイブまたは切断してください。
 agent_sessions.error.workspace_has_attached_thread = このワークスペースには APP スレッドが紐付いているため削除できません。
 agent_sessions.error.workspace_has_pending_thread = このワークスペースには APP スレッド要求が保留中なので削除できません。
+agent_sessions.error.thread_attached_elsewhere = この codex の会話は既に Agent Sessions で再開されているため、ここでは再度開けません。Agent Sessions の一覧から続けてください。
 activity.summary.workspaces = ワークスペース
 activity.summary.workspace_detail = 稼働 {active} · 待機 {warm} · 非活性 {idle}
 activity.summary.sessions = セッション

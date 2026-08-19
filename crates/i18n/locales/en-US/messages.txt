@@ -629,6 +629,7 @@ agent_sessions.error.archive_attached_thread = Disconnect the resumed APP thread
 agent_sessions.error.delete_attached_thread = Archive or disconnect the resumed APP thread before deleting its local record.
 agent_sessions.error.workspace_has_attached_thread = This workspace cannot be deleted while it has an attached APP thread.
 agent_sessions.error.workspace_has_pending_thread = This workspace cannot be deleted while an APP thread request is pending.
+agent_sessions.error.thread_attached_elsewhere = This codex conversation is already resumed in Agent Sessions and cannot be reopened here. Continue it from the Agent Sessions list.
 activity.summary.workspaces = Workspaces
 activity.summary.workspace_detail = Active {active} · Standby {warm} · Suspended {idle}
 activity.summary.sessions = Sessions

@@ -1265,6 +1265,29 @@ impl AgentSessionsUi {
         true
     }
 
+    /// App Server가 지금 writer로 붙잡고 있는(attach) codex thread 중 `thread_id`와
+    /// 일치하는 것의 local(App 소유) 세션 id를 찾는다. PTY 쪽 「이어서 하기」가 같은
+    /// thread를 또 열어 codex writer 충돌(`already has an active writer`, JSON-RPC
+    /// -32600)을 만들지 않도록 app.rs가 PTY resume을 만들기 전에 조회한다.
+    pub fn attached_local_session_for_thread(&self, thread_id: &str) -> Option<&str> {
+        self.attached_threads.iter().find_map(|session_id| {
+            self.persisted_threads
+                .get(session_id)
+                .filter(|row| row.thread_id == thread_id)
+                .map(|_| session_id.as_str())
+        })
+    }
+
+    /// 위 조회로 충돌은 찾았지만(`attached_local_session_for_thread`가 Some을 돌려줬지만)
+    /// 그 local 세션을 열 수 없는 드문 레이스용 — 원문 codex 에러 대신 이해할 수 있는
+    /// 안내를 보여준다. 패널도 함께 연다(닫혀 있으면 안내가 보이지 않는다).
+    pub fn report_thread_attached_elsewhere(&mut self) {
+        self.open = true;
+        self.transport_error = Some(CatalogMessage::Key(
+            "agent_sessions.error.thread_attached_elsewhere",
+        ));
+    }
+
     pub fn selected_surface_snapshot(&self) -> Option<AgentSurfaceSnapshot> {
         match self.selected_surface.as_ref()? {
             AgentSurfaceId::Pty { .. } => self
@@ -5424,6 +5447,44 @@ mod tests {
         assert!(ui.delete_selected_persisted().is_err());
         assert!(ui.client.is_none());
         assert!(ui.persisted_threads.contains_key("local-1"));
+    }
+
+    /// app.rs의 PTY 「이어서 하기」 충돌 판정이 기대는 조회 — attach 안 된 thread,
+    /// 다른 thread에 attach된 경우, 알려지지 않은 thread는 전부 None이어야 한다.
+    #[test]
+    fn attached_local_session_for_thread_finds_only_the_attached_match() {
+        let mut ui = AgentSessionsUi::new();
+        ui.import_persisted_threads(vec![
+            persisted_row("local-1", "thread-1"),
+            persisted_row("local-2", "thread-2"),
+        ]);
+        assert_eq!(ui.attached_local_session_for_thread("thread-1"), None);
+
+        ui.attached_threads.insert("local-1".to_owned());
+        assert_eq!(
+            ui.attached_local_session_for_thread("thread-1"),
+            Some("local-1")
+        );
+        assert_eq!(ui.attached_local_session_for_thread("thread-2"), None);
+        assert_eq!(ui.attached_local_session_for_thread("unknown-thread"), None);
+    }
+
+    #[test]
+    fn report_thread_attached_elsewhere_opens_panel_with_localized_notice() {
+        let mut ui = AgentSessionsUi::new();
+        assert!(!ui.is_open());
+
+        ui.report_thread_attached_elsewhere();
+
+        assert!(ui.is_open());
+        let rendered = ui
+            .transport_error
+            .as_ref()
+            .expect("notice set")
+            .render(&ui.catalog);
+        // catalog.t()는 키가 없으면 키 문자열 자체를 그대로 돌려준다(raw fallback) —
+        // 번역이 실제로 등록됐는지는 렌더 결과가 키와 달라야만 보장된다.
+        assert_ne!(rendered, "agent_sessions.error.thread_attached_elsewhere");
     }
 
     #[test]

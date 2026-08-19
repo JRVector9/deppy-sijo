@@ -629,6 +629,7 @@ agent_sessions.error.archive_attached_thread = 请先断开已恢复的 APP 线�
 agent_sessions.error.delete_attached_thread = 删除其本地记录前，请先归档或断开已恢复的 APP 线程。
 agent_sessions.error.workspace_has_attached_thread = 当前工作区附带 APP 线程，无法删除。
 agent_sessions.error.workspace_has_pending_thread = 当前工作区有待处理 APP 线程请求，无法删除。
+agent_sessions.error.thread_attached_elsewhere = 该 codex 对话已在 Agent Sessions 中恢复，此处无法重新打开。请在 Agent Sessions 列表中继续。
 activity.summary.workspaces = 工作区
 activity.summary.workspace_detail = 活跃 {active} · 待机 {warm} · 休眠 {idle}
 activity.summary.sessions = 会话

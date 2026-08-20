@@ -80,10 +80,22 @@ const GROK_EFFORTS: &[ReasoningEffort] = &[
 const DRAIN_PENDING_TTY_INPUT: &str =
     "stty -icanon -echo min 0 time 0 2>/dev/null && dd of=/dev/null bs=4096 count=1 2>/dev/null";
 
+/// `"$@"` 직후 `$?`(에이전트의 진짜 종료 코드 — 뒤이어 붙는 폴백 셸의 것이 아니다)를
+/// 잡아 sentinel 파일에 남긴다. 파일명은 이 래퍼 셸 자신의 PID(`$$`)로 결정되는데, 그
+/// PID는 runtime이 `process_identity()`로 이미 알고 있는 값과 정확히 같은 프로세스를
+/// 가리킨다(PTY가 직접 스폰하는 게 바로 이 `/bin/sh`) — 그래서 새 IPC 없이 파일 하나로
+/// 만난다. 경로 계산은 `session::agent_exit_sentinel_path`와 이 접두사를 공유한다
+/// (`DRAIN_PENDING_TTY_INPUT`과 같은 관례 — 한쪽만 고치면 서로 못 찾는다).
+///
+/// **화면에는 아무것도 안 남는다** — `printf`는 파일로만 쓰고, 실패해도(temp dir 없음
+/// 등) `|| true`로 조용히 넘어가 기존 동작(폴백 셸 진입)을 막지 않는다. 세션 로그
+/// redaction과도 무관하다 — PTY로 나가는 바이트가 아니라 파일 시스템 쓰기라 로그에
+/// 찍힐 게 없다.
 #[cfg(unix)]
 fn agent_then_shell_script() -> String {
+    let prefix = runtime::AGENT_EXIT_SENTINEL_PREFIX;
     format!(
-        r#""$@"; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${{SHELL:-/bin/sh}}""#
+        r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${{TMPDIR:-/tmp}}/{prefix}$$" 2>/dev/null || true; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; exec "${{SHELL:-/bin/sh}}""#
     )
 }
 
@@ -1607,6 +1619,85 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("agent-done\n"), "{stdout:?}");
         assert!(stdout.contains("shell-ready\n"), "{stdout:?}");
+    }
+
+    /// 래퍼가 폴백 셸의 exit code로 완료/실패를 오판하지 않도록, 에이전트 자신의 진짜
+    /// 종료 코드를 sentinel 파일에 남긴다. 파일 경로는 이 래퍼 프로세스의 PID(=`child.id()`)
+    /// 로 계산되므로 runtime과 같은 공식(`runtime::agent_exit_sentinel_path`)을 쓰면
+    /// 테스트 없이도 서로 찾는다는 걸 이 테스트가 고정한다.
+    #[cfg(unix)]
+    #[test]
+    fn 에이전트의_진짜_종료코드가_보이지_않게_sentinel_파일에_남는다() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let (command, args) = wrap_agent_then_shell(
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), "exit 7".to_owned()],
+        );
+        let mut child = Command::new(command)
+            .args(args)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "폴백 셸 자체는 정상 종료해야 한다");
+
+        let sentinel = runtime::agent_exit_sentinel_path(&std::env::temp_dir(), pid);
+        let content = std::fs::read_to_string(&sentinel)
+            .unwrap_or_else(|error| panic!("sentinel 파일이 없다({sentinel:?}): {error}"));
+        assert_eq!(
+            content, "7",
+            "폴백 셸이 아니라 에이전트 자신의 종료 코드여야 한다"
+        );
+
+        // 화면(stdout/stderr) 어디에도 흔적이 없어야 한다 — 터미널 질의 응답 유출
+        // 사고(2026-08-19)와 같은 종류의 문제를 이 sentinel이 반복하면 안 된다.
+        let visible = [output.stdout, output.stderr].concat();
+        let visible = String::from_utf8_lossy(&visible);
+        assert!(!visible.contains("__deppy_exit"), "{visible:?}");
+        assert!(
+            !visible.contains(sentinel.file_name().unwrap().to_str().unwrap()),
+            "{visible:?}"
+        );
+
+        let _ = std::fs::remove_file(&sentinel);
+    }
+
+    /// 정상 종료(0)도 같은 경로로 정확히 남아야 한다 — 7만 통과하고 0이 어긋나는
+    /// off-by-something을 잡는다.
+    #[cfg(unix)]
+    #[test]
+    fn 정상_종료코드_0도_sentinel에_그대로_남는다() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let (command, args) = wrap_agent_then_shell(
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), "exit 0".to_owned()],
+        );
+        let mut child = Command::new(command)
+            .args(args)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+
+        let sentinel = runtime::agent_exit_sentinel_path(&std::env::temp_dir(), pid);
+        let content = std::fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(content, "0");
+        let _ = std::fs::remove_file(&sentinel);
     }
 
     /// 2026-08-19 사용자 보고 — 에이전트 TUI가 던진 터미널 질의의 **응답**(CPR·OSC

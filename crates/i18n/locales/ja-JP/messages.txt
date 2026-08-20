@@ -410,6 +410,7 @@ notification.session.waiting = 入力待ち: {title}
 notification.session.needs_approval = 承認が必要: {title}
 notification.session.error = エラー: {title}
 notification.session.done = 完了: {title}
+notification.session.agent_vanished = エージェントプロセス終了、結果不明 - 確認してください: {title}
 runtime.spawn_failed.shell = シェル起動失敗: {error}
 runtime.spawn_failed.suspended = ワークスペースが一時停止中のためセッションを開始しませんでした
 runtime.spawn_failed.agent = エージェント起動失敗: {error}

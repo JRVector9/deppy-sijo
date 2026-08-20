@@ -8242,6 +8242,16 @@ pub struct App {
     /// 키 구조는 `agent_info`와 같은 이유(runtime_instance 네임스페이스)다.
     agent_kinds:
         std::collections::HashMap<(u64, runtime::SessionId), crate::agent_detect::RunningAgent>,
+    /// 완료 알림 겹④의 **한 틱 확인 유예** 목록 — 지난 감지에서 에이전트가 사라진
+    /// 세션과 그때의 종류.
+    ///
+    /// ps 스캔은 한 번 튈 수 있어서(pass가 MAX_DETECT_SESSIONS로 잘리거나 일시적
+    /// 미분류) 사라지자마자 알리면 아직 일하는 중인데 "끝났다"가 뜬다 — 안 온 알림보다
+    /// 틀린 알림이 나쁘다. 그래서 한 틱 적어 두고 **다음 감지에서도 여전히 없을 때만**
+    /// 알린다. 종류를 함께 들고 있는 이유는, 그 시점엔 세션이 이미 `agent_kinds`에서
+    /// 빠져 있어 어느 에이전트였는지 알 길이 없기 때문이다.
+    agent_vanish_last_kind:
+        std::collections::HashMap<(u64, runtime::SessionId), crate::agent_detect::RunningAgent>,
     /// 방금 우리가 PTY에 보낸 강도/모델. statusLine(→DB)은 다음 턴에야 갱신돼서,
     /// 이게 없으면 연속으로 눌러도 매번 같은 낡은 값에서 한 칸 움직여 같은 명령을
     /// 반복한다 (2026-08-02 실증: 강도를 올렸는데 계속 같은 단계가 적용됐다).
@@ -12030,6 +12040,7 @@ impl App {
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
             agent_kinds: std::collections::HashMap::new(),
+            agent_vanish_last_kind: std::collections::HashMap::new(),
             pty_agent_pending: std::collections::HashMap::new(),
             pty_agent_queued: std::collections::HashMap::new(),
             pty_agent_surfaces_cache: Vec::new(),
@@ -13848,6 +13859,58 @@ impl App {
                 .filter(|((rt, _), _)| *rt == instance)
                 .map(|((_, session), running)| (*session, running.clone()))
                 .collect();
+            // 완료/실패 알림 겹④(최후의 그물) — exit sentinel(agent_launcher)도 화면
+            // regex도 결과를 못 낸 채 ps 스캔에서 에이전트 프로세스가 사라진 세션에
+            // 중립 알림을 한 번만 낸다. Done/Error가 아니다 — 그 둘 다 실패했을 때만
+            // 의미 있는 마지막 신호라서 notifications.rs가 SessionStatus 없이 native
+            // intent만 낸다(agent_detect::agent_vanished_sessions 문서 참고).
+            let resolved = |session: runtime::SessionId| {
+                matches!(
+                    self.active.workspace_ui.last_session_status(session),
+                    Some(runtime::SessionStatus::Done | runtime::SessionStatus::Error)
+                )
+            };
+            // ㉮ 지난 틱에 사라졌다고 적어 둔 것을 **이번 틱에서 재확인**한다. 다시
+            //    잡혔거나(한 틱 튄 것), 세션이 죽었거나, 그 사이 sentinel·regex가 결과를
+            //    냈으면 알리지 않고 조용히 지운다. 판정 조건이 ㉯와 완전히 같아서
+            //    (적어둘 때 있었고 · 지금 없고 · 세션은 살아 있고 · 아직 결과 없음)
+            //    이미 테스트된 같은 함수를 유예 목록에 그대로 적용한다 — 규칙이 두
+            //    벌이 되면 한쪽만 고쳐지는 사고가 난다.
+            let pending_for_instance: std::collections::HashMap<
+                runtime::SessionId,
+                crate::agent_detect::RunningAgent,
+            > = self
+                .agent_vanish_last_kind
+                .iter()
+                .filter(|((rt, _), _)| *rt == instance)
+                .map(|((_, session), running)| (*session, running.clone()))
+                .collect();
+            let confirmed = crate::agent_detect::agent_vanished_sessions(
+                &pending_for_instance,
+                &kinds,
+                &live_detect_sessions,
+                resolved,
+            );
+            self.agent_vanish_last_kind
+                .retain(|(rt, _), _| *rt != instance);
+            for session in confirmed {
+                if let Some(running) = pending_for_instance.get(&session) {
+                    let title = crate::agent_surface::AgentProvider::from(running.kind).label();
+                    self.notifications_ui.on_agent_vanished(title, &self.i18n);
+                }
+            }
+            // ㉯ 이번 틱에 새로 사라진 것은 **적어만 두고** 다음 틱에 재확인한다.
+            for session in crate::agent_detect::agent_vanished_sessions(
+                &previous_for_instance,
+                &kinds,
+                &live_detect_sessions,
+                resolved,
+            ) {
+                if let Some(running) = previous_for_instance.get(&session) {
+                    self.agent_vanish_last_kind
+                        .insert((instance, session), running.clone());
+                }
+            }
             if claude_defaults_refresh_needed(&previous_for_instance, &kinds) {
                 // 새 직접-실행 Claude 세션은 직전 런처 스냅샷을 재사용하면
                 // 설정 변경 전 값으로 단축키를 보낼 수 있다. 먼저 무효화하고 worker

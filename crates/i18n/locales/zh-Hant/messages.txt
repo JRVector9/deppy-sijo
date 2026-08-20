@@ -410,6 +410,7 @@ notification.session.waiting = 等待輸入：{title}
 notification.session.needs_approval = 需要核准：{title}
 notification.session.error = 錯誤：{title}
 notification.session.done = 完成：{title}
+notification.session.agent_vanished = 代理程序已結束，結果未知 - 請檢查：{title}
 runtime.spawn_failed.shell = Shell 啟動失敗：{error}
 runtime.spawn_failed.suspended = 工作區已暫停，未啟動工作階段
 runtime.spawn_failed.agent = 代理啟動失敗：{error}

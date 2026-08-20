@@ -65,7 +65,8 @@ pub use terminal::{
 };
 
 pub use session::{
-    SessionStatus, SessionStatusView, StatusConfidence, StatusSource, UserStatusOverride,
+    AGENT_EXIT_SENTINEL_PREFIX, SessionStatus, SessionStatusView, StatusConfidence, StatusSource,
+    UserStatusOverride, agent_exit_sentinel_path,
 };
 
 #[cfg(test)]

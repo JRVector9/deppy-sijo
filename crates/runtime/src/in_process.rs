@@ -13,7 +13,7 @@ use pty::CommandSpec;
 #[cfg(test)]
 use secret::SecretStore;
 use secret::{RedactionLease, RedactionService, StreamRedactor};
-use session::{Session, StatusDetector, StatusPatterns};
+use session::{Session, StatusDetector, StatusPatterns, agent_exit_sentinel_path};
 use storage::SessionLogWriter;
 use terminal::{TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalCacheClass, TerminalCacheEvent};
 
@@ -276,6 +276,7 @@ impl InProcessRuntimeClient {
                     seed_redaction_lease: None,
                     logs: std::collections::HashMap::new(),
                     detectors: std::collections::HashMap::new(),
+                    agent_exit_watch: std::collections::HashMap::new(),
                     status_overrides: std::collections::HashMap::new(),
                     logs_root,
                     run_logs_root,
@@ -688,6 +689,11 @@ struct Worker {
     logs: std::collections::HashMap<SessionId, SessionLog>,
     /// 세션별 status detector (PR-12) — regex 있는 agent만
     detectors: std::collections::HashMap<SessionId, StatusDetector>,
+    /// 에이전트 exit sentinel 감시 목록 — `agent_launcher::wrap_agent_then_shell`이 남기는
+    /// 파일 경로(래퍼 PID로 결정). 값이 나타나면 detector에 진짜 종료 코드를 latch하고
+    /// 항목을 지운다(1회성). 폴백 셸이 아니라 에이전트 자신이 끝난 순간을 잡는다 —
+    /// SessionExited(폴백 셸이 exit 칠 때)보다 훨씬 먼저 온다.
+    agent_exit_watch: std::collections::HashMap<SessionId, PathBuf>,
     /// User status overrides. This affects `SessionStatusViewChanged` only;
     /// legacy `SessionStatusChanged` remains raw detector output.
     status_overrides: std::collections::HashMap<SessionId, session::SessionStatus>,
@@ -1629,6 +1635,7 @@ impl Worker {
                         );
                         // regex가 없어도 idle heuristic(3단)은 동작해야 한다 — 상시 설치
                         self.detectors.insert(id, StatusDetector::new(patterns));
+                        self.register_agent_exit_watch(id);
                         self.attach_in_new_tab(id, AGENT_TITLE_ID);
                         if let Some(pipe) = &mut self.persist {
                             // 스키마 CHECK: agent kind는 agent_id 필수 — config id가
@@ -2764,6 +2771,7 @@ impl Worker {
                         done_regex.as_deref(),
                     )),
                 );
+                self.register_agent_exit_watch(id);
 
                 // 여기서부터는 성공이 확정됐을 때만 실행된다 — 이전 archived 상태 정리.
                 self.remove_session(session);
@@ -2774,6 +2782,9 @@ impl Worker {
                 self.remote_viewing.remove(&session);
                 self.status_overrides.remove(&session);
                 self.detectors.remove(&session);
+                if let Some(path) = self.agent_exit_watch.remove(&session) {
+                    let _ = std::fs::remove_file(&path);
+                }
 
                 // 새 탭이 아니라 그 pane에 — attach_in_new_tab을 쓰면 안 된다 (새 탭 생성).
                 if let Some(pane) = self.mux.panes.get_mut(&pane_id) {
@@ -3254,6 +3265,55 @@ impl Worker {
         self.remote_viewing.keys().copied().collect()
     }
 
+    /// 방금 스폰한 세션에 exit sentinel 감시를 건다. pid를 못 구하면(플랫폼 제약,
+    /// portable-pty가 identity를 못 준 경우 등) 조용히 건너뛴다 — 실패해도 기존 동작
+    /// (idle heuristic·SessionExited)이 그대로 남는다. custom agent처럼
+    /// `wrap_agent_then_shell`을 거치지 않은 세션도 걸리지만, 그 sentinel은 영영 안
+    /// 나타날 뿐이고 세션 종료 시 항목을 함께 지우므로(아래 exited 처리) 누수되지 않는다.
+    #[cfg(unix)]
+    fn register_agent_exit_watch(&mut self, id: SessionId) {
+        let Some(pid) = self
+            .sessions
+            .get(&id)
+            .and_then(|session| session.process_identity().pid)
+        else {
+            return;
+        };
+        let path = agent_exit_sentinel_path(&std::env::temp_dir(), pid);
+        // 이 pid를 재사용한 옛 프로세스가 남긴 파일이 있으면(극히 드묾) 오판을 막기 위해
+        // 먼저 지운다 — session::agent_exit_sentinel_path 문서의 재사용 경고와 짝.
+        let _ = std::fs::remove_file(&path);
+        self.agent_exit_watch.insert(id, path);
+    }
+
+    #[cfg(not(unix))]
+    fn register_agent_exit_watch(&mut self, _id: SessionId) {}
+
+    /// exit sentinel이 나타났으면 detector에 진짜 종료 코드를 latch한다 —
+    /// SessionStatusChanged/SessionStatusViewChanged는 뒤이은 evaluate()가 평소처럼
+    /// emit한다(새 이벤트 타입 불필요, 기존 notifications 배선을 그대로 탄다).
+    /// 대부분의 tick은 아직 안 끝난 것뿐이라 못 찾는 게 정상 — 조용히 다음 tick으로.
+    fn poll_agent_exit_sentinels(&mut self) {
+        if self.agent_exit_watch.is_empty() {
+            return;
+        }
+        let mut resolved: Vec<(SessionId, PathBuf, u32)> = Vec::new();
+        for (session, path) in &self.agent_exit_watch {
+            if let Ok(content) = std::fs::read_to_string(path)
+                && let Ok(code) = content.trim().parse::<u32>()
+            {
+                resolved.push((*session, path.clone(), code));
+            }
+        }
+        for (session, path, code) in resolved {
+            self.agent_exit_watch.remove(&session);
+            let _ = std::fs::remove_file(&path);
+            if let Some(detector) = self.detectors.get_mut(&session) {
+                detector.note_exit_sentinel(code);
+            }
+        }
+    }
+
     /// 모든 세션의 PTY 출력을 반영하고, active pane 세션만 Viewport를 push한다
     /// (14.4: hidden pane snapshot 생성 금지 — dirty는 유지되어 포커스 전환 시 따라잡는다).
     fn pump_sessions(&mut self, allow_viewport: bool) -> PumpActivity {
@@ -3262,6 +3322,9 @@ impl Worker {
         // 다음 tick에야 archive 대상이 된다 — SessionExited emit과 detach MuxUpdated가
         // 서로 다른 tick(≈다른 UI drain)에 나뉘어, 알림/상태가 유실되지 않는다 (codex 리뷰).
         self.archive_over_cap();
+        // 폴백 셸이 이어받기 전에(=SessionExited보다 훨씬 먼저) 에이전트 자신의 진짜
+        // 종료 코드를 반영한다 — 아래 evaluate()가 이번 tick에 바로 새 상태를 emit한다.
+        self.poll_agent_exit_sentinels();
         let watched = self.mux.watched_sessions();
         // 원격 시청 lease 세션 — GUI 가시성과 무관하게 Viewport 대상 (P5a).
         let remote_viewed = self.remote_viewed_sessions();
@@ -3421,6 +3484,11 @@ impl Worker {
             self.close_session_log(session, "exited", detail.as_deref());
             self.detectors.remove(&session);
             self.status_overrides.remove(&session);
+            // sentinel이 끝내 안 나타났으면(에이전트가 아니었거나, 쓰기 실패 등) 감시
+            // 항목과 혹시 남은 파일을 함께 정리한다 — temp dir에 흔적을 남기지 않는다.
+            if let Some(path) = self.agent_exit_watch.remove(&session) {
+                let _ = std::fs::remove_file(&path);
+            }
             if let Some(pipe) = &mut self.persist {
                 pipe.session_exited(session);
             }
@@ -4576,6 +4644,7 @@ mod tests {
                 secret_resolver: resolver,
                 logs: std::collections::HashMap::new(),
                 detectors: std::collections::HashMap::new(),
+                agent_exit_watch: std::collections::HashMap::new(),
                 status_overrides: std::collections::HashMap::new(),
                 run_logs_root: logs_root.join("run"),
                 logs_root,
@@ -7899,6 +7968,65 @@ mod tests {
             } => Some(()),
             _ => None,
         });
+    }
+
+    /// agent_launcher::wrap_agent_then_shell이 만드는 것과 동등한 스크립트(app crate라
+    /// 여기서 직접 참조는 못 하지만 같은 형태)로 exit sentinel 경로를 진짜 PTY로 고정한다.
+    /// 폴백 셸은 일부러 오래 살려 둔다(sleep) — SessionExited가 오기 훨씬 전에, 에이전트
+    /// 자신의 종료 코드(0이 아님)로 Error가 즉시 반영돼야 한다는 게 이 테스트의 요점.
+    #[test]
+    #[cfg(unix)]
+    fn exit_sentinel은_폴백_셸이_살아있어도_에이전트의_진짜_종료코드를_즉시_반영한다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("exit-sentinel"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        let script = r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${TMPDIR:-/tmp}/deppy-agent-exit-$$" 2>/dev/null || true; sleep 30"#;
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    script.into(),
+                    "deppy-agent-session".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "exit 3".into(),
+                ],
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionStatusChanged {
+                session: s,
+                status: session::SessionStatus::Error,
+            } if *s == session => Some(()),
+            _ => None,
+        });
+        assert!(
+            !probe.seen.iter().any(
+                |e| matches!(e, RuntimeEvent::SessionExited { session: s, .. } if *s == session)
+            ),
+            "폴백 셸이 아직 안 죽었으니 SessionExited보다 먼저 와야 한다"
+        );
     }
 
     #[test]

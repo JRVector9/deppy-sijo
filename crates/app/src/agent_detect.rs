@@ -104,6 +104,78 @@ pub struct RunningAgent {
     pub effort: Option<String>,
 }
 
+/// 최후의 그물(완료/실패 알림 겹 ④) — ps 스캔이 "에이전트 있음"에서 "없음"으로 본
+/// 세션 중, **PTY 세션 자체는 아직 살아 있고**(=agent_launcher의 폴백 셸이 이어받았을
+/// 가능성) **아직 아무 결과 상태도 확정되지 않은** 세션만 고른다.
+///
+/// exit sentinel(①)이나 화면 regex가 이미 Done/Error를 확정했으면 여기서 다시 알리지
+/// 않는다 — 이건 그 둘이 **모두** 실패했을 때만 의미 있는 중립 신호다. 세션 자체가 이미
+/// 죽었으면(=`still_alive`에 없음) `SessionExited`/`on_pty_exit` 경로가 이미 담당하므로
+/// 제외한다. 어느 쪽이든 여기서 아는 건 "에이전트 프로세스가 사라졌다"뿐 — 완료인지
+/// 실패인지는 모른다. 그래서 호출측은 이 결과를 Done/Error가 아니라 **중립** 알림으로만
+/// 써야 한다(`NotificationsUi::on_agent_vanished`).
+pub fn agent_vanished_sessions(
+    previously_present: &HashMap<SessionId, RunningAgent>,
+    now_present: &HashMap<SessionId, RunningAgent>,
+    still_alive: &HashSet<SessionId>,
+    resolved: impl Fn(SessionId) -> bool,
+) -> Vec<SessionId> {
+    previously_present
+        .keys()
+        .filter(|session| !now_present.contains_key(session))
+        .filter(|session| still_alive.contains(session))
+        .filter(|session| !resolved(**session))
+        .copied()
+        .collect()
+}
+
+#[cfg(test)]
+mod agent_vanished_tests {
+    use super::*;
+
+    fn running() -> RunningAgent {
+        RunningAgent {
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn 살아있고_미확정인_세션만_최후의_그물에_걸린다() {
+        let previous = HashMap::from([(SessionId(1), running()), (SessionId(2), running())]);
+        let now = HashMap::new(); // 둘 다 감지에서 사라짐
+        let alive = HashSet::from([SessionId(1), SessionId(2)]);
+        // 1은 아직 결과 미확정(신경 써야 함), 2는 이미 exit sentinel이 확정(신경 안 씀)
+        let vanished = agent_vanished_sessions(&previous, &now, &alive, |s| s == SessionId(2));
+        assert_eq!(vanished, vec![SessionId(1)]);
+    }
+
+    #[test]
+    fn 여전히_감지되면_그물에_안_걸린다() {
+        let previous = HashMap::from([(SessionId(1), running())]);
+        let now = HashMap::from([(SessionId(1), running())]); // 계속 있음
+        let alive = HashSet::from([SessionId(1)]);
+        assert!(agent_vanished_sessions(&previous, &now, &alive, |_| false).is_empty());
+    }
+
+    #[test]
+    fn 세션_자체가_죽었으면_session_exited가_이미_담당한다() {
+        let previous = HashMap::from([(SessionId(1), running())]);
+        let now = HashMap::new();
+        let alive = HashSet::new(); // pane 자체가 이미 닫힘/종료
+        assert!(agent_vanished_sessions(&previous, &now, &alive, |_| false).is_empty());
+    }
+
+    #[test]
+    fn 처음부터_없던_세션은_대상이_아니다() {
+        let previous = HashMap::new();
+        let now = HashMap::new();
+        let alive = HashSet::from([SessionId(1)]);
+        assert!(agent_vanished_sessions(&previous, &now, &alive, |_| false).is_empty());
+    }
+}
+
 /// 이미 확정된 세션→바인딩을 캐시해 재발견(lsof/codex 재귀 스캔)을 스킵한다(codex #3).
 /// 각 세션(셸 pid)에서 실행 중인 에이전트를 감지해 transcript로 바인딩한다 — ps를 한 번
 /// 에이전트 프로세스(owner_pid)가 여전히 ps 결과에 살아있으면 캐시를 재사용하고, 사라졌으면

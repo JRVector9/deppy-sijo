@@ -16,6 +16,6 @@ pub use lifecycle::SessionLifecycle;
 pub use session::{PumpResult, Session, SessionKind};
 pub use shell_session::spawn_shell;
 pub use status::{
-    SessionStatus, SessionStatusView, StatusConfidence, StatusDetector, StatusPatterns,
-    StatusSource, UserStatusOverride,
+    AGENT_EXIT_SENTINEL_PREFIX, SessionStatus, SessionStatusView, StatusConfidence, StatusDetector,
+    StatusPatterns, StatusSource, UserStatusOverride, agent_exit_sentinel_path,
 };

@@ -264,6 +264,28 @@ impl NotificationsUi {
         );
     }
 
+    /// 완료/실패 알림의 최후 그물(겹 ④, `agent_detect::agent_vanished_sessions`가 고른
+    /// 대상). exit sentinel도 화면 regex도 결과를 못 낸 상태에서 에이전트 프로세스
+    /// 자체가 사라졌을 때만 호출된다 — 완료인지 실패인지 모르므로 **Done/Error로
+    /// 만들지 않는다**. `SessionStatus`를 쓰지 않아 history 목록·아이콘·색·`retain_*`
+    /// 정리 로직과 무관하다(그 전부가 "결과가 확정됐다"는 전제로 짜여 있다) — OS 알림
+    /// 한 번만 낸다. 뒤이어 진짜 결과(exit sentinel이 늦게 쓰였거나 사용자가 폴백
+    /// 셸에서 직접 exit)가 오면 그건 각자 경로(`on_pty_status`/`on_pty_exit`)가 정상
+    /// 발화한다.
+    pub fn on_agent_vanished(&mut self, title: &str, catalog: &i18n::Catalog) {
+        if !bounded_text(title, MAX_NATIVE_BODY_BYTES) {
+            return;
+        }
+        let rendered = catalog.t("notification.session.agent_vanished", &[("title", title)]);
+        let Some(intent) = NativeNotificationIntent::new(rendered, title) else {
+            return;
+        };
+        if self.native_intents.len() == MAX_NATIVE_INTENTS {
+            self.native_intents.pop_front();
+        }
+        self.native_intents.push_back(intent);
+    }
+
     /// 상태 전이 알림 — 같은 대상의 같은 상태가 반복되면 억제한다(재연결/resume 시
     /// 같은 이벤트가 다시 오는 게 흔하다).
     fn push_status(
@@ -667,6 +689,31 @@ mod tests {
         assert_eq!(n.unread(), 2);
         assert_eq!(n.items[0].title, "write_file");
         assert_eq!(n.items[1].title, "run_command");
+    }
+
+    /// 겹④(최후의 그물) — Done/Error를 판정하지 않고 native intent 하나만 낸다.
+    /// history 항목(`items`)에는 안 올린다 — SessionStatus가 없어 아이콘/색/dedup을
+    /// 정할 근거가 없고, 뒤이어 오는 진짜 결과 알림과 섞이면 안 된다.
+    #[test]
+    fn agent_vanished은_native_intent만_내고_history에는_안_올린다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        n.on_agent_vanished("작업", &catalog);
+        assert!(
+            n.items.is_empty(),
+            "결과 미확정 상태라 history에 남기지 않는다"
+        );
+        let intent = n.pop_native_intent().expect("native intent");
+        assert_eq!(intent.body(), "작업");
+        assert!(n.pop_native_intent().is_none());
+    }
+
+    #[test]
+    fn agent_vanished도_oversized_title은_거부한다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        n.on_agent_vanished(&"x".repeat(MAX_NATIVE_BODY_BYTES + 1), &catalog);
+        assert!(n.pop_native_intent().is_none());
     }
 
     #[test]

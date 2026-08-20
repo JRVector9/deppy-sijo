@@ -13848,6 +13848,27 @@ impl App {
                 .filter(|((rt, _), _)| *rt == instance)
                 .map(|((_, session), running)| (*session, running.clone()))
                 .collect();
+            // 완료/실패 알림 겹④(최후의 그물) — exit sentinel(agent_launcher)도 화면
+            // regex도 결과를 못 낸 채 ps 스캔에서 에이전트 프로세스가 사라진 세션에
+            // 중립 알림을 한 번만 낸다. Done/Error가 아니다 — 그 둘 다 실패했을 때만
+            // 의미 있는 마지막 신호라서 notifications.rs가 SessionStatus 없이 native
+            // intent만 낸다(agent_detect::agent_vanished_sessions 문서 참고).
+            for session in crate::agent_detect::agent_vanished_sessions(
+                &previous_for_instance,
+                &kinds,
+                &live_detect_sessions,
+                |session| {
+                    matches!(
+                        self.active.workspace_ui.last_session_status(session),
+                        Some(runtime::SessionStatus::Done | runtime::SessionStatus::Error)
+                    )
+                },
+            ) {
+                if let Some(running) = previous_for_instance.get(&session) {
+                    let title = crate::agent_surface::AgentProvider::from(running.kind).label();
+                    self.notifications_ui.on_agent_vanished(title, &self.i18n);
+                }
+            }
             if claude_defaults_refresh_needed(&previous_for_instance, &kinds) {
                 // 새 직접-실행 Claude 세션은 직전 런처 스냅샷을 재사용하면
                 // 설정 변경 전 값으로 단축키를 보낼 수 있다. 먼저 무효화하고 worker

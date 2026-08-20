@@ -410,6 +410,7 @@ notification.session.waiting = Waiting for input: {title}
 notification.session.needs_approval = Approval needed: {title}
 notification.session.error = Error: {title}
 notification.session.done = Done: {title}
+notification.session.agent_vanished = Agent process ended, outcome unknown - check: {title}
 runtime.spawn_failed.shell = Shell start failed: {error}
 runtime.spawn_failed.suspended = Workspace is suspended - session was not started
 runtime.spawn_failed.agent = Agent start failed: {error}

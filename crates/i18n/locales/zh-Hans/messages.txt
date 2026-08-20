@@ -410,6 +410,7 @@ notification.session.waiting = 等待输入：{title}
 notification.session.needs_approval = 需要审批：{title}
 notification.session.error = 错误：{title}
 notification.session.done = 完成：{title}
+notification.session.agent_vanished = 代理进程已结束，结果未知 - 请检查：{title}
 runtime.spawn_failed.shell = Shell 启动失败：{error}
 runtime.spawn_failed.suspended = 工作区已挂起，未启动会话
 runtime.spawn_failed.agent = 代理启动失败：{error}

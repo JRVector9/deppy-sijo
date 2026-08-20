@@ -204,7 +204,6 @@ const BODY_MARGIN_X: i8 = 14;
 const BODY_MARGIN_Y: i8 = 10;
 
 struct MetadataParts<'a> {
-    primary: Vec<&'a str>,
     branch: Option<&'a str>,
     git_change_count: Option<u32>,
 }
@@ -226,8 +225,6 @@ struct WorkHistoryGroup<'a> {
     /// 재조립(`WorkHistoryUi::cached_grouped_rows`)이 이 인덱스로 원본을 O(1)
     /// 역참조한다 — `WorkTurnIdentity::matches` 문자열 비교 선형 탐색을 없앤다.
     row_indices: Vec<usize>,
-    model: Option<&'a str>,
-    effort: Option<&'a str>,
     branch: Option<&'a str>,
     git_change_count: Option<u32>,
     /// 그룹 내 턴들의 `updated_at` 최댓값 — 헤더의 "최신 시각"이며, branch/변경
@@ -290,8 +287,6 @@ fn materialize_group<'a>(
     let group_rows: Vec<WorkHistoryRow<'a>> = indices.iter().map(|&index| rows[index]).collect();
     let kind = group_rows[0].kind;
     let agent_session_id = group_rows[0].agent_session_id;
-    let model = latest_with_value(&group_rows, |row| row.model);
-    let effort = latest_with_value(&group_rows, |row| row.effort);
     let branch = latest_with_value(&group_rows, |row| row.branch);
     let git_change_count = latest_with_value(&group_rows, |row| row.git_change_count);
     let latest_updated_at = group_rows
@@ -304,8 +299,6 @@ fn materialize_group<'a>(
         agent_session_id,
         row_indices: indices.to_vec(),
         rows: group_rows,
-        model,
-        effort,
         branch,
         git_change_count,
         latest_updated_at,
@@ -1132,14 +1125,9 @@ fn render_group_header(
             ui.horizontal_wrapped(|ui| {
                 ui.label(if collapsed { "▸" } else { "▾" });
                 ui.label(egui::RichText::new(provider_label(group.kind)).strong());
-                if let Some(model) = group.model {
-                    ui.label(egui::RichText::new("·").small().weak());
-                    ui.label(egui::RichText::new(model).small().weak().monospace());
-                }
-                if let Some(effort) = group.effort {
-                    ui.label(egui::RichText::new("·").small().weak());
-                    ui.label(egui::RichText::new(effort).small().weak().monospace());
-                }
+                // 모델·추론 강도는 화면에서 뺀다(2026-08-19 사용자) — 턴을 고를 때 쓰는
+                // 정보가 아닌데 고정폭이라 실제 지시문보다 길었다. 필드 자체는 DB와
+                // WorkHistoryRow에 그대로 있어 검색은 계속 걸린다.
                 if let Some(branch) = group.branch {
                     metadata_chip(ui, branch);
                 }
@@ -1197,16 +1185,18 @@ fn render_card(
     } else {
         tokens.app_background
     };
-    let stroke = if expanded {
-        egui::Stroke::new(1.0, tokens.accent)
-    } else {
-        egui::Stroke::new(1.0, tokens.separator)
-    };
+    // 고른 카드도 테두리는 중립선 그대로 두고 **표면 전체가 들려서** 구분된다
+    // (2026-08-19 사용자: 라운드에 컬러 넣지 말 것). accent 테두리는 카드가 여러 장
+    // 쌓인 목록에서 유일하게 색을 가진 선이라 그 자체로 시선을 끌었다.
+    let stroke = egui::Stroke::new(1.0, tokens.separator);
+    let well = agent_well_fill(tokens, fill);
     let shown = egui::Frame::NONE
         .fill(fill)
         .stroke(stroke)
-        .corner_radius(egui::CornerRadius::same(5))
-        .inner_margin(egui::Margin::symmetric(14, 12))
+        .corner_radius(egui::CornerRadius::same(6))
+        // 안쪽 여백은 0 — 블록(사용자/에이전트/부기)마다 자기 여백을 갖는다.
+        // 에이전트 블록이 카드 폭을 꽉 채우는 **면**이어야 하기 때문이다.
+        .inner_margin(egui::Margin::ZERO)
         .show(ui, |ui| {
             let mut action = None;
             let toggle = ui.scope_builder(
@@ -1221,178 +1211,226 @@ fn render_card(
                     .sense(egui::Sense::click()),
                 |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        provider_badge(ui, row.kind);
-                        ui.vertical(|ui| {
+                    // ① 사용자의 말 — 카드 표면. 짧은 명령문이라 한 줄이고, 목록의
+                    //    제목 역할을 맡는다. 시각만 오른쪽 끝에 붙는다.
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(14, 11))
+                        .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(relative_age_text(
-                                            catalog,
-                                            row.updated_at,
-                                            now,
-                                        ))
-                                        .small()
-                                        .weak(),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(collapsed_summary_line(
-                                                row.instruction,
-                                            ))
-                                            .strong()
-                                            .size(15.0),
-                                        )
-                                        .truncate(),
-                                    );
-                                },
-                            );
-                            ui.add_space(5.0);
+                            // `ui.horizontal(...)`로 한 번 감싸야 한다 — 감싸지 않고
+                            // `with_layout(..., Align::Center)`를 바로 부르면 이 ui의
+                            // 높이 예산이 `ui.horizontal`의 `interact_size.y`(한 줄)가
+                            // 아니라 부모의 **가용 높이 전체**가 된다(egui
+                            // `Ui::horizontal` 문서: "The new layout will take up all
+                            // available space" — `horizontal`은 내부에서 높이를
+                            // `interact_size.y`로 미리 못박아 이 함정을 피한다). 목록
+                            // 가상화가 그 잘못 잰 높이를 다음 프레임의 가용 높이로
+                            // 먹여 되돌리는 구조라, 감싸지 않으면 매 프레임 카드가
+                            // 점점 커지며 수렴하지 않는다(2026-08-20 회귀 원인 —
+                            // `git log`의 리디자인 커밋에서 기존 `ui.horizontal` 래퍼가
+                            // 빠지며 생겼다).
                             ui.horizontal(|ui| {
-                                status_dot(ui, row.state);
-                                let summary = row
-                                    .agent_summary
-                                    .map(collapsed_summary_line)
-                                    .unwrap_or_else(|| catalog_key_for_summary_fallback(row.state));
-                                let summary = if row.agent_summary.is_some() {
-                                    summary.to_owned()
-                                } else {
-                                    catalog.t(summary, &[])
-                                };
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(summary).weak())
-                                        .truncate(),
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(relative_age_text(
+                                                catalog,
+                                                row.updated_at,
+                                                now,
+                                            ))
+                                            .small()
+                                            .weak(),
+                                        );
+                                        // 남은 폭을 왼쪽부터 채우게 한 번 더 감싼다 —
+                                        // right_to_left 안에서 그냥 add하면 제목이 시각에
+                                        // 달라붙어 오른쪽 정렬로 보인다(현행 버그).
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(
+                                                            collapsed_summary_line(row.instruction),
+                                                        )
+                                                        .strong()
+                                                        .size(15.0),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
+                                    },
                                 );
                             });
                         });
-                    });
-                    ui.add_space(8.0);
+                    // ② 에이전트의 말 — 카드보다 한 단 파인 면. 카드 폭을 꽉 채워
+                    //    어디서 시작해 끝나는지가 글을 읽기 전에 보인다.
+                    egui::Frame::NONE
+                        .fill(well)
+                        .inner_margin(egui::Margin::symmetric(14, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let summary = match row.agent_summary {
+                                Some(text) => collapsed_summary_block(text),
+                                None => catalog.t(catalog_key_for_summary_fallback(row.state), &[]),
+                            };
+                            ui.add(egui::Label::new(egui::RichText::new(summary).weak()).wrap());
+                        });
+                    // ③ 부기 — 다시 카드 표면으로 돌아온다. 브랜치·변경 수는 그 턴을
+                    //    고르는 근거라 남기고, 상태는 「완료」가 아닐 때만 그린다
+                    //    (대부분이 완료라 다 적으면 목록이 그 단어로 덮인다).
                     render_metadata(ui, row, catalog);
                 },
             );
 
             if expanded {
-                ui.add_space(10.0);
-                crate::ui::hairline(ui);
-                expanded_text(
-                    ui,
-                    &catalog.t("history.card.instruction", &[]),
-                    row.instruction,
-                );
-                copy_button(
-                    ui,
-                    catalog,
-                    copy_feedback_id(row, "instruction"),
-                    "history.action.copy_instruction",
-                    row.instruction,
-                );
-                ui.add_space(8.0);
-                let messages = row
-                    .messages_json
-                    .map(|json| parse_turn_messages(json, row.instruction))
-                    .unwrap_or_default();
-                if messages.is_empty() {
-                    // messages_json이 없거나(구버전 행) 신뢰할 수 없으면 기존 경로 —
-                    // agent_summary 한 덩이.
-                    let summary = row
-                        .agent_summary
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| catalog.t("history.card.no_summary", &[]));
-                    expanded_text(ui, &catalog.t("history.card.latest_work", &[]), &summary);
-                } else {
-                    for message in &messages {
-                        let label = match message.role {
-                            crate::agent_transcript::TurnRole::User => {
-                                catalog.t("history.role.user", &[])
+                // 카드 inner_margin이 0이라(에이전트 면이 폭을 꽉 채워야 해서) 펼친
+                // 본문은 자기 여백을 직접 갖는다.
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(14, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        crate::ui::hairline(ui);
+                        expanded_text(
+                            ui,
+                            &catalog.t("history.card.instruction", &[]),
+                            row.instruction,
+                        );
+                        copy_button(
+                            ui,
+                            catalog,
+                            copy_feedback_id(row, "instruction"),
+                            "history.action.copy_instruction",
+                            row.instruction,
+                        );
+                        ui.add_space(8.0);
+                        let messages = row
+                            .messages_json
+                            .map(|json| parse_turn_messages(json, row.instruction))
+                            .unwrap_or_default();
+                        if messages.is_empty() {
+                            // messages_json이 없거나(구버전 행) 신뢰할 수 없으면 기존 경로 —
+                            // agent_summary 한 덩이.
+                            let summary = row
+                                .agent_summary
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| catalog.t("history.card.no_summary", &[]));
+                            expanded_text(
+                                ui,
+                                &catalog.t("history.card.latest_work", &[]),
+                                &summary,
+                            );
+                        } else {
+                            for message in &messages {
+                                let label = match message.role {
+                                    crate::agent_transcript::TurnRole::User => {
+                                        catalog.t("history.role.user", &[])
+                                    }
+                                    crate::agent_transcript::TurnRole::Assistant => {
+                                        catalog.t("history.role.agent", &[])
+                                    }
+                                };
+                                expanded_text(ui, &label, &message.text);
+                                ui.add_space(4.0);
                             }
-                            crate::agent_transcript::TurnRole::Assistant => {
-                                catalog.t("history.role.agent", &[])
-                            }
-                        };
-                        expanded_text(ui, &label, &message.text);
-                        ui.add_space(4.0);
-                    }
-                }
-                if let Some(summary_text) = row.agent_summary {
-                    copy_button(
-                        ui,
-                        catalog,
-                        copy_feedback_id(row, "summary"),
-                        "history.action.copy_summary",
-                        summary_text,
-                    );
-                }
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    if let Some(presentation) = presentation {
-                        let (label_key, enabled) = match presentation.primary {
-                            WorkHistoryPrimaryAction::Focus => ("history.action.focus", true),
-                            WorkHistoryPrimaryAction::Resume => ("history.action.resume", true),
-                            WorkHistoryPrimaryAction::NewRun => ("history.action.new_run", true),
-                            WorkHistoryPrimaryAction::Disabled(_) => {
-                                ("history.action.unavailable", false)
-                            }
-                        };
-                        let primary_button =
-                            ui.add_enabled(enabled, egui::Button::new(catalog.t(label_key, &[])));
-                        // PR-resume-without-pane(2026-08-19): pane 없이도 이력만으로
-                        // 정확히 이어갈 수 있으면 App이 Resume으로 올린다 — 그래서
-                        // 이 카드가 NewRun에 도달했다는 것 자체가 "정확히 이어갈 근거가
-                        // 없다"는 뜻이 됐다. 왜 「이어서 하기」 대신 「새로 실행」인지
-                        // 말없이 남기지 않고 짧게 알려준다.
-                        let primary_button =
-                            if presentation.primary == WorkHistoryPrimaryAction::NewRun {
-                                primary_button
-                                    .on_hover_text(catalog.t("history.action.new_run_hint", &[]))
-                            } else {
-                                primary_button
-                            };
-                        if primary_button.clicked() {
-                            // `presentation`은 identity를 담지 않는다(카드당 String 4개
-                            // 할당을 없애려고 App이 더 이상 만들지 않는다) — 지금 그리고
-                            // 있는 `row`에서 즉석으로 만든다. 이 카드가 가리키는 행과
-                            // `presentation`은 App이 같은 인덱스로 대응시켜 넘긴 값이라
-                            // 항상 같은 턴을 가리킨다(`WorkHistoryActionPresentation` 문서
-                            // 참고). 클릭은 프레임당 최대 한 번이라 이 할당은 무해하다 —
-                            // 「원문 보기」가 이미 같은 방식을 쓴다(아래).
-                            action = Some(WorkHistoryAction::Activate(WorkTurnIdentity::from(row)));
                         }
-                        if presentation.show_diff
-                            && ui
-                                .button(catalog.t("history.action.show_diff", &[]))
-                                .on_hover_text(catalog.t("history.action.show_diff_hint", &[]))
+                        if let Some(summary_text) = row.agent_summary {
+                            copy_button(
+                                ui,
+                                catalog,
+                                copy_feedback_id(row, "summary"),
+                                "history.action.copy_summary",
+                                summary_text,
+                            );
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(presentation) = presentation {
+                                let (label_key, enabled) = match presentation.primary {
+                                    WorkHistoryPrimaryAction::Focus => {
+                                        ("history.action.focus", true)
+                                    }
+                                    WorkHistoryPrimaryAction::Resume => {
+                                        ("history.action.resume", true)
+                                    }
+                                    WorkHistoryPrimaryAction::NewRun => {
+                                        ("history.action.new_run", true)
+                                    }
+                                    WorkHistoryPrimaryAction::Disabled(_) => {
+                                        ("history.action.unavailable", false)
+                                    }
+                                };
+                                let primary_button = ui.add_enabled(
+                                    enabled,
+                                    egui::Button::new(catalog.t(label_key, &[])),
+                                );
+                                // PR-resume-without-pane(2026-08-19): pane 없이도 이력만으로
+                                // 정확히 이어갈 수 있으면 App이 Resume으로 올린다 — 그래서
+                                // 이 카드가 NewRun에 도달했다는 것 자체가 "정확히 이어갈
+                                // 근거가 없다"는 뜻이 됐다. 왜 「이어서 하기」 대신 「새로
+                                // 실행」인지 말없이 남기지 않고 짧게 알려준다.
+                                let primary_button =
+                                    if presentation.primary == WorkHistoryPrimaryAction::NewRun {
+                                        primary_button.on_hover_text(
+                                            catalog.t("history.action.new_run_hint", &[]),
+                                        )
+                                    } else {
+                                        primary_button
+                                    };
+                                if primary_button.clicked() {
+                                    // `presentation`은 identity를 담지 않는다(카드당 String 4개
+                                    // 할당을 없애려고 App이 더 이상 만들지 않는다) — 지금 그리고
+                                    // 있는 `row`에서 즉석으로 만든다. 이 카드가 가리키는 행과
+                                    // `presentation`은 App이 같은 인덱스로 대응시켜 넘긴 값이라
+                                    // 항상 같은 턴을 가리킨다(`WorkHistoryActionPresentation` 문서
+                                    // 참고). 클릭은 프레임당 최대 한 번이라 이 할당은 무해하다 —
+                                    // 「원문 보기」가 이미 같은 방식을 쓴다(아래).
+                                    action = Some(WorkHistoryAction::Activate(
+                                        WorkTurnIdentity::from(row),
+                                    ));
+                                }
+                                if presentation.show_diff
+                                    && ui
+                                        .button(catalog.t("history.action.show_diff", &[]))
+                                        .on_hover_text(
+                                            catalog.t("history.action.show_diff_hint", &[]),
+                                        )
+                                        .clicked()
+                                {
+                                    action = Some(WorkHistoryAction::ShowDiff(
+                                        WorkTurnIdentity::from(row),
+                                    ));
+                                }
+                            }
+                            // presentation과 무관하게 항상 켜져 있다 — 원문은 런처 가용성이나
+                            // 활성 워크스페이스와 상관없이 세션이 끝난 뒤에도 열 수 있어야 한다.
+                            if ui
+                                .button(catalog.t("history.action.show_transcript", &[]))
                                 .clicked()
+                            {
+                                action = Some(WorkHistoryAction::ShowTranscript(
+                                    WorkTurnIdentity::from(row),
+                                ));
+                            }
+                        });
+                        if let Some(WorkHistoryActionPresentation {
+                            primary: WorkHistoryPrimaryAction::Disabled(reason),
+                            ..
+                        }) = presentation
                         {
-                            action = Some(WorkHistoryAction::ShowDiff(WorkTurnIdentity::from(row)));
+                            let key = match reason {
+                                WorkHistoryDisabledReason::Checking => {
+                                    "history.action.disabled.checking"
+                                }
+                                WorkHistoryDisabledReason::AgentUnavailable => {
+                                    "history.action.disabled.unavailable"
+                                }
+                                WorkHistoryDisabledReason::Stale => "history.action.disabled.stale",
+                            };
+                            ui.weak(catalog.t(key, &[]));
                         }
-                    }
-                    // presentation과 무관하게 항상 켜져 있다 — 원문은 런처 가용성이나
-                    // 활성 워크스페이스와 상관없이 세션이 끝난 뒤에도 열 수 있어야 한다.
-                    if ui
-                        .button(catalog.t("history.action.show_transcript", &[]))
-                        .clicked()
-                    {
-                        action = Some(WorkHistoryAction::ShowTranscript(WorkTurnIdentity::from(
-                            row,
-                        )));
-                    }
-                });
-                if let Some(WorkHistoryActionPresentation {
-                    primary: WorkHistoryPrimaryAction::Disabled(reason),
-                    ..
-                }) = presentation
-                {
-                    let key = match reason {
-                        WorkHistoryDisabledReason::Checking => "history.action.disabled.checking",
-                        WorkHistoryDisabledReason::AgentUnavailable => {
-                            "history.action.disabled.unavailable"
-                        }
-                        WorkHistoryDisabledReason::Stale => "history.action.disabled.stale",
-                    };
-                    ui.weak(catalog.t(key, &[]));
-                }
+                    });
             }
             (action, toggle.response)
         });
@@ -1422,6 +1460,40 @@ struct CardAction {
 fn expanded_text(ui: &mut egui::Ui, label: &str, body: &str) {
     ui.label(egui::RichText::new(label).small().weak());
     ui.add(egui::Label::new(body).wrap());
+}
+
+/// 에이전트의 말이 놓이는 **한 단 파인 면**의 색. 카드 표면에서 `content_canvas`
+/// 쪽으로 섞어 만든다(2026-08-19 시안 A).
+///
+/// 새 토큰을 하드코딩하지 않고 기존 토큰에서 유도하는 이유: `content_canvas`는 두
+/// 테마 모두에서 이미 "한 단 물러난 면"이다(다크는 더 어둡게, 라이트도 더 어둡게).
+/// 그래서 **같은 식 하나로 두 테마가 같은 방향**으로 움직인다 — 방향을 뒤집으면
+/// 라이트에서 에이전트 말이 도리어 떠올라 의미가 반대가 된다.
+/// 고른 카드에서도 표면이 들린 만큼 이 면도 함께 올라가 두 면의 관계가 유지된다.
+fn agent_well_fill(
+    tokens: crate::ui::designall::Tokens,
+    card_fill: egui::Color32,
+) -> egui::Color32 {
+    crate::ui::designall::mix(card_fill, tokens.content_canvas, 0.55)
+}
+
+/// 접힌 카드의 에이전트 요약 — 파인 면에 **두 줄까지** 보여준다(2026-08-19 시안 A).
+///
+/// 원문의 줄바꿈은 공백으로 접어 한 문단으로 만든 뒤 글자 수로 자른다. egui에는
+/// CSS의 line-clamp가 없어 폭이 아니라 글자 수로 근사한다 — 목록 폭을 좁히면 세 줄이
+/// 될 수 있지만, 측정 높이 가상화(`show_viewport`)라 레이아웃이 깨지지는 않는다.
+/// 한 줄만 보여주던 이전 규칙(`collapsed_summary_line`)은 제목(지시문)에 그대로 쓴다.
+const COLLAPSED_SUMMARY_MAX_CHARS: usize = 110;
+
+fn collapsed_summary_block(summary: &str) -> String {
+    let folded = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.chars().count() <= COLLAPSED_SUMMARY_MAX_CHARS {
+        return folded;
+    }
+    // char 경계로 자른다 — 바이트로 자르면 한글에서 패닉한다.
+    let mut cut: String = folded.chars().take(COLLAPSED_SUMMARY_MAX_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// 접힌 카드에 쓸 한 줄 — 요약이 여러 줄이어도 첫 줄만 보여준다(2026-08-15).
@@ -1575,15 +1647,9 @@ fn copy_button(
 }
 
 fn metadata_parts<'a>(row: &WorkHistoryRow<'a>) -> MetadataParts<'a> {
-    let mut primary = vec![provider_label(row.kind)];
-    if let Some(model) = row.model {
-        primary.push(model);
-    }
-    if let Some(effort) = row.effort {
-        primary.push(effort);
-    }
+    // 에이전트 이름은 그룹 헤더가 이미 말했고, 모델·추론 강도는 화면에서 뺐다
+    // (2026-08-19 사용자). 카드 부기에 남는 건 그 턴을 **고르는 근거**뿐이다.
     MetadataParts {
-        primary,
         branch: row.branch,
         git_change_count: row.git_change_count,
     }
@@ -1591,27 +1657,40 @@ fn metadata_parts<'a>(row: &WorkHistoryRow<'a>) -> MetadataParts<'a> {
 
 fn render_metadata(ui: &mut egui::Ui, row: &WorkHistoryRow<'_>, catalog: &i18n::Catalog) {
     let metadata = metadata_parts(row);
-    ui.horizontal_wrapped(|ui| {
-        for (index, part) in metadata.primary.iter().enumerate() {
-            if index > 0 {
-                ui.label(egui::RichText::new("·").small().weak());
-            }
-            ui.label(egui::RichText::new(*part).small().weak().monospace());
-        }
-        if let Some(branch) = metadata.branch {
-            metadata_chip(ui, branch);
-        }
-        if let Some(count) = metadata.git_change_count {
-            let count = count.to_string();
-            metadata_chip(ui, &catalog.t("history.card.changes", &[("count", &count)]));
-        }
-        ui.label(egui::RichText::new("·").small().weak());
-        ui.label(
-            egui::RichText::new(state_label(row.state, catalog))
-                .small()
-                .color(state_color(row.state, ui.visuals())),
-        );
-    });
+    // 그릴 것이 하나도 없으면 여백만 남은 빈 줄이 생긴다 — 아예 그리지 않는다.
+    let show_state = row.state != WorkHistoryState::Completed;
+    if metadata.branch.is_none() && metadata.git_change_count.is_none() && !show_state {
+        return;
+    }
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 14,
+            top: 0,
+            bottom: 10,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                if let Some(branch) = metadata.branch {
+                    metadata_chip(ui, branch);
+                }
+                if let Some(count) = metadata.git_change_count {
+                    let count = count.to_string();
+                    metadata_chip(ui, &catalog.t("history.card.changes", &[("count", &count)]));
+                }
+                // 「완료」는 대부분의 행이 가진 값이라 다 적으면 목록이 그 단어로 덮인다.
+                // 실행 중·확인 필요만 점과 함께 보여 눈에 걸리게 한다.
+                if show_state {
+                    status_dot(ui, row.state);
+                    ui.label(
+                        egui::RichText::new(state_label(row.state, catalog))
+                            .small()
+                            .color(state_color(row.state, ui.visuals())),
+                    );
+                }
+            });
+        });
 }
 
 fn metadata_chip(ui: &mut egui::Ui, text: &str) {
@@ -1634,41 +1713,6 @@ fn provider_label(kind: &str) -> &str {
         "grok" => "Grok",
         _ => kind,
     }
-}
-
-fn provider_badge(ui: &mut egui::Ui, kind: &str) {
-    let label = provider_label(kind);
-    // 배지 텍스트·색 판정이 각각 `kind.trim().to_ascii_lowercase()`를 새로 할당하던
-    // 것을 하나로 합쳤다(카드당 힙 alloc 2회 → 1회, 2026-08-19).
-    let normalized = kind.trim().to_ascii_lowercase();
-    let badge = match normalized.as_str() {
-        "claude" | "claude code" => "CL".to_owned(),
-        "codex" => "CX".to_owned(),
-        "kimi" | "kimi cli" => "KI".to_owned(),
-        "grok" => "GK".to_owned(),
-        _ => label
-            .chars()
-            .filter(|ch| ch.is_alphanumeric())
-            .take(2)
-            .flat_map(|ch| ch.to_uppercase())
-            .collect(),
-    };
-    let color = match normalized.as_str() {
-        "claude" | "claude code" => egui::Color32::from_rgb(0xd9, 0x70, 0x4e),
-        "codex" => egui::Color32::from_rgb(0x10, 0xa3, 0x7f),
-        "kimi" | "kimi cli" => egui::Color32::from_rgb(0x42, 0x73, 0xda),
-        "grok" => egui::Color32::from_rgb(0x52, 0x56, 0x60),
-        _ => crate::ui::designall::tokens(ui.visuals()).accent,
-    };
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 7.0, color);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        badge,
-        egui::FontId::proportional(11.0),
-        egui::Color32::WHITE,
-    );
 }
 
 fn status_dot(ui: &mut egui::Ui, state: WorkHistoryState) {
@@ -1814,25 +1858,32 @@ mod tests {
         presentation: &'a WorkHistoryActionPresentation,
     ) -> egui_kittest::Harness<'a, CardInteractionCapture> {
         let view = WorkHistoryRow::from(candidate);
-        egui_kittest::Harness::new_ui_state(
-            move |ui, capture: &mut CardInteractionCapture| {
-                let result = render_card(ui, &view, true, 10, Some(presentation), catalog);
-                if result.toggle {
-                    capture.toggles += 1;
-                }
-                if let Some(action) = result.action {
-                    capture.actions.push(action);
-                }
-                ui.ctx().output(|output| {
-                    for command in &output.commands {
-                        if let egui::OutputCommand::CopyText(text) = command {
-                            capture.copied_text.push(text.clone());
-                        }
+        // 펼친 카드가 기본 뷰포트(kittest 기본 크기)보다 길어질 수 있다 — 2026-08-19
+        // 재설계로 사용자/에이전트 면이 분리되며 세로가 늘었다. 크기를 명시하지 않으면
+        // 아래쪽 버튼이 화면 밖으로 밀려 클릭이 아무 데도 닿지 않는다(그러면 이 테스트가
+        // 검증하려는 "버튼이 카드 토글보다 우선한다"를 확인할 수조차 없다). 카드가
+        // 뷰포트에 들어가는지는 이 테스트의 대상이 아니므로 넉넉히 준다.
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(520.0, 900.0))
+            .build_ui_state(
+                move |ui, capture: &mut CardInteractionCapture| {
+                    let result = render_card(ui, &view, true, 10, Some(presentation), catalog);
+                    if result.toggle {
+                        capture.toggles += 1;
                     }
-                });
-            },
-            CardInteractionCapture::default(),
-        )
+                    if let Some(action) = result.action {
+                        capture.actions.push(action);
+                    }
+                    ui.ctx().output(|output| {
+                        for command in &output.commands {
+                            if let egui::OutputCommand::CopyText(text) = command {
+                                capture.copied_text.push(text.clone());
+                            }
+                        }
+                    });
+                },
+                CardInteractionCapture::default(),
+            )
     }
 
     fn assert_primary_button_wins_card_hit_test(primary: WorkHistoryPrimaryAction, label: &str) {
@@ -2390,6 +2441,10 @@ mod tests {
         assert!(WorkTurnIdentity::from(&first) != WorkTurnIdentity::from(&second));
     }
 
+    /// 2026-08-19 갱신: 카드 부기에서 provider·모델·추론 강도를 뺐다(에이전트 이름은
+    /// 그룹 헤더가 이미 말하고, 모델·강도는 고를 때 쓰지 않는다). 이제 부기에 남는 건
+    /// **그 턴을 고르는 근거**(branch·변경 수)뿐이라, 그 값이 없으면 아무것도 만들지
+    /// 않아야 한다 — 빈 칩이나 구분점만 남은 줄이 생기면 안 된다.
     #[test]
     fn 선택메타데이터가_없으면_빈토큰과_branch를_만들지않는다() {
         let mut candidate = row("minimal", storage::AgentWorkTurnState::Completed, 1);
@@ -2400,10 +2455,24 @@ mod tests {
 
         let view = WorkHistoryRow::from(&candidate);
         let metadata = metadata_parts(&view);
-        assert_eq!(metadata.primary, vec!["Codex"]);
         assert!(metadata.branch.is_none());
         assert!(metadata.git_change_count.is_none());
-        assert!(metadata.primary.iter().all(|part| !part.is_empty()));
+    }
+
+    /// provider·모델·추론 강도가 다 있어도 카드 부기는 그것들을 담지 않는다 —
+    /// 화면에서 뺀 것이 데이터로 되살아나지 않게 고정한다(그룹 헤더가 이름을 말한다).
+    #[test]
+    fn 카드_부기는_provider와_모델_추론강도를_담지_않는다() {
+        let mut candidate = row("full", storage::AgentWorkTurnState::Completed, 1);
+        candidate.model = Some("claude-sonnet-5".to_owned());
+        candidate.effort = Some("xhigh".to_owned());
+        candidate.branch = Some("main".to_owned());
+        candidate.git_change_count = Some(3);
+
+        let view = WorkHistoryRow::from(&candidate);
+        let metadata = metadata_parts(&view);
+        assert_eq!(metadata.branch, Some("main"));
+        assert_eq!(metadata.git_change_count, Some(3));
     }
 
     #[test]
@@ -2725,8 +2794,6 @@ mod tests {
         let group = &groups[0];
         assert_eq!(group.branch, Some("main"));
         assert_eq!(group.git_change_count, Some(2));
-        assert_eq!(group.model, Some("model-old"));
-        assert_eq!(group.effort, Some("low"));
         assert_eq!(
             group.latest_updated_at, 50,
             "헤더의 '최신 시각'은 값 유무와 무관하게 그룹의 진짜 최신 턴을 따른다"

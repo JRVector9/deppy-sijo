@@ -2,7 +2,20 @@
 //! stream line regex + 화면 텍스트 패턴 + output idle heuristic 3단 병행.
 //! 감지 주기는 output batch 단위 — 호출측(runtime worker)이 tick마다 부른다.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// 에이전트 종료 코드 sentinel 파일 이름 접두사. `agent_launcher`의 래퍼 스크립트(셸)와
+/// runtime worker(Rust) 양쪽이 **같은 문자열**로 파일 경로를 계산해야 하므로 상수로 공유한다
+/// (`DRAIN_PENDING_TTY_INPUT`과 같은 관례) — 한쪽만 고치면 sentinel을 서로 못 찾는다.
+pub const AGENT_EXIT_SENTINEL_PREFIX: &str = "deppy-agent-exit-";
+
+/// PID로 결정되는 sentinel 경로. 래퍼 스크립트의 `$$`(자기 PID)와 runtime이 그 세션에 대해
+/// 이미 알고 있는 `process_identity().pid`가 항상 같은 프로세스(PTY가 직접 스폰한 `/bin/sh`)를
+/// 가리키므로, 새 IPC 채널 없이도 둘이 같은 파일에서 만난다.
+pub fn agent_exit_sentinel_path(temp_dir: &Path, pid: u32) -> PathBuf {
+    temp_dir.join(format!("{AGENT_EXIT_SENTINEL_PREFIX}{pid}"))
+}
 
 /// agent의 감지 상태. Exited는 lifecycle 소관이라 여기 없다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -366,6 +379,22 @@ impl StatusDetector {
     /// pane에 직접 타이핑할 때까지 무기한 남는다.
     pub fn on_turn_start(&mut self) {
         self.on_input();
+    }
+
+    /// 폴백 셸이 아니라 **에이전트 자신**의 진짜 종료 코드(exit sentinel, agent_launcher
+    /// 래퍼가 남김)를 반영한다. 실제 프로세스 종료와 동급 신뢰도라 `ProcessExit` 출처로
+    /// latch한다 — evaluate()의 idle/화면 로직이 덮어쓰지 않고, 사용자 입력
+    /// (on_input/on_turn_start)으로만 해제된다. 폴백 셸이 그 자리를 이어받아도(SessionExited는
+    /// 훨씬 나중에 옴) 이 상태가 그대로 보고된다.
+    pub fn note_exit_sentinel(&mut self, exit_code: u32) {
+        self.status = if exit_code == 0 {
+            SessionStatus::Done
+        } else {
+            SessionStatus::Error
+        };
+        self.source = StatusSource::ProcessExit;
+        self.screen_derived = false;
+        self.idle_waiting = false;
     }
 
     /// output chunk 수신 — stream line regex 단계.
@@ -783,6 +812,59 @@ mod tests {
         d.on_output(b"working\n");
         let screen = "  1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel";
         assert_eq!(d.evaluate(Some(screen)), Some(SessionStatus::NeedsApproval));
+    }
+
+    #[test]
+    fn sentinel_경로는_temp_dir와_pid로_결정된다() {
+        let dir = Path::new("/tmp");
+        assert_eq!(
+            agent_exit_sentinel_path(dir, 4242),
+            dir.join("deppy-agent-exit-4242")
+        );
+        // 같은 pid라도 temp_dir가 다르면 다른 경로 — 스크립트·runtime이 같은 TMPDIR을
+        // 봐야 만나는 계약이 실제로 성립함을 고정한다.
+        assert_ne!(
+            agent_exit_sentinel_path(Path::new("/var/tmp"), 4242),
+            agent_exit_sentinel_path(dir, 4242)
+        );
+    }
+
+    #[test]
+    fn exit_sentinel은_종료코드로_done_error를_latch한다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.on_output(b"working\n");
+        d.note_exit_sentinel(0);
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Done));
+        assert_eq!(d.status_view(None).source, StatusSource::ProcessExit);
+
+        let mut d2 = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d2.note_exit_sentinel(7);
+        assert_eq!(d2.evaluate(None), Some(SessionStatus::Error));
+    }
+
+    /// sentinel이 확정한 상태는 폴백 셸이 이어받아 계속 idle이어도(=출력 없음) 유지돼야
+    /// 한다 — idle heuristic이 Done/Error를 Idle로 덮어쓰면 사용자가 pane을 열었을 때
+    /// 다시 "쉬는 중"으로 보인다.
+    #[test]
+    fn exit_sentinel_상태는_idle_휴리스틱에_덮이지_않는다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.note_exit_sentinel(1);
+        d.last_output = Instant::now() - Duration::from_secs(11);
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Error));
+        // 후속 tick에서도 유지(변화 없음 = None)
+        assert_eq!(d.evaluate(None), None);
+        assert_eq!(d.status(), SessionStatus::Error);
+    }
+
+    /// 사용자가 폴백 셸에서 실제로 타이핑하면(=새 세션 시작) sentinel latch도 다른
+    /// 결과 상태와 동일하게 해제돼야 한다.
+    #[test]
+    fn exit_sentinel_상태도_입력으로_해제된다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.note_exit_sentinel(0);
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Done));
+        d.on_input();
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Running));
     }
 
     #[test]

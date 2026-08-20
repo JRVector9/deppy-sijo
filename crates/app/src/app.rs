@@ -24730,8 +24730,21 @@ impl eframe::App for App {
                 entry.attention = entry
                     .session
                     .is_some_and(|session| needs_input.contains(&session));
-                entry.resumable =
-                    entry.agent_line.is_none() && self.restore_agents.contains_key(&entry.pane.0);
+                // 비활성 워크스페이스 행에는 「이어가기」를 **띄우지 않는다**.
+                //
+                // 지금까지는 `self.restore_agents`를 그대로 조회해 우연히 false가 나오고
+                // 있었다 — 그 캐시는 활성 워크스페이스 한 곳만 담고(`request_agent_state_
+                // scope`가 `self.active.id` 하나만 싣는다) `MuxPaneId`가 UUID라 warm 행의
+                // pane id가 들어 있을 수 없다. 우연히 맞는 동작이라 위험했다: 나중에 그
+                // 캐시를 전역화하면 버튼이 뜨는데, 실행부(`stage_agent_resume`)는 여전히
+                // 활성 워크스페이스의 `restore_agents`만 보므로 **눌러도 조용히 아무 일도
+                // 안 일어난다**(`WorkspaceControllerAction::ResumeAgent`는 워크스페이스를
+                // 전환하지 않는다). 그래서 의도를 코드로 못박는다.
+                //
+                // warm 워크스페이스에서도 이어가기를 하려면 (1) 워크스페이스별 재개 가능
+                // 여부를 담는 조회와 (2) "전환 후 재개" 경로가 함께 필요하다 — 버그 수정이
+                // 아니라 기능이라 여기서 하지 않는다(2026-08-20 코드 리뷰).
+                entry.resumable = false;
             }
             let entries = entries
                 .into_iter()
@@ -28872,6 +28885,36 @@ mod tests {
             last_agent_summary: summary.map(str::to_owned),
             user_instruction: instruction.map(str::to_owned),
         }
+    }
+
+    /// 비활성(warm/절전) 워크스페이스 행에는 「이어가기」가 뜨면 안 된다 — 실행부
+    /// (`stage_agent_resume`)가 활성 워크스페이스의 `restore_agents`만 보고,
+    /// `WorkspaceControllerAction::ResumeAgent`는 워크스페이스를 전환하지 않아서
+    /// 눌러도 조용히 아무 일도 안 일어난다. 예전엔 활성 범위 캐시를 조회해 **우연히**
+    /// false가 나왔는데, 그 캐시가 전역화되면 버튼이 뜨고 먹통이 된다(2026-08-20 리뷰).
+    /// 배선이라 순수 함수로 뽑을 수 없어 소스로 고정한다.
+    #[test]
+    fn 비활성_워크스페이스_행은_이어가기를_띄우지_않는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        // 비활성 워크스페이스만 도는 루프(활성은 continue로 건너뛴다) 안쪽을 잘라 본다.
+        let warm_loop = production
+            .split_once("if workspace.id == active_workspace_id {")
+            .expect("비활성 워크스페이스 루프가 있어야 한다")
+            .1;
+        let warm_loop = warm_loop
+            .split_once("SidebarSessionRow::from_live")
+            .expect("행 조립 지점이 있어야 한다")
+            .0;
+        assert!(
+            warm_loop.contains("entry.resumable = false;"),
+            "비활성 행의 resumable을 상수 false로 못박아야 한다"
+        );
+        // 주석에는 이 이름이 근거 설명으로 나오므로 **코드 형태**로 겨냥한다.
+        assert!(
+            !warm_loop.contains("self.restore_agents.contains_key"),
+            "활성 범위 캐시(restore_agents)로 비활성 행을 판정하면 안 된다"
+        );
     }
 
     /// 2026-08-19 사용자: 대기 상태로 두고 다른 세션에 갔다 오면 활동 문구가 폴더명으로

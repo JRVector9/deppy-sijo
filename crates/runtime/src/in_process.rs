@@ -2909,9 +2909,14 @@ impl Worker {
                     .get_mut(&tab_id)
                     .is_some_and(|tab| tab.split_pane(&target, direction, pane_id.clone()));
                 if !split_ok {
-                    // 방어: split 실패 시 고아 pane/세션을 남기지 않는다
+                    // 방어: split 실패 시 고아 pane/세션을 남기지 않는다.
+                    // `detectors`도 반드시 함께 지운다 — 다른 정리 지점(close_pane,
+                    // kill_session_owned, close_tab)은 전부 지우는데 여기만 빠져 있었다
+                    // (2026-08-20 코드 리뷰). SessionId는 단조 증가라 한 번 새면 그
+                    // 항목은 영영 남는다.
                     self.mux.panes.remove(&pane_id);
                     self.remove_session(id);
+                    self.detectors.remove(&id);
                     self.status_overrides.remove(&id);
                     self.close_session_log(id, "killed", None);
                     self.emit(RuntimeEvent::SpawnFailed {

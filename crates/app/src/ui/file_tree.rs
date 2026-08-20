@@ -335,6 +335,9 @@ pub enum SidebarAction {
     },
     /// 저장된 에이전트 세션을 이 pane 셸에서 resume한다 (수동 이어가기).
     ResumeAgent {
+        /// 이 행이 속한 워크스페이스 — 비활성(warm) 행이면 App이 먼저 전환한다
+        /// (2026-08-20).
+        workspace_id: String,
         pane: runtime::MuxPaneId,
         session: runtime::SessionId,
         title: String,
@@ -2287,6 +2290,10 @@ impl FileTreeUi {
                                                             {
                                                                 action = Some(
                                                                     SidebarAction::ResumeAgent {
+                                                                        workspace_id: entry
+                                                                            .target
+                                                                            .workspace_id()
+                                                                            .to_owned(),
                                                                         pane: entry.target.pane().clone(),
                                                                         session,
                                                                         title: entry.title.clone(),

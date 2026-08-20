@@ -815,6 +815,10 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
                     AppAgentStateProjectionKind::Restore,
                 ) => {
                     storage_job.include_agent_sessions = true;
+                    // warm(비활성) 워크스페이스 행의 「이어가기」 노출 판정용 — 전 워크스페이스
+                    // 스코프의 pane_id 존재 여부(2026-08-20, 유계 준수는 db.rs의
+                    // AGENT_SESSIONS_GLOBAL_BOUNDED_* 참고).
+                    storage_job.include_global_agent_sessions = true;
                     storage_needed = true;
                 }
                 (
@@ -1601,6 +1605,27 @@ struct PendingPrimaryPaneActivation {
 
 const PRIMARY_PANE_MATERIALIZATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
+
+/// warm(비활성) 워크스페이스 행의 「이어가기」 — `switch_workspace` 직후 새 활성
+/// 워크스페이스의 `restore_agents`가 비동기로 채워지길 기다리는 지연 실행 대상
+/// (2026-08-20). `PendingPaneFocus`와 같은 이유로 `runtime_instance`까지 확인한다 —
+/// 워크스페이스 id는 워크스페이스가 닫혔다 같은 이름으로 다시 만들어질 수 있어
+/// 재사용을 배제할 수 없다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingResumeAgent {
+    workspace_id: String,
+    runtime_instance: u64,
+    pane_key: String,
+    title: String,
+    session: runtime::SessionId,
+    requested_at: std::time::Instant,
+}
+
+impl PendingResumeAgent {
+    fn timed_out(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.requested_at) >= PRIMARY_PANE_MATERIALIZATION_TIMEOUT
+    }
+}
 const RUNTIME_DELIVERY_FAILURE_LIMIT: u8 = 6;
 const RUNTIME_DELIVERY_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(16);
 const RUNTIME_DELIVERY_RECOVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -8276,6 +8301,13 @@ pub struct App {
     restore_agents: std::collections::HashMap<String, storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
     restore_loaded_for: Option<String>,
+    /// 전 워크스페이스 스코프의 `(workspace_id, pane_id)` — warm(비활성) 워크스페이스 행의
+    /// 「이어가기」 노출 판정용(2026-08-20). `restore_agents`와 달리 활성 워크스페이스
+    /// 하나가 아니라 `AgentStateSection::Restore` 프로젝션이 돌 때마다 전 워크스페이스가
+    /// 갱신된다 — 실제 kind/session_id는 여기 없다(존재 여부만). 전환 후 실행은
+    /// `restore_agents`가 새 활성 워크스페이스로 다시 채워진 뒤에야 한다
+    /// (`pending_resume_agent` 참고).
+    global_resumable_panes: std::collections::HashSet<(String, String)>,
     /// 이번 workspace 활성화에서 자동 resume 판단을 끝낸 pane. 명령을 보낸 경우뿐 아니라
     /// 이미 에이전트/ssh 등 다른 작업이 있어 건너뛴 경우도 포함한다. 그래야 사용자가
     /// 작업을 종료한 뒤 뒤늦게 resume 명령이 주입되지 않는다.
@@ -8283,6 +8315,13 @@ pub struct App {
     resume_probe_pending_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, u64, runtime::SessionId)>,
+    /// warm(비활성) 워크스페이스 행에서 「이어가기」를 눌러 `switch_workspace`한 직후 —
+    /// 새 활성 워크스페이스의 `restore_agents`가 비동기로 채워질 때까지 지연 실행할
+    /// 대상(2026-08-20). `pending_focus`와 동일한 패턴: 매 프레임 `poll_pending_workspace_
+    /// focus`에서 워크스페이스/런타임이 여전히 일치하는지 확인하고, 어긋나면(사용자가
+    /// 다른 곳으로 옮겼거나 워크스페이스가 닫혔으면) 조용히 버린다. 타임아웃도 같은
+    /// `PRIMARY_PANE_MATERIALIZATION_TIMEOUT`을 써서 무한 대기하지 않는다.
+    pending_resume_agent: Option<PendingResumeAgent>,
     /// 저장 세션 선택 시 정확한 pane이 materialize될 때까지 유지하는 포커스 intent.
     pending_pane_focus: Option<PendingPaneFocus>,
     /// 저장 pane의 dotenv 완료, targeted restore, materialization, focus, full restore를
@@ -9030,6 +9069,9 @@ enum WorkspaceControllerAction {
         cwd: Option<String>,
     },
     ResumeAgent {
+        /// 이 pane이 속한 워크스페이스. 활성 워크스페이스와 다르면 먼저 전환한다
+        /// (2026-08-20, `FocusPty`와 동일한 관례).
+        workspace_id: String,
         pane_key: String,
         title: String,
         session: runtime::SessionId,
@@ -12047,9 +12089,11 @@ impl App {
             statuslines: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
+            global_resumable_panes: std::collections::HashSet::new(),
             resumed_panes: std::collections::HashSet::new(),
             resume_probe_pending_panes: std::collections::HashSet::new(),
             pending_focus: None,
+            pending_resume_agent: None,
             pending_pane_focus: None,
             pending_primary_pane_activation: None,
             pending_workspace_restore_delivery: std::collections::HashMap::with_capacity(
@@ -13330,6 +13374,11 @@ impl App {
                     .collect::<std::collections::HashMap<_, _>>();
                 self.restore_agents = rows.clone();
                 self.persisted_agents = rows;
+                // warm(비활성) 워크스페이스 행의 「이어가기」 노출 판정용 — 전 워크스페이스
+                // 스코프(2026-08-20). Restore 프로젝션이 돌 때마다 통째로 재구성한다
+                // (global_waiting/global_working과 동일한 관례).
+                self.global_resumable_panes =
+                    snapshot.global_agent_sessions.iter().cloned().collect();
                 self.archived_agent_resume = snapshot
                     .archived_agent_resume
                     .iter()
@@ -15214,6 +15263,9 @@ impl App {
                     } => {
                         let _ = self.stage_workspace_controller_action(
                             WorkspaceControllerAction::ResumeAgent {
+                                // 작업 이력 탭은 항상 활성 워크스페이스의 턴만 보여준다
+                                // (work_history.rs 소유 밖).
+                                workspace_id: self.active.id.clone(),
                                 pane_key,
                                 title,
                                 session,
@@ -15838,14 +15890,42 @@ impl App {
                     .spawn_shell_at(self.config.terminal.scrollback_lines as usize, cwd);
             }
             WorkspaceControllerAction::ResumeAgent {
+                workspace_id,
                 pane_key,
                 title,
                 session,
             } => {
-                if self.stage_agent_resume(&pane_key, &title, session) {
-                    self.resumed_panes.insert(pane_key);
-                    self.reveal_terminal_session();
+                if workspace_id == self.active.id {
+                    if self.stage_agent_resume(&pane_key, &title, session) {
+                        self.resumed_panes.insert(pane_key);
+                        self.reveal_terminal_session();
+                    } else {
+                        // 활성 워크스페이스인데도 실패 — 이미 재개할 게 없어졌다(pane
+                        // 정리 등). 버튼을 눌렀는데 조용히 아무 일도 없어 보이면 안 된다.
+                        self.notify_resume_failed(&title);
+                    }
+                    return;
                 }
+                // warm(비활성) 워크스페이스 행 — FocusPty와 같은 관례로 먼저 전환한다.
+                // 전환 직후엔 새 활성 워크스페이스의 restore_agents가 아직 안 채워져
+                // 있다(agent state worker가 비동기로 채운다) — 지금 바로
+                // stage_agent_resume을 부르면 조용히 false로 떨어져 아무 일도 안
+                // 일어난 것처럼 보인다. poll_pending_resume_agent가 데이터 도착 후
+                // 대신 실행하도록 지연시킨다(2026-08-20).
+                self.switch_workspace(&workspace_id);
+                if self.active.id != workspace_id {
+                    // 전환 자체가 실패했다(warm 한도 초과 등) — 조용히 포기하지 않는다.
+                    self.notify_resume_failed(&title);
+                    return;
+                }
+                self.pending_resume_agent = Some(PendingResumeAgent {
+                    workspace_id,
+                    runtime_instance: self.active.runtime_instance,
+                    pane_key,
+                    title,
+                    session,
+                    requested_at: std::time::Instant::now(),
+                });
             }
             WorkspaceControllerAction::ClosePane(pane) => {
                 self.active.workspace_ui.request_close_pane(pane);
@@ -16097,6 +16177,49 @@ impl App {
             self.egui_ctx.request_repaint_after(delay);
         } else {
             self.active.workspace_ui.cancel_terminal_focus();
+        }
+    }
+
+    /// warm(비활성) 워크스페이스 행 「이어가기」의 지연 실행(2026-08-20) —
+    /// `WorkspaceControllerAction::ResumeAgent`가 `switch_workspace` 직후 남겨둔
+    /// `pending_resume_agent`를, 새 활성 워크스페이스의 `restore_agents`가 채워지고 나서
+    /// 대신 실행한다. `poll_pending_workspace_focus`와 같은 틱에서 돈다(그 뒤에 호출) —
+    /// 둘 다 `poll_workspace_controller`가 만든 상태를 그날 프레임 안에서 소비한다.
+    fn poll_pending_resume_agent(&mut self) {
+        let Some(pending) = self.pending_resume_agent.clone() else {
+            return;
+        };
+        // 사용자가 그 사이 다른 워크스페이스로 옮겼거나(다른 클릭), 대상 워크스페이스
+        // runtime이 재구성됐다(닫혔다 다시 열림 등) — 재개할 화면이 이미 없다, 조용히 포기.
+        if !workspace_focus_target_matches_runtime(
+            &pending.workspace_id,
+            Some(pending.runtime_instance),
+            &self.active.id,
+            self.active.runtime_instance,
+        ) {
+            self.pending_resume_agent = None;
+            return;
+        }
+        if self.restore_loaded_for.as_deref() != Some(pending.workspace_id.as_str()) {
+            // agent state worker가 아직 restore_agents를 못 채웠다 — 타임아웃 전까지 계속
+            // 기다린다(무한 대기 금지).
+            if pending.timed_out(std::time::Instant::now()) {
+                self.pending_resume_agent = None;
+                self.notify_resume_failed(&pending.title);
+            } else {
+                self.egui_ctx
+                    .request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            return;
+        }
+        self.pending_resume_agent = None;
+        if self.stage_agent_resume(&pending.pane_key, &pending.title, pending.session) {
+            self.resumed_panes.insert(pending.pane_key);
+            self.reveal_terminal_session();
+        } else {
+            // 데이터는 도착했는데 이미 재개할 게 없어졌다(그 사이 pane이 정리됐거나
+            // 다른 이유로 stale해짐) — 조용히 포기하지 않는다.
+            self.notify_resume_failed(&pending.title);
         }
     }
 
@@ -21533,6 +21656,19 @@ impl App {
         }
     }
 
+    /// warm(비활성) 워크스페이스 행의 「이어가기」가 실패했을 때 — 전환 자체가
+    /// 실패했거나, 전환 후 데이터를 기다리다 타임아웃했거나, 데이터가 도착했는데도
+    /// 이미 재개할 게 없어졌을 때 호출한다(2026-08-20). 버튼을 눌렀는데 조용히 아무
+    /// 일도 없어 보이면 안 된다는 요구사항 — worktree 실패 알림과 같은 패턴
+    /// (`platform::notify` + `self.i18n.t`, `dispatch_storm_notifications` 주석의
+    /// notify-rust 금지 사유도 동일하게 적용).
+    fn notify_resume_failed(&self, title: &str) {
+        platform::notify(
+            &self.i18n.t("sidebar.resume_failed", &[("title", title)]),
+            "",
+        );
+    }
+
     /// macOS의 시스템 전체 메모리 압박이 Critical로 격상됐을 때 OS 알림을 발화한다.
     /// 개별 Deppy 세션은 전역 압박의 원인으로 입증되지 않았으므로 지목하지 않는다.
     fn notify_memory_pressure(&self) {
@@ -23830,6 +23966,7 @@ impl eframe::App for App {
         }
         self.poll_workspace_controller();
         self.poll_pending_workspace_focus();
+        self.poll_pending_resume_agent();
         self.poll_turn_done_clear();
         self.apply_pending_visual_settings(ctx);
         self.poll_worktree_jobs();
@@ -24730,21 +24867,29 @@ impl eframe::App for App {
                 entry.attention = entry
                     .session
                     .is_some_and(|session| needs_input.contains(&session));
-                // 비활성 워크스페이스 행에는 「이어가기」를 **띄우지 않는다**.
+                // 비활성(warm) 워크스페이스 행의 「이어가기」 노출 판정(2026-08-20).
                 //
-                // 지금까지는 `self.restore_agents`를 그대로 조회해 우연히 false가 나오고
-                // 있었다 — 그 캐시는 활성 워크스페이스 한 곳만 담고(`request_agent_state_
+                // 한때 `self.restore_agents`를 그대로 조회해 우연히 false가 나오고
+                // 있었다 — 그 캐시는 활성 워크스페이스 한 곳만 담아(`request_agent_state_
                 // scope`가 `self.active.id` 하나만 싣는다) `MuxPaneId`가 UUID라 warm 행의
-                // pane id가 들어 있을 수 없다. 우연히 맞는 동작이라 위험했다: 나중에 그
-                // 캐시를 전역화하면 버튼이 뜨는데, 실행부(`stage_agent_resume`)는 여전히
-                // 활성 워크스페이스의 `restore_agents`만 보므로 **눌러도 조용히 아무 일도
-                // 안 일어난다**(`WorkspaceControllerAction::ResumeAgent`는 워크스페이스를
-                // 전환하지 않는다). 그래서 의도를 코드로 못박는다.
+                // pane id가 들어 있을 수 없었다. 우연히 맞는 동작이라 위험했다: 그
+                // 캐시를 전역화하면 버튼은 뜨는데, 실행부(`stage_agent_resume`)는 여전히
+                // 활성 워크스페이스의 `restore_agents`만 봐서 눌러도 조용히 아무 일도
+                // 안 일어났다(`WorkspaceControllerAction::ResumeAgent`가 워크스페이스를
+                // 전환하지 않았다).
                 //
-                // warm 워크스페이스에서도 이어가기를 하려면 (1) 워크스페이스별 재개 가능
-                // 여부를 담는 조회와 (2) "전환 후 재개" 경로가 함께 필요하다 — 버그 수정이
-                // 아니라 기능이라 여기서 하지 않는다(2026-08-20 코드 리뷰).
-                entry.resumable = false;
+                // 이제 둘 다 갖췄다 — (1) `self.global_resumable_panes`가 전
+                // 워크스페이스 스코프의 (workspace_id, pane_id) 존재 여부를 담고(유계,
+                // `AGENT_SESSIONS_GLOBAL_BOUNDED_*`, `AgentStateSection::Restore`가 돌 때마다
+                // 갱신), (2) `ResumeAgent` 핸들러가 비활성 워크스페이스면 먼저
+                // `switch_workspace`한 뒤 `pending_resume_agent`로 지연 실행해 새 활성
+                // 워크스페이스의 `restore_agents`가 채워진 뒤에야 `stage_agent_resume`을
+                // 부른다(`poll_pending_resume_agent`). 그래서 여기서 다시 true를 켜도
+                // 안전하다.
+                entry.resumable = entry.agent_line.is_none()
+                    && self
+                        .global_resumable_panes
+                        .contains(&(workspace.id.clone(), entry.pane.0.clone()));
             }
             let entries = entries
                 .into_iter()
@@ -25255,13 +25400,16 @@ impl eframe::App for App {
                     );
                 }
                 // 저장된 에이전트 수동 이어가기 — 자동 이어가기 OFF여도 동작한다.
+                // 비활성(warm) 행이면 workspace_id가 활성과 달라 App이 먼저 전환한다.
                 Some(ui::file_tree::SidebarAction::ResumeAgent {
+                    workspace_id,
                     pane,
                     session,
                     title,
                 }) => {
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::ResumeAgent {
+                            workspace_id,
                             pane_key: pane.0,
                             title,
                             session,
@@ -28887,14 +29035,18 @@ mod tests {
         }
     }
 
-    /// 비활성(warm/절전) 워크스페이스 행에는 「이어가기」가 뜨면 안 된다 — 실행부
-    /// (`stage_agent_resume`)가 활성 워크스페이스의 `restore_agents`만 보고,
-    /// `WorkspaceControllerAction::ResumeAgent`는 워크스페이스를 전환하지 않아서
-    /// 눌러도 조용히 아무 일도 안 일어난다. 예전엔 활성 범위 캐시를 조회해 **우연히**
-    /// false가 나왔는데, 그 캐시가 전역화되면 버튼이 뜨고 먹통이 된다(2026-08-20 리뷰).
-    /// 배선이라 순수 함수로 뽑을 수 없어 소스로 고정한다.
+    /// 비활성(warm/절전) 워크스페이스 행의 「이어가기」는 전 워크스페이스 스코프
+    /// `global_resumable_panes`로 판정해야 한다(2026-08-20) — 이전엔 상수 `false`로
+    /// 못박혀 있었다: 실행부(`stage_agent_resume`)가 활성 워크스페이스의
+    /// `restore_agents`만 보고 `WorkspaceControllerAction::ResumeAgent`가 워크스페이스를
+    /// 전환하지 않아서, 노출을 켜면 눌러도 조용히 아무 일도 안 일어났기 때문이다. 이제는
+    /// (1) `global_resumable_panes`가 유계 전역 조회로 채워지고 (2) `ResumeAgent`
+    /// 핸들러가 필요하면 먼저 전환한 뒤 `pending_resume_agent`로 지연 실행하므로 다시
+    /// 켤 수 있다. 활성 범위 캐시(`restore_agents`)를 여기서 오독하면 예전처럼 우연히
+    /// 맞는 값이 나올 뿐인 위험한 배선이므로 계속 금지한다. 배선이라 순수 함수로 뽑을
+    /// 수 없어 소스로 고정한다.
     #[test]
-    fn 비활성_워크스페이스_행은_이어가기를_띄우지_않는다() {
+    fn 비활성_워크스페이스_행의_이어가기는_전역_resumable_집합으로_판정한다() {
         let source = include_str!("app.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         // 비활성 워크스페이스만 도는 루프(활성은 continue로 건너뛴다) 안쪽을 잘라 본다.
@@ -28907,8 +29059,19 @@ mod tests {
             .expect("행 조립 지점이 있어야 한다")
             .0;
         assert!(
-            warm_loop.contains("entry.resumable = false;"),
-            "비활성 행의 resumable을 상수 false로 못박아야 한다"
+            !warm_loop.contains("entry.resumable = false;"),
+            "비활성 행의 resumable을 다시 상수 false로 못박으면 안 된다"
+        );
+        assert!(
+            warm_loop.contains("self.global_resumable_panes"),
+            "비활성 행은 전역 스코프 집합(global_resumable_panes)으로 판정해야 한다"
+        );
+        // workspace.id로 스코프를 좁히지 않으면 pane_id만으로 다른 워크스페이스의
+        // 저장된 에이전트를 오판정할 수 있다(pane_id는 사실상 유일하지만, 계약으로
+        // (workspace_id, pane_id) 쌍을 강제한다).
+        assert!(
+            warm_loop.contains("workspace.id.clone()"),
+            "resumable 판정은 이 행의 workspace.id로 스코프를 좁혀야 한다"
         );
         // 주석에는 이 이름이 근거 설명으로 나오므로 **코드 형태**로 겨냥한다.
         assert!(

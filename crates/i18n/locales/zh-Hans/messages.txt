@@ -30,6 +30,7 @@ sidebar.menu.new_shell_here = 在同一文件夹新建会话
 sidebar.menu.new_worktree_cell = 在新工作树中新建会话
 sidebar.menu.remove_worktree = 删除工作树
 sidebar.menu.resume_agent = 恢复智能体
+sidebar.resume_failed = 继续失败 - 请重试：{title}
 sidebar.menu.close_pane = 关闭会话
 sidebar.menu.close_workspace = 关闭工作区会话
 sidebar.menu.rename_workspace = 重命名

@@ -30,6 +30,7 @@ sidebar.menu.new_shell_here = 같은 폴더에서 새 세션
 sidebar.menu.new_worktree_cell = 새 워크트리에서 새 세션
 sidebar.menu.remove_worktree = 워크트리 삭제
 sidebar.menu.resume_agent = 에이전트 이어가기
+sidebar.resume_failed = 이어가기 실패 - 다시 시도해 주세요: {title}
 sidebar.menu.close_pane = 세션 닫기
 sidebar.menu.close_workspace = 워크스페이스 종료
 sidebar.menu.rename_workspace = 이름 바꾸기

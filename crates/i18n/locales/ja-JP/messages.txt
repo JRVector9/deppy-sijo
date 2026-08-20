@@ -30,6 +30,7 @@ sidebar.menu.new_shell_here = 同じフォルダで新規セッション
 sidebar.menu.new_worktree_cell = 新しいワークツリーで新規セッション
 sidebar.menu.remove_worktree = ワークツリーを削除
 sidebar.menu.resume_agent = エージェントを再開
+sidebar.resume_failed = 再開に失敗しました - もう一度お試しください: {title}
 sidebar.menu.close_pane = セッションを閉じる
 sidebar.menu.close_workspace = ワークスペースのセッションを終了
 sidebar.menu.rename_workspace = 名前を変更

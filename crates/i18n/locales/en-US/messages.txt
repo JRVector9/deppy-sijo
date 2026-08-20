@@ -30,6 +30,7 @@ sidebar.menu.new_shell_here = New session in same folder
 sidebar.menu.new_worktree_cell = New session in a new worktree
 sidebar.menu.remove_worktree = Delete worktree
 sidebar.menu.resume_agent = Resume agent
+sidebar.resume_failed = Resume failed - try again: {title}
 sidebar.menu.close_pane = Close session
 sidebar.menu.close_workspace = Close workspace sessions
 sidebar.menu.rename_workspace = Rename workspace

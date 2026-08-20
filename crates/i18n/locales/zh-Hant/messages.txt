@@ -30,6 +30,7 @@ sidebar.menu.new_shell_here = 在同一資料夾新增工作階段
 sidebar.menu.new_worktree_cell = 在新工作樹中新增工作階段
 sidebar.menu.remove_worktree = 刪除工作樹
 sidebar.menu.resume_agent = 恢復代理
+sidebar.resume_failed = 繼續失敗 - 請重試：{title}
 sidebar.menu.close_pane = 關閉工作階段
 sidebar.menu.close_workspace = 關閉工作區工作階段
 sidebar.menu.rename_workspace = 重新命名

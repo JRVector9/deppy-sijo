@@ -1039,6 +1039,11 @@ pub struct AgentStateJob {
     /// Projects persisted PTY-to-agent bindings for the active workspace. False performs no query
     /// or output allocation for this section. Binding mutations remain atomic regardless.
     pub include_agent_sessions: bool,
+    /// Opt-in bounded cross-workspace pane_id catalog for `agent_sessions` (warm/비활성
+    /// 워크스페이스의 「이어가기」 노출 판정용 — pane_id 존재 여부만 필요). False performs no
+    /// query or output allocation, keeping non-Restore AgentState jobs free of this global
+    /// projection cost.
+    pub include_global_agent_sessions: bool,
     /// Projects the bounded structured-thread catalog. False performs no projection query or
     /// output allocation for this section. Structured mutations remain atomic regardless.
     pub include_structured_threads: bool,
@@ -1116,6 +1121,7 @@ impl AgentStateJob {
             include_hook_status: true,
             include_attention: true,
             include_agent_sessions: true,
+            include_global_agent_sessions: false,
             include_structured_threads: true,
             include_archived_threads: true,
             include_work_history: false,
@@ -1179,6 +1185,10 @@ pub struct AgentStateSnapshot {
     /// 기록. waiting처럼 전역(모든 워크스페이스)이며 2분 stale 창으로 자기치유된다.
     pub working_sessions: Vec<String>,
     pub agent_sessions: Vec<AgentSessionRow>,
+    /// 전 워크스페이스 스코프의 `(workspace_id, pane_id)` 존재 여부 — warm(비활성)
+    /// 워크스페이스 사이드바 행의 「이어가기」 노출 판정용. `include_global_agent_sessions`가
+    /// false면 비어 있다.
+    pub global_agent_sessions: Vec<(String, String)>,
     pub archived_agent_resume: Vec<ArchivedAgentResumeRow>,
     pub structured_threads: Vec<StructuredThreadRow>,
     pub work_turns: Vec<AgentWorkTurnRow>,
@@ -1197,6 +1207,10 @@ impl std::fmt::Debug for AgentStateSnapshot {
             .field("turn_done_session_count", &self.turn_done_sessions.len())
             .field("working_session_count", &self.working_sessions.len())
             .field("agent_session_count", &self.agent_sessions.len())
+            .field(
+                "global_agent_session_count",
+                &self.global_agent_sessions.len(),
+            )
             .field(
                 "archived_agent_resume_count",
                 &self.archived_agent_resume.len(),
@@ -1781,6 +1795,33 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN
 const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id
     FROM agent_sessions WHERE workspace_id = ?1
     ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2";
+
+// 전 워크스페이스 스코프 — warm(비활성) 사이드바 행의 「이어가기」 노출 판정에는
+// pane_id 존재 여부만 있으면 된다(실제 kind/session_id는 전환 후 stage_agent_resume가
+// 새로 로드된 활성 workspace의 restore_agents에서 다시 읽는다). ACTIVITY_PANES_BOUNDED_*
+// (전 워크스페이스, LIMIT+tie-breaker)와 동일한 패턴 — 전 워크스페이스로 넓힐수록
+// 상한이 더 중요해진다는 원칙을 그대로 따른다.
+const AGENT_SESSIONS_GLOBAL_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM agent_sessions
+     ORDER BY updated_at DESC,
+              substr(CAST(workspace_id AS BLOB), 1, ?2),
+              substr(CAST(pane_id AS BLOB), 1, ?2), rowid LIMIT ?1
+), sized AS MATERIALIZED (
+    SELECT session.workspace_id, session.pane_id,
+           length(CAST(session.workspace_id AS BLOB))
+             + length(CAST(session.pane_id AS BLOB)) AS row_bytes
+      FROM selected JOIN agent_sessions session ON session.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(workspace_id) != 'text' OR length(CAST(workspace_id AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(pane_id) != 'text' OR length(CAST(pane_id AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR row_bytes > ?3 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const AGENT_SESSIONS_GLOBAL_BOUNDED_SELECT: &str = "SELECT workspace_id, pane_id
+    FROM agent_sessions
+    ORDER BY updated_at DESC,
+             substr(CAST(workspace_id AS BLOB), 1, ?2),
+             substr(CAST(pane_id AS BLOB), 1, ?2), rowid LIMIT ?1";
 
 const AGENT_WORK_HISTORY_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM agent_work_turns WHERE workspace_id = ?1
@@ -2646,6 +2687,11 @@ fn agent_state_snapshot_retained_bytes(
         checked_agent_state_string_capacity(&mut total, &row.pane_id)?;
         checked_agent_state_string_capacity(&mut total, &row.kind)?;
         checked_agent_state_string_capacity(&mut total, &row.session_id)?;
+    }
+    checked_agent_state_vec_allocation(&mut total, &snapshot.global_agent_sessions)?;
+    for (workspace_id, pane_id) in &snapshot.global_agent_sessions {
+        checked_agent_state_string_capacity(&mut total, workspace_id)?;
+        checked_agent_state_string_capacity(&mut total, pane_id)?;
     }
     checked_agent_state_vec_allocation(&mut total, &snapshot.archived_agent_resume)?;
     for row in &snapshot.archived_agent_resume {
@@ -7680,6 +7726,24 @@ impl Db {
         } else {
             None
         };
+        let global_agent_probe = if job.include_global_agent_sessions {
+            let sql_limit = bounded_limit_plus_one(AGENT_SESSION_ROWS_MAX, AGENT_SESSION_ROWS_MAX)?;
+            Some((
+                bounded_read_preflight(
+                    &tx,
+                    AGENT_SESSIONS_GLOBAL_BOUNDED_PREFLIGHT,
+                    rusqlite::params![
+                        sql_limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                        BOUNDED_ROW_BYTES_MAX as i64,
+                    ],
+                    AGENT_SESSION_ROWS_MAX,
+                )?,
+                sql_limit,
+            ))
+        } else {
+            None
+        };
         let archived_agent_resume_probe = if job.include_agent_sessions {
             let sql_limit = bounded_limit_plus_one(AGENT_SESSION_ROWS_MAX, AGENT_SESSION_ROWS_MAX)?;
             Some((
@@ -7781,6 +7845,9 @@ impl Db {
                 .as_ref()
                 .map_or(0, |(_, _, probe, _, _)| probe.retained_bytes),
             agent_probe
+                .as_ref()
+                .map_or(0, |(probe, _)| probe.retained_bytes),
+            global_agent_probe
                 .as_ref()
                 .map_or(0, |(probe, _)| probe.retained_bytes),
             structured_probe
@@ -7987,6 +8054,29 @@ impl Db {
         } else {
             Vec::new()
         };
+        let global_agent_sessions =
+            if let Some((global_agent_probe, sql_limit)) = &global_agent_probe {
+                let mut result = Vec::with_capacity(global_agent_probe.count);
+                let mut stmt = tx
+                    .prepare(AGENT_SESSIONS_GLOBAL_BOUNDED_SELECT)
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                let mut rows = stmt
+                    .query(rusqlite::params![sql_limit, BOUNDED_ID_BYTES_MAX as i64])
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+                {
+                    let workspace_id =
+                        bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned();
+                    let pane_id =
+                        bounded_required_text(row, 1, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned();
+                    result.push((workspace_id, pane_id));
+                }
+                result
+            } else {
+                Vec::new()
+            };
         let archived_agent_resume = if let Some((probe, sql_limit)) = &archived_agent_resume_probe {
             let mut result = Vec::with_capacity(probe.count);
             let mut stmt = tx
@@ -8162,6 +8252,7 @@ impl Db {
             turn_done_sessions,
             working_sessions,
             agent_sessions,
+            global_agent_sessions,
             archived_agent_resume,
             structured_threads,
             work_turns,
@@ -12864,6 +12955,106 @@ mod tests {
     }
 
     #[test]
+    fn agent_state_global_binding_omission은_corrupt_rows를조회하거나할당하지않는다() {
+        // 워크스페이스별 include_agent_sessions=false여도 전역 include_global_agent_sessions는
+        // 별개 플래그 — 둘 다 꺼져 있으면 corrupt pane_id가 있어도 조회조차 하지 않는다.
+        let db = Db::open_in_memory().unwrap();
+        let ws = db
+            .create_workspace("agent-state-omit-global-bindings")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO agent_sessions
+                    (workspace_id, pane_id, kind, session_id, updated_at)
+                 VALUES (?1, x'ff', 'claude', 'session',
+                         CAST(strftime('%s','now') AS INTEGER))",
+                [&ws],
+            )
+            .unwrap();
+
+        let omitted = agent_state_mutation_only_job(&ws);
+        assert!(!omitted.include_global_agent_sessions);
+        let snapshot = db.apply_agent_state_job(&omitted).unwrap();
+        assert_eq!(snapshot.global_agent_sessions.capacity(), 0);
+        let mut requested = omitted;
+        requested.include_global_agent_sessions = true;
+        assert_eq!(
+            db.apply_agent_state_job(&requested)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn agent_state_global_agent_sessions는_다른_워크스페이스의_pane도_담는다() {
+        // 이게 이 기능의 핵심 계약이다: include_agent_sessions(워크스페이스 스코프)는
+        // job.workspace_id 하나만 보지만, include_global_agent_sessions는 전 워크스페이스의
+        // (workspace_id, pane_id)를 담아 warm(비활성) 워크스페이스 행의 「이어가기」
+        // 판정에 쓴다.
+        let db = Db::open_in_memory().unwrap();
+        let active = db.create_workspace("agent-state-global-active").unwrap();
+        let warm = db.create_workspace("agent-state-global-warm").unwrap();
+        db.upsert_agent_session(&active, "active-pane", "claude", "active-session")
+            .unwrap();
+        db.upsert_agent_session(&warm, "warm-pane", "codex", "warm-session")
+            .unwrap();
+
+        let mut job = AgentStateJob::projection(&active);
+        job.include_global_agent_sessions = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+
+        // 워크스페이스 스코프 agent_sessions는 여전히 active만.
+        assert_eq!(snapshot.agent_sessions.len(), 1);
+        assert_eq!(snapshot.agent_sessions[0].pane_id, "active-pane");
+
+        // 전역 스코프는 active·warm 둘 다.
+        let mut global = snapshot.global_agent_sessions.clone();
+        global.sort();
+        let mut expected = vec![
+            (active.clone(), "active-pane".to_owned()),
+            (warm.clone(), "warm-pane".to_owned()),
+        ];
+        expected.sort();
+        assert_eq!(global, expected);
+    }
+
+    #[test]
+    fn agent_state_global_agent_sessions는_상한을_넘지_않는다() {
+        // ACTIVITY_PANES_BOUNDED_*와 동일한 계약 — 전역 스코프로 넓혀도 LIMIT+tie-breaker로
+        // 유계를 지킨다. upsert_agent_session 자체가 워크스페이스당 AGENT_SESSION_ROWS_MAX로
+        // 이미 상한을 걸므로(단일 워크스페이스로는 전역 상한을 못 넘긴다), 전역 상한이
+        // "워크스페이스별 상한의 합"이 아니라 진짜 전역임을 확인하려면 여러 워크스페이스에
+        // 나눠 심어야 한다.
+        // create_workspace 자체도 워크스페이스 총량 SETTINGS_WORKSPACE_LIMIT_MAX(256)로
+        // 상한이 있다 — AGENT_SESSION_ROWS_MAX(256)와 같은 값이라 워크스페이스를 그만큼만
+        // 만들고, 상한 초과 행은 그중 하나에 pane을 하나 더 추가해 만든다(워크스페이스당
+        // 상한도 256이라 2개는 넉넉히 여유가 있다).
+        let db = Db::open_in_memory().unwrap();
+        let mut workspaces = Vec::with_capacity(AGENT_SESSION_ROWS_MAX);
+        for index in 0..AGENT_SESSION_ROWS_MAX {
+            let ws = db
+                .create_workspace(&format!("agent-state-global-bound-{index}"))
+                .unwrap();
+            db.upsert_agent_session(&ws, "pane", "claude", "session")
+                .unwrap();
+            workspaces.push(ws);
+        }
+
+        let mut job = AgentStateJob::projection(&workspaces[0]);
+        job.include_global_agent_sessions = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert_eq!(snapshot.global_agent_sessions.len(), AGENT_SESSION_ROWS_MAX);
+
+        db.upsert_agent_session(&workspaces[0], "pane-2", "claude", "session")
+            .unwrap();
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            BOUNDED_READ_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
     fn agent_state_structured_omission은_corrupt_rows를조회하거나할당하지않는다() {
         let db = Db::open_in_memory().unwrap();
         let ws = db.create_workspace("agent-state-omit-structured").unwrap();
@@ -13805,6 +13996,7 @@ mod tests {
             include_hook_status: true,
             include_attention: true,
             include_agent_sessions: true,
+            include_global_agent_sessions: true,
             include_structured_threads: true,
             include_archived_threads: true,
             include_work_history: true,
@@ -13841,6 +14033,7 @@ mod tests {
                 title: marker.to_owned(),
                 cwd: marker.to_owned(),
             }],
+            global_agent_sessions: vec![(marker.to_owned(), marker.to_owned())],
         };
 
         for debug in [

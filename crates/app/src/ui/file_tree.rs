@@ -4791,12 +4791,26 @@ fn session_row_fill(
     tokens: crate::ui::designall::Tokens,
     hovered: bool,
     attention: bool,
+    focused: bool,
     status: egui::Color32,
 ) -> Option<SessionRowFill> {
     if attention {
         return Some(SessionRowFill {
             color: status.gamma_multiply(SESSION_ATTENTION_FILL_ALPHA),
             full_bleed: false,
+        });
+    }
+    // **지금 화면에 떠 있는 세션**은 면을 유지한다(2026-08-20 사용자) — 선택된
+    // 워크스페이스만 배경이 있고 그 안에서 실제로 보고 있는 세션은 표시가 없어,
+    // 목록에서 "어느 것을 보고 있는지"를 제목 색(session_title_color) 하나로만
+    // 구분해야 했다. hover보다 우선한다 — 마우스를 다른 행에 얹어도 지금 보고 있는
+    // 곳이 사라지면 안 된다. attention(내 입력을 기다림)은 더 급한 신호라 그대로 이긴다.
+    // 워크스페이스 행처럼 accent를 섞지는 않는다 — 부모(워크스페이스)와 자식(세션)이
+    // 같은 색이면 계층이 뭉개진다.
+    if focused {
+        return Some(SessionRowFill {
+            color: tokens.selected_background,
+            full_bleed: true,
         });
     }
     hovered.then_some(SessionRowFill {
@@ -5032,7 +5046,9 @@ fn session_row_impl(
             drag_style.stroke,
             egui::StrokeKind::Inside,
         );
-    } else if let Some(fill) = session_row_fill(tokens, resp.hovered(), entry.attention, dot) {
+    } else if let Some(fill) =
+        session_row_fill(tokens, resp.hovered(), entry.attention, entry.focused, dot)
+    {
         // 면은 **점까지 덮는다**. 예전엔 좌측 레일이 배경 위에 얹힌 별도 요소라
         // 배경을 레일 다음부터 시작했는데, 점이 된 지금 그 규칙을 남기면 점만 면
         // 바깥에 떠서 행이 둘로 갈라져 보인다(2026-08-11 사용자).
@@ -7078,31 +7094,54 @@ mod tests {
     }
 
     #[test]
-    fn 선택은_면을_쓰지_않고_승인만_면을_가진다() {
+    fn 보고있는_세션은_면을_갖고_승인은_그보다_우선한다() {
         let tokens = crate::ui::designall::DARK;
         let status =
             crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::Waiting);
 
-        // 주안 — 면 없음: hover도 승인도 아닌 평상시 행엔 면이 없다. 선택은 이
-        // 함수에 들어오지도 않는다.
-        assert_eq!(session_row_fill(tokens, false, false, status), None);
+        // 평상시(hover·승인·보고있음 아님) 행엔 면이 없다 — 목록이 면으로 뒤덮이면
+        // 어느 것이 특별한지 알 수 없다.
+        assert_eq!(session_row_fill(tokens, false, false, false, status), None);
+        // 2026-08-20 갱신: **지금 보고 있는 세션**은 면을 갖는다. 예전엔 글자 밝기로만
+        // 날라서, 선택된 워크스페이스만 배경이 있고 그 안에서 실제로 보고 있는 세션은
+        // 표시가 없었다(사용자 보고).
+        assert_eq!(
+            session_row_fill(tokens, false, false, true, status),
+            Some(SessionRowFill {
+                color: tokens.selected_background,
+                full_bleed: true,
+            })
+        );
+        // hover보다 우선한다 — 마우스를 다른 행에 얹어도 보고 있는 곳이 사라지면 안 된다.
+        assert_eq!(
+            session_row_fill(tokens, true, false, true, status)
+                .expect("보고있는 행에 면이 없다")
+                .color,
+            tokens.selected_background,
+            "hover 면이 '보고 있는 세션' 표시를 덮었다"
+        );
         // 승인·입력 대기만 면을 가진다 — 「혼자만 면을 가져」 최대로 튄다.
         let attention_fill = Some(SessionRowFill {
             color: status.gamma_multiply(SESSION_ATTENTION_FILL_ALPHA),
             full_bleed: false,
         });
         assert_eq!(
-            session_row_fill(tokens, false, true, status),
+            session_row_fill(tokens, false, true, false, status),
             attention_fill
         );
         assert_eq!(
-            session_row_fill(tokens, true, true, status),
+            session_row_fill(tokens, true, true, false, status),
             attention_fill,
             "hover 회색 면이 승인 상태색을 덮었다"
         );
+        assert_eq!(
+            session_row_fill(tokens, true, true, true, status),
+            attention_fill,
+            "'보고 있음' 면이 승인 상태색을 덮었다 — 내 입력을 기다리는 쪽이 더 급하다"
+        );
         // hover는 패널 폭을 다 쓰고, 승인 면은 둥근 카드로 남는다.
         assert!(
-            session_row_fill(tokens, true, false, status)
+            session_row_fill(tokens, true, false, false, status)
                 .expect("hover 면이 없다")
                 .full_bleed,
             "hover 면이 여백을 남겼다"
@@ -7112,7 +7151,7 @@ mod tests {
         assert_eq!(bleed.left(), row.left() - SESSION_LIST_INDENT, "hover 좌측");
         assert_eq!(bleed.right(), row.right(), "hover 우측");
 
-        // 선택은 글자 밝기로만 나른다.
+        // 글자 밝기도 그대로 함께 나른다(면과 이중으로 표시).
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(tokens.text);
         assert_eq!(session_title_color(&visuals, true), tokens.text);

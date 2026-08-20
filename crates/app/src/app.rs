@@ -1626,6 +1626,52 @@ impl PendingResumeAgent {
         now.saturating_duration_since(self.requested_at) >= PRIMARY_PANE_MATERIALIZATION_TIMEOUT
     }
 }
+
+/// warm 「이어가기」 지연 실행이 이번 틱에 할 일(2026-08-21). `poll_pending_resume_agent`가
+/// 판단과 실행을 한 몸으로 갖고 있어 상태 전이를 테스트할 수 없었다 —
+/// `should_stage_catalog_restore`/`primary_pane_materialization_timed_out`과 같은 관례로
+/// 판단만 순수 함수로 떼어 검증 가능하게 만든다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingResumeStep {
+    /// 워크스페이스/런타임이 어긋났다 — 재개할 화면이 이미 없다, 조용히 버린다.
+    Abandon,
+    /// `restore_agents`가 아직 안 채워졌다 — 다음 틱에 다시 본다.
+    Wait,
+    /// 기다리다 한도를 넘겼다 — 버리고 실패를 알린다.
+    TimedOut,
+    /// 데이터가 도착했다 — 재개를 실행한다.
+    Run,
+}
+
+/// `pending_resume_agent`가 이번 틱에 무엇을 해야 하는지 판단한다(2026-08-21).
+///
+/// `restore_loaded_for`를 **대상 워크스페이스와 대조**하는 것이 이 함수의 핵심이다.
+/// 이 검사가 없으면 `switch_workspace` 직후 옛 워크스페이스의 `restore_agents`로
+/// 재개해 엉뚱한 pane에 명령을 넣는다.
+fn pending_resume_step(
+    pending: &PendingResumeAgent,
+    active_workspace_id: &str,
+    active_runtime_instance: u64,
+    restore_loaded_for: Option<&str>,
+    now: std::time::Instant,
+) -> PendingResumeStep {
+    if !workspace_focus_target_matches_runtime(
+        &pending.workspace_id,
+        Some(pending.runtime_instance),
+        active_workspace_id,
+        active_runtime_instance,
+    ) {
+        return PendingResumeStep::Abandon;
+    }
+    if restore_loaded_for != Some(pending.workspace_id.as_str()) {
+        return if pending.timed_out(now) {
+            PendingResumeStep::TimedOut
+        } else {
+            PendingResumeStep::Wait
+        };
+    }
+    PendingResumeStep::Run
+}
 const RUNTIME_DELIVERY_FAILURE_LIMIT: u8 = 6;
 const RUNTIME_DELIVERY_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(16);
 const RUNTIME_DELIVERY_RECOVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -16189,37 +16235,39 @@ impl App {
         let Some(pending) = self.pending_resume_agent.clone() else {
             return;
         };
-        // 사용자가 그 사이 다른 워크스페이스로 옮겼거나(다른 클릭), 대상 워크스페이스
-        // runtime이 재구성됐다(닫혔다 다시 열림 등) — 재개할 화면이 이미 없다, 조용히 포기.
-        if !workspace_focus_target_matches_runtime(
-            &pending.workspace_id,
-            Some(pending.runtime_instance),
+        // 판단은 pending_resume_step이 갖는다(테스트 가능) — 여기서는 실행만 한다.
+        match pending_resume_step(
+            &pending,
             &self.active.id,
             self.active.runtime_instance,
+            self.restore_loaded_for.as_deref(),
+            std::time::Instant::now(),
         ) {
-            self.pending_resume_agent = None;
-            return;
-        }
-        if self.restore_loaded_for.as_deref() != Some(pending.workspace_id.as_str()) {
-            // agent state worker가 아직 restore_agents를 못 채웠다 — 타임아웃 전까지 계속
-            // 기다린다(무한 대기 금지).
-            if pending.timed_out(std::time::Instant::now()) {
+            // 사용자가 그 사이 다른 워크스페이스로 옮겼거나 runtime이 재구성됐다 —
+            // 재개할 화면이 이미 없다, 조용히 포기한다.
+            PendingResumeStep::Abandon => {
                 self.pending_resume_agent = None;
-                self.notify_resume_failed(&pending.title);
-            } else {
+            }
+            // agent state worker가 아직 restore_agents를 못 채웠다 — 다음 틱에 다시 본다.
+            PendingResumeStep::Wait => {
                 self.egui_ctx
                     .request_repaint_after(std::time::Duration::from_millis(50));
             }
-            return;
-        }
-        self.pending_resume_agent = None;
-        if self.stage_agent_resume(&pending.pane_key, &pending.title, pending.session) {
-            self.resumed_panes.insert(pending.pane_key);
-            self.reveal_terminal_session();
-        } else {
-            // 데이터는 도착했는데 이미 재개할 게 없어졌다(그 사이 pane이 정리됐거나
-            // 다른 이유로 stale해짐) — 조용히 포기하지 않는다.
-            self.notify_resume_failed(&pending.title);
+            PendingResumeStep::TimedOut => {
+                self.pending_resume_agent = None;
+                self.notify_resume_failed(&pending.title);
+            }
+            PendingResumeStep::Run => {
+                self.pending_resume_agent = None;
+                if self.stage_agent_resume(&pending.pane_key, &pending.title, pending.session) {
+                    self.resumed_panes.insert(pending.pane_key);
+                    self.reveal_terminal_session();
+                } else {
+                    // 데이터는 도착했는데 이미 재개할 게 없어졌다(그 사이 pane이 정리됐거나
+                    // 다른 이유로 stale해짐) — 조용히 포기하지 않는다.
+                    self.notify_resume_failed(&pending.title);
+                }
+            }
         }
     }
 
@@ -29358,6 +29406,85 @@ mod tests {
             .0;
         assert!(catalog_restore.contains("stage_runtime_restore"));
         assert!(!catalog_restore.contains("stage_primary_pane_activation"));
+    }
+
+    #[test]
+    fn pending_resume는_대상_워크스페이스_데이터가_오기_전엔_실행하지_않는다() {
+        // 이 테스트가 지키는 것: restore_loaded_for 대조를 지우면 switch_workspace 직후
+        // 옛 워크스페이스의 restore_agents로 재개해 엉뚱한 pane에 명령이 들어간다.
+        let pending = pending_resume_fixture();
+        let now = pending.requested_at;
+
+        // 아무것도 로드 안 됐다 → 기다린다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, None, now),
+            PendingResumeStep::Wait
+        );
+        // **다른** 워크스페이스 데이터가 로드돼 있다 → 그건 이 재개에 쓸 수 없다, 기다린다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, Some("workspace-a"), now),
+            PendingResumeStep::Wait,
+            "다른 워크스페이스의 restore_agents로 재개하면 안 된다"
+        );
+        // 대상 워크스페이스 데이터가 도착했다 → 그때 실행한다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, Some("workspace-b"), now),
+            PendingResumeStep::Run
+        );
+    }
+
+    #[test]
+    fn pending_resume는_워크스페이스나_런타임이_어긋나면_포기한다() {
+        let pending = pending_resume_fixture();
+        let now = pending.requested_at;
+
+        // 사용자가 다른 워크스페이스로 옮겼다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-c", 7, Some("workspace-b"), now),
+            PendingResumeStep::Abandon
+        );
+        // 워크스페이스가 닫혔다 다시 열려 runtime이 새로 만들어졌다 — 데이터가 도착해
+        // 있어도 그 화면은 이미 없다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 8, Some("workspace-b"), now),
+            PendingResumeStep::Abandon,
+            "runtime이 재구성됐으면 재개할 화면이 없다"
+        );
+    }
+
+    #[test]
+    fn pending_resume는_무한히_기다리지_않는다() {
+        let pending = pending_resume_fixture();
+        let just_before = pending.requested_at + PRIMARY_PANE_MATERIALIZATION_TIMEOUT
+            - std::time::Duration::from_millis(1);
+        let at_limit = pending.requested_at + PRIMARY_PANE_MATERIALIZATION_TIMEOUT;
+
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, None, just_before),
+            PendingResumeStep::Wait
+        );
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, None, at_limit),
+            PendingResumeStep::TimedOut,
+            "한도를 넘기면 버리고 실패를 알려야 한다"
+        );
+        // 한도를 넘겨도 데이터가 이미 와 있으면 실행이 우선이다 — 실패 알림을 띄우고
+        // 나서 재개되는 모순이 없어야 한다.
+        assert_eq!(
+            pending_resume_step(&pending, "workspace-b", 7, Some("workspace-b"), at_limit),
+            PendingResumeStep::Run
+        );
+    }
+
+    fn pending_resume_fixture() -> PendingResumeAgent {
+        PendingResumeAgent {
+            workspace_id: "workspace-b".to_owned(),
+            runtime_instance: 7,
+            pane_key: "pane-b".to_owned(),
+            title: "세션".to_owned(),
+            session: runtime::SessionId(3),
+            requested_at: std::time::Instant::now(),
+        }
     }
 
     #[test]

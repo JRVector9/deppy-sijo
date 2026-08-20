@@ -1527,6 +1527,20 @@ const ACTIVITY_PANE_ROWS_MAX: usize = 256 * 256;
 /// (`AGENT_SESSION_ROWS_MAX`)을 워크스페이스 총량 상한(`SETTINGS_WORKSPACE_LIMIT_MAX`)만큼
 /// 스케일한다 — `ACTIVITY_PANE_ROWS_MAX`와 같은 관례. 워크스페이스당 상한을 그대로 쓰면
 /// 합법적으로 쓴 상태를 읽기에서 거부하게 된다(2026-08-20).
+///
+/// **이 상한은 실질 경계가 아니다.** 행당 UUID 2개(36 + 36 = 72바이트)라
+/// `AGENT_STATE_SNAPSHOT_BYTES_MAX`(4MiB)에 담기는 최대치는 58,254행이고, 이 상한
+/// (65,536행)까지 차려면 4,718,592바이트가 필요하다. 즉 최대 합법 상태에서는 행
+/// 가드보다 **바이트 가드가 먼저** 터지고, 그 에러는 `apply_agent_state_job` 전체를
+/// 빠져나가 활성 워크스페이스의 복원까지 같이 죽인다.
+///
+/// 알면서 남겨둔 한계다(2026-08-21 코드 리뷰). 발생하려면 워크스페이스 228개에
+/// 각각 pane 256개가 필요해 실사용 거리가 아득하고, 기존 `ACTIVITY_PANE_ROWS_MAX`도
+/// 같은 상한에 같은 예산이면서 행이 더 커 같은 긴장을 이미 안고 있다 — 도달 불가능한
+/// 시나리오 때문에 전역 메모리 가드를 키우는 쪽이 더 나쁜 거래라고 판단했다.
+/// 이 경로가 실제로 문제가 되면 예산을 키우기보다 **전역 조회 실패를 국소화**하는
+/// 편이 옳다(이 집합은 「이어가기」 버튼 노출 판정용 보조 데이터라, 넘치면 그 기능만
+/// 꺼지고 복원은 살아남아야 한다).
 const AGENT_SESSIONS_GLOBAL_ROWS_MAX: usize = AGENT_SESSION_ROWS_MAX * SETTINGS_WORKSPACE_LIMIT_MAX;
 const WEB_PUSH_SUBSCRIPTION_ROWS_MAX: usize = 8;
 const WEB_PUSH_RETAINED_BYTES_MAX: usize = 64 * 1024;

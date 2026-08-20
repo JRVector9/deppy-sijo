@@ -237,3 +237,23 @@ DB 스키마 변경은 없었다(`agent_sessions` 테이블은 그대로, 새 �
   동작하는지(단위 테스트로 로직은 확인했지만 실제 프레임 타이밍은 아니다).
 - 5개 로케일 전부에서 `sidebar.resume_failed` 알림 문구가 실제 macOS 알림
   배너에서 잘리지 않고 자연스러운지.
+
+## 코드 리뷰 후속 — 전역 읽기 상한 교정 (2026-08-20)
+
+첫 구현은 전역 스코프 읽기에 **워크스페이스당** 상한(`AGENT_SESSION_ROWS_MAX` = 256)을
+그대로 재사용했다. 쓰기 경로는 `WHERE workspace_id = ?1` 기준으로 워크스페이스당 256을
+허용하므로(`upsert_agent_session`), 워크스페이스 2개가 각각 200행이면 **전부 합법적인
+쓰기인데 전역 읽기가 `BOUNDED_READ_LIMIT_EXCEEDED`로 거부**한다. 그 에러는 `?`로 스냅샷
+함수 전체를 빠져나가므로 warm 행의 버튼만 사라지는 게 아니라 **활성 워크스페이스의
+`restore_agents`까지 같이 죽는다** — 기존 기능의 회귀다.
+
+교정: 저장소의 기존 전역 쿼리 관례(`ACTIVITY_PANE_ROWS_MAX = 256 * 256`)를 따라
+`AGENT_SESSIONS_GLOBAL_ROWS_MAX = AGENT_SESSION_ROWS_MAX * SETTINGS_WORKSPACE_LIMIT_MAX`로
+스케일했다. 행 상한은 안전 천장 역할이고, 실질적인 메모리 한계는 기존 바이트 회계
+(`agent_state_snapshot_retained_bytes`가 `global_agent_sessions`도 계산)와
+`AGENT_STATE_SNAPSHOT_BYTES_MAX`(4MB)가 잡는다 — activity 쿼리와 동일한 자세.
+
+계약 테스트도 뒤집었다. `...는_상한을_넘지_않는다`는 "합법적으로 쓴 257행 상태에서
+읽기가 에러난다"를 **정답으로 고정**하고 있었다(결함을 계약으로 굳힘).
+`...는_합법적인_쓰기를_거부하지_않는다`로 바꿔 그 상태가 257행 전부를 돌려주는지 본다.
+옛 상한에서 FAIL / 고친 상한에서 PASS를 mtime 강제 후 각각 확인했다.

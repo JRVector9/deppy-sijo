@@ -1523,6 +1523,11 @@ pub const AGENT_STATE_JOB_BYTES_MAX: usize = BOUNDED_RETAINED_BYTES_MAX;
 /// Aggregate retained heap bytes across every section of one worker snapshot.
 pub const AGENT_STATE_SNAPSHOT_BYTES_MAX: usize = 4 * 1024 * 1024;
 const ACTIVITY_PANE_ROWS_MAX: usize = 256 * 256;
+/// 전 워크스페이스 스코프 agent_sessions 읽기의 상한. 워크스페이스당 상한
+/// (`AGENT_SESSION_ROWS_MAX`)을 워크스페이스 총량 상한(`SETTINGS_WORKSPACE_LIMIT_MAX`)만큼
+/// 스케일한다 — `ACTIVITY_PANE_ROWS_MAX`와 같은 관례. 워크스페이스당 상한을 그대로 쓰면
+/// 합법적으로 쓴 상태를 읽기에서 거부하게 된다(2026-08-20).
+const AGENT_SESSIONS_GLOBAL_ROWS_MAX: usize = AGENT_SESSION_ROWS_MAX * SETTINGS_WORKSPACE_LIMIT_MAX;
 const WEB_PUSH_SUBSCRIPTION_ROWS_MAX: usize = 8;
 const WEB_PUSH_RETAINED_BYTES_MAX: usize = 64 * 1024;
 const BOUNDED_READ_INPUT_INVALID: &str = "bounded read input invalid";
@@ -7727,7 +7732,10 @@ impl Db {
             None
         };
         let global_agent_probe = if job.include_global_agent_sessions {
-            let sql_limit = bounded_limit_plus_one(AGENT_SESSION_ROWS_MAX, AGENT_SESSION_ROWS_MAX)?;
+            let sql_limit = bounded_limit_plus_one(
+                AGENT_SESSIONS_GLOBAL_ROWS_MAX,
+                AGENT_SESSIONS_GLOBAL_ROWS_MAX,
+            )?;
             Some((
                 bounded_read_preflight(
                     &tx,
@@ -7737,7 +7745,7 @@ impl Db {
                         BOUNDED_ID_BYTES_MAX as i64,
                         BOUNDED_ROW_BYTES_MAX as i64,
                     ],
-                    AGENT_SESSION_ROWS_MAX,
+                    AGENT_SESSIONS_GLOBAL_ROWS_MAX,
                 )?,
                 sql_limit,
             ))
@@ -13020,16 +13028,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_state_global_agent_sessions는_상한을_넘지_않는다() {
-        // ACTIVITY_PANES_BOUNDED_*와 동일한 계약 — 전역 스코프로 넓혀도 LIMIT+tie-breaker로
-        // 유계를 지킨다. upsert_agent_session 자체가 워크스페이스당 AGENT_SESSION_ROWS_MAX로
-        // 이미 상한을 걸므로(단일 워크스페이스로는 전역 상한을 못 넘긴다), 전역 상한이
-        // "워크스페이스별 상한의 합"이 아니라 진짜 전역임을 확인하려면 여러 워크스페이스에
-        // 나눠 심어야 한다.
-        // create_workspace 자체도 워크스페이스 총량 SETTINGS_WORKSPACE_LIMIT_MAX(256)로
-        // 상한이 있다 — AGENT_SESSION_ROWS_MAX(256)와 같은 값이라 워크스페이스를 그만큼만
-        // 만들고, 상한 초과 행은 그중 하나에 pane을 하나 더 추가해 만든다(워크스페이스당
-        // 상한도 256이라 2개는 넉넉히 여유가 있다).
+    fn agent_state_global_agent_sessions는_합법적인_쓰기를_거부하지_않는다() {
+        // 전역 스코프 읽기의 상한은 "워크스페이스당 상한"이 아니라 "전역 상한"이어야 한다.
+        // upsert_agent_session은 워크스페이스당 AGENT_SESSION_ROWS_MAX(256)까지 허용하므로
+        // 워크스페이스가 여러 개면 전체 합계는 그보다 훨씬 커질 수 있다 — 전역 읽기가
+        // 워크스페이스당 상한을 그대로 쓰면 **전부 합법적으로 쓴 상태**를 읽기에서
+        // BOUNDED_READ_LIMIT_EXCEEDED로 거부하게 되고, 그 에러는 스냅샷 함수 전체를
+        // 빠져나가 활성 워크스페이스의 restore_agents까지 같이 죽인다(2026-08-20).
+        // ACTIVITY_PANE_ROWS_MAX(256 * 256)와 같은 관례로 전역 상한을 스케일한다.
         let db = Db::open_in_memory().unwrap();
         let mut workspaces = Vec::with_capacity(AGENT_SESSION_ROWS_MAX);
         for index in 0..AGENT_SESSION_ROWS_MAX {
@@ -13040,17 +13046,17 @@ mod tests {
                 .unwrap();
             workspaces.push(ws);
         }
+        // 워크스페이스당 상한(256)에는 한참 못 미치는 두 번째 pane — 쓰기는 당연히 성공한다.
+        db.upsert_agent_session(&workspaces[0], "pane-2", "claude", "session")
+            .unwrap();
 
         let mut job = AgentStateJob::projection(&workspaces[0]);
         job.include_global_agent_sessions = true;
         let snapshot = db.apply_agent_state_job(&job).unwrap();
-        assert_eq!(snapshot.global_agent_sessions.len(), AGENT_SESSION_ROWS_MAX);
-
-        db.upsert_agent_session(&workspaces[0], "pane-2", "claude", "session")
-            .unwrap();
         assert_eq!(
-            db.apply_agent_state_job(&job).unwrap_err().to_string(),
-            BOUNDED_READ_LIMIT_EXCEEDED
+            snapshot.global_agent_sessions.len(),
+            AGENT_SESSION_ROWS_MAX + 1,
+            "합법적으로 쓴 행은 전역 읽기에서도 전부 보여야 한다"
         );
     }
 

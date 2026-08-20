@@ -6788,7 +6788,18 @@ fn clean_terminal_selection_for_copy(text: &str) -> String {
     cleaned.join(" ")
 }
 
-/// 세션 행 2행: "[PTY] Codex · gpt-5.5 · xhigh · ctx 69%" (빈 부분은 생략).
+/// 모델명이 이미 provider 이름을 품고 있는가 — `Claude · claude-opus-5`처럼 같은
+/// 낱말이 한 줄에 두 번 나오는 것을 막는다(2026-08-20 사용자).
+///
+/// 포함 여부로만 판단한다: `claude-opus-5`는 "claude"를 품으므로 provider 라벨을
+/// 빼고, `gpt-5.6-sol`은 "codex"를 품지 않으므로 **남긴다** — 그 경우엔 라벨이 어느
+/// 에이전트인지 알려주는 유일한 단서라 지우면 정보가 준다.
+fn model_implies_provider(provider_label: &str, model: &str) -> bool {
+    let provider = provider_label.trim().to_ascii_lowercase();
+    !provider.is_empty() && model.to_ascii_lowercase().contains(&provider)
+}
+
+/// 세션 행 2행: "Codex · gpt-5.5 · xhigh · ctx 69%" (빈 부분은 생략).
 fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
     use crate::agent_surface::AgentProvider;
 
@@ -6796,8 +6807,12 @@ fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
     // 전송 방식 배지([PTY])는 뺀다(2026-08-19 사용자) — 이 앱의 에이전트 행은 전부 PTY라
     // 모든 행에 같은 글자가 붙어 구분에 기여하지 않았다. AgentTransport 자체는 다른
     // 표면(구조화 세션 목록)이 계속 쓴다.
-    let mut parts = vec![provider.label().to_owned()];
-    if let Some(m) = d.model.as_deref().filter(|s| !s.is_empty()) {
+    let model = d.model.as_deref().filter(|s| !s.is_empty());
+    let mut parts = Vec::new();
+    if !model.is_some_and(|m| model_implies_provider(provider.label(), m)) {
+        parts.push(provider.label().to_owned());
+    }
+    if let Some(m) = model {
         parts.push(m.to_owned());
     }
     if let Some(e) = d.effort.as_deref().filter(|s| !s.is_empty()) {
@@ -10257,6 +10272,30 @@ mod tests {
         );
     }
 
+    /// 2026-08-20 사용자: `Claude · claude-opus-5`처럼 같은 낱말이 한 줄에 두 번
+    /// 나올 필요가 없다. 모델명이 provider를 품으면 라벨을 뺀다.
+    #[test]
+    fn 모델명이_provider를_품으면_라벨을_빼서_중복을_없앤다() {
+        let display = crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Claude,
+            model: Some("claude-opus-5".to_owned()),
+            effort: None,
+            context_pct: None,
+            last_agent_summary: None,
+            user_instruction: None,
+        };
+
+        assert_eq!(agent_info_line(&display), "claude-opus-5");
+        assert!(model_implies_provider("Claude", "claude-opus-5"));
+        assert!(!model_implies_provider("Codex", "gpt-5.6-sol"));
+        // 모델이 아예 없으면 라벨만 남아야 한다 — 빈 줄이 되면 안 된다.
+        let no_model = crate::agent_detect::AgentDisplay {
+            model: None,
+            ..display
+        };
+        assert_eq!(agent_info_line(&no_model), "Claude");
+    }
+
     #[test]
     fn agent_info_line은_전송배지_없이_provider와_모델을_보여준다() {
         let display = crate::agent_detect::AgentDisplay {
@@ -10270,7 +10309,8 @@ mod tests {
 
         assert_eq!(
             agent_info_line(&display),
-            "Codex · gpt-test · high · ctx 69%"
+            "Codex · gpt-test · high · ctx 69%",
+            "모델명이 provider를 안 품으면 라벨을 남긴다 — 어느 에이전트인지 알려주는 유일한 단서다"
         );
         let catalog = catalog();
         assert_eq!(

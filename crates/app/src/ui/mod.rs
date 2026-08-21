@@ -21,6 +21,7 @@ pub mod fleet;
 pub mod git_panel;
 pub mod inbox_approvals;
 pub mod inbox_waiting;
+pub mod markdown_viewer;
 pub mod notes;
 pub mod notifications;
 pub(crate) mod ports;

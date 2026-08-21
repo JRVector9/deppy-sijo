@@ -18,6 +18,7 @@ mod claude_usage;
 mod codex_app_server;
 mod codex_backend_usage;
 mod config;
+mod document_io;
 mod dotenv_sync;
 mod env;
 mod env_reload;

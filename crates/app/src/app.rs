@@ -8012,6 +8012,15 @@ pub struct App {
     /// 이력 본문 좌(카드)/우(원문) 분할 폭 — `git_tab_split_width`와 같은 규칙, Git과는
     /// 따로 기억한다.
     work_history_tab_split_width: Option<f32>,
+    /// 이력·Git과 같은 보조 UI 탭 상태 기계 — 문서(D0). 실제 로드·저장은 아직 없다
+    /// (TODO(D4): `document_io`가 채운다) — 지금은 자리표시자 본문만 보여준다.
+    document_tab: ui::workspace::PaneAuxTabState,
+    /// 지금 문서 탭에 열려 있는 파일 경로 — 자리표시자 본문에 파일명만 보여준다.
+    /// TODO(D4): 같은 pane에서 다른 문서를 열면 dirty 확인 없이 곧장 이 값을 교체한다.
+    document_open_path: Option<PathBuf>,
+    /// pane이 하나도 없는 워크스페이스에서 문서를 열었을 때 — 셸 pane을 먼저 스폰하고
+    /// (`SpawnShellAt`), 그 pane이 나타나면 `poll_pending_document_open`이 이어받아 연다.
+    pending_document_open: Option<PathBuf>,
     work_history_rows: Vec<storage::AgentWorkTurnRow>,
     /// `work_history_rows`를 실제로 수정할 때마다(교체·in-place 갱신·비움) 올린다.
     /// leaf(`ui::work_history::WorkHistorySnapshot::rows_revision`)가 이 값으로
@@ -8926,23 +8935,34 @@ fn github_branch_url_path(branch: &str) -> String {
 enum AuxTabWinner {
     History,
     Git,
+    Document,
 }
 
-/// 보조 본문은 하나뿐이라 두 탭이 동시에 활성일 수 없다. 진 쪽은 세션 탭으로 물러나되
-/// 탭 자체는 남는다(`on_session_tab_click`).
+/// 보조 본문은 하나뿐이라 세 탭이 동시에 활성일 수 없다. 진 쪽은 세션 탭으로 물러나되
+/// 탭 자체는 남는다(`on_session_tab_click`) — 이미 비활성/닫힘인 탭에 걸어도 안전하다
+/// (`on_session_tab_click`은 그 경우 그대로 돌려준다).
 fn resolve_aux_tab_exclusivity(
     history: ui::workspace::PaneAuxTabState,
     git: ui::workspace::PaneAuxTabState,
+    document: ui::workspace::PaneAuxTabState,
     winner: AuxTabWinner,
 ) -> (
     ui::workspace::PaneAuxTabState,
     ui::workspace::PaneAuxTabState,
+    ui::workspace::PaneAuxTabState,
 ) {
-    match winner {
-        AuxTabWinner::History if git.is_active() => (history, git.on_session_tab_click()),
-        AuxTabWinner::Git if history.is_active() => (history.on_session_tab_click(), git),
-        _ => (history, git),
-    }
+    let demote = |state: ui::workspace::PaneAuxTabState, is_winner: bool| {
+        if is_winner {
+            state
+        } else {
+            state.on_session_tab_click()
+        }
+    };
+    (
+        demote(history, winner == AuxTabWinner::History),
+        demote(git, winner == AuxTabWinner::Git),
+        demote(document, winner == AuxTabWinner::Document),
+    )
 }
 
 /// Git 보조 본문 좌측 목록 폭 — 목록은 경로가 읽히는 최소 폭이 있고, diff는 넓을수록
@@ -12013,6 +12033,9 @@ impl App {
             work_history_ui: ui::work_history::WorkHistoryUi::new(),
             work_history_tab: ui::workspace::PaneAuxTabState::default(),
             work_history_tab_split_width: None,
+            document_tab: ui::workspace::PaneAuxTabState::default(),
+            document_open_path: None,
+            pending_document_open: None,
             work_history_rows: Vec::new(),
             work_history_rows_revision: 0,
             work_history_workspace_id: None,
@@ -15203,9 +15226,10 @@ impl App {
         if self.work_history_tab.is_active() && !previous.is_active() {
             // 헤더에서 이력 탭을 직접 눌러 활성화하는 경로 — Git이 활성이었다면 물러난다
             // (보조 본문은 하나뿐이다, 스펙 §8-2).
-            (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
+            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
                 self.work_history_tab,
                 self.git_tab,
+                self.document_tab,
                 AuxTabWinner::History,
             );
             self.enter_work_history_tab();
@@ -15230,9 +15254,88 @@ impl App {
             self.aux_search.reset();
         }
         if self.git_tab.is_active() && !previous.is_active() {
-            (self.work_history_tab, self.git_tab) =
-                resolve_aux_tab_exclusivity(self.work_history_tab, self.git_tab, AuxTabWinner::Git);
+            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
+                self.work_history_tab,
+                self.git_tab,
+                self.document_tab,
+                AuxTabWinner::Git,
+            );
             self.request_git_panel_io(ctx, ui::git_panel::GitPanelIoRequest::Snapshot);
+        }
+    }
+
+    /// 문서 보조 탭이 올린 의도 — `apply_work_history_tab_intent`와 같은 모양이다(D0).
+    /// 문서 X는 UI 탭만 닫는다 — 어떤 경로도 `RuntimeCommand`를 만들지 않는다.
+    fn apply_document_tab_intent(&mut self, intent: ui::workspace::PaneAuxTabIntent) {
+        let previous = self.document_tab;
+        self.document_tab = match intent {
+            ui::workspace::PaneAuxTabIntent::Activate => previous.on_tab_click(),
+            ui::workspace::PaneAuxTabIntent::ShowSession => previous.on_session_tab_click(),
+            ui::workspace::PaneAuxTabIntent::Close => previous.on_close(),
+        };
+        if self.document_tab.is_active() != previous.is_active() {
+            self.aux_search.reset();
+        }
+        if self.document_tab.is_active() && !previous.is_active() {
+            (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
+                self.work_history_tab,
+                self.git_tab,
+                self.document_tab,
+                AuxTabWinner::Document,
+            );
+        }
+    }
+
+    /// 문서 탭을 포커스된 pane 위에 연다(D0 자리표시자) — `SidebarAction::OpenDocument`
+    /// 라우팅과 `poll_pending_document_open` 둘 다 이 헬퍼로 모인다.
+    /// TODO(D4): 같은 pane에 이미 문서가 열려 있으면 dirty 확인 없이 곧장 교체한다 —
+    /// 실제 편집 상태가 생기면(D1) 저장/버리기 확인이 필요하다.
+    fn attach_document_tab(&mut self, path: PathBuf) {
+        self.document_open_path = Some(path);
+        self.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
+        (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
+            self.work_history_tab,
+            self.git_tab,
+            self.document_tab,
+            AuxTabWinner::Document,
+        );
+        self.aux_search.reset();
+        self.reveal_terminal_view_for_aux_tab();
+    }
+
+    /// 파일 트리에서 문서를 열었다 — 포커스된 pane이 있으면 곧장 연다. pane이 하나도
+    /// 없으면 문서도 붙을 곳이 없으므로 셸 pane을 먼저 스폰하고, `poll_pending_document_open`이
+    /// 다음 틱들에서 pane이 나타나길 기다렸다가 이어받는다(설계 §3.2).
+    fn open_document(&mut self, path: PathBuf) {
+        let has_focused_pane = self
+            .active
+            .workspace_ui
+            .mux()
+            .is_some_and(|mux| mux.focused_pane.is_some());
+        if has_focused_pane {
+            self.attach_document_tab(path);
+        } else {
+            self.pending_document_open = Some(path);
+            self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellAt {
+                cwd: None,
+            });
+        }
+    }
+
+    /// `open_document`가 pane이 없어 미룬 문서 열기 — 스폰된 pane이 포커스를 받으면
+    /// 이어받는다. `poll_pending_resume_agent`와 같은 틱에서 돈다.
+    fn poll_pending_document_open(&mut self) {
+        let Some(path) = self.pending_document_open.clone() else {
+            return;
+        };
+        let ready = self
+            .active
+            .workspace_ui
+            .mux()
+            .is_some_and(|mux| mux.focused_pane.is_some());
+        if ready {
+            self.pending_document_open = None;
+            self.attach_document_tab(path);
         }
     }
 
@@ -24167,6 +24270,7 @@ impl eframe::App for App {
         self.poll_workspace_controller();
         self.poll_pending_workspace_focus();
         self.poll_pending_resume_agent();
+        self.poll_pending_document_open();
         self.poll_turn_done_clear();
         self.apply_pending_visual_settings(ctx);
         self.poll_worktree_jobs();
@@ -25371,11 +25475,13 @@ impl eframe::App for App {
                     }
                     if self.work_history_tab.is_active() {
                         // Git이 활성이었다면 물러난다 — 보조 본문은 하나뿐이다(스펙 §8-2).
-                        (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
-                            self.work_history_tab,
-                            self.git_tab,
-                            AuxTabWinner::History,
-                        );
+                        (self.work_history_tab, self.git_tab, self.document_tab) =
+                            resolve_aux_tab_exclusivity(
+                                self.work_history_tab,
+                                self.git_tab,
+                                self.document_tab,
+                                AuxTabWinner::History,
+                            );
                         // 홈/작업 페이지 위에서 눌렀다면 탭이 있는 작업면으로 먼저 돌아간다.
                         self.reveal_terminal_view_for_aux_tab();
                         self.enter_work_history_tab();
@@ -25393,11 +25499,13 @@ impl eframe::App for App {
                     }
                     if self.git_tab.is_active() {
                         // 이력과 같은 진입 — 활성이 될 때만 스냅샷을 새로 받는다(폴링 없음).
-                        (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
-                            self.work_history_tab,
-                            self.git_tab,
-                            AuxTabWinner::Git,
-                        );
+                        (self.work_history_tab, self.git_tab, self.document_tab) =
+                            resolve_aux_tab_exclusivity(
+                                self.work_history_tab,
+                                self.git_tab,
+                                self.document_tab,
+                                AuxTabWinner::Git,
+                            );
                         self.reveal_terminal_view_for_aux_tab();
                         self.request_git_panel_io(
                             ui.ctx(),
@@ -25547,11 +25655,13 @@ impl eframe::App for App {
                 // (2026-08-15 회귀 수정 유지, 2차에서 사이드바 탭 → 보조 탭으로 갱신).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
                     self.git_tab = ui::workspace::PaneAuxTabState::OpenActive;
-                    (self.work_history_tab, self.git_tab) = resolve_aux_tab_exclusivity(
-                        self.work_history_tab,
-                        self.git_tab,
-                        AuxTabWinner::Git,
-                    );
+                    (self.work_history_tab, self.git_tab, self.document_tab) =
+                        resolve_aux_tab_exclusivity(
+                            self.work_history_tab,
+                            self.git_tab,
+                            self.document_tab,
+                            AuxTabWinner::Git,
+                        );
                     self.reveal_terminal_view_for_aux_tab();
                     let cwd = self.cached_session_cwd(session).map(PathBuf::from);
                     self.request_git_panel_io_at(
@@ -25559,6 +25669,11 @@ impl eframe::App for App {
                         cwd,
                         ui::git_panel::GitPanelIoRequest::Snapshot,
                     );
+                }
+                // 파일 트리에서 문서 대상(md·txt 등)을 열었다(D0) — kind는 아직 쓰지 않는다
+                // (본문은 자리표시자, 실제 소스/미리보기는 D1·D2가 채운다).
+                Some(ui::file_tree::SidebarAction::OpenDocument { target, kind: _kind }) => {
+                    self.open_document(target.as_path().to_path_buf());
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
                 // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.
@@ -26348,6 +26463,7 @@ impl eframe::App for App {
                     self.apply_work_history_tab_intent(intent);
                 }
                 ui::workspace::PaneAuxTabKind::Git => self.apply_git_tab_intent(ui.ctx(), intent),
+                ui::workspace::PaneAuxTabKind::Document => self.apply_document_tab_intent(intent),
             }
             ui.ctx().request_repaint();
         }

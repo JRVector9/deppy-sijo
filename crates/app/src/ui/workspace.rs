@@ -765,6 +765,8 @@ const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
 pub enum PaneAuxTabKind {
     History,
     Git,
+    /// md·txt 등 문서를 pane 본문 전체에 연다(설계 §1) — 이력·Git과 같은 기구를 쓴다.
+    Document,
 }
 
 impl PaneAuxTabKind {
@@ -772,6 +774,7 @@ impl PaneAuxTabKind {
         match self {
             Self::History => "workspace.tab.history_hint",
             Self::Git => "workspace.tab.git_hint",
+            Self::Document => "workspace.tab.document_hint",
         }
     }
 
@@ -779,12 +782,14 @@ impl PaneAuxTabKind {
         match self {
             Self::History => "workspace.tab.history_close",
             Self::Git => "workspace.tab.git_close",
+            Self::Document => "workspace.tab.document_close",
         }
     }
 }
 
-/// 헤더에 놓는 보조 탭 상한 — 세션 제목이 우선이라 그 이상은 받지 않는다.
-pub const PANE_AUX_TAB_MAX: usize = 2;
+/// 헤더에 놓는 보조 탭 상한 — 세션 제목이 우선이라 그 이상은 받지 않는다. 이력·Git·
+/// 문서 셋이 정확히 다 찬다(설계 §2).
+pub const PANE_AUX_TAB_MAX: usize = 3;
 
 /// 세션 헤더 옆에 붙는 보조 탭의 표시 상태 — App이 소유하고 매 프레임 넘긴다.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -902,14 +907,17 @@ struct PaneAuxTabGeometry {
 /// 앞에 이미 놓인 보조 탭의 오른쪽 끝)다. 여러 탭을 이어 붙일 때는 `left`를 호출부가
 /// 직접 관리한다(`layout_aux_tabs` 참고).
 ///
-/// 좁은 폭에서는 순서대로 양보한다: 닫기(×)를 먼저 버리고, 최소 라벨 폭조차 없으면
-/// 탭 자체를 만들지 않는다(레일로 계속 전환할 수 있다). 어떤 경우에도 `toolbar_left`나
-/// 헤더 오른쪽 끝을 넘지 않는다.
+/// 좁은 폭에서는 순서대로 양보한다: `include_close`가 꺼져 있으면(호출부의 축약
+/// 우선순위 판단) 애초에 닫기를 만들지 않는다. `include_close`가 켜져 있어도 자리가
+/// 없으면(다음 탭이 밀려 들어와 이 탭 몫이 줄었을 때) 닫기만 접는다. 최소 라벨 폭조차
+/// 없으면 탭 자체를 만들지 않는다(레일로 계속 전환할 수 있다). 어떤 경우에도
+/// `toolbar_left`나 헤더 오른쪽 끝을 넘지 않는다.
 fn pane_aux_tab_geometry(
     header: egui::Rect,
     left: f32,
     toolbar_left: f32,
     label_width: f32,
+    include_close: bool,
 ) -> Option<PaneAuxTabGeometry> {
     let center_y = header.center().y;
     let limit = toolbar_left.min(header.right());
@@ -919,7 +927,8 @@ fn pane_aux_tab_geometry(
         return None;
     }
     let close_center_x = label_left + label_width + PANE_AUX_TAB_CLOSE_GAP;
-    let close = (close_center_x + PANE_AUX_TAB_CLOSE_SIZE * 0.5 + PANE_AUX_TAB_RIGHT_PAD <= limit)
+    let close = (include_close
+        && close_center_x + PANE_AUX_TAB_CLOSE_SIZE * 0.5 + PANE_AUX_TAB_RIGHT_PAD <= limit)
         .then(|| {
             egui::Rect::from_center_size(
                 egui::pos2(close_center_x, center_y),
@@ -948,22 +957,33 @@ struct AuxTabPlacement {
     geometry: PaneAuxTabGeometry,
 }
 
-/// 세션 ×의 accent 경계에서 시작해 왼→오로 이어 붙인다. 한 탭이라도 자리를 못 만들면
-/// 거기서 멈춘다 — 뒤 탭부터 사라지고, 남은 탭은 레일로 계속 전환할 수 있다.
-fn layout_aux_tabs(
+/// 축약 우선순위(설계 §2) — 문서 → Git → 이력 순으로 먼저 접힌다: ×부터 이 순서대로
+/// 빼고, 그래도 모자라면 탭 자체를 이 순서대로 뺀다. 문서가 먼저인 이유: 파일명이
+/// 라벨이라 길고, 닫기가 툴바에도 있다.
+const AUX_TAB_SHRINK_ORDER: [PaneAuxTabKind; 3] = [
+    PaneAuxTabKind::Document,
+    PaneAuxTabKind::Git,
+    PaneAuxTabKind::History,
+];
+
+/// 주어진 탭 집합을 세션 ×의 accent 경계에서 시작해 왼→오로 배치해본다. `stripped`에
+/// 속한 종류는 처음부터 ×를 만들지 않는다. 하나라도 최소 라벨 폭을 못 채우면 이
+/// 시도 전체가 실패다(`None`) — 호출부가 다음 축약 단계로 넘어간다.
+fn try_layout_aux_tabs(
     header: egui::Rect,
     session_close: egui::Rect,
     toolbar_left: f32,
-    tabs: &[PaneAuxTab],
-    natural_width: impl Fn(&str) -> f32,
-) -> Vec<AuxTabPlacement> {
+    visible: &[&PaneAuxTab],
+    stripped: &[PaneAuxTabKind],
+    natural_width: &impl Fn(&str) -> f32,
+) -> Option<Vec<AuxTabPlacement>> {
     let mut left = pane_header_active_boundary(header, session_close);
-    let mut out = Vec::new();
-    for tab in tabs.iter().take(PANE_AUX_TAB_MAX) {
-        let width = pane_aux_tab_label_width(header.width(), natural_width(&tab.label), tabs.len());
-        let Some(geometry) = pane_aux_tab_geometry(header, left, toolbar_left, width) else {
-            break;
-        };
+    let mut out = Vec::with_capacity(visible.len());
+    for tab in visible {
+        let width =
+            pane_aux_tab_label_width(header.width(), natural_width(&tab.label), visible.len());
+        let include_close = !stripped.contains(&tab.kind);
+        let geometry = pane_aux_tab_geometry(header, left, toolbar_left, width, include_close)?;
         left = geometry.tab.right();
         out.push(AuxTabPlacement {
             kind: tab.kind,
@@ -972,7 +992,48 @@ fn layout_aux_tabs(
             geometry,
         });
     }
-    out
+    Some(out)
+}
+
+/// 세션 ×의 accent 경계에서 시작해 왼→오로 이어 붙인다. 좁을 때의 축약 순서(설계 §2):
+/// ⓐ 각 탭의 ×를 `AUX_TAB_SHRINK_ORDER` 순서로 뺀다 → ⓑ 그래도 모자라면 같은 순서로
+/// 탭 자체를 뺀다 → ⓒ 세션 제목은 마지막까지 남는다(탭이 하나도 안 들어가도 세션
+/// 헤더는 그대로다).
+fn layout_aux_tabs(
+    header: egui::Rect,
+    session_close: egui::Rect,
+    toolbar_left: f32,
+    tabs: &[PaneAuxTab],
+    natural_width: impl Fn(&str) -> f32,
+) -> Vec<AuxTabPlacement> {
+    let mut visible: Vec<&PaneAuxTab> = tabs.iter().take(PANE_AUX_TAB_MAX).collect();
+    loop {
+        if visible.is_empty() {
+            return Vec::new();
+        }
+        let shrink_order: Vec<PaneAuxTabKind> = AUX_TAB_SHRINK_ORDER
+            .into_iter()
+            .filter(|kind| visible.iter().any(|tab| tab.kind == *kind))
+            .collect();
+        for strip in 0..=shrink_order.len() {
+            let stripped = &shrink_order[..strip];
+            if let Some(placements) = try_layout_aux_tabs(
+                header,
+                session_close,
+                toolbar_left,
+                &visible,
+                stripped,
+                &natural_width,
+            ) {
+                return placements;
+            }
+        }
+        // ×를 전부 빼도 안 맞는다 — 축약 순서 맨 앞(가장 먼저 접히는 탭)을 통째로 뺀다.
+        let Some(drop_kind) = shrink_order.first().copied() else {
+            return Vec::new();
+        };
+        visible.retain(|tab| tab.kind != drop_kind);
+    }
 }
 
 /// 닫기(×) 글리프. 세션 닫기와 보조 탭 닫기가 같은 모양을 쓰되 **색만** 다르다
@@ -7946,7 +8007,7 @@ mod tests {
         let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
         let buttons = pane_header_buttons(header, 180.0, 4, aux_reserved);
         let left = pane_header_active_boundary(header, buttons.close);
-        let aux = pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width)
+        let aux = pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width, true)
             .expect("520pt 헤더에는 보조 탭이 들어간다");
         let aux_close = aux.close.expect("넓은 헤더에서는 이력 X도 보인다");
 
@@ -7989,7 +8050,7 @@ mod tests {
             let aux_reserved = pane_aux_tab_width(label_width) + PANE_AUX_TAB_RIGHT_PAD;
             let buttons = pane_header_buttons(header, 120.0, 4, aux_reserved);
             let left = pane_header_active_boundary(header, buttons.close);
-            match pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width) {
+            match pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width, true) {
                 None => saw_tab_dropped = true,
                 Some(aux) => {
                     assert!(
@@ -8033,7 +8094,7 @@ mod tests {
         let toolbar_left = 112.0;
         let left = pane_header_active_boundary(header, session_close);
         let aux =
-            pane_aux_tab_geometry(header, left, toolbar_left, 20.0).expect("라벨은 들어가야 한다");
+            pane_aux_tab_geometry(header, left, toolbar_left, 20.0, true).expect("라벨은 들어가야 한다");
 
         assert_eq!(aux.close, None, "자리가 없으면 X만 접는다");
         assert!(aux.label_width >= PANE_AUX_TAB_MIN_LABEL);
@@ -8100,9 +8161,10 @@ mod tests {
     }
 
     #[test]
-    fn 탭이_세_개면_두_개만_남는다() {
+    fn 탭이_넷이면_셋만_남는다() {
         // 상한은 계약이다 — 헤더는 세션 제목이 우선이라 그 이상은 놓지 않는다.
-        assert_eq!(PANE_AUX_TAB_MAX, 2);
+        // 이력·Git·문서 셋이 정확히 다 찬다(설계 §2).
+        assert_eq!(PANE_AUX_TAB_MAX, 3);
     }
 
     /// 이력 X는 **UI 탭만** 닫는다 — 세션 닫기 확인이나 ClosePane이 나가면 설계 실패다.
@@ -8315,7 +8377,7 @@ mod tests {
                 .x;
             let buttons = pane_header_buttons(header, title_width, 4, aux_reserved);
             let left = pane_header_active_boundary(header, buttons.close);
-            geometry = pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width);
+            geometry = pane_aux_tab_geometry(header, left, buttons.toolbar_left, label_width, true);
         });
         geometry.expect("테스트 헤더에는 보조 탭이 들어간다")
     }

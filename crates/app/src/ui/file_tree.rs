@@ -379,6 +379,37 @@ pub enum SidebarAction {
     /// 워크스페이스를 만들어 전환한다. rfd 다이얼로그는 UI leaf가 아니라 App이 연다
     /// (기존 ws_create 관례, 2026-07-18).
     CreateWorkspaceFromPicker,
+    /// 파일 트리에서 문서 대상(md·txt 등) 파일을 열었다 — App이 포커스된 pane 위에
+    /// 문서 보조 탭을 연다(설계 §3.2). 그 외 확장자는 여전히 `FileTreeIoRequest::OpenPath`
+    /// 로 OS 기본 앱이 연다 — 이 액션으로 오지 않는다.
+    OpenDocument {
+        target: FileTreePathPayload,
+        kind: DocumentTargetKind,
+    },
+}
+
+/// 문서 탭으로 열리는 파일의 대상 종류(설계 §3.1). 순수 확장자 판정이라 filesystem에
+/// 접근하지 않는다 — host가 실존 regular file 여부를 다시 검증한다(기존 OpenPath 관례).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentTargetKind {
+    Markdown,
+    PlainText,
+}
+
+/// 더블클릭 대상이 문서 탭으로 열릴지 분류한다. `.md`/`.markdown`은 markdown,
+/// `.txt`/`.log`/확장자 없음은 평문. 그 외는 `None` — 기존 OS 열기 동작을 그대로
+/// 유지한다(설계 §3.1, 기존 동작을 빼앗지 않는다).
+fn classify_document_target(path: &Path) -> Option<DocumentTargetKind> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") => {
+            Some(DocumentTargetKind::Markdown)
+        }
+        Some(ext) if ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("log") => {
+            Some(DocumentTargetKind::PlainText)
+        }
+        None => Some(DocumentTargetKind::PlainText),
+        Some(_) => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2768,6 +2799,8 @@ impl FileTreeUi {
         let mut toggle: Option<PathBuf> = None;
         let mut navigate_root: Option<PathBuf> = None;
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
+        // 문서 대상(md·txt 등) 더블클릭 → 문서 탭. open_file과 같은 이유로 루프 밖에서 처리.
+        let mut open_document: Option<(PathBuf, DocumentTargetKind)> = None;
         let mut drop_action: Option<(PathBuf, PathBuf)> = None; // (src, dst_dir)
         let mut observed_row_height: Option<f32> = None;
         // ── OS 파일 반입 상태 (Finder → 트리, §드롭·⌘V) ──
@@ -3063,13 +3096,31 @@ impl FileTreeUi {
                             toggle = Some(row.path.clone());
                         }
                     } else if row_resp.double_clicked() || label_resp.double_clicked() {
-                        // host가 실존 regular file + 원본/realpath 허용 확장자를 다시 검증한
-                        // 뒤에만 연다. leaf는 filesystem metadata를 읽지 않는다.
-                        open_file = Some(row.path.clone());
+                        match classify_document_target(&row.path) {
+                            // 문서 대상(md·txt 등)은 문서 탭으로 연다 — App이 포커스된
+                            // pane 위에 연다(설계 §3.2). 검증(`self.reject_io`가 필요할 수
+                            // 있는 mutable self 접근)은 루프 밖(`row`의 대여가 끝난 뒤)에서
+                            // `open_document`로 미룬다 — `open_file`과 같은 관례.
+                            Some(kind) => open_document = Some((row.path.clone(), kind)),
+                            // 그 외 확장자는 예전 그대로 OS 기본 앱이 연다. host가 실존
+                            // regular file + 원본/realpath 허용 확장자를 다시 검증한 뒤에만
+                            // 연다. leaf는 filesystem metadata를 읽지 않는다.
+                            None => open_file = Some(row.path.clone()),
+                        }
                     }
                     // 우클릭 컨텍스트 메뉴 (FT-3) — 행 전체에서 열리게 row_resp에 단다
                     if !inaccessible {
                         row_resp.context_menu(|ui| {
+                            // 문서 대상은 더블클릭이 문서 탭으로 가로채므로, OS 기본 앱으로
+                            // 여는 예전 길을 메뉴에 남긴다(설계 §3.1, 기존 동작을 빼앗지
+                            // 않는다).
+                            if !row.is_dir
+                                && classify_document_target(&row.path).is_some()
+                                && ui.button(catalog.t("file_tree.open_with_os", &[])).clicked()
+                            {
+                                menu_action = Some(MenuAction::OpenWithOs(row.path.clone()));
+                                ui.close();
+                            }
                             let new_folder_parent = if row.is_dir {
                                 Some(row.path.clone())
                             } else {
@@ -3151,6 +3202,12 @@ impl FileTreeUi {
                 request.and_then(|request| self.queue_io(request, Vec::new(), None, None))
             {
                 self.reject_io(code);
+            }
+        }
+        if let Some((path, kind)) = open_document {
+            match FileTreePathPayload::try_new(path) {
+                Ok(target) => action = Some(SidebarAction::OpenDocument { target, kind }),
+                Err(code) => self.reject_io(code),
             }
         }
         if let Some((src, dst_dir)) = drop_action {
@@ -3293,6 +3350,18 @@ impl FileTreeUi {
                 Ok(path) => action = Some(SidebarAction::CdPath(path)),
                 Err(code) => self.reject_io(code),
             },
+            Some(MenuAction::OpenWithOs(path)) => {
+                let request =
+                    FileTreePathPayload::try_new(path).map(|target| FileTreeIoRequest::OpenPath {
+                        target,
+                        require_openable_file: true,
+                    });
+                if let Err(code) =
+                    request.and_then(|request| self.queue_io(request, Vec::new(), None, None))
+                {
+                    self.reject_io(code);
+                }
+            }
             None => {}
         }
         self.edit = edit;
@@ -3756,6 +3825,9 @@ enum MenuAction {
     CopyPath(PathBuf),
     InsertPath(PathBuf),
     CdPath(PathBuf),
+    /// 문서 대상 파일을 OS 기본 앱으로 연다 — 더블클릭이 문서 탭으로 가로챈 뒤에도
+    /// 남겨두는 우회로(설계 §3.1).
+    OpenWithOs(PathBuf),
 }
 
 /// 이름 검증 (§5): 빈 이름·경로 구분자·'.'/'..' 거부. Ok = 트림된 이름.

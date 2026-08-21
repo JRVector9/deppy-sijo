@@ -15190,7 +15190,12 @@ impl App {
     /// 문서 탭 본문 — D0 자리표시자다. 실제 로딩·편집·미리보기는 `document_io`·
     /// `markdown_viewer`를 채우는 다른 PR이 맡는다(설계 §9 D1·D2). 지금은 pane 본문
     /// rect가 App 소유로 넘어왔다는 것과 열린 파일명만 보여준다.
-    fn render_document_tab_body(&mut self, ui: &mut egui::Ui, body: egui::Rect, text: &i18n::Catalog) {
+    fn render_document_tab_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        body: egui::Rect,
+        text: &i18n::Catalog,
+    ) {
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(body)
@@ -25693,7 +25698,10 @@ impl eframe::App for App {
                 }
                 // 파일 트리에서 문서 대상(md·txt 등)을 열었다(D0) — kind는 아직 쓰지 않는다
                 // (본문은 자리표시자, 실제 소스/미리보기는 D1·D2가 채운다).
-                Some(ui::file_tree::SidebarAction::OpenDocument { target, kind: _kind }) => {
+                Some(ui::file_tree::SidebarAction::OpenDocument {
+                    target,
+                    kind: _kind,
+                }) => {
                     self.open_document(target.as_path().to_path_buf());
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →

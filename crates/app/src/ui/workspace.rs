@@ -8154,14 +8154,20 @@ mod tests {
             let mut previous_right: Option<f32> = None;
             for placement in &placements {
                 let aux = placement.geometry;
-                assert!(aux.label_width >= PANE_AUX_TAB_MIN_LABEL, "{width}: 라벨 0폭");
+                assert!(
+                    aux.label_width >= PANE_AUX_TAB_MIN_LABEL,
+                    "{width}: 라벨 0폭"
+                );
                 assert!(
                     aux.tab.right() <= buttons.toolbar_left.min(header.right()) + 0.001,
                     "{width}: 보조 탭이 도구/헤더 경계를 넘었다"
                 );
                 assert!(aux.tab.left() >= close.right(), "{width}: 세션 닫기와 겹침");
                 if let Some(previous_right) = previous_right {
-                    assert!(aux.tab.left() >= previous_right, "{width}: 보조 탭끼리 겹침");
+                    assert!(
+                        aux.tab.left() >= previous_right,
+                        "{width}: 보조 탭끼리 겹침"
+                    );
                 }
                 previous_right = Some(aux.tab.right());
                 match aux.close {
@@ -8174,8 +8180,14 @@ mod tests {
             }
             width += 1.0;
         }
-        assert!(saw_close_stripped, "좁아지면 ×부터 접혀야 한다(축약 순서 ⓐ)");
-        assert!(saw_tab_dropped, "가장 좁은 폭에서는 탭 자체도 접혀야 한다(축약 순서 ⓑ)");
+        assert!(
+            saw_close_stripped,
+            "좁아지면 ×부터 접혀야 한다(축약 순서 ⓐ)"
+        );
+        assert!(
+            saw_tab_dropped,
+            "가장 좁은 폭에서는 탭 자체도 접혀야 한다(축약 순서 ⓑ)"
+        );
     }
 
     /// 라벨은 들어가지만 X까지는 안 들어가는 폭에서는 **X만** 버리고 탭 전환은 남긴다.
@@ -8192,8 +8204,8 @@ mod tests {
         // 라벨 끝(=76+10+20=106) 뒤로 6pt만 남기면 X(중심 +14, 반폭 10, 여백 6)가 못 들어간다.
         let toolbar_left = 112.0;
         let left = pane_header_active_boundary(header, session_close);
-        let aux =
-            pane_aux_tab_geometry(header, left, toolbar_left, 20.0, true).expect("라벨은 들어가야 한다");
+        let aux = pane_aux_tab_geometry(header, left, toolbar_left, 20.0, true)
+            .expect("라벨은 들어가야 한다");
 
         assert_eq!(aux.close, None, "자리가 없으면 X만 접는다");
         assert!(aux.label_width >= PANE_AUX_TAB_MIN_LABEL);
@@ -8256,7 +8268,11 @@ mod tests {
             ],
             |_| 30.0,
         );
-        assert_eq!(placements.len(), 2, "×를 뺀 두 탭 다 들어가야 한다: {placements:?}");
+        assert_eq!(
+            placements.len(),
+            2,
+            "×를 뺀 두 탭 다 들어가야 한다: {placements:?}"
+        );
         assert!(
             placements.iter().all(|p| p.geometry.close.is_none()),
             "이 폭에서는 ×가 전부 접혀야 한다: {placements:?}"
@@ -8285,7 +8301,11 @@ mod tests {
             ],
             |_| 30.0,
         );
-        assert_eq!(placements.len(), 1, "이 폭에서는 한 탭만 남아야 한다: {placements:?}");
+        assert_eq!(
+            placements.len(),
+            1,
+            "이 폭에서는 한 탭만 남아야 한다: {placements:?}"
+        );
         assert_eq!(
             placements[0].kind,
             PaneAuxTabKind::History,
@@ -8306,7 +8326,8 @@ mod tests {
             aux_tab(PaneAuxTabKind::Git, "Git", false),
             aux_tab(PaneAuxTabKind::Document, "note.md", true),
         ];
-        let place = |toolbar_left: f32| layout_aux_tabs(header, close, toolbar_left, &tabs, |_| 30.0);
+        let place =
+            |toolbar_left: f32| layout_aux_tabs(header, close, toolbar_left, &tabs, |_| 30.0);
         let has_close = |placements: &[AuxTabPlacement], kind: PaneAuxTabKind| {
             placements
                 .iter()
@@ -13844,4 +13865,3 @@ https://example.test/login \
         }
     }
 }
-

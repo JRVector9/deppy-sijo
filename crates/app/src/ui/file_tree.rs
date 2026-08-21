@@ -3116,7 +3116,9 @@ impl FileTreeUi {
                             // 않는다).
                             if !row.is_dir
                                 && classify_document_target(&row.path).is_some()
-                                && ui.button(catalog.t("file_tree.open_with_os", &[])).clicked()
+                                && ui
+                                    .button(catalog.t("file_tree.open_with_os", &[]))
+                                    .clicked()
                             {
                                 menu_action = Some(MenuAction::OpenWithOs(row.path.clone()));
                                 ui.close();

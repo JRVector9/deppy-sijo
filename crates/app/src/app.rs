@@ -1502,6 +1502,31 @@ fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
     ) || runtime_command_is_targeted_workspace_restore(command)
 }
 
+/// dotenv 동기화가 실패했을 때도 통과시킬 continuation인가(2026-08-21).
+///
+/// **세션을 여는 일은 `.env`와 독립이어야 한다.** `.env` 한 줄이 문제라고 그
+/// 워크스페이스에서 셸도 에이전트도 못 열면, 정작 그 `.env`를 고치러 들어갈 수단마저
+/// 사라진다(사용자 보고). 값 하나를 보호할 수 없는 경우는 이제 동기화 단계에서 그
+/// 항목만 제외하므로(`apply_workspace_dotenv_plan`), 여기까지 오는 실패는 저장소·키체인
+/// 장애 같은 계통 문제다 — 그때도 세션은 열려야 한다.
+///
+/// 복원(`RestoreWorkspace`/`RestoreWorkspacePane`)은 제외한다. 그건 사용자가 방금 누른
+/// 동작이 아니라 자동 절차라, 환경이 불완전한 채로 밀어붙일 이유가 없다.
+fn dotenv_failure_allows_session(continuation: &PendingDotenvContinuation) -> bool {
+    let command = match continuation {
+        PendingDotenvContinuation::RuntimeCommand(command) => command,
+        PendingDotenvContinuation::WorkspaceProtocol { command, .. } => command,
+        PendingDotenvContinuation::AgentLaunch { command, .. } => command,
+        PendingDotenvContinuation::PrimaryPaneActivation { .. } => return false,
+    };
+    matches!(
+        command,
+        runtime::RuntimeCommand::SpawnShell { .. }
+            | runtime::RuntimeCommand::SplitPane { .. }
+            | runtime::RuntimeCommand::SpawnAgent { .. }
+    )
+}
+
 fn runtime_command_creates_session(command: &runtime::RuntimeCommand) -> bool {
     matches!(
         command,
@@ -3280,11 +3305,26 @@ fn execute_dotenv_sync_job(
                 payload,
             })
         }
-        Err(_) => {
+        Err(error) => {
+            // 이 게이트는 fail-closed다 — 여기서 실패하면 그 워크스페이스에서는 빈
+            // 터미널조차 열리지 않는다. 이유를 버리면(예전엔 `Err(_)`였다) 로그에
+            // "execute_failed"만 남아 원인을 좁힐 수단이 전혀 없다(2026-08-21 사용자
+            // 보고: 특정 워크스페이스가 열리지 않는데 로그에 이유가 없었다).
+            //
+            // 에러 문구에 .env 값이 섞여 들어올 수 있으므로 **레닥션을 거쳐** 남긴다 —
+            // 이 저장소는 디스크 기록 전부에 레닥션을 요구한다.
+            // StreamRedactor는 비밀이 청크 경계에 걸칠 수 있어 뒤끝을 버퍼에 쥐고 있다 —
+            // flush()로 남은 것까지 꺼내지 않으면 문구가 통째로 비어 나온다(첫 시도에서
+            // `error=`가 빈 채로 찍혔다).
+            let mut redactor = resource.redaction.stream_redactor();
+            let mut redacted = redactor.redact_chunk(format!("{error:#}").as_bytes());
+            redacted.extend(redactor.flush());
+            let detail = String::from_utf8_lossy(&redacted).into_owned();
             tracing::warn!(
                 kind = "dotenv",
                 phase = "synchronize",
                 error_code = "execute_failed",
+                error = %detail,
                 "dotenv synchronization failed"
             );
             Err(crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)
@@ -19487,6 +19527,72 @@ impl App {
             _ => None,
         };
         let Some(outcome) = outcome else {
+            // 세션은 .env와 독립이다(위 dotenv_failure_allows_session 주석 참고).
+            //
+            // `runtime.dotenv_state`는 **절대 건드리지 않는다**. 여기서 baseline을
+            // 기록하면 execute_dotenv_sync_job이 다음 요청을 "변한 게 없다"며 건너뛰어
+            // (`job.previous_state == Some(baseline)`) 재시도가 영영 막힌다. 동기화는
+            // 여전히 실패한 상태로 남겨두고 세션만 통과시킨다.
+            if dotenv_failure_allows_session(&pending.continuation) {
+                // 에이전트면 승인 티켓을 성공 경로와 **동일하게** 소비한다. 빼먹으면
+                // 티켓이 미소비로 남아 승인 추적이 어긋나고 런처 요청이 매달린다.
+                if let Some(ticket_id) = agent_ticket
+                    && !self
+                        .approval_launch_tracker
+                        .mark_spawn_sent(ticket_id, std::time::Instant::now())
+                {
+                    self.agents_ui
+                        .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+                    if let Some(request_id) = launcher_request_id {
+                        self.fail_agent_launcher_request(request_id);
+                    }
+                    tracing::warn!(
+                        kind = "agent",
+                        phase = "spawn_admission",
+                        error_code = "stale_ticket",
+                        "agent launch ticket expired before delivery"
+                    );
+                    return;
+                }
+            }
+            if dotenv_failure_allows_session(&pending.continuation)
+                && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
+            {
+                let delivered = match pending.continuation {
+                    PendingDotenvContinuation::AgentLaunch { command, .. } => {
+                        runtime.runtime.send_command(command).is_ok()
+                    }
+                    PendingDotenvContinuation::WorkspaceProtocol {
+                        operation,
+                        generation,
+                        command,
+                    } => {
+                        let delivered = runtime.runtime.send_command(command).is_ok();
+                        runtime.workspace_ui.complete_protocol(
+                            ui::workspace::WorkspaceProtocolCompletion {
+                                operation,
+                                generation,
+                                result: delivered.then_some(()).ok_or(
+                                    ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed,
+                                ),
+                            },
+                        );
+                        delivered
+                    }
+                    PendingDotenvContinuation::RuntimeCommand(command) => {
+                        runtime.runtime.send_command(command).is_ok()
+                    }
+                    _ => unreachable!("dotenv_failure_allows_session이 세션 생성만 통과시킨다"),
+                };
+                tracing::warn!(
+                    kind = "dotenv",
+                    phase = "continuation",
+                    error_code = "session_without_env",
+                    delivered,
+                    "dotenv sync failed; opened the session without project env"
+                );
+                return;
+            }
             if restore_lifetime
                 && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
             {
@@ -34365,6 +34471,60 @@ mod tests {
 
     /// ⑦ 검증: .env 외부 수정 감지의 근거인 baseline 상태가 파일 변경/생성/삭제를
     /// 구분한다 — 2초 점검이 이 값의 변화로 재동기화를 트리거한다(B 경로).
+    #[test]
+    fn dotenv_동기화가_실패해도_세션은_열리고_복원만_막힌다() {
+        // 세션을 여는 일은 `.env`와 독립이어야 한다(2026-08-21 사용자 지시). 셸이든
+        // 에이전트든, `.env` 사정 때문에 못 열리면 정작 그 `.env`를 고칠 수단이 없다.
+        // 값 하나를 보호할 수 없는 경우는 동기화 단계에서 그 항목만 제외하므로
+        // (`apply_workspace_dotenv_plan`), 여기까지 오는 실패는 계통 장애다.
+        // 자동 복원만은 예외로 둔다 — 사용자가 방금 누른 동작이 아니다.
+        let shell = || runtime::RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 1000,
+        };
+
+        assert!(
+            dotenv_failure_allows_session(&PendingDotenvContinuation::RuntimeCommand(shell())),
+            "빈 터미널은 .env 없이도 열려야 한다"
+        );
+        assert!(
+            dotenv_failure_allows_session(&PendingDotenvContinuation::WorkspaceProtocol {
+                operation: ui::workspace::WorkspaceProtocolOperation::for_test(1),
+                generation: 1,
+                command: shell(),
+            }),
+            "프로토콜 경로로 온 셸도 열려야 한다 — 빈 터미널 버튼이 이 경로다"
+        );
+        assert!(
+            dotenv_failure_allows_session(&PendingDotenvContinuation::AgentLaunch {
+                command: runtime::RuntimeCommand::SpawnAgent {
+                    agent_config_id: None,
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 1000,
+                    command: "/bin/sh".to_owned(),
+                    args: Vec::new(),
+                    env_plain: Vec::new(),
+                    env_secrets: Vec::new(),
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
+                },
+                approval_ticket: None,
+                launcher_request_id: None,
+            }),
+            "에이전트도 .env와 독립적으로 열려야 한다"
+        );
+        assert!(
+            !dotenv_failure_allows_session(&PendingDotenvContinuation::RuntimeCommand(
+                runtime::RuntimeCommand::RestoreWorkspace
+            )),
+            "자동 복원은 이 예외에 포함되지 않는다"
+        );
+    }
+
     #[test]
     fn dotenv_baseline은_외부_수정과_생성_삭제를_감지한다() {
         let dir = std::env::temp_dir().join(format!(

@@ -230,6 +230,15 @@ impl fmt::Debug for WorkspaceNotice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WorkspaceProtocolOperation(u64);
 
+#[cfg(test)]
+impl WorkspaceProtocolOperation {
+    /// 테스트에서만 쓰는 생성자 — 필드가 비공개라 App 쪽 테스트가 프로토콜 경로를
+    /// 재현할 수 없었다(2026-08-21).
+    pub(crate) fn for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceProtocolErrorCode {
     Busy,

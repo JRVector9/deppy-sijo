@@ -174,7 +174,13 @@ fn collect_dotenv_lines_bounded(content: &str) -> anyhow::Result<Vec<String>> {
 pub struct DotenvSyncReport {
     pub upserted: usize,
     pub removed: usize,
+    /// 보호할 수 없어 동기화에서 제외한 키(2026-08-21). 값은 담지 않는다 — 키 이름만.
+    /// 상한은 `DOTENV_SKIPPED_KEYS_MAX`.
+    pub skipped_keys: Vec<String>,
 }
+
+/// 리포트에 담는 제외 키의 상한. 넘으면 개수만 세고 이름은 더 담지 않는다.
+pub const DOTENV_SKIPPED_KEYS_MAX: usize = 32;
 
 /// Persistence projection used by dotenv orchestration. Storage rows must be mapped at the app
 /// composition root rather than crossing into this module.
@@ -1149,18 +1155,66 @@ pub fn apply_workspace_dotenv_plan(
     // even one value cannot enter the rotating redaction corpus, every previously acquired lease
     // drops here and the dotenv profile remains untouched.
     let mut prepared = Vec::with_capacity(plan.entries.len());
+    let mut skipped_keys: Vec<String> = Vec::new();
     for (key, value) in plan.entries {
         // Secret classification must match storage validation: a value the repository refuses to
         // persist as plain is prepared through the same redacted physical-slot path.
-        let needs_secret = is_secret_key(&key) || !repository.plain_env_value_allowed(&key, &value);
+        // 마스킹할 수 없는 값은 비밀로 다룰 수 없다(2026-08-21).
+        //
+        // `is_secret_key`는 부분 문자열 판정이라 매우 넓다 — "OAUTH"가 AUTH를,
+        // "ALLOW_PRIVATE_URLS"가 PRIVATE를 물어 secret으로 잡힌다. 그런데 그 값이
+        // redaction 최소 길이(6바이트) 미만이면 코퍼스에 등록할 수 없고, 예전엔 그것이
+        // 동기화 전체의 실패가 되어 `.env`의 빈 플레이스홀더 한 줄이 워크스페이스를
+        // 통째로 막았다(사용자 보고: `GITHUB_OAUTH_CLIENT_ID=`).
+        //
+        // 빈 값은 지킬 내용이 아예 없고, 1~5바이트 값도 마스킹이 불가능하다. 그런 값은
+        // 애초에 비밀이 아니므로 plain으로 저장한다 — 런타임의 fail-closed 계약
+        // (`resolve_secret_set`)은 건드리지 않는다. 저장소가 plain을 거부하면 예전대로
+        // 비밀 경로로 보내 fail-closed를 유지한다.
+        // 빈 값은 자격증명이 아니다 — 지킬 내용이 아예 없다. 키 이름만 보고 비밀로
+        // 분류하면 `.env`의 빈 플레이스홀더 한 줄이 워크스페이스를 통째로 막는다
+        // (2026-08-21 사용자 보고: `GITHUB_OAUTH_CLIENT_ID=`가 "OAUTH" 안의 AUTH에
+        // 걸려 비밀이 되고, 빈 값은 redaction 최소 길이에 미달해 동기화 전체가 죽었다).
+        //
+        // 빈 값이 **아닌** 짧은 값에는 이 예외를 주지 않는다. `is_secret_key`(부분문자열,
+        // 넓음)와 저장소의 `secret_like_env_key`(정확/접미사, 좁음) 사이에는 간극이 있어
+        // (`DB_PWD`, `*_CREDENTIAL` 등은 넓은 쪽만 잡는다), 길이만 보고 넓은 판정을
+        // 건너뛰면 `DB_PWD=1234` 같은 **진짜** 짧은 비밀이 SQLite에 평문으로 저장되고
+        // redaction 등록도 되지 않아 로그에 그대로 남는다(2026-08-21 리뷰 HIGH).
+        let needs_secret = if value.is_empty() {
+            !repository.plain_env_value_allowed(&key, &value)
+        } else {
+            is_secret_key(&key) || !repository.plain_env_value_allowed(&key, &value)
+        };
         let value = if needs_secret {
             let value = secret::SecretString::new(value);
-            let redaction_lease = redaction
-                .acquire_rotating(&value)
-                .map_err(|_| static_secret_error(ERROR_SECRET_REDACTION))?;
-            PreparedDotenvValue::Secret {
-                value,
-                _redaction_lease: redaction_lease,
+            match redaction.acquire_rotating(&value) {
+                Ok(redaction_lease) => PreparedDotenvValue::Secret {
+                    value,
+                    _redaction_lease: redaction_lease,
+                },
+                // **이 값 하나**가 너무 짧아 마스킹할 수 없는 경우만 그 항목을 뺀다
+                // (2026-08-21). 예전엔 동기화 전체를 죽였고, 그래서 `.env` 50줄 중
+                // 1줄이 걸리면 나머지 49줄도 반영되지 않고 워크스페이스가 통째로 막혔다.
+                //
+                // 빼는 것이 평문 저장보다 안전하다 — 마스킹할 수 없는 값을 SQLite에
+                // 평문으로 남기면 로그로도 샌다. 제외한 키는 리포트로 올린다.
+                Err(secret::RedactionCapacityError::SecretTooShort { .. }) => {
+                    tracing::warn!(
+                        kind = "dotenv",
+                        phase = "prepare",
+                        error_code = "unprotectable_value",
+                        key = %key,
+                        "dotenv value is too short to mask; excluded from this workspace"
+                    );
+                    skipped_keys.push(key);
+                    continue;
+                }
+                // 코퍼스 고갈·fail-closed 같은 **계통** 실패는 예전대로 전체를 거부한다.
+                // 이걸 항목별 제외로 처리하면 모든 비밀이 빠지고, 뒤의 prune 루프가
+                // 기존 credential과 키체인 항목을 통째로 지운다 — 일시적 장애가 영구
+                // 데이터 손실이 된다(2026-08-21, 기존 계약 테스트 2건이 이걸 지킨다).
+                Err(_) => return Err(static_secret_error(ERROR_SECRET_REDACTION)),
             }
         } else {
             PreparedDotenvValue::Plain(value)
@@ -1184,6 +1238,8 @@ pub fn apply_workspace_dotenv_plan(
     let dotenv_owned = repository
         .list_dotenv_owned_credential_ids(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?;
     let mut report = DotenvSyncReport::default();
+    skipped_keys.truncate(DOTENV_SKIPPED_KEYS_MAX);
+    report.skipped_keys = skipped_keys;
 
     for (key, value) in &prepared {
         let current = existing.iter().find(|v| &v.key == key);
@@ -3329,6 +3385,86 @@ INVALID LINE
     }
 
     #[test]
+    fn 보호할_수_없는_값은_그_항목만_제외되고_동기화는_계속된다() {
+        // 2026-08-21 사용자 보고: `.env`에 `GITHUB_OAUTH_CLIENT_ID=`(빈 값)가 있으면
+        // 그 워크스페이스에서 빈 터미널조차 열리지 않았다. 키 이름이 secret으로
+        // 분류되는데("OAUTH"가 AUTH를 포함) 빈 값은 redaction 최소 길이(6바이트)에
+        // 걸려 동기화 전체가 fail-closed로 죽었기 때문이다.
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-short-secret-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
+        let store = MemStore::new();
+        let redaction = secret::RedactionService::new();
+        let workspace_id = db.create_workspace("test").unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            // 빈 secret 값 둘 + 정상 길이 하나.
+            "GITHUB_OAUTH_CLIENT_ID=\nGITHUB_OAUTH_CLIENT_SECRET=\nAUTH_SECRET=long-enough-to-redact\n",
+        )
+        .unwrap();
+
+        let report =
+            sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &workspace_id, &dir)
+                .expect("빈 값 때문에 동기화 전체가 실패하면 안 된다");
+
+        assert!(report.is_some(), "프로필이 만들어져야 한다");
+        assert!(
+            db.list_env_profiles(&workspace_id)
+                .unwrap()
+                .into_iter()
+                .any(|profile| profile.kind == DOTENV_PROFILE_KIND),
+            "dotenv 프로필이 남아야 한다"
+        );
+
+        // 보호할 수 없는 값이 섞여도 **나머지는 동기화된다**(2026-08-21). 예전엔 그
+        // 한 줄이 동기화 전체를 죽여 워크스페이스가 통째로 막혔다. 그 값은 평문으로
+        // 강등되지도 않는다 — 마스킹할 수 없는 값을 SQLite에 평문으로 남기면 로그로도
+        // 샌다. 제외하고, 어떤 키였는지 리포트로 올린다.
+        std::fs::write(
+            dir.join(".env"),
+            "DB_PWD=1234\nKEEP_ME=plain-value\nGOOD_SECRET=long-enough-to-redact\n",
+        )
+        .unwrap();
+        let report =
+            sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &workspace_id, &dir)
+                .expect("보호 못 하는 값 하나가 동기화 전체를 죽이면 안 된다")
+                .expect("변경이 있으므로 리포트가 있어야 한다");
+        assert_eq!(
+            report.skipped_keys,
+            vec!["DB_PWD".to_owned()],
+            "보호할 수 없는 키는 제외 목록에 올라야 한다"
+        );
+
+        let profile_id = db
+            .list_env_profiles(&workspace_id)
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.kind == DOTENV_PROFILE_KIND)
+            .expect("dotenv 프로필")
+            .id;
+        let keys = db
+            .list_env_vars(&profile_id)
+            .unwrap()
+            .into_iter()
+            .map(|var| var.key)
+            .collect::<Vec<_>>();
+        assert!(
+            keys.contains(&"KEEP_ME".to_owned()) && keys.contains(&"GOOD_SECRET".to_owned()),
+            "나머지 항목은 반영돼야 한다: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"DB_PWD".to_owned()),
+            "보호 못 하는 값은 평문으로도 저장되면 안 된다: {keys:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn 백회_rotation뒤에도_keyring_ledger_redaction_corpus가_증가하지_않는다() {
         struct FixedClock;
         impl secret::RedactionClock for FixedClock {
@@ -3794,7 +3930,20 @@ INVALID LINE
         ] {
             assert!(is_secret_key(k), "{k}는 secret이어야 함");
         }
-        for k in ["NODE_ENV", "PORT", "LOG_LEVEL"] {
+        // `PRIVATE_KEY`는 잡되 `PRIVATE` 단독은 잡지 않는다(2026-08-21) — 저장소의
+        // `secret_like_env_key`와 같은 기준이다.
+        assert!(
+            is_secret_key("SSH_PRIVATE_KEY"),
+            "PRIVATE_KEY는 secret이어야 함"
+        );
+        for k in [
+            "NODE_ENV",
+            "PORT",
+            "LOG_LEVEL",
+            // 평범한 플래그가 비밀로 잡히면, 값이 짧을 때 dotenv 동기화 전체가
+            // fail-closed로 죽어 워크스페이스가 통째로 막힌다(사용자 보고).
+            "ALLOW_PRIVATE_URLS",
+        ] {
             assert!(!is_secret_key(k), "{k}는 plain이어야 함");
         }
     }

@@ -4624,6 +4624,12 @@ impl SecretLikeReason {
 }
 
 fn secret_like_env_plain_reason(key: &str, value: &str) -> Option<SecretLikeReason> {
+    // 빈 값은 자격증명이 아니다 — 지킬 내용이 없다. 키 이름만 보고 거부하면 `.env`의
+    // 빈 플레이스홀더(`GITHUB_OAUTH_CLIENT_SECRET=`)를 저장할 방법이 사라진다
+    // (2026-08-21 사용자 보고: 그 한 줄이 워크스페이스 전체를 막았다).
+    if value.is_empty() {
+        return None;
+    }
     if secret_like_env_key(key) {
         return Some(SecretLikeReason::EnvKey);
     }

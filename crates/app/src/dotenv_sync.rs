@@ -1199,6 +1199,12 @@ pub fn apply_workspace_dotenv_plan(
                 //
                 // 빼는 것이 평문 저장보다 안전하다 — 마스킹할 수 없는 값을 SQLite에
                 // 평문으로 남기면 로그로도 샌다. 제외한 키는 리포트로 올린다.
+                // `SecretTooLarge`는 여기에 **넣지 않는다**. 리뷰에서 "값 하나의 길이만
+                // 보는 값 단위 실패"라는 지적이 있었으나 사실이 아니다 — 그 상한은
+                // `maximum_input_len() = max_bytes / 128`로 **코퍼스 설정에서 파생**된다.
+                // 코퍼스가 작게 잡히면 모든 값이 too-large가 되고, 전부 제외되면 뒤의
+                // prune 루프가 기존 credential과 키체인 항목을 통째로 지운다. 기존 계약
+                // 테스트 2건이 정확히 그 시나리오를 지킨다(2026-08-21, 되돌린 시도).
                 Err(secret::RedactionCapacityError::SecretTooShort { .. }) => {
                     tracing::warn!(
                         kind = "dotenv",

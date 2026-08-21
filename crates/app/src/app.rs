@@ -19555,6 +19555,8 @@ impl App {
                     return;
                 }
             }
+            // runtime을 mut로 빌리기 전에 만들어 둔다 — 안에서 self를 다시 못 빌린다.
+            let fallback_cache_policy = self.terminal_cache_policy_command();
             if dotenv_failure_allows_session(&pending.continuation)
                 && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
             {
@@ -19584,13 +19586,31 @@ impl App {
                     }
                     _ => unreachable!("dotenv_failure_allows_session이 세션 생성만 통과시킨다"),
                 };
+                // 캐시 정책은 성공 경로가 모든 세션에 반드시 보내는 것이다. 여기서
+                // 빼면 그 워커는 다음 설정 변경 때까지 기본 예산으로 돈다(2026-08-21 리뷰).
+                let _ = runtime.runtime.send_command(fallback_cache_policy);
                 tracing::warn!(
                     kind = "dotenv",
                     phase = "continuation",
                     error_code = "session_without_env",
+                    workspace_id = %pending.workspace_id,
                     delivered,
                     "dotenv sync failed; opened the session without project env"
                 );
+                if delivered && is_agent_launch {
+                    // 성공 경로와 **같은 뒷정리**를 한다. `mark_launch_accepted`를 빼면
+                    // `pending_agent_spawns`가 안 늘어, 곧바로 워크스페이스를 전환했을 때
+                    // `has_live_sessions`가 그 워크스페이스를 죽은 것으로 오판해 방금
+                    // 띄운 에이전트 PTY가 suspend로 죽을 수 있다(2026-07-05에 고쳤던
+                    // race를 이 경로에만 재도입하는 셈이었다, 2026-08-21 리뷰 HIGH).
+                    self.agents_ui.mark_launch_accepted();
+                    self.reveal_active_workspace_for_new_session();
+                }
+                if delivered {
+                    // env 없이 떴다는 사실이 사용자에게 보여야 한다 — 로그만 남기면
+                    // 에이전트가 인증 실패로 죽어도 원인을 알 수 없다(리뷰 HIGH).
+                    self.notify_session_without_env();
+                }
                 return;
             }
             if restore_lifetime
@@ -19671,15 +19691,23 @@ impl App {
         }
         let live_reload = self.config.ui.env_live_reload;
         let cache_policy = self.terminal_cache_policy_command();
+        let mut skipped_env_keys: Vec<String> = Vec::new();
         if let Some(payload) = &mut payload {
             if let Some(report) = payload.report.take()
-                && report.upserted + report.removed > 0
+                && report.upserted + report.removed + report.skipped_keys.len() > 0
             {
                 tracing::info!(
                     upserted = report.upserted,
                     removed = report.removed,
+                    // 보호할 수 없어 제외한 키. 채우기만 하고 여기서 버리면 사용자가
+                    // "이 환경변수가 왜 세션에 없지"를 알 방법이 없다(2026-08-21 리뷰).
+                    skipped = report.skipped_keys.len(),
+                    skipped_keys = %report.skipped_keys.join(","),
                     "dotenv launch synchronization"
                 );
+                if !report.skipped_keys.is_empty() {
+                    skipped_env_keys = report.skipped_keys.clone();
+                }
             }
             if live_reload && let Some(root) = pending.root.as_deref() {
                 payload
@@ -19689,6 +19717,17 @@ impl App {
                     .env_plain
                     .push(("DEPPY_PROJECT_ROOT".to_owned(), root.display().to_string()));
             }
+        }
+        if !skipped_env_keys.is_empty() {
+            // 제외된 키를 사용자에게 알린다. 로그만 남기면 "이 환경변수가 왜 세션에
+            // 없지"를 알 방법이 없다(2026-08-21 리뷰: skipped_keys가 죽은 데이터였다).
+            platform::notify(
+                &self.i18n.t(
+                    "dotenv.keys_excluded",
+                    &[("keys", &skipped_env_keys.join(", "))],
+                ),
+                "",
+            );
         }
         let restore_command_allowed = restore_pane.as_ref().is_none_or(|pane| {
             self.cross_workspace_restore
@@ -21808,6 +21847,13 @@ impl App {
             );
             platform::notify(&summary, &body);
         }
+    }
+
+    /// dotenv 동기화가 실패한 채로 세션을 열었을 때(2026-08-21). 세션을 여는 일은
+    /// `.env`와 독립이지만, **프로젝트 환경 없이 떴다는 사실은 보여야 한다** — 안
+    /// 보이면 에이전트가 인증 실패로 죽어도 사용자가 원인을 알 수 없다.
+    fn notify_session_without_env(&self) {
+        platform::notify(&self.i18n.t("dotenv.session_without_env", &[]), "");
     }
 
     /// warm(비활성) 워크스페이스 행의 「이어가기」가 실패했을 때 — 전환 자체가

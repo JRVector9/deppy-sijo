@@ -146,8 +146,13 @@ impl TerminalRenderCache {
 struct RowRenderCache {
     bg_runs: Vec<RowBgRun>,
     text_runs: Vec<RowTextRun>,
+    /// 밑줄·취소선은 갤리(TextFormat)가 아니라 셀 격자 위에 직접 긋는다(2026-08-21).
+    /// 갤리에 맡기면 공백과 wide 문자마다 run이 끊겨 선이 토막나 보인다.
+    underline_runs: Vec<RowBgRun>,
+    strikeout_runs: Vec<RowBgRun>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowBgRun {
     start_col: usize,
     end_col: usize,
@@ -160,9 +165,25 @@ struct RowTextRun {
     color: egui::Color32,
 }
 
-/// bold 셀에 쓸 모노 굵은 폰트 패밀리 이름 (B-1). 앱(fonts.rs)이 같은 이름으로 등록한다 —
-/// 미등록이면 egui가 기본 Monospace로 폴백하므로 안전하다.
+/// bold 셀에 쓸 모노 굵은 폰트 패밀리 이름 (B-1). 앱(fonts.rs)이 같은 이름으로 등록한다.
+///
+/// **미등록이면 egui는 폴백하지 않고 패닉한다** — `FontFamily::Name`이 어떤 폰트에도
+/// 묶여 있지 않으면 epaint가 `panic!("FontFamily::{{family:?}} is not bound to any fonts")`로
+/// 죽는다(egui 0.35 실측, 2026-08-21 리뷰). 예전 주석은 "기본 Monospace로 폴백하므로
+/// 안전하다"고 적혀 있었으나 사실이 아니었다. 그래서 렌더러가 직접 등록 여부를 확인하고
+/// 미등록이면 Monospace로 내려간다(`mono_bold_family_ready`).
 pub const MONO_BOLD_FAMILY: &str = "mono_bold";
+
+/// bold 패밀리가 실제로 등록돼 있는지 — 미등록 상태로 그리면 epaint가 패닉하므로,
+/// 프레임마다 한 번 확인해 bold run의 폴백 여부를 정한다(2026-08-21).
+/// 폰트 설정을 런타임에 바꿀 수 있어 한 번 캐시하지 않고 프레임마다 본다.
+fn mono_bold_family_ready(ctx: &egui::Context) -> bool {
+    ctx.fonts(|fonts| {
+        fonts.families().iter().any(|family| {
+            matches!(family, egui::FontFamily::Name(name) if name.as_ref() == MONO_BOLD_FAMILY)
+        })
+    })
+}
 
 /// 속성이 적용된 셀 텍스트 갤리를 만든다 (B-1). bold는 굵은 패밀리, italic은 egui가
 /// 합성(기울임), underline/strikeout은 TextFormat의 선, dim은 색을 낮춘다.
@@ -172,12 +193,14 @@ fn layout_attr_text(
     font_id: &egui::FontId,
     color: egui::Color32,
     attrs: CellAttrs,
+    bold_family_ready: bool,
 ) -> Arc<egui::Galley> {
     if attrs.is_empty() {
-        return painter.layout_no_wrap(text, font_id.clone(), color);
+        return layout_spaced(painter, text, font_id.clone(), color, false);
     }
     let mut font = font_id.clone();
-    if attrs.contains(CellAttrs::BOLD) {
+    // 미등록 패밀리를 지정하면 epaint가 패닉한다 — 등록됐을 때만 바꾼다.
+    if attrs.contains(CellAttrs::BOLD) && bold_family_ready {
         font.family = egui::FontFamily::Name(MONO_BOLD_FAMILY.into());
     }
     let color = if attrs.contains(CellAttrs::DIM) {
@@ -185,21 +208,31 @@ fn layout_attr_text(
     } else {
         color
     };
-    let line = egui::Stroke::new(1.0, color);
+    // 밑줄은 여기서 긋지 않는다 — 셀 격자 위에 직접 그어야 공백/wide 문자에서
+    // 끊기지 않는다(underline_runs).
+    layout_spaced(
+        painter,
+        text,
+        font,
+        color,
+        attrs.contains(CellAttrs::ITALIC),
+    )
+}
+
+/// 자간을 반영한 갤리를 만든다 — 셀 폭과 같은 값을 써야 격자와 어긋나지 않는다.
+fn layout_spaced(
+    painter: &egui::Painter,
+    text: String,
+    font: egui::FontId,
+    color: egui::Color32,
+    italics: bool,
+) -> Arc<egui::Galley> {
+    let extra = extra_letter_spacing(font.size);
     let format = egui::TextFormat {
         font_id: font,
+        extra_letter_spacing: extra,
         color,
-        italics: attrs.contains(CellAttrs::ITALIC),
-        underline: if attrs.contains(CellAttrs::UNDERLINE) {
-            line
-        } else {
-            egui::Stroke::NONE
-        },
-        strikethrough: if attrs.contains(CellAttrs::STRIKEOUT) {
-            line
-        } else {
-            egui::Stroke::NONE
-        },
+        italics,
         ..Default::default()
     };
     let mut job = egui::text::LayoutJob::default();
@@ -231,10 +264,51 @@ pub fn cell_size(ctx: &egui::Context, metrics: CellMetrics) -> egui::Vec2 {
     let font_id = egui::FontId::monospace(metrics.font_size);
     ctx.fonts_mut(|fonts| {
         egui::vec2(
-            fonts.glyph_width(&font_id, 'M'),
+            fonts.glyph_width(&font_id, 'M') + extra_letter_spacing(metrics.font_size),
             fonts.row_height(&font_id) * metrics.line_height,
         )
     })
+}
+
+/// 글자 사이에 더하는 여백(2026-08-21). 모노 폰트의 원래 advance만 쓰면 글자가 서로
+/// 붙어 읽기 어려웠다.
+///
+/// 셀 폭(`cell_size`)과 갤리 레이아웃(`extra_letter_spacing`)에 **같은 값**이 들어가야
+/// 한다 — 한쪽만 넓히면 run 안에서 글자가 자기 셀에서 조금씩 밀려 커서·선택 영역과
+/// 어긋난다.
+fn extra_letter_spacing(font_size: f32) -> f32 {
+    (font_size * TERMINAL_LETTER_SPACING_RATIO).round()
+}
+
+/// 폰트 크기 대비 자간 비율 — 크기를 바꿔도 인상이 유지되도록 비례로 둔다.
+const TERMINAL_LETTER_SPACING_RATIO: f32 = 0.08;
+
+/// 밑줄·취소선 두께와, 밑줄을 글자 블록 바닥에서 끌어올리는 양.
+const UNDERLINE_THICKNESS: f32 = 1.0;
+const UNDERLINE_LIFT: f32 = 2.0;
+/// 취소선을 글자 블록 높이의 어디에 둘지(위에서부터의 비율).
+const STRIKEOUT_HEIGHT_RATIO: f32 = 0.55;
+
+/// 셀 격자 위에 가로선 런을 긋는다 — 밑줄과 취소선이 공유한다(2026-08-21).
+/// 갤리에 맡기지 않는 이유는 `RowRenderCache::underline_runs` 주석 참고.
+fn paint_cell_lines(
+    painter: &egui::Painter,
+    runs: &[RowBgRun],
+    origin_x: f32,
+    cell_width: f32,
+    y: f32,
+) {
+    for run in runs {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(origin_x + run.start_col as f32 * cell_width, y),
+            egui::pos2(
+                origin_x + run.end_col as f32 * cell_width,
+                y + UNDERLINE_THICKNESS,
+            ),
+        )
+        .round_to_pixels(painter.pixels_per_point());
+        painter.rect_filled(rect, 0.0, run.color);
+    }
 }
 
 /// snapshot을 그린다. preedit은 IME 조합 중 텍스트 — 커서 위치에 표시한다.
@@ -256,10 +330,13 @@ pub fn draw(
 ) -> RenderOutput {
     let font_id = egui::FontId::monospace(metrics.font_size);
     let cell = cell_size(ui.ctx(), metrics);
+    let bold_family_ready = mono_bold_family_ready(ui.ctx());
     // 셀 안에서 글자를 세로 중앙에 둔다 — 안 그러면 넓힌 행간이 전부 글자 아래로만 몰린다.
     // cell.y는 글자 높이 × line_height라 나누면 원래 글자 높이가 되고(config에서 0.8 하한으로
     // clamp되어 0으로 나눌 일이 없다), 그 차이의 절반이 위쪽 여백이다.
     let text_dy = (cell.y - cell.y / metrics.line_height) * 0.5;
+    // 글자 블록 높이(행간 배수를 뺀 순수 글자 높이) — 밑줄을 그 바로 아래에 둔다.
+    let text_height = cell.y / metrics.line_height;
     // hit-test/응답 rect는 pane 영역을 넘지 않게 clamp한다 — split/resize 직후
     // stale(더 큰) snapshot이 이웃 pane의 클릭/스크롤을 가로채는 것 방지 (codex 리뷰).
     // 넘치는 셀은 아래 content_rect로 잘리며 좌우 여백을 침범하지 않는다.
@@ -321,7 +398,14 @@ pub fn draw(
                 .and_then(|cached| cached.as_ref())
                 .is_none();
         if needs_rebuild {
-            let row_cache = build_row_cache(&painter, snapshot, row, &font_id, SNAPSHOT_DEFAULT_BG);
+            let row_cache = build_row_cache(
+                &painter,
+                snapshot,
+                row,
+                &font_id,
+                SNAPSHOT_DEFAULT_BG,
+                bold_family_ready,
+            );
             if let Some(slot) = cache.rows_cache.get_mut(row) {
                 *slot = Some(row_cache);
                 cache.counters.rows_rebuilt += 1;
@@ -346,9 +430,28 @@ pub fn draw(
                 let pos = origin + egui::vec2(run.col as f32 * cell.x, row_y + text_dy);
                 painter.galley(pos, Arc::clone(&run.galley), run.color);
             }
+            // 밑줄·취소선은 셀 경계까지 이어 긋는다 — 글자 아래/한가운데.
+            let text_top = origin.y + row_y + text_dy;
+            paint_cell_lines(
+                &painter,
+                &row_cache.underline_runs,
+                origin.x,
+                cell.x,
+                text_top + text_height - UNDERLINE_LIFT,
+            );
+            paint_cell_lines(
+                &painter,
+                &row_cache.strikeout_runs,
+                origin.x,
+                cell.x,
+                text_top + text_height * STRIKEOUT_HEIGHT_RATIO,
+            );
             cache.counters.rows_painted += 1;
-            cache.counters.shapes +=
-                row_cache.bg_runs.len() + row_cache.text_runs.len() + selection_shapes;
+            cache.counters.shapes += row_cache.bg_runs.len()
+                + row_cache.text_runs.len()
+                + row_cache.underline_runs.len()
+                + row_cache.strikeout_runs.len()
+                + selection_shapes;
         }
     }
 
@@ -458,6 +561,7 @@ fn build_row_cache(
     row: usize,
     font_id: &egui::FontId,
     default_bg: egui::Color32,
+    bold_family_ready: bool,
 ) -> RowRenderCache {
     let cols = snapshot.cols as usize;
     let row_start = row * cols;
@@ -466,6 +570,8 @@ fn build_row_cache(
         return RowRenderCache {
             bg_runs: Vec::new(),
             text_runs: Vec::new(),
+            underline_runs: Vec::new(),
+            strikeout_runs: Vec::new(),
         };
     };
 
@@ -482,34 +588,41 @@ fn build_row_cache(
         push_bg_run(&mut bg_runs, col, (col + width_cols).min(cols), bg);
     }
 
+    let (underline_runs, strikeout_runs) = build_line_runs(cells, cols);
+
     let mut text_runs = Vec::new();
     let mut pending = PendingTextRun::default();
     for (col, term_cell) in cells.iter().enumerate() {
         if term_cell.wide_spacer || term_cell.c == ' ' {
-            pending.flush(&mut text_runs, painter, font_id);
+            pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
             continue;
         }
 
         let fg = rgb(term_cell.fg);
         let attrs = term_cell.attrs;
         if term_cell.wide {
-            pending.flush(&mut text_runs, painter, font_id);
+            pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
             let text = display_char(term_cell.c).to_string();
             text_runs.push(RowTextRun {
                 col,
-                galley: layout_attr_text(painter, text, font_id, fg, attrs),
+                galley: layout_attr_text(painter, text, font_id, fg, attrs, bold_family_ready),
                 color: fg,
             });
         } else {
             if pending.needs_flush(col, fg, attrs) {
-                pending.flush(&mut text_runs, painter, font_id);
+                pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
             }
             pending.push(col, display_char(term_cell.c), fg, attrs);
         }
     }
-    pending.flush(&mut text_runs, painter, font_id);
+    pending.flush(&mut text_runs, painter, font_id, bold_family_ready);
 
-    RowRenderCache { bg_runs, text_runs }
+    RowRenderCache {
+        bg_runs,
+        text_runs,
+        underline_runs,
+        strikeout_runs,
+    }
 }
 
 #[derive(Default)]
@@ -544,6 +657,7 @@ impl PendingTextRun {
         text_runs: &mut Vec<RowTextRun>,
         painter: &egui::Painter,
         font_id: &egui::FontId,
+        bold_family_ready: bool,
     ) {
         let Some(color) = self.color.take() else {
             return;
@@ -555,10 +669,47 @@ impl PendingTextRun {
         let attrs = std::mem::take(&mut self.attrs);
         text_runs.push(RowTextRun {
             col: self.start_col,
-            galley: layout_attr_text(painter, text, font_id, color, attrs),
+            galley: layout_attr_text(painter, text, font_id, color, attrs, bold_family_ready),
             color,
         });
     }
+}
+
+/// 밑줄·취소선 런을 만든다(2026-08-21). 공백 셀도 SGR 속성을 물고 있으므로 함께 이어
+/// 붙인다 — 그래야 「A. 사이드네비 상태」처럼 단어 사이에서 선이 끊기지 않는다.
+///
+/// `wide_spacer` 칸은 `bg_runs`와 똑같이 건너뛴다. 두 종류가 다 걸린다:
+/// 소유자가 같은 행에 있는 **뒷칸**은 소유자가 이미 2칸을 덮었으니 다시 밀어넣으면
+/// 겹치는 run이 생기고, 행 끝 **필러**(`LEADING_WIDE_CHAR_SPACER`)는 소유자가 다음 줄에
+/// 있어 이 행엔 그릴 글자가 없는데도 pen 속성을 물고 있어 **빈 칸 아래 유령 밑줄**이
+/// 그려진다. 선택 하이라이트가 2026-08-18에 같은 자리에서 같은 실수를 했다
+/// (`selection_covers_cell` 주석 참고).
+fn build_line_runs(cells: &[crate::TerminalCell], cols: usize) -> (Vec<RowBgRun>, Vec<RowBgRun>) {
+    let mut underline_runs: Vec<RowBgRun> = Vec::new();
+    let mut strikeout_runs: Vec<RowBgRun> = Vec::new();
+    for (col, term_cell) in cells.iter().enumerate() {
+        if term_cell.wide_spacer {
+            continue;
+        }
+        let attrs = term_cell.attrs;
+        if !attrs.contains(CellAttrs::UNDERLINE) && !attrs.contains(CellAttrs::STRIKEOUT) {
+            continue;
+        }
+        let color = if attrs.contains(CellAttrs::DIM) {
+            dim_color(rgb(term_cell.fg))
+        } else {
+            rgb(term_cell.fg)
+        };
+        let width_cols = if term_cell.wide { 2 } else { 1 };
+        let end_col = (col + width_cols).min(cols);
+        if attrs.contains(CellAttrs::UNDERLINE) {
+            push_bg_run(&mut underline_runs, col, end_col, color);
+        }
+        if attrs.contains(CellAttrs::STRIKEOUT) {
+            push_bg_run(&mut strikeout_runs, col, end_col, color);
+        }
+    }
+    (underline_runs, strikeout_runs)
 }
 
 fn push_bg_run(runs: &mut Vec<RowBgRun>, start_col: usize, end_col: usize, color: egui::Color32) {
@@ -777,6 +928,130 @@ mod tests {
     use crate::AlacrittyBackend;
     use crate::backend::TerminalBackend;
     use crate::viewport_snapshot::{CellRange, CursorShape, CursorSnapshot, TerminalCell};
+
+    /// 밑줄 런 테스트용 셀 — 문자/속성/wide 지정.
+    fn line_cell(c: char, bits: u8, wide: bool, wide_spacer: bool) -> crate::TerminalCell {
+        crate::TerminalCell {
+            c,
+            fg: [0xd8; 3],
+            bg: [0x18, 0x18, 0x1c],
+            wide,
+            wide_spacer,
+            attrs: CellAttrs(bits),
+        }
+    }
+
+    #[test]
+    fn bold_패밀리가_미등록이면_기본_모노로_내려간다() {
+        // egui는 미등록 FontFamily::Name을 만나면 폴백하지 않고 패닉한다(0.35 실측).
+        // 등록 여부를 확인해 내려가지 않으면 bold 셀을 그리는 순간 렌더가 죽는다.
+        let ctx = egui::Context::default();
+        let mut checked = false;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ready = mono_bold_family_ready(ui.ctx());
+            assert!(
+                !ready,
+                "기본 Context에는 mono_bold가 등록돼 있지 않다 — 이 전제가 깨지면 테스트가 무의미하다"
+            );
+            // 폴백이 없으면 이 호출이 패닉한다.
+            let galley = layout_attr_text(
+                ui.painter(),
+                "A".to_owned(),
+                &egui::FontId::monospace(12.0),
+                egui::Color32::WHITE,
+                CellAttrs(CellAttrs::BOLD),
+                ready,
+            );
+            assert_eq!(
+                galley.job.sections[0].format.font_id.family,
+                egui::FontFamily::Monospace,
+                "미등록이면 Monospace로 내려가야 한다"
+            );
+            checked = true;
+        });
+        assert!(checked, "프레임이 돌지 않으면 검증이 비어 있다");
+    }
+
+    #[test]
+    fn 밑줄은_공백을_건너뛰지_않고_한_런으로_이어진다() {
+        // 원래 결함: 갤리에 밑줄을 맡기면 공백마다 run이 끊겨 밑줄이 토막나 보였다.
+        let u = CellAttrs::UNDERLINE;
+        let cells = vec![
+            line_cell('A', u, false, false),
+            line_cell(' ', u, false, false),
+            line_cell('B', u, false, false),
+        ];
+
+        let (underline, strikeout) = build_line_runs(&cells, 3);
+
+        assert_eq!(underline.len(), 1, "공백에서 끊기면 안 된다: {underline:?}");
+        assert_eq!(underline[0].start_col, 0);
+        assert_eq!(underline[0].end_col, 3);
+        assert!(strikeout.is_empty());
+    }
+
+    #[test]
+    fn 밑줄은_wide_문자의_뒷칸을_중복으로_담지_않는다() {
+        // wide 소유자가 이미 2칸을 덮으므로 뒷칸(wide_spacer)까지 밀어넣으면 겹치는
+        // run이 생긴다 — bg_runs는 이 칸을 건너뛴다. 같은 규칙을 지켜야 한다.
+        let u = CellAttrs::UNDERLINE;
+        let cells = vec![
+            line_cell('가', u, true, false),
+            line_cell(' ', u, false, true),
+            line_cell('나', u, true, false),
+            line_cell(' ', u, false, true),
+        ];
+
+        let (underline, _) = build_line_runs(&cells, 4);
+
+        assert_eq!(
+            underline,
+            vec![RowBgRun {
+                start_col: 0,
+                end_col: 4,
+                color: egui::Color32::from_rgb(0xd8, 0xd8, 0xd8),
+            }],
+            "wide 두 글자는 겹침 없이 한 런이어야 한다"
+        );
+    }
+
+    #[test]
+    fn 밑줄은_행끝_필러에_유령선을_긋지_않는다() {
+        // 행 끝 필러(LEADING_WIDE_CHAR_SPACER)는 소유자가 다음 줄에 있어 이 행엔 그릴
+        // 글자가 없는데도 pen 속성을 물고 있다 — 빈 칸 아래 밑줄이 그려지면 안 된다.
+        let u = CellAttrs::UNDERLINE;
+        let cells = vec![
+            line_cell('A', u, false, false),
+            line_cell(' ', u, false, true),
+        ];
+
+        let (underline, _) = build_line_runs(&cells, 2);
+
+        assert_eq!(
+            underline,
+            vec![RowBgRun {
+                start_col: 0,
+                end_col: 1,
+                color: egui::Color32::from_rgb(0xd8, 0xd8, 0xd8),
+            }],
+            "필러 칸까지 선이 넘어가면 안 된다"
+        );
+    }
+
+    #[test]
+    fn 취소선은_밑줄과_독립적으로_런을_만든다() {
+        let cells = vec![
+            line_cell('A', CellAttrs::UNDERLINE, false, false),
+            line_cell('B', CellAttrs::STRIKEOUT, false, false),
+        ];
+
+        let (underline, strikeout) = build_line_runs(&cells, 2);
+
+        assert_eq!(underline.len(), 1);
+        assert_eq!((underline[0].start_col, underline[0].end_col), (0, 1));
+        assert_eq!(strikeout.len(), 1);
+        assert_eq!((strikeout[0].start_col, strikeout[0].end_col), (1, 2));
+    }
 
     fn snap(cols: u16, rows: u16, text: &[&str]) -> TerminalViewportSnapshot {
         let mut cells = Vec::new();

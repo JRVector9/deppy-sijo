@@ -25256,13 +25256,18 @@ impl eframe::App for App {
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
                     self.agent_sessions_ui.open();
                 }
+                Some(ui::file_tree::SidebarAction::CheckUpdate) => {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/JRVector9/deppy-sijo/releases",
+                    ));
+                }
+                Some(ui::file_tree::SidebarAction::OpenFeedback) => {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/JRVector9/deppy-sijo/issues/new",
+                    ));
+                }
                 Some(ui::file_tree::SidebarAction::OpenSettings) => {
                     self.settings_open = true;
-                }
-                Some(ui::file_tree::SidebarAction::OpenHelp) => {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(
-                        "https://github.com/JRVector9/deppy-sijo",
-                    ));
                 }
                 // Git은 2026-08-15 2차부터 pane 보조 탭이다 — 새로고침/원격 열기/파일
                 // diff는 이제 git 패널이 보조 본문 안에서 App에 직접 올린다.

@@ -299,7 +299,6 @@ pub enum SidebarAction {
     ShowGit,
     OpenAgents,
     OpenSettings,
-    OpenHelp,
     /// 메모 본문이 바뀌었다. App이 디바운스해 DB에 쓴다(leaf는 IO를 하지 않는다).
     NoteEdited(String),
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
@@ -333,6 +332,10 @@ pub enum SidebarAction {
     NewShellSameFolder {
         session: runtime::SessionId,
     },
+    /// 도움말 메뉴 — 업데이트 확인(릴리스 페이지를 연다).
+    CheckUpdate,
+    /// 도움말 메뉴 — 피드백 보내기(이슈 페이지를 연다).
+    OpenFeedback,
     /// 저장된 에이전트 세션을 이 pane 셸에서 resume한다 (수동 이어가기).
     ResumeAgent {
         /// 이 행이 속한 워크스페이스 — 비활성(warm) 행이면 App이 먼저 전환한다
@@ -4069,7 +4072,14 @@ fn workspace_row(
 /// 낮추면 둘이 붙고, 44는 클릭 대상 최소 크기이기도 하다. 워크스페이스 목록처럼
 /// 여백 0으로 붙이려면 아이콘 위 라벨 아래 구성 자체를 버려야 한다.
 const SIDEBAR_NAV_ROW_HEIGHT: f32 = 44.0;
-const SIDEBAR_NAV_ITEM_SPACING: f32 = 2.0;
+/// 레일 내비 항목 세로 간격. 2.0이던 시절엔 아이콘+라벨 두 줄이 서로 붙어 읽기
+/// 어려웠다 — 항목 사이를 눈으로 끊을 수 있을 만큼 띄운다(2026-08-21).
+const SIDEBAR_NAV_ITEM_SPACING: f32 = 12.0;
+/// 하단 설정 dot 버튼의 지름과 좌측 여백.
+const NAV_UTILITY_DOT_SIZE: f32 = 22.0;
+const NAV_UTILITY_LEFT_PAD: f32 = 2.0;
+/// 도움말 팝업 메뉴 최소 너비.
+const NAV_HELP_MENU_MIN_WIDTH: f32 = 170.0;
 const PROJECT_SECTION_MIN_HEIGHT: f32 = 84.0;
 const FILE_SECTION_MIN_HEIGHT: f32 = 50.0;
 const PROJECT_FILE_SPLIT_HEIGHT: f32 = 6.0;
@@ -5603,7 +5613,6 @@ enum NavIcon {
     History,
     Git,
     Agents,
-    Settings,
     Help,
 }
 
@@ -5792,47 +5801,43 @@ fn nav_utility_height(width: f32) -> f32 {
 
 fn nav_utilities(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> Option<SidebarAction> {
     let mut action = None;
-    let stacked = ui.available_width() < 56.0;
-    if stacked {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.vertical_centered(|ui| {
-            let side = ui.available_width().min(24.0);
-            if nav_utility_button(
-                ui,
-                NavIcon::Settings,
-                &catalog.t("settings.title", &[]),
-                side,
-            )
-            .clicked()
-            {
-                action = Some(SidebarAction::OpenSettings);
-            }
-            if nav_utility_button(ui, NavIcon::Help, &catalog.t("sidebar.nav.help", &[]), side)
+    // 설정 하나만 남긴다(도움말 물음표는 2026-08-21에 뺐다). 가운데 정렬이 아니라
+    // 레일 가장 좌측에 붙인다 — 위쪽 내비 아이콘 열과 겹치지 않는 자리다.
+    ui.spacing_mut().item_spacing.x = 0.0;
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.add_space(NAV_UTILITY_LEFT_PAD);
+        let help = nav_utility_button(
+            ui,
+            NavIcon::Help,
+            &catalog.t("sidebar.nav.help", &[]),
+            NAV_UTILITY_DOT_SIZE,
+        );
+        // 버전 → 업데이트 → 피드백 → 설정 순(2026-08-21). 맨 윗줄은 버전 표시라
+        // 누를 수 없는 라벨이다.
+        egui::Popup::menu(&help).show(|ui| {
+            ui.set_min_width(NAV_HELP_MENU_MIN_WIDTH);
+            ui.label(catalog.t(
+                "sidebar.help.version",
+                &[("version", env!("CARGO_PKG_VERSION"))],
+            ));
+            ui.separator();
+            if ui
+                .button(catalog.t("sidebar.help.check_update", &[]))
                 .clicked()
             {
-                action = Some(SidebarAction::OpenHelp);
+                action = Some(SidebarAction::CheckUpdate);
+                ui.close();
             }
-        });
-    } else {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.horizontal_centered(|ui| {
-            if nav_utility_button(
-                ui,
-                NavIcon::Settings,
-                &catalog.t("settings.title", &[]),
-                28.0,
-            )
-            .clicked()
-            {
+            if ui.button(catalog.t("sidebar.help.feedback", &[])).clicked() {
+                action = Some(SidebarAction::OpenFeedback);
+                ui.close();
+            }
+            if ui.button(catalog.t("settings.title", &[])).clicked() {
                 action = Some(SidebarAction::OpenSettings);
-            }
-            if nav_utility_button(ui, NavIcon::Help, &catalog.t("sidebar.nav.help", &[]), 28.0)
-                .clicked()
-            {
-                action = Some(SidebarAction::OpenHelp);
+                ui.close();
             }
         });
-    }
+    });
     action
 }
 
@@ -5841,11 +5846,7 @@ fn nav_utility_button(ui: &mut egui::Ui, icon: NavIcon, label: &str, side: f32) 
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
-    if response.hovered() {
-        let tokens = crate::ui::designall::tokens(ui.visuals());
-        ui.painter()
-            .rect_filled(rect.shrink(2.0), 0.0, tokens.hover_background);
-    }
+    // hover 배경 없음 — 아이콘 색만 바뀐다(2026-08-21, nav_row와 같은 규칙).
     let color = if response.hovered() {
         ui.visuals().text_color()
     } else {
@@ -5896,7 +5897,9 @@ fn nav_row(
     }
     let row = rect.shrink2(egui::vec2(4.0, 0.0));
     let tokens = crate::ui::designall::tokens(ui.visuals());
-    if let Some(fill) = crate::ui::designall::row_fill(tokens, selected, response.hovered()) {
+    // hover에는 배경을 칠하지 않는다 — 아이콘/라벨 색만 바뀐다(2026-08-21).
+    // 선택된 항목의 면은 그대로 유지한다.
+    if let Some(fill) = crate::ui::designall::row_fill(tokens, selected, false) {
         ui.painter().rect_filled(row, 0.0, fill);
     }
     if selected {
@@ -6015,22 +6018,13 @@ fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Co
             p.circle_filled(egui::pos2(c.x - 2.5, c.y + 1.0), 1.2, col);
             p.circle_filled(egui::pos2(c.x + 2.5, c.y + 1.0), 1.2, col);
         }
-        NavIcon::Settings => {
-            p.circle_stroke(c, 5.0, stroke);
-            p.circle_stroke(c, 1.8, stroke);
-            for index in 0..8 {
-                let angle = index as f32 * std::f32::consts::TAU / 8.0;
-                let direction = egui::vec2(angle.cos(), angle.sin());
-                p.line_segment([c + direction * 5.5, c + direction * 7.0], stroke);
-            }
-        }
         NavIcon::Help => {
-            p.circle_stroke(c, 6.0, stroke);
+            p.circle_stroke(c, 4.5, stroke);
             p.text(
                 c,
                 egui::Align2::CENTER_CENTER,
                 "?",
-                egui::FontId::monospace(10.0),
+                egui::FontId::proportional(9.0),
                 col,
             );
         }
@@ -9817,7 +9811,7 @@ mod tests {
     }
 
     #[test]
-    fn kittest_설정은_레일하단에_고정되고_액션을_낸다() {
+    fn kittest_도움말_버튼은_레일하단에_고정되고_메뉴로_설정을_연다() {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -9854,14 +9848,28 @@ mod tests {
             );
         harness.run();
 
-        let settings_rect = harness.get_by_label("Settings").rect();
+        // 레일 하단에 고정되는 것은 이제 도움말(물음표) 버튼이다(2026-08-21).
+        let help_rect = harness.get_by_label("Help").rect();
         let rail = egui::PanelState::load(&harness.ctx, egui::Id::new("designall_navigation_rail"))
             .unwrap();
         assert!(
-            (settings_rect.bottom() - rail.outer_rect.bottom()).abs() < 4.0,
-            "settings bottom {} vs rail bottom {}",
-            settings_rect.bottom(),
+            (help_rect.bottom() - rail.outer_rect.bottom()).abs() < 4.0,
+            "help bottom {} vs rail bottom {}",
+            help_rect.bottom(),
             rail.outer_rect.bottom()
+        );
+
+        harness.get_by_label("Help").click();
+        harness.run();
+
+        // 메뉴 순서는 버전 → 업데이트 → 피드백 → 설정이다. 사용자가 지정한 순서라
+        // y좌표로 고정한다.
+        let update_y = harness.get_by_label("Check for updates").rect().top();
+        let feedback_y = harness.get_by_label("Send feedback").rect().top();
+        let settings_y = harness.get_by_label("Settings").rect().top();
+        assert!(
+            update_y < feedback_y && feedback_y < settings_y,
+            "메뉴 순서가 업데이트 < 피드백 < 설정이어야 한다: {update_y} / {feedback_y} / {settings_y}"
         );
 
         harness.get_by_label("Settings").click();

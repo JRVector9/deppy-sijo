@@ -7894,6 +7894,47 @@ mod tests {
         );
     }
 
+    /// 문서 탭이 활성이면 **실제 세션이 있어도** pane 본문 rect가 App으로 넘어가고
+    /// 터미널 표면·입력은 렌더되지 않는다 — 이력·Git과 같은 fail-closed 규칙(설계
+    /// "터미널이 멀쩡해야 한다" 합격 기준의 반대쪽: 문서가 활성인 동안은 반대로
+    /// 막혀야 한다).
+    #[test]
+    fn 문서탭이_활성이면_세션이_있어도_본문rect를_주고_터미널을_건너뛴다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::Document,
+            label: "note.md".to_owned(),
+            active: true,
+        }]);
+
+        let context = egui::Context::default();
+        let mut output = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            output = Some(ws.show_with_input(ui, &config, &[], &catalog, true));
+        });
+
+        let output = output.expect("렌더가 돌아야 한다");
+        let body = output
+            .aux_body_rect
+            .expect("문서 탭 활성 중에는 본문 rect가 있어야 한다");
+        assert!(body.height() > 0.0, "본문 높이가 0이면 안 된다");
+        assert!(
+            drain_protocol(&mut ws).is_empty(),
+            "문서 탭 활성 중에는 어떤 protocol intent도 나가면 안 된다(터미널 fail-closed)"
+        );
+    }
+
     /// 세션이 없고 이력 탭이 **비활성**이면 예전처럼 「새 셸」 진입점이 본문을 쓴다.
     #[test]
     fn 세션없는_워크스페이스의_비활성_이력탭은_본문rect를_주지_않는다() {
@@ -8079,6 +8120,64 @@ mod tests {
         );
     }
 
+    /// 이력·Git·문서 세 탭이 다 있을 때도 폭을 1pt씩 훑어 어떤 rect도 툴바/헤더 경계를
+    /// 넘지 않고 라벨이 0폭이 되지 않는지 확인한다(위 단일 탭 스윕과 같은 방식,
+    /// `layout_aux_tabs`가 실제로 쓰는 다중 탭 경로를 훑는다).
+    #[test]
+    fn 좁은_헤더에서_세_탭도_경계를_넘지_않고_결국_접힌다() {
+        let mut saw_tab_dropped = false;
+        let mut saw_close_stripped = false;
+        let tabs = [
+            aux_tab(PaneAuxTabKind::History, "이력", false),
+            aux_tab(PaneAuxTabKind::Git, "Git", false),
+            aux_tab(PaneAuxTabKind::Document, "note.md", true),
+        ];
+        let mut width = 40.0_f32;
+        while width <= 600.0 {
+            let header = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, TERMINAL_PANE_HEADER_HEIGHT),
+            );
+            let aux_reserved: f32 = tabs
+                .iter()
+                .map(|_tab| {
+                    pane_aux_tab_width(pane_aux_tab_label_width(header.width(), 26.0, tabs.len()))
+                        + PANE_AUX_TAB_RIGHT_PAD
+                })
+                .sum();
+            let buttons = pane_header_buttons(header, 120.0, 4, aux_reserved);
+            let close = buttons.close;
+            let placements = layout_aux_tabs(header, close, buttons.toolbar_left, &tabs, |_| 26.0);
+            if placements.len() < tabs.len() {
+                saw_tab_dropped = true;
+            }
+            let mut previous_right: Option<f32> = None;
+            for placement in &placements {
+                let aux = placement.geometry;
+                assert!(aux.label_width >= PANE_AUX_TAB_MIN_LABEL, "{width}: 라벨 0폭");
+                assert!(
+                    aux.tab.right() <= buttons.toolbar_left.min(header.right()) + 0.001,
+                    "{width}: 보조 탭이 도구/헤더 경계를 넘었다"
+                );
+                assert!(aux.tab.left() >= close.right(), "{width}: 세션 닫기와 겹침");
+                if let Some(previous_right) = previous_right {
+                    assert!(aux.tab.left() >= previous_right, "{width}: 보조 탭끼리 겹침");
+                }
+                previous_right = Some(aux.tab.right());
+                match aux.close {
+                    Some(rect) => {
+                        assert!(rect.right() <= header.right() + 0.001, "{width}: X 초과");
+                        assert!(!rect.intersects(close), "{width}: 두 X가 겹침");
+                    }
+                    None => saw_close_stripped = true,
+                }
+            }
+            width += 1.0;
+        }
+        assert!(saw_close_stripped, "좁아지면 ×부터 접혀야 한다(축약 순서 ⓐ)");
+        assert!(saw_tab_dropped, "가장 좁은 폭에서는 탭 자체도 접혀야 한다(축약 순서 ⓑ)");
+    }
+
     /// 라벨은 들어가지만 X까지는 안 들어가는 폭에서는 **X만** 버리고 탭 전환은 남긴다.
     #[test]
     fn 라벨만_들어가는_폭에서는_이력_닫기만_접는다() {
@@ -8141,7 +8240,10 @@ mod tests {
     }
 
     #[test]
-    fn 폭이_모자라면_뒤_탭부터_사라진다() {
+    fn 폭이_모자라면_탭보다_x부터_먼저_사라진다() {
+        // 예전엔 이 폭에서 뒤 탭(Git)이 통째로 사라졌다. 축약 순서 ⓐ(×부터 뺀다)가
+        // 생긴 뒤로는 두 탭 다 남고 ×만 접힌다 — 탭이 사라지는 건 ×를 전부 빼도
+        // 안 맞을 때뿐이다(설계 §2).
         let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(220.0, 24.0));
         let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
         let placements = layout_aux_tabs(
@@ -8154,10 +8256,114 @@ mod tests {
             ],
             |_| 30.0,
         );
+        assert_eq!(placements.len(), 2, "×를 뺀 두 탭 다 들어가야 한다: {placements:?}");
         assert!(
-            placements.len() < 2,
-            "좁은 헤더에서 두 탭이 다 들어갔다: {placements:?}"
+            placements.iter().all(|p| p.geometry.close.is_none()),
+            "이 폭에서는 ×가 전부 접혀야 한다: {placements:?}"
         );
+        assert!(
+            placements
+                .iter()
+                .all(|p| p.geometry.label_width >= PANE_AUX_TAB_MIN_LABEL),
+            "라벨이 0폭이면 안 된다"
+        );
+    }
+
+    #[test]
+    fn 폭이_x를_다_접어도_모자라면_뒤_탭부터_사라진다() {
+        // ×를 전부 접어도(ⓐ) 안 들어가는 폭 — 그제서야 탭 자체가 축약 순서(문서→
+        // Git→이력)대로 사라진다(ⓑ). Document가 없는 두 탭 집합이라 Git이 먼저다.
+        let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(220.0, 24.0));
+        let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let placements = layout_aux_tabs(
+            header,
+            close,
+            180.0,
+            &[
+                aux_tab(PaneAuxTabKind::History, "이력", false),
+                aux_tab(PaneAuxTabKind::Git, "Git", true),
+            ],
+            |_| 30.0,
+        );
+        assert_eq!(placements.len(), 1, "이 폭에서는 한 탭만 남아야 한다: {placements:?}");
+        assert_eq!(
+            placements[0].kind,
+            PaneAuxTabKind::History,
+            "Git이 먼저 빠지고 이력이 남아야 한다"
+        );
+    }
+
+    /// 축약 순서(설계 §2) 전 단계를 좌표로 고정한다: 이력·Git·문서가 다 있을 때 폭을
+    /// 줄이면 ⓐ 문서 → Git → 이력 순으로 ×가 먼저 접히고, ×를 다 접어도 모자라면
+    /// ⓑ 같은 순서로 탭 자체가 사라지며, ⓒ 세션 제목이 필요한 최소 폭까지 가면
+    /// 탭이 하나도 안 남아도 배열만 빈다(패닉하지 않는다).
+    #[test]
+    fn 세_탭의_축약_순서를_좌표로_고정한다() {
+        let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 24.0));
+        let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let tabs = [
+            aux_tab(PaneAuxTabKind::History, "이력", false),
+            aux_tab(PaneAuxTabKind::Git, "Git", false),
+            aux_tab(PaneAuxTabKind::Document, "note.md", true),
+        ];
+        let place = |toolbar_left: f32| layout_aux_tabs(header, close, toolbar_left, &tabs, |_| 30.0);
+        let has_close = |placements: &[AuxTabPlacement], kind: PaneAuxTabKind| {
+            placements
+                .iter()
+                .find(|p| p.kind == kind)
+                .expect("탭이 있어야 한다")
+                .geometry
+                .close
+                .is_some()
+        };
+
+        // 0단계: 셋 다 ×까지 온전하다.
+        let p = place(350.0);
+        assert_eq!(p.len(), 3);
+        assert!(has_close(&p, PaneAuxTabKind::History));
+        assert!(has_close(&p, PaneAuxTabKind::Git));
+        assert!(has_close(&p, PaneAuxTabKind::Document));
+
+        // ⓐ-1: 문서 ×만 먼저 접힌다.
+        let p = place(330.0);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(has_close(&p, PaneAuxTabKind::History));
+        assert!(has_close(&p, PaneAuxTabKind::Git));
+        assert!(!has_close(&p, PaneAuxTabKind::Document));
+
+        // ⓐ-2: 문서에 이어 Git ×도 접힌다 — 이력은 아직 남는다.
+        let p = place(285.0);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(has_close(&p, PaneAuxTabKind::History));
+        assert!(!has_close(&p, PaneAuxTabKind::Git));
+        assert!(!has_close(&p, PaneAuxTabKind::Document));
+
+        // ⓐ-3: 셋 다 ×가 없다 — 탭은 아직 셋 다 남는다.
+        let p = place(270.0);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(p.iter().all(|t| t.geometry.close.is_none()));
+
+        // ⓑ-1: ×를 다 접어도 안 맞아 문서 탭 자체가 사라진다 — Git·이력만 남고,
+        // 남은 둘은 축약 사다리를 처음부터 다시 타 Git의 ×부터 접힌다.
+        let p = place(252.0);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p.iter().any(|t| t.kind == PaneAuxTabKind::History));
+        assert!(p.iter().any(|t| t.kind == PaneAuxTabKind::Git));
+        assert!(!p.iter().any(|t| t.kind == PaneAuxTabKind::Document));
+        assert!(has_close(&p, PaneAuxTabKind::History));
+        assert!(!has_close(&p, PaneAuxTabKind::Git));
+
+        // ⓑ-2: Git도 통째로 사라지고 이력만 남는다(×는 다시 붙는다 — 사다리를
+        // 처음부터 다시 타므로).
+        let p = place(210.0);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].kind, PaneAuxTabKind::History);
+        assert!(p[0].geometry.close.is_some());
+
+        // ⓒ: 이력마저 안 들어가는 폭 — 탭이 하나도 없다. 패닉하지 않고 빈 배열만
+        // 돌려줘야 세션 제목이 그대로 남는다.
+        let p = place(150.0);
+        assert!(p.is_empty(), "{p:?}");
     }
 
     #[test]
@@ -8236,6 +8442,78 @@ mod tests {
                     RuntimeCommand::ClosePane { .. } | RuntimeCommand::KillSession { .. }
                 )),
             "이력 X가 세션/pane 종료 명령을 보내면 안 된다"
+        );
+    }
+
+    /// 문서 X도 **UI 탭만** 닫는다 — 세션 ×와 끝까지 다른 동작이어야 한다(설계
+    /// "보조 탭에서 RuntimeCommand가 파생되면 안 된다 — 문서 ×는 pane을 닫지 않는다").
+    /// 이력 X 테스트와 같은 모양이다.
+    #[test]
+    fn kittest_문서탭_닫기는_pane을_닫지_않고_닫기의도만_올린다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::Document,
+            label: "note.md".to_owned(),
+            active: true,
+        }]);
+        ws.aux_tab_pane = Some(pane_id("p"));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(520.0, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let mut intents = Vec::new();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut (WorkspaceUi, Vec<Option<(PaneAuxTabKind, PaneAuxTabIntent)>>)| {
+                let output = state
+                    .0
+                    .render_pane_header(ui, header, &snapshot, true, &config, &catalog, true);
+                state.1.push(output.aux_tab_intent);
+            },
+            (ws, std::mem::take(&mut intents)),
+        );
+        harness.run();
+        let aux_close = aux_close_center(&harness.state().0, header, &snapshot);
+        harness.state_mut().1.clear();
+
+        harness.hover_at(aux_close);
+        harness.run();
+        harness.drag_at(aux_close);
+        harness.run();
+        harness.drop_at(aux_close);
+        harness.run();
+
+        assert!(
+            harness
+                .state()
+                .1
+                .contains(&Some((PaneAuxTabKind::Document, PaneAuxTabIntent::Close))),
+            "문서 X는 Close 의도를 올려야 한다"
+        );
+        assert_eq!(
+            harness.state().0.confirm_close,
+            None,
+            "문서 X가 세션 닫기 확인을 띄우면 안 된다"
+        );
+        assert!(
+            !drain_protocol(&mut harness.state_mut().0)
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    RuntimeCommand::ClosePane { .. } | RuntimeCommand::KillSession { .. }
+                )),
+            "문서 X가 세션/pane 종료 명령을 보내면 안 된다"
         );
     }
 
@@ -13566,3 +13844,4 @@ https://example.test/login \
         }
     }
 }
+

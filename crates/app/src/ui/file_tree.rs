@@ -6661,6 +6661,54 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 mod tests {
     use super::*;
 
+    /// 문서 대상 분류(설계 §3.1) — md·markdown은 markdown, txt·log·확장자 없음은
+    /// 평문, 그 외는 `None`이라 더블클릭이 예전처럼 OS 기본 앱으로 간다(기존 동작을
+    /// 빼앗지 않는다).
+    #[test]
+    fn classify_document_target은_설계_3_1_대상만_분류한다() {
+        assert_eq!(
+            classify_document_target(Path::new("readme.md")),
+            Some(DocumentTargetKind::Markdown)
+        );
+        assert_eq!(
+            classify_document_target(Path::new("README.MD")),
+            Some(DocumentTargetKind::Markdown),
+            "확장자 대소문자를 가리지 않는다"
+        );
+        assert_eq!(
+            classify_document_target(Path::new("notes.markdown")),
+            Some(DocumentTargetKind::Markdown)
+        );
+        assert_eq!(
+            classify_document_target(Path::new("todo.txt")),
+            Some(DocumentTargetKind::PlainText)
+        );
+        assert_eq!(
+            classify_document_target(Path::new("server.log")),
+            Some(DocumentTargetKind::PlainText)
+        );
+        assert_eq!(
+            classify_document_target(Path::new("LICENSE")),
+            Some(DocumentTargetKind::PlainText),
+            "확장자 없는 파일은 평문이다"
+        );
+        assert_eq!(
+            classify_document_target(Path::new("main.rs")),
+            None,
+            "비대상 확장자는 예전 그대로 OS 열기로 가야 한다"
+        );
+        assert_eq!(
+            classify_document_target(Path::new("photo.png")),
+            None,
+            "비대상 확장자는 예전 그대로 OS 열기로 가야 한다"
+        );
+        assert_eq!(
+            classify_document_target(Path::new("archive.tar.gz")),
+            None,
+            "마지막 확장자(gz)만 본다 — 대상이 아니다"
+        );
+    }
+
     #[test]
     fn native_only_copy는_유효한_트리_행이_소유한다() {
         let mut tree = FileTreeUi::new(egui::Context::default());

@@ -15187,6 +15187,27 @@ impl App {
             .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
     }
 
+    /// 문서 탭 본문 — D0 자리표시자다. 실제 로딩·편집·미리보기는 `document_io`·
+    /// `markdown_viewer`를 채우는 다른 PR이 맡는다(설계 §9 D1·D2). 지금은 pane 본문
+    /// rect가 App 소유로 넘어왔다는 것과 열린 파일명만 보여준다.
+    fn render_document_tab_body(&mut self, ui: &mut egui::Ui, body: egui::Rect, text: &i18n::Catalog) {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body)
+                .id_salt("document_tab_body"),
+        );
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        child.centered_and_justified(|ui| {
+            let label = self
+                .document_open_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            ui.weak(text.t("workspace.tab.document_placeholder", &[("name", &label)]));
+        });
+    }
+
     /// 이력 탭이 방금 활성화됐을 때의 공통 진입 — projection을 새로 요청하고, 카드
     /// 액션이 필요로 하는 런처 감지가 없으면 함께 예약한다.
     fn enter_work_history_tab(&mut self) {
@@ -15265,7 +15286,7 @@ impl App {
     }
 
     /// 문서 보조 탭이 올린 의도 — `apply_work_history_tab_intent`와 같은 모양이다(D0).
-    /// 문서 X는 UI 탭만 닫는다 — 어떤 경로도 `RuntimeCommand`를 만들지 않는다.
+    /// 문서 X는 UI 탭만 닫는다 — 어떤 경로도 runtime에 종료 명령을 보내지 않는다.
     fn apply_document_tab_intent(&mut self, intent: ui::workspace::PaneAuxTabIntent) {
         let previous = self.document_tab;
         self.document_tab = match intent {
@@ -25812,6 +25833,8 @@ impl eframe::App for App {
         let history_tab_active = self.work_history_tab.is_active();
         // Git도 이력과 같은 보조 탭이다 — 동시 활성은 없다(스펙 §8-2).
         let git_tab_active = self.git_tab.is_active();
+        // 문서도 같은 보조 탭이다(D0) — 셋 다 동시 활성은 없다.
+        let document_tab_active = self.document_tab.is_active();
         // 홈/작업함/fleet이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
         if information_visible {
             self.active
@@ -25909,10 +25932,23 @@ impl eframe::App for App {
                 active: git_tab_active,
             });
         }
+        // 문서 탭 라벨은 파일명이다(설계 §2 — 문서가 먼저 축약되는 이유이기도 하다).
+        if terminal_visible && self.document_tab.is_open() {
+            aux_tabs.push(ui::workspace::PaneAuxTab {
+                kind: ui::workspace::PaneAuxTabKind::Document,
+                label: self
+                    .document_open_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                active: document_tab_active,
+            });
+        }
         self.active.workspace_ui.set_aux_tabs(aux_tabs);
         // 이력·Git 본문이 떠 있는 동안 입력 소유권은 명시적으로 없다(fail-closed) —
         // 타이핑·IME·붙여넣기가 숨은 PTY로 새지 않게 한다.
-        if terminal_visible && !(history_tab_active || git_tab_active) {
+        if terminal_visible && !(history_tab_active || git_tab_active || document_tab_active) {
             self.frame_terminal_owner = frame_terminal_owner(
                 &self.cross_workspace_pane,
                 true,
@@ -25933,7 +25969,7 @@ impl eframe::App for App {
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함/fleet은 전체 폭 페이지가 중앙을 쓴다.
         // 이력·Git 탭이 활성이면 보낼 터미널이 없으므로 함께 감춘다.
         if terminal_visible
-            && !(history_tab_active || git_tab_active)
+            && !(history_tab_active || git_tab_active || document_tab_active)
             && self.config.ui.composer_enabled
         {
             self.render_composer_dock(ui, &text);
@@ -26010,7 +26046,7 @@ impl eframe::App for App {
         let mut current_owner = FrameTerminalOwner::None;
         let mut dropped_session_open = None;
         let session_drop_label = (terminal_visible
-            && !(history_tab_active || git_tab_active)
+            && !(history_tab_active || git_tab_active || document_tab_active)
             && egui::DragAndDrop::has_payload_of_type::<ui::file_tree::SessionRowDragPayload>(
                 ui.ctx(),
             ))
@@ -26372,7 +26408,7 @@ impl eframe::App for App {
                         &events,
                         &text,
                         current_owner == FrameTerminalOwner::Primary
-                            && !(history_tab_active || git_tab_active),
+                            && !(history_tab_active || git_tab_active || document_tab_active),
                     );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
@@ -26383,6 +26419,8 @@ impl eframe::App for App {
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
                             git_panel_action = self.render_git_tab_body(&mut primary, body, &text);
+                        } else if document_tab_active {
+                            self.render_document_tab_body(&mut primary, body, &text);
                         } else {
                             work_history_action = self.render_work_history_tab_body(
                                 &mut primary,
@@ -26413,7 +26451,7 @@ impl eframe::App for App {
                         &self.config.terminal,
                         &events,
                         &text,
-                        !(history_tab_active || git_tab_active),
+                        !(history_tab_active || git_tab_active || document_tab_active),
                     );
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
@@ -26424,6 +26462,8 @@ impl eframe::App for App {
                     if let Some(body) = primary_output.aux_body_rect {
                         if git_tab_active {
                             git_panel_action = self.render_git_tab_body(ui, body, &text);
+                        } else if document_tab_active {
+                            self.render_document_tab_body(ui, body, &text);
                         } else {
                             work_history_action = self.render_work_history_tab_body(
                                 ui,
@@ -26452,7 +26492,7 @@ impl eframe::App for App {
                 .take(ui::cross_workspace::HARD_MAX_CROSS_WORKSPACE_PANES),
         );
         // 이력 본문이 떠 있던 프레임은 어떤 pane도 입력 소유자가 아니다.
-        self.frame_terminal_owner = if history_tab_active || git_tab_active {
+        self.frame_terminal_owner = if history_tab_active || git_tab_active || document_tab_active {
             FrameTerminalOwner::None
         } else {
             current_owner
@@ -32290,17 +32330,25 @@ mod tests {
         );
     }
 
-    /// 보조 본문은 하나뿐이라 이력·Git이 동시에 활성일 수 없다 — 새로 활성된 쪽이
-    /// 이기고, 진 쪽은 세션 탭으로 물러나되 탭 자체는 남는다(스펙 §8-2).
+    /// 보조 본문은 하나뿐이라 이력·Git·문서가 동시에 활성일 수 없다 — 새로 활성된
+    /// 쪽이 이기고, 진 쪽은 세션 탭으로 물러나되 탭 자체는 남는다(스펙 §8-2).
     #[test]
     fn 보조_탭은_동시에_활성되지_않는다() {
         use ui::workspace::PaneAuxTabState::{OpenActive, OpenInactive};
-        let (history, git) = resolve_aux_tab_exclusivity(OpenActive, OpenActive, AuxTabWinner::Git);
+        let (history, git, document) =
+            resolve_aux_tab_exclusivity(OpenActive, OpenActive, OpenActive, AuxTabWinner::Git);
         assert_eq!(git, OpenActive);
         assert_eq!(history, OpenInactive, "본문은 하나뿐이라 진 쪽은 물러난다");
-        let (history, git) =
-            resolve_aux_tab_exclusivity(OpenActive, OpenActive, AuxTabWinner::History);
+        assert_eq!(document, OpenInactive, "문서도 진 쪽이면 물러난다");
+        let (history, git, document) =
+            resolve_aux_tab_exclusivity(OpenActive, OpenActive, OpenActive, AuxTabWinner::History);
         assert_eq!(history, OpenActive);
+        assert_eq!(git, OpenInactive);
+        assert_eq!(document, OpenInactive);
+        let (history, git, document) =
+            resolve_aux_tab_exclusivity(OpenActive, OpenActive, OpenActive, AuxTabWinner::Document);
+        assert_eq!(document, OpenActive, "문서가 이기면 나머지 둘이 물러난다");
+        assert_eq!(history, OpenInactive);
         assert_eq!(git, OpenInactive);
     }
 
@@ -32841,7 +32889,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            render.contains("if terminal_visible && !(history_tab_active || git_tab_active) {"),
+            render.contains("if terminal_visible && !(history_tab_active || git_tab_active || document_tab_active) {"),
             "이력·Git 활성 프레임은 터미널 입력 소유자를 잡으면 안 된다"
         );
         assert!(
@@ -32850,7 +32898,7 @@ mod tests {
         );
         assert!(
             squeeze_ws(render).contains(
-                "terminal_visible && !(history_tab_active || git_tab_active) && self.config.ui.composer_enabled"
+                "terminal_visible && !(history_tab_active || git_tab_active || document_tab_active) && self.config.ui.composer_enabled"
             ),
             "이력·Git 활성 프레임은 컴포저를 감춰야 한다"
         );
@@ -32892,9 +32940,10 @@ mod tests {
         }
         assert_eq!(
             intent.matches("self.aux_search.reset()").count(),
-            2,
-            "activation apply_work_history_tab_intent·apply_git_tab_intent 둘 다 활성 \
-             보조 탭이 바뀌면 보조 검색을 비워야 한다"
+            4,
+            "activation apply_work_history_tab_intent·apply_git_tab_intent·\
+             apply_document_tab_intent·attach_document_tab 넷 다 활성 보조 탭이 \
+             바뀌면 보조 검색을 비워야 한다"
         );
     }
 

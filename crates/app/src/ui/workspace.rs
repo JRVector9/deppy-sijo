@@ -7920,6 +7920,66 @@ mod tests {
         );
     }
 
+    /// 위 테스트(정적 aux_body_rect·protocol 확인)를 실제 키 입력으로 재확인한다 —
+    /// 문서 편집기(`ui::document::source_editor`)가 포커스를 쥐고 실제로 타이핑해도
+    /// 터미널로 새지 않는다. 문서 탭 활성 중에는 터미널 표면 자체가 그려지지 않아
+    /// 구조적으로 불가능하지만(위 테스트), "TextEdit 포커스 상태에서 타이핑"이라는
+    /// 구체적 시나리오(설계 §10 수동 항목)를 직접 재현해 회귀를 잡는다.
+    #[test]
+    fn kittest_문서탭_활성중_텍스트편집기_포커스로_타이핑해도_터미널_protocol이_비어있다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        ws.set_aux_tabs(vec![PaneAuxTab {
+            kind: PaneAuxTabKind::Document,
+            label: "note.md".to_owned(),
+            active: true,
+        }]);
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, String)| {
+                let output = state.0.show_with_input(ui, &config, &[], &catalog, true);
+                if let Some(body) = output.aux_body_rect {
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
+                    crate::ui::document::source_editor(&mut child, &mut state.1, true);
+                }
+            },
+            (ws, String::new()),
+        );
+        harness.run();
+
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .type_text("hello");
+        harness.run();
+
+        assert_eq!(
+            harness.state().1,
+            "hello",
+            "문서 TextEdit이 포커스 상태에서 타이핑을 그대로 받아야 한다"
+        );
+        assert!(
+            drain_protocol(&mut harness.state_mut().0).is_empty(),
+            "문서 탭 활성 중 TextEdit 타이핑이 터미널 protocol intent로 새면 안 된다\
+             (fail-closed)"
+        );
+    }
+
     /// 세션이 없고 이력 탭이 **비활성**이면 예전처럼 「새 셸」 진입점이 본문을 쓴다.
     #[test]
     fn 세션없는_워크스페이스의_비활성_이력탭은_본문rect를_주지_않는다() {

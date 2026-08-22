@@ -9033,6 +9033,13 @@ impl OpenDocument {
     fn can_save(&self) -> bool {
         self.dirty && !self.saving && self.is_editable()
     }
+
+    /// dirty 판정 — 저장(또는 로드) 시점 내용과 현재 내용을 직접 비교한다. 편집 →
+    /// dirty, 저장 → 해제, 원래 내용으로 되돌리면 → 해제(모두 이 비교 하나로
+    /// 성립한다 — 별도의 "편집했었다" 플래그가 없다).
+    fn recompute_dirty(&mut self) {
+        self.dirty = self.source != self.saved_source;
+    }
 }
 
 /// 문서 로드 결과의 App 쪽 표현(설계 §6 4티어 + Loading). `document_io::DocumentLoadOutcome`을
@@ -9057,6 +9064,66 @@ enum DocumentLoadState {
     },
 }
 
+/// 로드 결과(설계 §6 4티어 + 실패) → `DocumentLoadState` 매핑. `source`는 여기서
+/// 다루지 않는다(순수 함수라 소유권을 가져가지 않는다) — 호출부가 `&outcome`으로
+/// 먼저 이 매핑을 뽑은 뒤, 같은 `outcome`을 값으로 소비해 `source`를 옮긴다.
+fn document_load_state_from_outcome(
+    outcome: &document_io::DocumentLoadOutcome,
+) -> DocumentLoadState {
+    match outcome {
+        document_io::DocumentLoadOutcome::Loaded { revision, .. } => DocumentLoadState::Loaded {
+            revision: *revision,
+            limit: document_io::DocumentLimitTier::Full,
+        },
+        document_io::DocumentLoadOutcome::ViewOnly { revision, .. } => DocumentLoadState::Loaded {
+            revision: *revision,
+            limit: document_io::DocumentLimitTier::ViewOnly,
+        },
+        document_io::DocumentLoadOutcome::Refused { byte_len } => DocumentLoadState::Refused {
+            byte_len: *byte_len,
+        },
+        document_io::DocumentLoadOutcome::Binary { byte_len } => DocumentLoadState::Binary {
+            byte_len: *byte_len,
+        },
+        document_io::DocumentLoadOutcome::Failed { code } => {
+            DocumentLoadState::Failed { code: *code }
+        }
+    }
+}
+
+/// 저장 결과를 문서 필드에 반영한다 — Conflict는 `source`를 절대 건드리지 않는다
+/// (설계 §7, 이 함수의 가장 중요한 계약). 확인 모달이 필요하면 그 종류를 돌려주고,
+/// 필요 없으면(저장 성공/실패) `None`을 돌려준다 — App은 `Some`이면 continuation을
+/// 실행하지 않고 그대로 확인 모달로 간다.
+fn apply_save_outcome_to_document(
+    document: &mut OpenDocument,
+    outcome: &document_io::DocumentSaveOutcome,
+) -> Option<DocumentPendingConfirm> {
+    match outcome {
+        document_io::DocumentSaveOutcome::Saved { revision } => {
+            document.saving = false;
+            document.saved_source = document.source.clone();
+            document.dirty = false;
+            document.save_error = None;
+            document.saved_feedback_until =
+                Some(std::time::Instant::now() + DOCUMENT_SAVED_FEEDBACK_DURATION);
+            if let DocumentLoadState::Loaded { revision: slot, .. } = &mut document.load_state {
+                *slot = *revision;
+            }
+            None
+        }
+        document_io::DocumentSaveOutcome::Conflict => {
+            document.saving = false;
+            Some(DocumentPendingConfirm::SaveConflict)
+        }
+        document_io::DocumentSaveOutcome::Failed { code } => {
+            document.saving = false;
+            document.save_error = Some(*code);
+            None
+        }
+    }
+}
+
 /// 저장이 성공하면 이어서 할 일 — dirty 확인 모달에서 「저장」을 골랐을 때만 채운다.
 #[derive(Debug, Clone)]
 enum DocumentSaveContinuation {
@@ -9068,7 +9135,7 @@ enum DocumentSaveContinuation {
 
 /// 문서 탭 확인 모달 종류(설계 §3.3·§7). 셋 다 버튼은 최대 두세 개 — "다른 이름으로
 /// 저장"은 이번 범위에서 생략한다(설계 §4 지시).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DocumentPendingConfirm {
     /// dirty 상태에서 다른 문서를 열려던 참.
     ReplaceWithDirty { next_path: PathBuf },
@@ -9084,6 +9151,46 @@ enum DocumentConfirmChoice {
     Save,
     Discard,
     Cancel,
+}
+
+/// `MarkdownLinkIntent`를 실제로 실행할 행동으로 분류한 결과(설계 §5·§7.3). 실행은
+/// App이 하지만, 분류 자체는 App 상태 없이 순수하게 계산해 유닛 테스트로 3종
+/// 라우팅을 직접 확인한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DocumentLinkAction {
+    OpenExternal(String),
+    OpenDocument(PathBuf),
+    Ignored,
+}
+
+/// Markdown 링크 intent → 실행할 행동. `base_directory`는 현재 문서의 디렉터리 —
+/// 상대 문서 경로를 여기 기준으로 해석한다(설계 §5).
+fn classify_document_link_intent(
+    base_directory: &Path,
+    intent: &ui::markdown_viewer::MarkdownLinkIntent,
+) -> DocumentLinkAction {
+    match intent {
+        ui::markdown_viewer::MarkdownLinkIntent::OpenExternal(url) => {
+            DocumentLinkAction::OpenExternal(url.clone())
+        }
+        ui::markdown_viewer::MarkdownLinkIntent::OpenRelativeDocument(relative) => {
+            DocumentLinkAction::OpenDocument(base_directory.join(relative))
+        }
+        ui::markdown_viewer::MarkdownLinkIntent::Rejected(_) => DocumentLinkAction::Ignored,
+    }
+}
+
+/// 문서 탭 X — dirty면 곧장 닫지 않고 확인을 받는다(설계 §3.3). `apply_document_tab_intent`의
+/// Close 분기 맨 앞에서 쓰는 조건 그 자체 — 순수 함수라 App 없이 테스트한다.
+fn document_close_requires_confirm(document: Option<&OpenDocument>) -> bool {
+    document.is_some_and(|document| document.dirty)
+}
+
+/// 다른 문서를 열려는 시도 — dirty고 **다른** 경로일 때만 확인을 받는다(같은 문서
+/// 재클릭은 편집 중이던 내용을 버릴 이유가 없다). `open_document` 맨 앞에서 쓰는
+/// 조건 그 자체.
+fn document_replace_requires_confirm(document: Option<&OpenDocument>, next_path: &Path) -> bool {
+    document.is_some_and(|document| document.dirty && document.path != next_path)
 }
 
 /// 보조 본문은 하나뿐이라 세 탭이 동시에 활성일 수 없다. 진 쪽은 세션 탭으로 물러나되
@@ -15646,35 +15753,34 @@ impl App {
         let Some(document) = self.document.as_mut() else {
             return;
         };
-        document.dirty = document.source != document.saved_source;
+        document.recompute_dirty();
         document.save_error = None;
         self.document_source_revision = self.document_source_revision.wrapping_add(1);
     }
 
     /// Markdown 링크 클릭 intent 라우팅(설계 §5·§7.3) — leaf는 절대 파일을 열거나 URL을
-    /// 열지 않는다.
+    /// 열지 않는다. 실제 분류는 `classify_document_link_intent`(순수 함수, 유닛 테스트
+    /// 대상)에 맡기고 여기서는 그 결과를 실행만 한다.
     fn apply_document_link_intent(
         &mut self,
         ctx: &egui::Context,
         intent: ui::markdown_viewer::MarkdownLinkIntent,
     ) {
-        match intent {
-            ui::markdown_viewer::MarkdownLinkIntent::OpenExternal(url) => {
+        let Some(base_directory) = self.document.as_ref().map(|document| {
+            document
+                .path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        }) else {
+            return;
+        };
+        match classify_document_link_intent(&base_directory, &intent) {
+            DocumentLinkAction::OpenExternal(url) => {
                 ctx.open_url(egui::OpenUrl::new_tab(url));
             }
-            ui::markdown_viewer::MarkdownLinkIntent::OpenRelativeDocument(relative) => {
-                let Some(target) = self.document.as_ref().map(|document| {
-                    document
-                        .path
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .join(&relative)
-                }) else {
-                    return;
-                };
-                self.open_document(target);
-            }
-            ui::markdown_viewer::MarkdownLinkIntent::Rejected(_) => {
+            DocumentLinkAction::OpenDocument(path) => self.open_document(path),
+            DocumentLinkAction::Ignored => {
                 // 내용(스킴·경로)은 로그에 남기지 않는다(§7) — 무슨 일이 있었는지만.
                 tracing::debug!(kind = "document_link", "rejected link scheme");
             }
@@ -15802,10 +15908,7 @@ impl App {
     /// dirty 상태에서 닫으려 하면 곧장 닫지 않고 확인을 받는다(설계 §3.3).
     fn apply_document_tab_intent(&mut self, intent: ui::workspace::PaneAuxTabIntent) {
         if matches!(intent, ui::workspace::PaneAuxTabIntent::Close)
-            && self
-                .document
-                .as_ref()
-                .is_some_and(|document| document.dirty)
+            && document_close_requires_confirm(self.document.as_ref())
         {
             self.document_pending_confirm = Some(DocumentPendingConfirm::CloseWithDirty);
             return;
@@ -15889,11 +15992,7 @@ impl App {
     /// §3.3). 포커스된 pane이 있으면 곧장 열고, 하나도 없으면 셸 pane을 먼저 스폰하고
     /// `poll_pending_document_open`이 다음 틱들에서 이어받는다(설계 §3.2).
     fn open_document(&mut self, path: PathBuf) {
-        if self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.dirty && document.path != path)
-        {
+        if document_replace_requires_confirm(self.document.as_ref(), &path) {
             self.document_pending_confirm =
                 Some(DocumentPendingConfirm::ReplaceWithDirty { next_path: path });
             return;
@@ -16073,44 +16172,31 @@ impl App {
     }
 
     /// 로드 결과 4종(Loaded/ViewOnly/Refused/Binary) + 실패를 App 상태로 반영한다.
+    /// 티어 매핑 자체는 `document_load_state_from_outcome`(순수 함수)에 맡긴다.
     fn apply_document_load_outcome(&mut self, outcome: document_io::DocumentLoadOutcome) {
+        let load_state = document_load_state_from_outcome(&outcome);
         let Some(document) = self.document.as_mut() else {
             return;
         };
+        document.load_state = load_state;
         document.view_only_byte_len = None;
         match outcome {
-            document_io::DocumentLoadOutcome::Loaded { source, revision } => {
+            document_io::DocumentLoadOutcome::Loaded { source, .. } => {
                 document.saved_source = source.clone();
                 document.source = source;
                 document.dirty = false;
-                document.load_state = DocumentLoadState::Loaded {
-                    revision,
-                    limit: document_io::DocumentLimitTier::Full,
-                };
             }
             document_io::DocumentLoadOutcome::ViewOnly {
-                source,
-                revision,
-                byte_len,
+                source, byte_len, ..
             } => {
                 document.saved_source = source.clone();
                 document.source = source;
                 document.dirty = false;
-                document.load_state = DocumentLoadState::Loaded {
-                    revision,
-                    limit: document_io::DocumentLimitTier::ViewOnly,
-                };
                 document.view_only_byte_len = Some(byte_len);
             }
-            document_io::DocumentLoadOutcome::Refused { byte_len } => {
-                document.load_state = DocumentLoadState::Refused { byte_len };
-            }
-            document_io::DocumentLoadOutcome::Binary { byte_len } => {
-                document.load_state = DocumentLoadState::Binary { byte_len };
-            }
-            document_io::DocumentLoadOutcome::Failed { code } => {
-                document.load_state = DocumentLoadState::Failed { code };
-            }
+            document_io::DocumentLoadOutcome::Refused { .. }
+            | document_io::DocumentLoadOutcome::Binary { .. }
+            | document_io::DocumentLoadOutcome::Failed { .. } => {}
         }
         document.save_error = None;
         document.saved_feedback_until = None;
@@ -16118,23 +16204,19 @@ impl App {
     }
 
     /// 저장 결과를 App 상태로 반영한다 — Conflict는 덮어쓰지 않고 확인 상태로 간다
-    /// (설계 §7).
+    /// (설계 §7). 문서 필드 갱신 자체는 `apply_save_outcome_to_document`(순수 함수)에
+    /// 맡기고, 여기서는 그 결과(확인 모달 요청)와 저장 후 continuation만 실행한다.
     fn apply_document_save_outcome(&mut self, outcome: document_io::DocumentSaveOutcome) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if let Some(confirm) = apply_save_outcome_to_document(document, &outcome) {
+            self.document_save_then = None;
+            self.document_pending_confirm = Some(confirm);
+            return;
+        }
         match outcome {
-            document_io::DocumentSaveOutcome::Saved { revision } => {
-                if let Some(document) = self.document.as_mut() {
-                    document.saving = false;
-                    document.saved_source = document.source.clone();
-                    document.dirty = false;
-                    document.save_error = None;
-                    document.saved_feedback_until =
-                        Some(std::time::Instant::now() + DOCUMENT_SAVED_FEEDBACK_DURATION);
-                    if let DocumentLoadState::Loaded { revision: slot, .. } =
-                        &mut document.load_state
-                    {
-                        *slot = revision;
-                    }
-                }
+            document_io::DocumentSaveOutcome::Saved { .. } => {
                 self.egui_ctx
                     .request_repaint_after(DOCUMENT_SAVED_FEEDBACK_DURATION);
                 match self.document_save_then.take() {
@@ -16145,19 +16227,11 @@ impl App {
                     None => {}
                 }
             }
-            document_io::DocumentSaveOutcome::Conflict => {
-                if let Some(document) = self.document.as_mut() {
-                    document.saving = false;
-                }
+            document_io::DocumentSaveOutcome::Failed { .. } => {
                 self.document_save_then = None;
-                self.document_pending_confirm = Some(DocumentPendingConfirm::SaveConflict);
             }
-            document_io::DocumentSaveOutcome::Failed { code } => {
-                if let Some(document) = self.document.as_mut() {
-                    document.saving = false;
-                    document.save_error = Some(code);
-                }
-                self.document_save_then = None;
+            document_io::DocumentSaveOutcome::Conflict => {
+                unreachable!("Conflict는 위 apply_save_outcome_to_document에서 이미 처리됐다")
             }
         }
     }
@@ -33813,6 +33887,337 @@ mod tests {
              다섯 다 활성 보조 탭이 바뀌면 보조 검색을 비워야 한다 \
              (close_document_tab은 dirty 확인을 거쳐 닫힐 때 \
              apply_document_tab_intent의 상태 기계를 거치지 않는 별도 경로다)"
+        );
+    }
+
+    // ── 문서 탭 상태 기계(설계 §3.3·§4·§6·§7) ───────────────────────────────
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-app-document-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn stub_open_document(
+        path: &str,
+        source: &str,
+        saved_source: &str,
+        dirty: bool,
+    ) -> OpenDocument {
+        OpenDocument {
+            path: PathBuf::from(path),
+            source: source.to_owned(),
+            mode: ui::document::DocumentViewMode::Source,
+            load_state: DocumentLoadState::Loading,
+            saved_source: saved_source.to_owned(),
+            dirty,
+            saving: false,
+            save_error: None,
+            saved_feedback_until: None,
+            view_only_byte_len: None,
+        }
+    }
+
+    #[test]
+    fn recompute_dirty는_편집_저장_원복을_올바르게_판정한다() {
+        let mut document = stub_open_document("/tmp/doc.md", "A", "A", false);
+
+        // 편집 → dirty.
+        document.source = "B".to_owned();
+        document.recompute_dirty();
+        assert!(
+            document.dirty,
+            "내용이 saved_source와 다르면 dirty여야 한다"
+        );
+
+        // 저장(=saved_source를 현재 내용으로 맞춤) → 해제.
+        document.saved_source = document.source.clone();
+        document.recompute_dirty();
+        assert!(!document.dirty, "저장 직후에는 dirty가 해제돼야 한다");
+
+        // 다시 편집한 뒤 saved_source와 같은 내용으로 되돌리면 → 해제(해시가 아니라
+        // 전체 비교 기준이지만 계약은 동일하다).
+        document.source = "C".to_owned();
+        document.recompute_dirty();
+        assert!(document.dirty);
+        document.source = document.saved_source.clone();
+        document.recompute_dirty();
+        assert!(
+            !document.dirty,
+            "원래 내용으로 되돌리면 dirty가 해제돼야 한다"
+        );
+    }
+
+    #[test]
+    fn document_load_state_from_outcome은_4티어를_올바르게_매핑한다() {
+        let dir = unique_temp_dir("load-tiers");
+
+        let full_path = dir.join("full.md");
+        std::fs::write(&full_path, b"hello").unwrap();
+        let outcome =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: full_path });
+        assert!(
+            matches!(
+                document_load_state_from_outcome(&outcome),
+                DocumentLoadState::Loaded {
+                    limit: document_io::DocumentLimitTier::Full,
+                    ..
+                }
+            ),
+            "Full 티어는 Loaded{{limit: Full}}로 가야 한다"
+        );
+
+        let view_only_path = dir.join("view-only.md");
+        std::fs::write(
+            &view_only_path,
+            vec![b'a'; document_io::DOCUMENT_FULL_BYTES_MAX as usize + 1],
+        )
+        .unwrap();
+        let outcome = document_io::load_document(&document_io::DocumentLoadRequest {
+            path: view_only_path,
+        });
+        assert!(
+            matches!(
+                document_load_state_from_outcome(&outcome),
+                DocumentLoadState::Loaded {
+                    limit: document_io::DocumentLimitTier::ViewOnly,
+                    ..
+                }
+            ),
+            "ViewOnly 티어는 Loaded{{limit: ViewOnly}}로 가야 한다"
+        );
+
+        let refused_path = dir.join("refused.md");
+        std::fs::write(
+            &refused_path,
+            vec![b'a'; document_io::DOCUMENT_REFUSE_BYTES_MAX as usize + 1],
+        )
+        .unwrap();
+        let outcome =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: refused_path });
+        assert!(matches!(
+            document_load_state_from_outcome(&outcome),
+            DocumentLoadState::Refused { .. }
+        ));
+
+        let binary_path = dir.join("binary.md");
+        std::fs::write(&binary_path, [0xFFu8, 0xFE, 0x00, 0x80]).unwrap();
+        let outcome =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: binary_path });
+        assert!(matches!(
+            document_load_state_from_outcome(&outcome),
+            DocumentLoadState::Binary { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_save_outcome_to_document은_conflict에서_source를_보존하고_확인을_요청한다() {
+        let mut document = stub_open_document("/tmp/doc.md", "EDITED", "ORIGINAL", true);
+        document.saving = true;
+
+        let confirm = apply_save_outcome_to_document(
+            &mut document,
+            &document_io::DocumentSaveOutcome::Conflict,
+        );
+
+        assert_eq!(confirm, Some(DocumentPendingConfirm::SaveConflict));
+        assert_eq!(
+            document.source, "EDITED",
+            "충돌 시 source를 덮어쓰면 안 된다"
+        );
+        assert!(document.dirty, "충돌 시 dirty를 임의로 해제하면 안 된다");
+        assert!(
+            !document.saving,
+            "충돌 결과를 받으면 저장 중 플래그는 내려간다"
+        );
+    }
+
+    #[test]
+    fn apply_save_outcome_to_document은_saved에서_dirty를_해제하고_revision을_갱신한다() {
+        let dir = unique_temp_dir("save-outcome-saved");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded {
+            revision: initial_revision,
+            ..
+        } = load
+        else {
+            panic!("expected Loaded");
+        };
+
+        let mut document = stub_open_document(path.to_str().unwrap(), "UPDATED", "ORIGINAL", true);
+        document.saving = true;
+        document.load_state = DocumentLoadState::Loaded {
+            revision: initial_revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+
+        let save = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: document.source.clone(),
+            expected_revision: initial_revision,
+        });
+        let confirm = apply_save_outcome_to_document(&mut document, &save);
+
+        assert_eq!(confirm, None);
+        assert!(!document.dirty);
+        assert!(!document.saving);
+        assert_eq!(document.saved_source, "UPDATED");
+        let DocumentLoadState::Loaded {
+            revision: stored, ..
+        } = document.load_state
+        else {
+            panic!("expected Loaded load_state");
+        };
+        assert_ne!(stored, initial_revision, "저장 후 revision이 갱신돼야 한다");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn document_close_requires_confirm은_dirty일_때만_참이다() {
+        assert!(!document_close_requires_confirm(None));
+        let clean = stub_open_document("/tmp/a.md", "A", "A", false);
+        assert!(!document_close_requires_confirm(Some(&clean)));
+        let dirty = stub_open_document("/tmp/a.md", "B", "A", true);
+        assert!(document_close_requires_confirm(Some(&dirty)));
+    }
+
+    #[test]
+    fn document_replace_requires_confirm은_dirty고_다른_경로일_때만_참이다() {
+        let next = Path::new("/tmp/other.md");
+        assert!(!document_replace_requires_confirm(None, next));
+
+        let clean = stub_open_document("/tmp/other.md", "A", "A", false);
+        assert!(
+            !document_replace_requires_confirm(Some(&clean), next),
+            "clean이면 확인이 필요 없다"
+        );
+
+        let dirty_same_path = stub_open_document("/tmp/other.md", "B", "A", true);
+        assert!(
+            !document_replace_requires_confirm(Some(&dirty_same_path), next),
+            "같은 문서 재클릭은 편집 중이던 내용을 버릴 이유가 없다"
+        );
+
+        let dirty_different_path = stub_open_document("/tmp/a.md", "B", "A", true);
+        assert!(document_replace_requires_confirm(
+            Some(&dirty_different_path),
+            next
+        ));
+    }
+
+    #[test]
+    fn classify_document_link_intent은_3종을_올바르게_라우팅한다() {
+        let base = Path::new("/workspace/docs");
+        assert_eq!(
+            classify_document_link_intent(
+                base,
+                &ui::markdown_viewer::MarkdownLinkIntent::OpenExternal(
+                    "https://example.com".to_owned()
+                )
+            ),
+            DocumentLinkAction::OpenExternal("https://example.com".to_owned())
+        );
+        assert_eq!(
+            classify_document_link_intent(
+                base,
+                &ui::markdown_viewer::MarkdownLinkIntent::OpenRelativeDocument(
+                    "other.md".to_owned()
+                )
+            ),
+            DocumentLinkAction::OpenDocument(PathBuf::from("/workspace/docs/other.md"))
+        );
+        assert_eq!(
+            classify_document_link_intent(
+                base,
+                &ui::markdown_viewer::MarkdownLinkIntent::Rejected(
+                    "javascript:alert(1)".to_owned()
+                )
+            ),
+            DocumentLinkAction::Ignored
+        );
+    }
+
+    #[test]
+    fn 문서_source가_바뀌는_세_지점_모두_revision을_올린다() {
+        // on_document_source_edited(편집) · begin_document_open(새 문서 로딩 진입,
+        // source가 이전 내용에서 빈 문자열로 바뀐다) · apply_document_load_outcome
+        // (로드·재로드 완료) — 셋 다 안 올리면 뷰어가 옛 내용을 계속 보여준다.
+        let source = include_str!("app.rs");
+        let scanned = source
+            .split_once("fn on_document_source_edited(&mut self)")
+            .expect("on_document_source_edited 정의를 찾아야 한다")
+            .1
+            .split_once("fn apply_document_save_outcome(&mut self")
+            .expect("apply_document_save_outcome 정의를 찾아야 한다")
+            .0;
+        let count = scanned
+            .matches(
+                "self.document_source_revision = self.document_source_revision.wrapping_add(1);",
+            )
+            .count();
+        assert_eq!(
+            count, 3,
+            "on_document_source_edited·begin_document_open·apply_document_load_outcome \
+             세 곳 모두 document_source_revision을 올려야 한다"
+        );
+    }
+
+    #[test]
+    fn 문서_닫기_확인_분기는_clear_document_state보다_먼저_return해_문서를_즉시_버리지_않는다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn apply_document_tab_intent(&mut self")
+            .expect("apply_document_tab_intent 정의를 찾아야 한다")
+            .1
+            .split_once("fn clear_document_state(&mut self)")
+            .expect("clear_document_state 정의를 찾아야 한다")
+            .0;
+        let confirm_branch = function_body
+            .split_once("document_close_requires_confirm(self.document.as_ref())")
+            .expect("dirty 확인 조건이 있어야 한다")
+            .1
+            .split_once("return;")
+            .expect("확인이 필요하면 곧장 return해야 한다")
+            .0;
+        assert!(
+            confirm_branch.contains("DocumentPendingConfirm::CloseWithDirty"),
+            "확인 분기는 CloseWithDirty를 세워야 한다"
+        );
+        assert!(
+            !confirm_branch.contains("self.document = None")
+                && !confirm_branch.contains("clear_document_state"),
+            "확인 분기는 return 전에 문서를 지우면 안 된다 — 문서가 즉시 버려지면 안 된다"
+        );
+    }
+
+    #[test]
+    fn 문서_교체_확인_분기는_begin_document_open보다_먼저_return해_문서를_즉시_버리지_않는다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn open_document(&mut self, path: PathBuf) {")
+            .expect("open_document 정의를 찾아야 한다")
+            .1;
+        let confirm_branch = function_body
+            .split_once("document_replace_requires_confirm(self.document.as_ref(), &path)")
+            .expect("dirty 확인 조건이 있어야 한다")
+            .1
+            .split_once("return;")
+            .expect("확인이 필요하면 곧장 return해야 한다")
+            .0;
+        assert!(confirm_branch.contains("DocumentPendingConfirm::ReplaceWithDirty"));
+        assert!(
+            !confirm_branch.contains("begin_document_open"),
+            "확인 분기는 return 전에 새 문서를 열면 안 된다 — 기존 문서가 즉시 버려지면 안 된다"
         );
     }
 

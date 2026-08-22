@@ -170,6 +170,10 @@ pub fn source_editor(
                 egui::TextEdit::multiline(source)
                     .id_salt(id_salt)
                     .interactive(editable)
+                    // 기본 프레임(배경 + 테두리)을 끈다 — 켜두면 편집기만 어두운
+                    // 상자로 보여 미리보기와 두 물건처럼 갈린다. 고정폭 글꼴이 이미
+                    // "원본"임을 말해준다(2026-08-22).
+                    .frame(egui::Frame::NONE)
                     .desired_width(f32::INFINITY),
             )
         })

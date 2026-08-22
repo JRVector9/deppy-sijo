@@ -360,7 +360,10 @@ fn apply_page_style(ui: &mut egui::Ui) {
     // `extreme_bg_color`(코드 블록이 쓴다)와 별개 필드(`code_bg_color`)라 egui 기본
     // 회색(gray(64)/gray(230))이 새 나가고 있었다 — 다크/라이트 둘 다 앱 팔레트 밖의
     // 무채색이라 여기서 토큰으로 덮는다.
-    style.visuals.code_bg_color = tokens.input_background;
+    // 본문 면보다 **한 단 밝게**. `input_background`(#0f1115)는 문서 면(pane 면)보다
+    // 어두워 코드 조각이 구멍처럼 파여 보였다 — 칩으로 읽히려면 위로 올라와야 한다
+    // (2026-08-22).
+    style.visuals.code_bg_color = tokens.selected_background;
 }
 
 /// 워크스페이스 루트 밖 파일을 읽지 않는 로컬 PNG broker(§7.2). `MarkdownViewer`가
@@ -462,14 +465,23 @@ impl MarkdownViewer {
             self.cache.add_link_hook(dest.clone());
         }
 
+        // 면을 **칠하지 않는다**(2026-08-22). pane 면(`app_background`)이 이미
+        // 본문 rect 전체에 깔려 있으므로, 여기서 따로 채우지 않으면 문서가 짧아도
+        // 그 면이 pane 끝까지 이어진다 — 예전엔 `content_canvas`(#0f1115)를 칠해
+        // 터미널 작업면(#18181c)보다 어두운 패널이 얹힌 것처럼 보였고, 내용이 짧으면
+        // 그 아래로 더 밝은 바닥이 드러났다(사용자 보고).
+        //
+        // 이력·Git 보조 본문은 계속 `content_canvas`를 쓴다 — 그쪽은 카드·목록·diff를
+        // 얹는 **데이터 패널**이라 한 단 파인 면이 맞고, 문서는 읽고 쓰는 **작업면**이라
+        // 터미널과 같은 단이어야 한다. 의도된 분기다.
         let tokens = designall::tokens(ui.visuals());
-
         egui::Frame::NONE
-            .fill(tokens.content_canvas)
             .inner_margin(egui::Margin::symmetric(PAGE_PADDING_X, PAGE_PADDING_Y))
             .show(ui, |ui| {
                 apply_page_style(ui);
-                ui.vertical_centered(|ui| {
+                // 가운데 정렬이 아니라 왼쪽 정렬 — 가운데는 "웹 페이지"처럼 보이고,
+                // 나란히 모드에서 좌우 줄이 어긋난다(2026-08-22).
+                ui.vertical(|ui| {
                     let column_width = ui.available_width().clamp(0.0, PAGE_MAX_CONTENT_WIDTH);
                     ui.set_max_width(column_width);
 

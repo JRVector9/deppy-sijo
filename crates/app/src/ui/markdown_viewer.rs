@@ -23,14 +23,20 @@ use egui_commonmark::{Alert, AlertBundle, CommonMarkCache, CommonMarkViewer};
 
 use crate::ui::designall;
 
-// ── 페이지 디자인 상수 (§6.2) ────────────────────────────────────────────────
-// 본문 최대 폭 840-900px 중앙값. 좁은 pane에서는 `min`으로 자연스럽게 줄어든다
-// (하한을 강제로 두지 않는다 — 좁은 보조 탭에서 억지로 폭을 넓히면 잘림만 는다).
-const PAGE_MAX_CONTENT_WIDTH: f32 = 880.0;
-const PAGE_PADDING_X: i8 = 32;
-const PAGE_PADDING_Y: i8 = 40;
-const PAGE_BODY_FONT_SIZE: f32 = 16.0;
-const PAGE_HEADING_FONT_SIZE: f32 = 30.0;
+// ── 페이지 디자인 상수 (§6.2, 2026-08-22 앱 통일성 재조정) ──────────────────
+// 터미널 11pt · 사이드바 12-13pt인 앱 안에서 문서 표면만 웹 아티클 스케일(본문
+// 16pt · 폭 880px · 헤딩 30pt 단일)을 그대로 써서 "다른 앱처럼" 보였다(2026-08-22
+// 사용자 스크린샷 지적). 본문·폭·여백을 앱 스케일로 낮춘다. 좁은 pane에서는
+// `min`으로 자연스럽게 줄어든다(하한을 강제로 두지 않는다 — 좁은 보조 탭에서
+// 억지로 폭을 넓히면 잘림만 는다).
+const PAGE_MAX_CONTENT_WIDTH: f32 = 640.0;
+const PAGE_PADDING_X: i8 = 26;
+const PAGE_PADDING_Y: i8 = 22;
+const PAGE_BODY_FONT_SIZE: f32 = 13.0;
+/// H1의 실제 렌더 크기. `apply_page_style`가 `TextStyle::Heading`에 심는 값이고,
+/// egui_commonmark는 H1(레벨 0)에서 이 값을 그대로 쓴다(보간 없음) — 그래서 이
+/// 상수만은 표의 목표(19)를 정확히 맞춘다. H2 이하는 `apply_page_style` 주석 참고.
+const PAGE_HEADING_FONT_SIZE: f32 = 19.0;
 /// 문단·리스트·인용 사이 세로 리듬 — egui 기본 item_spacing.y(4px 안팎)보다 넉넉하게.
 const PAGE_ITEM_SPACING_Y: f32 = 10.0;
 /// 캐시 무효화 세분도용 폭 버킷 크기 — 이보다 작은 리사이즈는 같은 버킷으로 묶여
@@ -295,7 +301,37 @@ fn deppy_alert_bundle(tokens: designall::Tokens) -> AlertBundle {
 
 /// 색·타이포·간격을 전부 `designall` 토큰/스타일 조정에서 가져온다(§6.2). 이 함수가
 /// 받은 `ui`(centered column 안쪽)에만 적용되고 바깥 UI로 새지 않는다.
+///
+/// ## 헤딩 레벨별 크기 — 시도한 것과 막힌 지점
+///
+/// egui는 `TextStyle::Heading`이 하나뿐이라 H1~H6이 전부 같은 크기로 나올 것 같지만,
+/// `egui_commonmark_backend::misc::Style::to_richtext`(비공개 헬퍼, 0.24.0)가 이미
+/// 레벨별로 크기를 갈아끼운다: 레벨 0(H1)은 `TextStyle::Heading` 값을 그대로 쓰고,
+/// 레벨 1~5(H2~H6)는 `Body`~`Heading` 사이를 고정 비율로 보간한다
+/// (0.835 / 0.668 / 0.501 / 0.334 / 0.167 — 소스에서 실측). 이 facade가 손댈 수 있는
+/// 레버는 딱 두 개, `TextStyle::Body`·`TextStyle::Heading`의 크기뿐이다.
+///
+/// 문제는 이 두 레버로 표의 목표(H1 19 / H2 15.5 / H3 13.5, 본문 13)를 동시에 맞출
+/// 수 없다는 점이다. H2 = Body + 0.835×(Heading−Body)인데, Body를 0으로 내려도
+/// H2 ≥ 0.835×Heading = 0.835×19 ≈ 15.87로 목표 15.5보다 크다 — 즉 body가 몇이든
+/// H1을 19로 고정하는 한 H2는 15.5 밑으로 내려갈 수 없다(수식으로 확인, 크레이트를
+/// 고치지 않는 한 불가능). `render_math_fn`/`render_html_fn`처럼 레벨별로 갈아끼울
+/// 콜백은 이 크레이트에 없다(공개 API 전수 확인: `indentation_spaces`,
+/// `max_image_width`, `default_width`, `show_alt_text_on_hover`,
+/// `default_implicit_uri_scheme`, `explicit_image_uri_scheme`, syntax 테마, `alerts`,
+/// `render_math_fn`, `render_html_fn`, `enable_scroll_to_heading`뿐 — heading 전용
+/// 훅은 없다). 이 값 자체가 `egui_commonmark_backend`(비공개 크레이트) 안에 박혀 있어
+/// facade 밖에서 가로챌 지점이 없고, 크레이트를 포크/패치하는 건 이 작업의 범위(문서
+/// 표면 스타일링)를 크게 벗어난다고 판단해 시도하지 않았다.
+///
+/// 그래서 표에서 정확히 맞출 수 있는 두 값(본문 13, H1 19)만 그대로 심는다. H2 이하는
+/// 크레이트의 내장 보간이 대신 계산하며, H1(19, bold) > H2(≈18.0, bold) > H3(≈17.0,
+/// bold) > H4(≈16.0, bold) > H5(≈15.0) > H6(≈14.0) 순으로 **단조 감소는 유지**하지만
+/// 표의 간격(H1-H2 3.5pt)만큼 벌어지지는 않는다 — H1은 본문(13)과 6pt·46% 차이로
+/// 뚜렷이 구분되고, 그 아래는 계단이 촘촘하다. 상위 설계에 보고: 정확한 표 값이
+/// 필요하면 `egui_commonmark`를 포크하거나 다른 렌더 경로가 필요하다.
 fn apply_page_style(ui: &mut egui::Ui) {
+    let tokens = designall::tokens(ui.visuals());
     designall::apply_workspace_visuals(ui);
     let style = ui.style_mut();
     style.spacing.item_spacing.y = PAGE_ITEM_SPACING_Y;
@@ -307,6 +343,11 @@ fn apply_page_style(ui: &mut egui::Ui) {
     if let Some(heading) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
         heading.size = PAGE_HEADING_FONT_SIZE;
     }
+    // 인라인 코드 span(`` `code` ``)의 배경은 `apply_workspace_visuals`가 짚어주는
+    // `extreme_bg_color`(코드 블록이 쓴다)와 별개 필드(`code_bg_color`)라 egui 기본
+    // 회색(gray(64)/gray(230))이 새 나가고 있었다 — 다크/라이트 둘 다 앱 팔레트 밖의
+    // 무채색이라 여기서 토큰으로 덮는다.
+    style.visuals.code_bg_color = tokens.input_background;
 }
 
 /// 워크스페이스 루트 밖 파일을 읽지 않는 로컬 PNG broker(§7.2). `MarkdownViewer`가
@@ -908,5 +949,27 @@ mod tests {
                 "https://example.com/doc".to_owned()
             ))
         );
+    }
+
+    /// 페이지 색은 전부 `designall::tokens`/`apply_workspace_visuals`에서 와야 한다 —
+    /// 리터럴 `Color32`를 직접 적으면 다크/라이트 중 한쪽에서만 어긋나는 색이 슬쩍
+    /// 섞여 들어올 수 있다(`activity.rs`의
+    /// `production_source_has_no_render_host_or_polling_edges`와 같은 소스 스캔 관례).
+    #[test]
+    fn 프로덕션_코드는_색을_리터럴로_적지_않고_토큰에서만_가져온다() {
+        let source = include_str!("markdown_viewer.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            "Color32::from_rgb",
+            "Color32::from_gray",
+            "Color32::from_rgba",
+            "Color32::WHITE",
+            "Color32::BLACK",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "markdown_viewer.rs leaf는 색을 하드코딩하면 안 된다, 발견: {forbidden}"
+            );
+        }
     }
 }

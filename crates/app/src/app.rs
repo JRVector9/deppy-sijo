@@ -9215,6 +9215,58 @@ fn document_close_requires_confirm(document: Option<&OpenDocument>) -> bool {
     document.is_some_and(|document| document.dirty)
 }
 
+/// 같은 경로가 이미 열려 있으면 그 id를 돌려준다(멀티 문서 탭 설계 ③) —
+/// `begin_document_open`이 이 값이 있으면 새로 열지 않고 그 탭만 활성화한다.
+/// 순수 함수라 App 없이 테스트한다.
+fn find_open_document_by_path(
+    documents: &[OpenDocument],
+    path: &Path,
+) -> Option<ui::workspace::DocumentTabId> {
+    documents
+        .iter()
+        .find(|document| document.path == path)
+        .map(|document| document.id)
+}
+
+/// 새 문서 하나를 위해 상한(개수 `DOCUMENT_TABS_MAX`·바이트
+/// `DOCUMENT_TOTAL_RETAINED_BYTES_MAX`, 설계 §4) 안으로 자리를 만들려면 어떤
+/// 문서들을(가장 먼저 연 것부터) 닫아야 하는지 결정한다 — 순수 함수라 App 없이
+/// 테스트한다. 활성 문서는 후보에서 제외한다. clean 비활성 문서를 다 닫아도
+/// 여전히 상한을 넘으면(=더 닫을 게 없는데 아직 넘는다) `None`을 돌려준다 —
+/// 자리를 못 만든다는 뜻이다. dirty 문서는 절대 후보에 넣지 않는다 — 저장 안 된
+/// 내용을 조용히 버리지 않는다.
+fn plan_document_eviction(
+    documents: &[OpenDocument],
+    active_document: Option<ui::workspace::DocumentTabId>,
+) -> Option<Vec<ui::workspace::DocumentTabId>> {
+    let mut remaining: Vec<&OpenDocument> = documents.iter().collect();
+    let mut bytes: u64 = remaining
+        .iter()
+        .map(|document| document.source.len() as u64)
+        .sum();
+    let mut evict = Vec::new();
+    while remaining.len() + 1 > DOCUMENT_TABS_MAX || bytes > DOCUMENT_TOTAL_RETAINED_BYTES_MAX {
+        let position = remaining
+            .iter()
+            .position(|document| !document.dirty && Some(document.id) != active_document)?;
+        let victim = remaining.remove(position);
+        bytes -= victim.source.len() as u64;
+        evict.push(victim.id);
+    }
+    Some(evict)
+}
+
+/// 문서 하나를 닫은 뒤(`documents`에서 이미 그 문서가 제거된 상태) 다음에 활성화할
+/// 문서를 고른다(순수 함수, 멀티 문서 탭 설계 ⑥) — 이웃(오른쪽 우선, 없으면 왼쪽).
+/// `closed_index`는 방금 제거된 문서가 있던 자리(`Vec::remove`에 준 인덱스)다.
+fn next_active_document_after_close(
+    documents: &[OpenDocument],
+    closed_index: usize,
+) -> Option<ui::workspace::DocumentTabId> {
+    let neighbor_index = closed_index.min(documents.len().checked_sub(1)?);
+    documents.get(neighbor_index).map(|document| document.id)
+}
+
 /// 보조 본문은 하나뿐이라 세 탭이 동시에 활성일 수 없다. 진 쪽은 세션 탭으로 물러나되
 /// 탭 자체는 남는다(`on_session_tab_click`) — 이미 비활성/닫힘인 탭에 걸어도 안전하다
 /// (`on_session_tab_click`은 그 경우 그대로 돌려준다).
@@ -15558,7 +15610,7 @@ impl App {
             .unwrap_or_default();
         // 슬롯을 문서 id로 만든다 — 안 그러면 문서마다 다른 캐시가 아니라 하나를
         // 나눠 써서 문서 A의 Preview 렌더 캐시가 문서 B에 그대로 보이는 사고가 난다
-        // (멀티 문서 탭 설계 §2, 예전에는 `MarkdownDocumentSlot(0)`으로 고정돼 있었다).
+        // (멀티 문서 탭 설계 §2, 예전에는 슬롯이 고정값 하나였다).
         let slot = ui::markdown_viewer::MarkdownDocumentSlot(u64::from(id.0));
         let revision = ui::markdown_viewer::MarkdownSourceRevision(document.source_revision);
 
@@ -16080,8 +16132,7 @@ impl App {
             self.document_pending_confirm = None;
         }
         if self.active_document == Some(id) {
-            let neighbor_index = index.min(self.documents.len().saturating_sub(1));
-            self.active_document = self.documents.get(neighbor_index).map(|document| document.id);
+            self.active_document = next_active_document_after_close(&self.documents, index);
             self.aux_search.reset();
         }
         if self.documents.is_empty() {
@@ -16089,53 +16140,27 @@ impl App {
         }
     }
 
-    /// 열려 있는 문서들의 `source` 바이트 합계(멀티 문서 탭 설계 §4 상한 판정 기준).
-    fn document_retained_bytes(&self) -> u64 {
-        self.documents
-            .iter()
-            .map(|document| document.source.len() as u64)
-            .sum()
-    }
-
-    /// 문서 하나를 새로 열기 전에 상한(개수 `DOCUMENT_TABS_MAX`·바이트
-    /// `DOCUMENT_TOTAL_RETAINED_BYTES_MAX`) 안으로 자리를 만든다(멀티 문서 탭 설계
-    /// §4). 활성 문서는 후보에서 제외되고, 가장 먼저 연(=`documents`에서 가장 앞의)
-    /// clean 비활성 문서부터 닫는다. clean 비활성이 하나도 없으면 자리를 못 만들고
-    /// `false`를 돌려준다 — 저장 안 된 내용을 조용히 버리지 않는다.
-    fn make_room_for_document_open(&mut self) -> bool {
-        while self.documents.len() + 1 > DOCUMENT_TABS_MAX
-            || self.document_retained_bytes() > DOCUMENT_TOTAL_RETAINED_BYTES_MAX
-        {
-            let Some(victim) = self
-                .documents
-                .iter()
-                .find(|document| !document.dirty && Some(document.id) != self.active_document)
-                .map(|document| document.id)
-            else {
-                return false;
-            };
-            self.close_document_entry(victim);
-        }
-        true
-    }
-
     /// dirty 확인을 통과한 뒤(또는 확인이 필요 없을 때) 문서 탭을 포커스된 pane 위에
     /// 연다 — `SidebarAction::OpenDocument` 라우팅과 `poll_pending_document_open` 둘
     /// 다 이 헬퍼로 모인다. 이미 열려 있는 문서와 같은 경로면 새 탭을 만들지 않고 그
     /// 탭만 활성화한다 — 다른 문서를 열어도 기존 문서는 그대로 남는다(멀티 문서 탭
-    /// 설계 ③). 상한에 걸리면(`make_room_for_document_open`이 자리를 못 만들면) 열지
-    /// 않고 안내를 띄운다.
+    /// 설계 ③). 상한에 걸리면(`plan_document_eviction`이 자리를 못 만들면) 열지 않고
+    /// 안내를 띄운다. 무엇을 할지 자체는 `find_open_document_by_path`·
+    /// `plan_document_eviction`(둘 다 순수 함수)이 판정하고, 여기서는 그 결정을
+    /// 실행만 한다.
     fn begin_document_open(&mut self, path: PathBuf) {
-        if let Some(existing) = self.documents.iter().find(|document| document.path == path) {
-            let id = existing.id;
+        if let Some(id) = find_open_document_by_path(&self.documents, &path) {
             self.activate_document_tab(id);
             self.document_cap_notice = false;
             self.reveal_terminal_view_for_aux_tab();
             return;
         }
-        if !self.make_room_for_document_open() {
+        let Some(evict) = plan_document_eviction(&self.documents, self.active_document) else {
             self.document_cap_notice = true;
             return;
+        };
+        for victim in evict {
+            self.close_document_entry(victim);
         }
         let id = ui::workspace::DocumentTabId(self.next_document_tab_id);
         self.next_document_tab_id = self.next_document_tab_id.wrapping_add(1);
@@ -34114,6 +34139,246 @@ mod tests {
             view_only_byte_len: None,
             source_revision: 0,
         }
+    }
+
+    /// `stub_open_document`에 명시적 id를 얹는다 — 여러 문서가 동시에 열려 있는
+    /// 시나리오(멀티 문서 탭 설계)를 만들 때 쓴다.
+    fn stub_open_document_id(
+        id: u32,
+        path: &str,
+        source: &str,
+        saved_source: &str,
+        dirty: bool,
+    ) -> OpenDocument {
+        OpenDocument {
+            id: ui::workspace::DocumentTabId(id),
+            ..stub_open_document(path, source, saved_source, dirty)
+        }
+    }
+
+    #[test]
+    fn find_open_document_by_path은_같은_경로면_그_id를_돌려주고_아니면_없다() {
+        let documents = vec![
+            stub_open_document_id(1, "/tmp/a.md", "A", "A", false),
+            stub_open_document_id(2, "/tmp/b.md", "B", "B", false),
+        ];
+        assert_eq!(
+            find_open_document_by_path(&documents, Path::new("/tmp/b.md")),
+            Some(ui::workspace::DocumentTabId(2)),
+            "같은 파일을 다시 열면 새 탭이 아니라 기존 id를 활성화해야 한다"
+        );
+        assert_eq!(
+            find_open_document_by_path(&documents, Path::new("/tmp/c.md")),
+            None,
+            "새 파일이면 어느 기존 문서와도 매칭되면 안 된다 — 그래야 기존 문서를 \
+             건드리지 않고 새 탭을 더한다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_개수_상한을_넘으면_가장_먼저_연_clean_비활성_문서부터_닫는다()
+     {
+        let mut documents = Vec::new();
+        for i in 0..DOCUMENT_TABS_MAX as u32 {
+            documents.push(stub_open_document_id(
+                i,
+                &format!("/tmp/{i}.md"),
+                "x",
+                "x",
+                false,
+            ));
+        }
+        let active = Some(ui::workspace::DocumentTabId(DOCUMENT_TABS_MAX as u32 - 1));
+        let evict = plan_document_eviction(&documents, active)
+            .expect("clean 비활성 문서가 있으니 자리를 만들 수 있어야 한다");
+        assert_eq!(
+            evict,
+            vec![ui::workspace::DocumentTabId(0)],
+            "가장 먼저 연(맨 앞) clean 비활성 문서 하나만 닫아도 개수 상한 안으로 \
+             들어와야 한다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_dirty_문서를_절대_후보에_넣지_않는다() {
+        // 개수 상한을 넘겼는데 활성 문서를 뺀 나머지가 전부 dirty면 자리를 못 만든다
+        // — 저장 안 된 내용을 조용히 버리면 안 된다(설계 ④).
+        let mut documents = Vec::new();
+        for i in 0..DOCUMENT_TABS_MAX as u32 {
+            documents.push(stub_open_document_id(
+                i,
+                &format!("/tmp/{i}.md"),
+                "dirty",
+                "clean",
+                true,
+            ));
+        }
+        let active = Some(ui::workspace::DocumentTabId(DOCUMENT_TABS_MAX as u32 - 1));
+        assert_eq!(
+            plan_document_eviction(&documents, active),
+            None,
+            "닫을 clean 비활성 문서가 하나도 없으면 자리를 만들 수 없어야 한다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_활성_문서를_절대_후보로_뽑지_않는다() {
+        // documents[0]만 clean이고 활성 문서다. 나머지는 dirty라 후보가 안 되고,
+        // 유일한 clean 문서는 활성이라 후보가 안 된다 — 자리를 못 만들어야 한다.
+        let mut documents = Vec::new();
+        for i in 0..DOCUMENT_TABS_MAX as u32 {
+            documents.push(stub_open_document_id(
+                i,
+                &format!("/tmp/{i}.md"),
+                "x",
+                "x",
+                i != 0,
+            ));
+        }
+        let active = Some(ui::workspace::DocumentTabId(0));
+        assert_eq!(
+            plan_document_eviction(&documents, active),
+            None,
+            "활성 문서는 clean이어도 절대 후보가 아니다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_바이트_상한도_넘으면_자리를_만든다() {
+        // 개수는 상한 밑이지만(3개) ViewOnly급 큰 문서 하나가 바이트 상한을 이미
+        // 넘겼다 — clean 비활성 문서를 닫아 자리를 만들어야 한다.
+        let big = vec![b'a'; (DOCUMENT_TOTAL_RETAINED_BYTES_MAX + 1) as usize];
+        let big_source = String::from_utf8(big).unwrap();
+        let mut documents = vec![stub_open_document_id(0, "/tmp/big.md", &big_source, &big_source, false)];
+        documents.push(stub_open_document_id(1, "/tmp/small.md", "x", "x", false));
+        let evict = plan_document_eviction(&documents, Some(ui::workspace::DocumentTabId(1)))
+            .expect("clean 비활성 문서를 닫으면 바이트 상한 안으로 들어와야 한다");
+        assert_eq!(
+            evict,
+            vec![ui::workspace::DocumentTabId(0)],
+            "바이트 상한을 넘긴 큰 문서부터(맨 앞이기도 하다) 닫아야 한다"
+        );
+    }
+
+    #[test]
+    fn next_active_document_after_close는_오른쪽_이웃을_우선하고_없으면_왼쪽이다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let c = ui::workspace::DocumentTabId(3);
+
+        // [a, b, c]에서 가운데(b, index 1)를 닫으면 [a, c]가 남는다 — 오른쪽 이웃(c)이
+        // 그 자리를 밀고 들어와 있으니 그대로 활성화한다.
+        let after_removing_middle = vec![
+            stub_open_document_id(a.0, "/tmp/a.md", "A", "A", false),
+            stub_open_document_id(c.0, "/tmp/c.md", "C", "C", false),
+        ];
+        assert_eq!(
+            next_active_document_after_close(&after_removing_middle, 1),
+            Some(c),
+            "오른쪽 이웃이 있으면 그쪽을 활성화해야 한다"
+        );
+
+        // [a, b, c]에서 마지막(c, index 2)을 닫으면 [a, b]가 남는다 — 오른쪽 이웃이
+        // 없으니 왼쪽 이웃(b)을 활성화한다.
+        let after_removing_last = vec![
+            stub_open_document_id(a.0, "/tmp/a.md", "A", "A", false),
+            stub_open_document_id(b.0, "/tmp/b.md", "B", "B", false),
+        ];
+        assert_eq!(
+            next_active_document_after_close(&after_removing_last, 2),
+            Some(b),
+            "오른쪽 이웃이 없으면 왼쪽 이웃을 활성화해야 한다"
+        );
+
+        // 마지막 하나 남은 문서를 닫으면(제거 후 목록이 빈다) 활성화할 문서가 없다
+        // — 문서 그룹 자체가 닫히고 터미널로 돌아간다(설계 ⑥).
+        assert_eq!(
+            next_active_document_after_close(&[], 0),
+            None,
+            "마지막 문서를 닫으면 활성화할 문서가 없어야 한다"
+        );
+    }
+
+    #[test]
+    fn close_document_entry는_활성_문서를_닫으면_이웃을_고르고_마지막이면_그룹을_닫는다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn close_document_entry(&mut self")
+            .expect("close_document_entry 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains(
+                "self.active_document = next_active_document_after_close(&self.documents, index);"
+            ),
+            "활성 문서를 닫으면 next_active_document_after_close로 이웃을 골라야 한다: \
+             {function_body}"
+        );
+        assert!(
+            function_body.contains("if self.documents.is_empty() {")
+                && function_body.contains("self.document_tab = self.document_tab.on_close();"),
+            "마지막 문서를 닫으면 문서 그룹 자체가 닫혀야 한다: {function_body}"
+        );
+    }
+
+    #[test]
+    fn begin_document_open은_새_문서를_추가만_하고_기존_문서를_건드리지_않는다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn begin_document_open(&mut self, path: PathBuf) {")
+            .expect("begin_document_open 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains("self.documents.push(OpenDocument {"),
+            "새 문서는 목록에 추가돼야 한다(교체가 아니다): {function_body}"
+        );
+        assert!(
+            !function_body.contains("self.documents = ") && !function_body.contains("self.documents.clear()"),
+            "새 문서를 열 때 기존 목록을 지우거나 통째로 바꾸면 안 된다: {function_body}"
+        );
+        let refuse_branch = function_body
+            .split_once("plan_document_eviction(&self.documents, self.active_document) else {")
+            .expect("상한 판정 호출이 있어야 한다")
+            .1
+            .split_once("};")
+            .expect("else 블록이 끝나야 한다")
+            .0;
+        assert!(
+            refuse_branch.contains("self.document_cap_notice = true;"),
+            "자리를 못 만들면 상한 안내를 세워야 한다: {refuse_branch}"
+        );
+        assert!(
+            !refuse_branch.contains("self.documents.push"),
+            "자리를 못 만들었으면 문서를 열면 안 된다: {refuse_branch}"
+        );
+    }
+
+    /// 문서마다 `MarkdownDocumentSlot`이 달라야 Preview 렌더 캐시가 문서별로
+    /// 갈린다(멀티 문서 탭 설계 §2) — 예전에는 `MarkdownDocumentSlot(0)`으로 고정돼
+    /// 있어 모든 문서가 캐시를 공유했다(문서 A의 렌더 결과가 B에 보이는 사고).
+    #[test]
+    fn render_document_tab_body는_슬롯을_문서_id로_만들어_문서별로_캐시를_가른다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn render_document_tab_body(")
+            .expect("render_document_tab_body 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains("MarkdownDocumentSlot(u64::from(id.0))"),
+            "슬롯은 문서 id에서 만들어야 한다: {function_body}"
+        );
+        assert!(
+            !function_body.contains("MarkdownDocumentSlot(0)"),
+            "슬롯이 다시 0으로 고정되면 안 된다(모든 문서가 캐시를 공유하게 된다)"
+        );
     }
 
     #[test]

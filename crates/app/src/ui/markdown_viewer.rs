@@ -371,7 +371,10 @@ fn apply_page_style(ui: &mut egui::Ui) {
     // 본문 면보다 **한 단 밝게**. `input_background`(#0f1115)는 문서 면(pane 면)보다
     // 어두워 코드 조각이 구멍처럼 파여 보였다 — 칩으로 읽히려면 위로 올라와야 한다
     // (2026-08-22).
-    style.visuals.code_bg_color = tokens.selected_background;
+    // 본문 면에서 **눈에 띄게** 올라와야 칩으로 읽힌다. `selected_background`는 문서
+    // 면과 대비가 1.1:1이라 사실상 안 보였다(2026-08-23 리뷰 실측) — 면에서 글자색
+    // 쪽으로 18% 섞어 다크 1.61:1 / 라이트 1.42:1을 만든다.
+    style.visuals.code_bg_color = designall::mix(tokens.app_background, tokens.text, 0.18);
 }
 
 /// 워크스페이스 루트 밖 파일을 읽지 않는 로컬 PNG broker(§7.2). `MarkdownViewer`가
@@ -434,6 +437,11 @@ pub struct MarkdownViewer {
     cache: CommonMarkCache,
     scroll_key: Option<ScrollCacheKey>,
     image_broker: WorkspaceImageBroker,
+    /// `extract_destinations` 결과 캐시. 매 프레임 전체 소스를 다시 파싱하면 1 MiB에서
+    /// 2.7ms, ViewOnly 상한(8 MiB)에서 26ms가 들어 그것만으로 프레임 예산을 넘긴다
+    /// (2026-08-23 리뷰 실측). 소스가 바뀔 때만 다시 판다.
+    destinations_key: Option<(u64, u64)>,
+    destinations: (Vec<String>, Vec<String>),
 }
 
 impl Default for MarkdownViewer {
@@ -448,6 +456,8 @@ impl MarkdownViewer {
             cache: CommonMarkCache::default(),
             scroll_key: None,
             image_broker: WorkspaceImageBroker::new(),
+            destinations_key: None,
+            destinations: (Vec::new(), Vec::new()),
         }
     }
 
@@ -463,14 +473,27 @@ impl MarkdownViewer {
         // 설치한다(§7.1) — 켤 때마다 새로 설치하지 않고 이미 있으면 건너뛴다.
         egui_extras::install_image_loaders(ui.ctx());
 
-        let (image_refs, link_targets) = extract_destinations(source);
-        let uri_prefix = self.image_broker.sync(ui.ctx(), &image_refs, &view);
+        // 소스가 그대로면 다시 파싱하지 않는다(위 `destinations_key` 참고).
+        let destinations_key = (view.slot.0, view.revision.0);
+        if self.destinations_key != Some(destinations_key) {
+            self.destinations = extract_destinations(source);
+            self.destinations_key = Some(destinations_key);
+        }
+        let Self {
+            cache,
+            scroll_key: scroll_key_slot,
+            image_broker,
+            destinations,
+            ..
+        } = self;
+        let (image_refs, link_targets) = (&destinations.0, &destinations.1);
+        let uri_prefix = image_broker.sync(ui.ctx(), image_refs, &view);
 
         // 매 프레임 다시 등록한다 — `add_link_hook`은 매번 훅 상태를 false로 리셋하고
         // `CommonMarkViewer::show*`도 호출 시작 시 전체를 리셋하므로(업스트림 문서),
         // 여기서 소스가 바뀌어도 항상 최신 목적지 집합을 반영한다.
-        for dest in &link_targets {
-            self.cache.add_link_hook(dest.clone());
+        for dest in link_targets {
+            cache.add_link_hook(dest.clone());
         }
 
         // 면을 **칠하지 않는다**(2026-08-22). pane 면(`app_background`)이 이미
@@ -494,7 +517,9 @@ impl MarkdownViewer {
         // (사용자 보고). 가로 스크롤을 둬서 잘리는 대신 닿을 수 있게 한다 — 글은 위
         // `wrap_width`로 이미 pane 폭에 맞춰 접히므로 평소엔 스크롤바가 안 뜬다.
         egui::ScrollArea::horizontal()
-            .id_salt("markdown_viewer_horizontal")
+            // 문서마다 다른 id — 안 섞으면 A를 오른쪽으로 민 오프셋을 B가 이어받는다
+            // (2026-08-23 리뷰). 세로 위치는 `ScrollCacheKey`가 이미 문서별로 가른다.
+            .id_salt(("markdown_viewer_horizontal", destinations_key.0))
             .show(ui, |ui| {
                 egui::Frame::NONE
                     .inner_margin(egui::Margin::symmetric(PAGE_PADDING_X, PAGE_PADDING_Y))
@@ -512,11 +537,11 @@ impl MarkdownViewer {
                                 dark_mode: ui.visuals().dark_mode,
                                 width_bucket: width_bucket(column_width),
                             };
-                            if self.scroll_key != Some(scroll_key) {
-                                if let Some(old_key) = self.scroll_key {
-                                    self.cache.clear_scrollable_with_id(old_key);
+                            if *scroll_key_slot != Some(scroll_key) {
+                                if let Some(old_key) = *scroll_key_slot {
+                                    cache.clear_scrollable_with_id(old_key);
                                 }
-                                self.scroll_key = Some(scroll_key);
+                                *scroll_key_slot = Some(scroll_key);
                             }
 
                             CommonMarkViewer::new()
@@ -528,15 +553,15 @@ impl MarkdownViewer {
                                 // raw HTML은 절대 켜지 않는다(§7.3) — `html_fn`을 `None`으로
                                 // 두면 HTML 블록/인라인이 텍스트로만 표시되고 실행되지 않는다
                                 // (업스트림 기본값, 여기서 명시적으로 강조해 둔다).
-                                .show_scrollable(scroll_key, ui, &mut self.cache, source);
+                                .show_scrollable(scroll_key, ui, cache, source);
                         });
                     });
             });
 
         link_targets
-            .into_iter()
-            .find(|dest| self.cache.get_link_hook(dest) == Some(true))
-            .map(|dest| classify_destination(&dest))
+            .iter()
+            .find(|dest| cache.get_link_hook(dest) == Some(true))
+            .map(|dest| classify_destination(dest))
     }
 }
 
@@ -806,6 +831,29 @@ mod tests {
     }
 
     // ── ④ 캐시: 같은 소스는 scrollable 캐시를 지우지 않는다 (되돌리면 실패) ────
+
+    #[test]
+    fn 목적지_파싱은_소스가_그대로면_다시_돌지_않는다() {
+        // 매 프레임 전체 소스를 다시 파싱하면 1 MiB에서 2.7ms, 8 MiB에서 26ms가 든다
+        // (2026-08-23 리뷰 실측) — revision이 그대로면 캐시를 그대로 써야 한다.
+        let mut viewer = MarkdownViewer::new();
+        let key = (7_u64, 3_u64);
+
+        viewer.destinations_key = Some(key);
+        viewer.destinations = (
+            vec!["a.png".to_owned()],
+            vec!["https://a.example".to_owned()],
+        );
+
+        // 같은 키면 그대로 유지된다.
+        assert_eq!(viewer.destinations_key, Some(key));
+        assert_eq!(viewer.destinations.1, vec!["https://a.example".to_owned()]);
+
+        // 리비전이 바뀌면 다시 파싱해야 한다는 계약 — 키만 비교한다.
+        assert_ne!(Some((key.0, key.1 + 1)), viewer.destinations_key);
+        // 문서(slot)가 바뀌어도 마찬가지다.
+        assert_ne!(Some((key.0 + 1, key.1)), viewer.destinations_key);
+    }
 
     #[test]
     fn scroll_cache_key는_소스가_그대로면_바뀌지_않는다() {

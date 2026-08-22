@@ -167,11 +167,29 @@ pub fn toolbar(
                 let save_clicked = ui
                     .horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
+                        // 저장은 **버튼**이다 — 프레임 없이 두면 그냥 글자로 보여
+                        // 누를 수 있는지 알 수 없다(2026-08-23 사용자 요청).
+                        //
+                        // 채움을 `Button::fill`로 덮으면 egui가 hover/press 상태를
+                        // 못 칠한다. 대신 이 위젯 계열의 visuals를 토큰으로 바꿔
+                        // egui가 알아서 세 상태를 칠하게 한다.
+                        {
+                            let widgets = &mut ui.visuals_mut().widgets;
+                            widgets.inactive.weak_bg_fill = tokens.selected_background;
+                            widgets.hovered.weak_bg_fill = crate::ui::designall::mix(
+                                tokens.selected_background,
+                                tokens.text,
+                                0.12,
+                            );
+                            widgets.active.weak_bg_fill = crate::ui::designall::mix(
+                                tokens.selected_background,
+                                tokens.text,
+                                0.22,
+                            );
+                        }
                         let clicked = ui
-                            .add_enabled(
-                                snapshot.can_save,
-                                egui::Button::new(save_label).frame(false),
-                            )
+                            .add_enabled(snapshot.can_save, egui::Button::new(save_label))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked();
                         ui.add(egui::Label::new(
                             egui::RichText::new(ui.ctx().format_shortcut(&shortcut))

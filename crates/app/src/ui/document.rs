@@ -119,18 +119,18 @@ pub fn toolbar(
                                     } else {
                                         tokens.muted_text
                                     });
-                                // 활성/비활성 **둘 다 프레임을 켠다**. 비활성은
-                                // 투명 채움이라 보이지 않지만 패딩이 같아 세 칸의
-                                // 크기가 일치한다.
+                                // 선택 표시는 **글자색만**으로 한다(2026-08-22 사용자
+                                // 요청) — 배경을 칠하면 좁은 툴바에서 그 덩어리가
+                                // 도드라진다. 활성 `tokens.text`(밝음) · 비활성
+                                // `tokens.muted_text`는 위 `label`이 이미 정한다.
+                                //
+                                // 세 칸 모두 프레임을 켠 채 투명하게 둔다 — 끄면
+                                // 패딩까지 사라져 칸 크기가 서로 달라진다.
                                 let button = egui::Button::new(label)
                                     .frame(true)
                                     .selected(active)
                                     .stroke(egui::Stroke::NONE)
-                                    .fill(if active {
-                                        tokens.selected_background
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    });
+                                    .fill(egui::Color32::TRANSPARENT);
                                 if ui.add(button).clicked() && !active {
                                     action = Some(DocumentToolbarAction::SetMode(mode));
                                 }

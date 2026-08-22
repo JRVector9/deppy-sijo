@@ -422,9 +422,9 @@ fn workspace_protocol_command_is_valid(
 
 // 각 split leaf가 독립 터미널이 되는 패널형 구조. 헤더는 한 줄로 얇게 유지하고
 // PTY는 외곽 카드 여백 없이 패널 면을 채운다.
-/// pane 헤더(세션·문서 탭 줄)의 높이. 32에서 2px 줄였다(2026-08-22 사용자 요청) —
+/// pane 헤더(세션·문서 탭 줄)의 높이. 32 → 30 → 29로 줄였다(2026-08-22 사용자 요청) —
 /// 탭 줄이 화면에서 차지하는 몫을 줄여 본문에 돌려준다.
-const TERMINAL_PANE_HEADER_HEIGHT: f32 = 30.0;
+const TERMINAL_PANE_HEADER_HEIGHT: f32 = 29.0;
 const TERMINAL_STREAM_LEFT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_RIGHT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_VERTICAL_PADDING: f32 = 6.0;

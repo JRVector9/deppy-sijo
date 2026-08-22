@@ -15631,6 +15631,20 @@ impl App {
                                 &mut document.source,
                                 editable,
                             );
+                            // Split은 같은 프레임에 source와 preview를 함께 그린다 —
+                            // `revision`(외부 스코프)이 다음 프레임에야 올라가면 방금 친
+                            // 글자가 이 프레임의 preview에는 반영되지 않는다(캐시 키가
+                            // 그대로라 재파싱을 건너뛴다). 이 프레임에서만 로컬로 앞당겨
+                            // 써서 preview가 같은 프레임에 최신 내용을 그리게 한다 —
+                            // `self.document_source_revision`(App 상태) 자체는
+                            // `on_document_source_edited`가 이 함수 끝에서 올린다.
+                            let revision = if editor_changed {
+                                ui::markdown_viewer::MarkdownSourceRevision(
+                                    revision.0.wrapping_add(1),
+                                )
+                            } else {
+                                revision
+                            };
 
                             let divider_hit_rect = egui::Rect::from_min_max(
                                 egui::pos2(source_rect.right() - 3.0, content_rect.top()),

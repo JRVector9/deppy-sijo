@@ -52,6 +52,11 @@ const SOURCE_EDITOR_LEFT_MARGIN: i8 = crate::ui::workspace::PANE_HEADER_TITLE_LE
 /// 여기서는 바꿀 수 있다.
 const SOURCE_EDITOR_LINE_HEIGHT: f32 = 1.75;
 
+/// 단축키 힌트(`⌘S`)를 보여줄 최소 남은 폭. 이보다 좁으면 접는다.
+const SHORTCUT_HINT_MIN_WIDTH: f32 = 64.0;
+/// 상태 문구를 보여줄 최소 남은 폭.
+const STATUS_MIN_WIDTH: f32 = 80.0;
+
 /// 세그먼트 칸의 좌우 안쪽 여백.
 const SEGMENT_PADDING_X: f32 = 8.0;
 /// 툴바 왼쪽 여백 — **역산**한 값이다. 세그먼트 첫 라벨("본문")의 첫 글자가 헤더 탭
@@ -191,10 +196,15 @@ pub fn toolbar(
                             .add_enabled(snapshot.can_save, egui::Button::new(save_label))
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked();
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(ui.ctx().format_shortcut(&shortcut))
-                                .color(tokens.muted_text),
-                        ));
+                        // 좁아지면 단축키 힌트부터 접는다 — 툴바는 줄바꿈이 없어
+                        // 넘치면 그대로 잘리고, 잘리면 「나란히」 같은 필수 항목이
+                        // 화면 밖으로 나간다(2026-08-23 리뷰).
+                        if ui.available_width() >= SHORTCUT_HINT_MIN_WIDTH {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(ui.ctx().format_shortcut(&shortcut))
+                                    .color(tokens.muted_text),
+                            ));
+                        }
                         clicked
                     })
                     .inner;
@@ -203,15 +213,22 @@ pub fn toolbar(
                 // 화면의 `⌘S`를 가로채지 않는다(notes.rs `⌘⇧D`와 같은 근거 — 전역 단축키
                 // 디스패처는 TextEdit 포커스 중엔 이미 꺼져 있고, 포커스가 없어도 이
                 // 함수가 먼저 그려진다).
-                let save_shortcut = snapshot.can_save
-                    && ui.input_mut(|input| {
-                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
-                    });
+                //
+                // **소비는 `can_save`와 무관하게 한다.** 예전엔 `can_save && consume_key`
+                // 라 단락평가로 dirty가 아닐 때 아예 소비되지 않아 이벤트가 큐에 남았다
+                // (2026-08-23 리뷰). 지금은 듣는 핸들러가 없어 무해했지만, 문서 표면이
+                // 활성인 동안 `⌘S`는 이 표면이 소유하는 게 맞다 — 나중에 전역 핸들러가
+                // 생기면 저장할 게 없을 때만 그쪽이 발화하는 조용한 버그가 된다.
+                let shortcut_pressed =
+                    ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
+                let save_shortcut = shortcut_pressed && snapshot.can_save;
                 if save_clicked || save_shortcut {
                     action = Some(DocumentToolbarAction::Save);
                 }
 
-                if let Some(status_text) = &snapshot.status_text {
+                if let Some(status_text) = &snapshot.status_text
+                    && ui.available_width() >= STATUS_MIN_WIDTH
+                {
                     // 오른쪽 정렬 — 남은 폭을 오른쪽부터 채우는 중첩 레이아웃.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(egui::Label::new(
@@ -338,6 +355,51 @@ mod tests {
             harness.state().last_action,
             Some(DocumentToolbarAction::SetMode(DocumentViewMode::Preview))
         );
+    }
+
+    #[test]
+    fn 저장할_게_없어도_cmd_s는_삼켜진다() {
+        // 문서 표면이 활성인 동안 `⌘S`는 이 표면이 소유한다 — dirty가 아니어도
+        // 소비해야 다른 화면 핸들러로 새지 않는다. 예전엔 `can_save && consume_key`
+        // 단락평가라 저장할 게 없을 때 이벤트가 큐에 남았다(2026-08-23 리뷰).
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let state = ToolbarHarnessState {
+            // can_save = false — 저장할 게 없는 상태.
+            snapshot: snapshot(DocumentViewMode::Source, false, None),
+            catalog,
+            last_action: None,
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut ToolbarHarnessState| {
+                state.last_action = toolbar(ui, &state.snapshot, &state.catalog);
+            },
+            state,
+        );
+        harness.run();
+
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.step();
+
+        // 저장은 일어나지 않지만(can_save=false) 이벤트는 소비돼 큐에 남지 않는다.
+        assert_eq!(harness.state().last_action, None);
+        let leftover = harness.ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::S,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(!leftover, "⌘S가 소비되지 않고 큐에 남았다");
     }
 
     #[test]

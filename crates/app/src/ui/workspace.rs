@@ -1109,15 +1109,8 @@ fn paint_pane_header_base(
         );
         ui.painter().hline(range, top_y, active_stroke);
     }
-    ui.painter().hline(
-        header.x_range(),
-        crate::ui::snap_line_to_pixel(
-            header.bottom(),
-            crate::ui::designall::SEPARATOR_WIDTH,
-            ui.ctx().pixels_per_point(),
-        ),
-        crate::ui::designall::separator_stroke(ui.visuals()),
-    );
+    // 헤더와 본문 사이 하단 구분선은 긋지 않는다 — 탭 면과 터미널이 한 덩어리로
+    // 이어져 보여야 한다(2026-08-22 사용자 요청).
 }
 
 /// 두 탭 사이 세로 헤어라인 — 같은 배경을 쓰는 두 영역의 경계를 읽히게 한다.
@@ -4027,15 +4020,7 @@ impl WorkspaceUi {
         );
         ui.painter()
             .rect_filled(header, 0.0, identity_style.header_fill);
-        ui.painter().hline(
-            header.x_range(),
-            crate::ui::snap_line_to_pixel(
-                header.bottom(),
-                crate::ui::designall::SEPARATOR_WIDTH,
-                ui.ctx().pixels_per_point(),
-            ),
-            crate::ui::designall::separator_stroke(ui.visuals()),
-        );
+        // 하단 구분선 없음 — 일반 pane 헤더와 같은 규칙(2026-08-22).
         if identity_style.top_line.color != egui::Color32::TRANSPARENT {
             ui.painter().hline(
                 header.x_range(),

@@ -15209,7 +15209,16 @@ impl App {
                 .and_then(|path| path.file_name())
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            ui.weak(text.t("workspace.tab.document_placeholder", &[("name", &label)]));
+            // 선택 불가 라벨 — 자리표시자 문구가 드래그로 파랗게 잡히면 안 된다.
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        text.t("workspace.tab.document_placeholder", &[("name", &label)]),
+                    )
+                    .weak(),
+                )
+                .selectable(false),
+            );
         });
     }
 

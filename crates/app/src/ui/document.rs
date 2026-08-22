@@ -45,19 +45,20 @@ pub enum DocumentToolbarAction {
 /// 텍스트"처럼 보인다(2026-08-22 사용자 스크린샷 지적). 그래서 `Button`을 직접 만들어
 /// `.fill()`/`.stroke()`로 토큰 색만 명시한다.
 /// 본문(Source) 편집기의 왼쪽 여백 — 경계선에 글자가 붙지 않게.
-const SOURCE_EDITOR_LEFT_MARGIN: i8 = 4;
+const SOURCE_EDITOR_LEFT_MARGIN: i8 = 14;
+/// 원문 줄 간격 배수 — 고정폭 행 높이의 기본(약 1.2배)은 마크다운 원문을 읽기엔
+/// 촘촘하다(2026-08-22 사용자 지적). 미리보기와 달리 원문은 우리가 직접 그리므로
+/// 여기서는 바꿀 수 있다.
+const SOURCE_EDITOR_LINE_HEIGHT: f32 = 1.75;
 
 /// 세그먼트 칸의 좌우 안쪽 여백.
 const SEGMENT_PADDING_X: f32 = 8.0;
-/// 세그먼트 컨테이너의 테두리 두께(안쪽 여백 1 + stroke 1이 아니라 `inner_margin(1)`).
-const SEGMENT_BORDER_INSET: f32 = 1.0;
-
 /// 툴바 왼쪽 여백 — **역산**한 값이다. 세그먼트 첫 라벨("본문")의 첫 글자가 헤더 탭
-/// 제목("nomorevibe")과 **같은 x**에 오도록, `여백 + 테두리 + 버튼 패딩`이
-/// `PANE_HEADER_TITLE_LEFT`와 같아지게 맞춘다(2026-08-22 사용자 요청). 셋 중 하나만
+/// 제목("nomorevibe")과 **같은 x**에 오도록 `여백 + 칸 안쪽 여백`이
+/// `PANE_HEADER_TITLE_LEFT`와 같아지게 맞춘다(2026-08-22 사용자 요청). 둘 중 하나만
 /// 바꾸면 어긋나므로 상수에서 뽑아 계산한다.
 const TOOLBAR_LEFT_MARGIN: i8 =
-    (crate::ui::workspace::PANE_HEADER_TITLE_LEFT - SEGMENT_BORDER_INSET - SEGMENT_PADDING_X) as i8;
+    (crate::ui::workspace::PANE_HEADER_TITLE_LEFT - SEGMENT_PADDING_X) as i8;
 
 pub fn toolbar(
     ui: &mut egui::Ui,
@@ -66,10 +67,9 @@ pub fn toolbar(
 ) -> Option<DocumentToolbarAction> {
     let tokens = crate::ui::designall::tokens(ui.visuals());
     let mut action = None;
-    // 툴바 바탕 = 본문(Preview 페이지)과 같은 면(content_canvas). 아래 1px 구분선은
-    // 호출부(app.rs)가 이 함수 바로 뒤에 `ui.separator()`로 긋는다 — 그 stroke 색은
-    // `theme.rs`가 전역으로 `tokens.separator`와 같은 값을 심어 둬 여기서 다시 그릴
-    // 필요가 없다.
+    // 툴바와 본문을 가르는 1px 선은 호출부(app.rs)가 이 함수 바로 뒤에
+    // `ui.separator()`로 긋는다 — 문서 표면에 남는 선은 그것 하나뿐이다.
+    //
     // 툴바 바탕은 **본문과 같은 면**이다 — 따로 칠하지 않는다(2026-08-22). 예전엔
     // `content_canvas`를 칠해 본문(pane 면)보다 어두운 띠가 위에 얹혀 보였다.
     // 좌우 여백이 없으면 첫 글자가 pane 모서리에 붙는다.
@@ -87,50 +87,48 @@ pub fn toolbar(
                     // 상태만 있다. 헤더 보조 탭(`workspace.rs`의 `render_aux_tab`)이 쓰는
                     // 것과 같은 규칙(활성 tokens.text · 비활성 tokens.muted_text)이라 두
                     // 화면의 "선택됨" 표시가 같은 언어로 읽힌다.
-                    egui::Frame::NONE
-                        .stroke(egui::Stroke::new(1.0, tokens.separator))
-                        .corner_radius(crate::ui::designall::STRUCTURAL_CORNER_RADIUS)
-                        .inner_margin(egui::Margin::same(1))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                // 세 칸의 **안쪽 여백을 똑같이** 고정한다. 예전엔
-                                // 비활성 칸만 `frame(false)`라 프레임 패딩이 빠져
-                                // 칸마다 폭·높이가 달라졌다 — 그게 얼라인이 어긋나
-                                // 보이던 원인이다(2026-08-22 사용자 지적).
-                                ui.spacing_mut().button_padding =
-                                    egui::vec2(SEGMENT_PADDING_X, 3.0);
-                                for (mode, key) in [
-                                    (DocumentViewMode::Source, "document.mode.source"),
-                                    (DocumentViewMode::Preview, "document.mode.preview"),
-                                    (DocumentViewMode::Split, "document.mode.split"),
-                                ] {
-                                    let active = snapshot.mode == mode;
-                                    let label =
-                                        egui::RichText::new(text.t(key, &[])).color(if active {
-                                            tokens.text
-                                        } else {
-                                            tokens.muted_text
-                                        });
-                                    // 활성/비활성 **둘 다 프레임을 켠다**. 비활성은
-                                    // 투명 채움이라 보이지 않지만 패딩이 같아 세 칸의
-                                    // 크기가 일치한다.
-                                    let button = egui::Button::new(label)
-                                        .frame(true)
-                                        .selected(active)
-                                        .stroke(egui::Stroke::NONE)
-                                        .fill(if active {
-                                            tokens.selected_background
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        });
-                                    if ui.add(button).clicked() && !active {
-                                        action = Some(DocumentToolbarAction::SetMode(mode));
-                                    }
+                    // 테두리를 두지 않는다(2026-08-22 사용자 요청) — 좁은 pane에서
+                    // 선이 겹치면 답답해진다. 활성 칸만 면으로 올리고 나머지는 글자색만
+                    // 낮춘다: 헤더 탭이 활성일 때와 같은 규칙이다.
+                    {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            // 세 칸의 **안쪽 여백을 똑같이** 고정한다. 예전엔
+                            // 비활성 칸만 `frame(false)`라 프레임 패딩이 빠져
+                            // 칸마다 폭·높이가 달라졌다 — 그게 얼라인이 어긋나
+                            // 보이던 원인이다(2026-08-22 사용자 지적).
+                            ui.spacing_mut().button_padding = egui::vec2(SEGMENT_PADDING_X, 3.0);
+                            for (mode, key) in [
+                                (DocumentViewMode::Source, "document.mode.source"),
+                                (DocumentViewMode::Preview, "document.mode.preview"),
+                                (DocumentViewMode::Split, "document.mode.split"),
+                            ] {
+                                let active = snapshot.mode == mode;
+                                let label =
+                                    egui::RichText::new(text.t(key, &[])).color(if active {
+                                        tokens.text
+                                    } else {
+                                        tokens.muted_text
+                                    });
+                                // 활성/비활성 **둘 다 프레임을 켠다**. 비활성은
+                                // 투명 채움이라 보이지 않지만 패딩이 같아 세 칸의
+                                // 크기가 일치한다.
+                                let button = egui::Button::new(label)
+                                    .frame(true)
+                                    .selected(active)
+                                    .stroke(egui::Stroke::NONE)
+                                    .fill(if active {
+                                        tokens.selected_background
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    });
+                                if ui.add(button).clicked() && !active {
+                                    action = Some(DocumentToolbarAction::SetMode(mode));
                                 }
-                            });
+                            }
                         });
-                    ui.add_space(10.0);
+                    }
+                    ui.add_space(12.0);
                 }
 
                 // 저장 — 텍스트 버튼(프레임 없음). dirty(=can_save)일 때만 accent, 아니면
@@ -208,10 +206,15 @@ pub fn source_editor(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // 원문은 **고정폭**이어야 한다 — `TextEdit`의 기본은 비례 폰트라 표·
+            // 들여쓰기·코드 펜스가 어긋나 보였다(2026-08-22 사용자 스크린샷).
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
+            let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
             ui.add(
                 egui::TextEdit::multiline(source)
                     .id_salt(id_salt)
                     .interactive(editable)
+                    .font(font.clone())
                     // 기본 프레임(배경 + 테두리)을 끈다 — 켜두면 편집기만 어두운
                     // 상자로 보여 미리보기와 두 물건처럼 갈린다. 고정폭 글꼴이 이미
                     // "원본"임을 말해준다(2026-08-22).
@@ -226,7 +229,21 @@ pub fn source_editor(
                         top: 2,
                         bottom: 0,
                     })
-                    .desired_width(f32::INFINITY),
+                    .desired_width(f32::INFINITY)
+                    .layouter(&mut |ui, text, wrap_width| {
+                        let mut job = egui::text::LayoutJob::simple(
+                            text.as_str().to_owned(),
+                            font.clone(),
+                            ui.visuals().text_color(),
+                            wrap_width,
+                        );
+                        // 줄 간격은 섹션 단위로만 줄 수 있다 — `TextEdit`은 우리가
+                        // job을 만들어 넘기므로 여기서 지정한다.
+                        for section in &mut job.sections {
+                            section.format.line_height = Some(row * SOURCE_EDITOR_LINE_HEIGHT);
+                        }
+                        ui.fonts_mut(|fonts| fonts.layout_job(job))
+                    }),
             )
         })
         .inner

@@ -196,5 +196,15 @@ document.error.load_failed / document.error.save_failed
 ## 11. 이번 범위에서 제외
 
 원격 파일, 범위 주석, LSP, multi-cursor, slash command, wikilink 색인, 최근 문서
-영속화, 문서 탭 여러 개 동시 표시. 편집기 엔진 경쟁(CodeMirror/Monaco)은
-`document-editor-development-plan.md`가 이어받는다.
+영속화. 편집기 엔진 경쟁(CodeMirror/Monaco)은 `document-editor-development-plan.md`가
+이어받는다.
+
+**2026-08-22 갱신**: "문서 탭 여러 개 동시 표시"는 이 범위 제외 목록에서 빠졌다 —
+별도 라운드(멀티 문서 탭 설계)에서 구현했다. `PaneAuxTabKind::Document`가
+`DocumentTabId`를 실어 문서별로 식별하고, App은 `document: Option<OpenDocument>`
+대신 `documents: Vec<OpenDocument>` + `active_document`를 소유한다. §2의 탭 상한
+(`PANE_AUX_TAB_MAX`)과 §3.3의 "pane당 문서 하나(교체)" 규칙은 이 갱신으로
+대체됐다 — 상한은 이제 개수 상한이 없는 축약 사다리(활성 탭은 절대 버리지
+않는다) + App 쪽 `DOCUMENT_TABS_MAX`·`DOCUMENT_TOTAL_RETAINED_BYTES_MAX`가 맡고,
+새 문서를 열어도 기존 문서를 교체하지 않는다(가득 차면 가장 오래된 clean 비활성
+문서를 닫아 자리를 만든다).

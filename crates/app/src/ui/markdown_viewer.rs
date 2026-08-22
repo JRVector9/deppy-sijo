@@ -50,8 +50,14 @@ const PAGE_BODY_FONT_SIZE: f32 = 11.5;
 /// 계산식 자체를 바꾸려면 포크(`egui_commonmark_extended`, 다운로드 737회)나 자체
 /// 패치가 필요한데, 미관 문제에 안정성을 남에게 맡기는 거래라 택하지 않았다.
 const PAGE_HEADING_FONT_SIZE: f32 = 23.0;
-/// 문단·리스트·인용 사이 세로 리듬 — egui 기본 item_spacing.y(4px 안팎)보다 넉넉하게.
-const PAGE_ITEM_SPACING_Y: f32 = 10.0;
+/// 문단·리스트·인용 **사이** 세로 리듬 — egui 기본 item_spacing.y(4px 안팎)보다 넉넉하게.
+///
+/// 주의: 이건 블록과 블록 사이만 벌린다. **문단 안 줄 간격(line-height)은 여기서 못
+/// 바꾼다** — egui는 글꼴 메트릭에서 행 높이를 뽑고, `RichText::line_height`로 덮으려면
+/// 텍스트를 만드는 쪽이 지정해야 하는데 그건 egui_commonmark 안이라 손댈 수 없다.
+/// 11.5pt 본문의 행 높이는 약 1.2배로 촘촘하다(사용자 지적: "글이 다 붙어있다").
+/// 블록 간격이라도 넉넉히 둬 밀도를 낮춘다.
+const PAGE_ITEM_SPACING_Y: f32 = 14.0;
 /// 캐시 무효화 세분도용 폭 버킷 크기 — 이보다 작은 리사이즈는 같은 버킷으로 묶여
 /// 재캐시를 트리거하지 않는다(§6.4 WidthBucket).
 const CONTENT_WIDTH_BUCKET_PX: f32 = 40.0;

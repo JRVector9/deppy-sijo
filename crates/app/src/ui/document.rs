@@ -55,8 +55,16 @@ pub fn toolbar(
     // 호출부(app.rs)가 이 함수 바로 뒤에 `ui.separator()`로 긋는다 — 그 stroke 색은
     // `theme.rs`가 전역으로 `tokens.separator`와 같은 값을 심어 둬 여기서 다시 그릴
     // 필요가 없다.
+    // 툴바 바탕은 **본문과 같은 면**이다 — 따로 칠하지 않는다(2026-08-22). 예전엔
+    // `content_canvas`를 칠해 본문(pane 면)보다 어두운 띠가 위에 얹혀 보였다.
+    // 좌우 여백이 없으면 첫 글자가 pane 모서리에 붙는다.
     egui::Frame::NONE
-        .fill(tokens.content_canvas)
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top: 5,
+            bottom: 5,
+        })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if snapshot.show_mode_toggle {
@@ -71,6 +79,11 @@ pub fn toolbar(
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
+                                // 세 칸의 **안쪽 여백을 똑같이** 고정한다. 예전엔
+                                // 비활성 칸만 `frame(false)`라 프레임 패딩이 빠져
+                                // 칸마다 폭·높이가 달라졌다 — 그게 얼라인이 어긋나
+                                // 보이던 원인이다(2026-08-22 사용자 지적).
+                                ui.spacing_mut().button_padding = egui::vec2(9.0, 3.0);
                                 for (mode, key) in [
                                     (DocumentViewMode::Source, "document.mode.source"),
                                     (DocumentViewMode::Preview, "document.mode.preview"),
@@ -83,13 +96,18 @@ pub fn toolbar(
                                         } else {
                                             tokens.muted_text
                                         });
-                                    let mut button =
-                                        egui::Button::new(label).frame(active).selected(active);
-                                    if active {
-                                        button = button
-                                            .fill(tokens.selected_background)
-                                            .stroke(egui::Stroke::NONE);
-                                    }
+                                    // 활성/비활성 **둘 다 프레임을 켠다**. 비활성은
+                                    // 투명 채움이라 보이지 않지만 패딩이 같아 세 칸의
+                                    // 크기가 일치한다.
+                                    let button = egui::Button::new(label)
+                                        .frame(true)
+                                        .selected(active)
+                                        .stroke(egui::Stroke::NONE)
+                                        .fill(if active {
+                                            tokens.selected_background
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        });
                                     if ui.add(button).clicked() && !active {
                                         action = Some(DocumentToolbarAction::SetMode(mode));
                                     }
@@ -109,17 +127,25 @@ pub fn toolbar(
                 };
                 let save_label =
                     egui::RichText::new(text.t("document.save", &[])).color(save_color);
-                let save_clicked = ui
-                    .add_enabled(
-                        snapshot.can_save,
-                        egui::Button::new(save_label).frame(false),
-                    )
-                    .clicked();
+                // 「저장」과 「⌘S」는 한 덩어리로 읽혀야 한다 — 기본 item_spacing이
+                // 들어가면 둘이 떨어져 보인다(2026-08-22).
                 let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
-                ui.add(egui::Label::new(
-                    egui::RichText::new(ui.ctx().format_shortcut(&shortcut))
-                        .color(tokens.muted_text),
-                ));
+                let save_clicked = ui
+                    .horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let clicked = ui
+                            .add_enabled(
+                                snapshot.can_save,
+                                egui::Button::new(save_label).frame(false),
+                            )
+                            .clicked();
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(ui.ctx().format_shortcut(&shortcut))
+                                .color(tokens.muted_text),
+                        ));
+                        clicked
+                    })
+                    .inner;
 
                 // 문서 탭이 활성인 동안에만 호출되는 함수라 여기서 그대로 소비해도 다른
                 // 화면의 `⌘S`를 가로채지 않는다(notes.rs `⌘⇧D`와 같은 근거 — 전역 단축키

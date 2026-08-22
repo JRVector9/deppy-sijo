@@ -15791,20 +15791,10 @@ impl App {
                     },
                     text,
                 );
-                // `ui.separator()`는 자기 높이(약 6px)를 따로 할당해 툴바 아래에만
-                // 빈 띠를 만든다 — 정확히 1px만 할당해 직접 긋는다. 나란히 모드의
-                // 세로 분리선이 이 y에서 시작해 이어진다.
-                let (line_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 1.0),
-                    egui::Sense::hover(),
-                );
-                let line_y = line_rect.center().y;
-                ui.painter().hline(
-                    line_rect.x_range(),
-                    line_y,
-                    ui::designall::separator_stroke(ui.visuals()),
-                );
-                toolbar_separator_y = Some(line_y);
+                // 툴바 아래 구분선은 **긋지 않는다**(2026-08-23 사용자 요청) — 툴바가
+                // 헤더와 같은 면이고 본문은 다른 단이라, 선이 없어도 경계가 보인다.
+                // 나란히 모드의 세로 분리선은 툴바 바로 아래(본문 시작)에서 시작한다.
+                toolbar_separator_y = Some(ui.cursor().top());
             }
 
             match &load_state {

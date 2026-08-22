@@ -68,13 +68,14 @@ pub fn toolbar(
 ) -> Option<DocumentToolbarAction> {
     let tokens = crate::ui::designall::tokens(ui.visuals());
     let mut action = None;
-    // 툴바와 본문을 가르는 1px 선은 호출부(app.rs)가 이 함수 바로 뒤에
-    // `ui.separator()`로 긋는다 — 문서 표면에 남는 선은 그것 하나뿐이다.
+    // 툴바 바탕은 **헤더 탭 줄과 같은 면**이다(2026-08-23 사용자 요청) — 탭과 툴바가
+    // 한 덩어리로 읽히고, 그 아래 본문만 다른 단으로 갈린다. 헤더가 쓰는 것과 같은
+    // 상수를 그대로 가져와 둘이 따로 놀 수 없게 한다(`pane_header_style` 참고 —
+    // 테마와 무관하게 항상 다크인 면이라 tokens가 아니라 렌더러 상수를 쓴다).
     //
-    // 툴바 바탕은 **본문과 같은 면**이다 — 따로 칠하지 않는다(2026-08-22). 예전엔
-    // `content_canvas`를 칠해 본문(pane 면)보다 어두운 띠가 위에 얹혀 보였다.
-    // 좌우 여백이 없으면 첫 글자가 pane 모서리에 붙는다.
+    // 툴바 아래 구분선은 긋지 않는다 — 면이 갈리므로 선이 없어도 경계가 보인다.
     egui::Frame::NONE
+        .fill(terminal::renderer_egui::TERMINAL_SURFACE_BG)
         .inner_margin(egui::Margin {
             left: TOOLBAR_LEFT_MARGIN,
             right: 12,

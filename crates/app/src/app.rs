@@ -15773,6 +15773,7 @@ impl App {
         let mut link_intent = None;
         let mut split_width: Option<f32> = None;
         let mut open_with_os_clicked = false;
+        let mut toolbar_separator_y: Option<f32> = None;
 
         child.vertical(|ui| {
             if matches!(load_state, DocumentLoadState::Loaded { .. }) {
@@ -15786,7 +15787,10 @@ impl App {
                     },
                     text,
                 );
-                ui.separator();
+                // 나란히 모드의 세로 분리선이 이 가로선까지 닿아야 한다 — 안 그러면
+                // 위쪽이 끊어져 보인다(2026-08-22 사용자 지적). 선이 실제로 그려지는
+                // y(할당 rect의 중앙)를 넘겨준다.
+                toolbar_separator_y = Some(ui.separator().rect.center().y);
             }
 
             match &load_state {
@@ -15954,7 +15958,15 @@ impl App {
                                 separator.width,
                                 ppp,
                             );
-                            ui.painter().vline(sep_x, content_rect.y_range(), separator);
+                            // 위쪽을 툴바 구분선까지 끌어올려 이어 붙인다.
+                            let divider_top = toolbar_separator_y
+                                .unwrap_or(content_rect.top())
+                                .min(content_rect.top());
+                            ui.painter().vline(
+                                sep_x,
+                                egui::Rangef::new(divider_top, content_rect.bottom()),
+                                separator,
+                            );
 
                             let mut preview_ui = ui.new_child(
                                 egui::UiBuilder::new()

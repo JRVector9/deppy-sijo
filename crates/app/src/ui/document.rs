@@ -44,8 +44,9 @@ pub enum DocumentToolbarAction {
 /// 칠하는데, 그건 드래그 텍스트 선택과 같은 색이라 "선택된 탭"이 아니라 "드래그된
 /// 텍스트"처럼 보인다(2026-08-22 사용자 스크린샷 지적). 그래서 `Button`을 직접 만들어
 /// `.fill()`/`.stroke()`로 토큰 색만 명시한다.
-/// 본문(Source) 편집기의 왼쪽 여백 — 경계선에 글자가 붙지 않게.
-const SOURCE_EDITOR_LEFT_MARGIN: i8 = 4;
+/// 본문(Source) 편집기의 왼쪽 여백. 헤더 탭 제목·툴바 라벨과 **같은 세로선**에
+/// 맞춘다(2026-08-22 사용자 요청) — 셋이 제각각이면 pane 왼쪽이 계단처럼 보인다.
+const SOURCE_EDITOR_LEFT_MARGIN: i8 = crate::ui::workspace::PANE_HEADER_TITLE_LEFT as i8;
 /// 원문 줄 간격 배수 — 고정폭 행 높이의 기본(약 1.2배)은 마크다운 원문을 읽기엔
 /// 촘촘하다(2026-08-22 사용자 지적). 미리보기와 달리 원문은 우리가 직접 그리므로
 /// 여기서는 바꿀 수 있다.

@@ -32,11 +32,24 @@ use crate::ui::designall;
 const PAGE_MAX_CONTENT_WIDTH: f32 = 640.0;
 const PAGE_PADDING_X: i8 = 26;
 const PAGE_PADDING_Y: i8 = 22;
-const PAGE_BODY_FONT_SIZE: f32 = 13.0;
+/// 본문 크기. 터미널 11pt·사이드바 12~13pt와 같은 계열로 둔다 — 이 값이 헤딩 위계의
+/// **아래쪽 기준점**이기도 해서, 낮출수록 헤딩 단계 간격이 벌어진다(아래 참고).
+const PAGE_BODY_FONT_SIZE: f32 = 11.5;
 /// H1의 실제 렌더 크기. `apply_page_style`가 `TextStyle::Heading`에 심는 값이고,
-/// egui_commonmark는 H1(레벨 0)에서 이 값을 그대로 쓴다(보간 없음) — 그래서 이
-/// 상수만은 표의 목표(19)를 정확히 맞춘다. H2 이하는 `apply_page_style` 주석 참고.
-const PAGE_HEADING_FONT_SIZE: f32 = 19.0;
+/// egui_commonmark는 H1(레벨 0)에서 이 값을 그대로 쓴다(보간 없음).
+///
+/// **왜 이 두 상수가 함께 정해지는가**(2026-08-22): egui_commonmark_backend 0.24는
+/// 헤딩 크기를 `본문 + (헤딩 − 본문) × 고정비율`(H2=0.835, H3=0.668, …)로 계산하고
+/// 그 비율을 바꿀 공개 API가 없다. 즉 우리가 돌릴 수 있는 손잡이는 이 두 개뿐이고,
+/// **단계 간격은 (헤딩 − 본문)에 비례**한다.
+///
+/// 본문 13 / H1 19이던 시절엔 간격이 1pt라 H1~H4가 전부 bold인 상태에서 사실상
+/// 구분되지 않았다(사용자 보고: "H1과 H2가 같아 보인다"). 본문을 11.5로 낮추고 H1을
+/// 23으로 올려 간격을 1.9pt로 벌린다 — H1 23 / H2 21.1 / H3 19.2 / H4 17.3.
+///
+/// 계산식 자체를 바꾸려면 포크(`egui_commonmark_extended`, 다운로드 737회)나 자체
+/// 패치가 필요한데, 미관 문제에 안정성을 남에게 맡기는 거래라 택하지 않았다.
+const PAGE_HEADING_FONT_SIZE: f32 = 23.0;
 /// 문단·리스트·인용 사이 세로 리듬 — egui 기본 item_spacing.y(4px 안팎)보다 넉넉하게.
 const PAGE_ITEM_SPACING_Y: f32 = 10.0;
 /// 캐시 무효화 세분도용 폭 버킷 크기 — 이보다 작은 리사이즈는 같은 버킷으로 묶여

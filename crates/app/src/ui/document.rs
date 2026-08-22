@@ -107,9 +107,10 @@ pub fn toolbar(
                             // 여백). 높이를 조절할 땐 **프레임 여백이 아니라 이 값**을
                             // 쓴다 — 여백은 정수라 홀수 px을 나누면 위아래가 비대칭이
                             // 되고, 그러면 글자가 한쪽으로 밀려 보인다(2026-08-22).
-                            // 2.5 → 5.5로 줄 전체를 6px 높였다(사용자 요청, 여러 번에
-                            // 나눠 조정).
-                            ui.spacing_mut().button_padding = egui::vec2(SEGMENT_PADDING_X, 5.5);
+                            // 2.5 → 5.25로 줄 전체를 5.5px 높였다(사용자 요청, 여러 번에
+                            // 나눠 조정). 소수 값이라 Retina(2x)에서는 물리 픽셀로
+                            // 딱 떨어진다.
+                            ui.spacing_mut().button_padding = egui::vec2(SEGMENT_PADDING_X, 5.25);
                             for (mode, key) in [
                                 (DocumentViewMode::Source, "document.mode.source"),
                                 (DocumentViewMode::Preview, "document.mode.preview"),

@@ -30,7 +30,9 @@ use crate::ui::designall;
 // `min`으로 자연스럽게 줄어든다(하한을 강제로 두지 않는다 — 좁은 보조 탭에서
 // 억지로 폭을 넓히면 잘림만 는다).
 const PAGE_MAX_CONTENT_WIDTH: f32 = 640.0;
-const PAGE_PADDING_X: i8 = 26;
+/// 좌우 여백. 26에서 6으로 줄였다(2026-08-23 사용자 요청) — 보조 탭 본문은 웹
+/// 페이지가 아니라 pane 안이라 여백이 크면 읽을 폭만 깎인다.
+const PAGE_PADDING_X: i8 = 6;
 const PAGE_PADDING_Y: i8 = 22;
 /// 본문 크기. 터미널 11pt·사이드바 12~13pt와 같은 계열로 둔다 — 이 값이 헤딩 위계의
 /// **아래쪽 기준점**이기도 해서, 낮출수록 헤딩 단계 간격이 벌어진다(아래 참고).
@@ -481,40 +483,54 @@ impl MarkdownViewer {
         // 얹는 **데이터 패널**이라 한 단 파인 면이 맞고, 문서는 읽고 쓰는 **작업면**이라
         // 터미널과 같은 단이어야 한다. 의도된 분기다.
         let tokens = designall::tokens(ui.visuals());
-        egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(PAGE_PADDING_X, PAGE_PADDING_Y))
+
+        // 글이 **줄바꿈될 폭**은 가로 스크롤에 들어가기 전에 재야 한다. 가로 스크롤
+        // 안에서는 `available_width`가 사실상 무한이라, 거기서 재면 문단이 한 줄로
+        // 늘어져 스크롤해야 읽히게 된다(2026-08-23).
+        let wrap_width = (ui.available_width() - f32::from(PAGE_PADDING_X) * 2.0)
+            .clamp(0.0, PAGE_MAX_CONTENT_WIDTH);
+
+        // 표처럼 줄바꿈이 안 되는 요소는 좁은 pane에서 오른쪽이 잘려 아예 못 읽었다
+        // (사용자 보고). 가로 스크롤을 둬서 잘리는 대신 닿을 수 있게 한다 — 글은 위
+        // `wrap_width`로 이미 pane 폭에 맞춰 접히므로 평소엔 스크롤바가 안 뜬다.
+        egui::ScrollArea::horizontal()
+            .id_salt("markdown_viewer_horizontal")
             .show(ui, |ui| {
-                apply_page_style(ui);
-                // 가운데 정렬이 아니라 왼쪽 정렬 — 가운데는 "웹 페이지"처럼 보이고,
-                // 나란히 모드에서 좌우 줄이 어긋난다(2026-08-22).
-                ui.vertical(|ui| {
-                    let column_width = ui.available_width().clamp(0.0, PAGE_MAX_CONTENT_WIDTH);
-                    ui.set_max_width(column_width);
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(PAGE_PADDING_X, PAGE_PADDING_Y))
+                    .show(ui, |ui| {
+                        apply_page_style(ui);
+                        // 가운데 정렬이 아니라 왼쪽 정렬 — 가운데는 "웹 페이지"처럼 보이고,
+                        // 나란히 모드에서 좌우 줄이 어긋난다(2026-08-22).
+                        ui.vertical(|ui| {
+                            let column_width = wrap_width;
+                            ui.set_max_width(column_width);
 
-                    let scroll_key = ScrollCacheKey {
-                        slot: view.slot.0,
-                        revision: view.revision.0,
-                        dark_mode: ui.visuals().dark_mode,
-                        width_bucket: width_bucket(column_width),
-                    };
-                    if self.scroll_key != Some(scroll_key) {
-                        if let Some(old_key) = self.scroll_key {
-                            self.cache.clear_scrollable_with_id(old_key);
-                        }
-                        self.scroll_key = Some(scroll_key);
-                    }
+                            let scroll_key = ScrollCacheKey {
+                                slot: view.slot.0,
+                                revision: view.revision.0,
+                                dark_mode: ui.visuals().dark_mode,
+                                width_bucket: width_bucket(column_width),
+                            };
+                            if self.scroll_key != Some(scroll_key) {
+                                if let Some(old_key) = self.scroll_key {
+                                    self.cache.clear_scrollable_with_id(old_key);
+                                }
+                                self.scroll_key = Some(scroll_key);
+                            }
 
-                    CommonMarkViewer::new()
-                        .default_implicit_uri_scheme(uri_prefix)
-                        .enable_scroll_to_heading(true)
-                        .show_alt_text_on_hover(true)
-                        .max_image_width(Some(column_width as usize))
-                        .alerts(deppy_alert_bundle(tokens))
-                        // raw HTML은 절대 켜지 않는다(§7.3) — `html_fn`을 `None`으로
-                        // 두면 HTML 블록/인라인이 텍스트로만 표시되고 실행되지 않는다
-                        // (업스트림 기본값, 여기서 명시적으로 강조해 둔다).
-                        .show_scrollable(scroll_key, ui, &mut self.cache, source);
-                });
+                            CommonMarkViewer::new()
+                                .default_implicit_uri_scheme(uri_prefix)
+                                .enable_scroll_to_heading(true)
+                                .show_alt_text_on_hover(true)
+                                .max_image_width(Some(column_width as usize))
+                                .alerts(deppy_alert_bundle(tokens))
+                                // raw HTML은 절대 켜지 않는다(§7.3) — `html_fn`을 `None`으로
+                                // 두면 HTML 블록/인라인이 텍스트로만 표시되고 실행되지 않는다
+                                // (업스트림 기본값, 여기서 명시적으로 강조해 둔다).
+                                .show_scrollable(scroll_key, ui, &mut self.cache, source);
+                        });
+                    });
             });
 
         link_targets

@@ -8045,18 +8045,32 @@ pub struct App {
     /// 문서 id를 실어 보낸다(닫힌 문서의 결과는 `documents`에서 id를 못 찾아
     /// 자연히 버려진다).
     document_load_worker: crate::lazy_worker::LazyBoundedWorker<
-        (ui::workspace::DocumentTabId, document_io::DocumentLoadRequest),
-        (ui::workspace::DocumentTabId, document_io::DocumentLoadOutcome),
+        (
+            ui::workspace::DocumentTabId,
+            document_io::DocumentLoadRequest,
+        ),
+        (
+            ui::workspace::DocumentTabId,
+            document_io::DocumentLoadOutcome,
+        ),
     >,
     /// 아직 워커에 admit되지 못한 저장 요청들.
-    document_pending_saves:
-        std::collections::VecDeque<(ui::workspace::DocumentTabId, document_io::DocumentSaveRequest)>,
+    document_pending_saves: std::collections::VecDeque<(
+        ui::workspace::DocumentTabId,
+        document_io::DocumentSaveRequest,
+    )>,
     /// 지금 워커가 처리 중인 저장 잡의 문서 id — `document_load_inflight`와 같은 이유.
     document_save_inflight: Option<ui::workspace::DocumentTabId>,
     /// 문서 저장 lane — `document_io::save_document`.
     document_save_worker: crate::lazy_worker::LazyBoundedWorker<
-        (ui::workspace::DocumentTabId, document_io::DocumentSaveRequest),
-        (ui::workspace::DocumentTabId, document_io::DocumentSaveOutcome),
+        (
+            ui::workspace::DocumentTabId,
+            document_io::DocumentSaveRequest,
+        ),
+        (
+            ui::workspace::DocumentTabId,
+            document_io::DocumentSaveOutcome,
+        ),
     >,
     /// dirty 상태에서 문서를 닫으려 하거나 저장이 충돌했을 때의 확인 대기(설계
     /// §3.3·§7). `Some`이면 모달을 그린다. 어느 문서에 대한 확인인지는
@@ -9165,13 +9179,9 @@ fn apply_save_outcome_to_document(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DocumentPendingConfirm {
     /// dirty 상태에서 이 문서 탭을 닫으려던 참.
-    CloseWithDirty {
-        id: ui::workspace::DocumentTabId,
-    },
+    CloseWithDirty { id: ui::workspace::DocumentTabId },
     /// 저장 직전 다시 읽은 revision이 로드 시점과 달랐다 — 덮어쓰지 않았다.
-    SaveConflict {
-        id: ui::workspace::DocumentTabId,
-    },
+    SaveConflict { id: ui::workspace::DocumentTabId },
 }
 
 /// dirty 확인 모달(교체/닫기 공용)에서 사용자가 누른 버튼.
@@ -12208,9 +12218,10 @@ impl App {
             "document-load",
             std::time::Duration::from_secs(30),
             || {
-                |(id, request): (ui::workspace::DocumentTabId, document_io::DocumentLoadRequest)| {
-                    (id, document_io::load_document(&request))
-                }
+                |(id, request): (
+                    ui::workspace::DocumentTabId,
+                    document_io::DocumentLoadRequest,
+                )| { (id, document_io::load_document(&request)) }
             },
             move || document_load_ctx.request_repaint(),
         );
@@ -12219,9 +12230,10 @@ impl App {
             "document-save",
             std::time::Duration::from_secs(30),
             || {
-                |(id, request): (ui::workspace::DocumentTabId, document_io::DocumentSaveRequest)| {
-                    (id, document_io::save_document(request))
-                }
+                |(id, request): (
+                    ui::workspace::DocumentTabId,
+                    document_io::DocumentSaveRequest,
+                )| { (id, document_io::save_document(request)) }
             },
             move || document_save_ctx.request_repaint(),
         );
@@ -15935,7 +15947,11 @@ impl App {
     /// 자체 세대 큐(`FileTreeUi::queue_io`)를 거치지 않는 독립 슬롯
     /// (`AppHostIoAction::OpenPath`, 세션 폴더 열기가 이미 쓰는 것과 같은 자리)을
     /// 재사용한다 — 사이드바가 열려 있지 않아도 동작하고, 세대 번호 충돌 여지가 없다.
-    fn open_document_path_with_os(&mut self, ctx: &egui::Context, id: ui::workspace::DocumentTabId) {
+    fn open_document_path_with_os(
+        &mut self,
+        ctx: &egui::Context,
+        id: ui::workspace::DocumentTabId,
+    ) {
         let Some(path) = self
             .documents
             .iter()
@@ -16120,8 +16136,10 @@ impl App {
             return;
         };
         self.documents.remove(index);
-        self.document_pending_loads.retain(|(job_id, _)| *job_id != id);
-        self.document_pending_saves.retain(|(job_id, _)| *job_id != id);
+        self.document_pending_loads
+            .retain(|(job_id, _)| *job_id != id);
+        self.document_pending_saves
+            .retain(|(job_id, _)| *job_id != id);
         self.document_close_after_save.remove(&id);
         if matches!(
             self.document_pending_confirm,
@@ -16240,7 +16258,8 @@ impl App {
         document.load_state = DocumentLoadState::Loading;
         document.saving = false;
         document.save_error = None;
-        self.document_pending_saves.retain(|(job_id, _)| *job_id != id);
+        self.document_pending_saves
+            .retain(|(job_id, _)| *job_id != id);
         self.document_close_after_save.remove(&id);
         self.document_pending_loads.push_back((id, path));
     }
@@ -34176,8 +34195,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_document_eviction은_개수_상한을_넘으면_가장_먼저_연_clean_비활성_문서부터_닫는다()
-     {
+    fn plan_document_eviction은_개수_상한을_넘으면_가장_먼저_연_clean_비활성_문서부터_닫는다() {
         let mut documents = Vec::new();
         for i in 0..DOCUMENT_TABS_MAX as u32 {
             documents.push(stub_open_document_id(
@@ -34249,7 +34267,13 @@ mod tests {
         // 넘겼다 — clean 비활성 문서를 닫아 자리를 만들어야 한다.
         let big = vec![b'a'; (DOCUMENT_TOTAL_RETAINED_BYTES_MAX + 1) as usize];
         let big_source = String::from_utf8(big).unwrap();
-        let mut documents = vec![stub_open_document_id(0, "/tmp/big.md", &big_source, &big_source, false)];
+        let mut documents = vec![stub_open_document_id(
+            0,
+            "/tmp/big.md",
+            &big_source,
+            &big_source,
+            false,
+        )];
         documents.push(stub_open_document_id(1, "/tmp/small.md", "x", "x", false));
         let evict = plan_document_eviction(&documents, Some(ui::workspace::DocumentTabId(1)))
             .expect("clean 비활성 문서를 닫으면 바이트 상한 안으로 들어와야 한다");
@@ -34338,7 +34362,8 @@ mod tests {
             "새 문서는 목록에 추가돼야 한다(교체가 아니다): {function_body}"
         );
         assert!(
-            !function_body.contains("self.documents = ") && !function_body.contains("self.documents.clear()"),
+            !function_body.contains("self.documents = ")
+                && !function_body.contains("self.documents.clear()"),
             "새 문서를 열 때 기존 목록을 지우거나 통째로 바꾸면 안 된다: {function_body}"
         );
         let refuse_branch = function_body
@@ -34487,10 +34512,7 @@ mod tests {
             &document_io::DocumentSaveOutcome::Conflict,
         );
 
-        assert_eq!(
-            confirm,
-            Some(DocumentPendingConfirm::SaveConflict { id })
-        );
+        assert_eq!(confirm, Some(DocumentPendingConfirm::SaveConflict { id }));
         assert_eq!(
             document.source, "EDITED",
             "충돌 시 source를 덮어쓰면 안 된다"

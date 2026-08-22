@@ -8630,13 +8630,10 @@ mod tests {
         harness.run();
 
         assert!(
-            harness
-                .state()
-                .1
-                .contains(&Some((
-                    PaneAuxTabKind::Document(DocumentTabId(1)),
-                    PaneAuxTabIntent::Close
-                ))),
+            harness.state().1.contains(&Some((
+                PaneAuxTabKind::Document(DocumentTabId(1)),
+                PaneAuxTabIntent::Close
+            ))),
             "문서 X는 Close 의도를 올려야 한다"
         );
         assert_eq!(

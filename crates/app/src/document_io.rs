@@ -10,11 +10,6 @@
 //! 경로·문서 내용은 로그에 남기지 않는다(§7). 실패 로그는 error code와 바이트 수까지만
 //! 남긴다 — `tests::production_source_never_logs_path_or_content`가 회귀를 잡는다.
 
-// feat/document-io는 이 파일만 소유한다 — D0/D1(§9)의 App 배선(탭 상태, 워커 스레드)은
-// 별도 PR이 잇는다. 그때까지 pub API는 App에서 호출되지 않는다. 그 PR이 통합되면 이
-// allow를 지운다.
-#![allow(dead_code)]
-
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -179,7 +174,10 @@ pub enum DocumentLoadOutcome {
 }
 
 impl DocumentLoadOutcome {
-    /// 테스트/App에서 참조하는 티어 분류.
+    /// 테스트가 §6 티어 경계를 확인할 때 쓰는 분류. App은 `Loaded`/`ViewOnly` 등
+    /// 각 변형이 담은 값(source·revision·byte_len)이 그대로 필요해 이 요약 대신
+    /// 전체 매치를 쓴다 — 그래서 프로덕션 호출부가 없다(test-only).
+    #[cfg(test)]
     pub fn tier(&self) -> Option<DocumentLimitTier> {
         match self {
             Self::Loaded { .. } => Some(DocumentLimitTier::Full),

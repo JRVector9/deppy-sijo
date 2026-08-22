@@ -17,12 +17,6 @@
 //!   처리하지 않는다. `show`는 클릭된 링크의 [`MarkdownLinkIntent`]만 돌려주고,
 //!   실제로 브라우저를 열거나 다른 문서를 로드하는 일은 호출부(App host) 몫이다.
 
-// 탭 배선(`app.rs`/`workspace.rs`)은 이 PR과 동시에 진행 중인 별도 에이전트 몫이라
-// 아직 `MarkdownViewer::show`를 호출하는 프로덕션 코드가 없다 — 이 파일은 지금은
-// 자기 테스트에서만 쓰인다. `cargo check --bin`(테스트 cfg 없음)은 그래서 이 모듈
-// 전체를 dead_code로 본다. 배선 PR이 머지되면 이 allow는 지운다.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use egui_commonmark::{Alert, AlertBundle, CommonMarkCache, CommonMarkViewer};

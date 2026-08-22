@@ -11,6 +11,7 @@ use secret::KeyringSecretStore;
 use storage::Db;
 
 use crate::agent_resume::ArchivedResumePresentation;
+use crate::document_io;
 
 /// 커스텀 상단 타이틀바 높이 — macOS 신호등(닫기/최소화/전체화면) 수직 중앙 정렬에도
 /// 쓰인다(main.rs의 `set_traffic_light_titlebar_height`). 값이 바뀌면 신호등도 다시
@@ -8012,12 +8013,48 @@ pub struct App {
     /// 이력 본문 좌(카드)/우(원문) 분할 폭 — `git_tab_split_width`와 같은 규칙, Git과는
     /// 따로 기억한다.
     work_history_tab_split_width: Option<f32>,
-    /// 이력·Git과 같은 보조 UI 탭 상태 기계 — 문서(D0). 실제 로드·저장은 아직 없다
-    /// (TODO(D4): `document_io`가 채운다) — 지금은 자리표시자 본문만 보여준다.
+    /// 이력·Git과 같은 보조 UI 탭 상태 기계 — 문서(설계 §4).
     document_tab: ui::workspace::PaneAuxTabState,
-    /// 지금 문서 탭에 열려 있는 파일 경로 — 자리표시자 본문에 파일명만 보여준다.
-    /// TODO(D4): 같은 pane에서 다른 문서를 열면 dirty 확인 없이 곧장 이 값을 교체한다.
-    document_open_path: Option<PathBuf>,
+    /// 지금 문서 탭에 열려 있는 문서 — App 소유(설계 §4 `OpenDocument`). `None`이면
+    /// 아직 아무 문서도 연 적이 없거나(탭 자체가 닫힘) 방금 닫혔다.
+    document: Option<OpenDocument>,
+    /// 문서 본문 좌(source)/우(preview) Split 분할 폭 — `git_tab_split_width`와 같은
+    /// 규칙, Git·이력과는 따로 기억한다(설계 §4).
+    document_tab_split_width: Option<f32>,
+    /// `document.source`가 바뀔 때마다(편집·로드·재로드) 올리는 카운터 —
+    /// `MarkdownSourceRevision`으로 그대로 넘겨 Preview 캐시를 무효화한다. 안 올리면
+    /// 뷰어가 옛 내용을 계속 보여준다.
+    document_source_revision: u64,
+    /// 문서 열기(교체·최초 로드·재로드)마다 올리는 세대. 로드/저장 워커 결과에 실어
+    /// 보내 stale 결과(이미 다른 문서로 교체된 뒤에 늦게 도착한 결과)를 조용히
+    /// 버린다 — `git_panel_generation`과 같은 관례.
+    document_generation: u64,
+    /// 아직 워커에 admit되지 못한 로드 요청. `poll_document_io`가 매 틱 재시도한다
+    /// (`agent_launcher_detection_requested`와 같은 관례).
+    document_pending_load: Option<(u64, PathBuf)>,
+    /// 문서 로드 lane — `document_io::load_document`를 스레드에서 돌린다. 잡·결과에
+    /// 세대를 실어 보낸다(J/O 자체는 path를 돌려주지 않으므로).
+    document_load_worker: crate::lazy_worker::LazyBoundedWorker<
+        (u64, document_io::DocumentLoadRequest),
+        (u64, document_io::DocumentLoadOutcome),
+    >,
+    /// 아직 워커에 admit되지 못한 저장 요청.
+    document_pending_save: Option<(u64, document_io::DocumentSaveRequest)>,
+    /// 문서 저장 lane — `document_io::save_document`.
+    document_save_worker: crate::lazy_worker::LazyBoundedWorker<
+        (u64, document_io::DocumentSaveRequest),
+        (u64, document_io::DocumentSaveOutcome),
+    >,
+    /// dirty 상태에서 문서를 교체/닫으려 하거나 저장이 충돌했을 때의 확인 대기(설계
+    /// §3.3·§7). `Some`이면 모달을 그린다.
+    document_pending_confirm: Option<DocumentPendingConfirm>,
+    /// 확인 모달에서 「저장」을 고른 뒤 — 저장이 성공하면 이어서 할 일(교체/닫기).
+    /// 저장이 실패·충돌하면 이 값은 버리고 문서를 그대로 둔다(설계 §7: 덮어쓰지
+    /// 않는다).
+    document_save_then: Option<DocumentSaveContinuation>,
+    /// Markdown Preview/Split 렌더 캐시 — leaf 소유 상태를 App이 세션처럼 들고
+    /// 있는다(`transcript_viewer_ui`·`diff_viewer_ui`와 같은 관례).
+    document_markdown_viewer: ui::markdown_viewer::MarkdownViewer,
     /// pane이 하나도 없는 워크스페이스에서 문서를 열었을 때 — 셸 pane을 먼저 스폰하고
     /// (`SpawnShellAt`), 그 pane이 나타나면 `poll_pending_document_open`이 이어받아 연다.
     pending_document_open: Option<PathBuf>,
@@ -8938,6 +8975,117 @@ enum AuxTabWinner {
     Document,
 }
 
+/// 문서 탭에 지금 열려 있는 문서(설계 §4 `OpenDocument`). App 소유 — leaf
+/// (`ui::document`)는 이 값에서 뽑은 스냅샷만 받는다.
+struct OpenDocument {
+    path: PathBuf,
+    /// authoritative state — Viewer는 이 값을 재직렬화·저장하지 않는다(설계 §5).
+    source: String,
+    mode: ui::document::DocumentViewMode,
+    load_state: DocumentLoadState,
+    /// 저장(또는 로드) 시점 내용 — dirty 판정 기준. 설계 §4는 `saved_hash`(해시)를
+    /// 적었지만, Full 티어 상한이 1 MiB라 통째로 들고 비교해도 비용이 무시할 만하고
+    /// 해시 충돌 걱정이 아예 없다 — 단순함을 우선했다.
+    saved_source: String,
+    dirty: bool,
+    /// 저장 요청이 이미 나가 있는 동안 true — 저장 버튼 중복 클릭을 막는다.
+    saving: bool,
+    /// 마지막 저장 실패 이유 — 편집을 계속할 수 있어야 하므로(§6은 로드 실패만
+    /// 전면 차단이다) `load_state`를 덮어쓰지 않고 이 필드에만 남긴다. 다음 편집이나
+    /// 저장 재시도에서 지운다.
+    save_error: Option<document_io::DocumentIoErrorCode>,
+    /// 저장이 막 성공했다는 짧은 피드백("저장됨") 창 — 이 시각까지만 툴바에 보인다.
+    saved_feedback_until: Option<std::time::Instant>,
+    /// ViewOnly 티어로 열렸을 때의 파일 크기 — 툴바 문구에 이유(1 MiB 초과)를 함께
+    /// 보여준다. Full 티어면 `None`.
+    view_only_byte_len: Option<u64>,
+}
+
+impl OpenDocument {
+    /// 평문(`.txt` 등)은 모드 토글을 숨긴다(설계 §3.1) — Markdown 확장자만 preview를
+    /// 지원한다.
+    fn supports_preview(&self) -> bool {
+        matches!(
+            self.path.extension().and_then(|ext| ext.to_str()),
+            Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+        )
+    }
+
+    fn limit_tier(&self) -> Option<document_io::DocumentLimitTier> {
+        match &self.load_state {
+            DocumentLoadState::Loaded { limit, .. } => Some(*limit),
+            DocumentLoadState::Refused { .. } => Some(document_io::DocumentLimitTier::Refuse),
+            DocumentLoadState::Binary { .. } => Some(document_io::DocumentLimitTier::Binary),
+            DocumentLoadState::Loading | DocumentLoadState::Failed { .. } => None,
+        }
+    }
+
+    fn is_editable(&self) -> bool {
+        matches!(
+            self.load_state,
+            DocumentLoadState::Loaded {
+                limit: document_io::DocumentLimitTier::Full,
+                ..
+            }
+        )
+    }
+
+    fn can_save(&self) -> bool {
+        self.dirty && !self.saving && self.is_editable()
+    }
+}
+
+/// 문서 로드 결과의 App 쪽 표현(설계 §6 4티어 + Loading). `document_io::DocumentLoadOutcome`을
+/// 그대로 들고 있지 않는 이유: 그 타입은 "이번 로드 한 번"의 결과값이고, 여기서는
+/// "지금 문서 탭이 보여줄 상태"가 필요하다(재로드로 다시 Loading에 들어갔다가 새
+/// 결과로 갱신되는 상태 기계).
+#[derive(Debug, Clone)]
+enum DocumentLoadState {
+    Loading,
+    Loaded {
+        revision: document_io::DocumentRevision,
+        limit: document_io::DocumentLimitTier,
+    },
+    Refused {
+        byte_len: u64,
+    },
+    Binary {
+        byte_len: u64,
+    },
+    Failed {
+        code: document_io::DocumentIoErrorCode,
+    },
+}
+
+/// 저장이 성공하면 이어서 할 일 — dirty 확인 모달에서 「저장」을 골랐을 때만 채운다.
+#[derive(Debug, Clone)]
+enum DocumentSaveContinuation {
+    /// 저장 후 다른 문서로 교체한다.
+    ReplaceWith(PathBuf),
+    /// 저장 후 탭을 닫는다.
+    Close,
+}
+
+/// 문서 탭 확인 모달 종류(설계 §3.3·§7). 셋 다 버튼은 최대 두세 개 — "다른 이름으로
+/// 저장"은 이번 범위에서 생략한다(설계 §4 지시).
+#[derive(Debug, Clone)]
+enum DocumentPendingConfirm {
+    /// dirty 상태에서 다른 문서를 열려던 참.
+    ReplaceWithDirty { next_path: PathBuf },
+    /// dirty 상태에서 탭을 닫으려던 참.
+    CloseWithDirty,
+    /// 저장 직전 다시 읽은 revision이 로드 시점과 달랐다 — 덮어쓰지 않았다.
+    SaveConflict,
+}
+
+/// dirty 확인 모달(교체/닫기 공용)에서 사용자가 누른 버튼.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentConfirmChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
 /// 보조 본문은 하나뿐이라 세 탭이 동시에 활성일 수 없다. 진 쪽은 세션 탭으로 물러나되
 /// 탭 자체는 남는다(`on_session_tab_click`) — 이미 비활성/닫힘인 탭에 걸어도 안전하다
 /// (`on_session_tab_click`은 그 경우 그대로 돌려준다).
@@ -8991,6 +9139,14 @@ fn history_tab_list_width(body_width: f32) -> f32 {
 /// 구분선을 끝까지 끌어도 상세가 0폭이 되면 안 된다(2026-08-16 사용자 보고: 우측이
 /// 잘려 읽기 힘들다).
 const AUX_DETAIL_MIN_WIDTH: f32 = 240.0;
+
+/// 문서 탭 Split 좌측 source 편집기의 최소 폭 — 목록이 아니라 편집기라 이력·Git의
+/// 목록 최소 폭보다 넉넉하게 잡는다.
+const DOCUMENT_TAB_SOURCE_MIN_WIDTH: f32 = 320.0;
+
+/// 저장 성공 직후 툴바에 "저장됨" 문구를 보여주는 시간.
+const DOCUMENT_SAVED_FEEDBACK_DURATION: std::time::Duration =
+    std::time::Duration::from_millis(1500);
 
 /// 이력·Git 본문의 좌우 분할 폭 — 사용자가 구분선을 끌기 전(`stored: None`)에는 `auto`
 /// (`git_tab_list_width`/`history_tab_list_width`가 계산한 기존 자동값)를 쓰고, 한 번
@@ -11849,6 +12005,32 @@ impl App {
             },
             move || launcher_ctx.request_repaint(),
         );
+        // 문서 탭 로드/저장 lane(설계 §4·§9 D1) — `document_io`는 UI 타입을 모르는 순수
+        // 동기 함수만 노출한다. 파일 I/O를 UI 프레임에서 하지 않도록 여기서 각각 자기
+        // 스레드로 돌린다. 잡/결과에 세대(u64)를 실어 보내 stale 결과를 App 쪽에서
+        // 걸러낸다(`document_io` 자체는 path를 결과에 담지 않는다).
+        let document_load_ctx = egui_ctx.clone();
+        let document_load_worker = crate::lazy_worker::LazyBoundedWorker::new(
+            "document-load",
+            std::time::Duration::from_secs(30),
+            || {
+                |(generation, request): (u64, document_io::DocumentLoadRequest)| {
+                    (generation, document_io::load_document(&request))
+                }
+            },
+            move || document_load_ctx.request_repaint(),
+        );
+        let document_save_ctx = egui_ctx.clone();
+        let document_save_worker = crate::lazy_worker::LazyBoundedWorker::new(
+            "document-save",
+            std::time::Duration::from_secs(30),
+            || {
+                |(generation, request): (u64, document_io::DocumentSaveRequest)| {
+                    (generation, document_io::save_document(request))
+                }
+            },
+            move || document_save_ctx.request_repaint(),
+        );
         let dotenv_sync_worker =
             new_dotenv_sync_worker(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let initial_agent_state_scope = Arc::new(
@@ -12034,7 +12216,17 @@ impl App {
             work_history_tab: ui::workspace::PaneAuxTabState::default(),
             work_history_tab_split_width: None,
             document_tab: ui::workspace::PaneAuxTabState::default(),
-            document_open_path: None,
+            document: None,
+            document_tab_split_width: None,
+            document_source_revision: 0,
+            document_generation: 0,
+            document_pending_load: None,
+            document_load_worker,
+            document_pending_save: None,
+            document_save_worker,
+            document_pending_confirm: None,
+            document_save_then: None,
+            document_markdown_viewer: ui::markdown_viewer::MarkdownViewer::new(),
             pending_document_open: None,
             work_history_rows: Vec::new(),
             work_history_rows_revision: 0,
@@ -15187,39 +15379,345 @@ impl App {
             .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
     }
 
-    /// 문서 탭 본문 — D0 자리표시자다. 실제 로딩·편집·미리보기는 `document_io`·
-    /// `markdown_viewer`를 채우는 다른 PR이 맡는다(설계 §9 D1·D2). 지금은 pane 본문
-    /// rect가 App 소유로 넘어왔다는 것과 열린 파일명만 보여준다.
+    /// 문서 탭 본문 — 툴바 + source 편집기/Preview/Split(설계 §3·§5·§6). 본문 자체는
+    /// leaf(`ui::document`·`ui::markdown_viewer`)가 그리고, 여기서는 상태 판정과
+    /// 액션 적용만 한다(leaf는 intent만 돌려준다).
     fn render_document_tab_body(
         &mut self,
         ui: &mut egui::Ui,
         body: egui::Rect,
         text: &i18n::Catalog,
     ) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let mode = document.mode;
+        let show_mode_toggle = document.supports_preview();
+        let can_save = document.can_save();
+        let status_text = self.document_toolbar_status_text(text);
+        let load_state = document.load_state.clone();
+        let workspace_root = self.active_tree_root().unwrap_or_else(|| {
+            document
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default()
+        });
+        let base_directory = document
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let slot = ui::markdown_viewer::MarkdownDocumentSlot(0);
+        let revision = ui::markdown_viewer::MarkdownSourceRevision(self.document_source_revision);
+
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(body)
                 .id_salt("document_tab_body"),
         );
         child.set_clip_rect(body.intersect(ui.clip_rect()));
-        child.centered_and_justified(|ui| {
-            let label = self
-                .document_open_path
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            // 선택 불가 라벨 — 자리표시자 문구가 드래그로 파랗게 잡히면 안 된다.
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(
-                        text.t("workspace.tab.document_placeholder", &[("name", &label)]),
-                    )
-                    .weak(),
-                )
-                .selectable(false),
-            );
+
+        let mut toolbar_action = None;
+        let mut editor_changed = false;
+        let mut link_intent = None;
+        let mut split_width: Option<f32> = None;
+        let mut open_with_os_clicked = false;
+
+        child.vertical(|ui| {
+            if matches!(load_state, DocumentLoadState::Loaded { .. }) {
+                toolbar_action = ui::document::toolbar(
+                    ui,
+                    &ui::document::DocumentToolbarSnapshot {
+                        mode,
+                        show_mode_toggle,
+                        can_save,
+                        status_text,
+                    },
+                    text,
+                );
+                ui.separator();
+            }
+
+            match &load_state {
+                DocumentLoadState::Loading => {
+                    ui.centered_and_justified(|ui| ui.label(text.t("document.loading", &[])));
+                }
+                DocumentLoadState::Refused { byte_len } => {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(text.t(
+                                "document.limit.refused",
+                                &[("bytes", &byte_len.to_string())],
+                            ));
+                            ui.add_space(8.0);
+                            if ui.button(text.t("file_tree.open_with_os", &[])).clicked() {
+                                open_with_os_clicked = true;
+                            }
+                        });
+                    });
+                }
+                DocumentLoadState::Binary { byte_len } => {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                text.t(
+                                    "document.limit.binary",
+                                    &[("bytes", &byte_len.to_string())],
+                                ),
+                            );
+                            ui.add_space(8.0);
+                            if ui.button(text.t("file_tree.open_with_os", &[])).clicked() {
+                                open_with_os_clicked = true;
+                            }
+                        });
+                    });
+                }
+                DocumentLoadState::Failed { code } => {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(text.t("document.error.load_failed", &[("code", code.as_str())]));
+                    });
+                }
+                DocumentLoadState::Loaded { .. } => {
+                    let Some(document) = self.document.as_mut() else {
+                        return;
+                    };
+                    let editable = document.is_editable();
+                    match mode {
+                        ui::document::DocumentViewMode::Source => {
+                            editor_changed =
+                                ui::document::source_editor(ui, &mut document.source, editable);
+                        }
+                        ui::document::DocumentViewMode::Preview => {
+                            link_intent = self.document_markdown_viewer.show(
+                                ui,
+                                &document.source,
+                                ui::markdown_viewer::MarkdownViewerContext {
+                                    slot,
+                                    revision,
+                                    workspace_root: &workspace_root,
+                                    base_directory: &base_directory,
+                                },
+                            );
+                        }
+                        ui::document::DocumentViewMode::Split => {
+                            let content_rect = ui.available_rect_before_wrap();
+                            let auto_source_width = content_rect.width() * 0.5;
+                            let source_width = aux_split_width(
+                                self.document_tab_split_width,
+                                auto_source_width,
+                                content_rect.width(),
+                                DOCUMENT_TAB_SOURCE_MIN_WIDTH,
+                            );
+                            let (source_rect, preview_rect) = content_rect
+                                .split_left_right_at_x(content_rect.left() + source_width);
+
+                            let mut source_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(source_rect)
+                                    .id_salt("document_tab_split_source"),
+                            );
+                            source_ui.set_clip_rect(source_rect.intersect(ui.clip_rect()));
+                            let document = self.document.as_mut().expect("checked above");
+                            editor_changed = ui::document::source_editor(
+                                &mut source_ui,
+                                &mut document.source,
+                                editable,
+                            );
+
+                            let divider_hit_rect = egui::Rect::from_min_max(
+                                egui::pos2(source_rect.right() - 3.0, content_rect.top()),
+                                egui::pos2(source_rect.right() + 3.0, content_rect.bottom()),
+                            );
+                            let resize_id = ui.id().with("document_tab_split_resize");
+                            let resize_response = ui
+                                .interact(divider_hit_rect, resize_id, egui::Sense::drag())
+                                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                            let resize_start_id = resize_id.with("drag_start_width");
+                            if resize_response.drag_started() {
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(resize_start_id, source_width)
+                                });
+                            }
+                            if let Some(total_drag_delta) = resize_response.total_drag_delta() {
+                                let start_width = ui
+                                    .ctx()
+                                    .data(|data| data.get_temp::<f32>(resize_start_id))
+                                    .unwrap_or(source_width);
+                                split_width =
+                                    aux_divider_requested_width(start_width, total_drag_delta.x);
+                                ui.ctx().request_repaint();
+                            }
+                            if resize_response.drag_stopped() {
+                                ui.ctx()
+                                    .data_mut(|data| data.remove::<f32>(resize_start_id));
+                            }
+                            let separator = if resize_response.dragged() {
+                                ui.visuals().widgets.active.bg_stroke
+                            } else if resize_response.hovered() {
+                                ui.visuals().widgets.hovered.bg_stroke
+                            } else {
+                                ui::designall::separator_stroke(ui.visuals())
+                            };
+                            let ppp = ui.ctx().pixels_per_point();
+                            let sep_x = ui::snap_line_to_pixel(
+                                ui::designall::panel_edge_separator_x(source_rect.right(), ppp),
+                                separator.width,
+                                ppp,
+                            );
+                            ui.painter().vline(sep_x, content_rect.y_range(), separator);
+
+                            let mut preview_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(preview_rect.shrink2(egui::vec2(6.0, 0.0)))
+                                    .id_salt("document_tab_split_preview"),
+                            );
+                            preview_ui.set_clip_rect(preview_rect.intersect(ui.clip_rect()));
+                            link_intent = self.document_markdown_viewer.show(
+                                &mut preview_ui,
+                                &document.source,
+                                ui::markdown_viewer::MarkdownViewerContext {
+                                    slot,
+                                    revision,
+                                    workspace_root: &workspace_root,
+                                    base_directory: &base_directory,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
         });
+
+        if let Some(action) = toolbar_action {
+            match action {
+                ui::document::DocumentToolbarAction::SetMode(mode) => {
+                    if let Some(document) = self.document.as_mut() {
+                        document.mode = mode;
+                    }
+                }
+                ui::document::DocumentToolbarAction::Save => {
+                    self.request_document_save();
+                }
+            }
+        }
+        if editor_changed {
+            self.on_document_source_edited();
+        }
+        if let Some(width) = split_width {
+            self.document_tab_split_width = Some(width);
+        }
+        if open_with_os_clicked {
+            self.open_document_path_with_os(ui.ctx());
+        }
+        if let Some(intent) = link_intent {
+            self.apply_document_link_intent(ui.ctx(), intent);
+        }
+    }
+
+    /// 툴바 상태 문구 — 저장 직후 잠깐의 "저장됨" 피드백이 dirty/ViewOnly 문구보다
+    /// 우선한다. `DOCUMENT_SAVED_FEEDBACK_DURATION`이 지나면 자연히 사라진다(피드백
+    /// 창이 열려 있는 동안 계속 리페인트를 예약해 타이머 만료가 화면에 반영되게 한다).
+    fn document_toolbar_status_text(&self, text: &i18n::Catalog) -> Option<String> {
+        let document = self.document.as_ref()?;
+        if let Some(until) = document.saved_feedback_until {
+            let now = std::time::Instant::now();
+            if now < until {
+                self.egui_ctx.request_repaint_after(until - now);
+                return Some(text.t("document.saved", &[]));
+            }
+        }
+        if let Some(code) = document.save_error {
+            return Some(text.t("document.error.save_failed", &[("code", code.as_str())]));
+        }
+        if document.dirty {
+            return Some(text.t("document.dirty", &[]));
+        }
+        if document.limit_tier() == Some(document_io::DocumentLimitTier::ViewOnly) {
+            let bytes = document.view_only_byte_len.unwrap_or_default().to_string();
+            return Some(text.t("document.limit.view_only", &[("bytes", &bytes)]));
+        }
+        None
+    }
+
+    /// 편집 반영 — dirty 판정(저장 시점 내용과 비교)과 Preview 캐시 무효화 카운터를
+    /// 함께 올린다. 안 올리면 뷰어가 옛 내용을 계속 보여준다.
+    fn on_document_source_edited(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        document.dirty = document.source != document.saved_source;
+        document.save_error = None;
+        self.document_source_revision = self.document_source_revision.wrapping_add(1);
+    }
+
+    /// Markdown 링크 클릭 intent 라우팅(설계 §5·§7.3) — leaf는 절대 파일을 열거나 URL을
+    /// 열지 않는다.
+    fn apply_document_link_intent(
+        &mut self,
+        ctx: &egui::Context,
+        intent: ui::markdown_viewer::MarkdownLinkIntent,
+    ) {
+        match intent {
+            ui::markdown_viewer::MarkdownLinkIntent::OpenExternal(url) => {
+                ctx.open_url(egui::OpenUrl::new_tab(url));
+            }
+            ui::markdown_viewer::MarkdownLinkIntent::OpenRelativeDocument(relative) => {
+                let Some(target) = self.document.as_ref().map(|document| {
+                    document
+                        .path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(&relative)
+                }) else {
+                    return;
+                };
+                self.open_document(target);
+            }
+            ui::markdown_viewer::MarkdownLinkIntent::Rejected(_) => {
+                // 내용(스킴·경로)은 로그에 남기지 않는다(§7) — 무슨 일이 있었는지만.
+                tracing::debug!(kind = "document_link", "rejected link scheme");
+            }
+        }
+    }
+
+    /// 「OS로 열기」 — Refused/Binary 티어에서 쓴다. `FileTreeIoRequest::OpenPath`와
+    /// 같은 실행 경로(`app_host_open_path_reaped`)를 쓰지만, file_tree 사이드바의
+    /// 자체 세대 큐(`FileTreeUi::queue_io`)를 거치지 않는 독립 슬롯
+    /// (`AppHostIoAction::OpenPath`, 세션 폴더 열기가 이미 쓰는 것과 같은 자리)을
+    /// 재사용한다 — 사이드바가 열려 있지 않아도 동작하고, 세대 번호 충돌 여지가 없다.
+    fn open_document_path_with_os(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.document.as_ref().map(|document| document.path.clone()) else {
+            return;
+        };
+        if self.pending_app_host_action.is_none() {
+            self.pending_app_host_action = Some(AppHostIoAction::OpenPath(path));
+            ctx.request_repaint();
+        }
+    }
+
+    /// 저장 요청 — dirty && Full 티어일 때만 유효(`OpenDocument::can_save`). 워커
+    /// admit은 `poll_document_io`가 매 틱 재시도한다.
+    fn request_document_save(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if !document.can_save() {
+            return;
+        }
+        let DocumentLoadState::Loaded { revision, .. } = document.load_state else {
+            return;
+        };
+        document.saving = true;
+        document.save_error = None;
+        self.document_pending_save = Some((
+            self.document_generation,
+            document_io::DocumentSaveRequest {
+                path: document.path.clone(),
+                contents: document.source.clone(),
+                expected_revision: revision,
+            },
+        ));
     }
 
     /// 이력 탭이 방금 활성화됐을 때의 공통 진입 — projection을 새로 요청하고, 카드
@@ -15299,9 +15797,19 @@ impl App {
         }
     }
 
-    /// 문서 보조 탭이 올린 의도 — `apply_work_history_tab_intent`와 같은 모양이다(D0).
+    /// 문서 보조 탭이 올린 의도 — `apply_work_history_tab_intent`와 같은 모양이다.
     /// 문서 X는 UI 탭만 닫는다 — 어떤 경로도 runtime에 종료 명령을 보내지 않는다.
+    /// dirty 상태에서 닫으려 하면 곧장 닫지 않고 확인을 받는다(설계 §3.3).
     fn apply_document_tab_intent(&mut self, intent: ui::workspace::PaneAuxTabIntent) {
+        if matches!(intent, ui::workspace::PaneAuxTabIntent::Close)
+            && self
+                .document
+                .as_ref()
+                .is_some_and(|document| document.dirty)
+        {
+            self.document_pending_confirm = Some(DocumentPendingConfirm::CloseWithDirty);
+            return;
+        }
         let previous = self.document_tab;
         self.document_tab = match intent {
             ui::workspace::PaneAuxTabIntent::Activate => previous.on_tab_click(),
@@ -15319,14 +15827,52 @@ impl App {
                 AuxTabWinner::Document,
             );
         }
+        if matches!(intent, ui::workspace::PaneAuxTabIntent::Close) {
+            // 실제로 닫혔다(dirty가 아니었다) — 문서 상태를 통째로 비운다. 이후 도착하는
+            // 로드/저장 결과는 세대 불일치로 걸러진다.
+            self.clear_document_state();
+        }
     }
 
-    /// 문서 탭을 포커스된 pane 위에 연다(D0 자리표시자) — `SidebarAction::OpenDocument`
-    /// 라우팅과 `poll_pending_document_open` 둘 다 이 헬퍼로 모인다.
-    /// TODO(D4): 같은 pane에 이미 문서가 열려 있으면 dirty 확인 없이 곧장 교체한다 —
-    /// 실제 편집 상태가 생기면(D1) 저장/버리기 확인이 필요하다.
-    fn attach_document_tab(&mut self, path: PathBuf) {
-        self.document_open_path = Some(path);
+    /// 문서 탭·상태를 완전히 비운다 — 실제로 닫힐 때만 부른다(dirty 확인을 통과했거나
+    /// 애초에 dirty가 아니었을 때).
+    fn clear_document_state(&mut self) {
+        self.document = None;
+        self.document_pending_load = None;
+        self.document_pending_save = None;
+        self.document_save_then = None;
+        self.document_pending_confirm = None;
+        self.document_generation = self.document_generation.wrapping_add(1);
+    }
+
+    /// dirty 확인을 통과한 뒤(또는 확인이 필요 없을 때) 문서 탭을 포커스된 pane 위에
+    /// 연다 — `SidebarAction::OpenDocument` 라우팅과 `poll_pending_document_open` 둘
+    /// 다 이 헬퍼로 모인다. 이미 열려 있는 문서와 같은 경로면 재로드하지 않고 탭만
+    /// 활성화한다(같은 문서를 다시 클릭했다고 편집 중이던 내용을 버릴 이유가 없다).
+    fn begin_document_open(&mut self, path: PathBuf) {
+        let already_open = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.path == path);
+        if !already_open {
+            self.document_generation = self.document_generation.wrapping_add(1);
+            self.document_pending_save = None;
+            self.document_save_then = None;
+            self.document = Some(OpenDocument {
+                path: path.clone(),
+                source: String::new(),
+                mode: ui::document::DocumentViewMode::Source,
+                load_state: DocumentLoadState::Loading,
+                saved_source: String::new(),
+                dirty: false,
+                saving: false,
+                save_error: None,
+                saved_feedback_until: None,
+                view_only_byte_len: None,
+            });
+            self.document_source_revision = self.document_source_revision.wrapping_add(1);
+            self.document_pending_load = Some((self.document_generation, path));
+        }
         self.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
         (self.work_history_tab, self.git_tab, self.document_tab) = resolve_aux_tab_exclusivity(
             self.work_history_tab,
@@ -15338,17 +15884,27 @@ impl App {
         self.reveal_terminal_view_for_aux_tab();
     }
 
-    /// 파일 트리에서 문서를 열었다 — 포커스된 pane이 있으면 곧장 연다. pane이 하나도
-    /// 없으면 문서도 붙을 곳이 없으므로 셸 pane을 먼저 스폰하고, `poll_pending_document_open`이
-    /// 다음 틱들에서 pane이 나타나길 기다렸다가 이어받는다(설계 §3.2).
+    /// 파일 트리에서 문서를 열었다(또는 Markdown 링크로 다른 문서를 열었다) — 이미
+    /// 다른 문서가 dirty 상태로 열려 있으면 곧장 교체하지 않고 확인을 받는다(설계
+    /// §3.3). 포커스된 pane이 있으면 곧장 열고, 하나도 없으면 셸 pane을 먼저 스폰하고
+    /// `poll_pending_document_open`이 다음 틱들에서 이어받는다(설계 §3.2).
     fn open_document(&mut self, path: PathBuf) {
+        if self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.dirty && document.path != path)
+        {
+            self.document_pending_confirm =
+                Some(DocumentPendingConfirm::ReplaceWithDirty { next_path: path });
+            return;
+        }
         let has_focused_pane = self
             .active
             .workspace_ui
             .mux()
             .is_some_and(|mux| mux.focused_pane.is_some());
         if has_focused_pane {
-            self.attach_document_tab(path);
+            self.begin_document_open(path);
         } else {
             self.pending_document_open = Some(path);
             self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellAt {
@@ -15370,7 +15926,239 @@ impl App {
             .is_some_and(|mux| mux.focused_pane.is_some());
         if ready {
             self.pending_document_open = None;
-            self.attach_document_tab(path);
+            self.begin_document_open(path);
+        }
+    }
+
+    /// dirty 확인 모달에서 「저장」을 골랐을 때만 채워지는, 저장 성공 뒤 실행할 continuation.
+    /// 실제로 닫는다 — 저장이 이미 성공했으므로 dirty 재확인 없이 곧장 닫는다.
+    fn close_document_tab(&mut self) {
+        self.clear_document_state();
+        self.document_tab = self.document_tab.on_close();
+        self.aux_search.reset();
+    }
+
+    /// 저장 Conflict 확인에서 「다시 불러오기」를 골랐다 — 로컬 편집을 버리고 디스크의
+    /// 최신 내용을 다시 읽는다. 보기 모드(`mode`)는 그대로 둔다.
+    fn reload_document_from_disk(&mut self) {
+        let Some(path) = self.document.as_ref().map(|document| document.path.clone()) else {
+            return;
+        };
+        self.document_generation = self.document_generation.wrapping_add(1);
+        self.document_pending_save = None;
+        self.document_save_then = None;
+        if let Some(document) = self.document.as_mut() {
+            document.load_state = DocumentLoadState::Loading;
+            document.saving = false;
+            document.save_error = None;
+        }
+        self.document_pending_load = Some((self.document_generation, path));
+    }
+
+    /// dirty 확인 모달(교체/닫기 공용)에서 사용자가 고른 선택을 적용한다.
+    fn apply_document_confirm_choice(&mut self, choice: DocumentConfirmChoice) {
+        let Some(pending) = self.document_pending_confirm.take() else {
+            return;
+        };
+        match (choice, pending) {
+            (DocumentConfirmChoice::Cancel, _) => {}
+            (
+                DocumentConfirmChoice::Discard,
+                DocumentPendingConfirm::ReplaceWithDirty { next_path },
+            ) => self.begin_document_open(next_path),
+            (DocumentConfirmChoice::Discard, DocumentPendingConfirm::CloseWithDirty) => {
+                self.close_document_tab();
+            }
+            (
+                DocumentConfirmChoice::Save,
+                DocumentPendingConfirm::ReplaceWithDirty { next_path },
+            ) => {
+                self.document_save_then = Some(DocumentSaveContinuation::ReplaceWith(next_path));
+                self.request_document_save();
+            }
+            (DocumentConfirmChoice::Save, DocumentPendingConfirm::CloseWithDirty) => {
+                self.document_save_then = Some(DocumentSaveContinuation::Close);
+                self.request_document_save();
+            }
+            // SaveConflict 모달은 이 함수를 거치지 않는다(재로드/취소 두 가지뿐 —
+            // `apply_document_conflict_choice`가 따로 처리한다).
+            (_, DocumentPendingConfirm::SaveConflict) => {}
+        }
+    }
+
+    /// 저장 Conflict 확인(재로드/취소 두 가지)에서 사용자가 고른 선택을 적용한다.
+    fn apply_document_conflict_choice(&mut self, reload: bool) {
+        self.document_pending_confirm = None;
+        if reload {
+            self.reload_document_from_disk();
+        }
+    }
+
+    /// 문서 로드/저장 lane 폴링(설계 §4·§7) — 파일 I/O는 워커에서 끝났고, 여기서는
+    /// 최신 결과만 짧게 적용한다. `logic()`에서만 부른다(render 경로에서 IO를 시작하지
+    /// 않는다).
+    fn poll_document_io(&mut self) {
+        while let Some(outcome) = self.document_load_worker.try_recv() {
+            match outcome.into_result() {
+                Ok((generation, load_outcome)) => {
+                    if generation == self.document_generation {
+                        self.apply_document_load_outcome(load_outcome);
+                    }
+                }
+                // 잡 데이터를 잃는 실패(spawn 실패·panic·disconnect)라 어느 세대인지
+                // 알 수 없다 — 지금 Loading 중인 문서가 있으면 그것으로 본다(best-effort).
+                Err(_) => {
+                    if let Some(document) = self.document.as_mut()
+                        && matches!(document.load_state, DocumentLoadState::Loading)
+                    {
+                        document.load_state = DocumentLoadState::Failed {
+                            code: document_io::DocumentIoErrorCode::ReadFailed,
+                        };
+                    }
+                }
+            }
+        }
+        if let Some((generation, path)) = self.document_pending_load.take() {
+            match self
+                .document_load_worker
+                .try_request((generation, document_io::DocumentLoadRequest { path }))
+            {
+                Ok(()) => {}
+                Err(crate::lazy_worker::LazyWorkerSubmitError::Full(job)) => {
+                    self.document_pending_load = Some((job.0, job.1.path));
+                }
+                Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { job, .. }) => {
+                    if job.0 == self.document_generation
+                        && let Some(document) = self.document.as_mut()
+                    {
+                        document.load_state = DocumentLoadState::Failed {
+                            code: document_io::DocumentIoErrorCode::ReadFailed,
+                        };
+                    }
+                }
+            }
+        }
+
+        while let Some(outcome) = self.document_save_worker.try_recv() {
+            match outcome.into_result() {
+                Ok((generation, save_outcome)) => {
+                    if generation == self.document_generation {
+                        self.apply_document_save_outcome(save_outcome);
+                    }
+                }
+                Err(_) => {
+                    if let Some(document) = self.document.as_mut() {
+                        document.saving = false;
+                    }
+                }
+            }
+        }
+        if let Some(pending) = self.document_pending_save.take() {
+            let generation = pending.0;
+            match self.document_save_worker.try_request(pending) {
+                Ok(()) => {}
+                Err(crate::lazy_worker::LazyWorkerSubmitError::Full(job)) => {
+                    self.document_pending_save = Some(job);
+                }
+                Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { .. }) => {
+                    if generation == self.document_generation
+                        && let Some(document) = self.document.as_mut()
+                    {
+                        document.saving = false;
+                        document.save_error = Some(document_io::DocumentIoErrorCode::ReadFailed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 로드 결과 4종(Loaded/ViewOnly/Refused/Binary) + 실패를 App 상태로 반영한다.
+    fn apply_document_load_outcome(&mut self, outcome: document_io::DocumentLoadOutcome) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        document.view_only_byte_len = None;
+        match outcome {
+            document_io::DocumentLoadOutcome::Loaded { source, revision } => {
+                document.saved_source = source.clone();
+                document.source = source;
+                document.dirty = false;
+                document.load_state = DocumentLoadState::Loaded {
+                    revision,
+                    limit: document_io::DocumentLimitTier::Full,
+                };
+            }
+            document_io::DocumentLoadOutcome::ViewOnly {
+                source,
+                revision,
+                byte_len,
+            } => {
+                document.saved_source = source.clone();
+                document.source = source;
+                document.dirty = false;
+                document.load_state = DocumentLoadState::Loaded {
+                    revision,
+                    limit: document_io::DocumentLimitTier::ViewOnly,
+                };
+                document.view_only_byte_len = Some(byte_len);
+            }
+            document_io::DocumentLoadOutcome::Refused { byte_len } => {
+                document.load_state = DocumentLoadState::Refused { byte_len };
+            }
+            document_io::DocumentLoadOutcome::Binary { byte_len } => {
+                document.load_state = DocumentLoadState::Binary { byte_len };
+            }
+            document_io::DocumentLoadOutcome::Failed { code } => {
+                document.load_state = DocumentLoadState::Failed { code };
+            }
+        }
+        document.save_error = None;
+        document.saved_feedback_until = None;
+        self.document_source_revision = self.document_source_revision.wrapping_add(1);
+    }
+
+    /// 저장 결과를 App 상태로 반영한다 — Conflict는 덮어쓰지 않고 확인 상태로 간다
+    /// (설계 §7).
+    fn apply_document_save_outcome(&mut self, outcome: document_io::DocumentSaveOutcome) {
+        match outcome {
+            document_io::DocumentSaveOutcome::Saved { revision } => {
+                if let Some(document) = self.document.as_mut() {
+                    document.saving = false;
+                    document.saved_source = document.source.clone();
+                    document.dirty = false;
+                    document.save_error = None;
+                    document.saved_feedback_until =
+                        Some(std::time::Instant::now() + DOCUMENT_SAVED_FEEDBACK_DURATION);
+                    if let DocumentLoadState::Loaded { revision: slot, .. } =
+                        &mut document.load_state
+                    {
+                        *slot = revision;
+                    }
+                }
+                self.egui_ctx
+                    .request_repaint_after(DOCUMENT_SAVED_FEEDBACK_DURATION);
+                match self.document_save_then.take() {
+                    Some(DocumentSaveContinuation::ReplaceWith(path)) => {
+                        self.begin_document_open(path);
+                    }
+                    Some(DocumentSaveContinuation::Close) => self.close_document_tab(),
+                    None => {}
+                }
+            }
+            document_io::DocumentSaveOutcome::Conflict => {
+                if let Some(document) = self.document.as_mut() {
+                    document.saving = false;
+                }
+                self.document_save_then = None;
+                self.document_pending_confirm = Some(DocumentPendingConfirm::SaveConflict);
+            }
+            document_io::DocumentSaveOutcome::Failed { code } => {
+                if let Some(document) = self.document.as_mut() {
+                    document.saving = false;
+                    document.save_error = Some(code);
+                }
+                self.document_save_then = None;
+            }
         }
     }
 
@@ -24306,6 +25094,7 @@ impl eframe::App for App {
         self.poll_pending_workspace_focus();
         self.poll_pending_resume_agent();
         self.poll_pending_document_open();
+        self.poll_document_io();
         self.poll_turn_done_clear();
         self.apply_pending_visual_settings(ctx);
         self.poll_worktree_jobs();
@@ -25954,8 +26743,9 @@ impl eframe::App for App {
             aux_tabs.push(ui::workspace::PaneAuxTab {
                 kind: ui::workspace::PaneAuxTabKind::Document,
                 label: self
-                    .document_open_path
+                    .document
                     .as_ref()
+                    .map(|document| document.path.as_path())
                     .and_then(|path| path.file_name())
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default(),
@@ -27060,6 +27850,66 @@ impl eframe::App for App {
                 }
                 Some(false) => self.ws_close_confirm = None,
                 None => {}
+            }
+        }
+
+        // 문서 탭 확인 모달(설계 §3.3·§7) — 교체/닫기는 저장/버리기/취소, 저장 충돌은
+        // 다시 불러오기/취소(「다른 이름으로」는 이번 범위에서 뺐다).
+        if let Some(pending) = self.document_pending_confirm.clone() {
+            match pending {
+                DocumentPendingConfirm::ReplaceWithDirty { .. }
+                | DocumentPendingConfirm::CloseWithDirty => {
+                    let mut choice = None;
+                    egui::Window::new(text.t("document.confirm_discard.title", &[]))
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ui.ctx(), |ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(text.t("document.confirm_discard.save", &[]))
+                                    .clicked()
+                                {
+                                    choice = Some(DocumentConfirmChoice::Save);
+                                }
+                                if ui
+                                    .button(text.t("document.confirm_discard.discard", &[]))
+                                    .clicked()
+                                {
+                                    choice = Some(DocumentConfirmChoice::Discard);
+                                }
+                                if ui
+                                    .button(text.t("document.confirm_discard.cancel", &[]))
+                                    .clicked()
+                                {
+                                    choice = Some(DocumentConfirmChoice::Cancel);
+                                }
+                            });
+                        });
+                    if let Some(choice) = choice {
+                        self.apply_document_confirm_choice(choice);
+                    }
+                }
+                DocumentPendingConfirm::SaveConflict => {
+                    let mut decision: Option<bool> = None; // Some(true)=다시 불러오기, Some(false)=취소
+                    egui::Window::new(text.t("document.conflict.title", &[]))
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ui.ctx(), |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button(text.t("document.conflict.reload", &[])).clicked() {
+                                    decision = Some(true);
+                                }
+                                if ui.button(text.t("document.conflict.cancel", &[])).clicked() {
+                                    decision = Some(false);
+                                }
+                            });
+                        });
+                    if let Some(reload) = decision {
+                        self.apply_document_conflict_choice(reload);
+                    }
+                }
             }
         }
 
@@ -32957,10 +33807,12 @@ mod tests {
         }
         assert_eq!(
             intent.matches("self.aux_search.reset()").count(),
-            4,
+            5,
             "activation apply_work_history_tab_intent·apply_git_tab_intent·\
-             apply_document_tab_intent·attach_document_tab 넷 다 활성 보조 탭이 \
-             바뀌면 보조 검색을 비워야 한다"
+             apply_document_tab_intent·begin_document_open·close_document_tab \
+             다섯 다 활성 보조 탭이 바뀌면 보조 검색을 비워야 한다 \
+             (close_document_tab은 dirty 확인을 거쳐 닫힐 때 \
+             apply_document_tab_intent의 상태 기계를 거치지 않는 별도 경로다)"
         );
     }
 

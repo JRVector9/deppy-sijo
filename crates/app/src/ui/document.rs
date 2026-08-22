@@ -45,7 +45,7 @@ pub enum DocumentToolbarAction {
 /// 텍스트"처럼 보인다(2026-08-22 사용자 스크린샷 지적). 그래서 `Button`을 직접 만들어
 /// `.fill()`/`.stroke()`로 토큰 색만 명시한다.
 /// 본문(Source) 편집기의 왼쪽 여백 — 경계선에 글자가 붙지 않게.
-const SOURCE_EDITOR_LEFT_MARGIN: i8 = 14;
+const SOURCE_EDITOR_LEFT_MARGIN: i8 = 4;
 /// 원문 줄 간격 배수 — 고정폭 행 높이의 기본(약 1.2배)은 마크다운 원문을 읽기엔
 /// 촘촘하다(2026-08-22 사용자 지적). 미리보기와 달리 원문은 우리가 직접 그리므로
 /// 여기서는 바꿀 수 있다.
@@ -77,11 +77,13 @@ pub fn toolbar(
         .inner_margin(egui::Margin {
             left: TOOLBAR_LEFT_MARGIN,
             right: 12,
-            top: 5,
-            bottom: 5,
+            top: 3,
+            bottom: 3,
         })
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            // 세로 가운데 정렬을 명시한다 — 칸(패딩 있는 버튼)과 라벨(패딩 없음)이
+            // 섞여 있어 기준을 안 주면 높이가 다른 것끼리 밑선에 걸린다(2026-08-22).
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 if snapshot.show_mode_toggle {
                     // 세그먼트 컨트롤 — 테두리 1px(tokens.separator) 안에 활성/비활성 두
                     // 상태만 있다. 헤더 보조 탭(`workspace.rs`의 `render_aux_tab`)이 쓰는
@@ -215,20 +217,22 @@ pub fn source_editor(
                     .id_salt(id_salt)
                     .interactive(editable)
                     .font(font.clone())
-                    // 기본 프레임(배경 + 테두리)을 끈다 — 켜두면 편집기만 어두운
-                    // 상자로 보여 미리보기와 두 물건처럼 갈린다. 고정폭 글꼴이 이미
-                    // "원본"임을 말해준다(2026-08-22).
-                    .frame(egui::Frame::NONE)
-                    // 프레임을 끄면 그 여백까지 사라져 첫 글자가 pane 경계선에 붙는다
-                    // (2026-08-22 사용자 지적). `margin`으로 직접 준다 — 컨테이너를
-                    // 하나 더 끼우면 위젯 계층이 바뀌어 `TextEditState` id 공식
-                    // (`app.rs`의 `document_source_editor_state_id`)이 어긋난다.
-                    .margin(egui::Margin {
+                    // 배경·테두리 없는 프레임에 **여백만** 싣는다.
+                    //
+                    // `.margin(..)`은 여기서 쓸 수 없다 — egui는 프레임을 명시하면
+                    // margin을 버린다(`builder.rs`: `frame.unwrap_or_else(|| ...
+                    // .inner_margin(margin))`). 그래서 margin만 주면 여백이 통째로
+                    // 무시돼 첫 글자가 경계선에 붙는다(2026-08-22 실측).
+                    //
+                    // 컨테이너를 하나 더 끼우는 방법은 쓰지 않는다 — 위젯 계층이
+                    // 바뀌어 `app.rs`의 `document_source_editor_state_id` 공식이
+                    // 어긋난다(문서를 닫을 때 undo 기록을 지우는 그 id다).
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin {
                         left: SOURCE_EDITOR_LEFT_MARGIN,
                         right: 0,
                         top: 2,
                         bottom: 0,
-                    })
+                    }))
                     .desired_width(f32::INFINITY)
                     .layouter(&mut |ui, text, wrap_width| {
                         let mut job = egui::text::LayoutJob::simple(

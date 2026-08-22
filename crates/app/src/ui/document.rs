@@ -103,7 +103,10 @@ pub fn toolbar(
                             // 비활성 칸만 `frame(false)`라 프레임 패딩이 빠져
                             // 칸마다 폭·높이가 달라졌다 — 그게 얼라인이 어긋나
                             // 보이던 원인이다(2026-08-22 사용자 지적).
-                            ui.spacing_mut().button_padding = egui::vec2(SEGMENT_PADDING_X, 3.0);
+                            // 세로 여백 2.5 — 툴바 줄 높이는 이 칸의 높이가 정한다
+                            // (텍스트 + 위아래 여백). 3.0에서 0.5씩 줄여 줄 전체를
+                            // 1px 낮춘다(2026-08-22 사용자 요청).
+                            ui.spacing_mut().button_padding = egui::vec2(SEGMENT_PADDING_X, 2.5);
                             for (mode, key) in [
                                 (DocumentViewMode::Source, "document.mode.source"),
                                 (DocumentViewMode::Preview, "document.mode.preview"),

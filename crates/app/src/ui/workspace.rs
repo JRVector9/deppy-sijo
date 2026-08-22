@@ -760,13 +760,21 @@ const PANE_HEADER_TOOLBAR_GAP: f32 = 2.0;
 /// **같은 값**을 써야 닫기 버튼 위치와 제목 폭 계산이 어긋나지 않는다.
 const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
 
+/// 문서 탭 하나를 식별하는 안정 id(멀티 문서 탭 설계 §1) — 헤더에서의 위치(인덱스)가
+/// 아니다. 인덱스는 탭이 닫히면 밀려서 조용히 어긋난다. App이 한 번 배정하면 그
+/// 문서가 열려 있는 동안 바뀌지 않고, 닫힌 뒤에도 재사용하지 않는다(닫힌 문서의
+/// 지연 IO 결과가 같은 id를 재사용한 새 문서에 잘못 적용되는 걸 막는다).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DocumentTabId(pub u32);
+
 /// 보조 탭 종류 — 헤더에 붙는 순서이자 hover 문구 키의 근거다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneAuxTabKind {
     History,
     Git,
     /// md·txt 등 문서를 pane 본문 전체에 연다(설계 §1) — 이력·Git과 같은 기구를 쓴다.
-    Document,
+    /// 문서는 여러 개를 동시에 열 수 있어(멀티 문서 탭 설계) id로 어느 것인지 구분한다.
+    Document(DocumentTabId),
 }
 
 impl PaneAuxTabKind {
@@ -774,7 +782,7 @@ impl PaneAuxTabKind {
         match self {
             Self::History => "workspace.tab.history_hint",
             Self::Git => "workspace.tab.git_hint",
-            Self::Document => "workspace.tab.document_hint",
+            Self::Document(_) => "workspace.tab.document_hint",
         }
     }
 
@@ -782,14 +790,10 @@ impl PaneAuxTabKind {
         match self {
             Self::History => "workspace.tab.history_close",
             Self::Git => "workspace.tab.git_close",
-            Self::Document => "workspace.tab.document_close",
+            Self::Document(_) => "workspace.tab.document_close",
         }
     }
 }
-
-/// 헤더에 놓는 보조 탭 상한 — 세션 제목이 우선이라 그 이상은 받지 않는다. 이력·Git·
-/// 문서 셋이 정확히 다 찬다(설계 §2).
-pub const PANE_AUX_TAB_MAX: usize = 3;
 
 /// 세션 헤더 옆에 붙는 보조 탭의 표시 상태 — App이 소유하고 매 프레임 넘긴다.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -957,18 +961,45 @@ struct AuxTabPlacement {
     geometry: PaneAuxTabGeometry,
 }
 
-/// 축약 우선순위(설계 §2) — 문서 → Git → 이력 순으로 먼저 접힌다: ×부터 이 순서대로
-/// 빼고, 그래도 모자라면 탭 자체를 이 순서대로 뺀다. 문서가 먼저인 이유: 파일명이
-/// 라벨이라 길고, 닫기가 툴바에도 있다.
-const AUX_TAB_SHRINK_ORDER: [PaneAuxTabKind; 3] = [
-    PaneAuxTabKind::Document,
-    PaneAuxTabKind::Git,
-    PaneAuxTabKind::History,
-];
+/// 비활성 탭만, 축약 우선순위(멀티 문서 탭 설계 §5)로 나열한다 — 비활성 문서를
+/// 오른쪽(탭 스트립에서 나중에 오는 것)부터, 그다음 Git(비활성이면), 그다음
+/// 이력(비활성이면). **활성 탭은 이 목록에 절대 포함되지 않는다** — ⓑ(탭을 통째로
+/// 빼기)가 이 순서를 그대로 쓰므로, 활성 탭은 탭 자체가 빠지는 일이 없다(새 불변식).
+/// 문서가 먼저인 이유는 그대로다: 파일명이 라벨이라 길고, 닫기가 툴바에도 있다.
+fn aux_tab_inactive_priority(tabs: &[&PaneAuxTab]) -> Vec<PaneAuxTabKind> {
+    let mut order: Vec<PaneAuxTabKind> = tabs
+        .iter()
+        .rev()
+        .filter(|tab| !tab.active && matches!(tab.kind, PaneAuxTabKind::Document(_)))
+        .map(|tab| tab.kind)
+        .collect();
+    for target in [PaneAuxTabKind::Git, PaneAuxTabKind::History] {
+        if let Some(tab) = tabs.iter().find(|tab| !tab.active && tab.kind == target) {
+            order.push(tab.kind);
+        }
+    }
+    order
+}
+
+/// ⓐ(×부터 빼기) 순서 — `aux_tab_inactive_priority` 뒤에 활성 탭을 하나 더 얹는다.
+/// **활성 탭은 언제나 맨 마지막**이라 ×가 가장 늦게 접힌다(새 불변식: 활성 탭은
+/// 절대 버리지 않는다 — ⓐ 단계에서는 ×는 잃을 수 있지만 탭 자체는 ⓑ에서도 살아남는다).
+fn aux_tab_strip_priority(tabs: &[&PaneAuxTab]) -> Vec<PaneAuxTabKind> {
+    let mut order = aux_tab_inactive_priority(tabs);
+    if let Some(tab) = tabs.iter().find(|tab| tab.active) {
+        order.push(tab.kind);
+    }
+    order
+}
 
 /// 주어진 탭 집합을 세션 ×의 accent 경계에서 시작해 왼→오로 배치해본다. `stripped`에
 /// 속한 종류는 처음부터 ×를 만들지 않는다. 하나라도 최소 라벨 폭을 못 채우면 이
 /// 시도 전체가 실패다(`None`) — 호출부가 다음 축약 단계로 넘어간다.
+///
+/// `stripped`에 없는 탭인데도 `pane_aux_tab_geometry`가 자리가 없어 ×를 자체적으로
+/// 접었다면(뒤에 놓인 탭일수록 room이 먼저 바닥난다) 이 시도도 실패로 친다 — 그러지
+/// 않으면 우선순위(축약 순서 ⓐ)를 무시하고 "포지션상 뒤에 있다"는 이유만으로
+/// 엉뚱한 탭의 ×가 먼저 사라진다(활성 탭이 우연히 뒤쪽에 있으면 새 불변식이 깨진다).
 fn try_layout_aux_tabs(
     header: egui::Rect,
     session_close: egui::Rect,
@@ -984,6 +1015,9 @@ fn try_layout_aux_tabs(
             pane_aux_tab_label_width(header.width(), natural_width(&tab.label), visible.len());
         let include_close = !stripped.contains(&tab.kind);
         let geometry = pane_aux_tab_geometry(header, left, toolbar_left, width, include_close)?;
+        if include_close && geometry.close.is_none() {
+            return None;
+        }
         left = geometry.tab.right();
         out.push(AuxTabPlacement {
             kind: tab.kind,
@@ -995,10 +1029,12 @@ fn try_layout_aux_tabs(
     Some(out)
 }
 
-/// 세션 ×의 accent 경계에서 시작해 왼→오로 이어 붙인다. 좁을 때의 축약 순서(설계 §2):
-/// ⓐ 각 탭의 ×를 `AUX_TAB_SHRINK_ORDER` 순서로 뺀다 → ⓑ 그래도 모자라면 같은 순서로
-/// 탭 자체를 뺀다 → ⓒ 세션 제목은 마지막까지 남는다(탭이 하나도 안 들어가도 세션
-/// 헤더는 그대로다).
+/// 세션 ×의 accent 경계에서 시작해 왼→오로 이어 붙인다. 좁을 때의 축약 순서(멀티
+/// 문서 탭 설계 §5, 새 불변식 — **활성 탭은 절대 버리지 않는다**):
+/// ⓐ 비활성 문서(오른쪽부터) → Git → 이력 → 활성 탭 순으로 ×를 뺀다 → ⓑ 그래도
+/// 모자라면 같은 순서(활성 탭 제외)로 탭 자체를 뺀다 → ⓒ 활성 탭과 세션 제목은
+/// 마지막까지 남는다(탭이 하나도 안 들어가도 세션 헤더는 그대로다). 탭 개수에
+/// 고정 상한이 없다 — App이 문서 탭 개수를 이미 유계로 관리한다.
 fn layout_aux_tabs(
     header: egui::Rect,
     session_close: egui::Rect,
@@ -1006,17 +1042,14 @@ fn layout_aux_tabs(
     tabs: &[PaneAuxTab],
     natural_width: impl Fn(&str) -> f32,
 ) -> Vec<AuxTabPlacement> {
-    let mut visible: Vec<&PaneAuxTab> = tabs.iter().take(PANE_AUX_TAB_MAX).collect();
+    let mut visible: Vec<&PaneAuxTab> = tabs.iter().collect();
     loop {
         if visible.is_empty() {
             return Vec::new();
         }
-        let shrink_order: Vec<PaneAuxTabKind> = AUX_TAB_SHRINK_ORDER
-            .into_iter()
-            .filter(|kind| visible.iter().any(|tab| tab.kind == *kind))
-            .collect();
-        for strip in 0..=shrink_order.len() {
-            let stripped = &shrink_order[..strip];
+        let strip_order = aux_tab_strip_priority(&visible);
+        for strip in 0..=strip_order.len() {
+            let stripped = &strip_order[..strip];
             if let Some(placements) = try_layout_aux_tabs(
                 header,
                 session_close,
@@ -1028,8 +1061,10 @@ fn layout_aux_tabs(
                 return placements;
             }
         }
-        // ×를 전부 빼도 안 맞는다 — 축약 순서 맨 앞(가장 먼저 접히는 탭)을 통째로 뺀다.
-        let Some(drop_kind) = shrink_order.first().copied() else {
+        // ×를 전부 빼도 안 맞는다 — 비활성 탭 중 우선순위 맨 앞을 통째로 뺀다. 활성
+        // 탭은 `aux_tab_inactive_priority`에 아예 없으므로 여기서 뽑힐 수 없다.
+        let Some(drop_kind) = aux_tab_inactive_priority(&visible).first().copied() else {
+            // 남은 게 활성 탭 하나뿐인데 그마저 안 들어간다 — 더 뺄 게 없다.
             return Vec::new();
         };
         visible.retain(|tab| tab.kind != drop_kind);
@@ -1631,7 +1666,7 @@ pub struct WorkspaceUi {
     /// 활성 워크스페이스의 고유색 — 포커스된 pane 상단선에 쓴다.
     /// App이 매 프레임 밀어 넣는다(사이드바 목록 순서에 따라 배정되므로 여기서 못 만든다).
     workspace_accent: egui::Color32,
-    /// App이 소유한 보조 탭 목록(이력·Git, 최대 `PANE_AUX_TAB_MAX`개) — 있으면 포커스된
+    /// App이 소유한 보조 탭 목록(이력·Git·문서 여러 개) — 있으면 포커스된
     /// 로컬 pane 헤더의 **같은 32pt 행**에 세션 탭 옆으로 이어 붙여 그린다. runtime의
     /// `MuxTabId`/pane이 아니므로 이 값이 바뀌어도 PTY·세션·mux 탭은 생기거나 죽지
     /// 않는다. WorkspaceUi는 클릭 의도만 돌려주고 상태와 본문은 App이 소유한다.
@@ -2858,9 +2893,9 @@ impl WorkspaceUi {
     }
 
     /// 포커스된 로컬 pane 헤더 옆에 붙일 보조 탭 목록. 비어 있으면 헤더는 예전 그대로다.
-    /// `PANE_AUX_TAB_MAX`를 넘는 뒤쪽 탭은 자른다 — 헤더는 세션 제목이 우선이다.
-    pub fn set_aux_tabs(&mut self, mut tabs: Vec<PaneAuxTab>) {
-        tabs.truncate(PANE_AUX_TAB_MAX);
+    /// 개수 상한은 여기서 자르지 않는다 — App이 문서 탭 개수를 이미 유계로 관리하고,
+    /// 좁은 헤더에서의 축약은 `layout_aux_tabs`가 활성 탭을 보존하며 처리한다.
+    pub fn set_aux_tabs(&mut self, tabs: Vec<PaneAuxTab>) {
         self.aux_tabs = tabs;
     }
 
@@ -7898,7 +7933,7 @@ mod tests {
             "p",
         ));
         ws.set_aux_tabs(vec![PaneAuxTab {
-            kind: PaneAuxTabKind::Document,
+            kind: PaneAuxTabKind::Document(DocumentTabId(1)),
             label: "note.md".to_owned(),
             active: true,
         }]);
@@ -7942,7 +7977,7 @@ mod tests {
             "p",
         ));
         ws.set_aux_tabs(vec![PaneAuxTab {
-            kind: PaneAuxTabKind::Document,
+            kind: PaneAuxTabKind::Document(DocumentTabId(1)),
             label: "note.md".to_owned(),
             active: true,
         }]);
@@ -8170,17 +8205,23 @@ mod tests {
         );
     }
 
-    /// 이력·Git·문서 세 탭이 다 있을 때도 폭을 1pt씩 훑어 어떤 rect도 툴바/헤더 경계를
-    /// 넘지 않고 라벨이 0폭이 되지 않는지 확인한다(위 단일 탭 스윕과 같은 방식,
-    /// `layout_aux_tabs`가 실제로 쓰는 다중 탭 경로를 훑는다).
+    /// 이력·Git·문서 여러 개(가운데 문서가 활성)가 다 있을 때도 폭을 1pt씩 훑어
+    /// 어떤 rect도 툴바/헤더 경계를 넘지 않고 라벨이 0폭이 되지 않는지 확인한다(위
+    /// 단일 탭 스윕과 같은 방식, `layout_aux_tabs`가 실제로 쓰는 다중 탭 경로를
+    /// 훑는다). 멀티 문서 탭 설계 §5의 새 불변식도 같은 스윕에서 고정한다: **활성
+    /// 탭(가운데 문서)은 placements가 비지 않는 한 항상 그 안에 있어야 한다** — 탭이
+    /// 여러 개 있는 폭에서 활성 탭을 대신 접어 지워버리면 안 된다.
     #[test]
-    fn 좁은_헤더에서_세_탭도_경계를_넘지_않고_결국_접힌다() {
+    fn 좁은_헤더에서_여러_탭도_경계를_넘지_않고_활성_탭을_버리지_않는다() {
         let mut saw_tab_dropped = false;
         let mut saw_close_stripped = false;
+        let active_kind = PaneAuxTabKind::Document(DocumentTabId(2));
         let tabs = [
             aux_tab(PaneAuxTabKind::History, "이력", false),
             aux_tab(PaneAuxTabKind::Git, "Git", false),
-            aux_tab(PaneAuxTabKind::Document, "note.md", true),
+            aux_tab(PaneAuxTabKind::Document(DocumentTabId(1)), "a.md", false),
+            aux_tab(active_kind, "b.md", true),
+            aux_tab(PaneAuxTabKind::Document(DocumentTabId(3)), "c.md", false),
         ];
         let mut width = 40.0_f32;
         while width <= 600.0 {
@@ -8201,6 +8242,10 @@ mod tests {
             if placements.len() < tabs.len() {
                 saw_tab_dropped = true;
             }
+            assert!(
+                placements.is_empty() || placements.iter().any(|p| p.kind == active_kind),
+                "{width}: 활성 탭이 비어있지 않은 배치에서 빠졌다: {placements:?}"
+            );
             let mut previous_right: Option<f32> = None;
             for placement in &placements {
                 let aux = placement.geometry;
@@ -8337,8 +8382,8 @@ mod tests {
 
     #[test]
     fn 폭이_x를_다_접어도_모자라면_뒤_탭부터_사라진다() {
-        // ×를 전부 접어도(ⓐ) 안 들어가는 폭 — 그제서야 탭 자체가 축약 순서(문서→
-        // Git→이력)대로 사라진다(ⓑ). Document가 없는 두 탭 집합이라 Git이 먼저다.
+        // ×를 전부 접어도(ⓐ) 안 들어가는 폭 — 그제서야 탭 자체가 우선순위대로
+        // 사라진다(ⓑ). Git이 활성이라(새 불변식) 비활성인 이력이 먼저 빠진다.
         let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(220.0, 24.0));
         let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
         let placements = layout_aux_tabs(
@@ -8358,23 +8403,26 @@ mod tests {
         );
         assert_eq!(
             placements[0].kind,
-            PaneAuxTabKind::History,
-            "Git이 먼저 빠지고 이력이 남아야 한다"
+            PaneAuxTabKind::Git,
+            "이력이 먼저 빠지고 활성 탭(Git)이 남아야 한다"
         );
     }
 
-    /// 축약 순서(설계 §2) 전 단계를 좌표로 고정한다: 이력·Git·문서가 다 있을 때 폭을
-    /// 줄이면 ⓐ 문서 → Git → 이력 순으로 ×가 먼저 접히고, ×를 다 접어도 모자라면
-    /// ⓑ 같은 순서로 탭 자체가 사라지며, ⓒ 세션 제목이 필요한 최소 폭까지 가면
-    /// 탭이 하나도 안 남아도 배열만 빈다(패닉하지 않는다).
+    /// 축약 순서(멀티 문서 탭 설계 §5) 전 단계를 좌표로 고정한다: 이력·Git·**활성**
+    /// 문서가 다 있을 때 폭을 줄이면 ⓐ 비활성 탭(Git → 이력) × 부터 접히고, **활성
+    /// 문서의 ×는 맨 마지막에** 접힌다(새 불변식) — ×를 다 접어도 모자라면 ⓑ 같은
+    /// 순서(활성 제외)로 탭 자체가 사라지고 나머지는 사다리를 처음부터 다시 타되,
+    /// **활성 문서 탭 자체는 끝까지 살아남는다.** ⓒ 활성 문서마저 최소 폭을 못 채우면
+    /// 그제서야 배열이 빈다(패닉하지 않는다).
     #[test]
     fn 세_탭의_축약_순서를_좌표로_고정한다() {
         let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 24.0));
         let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let document = PaneAuxTabKind::Document(DocumentTabId(1));
         let tabs = [
             aux_tab(PaneAuxTabKind::History, "이력", false),
             aux_tab(PaneAuxTabKind::Git, "Git", false),
-            aux_tab(PaneAuxTabKind::Document, "note.md", true),
+            aux_tab(document, "note.md", true),
         ];
         let place =
             |toolbar_left: f32| layout_aux_tabs(header, close, toolbar_left, &tabs, |_| 30.0);
@@ -8393,55 +8441,48 @@ mod tests {
         assert_eq!(p.len(), 3);
         assert!(has_close(&p, PaneAuxTabKind::History));
         assert!(has_close(&p, PaneAuxTabKind::Git));
-        assert!(has_close(&p, PaneAuxTabKind::Document));
+        assert!(has_close(&p, document));
 
-        // ⓐ-1: 문서 ×만 먼저 접힌다.
+        // ⓐ-1: 비활성인 Git의 ×가 먼저 접힌다 — 활성 문서는 아직 손대지 않는다.
         let p = place(330.0);
         assert_eq!(p.len(), 3, "{p:?}");
         assert!(has_close(&p, PaneAuxTabKind::History));
-        assert!(has_close(&p, PaneAuxTabKind::Git));
-        assert!(!has_close(&p, PaneAuxTabKind::Document));
-
-        // ⓐ-2: 문서에 이어 Git ×도 접힌다 — 이력은 아직 남는다.
-        let p = place(285.0);
-        assert_eq!(p.len(), 3, "{p:?}");
-        assert!(has_close(&p, PaneAuxTabKind::History));
         assert!(!has_close(&p, PaneAuxTabKind::Git));
-        assert!(!has_close(&p, PaneAuxTabKind::Document));
+        assert!(has_close(&p, document));
 
-        // ⓐ-3: 셋 다 ×가 없다 — 탭은 아직 셋 다 남는다.
+        // ⓐ-2: Git에 이어 이력 ×도 접힌다 — 활성 문서는 여전히 남는다.
+        let p = place(310.0);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(!has_close(&p, PaneAuxTabKind::History));
+        assert!(!has_close(&p, PaneAuxTabKind::Git));
+        assert!(has_close(&p, document));
+
+        // ⓐ-3: 활성 문서의 ×도 결국 접힌다 — 새 불변식은 "면제"가 아니라 "맨 마지막"이다.
         let p = place(270.0);
         assert_eq!(p.len(), 3, "{p:?}");
         assert!(p.iter().all(|t| t.geometry.close.is_none()));
 
-        // ⓑ-1: ×를 다 접어도 안 맞아 문서 탭 자체가 사라진다 — Git·이력만 남고,
-        // 남은 둘은 축약 사다리를 처음부터 다시 타 Git의 ×부터 접힌다.
-        let p = place(252.0);
+        // ⓑ-1: ×를 다 접어도 안 맞는다 — 비활성 탭 우선순위 맨 앞(Git)이 통째로
+        // 사라진다. 활성 문서는 `aux_tab_inactive_priority`에 없어 뽑히지 않는다.
+        let p = place(255.0);
         assert_eq!(p.len(), 2, "{p:?}");
         assert!(p.iter().any(|t| t.kind == PaneAuxTabKind::History));
-        assert!(p.iter().any(|t| t.kind == PaneAuxTabKind::Git));
-        assert!(!p.iter().any(|t| t.kind == PaneAuxTabKind::Document));
-        assert!(has_close(&p, PaneAuxTabKind::History));
-        assert!(!has_close(&p, PaneAuxTabKind::Git));
+        assert!(!p.iter().any(|t| t.kind == PaneAuxTabKind::Git));
+        assert!(p.iter().any(|t| t.kind == document));
+        assert!(!has_close(&p, PaneAuxTabKind::History));
+        assert!(has_close(&p, document));
 
-        // ⓑ-2: Git도 통째로 사라지고 이력만 남는다(×는 다시 붙는다 — 사다리를
-        // 처음부터 다시 타므로).
+        // ⓑ-2: 이력도 통째로 사라지고 활성 문서만 남는다(×는 다시 붙는다 — 사다리를
+        // 처음부터 다시 타므로). 활성 탭은 끝까지 살아남는다는 게 이 단계의 요점이다.
         let p = place(210.0);
         assert_eq!(p.len(), 1, "{p:?}");
-        assert_eq!(p[0].kind, PaneAuxTabKind::History);
+        assert_eq!(p[0].kind, document);
         assert!(p[0].geometry.close.is_some());
 
-        // ⓒ: 이력마저 안 들어가는 폭 — 탭이 하나도 없다. 패닉하지 않고 빈 배열만
-        // 돌려줘야 세션 제목이 그대로 남는다.
+        // ⓒ: 활성 문서마저 최소 라벨 폭을 못 채우는 폭 — 탭이 하나도 없다. 패닉하지
+        // 않고 빈 배열만 돌려줘야 세션 제목이 그대로 남는다.
         let p = place(150.0);
         assert!(p.is_empty(), "{p:?}");
-    }
-
-    #[test]
-    fn 탭이_넷이면_셋만_남는다() {
-        // 상한은 계약이다 — 헤더는 세션 제목이 우선이라 그 이상은 놓지 않는다.
-        // 이력·Git·문서 셋이 정확히 다 찬다(설계 §2).
-        assert_eq!(PANE_AUX_TAB_MAX, 3);
     }
 
     /// 이력 X는 **UI 탭만** 닫는다 — 세션 닫기 확인이나 ClosePane이 나가면 설계 실패다.
@@ -8534,7 +8575,7 @@ mod tests {
             "p",
         ));
         ws.set_aux_tabs(vec![PaneAuxTab {
-            kind: PaneAuxTabKind::Document,
+            kind: PaneAuxTabKind::Document(DocumentTabId(1)),
             label: "note.md".to_owned(),
             active: true,
         }]);
@@ -8569,7 +8610,10 @@ mod tests {
             harness
                 .state()
                 .1
-                .contains(&Some((PaneAuxTabKind::Document, PaneAuxTabIntent::Close))),
+                .contains(&Some((
+                    PaneAuxTabKind::Document(DocumentTabId(1)),
+                    PaneAuxTabIntent::Close
+                ))),
             "문서 X는 Close 의도를 올려야 한다"
         );
         assert_eq!(

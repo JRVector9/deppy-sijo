@@ -1256,6 +1256,16 @@ fn search_click_targets_aux_search(icon: TerminalToolbarIcon, aux_active: bool) 
     matches!(icon, TerminalToolbarIcon::Search) && aux_active
 }
 
+/// 보조 탭이 실제로 활성인지 — App이 넘긴 원본 목록(`aux_tabs`, ground truth)만
+/// 본다. `layout_aux_tabs`가 돌려주는 배치(placements)로 판정하면 안 되는 이유:
+/// 헤더가 극단적으로 좁으면 그 함수가 활성 탭까지 접어(빈 Vec) 돌려줄 수 있는데,
+/// 그래도 그 문서는 실제로 활성이라 본문은 계속 그려진다(레이아웃과 무관한 별도
+/// 게이트) — 헤더 chrome(제목 밝기·검색 라우팅)만 이 목록을 안 쓰면 "세션이 선택된
+/// 것처럼" 실제 상태와 어긋나 보인다(2026-08-22 리뷰).
+fn any_aux_tab_active(aux_tabs: &[PaneAuxTab]) -> bool {
+    aux_tabs.iter().any(|tab| tab.active)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct AttachedPaneTarget {
@@ -4394,7 +4404,12 @@ impl WorkspaceUi {
                 .x
         });
         let active_kind = placements.iter().find(|p| p.active).map(|p| p.kind);
-        let aux_active = active_kind.is_some();
+        // 헤더 chrome(제목 밝기·검색 라우팅)은 레이아웃 결과(placements)가 아니라
+        // 실제 활성 상태(aux_tabs, ground truth)를 따라야 한다 — 헤더가 극단적으로
+        // 좁으면 `layout_aux_tabs`가 활성 탭까지 접어(빈 Vec) 돌려줄 수 있는데, 본문
+        // 게이트는 이미 이 목록으로 문서를 그리고 있어(레이아웃과 무관) 헤더만 다른
+        // 기준을 쓰면 "세션이 선택된 것처럼" 어긋나 보인다(2026-08-22 리뷰).
+        let aux_active = any_aux_tab_active(&aux_tabs);
         let tokens = crate::ui::designall::tokens(ui.visuals());
         let style = pane_header_style(self.workspace_accent, focused);
         // 상단 accent는 **선택된 탭**만 덮는다. 보조 탭이 붙으면 이 선의 범위가 곧
@@ -10589,6 +10604,32 @@ mod tests {
             TerminalToolbarIcon::SplitRows,
             true
         ));
+    }
+
+    /// ④ 헤더가 극단적으로 좁아 `layout_aux_tabs`가 활성 문서 탭까지 접어(빈 배치)
+    /// 돌려줘도, `any_aux_tab_active`는 App이 넘긴 원본 목록만 보고 true를 돌려줘야
+    /// 한다 — `render_pane_header`가 이 값으로 세션 제목 밝기를 정하기 때문에,
+    /// placements가 아니라 이 값을 쓰지 않으면 세션이 선택된 것처럼 잘못 칠해진다.
+    #[test]
+    fn any_aux_tab_active는_레이아웃이_아니라_실제_활성_여부를_따른다() {
+        let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 24.0));
+        let close = egui::Rect::from_center_size(egui::pos2(120.0, 12.0), egui::vec2(20.0, 20.0));
+        let tabs = [aux_tab(
+            PaneAuxTabKind::Document(DocumentTabId(1)),
+            "note.md",
+            true,
+        )];
+        // 세_탭의_축약_순서를_좌표로_고정한다의 ⓒ 단계와 같은 폭(150.0) — 활성 문서마저
+        // 최소 라벨 폭을 못 채워 배치가 빈다.
+        let placements = layout_aux_tabs(header, close, 150.0, &tabs, |_| 30.0);
+        assert!(
+            placements.is_empty(),
+            "전제: 이 폭에서 배치는 비어야 한다 {placements:?}"
+        );
+        assert!(
+            any_aux_tab_active(&tabs),
+            "배치가 비어도 실제로는 문서가 활성이다"
+        );
     }
 
     /// 헤더가 실제로 배치한 것과 같은 기하로 Search 버튼(도구 4개 중 첫 번째) 중심을

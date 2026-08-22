@@ -81,9 +81,12 @@ pub fn toolbar(
             bottom: 3,
         })
         .show(ui, |ui| {
-            // 세로 가운데 정렬을 명시한다 — 칸(패딩 있는 버튼)과 라벨(패딩 없음)이
-            // 섞여 있어 기준을 안 주면 높이가 다른 것끼리 밑선에 걸린다(2026-08-22).
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            // **`with_layout`을 쓰지 않는다.** 그건 부모의 남은 높이를 통째로 물려받아,
+            // `Align::Center`가 툴바 한 줄이 아니라 pane 본문 전체 높이를 기준으로
+            // 세로 가운데 정렬을 해버린다 — 툴바가 화면 한복판까지 내려간다
+            // (2026-08-22 실측). `horizontal`은 높이를 한 줄로 묶고 그 안에서 이미
+            // 세로 가운데(Align::Center)로 배치한다.
+            ui.horizontal(|ui| {
                 if snapshot.show_mode_toggle {
                     // 세그먼트 컨트롤 — 테두리 1px(tokens.separator) 안에 활성/비활성 두
                     // 상태만 있다. 헤더 보조 탭(`workspace.rs`의 `render_aux_tab`)이 쓰는

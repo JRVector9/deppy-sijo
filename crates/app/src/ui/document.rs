@@ -78,8 +78,8 @@ pub fn toolbar(
         .inner_margin(egui::Margin {
             left: TOOLBAR_LEFT_MARGIN,
             right: 12,
-            top: 3,
-            bottom: 3,
+            top: 2,
+            bottom: 2,
         })
         .show(ui, |ui| {
             // **`with_layout`을 쓰지 않는다.** 그건 부모의 남은 높이를 통째로 물려받아,

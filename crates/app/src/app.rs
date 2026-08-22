@@ -15776,6 +15776,10 @@ impl App {
         let mut toolbar_separator_y: Option<f32> = None;
 
         child.vertical(|ui| {
+            // 툴바와 구분선 사이에 기본 item_spacing이 들어가면, 툴바 텍스트 **아래에만**
+            // 여백이 더 붙어 글자가 위로 밀려 보인다(2026-08-22 사용자 지적). 이 세로
+            // 컨테이너에서는 간격을 0으로 두고 필요한 여백은 각자 프레임이 갖는다.
+            ui.spacing_mut().item_spacing.y = 0.0;
             if matches!(load_state, DocumentLoadState::Loaded { .. }) {
                 toolbar_action = ui::document::toolbar(
                     ui,
@@ -15787,10 +15791,20 @@ impl App {
                     },
                     text,
                 );
-                // 나란히 모드의 세로 분리선이 이 가로선까지 닿아야 한다 — 안 그러면
-                // 위쪽이 끊어져 보인다(2026-08-22 사용자 지적). 선이 실제로 그려지는
-                // y(할당 rect의 중앙)를 넘겨준다.
-                toolbar_separator_y = Some(ui.separator().rect.center().y);
+                // `ui.separator()`는 자기 높이(약 6px)를 따로 할당해 툴바 아래에만
+                // 빈 띠를 만든다 — 정확히 1px만 할당해 직접 긋는다. 나란히 모드의
+                // 세로 분리선이 이 y에서 시작해 이어진다.
+                let (line_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                let line_y = line_rect.center().y;
+                ui.painter().hline(
+                    line_rect.x_range(),
+                    line_y,
+                    ui::designall::separator_stroke(ui.visuals()),
+                );
+                toolbar_separator_y = Some(line_y);
             }
 
             match &load_state {

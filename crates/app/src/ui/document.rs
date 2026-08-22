@@ -74,6 +74,10 @@ pub fn toolbar(
     // 테마와 무관하게 항상 다크인 면이라 tokens가 아니라 렌더러 상수를 쓴다).
     //
     // 툴바 아래 구분선은 긋지 않는다 — 면이 갈리므로 선이 없어도 경계가 보인다.
+    // `Frame`은 내용 크기만큼만 그려진다 — 그대로 두면 면이 마지막 글자에서 끊겨
+    // 띠가 중간에 잘려 보인다(2026-08-23 사용자 지적). 프레임에 들어가기 전 폭을
+    // 재서 안에서 최소 폭으로 못박아 pane 끝까지 이어지게 한다.
+    let toolbar_full_width = ui.available_width();
     egui::Frame::NONE
         .fill(terminal::renderer_egui::TERMINAL_SURFACE_BG)
         .inner_margin(egui::Margin {
@@ -83,6 +87,7 @@ pub fn toolbar(
             bottom: 2,
         })
         .show(ui, |ui| {
+            ui.set_min_width((toolbar_full_width - f32::from(TOOLBAR_LEFT_MARGIN) - 12.0).max(0.0));
             // **`with_layout`을 쓰지 않는다.** 그건 부모의 남은 높이를 통째로 물려받아,
             // `Align::Center`가 툴바 한 줄이 아니라 pane 본문 전체 높이를 기준으로
             // 세로 가운데 정렬을 해버린다 — 툴바가 화면 한복판까지 내려간다

@@ -7917,7 +7917,9 @@ mod tests {
     /// 문서 탭이 활성이면 **실제 세션이 있어도** pane 본문 rect가 App으로 넘어가고
     /// 터미널 표면·입력은 렌더되지 않는다 — 이력·Git과 같은 fail-closed 규칙(설계
     /// "터미널이 멀쩡해야 한다" 합격 기준의 반대쪽: 문서가 활성인 동안은 반대로
-    /// 막혀야 한다).
+    /// 막혀야 한다). 문서 탭이 **여러 개**(멀티 문서 탭 설계) 동시에 있어도 그중
+    /// 하나만 활성이면 같은 규칙이 적용돼야 한다 — 비활성 문서 탭이 몇 개 더 있다고
+    /// fail-closed가 느슨해지면 안 된다.
     #[test]
     fn 문서탭이_활성이면_세션이_있어도_본문rect를_주고_터미널을_건너뛴다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -7932,11 +7934,23 @@ mod tests {
             )],
             "p",
         ));
-        ws.set_aux_tabs(vec![PaneAuxTab {
-            kind: PaneAuxTabKind::Document(DocumentTabId(1)),
-            label: "note.md".to_owned(),
-            active: true,
-        }]);
+        ws.set_aux_tabs(vec![
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(1)),
+                label: "note.md".to_owned(),
+                active: true,
+            },
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(2)),
+                label: "other.md".to_owned(),
+                active: false,
+            },
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(3)),
+                label: "third.md".to_owned(),
+                active: false,
+            },
+        ]);
 
         let context = egui::Context::default();
         let mut output = None;
@@ -7959,7 +7973,9 @@ mod tests {
     /// 문서 편집기(`ui::document::source_editor`)가 포커스를 쥐고 실제로 타이핑해도
     /// 터미널로 새지 않는다. 문서 탭 활성 중에는 터미널 표면 자체가 그려지지 않아
     /// 구조적으로 불가능하지만(위 테스트), "TextEdit 포커스 상태에서 타이핑"이라는
-    /// 구체적 시나리오(설계 §10 수동 항목)를 직접 재현해 회귀를 잡는다.
+    /// 구체적 시나리오(설계 §10 수동 항목)를 직접 재현해 회귀를 잡는다. 문서 탭이
+    /// 여러 개 열려 있는 상태(멀티 문서 탭 설계)로 확장했다 — 탭 개수와 무관하게
+    /// fail-closed가 지켜져야 한다.
     #[test]
     fn kittest_문서탭_활성중_텍스트편집기_포커스로_타이핑해도_터미널_protocol이_비어있다() {
         use egui_kittest::kittest::Queryable;
@@ -7976,11 +7992,18 @@ mod tests {
             )],
             "p",
         ));
-        ws.set_aux_tabs(vec![PaneAuxTab {
-            kind: PaneAuxTabKind::Document(DocumentTabId(1)),
-            label: "note.md".to_owned(),
-            active: true,
-        }]);
+        ws.set_aux_tabs(vec![
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(1)),
+                label: "note.md".to_owned(),
+                active: true,
+            },
+            PaneAuxTab {
+                kind: PaneAuxTabKind::Document(DocumentTabId(2)),
+                label: "other.md".to_owned(),
+                active: false,
+            },
+        ]);
 
         let mut harness = egui_kittest::Harness::new_ui_state(
             move |ui, state: &mut (WorkspaceUi, String)| {

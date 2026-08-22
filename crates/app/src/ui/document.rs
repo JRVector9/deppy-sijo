@@ -89,12 +89,24 @@ pub fn toolbar(
 /// 바뀌었는가"뿐이다 — 실제 내용은 `source`에 이미 반영돼 있다(App이 자신의 버퍼를
 /// `&mut`로 직접 빌려주므로 leaf가 복사본을 따로 들고 있지 않는다 — 매 키 입력마다
 /// 문서 전체를 복제하지 않는다).
-pub fn source_editor(ui: &mut egui::Ui, source: &mut String, editable: bool) -> bool {
+///
+/// `id_salt`는 호출부(App)가 문서 식별자(경로)에서 만든 안정 id다. 자동 위젯 id에
+/// 맡기면 다른 문서로 교체해도 화면상 "같은 자리"라 egui가 같은 위젯으로 보고
+/// undo 기록을 이어준다 — 문서 B에서 문서 A의 되돌리기 이력이 튀어나오는 사고로
+/// 이어진다. 문서마다 다른 id를 주면 교체 시 자연히 새 위젯이 되어 그 문제가
+/// 없다.
+pub fn source_editor(
+    ui: &mut egui::Ui,
+    id_salt: egui::Id,
+    source: &mut String,
+    editable: bool,
+) -> bool {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(source)
+                    .id_salt(id_salt)
                     .interactive(editable)
                     .desired_width(f32::INFINITY),
             )
@@ -182,7 +194,7 @@ mod tests {
         let mut source = "readonly content".to_owned();
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, source: &mut String| {
-                source_editor(ui, source, false);
+                source_editor(ui, egui::Id::new("test"), source, false);
             },
             source.clone(),
         );

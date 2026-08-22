@@ -7952,7 +7952,12 @@ mod tests {
                 let output = state.0.show_with_input(ui, &config, &[], &catalog, true);
                 if let Some(body) = output.aux_body_rect {
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
-                    crate::ui::document::source_editor(&mut child, &mut state.1, true);
+                    crate::ui::document::source_editor(
+                        &mut child,
+                        egui::Id::new("test_document_editor"),
+                        &mut state.1,
+                        true,
+                    );
                 }
             },
             (ws, String::new()),

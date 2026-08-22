@@ -15592,8 +15592,16 @@ impl App {
                     let editable = document.is_editable();
                     match mode {
                         ui::document::DocumentViewMode::Source => {
-                            editor_changed =
-                                ui::document::source_editor(ui, &mut document.source, editable);
+                            let id_salt = egui::Id::new((
+                                "document_tab_source_editor",
+                                document.path.as_path(),
+                            ));
+                            editor_changed = ui::document::source_editor(
+                                ui,
+                                id_salt,
+                                &mut document.source,
+                                editable,
+                            );
                         }
                         ui::document::DocumentViewMode::Preview => {
                             link_intent = self.document_markdown_viewer.show(
@@ -15626,8 +15634,13 @@ impl App {
                             );
                             source_ui.set_clip_rect(source_rect.intersect(ui.clip_rect()));
                             let document = self.document.as_mut().expect("checked above");
+                            let id_salt = egui::Id::new((
+                                "document_tab_source_editor",
+                                document.path.as_path(),
+                            ));
                             editor_changed = ui::document::source_editor(
                                 &mut source_ui,
+                                id_salt,
                                 &mut document.source,
                                 editable,
                             );

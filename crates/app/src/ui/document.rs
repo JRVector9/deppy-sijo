@@ -44,6 +44,21 @@ pub enum DocumentToolbarAction {
 /// 칠하는데, 그건 드래그 텍스트 선택과 같은 색이라 "선택된 탭"이 아니라 "드래그된
 /// 텍스트"처럼 보인다(2026-08-22 사용자 스크린샷 지적). 그래서 `Button`을 직접 만들어
 /// `.fill()`/`.stroke()`로 토큰 색만 명시한다.
+/// 본문(Source) 편집기의 왼쪽 여백 — 경계선에 글자가 붙지 않게.
+const SOURCE_EDITOR_LEFT_MARGIN: i8 = 4;
+
+/// 세그먼트 칸의 좌우 안쪽 여백.
+const SEGMENT_PADDING_X: f32 = 8.0;
+/// 세그먼트 컨테이너의 테두리 두께(안쪽 여백 1 + stroke 1이 아니라 `inner_margin(1)`).
+const SEGMENT_BORDER_INSET: f32 = 1.0;
+
+/// 툴바 왼쪽 여백 — **역산**한 값이다. 세그먼트 첫 라벨("본문")의 첫 글자가 헤더 탭
+/// 제목("nomorevibe")과 **같은 x**에 오도록, `여백 + 테두리 + 버튼 패딩`이
+/// `PANE_HEADER_TITLE_LEFT`와 같아지게 맞춘다(2026-08-22 사용자 요청). 셋 중 하나만
+/// 바꾸면 어긋나므로 상수에서 뽑아 계산한다.
+const TOOLBAR_LEFT_MARGIN: i8 =
+    (crate::ui::workspace::PANE_HEADER_TITLE_LEFT - SEGMENT_BORDER_INSET - SEGMENT_PADDING_X) as i8;
+
 pub fn toolbar(
     ui: &mut egui::Ui,
     snapshot: &DocumentToolbarSnapshot,
@@ -60,7 +75,7 @@ pub fn toolbar(
     // 좌우 여백이 없으면 첫 글자가 pane 모서리에 붙는다.
     egui::Frame::NONE
         .inner_margin(egui::Margin {
-            left: 12,
+            left: TOOLBAR_LEFT_MARGIN,
             right: 12,
             top: 5,
             bottom: 5,
@@ -83,7 +98,8 @@ pub fn toolbar(
                                 // 비활성 칸만 `frame(false)`라 프레임 패딩이 빠져
                                 // 칸마다 폭·높이가 달라졌다 — 그게 얼라인이 어긋나
                                 // 보이던 원인이다(2026-08-22 사용자 지적).
-                                ui.spacing_mut().button_padding = egui::vec2(9.0, 3.0);
+                                ui.spacing_mut().button_padding =
+                                    egui::vec2(SEGMENT_PADDING_X, 3.0);
                                 for (mode, key) in [
                                     (DocumentViewMode::Source, "document.mode.source"),
                                     (DocumentViewMode::Preview, "document.mode.preview"),
@@ -200,6 +216,16 @@ pub fn source_editor(
                     // 상자로 보여 미리보기와 두 물건처럼 갈린다. 고정폭 글꼴이 이미
                     // "원본"임을 말해준다(2026-08-22).
                     .frame(egui::Frame::NONE)
+                    // 프레임을 끄면 그 여백까지 사라져 첫 글자가 pane 경계선에 붙는다
+                    // (2026-08-22 사용자 지적). `margin`으로 직접 준다 — 컨테이너를
+                    // 하나 더 끼우면 위젯 계층이 바뀌어 `TextEditState` id 공식
+                    // (`app.rs`의 `document_source_editor_state_id`)이 어긋난다.
+                    .margin(egui::Margin {
+                        left: SOURCE_EDITOR_LEFT_MARGIN,
+                        right: 0,
+                        top: 2,
+                        bottom: 0,
+                    })
                     .desired_width(f32::INFINITY),
             )
         })

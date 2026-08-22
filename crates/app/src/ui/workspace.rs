@@ -758,7 +758,9 @@ const PANE_HEADER_TOOLBAR_GAP: f32 = 2.0;
 /// 제목의 좌측 원점. 예전 17px는 앞의 포커스 점(중심 8, 반지름 4)을 피한 값이었다 —
 /// 점을 지웠으니 그 자리를 되돌린다. pane_header_buttons와 render_pane_header가
 /// **같은 값**을 써야 닫기 버튼 위치와 제목 폭 계산이 어긋나지 않는다.
-const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
+/// 헤더 탭 제목의 왼쪽 들여쓰기. 문서 툴바가 이 값에 자기 라벨을 맞춘다
+/// (`ui::document::toolbar`) — 둘이 따로 놀면 툴바가 헤더와 어긋나 보인다.
+pub(crate) const PANE_HEADER_TITLE_LEFT: f32 = 10.0;
 
 /// 문서 탭 하나를 식별하는 안정 id(멀티 문서 탭 설계 §1) — 헤더에서의 위치(인덱스)가
 /// 아니다. 인덱스는 탭이 닫히면 밀려서 조용히 어긋난다. App이 한 번 배정하면 그

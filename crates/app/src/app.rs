@@ -8072,10 +8072,14 @@ pub struct App {
             document_io::DocumentSaveOutcome,
         ),
     >,
-    /// dirty 상태에서 문서를 닫으려 하거나 저장이 충돌했을 때의 확인 대기(설계
-    /// §3.3·§7). `Some`이면 모달을 그린다. 어느 문서에 대한 확인인지는
+    /// dirty 상태에서 문서를 닫으려 하거나 저장이 충돌했을 때의 확인 대기 큐(설계
+    /// §3.3·§7). 맨 앞(`front`)이 지금 그리는 모달이다. 문서별로 전역 단일 슬롯이
+    /// 아니라 큐인 이유: 두 문서의 확인이 겹치면(예: A의 닫기 확인이 뜬 채 B의
+    /// 저장이 Conflict로 돌아오거나 사용자가 B의 ×를 누르면) 응답 전에 먼저 온
+    /// 확인이 조용히 덮어써지던 결함이 있었다(2026-08-22 리뷰) — 이제 도착 순서대로
+    /// 쌓여(FIFO) 먼저 것부터 순서대로 처리한다. 어느 문서에 대한 확인인지는 각
     /// `DocumentPendingConfirm` 안의 id가 말한다.
-    document_pending_confirm: Option<DocumentPendingConfirm>,
+    document_pending_confirms: std::collections::VecDeque<DocumentPendingConfirm>,
     /// 「저장 후 닫기」가 걸린 문서 id들 — dirty 확인 모달에서 「저장」을 고르면 여기
     /// 담고, 그 문서의 저장이 성공하면 실제로 닫는다. 문서별로 독립이라(멀티 문서
     /// 탭 설계) App 전역 슬롯 하나가 아니라 집합이다 — 서로 다른 문서 둘을 동시에
@@ -9043,6 +9047,13 @@ struct OpenDocument {
     /// 설계 §2 — 예전에는 App 전역 카운터 하나를 모든 문서가 공유해 슬롯도 `0`으로
     /// 고정돼 있었다).
     source_revision: u64,
+    /// 문서 body를 그릴 때(`show_document_tab_body`류) 캡처해 두는 그 프레임의
+    /// `ui.id()` — source 편집기(`ui::document::source_editor`)가 egui `TextEdit`을
+    /// 만들 때 실제로 쓰는 컨테이너 id다. 문서를 닫을 때 이 값으로
+    /// `clear_document_editor_state`가 egui가 들고 있는 `TextEditState`(실행취소
+    /// 스냅샷 포함)를 지운다 — 안 그러면 문서를 닫아도 위젯 상태가 안 지워지고
+    /// 무한정 쌓인다(리뷰 지적). 아직 한 번도 안 그려졌으면 `None`(지울 것도 없다).
+    body_ui_id: Option<egui::Id>,
 }
 
 impl OpenDocument {
@@ -9184,6 +9195,81 @@ enum DocumentPendingConfirm {
     SaveConflict { id: ui::workspace::DocumentTabId },
 }
 
+impl DocumentPendingConfirm {
+    /// 이 확인이 어느 문서에 대한 것인지 — 큐 중복 제거(`enqueue_document_pending_confirm`)와
+    /// 문서를 닫을 때 큐 정리(`close_document_entry`)가 공용으로 쓴다.
+    fn document_id(self) -> ui::workspace::DocumentTabId {
+        match self {
+            Self::CloseWithDirty { id } | Self::SaveConflict { id } => id,
+        }
+    }
+}
+
+/// 확인 대기 큐에 새 항목을 넣는다 — 순수 함수라 App 없이 테스트한다. 같은 문서에
+/// 대한 확인이 이미 큐에 있으면(응답 전에 같은 문서로 새 이벤트가 왔다는 뜻) 새로
+/// 들어온 걸 버려 중복을 만들지 않는다. 서로 다른 문서의 확인은 도착한 순서대로
+/// 뒤에 쌓인다(FIFO) — 응답 전에 다른 확인이 와도 먼저 것이 사라지지 않는다
+/// (2026-08-22 리뷰: 예전엔 전역 단일 슬롯이라 응답 없이 조용히 덮어써졌다).
+fn enqueue_document_pending_confirm(
+    queue: &mut std::collections::VecDeque<DocumentPendingConfirm>,
+    confirm: DocumentPendingConfirm,
+) {
+    let id = confirm.document_id();
+    if queue.iter().any(|existing| existing.document_id() == id) {
+        return;
+    }
+    queue.push_back(confirm);
+}
+
+/// `apply_document_confirm_choice`(닫기 확인 모달)가 실행해야 할 일 — 순수 함수인
+/// `resolve_document_confirm_choice`가 무엇을 할지만 계산하고, 실제 실행(문서 닫기·
+/// 저장 요청)은 App이 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentConfirmAction {
+    /// 「버리기」 — 그 문서를 곧장 닫는다.
+    Discard(ui::workspace::DocumentTabId),
+    /// 「저장」 — 저장 후 닫기를 걸고 저장을 요청한다.
+    SaveThenClose(ui::workspace::DocumentTabId),
+}
+
+/// 큐 맨 앞(front) 항목에 사용자의 선택을 적용한다 — 순수 함수라 App 없이 테스트한다.
+/// 맨 앞이 곧 지금 화면에 그려지는 모달이므로 `pop_front`는 항상 사용자가 실제로 본
+/// 확인과 일치한다(여러 확인이 쌓여 있어도 뒤엣것은 절대 건드리지 않는다 — "각
+/// 확인이 올바른 문서에 적용되는지"). `SaveConflict`는 재로드/취소 두 가지뿐이라
+/// `resolve_document_conflict_choice`가 따로 처리한다(여기서는 `None`).
+fn resolve_document_confirm_choice(
+    queue: &mut std::collections::VecDeque<DocumentPendingConfirm>,
+    choice: DocumentConfirmChoice,
+) -> Option<DocumentConfirmAction> {
+    let pending = queue.pop_front()?;
+    match (choice, pending) {
+        (DocumentConfirmChoice::Cancel, _) => None,
+        (DocumentConfirmChoice::Discard, DocumentPendingConfirm::CloseWithDirty { id }) => {
+            Some(DocumentConfirmAction::Discard(id))
+        }
+        (DocumentConfirmChoice::Save, DocumentPendingConfirm::CloseWithDirty { id }) => {
+            Some(DocumentConfirmAction::SaveThenClose(id))
+        }
+        (_, DocumentPendingConfirm::SaveConflict { .. }) => None,
+    }
+}
+
+/// 큐 맨 앞 항목에 저장 충돌 확인(재로드/취소)의 선택을 적용한다 —
+/// `resolve_document_confirm_choice`와 같은 이유로 순수 함수다. `reload`가 참이고
+/// 맨 앞이 `SaveConflict`면 그 문서 id를 돌려준다(App이 `reload_document_from_disk`를
+/// 부른다).
+fn resolve_document_conflict_choice(
+    queue: &mut std::collections::VecDeque<DocumentPendingConfirm>,
+    reload: bool,
+) -> Option<ui::workspace::DocumentTabId> {
+    let pending = queue.pop_front()?;
+    if reload && let DocumentPendingConfirm::SaveConflict { id } = pending {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 /// dirty 확인 모달(교체/닫기 공용)에서 사용자가 누른 버튼.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DocumentConfirmChoice {
@@ -9225,6 +9311,45 @@ fn document_close_requires_confirm(document: Option<&OpenDocument>) -> bool {
     document.is_some_and(|document| document.dirty)
 }
 
+/// `ui::document::source_editor`(건드리지 않는다)가 내부적으로 만드는 편집기
+/// `TextEdit`의 실제 저장 id를 재현한다 — egui의 `ScrollArea`와 `Frame::NONE`가
+/// id_salt 없이 `new_child`를 각각 한 번씩 호출해(egui 0.35.0 기본값은 `"child"`
+/// salt) 두 겹을 더 감싼 뒤에야 `.id_salt(id_salt)`가 적용된다(egui 0.35.0 실측,
+/// 이 파일의 `문서_source_editor_state_id_공식은_실제_저장_위치와_일치한다`가
+/// 고정한다). `egui::Id::with`는 넘긴 salt를 매번 `IdSalt::new`로 다시 해싱하므로,
+/// 이미 `IdSalt`로 변환된 값(예: `TextEdit::id_salt`가 저장한 값)을 그대로 다시
+/// 넘겨야 실제 계산과 맞아떨어진다 — 그래서 `id_salt`도 `IdSalt::new`로 한 번 감싼
+/// 뒤 넘긴다. `body_ui_id`는 문서 body를 그릴 때 캡처해 둔 안정 id(App이 그
+/// 시점의 `ui.id()`를 그대로 들고 있는다).
+fn document_source_editor_state_id(body_ui_id: egui::Id, id_salt: egui::Id) -> egui::Id {
+    let child = egui::IdSalt::new("child");
+    body_ui_id
+        .with(child)
+        .with(child)
+        .with(egui::IdSalt::new(id_salt))
+}
+
+/// 문서를 닫을 때 egui가 들고 있던 source 편집기 `TextEditState`를 지운다(리뷰 지적
+/// ② — 안 그러면 문서를 닫아도 실행취소 스냅샷이 안 지워지고, 같은 경로를 다시
+/// 열면 되살아나며, 세션 동안 편집한 서로 다른 문서 수만큼 무한정 쌓인다). Source·
+/// Split 두 모드가 서로 다른 컨테이너를 쓰므로(app.rs의 두 호출부) 둘 다 지운다 —
+/// 문서가 그 모드로 열린 적이 없으면 해당 id는 애초에 저장된 적이 없어 `remove`가
+/// 조용히 no-op이다. `body_ui_id`가 `None`이면(문서 body가 한 번도 안 그려졌다)
+/// 지울 것도 없다.
+fn clear_document_editor_state(ctx: &egui::Context, document: &OpenDocument) {
+    let Some(body_ui_id) = document.body_ui_id else {
+        return;
+    };
+    let id_salt = egui::Id::new(("document_tab_source_editor", document.path.as_path()));
+    let source_mode_id = document_source_editor_state_id(body_ui_id, id_salt);
+    let split_mode_container = body_ui_id.with(egui::IdSalt::new("document_tab_split_source"));
+    let split_mode_id = document_source_editor_state_id(split_mode_container, id_salt);
+    ctx.data_mut(|d| {
+        d.remove::<egui::text_edit::TextEditState>(source_mode_id);
+        d.remove::<egui::text_edit::TextEditState>(split_mode_id);
+    });
+}
+
 /// 같은 경로가 이미 열려 있으면 그 id를 돌려준다(멀티 문서 탭 설계 ③) —
 /// `begin_document_open`이 이 값이 있으면 새로 열지 않고 그 탭만 활성화한다.
 /// 순수 함수라 App 없이 테스트한다.
@@ -9249,10 +9374,16 @@ fn plan_document_eviction(
     documents: &[OpenDocument],
     active_document: Option<ui::workspace::DocumentTabId>,
 ) -> Option<Vec<ui::workspace::DocumentTabId>> {
+    // 실제 힙 보유량은 source 하나가 아니라 source + saved_source 두 사본이다 —
+    // `apply_document_load_outcome`이 로드마다 saved_source도 항상 채우고(dirty
+    // 판정 기준이라 저장 후에도 계속 들고 있어야 한다), source만 세면 상한이 실제
+    // 보유량의 절반만 반영한다(2026-08-22 리뷰).
+    let retained_bytes =
+        |document: &OpenDocument| document.source.len() as u64 + document.saved_source.len() as u64;
     let mut remaining: Vec<&OpenDocument> = documents.iter().collect();
     let mut bytes: u64 = remaining
         .iter()
-        .map(|document| document.source.len() as u64)
+        .map(|document| retained_bytes(document))
         .sum();
     let mut evict = Vec::new();
     while remaining.len() + 1 > DOCUMENT_TABS_MAX || bytes > DOCUMENT_TOTAL_RETAINED_BYTES_MAX {
@@ -9260,7 +9391,7 @@ fn plan_document_eviction(
             .iter()
             .position(|document| !document.dirty && Some(document.id) != active_document)?;
         let victim = remaining.remove(position);
-        bytes -= victim.source.len() as u64;
+        bytes -= retained_bytes(victim);
         evict.push(victim.id);
     }
     Some(evict)
@@ -9344,11 +9475,15 @@ const DOCUMENT_SAVED_FEEDBACK_DURATION: std::time::Duration =
 /// 헤더 축약 사다리(×부터 접는다)가 충분히 감당하는 수다.
 const DOCUMENT_TABS_MAX: usize = 8;
 
-/// 열려 있는 문서들의 `source` 바이트 합계 상한(멀티 문서 탭 설계 §4) — 문서 하나가
-/// §6 ViewOnly 티어로 최대 8 MiB(`document_io::DOCUMENT_REFUSE_BYTES_MAX`)까지 열릴 수
-/// 있다. `DOCUMENT_TABS_MAX`(8개)보다 훨씬 작게 잡아, 큰 ViewOnly 문서 몇 개만
+/// 열려 있는 문서들의 **실제 힙 보유량** 상한(멀티 문서 탭 설계 §4) — `source` +
+/// `saved_source` 두 사본을 합친 값이다(`plan_document_eviction`의
+/// `retained_bytes`). `apply_document_load_outcome`이 로드마다 saved_source도
+/// 항상 채워 dirty 판정용 사본을 계속 들고 있으므로, source 하나만 세면 이 상수가
+/// 실제 보유량의 절반만 반영하게 된다(2026-08-22 리뷰 — 예전 버그). 문서 하나가
+/// §6 ViewOnly 티어로 최대 8 MiB(`document_io::DOCUMENT_REFUSE_BYTES_MAX`)까지 열릴
+/// 수 있다. `DOCUMENT_TABS_MAX`(8개)보다 훨씬 작게 잡아, 큰 ViewOnly 문서 몇 개만
 /// 몰려도(개수 상한에 한참 못 미쳐도) 전체 보유량이 무한정 커지지 않게 한다 —
-/// ViewOnly 문서 3개(24 MiB)만으로도 이 상한에 걸린다.
+/// ViewOnly 문서(사본 둘 합쳐 16 MiB) 두 개만으로도 이 상한에 걸린다.
 const DOCUMENT_TOTAL_RETAINED_BYTES_MAX: u64 = 24 * 1024 * 1024;
 
 /// 이력·Git 본문의 좌우 분할 폭 — 사용자가 구분선을 끌기 전(`stored: None`)에는 `auto`
@@ -12432,7 +12567,7 @@ impl App {
             document_pending_saves: std::collections::VecDeque::new(),
             document_save_inflight: None,
             document_save_worker,
-            document_pending_confirm: None,
+            document_pending_confirms: std::collections::VecDeque::new(),
             document_close_after_save: std::collections::HashSet::new(),
             document_cap_notice: false,
             document_markdown_viewer: ui::markdown_viewer::MarkdownViewer::new(),
@@ -15694,11 +15829,17 @@ impl App {
                     });
                 }
                 DocumentLoadState::Loaded { .. } => {
+                    // 이 프레임의 body ui id를 캡처해 둔다 — 문서를 닫을 때
+                    // `clear_document_editor_state`가 이 값으로 source 편집기가 egui에
+                    // 남긴 `TextEditState`를 지운다(리뷰 지적 ②, `body_ui_id` 필드 주석
+                    // 참고).
+                    let body_ui_id = ui.id();
                     let Some(document) =
                         self.documents.iter_mut().find(|document| document.id == id)
                     else {
                         return;
                     };
+                    document.body_ui_id = Some(body_ui_id);
                     let editable = document.is_editable();
                     match mode {
                         ui::document::DocumentViewMode::Source => {
@@ -16081,8 +16222,10 @@ impl App {
             ui::workspace::PaneAuxTabIntent::Close => {
                 let document = self.documents.iter().find(|document| document.id == id);
                 if document_close_requires_confirm(document) {
-                    self.document_pending_confirm =
-                        Some(DocumentPendingConfirm::CloseWithDirty { id });
+                    enqueue_document_pending_confirm(
+                        &mut self.document_pending_confirms,
+                        DocumentPendingConfirm::CloseWithDirty { id },
+                    );
                     return;
                 }
                 self.close_document_entry(id);
@@ -16135,20 +16278,17 @@ impl App {
         let Some(index) = self.documents.iter().position(|document| document.id == id) else {
             return;
         };
-        self.documents.remove(index);
+        let document = self.documents.remove(index);
+        // egui가 경로 기반 id로 들고 있던 source 편집기 상태(실행취소 스냅샷 포함)를
+        // 지운다 — 안 그러면 문서를 닫아도 안 지워지고 무한정 쌓인다(리뷰 지적 ②).
+        clear_document_editor_state(&self.egui_ctx, &document);
         self.document_pending_loads
             .retain(|(job_id, _)| *job_id != id);
         self.document_pending_saves
             .retain(|(job_id, _)| *job_id != id);
         self.document_close_after_save.remove(&id);
-        if matches!(
-            self.document_pending_confirm,
-            Some(DocumentPendingConfirm::CloseWithDirty { id: pending_id })
-                | Some(DocumentPendingConfirm::SaveConflict { id: pending_id })
-                if pending_id == id
-        ) {
-            self.document_pending_confirm = None;
-        }
+        self.document_pending_confirms
+            .retain(|confirm| confirm.document_id() != id);
         if self.active_document == Some(id) {
             self.active_document = next_active_document_after_close(&self.documents, index);
             self.aux_search.reset();
@@ -16195,6 +16335,7 @@ impl App {
             saved_feedback_until: None,
             view_only_byte_len: None,
             source_revision: 0,
+            body_ui_id: None,
         });
         self.document_pending_loads.push_back((id, path));
         self.active_document = Some(id);
@@ -16264,30 +16405,39 @@ impl App {
         self.document_pending_loads.push_back((id, path));
     }
 
-    /// dirty 확인 모달(닫기)에서 사용자가 고른 선택을 적용한다.
+    /// 확인 모달 문구에 넣을 파일명 — 어느 문서에 대한 확인인지 사용자가 알 수
+    /// 있어야 한다(2026-08-22 리뷰: 예전엔 제네릭 문구뿐이라 대상을 알 수 없었다).
+    /// 큐에 확인이 남아 있는 한 그 문서는 `close_document_entry`가 지우기 전까지
+    /// `documents`에 그대로 있으므로 찾지 못하는 경우는 방어적으로만 다룬다.
+    fn document_file_name(&self, id: ui::workspace::DocumentTabId) -> String {
+        self.documents
+            .iter()
+            .find(|document| document.id == id)
+            .and_then(|document| document.path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// dirty 확인 모달(닫기)에서 사용자가 고른 선택을 적용한다 — 무엇을 할지는
+    /// 순수 함수 `resolve_document_confirm_choice`가 큐 맨 앞을 보고 정하고, 여기서는
+    /// 그 결정만 실행한다.
     fn apply_document_confirm_choice(&mut self, choice: DocumentConfirmChoice) {
-        let Some(pending) = self.document_pending_confirm.take() else {
-            return;
-        };
-        match (choice, pending) {
-            (DocumentConfirmChoice::Cancel, _) => {}
-            (DocumentConfirmChoice::Discard, DocumentPendingConfirm::CloseWithDirty { id }) => {
-                self.close_document_entry(id);
-            }
-            (DocumentConfirmChoice::Save, DocumentPendingConfirm::CloseWithDirty { id }) => {
+        match resolve_document_confirm_choice(&mut self.document_pending_confirms, choice) {
+            Some(DocumentConfirmAction::Discard(id)) => self.close_document_entry(id),
+            Some(DocumentConfirmAction::SaveThenClose(id)) => {
                 self.document_close_after_save.insert(id);
                 self.request_document_save(id);
             }
-            // SaveConflict 모달은 이 함수를 거치지 않는다(재로드/취소 두 가지뿐 —
-            // `apply_document_conflict_choice`가 따로 처리한다).
-            (_, DocumentPendingConfirm::SaveConflict { .. }) => {}
+            None => {}
         }
     }
 
-    /// 저장 Conflict 확인(재로드/취소 두 가지)에서 사용자가 고른 선택을 적용한다.
+    /// 저장 Conflict 확인(재로드/취소 두 가지)에서 사용자가 고른 선택을 적용한다 —
+    /// `apply_document_confirm_choice`와 같은 구조.
     fn apply_document_conflict_choice(&mut self, reload: bool) {
-        let pending = self.document_pending_confirm.take();
-        if reload && let Some(DocumentPendingConfirm::SaveConflict { id }) = pending {
+        if let Some(id) =
+            resolve_document_conflict_choice(&mut self.document_pending_confirms, reload)
+        {
             self.reload_document_from_disk(id);
         }
     }
@@ -16427,7 +16577,7 @@ impl App {
         };
         if let Some(confirm) = apply_save_outcome_to_document(id, document, &outcome) {
             self.document_close_after_save.remove(&id);
-            self.document_pending_confirm = Some(confirm);
+            enqueue_document_pending_confirm(&mut self.document_pending_confirms, confirm);
             return;
         }
         match outcome {
@@ -28144,16 +28294,30 @@ impl eframe::App for App {
 
         // 문서 탭 확인 모달(설계 §3.3·§7, 멀티 문서 탭 설계) — 닫기는 저장/버리기/취소,
         // 저장 충돌은 다시 불러오기/취소(「다른 이름으로」는 이번 범위에서 뺐다). 교체
-        // 확인은 더 이상 없다 — 새 문서를 열어도 기존 문서를 교체하지 않는다.
-        if let Some(pending) = self.document_pending_confirm {
+        // 확인은 더 이상 없다 — 새 문서를 열어도 기존 문서를 교체하지 않는다. 큐 맨
+        // 앞(front)만 그린다 — 나머지는 대기하다 이 모달이 처리되면 다음 프레임에
+        // 이어서 그려진다(2026-08-22 리뷰: 여러 문서의 확인이 겹쳐도 먼저 것이 사라지지
+        // 않는다). 문구에 파일명을 넣어 "어느 문서" 확인인지 보이게 한다 — 예전엔
+        // 제네릭 문구뿐이라 사용자가 대상을 알 수 없었다.
+        if let Some(pending) = self.document_pending_confirms.front().copied() {
+            let queued_after = self.document_pending_confirms.len() - 1;
             match pending {
-                DocumentPendingConfirm::CloseWithDirty { .. } => {
+                DocumentPendingConfirm::CloseWithDirty { id } => {
+                    let name = self.document_file_name(id);
                     let mut choice = None;
                     egui::Window::new(text.t("document.confirm_discard.title", &[]))
                         .collapsible(false)
                         .resizable(false)
                         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                         .show(ui.ctx(), |ui| {
+                            ui.label(text.t("document.confirm_discard.body", &[("name", &name)]));
+                            if queued_after > 0 {
+                                ui.label(text.t(
+                                    "document.confirm_discard.queued",
+                                    &[("count", &queued_after.to_string())],
+                                ));
+                            }
+                            ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 if ui
                                     .button(text.t("document.confirm_discard.save", &[]))
@@ -28179,13 +28343,22 @@ impl eframe::App for App {
                         self.apply_document_confirm_choice(choice);
                     }
                 }
-                DocumentPendingConfirm::SaveConflict { .. } => {
+                DocumentPendingConfirm::SaveConflict { id } => {
+                    let name = self.document_file_name(id);
                     let mut decision: Option<bool> = None; // Some(true)=다시 불러오기, Some(false)=취소
                     egui::Window::new(text.t("document.conflict.title", &[]))
                         .collapsible(false)
                         .resizable(false)
                         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                         .show(ui.ctx(), |ui| {
+                            ui.label(text.t("document.conflict.body", &[("name", &name)]));
+                            if queued_after > 0 {
+                                ui.label(text.t(
+                                    "document.conflict.queued",
+                                    &[("count", &queued_after.to_string())],
+                                ));
+                            }
+                            ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 if ui.button(text.t("document.conflict.reload", &[])).clicked() {
                                     decision = Some(true);
@@ -34157,6 +34330,7 @@ mod tests {
             saved_feedback_until: None,
             view_only_byte_len: None,
             source_revision: 0,
+            body_ui_id: None,
         }
     }
 
@@ -34191,6 +34365,116 @@ mod tests {
             None,
             "새 파일이면 어느 기존 문서와도 매칭되면 안 된다 — 그래야 기존 문서를 \
              건드리지 않고 새 탭을 더한다"
+        );
+    }
+
+    /// `document_source_editor_state_id`가 재현하는 값이 `ui::document::source_editor`
+    /// (건드리지 않는다, 실제 리프)가 진짜로 저장하는 `TextEditState` 위치와 맞는지 —
+    /// Source 모드는 body ui를 그대로 넘긴다.
+    #[test]
+    fn 문서_source_editor_state_id_공식은_실제_저장_위치와_일치한다() {
+        use std::cell::Cell;
+        let path = PathBuf::from("/tmp/explore.md");
+        let id_salt = egui::Id::new(("document_tab_source_editor", path.as_path()));
+        let mut source = "hello".to_owned();
+        let body_ui_id: Cell<Option<egui::Id>> = Cell::new(None);
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            body_ui_id.set(Some(ui.id()));
+            ui::document::source_editor(ui, id_salt, &mut source, true);
+        });
+        harness.run();
+        let candidate = document_source_editor_state_id(body_ui_id.get().unwrap(), id_salt);
+        assert!(
+            egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_some(),
+            "document_source_editor_state_id의 계산이 실제 저장 위치와 어긋난다 — \
+             egui나 source_editor의 내부 감싸기가 바뀌었을 수 있다"
+        );
+    }
+
+    /// 같은 계약을 Split 모드에서 확인한다 — `document_tab_split_source` 컨테이너를
+    /// 하나 더 감싼 뒤에 같은 공식을 적용해야 한다(app.rs의 Split 분기와 같은 순서).
+    #[test]
+    fn 문서_split_모드_source_editor_state_id_공식은_실제_저장_위치와_일치한다() {
+        use std::cell::Cell;
+        let path = PathBuf::from("/tmp/explore.md");
+        let id_salt = egui::Id::new(("document_tab_source_editor", path.as_path()));
+        let mut source = "hello".to_owned();
+        let body_ui_id: Cell<Option<egui::Id>> = Cell::new(None);
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            body_ui_id.set(Some(ui.id()));
+            let mut source_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(ui.available_rect_before_wrap())
+                    .id_salt("document_tab_split_source"),
+            );
+            ui::document::source_editor(&mut source_ui, id_salt, &mut source, true);
+        });
+        harness.run();
+        let split_container = body_ui_id
+            .get()
+            .unwrap()
+            .with(egui::IdSalt::new("document_tab_split_source"));
+        let candidate = document_source_editor_state_id(split_container, id_salt);
+        assert!(
+            egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_some(),
+            "Split 모드 컨테이너를 통한 계산이 실제 저장 위치와 어긋난다"
+        );
+    }
+
+    /// ② 문서를 닫으면 그 위젯이 들고 있던 `TextEditState`(실행취소 스냅샷 포함)가
+    /// 실제로 지워지는지 — `clear_document_editor_state`를 되돌리면(호출을 지우면)
+    /// 이 테스트가 실패한다.
+    #[test]
+    fn clear_document_editor_state는_저장된_텍스트편집기_상태를_지운다() {
+        use std::cell::Cell;
+        let path = PathBuf::from("/tmp/explore.md");
+        let id_salt = egui::Id::new(("document_tab_source_editor", path.as_path()));
+        let mut source = "hello".to_owned();
+        let body_ui_id: Cell<Option<egui::Id>> = Cell::new(None);
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            body_ui_id.set(Some(ui.id()));
+            ui::document::source_editor(ui, id_salt, &mut source, true);
+        });
+        harness.run();
+
+        let document = stub_open_document(path.to_str().unwrap(), "hello", "hello", false);
+        let mut document = OpenDocument {
+            body_ui_id: body_ui_id.get(),
+            ..document
+        };
+        let candidate = document_source_editor_state_id(document.body_ui_id.unwrap(), id_salt);
+        assert!(
+            egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_some(),
+            "전제: 렌더 한 번으로 상태가 이미 저장돼 있어야 한다"
+        );
+
+        clear_document_editor_state(&harness.ctx, &document);
+
+        assert!(
+            egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_none(),
+            "문서를 닫을 때 TextEditState가 지워지지 않았다 — 닫아도 남아 다시 열면 \
+             되살아나고, 세션 동안 편집한 문서 수만큼 무한정 쌓인다"
+        );
+        document.body_ui_id = None; // 정리 후 재사용 방지(빌림 경고 회피용 사용 표시).
+    }
+
+    /// `close_document_entry`가 실제로 `clear_document_editor_state`를 호출하는지 —
+    /// App 전체를 구성하지 않고도 배선을 검증한다(다른 문서 탭 테스트와 같은 관례).
+    #[test]
+    fn close_document_entry는_텍스트편집기_상태_정리를_호출한다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn close_document_entry(&mut self")
+            .expect("close_document_entry 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains("clear_document_editor_state"),
+            "문서를 닫을 때 TextEditState도 함께 정리해야 한다 — 안 그러면 egui가 \
+             경로 기반 id로 들고 있는 실행취소 스냅샷(egui 0.35 max_undos=100)이 \
+             무한정 쌓인다: {function_body}"
         );
     }
 
@@ -34281,6 +34565,31 @@ mod tests {
             evict,
             vec![ui::workspace::DocumentTabId(0)],
             "바이트 상한을 넘긴 큰 문서부터(맨 앞이기도 하다) 닫아야 한다"
+        );
+    }
+
+    /// ③ source만 세면(예전 버그) 상한의 절반보다 살짝 큰 정도라 넘지 않는 것처럼
+    /// 보이지만, `apply_document_load_outcome`이 항상 채우는 saved_source까지
+    /// 합치면(고친 계산) 실제로는 상한을 넘는다 — 되돌리면 실패하는 형태.
+    #[test]
+    fn plan_document_eviction은_source와_saved_source_두_사본을_합쳐서_바이트_상한을_판정한다() {
+        let half_plus = vec![b'a'; (DOCUMENT_TOTAL_RETAINED_BYTES_MAX / 2 + 1) as usize];
+        let half_plus_source = String::from_utf8(half_plus).unwrap();
+        let documents = vec![stub_open_document_id(
+            0,
+            "/tmp/half.md",
+            &half_plus_source,
+            &half_plus_source,
+            false,
+        )];
+        let evict = plan_document_eviction(&documents, None)
+            .expect("clean 비활성 문서 하나뿐이니 자리를 만들 수 있어야 한다");
+        assert_eq!(
+            evict,
+            vec![ui::workspace::DocumentTabId(0)],
+            "source만 세면(옛 계산) 상한의 절반+1이라 안 넘어 evict가 비어야 하지만, \
+             source+saved_source 두 사본을 합치면(고친 계산) 상한을 넘어 이 유일한 \
+             문서가 닫혀야 한다"
         );
     }
 
@@ -34576,6 +34885,135 @@ mod tests {
         assert!(!document_close_requires_confirm(Some(&clean)));
         let dirty = stub_open_document("/tmp/a.md", "B", "A", true);
         assert!(document_close_requires_confirm(Some(&dirty)));
+    }
+
+    /// ① 대기 중인 확인이 있을 때 다른 문서의 확인이 와도 먼저 것이 사라지면 안
+    /// 된다 — 예전엔 App 전역 슬롯 하나라 응답 없이 조용히 덮어써졌다. 이제는
+    /// 도착 순서대로 큐에 쌓인다(FIFO).
+    #[test]
+    fn enqueue_document_pending_confirm은_먼저_온_확인을_지우지_않고_뒤에_쌓는다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+        );
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::SaveConflict { id: b },
+        );
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![
+                DocumentPendingConfirm::CloseWithDirty { id: a },
+                DocumentPendingConfirm::SaveConflict { id: b },
+            ],
+            "먼저 온 A의 확인이 사라지지 않고, B의 확인은 그 뒤에 쌓여야 한다"
+        );
+    }
+
+    /// 같은 문서에 대한 확인이 이미 대기 중이면 중복으로 쌓이면 안 된다(순서가
+    /// 결정적이어야 한다는 요구의 일부 — 같은 문서 확인이 여러 개면 어느 게 먼저인지
+    /// 모호해진다).
+    #[test]
+    fn enqueue_document_pending_confirm은_같은_문서의_중복_확인을_버린다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+        );
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+        );
+        assert_eq!(
+            queue.len(),
+            1,
+            "같은 문서에 대한 확인이 중복으로 쌓이면 안 된다"
+        );
+    }
+
+    /// 큐에 두 문서의 확인이 쌓여 있을 때 사용자가 응답하면 **맨 앞(지금 화면에 뜬
+    /// 모달)**에만 적용돼야 한다 — 뒤엣것(B)이 잘못 적용되면 안 된다("각 확인이
+    /// 올바른 문서에 적용되는지").
+    #[test]
+    fn resolve_document_confirm_choice는_큐_맨앞의_확인만_소비하고_뒤는_그대로_둔다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut queue: std::collections::VecDeque<_> = [
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+            DocumentPendingConfirm::CloseWithDirty { id: b },
+        ]
+        .into_iter()
+        .collect();
+
+        let action = resolve_document_confirm_choice(&mut queue, DocumentConfirmChoice::Discard);
+
+        assert_eq!(
+            action,
+            Some(DocumentConfirmAction::Discard(a)),
+            "맨 앞(A)에 대한 확인이 적용돼야 한다 — B 것이 잘못 적용되면 안 된다"
+        );
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![DocumentPendingConfirm::CloseWithDirty { id: b }],
+            "B의 확인은 큐에 그대로 남아 다음 프레임에 이어서 그려져야 한다"
+        );
+    }
+
+    #[test]
+    fn resolve_document_confirm_choice는_저장을_고르면_save_then_close를_돌려준다() {
+        let id = ui::workspace::DocumentTabId(9);
+        let mut queue: std::collections::VecDeque<_> =
+            [DocumentPendingConfirm::CloseWithDirty { id }]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            resolve_document_confirm_choice(&mut queue, DocumentConfirmChoice::Save),
+            Some(DocumentConfirmAction::SaveThenClose(id))
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn resolve_document_confirm_choice는_취소면_아무것도_실행하지_않고_큐에서_지운다() {
+        let id = ui::workspace::DocumentTabId(3);
+        let mut queue: std::collections::VecDeque<_> =
+            [DocumentPendingConfirm::CloseWithDirty { id }]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            resolve_document_confirm_choice(&mut queue, DocumentConfirmChoice::Cancel),
+            None
+        );
+        assert!(
+            queue.is_empty(),
+            "취소해도 큐에서는 빠져야 한다(모달이 닫힌다)"
+        );
+    }
+
+    /// Conflict 확인도 같은 계약 — 맨 앞만 소비하고 뒤는 그대로 둔다.
+    #[test]
+    fn resolve_document_conflict_choice는_큐_맨앞의_확인만_소비한다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut queue: std::collections::VecDeque<_> = [
+            DocumentPendingConfirm::SaveConflict { id: a },
+            DocumentPendingConfirm::SaveConflict { id: b },
+        ]
+        .into_iter()
+        .collect();
+
+        let reload_id = resolve_document_conflict_choice(&mut queue, true);
+
+        assert_eq!(reload_id, Some(a), "맨 앞(A)만 재로드 대상이어야 한다");
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![DocumentPendingConfirm::SaveConflict { id: b }],
+            "B의 확인은 큐에 그대로 남아야 한다"
+        );
     }
 
     /// `document_replace_requires_confirm`은 멀티 문서 탭 설계에서 함께 사라졌다 —

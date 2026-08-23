@@ -385,6 +385,7 @@ document.save = Save
 document.saved = Saved
 document.dirty = Unsaved
 document.loading = Loading…
+document.limit.grew_past_full = Now {bytes} bytes — past the 1 MiB editing budget; typing may lag
 document.limit.view_only = Read-only — {bytes} bytes (over 1 MiB)
 document.limit.refused = This document is larger than 8 MiB ({bytes} bytes) and can't be opened here. Try opening it with the OS default app.
 document.limit.binary = This file can't be read as text ({bytes} bytes). Try opening it with the OS default app.

@@ -385,6 +385,7 @@ document.save = 저장
 document.saved = 저장됨
 document.dirty = 저장되지 않음
 document.loading = 불러오는 중…
+document.limit.grew_past_full = 현재 {bytes}바이트 — 편집 권장 한도(1 MiB)를 넘었습니다. 입력이 느려질 수 있습니다
 document.limit.view_only = 읽기 전용 — {bytes} 바이트(1 MiB 초과)
 document.limit.refused = 이 문서는 8 MiB보다 커서 열 수 없습니다({bytes} 바이트). OS 기본 앱으로 열어보세요.
 document.limit.binary = 텍스트로 읽을 수 없는 파일입니다({bytes} 바이트). OS 기본 앱으로 열어보세요.

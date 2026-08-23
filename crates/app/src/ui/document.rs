@@ -54,8 +54,8 @@ const SOURCE_EDITOR_LINE_HEIGHT: f32 = 1.75;
 
 /// 단축키 힌트(`⌘S`)를 보여줄 최소 남은 폭. 이보다 좁으면 접는다.
 const SHORTCUT_HINT_MIN_WIDTH: f32 = 64.0;
-/// 상태 문구를 보여줄 최소 남은 폭.
-const STATUS_MIN_WIDTH: f32 = 80.0;
+/// 상태 문구 오른쪽에 남길 여백 — 문구 폭은 그릴 때 실측한다.
+const STATUS_RIGHT_PAD: f32 = 8.0;
 
 /// 세그먼트 칸의 좌우 안쪽 여백.
 const SEGMENT_PADDING_X: f32 = 8.0;
@@ -226,15 +226,22 @@ pub fn toolbar(
                     action = Some(DocumentToolbarAction::Save);
                 }
 
-                if let Some(status_text) = &snapshot.status_text
-                    && ui.available_width() >= STATUS_MIN_WIDTH
-                {
-                    // 오른쪽 정렬 — 남은 폭을 오른쪽부터 채우는 중첩 레이아웃.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(status_text).color(tokens.muted_text),
-                        ));
-                    });
+                if let Some(status_text) = &snapshot.status_text {
+                    // 고정 임계값으로는 안 된다 — 상태 문구는 「저장됨」처럼 짧을 때도,
+                    // 「읽기 전용 — N바이트(1 MiB 초과)」처럼 길 때도 있어서 짧은 쪽에
+                    // 맞춘 문턱을 통과한 뒤 긴 문구가 삐져나갔다(2026-08-23 리뷰).
+                    // 실제로 그릴 문구의 폭을 재서 들어갈 때만 그린다.
+                    let galley = ui.painter().layout_no_wrap(
+                        status_text.clone(),
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        tokens.muted_text,
+                    );
+                    if ui.available_width() >= galley.size().x + STATUS_RIGHT_PAD {
+                        // 오른쪽 정렬 — 남은 폭을 오른쪽부터 채우는 중첩 레이아웃.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(galley));
+                        });
+                    }
                 }
             });
         });
@@ -247,17 +254,17 @@ pub fn toolbar(
 /// `&mut`로 직접 빌려주므로 leaf가 복사본을 따로 들고 있지 않는다 — 매 키 입력마다
 /// 문서 전체를 복제하지 않는다).
 ///
-/// `id_salt`는 호출부(App)가 문서 식별자(경로)에서 만든 안정 id다. 자동 위젯 id에
-/// 맡기면 다른 문서로 교체해도 화면상 "같은 자리"라 egui가 같은 위젯으로 보고
-/// undo 기록을 이어준다 — 문서 B에서 문서 A의 되돌리기 이력이 튀어나오는 사고로
-/// 이어진다. 문서마다 다른 id를 주면 교체 시 자연히 새 위젯이 되어 그 문제가
-/// 없다.
-pub fn source_editor(
-    ui: &mut egui::Ui,
-    id_salt: egui::Id,
-    source: &mut String,
-    editable: bool,
-) -> bool {
+/// `id`는 호출부(App)가 문서 식별자(경로)에서 만든 **절대 id**다(부모 Ui와 조합되지
+/// 않는다). 두 가지를 동시에 해결한다.
+///
+/// 첫째, 자동 위젯 id에 맡기면 다른 문서로 교체해도 화면상 "같은 자리"라 egui가 같은
+/// 위젯으로 보고 undo 기록을 이어준다 — 문서 B에서 문서 A의 되돌리기가 튀어나온다.
+///
+/// 둘째, **절대 id라 컨테이너가 달라도 같다.** 예전엔 `id_salt`를 써서 부모 Ui id와
+/// 조합됐고, Split 모드는 컨테이너를 한 겹 더 씌우므로 Source 모드와 다른 id가 됐다 —
+/// 모드를 오갈 때마다 커서와 undo 기록이 따로 놀았다(2026-08-23 리뷰). 게다가 App이
+/// 그 조합을 역산하는 취약한 공식을 들고 있어야 했다.
+pub fn source_editor(ui: &mut egui::Ui, id: egui::Id, source: &mut String, editable: bool) -> bool {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -267,7 +274,7 @@ pub fn source_editor(
             let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
             ui.add(
                 egui::TextEdit::multiline(source)
-                    .id_salt(id_salt)
+                    .id(id)
                     .interactive(editable)
                     .font(font.clone())
                     // 배경·테두리 없는 프레임에 **여백만** 싣는다.

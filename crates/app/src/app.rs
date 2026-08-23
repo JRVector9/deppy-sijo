@@ -9333,33 +9333,37 @@ fn document_close_requires_confirm(document: Option<&OpenDocument>) -> bool {
 /// 넘겨야 실제 계산과 맞아떨어진다 — 그래서 `id_salt`도 `IdSalt::new`로 한 번 감싼
 /// 뒤 넘긴다. `body_ui_id`는 문서 body를 그릴 때 캡처해 둔 안정 id(App이 그
 /// 시점의 `ui.id()`를 그대로 들고 있는다).
-fn document_source_editor_state_id(body_ui_id: egui::Id, id_salt: egui::Id) -> egui::Id {
-    let child = egui::IdSalt::new("child");
-    body_ui_id
-        .with(child)
-        .with(child)
-        .with(egui::IdSalt::new(id_salt))
+/// source 편집기의 `TextEditState` id. `source_editor`가 **절대 id**를 쓰므로 여기서
+/// 만드는 값이 곧 그 위젯의 id다 — 예전처럼 위젯 계층을 역산할 필요가 없다
+/// (2026-08-23). 컨테이너가 달라도 같은 값이라 Source·Split 두 모드가 커서와 undo
+/// 기록을 공유한다.
+fn document_source_editor_id(path: &Path) -> egui::Id {
+    egui::Id::new(("document_tab_source_editor", path))
 }
 
-/// 문서를 닫을 때 egui가 들고 있던 source 편집기 `TextEditState`를 지운다(리뷰 지적
-/// ② — 안 그러면 문서를 닫아도 실행취소 스냅샷이 안 지워지고, 같은 경로를 다시
-/// 열면 되살아나며, 세션 동안 편집한 서로 다른 문서 수만큼 무한정 쌓인다). Source·
-/// Split 두 모드가 서로 다른 컨테이너를 쓰므로(app.rs의 두 호출부) 둘 다 지운다 —
-/// 문서가 그 모드로 열린 적이 없으면 해당 id는 애초에 저장된 적이 없어 `remove`가
-/// 조용히 no-op이다. `body_ui_id`가 `None`이면(문서 body가 한 번도 안 그려졌다)
-/// 지울 것도 없다.
+/// 문서를 닫을 때 egui가 들고 있던 source 편집기 `TextEditState`를 지운다 — 안 지우면
+/// 실행취소 스냅샷이 남아 같은 경로를 다시 열 때 되살아나고, 세션 동안 편집한 서로
+/// 다른 문서 수만큼 무한정 쌓인다.
+///
+/// Source·Split 두 모드가 **같은 절대 id**를 쓰므로 한 번만 지우면 된다(2026-08-23).
+/// 그 모드로 열린 적이 없으면 애초에 저장된 적이 없어 `remove`가 조용히 no-op이다.
 fn clear_document_editor_state(ctx: &egui::Context, document: &OpenDocument) {
-    let Some(body_ui_id) = document.body_ui_id else {
-        return;
-    };
-    let id_salt = egui::Id::new(("document_tab_source_editor", document.path.as_path()));
-    let source_mode_id = document_source_editor_state_id(body_ui_id, id_salt);
-    let split_mode_container = body_ui_id.with(egui::IdSalt::new("document_tab_split_source"));
-    let split_mode_id = document_source_editor_state_id(split_mode_container, id_salt);
-    ctx.data_mut(|d| {
-        d.remove::<egui::text_edit::TextEditState>(source_mode_id);
-        d.remove::<egui::text_edit::TextEditState>(split_mode_id);
-    });
+    let editor_id = document_source_editor_id(&document.path);
+    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(editor_id));
+}
+
+/// 문서가 닫힐 때 미리보기 쪽이 들고 있던 그 문서 몫의 상태도 지운다 — 가로 스크롤
+/// 오프셋과 목적지 파싱 캐시다(2026-08-23 리뷰). 편집기 상태와 같은 이유로, egui는
+/// persisted 위젯 상태를 자동으로 GC하지 않는다.
+fn clear_document_viewer_state(
+    viewer: &mut ui::markdown_viewer::MarkdownViewer,
+    ctx: &egui::Context,
+    id: ui::workspace::DocumentTabId,
+) {
+    viewer.forget_document(
+        ctx,
+        ui::markdown_viewer::MarkdownDocumentSlot(u64::from(id.0)),
+    );
 }
 
 /// 같은 경로가 이미 열려 있으면 그 id를 돌려준다(멀티 문서 탭 설계 ③) —
@@ -15863,13 +15867,10 @@ impl App {
                     let editable = document.is_editable();
                     match mode {
                         ui::document::DocumentViewMode::Source => {
-                            let id_salt = egui::Id::new((
-                                "document_tab_source_editor",
-                                document.path.as_path(),
-                            ));
+                            let editor_id = document_source_editor_id(&document.path);
                             editor_changed = ui::document::source_editor(
                                 ui,
-                                id_salt,
+                                editor_id,
                                 &mut document.source,
                                 editable,
                             );
@@ -15909,13 +15910,10 @@ impl App {
                                 .iter_mut()
                                 .find(|document| document.id == id)
                                 .expect("checked above");
-                            let id_salt = egui::Id::new((
-                                "document_tab_source_editor",
-                                document.path.as_path(),
-                            ));
+                            let editor_id = document_source_editor_id(&document.path);
                             editor_changed = ui::document::source_editor(
                                 &mut source_ui,
-                                id_salt,
+                                editor_id,
                                 &mut document.source,
                                 editable,
                             );
@@ -16052,6 +16050,15 @@ impl App {
         }
         if let Some(code) = document.save_error {
             return Some(text.t("document.error.save_failed", &[("code", code.as_str())]));
+        }
+        // 편집으로 Full 티어 상한을 넘겼으면 알려준다(2026-08-23 리뷰). 티어는 **열 때**
+        // 정해지고 편집 중엔 재평가하지 않는다 — 타이핑 도중 편집기를 잠그는 건 더
+        // 나쁘기 때문이다. 대신 성능 근거(§6의 1 MiB 실측)를 넘겼다는 사실이 보이게
+        // 한다. 저장은 8 MiB 절대 상한에서만 막힌다.
+        let over_full = document.source.len() as u64 > document_io::DOCUMENT_FULL_BYTES_MAX;
+        if over_full && document.limit_tier() == Some(document_io::DocumentLimitTier::Full) {
+            let bytes = document.source.len().to_string();
+            return Some(text.t("document.limit.grew_past_full", &[("bytes", &bytes)]));
         }
         if document.dirty {
             return Some(text.t("document.dirty", &[]));
@@ -16311,6 +16318,7 @@ impl App {
         // egui가 경로 기반 id로 들고 있던 source 편집기 상태(실행취소 스냅샷 포함)를
         // 지운다 — 안 그러면 문서를 닫아도 안 지워지고 무한정 쌓인다(리뷰 지적 ②).
         clear_document_editor_state(&self.egui_ctx, &document);
+        clear_document_viewer_state(&mut self.document_markdown_viewer, &self.egui_ctx, id);
         self.document_pending_loads
             .retain(|(job_id, _)| *job_id != id);
         self.document_pending_saves
@@ -34413,57 +34421,42 @@ mod tests {
              건드리지 않고 새 탭을 더한다"
         );
     }
-
-    /// `document_source_editor_state_id`가 재현하는 값이 `ui::document::source_editor`
-    /// (건드리지 않는다, 실제 리프)가 진짜로 저장하는 `TextEditState` 위치와 맞는지 —
-    /// Source 모드는 body ui를 그대로 넘긴다.
+    /// `document_source_editor_id`가 `ui::document::source_editor`(실제 리프)가 진짜로
+    /// 저장하는 `TextEditState` 위치와 맞는지. 편집기가 **절대 id**를 쓰므로 컨테이너가
+    /// 달라도 같은 값이어야 한다 — Source 모드와 Split 모드(컨테이너 한 겹 더)를 같은
+    /// 하네스에서 확인해 그 불변식을 고정한다(2026-08-23).
     #[test]
-    fn 문서_source_editor_state_id_공식은_실제_저장_위치와_일치한다() {
-        use std::cell::Cell;
+    fn 문서_편집기_id는_컨테이너와_무관하게_같고_실제_저장_위치와_일치한다() {
         let path = PathBuf::from("/tmp/explore.md");
-        let id_salt = egui::Id::new(("document_tab_source_editor", path.as_path()));
+        let editor_id = document_source_editor_id(&path);
         let mut source = "hello".to_owned();
-        let body_ui_id: Cell<Option<egui::Id>> = Cell::new(None);
+
+        // Source 모드 — body ui에 그대로 그린다.
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            body_ui_id.set(Some(ui.id()));
-            ui::document::source_editor(ui, id_salt, &mut source, true);
+            ui::document::source_editor(ui, editor_id, &mut source, true);
         });
         harness.run();
-        let candidate = document_source_editor_state_id(body_ui_id.get().unwrap(), id_salt);
         assert!(
-            egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_some(),
-            "document_source_editor_state_id의 계산이 실제 저장 위치와 어긋난다 — \
-             egui나 source_editor의 내부 감싸기가 바뀌었을 수 있다"
+            egui::text_edit::TextEditState::load(&harness.ctx, editor_id).is_some(),
+            "절대 id가 실제 저장 위치와 어긋난다 — egui나 source_editor 내부가 바뀌었다"
         );
-    }
 
-    /// 같은 계약을 Split 모드에서 확인한다 — `document_tab_split_source` 컨테이너를
-    /// 하나 더 감싼 뒤에 같은 공식을 적용해야 한다(app.rs의 Split 분기와 같은 순서).
-    #[test]
-    fn 문서_split_모드_source_editor_state_id_공식은_실제_저장_위치와_일치한다() {
-        use std::cell::Cell;
-        let path = PathBuf::from("/tmp/explore.md");
-        let id_salt = egui::Id::new(("document_tab_source_editor", path.as_path()));
-        let mut source = "hello".to_owned();
-        let body_ui_id: Cell<Option<egui::Id>> = Cell::new(None);
-        let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            body_ui_id.set(Some(ui.id()));
-            let mut source_ui = ui.new_child(
+        // Split 모드 — 컨테이너를 한 겹 더 씌워도 **같은 id**여야 커서·undo가 이어진다.
+        let mut split_source = "hello".to_owned();
+        let mut split_harness = egui_kittest::Harness::new_ui(|ui| {
+            let rect = ui.available_rect_before_wrap();
+            let mut child = ui.new_child(
                 egui::UiBuilder::new()
-                    .max_rect(ui.available_rect_before_wrap())
+                    .max_rect(rect)
                     .id_salt("document_tab_split_source"),
             );
-            ui::document::source_editor(&mut source_ui, id_salt, &mut source, true);
+            ui::document::source_editor(&mut child, editor_id, &mut split_source, true);
         });
-        harness.run();
-        let split_container = body_ui_id
-            .get()
-            .unwrap()
-            .with(egui::IdSalt::new("document_tab_split_source"));
-        let candidate = document_source_editor_state_id(split_container, id_salt);
+        split_harness.run();
         assert!(
-            egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_some(),
-            "Split 모드 컨테이너를 통한 계산이 실제 저장 위치와 어긋난다"
+            egui::text_edit::TextEditState::load(&split_harness.ctx, editor_id).is_some(),
+            "Split 컨테이너 안에서도 같은 id에 저장돼야 한다 — 다르면 모드를 오갈 때 \
+             커서와 undo 기록이 따로 논다"
         );
     }
 
@@ -34472,23 +34465,16 @@ mod tests {
     /// 이 테스트가 실패한다.
     #[test]
     fn clear_document_editor_state는_저장된_텍스트편집기_상태를_지운다() {
-        use std::cell::Cell;
         let path = PathBuf::from("/tmp/explore.md");
-        let id_salt = egui::Id::new(("document_tab_source_editor", path.as_path()));
+        let editor_id = document_source_editor_id(&path);
         let mut source = "hello".to_owned();
-        let body_ui_id: Cell<Option<egui::Id>> = Cell::new(None);
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            body_ui_id.set(Some(ui.id()));
-            ui::document::source_editor(ui, id_salt, &mut source, true);
+            ui::document::source_editor(ui, editor_id, &mut source, true);
         });
         harness.run();
 
         let document = stub_open_document(path.to_str().unwrap(), "hello", "hello", false);
-        let mut document = OpenDocument {
-            body_ui_id: body_ui_id.get(),
-            ..document
-        };
-        let candidate = document_source_editor_state_id(document.body_ui_id.unwrap(), id_salt);
+        let candidate = editor_id;
         assert!(
             egui::text_edit::TextEditState::load(&harness.ctx, candidate).is_some(),
             "전제: 렌더 한 번으로 상태가 이미 저장돼 있어야 한다"
@@ -34501,7 +34487,6 @@ mod tests {
             "문서를 닫을 때 TextEditState가 지워지지 않았다 — 닫아도 남아 다시 열면 \
              되살아나고, 세션 동안 편집한 문서 수만큼 무한정 쌓인다"
         );
-        document.body_ui_id = None; // 정리 후 재사용 방지(빌림 경고 회피용 사용 표시).
     }
 
     /// `close_document_entry`가 실제로 `clear_document_editor_state`를 호출하는지 —

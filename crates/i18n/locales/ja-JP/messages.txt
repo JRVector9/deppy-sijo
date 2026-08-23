@@ -385,6 +385,7 @@ document.save = 保存
 document.saved = 保存しました
 document.dirty = 未保存
 document.loading = 読み込み中…
+document.limit.grew_past_full = 現在{bytes}バイト — 編集の推奨上限(1 MiB)を超えました。入力が遅くなることがあります
 document.limit.view_only = 読み取り専用 — {bytes} バイト(1 MiB超)
 document.limit.refused = このドキュメントは8 MiBを超えているため開けません({bytes} バイト)。OS標準アプリで開いてください。
 document.limit.binary = テキストとして読み込めないファイルです({bytes} バイト)。OS標準アプリで開いてください。

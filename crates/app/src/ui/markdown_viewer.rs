@@ -374,7 +374,12 @@ fn apply_page_style(ui: &mut egui::Ui) {
     // 본문 면에서 **눈에 띄게** 올라와야 칩으로 읽힌다. `selected_background`는 문서
     // 면과 대비가 1.1:1이라 사실상 안 보였다(2026-08-23 리뷰 실측) — 면에서 글자색
     // 쪽으로 18% 섞어 다크 1.61:1 / 라이트 1.42:1을 만든다.
-    style.visuals.code_bg_color = designall::mix(tokens.app_background, tokens.text, 0.18);
+    let code_surface = designall::mix(tokens.app_background, tokens.text, 0.18);
+    style.visuals.code_bg_color = code_surface;
+    // 코드 **블록**도 같은 방향이어야 한다. `apply_workspace_visuals`가 심는
+    // `extreme_bg_color`(input_background)는 문서 면보다 **어두워**, 인라인 칩은 위로
+    // 뜨고 블록은 아래로 파이는 정반대 규칙이 한 문서 안에 섞였다(2026-08-23 리뷰).
+    style.visuals.extreme_bg_color = code_surface;
 }
 
 /// 워크스페이스 루트 밖 파일을 읽지 않는 로컬 PNG broker(§7.2). `MarkdownViewer`가
@@ -442,6 +447,10 @@ pub struct MarkdownViewer {
     /// (2026-08-23 리뷰 실측). 소스가 바뀔 때만 다시 판다.
     destinations_key: Option<(u64, u64)>,
     destinations: (Vec<String>, Vec<String>),
+    /// slot별 가로 스크롤 영역 id. egui는 persisted 위젯 상태를 자동으로 GC하지 않아,
+    /// 문서를 열고 닫을수록 오프셋이 무한정 쌓인다(2026-08-23 리뷰). 닫을 때 지우려면
+    /// 실제 id를 알아야 하므로 그릴 때 받아 둔다.
+    horizontal_scroll_ids: std::collections::HashMap<u64, egui::Id>,
 }
 
 impl Default for MarkdownViewer {
@@ -451,6 +460,20 @@ impl Default for MarkdownViewer {
 }
 
 impl MarkdownViewer {
+    /// 문서가 닫힐 때 그 문서 몫의 위젯 상태를 지운다(2026-08-23 리뷰). egui는
+    /// persisted 상태를 자동으로 GC하지 않으므로, 안 지우면 세션 동안 열고 닫은
+    /// 문서 수만큼 가로 스크롤 오프셋이 쌓인다.
+    pub fn forget_document(&mut self, ctx: &egui::Context, slot: MarkdownDocumentSlot) {
+        if let Some(id) = self.horizontal_scroll_ids.remove(&slot.0) {
+            ctx.data_mut(|data| data.remove::<egui::scroll_area::State>(id));
+        }
+        // 지금 이 문서를 보고 있었다면 파싱 캐시도 무의미하다.
+        if self.destinations_key.map(|key| key.0) == Some(slot.0) {
+            self.destinations_key = None;
+            self.destinations = (Vec::new(), Vec::new());
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             cache: CommonMarkCache::default(),
@@ -458,6 +481,7 @@ impl MarkdownViewer {
             image_broker: WorkspaceImageBroker::new(),
             destinations_key: None,
             destinations: (Vec::new(), Vec::new()),
+            horizontal_scroll_ids: std::collections::HashMap::new(),
         }
     }
 
@@ -516,7 +540,7 @@ impl MarkdownViewer {
         // 표처럼 줄바꿈이 안 되는 요소는 좁은 pane에서 오른쪽이 잘려 아예 못 읽었다
         // (사용자 보고). 가로 스크롤을 둬서 잘리는 대신 닿을 수 있게 한다 — 글은 위
         // `wrap_width`로 이미 pane 폭에 맞춰 접히므로 평소엔 스크롤바가 안 뜬다.
-        egui::ScrollArea::horizontal()
+        let scroll_output = egui::ScrollArea::horizontal()
             // 문서마다 다른 id — 안 섞으면 A를 오른쪽으로 민 오프셋을 B가 이어받는다
             // (2026-08-23 리뷰). 세로 위치는 `ScrollCacheKey`가 이미 문서별로 가른다.
             .id_salt(("markdown_viewer_horizontal", destinations_key.0))
@@ -557,7 +581,10 @@ impl MarkdownViewer {
                         });
                     });
             });
+        self.horizontal_scroll_ids
+            .insert(destinations_key.0, scroll_output.id);
 
+        let Self { cache, .. } = self;
         link_targets
             .iter()
             .find(|dest| cache.get_link_hook(dest) == Some(true))

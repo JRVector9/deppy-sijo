@@ -27,6 +27,8 @@ const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 const RESIZE_DRAG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 const RESIZE_VIEWPORT_QUIET: std::time::Duration = std::time::Duration::from_millis(32);
 const RESIZE_VIEWPORT_HARD_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+const PROTOCOL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(16);
+const PROTOCOL_RETRY_LIMIT: u8 = 6;
 const WORKSPACE_IO_QUEUE_CAP: usize = 1;
 const WORKSPACE_PATH_MAX_BYTES: usize = 32 * 1024;
 const WORKSPACE_URL_MAX_BYTES: usize = 32 * 1024;
@@ -1734,6 +1736,10 @@ struct SplitDragTransaction {
     path: Vec<u8>,
     ratio: f32,
     phase: SplitDragPhase,
+    /// Local queue admission is not runtime delivery. Matching mux state is accepted as an ACK
+    /// only after this exact operation/generation completes successfully.
+    pending_delivery: Option<(WorkspaceProtocolOperation, u64)>,
+    retry: ProtocolRetryBackoff,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1741,6 +1747,51 @@ struct StagedTerminalResize {
     pass: u64,
     cols: u16,
     rows: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResizeDeliveryRollback {
+    session: SessionId,
+    target: (u16, u16),
+    previous: Option<(u16, u16)>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProtocolRetryBackoff {
+    failures: u8,
+    retry_at: Option<std::time::Instant>,
+}
+
+enum ProtocolRetryGate {
+    Ready,
+    Wait(std::time::Duration),
+    Exhausted,
+}
+
+impl ProtocolRetryBackoff {
+    fn record_busy(&mut self, now: std::time::Instant) -> bool {
+        if self.failures >= PROTOCOL_RETRY_LIMIT {
+            self.retry_at = None;
+            return false;
+        }
+        let shift = u32::from(self.failures);
+        self.failures = self.failures.saturating_add(1);
+        let delay = PROTOCOL_RETRY_BASE.saturating_mul(1_u32 << shift);
+        self.retry_at = Some(now + delay);
+        true
+    }
+
+    fn gate(&mut self, now: std::time::Instant) -> ProtocolRetryGate {
+        match self.retry_at {
+            Some(retry_at) if now < retry_at => ProtocolRetryGate::Wait(retry_at - now),
+            Some(_) => {
+                self.retry_at = None;
+                ProtocolRetryGate::Ready
+            }
+            None if self.failures >= PROTOCOL_RETRY_LIMIT => ProtocolRetryGate::Exhausted,
+            None => ProtocolRetryGate::Ready,
+        }
+    }
 }
 
 pub struct WorkspaceUi {
@@ -1837,8 +1888,19 @@ pub struct WorkspaceUi {
     /// tab/path/ratio MuxUpdated까지 미리보기를 유지해 persisted ratio로 되튀지 않는다.
     split_drag: Option<SplitDragTransaction>,
     /// matching ACK 뒤 실제 grid가 바뀌어야 하는 visible session. 각 세션은 최종 UI
-    /// pass에서 distinct Resize를 한 번 성공적으로 admission할 때까지 남는다.
+    /// pass에서 distinct Resize를 admission하고 exact runtime completion을 받을 때까지
+    /// queued/in-flight 상태로 추적된다.
     split_final_resize_sessions: HashSet<SessionId>,
+    /// Exact queued/in-flight final Resize operations. Selection invalidation and presentation
+    /// fencing begin only after the runtime accepts the matching operation.
+    split_final_resize_pending: HashMap<(WorkspaceProtocolOperation, u64), (SessionId, u16, u16)>,
+    /// `sent_sizes` is an optimistic queue-side dedupe. Preserve its previous value so an exact
+    /// delivery failure cannot masquerade as a successful PTY resize.
+    resize_delivery_rollbacks: HashMap<(WorkspaceProtocolOperation, u64), ResizeDeliveryRollback>,
+    /// A closed runtime channel must not create an immediate repaint/retry loop. A different
+    /// geometry or fresh viewport evidence clears this bounded per-session sentinel.
+    failed_resize_targets: HashMap<SessionId, (u16, u16)>,
+    resize_retry: HashMap<SessionId, ProtocolRetryBackoff>,
     /// egui render pass에서는 protocol/debounce 상태를 직접 바꾸지 않는다. sizing pass는
     /// 후보도 만들지 않고, 일반 pass 후보는 App::ui의 마지막 widget 뒤 final-pass flush가
     /// 같은 cumulative pass만 실행한다.
@@ -2282,6 +2344,17 @@ impl SessionView {
         });
     }
 
+    fn retarget_resize_presentation(&mut self, cols: u16, rows: u16) {
+        let Some(fence) = self.resize_presentation.as_mut() else {
+            return;
+        };
+        if fence.target != (cols, rows) {
+            fence.target = (cols, rows);
+            fence.last_target_at = None;
+            fence.latest_target = None;
+        }
+    }
+
     fn arm_initial_presentation(&mut self, now: std::time::Instant) {
         if self.snapshot.is_none() && self.initial_presentation.is_none() {
             self.initial_presentation = Some(InitialSnapshotFence {
@@ -2419,6 +2492,10 @@ impl WorkspaceUi {
             pending_spawn_cwds: VecDeque::with_capacity(WORKSPACE_PROTOCOL_CAP),
             split_drag: None,
             split_final_resize_sessions: HashSet::new(),
+            split_final_resize_pending: HashMap::with_capacity(WORKSPACE_PROTOCOL_CAP),
+            resize_delivery_rollbacks: HashMap::with_capacity(WORKSPACE_PROTOCOL_CAP),
+            failed_resize_targets: HashMap::new(),
+            resize_retry: HashMap::new(),
             staged_terminal_resizes: HashMap::new(),
             staged_split_commit_pass: None,
             confirm_close: None,
@@ -2600,26 +2677,59 @@ impl WorkspaceUi {
         &mut self,
         command: RuntimeCommand,
     ) -> Result<(), WorkspaceProtocolErrorCode> {
-        self.queue_protocol_intent_with_spawn_cwd(command, None)
+        self.queue_protocol_intent_tracked(command).map(|_| ())
     }
 
-    fn queue_terminal_resize(&mut self, session: SessionId, cols: u16, rows: u16) -> bool {
+    fn queue_protocol_intent_tracked(
+        &mut self,
+        command: RuntimeCommand,
+    ) -> Result<(WorkspaceProtocolOperation, u64), WorkspaceProtocolErrorCode> {
+        self.queue_protocol_intent_tracked_with_spawn_cwd(command, None)
+    }
+
+    fn queue_terminal_resize_tracked(
+        &mut self,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    ) -> Option<(WorkspaceProtocolOperation, u64)> {
         if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
-            return false;
+            return None;
         }
-        if self
-            .queue_protocol_intent(RuntimeCommand::Resize {
+        if self.failed_resize_targets.get(&session) == Some(&(cols, rows)) {
+            return None;
+        }
+        self.failed_resize_targets.remove(&session);
+        let previous = self.sent_sizes.get(&session).copied();
+        let key = self
+            .queue_protocol_intent_tracked(RuntimeCommand::Resize {
                 session,
                 cols,
                 rows,
             })
-            .is_ok()
+            .ok()?;
+        self.resize_delivery_rollbacks
+            .entry(key)
+            .and_modify(|rollback| rollback.target = (cols, rows))
+            .or_insert(ResizeDeliveryRollback {
+                session,
+                target: (cols, rows),
+                previous,
+            });
+        if let Some((pending_session, pending_cols, pending_rows)) =
+            self.split_final_resize_pending.get_mut(&key)
+            && *pending_session == session
         {
-            self.sent_sizes.insert(session, (cols, rows));
-            true
-        } else {
-            false
+            *pending_cols = cols;
+            *pending_rows = rows;
         }
+        self.sent_sizes.insert(session, (cols, rows));
+        Some(key)
+    }
+
+    fn queue_terminal_resize(&mut self, session: SessionId, cols: u16, rows: u16) -> bool {
+        self.queue_terminal_resize_tracked(session, cols, rows)
+            .is_some()
     }
 
     fn apply_split_final_resize_at(
@@ -2627,7 +2737,7 @@ impl WorkspaceUi {
         session: SessionId,
         cols: u16,
         rows: u16,
-        now: std::time::Instant,
+        _now: std::time::Instant,
     ) -> bool {
         if !self.split_final_resize_sessions.contains(&session) {
             return false;
@@ -2637,23 +2747,33 @@ impl WorkspaceUi {
             self.pending_resize_target.remove(&session);
             return false;
         }
-        if !self.queue_terminal_resize(session, cols, rows) {
+        let Some(key) = self.queue_terminal_resize_tracked(session, cols, rows) else {
             return false;
-        }
+        };
 
         self.split_final_resize_sessions.remove(&session);
         self.pending_resize_target.remove(&session);
-        if self
-            .selection
-            .is_some_and(|(selected, _, _)| selected == session)
+        self.split_final_resize_pending
+            .insert(key, (session, cols, rows));
+        true
+    }
+
+    fn settle_session_resize_presentation(
+        &mut self,
+        session: SessionId,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let view = self.sessions.get_mut(&session)?;
+        let generation_before = view.snapshot_gen;
+        let repaint_after = view.settle_resize_presentation(now);
+        if view.snapshot_gen != generation_before
+            && self
+                .selection
+                .is_some_and(|(selected, _, _)| selected == session)
         {
             self.selection = None;
         }
-        self.sessions
-            .entry(session)
-            .or_default()
-            .arm_resize_presentation(cols, rows, now);
-        true
+        repaint_after
     }
 
     /// `queue_terminal_resize`의 디바운스 래퍼 — pane 렌더 호출부는 매 프레임 이걸 부른다.
@@ -2675,10 +2795,10 @@ impl WorkspaceUi {
         session: SessionId,
         cols: u16,
         rows: u16,
-    ) {
+    ) -> bool {
         if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
             self.pending_resize_target.remove(&session);
-            return;
+            return false;
         }
         let now = std::time::Instant::now();
         match self.pending_resize_target.get(&session).copied() {
@@ -2687,7 +2807,7 @@ impl WorkspaceUi {
                 // (아래 Some(_) 분기) 그때부터 디바운스가 걸린다.
                 self.pending_resize_target
                     .insert(session, (cols, rows, now));
-                self.queue_terminal_resize(session, cols, rows);
+                self.queue_terminal_resize(session, cols, rows)
             }
             Some((pending_cols, pending_rows, since))
                 if (pending_cols, pending_rows) == (cols, rows) =>
@@ -2696,9 +2816,9 @@ impl WorkspaceUi {
                 let elapsed = now.duration_since(since);
                 if elapsed < RESIZE_DRAG_DEBOUNCE {
                     ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE - elapsed);
-                    return;
+                    return false;
                 }
-                self.queue_terminal_resize(session, cols, rows);
+                let admitted = self.queue_terminal_resize(session, cols, rows);
                 // 전송이 **성사됐을 때만** 보류를 지운다. 프로토콜 큐가 가득 차
                 // queue_terminal_resize가 삼켜버린 경우 보류를 지우면 다음 프레임이
                 // None 분기로 떨어져 즉시 재전송하고, 그 실패가 다시 이 분기로 와서
@@ -2709,6 +2829,7 @@ impl WorkspaceUi {
                 if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
                     self.pending_resize_target.remove(&session);
                 }
+                admitted
             }
             Some(_) => {
                 // 목표가 직전 프레임과 또 달라졌다 — 드래그가 계속되는 중. 디바운스
@@ -2716,6 +2837,7 @@ impl WorkspaceUi {
                 self.pending_resize_target
                     .insert(session, (cols, rows, now));
                 ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE);
+                false
             }
         }
     }
@@ -2735,6 +2857,8 @@ impl WorkspaceUi {
                     path,
                     ratio,
                     phase: SplitDragPhase::Active,
+                    pending_delivery: None,
+                    retry: ProtocolRetryBackoff::default(),
                 });
             }
         }
@@ -2760,15 +2884,33 @@ impl WorkspaceUi {
         }
     }
 
-    fn stage_unadmitted_split_commit_for_pass(&mut self, pass: u64, sizing_pass: bool) {
-        if !sizing_pass
-            && self.split_drag.as_ref().is_some_and(|transaction| {
-                matches!(
-                    transaction.phase,
-                    SplitDragPhase::Committed { admitted: false }
-                )
-            })
-        {
+    fn stage_unadmitted_split_commit_for_pass(
+        &mut self,
+        ctx: &egui::Context,
+        pass: u64,
+        sizing_pass: bool,
+    ) {
+        if sizing_pass {
+            return;
+        }
+        let should_stage = self.split_drag.as_mut().is_some_and(|transaction| {
+            if !matches!(
+                transaction.phase,
+                SplitDragPhase::Committed { admitted: false }
+            ) || transaction.pending_delivery.is_some()
+            {
+                return false;
+            }
+            match transaction.retry.gate(std::time::Instant::now()) {
+                ProtocolRetryGate::Ready => true,
+                ProtocolRetryGate::Wait(after) => {
+                    ctx.request_repaint_after(after);
+                    false
+                }
+                ProtocolRetryGate::Exhausted => false,
+            }
+        });
+        if should_stage {
             self.staged_split_commit_pass = Some(pass);
         }
     }
@@ -2800,58 +2942,85 @@ impl WorkspaceUi {
         ctx: &egui::Context,
         pass: u64,
         will_discard: bool,
-    ) {
+    ) -> bool {
         if will_discard {
-            return;
+            return false;
         }
+
+        let mut admitted = false;
 
         if self.staged_split_commit_pass == Some(pass) {
             let command = self.split_drag.as_ref().and_then(|transaction| {
-                matches!(
+                (matches!(
                     transaction.phase,
                     SplitDragPhase::Committed { admitted: false }
-                )
+                ) && transaction.pending_delivery.is_none())
                 .then(|| RuntimeCommand::ResizeSplit {
                     tab: transaction.tab.clone(),
                     path: transaction.path.clone(),
                     ratio: transaction.ratio,
                 })
             });
-            if let Some(command) = command
-                && self.send_keep_selection(command)
-                && let Some(transaction) = self.split_drag.as_mut()
-                && matches!(
-                    transaction.phase,
-                    SplitDragPhase::Committed { admitted: false }
-                )
-            {
-                transaction.phase = SplitDragPhase::Committed { admitted: true };
+            if let Some(command) = command {
+                match self.queue_protocol_intent_tracked(command) {
+                    Ok(key) => {
+                        if let Some(transaction) = self.split_drag.as_mut()
+                            && matches!(
+                                transaction.phase,
+                                SplitDragPhase::Committed { admitted: false }
+                            )
+                        {
+                            transaction.pending_delivery = Some(key);
+                            admitted = true;
+                        }
+                    }
+                    Err(code) => self.report_protocol_queue_rejection(code, "protocol_queue"),
+                }
             }
             self.staged_split_commit_pass = None;
         }
 
-        let staged = std::mem::take(&mut self.staged_terminal_resizes);
-        for (session, resize) in staged {
+        let mut staged = std::mem::take(&mut self.staged_terminal_resizes);
+        for (session, resize) in staged.drain() {
             if resize.pass != pass || self.split_drag.is_some() {
                 continue;
             }
+            if let Some(retry) = self.resize_retry.get_mut(&session) {
+                match retry.gate(std::time::Instant::now()) {
+                    ProtocolRetryGate::Ready => {}
+                    ProtocolRetryGate::Wait(after) => {
+                        ctx.request_repaint_after(after);
+                        continue;
+                    }
+                    ProtocolRetryGate::Exhausted => continue,
+                }
+            }
             if self.split_final_resize_sessions.contains(&session) {
-                self.apply_split_final_resize_at(
+                admitted |= self.apply_split_final_resize_at(
                     session,
                     resize.cols,
                     resize.rows,
                     std::time::Instant::now(),
                 );
             } else {
-                self.queue_terminal_resize_debounced(ctx, session, resize.cols, resize.rows);
+                admitted |=
+                    self.queue_terminal_resize_debounced(ctx, session, resize.cols, resize.rows);
             }
         }
+        self.staged_terminal_resizes = staged;
+        admitted
     }
 
     /// App host의 마지막 UI-producing widget 뒤에서만 호출한다. workspace 렌더 시점의
     /// `will_discard`는 뒤쪽 widget이 나중에 discard를 요청할 수 있어 final 판별이 아니다.
     pub fn flush_render_side_effects(&mut self, ctx: &egui::Context) {
-        self.flush_render_side_effects_for_pass(ctx, ctx.cumulative_pass_nr(), ctx.will_discard());
+        if self.flush_render_side_effects_for_pass(
+            ctx,
+            ctx.cumulative_pass_nr(),
+            ctx.will_discard(),
+        ) {
+            ctx.request_repaint();
+        }
     }
 
     fn queue_protocol_intent_with_spawn_cwd(
@@ -2859,6 +3028,15 @@ impl WorkspaceUi {
         command: RuntimeCommand,
         spawn_cwd: Option<String>,
     ) -> Result<(), WorkspaceProtocolErrorCode> {
+        self.queue_protocol_intent_tracked_with_spawn_cwd(command, spawn_cwd)
+            .map(|_| ())
+    }
+
+    fn queue_protocol_intent_tracked_with_spawn_cwd(
+        &mut self,
+        command: RuntimeCommand,
+        spawn_cwd: Option<String>,
+    ) -> Result<(WorkspaceProtocolOperation, u64), WorkspaceProtocolErrorCode> {
         workspace_protocol_command_is_valid(&command)?;
 
         let spawn = matches!(
@@ -2898,6 +3076,8 @@ impl WorkspaceUi {
             rows: next_rows,
         } = &command
             && let Some(WorkspaceProtocolIntent {
+                operation,
+                generation,
                 command:
                     RuntimeCommand::Resize {
                         session: queued_session,
@@ -2916,7 +3096,7 @@ impl WorkspaceUi {
             *queued_cols = *next_cols;
             *queued_rows = *next_rows;
             self.command_sent = true;
-            return Ok(());
+            return Ok((*operation, *generation));
         }
 
         if let RuntimeCommand::WriteInput {
@@ -2924,6 +3104,8 @@ impl WorkspaceUi {
             bytes: next_bytes,
         } = &command
             && let Some(WorkspaceProtocolIntent {
+                operation,
+                generation,
                 command:
                     RuntimeCommand::WriteInput {
                         session: queued_session,
@@ -2942,7 +3124,7 @@ impl WorkspaceUi {
             }
             queued_bytes.extend_from_slice(next_bytes);
             self.command_sent = true;
-            return Ok(());
+            return Ok((*operation, *generation));
         }
 
         if self
@@ -2961,7 +3143,7 @@ impl WorkspaceUi {
             spawn_cwd,
         });
         self.command_sent = true;
-        Ok(())
+        Ok((operation, generation))
     }
 
     /// Drains one validated protocol request for the composition root. A taken request occupies
@@ -2986,12 +3168,16 @@ impl WorkspaceUi {
     /// Applies only the exact operation/generation currently in flight. Unknown, duplicate, or
     /// pre-wrap completions are discarded without mutating UI lifecycle state.
     pub fn complete_protocol(&mut self, completion: WorkspaceProtocolCompletion) {
-        let Some(pending) = self
-            .protocol_inflight
-            .remove(&(completion.operation, completion.generation))
-        else {
+        let key = (completion.operation, completion.generation);
+        let Some(pending) = self.protocol_inflight.remove(&key) else {
             return;
         };
+        let split_delivery_matches = self
+            .split_drag
+            .as_ref()
+            .is_some_and(|transaction| transaction.pending_delivery == Some(key));
+        let resize_rollback = self.resize_delivery_rollbacks.remove(&key);
+        let final_resize = self.split_final_resize_pending.remove(&key);
         match completion.result {
             Ok(()) => {
                 if pending.spawn {
@@ -3001,10 +3187,87 @@ impl WorkspaceUi {
                             cwd: pending.spawn_cwd,
                         });
                 }
+                if split_delivery_matches && let Some(transaction) = self.split_drag.as_mut() {
+                    transaction.pending_delivery = None;
+                    transaction.phase = SplitDragPhase::Committed { admitted: true };
+                    transaction.retry = ProtocolRetryBackoff::default();
+                }
+                if let Some(rollback) = resize_rollback {
+                    self.failed_resize_targets.remove(&rollback.session);
+                    self.resize_retry.remove(&rollback.session);
+                    if final_resize.is_none()
+                        && let Some(view) = self.sessions.get_mut(&rollback.session)
+                    {
+                        view.retarget_resize_presentation(rollback.target.0, rollback.target.1);
+                    }
+                }
+                if let Some((session, cols, rows)) = final_resize {
+                    if self
+                        .selection
+                        .is_some_and(|(selected, _, _)| selected == session)
+                    {
+                        self.selection = None;
+                    }
+                    self.sessions
+                        .entry(session)
+                        .or_default()
+                        .arm_resize_presentation(cols, rows, std::time::Instant::now());
+                }
             }
             Err(code) => {
-                // 운영 코드에서 app.rs가 여기로 넘기는 값은 Busy(dotenv 승인 상한)와
-                // DeliveryFailed 둘뿐이다 — 그리고 DeliveryFailed의 절대다수는 실제 전송
+                let now = std::time::Instant::now();
+                let mut split_retry_exhausted = false;
+                if split_delivery_matches {
+                    match code {
+                        WorkspaceProtocolErrorCode::Busy => {
+                            if let Some(transaction) = self.split_drag.as_mut() {
+                                transaction.pending_delivery = None;
+                                transaction.phase = SplitDragPhase::Committed { admitted: false };
+                                split_retry_exhausted = !transaction.retry.record_busy(now);
+                            }
+                        }
+                        _ => {
+                            self.split_drag = None;
+                            self.staged_split_commit_pass = None;
+                        }
+                    }
+                }
+                if split_retry_exhausted {
+                    self.split_drag = None;
+                    self.staged_split_commit_pass = None;
+                }
+                if let Some(rollback) = resize_rollback
+                    && self.sent_sizes.get(&rollback.session) == Some(&rollback.target)
+                {
+                    if let Some(previous) = rollback.previous {
+                        self.sent_sizes.insert(rollback.session, previous);
+                    } else {
+                        self.sent_sizes.remove(&rollback.session);
+                    }
+                }
+                if let Some(rollback) = resize_rollback {
+                    match code {
+                        WorkspaceProtocolErrorCode::Busy => {
+                            let retry = self.resize_retry.entry(rollback.session).or_default();
+                            if !retry.record_busy(now) {
+                                self.resize_retry.remove(&rollback.session);
+                                self.failed_resize_targets
+                                    .insert(rollback.session, rollback.target);
+                            }
+                        }
+                        _ => {
+                            self.resize_retry.remove(&rollback.session);
+                            self.failed_resize_targets
+                                .insert(rollback.session, rollback.target);
+                        }
+                    }
+                }
+                if let Some((session, _, _)) = final_resize {
+                    self.split_final_resize_sessions.insert(session);
+                }
+                // 운영 코드에서 app.rs가 여기로 넘기는 값은 Busy(dotenv 승인 상한 또는
+                // typed runtime backpressure)와 DeliveryFailed뿐이다. DeliveryFailed의
+                // 절대다수는 실제 전송
                 // 실패가 아니라 "느지막이 도착한 결과가 이미 한물간 상태"(워크스페이스
                 // 전환/종료, dotenv 계속 처리가 stale로 판정됨 등 반납 경로)다. 세션이
                 // 정말 죽어서 벌어진 소수 사례도 종료 배지 등 별도 신호가 이미 있어, 여기서
@@ -3710,12 +3973,27 @@ impl WorkspaceUi {
                         self.split_drag.as_ref().is_some_and(|transaction| {
                             !snapshot.tabs.iter().any(|tab| tab.id == transaction.tab)
                         });
+                    let split_path_disappeared =
+                        self.split_drag.as_ref().is_some_and(|transaction| {
+                            snapshot.tabs.iter().any(|tab| tab.id == transaction.tab)
+                                && mux_split_ratio(snapshot, &transaction.tab, &transaction.path)
+                                    .is_none()
+                        });
                     // 사라진 세션의 캐시 정리
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
                     self.pending_resize_target
                         .retain(|id, _| alive.contains(id));
+                    self.failed_resize_targets
+                        .retain(|id, _| alive.contains(id));
+                    self.resize_retry.retain(|id, _| alive.contains(id));
+                    self.split_final_resize_sessions
+                        .retain(|id| alive.contains(id));
+                    self.resize_delivery_rollbacks
+                        .retain(|_, rollback| alive.contains(&rollback.session));
+                    self.split_final_resize_pending
+                        .retain(|_, (id, _, _)| alive.contains(id));
                     self.session_project_names =
                         self.session_project_names.retain_live_sessions(&alive);
                     self.last_output_copy_pending
@@ -3763,7 +4041,7 @@ impl WorkspaceUi {
                         self.staged_terminal_resizes.clear();
                         self.split_drag = None;
                         self.staged_split_commit_pass = None;
-                    } else if split_tab_disappeared {
+                    } else if split_tab_disappeared || split_path_disappeared {
                         self.split_drag = None;
                         self.staged_split_commit_pass = None;
                     }
@@ -4333,6 +4611,7 @@ impl WorkspaceUi {
         self.prepare_frame(ui.ctx(), events, catalog, input_enabled);
         self.reconcile_explicit_terminal_focus();
         self.stage_unadmitted_split_commit_for_pass(
+            ui.ctx(),
             ui.ctx().cumulative_pass_nr(),
             ui.is_sizing_pass(),
         );
@@ -5682,13 +5961,15 @@ impl WorkspaceUi {
             rows,
         );
 
+        if let Some(after) =
+            self.settle_session_resize_presentation(session, std::time::Instant::now())
+        {
+            ui.ctx().request_repaint_after(after);
+        }
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
         let (exit_code, bracketed, restored_readonly, snapshot) = {
             let view = self.sessions.entry(session).or_default();
             if let Some(after) = view.settle_initial_presentation(std::time::Instant::now()) {
-                ui.ctx().request_repaint_after(after);
-            }
-            if let Some(after) = view.settle_resize_presentation(std::time::Instant::now()) {
                 ui.ctx().request_repaint_after(after);
             }
             // 선택이 없으면(freeze 해제) freeze 중 보관한 최신본으로 catch-up한다 — 새
@@ -8313,6 +8594,189 @@ mod tests {
     }
 
     #[test]
+    fn final_pass_admission_requests_the_next_logic_repaint() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repaint_count_for_callback = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_count_for_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let pass = ctx.cumulative_pass_nr();
+        let before = repaint_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        ui.stage_terminal_resize_for_pass(pass, false, SessionId(52), 80, 24);
+        ui.flush_render_side_effects(&ctx);
+
+        assert!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "tail admission must wake the next logic drain"
+        );
+    }
+
+    #[test]
+    fn flushed_resize_staging_reuses_its_bounded_allocation() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        for session in 1..=4 {
+            ui.stage_terminal_resize_for_pass(43, false, SessionId(session), 80, 24);
+        }
+        let capacity = ui.staged_terminal_resizes.capacity();
+
+        ui.flush_render_side_effects_for_pass(&ctx, 43, false);
+
+        assert!(ui.staged_terminal_resizes.is_empty());
+        assert!(
+            ui.staged_terminal_resizes.capacity() >= capacity,
+            "normal passes should retain the bounded staging allocation"
+        );
+    }
+
+    #[test]
+    fn failed_split_delivery_cancels_preview_and_unblocks_terminal_resize() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+        ui.commit_split_drag(44);
+        ui.flush_render_side_effects_for_pass(&ctx, 44, false);
+        let intent = ui.take_protocol_intent().expect("split commit");
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+
+        assert!(ui.split_drag.is_none(), "failed commit cannot await an ACK");
+        ui.stage_terminal_resize_for_pass(45, false, SessionId(41), 100, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 45, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::Resize { session, cols: 100, rows: 24 }]
+                if *session == SessionId(41)
+        ));
+    }
+
+    #[test]
+    fn matching_mux_ratio_is_not_an_ack_before_split_delivery_succeeds() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+        ui.commit_split_drag(46);
+        ui.flush_render_side_effects_for_pass(&ctx, 46, false);
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.7),
+            }],
+            &catalog(),
+        );
+
+        assert!(
+            ui.split_drag.is_some(),
+            "a locally queued command is not a delivered command"
+        );
+    }
+
+    #[test]
+    fn busy_split_delivery_waits_for_backoff_instead_of_hot_looping_or_cancelling() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+        ui.commit_split_drag(47);
+        ui.flush_render_side_effects_for_pass(&ctx, 47, false);
+        let intent = ui.take_protocol_intent().expect("split commit");
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+
+        let transaction = ui
+            .split_drag
+            .as_ref()
+            .expect("transient pressure keeps preview");
+        assert!(transaction.pending_delivery.is_none());
+        assert!(transaction.retry.retry_at.is_some());
+        ui.stage_unadmitted_split_commit_for_pass(&ctx, 48, false);
+        ui.flush_render_side_effects_for_pass(&ctx, 48, false);
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "same-frame retry is a hot loop"
+        );
+    }
+
+    #[test]
+    fn protocol_busy_backoff_is_exponential_and_stops_after_bounded_attempts() {
+        let started = std::time::Instant::now();
+        let mut retry = ProtocolRetryBackoff::default();
+
+        for failure in 0..PROTOCOL_RETRY_LIMIT {
+            assert!(retry.record_busy(started));
+            let expected = PROTOCOL_RETRY_BASE.saturating_mul(1_u32 << u32::from(failure));
+            assert!(matches!(
+                retry.gate(started),
+                ProtocolRetryGate::Wait(delay) if delay == expected
+            ));
+            assert!(matches!(
+                retry.gate(started + expected),
+                ProtocolRetryGate::Ready
+            ));
+        }
+
+        assert!(!retry.record_busy(started));
+        assert!(matches!(retry.gate(started), ProtocolRetryGate::Exhausted));
+    }
+
+    #[test]
+    fn disappearing_split_path_cancels_transaction_without_waiting_forever() {
+        let mut ui = WorkspaceUi::new();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+
+        let collapsed = mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("left", SessionId(41))],
+                LayoutNode::Pane(pane_id("left")),
+            )],
+            "left",
+        );
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: collapsed,
+            }],
+            &catalog(),
+        );
+
+        assert!(ui.split_drag.is_none());
+    }
+
+    #[test]
     fn final_resize_keeps_stable_snapshot_until_target_viewport_settles() {
         let started = std::time::Instant::now();
         let stable = shaped_snapshot(80, 24, "stable content");
@@ -8412,6 +8876,19 @@ mod tests {
         ui.split_final_resize_sessions.insert(session);
         assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
         assert!(
+            ui.selection.is_some(),
+            "selection stays valid until the runtime accepts the new grid"
+        );
+        assert!(
+            ui.sessions
+                .get(&session)
+                .unwrap()
+                .resize_presentation
+                .is_none(),
+            "the viewport fence starts at delivery, not local queue admission"
+        );
+        drain_protocol(&mut ui);
+        assert!(
             ui.selection.is_none(),
             "changed grid invalidates coordinates"
         );
@@ -8420,6 +8897,200 @@ mod tests {
         assert_eq!(
             view.resize_presentation.as_ref().map(|fence| fence.target),
             Some((100, 30))
+        );
+    }
+
+    #[test]
+    fn final_resize_promotion_clears_selection_created_while_fenced() {
+        let started = std::time::Instant::now();
+        let session = SessionId(62);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, "settled"),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.selection = Some((session, 0, 3));
+
+        let repaint = ui.settle_session_resize_presentation(
+            session,
+            started + std::time::Duration::from_millis(33),
+        );
+
+        assert_eq!(repaint, None);
+        assert!(ui.selection.is_none());
+        assert_eq!(
+            ui.sessions[&session]
+                .snapshot
+                .as_ref()
+                .map(|snapshot| (snapshot.cols, snapshot.rows)),
+            Some((100, 30))
+        );
+    }
+
+    #[test]
+    fn failed_final_resize_rolls_back_and_requires_new_geometry_before_retry() {
+        let started = std::time::Instant::now();
+        let session = SessionId(63);
+        let mut ui = WorkspaceUi::new();
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.selection = Some((session, 0, 3));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, started));
+        let intent = ui.take_protocol_intent().expect("final resize");
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        assert!(
+            ui.sessions[&session].resize_presentation.is_none(),
+            "a command that never reached the runtime cannot own a viewport fence"
+        );
+        assert!(ui.selection.is_some());
+        assert!(ui.split_final_resize_sessions.contains(&session));
+        assert!(!ui.apply_split_final_resize_at(session, 100, 30, started));
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "do not spin on a dead channel"
+        );
+
+        ui.handle_events(
+            &[RuntimeEvent::Viewport {
+                session,
+                snapshot: shaped_snapshot(80, 24, "unrelated output"),
+                bracketed_paste: false,
+            }],
+            &catalog(),
+        );
+        assert!(
+            !ui.apply_split_final_resize_at(session, 100, 30, started),
+            "viewport output does not prove that command backpressure recovered"
+        );
+        assert!(ui.apply_split_final_resize_at(session, 101, 30, started));
+    }
+
+    #[test]
+    fn coalesced_newer_geometry_updates_the_exact_pending_final_fence() {
+        let started = std::time::Instant::now();
+        let session = SessionId(64);
+        let mut ui = WorkspaceUi::new();
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, started));
+
+        assert!(ui.queue_terminal_resize(session, 120, 40));
+        assert_eq!(
+            ui.protocol_intents.len(),
+            1,
+            "same-session Resize coalesces"
+        );
+        drain_protocol(&mut ui);
+
+        assert_eq!(
+            ui.sessions[&session]
+                .resize_presentation
+                .as_ref()
+                .map(|fence| fence.target),
+            Some((120, 40)),
+            "the fence must match the command that actually reached the runtime"
+        );
+    }
+
+    #[test]
+    fn newer_resize_delivery_retargets_existing_fence_without_extending_deadline() {
+        let started = std::time::Instant::now();
+        let session = SessionId(65);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, ""),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (100, 30));
+
+        assert!(ui.queue_terminal_resize(session, 120, 40));
+        drain_protocol(&mut ui);
+        let fence = ui.sessions[&session]
+            .resize_presentation
+            .as_ref()
+            .expect("original stable presentation remains fenced");
+        assert_eq!(fence.target, (120, 40));
+        assert_eq!(fence.started_at, started, "hard deadline must not extend");
+        assert!(
+            fence.latest_target.is_none(),
+            "stale A candidate must be dropped"
+        );
+
+        assert!(
+            ui.sessions
+                .get_mut(&session)
+                .unwrap()
+                .buffer_resize_snapshot(
+                    shaped_snapshot(120, 40, "new target"),
+                    started + std::time::Duration::from_millis(10),
+                )
+        );
+        ui.settle_session_resize_presentation(
+            session,
+            started + std::time::Duration::from_millis(42),
+        );
+        assert_eq!(
+            ui.sessions[&session]
+                .snapshot
+                .as_ref()
+                .map(|snapshot| (snapshot.cols, snapshot.rows)),
+            Some((120, 40))
+        );
+    }
+
+    #[test]
+    fn busy_final_resize_rolls_back_and_waits_before_retrying() {
+        let started = std::time::Instant::now();
+        let session = SessionId(66);
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, started));
+        let intent = ui.take_protocol_intent().expect("final resize");
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::Busy),
+        });
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        assert!(ui.split_final_resize_sessions.contains(&session));
+        assert!(
+            ui.resize_retry
+                .get(&session)
+                .is_some_and(|retry| retry.retry_at.is_some())
+        );
+        ui.stage_terminal_resize_for_pass(49, false, session, 100, 30);
+        ui.flush_render_side_effects_for_pass(&ctx, 49, false);
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "same-frame retry is a hot loop"
         );
     }
 

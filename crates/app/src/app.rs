@@ -1503,6 +1503,20 @@ fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
     ) || runtime_command_is_targeted_workspace_restore(command)
 }
 
+fn classify_workspace_protocol_delivery(
+    result: anyhow::Result<()>,
+) -> Result<(), ui::workspace::WorkspaceProtocolErrorCode> {
+    result.map_err(|error| {
+        if error.downcast_ref::<runtime::RuntimeCommandSendError>()
+            == Some(&runtime::RuntimeCommandSendError::Backpressure)
+        {
+            ui::workspace::WorkspaceProtocolErrorCode::Busy
+        } else {
+            ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed
+        }
+    })
+}
+
 /// dotenv 동기화가 실패했을 때도 통과시킬 continuation인가(2026-08-21).
 ///
 /// **세션을 여는 일은 `.env`와 독립이어야 한다.** `.env` 한 줄이 문제라고 그
@@ -17576,10 +17590,8 @@ impl App {
             let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) else {
                 continue;
             };
-            let result = runtime
-                .runtime
-                .send_command(command)
-                .map_err(|_| ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed);
+            let result =
+                classify_workspace_protocol_delivery(runtime.runtime.send_command(command));
             let delivered = result.is_ok();
             runtime
                 .workspace_ui
@@ -17611,10 +17623,7 @@ impl App {
             let result = if runtime_command_requires_dotenv(&command) {
                 Err(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed)
             } else {
-                runtime
-                    .runtime
-                    .send_command(command)
-                    .map_err(|_| ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed)
+                classify_workspace_protocol_delivery(runtime.runtime.send_command(command))
             };
             runtime
                 .workspace_ui
@@ -37704,6 +37713,23 @@ mod tests {
         });
         assert_eq!(workspace_ui.pending_spawns(), 1);
         workspace_ui
+    }
+
+    #[test]
+    fn workspace_protocol_delivery_maps_runtime_pressure_separately_from_disconnect() {
+        assert_eq!(
+            classify_workspace_protocol_delivery(Err(
+                runtime::RuntimeCommandSendError::Backpressure.into()
+            )),
+            Err(ui::workspace::WorkspaceProtocolErrorCode::Busy)
+        );
+        assert_eq!(
+            classify_workspace_protocol_delivery(Err(
+                runtime::RuntimeCommandSendError::Disconnected.into()
+            )),
+            Err(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed)
+        );
+        assert_eq!(classify_workspace_protocol_delivery(Ok(())), Ok(()));
     }
 
     fn overflow_spawn_replay(

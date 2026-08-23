@@ -35,7 +35,10 @@ pub(crate) fn signal_memory_released() {
     }
 }
 
-pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
+pub use client::{
+    RuntimeClient, RuntimeCommandSendError, RuntimeCommandSink, RuntimeEventReceiver,
+    RuntimeEventStream,
+};
 pub use command::{
     MuxPaneId, MuxTabId, RuntimeCommand, RuntimeCommandPreparationErrorCode,
     RuntimeCommandRetention, SessionId, SplitDirection, WorkspaceRuntimeState,

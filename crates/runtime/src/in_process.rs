@@ -18,8 +18,8 @@ use storage::SessionLogWriter;
 use terminal::{TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalCacheClass, TerminalCacheEvent};
 
 use crate::client::{
-    LOCAL_EVENT_QUEUE_CAP, RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver,
-    RuntimeEventStream,
+    LOCAL_EVENT_QUEUE_CAP, RuntimeClient, RuntimeCommandSendError, RuntimeCommandSink,
+    RuntimeEventReceiver, RuntimeEventStream,
 };
 use crate::command::{
     RUNTIME_COMMAND_QUEUE_BYTES_MAX, RUNTIME_SESSION_CAP, RuntimeCommand, SessionId,
@@ -382,7 +382,7 @@ impl RuntimeCommandSink for InProcessRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
         let queued = prepare_queued_command(command, &self.command_budget)?;
         let Some(tx) = self.command_tx.as_ref() else {
-            anyhow::bail!("runtime worker가 종료됨");
+            return Err(RuntimeCommandSendError::Disconnected.into());
         };
         match tx.try_send(queued) {
             Ok(()) => {
@@ -391,10 +391,8 @@ impl RuntimeCommandSink for InProcessRuntimeClient {
                 }
                 Ok(())
             }
-            Err(TrySendError::Full(_)) => {
-                anyhow::bail!("runtime 명령 큐 가득참 — local runtime backpressure")
-            }
-            Err(TrySendError::Disconnected(_)) => anyhow::bail!("runtime worker가 종료됨"),
+            Err(TrySendError::Full(_)) => Err(RuntimeCommandSendError::Backpressure.into()),
+            Err(TrySendError::Disconnected(_)) => Err(RuntimeCommandSendError::Disconnected.into()),
         }
     }
 }
@@ -503,11 +501,9 @@ impl RuntimeHost for InProcessRuntimeClient {
                     }
                     Ok(())
                 }
-                Err(TrySendError::Full(_)) => {
-                    anyhow::bail!("runtime 명령 큐 가득참 — local runtime backpressure")
-                }
+                Err(TrySendError::Full(_)) => Err(RuntimeCommandSendError::Backpressure.into()),
                 Err(TrySendError::Disconnected(_)) => {
-                    anyhow::bail!("runtime worker가 종료됨")
+                    Err(RuntimeCommandSendError::Disconnected.into())
                 }
             }
         }))
@@ -600,7 +596,7 @@ impl RuntimeCommandQueueBudget {
             },
         );
         if reserved.is_err() {
-            anyhow::bail!("runtime_command_queue_bytes_exceeded");
+            return Err(RuntimeCommandSendError::Backpressure.into());
         }
         Ok(RuntimeCommandQueueReservation {
             budget: Arc::clone(self),
@@ -6332,7 +6328,7 @@ mod tests {
     fn in_process_command_queue_full은_err로_surface된다() {
         let (tx, rx) = sync_channel(1);
         let command_budget = Arc::new(RuntimeCommandQueueBudget::default());
-        let client = InProcessRuntimeClient {
+        let mut client = InProcessRuntimeClient {
             command_tx: Some(tx),
             command_budget: Arc::clone(&command_budget),
             subscribers: Arc::default(),
@@ -6352,9 +6348,26 @@ mod tests {
             ))
             .unwrap_err();
         assert!(err.to_string().contains("명령 큐 가득참"));
+        assert_eq!(
+            err.downcast_ref::<crate::RuntimeCommandSendError>(),
+            Some(&crate::RuntimeCommandSendError::Backpressure),
+            "host must be able to distinguish retryable pressure from disconnect"
+        );
         assert_eq!(command_budget.retained_bytes(), retained_after_first);
         drop(rx);
         assert_eq!(command_budget.retained_bytes(), 0);
+
+        client.command_tx = None;
+        let err = client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::RuntimeCommandSendError>(),
+            Some(&crate::RuntimeCommandSendError::Disconnected),
+            "an explicitly shut-down local runtime must preserve typed disconnect"
+        );
     }
 
     #[test]
@@ -6363,7 +6376,15 @@ mod tests {
         let exact = budget.reserve(RUNTIME_COMMAND_QUEUE_BYTES_MAX).unwrap();
         assert_eq!(budget.retained_bytes(), RUNTIME_COMMAND_QUEUE_BYTES_MAX);
         for _ in 0..128 {
-            assert!(budget.reserve(1).is_err());
+            let error = match budget.reserve(1) {
+                Ok(_) => panic!("aggregate byte-budget overflow must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.downcast_ref::<crate::RuntimeCommandSendError>(),
+                Some(&crate::RuntimeCommandSendError::Backpressure),
+                "aggregate byte-budget pressure must remain retryable"
+            );
             assert_eq!(budget.retained_bytes(), RUNTIME_COMMAND_QUEUE_BYTES_MAX);
         }
         drop(exact);

@@ -7,6 +7,27 @@ use deppy_core::SessionId;
 use crate::command::RuntimeCommand;
 use crate::event::RuntimeEvent;
 
+/// Typed delivery boundary for bounded runtime command channels. Callers may retry
+/// `Backpressure`; `Disconnected` means the owning runtime can no longer accept work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeCommandSendError {
+    Backpressure,
+    Disconnected,
+}
+
+impl std::fmt::Display for RuntimeCommandSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backpressure => {
+                formatter.write_str("runtime 명령 큐 가득참 — runtime backpressure")
+            }
+            Self::Disconnected => formatter.write_str("runtime worker가 종료됨"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeCommandSendError {}
+
 /// 구독자별 durable lifecycle 이벤트 큐 상한. Viewport/pressure/resource는 별도 최신값
 /// slot이라 이 큐를 쓰지 않는다. 포화 시 느린 구독자를 끊어 메모리 상한을 지킨다.
 pub(crate) const LOCAL_EVENT_QUEUE_CAP: usize = 1024;

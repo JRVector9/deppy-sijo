@@ -38,7 +38,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Server
 use terminal::TerminalViewportSnapshot;
 
 use crate::client::{
-    LOCAL_EVENT_QUEUE_CAP, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream,
+    LOCAL_EVENT_QUEUE_CAP, RuntimeCommandSendError, RuntimeCommandSink, RuntimeEventReceiver,
+    RuntimeEventStream,
 };
 use crate::command::RuntimeCommand;
 use crate::event::RuntimeEvent;
@@ -2325,12 +2326,12 @@ impl RuntimeCommandSink for RemoteRuntimeClient {
                 }
                 match commands.try_send(payload) {
                     Ok(()) => Ok(()),
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => Err(anyhow::anyhow!(
-                        "remote 명령 전송 큐 가득참 — 원격 서버 응답 지연(backpressure)"
-                    )),
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(anyhow::anyhow!(
-                        "remote TLS IO 스레드 종료 — 명령 전송 불가"
-                    )),
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        Err(RuntimeCommandSendError::Backpressure.into())
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        Err(RuntimeCommandSendError::Disconnected.into())
+                    }
                 }
             }
         }
@@ -4723,12 +4724,20 @@ mod tests {
             format!("{err:#}").contains("가득"),
             "큐 포화는 가득참 Err여야 한다: {err:#}"
         );
+        assert_eq!(
+            err.downcast_ref::<crate::RuntimeCommandSendError>(),
+            Some(&crate::RuntimeCommandSendError::Backpressure)
+        );
         // IO 스레드 죽음(Receiver drop) → 이후 send는 종료 Err.
         drop(rx);
         let err = client.send_command(cmd()).unwrap_err();
         assert!(
             format!("{err:#}").contains("종료"),
             "IO 스레드 종료는 종료 Err여야 한다: {err:#}"
+        );
+        assert_eq!(
+            err.downcast_ref::<crate::RuntimeCommandSendError>(),
+            Some(&crate::RuntimeCommandSendError::Disconnected)
         );
     }
 

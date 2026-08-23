@@ -2218,6 +2218,11 @@ struct ResizePresentationFence {
     stable_had_visible_text: bool,
 }
 
+struct InitialSnapshotFence {
+    started_at: std::time::Instant,
+    latest_blank: Option<Arc<TerminalViewportSnapshot>>,
+}
+
 #[derive(Default)]
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
@@ -2228,6 +2233,9 @@ struct SessionView {
     /// freeze(선택 중) 동안 도착한 최신 snapshot을 보관 — 선택 해제 시 이걸로 catch-up해
     /// 화면이 선택 당시에 머무는 것을 막는다(codex). 프레임 시작 시 프로모트한다.
     pending_snapshot: Option<Arc<TerminalViewportSnapshot>>,
+    /// split로 갓 생긴 shell의 output-free 80×24 seed만 숨기는 causal one-shot gate.
+    /// deadline은 replay/후속 blank로 연장하지 않는다.
+    initial_presentation: Option<InitialSnapshotFence>,
     /// 최종 split Resize 뒤 TUI의 clear→redraw 중간 viewport가 표시되지 않도록 마지막
     /// stable 화면을 유지하는 유계 fence. target shape 후보만 latest-wins로 받는다.
     resize_presentation: Option<ResizePresentationFence>,
@@ -2272,6 +2280,57 @@ impl SessionView {
                 .as_deref()
                 .is_some_and(snapshot_has_visible_text),
         });
+    }
+
+    fn arm_initial_presentation(&mut self, now: std::time::Instant) {
+        if self.snapshot.is_none() && self.initial_presentation.is_none() {
+            self.initial_presentation = Some(InitialSnapshotFence {
+                started_at: now,
+                latest_blank: None,
+            });
+        }
+    }
+
+    /// initial gate가 이벤트를 소비했는지 반환한다. 첫 nonblank는 즉시 설치하고,
+    /// blank seed는 original deadline까지 latest-wins로 보관한다.
+    fn buffer_initial_snapshot(
+        &mut self,
+        snapshot: Arc<TerminalViewportSnapshot>,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(fence) = self.initial_presentation.as_ref() else {
+            return false;
+        };
+        if snapshot_has_visible_text(&snapshot)
+            || now.saturating_duration_since(fence.started_at) >= RESIZE_VIEWPORT_HARD_DEADLINE
+        {
+            self.initial_presentation = None;
+            self.install_snapshot(snapshot);
+            return true;
+        }
+        if let Some(fence) = self.initial_presentation.as_mut() {
+            fence.latest_blank = Some(snapshot);
+        }
+        true
+    }
+
+    fn settle_initial_presentation(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let fence = self.initial_presentation.as_ref()?;
+        let elapsed = now.saturating_duration_since(fence.started_at);
+        if elapsed >= RESIZE_VIEWPORT_HARD_DEADLINE {
+            let candidate = self
+                .initial_presentation
+                .take()
+                .and_then(|fence| fence.latest_blank);
+            if let Some(candidate) = candidate {
+                self.install_snapshot(candidate);
+            }
+            return None;
+        }
+        Some(RESIZE_VIEWPORT_HARD_DEADLINE - elapsed)
     }
 
     /// resize fence가 있으면 viewport를 표시하지 않고 target 후보에만 보관한다.
@@ -3691,6 +3750,7 @@ impl WorkspaceUi {
                             view.snapshot = None;
                             view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
                             view.pending_snapshot = None;
+                            view.initial_presentation = None;
                             view.resize_presentation = None;
                             view.render_cache.clear();
                         }
@@ -3741,9 +3801,10 @@ impl WorkspaceUi {
                         let frozen = self.selection.is_some_and(|(s, _, _)| s == *session);
                         let view = self.sessions.entry(*session).or_default();
                         view.bracketed_paste = *bracketed_paste;
-                        if view
-                            .buffer_resize_snapshot(Arc::clone(snapshot), std::time::Instant::now())
-                        {
+                        let now = std::time::Instant::now();
+                        if view.buffer_initial_snapshot(Arc::clone(snapshot), now) {
+                            // split seed는 first nonblank 또는 original deadline까지 보류.
+                        } else if view.buffer_resize_snapshot(Arc::clone(snapshot), now) {
                             // resize target이 quiet window를 통과할 때까지 last stable 화면 유지.
                         } else if frozen {
                             // 선택 중엔 표시 snapshot을 얼리되, 최신본은 pending에 보관해
@@ -3812,6 +3873,16 @@ impl WorkspaceUi {
                     ));
                 }
                 RuntimeEvent::ShellSpawned { session } => {
+                    if self
+                        .mux
+                        .as_deref()
+                        .is_some_and(|mux| visible_split_contains_session(mux, *session))
+                    {
+                        self.sessions
+                            .entry(*session)
+                            .or_default()
+                            .arm_initial_presentation(std::time::Instant::now());
+                    }
                     self.resolve_pending_shell_spawn(Some(*session));
                 }
                 // Launch correlation is app-owned lifecycle state (approval listener/runtime host),
@@ -4173,6 +4244,16 @@ impl WorkspaceUi {
                     self.error = Some(crate::ui::render_message(catalog, message));
                 }
                 RuntimeEvent::ShellSpawned { session } => {
+                    if self
+                        .mux
+                        .as_deref()
+                        .is_some_and(|mux| visible_split_contains_session(mux, *session))
+                    {
+                        self.sessions
+                            .entry(*session)
+                            .or_default()
+                            .arm_initial_presentation(std::time::Instant::now());
+                    }
                     self.resolve_pending_shell_spawn(Some(*session));
                 }
                 RuntimeEvent::DurableEventBarrierReached { .. } => {}
@@ -5604,6 +5685,9 @@ impl WorkspaceUi {
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
         let (exit_code, bracketed, restored_readonly, snapshot) = {
             let view = self.sessions.entry(session).or_default();
+            if let Some(after) = view.settle_initial_presentation(std::time::Instant::now()) {
+                ui.ctx().request_repaint_after(after);
+            }
             if let Some(after) = view.settle_resize_presentation(std::time::Instant::now()) {
                 ui.ctx().request_repaint_after(after);
             }
@@ -7972,6 +8056,20 @@ fn visible_mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
         .collect()
 }
 
+fn visible_split_contains_session(snapshot: &MuxSnapshot, session: SessionId) -> bool {
+    snapshot
+        .active_tab
+        .as_ref()
+        .and_then(|active| snapshot.tabs.iter().find(|tab| &tab.id == active))
+        .is_some_and(|tab| {
+            matches!(&tab.layout, LayoutNode::Split { .. })
+                && tab
+                    .panes
+                    .iter()
+                    .any(|pane| pane.session_id == Some(session))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8345,6 +8443,145 @@ mod tests {
                 .filter(|command| matches!(command, RuntimeCommand::Resize { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn split_shell_blank_seed_is_withheld_until_first_nonblank_viewport() {
+        let new_session = SessionId(42);
+        let blank = shaped_snapshot(80, 24, "");
+        let prompt = shaped_snapshot(80, 24, "prompt ready");
+        let mut ui = WorkspaceUi::new();
+        ui.handle_events(
+            &[
+                RuntimeEvent::MuxUpdated {
+                    snapshot: split_mux_snapshot(0.5),
+                },
+                RuntimeEvent::ShellSpawned {
+                    session: new_session,
+                },
+                RuntimeEvent::Viewport {
+                    session: new_session,
+                    snapshot: Arc::clone(&blank),
+                    bracketed_paste: false,
+                },
+            ],
+            &catalog(),
+        );
+
+        let view = ui.sessions.get(&new_session).expect("new split view");
+        assert!(view.snapshot.is_none(), "blank seed became visible");
+        assert!(view.initial_presentation.is_some());
+
+        ui.handle_events(
+            &[RuntimeEvent::Viewport {
+                session: new_session,
+                snapshot: Arc::clone(&prompt),
+                bracketed_paste: true,
+            }],
+            &catalog(),
+        );
+        let view = ui.sessions.get(&new_session).unwrap();
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &prompt));
+        assert!(view.initial_presentation.is_none());
+        assert!(view.bracketed_paste);
+    }
+
+    #[test]
+    fn split_shell_blank_seed_is_bounded_by_250ms() {
+        let started = std::time::Instant::now();
+        let blank = shaped_snapshot(80, 24, "");
+        let mut view = SessionView::default();
+        view.arm_initial_presentation(started);
+        assert!(view.buffer_initial_snapshot(
+            Arc::clone(&blank),
+            started + std::time::Duration::from_millis(249)
+        ));
+        view.settle_initial_presentation(started + std::time::Duration::from_millis(249));
+        assert!(view.snapshot.is_none());
+        view.settle_initial_presentation(started + std::time::Duration::from_millis(250));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &blank));
+        assert!(view.initial_presentation.is_none());
+    }
+
+    #[test]
+    fn ordinary_existing_session_blank_output_is_not_misclassified_as_seed() {
+        let session = SessionId(41);
+        let blank = shaped_snapshot(80, 24, "");
+        let mut ui = WorkspaceUi::new();
+        ui.handle_events(
+            &[
+                RuntimeEvent::MuxUpdated {
+                    snapshot: split_mux_snapshot(0.5),
+                },
+                RuntimeEvent::Viewport {
+                    session,
+                    snapshot: Arc::clone(&blank),
+                    bracketed_paste: false,
+                },
+            ],
+            &catalog(),
+        );
+        let view = ui.sessions.get(&session).unwrap();
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &blank));
+        assert!(view.initial_presentation.is_none());
+    }
+
+    #[test]
+    fn discarded_pass_does_not_consume_final_resize_arm() {
+        let ctx = egui::Context::default();
+        let session = SessionId(81);
+        let mut ui = WorkspaceUi::new();
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+
+        ui.stage_terminal_resize_for_pass(50, false, session, 100, 30);
+        ui.flush_render_side_effects_for_pass(&ctx, 50, true);
+        assert!(ui.protocol_intents.is_empty());
+        assert!(ui.split_final_resize_sessions.contains(&session));
+
+        ui.stage_terminal_resize_for_pass(51, false, session, 100, 30);
+        ui.flush_render_side_effects_for_pass(&ctx, 51, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::Resize { session: sent, cols: 100, rows: 30 }] if *sent == session
+        ));
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+    }
+
+    #[test]
+    fn warm_split_shell_replay_does_not_extend_seed_deadline() {
+        let new_session = SessionId(42);
+        let mut ui = WorkspaceUi::new();
+        let events = [
+            RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            },
+            RuntimeEvent::ShellSpawned {
+                session: new_session,
+            },
+        ];
+        ui.apply_warm_events(&events, &catalog());
+        let started = ui
+            .sessions
+            .get(&new_session)
+            .and_then(|view| view.initial_presentation.as_ref())
+            .expect("warm split seed fence")
+            .started_at;
+
+        ui.apply_warm_events(
+            &[RuntimeEvent::ShellSpawned {
+                session: new_session,
+            }],
+            &catalog(),
+        );
+        assert_eq!(
+            ui.sessions
+                .get(&new_session)
+                .and_then(|view| view.initial_presentation.as_ref())
+                .unwrap()
+                .started_at,
+            started
         );
     }
 

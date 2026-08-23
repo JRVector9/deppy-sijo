@@ -383,7 +383,6 @@ fn workspace_protocol_command_is_valid(
             tab, path, ratio, ..
         } => {
             if id_is_valid(&tab.0)
-                && !path.is_empty()
                 && path.len() <= WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS
                 && path.iter().all(|part| *part <= 1)
                 && ratio.is_finite()
@@ -425,6 +424,11 @@ fn workspace_protocol_command_is_valid(
 /// pane 헤더(세션·문서 탭 줄)의 높이. 32 → 30 → 29로 줄였다(2026-08-22 사용자 요청) —
 /// 탭 줄이 화면에서 차지하는 몫을 줄여 본문에 돌려준다.
 const TERMINAL_PANE_HEADER_HEIGHT: f32 = 29.0;
+/// 각 terminal leaf가 분할 축에서 유지하는 최소 logical pixel 크기.
+/// 좌/우 분할에는 너비, 상/하 분할에는 높이로 적용한다.
+const TERMINAL_PANE_MIN_SIZE: f32 = 50.0;
+/// pane 사이의 실제 구분선 폭. 최소 크기와 split 배치가 같은 값을 공유해야 한다.
+const TERMINAL_SPLIT_GAP: f32 = 1.0;
 const TERMINAL_STREAM_LEFT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_RIGHT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_VERTICAL_PADDING: f32 = 6.0;
@@ -723,6 +727,168 @@ fn terminal_pane_layout_for_state(
         content,
         archived_notice,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalLayoutMetric {
+    min_size: egui::Vec2,
+    /// preorder 벡터에서 이 node와 모든 descendant가 차지하는 항목 수.
+    subtree_len: usize,
+}
+
+/// layout 전체의 minimum을 재귀 반환값으로 한 번만 계산해 preorder 벡터에 기록한다.
+/// render도 같은 순서로 순회하므로 HashMap이나 node별 재귀 재계산 없이 자식 metric을
+/// O(1)에 찾는다. 기존의 매-frame `LayoutNode::clone`도 이 compact 벡터로 대체한다.
+fn terminal_layout_metrics(node: &LayoutNode) -> Vec<TerminalLayoutMetric> {
+    fn append(node: &LayoutNode, metrics: &mut Vec<TerminalLayoutMetric>) -> TerminalLayoutMetric {
+        let index = metrics.len();
+        metrics.push(TerminalLayoutMetric {
+            min_size: egui::Vec2::ZERO,
+            subtree_len: 1,
+        });
+
+        let metric = match node {
+            LayoutNode::Pane(_) => TerminalLayoutMetric {
+                min_size: egui::vec2(TERMINAL_PANE_MIN_SIZE, TERMINAL_PANE_MIN_SIZE),
+                subtree_len: 1,
+            },
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                let first = append(first, metrics);
+                let second = append(second, metrics);
+                let min_size = match direction {
+                    SplitDirection::Horizontal => egui::vec2(
+                        first.min_size.x + TERMINAL_SPLIT_GAP + second.min_size.x,
+                        first.min_size.y.max(second.min_size.y),
+                    ),
+                    SplitDirection::Vertical => egui::vec2(
+                        first.min_size.x.max(second.min_size.x),
+                        first.min_size.y + TERMINAL_SPLIT_GAP + second.min_size.y,
+                    ),
+                };
+                TerminalLayoutMetric {
+                    min_size,
+                    subtree_len: 1 + first.subtree_len + second.subtree_len,
+                }
+            }
+        };
+        metrics[index] = metric;
+        metric
+    }
+
+    let mut metrics = Vec::new();
+    append(node, &mut metrics);
+    metrics
+}
+
+#[cfg(test)]
+fn terminal_layout_min_size(node: &LayoutNode) -> egui::Vec2 {
+    terminal_layout_metrics(node)[0].min_size
+}
+
+fn terminal_split_gap(rect: egui::Rect, direction: SplitDirection) -> f32 {
+    let axis_extent = match direction {
+        SplitDirection::Horizontal => rect.width(),
+        SplitDirection::Vertical => rect.height(),
+    };
+    if axis_extent <= TERMINAL_SPLIT_GAP {
+        axis_extent.max(0.0)
+    } else {
+        TERMINAL_SPLIT_GAP
+    }
+}
+
+/// 저장 ratio와 드래그 preview를 현재 rect의 실제 px minimum으로 제한한다.
+///
+/// 창이 subtree minimum보다 작으면 50px 보장은 물리적으로 불가능하다. 이 경우 한쪽을
+/// 임의로 굶기지 않고 두 subtree가 요구하는 크기에 비례해 가용 공간을 나눈다.
+fn terminal_split_ratio(
+    rect: egui::Rect,
+    direction: SplitDirection,
+    requested_ratio: f32,
+    first_min: egui::Vec2,
+    second_min: egui::Vec2,
+) -> f32 {
+    let (axis_extent, first_min, second_min) = match direction {
+        SplitDirection::Horizontal => (rect.width(), first_min.x, second_min.x),
+        SplitDirection::Vertical => (rect.height(), first_min.y, second_min.y),
+    };
+    let available = (axis_extent - terminal_split_gap(rect, direction)).max(0.0);
+    let required = first_min + second_min;
+
+    if available < required {
+        return first_min / required;
+    }
+
+    let requested_ratio = if requested_ratio.is_finite() {
+        requested_ratio
+    } else {
+        0.5
+    };
+    let min_ratio = first_min / available;
+    let max_ratio = 1.0 - second_min / available;
+    if min_ratio >= max_ratio {
+        // available == required인 비대칭 subtree는 서로 다른 f32 연산 반올림 때문에
+        // min_ratio가 max_ratio보다 1 ULP 커질 수 있다. f32::clamp는 그때 panic하므로
+        // 정확한 minimum 비율로 수렴시킨다.
+        return first_min / required;
+    }
+    requested_ratio.clamp(min_ratio, max_ratio)
+}
+
+fn terminal_split_rects(
+    rect: egui::Rect,
+    direction: SplitDirection,
+    ratio: f32,
+) -> (egui::Rect, egui::Rect, egui::Rect) {
+    let gap = terminal_split_gap(rect, direction);
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+
+    match direction {
+        SplitDirection::Horizontal => {
+            let split_x = rect.min.x + (rect.width() - gap).max(0.0) * ratio;
+            (
+                egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y)),
+                egui::Rect::from_min_max(egui::pos2(split_x + gap, rect.min.y), rect.max),
+                egui::Rect::from_min_max(
+                    egui::pos2(split_x, rect.min.y),
+                    egui::pos2(split_x + gap, rect.max.y),
+                ),
+            )
+        }
+        SplitDirection::Vertical => {
+            let split_y = rect.min.y + (rect.height() - gap).max(0.0) * ratio;
+            (
+                egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, split_y)),
+                egui::Rect::from_min_max(egui::pos2(rect.min.x, split_y + gap), rect.max),
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, split_y),
+                    egui::pos2(rect.max.x, split_y + gap),
+                ),
+            )
+        }
+    }
+}
+
+fn terminal_split_hit_rect(
+    parent: egui::Rect,
+    gap_rect: egui::Rect,
+    direction: SplitDirection,
+) -> egui::Rect {
+    gap_rect
+        .expand2(match direction {
+            SplitDirection::Horizontal => egui::vec2(2.0, 0.0),
+            SplitDirection::Vertical => egui::vec2(0.0, 2.0),
+        })
+        .intersect(parent)
 }
 
 /// layout 트리의 pane을 배치 순서대로 모은다.
@@ -1183,7 +1349,7 @@ struct PaneHeaderButtons {
 /// 헤더 폭·제목 폭으로 닫기(×)와 우측 도구의 히트박스를 계산한다.
 ///
 /// codex 리뷰 P2 회귀 가드: compact 헤더(3e3e909)는 visible_toolbar를
-/// clamp(1,·)로 최소 1개 강제해 589pt 픽스처의 10% pane(≈59px)에서 Split
+/// clamp(1,·)로 최소 1개 강제해 당시 최소 pane(≈59px)에서 Split
 /// 버튼이 닫기 히트박스 22px 중 17px를 덮었고, 도구 interact가 나중에
 /// 등록되므로 겹침 클릭이 닫기 대신 분할을 실행했다. 지금은 도구 0개를
 /// 허용하고, 만에 하나 기하가 어긋나 도구가 닫기를 덮으면 왼쪽 도구를 더
@@ -3880,17 +4046,20 @@ impl WorkspaceUi {
         }
 
         let rect = ui.available_rect_before_wrap();
-        let layout = active_tab.layout.clone();
+        let layout = &active_tab.layout;
+        let layout_metrics = terminal_layout_metrics(layout);
         self.aux_tab_pane = (!self.aux_tabs.is_empty())
-            .then(|| aux_tab_owner_pane(&layout, mux.focused_pane.as_ref()))
+            .then(|| aux_tab_owner_pane(layout, mux.focused_pane.as_ref()))
             .flatten();
-        let embedded_headers = keeps_embedded_pane_header(&layout);
+        let embedded_headers = keeps_embedded_pane_header(layout);
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
         let pane_output = self.render_node(
             ui,
             rect,
-            &layout,
+            layout,
+            &layout_metrics,
+            0,
             &mux,
             config,
             &tab_id,
@@ -4672,6 +4841,8 @@ impl WorkspaceUi {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         node: &LayoutNode,
+        layout_metrics: &[TerminalLayoutMetric],
+        metric_index: usize,
         mux: &MuxSnapshot,
         config: &TerminalConfig,
         tab_id: &runtime::MuxTabId,
@@ -4704,51 +4875,33 @@ impl WorkspaceUi {
                 first,
                 second,
             } => {
+                let first_metric_index = metric_index + 1;
+                let second_metric_index =
+                    first_metric_index + layout_metrics[first_metric_index].subtree_len;
+                let first_min = layout_metrics[first_metric_index].min_size;
+                let second_min = layout_metrics[second_metric_index].min_size;
                 // 목업처럼 pane을 붙이고 1px 구분선만 둔다 (기존 4px 투명 gap 제거).
                 // 리사이즈 잡기는 split_handle이 히트영역을 ±2px 확장해 보장한다.
-                let gap = 1.0;
+                let gap = terminal_split_gap(rect, *direction);
                 // 드래그 중이면 로컬 미리보기 ratio 사용 (릴리즈 시에만 명령 전송)
-                let ratio = match &self.split_drag {
+                let requested_ratio = match &self.split_drag {
                     Some((drag_path, preview)) if drag_path == path => *preview,
                     _ => *ratio,
                 };
-                let (first_rect, second_rect, gap_rect) = match direction {
-                    SplitDirection::Horizontal => {
-                        // 좌/우 분할
-                        let split_x = rect.min.x + (rect.width() - gap) * ratio;
-                        (
-                            egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y)),
-                            egui::Rect::from_min_max(
-                                egui::pos2(split_x + gap, rect.min.y),
-                                rect.max,
-                            ),
-                            egui::Rect::from_min_max(
-                                egui::pos2(split_x, rect.min.y),
-                                egui::pos2(split_x + gap, rect.max.y),
-                            ),
-                        )
-                    }
-                    SplitDirection::Vertical => {
-                        // 상/하 분할
-                        let split_y = rect.min.y + (rect.height() - gap) * ratio;
-                        (
-                            egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, split_y)),
-                            egui::Rect::from_min_max(
-                                egui::pos2(rect.min.x, split_y + gap),
-                                rect.max,
-                            ),
-                            egui::Rect::from_min_max(
-                                egui::pos2(rect.min.x, split_y),
-                                egui::pos2(rect.max.x, split_y + gap),
-                            ),
-                        )
-                    }
-                };
+                // 저장된 ratio가 오래된 10% 규칙이나 remote snapshot에서 왔더라도 현재
+                // rect와 subtree의 실제 minimum으로 다시 제한한다. 창 축소도 같은 경로라
+                // divider를 드래그하지 않아도 모든 leaf가 가능한 한 50px를 유지한다.
+                let ratio =
+                    terminal_split_ratio(rect, *direction, requested_ratio, first_min, second_min);
+                let (first_rect, second_rect, gap_rect) =
+                    terminal_split_rects(rect, *direction, ratio);
                 path.push(0);
                 let mut output = self.render_node(
                     ui,
                     first_rect,
                     first,
+                    layout_metrics,
+                    first_metric_index,
                     mux,
                     config,
                     tab_id,
@@ -4763,6 +4916,8 @@ impl WorkspaceUi {
                     ui,
                     second_rect,
                     second,
+                    layout_metrics,
+                    second_metric_index,
                     mux,
                     config,
                     tab_id,
@@ -4776,7 +4931,9 @@ impl WorkspaceUi {
                 // 우선이라, ±2px 확장 히트영역이 터미널 선택 드래그에 밀리지 않는다
                 // (codex 리뷰: 가장자리에서 리사이즈 대신 선택이 잡히는 문제).
                 if mode.input_enabled() {
-                    self.split_handle(ui, rect, gap_rect, *direction, gap, tab_id, path);
+                    self.split_handle(
+                        ui, rect, gap_rect, *direction, gap, first_min, second_min, tab_id, path,
+                    );
                 } else {
                     ui.painter().rect_filled(
                         gap_rect,
@@ -4799,14 +4956,13 @@ impl WorkspaceUi {
         gap_rect: egui::Rect,
         direction: SplitDirection,
         gap: f32,
+        first_min: egui::Vec2,
+        second_min: egui::Vec2,
         tab_id: &runtime::MuxTabId,
         path: &[u8],
     ) {
-        // 4px 경계는 잡기 어려우니 히트 영역만 양쪽 2px씩 확장 (시각 폭은 그대로)
-        let hit_rect = gap_rect.expand2(match direction {
-            SplitDirection::Horizontal => egui::vec2(2.0, 0.0),
-            SplitDirection::Vertical => egui::vec2(0.0, 2.0),
-        });
+        // 1px 경계는 잡기 어려우니 히트 영역만 양쪽 2px씩 확장 (시각 폭은 그대로)
+        let hit_rect = terminal_split_hit_rect(rect, gap_rect, direction);
         let id = egui::Id::new(("split_handle", tab_id, path));
         let resp = ui.interact(hit_rect, id, egui::Sense::drag());
         let cursor = match direction {
@@ -4824,11 +4980,12 @@ impl WorkspaceUi {
         if resp.dragged()
             && let Some(pointer) = resp.interact_pointer_pos()
         {
-            let ratio = match direction {
+            let requested_ratio = match direction {
                 SplitDirection::Horizontal => (pointer.x - rect.min.x) / (rect.width() - gap),
                 SplitDirection::Vertical => (pointer.y - rect.min.y) / (rect.height() - gap),
-            }
-            .clamp(0.1, 0.9);
+            };
+            let ratio =
+                terminal_split_ratio(rect, direction, requested_ratio, first_min, second_min);
             self.split_drag = Some((path.to_vec(), ratio));
         }
         if resp.drag_stopped()
@@ -7813,24 +7970,201 @@ mod tests {
         }
     }
 
+    #[test]
+    fn 분할_최소크기는_모든_leaf의_축방향_50px를_합산한다() {
+        let leaf = || LayoutNode::Pane(pane_id("leaf"));
+        let columns = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(leaf()),
+            second: Box::new(leaf()),
+        };
+        let rows = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf()),
+            second: Box::new(leaf()),
+        };
+
+        assert_eq!(
+            terminal_layout_min_size(&columns),
+            egui::vec2(
+                TERMINAL_PANE_MIN_SIZE * 2.0 + TERMINAL_SPLIT_GAP,
+                TERMINAL_PANE_MIN_SIZE
+            )
+        );
+        assert_eq!(
+            terminal_layout_min_size(&rows),
+            egui::vec2(
+                TERMINAL_PANE_MIN_SIZE,
+                TERMINAL_PANE_MIN_SIZE * 2.0 + TERMINAL_SPLIT_GAP
+            )
+        );
+
+        let nested_columns = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(columns),
+            second: Box::new(leaf()),
+        };
+        assert_eq!(
+            terminal_layout_min_size(&nested_columns),
+            egui::vec2(
+                TERMINAL_PANE_MIN_SIZE * 3.0 + TERMINAL_SPLIT_GAP * 2.0,
+                TERMINAL_PANE_MIN_SIZE
+            ),
+            "같은 축의 중첩 split도 각 leaf의 50px를 보존해야 한다"
+        );
+    }
+
+    #[test]
+    fn 분할_minimum측정은_각_node를_한번만_기록한다() {
+        let leaf = || LayoutNode::Pane(pane_id("leaf"));
+        let first = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(leaf()),
+            second: Box::new(leaf()),
+        };
+        let tree = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(leaf()),
+        };
+
+        let metrics = terminal_layout_metrics(&tree);
+        assert_eq!(metrics.len(), 5, "split 2개 + leaf 3개를 각각 한 번만 측정");
+        assert_eq!(metrics[0].subtree_len, 5);
+        assert_eq!(metrics[1].subtree_len, 3);
+        assert_eq!(metrics[4].subtree_len, 1);
+        assert_eq!(metrics[0].min_size, terminal_layout_min_size(&tree));
+    }
+
+    #[test]
+    fn 분할_ratio는_좌우와_상하_모두_각_pane의_50px에서_멈춘다() {
+        let first = LayoutNode::Pane(pane_id("first"));
+        let second = LayoutNode::Pane(pane_id("second"));
+        let first_min = terminal_layout_min_size(&first);
+        let second_min = terminal_layout_min_size(&second);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(501.0, 501.0));
+
+        for direction in [SplitDirection::Horizontal, SplitDirection::Vertical] {
+            let low = terminal_split_ratio(rect, direction, 0.0, first_min, second_min);
+            let high = terminal_split_ratio(rect, direction, 1.0, first_min, second_min);
+            let axis = match direction {
+                SplitDirection::Horizontal => rect.width(),
+                SplitDirection::Vertical => rect.height(),
+            } - TERMINAL_SPLIT_GAP;
+
+            assert!((axis * low - TERMINAL_PANE_MIN_SIZE).abs() < 0.0001);
+            assert!((axis * (1.0 - high) - TERMINAL_PANE_MIN_SIZE).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn 분할_ratio는_비대칭_subtree의_정확한_minimum에서도_panic하지_않는다() {
+        let first_min = egui::vec2(50.0, 50.0);
+        let second_min = egui::vec2(152.0, 152.0);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(203.0, 203.0));
+
+        for direction in [SplitDirection::Horizontal, SplitDirection::Vertical] {
+            let ratio = terminal_split_ratio(rect, direction, 0.5, first_min, second_min);
+            let available = match direction {
+                SplitDirection::Horizontal => rect.width(),
+                SplitDirection::Vertical => rect.height(),
+            } - TERMINAL_SPLIT_GAP;
+            assert!(ratio.is_finite());
+            assert!((available * ratio - 50.0).abs() < 0.0001);
+            assert!((available * (1.0 - ratio) - 152.0).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn 분할_ratio는_중첩_minimum과_물리적으로_좁은_창을_안전하게_처리한다() {
+        let leaf = || LayoutNode::Pane(pane_id("leaf"));
+        let two_columns = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(leaf()),
+            second: Box::new(leaf()),
+        };
+        let right = leaf();
+        let exact_width = TERMINAL_PANE_MIN_SIZE * 3.0 + TERMINAL_SPLIT_GAP * 2.0;
+        let exact = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(exact_width, TERMINAL_PANE_MIN_SIZE),
+        );
+        let two_columns_min = terminal_layout_min_size(&two_columns);
+        let right_min = terminal_layout_min_size(&right);
+        let ratio = terminal_split_ratio(
+            exact,
+            SplitDirection::Horizontal,
+            0.0,
+            two_columns_min,
+            right_min,
+        );
+        assert!(((exact.width() - TERMINAL_SPLIT_GAP) * ratio - two_columns_min.x).abs() < 0.0001);
+
+        // 세 leaf의 최소 합보다 좁으면 불가능한 50px를 가장하지 않고, 필요한 크기에
+        // 비례해 공간을 나눈다. NaN snapshot도 같은 안전한 경로로 수렴한다.
+        let narrow =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, TERMINAL_PANE_MIN_SIZE));
+        let expected = two_columns_min.x / (two_columns_min.x + right_min.x);
+        let constrained = terminal_split_ratio(
+            narrow,
+            SplitDirection::Horizontal,
+            f32::NAN,
+            two_columns_min,
+            right_min,
+        );
+        assert!((constrained - expected).abs() < 0.0001);
+        assert!(constrained.is_finite());
+    }
+
+    #[test]
+    fn 분할_geometry는_축이_구분선보다_작아도_음수_rect를_만들지_않는다() {
+        let first = LayoutNode::Pane(pane_id("first"));
+        let second = LayoutNode::Pane(pane_id("second"));
+        let first_min = terminal_layout_min_size(&first);
+        let second_min = terminal_layout_min_size(&second);
+
+        for (direction, size) in [
+            (SplitDirection::Horizontal, egui::vec2(0.5, 100.0)),
+            (SplitDirection::Vertical, egui::vec2(100.0, 0.5)),
+        ] {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let ratio = terminal_split_ratio(rect, direction, 0.5, first_min, second_min);
+            let (first_rect, second_rect, gap_rect) = terminal_split_rects(rect, direction, ratio);
+            let hit_rect = terminal_split_hit_rect(rect, gap_rect, direction);
+
+            for child in [first_rect, second_rect, gap_rect, hit_rect] {
+                assert!(child.width() >= 0.0, "음수 width: {child:?}");
+                assert!(child.height() >= 0.0, "음수 height: {child:?}");
+                assert!(child.left() >= rect.left() && child.right() <= rect.right());
+                assert!(child.top() >= rect.top() && child.bottom() <= rect.bottom());
+            }
+        }
+    }
+
     /// codex 리뷰 P2 재현 가드 — compact 헤더(3e3e909)는 visible_toolbar를
-    /// clamp(1,·)로 최소 1개 강제해, 589pt 픽스처의 10% pane(58.9px)에서
+    /// clamp(1,·)로 최소 1개 강제해, 당시 최소 pane(58.9px)에서
     /// SplitRows 버튼([30.9, 54.9])이 닫기(×) 히트박스 22px 중 17.1px([26, 48])를
     /// 덮었다. 도구 interact가 나중에 등록되므로 겹침 클릭은 닫기 대신 분할을
     /// 실행했다. 지금은 도구 0개 허용 + 겹침 시 왼쪽 도구 추가 숨김으로 닫기가
     /// 항상 우선한다.
     #[test]
     fn 지원되는_모든_좁은_split에서_도구가_닫기를_덮지_않는다() {
-        // 589pt 픽스처의 지원 최소 split 비율 10%(resize clamp 0.1) — 58.9px pane.
+        // 현재 px 기반 최소 split 크기 — 정확히 50px pane.
         let narrow = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(58.9, TERMINAL_PANE_HEADER_HEIGHT),
+            egui::vec2(TERMINAL_PANE_MIN_SIZE, TERMINAL_PANE_HEADER_HEIGHT),
         );
         for title_width in [0.0_f32, 13.0, 26.0, 70.0, 130.0] {
             let buttons = pane_header_buttons(narrow, title_width, 4, 0.0);
             assert!(
                 buttons.toolbar.is_empty(),
-                "59px pane은 도구 0개가 정상 (title_width {title_width})"
+                "50px pane은 도구 0개가 정상 (title_width {title_width})"
             );
             assert!(
                 narrow.contains_rect(buttons.close),
@@ -11934,6 +12268,16 @@ mod tests {
             ratio: 0.5,
         };
         assert_eq!(workspace_protocol_command_is_valid(&exact_path), Ok(()));
+        let root_path = RuntimeCommand::ResizeSplit {
+            tab: MuxTabId("t".to_owned()),
+            path: Vec::new(),
+            ratio: 0.5,
+        };
+        assert_eq!(
+            workspace_protocol_command_is_valid(&root_path),
+            Ok(()),
+            "빈 path는 최상위 split divider를 가리킨다"
+        );
         let too_deep_path = RuntimeCommand::ResizeSplit {
             tab: MuxTabId("t".to_owned()),
             path: vec![0; WORKSPACE_PROTOCOL_SPLIT_PATH_MAX_ITEMS + 1],
@@ -12681,7 +13025,7 @@ mod tests {
         );
     }
 
-    /// kittest 재현 — 10% pane(58.9px) 헤더에서 닫기(×) 자리를 클릭하면 분할이
+    /// kittest 재현 — 최소 pane(50px) 헤더에서 닫기(×) 자리를 클릭하면 분할이
     /// 아니라 닫기 확인이 떠야 한다. compact 헤더(3e3e909)에서는 강제 표시된
     /// Split 버튼이 닫기 히트박스를 덮고 interact가 나중 등록이라 SplitPane이
     /// 나갔다 (codex 리뷰 P2).
@@ -12701,7 +13045,7 @@ mod tests {
         ));
         let header = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(58.9, TERMINAL_PANE_HEADER_HEIGHT),
+            egui::vec2(TERMINAL_PANE_MIN_SIZE, TERMINAL_PANE_HEADER_HEIGHT),
         );
         let snapshot = pane("p", SessionId(7));
         let mut harness = egui_kittest::Harness::new_ui_state(

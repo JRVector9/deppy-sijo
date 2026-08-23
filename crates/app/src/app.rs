@@ -29499,6 +29499,13 @@ impl eframe::App for App {
             self.pending_agent_launcher_intent = Some(intent);
             ui.ctx().request_repaint();
         }
+        // egui는 이 workspace 뒤의 widget도 request_discard할 수 있다. Terminal resize와
+        // split commit은 모든 UI-producing widget이 끝난 이 경계에서만 같은 pass 후보를
+        // flush해야 discarded/correction pass가 중간 SIGWINCH를 만들지 않는다.
+        self.active.workspace_ui.flush_render_side_effects(ui.ctx());
+        for runtime in self.warm.values_mut() {
+            runtime.workspace_ui.flush_render_side_effects(ui.ctx());
+        }
         self.frame_stats.end();
         // B1: 이번 프레임에 그린 터미널 렌더 카운터를 프레임 이벤트에 실어 보낸다.
         // frame_stats.end() 뒤라 JSONL 기록 비용은 ui_ms에 섞이지 않는다.
@@ -31134,6 +31141,35 @@ mod tests {
         assert!(replay_impl.contains("stage_runtime_restore(runtime_instance)"));
         assert!(replay_impl.contains("request_repaint_after(CATALOG_STARTUP_RETRY_DELAY)"));
         assert!(replay_impl.contains("pop_front()"));
+    }
+
+    #[test]
+    fn app_flushes_workspace_render_effects_after_the_last_widget() {
+        let source = include_str!("app.rs");
+        let ui_body = source
+            .split_once("fn ui(&mut self, ui: &mut egui::Ui")
+            .expect("App::ui")
+            .1
+            .split_once("\n    }\n}\n\n/// Instant")
+            .expect("end of App::ui")
+            .0;
+        let last_widget = ui_body
+            .rfind("self.agent_launcher_ui.show(")
+            .expect("agent launcher is the final widget");
+        let active_flush = ui_body
+            .rfind("self.active.workspace_ui.flush_render_side_effects(ui.ctx())")
+            .expect("active workspace final-pass flush");
+        let warm_flush = ui_body
+            .rfind("runtime.workspace_ui.flush_render_side_effects(ui.ctx())")
+            .expect("attached warm workspace final-pass flush");
+        let stats_end = ui_body
+            .rfind("self.frame_stats.end();")
+            .expect("frame stats end");
+
+        assert!(last_widget < active_flush);
+        assert!(last_widget < warm_flush);
+        assert!(active_flush < stats_end);
+        assert!(warm_flush < stats_end);
     }
 
     #[test]

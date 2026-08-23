@@ -1720,6 +1720,27 @@ fn paint_terminal_toolbar_icon(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SplitDragPhase {
+    Active,
+    Committed { admitted: bool },
+}
+
+#[derive(Clone, Debug)]
+struct SplitDragTransaction {
+    tab: runtime::MuxTabId,
+    path: Vec<u8>,
+    ratio: f32,
+    phase: SplitDragPhase,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StagedTerminalResize {
+    pass: u64,
+    cols: u16,
+    rows: u16,
+}
+
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
     sessions: HashMap<SessionId, SessionView>,
@@ -1810,9 +1831,17 @@ pub struct WorkspaceUi {
     /// 성공 전달된 셸 spawn 순서와 프로토콜 입장을 기다리는 cd 후속 명령.
     /// spawn·후속 cd를 합쳐 최대 WORKSPACE_PROTOCOL_CAP개만 유지한다.
     pending_spawn_cwds: VecDeque<PendingShellSpawn>,
-    /// split 경계 드래그 중 로컬 미리보기 (path, ratio). 드래그 동안은 명령을 보내지
-    /// 않고(매 프레임 DB 저장 방지) 릴리즈 시 1회 ResizeSplit을 보낸다.
-    split_drag: Option<(Vec<u8>, f32)>,
+    /// split 경계의 로컬 미리보기와 비동기 mux ACK 수명. 릴리즈 뒤에도 matching
+    /// tab/path/ratio MuxUpdated까지 미리보기를 유지해 persisted ratio로 되튀지 않는다.
+    split_drag: Option<SplitDragTransaction>,
+    /// matching ACK 뒤 실제 grid가 바뀌어야 하는 visible session. 각 세션은 최종 UI
+    /// pass에서 distinct Resize를 한 번 성공적으로 admission할 때까지 남는다.
+    split_final_resize_sessions: HashSet<SessionId>,
+    /// egui render pass에서는 protocol/debounce 상태를 직접 바꾸지 않는다. sizing pass는
+    /// 후보도 만들지 않고, 일반 pass 후보는 App::ui의 마지막 widget 뒤 final-pass flush가
+    /// 같은 cumulative pass만 실행한다.
+    staged_terminal_resizes: HashMap<SessionId, StagedTerminalResize>,
+    staged_split_commit_pass: Option<u64>,
     /// 닫기 확인 대기 중인 pane — 실행 중 세션이 있는 pane 닫기는 확인을 거친다
     /// (2026-07-05 사용자 보고: 닫기 실수로 셸 전체 즉사 방지).
     confirm_close: Option<runtime::MuxPaneId>,
@@ -2240,6 +2269,9 @@ impl WorkspaceUi {
             terminal_focus_claimed: false,
             pending_spawn_cwds: VecDeque::with_capacity(WORKSPACE_PROTOCOL_CAP),
             split_drag: None,
+            split_final_resize_sessions: HashSet::new(),
+            staged_terminal_resizes: HashMap::new(),
+            staged_split_commit_pass: None,
             confirm_close: None,
             agent_send_presets: Vec::new(),
             open_environment_requested: false,
@@ -2500,6 +2532,144 @@ impl WorkspaceUi {
                 ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE);
             }
         }
+    }
+
+    fn begin_split_drag(&mut self, tab: runtime::MuxTabId, path: Vec<u8>, ratio: f32) {
+        match self.split_drag.as_mut() {
+            Some(transaction)
+                if transaction.tab == tab
+                    && transaction.path == path
+                    && transaction.phase == SplitDragPhase::Active =>
+            {
+                transaction.ratio = ratio;
+            }
+            _ => {
+                self.split_drag = Some(SplitDragTransaction {
+                    tab,
+                    path,
+                    ratio,
+                    phase: SplitDragPhase::Active,
+                });
+            }
+        }
+        // 직전 geometry의 debounce/final 후보가 새 drag 중에 늦게 실행되면 중간
+        // SIGWINCH가 된다. sent_sizes는 마지막 stable grid 기준으로 보존한다.
+        self.pending_resize_target.clear();
+        self.staged_terminal_resizes.clear();
+        self.split_final_resize_sessions.clear();
+    }
+
+    fn commit_split_drag(&mut self, pass: u64) {
+        let Some(transaction) = self.split_drag.as_mut() else {
+            return;
+        };
+        if transaction.phase == SplitDragPhase::Active {
+            transaction.phase = SplitDragPhase::Committed { admitted: false };
+        }
+        if matches!(
+            transaction.phase,
+            SplitDragPhase::Committed { admitted: false }
+        ) {
+            self.staged_split_commit_pass = Some(pass);
+        }
+    }
+
+    fn stage_unadmitted_split_commit_for_pass(&mut self, pass: u64, sizing_pass: bool) {
+        if !sizing_pass
+            && self.split_drag.as_ref().is_some_and(|transaction| {
+                matches!(
+                    transaction.phase,
+                    SplitDragPhase::Committed { admitted: false }
+                )
+            })
+        {
+            self.staged_split_commit_pass = Some(pass);
+        }
+    }
+
+    fn split_preview_ratio(&self, tab: &runtime::MuxTabId, path: &[u8], persisted: f32) -> f32 {
+        self.split_drag
+            .as_ref()
+            .filter(|transaction| &transaction.tab == tab && transaction.path == path)
+            .map_or(persisted, |transaction| transaction.ratio)
+    }
+
+    fn stage_terminal_resize_for_pass(
+        &mut self,
+        pass: u64,
+        sizing_pass: bool,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    ) {
+        if sizing_pass || self.split_drag.is_some() {
+            return;
+        }
+        self.staged_terminal_resizes
+            .insert(session, StagedTerminalResize { pass, cols, rows });
+    }
+
+    fn flush_render_side_effects_for_pass(
+        &mut self,
+        ctx: &egui::Context,
+        pass: u64,
+        will_discard: bool,
+    ) {
+        if will_discard {
+            return;
+        }
+
+        if self.staged_split_commit_pass == Some(pass) {
+            let command = self.split_drag.as_ref().and_then(|transaction| {
+                matches!(
+                    transaction.phase,
+                    SplitDragPhase::Committed { admitted: false }
+                )
+                .then(|| RuntimeCommand::ResizeSplit {
+                    tab: transaction.tab.clone(),
+                    path: transaction.path.clone(),
+                    ratio: transaction.ratio,
+                })
+            });
+            if let Some(command) = command
+                && self.send_keep_selection(command)
+                && let Some(transaction) = self.split_drag.as_mut()
+                && matches!(
+                    transaction.phase,
+                    SplitDragPhase::Committed { admitted: false }
+                )
+            {
+                transaction.phase = SplitDragPhase::Committed { admitted: true };
+            }
+            self.staged_split_commit_pass = None;
+        }
+
+        let staged = std::mem::take(&mut self.staged_terminal_resizes);
+        for (session, resize) in staged {
+            if resize.pass != pass || self.split_drag.is_some() {
+                continue;
+            }
+            if self.split_final_resize_sessions.contains(&session) {
+                if self.sent_sizes.get(&session) == Some(&(resize.cols, resize.rows)) {
+                    self.split_final_resize_sessions.remove(&session);
+                    self.pending_resize_target.remove(&session);
+                    continue;
+                }
+                self.queue_terminal_resize(session, resize.cols, resize.rows);
+                if self.sent_sizes.get(&session) == Some(&(resize.cols, resize.rows)) {
+                    self.split_final_resize_sessions.remove(&session);
+                    self.pending_resize_target.remove(&session);
+                }
+            } else {
+                self.queue_terminal_resize_debounced(ctx, session, resize.cols, resize.rows);
+            }
+        }
+    }
+
+    /// App host의 마지막 UI-producing widget 뒤에서만 호출한다. workspace 렌더 시점의
+    /// `will_discard`는 뒤쪽 widget이 나중에 discard를 요청할 수 있어 final 판별이 아니다.
+    pub fn flush_render_side_effects(&mut self, ctx: &egui::Context) {
+        self.flush_render_side_effects_for_pass(ctx, ctx.cumulative_pass_nr(), ctx.will_discard());
     }
 
     fn queue_protocol_intent_with_spawn_cwd(
@@ -3347,6 +3517,17 @@ impl WorkspaceUi {
         for event in events {
             match event {
                 RuntimeEvent::MuxUpdated { snapshot } => {
+                    let split_acknowledged = self.split_drag.as_ref().is_some_and(|transaction| {
+                        matches!(
+                            transaction.phase,
+                            SplitDragPhase::Committed { admitted: true }
+                        ) && mux_split_ratio(snapshot, &transaction.tab, &transaction.path)
+                            .is_some_and(|ratio| (ratio - transaction.ratio).abs() <= 0.0001)
+                    });
+                    let split_tab_disappeared =
+                        self.split_drag.as_ref().is_some_and(|transaction| {
+                            !snapshot.tabs.iter().any(|tab| tab.id == transaction.tab)
+                        });
                     // 사라진 세션의 캐시 정리
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
@@ -3390,13 +3571,17 @@ impl WorkspaceUi {
                             view.render_cache.clear();
                         }
                     }
-                    // 드래그 중 tab 전환/분할 구조 변경이면 미리보기가 다른 split에
-                    // 잘못 적용될 수 있다 — 구조가 바뀌는 지점에서 정리 (codex 리뷰).
-                    // 리사이즈 자신의 MuxUpdated는 drag_stopped 이후라 잃을 상태가 없다.
-                    if self.mux.as_ref().map(|m| (&m.active_tab, &m.tabs))
-                        != Some((&snapshot.active_tab, &snapshot.tabs))
-                    {
+                    if split_acknowledged {
+                        self.split_final_resize_sessions = visible_mux_sessions(snapshot);
+                        self.pending_resize_target.retain(|session, _| {
+                            !self.split_final_resize_sessions.contains(session)
+                        });
+                        self.staged_terminal_resizes.clear();
                         self.split_drag = None;
+                        self.staged_split_commit_pass = None;
+                    } else if split_tab_disappeared {
+                        self.split_drag = None;
+                        self.staged_split_commit_pass = None;
                     }
                     self.mux = Some(Arc::clone(snapshot));
                 }
@@ -3942,6 +4127,10 @@ impl WorkspaceUi {
     ) -> WorkspaceSurfaceOutput {
         self.prepare_frame(ui.ctx(), events, catalog, input_enabled);
         self.reconcile_explicit_terminal_focus();
+        self.stage_unadmitted_split_commit_for_pass(
+            ui.ctx().cumulative_pass_nr(),
+            ui.is_sizing_pass(),
+        );
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
@@ -4884,10 +5073,7 @@ impl WorkspaceUi {
                 // 리사이즈 잡기는 split_handle이 히트영역을 ±2px 확장해 보장한다.
                 let gap = terminal_split_gap(rect, *direction);
                 // 드래그 중이면 로컬 미리보기 ratio 사용 (릴리즈 시에만 명령 전송)
-                let requested_ratio = match &self.split_drag {
-                    Some((drag_path, preview)) if drag_path == path => *preview,
-                    _ => *ratio,
-                };
+                let requested_ratio = self.split_preview_ratio(tab_id, path, *ratio);
                 // 저장된 ratio가 오래된 10% 규칙이나 remote snapshot에서 왔더라도 현재
                 // rect와 subtree의 실제 minimum으로 다시 제한한다. 창 축소도 같은 경로라
                 // divider를 드래그하지 않아도 모든 leaf가 가능한 한 50px를 유지한다.
@@ -4986,17 +5172,15 @@ impl WorkspaceUi {
             };
             let ratio =
                 terminal_split_ratio(rect, direction, requested_ratio, first_min, second_min);
-            self.split_drag = Some((path.to_vec(), ratio));
+            self.begin_split_drag(tab_id.clone(), path.to_vec(), ratio);
         }
         if resp.drag_stopped()
-            && let Some((drag_path, ratio)) = self.split_drag.take()
-            && drag_path == path
+            && self
+                .split_drag
+                .as_ref()
+                .is_some_and(|transaction| &transaction.tab == tab_id && transaction.path == path)
         {
-            self.send(RuntimeCommand::ResizeSplit {
-                tab: tab_id.clone(),
-                path: drag_path,
-                ratio,
-            });
+            self.commit_split_drag(ui.ctx().cumulative_pass_nr());
         }
     }
 
@@ -5285,7 +5469,13 @@ impl WorkspaceUi {
         // 창 드래그로 avail이 프레임마다 바뀌는 동안 cols/rows도 매 프레임 바뀐다 — 그대로
         // 보내면 드래그 내내 PTY가 매번 reflow하며 화면이 깜빡인다. 디바운스 래퍼가 목표가
         // 안정될 때까지 기다렸다가 한 번만 보낸다(최종 크기는 request_repaint_after로 보장).
-        self.queue_terminal_resize_debounced(ui.ctx(), session, cols, rows);
+        self.stage_terminal_resize_for_pass(
+            ui.ctx().cumulative_pass_nr(),
+            ui.is_sizing_pass(),
+            session,
+            cols,
+            rows,
+        );
 
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
         let (exit_code, bracketed, restored_readonly, snapshot) = {
@@ -7590,6 +7780,21 @@ fn mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
         .collect()
 }
 
+fn mux_split_ratio(snapshot: &MuxSnapshot, tab_id: &runtime::MuxTabId, path: &[u8]) -> Option<f32> {
+    let mut node = &snapshot.tabs.iter().find(|tab| &tab.id == tab_id)?.layout;
+    for part in path {
+        match (node, part) {
+            (LayoutNode::Split { first, .. }, 0) => node = first,
+            (LayoutNode::Split { second, .. }, 1) => node = second,
+            _ => return None,
+        }
+    }
+    match node {
+        LayoutNode::Split { ratio, .. } => Some(*ratio),
+        LayoutNode::Pane(_) => None,
+    }
+}
+
 /// 분할이 대상으로 삼을 pane: 포커스된 pane이 있으면 그것, 없으면 활성 탭(없으면 첫 탭)의
 /// 첫 pane. pane이 하나도 없으면 None(빈 워크스페이스 — 분할할 게 없다).
 fn split_target_pane(snapshot: &MuxSnapshot) -> Option<runtime::MuxPaneId> {
@@ -7696,6 +7901,188 @@ mod tests {
             });
         }
         commands
+    }
+
+    fn split_mux_snapshot(ratio: f32) -> Arc<MuxSnapshot> {
+        mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("left", SessionId(41)), pane("right", SessionId(42))],
+                LayoutNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio,
+                    first: Box::new(LayoutNode::Pane(pane_id("left"))),
+                    second: Box::new(LayoutNode::Pane(pane_id("right"))),
+                },
+            )],
+            "left",
+        )
+    }
+
+    #[test]
+    fn pane_drag_stable_state_does_not_enqueue_resize_until_matching_ack() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.sent_sizes.insert(SessionId(41), (80, 24));
+        ui.sent_sizes.insert(SessionId(42), (80, 24));
+        assert!(ui.pending_resize_target.is_empty());
+
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        for (pass, cols) in [(10, 90), (11, 100), (12, 110)] {
+            ui.stage_terminal_resize_for_pass(pass, false, SessionId(41), cols, 24);
+            ui.stage_terminal_resize_for_pass(pass, false, SessionId(42), cols, 24);
+            ui.flush_render_side_effects_for_pass(&ctx, pass, false);
+            assert!(ui.protocol_intents.is_empty(), "active drag sent Resize");
+        }
+
+        ui.commit_split_drag(13);
+        ui.flush_render_side_effects_for_pass(&ctx, 13, false);
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, RuntimeCommand::ResizeSplit { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::Resize { .. }))
+        );
+
+        ui.stage_terminal_resize_for_pass(14, false, SessionId(41), 110, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 14, false);
+        assert!(ui.protocol_intents.is_empty(), "pre-ACK Resize escaped");
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.6),
+            }],
+            &catalog(),
+        );
+        assert!(ui.split_drag.is_some(), "old ratio is not an ACK");
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.72),
+            }],
+            &catalog(),
+        );
+        assert!(ui.split_drag.is_none(), "matching ACK must settle preview");
+        assert_eq!(
+            ui.split_final_resize_sessions,
+            HashSet::from([SessionId(41), SessionId(42)])
+        );
+
+        ui.stage_terminal_resize_for_pass(15, false, SessionId(41), 110, 24);
+        ui.stage_terminal_resize_for_pass(15, false, SessionId(42), 50, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 15, false);
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, RuntimeCommand::Resize { .. }))
+                .count(),
+            2,
+            "matching ACK must produce one final Resize per changed session"
+        );
+    }
+
+    #[test]
+    fn committed_split_preview_survives_until_matching_mux_ack() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.7);
+        ui.commit_split_drag(20);
+        ui.flush_render_side_effects_for_pass(&ctx, 20, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::ResizeSplit { ratio, .. }] if (*ratio - 0.7).abs() < 0.0001
+        ));
+        assert!((ui.split_preview_ratio(&tab_id("t"), &[], 0.5) - 0.7).abs() < 0.0001);
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        assert!((ui.split_preview_ratio(&tab_id("t"), &[], 0.5) - 0.7).abs() < 0.0001);
+
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.7),
+            }],
+            &catalog(),
+        );
+        assert!((ui.split_preview_ratio(&tab_id("t"), &[], 0.7) - 0.7).abs() < 0.0001);
+        assert!(ui.split_drag.is_none());
+    }
+
+    #[test]
+    fn late_first_ack_does_not_cancel_a_new_active_drag() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.65);
+        ui.commit_split_drag(30);
+        ui.flush_render_side_effects_for_pass(&ctx, 30, false);
+        drain_protocol(&mut ui);
+
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.8);
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.65),
+            }],
+            &catalog(),
+        );
+
+        assert!((ui.split_preview_ratio(&tab_id("t"), &[], 0.65) - 0.8).abs() < 0.0001);
+        assert!(ui.split_drag.is_some(), "late ACK cancelled the new drag");
+    }
+
+    #[test]
+    fn discarded_or_sizing_pass_does_not_admit_split_protocol() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        let session = SessionId(51);
+
+        ui.stage_terminal_resize_for_pass(40, true, session, 80, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 40, false);
+        assert!(ui.protocol_intents.is_empty(), "sizing pass staged Resize");
+
+        ui.stage_terminal_resize_for_pass(41, false, session, 80, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 41, true);
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "discarded pass admitted Resize"
+        );
+
+        ui.stage_terminal_resize_for_pass(42, false, session, 80, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 42, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::Resize { session: sent, cols: 80, rows: 24 }] if *sent == session
+        ));
     }
 
     #[test]
@@ -10566,6 +10953,16 @@ mod tests {
 
         assert!(harness.query_by_label(&unavailable).is_some());
         assert!(harness.query_by_label(&connecting).is_none());
+        let ctx = harness.ctx.clone();
+        let pass = harness
+            .state()
+            .staged_terminal_resizes
+            .get(&SessionId(7))
+            .expect("attached pane resize candidate")
+            .pass;
+        harness
+            .state_mut()
+            .flush_render_side_effects_for_pass(&ctx, pass, false);
         assert!(
             drain_protocol(harness.state_mut())
                 .iter()

@@ -25,6 +25,8 @@ const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 /// 다시 그려지는 것이 사용자에게 깜빡임으로 보인다(2026-08-18 사용자 보고). 목표가 이
 /// 시간만큼 안 바뀌어야 그 순간의 최종 목표를 정확히 한 번 보낸다.
 const RESIZE_DRAG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+const RESIZE_VIEWPORT_QUIET: std::time::Duration = std::time::Duration::from_millis(32);
+const RESIZE_VIEWPORT_HARD_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
 const WORKSPACE_IO_QUEUE_CAP: usize = 1;
 const WORKSPACE_PATH_MAX_BYTES: usize = 32 * 1024;
 const WORKSPACE_URL_MAX_BYTES: usize = 32 * 1024;
@@ -2208,6 +2210,14 @@ struct PendingPaste {
 const PASTE_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 세션별 화면 캐시. hidden tab 세션의 스냅샷은 `MuxUpdated`에서 버린다.
+struct ResizePresentationFence {
+    target: (u16, u16),
+    started_at: std::time::Instant,
+    last_target_at: Option<std::time::Instant>,
+    latest_target: Option<Arc<TerminalViewportSnapshot>>,
+    stable_had_visible_text: bool,
+}
+
 #[derive(Default)]
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
@@ -2218,6 +2228,9 @@ struct SessionView {
     /// freeze(선택 중) 동안 도착한 최신 snapshot을 보관 — 선택 해제 시 이걸로 catch-up해
     /// 화면이 선택 당시에 머무는 것을 막는다(codex). 프레임 시작 시 프로모트한다.
     pending_snapshot: Option<Arc<TerminalViewportSnapshot>>,
+    /// 최종 split Resize 뒤 TUI의 clear→redraw 중간 viewport가 표시되지 않도록 마지막
+    /// stable 화면을 유지하는 유계 fence. target shape 후보만 latest-wins로 받는다.
+    resize_presentation: Option<ResizePresentationFence>,
     render_cache: renderer_egui::TerminalRenderCache,
     bracketed_paste: bool,
     /// 사이드바 세션 목록에 보여줄 최신 화면 요약 (마지막 비어있지 않은 행, ≤48자)
@@ -2237,6 +2250,83 @@ struct SessionView {
     /// "작업 중"과 "멈춘 것"은 화면상 둘 다 파란 점인데 실제로는 전혀 다르다. 마지막
     /// 출력 이후 경과로 조용히 죽은 세션을 찾아낸다(2026-08-08).
     last_output_at: Option<i64>,
+}
+
+impl SessionView {
+    fn install_snapshot(&mut self, snapshot: Arc<TerminalViewportSnapshot>) {
+        self.summary = last_line_summary(&snapshot);
+        self.snapshot = Some(snapshot);
+        self.snapshot_gen = self.snapshot_gen.wrapping_add(1);
+        self.pending_snapshot = None;
+    }
+
+    fn arm_resize_presentation(&mut self, cols: u16, rows: u16, now: std::time::Instant) {
+        self.pending_snapshot = None;
+        self.resize_presentation = Some(ResizePresentationFence {
+            target: (cols, rows),
+            started_at: now,
+            last_target_at: None,
+            latest_target: None,
+            stable_had_visible_text: self
+                .snapshot
+                .as_deref()
+                .is_some_and(snapshot_has_visible_text),
+        });
+    }
+
+    /// resize fence가 있으면 viewport를 표시하지 않고 target 후보에만 보관한다.
+    /// non-target은 resize 이전/중간 grid라 안정 화면을 덮을 수 없다.
+    fn buffer_resize_snapshot(
+        &mut self,
+        snapshot: Arc<TerminalViewportSnapshot>,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(fence) = self.resize_presentation.as_mut() else {
+            return false;
+        };
+        if (snapshot.cols, snapshot.rows) == fence.target {
+            fence.latest_target = Some(snapshot);
+            fence.last_target_at = Some(now);
+        }
+        true
+    }
+
+    /// 승격 전이면 다음으로 확인할 one-shot repaint 지연을 반환한다.
+    fn settle_resize_presentation(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let fence = self.resize_presentation.as_ref()?;
+        let hard_elapsed = now.saturating_duration_since(fence.started_at);
+        let hard_expired = hard_elapsed >= RESIZE_VIEWPORT_HARD_DEADLINE;
+        let quiet_ready = fence
+            .last_target_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= RESIZE_VIEWPORT_QUIET);
+        let candidate_allowed = fence.latest_target.as_deref().is_some_and(|candidate| {
+            !fence.stable_had_visible_text || snapshot_has_visible_text(candidate)
+        });
+        let promote = hard_expired || (quiet_ready && candidate_allowed);
+
+        if promote {
+            let candidate = self
+                .resize_presentation
+                .take()
+                .and_then(|fence| fence.latest_target);
+            if let Some(candidate) = candidate {
+                self.install_snapshot(candidate);
+            }
+            return None;
+        }
+
+        let hard_remaining = RESIZE_VIEWPORT_HARD_DEADLINE.saturating_sub(hard_elapsed);
+        if candidate_allowed && let Some(last) = fence.last_target_at {
+            let quiet_remaining =
+                RESIZE_VIEWPORT_QUIET.saturating_sub(now.saturating_duration_since(last));
+            Some(hard_remaining.min(quiet_remaining))
+        } else {
+            Some(hard_remaining)
+        }
+    }
 }
 
 impl WorkspaceUi {
@@ -2454,9 +2544,9 @@ impl WorkspaceUi {
         self.queue_protocol_intent_with_spawn_cwd(command, None)
     }
 
-    fn queue_terminal_resize(&mut self, session: SessionId, cols: u16, rows: u16) {
+    fn queue_terminal_resize(&mut self, session: SessionId, cols: u16, rows: u16) -> bool {
         if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
-            return;
+            return false;
         }
         if self
             .queue_protocol_intent(RuntimeCommand::Resize {
@@ -2467,7 +2557,44 @@ impl WorkspaceUi {
             .is_ok()
         {
             self.sent_sizes.insert(session, (cols, rows));
+            true
+        } else {
+            false
         }
+    }
+
+    fn apply_split_final_resize_at(
+        &mut self,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.split_final_resize_sessions.contains(&session) {
+            return false;
+        }
+        if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
+            self.split_final_resize_sessions.remove(&session);
+            self.pending_resize_target.remove(&session);
+            return false;
+        }
+        if !self.queue_terminal_resize(session, cols, rows) {
+            return false;
+        }
+
+        self.split_final_resize_sessions.remove(&session);
+        self.pending_resize_target.remove(&session);
+        if self
+            .selection
+            .is_some_and(|(selected, _, _)| selected == session)
+        {
+            self.selection = None;
+        }
+        self.sessions
+            .entry(session)
+            .or_default()
+            .arm_resize_presentation(cols, rows, now);
+        true
     }
 
     /// `queue_terminal_resize`의 디바운스 래퍼 — pane 렌더 호출부는 매 프레임 이걸 부른다.
@@ -2650,16 +2777,12 @@ impl WorkspaceUi {
                 continue;
             }
             if self.split_final_resize_sessions.contains(&session) {
-                if self.sent_sizes.get(&session) == Some(&(resize.cols, resize.rows)) {
-                    self.split_final_resize_sessions.remove(&session);
-                    self.pending_resize_target.remove(&session);
-                    continue;
-                }
-                self.queue_terminal_resize(session, resize.cols, resize.rows);
-                if self.sent_sizes.get(&session) == Some(&(resize.cols, resize.rows)) {
-                    self.split_final_resize_sessions.remove(&session);
-                    self.pending_resize_target.remove(&session);
-                }
+                self.apply_split_final_resize_at(
+                    session,
+                    resize.cols,
+                    resize.rows,
+                    std::time::Instant::now(),
+                );
             } else {
                 self.queue_terminal_resize_debounced(ctx, session, resize.cols, resize.rows);
             }
@@ -3568,6 +3691,7 @@ impl WorkspaceUi {
                             view.snapshot = None;
                             view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
                             view.pending_snapshot = None;
+                            view.resize_presentation = None;
                             view.render_cache.clear();
                         }
                     }
@@ -3617,16 +3741,16 @@ impl WorkspaceUi {
                         let frozen = self.selection.is_some_and(|(s, _, _)| s == *session);
                         let view = self.sessions.entry(*session).or_default();
                         view.bracketed_paste = *bracketed_paste;
-                        if frozen {
+                        if view
+                            .buffer_resize_snapshot(Arc::clone(snapshot), std::time::Instant::now())
+                        {
+                            // resize target이 quiet window를 통과할 때까지 last stable 화면 유지.
+                        } else if frozen {
                             // 선택 중엔 표시 snapshot을 얼리되, 최신본은 pending에 보관해
                             // 해제 시 catch-up한다(codex — 안 그러면 화면이 선택 당시에 멈춤).
                             view.pending_snapshot = Some(Arc::clone(snapshot));
                         } else {
-                            view.snapshot = Some(Arc::clone(snapshot));
-                            view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
-                            view.pending_snapshot = None;
-                            // 사이드바 세션 요약 — 마지막 비어있지 않은 행 (2026-07-05)
-                            view.summary = last_line_summary(snapshot);
+                            view.install_snapshot(Arc::clone(snapshot));
                         }
                     }
                 }
@@ -5480,12 +5604,13 @@ impl WorkspaceUi {
         let selected = self.selection.is_some_and(|(s, _, _)| s == session);
         let (exit_code, bracketed, restored_readonly, snapshot) = {
             let view = self.sessions.entry(session).or_default();
+            if let Some(after) = view.settle_resize_presentation(std::time::Instant::now()) {
+                ui.ctx().request_repaint_after(after);
+            }
             // 선택이 없으면(freeze 해제) freeze 중 보관한 최신본으로 catch-up한다 — 새
             // Viewport가 안 와도 화면이 선택 당시에 멈추지 않게(codex).
             if !selected && let Some(pending) = view.pending_snapshot.take() {
-                view.summary = last_line_summary(&pending);
-                view.snapshot = Some(pending);
-                view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
+                view.install_snapshot(pending);
             }
             let Some(snapshot) = view.snapshot.clone() else {
                 let message = match mode {
@@ -7451,6 +7576,10 @@ fn cell_has_content(snapshot: &terminal::TerminalViewportSnapshot, idx: usize) -
         .is_some_and(|cell| !cell.wide_spacer && !cell.c.is_whitespace() && cell.c != '\0')
 }
 
+fn snapshot_has_visible_text(snapshot: &TerminalViewportSnapshot) -> bool {
+    (0..snapshot.visible_cells.len()).any(|index| cell_has_content(snapshot, index))
+}
+
 /// 더블클릭이 잡는 **화면 행 전체** 범위 (2026-08-17 사용자 요청).
 ///
 /// 스냅샷은 평면 그리드라 wrap 정보가 없다 — 접힌 논리 줄을 이어 붙일 방법이 없으므로
@@ -8083,6 +8212,140 @@ mod tests {
             drain_protocol(&mut ui).as_slice(),
             [RuntimeCommand::Resize { session: sent, cols: 80, rows: 24 }] if *sent == session
         ));
+    }
+
+    #[test]
+    fn final_resize_keeps_stable_snapshot_until_target_viewport_settles() {
+        let started = std::time::Instant::now();
+        let stable = shaped_snapshot(80, 24, "stable content");
+        let first_target = shaped_snapshot(100, 30, "first target");
+        let latest_target = shaped_snapshot(100, 30, "latest target");
+        let mut view = SessionView::default();
+        view.install_snapshot(Arc::clone(&stable));
+        let stable_generation = view.snapshot_gen;
+        view.arm_resize_presentation(100, 30, started);
+
+        view.buffer_resize_snapshot(
+            Arc::clone(&first_target),
+            started + std::time::Duration::from_millis(1),
+        );
+        view.buffer_resize_snapshot(
+            Arc::clone(&latest_target),
+            started + std::time::Duration::from_millis(10),
+        );
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(41));
+
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &stable));
+        assert_eq!(view.snapshot_gen, stable_generation);
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(42));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &latest_target));
+        assert_eq!(view.snapshot_gen, stable_generation + 1);
+        assert!(view.resize_presentation.is_none());
+    }
+
+    #[test]
+    fn blank_target_viewport_waits_for_nonblank_or_hard_deadline() {
+        let started = std::time::Instant::now();
+        let stable = shaped_snapshot(80, 24, "stable content");
+        let blank = shaped_snapshot(100, 30, "");
+        let nonblank = shaped_snapshot(100, 30, "ready");
+        let mut view = SessionView::default();
+        view.install_snapshot(Arc::clone(&stable));
+        view.arm_resize_presentation(100, 30, started);
+        view.buffer_resize_snapshot(
+            Arc::clone(&blank),
+            started + std::time::Duration::from_millis(1),
+        );
+
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(40));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &stable));
+        view.buffer_resize_snapshot(
+            Arc::clone(&nonblank),
+            started + std::time::Duration::from_millis(50),
+        );
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(81));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &stable));
+        view.settle_resize_presentation(started + std::time::Duration::from_millis(82));
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &nonblank));
+
+        let mut hard_deadline_view = SessionView::default();
+        hard_deadline_view.install_snapshot(Arc::clone(&stable));
+        hard_deadline_view.arm_resize_presentation(100, 30, started);
+        hard_deadline_view.buffer_resize_snapshot(Arc::clone(&blank), started);
+        hard_deadline_view
+            .settle_resize_presentation(started + std::time::Duration::from_millis(249));
+        assert!(Arc::ptr_eq(
+            hard_deadline_view.snapshot.as_ref().unwrap(),
+            &stable
+        ));
+        hard_deadline_view
+            .settle_resize_presentation(started + std::time::Duration::from_millis(250));
+        assert!(Arc::ptr_eq(
+            hard_deadline_view.snapshot.as_ref().unwrap(),
+            &blank
+        ));
+    }
+
+    #[test]
+    fn final_resize_clears_selection_only_for_changed_grid() {
+        let now = std::time::Instant::now();
+        let session = SessionId(61);
+        let mut ui = WorkspaceUi::new();
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(shaped_snapshot(80, 24, "selected"));
+        ui.sessions.get_mut(&session).unwrap().pending_snapshot =
+            Some(shaped_snapshot(80, 24, "pending"));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.selection = Some((session, 0, 3));
+        ui.split_final_resize_sessions.insert(session);
+
+        assert!(!ui.apply_split_final_resize_at(session, 80, 24, now));
+        assert!(ui.selection.is_some(), "same grid must preserve selection");
+        assert!(
+            ui.sessions
+                .get(&session)
+                .unwrap()
+                .resize_presentation
+                .is_none()
+        );
+
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
+        assert!(
+            ui.selection.is_none(),
+            "changed grid invalidates coordinates"
+        );
+        let view = ui.sessions.get(&session).unwrap();
+        assert!(view.pending_snapshot.is_none());
+        assert_eq!(
+            view.resize_presentation.as_ref().map(|fence| fence.target),
+            Some((100, 30))
+        );
+    }
+
+    #[test]
+    fn one_matching_ack_produces_at_most_one_distinct_resize_per_session() {
+        let now = std::time::Instant::now();
+        let mut ui = WorkspaceUi::new();
+        ui.split_final_resize_sessions = HashSet::from([SessionId(71), SessionId(72)]);
+        ui.sent_sizes.insert(SessionId(71), (80, 24));
+        ui.sent_sizes.insert(SessionId(72), (80, 24));
+
+        assert!(ui.apply_split_final_resize_at(SessionId(71), 100, 30, now));
+        assert!(ui.apply_split_final_resize_at(SessionId(72), 50, 30, now));
+        assert!(!ui.apply_split_final_resize_at(SessionId(71), 100, 30, now));
+        assert!(!ui.apply_split_final_resize_at(SessionId(72), 50, 30, now));
+
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, RuntimeCommand::Resize { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -11948,8 +12211,10 @@ mod tests {
     }
 
     fn snapshot(text: &str) -> Arc<TerminalViewportSnapshot> {
-        let cols = 12;
-        let rows = 2;
+        shaped_snapshot(12, 2, text)
+    }
+
+    fn shaped_snapshot(cols: usize, rows: usize, text: &str) -> Arc<TerminalViewportSnapshot> {
         let mut cells = Vec::with_capacity(cols * rows);
         let chars: Vec<char> = text.chars().collect();
         for idx in 0..cols * rows {

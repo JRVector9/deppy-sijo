@@ -70,15 +70,24 @@
 - 안정 `source_id`: `MarkdownDocumentSlot`만으로 만든 절대 `egui::Id`
 - 렌더 signature: `slot + revision + dark_mode + width_bucket`
 
-signature가 바뀌면 안정 `source_id`에 대응하는 CommonMark scrollable cache만
-`clear_scrollable_with_id`로 비운 뒤 같은 `source_id`로 다시 렌더한다. 이 호출은
-CommonMark의 split-point/page-size 캐시만 지우고 egui의 persisted ScrollArea state는
-지우지 않으므로, 새 source를 파싱하면서 offset은 유지된다.
+signature가 바뀌면 **이전 signature의 slot**에서 안정 `source_id`를 다시 만들어 그
+CommonMark scrollable cache를 `clear_scrollable_with_id`로 비운 뒤, 현재 slot의 안정
+`source_id`로 다시 렌더한다. 같은 slot의 revision 변경이면 두 ID는 같고, A→B 문서
+전환이면 A cache가 정확히 지워진다. 이 호출은 CommonMark의 split-point/page-size
+캐시만 지우고 egui의 persisted ScrollArea state는 지우지 않으므로, 새 source를
+파싱하면서 offset은 유지된다.
+
+업스트림의 실제 persisted 세로 ID는 단순히 `source_id.with("_scroll_area")`가 아니다.
+`egui_commonmark`가 `Id::new(source_id).with("_scroll_area")`를 만들고, egui ScrollArea가
+다시 현재 parent의 `ui.make_persistent_id(...)`를 적용한다. 따라서 실제 호출 직전에
+이 공식을 그대로 계산해 `HashMap<slot, HashSet<Id>>`에 기록한다. 같은 parent에서
+revision만 바뀌면 ID가 안정적이고, Preview/Split처럼 parent가 다르면 두 실제 ID를
+모두 보존했다가 닫을 때 지운다.
 
 문서를 닫을 때는 둘 다 지운다.
 
 1. 안정 `source_id`의 CommonMark scrollable cache 제거
-2. 업스트림이 만드는 `source_id.with("_scroll_area")` persisted state 제거
+2. slot에 기록한 실제 parent-scoped vertical persisted state 전부 제거
 3. 현재 signature가 그 slot이면 signature를 `None`으로 초기화
 
 ### 3.2 가로 스크롤: slot당 실제 ID 전부 소유
@@ -130,6 +139,11 @@ CommonMark의 split-point/page-size 캐시만 지우고 egui의 persisted Scroll
 - 편집으로 다시 8 MiB 이하가 되면 별도 조작 없이 저장 가능 상태로 돌아온다.
 
 `OpenDocument::can_save`는 기존 `dirty && !saving && Full`에 byte 경계를 더한다.
+dirty 닫기 확인창의 Save는 툴바와 한 가지 차이가 있다. 이미 저장이 진행 중이면
+새 저장을 시작하지 않고 기존 `document_close_after_save` continuation만 설치해야 하므로,
+현재 source가 상한 안이고 dirty/editable이면 `saving == true`여도 선택할 수 있다. 저장
+완료 시 현재 source가 snapshot과 같으면 닫고, 저장 중 새 편집이 들어왔으면 기존처럼
+다시 확인한다. 8 MiB 초과 상태에서는 진행 중 저장 여부와 관계없이 비활성화한다.
 UI의 비활성화만 신뢰하지 않고 `request_document_save`도 먼저 기본 자격
 (`dirty && !saving && Full`)을 확인한 뒤 `source.len()`을 clone보다 먼저 검사한다.
 따라서 request 함수는 size까지 포함한 `can_save == false`만 보고 곧장 return해서는
@@ -162,6 +176,10 @@ UI의 비활성화만 신뢰하지 않고 `request_document_save`도 먼저 기�
 - 저장 초과는 source를 변경하거나 디스크에 쓰지 않는다.
 - 저장 초과 뒤 source를 줄이면 기존 `on_document_source_edited`가 오류를 지우고
   `can_save`가 다시 true가 된다.
+- 저장 진행 중 닫기 확인과 같은 문서의 저장 충돌이 겹치면 `SaveConflict`가 기존
+  `CloseWithDirty`를 같은 큐 위치에서 대체한다. 다른 문서의 FIFO 순서는 유지한다.
+- save worker의 spawn/panic/disconnect 실패는 `saving`, `saving_source`, save-after-close
+  continuation을 함께 정리해 나중 저장이 오래된 닫기 의도를 소비하지 않게 한다.
 - 링크·경로·문서 내용은 로그에 남기지 않는다.
 
 ## 7. 검증 설계
@@ -190,6 +208,10 @@ UI의 비활성화만 신뢰하지 않고 `request_document_save`도 먼저 기�
    close-after-save continuation을 제거한다.
 4. 초과 상태에서 source를 8 MiB 이하로 줄이면 저장이 다시 활성화된다.
 5. 초과 저장 시 디스크 내용은 바뀌지 않는다.
+6. 저장 진행 중 dirty 문서를 닫을 때 Save를 고르면 기존 저장의 continuation이 유지되고,
+   성공 뒤 새 편집이 없으면 닫히며 새 편집이 있으면 다시 확인한다.
+7. 같은 문서의 pending close와 저장 충돌이 겹치면 conflict가 제자리에서 우선하며,
+   save worker 인프라 실패 뒤에는 snapshot과 close continuation이 남지 않는다.
 
 ### 마감 gate
 

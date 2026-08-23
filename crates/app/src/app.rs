@@ -9052,13 +9052,6 @@ struct OpenDocument {
     /// 설계 §2 — 예전에는 App 전역 카운터 하나를 모든 문서가 공유해 슬롯도 `0`으로
     /// 고정돼 있었다).
     source_revision: u64,
-    /// 문서 body를 그릴 때(`show_document_tab_body`류) 캡처해 두는 그 프레임의
-    /// `ui.id()` — source 편집기(`ui::document::source_editor`)가 egui `TextEdit`을
-    /// 만들 때 실제로 쓰는 컨테이너 id다. 문서를 닫을 때 이 값으로
-    /// `clear_document_editor_state`가 egui가 들고 있는 `TextEditState`(실행취소
-    /// 스냅샷 포함)를 지운다 — 안 그러면 문서를 닫아도 위젯 상태가 안 지워지고
-    /// 무한정 쌓인다(리뷰 지적). 아직 한 번도 안 그려졌으면 `None`(지울 것도 없다).
-    body_ui_id: Option<egui::Id>,
 }
 
 impl OpenDocument {
@@ -9090,8 +9083,20 @@ impl OpenDocument {
         )
     }
 
-    fn can_save(&self) -> bool {
+    fn has_save_eligibility(&self) -> bool {
         self.dirty && !self.saving && self.is_editable()
+    }
+
+    fn source_fits_save_limit(&self) -> bool {
+        self.source.len() as u64 <= document_io::DOCUMENT_REFUSE_BYTES_MAX
+    }
+
+    fn can_save(&self) -> bool {
+        self.has_save_eligibility() && self.source_fits_save_limit()
+    }
+
+    fn can_save_then_close(&self) -> bool {
+        self.dirty && self.is_editable() && self.source_fits_save_limit()
     }
 
     /// dirty 판정 — 저장(또는 로드) 시점 내용과 현재 내용을 직접 비교한다. 편집 →
@@ -9194,6 +9199,19 @@ fn apply_save_outcome_to_document(
     }
 }
 
+fn apply_document_save_infrastructure_failure(
+    documents: &mut [OpenDocument],
+    close_after_save: &mut std::collections::HashSet<ui::workspace::DocumentTabId>,
+    id: ui::workspace::DocumentTabId,
+) {
+    if let Some(document) = documents.iter_mut().find(|document| document.id == id) {
+        document.saving = false;
+        document.saving_source = None;
+        document.save_error = Some(document_io::DocumentIoErrorCode::ReadFailed);
+    }
+    close_after_save.remove(&id);
+}
+
 /// 문서 탭 확인 모달 종류(설계 §3.3·§7, 멀티 문서 탭 설계). 셋 다 버튼은 최대 두세
 /// 개 — "다른 이름으로 저장"은 이번 범위에서 생략한다(설계 §4 지시). 여러 문서가
 /// 동시에 열려 있을 수 있어 어느 문서에 대한 확인인지 `id`로 못박는다. 교체
@@ -9218,19 +9236,39 @@ impl DocumentPendingConfirm {
 }
 
 /// 확인 대기 큐에 새 항목을 넣는다 — 순수 함수라 App 없이 테스트한다. 같은 문서에
-/// 대한 확인이 이미 큐에 있으면(응답 전에 같은 문서로 새 이벤트가 왔다는 뜻) 새로
-/// 들어온 걸 버려 중복을 만들지 않는다. 서로 다른 문서의 확인은 도착한 순서대로
-/// 뒤에 쌓인다(FIFO) — 응답 전에 다른 확인이 와도 먼저 것이 사라지지 않는다
-/// (2026-08-22 리뷰: 예전엔 전역 단일 슬롯이라 응답 없이 조용히 덮어써졌다).
+/// 대한 같은 종류의 확인이 이미 큐에 있으면 중복을 만들지 않는다. 다만 저장 충돌은
+/// 닫기 확인보다 우선하므로 같은 문서의 `CloseWithDirty`를 그 자리에서 교체한다.
+/// 서로 다른 문서의 확인은 도착한 순서대로 뒤에 쌓인다(FIFO) — 응답 전에 다른
+/// 확인이 와도 먼저 것이 사라지지 않는다(2026-08-22 리뷰: 예전엔 전역 단일 슬롯이라
+/// 응답 없이 조용히 덮어써졌다).
 fn enqueue_document_pending_confirm(
     queue: &mut std::collections::VecDeque<DocumentPendingConfirm>,
     confirm: DocumentPendingConfirm,
 ) {
     let id = confirm.document_id();
-    if queue.iter().any(|existing| existing.document_id() == id) {
+    if let Some(existing) = queue
+        .iter_mut()
+        .find(|existing| existing.document_id() == id)
+    {
+        if matches!(confirm, DocumentPendingConfirm::SaveConflict { .. })
+            && matches!(existing, DocumentPendingConfirm::CloseWithDirty { .. })
+        {
+            *existing = confirm;
+        }
         return;
     }
     queue.push_back(confirm);
+}
+
+fn should_complete_pending_close_after_save(
+    queue: &std::collections::VecDeque<DocumentPendingConfirm>,
+    id: ui::workspace::DocumentTabId,
+    still_dirty: bool,
+) -> bool {
+    !still_dirty
+        && queue.iter().any(|confirm| {
+            matches!(confirm, DocumentPendingConfirm::CloseWithDirty { id: pending } if *pending == id)
+        })
 }
 
 /// `apply_document_confirm_choice`(닫기 확인 모달)가 실행해야 할 일 — 순수 함수인
@@ -9323,16 +9361,6 @@ fn document_close_requires_confirm(document: Option<&OpenDocument>) -> bool {
     document.is_some_and(|document| document.dirty)
 }
 
-/// `ui::document::source_editor`(건드리지 않는다)가 내부적으로 만드는 편집기
-/// `TextEdit`의 실제 저장 id를 재현한다 — egui의 `ScrollArea`와 `Frame::NONE`가
-/// id_salt 없이 `new_child`를 각각 한 번씩 호출해(egui 0.35.0 기본값은 `"child"`
-/// salt) 두 겹을 더 감싼 뒤에야 `.id_salt(id_salt)`가 적용된다(egui 0.35.0 실측,
-/// 이 파일의 `문서_source_editor_state_id_공식은_실제_저장_위치와_일치한다`가
-/// 고정한다). `egui::Id::with`는 넘긴 salt를 매번 `IdSalt::new`로 다시 해싱하므로,
-/// 이미 `IdSalt`로 변환된 값(예: `TextEdit::id_salt`가 저장한 값)을 그대로 다시
-/// 넘겨야 실제 계산과 맞아떨어진다 — 그래서 `id_salt`도 `IdSalt::new`로 한 번 감싼
-/// 뒤 넘긴다. `body_ui_id`는 문서 body를 그릴 때 캡처해 둔 안정 id(App이 그
-/// 시점의 `ui.id()`를 그대로 들고 있는다).
 /// source 편집기의 `TextEditState` id. `source_editor`가 **절대 id**를 쓰므로 여기서
 /// 만드는 값이 곧 그 위젯의 id다 — 예전처럼 위젯 계층을 역산할 필요가 없다
 /// (2026-08-23). 컨테이너가 달라도 같은 값이라 Source·Split 두 모드가 커서와 undo
@@ -15853,17 +15881,11 @@ impl App {
                     });
                 }
                 DocumentLoadState::Loaded { .. } => {
-                    // 이 프레임의 body ui id를 캡처해 둔다 — 문서를 닫을 때
-                    // `clear_document_editor_state`가 이 값으로 source 편집기가 egui에
-                    // 남긴 `TextEditState`를 지운다(리뷰 지적 ②, `body_ui_id` 필드 주석
-                    // 참고).
-                    let body_ui_id = ui.id();
                     let Some(document) =
                         self.documents.iter_mut().find(|document| document.id == id)
                     else {
                         return;
                     };
-                    document.body_ui_id = Some(body_ui_id);
                     let editable = document.is_editable();
                     match mode {
                         ui::document::DocumentViewMode::Source => {
@@ -16041,6 +16063,9 @@ impl App {
         text: &i18n::Catalog,
     ) -> Option<String> {
         let document = self.documents.iter().find(|document| document.id == id)?;
+        if document.is_editable() && !document.source_fits_save_limit() {
+            return Some(text.t("document.limit.save_too_large", &[]));
+        }
         if let Some(until) = document.saved_feedback_until {
             let now = std::time::Instant::now();
             if now < until {
@@ -16142,14 +16167,19 @@ impl App {
         }
     }
 
-    /// 저장 요청 — dirty && Full 티어일 때만 유효(`OpenDocument::can_save`). 워커
+    /// 저장 요청 — dirty && Full 티어일 때만 유효. 워커
     /// admit은 `poll_document_io`가 매 틱 재시도한다. `id`가 가리키는 문서만 저장한다
     /// — 여러 문서가 동시에 dirty여도 서로의 저장 요청이 섞이지 않는다.
     fn request_document_save(&mut self, id: ui::workspace::DocumentTabId) {
         let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
             return;
         };
-        if !document.can_save() {
+        if !document.has_save_eligibility() {
+            return;
+        }
+        if !document.source_fits_save_limit() {
+            document.save_error = Some(document_io::DocumentIoErrorCode::ContentTooLarge);
+            self.document_close_after_save.remove(&id);
             return;
         }
         let DocumentLoadState::Loaded { revision, .. } = document.load_state else {
@@ -16373,7 +16403,6 @@ impl App {
             saved_feedback_until: None,
             view_only_byte_len: None,
             source_revision: 0,
-            body_ui_id: None,
         });
         self.document_pending_loads.push_back((id, path));
         self.active_document = Some(id);
@@ -16533,11 +16562,12 @@ impl App {
             match outcome.into_result() {
                 Ok((id, save_outcome)) => self.apply_document_save_outcome(id, save_outcome),
                 Err(_) => {
-                    if let Some(id) = inflight
-                        && let Some(document) =
-                            self.documents.iter_mut().find(|document| document.id == id)
-                    {
-                        document.saving = false;
+                    if let Some(id) = inflight {
+                        apply_document_save_infrastructure_failure(
+                            &mut self.documents,
+                            &mut self.document_close_after_save,
+                            id,
+                        );
                     }
                 }
             }
@@ -16551,12 +16581,11 @@ impl App {
                     self.document_pending_saves.push_front(job);
                 }
                 Err(crate::lazy_worker::LazyWorkerSubmitError::Unavailable { .. }) => {
-                    if let Some(document) =
-                        self.documents.iter_mut().find(|document| document.id == id)
-                    {
-                        document.saving = false;
-                        document.save_error = Some(document_io::DocumentIoErrorCode::ReadFailed);
-                    }
+                    apply_document_save_infrastructure_failure(
+                        &mut self.documents,
+                        &mut self.document_close_after_save,
+                        id,
+                    );
                 }
             }
         }
@@ -16622,15 +16651,21 @@ impl App {
             document_io::DocumentSaveOutcome::Saved { .. } => {
                 self.egui_ctx
                     .request_repaint_after(DOCUMENT_SAVED_FEEDBACK_DURATION);
-                if self.document_close_after_save.remove(&id) {
+                let still_dirty = self
+                    .documents
+                    .iter()
+                    .find(|document| document.id == id)
+                    .is_some_and(|document| document.dirty);
+                let close_after_save = self.document_close_after_save.remove(&id);
+                let complete_pending_close = should_complete_pending_close_after_save(
+                    &self.document_pending_confirms,
+                    id,
+                    still_dirty,
+                );
+                if close_after_save || complete_pending_close {
                     // 저장 중에 들어온 편집이 있으면 아직 dirty다 — 그대로 닫으면
                     // 그 편집이 경고 없이 사라진다(2026-08-23 리뷰 CRITICAL).
                     // 닫지 말고 확인을 다시 받는다.
-                    let still_dirty = self
-                        .documents
-                        .iter()
-                        .find(|document| document.id == id)
-                        .is_some_and(|document| document.dirty);
                     if still_dirty {
                         enqueue_document_pending_confirm(
                             &mut self.document_pending_confirms,
@@ -28357,6 +28392,11 @@ impl eframe::App for App {
             match pending {
                 DocumentPendingConfirm::CloseWithDirty { id } => {
                     let name = self.document_file_name(id);
+                    let document = self.documents.iter().find(|document| document.id == id);
+                    let can_save = document.is_some_and(OpenDocument::can_save_then_close);
+                    let save_too_large = document.is_some_and(|document| {
+                        document.is_editable() && !document.source_fits_save_limit()
+                    });
                     let mut choice = None;
                     egui::Window::new(text.t("document.confirm_discard.title", &[]))
                         .collapsible(false)
@@ -28370,12 +28410,16 @@ impl eframe::App for App {
                                     &[("count", &queued_after.to_string())],
                                 ));
                             }
+                            if save_too_large {
+                                ui.label(text.t("document.limit.save_too_large", &[]));
+                            }
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                if ui
-                                    .button(text.t("document.confirm_discard.save", &[]))
-                                    .clicked()
-                                {
+                                let save = ui.add_enabled(
+                                    can_save,
+                                    egui::Button::new(text.t("document.confirm_discard.save", &[])),
+                                );
+                                if save.clicked() {
                                     choice = Some(DocumentConfirmChoice::Save);
                                 }
                                 if ui
@@ -34384,7 +34428,6 @@ mod tests {
             saved_feedback_until: None,
             view_only_byte_len: None,
             source_revision: 0,
-            body_ui_id: None,
         }
     }
 
@@ -34777,6 +34820,291 @@ mod tests {
     }
 
     #[test]
+    fn document_can_save는_8mib까지_허용하고_그_다음_byte부터_막는다() {
+        let dir = unique_temp_dir("save-limit-app");
+        let path = dir.join("a.md");
+        std::fs::write(&path, b"x").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded { revision, .. } = load else {
+            panic!("expected Loaded");
+        };
+        let mut document = stub_open_document(path.to_str().unwrap(), "x", "", true);
+        document.load_state = DocumentLoadState::Loaded {
+            revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+
+        document.source = "x".repeat(document_io::DOCUMENT_REFUSE_BYTES_MAX as usize);
+        assert!(document.can_save(), "정확히 8 MiB는 저장 가능해야 한다");
+        let exact_source = document.source.clone();
+        let exact = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: exact_source.clone(),
+            expected_revision: revision,
+        });
+        let document_io::DocumentSaveOutcome::Saved {
+            revision: exact_revision,
+        } = exact
+        else {
+            panic!("정확히 8 MiB 저장은 성공해야 한다");
+        };
+
+        document.source.push('x');
+        assert!(!document.can_save(), "8 MiB+1은 App 경계에서 막아야 한다");
+        let oversized = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: document.source.clone(),
+            expected_revision: exact_revision,
+        });
+        assert!(matches!(
+            oversized,
+            document_io::DocumentSaveOutcome::Failed {
+                code: document_io::DocumentIoErrorCode::ContentTooLarge
+            }
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), exact_source);
+
+        document.source.pop();
+        assert!(
+            document.can_save(),
+            "내용을 다시 8 MiB로 줄이면 저장 가능해야 한다"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn document_close_save_eligibility는_in_flight를_기다릴_수_있지만_초과_source는_막는다() {
+        let dir = unique_temp_dir("close-save-in-flight");
+        let path = dir.join("a.md");
+        std::fs::write(&path, b"x").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded { revision, .. } = load else {
+            panic!("expected Loaded");
+        };
+        let mut document = stub_open_document(path.to_str().unwrap(), "edited", "x", true);
+        document.load_state = DocumentLoadState::Loaded {
+            revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+        document.saving = true;
+
+        assert!(
+            !document.can_save(),
+            "in-flight 저장을 중복 요청하면 안 된다"
+        );
+        assert!(
+            document.can_save_then_close(),
+            "현재 저장 완료 후 닫기 continuation은 선택할 수 있어야 한다"
+        );
+
+        document.source = "x".repeat(document_io::DOCUMENT_REFUSE_BYTES_MAX as usize + 1);
+        assert!(
+            !document.can_save_then_close(),
+            "8 MiB 초과 source로는 저장 후 닫기를 선택할 수 없어야 한다"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn document_saved_outcome은_clean이_된_pending_close만_자동_완료한다() {
+        let id = ui::workspace::DocumentTabId(7);
+        let queue: std::collections::VecDeque<_> = [
+            DocumentPendingConfirm::CloseWithDirty { id },
+            DocumentPendingConfirm::CloseWithDirty {
+                id: ui::workspace::DocumentTabId(8),
+            },
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(should_complete_pending_close_after_save(&queue, id, false));
+        assert!(
+            !should_complete_pending_close_after_save(&queue, id, true),
+            "저장 중 새 편집이 들어와 여전히 dirty면 자동으로 닫으면 안 된다"
+        );
+        assert!(
+            !should_complete_pending_close_after_save(
+                &queue,
+                ui::workspace::DocumentTabId(9),
+                false,
+            ),
+            "닫기 intent가 없는 clean 문서를 저장 성공만으로 닫으면 안 된다"
+        );
+    }
+
+    #[test]
+    fn request_document_save는_상한을_clone보다_먼저_검사하고_close_continuation을_지운다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn request_document_save(&mut self")
+            .expect("request_document_save 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        let guard = function_body
+            .find("if !document.source_fits_save_limit()")
+            .expect("host 저장 경계 검사가 있어야 한다");
+        let first_clone = function_body
+            .find("document.source.clone()")
+            .expect("정상 저장 snapshot clone은 유지해야 한다");
+        assert!(
+            guard < first_clone,
+            "크기 검사는 첫 source clone보다 앞이어야 한다"
+        );
+        let overflow_branch = &function_body[guard..first_clone];
+        assert!(
+            overflow_branch.contains(
+                "document.save_error = Some(document_io::DocumentIoErrorCode::ContentTooLarge);"
+            ),
+            "초과 이유를 명시적으로 남겨야 한다: {overflow_branch}"
+        );
+        assert!(
+            overflow_branch.contains("self.document_close_after_save.remove(&id);")
+                && overflow_branch.contains("return;"),
+            "초과면 close-after-save를 제거하고 clone 전에 끝내야 한다: {overflow_branch}"
+        );
+        assert_eq!(
+            function_body.matches("document.source.clone()").count(),
+            2,
+            "정상 저장의 worker request와 saving snapshot 두 소유본은 유지해야 한다"
+        );
+    }
+
+    #[test]
+    fn document_save_infrastructure_failure는_target의_snapshot과_close_continuation을_정리한다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut documents = vec![
+            stub_open_document_id(a.0, "/tmp/a.md", "A2", "A1", true),
+            stub_open_document_id(b.0, "/tmp/b.md", "B2", "B1", true),
+        ];
+        for document in &mut documents {
+            document.saving = true;
+            document.saving_source = Some(document.source.clone());
+        }
+        let mut close_after_save: std::collections::HashSet<_> = [a, b].into_iter().collect();
+
+        apply_document_save_infrastructure_failure(&mut documents, &mut close_after_save, a);
+
+        let failed = documents.iter().find(|document| document.id == a).unwrap();
+        assert!(!failed.saving);
+        assert_eq!(failed.saving_source, None);
+        assert_eq!(
+            failed.save_error,
+            Some(document_io::DocumentIoErrorCode::ReadFailed)
+        );
+        assert!(!close_after_save.contains(&a));
+
+        let unaffected = documents.iter().find(|document| document.id == b).unwrap();
+        assert!(unaffected.saving);
+        assert_eq!(unaffected.saving_source.as_deref(), Some("B2"));
+        assert!(close_after_save.contains(&b));
+    }
+
+    #[test]
+    fn document_poll의_두_save_worker_인프라_실패는_같은_정리_helper를_쓴다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn poll_document_io(&mut self) {")
+            .expect("poll_document_io 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert_eq!(
+            function_body
+                .matches("apply_document_save_infrastructure_failure(")
+                .count(),
+            2,
+            "worker outcome Err와 admission Unavailable 모두 snapshot/continuation을 정리해야 한다"
+        );
+    }
+
+    #[test]
+    fn document_저장_상한은_toolbar와_dirty_close에서_같은_이유로_저장을_막는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let status_body = production
+            .split_once("fn document_toolbar_status_text(")
+            .expect("toolbar status 함수가 있어야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        let save_limit = status_body
+            .find("document.limit.save_too_large")
+            .expect("toolbar에 save 상한 이유가 있어야 한다");
+        let saved_feedback = status_body
+            .find("document.saved")
+            .expect("기존 저장 성공 피드백이 있어야 한다");
+        let editing_budget = status_body
+            .find("document.limit.grew_past_full")
+            .expect("기존 편집 권장 상한 이유가 있어야 한다");
+        assert!(
+            save_limit < saved_feedback && save_limit < editing_budget,
+            "절대 저장 상한 문구가 이전 Saved 피드백과 1 MiB 권장 상한보다 우선해야 한다"
+        );
+
+        let modal = production
+            .split_once("DocumentPendingConfirm::CloseWithDirty { id } => {")
+            .expect("dirty close modal 분기가 있어야 한다")
+            .1
+            .split_once("DocumentPendingConfirm::SaveConflict")
+            .expect("conflict modal 경계가 있어야 한다")
+            .0;
+        assert!(
+            modal.contains("document.limit.save_too_large"),
+            "dirty close에도 같은 초과 이유를 보여줘야 한다"
+        );
+        assert!(
+            modal.contains("document.is_some_and(OpenDocument::can_save_then_close)"),
+            "dirty close Save 버튼은 in-flight continuation을 허용하는 전용 자격을 써야 한다"
+        );
+        assert!(
+            !modal.contains("document.is_some_and(OpenDocument::can_save)"),
+            "일반 can_save는 saving 중 false라 dirty-close modal에 직접 쓰면 안 된다"
+        );
+        assert!(
+            modal.contains("ui.add_enabled(") && modal.contains("can_save,"),
+            "dirty close Save 버튼은 계산한 modal 자격으로 비활성화해야 한다"
+        );
+    }
+
+    #[test]
+    fn document_save_outcome은_clean이_된_stale_close_confirm을_닫기로_완료한다() {
+        let source = include_str!("app.rs");
+        let function_body = source
+            .split_once("fn apply_document_save_outcome(")
+            .expect("apply_document_save_outcome 정의를 찾아야 한다")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계를 찾아야 한다")
+            .0;
+        assert!(
+            function_body.contains("should_complete_pending_close_after_save("),
+            "저장 성공은 clean이 된 pending CloseWithDirty를 감지해야 한다"
+        );
+        assert!(
+            function_body.contains("self.close_document_entry(id);"),
+            "clean pending close는 원래 close intent대로 문서를 닫아야 한다"
+        );
+    }
+
+    #[test]
+    fn open_document에는_사용되지_않는_body_ui_state가_없다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production.matches("body_ui_id").count(),
+            0,
+            "절대 editor id 도입 뒤 body UI id 상태는 필요 없다"
+        );
+    }
+
+    #[test]
     fn document_load_state_from_outcome은_4티어를_올바르게_매핑한다() {
         let dir = unique_temp_dir("load-tiers");
 
@@ -35015,6 +35343,45 @@ mod tests {
             queue.len(),
             1,
             "같은 문서에 대한 확인이 중복으로 쌓이면 안 된다"
+        );
+    }
+
+    #[test]
+    fn enqueue_document_pending_confirm은_save_conflict로_같은_id의_close를_제자리_교체한다() {
+        let a = ui::workspace::DocumentTabId(1);
+        let b = ui::workspace::DocumentTabId(2);
+        let mut queue: std::collections::VecDeque<_> = [
+            DocumentPendingConfirm::CloseWithDirty { id: b },
+            DocumentPendingConfirm::CloseWithDirty { id: a },
+        ]
+        .into_iter()
+        .collect();
+
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::SaveConflict { id: a },
+        );
+
+        assert_eq!(
+            queue.iter().copied().collect::<Vec<_>>(),
+            vec![
+                DocumentPendingConfirm::CloseWithDirty { id: b },
+                DocumentPendingConfirm::SaveConflict { id: a },
+            ],
+            "A의 queue 위치와 B→A FIFO는 유지하면서 conflict만 유실되지 않아야 한다"
+        );
+
+        enqueue_document_pending_confirm(
+            &mut queue,
+            DocumentPendingConfirm::SaveConflict { id: a },
+        );
+        assert_eq!(
+            queue.iter().copied().collect::<Vec<_>>(),
+            vec![
+                DocumentPendingConfirm::CloseWithDirty { id: b },
+                DocumentPendingConfirm::SaveConflict { id: a },
+            ],
+            "같은 SaveConflict variant는 기존처럼 dedupe돼야 한다"
         );
     }
 

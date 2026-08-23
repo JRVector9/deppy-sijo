@@ -385,6 +385,7 @@ document.save = 儲存
 document.saved = 已儲存
 document.dirty = 未儲存
 document.loading = 載入中…
+document.limit.save_too_large = 編輯內容已保留 — 超過 8 MiB 時無法儲存。縮減內容後即可再次儲存。
 document.limit.grew_past_full = 目前 {bytes} 位元組 — 已超過 1 MiB 編輯上限，輸入可能變慢
 document.limit.view_only = 唯讀 — {bytes} 位元組(超過 1 MiB)
 document.limit.refused = 這份文件超過 8 MiB({bytes} 位元組),無法開啟。請嘗試用系統預設應用程式開啟。

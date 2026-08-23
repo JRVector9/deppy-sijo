@@ -124,6 +124,10 @@ fn width_bucket(available_width: f32) -> u32 {
     (available_width.max(0.0) / CONTENT_WIDTH_BUCKET_PX).floor() as u32
 }
 
+fn scroll_source_id(slot: MarkdownDocumentSlot) -> egui::Id {
+    egui::Id::new(("markdown_viewer_vertical", slot.0))
+}
+
 /// 로컬 PNG 이미지 검증 실패 사유. 등록을 생략하는 이유일 뿐 — 실패해도 렌더는
 /// 멈추지 않는다(§7.2: "decode 실패는 page 안 placeholder로 표시하고 render를
 /// 중단하지 않는다"). egui가 loader 없음으로 처리해 알아서 실패 placeholder를 그린다.
@@ -435,6 +439,19 @@ impl WorkspaceImageBroker {
         }
         prefix
     }
+
+    fn forget_document(&mut self, ctx: &egui::Context, slot: MarkdownDocumentSlot) {
+        if self
+            .last_generation
+            .is_none_or(|generation| generation.0 != slot.0)
+        {
+            return;
+        }
+        for uri in self.registered_uris.drain(..) {
+            ctx.forget_image(&uri);
+        }
+        self.last_generation = None;
+    }
 }
 
 /// Deppy가 소유하는 Markdown 뷰어. `egui_commonmark`는 이 구조체 안에서만 쓴다.
@@ -450,7 +467,10 @@ pub struct MarkdownViewer {
     /// slot별 가로 스크롤 영역 id. egui는 persisted 위젯 상태를 자동으로 GC하지 않아,
     /// 문서를 열고 닫을수록 오프셋이 무한정 쌓인다(2026-08-23 리뷰). 닫을 때 지우려면
     /// 실제 id를 알아야 하므로 그릴 때 받아 둔다.
-    horizontal_scroll_ids: std::collections::HashMap<u64, egui::Id>,
+    horizontal_scroll_ids: std::collections::HashMap<u64, std::collections::HashSet<egui::Id>>,
+    /// `show_scrollable` 내부 ScrollArea의 id에는 현재 parent UI id도 섞인다. 같은 slot도
+    /// Preview/Split parent에서 서로 달라지므로 실제 id를 모두 받아 둔다.
+    vertical_scroll_ids: std::collections::HashMap<u64, std::collections::HashSet<egui::Id>>,
 }
 
 impl Default for MarkdownViewer {
@@ -464,14 +484,27 @@ impl MarkdownViewer {
     /// persisted 상태를 자동으로 GC하지 않으므로, 안 지우면 세션 동안 열고 닫은
     /// 문서 수만큼 가로 스크롤 오프셋이 쌓인다.
     pub fn forget_document(&mut self, ctx: &egui::Context, slot: MarkdownDocumentSlot) {
-        if let Some(id) = self.horizontal_scroll_ids.remove(&slot.0) {
-            ctx.data_mut(|data| data.remove::<egui::scroll_area::State>(id));
+        let horizontal_ids = self
+            .horizontal_scroll_ids
+            .remove(&slot.0)
+            .unwrap_or_default();
+        let vertical_ids = self.vertical_scroll_ids.remove(&slot.0).unwrap_or_default();
+        ctx.data_mut(|data| {
+            for id in horizontal_ids.into_iter().chain(vertical_ids) {
+                data.remove::<egui::scroll_area::State>(id);
+            }
+        });
+        if self.scroll_key.map(|key| key.slot) == Some(slot.0) {
+            self.cache.clear_scrollable_with_id(scroll_source_id(slot));
+            self.scroll_key = None;
         }
         // 지금 이 문서를 보고 있었다면 파싱 캐시도 무의미하다.
         if self.destinations_key.map(|key| key.0) == Some(slot.0) {
             self.destinations_key = None;
             self.destinations = (Vec::new(), Vec::new());
+            self.cache.link_hooks_clear();
         }
+        self.image_broker.forget_document(ctx, slot);
     }
 
     pub fn new() -> Self {
@@ -482,6 +515,7 @@ impl MarkdownViewer {
             destinations_key: None,
             destinations: (Vec::new(), Vec::new()),
             horizontal_scroll_ids: std::collections::HashMap::new(),
+            vertical_scroll_ids: std::collections::HashMap::new(),
         }
     }
 
@@ -508,14 +542,15 @@ impl MarkdownViewer {
             scroll_key: scroll_key_slot,
             image_broker,
             destinations,
+            vertical_scroll_ids,
             ..
         } = self;
         let (image_refs, link_targets) = (&destinations.0, &destinations.1);
         let uri_prefix = image_broker.sync(ui.ctx(), image_refs, &view);
 
-        // 매 프레임 다시 등록한다 — `add_link_hook`은 매번 훅 상태를 false로 리셋하고
-        // `CommonMarkViewer::show*`도 호출 시작 시 전체를 리셋하므로(업스트림 문서),
-        // 여기서 소스가 바뀌어도 항상 최신 목적지 집합을 반영한다.
+        // 링크 훅은 현재 source의 집합만 소유한다. 값만 false로 리셋하면 과거
+        // revision의 destination key가 계속 남으므로 먼저 교체한다.
+        cache.link_hooks_clear();
         for dest in link_targets {
             cache.add_link_hook(dest.clone());
         }
@@ -542,7 +577,7 @@ impl MarkdownViewer {
         // `wrap_width`로 이미 pane 폭에 맞춰 접히므로 평소엔 스크롤바가 안 뜬다.
         let scroll_output = egui::ScrollArea::horizontal()
             // 문서마다 다른 id — 안 섞으면 A를 오른쪽으로 민 오프셋을 B가 이어받는다
-            // (2026-08-23 리뷰). 세로 위치는 `ScrollCacheKey`가 이미 문서별로 가른다.
+            // (2026-08-23 리뷰). 세로 위치는 slot 기반의 안정 id가 문서별로 가른다.
             .id_salt(("markdown_viewer_horizontal", destinations_key.0))
             .show(ui, |ui| {
                 egui::Frame::NONE
@@ -563,10 +598,21 @@ impl MarkdownViewer {
                             };
                             if *scroll_key_slot != Some(scroll_key) {
                                 if let Some(old_key) = *scroll_key_slot {
-                                    cache.clear_scrollable_with_id(old_key);
+                                    cache.clear_scrollable_with_id(scroll_source_id(
+                                        MarkdownDocumentSlot(old_key.slot),
+                                    ));
                                 }
                                 *scroll_key_slot = Some(scroll_key);
                             }
+
+                            let source_id = scroll_source_id(view.slot);
+                            let scroll_state_id = ui.make_persistent_id(egui::IdSalt::new(
+                                egui::Id::new(source_id).with("_scroll_area"),
+                            ));
+                            vertical_scroll_ids
+                                .entry(view.slot.0)
+                                .or_default()
+                                .insert(scroll_state_id);
 
                             CommonMarkViewer::new()
                                 .default_implicit_uri_scheme(uri_prefix)
@@ -577,12 +623,14 @@ impl MarkdownViewer {
                                 // raw HTML은 절대 켜지 않는다(§7.3) — `html_fn`을 `None`으로
                                 // 두면 HTML 블록/인라인이 텍스트로만 표시되고 실행되지 않는다
                                 // (업스트림 기본값, 여기서 명시적으로 강조해 둔다).
-                                .show_scrollable(scroll_key, ui, cache, source);
+                                .show_scrollable(source_id, ui, cache, source);
                         });
                     });
             });
         self.horizontal_scroll_ids
-            .insert(destinations_key.0, scroll_output.id);
+            .entry(destinations_key.0)
+            .or_default()
+            .insert(scroll_output.id);
 
         let Self { cache, .. } = self;
         link_targets
@@ -860,6 +908,115 @@ mod tests {
     // ── ④ 캐시: 같은 소스는 scrollable 캐시를 지우지 않는다 (되돌리면 실패) ────
 
     #[test]
+    fn link_hooks는_현재_source_집합으로_교체되고_닫으면_비워진다() {
+        let workspace = temp_dir("link-hook-replacement");
+        let ctx = egui::Context::default();
+        let slot = MarkdownDocumentSlot(7);
+        let mut viewer = MarkdownViewer::new();
+
+        for (revision, source) in [(1, "[A](https://a.example)"), (2, "[B](https://b.example)")] {
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                viewer.show(
+                    ui,
+                    source,
+                    MarkdownViewerContext {
+                        slot,
+                        revision: MarkdownSourceRevision(revision),
+                        workspace_root: &workspace,
+                        base_directory: &workspace,
+                    },
+                );
+            });
+        }
+
+        assert_eq!(viewer.cache.link_hooks().len(), 1);
+        assert!(viewer.cache.link_hooks().contains_key("https://b.example"));
+        viewer.forget_document(&ctx, slot);
+        assert!(viewer.cache.link_hooks().is_empty());
+    }
+
+    #[test]
+    fn forget_document는_target_slot의_이미지_loader_자원을_즉시_지운다() {
+        let workspace = temp_dir("forget-current-image");
+        write_png(&workspace.join("a.png"), 4, 4);
+        let ctx = egui::Context::default();
+        let slot = MarkdownDocumentSlot(2);
+        let mut viewer = MarkdownViewer::new();
+
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            viewer.show(
+                ui,
+                "![a](a.png)",
+                MarkdownViewerContext {
+                    slot,
+                    revision: MarkdownSourceRevision(1),
+                    workspace_root: &workspace,
+                    base_directory: &workspace,
+                },
+            );
+        });
+        let uri = viewer.image_broker.registered_uris[0].clone();
+        let size_hint = egui::load::SizeHint::default();
+        assert!(ctx.try_load_bytes(&uri).is_ok());
+        assert!(ctx.try_load_image(&uri, size_hint).is_ok());
+        assert!(
+            ctx.try_load_texture(&uri, egui::TextureOptions::default(), size_hint)
+                .is_ok()
+        );
+
+        viewer.forget_document(&ctx, slot);
+
+        assert!(viewer.image_broker.registered_uris.is_empty());
+        assert_eq!(viewer.image_broker.last_generation, None);
+        assert!(ctx.try_load_bytes(&uri).is_err());
+        assert!(ctx.try_load_image(&uri, size_hint).is_err());
+        assert!(
+            ctx.try_load_texture(&uri, egui::TextureOptions::default(), size_hint)
+                .is_err()
+        );
+        viewer.forget_document(&ctx, slot);
+    }
+
+    #[test]
+    fn forget_document는_background_slot으로_active_owner_자원을_지우지_않는다() {
+        let workspace = temp_dir("forget-background-owner");
+        write_png(&workspace.join("a.png"), 4, 4);
+        let ctx = egui::Context::default();
+        let active = MarkdownDocumentSlot(2);
+        let mut viewer = MarkdownViewer::new();
+
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            viewer.show(
+                ui,
+                "[A](https://a.example) ![a](a.png)",
+                MarkdownViewerContext {
+                    slot: active,
+                    revision: MarkdownSourceRevision(1),
+                    workspace_root: &workspace,
+                    base_directory: &workspace,
+                },
+            );
+        });
+        let uri = viewer.image_broker.registered_uris[0].clone();
+        let scroll_key = viewer.scroll_key;
+
+        viewer.forget_document(&ctx, MarkdownDocumentSlot(1));
+
+        assert_eq!(viewer.scroll_key, scroll_key);
+        assert_eq!(viewer.destinations_key, Some((active.0, 1)));
+        assert_eq!(viewer.image_broker.last_generation, Some((active.0, 1)));
+        assert_eq!(viewer.image_broker.registered_uris, vec![uri.clone()]);
+        assert!(viewer.cache.link_hooks().contains_key("https://a.example"));
+        assert!(ctx.try_load_bytes(&uri).is_ok());
+        assert!(
+            viewer
+                .cache
+                .clear_scrollable_with_id(scroll_source_id(active)),
+            "background slot 정리 뒤에도 active CommonMark cache는 남아야 한다"
+        );
+    }
+
+    #[test]
     fn 목적지_파싱은_소스가_그대로면_다시_돌지_않는다() {
         // 매 프레임 전체 소스를 다시 파싱하면 1 MiB에서 2.7ms, 8 MiB에서 26ms가 든다
         // (2026-08-23 리뷰 실측) — revision이 그대로면 캐시를 그대로 써야 한다.
@@ -919,11 +1076,186 @@ mod tests {
         });
         assert_eq!(
             viewer.scroll_key, first_key,
-            "리비전이 그대로면 scroll_key(=scrollable 캐시 id)가 바뀌면 안 된다"
+            "리비전이 그대로면 render signature가 바뀌면 안 된다"
+        );
+    }
+
+    #[test]
+    fn 문서가_바뀌면_이전_owner의_commonmark_scroll_cache를_지운다() {
+        let mut viewer = MarkdownViewer::new();
+        let workspace = temp_dir("scroll-cache-owner-switch");
+        let ctx = egui::Context::default();
+        let first = MarkdownDocumentSlot(7);
+        let second = MarkdownDocumentSlot(8);
+
+        let render = |viewer: &mut MarkdownViewer, slot| {
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                viewer.show(
+                    ui,
+                    "# 제목\n\n본문",
+                    MarkdownViewerContext {
+                        slot,
+                        revision: MarkdownSourceRevision(1),
+                        workspace_root: &workspace,
+                        base_directory: &workspace,
+                    },
+                );
+            });
+        };
+
+        render(&mut viewer, first);
+        assert!(
+            viewer
+                .cache
+                .clear_scrollable_with_id(scroll_source_id(first)),
+            "owner 전환 전에는 첫 문서의 CommonMark cache가 실제로 있어야 한다"
+        );
+        render(&mut viewer, first);
+        render(&mut viewer, second);
+
+        assert!(
+            !viewer
+                .cache
+                .clear_scrollable_with_id(scroll_source_id(first)),
+            "A→B 전환은 이전 A owner의 cache를 지워야 한다"
+        );
+        assert!(
+            viewer
+                .cache
+                .clear_scrollable_with_id(scroll_source_id(second)),
+            "현재 B owner의 cache는 남겨야 한다"
         );
     }
 
     // ── ⑤ egui_kittest: 대표 문서가 패닉 없이 그려진다 ──────────────────────────
+
+    #[test]
+    fn revision이_바뀌어도_실제_세로_scroll_state는_하나이고_offset을_보존한다() {
+        let mut viewer = MarkdownViewer::new();
+        let workspace = temp_dir("stable-vertical-scroll");
+        let source = (0..300)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let ctx = egui::Context::default();
+        let slot = MarkdownDocumentSlot(7);
+
+        let render = |viewer: &mut MarkdownViewer, revision| {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(500.0, 220.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.push_id("stable-parent", |ui| {
+                        viewer.show(
+                            ui,
+                            &source,
+                            MarkdownViewerContext {
+                                slot,
+                                revision: MarkdownSourceRevision(revision),
+                                workspace_root: &workspace,
+                                base_directory: &workspace,
+                            },
+                        );
+                    });
+                },
+            );
+        };
+
+        render(&mut viewer, 1);
+        let state_id = *viewer
+            .vertical_scroll_ids
+            .get(&slot.0)
+            .and_then(|ids| ids.iter().next())
+            .expect("실제 vertical ScrollArea id를 추적해야 한다");
+        let mut state = egui::scroll_area::State::load(&ctx, state_id).unwrap();
+        state.offset.y = 77.0;
+        state.store(&ctx, state_id);
+
+        for revision in 2..=100 {
+            render(&mut viewer, revision);
+        }
+
+        let ids = viewer.vertical_scroll_ids.get(&slot.0).unwrap();
+        assert_eq!(ids.len(), 1, "revision마다 vertical state가 늘면 안 된다");
+        assert_eq!(*ids.iter().next().unwrap(), state_id);
+        assert!(
+            egui::scroll_area::State::load(&ctx, state_id)
+                .unwrap()
+                .offset
+                .y
+                > 0.0,
+            "revision 변경 뒤에도 offset을 보존해야 한다"
+        );
+    }
+
+    #[test]
+    fn forget_document는_preview_split의_모든_실제_scroll_state를_지운다() {
+        let mut viewer = MarkdownViewer::new();
+        let workspace = temp_dir("forget-all-scroll-states");
+        let ctx = egui::Context::default();
+        let slot = MarkdownDocumentSlot(7);
+
+        for (parent, revision) in [("preview-parent", 1), ("split-parent", 2)] {
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                ui.push_id(parent, |ui| {
+                    viewer.show(
+                        ui,
+                        "# title\n\nbody",
+                        MarkdownViewerContext {
+                            slot,
+                            revision: MarkdownSourceRevision(revision),
+                            workspace_root: &workspace,
+                            base_directory: &workspace,
+                        },
+                    );
+                });
+            });
+        }
+
+        let horizontal_ids = viewer.horizontal_scroll_ids.get(&slot.0).unwrap().clone();
+        let vertical_ids = viewer.vertical_scroll_ids.get(&slot.0).unwrap().clone();
+        assert_eq!(horizontal_ids.len(), 2);
+        assert_eq!(vertical_ids.len(), 2);
+        for id in horizontal_ids.iter().chain(&vertical_ids) {
+            assert!(egui::scroll_area::State::load(&ctx, *id).is_some());
+        }
+        assert!(
+            viewer
+                .cache
+                .clear_scrollable_with_id(scroll_source_id(slot)),
+            "닫기 전에 현재 slot의 CommonMark cache가 있어야 한다"
+        );
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            ui.push_id("split-parent", |ui| {
+                viewer.show(
+                    ui,
+                    "# title\n\nbody",
+                    MarkdownViewerContext {
+                        slot,
+                        revision: MarkdownSourceRevision(2),
+                        workspace_root: &workspace,
+                        base_directory: &workspace,
+                    },
+                );
+            });
+        });
+
+        viewer.forget_document(&ctx, slot);
+
+        for id in horizontal_ids.iter().chain(&vertical_ids) {
+            assert!(egui::scroll_area::State::load(&ctx, *id).is_none());
+        }
+        assert!(
+            !viewer
+                .cache
+                .clear_scrollable_with_id(scroll_source_id(slot))
+        );
+    }
 
     struct MarkdownHarnessState {
         viewer: MarkdownViewer,

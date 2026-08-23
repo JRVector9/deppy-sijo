@@ -9033,6 +9033,11 @@ struct OpenDocument {
     dirty: bool,
     /// 저장 요청이 이미 나가 있는 동안 true — 저장 버튼 중복 클릭을 막는다.
     saving: bool,
+    /// 저장 워커에 **실제로 보낸** 내용. 저장은 요청 시점 스냅샷을 디스크에 쓰는데,
+    /// 그 사이에도 편집기는 계속 입력을 받는다. 완료 시 `saved_source`를 현재 버퍼로
+    /// 스탬프하면 디스크에 없는 편집분까지 "저장됨"이 되어 **조용히 사라진다**
+    /// (2026-08-23 리뷰 CRITICAL). 그래서 보낸 스냅샷을 들고 있다가 그걸로 스탬프한다.
+    saving_source: Option<String>,
     /// 마지막 저장 실패 이유 — 편집을 계속할 수 있어야 하므로(§6은 로드 실패만
     /// 전면 차단이다) `load_state`를 덮어쓰지 않고 이 필드에만 남긴다. 다음 편집이나
     /// 저장 재시도에서 지운다.
@@ -9160,8 +9165,13 @@ fn apply_save_outcome_to_document(
     match outcome {
         document_io::DocumentSaveOutcome::Saved { revision } => {
             document.saving = false;
-            document.saved_source = document.source.clone();
-            document.dirty = false;
+            // 디스크에 들어간 것은 **요청 시점 스냅샷**이다. 저장 중에 들어온 편집은
+            // 아직 저장되지 않았으므로 dirty로 남아야 한다(위 `saving_source` 주석).
+            document.saved_source = document
+                .saving_source
+                .take()
+                .unwrap_or_else(|| document.source.clone());
+            document.dirty = document.source != document.saved_source;
             document.save_error = None;
             document.saved_feedback_until =
                 Some(std::time::Instant::now() + DOCUMENT_SAVED_FEEDBACK_DURATION);
@@ -9172,10 +9182,12 @@ fn apply_save_outcome_to_document(
         }
         document_io::DocumentSaveOutcome::Conflict => {
             document.saving = false;
+            document.saving_source = None;
             Some(DocumentPendingConfirm::SaveConflict { id })
         }
         document_io::DocumentSaveOutcome::Failed { code } => {
             document.saving = false;
+            document.saving_source = None;
             document.save_error = Some(*code);
             None
         }
@@ -16138,6 +16150,7 @@ impl App {
         };
         document.saving = true;
         document.save_error = None;
+        document.saving_source = Some(document.source.clone());
         self.document_pending_saves.push_back((
             id,
             document_io::DocumentSaveRequest {
@@ -16347,6 +16360,7 @@ impl App {
             saved_source: String::new(),
             dirty: false,
             saving: false,
+            saving_source: None,
             save_error: None,
             saved_feedback_until: None,
             view_only_byte_len: None,
@@ -16601,7 +16615,22 @@ impl App {
                 self.egui_ctx
                     .request_repaint_after(DOCUMENT_SAVED_FEEDBACK_DURATION);
                 if self.document_close_after_save.remove(&id) {
-                    self.close_document_entry(id);
+                    // 저장 중에 들어온 편집이 있으면 아직 dirty다 — 그대로 닫으면
+                    // 그 편집이 경고 없이 사라진다(2026-08-23 리뷰 CRITICAL).
+                    // 닫지 말고 확인을 다시 받는다.
+                    let still_dirty = self
+                        .documents
+                        .iter()
+                        .find(|document| document.id == id)
+                        .is_some_and(|document| document.dirty);
+                    if still_dirty {
+                        enqueue_document_pending_confirm(
+                            &mut self.document_pending_confirms,
+                            DocumentPendingConfirm::CloseWithDirty { id },
+                        );
+                    } else {
+                        self.close_document_entry(id);
+                    }
                 }
             }
             document_io::DocumentSaveOutcome::Failed { .. } => {
@@ -34342,6 +34371,7 @@ mod tests {
             saved_source: saved_source.to_owned(),
             dirty,
             saving: false,
+            saving_source: None,
             save_error: None,
             saved_feedback_until: None,
             view_only_byte_len: None,
@@ -34847,6 +34877,58 @@ mod tests {
             !document.saving,
             "충돌 결과를 받으면 저장 중 플래그는 내려간다"
         );
+    }
+
+    #[test]
+    fn 저장_중_들어온_편집은_저장됨으로_표시되지_않는다() {
+        // 저장은 **요청 시점 스냅샷**을 디스크에 쓴다. 그 사이에도 편집기는 입력을
+        // 받으므로, 완료 시 `saved_source`를 현재 버퍼로 스탬프하면 디스크에 없는
+        // 편집분까지 "저장됨"이 되어 조용히 사라진다(2026-08-23 리뷰 CRITICAL).
+        let dir = unique_temp_dir("save-outcome-raced");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded {
+            revision: initial_revision,
+            ..
+        } = load
+        else {
+            panic!("expected Loaded");
+        };
+
+        let mut document = stub_open_document(path.to_str().unwrap(), "SENT", "ORIGINAL", true);
+        document.load_state = DocumentLoadState::Loaded {
+            revision: initial_revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+
+        // 워커에 "SENT"를 보낸 상태.
+        document.saving = true;
+        document.saving_source = Some("SENT".to_owned());
+        let save = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: "SENT".to_owned(),
+            expected_revision: initial_revision,
+        });
+
+        // 결과가 도착하기 전에 사용자가 한 글자 더 쳤다.
+        document.source = "SENT+MORE".to_owned();
+
+        let confirm =
+            apply_save_outcome_to_document(ui::workspace::DocumentTabId(0), &mut document, &save);
+
+        assert_eq!(confirm, None);
+        assert_eq!(
+            document.saved_source, "SENT",
+            "디스크에 들어간 것은 보낸 스냅샷이다"
+        );
+        assert!(
+            document.dirty,
+            "저장 중 들어온 편집은 아직 저장되지 않았으므로 dirty로 남아야 한다"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SENT");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

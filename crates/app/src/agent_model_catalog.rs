@@ -12,7 +12,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::agent_launcher::{AgentKind, ModelChoice, ReasoningEffort};
 
@@ -440,10 +441,86 @@ enum GrokModelCollection {
     Object(BTreeMap<String, GrokCacheEntry>),
 }
 
-#[derive(Deserialize)]
 struct GrokCacheEntry {
-    #[serde(default)]
     info: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for GrokCacheEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct GrokCacheEntryVisitor;
+
+        impl<'de> Visitor<'de> for GrokCacheEntryVisitor {
+            type Value = GrokCacheEntry;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Grok model cache entry")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut info = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "info" {
+                        info = Some(map.next_value()?);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(GrokCacheEntry { info })
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(GrokCacheEntry { info: None })
+            }
+        }
+
+        deserializer.deserialize_any(GrokCacheEntryVisitor)
+    }
 }
 
 #[derive(Deserialize)]
@@ -1165,6 +1242,19 @@ display_name = "Ok"
         let models = parse_grok(
             r#"{"models":{
               "missing-info":{"api_key":"must-not-be-projected"},
+              "grok-4.6":{"api_key":"must-not-be-projected","info":{"name":"Grok 4.6"}}
+            }}"#,
+            None,
+        );
+        assert_eq!(values(&models), ["grok-4.6"]);
+        assert_eq!(models[0].label(), "Grok 4.6");
+    }
+
+    #[test]
+    fn grok_object_catalog_drops_only_non_object_entries() {
+        let models = parse_grok(
+            r#"{"models":{
+              "broken":"not-an-object",
               "grok-4.6":{"api_key":"must-not-be-projected","info":{"name":"Grok 4.6"}}
             }}"#,
             None,

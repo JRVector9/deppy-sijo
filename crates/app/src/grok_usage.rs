@@ -50,12 +50,8 @@ fn fresh_usage_after(usage: GrokUsage, elapsed: Duration) -> Option<GrokUsage> {
     (elapsed <= STALE_AFTER).then_some(usage)
 }
 
-fn last_request_after_spawn(
-    previous: Option<Instant>,
-    attempted: Instant,
-    spawned: bool,
-) -> Option<Instant> {
-    if spawned { Some(attempted) } else { previous }
+fn last_request_after_spawn(attempted: Instant) -> Instant {
+    attempted
 }
 
 pub(crate) fn current(ctx: &egui::Context, executable: Option<&Path>) -> Option<GrokUsage> {
@@ -88,7 +84,7 @@ pub(crate) fn current(ctx: &egui::Context, executable: Option<&Path>) -> Option<
                 repaint.request_repaint();
             })
             .is_ok();
-        state.last_request = last_request_after_spawn(state.last_request, attempted, spawned);
+        state.last_request = Some(last_request_after_spawn(attempted));
         if spawned {
             state.pending = Some(receiver);
         }
@@ -451,18 +447,9 @@ Credits left: $1,234.50
     }
 
     #[test]
-    fn failed_probe_spawn_does_not_advance_last_request() {
-        let previous = Instant::now() - Duration::from_secs(120);
+    fn failed_probe_spawn_records_attempt_to_throttle_retries() {
         let attempted = Instant::now();
-        assert_eq!(last_request_after_spawn(None, attempted, false), None);
-        assert_eq!(
-            last_request_after_spawn(Some(previous), attempted, false),
-            Some(previous)
-        );
-        assert_eq!(
-            last_request_after_spawn(Some(previous), attempted, true),
-            Some(attempted)
-        );
+        assert_eq!(last_request_after_spawn(attempted), attempted);
     }
 
     #[test]

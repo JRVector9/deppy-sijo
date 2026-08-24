@@ -9170,6 +9170,35 @@ fn document_load_state_from_outcome(
     }
 }
 
+fn apply_document_load_outcome_to_document(
+    document: &mut OpenDocument,
+    outcome: document_io::DocumentLoadOutcome,
+) {
+    document.load_state = document_load_state_from_outcome(&outcome);
+    document.view_only_byte_len = None;
+    match outcome {
+        document_io::DocumentLoadOutcome::Loaded { source, .. } => {
+            document.saved_source = source.clone();
+            document.source = source;
+            document.dirty = false;
+        }
+        document_io::DocumentLoadOutcome::ViewOnly {
+            source, byte_len, ..
+        } => {
+            document.saved_source = source.clone();
+            document.source = source;
+            document.dirty = false;
+            document.view_only_byte_len = Some(byte_len);
+        }
+        document_io::DocumentLoadOutcome::Refused { .. }
+        | document_io::DocumentLoadOutcome::Binary { .. }
+        | document_io::DocumentLoadOutcome::Failed { .. } => {}
+    }
+    document.save_error = None;
+    document.saved_feedback_until = None;
+    document.source_revision = document.source_revision.wrapping_add(1);
+}
+
 /// 저장 결과를 문서 필드에 반영한다 — Conflict는 `source`를 절대 건드리지 않는다
 /// (설계 §7, 이 함수의 가장 중요한 계약). 확인 모달이 필요하면 그 종류를 돌려주고,
 /// 필요 없으면(저장 성공/실패) `None`을 돌려준다 — App은 `Some`이면 continuation을
@@ -9427,6 +9456,105 @@ fn find_open_document_by_path(
         .map(|document| document.id)
 }
 
+fn retained_document_bytes(document: &OpenDocument) -> Option<u64> {
+    let source = u64::try_from(document.source.len()).ok()?;
+    let saved_source = u64::try_from(document.saved_source.len()).ok()?;
+    source.checked_add(saved_source)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DocumentLoadAdmission {
+    Missing,
+    Admit {
+        evict: Vec<ui::workspace::DocumentTabId>,
+    },
+    Reject,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DocumentLoadAdmissionExecution {
+    apply_outcome: bool,
+    show_cap_notice: bool,
+}
+
+fn execute_document_load_admission(
+    admission: DocumentLoadAdmission,
+    incoming_id: ui::workspace::DocumentTabId,
+    mut close_document: impl FnMut(ui::workspace::DocumentTabId),
+) -> DocumentLoadAdmissionExecution {
+    match admission {
+        DocumentLoadAdmission::Missing => DocumentLoadAdmissionExecution {
+            apply_outcome: false,
+            show_cap_notice: false,
+        },
+        DocumentLoadAdmission::Admit { evict } => {
+            for victim in evict {
+                close_document(victim);
+            }
+            DocumentLoadAdmissionExecution {
+                apply_outcome: true,
+                show_cap_notice: false,
+            }
+        }
+        DocumentLoadAdmission::Reject => {
+            close_document(incoming_id);
+            DocumentLoadAdmissionExecution {
+                apply_outcome: false,
+                show_cap_notice: true,
+            }
+        }
+    }
+}
+
+fn plan_document_load_admission(
+    documents: &[OpenDocument],
+    incoming_id: ui::workspace::DocumentTabId,
+    incoming_source_bytes: u64,
+    active_document: Option<ui::workspace::DocumentTabId>,
+) -> DocumentLoadAdmission {
+    if !documents.iter().any(|document| document.id == incoming_id) {
+        return DocumentLoadAdmission::Missing;
+    }
+    let Some(incoming_retained) = incoming_source_bytes.checked_mul(2) else {
+        return DocumentLoadAdmission::Reject;
+    };
+    let mut remaining: Vec<&OpenDocument> = documents
+        .iter()
+        .filter(|document| document.id != incoming_id)
+        .collect();
+    let Some(existing_retained) = remaining.iter().try_fold(0_u64, |total, document| {
+        total.checked_add(retained_document_bytes(document)?)
+    }) else {
+        return DocumentLoadAdmission::Reject;
+    };
+    let Some(mut retained) = existing_retained.checked_add(incoming_retained) else {
+        return DocumentLoadAdmission::Reject;
+    };
+    let mut evict = Vec::new();
+
+    while retained > DOCUMENT_TOTAL_RETAINED_BYTES_MAX {
+        let Some(position) = remaining.iter().position(|document| {
+            !document.dirty
+                && !document.saving
+                && Some(document.id) != active_document
+                && retained_document_bytes(document).is_some_and(|bytes| bytes > 0)
+        }) else {
+            return DocumentLoadAdmission::Reject;
+        };
+        let victim = remaining.remove(position);
+        let Some(victim_retained) = retained_document_bytes(victim) else {
+            return DocumentLoadAdmission::Reject;
+        };
+        let Some(next_retained) = retained.checked_sub(victim_retained) else {
+            return DocumentLoadAdmission::Reject;
+        };
+        retained = next_retained;
+        evict.push(victim.id);
+    }
+
+    DocumentLoadAdmission::Admit { evict }
+}
+
 /// 새 문서 하나를 위해 상한(개수 `DOCUMENT_TABS_MAX`·바이트
 /// `DOCUMENT_TOTAL_RETAINED_BYTES_MAX`, 설계 §4) 안으로 자리를 만들려면 어떤
 /// 문서들을(가장 먼저 연 것부터) 닫아야 하는지 결정한다 — 순수 함수라 App 없이
@@ -9438,24 +9566,26 @@ fn plan_document_eviction(
     documents: &[OpenDocument],
     active_document: Option<ui::workspace::DocumentTabId>,
 ) -> Option<Vec<ui::workspace::DocumentTabId>> {
-    // 실제 힙 보유량은 source 하나가 아니라 source + saved_source 두 사본이다 —
+    // 논리 보유량은 source 하나가 아니라 source + saved_source 두 사본이다 —
     // `apply_document_load_outcome`이 로드마다 saved_source도 항상 채우고(dirty
     // 판정 기준이라 저장 후에도 계속 들고 있어야 한다), source만 세면 상한이 실제
     // 보유량의 절반만 반영한다(2026-08-22 리뷰).
-    let retained_bytes =
-        |document: &OpenDocument| document.source.len() as u64 + document.saved_source.len() as u64;
     let mut remaining: Vec<&OpenDocument> = documents.iter().collect();
-    let mut bytes: u64 = remaining
-        .iter()
-        .map(|document| retained_bytes(document))
-        .sum();
+    let mut bytes = remaining.iter().try_fold(0_u64, |total, document| {
+        total.checked_add(retained_document_bytes(document)?)
+    })?;
     let mut evict = Vec::new();
     while remaining.len() + 1 > DOCUMENT_TABS_MAX || bytes > DOCUMENT_TOTAL_RETAINED_BYTES_MAX {
-        let position = remaining
-            .iter()
-            .position(|document| !document.dirty && Some(document.id) != active_document)?;
+        let needs_tab_room = remaining.len() + 1 > DOCUMENT_TABS_MAX;
+        let position = remaining.iter().position(|document| {
+            !document.dirty
+                && !document.saving
+                && Some(document.id) != active_document
+                && (needs_tab_room
+                    || retained_document_bytes(document).is_some_and(|bytes| bytes > 0))
+        })?;
         let victim = remaining.remove(position);
-        bytes -= retained_bytes(victim);
+        bytes = bytes.checked_sub(retained_document_bytes(victim)?)?;
         evict.push(victim.id);
     }
     Some(evict)
@@ -9539,11 +9669,10 @@ const DOCUMENT_SAVED_FEEDBACK_DURATION: std::time::Duration =
 /// 헤더 축약 사다리(×부터 접는다)가 충분히 감당하는 수다.
 const DOCUMENT_TABS_MAX: usize = 8;
 
-/// 열려 있는 문서들의 **실제 힙 보유량** 상한(멀티 문서 탭 설계 §4) — `source` +
-/// `saved_source` 두 사본을 합친 값이다(`plan_document_eviction`의
-/// `retained_bytes`). `apply_document_load_outcome`이 로드마다 saved_source도
-/// 항상 채워 dirty 판정용 사본을 계속 들고 있으므로, source 하나만 세면 이 상수가
-/// 실제 보유량의 절반만 반영하게 된다(2026-08-22 리뷰 — 예전 버그). 문서 하나가
+/// 열려 있는 문서들의 **논리 텍스트 보유량** 상한(멀티 문서 탭 설계 §4) — `source` +
+/// `saved_source` 두 문자열 길이를 합친 값이다(`retained_document_bytes`).
+/// `apply_document_load_outcome`이 로드마다 saved_source도 항상 채워 dirty 판정용 사본을
+/// 계속 들고 있으므로, source 하나만 세면 보유한 텍스트의 절반만 반영하게 된다. 문서 하나가
 /// §6 ViewOnly 티어로 최대 8 MiB(`document_io::DOCUMENT_REFUSE_BYTES_MAX`)까지 열릴
 /// 수 있다. `DOCUMENT_TABS_MAX`(8개)보다 훨씬 작게 잡아, 큰 ViewOnly 문서 몇 개만
 /// 몰려도(개수 상한에 한참 못 미쳐도) 전체 보유량이 무한정 커지지 않게 한다 —
@@ -16619,33 +16748,36 @@ impl App {
         id: ui::workspace::DocumentTabId,
         outcome: document_io::DocumentLoadOutcome,
     ) {
-        let load_state = document_load_state_from_outcome(&outcome);
-        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
-            return;
-        };
-        document.load_state = load_state;
-        document.view_only_byte_len = None;
-        match outcome {
-            document_io::DocumentLoadOutcome::Loaded { source, .. } => {
-                document.saved_source = source.clone();
-                document.source = source;
-                document.dirty = false;
-            }
-            document_io::DocumentLoadOutcome::ViewOnly {
-                source, byte_len, ..
-            } => {
-                document.saved_source = source.clone();
-                document.source = source;
-                document.dirty = false;
-                document.view_only_byte_len = Some(byte_len);
+        let incoming_source_bytes = match &outcome {
+            document_io::DocumentLoadOutcome::Loaded { source, .. }
+            | document_io::DocumentLoadOutcome::ViewOnly { source, .. } => {
+                Some(u64::try_from(source.len()).unwrap_or(u64::MAX))
             }
             document_io::DocumentLoadOutcome::Refused { .. }
             | document_io::DocumentLoadOutcome::Binary { .. }
-            | document_io::DocumentLoadOutcome::Failed { .. } => {}
+            | document_io::DocumentLoadOutcome::Failed { .. } => None,
+        };
+        if let Some(incoming_source_bytes) = incoming_source_bytes {
+            let admission = plan_document_load_admission(
+                &self.documents,
+                id,
+                incoming_source_bytes,
+                self.active_document,
+            );
+            let execution = execute_document_load_admission(admission, id, |victim| {
+                self.close_document_entry(victim);
+            });
+            if execution.show_cap_notice {
+                self.document_cap_notice = true;
+            }
+            if !execution.apply_outcome {
+                return;
+            }
         }
-        document.save_error = None;
-        document.saved_feedback_until = None;
-        document.source_revision = document.source_revision.wrapping_add(1);
+        let Some(document) = self.documents.iter_mut().find(|document| document.id == id) else {
+            return;
+        };
+        apply_document_load_outcome_to_document(document, outcome);
     }
 
     /// 저장 결과를 App 상태로 반영한다 — Conflict는 덮어쓰지 않고 확인 상태로 간다
@@ -34503,6 +34635,343 @@ mod tests {
         }
     }
 
+    fn stub_loaded_document_id(
+        id: u32,
+        path: &str,
+        source: &str,
+        saved_source: &str,
+        dirty: bool,
+    ) -> OpenDocument {
+        let dir = unique_temp_dir("loaded-stub-revision");
+        let fixture = dir.join("fixture.txt");
+        std::fs::write(&fixture, b"x").unwrap();
+        let revision =
+            match document_io::load_document(&document_io::DocumentLoadRequest { path: fixture }) {
+                document_io::DocumentLoadOutcome::Loaded { revision, .. } => revision,
+                _ => panic!("stub revision fixture must load"),
+            };
+        let _ = std::fs::remove_dir_all(dir);
+        let mut document = stub_open_document_id(id, path, source, saved_source, dirty);
+        document.load_state = DocumentLoadState::Loaded {
+            revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+        document
+    }
+
+    #[test]
+    fn plan_document_load_admission은_닫힌_incoming의_늦은_결과를_missing으로_버린다() {
+        let documents = vec![stub_loaded_document_id(
+            1,
+            "/tmp/unrelated.md",
+            "kept",
+            "kept",
+            false,
+        )];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(99),
+                u64::MAX,
+                Some(ui::workspace::DocumentTabId(1)),
+            ),
+            DocumentLoadAdmission::Missing
+        );
+        assert_eq!(
+            documents.len(),
+            1,
+            "planner는 unrelated 문서를 변경하지 않는다"
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_0byte_loading을_건너뛰고_oldest_clean_loaded를_고른다() {
+        let eight_mib = "a".repeat(8 * 1024 * 1024);
+        let documents = vec![
+            stub_loaded_document_id(1, "/tmp/loaded.md", &eight_mib, &eight_mib, false),
+            stub_open_document_id(2, "/tmp/still-loading.md", "", "", false),
+            stub_open_document_id(3, "/tmp/incoming.md", "", "", false),
+        ];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(3),
+                eight_mib.len() as u64,
+                Some(ui::workspace::DocumentTabId(3)),
+            ),
+            DocumentLoadAdmission::Admit {
+                evict: vec![ui::workspace::DocumentTabId(1)]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_exact_24mib를_허용한다() {
+        let four_mib = "a".repeat(4 * 1024 * 1024);
+        let documents = vec![
+            stub_loaded_document_id(1, "/tmp/existing.md", &four_mib, &four_mib, false),
+            stub_open_document_id(2, "/tmp/incoming.md", "", "", false),
+        ];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(2),
+                (8 * 1024 * 1024) as u64,
+                Some(ui::workspace::DocumentTabId(2)),
+            ),
+            DocumentLoadAdmission::Admit { evict: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_dirty_active_saving을_각각_보호한다() {
+        let eight_mib = "a".repeat(8 * 1024 * 1024);
+        for protected in ["dirty", "active", "saving"] {
+            let mut existing = stub_loaded_document_id(
+                1,
+                "/tmp/protected.md",
+                &eight_mib,
+                &eight_mib,
+                protected == "dirty",
+            );
+            existing.saving = protected == "saving";
+            let documents = vec![
+                existing,
+                stub_open_document_id(2, "/tmp/incoming.md", "", "", false),
+            ];
+            let active = if protected == "active" {
+                Some(ui::workspace::DocumentTabId(1))
+            } else {
+                Some(ui::workspace::DocumentTabId(2))
+            };
+
+            assert_eq!(
+                plan_document_load_admission(
+                    &documents,
+                    ui::workspace::DocumentTabId(2),
+                    eight_mib.len() as u64,
+                    active,
+                ),
+                DocumentLoadAdmission::Reject,
+                "{protected} 문서를 자동으로 닫으면 안 된다"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_document_load_admission은_0byte를_보존하고_필요한_victim을_oldest_first로_고른다() {
+        let one_mib = "a".repeat(1024 * 1024);
+        let two_mib = "b".repeat(2 * 1024 * 1024);
+        let three_mib = "c".repeat(3 * 1024 * 1024);
+        let documents = vec![
+            stub_loaded_document_id(1, "/tmp/first.md", &one_mib, &one_mib, false),
+            stub_open_document_id(2, "/tmp/loading.md", "", "", false),
+            stub_loaded_document_id(3, "/tmp/second.md", &two_mib, &two_mib, false),
+            stub_loaded_document_id(4, "/tmp/protected.md", &three_mib, &three_mib, true),
+            stub_open_document_id(5, "/tmp/incoming.md", "", "", false),
+        ];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(5),
+                (8 * 1024 * 1024) as u64,
+                Some(ui::workspace::DocumentTabId(5)),
+            ),
+            DocumentLoadAdmission::Admit {
+                evict: vec![
+                    ui::workspace::DocumentTabId(1),
+                    ui::workspace::DocumentTabId(3),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_reload의_기존_두사본을_새_결과로_교체해_계산한다() {
+        let eight_mib = "a".repeat(8 * 1024 * 1024);
+        let documents = vec![stub_loaded_document_id(
+            1,
+            "/tmp/reload.md",
+            &eight_mib,
+            &eight_mib,
+            false,
+        )];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(1),
+                eight_mib.len() as u64,
+                Some(ui::workspace::DocumentTabId(1)),
+            ),
+            DocumentLoadAdmission::Admit { evict: Vec::new() },
+            "incoming의 기존 source/saved_source를 새 결과와 중복 계산하면 안 된다"
+        );
+    }
+
+    #[test]
+    fn plan_document_load_admission은_산술_overflow를_reject한다() {
+        let documents = vec![stub_open_document_id(1, "/tmp/incoming.md", "", "", false)];
+
+        assert_eq!(
+            plan_document_load_admission(
+                &documents,
+                ui::workspace::DocumentTabId(1),
+                u64::MAX,
+                Some(ui::workspace::DocumentTabId(1)),
+            ),
+            DocumentLoadAdmission::Reject
+        );
+    }
+
+    #[test]
+    fn execute_document_load_admission은_missing이면_문서와_notice를_건드리지_않는다() {
+        let mut documents = vec![stub_loaded_document_id(
+            1,
+            "/tmp/unrelated.md",
+            "kept",
+            "kept",
+            false,
+        )];
+        let before_paths = documents
+            .iter()
+            .map(|document| document.path.clone())
+            .collect::<Vec<_>>();
+        let mut closed = Vec::new();
+
+        let execution = execute_document_load_admission(
+            DocumentLoadAdmission::Missing,
+            ui::workspace::DocumentTabId(99),
+            |id| {
+                closed.push(id);
+                documents.retain(|document| document.id != id);
+            },
+        );
+
+        assert!(!execution.apply_outcome);
+        assert!(!execution.show_cap_notice);
+        assert!(closed.is_empty());
+        assert_eq!(
+            documents
+                .iter()
+                .map(|document| document.path.clone())
+                .collect::<Vec<_>>(),
+            before_paths
+        );
+    }
+
+    #[test]
+    fn execute_document_load_admission은_reject시_active_incoming만_닫고_오른쪽_이웃을_고른다() {
+        let incoming = ui::workspace::DocumentTabId(2);
+        let mut documents = vec![
+            stub_loaded_document_id(1, "/tmp/left.md", "left", "left", false),
+            stub_open_document_id(2, "/tmp/incoming.md", "", "", false),
+            stub_loaded_document_id(3, "/tmp/right.md", "right", "right", false),
+        ];
+        let mut active = Some(incoming);
+        let mut closed = Vec::new();
+
+        let execution =
+            execute_document_load_admission(DocumentLoadAdmission::Reject, incoming, |id| {
+                let index = documents
+                    .iter()
+                    .position(|document| document.id == id)
+                    .expect("close target");
+                documents.remove(index);
+                if active == Some(id) {
+                    active = next_active_document_after_close(&documents, index);
+                }
+                closed.push(id);
+            });
+
+        assert!(!execution.apply_outcome);
+        assert!(execution.show_cap_notice);
+        assert_eq!(closed, vec![incoming]);
+        assert_eq!(active, Some(ui::workspace::DocumentTabId(3)));
+        assert_eq!(
+            documents
+                .iter()
+                .map(|document| document.id)
+                .collect::<Vec<_>>(),
+            vec![
+                ui::workspace::DocumentTabId(1),
+                ui::workspace::DocumentTabId(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_admission과_outcome적용은_exact_24mib를_넘지_않는다() {
+        let four_mib = "a".repeat(4 * 1024 * 1024);
+        let eight_mib = "b".repeat(8 * 1024 * 1024);
+        let incoming = ui::workspace::DocumentTabId(2);
+        let mut documents = vec![
+            stub_loaded_document_id(1, "/tmp/existing.md", &four_mib, &four_mib, false),
+            stub_open_document_id(2, "/tmp/incoming.md", "", "", false),
+        ];
+        let admission = plan_document_load_admission(
+            &documents,
+            incoming,
+            eight_mib.len() as u64,
+            Some(incoming),
+        );
+        let execution = execute_document_load_admission(admission, incoming, |id| {
+            documents.retain(|document| document.id != id);
+        });
+        assert!(execution.apply_outcome);
+        assert!(!execution.show_cap_notice);
+        let revision =
+            match stub_loaded_document_id(99, "/tmp/revision", "x", "x", false).load_state {
+                DocumentLoadState::Loaded { revision, .. } => revision,
+                _ => panic!("loaded stub"),
+            };
+        let document = documents
+            .iter_mut()
+            .find(|document| document.id == incoming)
+            .expect("incoming placeholder");
+        apply_document_load_outcome_to_document(
+            document,
+            document_io::DocumentLoadOutcome::Loaded {
+                source: eight_mib,
+                revision,
+            },
+        );
+        let retained = documents.iter().try_fold(0_u64, |total, document| {
+            total.checked_add(retained_document_bytes(document)?)
+        });
+
+        assert_eq!(retained, Some(DOCUMENT_TOTAL_RETAINED_BYTES_MAX));
+    }
+
+    #[test]
+    fn apply_document_load_outcome은_missing_admit_reject를_source_clone전에_실행한다() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("fn apply_document_load_outcome(")
+            .expect("apply_document_load_outcome 정의")
+            .1
+            .split_once("\n    fn ")
+            .expect("다음 함수 경계")
+            .0;
+        let plan = body
+            .find("plan_document_load_admission(")
+            .expect("로드 결과 적용 전 admission 판정");
+        let execute = body
+            .find("execute_document_load_admission(")
+            .expect("Missing/Admit/Reject 실행");
+        let clone = body
+            .find("apply_document_load_outcome_to_document(")
+            .expect("admission 뒤 outcome 적용");
+        assert!(plan < execute && execute < clone);
+        assert!(body.contains("self.close_document_entry(victim);"));
+        assert!(body.contains("self.document_cap_notice = true;"));
+        assert!(body.contains("if !execution.apply_outcome {"));
+    }
+
     #[test]
     fn dispatch_document_drop_paths는_입력_순서를_그대로_보존한다() {
         let paths = vec![
@@ -34718,6 +35187,48 @@ mod tests {
             plan_document_eviction(&documents, active),
             None,
             "활성 문서는 clean이어도 절대 후보가 아니다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_saving_문서를_절대_후보로_뽑지_않는다() {
+        let mut documents = Vec::new();
+        for i in 0..DOCUMENT_TABS_MAX as u32 {
+            let mut document = stub_open_document_id(
+                i,
+                &format!("/tmp/{i}.md"),
+                if i == 0 { "saving" } else { "dirty" },
+                if i == 0 { "saving" } else { "clean" },
+                i != 0,
+            );
+            document.saving = i == 0;
+            documents.push(document);
+        }
+
+        assert_eq!(
+            plan_document_eviction(
+                &documents,
+                Some(ui::workspace::DocumentTabId(DOCUMENT_TABS_MAX as u32 - 1)),
+            ),
+            None,
+            "clean이어도 저장 lane에 들어간 문서는 자동으로 닫으면 안 된다"
+        );
+    }
+
+    #[test]
+    fn plan_document_eviction은_바이트만_넘을때_0byte_loading보다_retained_victim을_고른다() {
+        let eight_mib = "a".repeat(8 * 1024 * 1024);
+        let five_mib = "b".repeat(5 * 1024 * 1024);
+        let documents = vec![
+            stub_open_document_id(1, "/tmp/loading.md", "", "", false),
+            stub_loaded_document_id(2, "/tmp/oldest-loaded.md", &eight_mib, &eight_mib, false),
+            stub_loaded_document_id(3, "/tmp/active.md", &five_mib, &five_mib, false),
+        ];
+
+        assert_eq!(
+            plan_document_eviction(&documents, Some(ui::workspace::DocumentTabId(3))),
+            Some(vec![ui::workspace::DocumentTabId(2)]),
+            "0-byte placeholder를 닫아도 byte를 회수하지 못하므로 loaded victim만 골라야 한다"
         );
     }
 

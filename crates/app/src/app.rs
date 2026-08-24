@@ -36119,28 +36119,40 @@ mod tests {
 
     #[test]
     fn 문서_source가_바뀌는_두_지점_모두_revision을_올린다() {
-        // on_document_source_edited(편집) · apply_document_load_outcome(로드·재로드
-        // 완료) — 둘 다 안 올리면 뷰어가 옛 내용을 계속 보여준다. 예전에는 새 문서를
+        // on_document_source_edited(편집) · apply_document_load_outcome_to_document
+        // (로드·재로드 완료) — 둘 다 안 올리면 뷰어가 옛 내용을 계속 보여준다. 예전에는 새 문서를
         // 열 때(begin_document_open)도 세 번째로 올려야 했다 — 그때는 슬롯이 모든
         // 문서에 걸쳐 `0`으로 고정돼 있어 revision만이 유일한 캐시 구분 수단이었기
         // 때문이다. 이제 슬롯 자체가 문서 id라 새 문서는 그냥 `source_revision: 0`으로
         // 시작해도 다른 문서와 캐시가 섞이지 않는다.
         let source = include_str!("app.rs");
-        let scanned = source
+        let edited_body = source
             .split_once("fn on_document_source_edited(&mut self")
             .expect("on_document_source_edited 정의를 찾아야 한다")
             .1
             .split_once("fn apply_document_save_outcome(&mut self")
             .expect("apply_document_save_outcome 정의를 찾아야 한다")
             .0;
-        let count = scanned
-            .matches("document.source_revision = document.source_revision.wrapping_add(1);")
-            .count();
-        assert_eq!(
-            count, 2,
-            "on_document_source_edited·apply_document_load_outcome 두 곳 모두 \
-             source_revision을 올려야 한다"
-        );
+        let loaded_body = source
+            .split_once("fn apply_document_load_outcome_to_document(")
+            .expect("apply_document_load_outcome_to_document 정의를 찾아야 한다")
+            .1
+            .split_once("fn apply_save_outcome_to_document(")
+            .expect("apply_save_outcome_to_document 정의를 찾아야 한다")
+            .0;
+        for (name, body) in [
+            ("on_document_source_edited", edited_body),
+            ("apply_document_load_outcome_to_document", loaded_body),
+        ] {
+            assert_eq!(
+                body.matches(
+                    "document.source_revision = document.source_revision.wrapping_add(1);"
+                )
+                .count(),
+                1,
+                "{name}은 source_revision을 한 번 올려야 한다"
+            );
+        }
     }
 
     #[test]
@@ -38465,7 +38477,11 @@ mod tests {
         assert_eq!(watcher.root, PathBuf::new());
         assert_eq!(watcher.generation, 0);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // submit 지연 계약은 위의 50ms assertion이 따로 검증한다. 이 watchdog은
+        // macOS FSEvents 서버 등록 완료만 기다린다. 동시 watcher 부하에서
+        // FSEventStreamStart RPC가 5초를 넘기는 경로를 sample로 확인했으므로,
+        // OS 스케줄링 지연을 submit_replace 회귀로 오판하지 않도록 분리한다.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let completion = loop {
             if let Some(completion) = watcher.poll_completion() {
                 break completion;

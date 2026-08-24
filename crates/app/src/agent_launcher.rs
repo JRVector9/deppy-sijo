@@ -46,9 +46,13 @@ const KIMI_EFFORTS: &[ReasoningEffort] = &[
 ];
 // `support_efforts`가 없는 Kimi 모델은 강도 단계 없이 thinking 켬/끔만 있다.
 const KIMI_THINKING_TOGGLE: &[ReasoningEffort] = &[ReasoningEffort::On, ReasoningEffort::Off];
-// grok-4.5가 광고하는 단계. Grok의 전체 어휘는 none/minimal도 포함하지만 모델마다
-// 부분집합만 받으므로, 카탈로그를 못 읽을 때 쓰는 이 폴백은 기본 모델 기준으로 둔다.
-const GROK_EFFORTS: &[ReasoningEffort] = &[
+const GROK_46_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+];
+const GROK_45_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
     ReasoningEffort::High,
@@ -404,13 +408,21 @@ impl AgentKind {
                 },
             ],
             // Grok의 `~/.grok/models_cache.json`은 로그인 후 서버에서 받아야 생긴다.
-            // 그 전까지는 내장 기본 모델 하나만 제시한다.
-            Self::Grok => &[BuiltinModel {
-                value: "grok-4.5",
-                label: "Grok 4.5",
-                efforts: GROK_EFFORTS,
-                default_effort: Some(ReasoningEffort::High),
-            }],
+            // 그 전까지는 현재 CLI가 광고하는 두 모델을 내장 목록으로 제시한다.
+            Self::Grok => &[
+                BuiltinModel {
+                    value: "grok-4.6",
+                    label: "Grok 4.6",
+                    efforts: GROK_46_EFFORTS,
+                    default_effort: Some(ReasoningEffort::High),
+                },
+                BuiltinModel {
+                    value: "grok-4.5",
+                    label: "Grok 4.5",
+                    efforts: GROK_45_EFFORTS,
+                    default_effort: Some(ReasoningEffort::High),
+                },
+            ],
             // Qwen Code는 모델 카탈로그를 받아오지 않는다. OAuth 기본 모델만 확실하고,
             // 나머지는 사용자가 settings.json에 직접 선언해야 쓸 수 있어 카탈로그에서 읽는다.
             // 추론 강도는 CLI 플래그가 없어(설정 파일/슬래시 명령 전용) 제시하지 않는다.
@@ -441,7 +453,7 @@ impl AgentKind {
         match self {
             Self::Codex => CODEX_EFFORTS_XHIGH,
             Self::Claude => CLAUDE_EFFORTS,
-            Self::Grok => GROK_EFFORTS,
+            Self::Grok => GROK_45_EFFORTS,
             _ => &[],
         }
     }
@@ -562,6 +574,7 @@ pub(crate) struct DetectedAgent {
     /// CLI가 자기 설정에 적어 둔 기본 모델(목록 안에 있을 때만). 런처는 이 값을 미리
     /// 골라 두어, 앱으로 띄운 결과가 CLI를 그냥 실행한 것과 같게 유지한다.
     default_model: Option<String>,
+    default_effort: Option<ReasoningEffort>,
 }
 
 impl DetectedAgent {
@@ -585,6 +598,14 @@ impl DetectedAgent {
             .filter(|model| find_model(&self.models, model).is_some())
             .or_else(|| self.models.first().map(ModelChoice::value))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn initial_effort(&self, model: &str) -> Option<ReasoningEffort> {
+        let choice = find_model(&self.models, model)?;
+        self.default_effort
+            .filter(|effort| choice.efforts().contains(effort))
+            .or_else(|| choice.default_effort())
+            .or_else(|| choice.efforts().first().copied())
     }
 
     pub(crate) fn supported_efforts(&self, model: &str) -> &[ReasoningEffort] {
@@ -656,8 +677,30 @@ impl DetectionSnapshot {
                     launch_path: None,
                     models: kind.builtin_model_choices(),
                     default_model: None,
+                    default_effort: None,
                 })
                 .collect(),
+            claude_default_model: None,
+            claude_default_effort: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_agent_with_defaults(
+        kind: AgentKind,
+        executable: PathBuf,
+        default_model: Option<String>,
+        default_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        Self {
+            agents: vec![DetectedAgent {
+                kind,
+                executable,
+                launch_path: None,
+                models: kind.builtin_model_choices(),
+                default_model,
+                default_effort,
+            }],
             claude_default_model: None,
             claude_default_effort: None,
         }
@@ -717,23 +760,31 @@ pub(crate) fn detect_installed_agents(excluded_directory: Option<&Path>) -> Dete
     let home = crate::paths::home_dir();
     let (claude_default_model, claude_default_effort) =
         crate::agent_model_catalog::claude_configured_defaults(home.as_deref());
+    let (grok_default_model, grok_default_effort) =
+        crate::agent_model_catalog::grok_configured_defaults(home.as_deref());
     let agents = AgentKind::ALL
         .into_iter()
         .filter_map(|kind| {
             resolve_executable(kind.detect_command(), &paths).map(|executable| {
                 // 설정 파일은 종류마다 한 번만 읽는다. 모델 목록과 초기 선택이 같은 값을
                 // 쓰므로 각각 읽으면 같은 파일을 두 번 열고 파싱하게 된다.
-                let configured = if kind == AgentKind::Claude {
-                    claude_default_model.clone()
-                } else {
-                    crate::agent_model_catalog::configured_default_model(kind, home.as_deref())
+                let configured = match kind {
+                    AgentKind::Claude => claude_default_model.clone(),
+                    AgentKind::Grok => grok_default_model.clone(),
+                    _ => {
+                        crate::agent_model_catalog::configured_default_model(kind, home.as_deref())
+                    }
                 };
+                let default_effort = (kind == AgentKind::Grok)
+                    .then_some(grok_default_effort)
+                    .flatten();
                 DetectedAgent {
                     kind,
                     executable,
                     launch_path: launch_path.clone(),
                     models: resolve_models(kind, home.as_deref(), configured.as_deref()),
                     default_model: configured,
+                    default_effort,
                 }
             })
         })
@@ -1126,7 +1177,63 @@ mod tests {
             launch_path: None,
             models: kind.builtin_model_choices(),
             default_model: None,
+            default_effort: None,
         }
+    }
+
+    #[test]
+    fn grok_builtin_models_match_the_current_cli_effort_ladders() {
+        let models = AgentKind::Grok.builtin_model_choices();
+        assert_eq!(
+            models.iter().map(ModelChoice::value).collect::<Vec<_>>(),
+            ["grok-4.6", "grok-4.5"]
+        );
+        assert_eq!(
+            find_model(&models, "grok-4.6").unwrap().efforts(),
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+            ]
+        );
+        assert_eq!(
+            find_model(&models, "grok-4.5").unwrap().efforts(),
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_46_launch_accepts_xhigh_and_grok_45_rejects_it() {
+        let grok = detected(AgentKind::Grok);
+        let spec = build_launch_spec(
+            &grok,
+            LaunchOptions {
+                model: "grok-4.6".to_owned(),
+                effort: Some(ReasoningEffort::XHigh),
+                yolo: false,
+            },
+            None,
+        )
+        .unwrap();
+        let (_, _, args, _) = spec.into_parts();
+        assert_eq!(args, ["--model", "grok-4.6", "--reasoning-effort", "xhigh"]);
+        assert!(matches!(
+            build_launch_spec(
+                &grok,
+                LaunchOptions {
+                    model: "grok-4.5".to_owned(),
+                    effort: Some(ReasoningEffort::XHigh),
+                    yolo: false,
+                },
+                None,
+            ),
+            Err(LaunchSpecErrorCode::UnsupportedEffort)
+        ));
     }
 
     #[test]
@@ -1285,6 +1392,7 @@ mod tests {
             launch_path: None,
             models,
             default_model: Some("opus[1m]".to_owned()),
+            default_effort: None,
         };
         assert_eq!(agent.initial_model(), "opus[1m]");
         let spec = build_launch_spec(
@@ -1526,6 +1634,7 @@ mod tests {
             )),
             models: AgentKind::Kimi.builtin_model_choices(),
             default_model: None,
+            default_effort: None,
         };
         let spec = build_launch_spec(
             &agent,

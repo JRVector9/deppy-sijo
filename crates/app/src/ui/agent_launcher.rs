@@ -773,11 +773,13 @@ impl AgentLauncherUi {
                 .find(|agent| crate::agent_launcher::agent_is_enabled(disabled, agent.kind()))
                 .map(|agent| agent.kind());
         }
-        if self.selected != previous_selected {
+        let provider_changed = self.selected != previous_selected;
+        if provider_changed {
             self.model.clear();
+            self.effort = None;
         }
         if let Some(agent) = self.selected.and_then(|kind| snapshot.find(kind)) {
-            self.reconcile_options(agent);
+            self.reconcile_options(agent, provider_changed);
         }
     }
 
@@ -802,18 +804,24 @@ impl AgentLauncherUi {
     }
 
     fn select(&mut self, agent: &DetectedAgent) {
-        if self.selected != Some(agent.kind()) {
+        let provider_changed = self.selected != Some(agent.kind());
+        if provider_changed {
             self.model.clear();
+            self.effort = None;
         }
         self.selected = Some(agent.kind());
         self.error = None;
-        self.reconcile_options(agent);
+        self.reconcile_options(agent, provider_changed);
     }
 
     /// 선택된 모델/강도/YOLO가 이 에이전트에서 여전히 유효한지 맞춘다.
-    fn reconcile_options(&mut self, agent: &DetectedAgent) {
-        self.reconcile_model(agent);
-        self.reconcile_effort(agent.models());
+    fn reconcile_options(&mut self, agent: &DetectedAgent, provider_changed: bool) {
+        let model_replaced = self.reconcile_model(agent);
+        if provider_changed || model_replaced {
+            self.effort = agent.initial_effort(&self.model);
+        } else {
+            self.reconcile_effort(agent.models());
+        }
         if !agent.kind().supports_yolo() {
             self.yolo = false;
         }
@@ -822,10 +830,12 @@ impl AgentLauncherUi {
     /// 모델은 "기본 모델" 항목 없이 항상 하나가 선택돼 있다. 선택이 비었거나 이 에이전트가
     /// 더 이상 제공하지 않는 모델이면, CLI가 자기 설정에 적어 둔 기본 모델로 되돌린다.
     /// 그래야 앱으로 띄운 결과가 CLI를 그냥 실행한 것과 같다.
-    fn reconcile_model(&mut self, agent: &DetectedAgent) {
-        if crate::agent_launcher::find_model(agent.models(), &self.model).is_none() {
-            self.model = agent.initial_model().to_owned();
+    fn reconcile_model(&mut self, agent: &DetectedAgent) -> bool {
+        if crate::agent_launcher::find_model(agent.models(), &self.model).is_some() {
+            return false;
         }
+        self.model = agent.initial_model().to_owned();
+        true
     }
 
     /// 강도는 "기본값" 항목 없이 항상 하나가 선택돼 있다. 화면에 보이는 값이 곧
@@ -1160,6 +1170,30 @@ mod tests {
         ui.effort = Some(ReasoningEffort::Max);
         ui.reconcile_effort(codex.models());
         assert_eq!(ui.effort, Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn grok_initial_selection_uses_configured_model_and_effort_once() {
+        let detected = DetectionSnapshot::from_test_agent_with_defaults(
+            AgentKind::Grok,
+            PathBuf::from("/tmp/grok"),
+            Some("grok-4.6".to_owned()),
+            Some(ReasoningEffort::Medium),
+        );
+        let grok = agent(&detected, AgentKind::Grok);
+        let mut ui = AgentLauncherUi::new();
+        ui.select(grok);
+        assert_eq!(ui.model, "grok-4.6");
+        assert_eq!(ui.effort, Some(ReasoningEffort::Medium));
+
+        ui.effort = Some(ReasoningEffort::High);
+        ui.select(grok);
+        assert_eq!(ui.effort, Some(ReasoningEffort::High));
+
+        ui.model = "grok-4.5".to_owned();
+        ui.effort = Some(ReasoningEffort::XHigh);
+        ui.reconcile_effort(grok.models());
+        assert_eq!(ui.effort, Some(ReasoningEffort::High));
     }
 
     #[test]

@@ -3219,7 +3219,7 @@ impl FileTreeUi {
         // ── Finder → 트리 반입: OS 드롭(①)·클립보드 ⌘V(②) — 원본 보존 복사 ──
         // 반입 영역 = 파일 헤더 + 행 목록 (워크스페이스 목록/하단 nav 제외).
         let tree_area = header_rect.union(scroll_output.inner_rect);
-        if os_drag_active && drag_pos.is_some_and(|pos| tree_area.contains(pos)) {
+        if os_drag_active && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos)) {
             if !drag_row_highlighted {
                 // 행 위가 아니면 루트 반입 — 외곽선 대신 면으로 덮는다(2026-08-10 사용자:
                 // 외곽 테두리 제거). 폴더 행 강조와 같은 언어라 "이 영역이 받는다"로 읽힌다.
@@ -3234,7 +3234,7 @@ impl FileTreeUi {
             ui.ctx().request_repaint();
         }
         if !os_dropped.is_empty()
-            && drag_pos.is_some_and(|pos| tree_area.contains(pos))
+            && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos))
             && let Some(root) = self.root.clone()
         {
             let dst_dir = drop_target_dir.unwrap_or(root);
@@ -6422,6 +6422,10 @@ fn is_tree_paste_signal(event: &egui::Event) -> bool {
     }
 }
 
+fn tree_area_owns_os_drop(tree_area: egui::Rect, pos: egui::Pos2) -> bool {
+    tree_area.contains(pos) && pos.x < tree_area.right()
+}
+
 /// OS 파일 드래그/드롭 중 포인터 위치(egui 창 좌표). winit 0.30은 macOS
 /// `draggingUpdated:`를 구현하지 않아 드래그 중 CursorMoved가 오지 않는다 — AppKit
 /// 전역 마우스 위치(bottom-left 스크린 좌표)를 primary 스크린 기준으로 뒤집고
@@ -6662,6 +6666,32 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_tree_os_drop은_공유_오른쪽_경계를_소유하지_않는다() {
+        let tree_area = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 120.0));
+
+        assert!(tree_area_owns_os_drop(
+            tree_area,
+            egui::pos2(tree_area.right() - 0.001, tree_area.center().y)
+        ));
+        assert!(tree_area_owns_os_drop(tree_area, tree_area.center()));
+        assert!(tree_area_owns_os_drop(
+            tree_area,
+            egui::pos2(tree_area.left(), tree_area.top())
+        ));
+        assert!(tree_area_owns_os_drop(
+            tree_area,
+            egui::pos2(tree_area.center().x, tree_area.bottom())
+        ));
+        assert!(
+            !tree_area_owns_os_drop(
+                tree_area,
+                egui::pos2(tree_area.right(), tree_area.center().y)
+            ),
+            "중앙 pane과 공유하는 오른쪽 경계는 file tree가 소유하지 않아야 한다"
+        );
+    }
 
     /// 문서 대상 분류(설계 §3.1) — md·markdown은 markdown, txt·log·확장자 없음은
     /// 평문, 그 외는 `None`이라 더블클릭이 예전처럼 OS 기본 앱으로 간다(기존 동작을

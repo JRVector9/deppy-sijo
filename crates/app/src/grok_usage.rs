@@ -1,4 +1,15 @@
-use std::sync::OnceLock;
+use std::path::Path;
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
+
+use pty::PtyBackend as _;
+
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+const STARTUP_DELAY: Duration = Duration::from_secs(2);
+const SETTLE_DELAY: Duration = Duration::from_secs(2);
+const MAX_OUTPUT_BYTES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrokCurrency {
@@ -16,6 +27,74 @@ pub(crate) struct GrokUsage {
     pub(crate) weekly_remaining_percent: Option<u8>,
     pub(crate) monthly_remaining_percent: Option<u8>,
     pub(crate) credits_left: Option<GrokCredits>,
+}
+
+#[derive(Default)]
+struct UsageState {
+    usage: Option<(Instant, GrokUsage)>,
+    pending: Option<mpsc::Receiver<Option<GrokUsage>>>,
+    last_request: Option<Instant>,
+}
+
+fn should_start_probe(
+    executable_present: bool,
+    pending: bool,
+    since_last_request: Option<Duration>,
+) -> bool {
+    executable_present
+        && !pending
+        && since_last_request.is_none_or(|elapsed| elapsed >= REFRESH_INTERVAL)
+}
+
+fn fresh_usage_after(usage: GrokUsage, elapsed: Duration) -> Option<GrokUsage> {
+    (elapsed <= STALE_AFTER).then_some(usage)
+}
+
+fn last_request_after_spawn(
+    previous: Option<Instant>,
+    attempted: Instant,
+    spawned: bool,
+) -> Option<Instant> {
+    if spawned { Some(attempted) } else { previous }
+}
+
+pub(crate) fn current(ctx: &egui::Context, executable: Option<&Path>) -> Option<GrokUsage> {
+    static STATE: OnceLock<Mutex<UsageState>> = OnceLock::new();
+    let executable = executable?.to_path_buf();
+    let state = STATE.get_or_init(|| Mutex::new(UsageState::default()));
+    let Ok(mut state) = state.lock() else {
+        return None;
+    };
+    if let Some(receiver) = state.pending.as_ref() {
+        match receiver.try_recv() {
+            Ok(Some(usage)) => {
+                state.usage = Some((Instant::now(), usage));
+                state.pending = None;
+            }
+            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => state.pending = None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    let since_last_request = state.last_request.map(|requested| requested.elapsed());
+    if should_start_probe(true, state.pending.is_some(), since_last_request) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let repaint = ctx.clone();
+        let attempted = Instant::now();
+        let spawned = std::thread::Builder::new()
+            .name("grok-usage-probe".to_owned())
+            .spawn(move || {
+                let usage = fetch_grok_usage(&executable).ok().flatten();
+                let _ = sender.send(usage);
+                repaint.request_repaint();
+            })
+            .is_ok();
+        state.last_request = last_request_after_spawn(state.last_request, attempted, spawned);
+        if spawned {
+            state.pending = Some(receiver);
+        }
+    }
+    let (measured_at, usage) = state.usage?;
+    fresh_usage_after(usage, measured_at.elapsed())
 }
 
 fn parse_usage(output: &str) -> Option<GrokUsage> {
@@ -103,6 +182,94 @@ fn extract_credits_left(lines: &[&str]) -> Option<GrokCredits> {
     None
 }
 
+fn usage_panel_rendered(lower: &str) -> bool {
+    let compact = compact_label(lower);
+    [
+        "weeklylimit",
+        "monthlylimit",
+        "creditsleft",
+        "notauthenticated",
+        "managebilling",
+        "failedtoload",
+    ]
+    .into_iter()
+    .any(|needle| compact.contains(needle))
+}
+
+fn fetch_grok_usage(executable: &Path) -> anyhow::Result<Option<GrokUsage>> {
+    let program = executable
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Grok executable path is not UTF-8"))?;
+    let probe_dir = crate::paths::home_dir()
+        .map(|home| home.join(".deppy-sijo").join("usage-probe"))
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&probe_dir)?;
+    let command = pty::CommandSpec {
+        program: program.to_owned(),
+        args: Vec::new(),
+        env: vec![("TERM".to_owned(), "xterm-256color".to_owned())],
+        cwd: Some(probe_dir),
+    };
+    let backend = pty::PortablePtyBackend;
+    let mut session = backend.spawn(&command, 120, 40)?;
+    let result = run_grok_usage_probe(&mut *session);
+    let kill_result = session.kill();
+    match (result, kill_result) {
+        (Ok(usage), Ok(())) => Ok(usage),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_grok_usage_probe(session: &mut dyn pty::PtySession) -> anyhow::Result<Option<GrokUsage>> {
+    let output = session
+        .take_output()
+        .ok_or_else(|| anyhow::anyhow!("Grok usage PTY output unavailable"))?;
+    std::thread::sleep(STARTUP_DELAY);
+    write_required_input(session, b"/usage\r")?;
+
+    let started = Instant::now();
+    let mut settle_at = None;
+    let mut trusted = false;
+    let mut bytes = Vec::new();
+    while started.elapsed() < PROBE_TIMEOUT {
+        match output.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => {
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() > MAX_OUTPUT_BYTES {
+                    bytes.drain(..bytes.len() - MAX_OUTPUT_BYTES);
+                }
+                let clean = strip_terminal_control_sequences(&String::from_utf8_lossy(&bytes));
+                let lower = clean.to_ascii_lowercase();
+                if !trusted && lower.contains("trust this folder") {
+                    write_required_input(session, b"\r")?;
+                    trusted = true;
+                    write_required_input(session, b"/usage\r")?;
+                }
+                if settle_at.is_none() && usage_panel_rendered(&lower) {
+                    settle_at = Some(Instant::now() + SETTLE_DELAY);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if settle_at.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+    }
+
+    let clean = strip_terminal_control_sequences(&String::from_utf8_lossy(&bytes));
+    Ok(parse_usage(&clean))
+}
+
+fn write_required_input(session: &mut dyn pty::PtySession, bytes: &[u8]) -> anyhow::Result<()> {
+    let result = session.write_input(bytes)?;
+    if !result.is_accepted() {
+        anyhow::bail!("Grok usage PTY input was not accepted");
+    }
+    Ok(())
+}
+
 fn parse_usd_minor(text: &str) -> Option<u64> {
     let normalized = text.replace(',', "");
     let (whole, fraction) = normalized.split_once('.').unwrap_or((&normalized, ""));
@@ -148,6 +315,7 @@ fn strip_terminal_control_sequences(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const FULL_PANEL: &str = "\
 Usage
@@ -245,5 +413,70 @@ Credits left: $1,234.50
             parse_usage("Weekly limit 184467440737095516160% used"),
             None
         );
+    }
+
+    #[test]
+    fn probe_admission_requires_an_executable_due_refresh_and_no_pending_job() {
+        assert!(!should_start_probe(false, false, None));
+        assert!(should_start_probe(true, false, None));
+        assert!(!should_start_probe(true, true, None));
+        assert!(!should_start_probe(
+            true,
+            false,
+            Some(Duration::from_secs(59))
+        ));
+        assert!(should_start_probe(
+            true,
+            false,
+            Some(Duration::from_secs(60))
+        ));
+    }
+
+    #[test]
+    fn successful_usage_survives_failures_for_ten_minutes_only() {
+        let usage = GrokUsage {
+            weekly_remaining_percent: Some(70),
+            monthly_remaining_percent: Some(85),
+            credits_left: None,
+        };
+        assert_eq!(
+            fresh_usage_after(usage, Duration::from_secs(599)),
+            Some(usage)
+        );
+        assert_eq!(
+            fresh_usage_after(usage, Duration::from_secs(600)),
+            Some(usage)
+        );
+        assert_eq!(fresh_usage_after(usage, Duration::from_secs(601)), None);
+    }
+
+    #[test]
+    fn failed_probe_spawn_does_not_advance_last_request() {
+        let previous = Instant::now() - Duration::from_secs(120);
+        let attempted = Instant::now();
+        assert_eq!(last_request_after_spawn(None, attempted, false), None);
+        assert_eq!(
+            last_request_after_spawn(Some(previous), attempted, false),
+            Some(previous)
+        );
+        assert_eq!(
+            last_request_after_spawn(Some(previous), attempted, true),
+            Some(attempted)
+        );
+    }
+
+    #[test]
+    #[ignore = "실제 Grok CLI를 최대 25초 띄운다"]
+    fn grok_실측_프로브는_민감한_원문_없이_끝난다() {
+        let Some(path) = std::env::var_os("DEPPY_GROK_EXECUTABLE").map(std::path::PathBuf::from)
+        else {
+            return;
+        };
+        let usage = fetch_grok_usage(&path).expect("bounded Grok probe");
+        assert!(usage.is_none_or(|value| {
+            value.weekly_remaining_percent.is_some()
+                || value.monthly_remaining_percent.is_some()
+                || value.credits_left.is_some()
+        }));
     }
 }

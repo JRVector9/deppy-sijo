@@ -9408,6 +9408,12 @@ fn clear_document_viewer_state(
     );
 }
 
+fn dispatch_document_drop_paths(paths: Vec<PathBuf>, mut open: impl FnMut(PathBuf)) {
+    for path in paths {
+        open(path);
+    }
+}
+
 /// 같은 경로가 이미 열려 있으면 그 id를 돌려준다(멀티 문서 탭 설계 ③) —
 /// `begin_document_open`이 이 값이 있으면 새로 열지 않고 그 탭만 활성화한다.
 /// 순수 함수라 App 없이 테스트한다.
@@ -27377,6 +27383,7 @@ impl eframe::App for App {
         };
         let mut primary_focus_requested = false;
         let mut primary_local_focus_claim = None;
+        let mut dropped_document_paths = Vec::new();
         let mut attached_focus_requested = None;
         let mut attached_detach_requested = None;
         let mut attached_reorder_requested = None;
@@ -27754,6 +27761,7 @@ impl eframe::App for App {
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
                     aux_tab_intent = primary_output.aux_tab_intent;
+                    dropped_document_paths.extend(primary_output.document_drop_paths);
                     if primary_output.aux_search_toggle_requested {
                         self.aux_search.toggle();
                     }
@@ -27797,6 +27805,7 @@ impl eframe::App for App {
                     primary_focus_requested = primary_output.focus_requested;
                     primary_local_focus_claim = primary_output.local_focus_claimed;
                     aux_tab_intent = primary_output.aux_tab_intent;
+                    dropped_document_paths.extend(primary_output.document_drop_paths);
                     if primary_output.aux_search_toggle_requested {
                         self.aux_search.toggle();
                     }
@@ -27889,6 +27898,9 @@ impl eframe::App for App {
             self.cancel_terminal_focus_intents();
             self.active.workspace_ui.arm_terminal_focus(pane);
         }
+        dispatch_document_drop_paths(dropped_document_paths, |path| {
+            self.open_document(path);
+        });
         if let Some(attachment_id) = attached_detach_requested {
             self.stage_workspace_controller_action(WorkspaceControllerAction::DetachWorkspacePane(
                 attachment_id,
@@ -34489,6 +34501,51 @@ mod tests {
             id: ui::workspace::DocumentTabId(id),
             ..stub_open_document(path, source, saved_source, dirty)
         }
+    }
+
+    #[test]
+    fn dispatch_document_drop_paths는_입력_순서를_그대로_보존한다() {
+        let paths = vec![
+            PathBuf::from("/tmp/a.rs"),
+            PathBuf::from("/tmp/b.json"),
+            PathBuf::from("/tmp/c.yaml"),
+        ];
+        let mut opened = Vec::new();
+
+        dispatch_document_drop_paths(paths.clone(), |path| opened.push(path));
+
+        assert_eq!(opened, paths);
+    }
+
+    #[test]
+    fn app은_primary_workspace_document_drop을_포커스_claim_뒤에_열고_pty로_보내지_않는다() {
+        let source = include_str!("app.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production
+                .matches("dropped_document_paths.extend(primary_output.document_drop_paths);")
+                .count(),
+            2,
+            "cross-workspace strip 유무 두 primary render 경로 모두 수집해야 한다"
+        );
+        let focus = production
+            .find("if let Some(pane) = primary_local_focus_claim")
+            .expect("primary focus claim 적용이 있어야 한다");
+        let dispatch = production
+            .find("dispatch_document_drop_paths(dropped_document_paths")
+            .expect("drop dispatch가 있어야 한다");
+        assert!(
+            focus < dispatch,
+            "drop 대상 pane focus를 문서 열기보다 먼저 적용해야 한다"
+        );
+        let dispatch_tail = &production[dispatch..];
+        assert!(dispatch_tail.contains("self.open_document(path)"));
+        assert!(
+            !dispatch_tail
+                .lines()
+                .take(8)
+                .any(|line| line.contains("WriteInput"))
+        );
     }
 
     #[test]

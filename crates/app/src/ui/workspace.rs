@@ -1535,6 +1535,7 @@ pub(crate) struct PreparedAttachedPaneOutput {
 pub struct WorkspaceSurfaceOutput {
     pub focus_requested: bool,
     pub local_focus_claimed: Option<runtime::MuxPaneId>,
+    pub document_drop_paths: Vec<PathBuf>,
     /// 이번 프레임에 보조 탭이 올린 의도(있으면 App이 그 종류의 탭 상태를 옮긴다).
     pub aux_tab_intent: Option<(PaneAuxTabKind, PaneAuxTabIntent)>,
     /// 보조 탭이 활성일 때 App이 본문을 그릴 pane body rect. 이 rect가 있으면
@@ -1576,6 +1577,7 @@ impl PaneRenderMode<'_> {
 struct PaneRenderOutput {
     focus_requested: bool,
     local_focus_claimed: Option<runtime::MuxPaneId>,
+    document_drop_paths: Vec<PathBuf>,
     aux_tab_intent: Option<(PaneAuxTabKind, PaneAuxTabIntent)>,
     aux_body_rect: Option<egui::Rect>,
     aux_search_toggle_requested: bool,
@@ -1587,6 +1589,7 @@ impl PaneRenderOutput {
         if other.local_focus_claimed.is_some() {
             self.local_focus_claimed = other.local_focus_claimed;
         }
+        self.document_drop_paths.extend(other.document_drop_paths);
         if other.aux_tab_intent.is_some() {
             self.aux_tab_intent = other.aux_tab_intent;
         }
@@ -4747,6 +4750,7 @@ impl WorkspaceUi {
         WorkspaceSurfaceOutput {
             focus_requested: pane_output.focus_requested,
             local_focus_claimed: pane_output.local_focus_claimed,
+            document_drop_paths: pane_output.document_drop_paths,
             aux_tab_intent: pane_output.aux_tab_intent,
             aux_body_rect: pane_output.aux_body_rect,
             aux_search_toggle_requested: pane_output.aux_search_toggle_requested,
@@ -5767,8 +5771,8 @@ impl WorkspaceUi {
         // (2026-08-10 사용자: 테두리 말고 공간이 열려 들어가는 느낌으로).
         let mut drop_target_hovered = false;
         if mode.is_local() && input_enabled && pane.session_id.is_some() {
-            // OS 파일 드롭 — 이 pane 위에서 놓으면 ⌘V 경로 붙여넣기와 같은 바이트를
-            // 세션에 쓴다(workspace.rs의 paths_insert_paste_bytes, ⌘V 경로와 동일 규칙).
+            // OS 파일 드롭 — 이 pane 위에서 놓으면 App이 문서 탭으로 열 경로 intent를
+            // 올린다. 텍스트 드롭만 기존처럼 터미널 입력으로 보낸다.
             // winit 0.30이 macOS draggingUpdated:를 구현하지 않아 드래그 중 egui
             // 포인터가 갱신되지 않는다 — file_tree.rs의 os_drag_pointer_pos로 신뢰
             // 가능한 위치를 구하고, 실패(kittest 등)하면 egui 포인터로 폴백한다
@@ -5801,12 +5805,13 @@ impl WorkspaceUi {
                 || (os_drag_active && os_over_pane);
             if let Some(session) = pane.session_id {
                 if let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&pane_resp) {
-                    let bytes = path_insert_paste_bytes(
-                        &path,
-                        self.session_shell_kind(session),
-                        self.session_bracketed_paste(session),
-                    );
-                    self.send(RuntimeCommand::WriteInput { session, bytes });
+                    render_output
+                        .document_drop_paths
+                        .push(path.as_ref().clone());
+                    render_output.local_focus_claimed = Some(pane_id.clone());
+                    if !focused {
+                        self.request_pane_focus(pane_id.clone());
+                    }
                 }
                 if let Some(text) = release_typed_dnd_payload::<TerminalTextDragPayload>(&pane_resp)
                 {
@@ -5817,12 +5822,11 @@ impl WorkspaceUi {
                     self.send(RuntimeCommand::WriteInput { session, bytes });
                 }
                 if !os_dropped.is_empty() && os_over_pane {
-                    let bytes = paths_insert_paste_bytes(
-                        &os_dropped,
-                        self.session_shell_kind(session),
-                        self.session_bracketed_paste(session),
-                    );
-                    self.send(RuntimeCommand::WriteInput { session, bytes });
+                    render_output.document_drop_paths.extend(os_dropped);
+                    render_output.local_focus_claimed = Some(pane_id.clone());
+                    if !focused {
+                        self.request_pane_focus(pane_id.clone());
+                    }
                 }
             }
         }
@@ -6279,15 +6283,17 @@ impl WorkspaceUi {
             }
         }
 
-        // 파일 트리에서 드래그한 경로를 터미널 위에 드롭 → 입력으로 삽입 (2026-07-05).
+        // 파일 트리에서 드래그한 경로를 터미널 위에 드롭 → 문서 intent로 전달.
         // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
         if mode.is_local()
             && input_enabled
             && let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&output.response)
         {
-            let bytes = path_insert_paste_bytes(&path, self.session_shell_kind(session), bracketed);
-            self.send(RuntimeCommand::WriteInput { session, bytes });
-            if mode.is_local() && !focused {
+            render_output
+                .document_drop_paths
+                .push(path.as_ref().clone());
+            render_output.local_focus_claimed = Some(pane_id.clone());
+            if !focused {
                 self.request_pane_focus(pane_id.clone());
             }
         }
@@ -8356,6 +8362,30 @@ mod tests {
     use super::*;
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    #[test]
+    fn pane_render_output_merge는_document_drop_경로_순서를_보존한다() {
+        let mut merged = PaneRenderOutput {
+            document_drop_paths: vec![PathBuf::from("/tmp/first.rs")],
+            ..Default::default()
+        };
+        merged.merge(PaneRenderOutput {
+            document_drop_paths: vec![
+                PathBuf::from("/tmp/second.json"),
+                PathBuf::from("/tmp/third.yaml"),
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            merged.document_drop_paths,
+            vec![
+                PathBuf::from("/tmp/first.rs"),
+                PathBuf::from("/tmp/second.json"),
+                PathBuf::from("/tmp/third.yaml"),
+            ]
+        );
+    }
 
     /// hook "작업 중"(v32) 병합 우선순위: 확정 상태(승인대기/오류/완료/화면 대기)가
     /// 이기고, 그 외엔 hook working이 transcript(지연·활성 전용)보다 우선한다.
@@ -15291,34 +15321,33 @@ https://example.test/login \
         assert!(!workspace.take_terminal_focus_claimed());
     }
 
-    /// OS 파일 드롭 — 터미널 pane 위에서 놓으면 그 세션에 ⌘V 경로 붙여넣기와 같은
-    /// 바이트를 쓴다(paths_insert_paste_bytes, workspace.rs 6176행). 예전엔 터미널
-    /// 영역에서 OS dropped_files를 읽는 핸들러가 아예 없어 조용히 버려졌다
-    /// (2026-08-14 사용자: "터미널에 넣으면 터미널로 들어가야해").
+    /// OS 파일 드롭은 확장자를 분류하거나 PTY에 경로를 쓰지 않고 App에 그대로 넘긴다.
     #[test]
-    fn kittest_터미널_pane_위_os_드롭은_경로를_붙여넣는다() {
+    fn kittest_터미널_pane_위_os_드롭은_모든_경로를_문서_intent로_보낸다() {
         let session = SessionId(7);
-        let mut harness = setup_focused_local_pane_harness(session);
-        let expected_bytes = paths_insert_paste_bytes(
-            &[PathBuf::from("/x/dropped.txt")],
-            harness.state().session_shell_kind(session),
-            harness.state().session_bracketed_paste(session),
-        );
+        let mut harness = setup_focused_local_pane_drop_harness(session);
+        let dropped = [
+            PathBuf::from("/x/main.rs"),
+            PathBuf::from("/x/config.json"),
+            PathBuf::from("/x/settings.toml"),
+            PathBuf::from("/x/deploy.yaml"),
+        ];
         let pane_point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
         harness
             .input_mut()
             .events
             .push(egui::Event::PointerMoved(pane_point));
-        harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(PathBuf::from("/x/dropped.txt")),
-            ..Default::default()
-        });
+        harness
+            .input_mut()
+            .dropped_files
+            .extend(dropped.iter().cloned().map(|path| egui::DroppedFile {
+                path: Some(path),
+                ..Default::default()
+            }));
         harness.run();
 
-        assert_eq!(
-            written_bytes(drain_protocol(harness.state_mut())),
-            expected_bytes
-        );
+        assert_eq!(harness.state().1.document_drop_paths, dropped.to_vec());
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     /// pane 헤더처럼 터미널 표면 밖에 놓인 OS 드롭은 무시한다 — dropped_files가
@@ -15327,7 +15356,7 @@ https://example.test/login \
     #[test]
     fn kittest_pane_밖_os_드롭은_무시된다() {
         let session = SessionId(7);
-        let mut harness = setup_focused_local_pane_harness(session);
+        let mut harness = setup_focused_local_pane_drop_harness(session);
         // pane 헤더 영역(표면 rect 위) — TERMINAL_PANE_HEADER_HEIGHT보다 작은 y는
         // pane_layout.surface(=pane_rect) 밖이다.
         let header_point = egui::pos2(80.0, 4.0);
@@ -15341,7 +15370,8 @@ https://example.test/login \
         });
         harness.run();
 
-        assert!(written_bytes(drain_protocol(harness.state_mut())).is_empty());
+        assert!(harness.state().1.document_drop_paths.is_empty());
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     /// 분할된 두 pane 중 포인터 밑 pane에만 들어간다 — 한 번의 OS 드롭이 두 목적지로
@@ -15376,43 +15406,68 @@ https://example.test/login \
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(600.0, 400.0))
             .build_ui_state(
-                move |ui, workspace: &mut WorkspaceUi| {
-                    workspace.show_with_input(ui, &config, &[], &catalog, true);
+                move |ui, state: &mut (WorkspaceUi, WorkspaceSurfaceOutput)| {
+                    let frame = state.0.show_with_input(ui, &config, &[], &catalog, true);
+                    state
+                        .1
+                        .document_drop_paths
+                        .extend(frame.document_drop_paths);
+                    if frame.local_focus_claimed.is_some() {
+                        state.1.local_focus_claimed = frame.local_focus_claimed;
+                    }
                 },
-                workspace,
+                (workspace, WorkspaceSurfaceOutput::default()),
             );
         harness.run();
-        drain_protocol(harness.state_mut());
+        drain_protocol(&mut harness.state_mut().0);
 
-        let expected_bytes = paths_insert_paste_bytes(
-            &[PathBuf::from("/x/dropped.txt")],
-            harness.state().session_shell_kind(left),
-            harness.state().session_bracketed_paste(left),
-        );
-        // 왼쪽 pane(폭 300pt의 안쪽) 위에서 드롭.
-        let left_point = egui::pos2(100.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        // 초기 포커스는 왼쪽이지만 오른쪽 pane 위에 드롭한다.
+        let right_point = egui::pos2(500.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
         harness
             .input_mut()
             .events
-            .push(egui::Event::PointerMoved(left_point));
+            .push(egui::Event::PointerMoved(right_point));
         harness.input_mut().dropped_files.push(egui::DroppedFile {
-            path: Some(PathBuf::from("/x/dropped.txt")),
+            path: Some(PathBuf::from("/x/right-pane.rs")),
             ..Default::default()
         });
         harness.run();
 
-        let writes = drain_protocol(harness.state_mut())
-            .into_iter()
-            .filter_map(|command| match command {
-                RuntimeCommand::WriteInput { session, bytes } => Some((session, bytes)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            writes,
-            vec![(left, expected_bytes)],
-            "포인터 아래 왼쪽 pane에만, 정확히 한 번만 들어가야 한다"
+            harness.state().1.document_drop_paths,
+            vec![PathBuf::from("/x/right-pane.rs")]
         );
+        assert_eq!(
+            harness.state().1.local_focus_claimed,
+            Some(pane_id("right"))
+        );
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn kittest_파일트리_PathBuf_드롭은_문서_intent이고_pty_write가_아니다() {
+        let session = SessionId(7);
+        let mut harness = setup_focused_local_pane_drop_harness(session);
+        let point = egui::pos2(80.0, TERMINAL_PANE_HEADER_HEIGHT + 40.0);
+        harness.hover_at(point);
+        harness.drag_at(point);
+        harness.run();
+        egui::DragAndDrop::set_payload(&harness.ctx, PathBuf::from("/x/lib.rs"));
+        harness.event(egui::Event::PointerMoved(point));
+        harness.event(egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        assert_eq!(
+            harness.state().1.document_drop_paths,
+            vec![PathBuf::from("/x/lib.rs")]
+        );
+        assert!(written_bytes(drain_protocol(&mut harness.state_mut().0)).is_empty());
     }
 
     fn printable_key(key: egui::Key) -> egui::Event {
@@ -15666,6 +15721,43 @@ https://example.test/login \
         // 연속 타이핑 중의 정상 경로를 테스트하기 위함이다.
         harness.run();
         drain_protocol(harness.state_mut());
+        harness
+    }
+
+    fn setup_focused_local_pane_drop_harness(
+        session: SessionId,
+    ) -> egui_kittest::Harness<'static, (WorkspaceUi, WorkspaceSurfaceOutput)> {
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let target_pane = pane_id("pane");
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(target_pane.clone()),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(target_pane.clone());
+        workspace.pending_focus = Some(target_pane);
+        workspace.sessions.entry(session).or_default().snapshot = Some(snapshot("ready"));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut (WorkspaceUi, WorkspaceSurfaceOutput)| {
+                let frame = state.0.show_with_input(ui, &config, &[], &catalog, true);
+                state
+                    .1
+                    .document_drop_paths
+                    .extend(frame.document_drop_paths);
+                if frame.local_focus_claimed.is_some() {
+                    state.1.local_focus_claimed = frame.local_focus_claimed;
+                }
+            },
+            (workspace, WorkspaceSurfaceOutput::default()),
+        );
+        harness.run();
+        drain_protocol(&mut harness.state_mut().0);
         harness
     }
 

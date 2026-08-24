@@ -437,12 +437,7 @@ struct GrokCache {
 #[serde(untagged)]
 enum GrokModelCollection {
     Array(Vec<serde_json::Value>),
-    Object(BTreeMap<String, GrokCacheEntry>),
-}
-
-#[derive(Deserialize)]
-struct GrokCacheEntry {
-    info: serde_json::Value,
+    Object(BTreeMap<String, serde_json::Value>),
 }
 
 #[derive(Deserialize)]
@@ -507,6 +502,14 @@ fn push_unique_model(
     }
 }
 
+fn grok_entry_info(mut entry: serde_json::Value) -> Option<serde_json::Value> {
+    entry.as_object_mut()?.remove("info")
+}
+
+fn grok_entry_info_ref(entry: &serde_json::Value) -> Option<serde_json::Value> {
+    entry.get("info").cloned()
+}
+
 /// `~/.grok/models_cache.json`. Codex와 달리 `priority` 필드가 없으므로 정렬하지 않고
 /// 카탈로그 배열 순서를 그대로 쓴다.
 fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> {
@@ -530,7 +533,8 @@ fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> 
             let mut promoted_key = None;
             if let Some(default) = configured_default
                 && let Some(entry) = values.get(default)
-                && let Some(model) = grok_model_choice(entry.info.clone(), Some(default.to_owned()))
+                && let Some(info) = grok_entry_info_ref(entry)
+                && let Some(model) = grok_model_choice(info, Some(default.to_owned()))
                 && model.value() == default
             {
                 push_unique_model(&mut models, &mut seen, model);
@@ -543,7 +547,9 @@ fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> 
                 if models.len() >= CATALOG_MODELS_MAX {
                     break;
                 }
-                if let Some(model) = grok_model_choice(entry.info, Some(id)) {
+                if let Some(info) = grok_entry_info(entry)
+                    && let Some(model) = grok_model_choice(info, Some(id))
+                {
                     push_unique_model(&mut models, &mut seen, model);
                 }
             }
@@ -1154,6 +1160,19 @@ display_name = "Ok"
             Some("configured-key"),
         );
         assert_eq!(values(&models), ["actual-id", "other"]);
+    }
+
+    #[test]
+    fn grok_object_catalog_drops_only_entries_missing_info() {
+        let models = parse_grok(
+            r#"{"models":{
+              "missing-info":{"api_key":"must-not-be-projected"},
+              "grok-4.6":{"api_key":"must-not-be-projected","info":{"name":"Grok 4.6"}}
+            }}"#,
+            None,
+        );
+        assert_eq!(values(&models), ["grok-4.6"]);
+        assert_eq!(models[0].label(), "Grok 4.6");
     }
 
     #[test]

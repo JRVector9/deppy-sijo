@@ -8,6 +8,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use unicode_normalization::UnicodeNormalization;
+
 /// 사이드바 세션 목록 항목 (§6 확장 — 좌측 패널은 트리+세션의 workspace 사이드바다,
 /// 2026-07-05). App이 WorkspaceUi 스냅샷에서 조립해 넘긴다.
 pub struct SessionEntry {
@@ -976,7 +978,7 @@ impl TreeNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FlatRow {
     path: PathBuf,
-    name: String,
+    display_name: String,
     depth: usize,
     is_dir: bool,
     expanded: bool,
@@ -2946,7 +2948,7 @@ impl FileTreeUi {
                                 // 캐럿+폴더/파일 아이콘을 도형으로 (이모지 □ 깨짐 회피, 목업 §트리)
                                 let caret_col = ui.visuals().weak_text_color();
                                 let entry_color = file_entry_color(
-                                    &row.name,
+                                    &row.display_name,
                                     row.is_dir,
                                     egui::Color32::from_rgb(0xc8, 0xcc, 0xd2),
                                 );
@@ -2977,7 +2979,7 @@ impl FileTreeUi {
                                 } else {
                                     let file_color = if inaccessible {
                                         ui.visuals().weak_text_color()
-                                    } else if row.name.starts_with('.') {
+                                    } else if row.display_name.starts_with('.') {
                                         entry_color.gamma_multiply(0.62)
                                     } else {
                                         entry_color
@@ -2992,12 +2994,12 @@ impl FileTreeUi {
                                 }
                                 let text_color = if inaccessible {
                                     ui.visuals().weak_text_color()
-                                } else if row.name.starts_with('.') {
+                                } else if row.display_name.starts_with('.') {
                                     entry_color.gamma_multiply(0.62)
                                 } else {
                                     entry_color
                                 };
-                                let rich = egui::RichText::new(&row.name)
+                                let rich = egui::RichText::new(&row.display_name)
                                     .family(crate::fonts::sidebar_font_family(ui.ctx()))
                                     .size(12.5)
                                     .color(text_color);
@@ -6580,7 +6582,7 @@ fn flatten(
         let path = base.join(&node.name);
         out.push(FlatRow {
             path: path.clone(),
-            name: node.name.clone(),
+            display_name: node.name.nfc().collect(),
             depth,
             is_dir: node.is_dir,
             expanded: node.expanded,
@@ -7421,7 +7423,7 @@ mod tests {
 
         let got: Vec<(String, usize, bool)> = out
             .iter()
-            .map(|r| (r.name.clone(), r.depth, r.is_dir))
+            .map(|r| (r.display_name.clone(), r.depth, r.is_dir))
             .collect();
         assert_eq!(
             got,
@@ -7437,6 +7439,23 @@ mod tests {
     }
 
     #[test]
+    fn 평탄화는_nfd_경로를_보존하고_표시명만_nfc로_합성한다() {
+        let raw = concat!(
+            "\u{1112}\u{116A}\u{1106}\u{1167}\u{11AB} ",
+            "\u{1103}\u{1175}\u{110C}\u{1161}\u{110B}",
+            "\u{1175}\u{11AB}"
+        );
+        let nodes = vec![file(raw)];
+        let mut out = Vec::new();
+        flatten(&nodes, Path::new("/r"), 0, false, &mut out);
+
+        assert_eq!(nodes[0].name, raw);
+        assert_eq!(out[0].display_name, "화면 디자인");
+        assert_eq!(out[0].path, Path::new("/r").join(raw));
+        assert_ne!(out[0].path, Path::new("/r/화면 디자인"));
+    }
+
+    #[test]
     fn 평탄화_숨김_필터와_토글() {
         let mut secret_dir = dir(".git");
         secret_dir.expanded = true;
@@ -7446,7 +7465,7 @@ mod tests {
         let mut hidden_off = Vec::new();
         flatten(&nodes, Path::new("/r"), 0, false, &mut hidden_off);
         assert_eq!(hidden_off.len(), 1);
-        assert_eq!(hidden_off[0].name, "visible.txt");
+        assert_eq!(hidden_off[0].display_name, "visible.txt");
 
         let mut hidden_on = Vec::new();
         flatten(&nodes, Path::new("/r"), 0, true, &mut hidden_on);
@@ -7973,11 +7992,11 @@ mod tests {
         pump_listings_for(&mut tree, std::time::Duration::from_millis(100));
 
         assert!(
-            tree.flat.iter().any(|row| row.name == "b.txt"),
+            tree.flat.iter().any(|row| row.display_name == "b.txt"),
             "현재 root 결과는 적용"
         );
         assert!(
-            !tree.flat.iter().any(|row| row.name == "a.txt"),
+            !tree.flat.iter().any(|row| row.display_name == "a.txt"),
             "이전 root late result는 epoch mismatch로 폐기"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -8106,10 +8125,14 @@ mod tests {
         });
 
         pump_listings_for(&mut tree, std::time::Duration::from_millis(100));
-        let d = tree.flat.iter().find(|row| row.name == "d").unwrap();
+        let d = tree
+            .flat
+            .iter()
+            .find(|row| row.display_name == "d")
+            .unwrap();
         assert!(!d.expanded);
         assert!(
-            !tree.flat.iter().any(|row| row.name == "child.txt"),
+            !tree.flat.iter().any(|row| row.display_name == "child.txt"),
             "collapse 이후 도착한 stale child listing은 tree state를 오염시키지 않는다"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -8131,8 +8154,8 @@ mod tests {
         drain_listings(&mut tree);
         tree.toggle_dir(&base.join("other"));
         drain_listings(&mut tree);
-        assert!(tree.flat.iter().any(|r| r.name == "o.txt"));
-        assert!(!tree.flat.iter().any(|r| r.name == "new.txt"));
+        assert!(tree.flat.iter().any(|r| r.display_name == "o.txt"));
+        assert!(!tree.flat.iter().any(|r| r.display_name == "new.txt"));
 
         // 디스크 변경 후 watched만 재나열 → 새 파일 반영, other는 캐시 유지 확인
         std::fs::write(base.join("watched/new.txt"), b"n").unwrap();
@@ -8141,11 +8164,11 @@ mod tests {
         drain_listings(&mut tree);
 
         assert!(
-            tree.flat.iter().any(|r| r.name == "new.txt"),
+            tree.flat.iter().any(|r| r.display_name == "new.txt"),
             "부분 재나열 반영"
         );
         assert!(
-            !tree.flat.iter().any(|r| r.name == "late.txt"),
+            !tree.flat.iter().any(|r| r.display_name == "late.txt"),
             "다른 디렉터리는 재나열되지 않는다 (부분 갱신)"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -8175,10 +8198,10 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(!tree.flat.iter().any(|r| r.name == "a.txt"));
+        assert!(!tree.flat.iter().any(|r| r.display_name == "a.txt"));
         drain_listings(&mut tree);
         assert!(
-            tree.flat.iter().any(|r| r.name == "a.txt"),
+            tree.flat.iter().any(|r| r.display_name == "a.txt"),
             "async listing 적용 후 반영"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -8236,7 +8259,7 @@ mod tests {
         drain_listings(&mut tree);
 
         assert!(
-            tree.flat.iter().any(|r| r.name == "new.txt"),
+            tree.flat.iter().any(|r| r.display_name == "new.txt"),
             "접힘 중에도 워처 이벤트가 반영된다"
         );
         assert_eq!(tree.in_flight, 0);
@@ -8306,21 +8329,21 @@ mod tests {
         drain_listings(&mut tree);
 
         assert!(
-            tree.flat.iter().any(|r| r.name == "design"),
+            tree.flat.iter().any(|r| r.display_name == "design"),
             "gitignore에 등록된 디렉터리도 이제 보인다"
         );
         assert!(
-            tree.flat.iter().any(|r| r.name == "info.log"),
+            tree.flat.iter().any(|r| r.display_name == "info.log"),
             "git/info/exclude 경로도 이제 보인다"
         );
         assert!(
-            tree.flat.iter().any(|r| r.name == "node_modules"),
+            tree.flat.iter().any(|r| r.display_name == "node_modules"),
             "기본 generated-dir 필터는 더 이상 숨기지 않는다"
         );
 
         tree.toggle_dir(&base.join("design"));
         drain_listings(&mut tree);
-        assert!(tree.flat.iter().any(|r| r.name == "mockup.png"));
+        assert!(tree.flat.iter().any(|r| r.display_name == "mockup.png"));
 
         std::fs::remove_dir_all(&base).unwrap();
     }
@@ -10212,14 +10235,14 @@ mod tests {
         let root = PathBuf::from("/ws");
         let dir_row = FlatRow {
             path: root.join("sub"),
-            name: "sub".to_owned(),
+            display_name: "sub".to_owned(),
             depth: 0,
             is_dir: true,
             expanded: false,
         };
         let file_row = FlatRow {
             path: root.join("sub/a.txt"),
-            name: "a.txt".to_owned(),
+            display_name: "a.txt".to_owned(),
             depth: 1,
             is_dir: false,
             expanded: false,

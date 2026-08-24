@@ -9399,9 +9399,21 @@ fn classify_document_link_intent(
 }
 
 /// 문서 탭 X — dirty면 곧장 닫지 않고 확인을 받는다(설계 §3.3). `apply_document_tab_intent`의
-/// Close 분기 맨 앞에서 쓰는 조건 그 자체 — 순수 함수라 App 없이 테스트한다.
-fn document_close_requires_confirm(document: Option<&OpenDocument>) -> bool {
-    document.is_some_and(|document| document.dirty)
+/// 다만 저장 중이면 dirty 판정보다 먼저 결과를 기다린다. Close 분기가 쓰는
+/// 상태 분류 그 자체이며, 순수 함수라 App 없이 테스트한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentCloseDisposition {
+    CloseNow,
+    ConfirmDirty,
+    DeferUntilSave,
+}
+
+fn document_close_disposition(document: Option<&OpenDocument>) -> DocumentCloseDisposition {
+    match document {
+        Some(document) if document.saving => DocumentCloseDisposition::DeferUntilSave,
+        Some(document) if document.dirty => DocumentCloseDisposition::ConfirmDirty,
+        _ => DocumentCloseDisposition::CloseNow,
+    }
 }
 
 /// source 편집기의 `TextEditState` id. `source_editor`가 **절대 id**를 쓰므로 여기서
@@ -9636,6 +9648,28 @@ fn resolve_aux_tab_exclusivity(
         demote(history, winner == AuxTabWinner::History),
         demote(git, winner == AuxTabWinner::Git),
         demote(document, winner == AuxTabWinner::Document),
+    )
+}
+
+/// 세션이 중앙 본문을 차지할 때 열린 보조 탭은 유지하되 모두 inactive로
+/// 물러난다. 반환 boolean은 실제로 활성 본문이 바뀌었는지이며, 공유
+/// 보조 검색 상태를 초기화할지 결정한다.
+fn reveal_session_aux_tabs(
+    history: ui::workspace::PaneAuxTabState,
+    git: ui::workspace::PaneAuxTabState,
+    document: ui::workspace::PaneAuxTabState,
+) -> (
+    ui::workspace::PaneAuxTabState,
+    ui::workspace::PaneAuxTabState,
+    ui::workspace::PaneAuxTabState,
+    bool,
+) {
+    let reset_search = history.is_active() || git.is_active() || document.is_active();
+    (
+        history.on_session_tab_click(),
+        git.on_session_tab_click(),
+        document.on_session_tab_click(),
+        reset_search,
     )
 }
 
@@ -16366,8 +16400,8 @@ impl App {
         }
     }
 
-    /// 세션을 드러내는 네비게이션 — 정보 페이지에서 나오고, 이력 탭이 활성이면 세션
-    /// 탭으로 되돌린다(탭 자체는 유지한다).
+    /// 세션을 드러내는 네비게이션 — 정보 페이지에서 나오고, 활성 이력·Git·
+    /// 문서 보조 탭을 세션 탭으로 되돌린다(열린 탭과 모델은 유지한다).
     ///
     /// 이력이 전역 view이던 시절에는 `set_view(Terminal)` 하나가 두 일을 다 했다.
     /// 이력이 pane 보조 탭이 된 뒤로는 view만 바꾸면 본문이 계속 이력이라, 사용자가
@@ -16376,7 +16410,14 @@ impl App {
     fn reveal_terminal_session(&mut self) {
         self.agent_terminal_ui
             .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-        self.work_history_tab = self.work_history_tab.on_session_tab_click();
+        let (history, git, document, reset_search) =
+            reveal_session_aux_tabs(self.work_history_tab, self.git_tab, self.document_tab);
+        self.work_history_tab = history;
+        self.git_tab = git;
+        self.document_tab = document;
+        if reset_search {
+            self.aux_search.reset();
+        }
     }
 
     /// pane 헤더 보조 탭이 올린 의도. 어떤 경로도 `RuntimeCommand`를 만들지 않는다 —
@@ -16446,14 +16487,18 @@ impl App {
         match intent {
             ui::workspace::PaneAuxTabIntent::Close => {
                 let document = self.documents.iter().find(|document| document.id == id);
-                if document_close_requires_confirm(document) {
-                    enqueue_document_pending_confirm(
-                        &mut self.document_pending_confirms,
-                        DocumentPendingConfirm::CloseWithDirty { id },
-                    );
-                    return;
+                match document_close_disposition(document) {
+                    DocumentCloseDisposition::DeferUntilSave => {
+                        self.document_close_after_save.insert(id);
+                    }
+                    DocumentCloseDisposition::ConfirmDirty => {
+                        enqueue_document_pending_confirm(
+                            &mut self.document_pending_confirms,
+                            DocumentPendingConfirm::CloseWithDirty { id },
+                        );
+                    }
+                    DocumentCloseDisposition::CloseNow => self.close_document_entry(id),
                 }
-                self.close_document_entry(id);
             }
             ui::workspace::PaneAuxTabIntent::Activate => self.activate_document_tab(id),
             ui::workspace::PaneAuxTabIntent::ShowSession => {
@@ -34012,6 +34057,31 @@ mod tests {
         assert_eq!(git, OpenInactive);
     }
 
+    #[test]
+    fn 세션이동은_모든_보조탭을_inactive로_보존한다() {
+        use ui::workspace::PaneAuxTabState;
+
+        let (history, git, document, reset_search) = reveal_session_aux_tabs(
+            PaneAuxTabState::OpenInactive,
+            PaneAuxTabState::OpenInactive,
+            PaneAuxTabState::OpenActive,
+        );
+        assert_eq!(history, PaneAuxTabState::OpenInactive);
+        assert_eq!(git, PaneAuxTabState::OpenInactive);
+        assert_eq!(document, PaneAuxTabState::OpenInactive);
+        assert!(reset_search);
+
+        let (history, git, document, reset_search) = reveal_session_aux_tabs(
+            PaneAuxTabState::Closed,
+            PaneAuxTabState::Closed,
+            PaneAuxTabState::Closed,
+        );
+        assert_eq!(history, PaneAuxTabState::Closed);
+        assert_eq!(git, PaneAuxTabState::Closed);
+        assert_eq!(document, PaneAuxTabState::Closed);
+        assert!(!reset_search);
+    }
+
     /// Git 보조 본문 좌측 목록 폭 — 넓은 창은 300pt 고정, 좁아지면 40%로 따라
     /// 줄되 180pt 밑으로는 내려가지 않는다(스펙 §8-3).
     #[test]
@@ -35917,6 +35987,53 @@ mod tests {
     }
 
     #[test]
+    fn 저장중_close후_저장된_스냅샷과_현재_source가_다르면_dirty로_남는다() {
+        let dir = unique_temp_dir("save-revert-close");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, b"A").unwrap();
+        let load =
+            document_io::load_document(&document_io::DocumentLoadRequest { path: path.clone() });
+        let document_io::DocumentLoadOutcome::Loaded {
+            revision: initial_revision,
+            ..
+        } = load
+        else {
+            panic!("expected Loaded");
+        };
+
+        let id = ui::workspace::DocumentTabId(0);
+        let mut document = stub_open_document(path.to_str().unwrap(), "A", "A", false);
+        document.load_state = DocumentLoadState::Loaded {
+            revision: initial_revision,
+            limit: document_io::DocumentLimitTier::Full,
+        };
+        document.saving = true;
+        document.saving_source = Some("B".to_owned());
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::DeferUntilSave,
+            "저장 중 닫기는 문서를 즉시 제거하면 안 된다"
+        );
+
+        let save = document_io::save_document(document_io::DocumentSaveRequest {
+            path: path.clone(),
+            contents: "B".to_owned(),
+            expected_revision: initial_revision,
+        });
+        let confirm = apply_save_outcome_to_document(id, &mut document, &save);
+
+        assert_eq!(confirm, None);
+        assert_eq!(document.saved_source, "B");
+        assert_eq!(document.source, "A");
+        assert!(
+            document.dirty,
+            "디스크에는 B, 현재 편집기에는 A가 남으므로 닫기 전에 다시 확인해야 한다"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "B");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_save_outcome_to_document은_saved에서_dirty를_해제하고_revision을_갱신한다() {
         let dir = unique_temp_dir("save-outcome-saved");
         let path = dir.join("doc.md");
@@ -35962,12 +36079,28 @@ mod tests {
     }
 
     #[test]
-    fn document_close_requires_confirm은_dirty일_때만_참이다() {
-        assert!(!document_close_requires_confirm(None));
-        let clean = stub_open_document("/tmp/a.md", "A", "A", false);
-        assert!(!document_close_requires_confirm(Some(&clean)));
-        let dirty = stub_open_document("/tmp/a.md", "B", "A", true);
-        assert!(document_close_requires_confirm(Some(&dirty)));
+    fn document_close_disposition은_saving을_dirty보다_우선한다() {
+        assert_eq!(
+            document_close_disposition(None),
+            DocumentCloseDisposition::CloseNow
+        );
+        let mut document = stub_open_document("/tmp/a.md", "A", "A", false);
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::CloseNow
+        );
+        document.dirty = true;
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::ConfirmDirty
+        );
+        document.saving = true;
+        document.dirty = false;
+        document.saving_source = Some("B".to_owned());
+        assert_eq!(
+            document_close_disposition(Some(&document)),
+            DocumentCloseDisposition::DeferUntilSave
+        );
     }
 
     /// ① 대기 중인 확인이 있을 때 다른 문서의 확인이 와도 먼저 것이 사라지면 안
@@ -36215,7 +36348,7 @@ mod tests {
     }
 
     #[test]
-    fn 문서_닫기_확인_분기는_close_document_entry보다_먼저_return해_문서를_즉시_버리지_않는다() {
+    fn 문서_닫기_disposition은_지연과_확인을_즉시닫기보다_먼저_처리한다() {
         let source = include_str!("app.rs");
         let function_body = source
             .split_once("fn apply_document_tab_intent(")
@@ -36224,20 +36357,24 @@ mod tests {
             .split_once("fn activate_document_tab(&mut self")
             .expect("activate_document_tab 정의를 찾아야 한다")
             .0;
-        let confirm_branch = function_body
-            .split_once("document_close_requires_confirm(document)")
-            .expect("dirty 확인 조건이 있어야 한다")
+        let non_immediate_branches = function_body
+            .split_once("match document_close_disposition(document)")
+            .expect("문서 닫기 disposition 분기가 있어야 한다")
             .1
-            .split_once("return;")
+            .split_once("DocumentCloseDisposition::CloseNow")
             .expect("확인이 필요하면 곧장 return해야 한다")
             .0;
         assert!(
-            confirm_branch.contains("DocumentPendingConfirm::CloseWithDirty"),
+            non_immediate_branches.contains("DocumentPendingConfirm::CloseWithDirty"),
             "확인 분기는 CloseWithDirty를 세워야 한다"
         );
         assert!(
-            !confirm_branch.contains("close_document_entry"),
-            "확인 분기는 return 전에 문서를 지우면 안 된다 — 문서가 즉시 버려지면 안 된다"
+            !non_immediate_branches.contains("close_document_entry"),
+            "지연·확인 분기는 문서를 즉시 지우면 안 된다"
+        );
+        assert!(
+            non_immediate_branches.contains("self.document_close_after_save.insert(id);"),
+            "저장 중 닫기는 결과를 받을 때까지 지연해야 한다"
         );
     }
 
@@ -36386,12 +36523,12 @@ mod tests {
         );
     }
 
-    /// 이력이 pane 보조 탭이 된 뒤로 `set_view(Terminal)`만으로는 이력 본문이 걷히지
+    /// 이력이 pane 보조 탭이 된 뒤로 `set_view(Terminal)`만으로는 보조 본문이 걷히지
     /// 않는다. 세션을 드러내는 네비게이션은 전부 `reveal_terminal_session`을 타야 하고,
     /// 날것의 `set_view(Terminal)`은 세 곳만 남는다 — 헬퍼 본문, 워크스페이스 전환
     /// (탭 유지 계약), 레일 이력 진입(작업면으로 먼저 복귀).
     #[test]
-    fn 세션을_드러내는_네비게이션은_전부_이력탭을_비활성화한다() {
+    fn 세션을_드러내는_네비게이션은_모든_보조탭을_비활성화한다() {
         let source = include_str!("app.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
 
@@ -36417,8 +36554,12 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            helper.contains("on_session_tab_click()"),
-            "세션 이동은 이력 탭을 비활성화하되 탭 자체는 남겨야 한다"
+            helper.contains("reveal_session_aux_tabs("),
+            "세션 이동은 이력·Git·문서 탭을 공통 전이로 비활성화해야 한다"
+        );
+        assert!(
+            helper.contains("if reset_search") && helper.contains("self.aux_search.reset();"),
+            "활성 보조 본문에서 세션으로 이동하면 공유 검색을 초기화해야 한다"
         );
         assert!(
             !helper.contains("on_close()"),

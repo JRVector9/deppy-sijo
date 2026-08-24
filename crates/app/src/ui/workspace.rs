@@ -895,6 +895,10 @@ fn terminal_split_hit_rect(
         .intersect(parent)
 }
 
+fn split_handle_id(tab: &runtime::MuxTabId, path: &[u8]) -> egui::Id {
+    egui::Id::new(("split_handle", tab, path))
+}
+
 /// layout 트리의 pane을 배치 순서대로 모은다.
 fn layout_panes<'a>(node: &'a LayoutNode, out: &mut Vec<&'a runtime::MuxPaneId>) {
     match node {
@@ -2747,7 +2751,9 @@ impl WorkspaceUi {
         if !self.split_final_resize_sessions.contains(&session) {
             return false;
         }
-        if self.sent_sizes.get(&session) == Some(&(cols, rows)) {
+        if self.sent_sizes.get(&session) == Some(&(cols, rows))
+            || self.failed_resize_targets.get(&session) == Some(&(cols, rows))
+        {
             self.split_final_resize_sessions.remove(&session);
             self.pending_resize_target.remove(&session);
             return false;
@@ -2763,11 +2769,23 @@ impl WorkspaceUi {
         true
     }
 
+    fn resize_presentation_settlement_deferred(&self, session: SessionId) -> bool {
+        self.split_drag.is_some()
+            || self.split_final_resize_sessions.contains(&session)
+            || self
+                .split_final_resize_pending
+                .values()
+                .any(|(pending, _, _)| *pending == session)
+    }
+
     fn settle_session_resize_presentation(
         &mut self,
         session: SessionId,
         now: std::time::Instant,
     ) -> Option<std::time::Duration> {
+        if self.resize_presentation_settlement_deferred(session) {
+            return None;
+        }
         let view = self.sessions.get_mut(&session)?;
         let generation_before = view.snapshot_gen;
         let repaint_after = view.settle_resize_presentation(now);
@@ -2872,6 +2890,66 @@ impl WorkspaceUi {
         self.pending_resize_target.clear();
         self.staged_terminal_resizes.clear();
         self.split_final_resize_sessions.clear();
+    }
+
+    fn cancel_active_split_drag(&mut self, ctx: &egui::Context) {
+        let Some(handle_id) = self
+            .split_drag
+            .as_ref()
+            .filter(|transaction| transaction.phase == SplitDragPhase::Active)
+            .map(|transaction| split_handle_id(&transaction.tab, &transaction.path))
+        else {
+            return;
+        };
+        if ctx.dragged_id() == Some(handle_id) {
+            ctx.stop_dragging();
+        }
+        self.split_drag = None;
+        self.staged_split_commit_pass = None;
+        self.staged_terminal_resizes.clear();
+        self.pending_resize_target.clear();
+        self.split_final_resize_sessions.clear();
+    }
+
+    fn reconcile_active_split_drag(
+        &mut self,
+        ctx: &egui::Context,
+        input_enabled: bool,
+        active_tab: Option<&runtime::MuxTabId>,
+    ) {
+        let Some(transaction) = self
+            .split_drag
+            .as_ref()
+            .filter(|transaction| transaction.phase == SplitDragPhase::Active)
+        else {
+            return;
+        };
+        let handle_id = split_handle_id(&transaction.tab, &transaction.path);
+        let owns_widget = input_enabled
+            && ctx.input(|input| input.focused)
+            && active_tab == Some(&transaction.tab)
+            && self.mux.as_deref().is_some_and(|mux| {
+                mux_split_ratio(mux, &transaction.tab, &transaction.path).is_some()
+            });
+        if !owns_widget {
+            self.cancel_active_split_drag(ctx);
+            return;
+        }
+        let is_being_dragged = ctx.is_being_dragged(handle_id);
+        let another_widget_owns_drag = ctx.dragged_id().is_some() && !is_being_dragged;
+        if another_widget_owns_drag {
+            self.cancel_active_split_drag(ctx);
+            return;
+        }
+        if ctx.drag_stopped_id() == Some(handle_id) {
+            self.commit_split_drag(ctx.cumulative_pass_nr());
+            return;
+        }
+
+        let primary_down = ctx.input(|input| input.pointer.primary_down());
+        if !is_being_dragged && !primary_down {
+            self.cancel_active_split_drag(ctx);
+        }
     }
 
     fn commit_split_drag(&mut self, pass: u64) {
@@ -3001,12 +3079,18 @@ impl WorkspaceUi {
                 }
             }
             if self.split_final_resize_sessions.contains(&session) {
-                admitted |= self.apply_split_final_resize_at(
+                let final_resize_admitted = self.apply_split_final_resize_at(
                     session,
                     resize.cols,
                     resize.rows,
                     std::time::Instant::now(),
                 );
+                admitted |= final_resize_admitted;
+                // 같은 grid면 protocol은 보내지 않아도 marker는 소비된다. pane settlement는
+                // 이 tail flush보다 앞서 이미 보류됐으므로 다음 pass를 한 번 깨운다.
+                if !final_resize_admitted && !self.split_final_resize_sessions.contains(&session) {
+                    ctx.request_repaint();
+                }
             } else {
                 admitted |=
                     self.queue_terminal_resize_debounced(ctx, session, resize.cols, resize.rows);
@@ -3222,6 +3306,7 @@ impl WorkspaceUi {
             Err(code) => {
                 let now = std::time::Instant::now();
                 let mut split_retry_exhausted = false;
+                let mut resize_busy_retry_scheduled = false;
                 if split_delivery_matches {
                     match code {
                         WorkspaceProtocolErrorCode::Busy => {
@@ -3254,7 +3339,8 @@ impl WorkspaceUi {
                     match code {
                         WorkspaceProtocolErrorCode::Busy => {
                             let retry = self.resize_retry.entry(rollback.session).or_default();
-                            if !retry.record_busy(now) {
+                            resize_busy_retry_scheduled = retry.record_busy(now);
+                            if !resize_busy_retry_scheduled {
                                 self.resize_retry.remove(&rollback.session);
                                 self.failed_resize_targets
                                     .insert(rollback.session, rollback.target);
@@ -3267,7 +3353,7 @@ impl WorkspaceUi {
                         }
                     }
                 }
-                if let Some((session, _, _)) = final_resize {
+                if resize_busy_retry_scheduled && let Some((session, _, _)) = final_resize {
                     self.split_final_resize_sessions.insert(session);
                 }
                 // 운영 코드에서 app.rs가 여기로 넘기는 값은 Busy(dotenv 승인 상한 또는
@@ -4461,6 +4547,7 @@ impl WorkspaceUi {
         self.prepare_frame_with_native_input(ctx, events, catalog, false, || {
             crate::native_key_monitor::NativeKeyDownBatch::default()
         });
+        self.cancel_active_split_drag(ctx);
         self.flush_command_repaint(ctx);
     }
 
@@ -4656,6 +4743,7 @@ impl WorkspaceUi {
         }
 
         let Some(mux) = self.mux.clone() else {
+            self.reconcile_active_split_drag(ui.ctx(), input_enabled, None);
             // 세션이 없어도 이력 보조 탭은 유효하다 — 탭이 열려 있으면 예전처럼
             // 「새 셸」 프롬프트만 남기고 끝내지 않고 탭 스트립과 본문 rect를 만든다.
             let output = if !self.aux_tabs.is_empty() {
@@ -4704,6 +4792,7 @@ impl WorkspaceUi {
             .as_ref()
             .and_then(|id| mux.tabs.iter().find(|tab| &tab.id == id))
         else {
+            self.reconcile_active_split_drag(ui.ctx(), input_enabled, None);
             // 세션이 없어도 이력 보조 탭은 유효하다 — 탭이 열려 있으면 예전처럼
             // 「새 셸」 프롬프트만 남기고 끝내지 않고 탭 스트립과 본문 rect를 만든다.
             let output = if !self.aux_tabs.is_empty() {
@@ -4717,6 +4806,8 @@ impl WorkspaceUi {
             self.flush_command_repaint(ui.ctx());
             return output;
         };
+
+        self.reconcile_active_split_drag(ui.ctx(), input_enabled, Some(&active_tab.id));
 
         // (출력/상태 폴링 제거 — 2026-07-04 상시 리페인트 원인 조사)
         // 예전엔 "가시+실행 세션 = 50ms 폴링"으로 출력을 끌어왔다(wake가 Viewport를
@@ -5573,6 +5664,30 @@ impl WorkspaceUi {
                 // 목업처럼 pane을 붙이고 1px 구분선만 둔다 (기존 4px 투명 gap 제거).
                 // 리사이즈 잡기는 split_handle이 히트영역을 ±2px 확장해 보장한다.
                 let gap = terminal_split_gap(rect, *direction);
+                // egui는 이전 pass의 widget rect로 현재 drag owner를 먼저 확정한다. 그 owner를
+                // child보다 먼저 읽어 transaction/fence가 같은 프레임의 pane settlement보다
+                // 앞서게 한다. 실제 interact 등록은 hit 우선권을 위해 계속 child 뒤에 둔다.
+                if mode.input_enabled()
+                    && ui.ctx().is_being_dragged(split_handle_id(tab_id, path))
+                    && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+                {
+                    let requested_ratio = match direction {
+                        SplitDirection::Horizontal => {
+                            (pointer.x - rect.min.x) / (rect.width() - gap)
+                        }
+                        SplitDirection::Vertical => {
+                            (pointer.y - rect.min.y) / (rect.height() - gap)
+                        }
+                    };
+                    let ratio = terminal_split_ratio(
+                        rect,
+                        *direction,
+                        requested_ratio,
+                        first_min,
+                        second_min,
+                    );
+                    self.begin_split_drag(tab_id.clone(), path.to_vec(), ratio);
+                }
                 // 드래그 중이면 로컬 미리보기 ratio 사용 (릴리즈 시에만 명령 전송)
                 let requested_ratio = self.split_preview_ratio(tab_id, path, *ratio);
                 // 저장된 ratio가 오래된 10% 규칙이나 remote snapshot에서 왔더라도 현재
@@ -5618,9 +5733,7 @@ impl WorkspaceUi {
                 // 우선이라, ±2px 확장 히트영역이 터미널 선택 드래그에 밀리지 않는다
                 // (codex 리뷰: 가장자리에서 리사이즈 대신 선택이 잡히는 문제).
                 if mode.input_enabled() {
-                    self.split_handle(
-                        ui, rect, gap_rect, *direction, gap, first_min, second_min, tab_id, path,
-                    );
+                    self.split_handle(ui, rect, gap_rect, *direction, tab_id, path);
                 } else {
                     ui.painter().rect_filled(
                         gap_rect,
@@ -5642,15 +5755,12 @@ impl WorkspaceUi {
         rect: egui::Rect,
         gap_rect: egui::Rect,
         direction: SplitDirection,
-        gap: f32,
-        first_min: egui::Vec2,
-        second_min: egui::Vec2,
         tab_id: &runtime::MuxTabId,
         path: &[u8],
     ) {
         // 1px 경계는 잡기 어려우니 히트 영역만 양쪽 2px씩 확장 (시각 폭은 그대로)
         let hit_rect = terminal_split_hit_rect(rect, gap_rect, direction);
-        let id = egui::Id::new(("split_handle", tab_id, path));
+        let id = split_handle_id(tab_id, path);
         let resp = ui.interact(hit_rect, id, egui::Sense::drag());
         let cursor = match direction {
             SplitDirection::Horizontal => egui::CursorIcon::ResizeHorizontal,
@@ -5664,17 +5774,6 @@ impl WorkspaceUi {
             tokens.separator
         };
         ui.painter().rect_filled(gap_rect, 0.0, color);
-        if resp.dragged()
-            && let Some(pointer) = resp.interact_pointer_pos()
-        {
-            let requested_ratio = match direction {
-                SplitDirection::Horizontal => (pointer.x - rect.min.x) / (rect.width() - gap),
-                SplitDirection::Vertical => (pointer.y - rect.min.y) / (rect.height() - gap),
-            };
-            let ratio =
-                terminal_split_ratio(rect, direction, requested_ratio, first_min, second_min);
-            self.begin_split_drag(tab_id.clone(), path.to_vec(), ratio);
-        }
         if resp.drag_stopped()
             && self
                 .split_drag
@@ -8880,6 +8979,202 @@ mod tests {
     }
 
     #[test]
+    fn hidden_input_cancels_active_split_drag_and_unblocks_resize() {
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        ui.cancel_active_split_drag(&ctx);
+        assert!(ui.split_drag.is_none());
+        ui.stage_terminal_resize_for_pass(45, false, SessionId(41), 100, 24);
+        ui.flush_render_side_effects_for_pass(&ctx, 45, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::Resize {
+                session,
+                cols: 100,
+                rows: 24
+            }] if *session == SessionId(41)
+        ));
+    }
+
+    #[test]
+    fn hidden_input_releases_matching_drag_owner_without_revival_on_return() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        for session in [SessionId(41), SessionId(42)] {
+            workspace
+                .sessions
+                .entry(session)
+                .or_default()
+                .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        }
+        let ctx = egui::Context::default();
+        let handle_id = split_handle_id(&tab_id("t"), &[]);
+        workspace.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        ctx.set_dragged_id(handle_id);
+
+        workspace.update_hidden_with_native_input(&ctx, &[], &catalog(), || {
+            crate::native_key_monitor::NativeKeyDownBatch::default()
+        });
+
+        assert_eq!(ctx.dragged_id(), None);
+        assert!(workspace.split_drag.is_none());
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 240.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(200.0, 120.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(200.0, 120.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            workspace.show_with_input(ui, &TerminalConfig::default(), &[], &catalog(), true);
+        });
+
+        assert!(workspace.split_drag.is_none());
+        assert!(
+            !drain_protocol(&mut workspace)
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ResizeSplit { .. })),
+            "returning to input must not revive or commit the cancelled divider drag",
+        );
+        workspace.stage_terminal_resize_for_pass(45, false, SessionId(41), 100, 24);
+        workspace.flush_render_side_effects_for_pass(&ctx, 45, false);
+        assert!(drain_protocol(&mut workspace).iter().any(|command| {
+            matches!(
+                command,
+                RuntimeCommand::Resize {
+                    session: SessionId(41),
+                    cols: 100,
+                    rows: 24,
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn focus_loss_cancels_active_split_drag_and_matching_egui_owner() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        let ctx = egui::Context::default();
+        let handle_id = split_handle_id(&tab_id("t"), &[]);
+        workspace.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        let input = egui::RawInput {
+            focused: false,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 240.0),
+            )),
+            ..egui::RawInput::default()
+        };
+
+        let _ = ctx.run_ui(input, |ui| {
+            ui.ctx().set_dragged_id(handle_id);
+            workspace.show_with_input(ui, &TerminalConfig::default(), &[], &catalog(), true);
+        });
+
+        assert!(workspace.split_drag.is_none());
+        assert_eq!(ctx.dragged_id(), None);
+        assert!(
+            !drain_protocol(&mut workspace)
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ResizeSplit { .. })),
+        );
+    }
+
+    #[test]
+    fn split_drag_release_while_widget_absent_cancels_preview_and_unblocks_resize() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        for session in [SessionId(41), SessionId(42)] {
+            workspace
+                .sessions
+                .entry(session)
+                .or_default()
+                .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        }
+        workspace.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        let ctx = egui::Context::default();
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            workspace.show_with_input(ui, &config, &[], &catalog, false);
+        });
+
+        assert!(workspace.split_drag.is_none());
+        assert!(
+            !drain_protocol(&mut workspace)
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ResizeSplit { .. })),
+            "losing the divider widget must cancel, not commit, the preview",
+        );
+        workspace.stage_terminal_resize_for_pass(45, false, SessionId(41), 100, 24);
+        workspace.flush_render_side_effects_for_pass(&ctx, 45, false);
+        assert!(matches!(
+            drain_protocol(&mut workspace).as_slice(),
+            [RuntimeCommand::Resize {
+                session,
+                cols: 100,
+                rows: 24
+            }] if *session == SessionId(41)
+        ));
+    }
+
+    #[test]
+    fn hidden_input_preserves_committed_split_ack_lifecycle() {
+        let mut workspace = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        workspace.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        workspace.commit_split_drag(44);
+
+        workspace.cancel_active_split_drag(&ctx);
+
+        assert!(workspace.split_drag.as_ref().is_some_and(|transaction| {
+            matches!(transaction.phase, SplitDragPhase::Committed { .. })
+        }));
+    }
+
+    #[test]
+    fn active_split_drag_reconciles_stop_tab_and_widget_owner_changes() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        let ctx = egui::Context::default();
+        let tab = tab_id("t");
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            workspace.begin_split_drag(tab.clone(), Vec::new(), 0.72);
+            ui.ctx().set_dragged_id(split_handle_id(&tab, &[]));
+            ui.ctx().stop_dragging();
+            workspace.reconcile_active_split_drag(ui.ctx(), true, Some(&tab));
+            assert!(workspace.split_drag.as_ref().is_some_and(|transaction| {
+                matches!(transaction.phase, SplitDragPhase::Committed { .. })
+            }));
+
+            workspace.split_drag = None;
+            workspace.begin_split_drag(tab.clone(), Vec::new(), 0.72);
+            workspace.reconcile_active_split_drag(ui.ctx(), true, Some(&tab_id("other")));
+            assert!(workspace.split_drag.is_none());
+
+            workspace.begin_split_drag(tab.clone(), Vec::new(), 0.72);
+            let another_widget = egui::Id::new("another_widget");
+            ui.ctx().set_dragged_id(another_widget);
+            workspace.reconcile_active_split_drag(ui.ctx(), true, Some(&tab));
+            assert!(workspace.split_drag.is_none());
+            assert_eq!(ui.ctx().dragged_id(), Some(another_widget));
+        });
+    }
+
+    #[test]
     fn final_resize_keeps_stable_snapshot_until_target_viewport_settles() {
         let started = std::time::Instant::now();
         let stable = shaped_snapshot(80, 24, "stable content");
@@ -8906,6 +9201,150 @@ mod tests {
         assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &latest_target));
         assert_eq!(view.snapshot_gen, stable_generation + 1);
         assert!(view.resize_presentation.is_none());
+    }
+
+    #[test]
+    fn active_split_drag_defers_prior_resize_presentation_fence() {
+        let started = std::time::Instant::now();
+        let session = SessionId(62);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, "old target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+
+        let repaint = ui.settle_session_resize_presentation(
+            session,
+            started + std::time::Duration::from_millis(250),
+        );
+
+        assert_eq!(repaint, None);
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 80);
+        assert!(ui.sessions[&session].resize_presentation.is_some());
+    }
+
+    #[test]
+    fn committed_and_final_resize_lifecycle_defer_prior_presentation_fence() {
+        let started = std::time::Instant::now();
+        let session = SessionId(63);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, "old target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        ui.commit_split_drag(44);
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 80);
+
+        ui.split_drag = None;
+        ui.split_final_resize_sessions.insert(session);
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 80);
+
+        ui.split_final_resize_sessions.clear();
+        ui.split_final_resize_pending
+            .insert((WorkspaceProtocolOperation(1), 1), (session, 100, 30));
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 80);
+
+        ui.split_final_resize_pending.clear();
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(250),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 100);
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
+    fn split_drag_is_activated_before_child_pane_settlement() {
+        let started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(split_mux_snapshot(0.5));
+        for session in [SessionId(41), SessionId(42)] {
+            workspace
+                .sessions
+                .entry(session)
+                .or_default()
+                .install_snapshot(shaped_snapshot(80, 24, "stable"));
+        }
+        let view = workspace.sessions.get_mut(&SessionId(41)).unwrap();
+        let stable_generation = view.snapshot_gen;
+        view.arm_resize_presentation(100, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(100, 30, "old target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+
+        let ctx = egui::Context::default();
+        let pointer = egui::pos2(200.0, 120.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 240.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..egui::RawInput::default()
+        };
+        let catalog = catalog();
+        let config = TerminalConfig::default();
+        let handle_id = split_handle_id(&tab_id("t"), &[]);
+        let _ = ctx.run_ui(input, |ui| {
+            ui.ctx().set_dragged_id(handle_id);
+            workspace.show_with_input(ui, &config, &[], &catalog, true);
+        });
+
+        assert!(workspace.split_drag.is_some());
+        assert_eq!(
+            workspace.sessions[&SessionId(41)].snapshot_gen,
+            stable_generation,
+            "the first dragged frame must activate the split fence before child panes settle",
+        );
+        assert!(
+            workspace.sessions[&SessionId(41)]
+                .resize_presentation
+                .is_some()
+        );
     }
 
     #[test]
@@ -9034,6 +9473,160 @@ mod tests {
     }
 
     #[test]
+    fn terminal_final_resize_failure_releases_prior_presentation_fence() {
+        let now = std::time::Instant::now();
+        let started = now
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let session = SessionId(67);
+        let mut ui = WorkspaceUi::new();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(90, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(90, 30, "prior target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
+        let intent = ui.take_protocol_intent().expect("final resize");
+
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: intent.operation(),
+            generation: intent.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+
+        assert_eq!(ui.failed_resize_targets.get(&session), Some(&(100, 30)));
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 90);
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
+    fn later_split_ack_consumes_exact_failed_final_target_and_releases_prior_fence() {
+        let now = std::time::Instant::now();
+        let started = now
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let session = SessionId(41);
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.5),
+            }],
+            &catalog(),
+        );
+        let ready = shaped_snapshot(90, 30, "prior target");
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(90, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            Arc::clone(&ready),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
+        let failed = ui.take_protocol_intent().expect("failed final resize");
+        ui.complete_protocol(WorkspaceProtocolCompletion {
+            operation: failed.operation(),
+            generation: failed.generation(),
+            result: Err(WorkspaceProtocolErrorCode::DeliveryFailed),
+        });
+        assert_eq!(ui.failed_resize_targets.get(&session), Some(&(100, 30)));
+
+        ui.begin_split_drag(tab_id("t"), Vec::new(), 0.72);
+        ui.commit_split_drag(60);
+        ui.flush_render_side_effects_for_pass(&ctx, 60, false);
+        assert!(matches!(
+            drain_protocol(&mut ui).as_slice(),
+            [RuntimeCommand::ResizeSplit { ratio, .. }] if (*ratio - 0.72).abs() < 0.0001
+        ));
+        ui.handle_events(
+            &[RuntimeEvent::MuxUpdated {
+                snapshot: split_mux_snapshot(0.72),
+            }],
+            &catalog(),
+        );
+        assert!(ui.split_final_resize_sessions.contains(&session));
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repaint_count_for_callback = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_count_for_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let pass = ctx.cumulative_pass_nr();
+        ui.stage_terminal_resize_for_pass(pass, false, session, 100, 30);
+        let before = repaint_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        ui.flush_render_side_effects(&ctx);
+
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert_eq!(ui.failed_resize_targets.get(&session), Some(&(100, 30)));
+        assert!(ui.protocol_intents.is_empty());
+        assert!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "consuming an exact failed target must wake prior fence settlement",
+        );
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+        assert!(Arc::ptr_eq(
+            ui.sessions[&session].snapshot.as_ref().unwrap(),
+            &ready,
+        ));
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
+    fn same_grid_final_marker_clear_wakes_prior_presentation_settlement() {
+        let now = std::time::Instant::now();
+        let started = now
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let session = SessionId(68);
+        let mut ui = WorkspaceUi::new();
+        let ready = shaped_snapshot(80, 24, "prior target");
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(80, 24, started);
+        assert!(view.buffer_resize_snapshot(
+            Arc::clone(&ready),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repaint_count_for_callback = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_count_for_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let pass = ctx.cumulative_pass_nr();
+        ui.stage_terminal_resize_for_pass(pass, false, session, 80, 24);
+        let before = repaint_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        ui.flush_render_side_effects(&ctx);
+
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "consuming a no-op final marker must wake the next settlement pass",
+        );
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+        assert!(Arc::ptr_eq(
+            ui.sessions[&session].snapshot.as_ref().unwrap(),
+            &ready,
+        ));
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    #[test]
     fn failed_final_resize_rolls_back_and_requires_new_geometry_before_retry() {
         let started = std::time::Instant::now();
         let session = SessionId(63);
@@ -9060,8 +9653,8 @@ mod tests {
             "a command that never reached the runtime cannot own a viewport fence"
         );
         assert!(ui.selection.is_some());
-        assert!(ui.split_final_resize_sessions.contains(&session));
-        assert!(!ui.apply_split_final_resize_at(session, 100, 30, started));
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert!(!ui.queue_terminal_resize(session, 100, 30));
         assert!(
             ui.protocol_intents.is_empty(),
             "do not spin on a dead channel"
@@ -9076,10 +9669,10 @@ mod tests {
             &catalog(),
         );
         assert!(
-            !ui.apply_split_final_resize_at(session, 100, 30, started),
+            !ui.queue_terminal_resize(session, 100, 30),
             "viewport output does not prove that command backpressure recovered"
         );
-        assert!(ui.apply_split_final_resize_at(session, 101, 30, started));
+        assert!(ui.queue_terminal_resize(session, 101, 30));
     }
 
     #[test]
@@ -9195,6 +9788,55 @@ mod tests {
             ui.protocol_intents.is_empty(),
             "same-frame retry is a hot loop"
         );
+    }
+
+    #[test]
+    fn exhausted_busy_final_resize_releases_prior_presentation_fence_without_hot_loop() {
+        let now = std::time::Instant::now();
+        let started = now
+            .checked_sub(std::time::Duration::from_millis(250))
+            .unwrap();
+        let session = SessionId(69);
+        let mut ui = WorkspaceUi::new();
+        let ctx = egui::Context::default();
+        let view = ui.sessions.entry(session).or_default();
+        view.install_snapshot(shaped_snapshot(80, 24, "stable"));
+        view.arm_resize_presentation(90, 30, started);
+        assert!(view.buffer_resize_snapshot(
+            shaped_snapshot(90, 30, "prior target"),
+            started + std::time::Duration::from_millis(1),
+        ));
+        ui.sent_sizes.insert(session, (80, 24));
+        ui.split_final_resize_sessions.insert(session);
+        assert!(ui.apply_split_final_resize_at(session, 100, 30, now));
+
+        for failure in 0..=PROTOCOL_RETRY_LIMIT {
+            let intent = ui.take_protocol_intent().expect("final resize attempt");
+            ui.complete_protocol(WorkspaceProtocolCompletion {
+                operation: intent.operation(),
+                generation: intent.generation(),
+                result: Err(WorkspaceProtocolErrorCode::Busy),
+            });
+            if failure < PROTOCOL_RETRY_LIMIT {
+                let retry = ui.resize_retry.get_mut(&session).expect("scheduled retry");
+                retry.retry_at = Some(
+                    std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_millis(1))
+                        .unwrap(),
+                );
+                let pass = 100 + u64::from(failure);
+                ui.stage_terminal_resize_for_pass(pass, false, session, 100, 30);
+                ui.flush_render_side_effects_for_pass(&ctx, pass, false);
+            }
+        }
+
+        assert_eq!(ui.failed_resize_targets.get(&session), Some(&(100, 30)));
+        assert!(!ui.resize_retry.contains_key(&session));
+        assert!(ui.protocol_intents.is_empty());
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+        assert_eq!(ui.settle_session_resize_presentation(session, now), None);
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 90);
+        assert!(ui.sessions[&session].resize_presentation.is_none());
     }
 
     #[test]

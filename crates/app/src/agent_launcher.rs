@@ -753,7 +753,7 @@ fn resolve_models(
     configured: Option<&str>,
 ) -> Vec<ModelChoice> {
     let mut models = if crate::agent_model_catalog::has_disk_catalog(kind) {
-        crate::agent_model_catalog::load(kind, home)
+        crate::agent_model_catalog::load(kind, home, configured)
     } else {
         Vec::new()
     };

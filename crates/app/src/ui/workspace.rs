@@ -5766,10 +5766,9 @@ impl WorkspaceUi {
 
         // 제목/닫기/검색/새 셸/분할은 각 leaf의 얇은 헤더에 있고, 본문은 그 아래를
         // 카드 외곽 여백 없이 채운다.
-        // 드롭 대상 표시는 pane 외곽선이 아니라 **글자가 실제로 들어갈 자리**에 그린다.
-        // 여기서는 여부만 기억하고, 커서 셀의 픽셀 위치를 아는 draw 이후에 그린다
-        // (2026-08-10 사용자: 테두리 말고 공간이 열려 들어가는 느낌으로).
-        let mut drop_target_hovered = false;
+        // 텍스트는 셀 위치를 아는 draw 이후에 삽입 마커를, 파일은
+        // 문서 탭으로 열린다는 별도 표시를 그린다.
+        let mut drop_feedback = None;
         if mode.is_local() && input_enabled && pane.session_id.is_some() {
             // OS 파일 드롭 — 이 pane 위에서 놓으면 App이 문서 탭으로 열 경로 intent를
             // 올린다. 텍스트 드롭만 기존처럼 터미널 입력으로 보낸다.
@@ -5796,13 +5795,15 @@ impl WorkspaceUi {
                 .flatten();
             let os_over_pane = os_drag_pos.is_some_and(|pos| pane_rect.contains(pos));
 
-            drop_target_hovered = pane_resp
-                .dnd_hover_payload::<std::path::PathBuf>()
-                .is_some()
-                || pane_resp
+            drop_feedback = classify_terminal_drop_feedback(
+                pane_resp
+                    .dnd_hover_payload::<std::path::PathBuf>()
+                    .is_some(),
+                pane_resp
                     .dnd_hover_payload::<TerminalTextDragPayload>()
-                    .is_some()
-                || (os_drag_active && os_over_pane);
+                    .is_some(),
+                os_drag_active && os_over_pane,
+            );
             if let Some(session) = pane.session_id {
                 if let Some(path) = release_typed_dnd_payload::<std::path::PathBuf>(&pane_resp) {
                     render_output
@@ -5927,6 +5928,7 @@ impl WorkspaceUi {
                 );
             }
         }
+        let pane_feedback_painter = ui.painter().clone();
         let mut terminal_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(pane_layout.content)
@@ -6048,18 +6050,39 @@ impl WorkspaceUi {
         // B1 실측: 이 프레임에 그린 pane들의 렌더 비용을 합산한다 (visible pane 전부).
         self.frame_counters += output.counters;
 
-        // 드롭 삽입 마커. 떨어뜨리면 경로/텍스트는 **셸 입력줄 커서 위치**로 들어가므로
-        // (아래 release 처리의 path_insert_paste_bytes) 그 자리를 가리킨다. 터미널은 고정
-        // 셀 격자라 실제로 행을 벌릴 수 없어, 커서 셀 폭만큼 슬롯을 열어 보여주는 것으로
-        // 대신한다 — Finder에서 틈이 벌어지는 것과 같은 신호를 위치로 준다.
-        if drop_target_hovered {
-            Self::paint_drop_insertion_marker(
-                ui,
-                output.origin,
-                output.cell_size,
-                snapshot.cursor.col,
-                snapshot.cursor.row,
-            );
+        match drop_feedback {
+            Some(TerminalDropFeedback::TerminalInsert) => {
+                Self::paint_drop_insertion_marker(
+                    ui,
+                    output.origin,
+                    output.cell_size,
+                    snapshot.cursor.col,
+                    snapshot.cursor.row,
+                );
+            }
+            Some(TerminalDropFeedback::DocumentOpen) => {
+                let painter = pane_feedback_painter.with_clip_rect(pane_rect);
+                let style = PaneDropFeedbackStyle {
+                    label_fill: tokens.input_background,
+                    label_text: tokens.text,
+                    ..pane_drop_feedback_style(tokens)
+                };
+                painter.rect_filled(pane_rect, 0.0, tokens.accent.gamma_multiply(0.10));
+                if let Some(label) = layout_pane_drop_feedback_label(
+                    &painter,
+                    pane_rect,
+                    &catalog.t("workspace.drop.open_document", &[]),
+                    style,
+                ) {
+                    painter.rect_filled(label.rect, 4.0, style.label_fill);
+                    painter.galley(
+                        label.rect.min + egui::vec2(6.0, 3.0),
+                        label.galley,
+                        style.label_text,
+                    );
+                }
+            }
+            None => {}
         }
 
         // 선택된 텍스트 위에서 시작한 드래그는 terminal-internal DnD payload가 된다.
@@ -7643,6 +7666,26 @@ pub(crate) fn qualify_project_name(project_name: &str, workspace_name: Option<&s
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TerminalTextDragPayload {
     text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalDropFeedback {
+    TerminalInsert,
+    DocumentOpen,
+}
+
+fn classify_terminal_drop_feedback(
+    typed_path_hovered: bool,
+    terminal_text_hovered: bool,
+    os_file_over_pane: bool,
+) -> Option<TerminalDropFeedback> {
+    if typed_path_hovered || os_file_over_pane {
+        Some(TerminalDropFeedback::DocumentOpen)
+    } else if terminal_text_hovered {
+        Some(TerminalDropFeedback::TerminalInsert)
+    } else {
+        None
+    }
 }
 
 fn release_typed_dnd_payload<Payload>(response: &egui::Response) -> Option<Arc<Payload>>
@@ -10812,6 +10855,23 @@ mod tests {
         assert!((measured.rect.center().x - pane.center().x).abs() < f32::EPSILON);
         assert!((measured.rect.center().y - pane.center().y).abs() < f32::EPSILON);
         assert_eq!(measured.galley.job.sections[0].format.font_id.size, 13.0);
+    }
+
+    #[test]
+    fn terminal_drop_hover_feedback은_입력종류를_정확히_분리한다() {
+        assert_eq!(
+            classify_terminal_drop_feedback(false, true, false),
+            Some(TerminalDropFeedback::TerminalInsert)
+        );
+        assert_eq!(
+            classify_terminal_drop_feedback(true, false, false),
+            Some(TerminalDropFeedback::DocumentOpen)
+        );
+        assert_eq!(
+            classify_terminal_drop_feedback(false, false, true),
+            Some(TerminalDropFeedback::DocumentOpen)
+        );
+        assert_eq!(classify_terminal_drop_feedback(false, false, false), None);
     }
 
     #[test]

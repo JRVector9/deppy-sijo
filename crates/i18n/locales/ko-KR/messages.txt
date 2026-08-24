@@ -377,6 +377,7 @@ workspace.tab.git = Git
 workspace.tab.git_hint = git 변경 사항 보기
 workspace.tab.git_close = Git 탭 닫기
 workspace.tab.document_hint = 문서 보기
+workspace.drop.open_document = 문서 탭으로 열기
 workspace.tab.document_close = 문서 탭 닫기
 document.mode.source = 본문
 document.mode.preview = 미리보기

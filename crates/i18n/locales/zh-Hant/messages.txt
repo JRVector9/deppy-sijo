@@ -377,6 +377,7 @@ workspace.tab.git = Git
 workspace.tab.git_hint = 檢視 git 變更
 workspace.tab.git_close = 關閉 Git 分頁
 workspace.tab.document_hint = 檢視文件
+workspace.drop.open_document = 在文件分頁中開啟
 workspace.tab.document_close = 關閉文件分頁
 document.mode.source = 正文
 document.mode.preview = 預覽

@@ -377,6 +377,7 @@ workspace.tab.git = Git
 workspace.tab.git_hint = gitの変更を表示
 workspace.tab.git_close = Gitタブを閉じる
 workspace.tab.document_hint = ドキュメントを表示
+workspace.drop.open_document = ドキュメントタブで開く
 workspace.tab.document_close = ドキュメントタブを閉じる
 document.mode.source = 本文
 document.mode.preview = プレビュー

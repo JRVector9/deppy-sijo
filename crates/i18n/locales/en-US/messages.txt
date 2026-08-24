@@ -377,6 +377,7 @@ workspace.tab.git = Git
 workspace.tab.git_hint = View git changes
 workspace.tab.git_close = Close Git tab
 workspace.tab.document_hint = View document
+workspace.drop.open_document = Open in document tab
 workspace.tab.document_close = Close document tab
 document.mode.source = Source
 document.mode.preview = Preview

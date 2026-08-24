@@ -36,7 +36,7 @@ fn extract_window_remaining(lines: &[&str], label: &str) -> Option<u8> {
     static PERCENT: OnceLock<regex::Regex> = OnceLock::new();
     static LIMIT: OnceLock<regex::Regex> = OnceLock::new();
     let percent = PERCENT.get_or_init(|| {
-        regex::Regex::new(r"(?i)(\d{1,3})(?:\.\d+)?\s*%\s*(used|left|remaining)")
+        regex::Regex::new(r"(?i)(\d+)(?:\.\d+)?\s*%\s*(used|left|remaining)")
             .expect("static Grok percent regex")
     });
     let limit = LIMIT.get_or_init(|| {
@@ -57,7 +57,7 @@ fn extract_window_remaining(lines: &[&str], label: &str) -> Option<u8> {
                 break;
             }
             if let Some(captures) = percent.captures(candidate) {
-                let value = captures.get(1)?.as_str().parse::<u16>().ok()?.min(100) as u8;
+                let value = captures.get(1)?.as_str().parse::<u64>().ok()?.min(100) as u8;
                 return match captures.get(2)?.as_str().to_ascii_lowercase().as_str() {
                     "used" => Some(100 - value),
                     "left" | "remaining" => Some(value),
@@ -228,6 +228,22 @@ Credits left: $1,234.50
                 monthly_remaining_percent: None,
                 credits_left: None,
             })
+        );
+    }
+
+    #[test]
+    fn oversized_percentages_capture_the_full_integer_before_clamping() {
+        assert_eq!(
+            parse_usage("Weekly limit 1000% used"),
+            Some(GrokUsage {
+                weekly_remaining_percent: Some(0),
+                monthly_remaining_percent: None,
+                credits_left: None,
+            })
+        );
+        assert_eq!(
+            parse_usage("Weekly limit 184467440737095516160% used"),
+            None
         );
     }
 }

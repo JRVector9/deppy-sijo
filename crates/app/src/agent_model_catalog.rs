@@ -437,7 +437,13 @@ struct GrokCache {
 #[serde(untagged)]
 enum GrokModelCollection {
     Array(Vec<serde_json::Value>),
-    Object(BTreeMap<String, serde_json::Value>),
+    Object(BTreeMap<String, GrokCacheEntry>),
+}
+
+#[derive(Deserialize)]
+struct GrokCacheEntry {
+    #[serde(default)]
+    info: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -502,14 +508,6 @@ fn push_unique_model(
     }
 }
 
-fn grok_entry_info(mut entry: serde_json::Value) -> Option<serde_json::Value> {
-    entry.as_object_mut()?.remove("info")
-}
-
-fn grok_entry_info_ref(entry: &serde_json::Value) -> Option<serde_json::Value> {
-    entry.get("info").cloned()
-}
-
 /// `~/.grok/models_cache.json`. Codex와 달리 `priority` 필드가 없으므로 정렬하지 않고
 /// 카탈로그 배열 순서를 그대로 쓴다.
 fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> {
@@ -533,7 +531,7 @@ fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> 
             let mut promoted_key = None;
             if let Some(default) = configured_default
                 && let Some(entry) = values.get(default)
-                && let Some(info) = grok_entry_info_ref(entry)
+                && let Some(info) = entry.info.as_ref().cloned()
                 && let Some(model) = grok_model_choice(info, Some(default.to_owned()))
                 && model.value() == default
             {
@@ -547,7 +545,7 @@ fn parse_grok(text: &str, configured_default: Option<&str>) -> Vec<ModelChoice> 
                 if models.len() >= CATALOG_MODELS_MAX {
                     break;
                 }
-                if let Some(info) = grok_entry_info(entry)
+                if let Some(info) = entry.info
                     && let Some(model) = grok_model_choice(info, Some(id))
                 {
                     push_unique_model(&mut models, &mut seen, model);

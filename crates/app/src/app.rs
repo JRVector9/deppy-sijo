@@ -9437,9 +9437,19 @@ fn clear_document_viewer_state(
     );
 }
 
-fn dispatch_document_drop_paths(paths: Vec<PathBuf>, mut open: impl FnMut(PathBuf)) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentDropOpenMode {
+    ClaimedPane,
+    ResolvePane,
+}
+
+fn dispatch_document_drop_paths(
+    paths: Vec<PathBuf>,
+    mode: DocumentDropOpenMode,
+    mut open: impl FnMut(DocumentDropOpenMode, PathBuf),
+) {
     for path in paths {
-        open(path);
+        open(mode, path);
     }
 }
 
@@ -28024,15 +28034,30 @@ impl eframe::App for App {
         } else if primary_focus_requested {
             self.cross_workspace_pane.focus_primary();
         }
+        let document_drop_open_mode = if primary_local_focus_claim.is_some() {
+            DocumentDropOpenMode::ClaimedPane
+        } else {
+            DocumentDropOpenMode::ResolvePane
+        };
         if let Some(pane) = primary_local_focus_claim {
             // A click on the pane already focused by the runtime produces no FocusPane command,
             // but it is still a newer user navigation event than an asynchronous restore.
             self.cancel_terminal_focus_intents();
             self.active.workspace_ui.arm_terminal_focus(pane);
         }
-        dispatch_document_drop_paths(dropped_document_paths, |path| {
-            self.open_document(path);
-        });
+        dispatch_document_drop_paths(
+            dropped_document_paths,
+            document_drop_open_mode,
+            |mode, path| {
+                match mode {
+                    // Workspace가 이 프레임에 실제 visible pane을 claim했다. mux의 focus ACK는
+                    // 비동기이므로 옛 snapshot을 다시 물으면 다중 drop이 단일 pending slot을
+                    // 덮어쓴다. 방금 확인한 pane을 신뢰해 모든 경로를 순서대로 바로 연다.
+                    DocumentDropOpenMode::ClaimedPane => self.begin_document_open(path),
+                    DocumentDropOpenMode::ResolvePane => self.open_document(path),
+                }
+            },
+        );
         if let Some(attachment_id) = attached_detach_requested {
             self.stage_workspace_controller_action(WorkspaceControllerAction::DetachWorkspacePane(
                 attachment_id,
@@ -34981,9 +35006,40 @@ mod tests {
         ];
         let mut opened = Vec::new();
 
-        dispatch_document_drop_paths(paths.clone(), |path| opened.push(path));
+        dispatch_document_drop_paths(
+            paths.clone(),
+            DocumentDropOpenMode::ResolvePane,
+            |_, path| {
+                opened.push(path);
+            },
+        );
 
         assert_eq!(opened, paths);
+    }
+
+    #[test]
+    fn dispatch_document_drop_paths는_현재_frame의_pane_claim이_있으면_모두_직접_연다() {
+        let paths = vec![PathBuf::from("/tmp/a.md"), PathBuf::from("/tmp/b.md")];
+        let mut direct = Vec::new();
+        let mut deferred = Vec::new();
+
+        dispatch_document_drop_paths(
+            paths.clone(),
+            DocumentDropOpenMode::ClaimedPane,
+            |mode, path| match mode {
+                DocumentDropOpenMode::ClaimedPane => direct.push(path),
+                DocumentDropOpenMode::ResolvePane => deferred.push(path),
+            },
+        );
+
+        assert_eq!(
+            direct, paths,
+            "stale mux focus와 무관하게 두 파일 모두 열어야 한다"
+        );
+        assert!(
+            deferred.is_empty(),
+            "방금 drop이 claim한 pane이 있으면 shell spawn 대기로 보내면 안 된다"
+        );
     }
 
     #[test]
@@ -35000,14 +35056,17 @@ mod tests {
         let focus = production
             .find("if let Some(pane) = primary_local_focus_claim")
             .expect("primary focus claim 적용이 있어야 한다");
-        let dispatch = production
-            .find("dispatch_document_drop_paths(dropped_document_paths")
-            .expect("drop dispatch가 있어야 한다");
+        let dispatch = focus
+            + production[focus..]
+                .find("dispatch_document_drop_paths(")
+                .expect("focus claim 뒤 drop dispatch가 있어야 한다");
         assert!(
             focus < dispatch,
             "drop 대상 pane focus를 문서 열기보다 먼저 적용해야 한다"
         );
         let dispatch_tail = &production[dispatch..];
+        assert!(dispatch_tail.contains("DocumentDropOpenMode::ClaimedPane"));
+        assert!(dispatch_tail.contains("self.begin_document_open(path)"));
         assert!(dispatch_tail.contains("self.open_document(path)"));
         assert!(
             !dispatch_tail

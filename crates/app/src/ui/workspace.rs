@@ -556,7 +556,7 @@ struct PaneDropFeedbackLabelLayout {
 fn layout_pane_drop_feedback_label(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
-    label: &str,
+    label: impl Into<String>,
     style: PaneDropFeedbackStyle,
 ) -> Option<PaneDropFeedbackLabelLayout> {
     let margin = 8.0;
@@ -567,7 +567,7 @@ fn layout_pane_drop_feedback_label(
     }
 
     let mut job = egui::text::LayoutJob::single_section(
-        label.to_owned(),
+        label.into(),
         egui::TextFormat {
             font_id: egui::FontId::proportional(13.0),
             color: style.label_text,
@@ -909,12 +909,14 @@ fn layout_panes<'a>(node: &'a LayoutNode, out: &mut Vec<&'a runtime::MuxPaneId>)
 /// 보조 탭을 붙일 pane — focused pane이 이 layout 안에 있으면 그것, 없으면 첫 pane.
 fn aux_tab_owner_pane(
     layout: &LayoutNode,
+    pending: Option<&runtime::MuxPaneId>,
     focused: Option<&runtime::MuxPaneId>,
 ) -> Option<runtime::MuxPaneId> {
     let mut panes = Vec::new();
     layout_panes(layout, &mut panes);
-    focused
+    pending
         .filter(|id| panes.contains(id))
+        .or_else(|| focused.filter(|id| panes.contains(id)))
         .or_else(|| panes.first().copied())
         .cloned()
 }
@@ -4612,6 +4614,11 @@ impl WorkspaceUi {
         input_enabled: bool,
     ) -> WorkspaceSurfaceOutput {
         self.prepare_frame(ui.ctx(), events, catalog, input_enabled);
+        request_terminal_os_drag_feedback_repaint(
+            ui.ctx(),
+            input_enabled,
+            ui.input(|input| !input.raw.hovered_files.is_empty()),
+        );
         self.reconcile_explicit_terminal_focus();
         self.stage_unadmitted_split_commit_for_pass(
             ui.ctx(),
@@ -4725,7 +4732,13 @@ impl WorkspaceUi {
         let layout = &active_tab.layout;
         let layout_metrics = terminal_layout_metrics(layout);
         self.aux_tab_pane = (!self.aux_tabs.is_empty())
-            .then(|| aux_tab_owner_pane(layout, mux.focused_pane.as_ref()))
+            .then(|| {
+                aux_tab_owner_pane(
+                    layout,
+                    self.pending_focus.as_ref(),
+                    mux.focused_pane.as_ref(),
+                )
+            })
             .flatten();
         let embedded_headers = keeps_embedded_pane_header(layout);
         let tab_id = active_tab.id.clone();
@@ -5928,7 +5941,9 @@ impl WorkspaceUi {
                 );
             }
         }
-        let pane_feedback_painter = ui.painter().clone();
+        let pane_feedback_painter =
+            matches!(drop_feedback, Some(TerminalDropFeedback::DocumentOpen))
+                .then(|| ui.painter().clone());
         let mut terminal_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(pane_layout.content)
@@ -6061,7 +6076,9 @@ impl WorkspaceUi {
                 );
             }
             Some(TerminalDropFeedback::DocumentOpen) => {
-                let painter = pane_feedback_painter.with_clip_rect(pane_rect);
+                let painter = pane_feedback_painter
+                    .expect("document drop feedback painter")
+                    .with_clip_rect(pane_rect);
                 let style = PaneDropFeedbackStyle {
                     label_fill: tokens.input_background,
                     label_text: tokens.text,
@@ -6071,7 +6088,7 @@ impl WorkspaceUi {
                 if let Some(label) = layout_pane_drop_feedback_label(
                     &painter,
                     pane_rect,
-                    &catalog.t("workspace.drop.open_document", &[]),
+                    catalog.t("workspace.drop.open_document", &[]),
                     style,
                 ) {
                     painter.rect_filled(label.rect, 4.0, style.label_fill);
@@ -7685,6 +7702,19 @@ fn classify_terminal_drop_feedback(
         Some(TerminalDropFeedback::TerminalInsert)
     } else {
         None
+    }
+}
+
+fn request_terminal_os_drag_feedback_repaint(
+    ctx: &egui::Context,
+    input_enabled: bool,
+    os_drag_active: bool,
+) {
+    if input_enabled && os_drag_active {
+        // macOS winit 0.30은 draggingUpdated: 포인터 이동 이벤트를 주지 않는다.
+        // OS drag가 실제로 진행 중일 때만 다음 frame을 요청해 AppKit 좌표를
+        // 다시 샘플링한다. hovered_files가 비면 즉시 종료되어 idle 타이머가 남지 않는다.
+        ctx.request_repaint();
     }
 }
 
@@ -10113,19 +10143,37 @@ mod tests {
         };
 
         assert_eq!(
-            aux_tab_owner_pane(&layout, None),
+            aux_tab_owner_pane(&layout, None, None),
             Some(pane_id("left")),
             "포커스가 없으면 layout의 첫 pane이 받는다"
         );
         assert_eq!(
-            aux_tab_owner_pane(&layout, Some(&pane_id("right"))),
+            aux_tab_owner_pane(&layout, None, Some(&pane_id("right"))),
             Some(pane_id("right")),
             "포커스된 pane이 layout 안에 있으면 그것이 받는다"
         );
         assert_eq!(
-            aux_tab_owner_pane(&layout, Some(&pane_id("other-tab"))),
+            aux_tab_owner_pane(&layout, None, Some(&pane_id("other-tab"))),
             Some(pane_id("left")),
             "다른 탭의 focused pane은 이 layout의 주인이 될 수 없다"
+        );
+    }
+
+    #[test]
+    fn 보조탭_owner_focus는_mux_ack전_pending_pane을_우선한다() {
+        let previous = pane_id("left");
+        let dropped = pane_id("right");
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane(previous.clone())),
+            second: Box::new(LayoutNode::Pane(dropped.clone())),
+        };
+
+        assert_eq!(
+            aux_tab_owner_pane(&layout, Some(&dropped), Some(&previous)),
+            Some(dropped),
+            "비포커스 split drop 직후에는 옛 mux focus보다 pending focus가 주인이어야 한다"
         );
     }
 
@@ -10858,6 +10906,34 @@ mod tests {
     }
 
     #[test]
+    fn document_drop_feedback_painter는_terminal_child전_parent_clip에서_조건부로_잡는다() {
+        let source = include_str!("workspace.rs");
+        let render_pane = source
+            .split_once("    fn render_pane(")
+            .expect("render_pane 정의")
+            .1
+            .split_once("    fn agent_send_targets(")
+            .expect("render_pane 끝")
+            .0;
+        let painter = render_pane
+            .find("let pane_feedback_painter")
+            .expect("document hover일 때만 parent painter를 보관해야 한다");
+        let child = render_pane
+            .find("let mut terminal_ui = ui.new_child")
+            .expect("terminal child 정의");
+
+        assert!(
+            painter < child,
+            "terminal child painter는 content clip이므로 pane 전체 feedback에 쓰면 안 된다"
+        );
+        assert!(
+            render_pane[painter..child]
+                .contains("matches!(drop_feedback, Some(TerminalDropFeedback::DocumentOpen))"),
+            "parent painter는 document feedback frame에만 복제해야 한다"
+        );
+    }
+
+    #[test]
     fn terminal_drop_hover_feedback은_입력종류를_정확히_분리한다() {
         assert_eq!(
             classify_terminal_drop_feedback(false, true, false),
@@ -10872,6 +10948,31 @@ mod tests {
             Some(TerminalDropFeedback::DocumentOpen)
         );
         assert_eq!(classify_terminal_drop_feedback(false, false, false), None);
+    }
+
+    #[test]
+    fn terminal_os_file_drag_repaint는_input_owner의_활성_drag에서만_유지된다() {
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let before = repaint_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        request_terminal_os_drag_feedback_repaint(&ctx, false, true);
+        request_terminal_os_drag_feedback_repaint(&ctx, true, false);
+        assert_eq!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "input을 소유하지 않거나 OS drag가 아니면 idle repaint를 추가하면 안 된다"
+        );
+
+        request_terminal_os_drag_feedback_repaint(&ctx, true, true);
+        assert!(
+            repaint_count.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "macOS drag 중에만 AppKit 포인터를 다시 샘플링할 다음 frame을 요청해야 한다"
+        );
     }
 
     #[test]

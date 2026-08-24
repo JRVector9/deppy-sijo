@@ -2888,7 +2888,7 @@ impl FileTreeUi {
                     // 드래그 중엔 egui 포인터가 멎으므로 drag_pos(AppKit 위치)로 판정한다.
                     if !inaccessible
                         && let Some(pos) = drag_pos
-                        && hover_rect.contains(pos)
+                        && tree_area_owns_os_drop(hover_rect, pos)
                     {
                         // 내부 드래그와 **같은 판정 함수**를 쓴다. 표시와 목적지를 각각
                         // 계산하면 반드시 어긋난다 — 실제로 어긋났었다: 폴더 행 가장자리에
@@ -6690,6 +6690,23 @@ mod tests {
                 egui::pos2(tree_area.right(), tree_area.center().y)
             ),
             "중앙 pane과 공유하는 오른쪽 경계는 file tree가 소유하지 않아야 한다"
+        );
+    }
+
+    #[test]
+    fn file_tree_os_drop_행_feedback도_공유_오른쪽_경계를_소유하지_않는다() {
+        let source = include_str!("file_tree.rs");
+        let row_hover = source
+            .split_once("// Finder 드래그 대상:")
+            .expect("Finder 행 hover 분기")
+            .1
+            .split_once("// 행 전체 = 드래그 소스")
+            .expect("행 hover 분기 끝")
+            .0;
+
+        assert!(
+            row_hover.contains("tree_area_owns_os_drop(hover_rect, pos)"),
+            "실제 drop을 거부하는 shared right edge에 행 허용 feedback을 그리면 안 된다"
         );
     }
 

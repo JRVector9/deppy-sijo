@@ -969,22 +969,26 @@ pub(crate) fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Re
         }
         "Grok" => {
             let color = egui::Color32::from_rgb(0xa5, 0x70, 0xff);
-            let stroke = egui::Stroke::new(2.0, color);
+            let stroke = egui::Stroke::new(2.0 * scale, color);
             painter.line_segment(
                 [
-                    center + egui::vec2(-7.0, 7.0),
-                    center + egui::vec2(7.0, -7.0),
+                    center + egui::vec2(-7.0 * scale, 7.0 * scale),
+                    center + egui::vec2(7.0 * scale, -7.0 * scale),
                 ],
                 stroke,
             );
             painter.line_segment(
                 [
-                    center + egui::vec2(-5.0, -6.0),
-                    center + egui::vec2(5.0, 6.0),
+                    center + egui::vec2(-5.0 * scale, -6.0 * scale),
+                    center + egui::vec2(5.0 * scale, 6.0 * scale),
                 ],
                 stroke,
             );
-            painter.circle_stroke(center + egui::vec2(4.0, -4.0), 3.0, stroke);
+            painter.circle_stroke(
+                center + egui::vec2(4.0 * scale, -4.0 * scale),
+                3.0 * scale,
+                stroke,
+            );
         }
         "Hugging Face" => {
             let yellow = egui::Color32::from_rgb(0xf4, 0xc4, 0x30);
@@ -1317,6 +1321,39 @@ mod tests {
         assert!(
             compact.contains("앱") && !compact.contains("세션"),
             "{compact}"
+        );
+    }
+
+    #[test]
+    fn grok_상태바_로고는_claude_codex와_같은_시각크기다() {
+        fn visual_bounds(source: &str) -> egui::Rect {
+            let context = egui::Context::default();
+            let logo_rect =
+                egui::Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(14.5, 14.5));
+            let output = context.run_ui(egui::RawInput::default(), |ui| {
+                paint_announcement_provider_logo(ui, logo_rect, source);
+            });
+            output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::LineSegment { .. } | egui::Shape::Circle(_) => {
+                        Some(clipped.shape.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .fold(egui::Rect::NOTHING, |bounds, shape| bounds | shape)
+        }
+
+        let grok = visual_bounds("Grok");
+        let claude = visual_bounds("Claude");
+        let codex = visual_bounds("Codex");
+        let peer_min = claude.width().min(codex.width());
+        let peer_max = claude.width().max(codex.width());
+
+        assert!(
+            (peer_min - 0.5..=peer_max + 0.5).contains(&grok.width()),
+            "Grok={grok:?}, Claude={claude:?}, Codex={codex:?}"
         );
     }
 

@@ -29,10 +29,12 @@ pub(crate) struct GrokUsage {
     pub(crate) credits_left: Option<GrokCredits>,
 }
 
+type CompletedProbe = Option<(Instant, GrokUsage)>;
+
 #[derive(Default)]
 struct UsageState {
     usage: Option<(Instant, GrokUsage)>,
-    pending: Option<mpsc::Receiver<Option<GrokUsage>>>,
+    pending: Option<mpsc::Receiver<CompletedProbe>>,
     last_request: Option<Instant>,
 }
 
@@ -54,6 +56,20 @@ fn last_request_after_spawn(attempted: Instant) -> Instant {
     attempted
 }
 
+fn receive_pending_probe(state: &mut UsageState) {
+    let Some(receiver) = state.pending.as_ref() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(Some(completed)) => {
+            state.usage = Some(completed);
+            state.pending = None;
+        }
+        Ok(None) | Err(mpsc::TryRecvError::Disconnected) => state.pending = None,
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
+}
+
 pub(crate) fn current(
     ctx: &egui::Context,
     agent: Option<&crate::agent_launcher::DetectedAgent>,
@@ -64,16 +80,7 @@ pub(crate) fn current(
     let Ok(mut state) = state.lock() else {
         return None;
     };
-    if let Some(receiver) = state.pending.as_ref() {
-        match receiver.try_recv() {
-            Ok(Some(usage)) => {
-                state.usage = Some((Instant::now(), usage));
-                state.pending = None;
-            }
-            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => state.pending = None,
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-    }
+    receive_pending_probe(&mut state);
     let since_last_request = state.last_request.map(|requested| requested.elapsed());
     if should_start_probe(true, state.pending.is_some(), since_last_request) {
         // 감지 스냅샷의 PATH는 최대 32KiB다. 상태바 렌더 때마다 복사하지 않고 실제로
@@ -89,7 +96,7 @@ pub(crate) fn current(
                 let usage = fetch_grok_usage(&executable, detected_launch_path.as_deref())
                     .ok()
                     .flatten();
-                let _ = sender.send(usage);
+                let _ = sender.send(usage.map(|usage| (Instant::now(), usage)));
                 repaint.request_repaint();
             })
             .is_ok();
@@ -217,6 +224,9 @@ fn usage_panel_rendered(lower: &str) -> bool {
         "notauthenticated",
         "managebilling",
         "failedtoload",
+        "nobillingdataavailable",
+        "usagelimitsaremanagedbyyourteam",
+        "couldntloadusage",
     ]
     .into_iter()
     .any(|needle| compact.contains(needle))
@@ -505,6 +515,17 @@ Credits left: $1,234.50
     }
 
     #[test]
+    fn installed_terminal_no_data_states_finish_the_probe() {
+        for panel in [
+            "No billing data available.",
+            "Usage limits are managed by your team.",
+            "Couldn't load usage: Loading session usage",
+        ] {
+            assert!(usage_panel_rendered(panel), "{panel}");
+        }
+    }
+
+    #[test]
     fn ansi_is_removed_and_percentages_are_clamped_without_context_false_positives() {
         assert_eq!(
             parse_usage("\u{1b}[31mWeekly limit 999% used\u{1b}[0m"),
@@ -570,6 +591,53 @@ Credits left: $1,234.50
             Some(usage)
         );
         assert_eq!(fresh_usage_after(usage, Duration::from_secs(601)), None);
+    }
+
+    #[test]
+    fn buffered_probe_result_keeps_worker_completion_time() {
+        let usage = GrokUsage {
+            weekly_remaining_percent: Some(70),
+            monthly_remaining_percent: None,
+            credits_left: None,
+        };
+        let completed_at = Instant::now();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(Some((completed_at, usage))).unwrap();
+        let mut state = UsageState {
+            pending: Some(receiver),
+            ..UsageState::default()
+        };
+
+        receive_pending_probe(&mut state);
+
+        let (stored_at, stored) = state.usage.unwrap();
+        assert_eq!(stored_at, completed_at);
+        assert_eq!(
+            fresh_usage_after(stored, STALE_AFTER + Duration::from_secs(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_probe_result_keeps_last_success_until_stale() {
+        let usage = GrokUsage {
+            weekly_remaining_percent: Some(70),
+            monthly_remaining_percent: Some(85),
+            credits_left: None,
+        };
+        let measured_at = Instant::now();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(None).unwrap();
+        let mut state = UsageState {
+            usage: Some((measured_at, usage)),
+            pending: Some(receiver),
+            last_request: None,
+        };
+
+        receive_pending_probe(&mut state);
+
+        assert_eq!(state.usage, Some((measured_at, usage)));
+        assert!(state.pending.is_none());
     }
 
     #[test]

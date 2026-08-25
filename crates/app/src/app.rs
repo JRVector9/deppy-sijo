@@ -11537,6 +11537,15 @@ fn app_host_move(
     }
 }
 
+fn app_host_rename_is_noop(source: &Path, requested_name: &str) -> bool {
+    source
+        .parent()
+        .is_some_and(|parent| parent.join(requested_name) == source)
+        || source
+            .file_name()
+            .is_some_and(|name| ui::os_str_canonically_eq(name, requested_name))
+}
+
 fn run_file_tree_host_io(
     request: ui::file_tree::FileTreeIoRequest,
     cancel: &std::sync::atomic::AtomicBool,
@@ -11548,10 +11557,10 @@ fn run_file_tree_host_io(
                 return Err(Error::InvalidName);
             }
             let source = source.into_path();
-            let destination = source.parent().ok_or(Error::InvalidPath)?.join(name);
-            if destination == source {
+            if app_host_rename_is_noop(&source, &name) {
                 return Ok(());
             }
+            let destination = source.parent().ok_or(Error::InvalidPath)?.join(name);
             app_host_rename_no_replace(&source, &destination).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     Error::Conflict
@@ -11744,9 +11753,9 @@ fn run_file_tree_listing(
         if items.len() >= max_items {
             return Err(Error::ListingTooLarge);
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = entry.file_name();
         bytes = bytes
-            .checked_add(name.len())
+            .checked_add(name.as_encoded_bytes().len())
             .filter(|bytes| *bytes <= max_bytes)
             .ok_or(Error::ListingTooLarge)?;
         let is_dir = entry
@@ -16766,8 +16775,7 @@ impl App {
         self.documents
             .iter()
             .find(|document| document.id == id)
-            .and_then(|document| document.path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
+            .map(|document| ui::path_file_name_display(&document.path))
             .unwrap_or_default()
     }
 
@@ -27563,11 +27571,7 @@ impl eframe::App for App {
             for document in &self.documents {
                 aux_tabs.push(ui::workspace::PaneAuxTab {
                     kind: ui::workspace::PaneAuxTabKind::Document(document.id),
-                    label: document
-                        .path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
+                    label: ui::path_file_name_display(&document.path),
                     active: document_tab_active && self.active_document == Some(document.id),
                 });
             }
@@ -34783,6 +34787,115 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // macOS/APFS rejects invalid UTF-8 path components with EILSEQ before `read_dir`; keep the
+    // real-filesystem boundary regression on Unix platforms that admit such names. The tree-level
+    // raw identity regression runs on every Unix target, including macOS.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn file_tree_listing_preserves_invalid_utf8_name_bytes() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let root = unique_temp_dir("file-tree-invalid-utf8");
+        let raw = std::ffi::OsString::from_vec(b"broken-\xff".to_vec());
+        std::fs::write(root.join(&raw), b"x").unwrap();
+
+        let snapshot = run_file_tree_listing(
+            &root,
+            &root,
+            ui::file_tree::FILE_TREE_LISTING_MAX_ITEMS,
+            ui::file_tree::FILE_TREE_LISTING_MAX_BYTES,
+        )
+        .unwrap();
+        let item = snapshot
+            .items()
+            .iter()
+            .find(|item| item.name().as_bytes() == raw.as_bytes())
+            .expect("listing must retain the exact OS filename bytes");
+        assert_eq!(item.name().as_bytes(), raw.as_bytes());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_equivalent_rename_display_value_is_a_noop_in_both_directions() {
+        let nfd = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}.md";
+        let nfd_source = Path::new("/tmp").join(nfd);
+        let nfc_source = Path::new("/tmp/한글.md");
+
+        assert!(app_host_rename_is_noop(&nfd_source, "한글.md"));
+        assert!(app_host_rename_is_noop(nfc_source, nfd));
+    }
+
+    #[test]
+    fn canonical_equivalent_rename_host_action_keeps_raw_source() {
+        let root = unique_temp_dir("file-tree-canonical-rename");
+        let raw_name = concat!("\u{1112}\u{1161}\u{11AB}", "\u{1100}\u{1173}\u{11AF}.md");
+        let source = root.join(raw_name);
+        std::fs::write(&source, b"raw-content").unwrap();
+        let request = ui::file_tree::FileTreeIoRequest::Rename {
+            source: ui::file_tree::FileTreePathPayload::try_new(source.clone()).unwrap(),
+            name: "한글.md".to_owned(),
+        };
+
+        let result = run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(false));
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(std::fs::read(&source).unwrap(), b"raw-content");
+        let entries = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from(raw_name)]);
+        assert!(
+            !entries
+                .iter()
+                .any(|name| name == std::ffi::OsStr::new("한글.md")),
+            "host action must not create a second NFC-named directory entry"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reverse_canonical_equivalent_rename_host_action_keeps_raw_source() {
+        let root = unique_temp_dir("file-tree-reverse-canonical-rename");
+        let nfd_name = concat!("\u{1112}\u{1161}\u{11AB}", "\u{1100}\u{1173}\u{11AF}.md");
+        let source = root.join("한글.md");
+        std::fs::write(&source, b"raw-content").unwrap();
+        let request = ui::file_tree::FileTreeIoRequest::Rename {
+            source: ui::file_tree::FileTreePathPayload::try_new(source.clone()).unwrap(),
+            name: nfd_name.to_owned(),
+        };
+
+        let result = run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(false));
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(std::fs::read(&source).unwrap(), b"raw-content");
+        let entries = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("한글.md")]);
+        assert!(
+            !entries
+                .iter()
+                .any(|name| name == std::ffi::OsStr::new(nfd_name)),
+            "host action must not create a second NFD-named directory entry"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_name_is_not_equal_to_its_lossy_display() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let source = Path::new("/tmp").join(std::ffi::OsString::from_vec(b"broken-\xff".to_vec()));
+
+        assert!(!app_host_rename_is_noop(&source, "broken-�"));
     }
 
     fn stub_open_document(

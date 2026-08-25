@@ -2055,11 +2055,11 @@ pub struct WorkspacePathPayload {
 
 impl WorkspacePathPayload {
     pub fn try_new(path: PathBuf) -> Result<Self, WorkspaceIoErrorCode> {
-        let display = path.to_string_lossy();
-        if display.as_bytes().contains(&0) {
+        let encoded = path.as_os_str().as_encoded_bytes();
+        if encoded.contains(&0) {
             return Err(WorkspaceIoErrorCode::InvalidPath);
         }
-        let bytes = display.len();
+        let bytes = encoded.len();
         if bytes == 0 || bytes > WORKSPACE_PATH_MAX_BYTES {
             return Err(WorkspaceIoErrorCode::PathTooLarge);
         }
@@ -2194,12 +2194,12 @@ impl TerminalClipboardPayload {
         }
         let mut path_bytes = 0usize;
         for path in &paths {
-            let display = path.to_string_lossy();
-            if display.as_bytes().contains(&0) || display.len() > WORKSPACE_PATH_MAX_BYTES {
+            let encoded = path.as_os_str().as_encoded_bytes();
+            if encoded.contains(&0) || encoded.len() > WORKSPACE_PATH_MAX_BYTES {
                 return Err(WorkspaceIoErrorCode::InvalidPath);
             }
             path_bytes = path_bytes
-                .checked_add(display.len())
+                .checked_add(encoded.len())
                 .ok_or(WorkspaceIoErrorCode::ClipboardTooLarge)?;
             if path_bytes > TERMINAL_CLIPBOARD_PATH_MAX_BYTES {
                 return Err(WorkspaceIoErrorCode::ClipboardTooLarge);
@@ -7074,10 +7074,7 @@ impl WorkspaceUi {
                     && let Some(PathClick::OpenFile(path)) =
                         self.resolve_path_cached(sel_session, text.trim())
                 {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    let name = super::path_file_name_display(&path);
                     if ui
                         .button(catalog.t("workspace.open_file", &[("name", name.as_str())]))
                         .clicked()
@@ -15583,6 +15580,22 @@ mod tests {
             clipboard_terminal_paste_bytes(None, Some(text.clone()), ShellKind::Posix, true),
             Some(text)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_raw_path_caps_use_encoded_os_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut raw = vec![b'x'; WORKSPACE_PATH_MAX_BYTES];
+        *raw.last_mut().unwrap() = 0xff;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        let expected = path.as_os_str().as_encoded_bytes().len();
+
+        let payload = WorkspacePathPayload::try_new(path.clone()).unwrap();
+        assert_eq!(payload.bytes, expected);
+        let clipboard = TerminalClipboardPayload::try_new(vec![path], None).unwrap();
+        assert_eq!(clipboard.path_bytes, expected);
     }
 
     #[test]

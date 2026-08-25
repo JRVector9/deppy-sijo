@@ -5,10 +5,9 @@
 //! 않고 bounded maintenance intent만 App host로 올린다.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use unicode_normalization::UnicodeNormalization;
 
 /// 사이드바 세션 목록 항목 (§6 확장 — 좌측 패널은 트리+세션의 workspace 사이드바다,
 /// 2026-07-05). App이 WorkspaceUi 스냅샷에서 조립해 넘긴다.
@@ -459,11 +458,11 @@ pub struct FileTreePathPayload {
 
 impl FileTreePathPayload {
     pub fn try_new(path: PathBuf) -> Result<Self, FileTreeIoErrorCode> {
-        let display = path.to_string_lossy();
-        if display.as_bytes().contains(&0) {
+        let encoded = path.as_os_str().as_encoded_bytes();
+        if encoded.contains(&0) {
             return Err(FileTreeIoErrorCode::InvalidPath);
         }
-        let bytes = display.len();
+        let bytes = encoded.len();
         if bytes == 0 || bytes > FILE_TREE_PATH_MAX_BYTES {
             return Err(FileTreeIoErrorCode::PathTooLarge);
         }
@@ -508,12 +507,12 @@ impl FileTreePathListPayload {
         }
         let mut bytes = 0usize;
         for path in &paths {
-            let display = path.to_string_lossy();
-            if display.as_bytes().contains(&0) || display.len() > FILE_TREE_PATH_MAX_BYTES {
+            let encoded = path.as_os_str().as_encoded_bytes();
+            if encoded.contains(&0) || encoded.len() > FILE_TREE_PATH_MAX_BYTES {
                 return Err(FileTreeIoErrorCode::InvalidPath);
             }
             bytes = bytes
-                .checked_add(display.len())
+                .checked_add(encoded.len())
                 .ok_or(FileTreeIoErrorCode::PathListTooLarge)?;
             if bytes > FILE_TREE_PATH_LIST_MAX_BYTES {
                 return Err(FileTreeIoErrorCode::PathListTooLarge);
@@ -648,23 +647,26 @@ pub struct FileTreeMaintenanceOperation(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileTreeListingItem {
-    name: Arc<str>,
+    name: OsString,
+    display_name: Arc<str>,
     is_dir: bool,
 }
 
 impl FileTreeListingItem {
-    pub fn try_new(name: String, is_dir: bool) -> Result<Self, FileTreeMaintenanceErrorCode> {
-        if name.is_empty() || name.as_bytes().contains(&0) || name.len() > FILE_TREE_PATH_MAX_BYTES
-        {
+    pub fn try_new(name: OsString, is_dir: bool) -> Result<Self, FileTreeMaintenanceErrorCode> {
+        let bytes = name.as_encoded_bytes();
+        if name.is_empty() || bytes.contains(&0) || bytes.len() > FILE_TREE_PATH_MAX_BYTES {
             return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
         }
+        let display_name = super::os_str_display(&name);
         Ok(Self {
-            name: Arc::from(name),
+            name,
+            display_name: Arc::from(display_name),
             is_dir,
         })
     }
 
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &OsStr {
         &self.name
     }
 
@@ -690,11 +692,16 @@ impl FileTreeListingSnapshot {
         }
         let bytes = items.iter().try_fold(0usize, |total, item| {
             total
-                .checked_add(item.name.len())
+                .checked_add(item.name.as_encoded_bytes().len())
                 .filter(|total| *total <= FILE_TREE_LISTING_MAX_BYTES)
                 .ok_or(FileTreeMaintenanceErrorCode::ListingTooLarge)
         })?;
-        items.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        items.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.display_name.cmp(&b.display_name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         Ok(Self {
             items: Arc::from(items),
             bytes,
@@ -744,15 +751,15 @@ impl FileTreeWatchPlan {
                 .iter()
                 .chain(&ignored_prefixes)
                 .try_fold(0usize, |total, path| {
-                    let display = path.to_string_lossy();
-                    if display.is_empty()
-                        || display.as_bytes().contains(&0)
-                        || display.len() > FILE_TREE_PATH_MAX_BYTES
+                    let encoded = path.as_os_str().as_encoded_bytes();
+                    if encoded.is_empty()
+                        || encoded.contains(&0)
+                        || encoded.len() > FILE_TREE_PATH_MAX_BYTES
                     {
                         return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
                     }
                     total
-                        .checked_add(display.len())
+                        .checked_add(encoded.len())
                         .filter(|total| *total <= FILE_TREE_WATCH_MAX_BYTES)
                         .ok_or(FileTreeMaintenanceErrorCode::WatchPlanTooLarge)
                 })?;
@@ -863,14 +870,11 @@ impl FileTreeWatchEvent {
         kind: FileTreeWatchEventKind,
         path: PathBuf,
     ) -> Result<Self, FileTreeMaintenanceErrorCode> {
-        let display = path.to_string_lossy();
-        if display.is_empty()
-            || display.as_bytes().contains(&0)
-            || display.len() > FILE_TREE_PATH_MAX_BYTES
-        {
+        let encoded = path.as_os_str().as_encoded_bytes();
+        if encoded.is_empty() || encoded.contains(&0) || encoded.len() > FILE_TREE_PATH_MAX_BYTES {
             return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
         }
-        let bytes = display.len();
+        let bytes = encoded.len();
         Ok(Self { kind, path, bytes })
     }
 }
@@ -957,16 +961,19 @@ struct PendingFileTreeIo {
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
 /// 접으면 children을 버려 캐시는 항상 "펼친 노드"만 유지한다(§3 메모리 상한).
 struct TreeNode {
-    name: String,
+    name: OsString,
+    display_name: String,
     is_dir: bool,
     expanded: bool,
     children: Option<Vec<TreeNode>>,
 }
 
 impl TreeNode {
-    fn new(name: String, is_dir: bool) -> Self {
+    fn new(name: OsString, is_dir: bool) -> Self {
+        let display_name = super::os_str_display(&name);
         Self {
             name,
+            display_name,
             is_dir,
             expanded: false,
             children: None,
@@ -1082,6 +1089,7 @@ enum EditState {
         path: PathBuf,
         buffer: String,
         focus: bool,
+        changed: bool,
     },
     NewFolder {
         parent: PathBuf,
@@ -1567,14 +1575,14 @@ impl FileTreeUi {
     /// 워처 무시 prefix 설정 (앱 data dir 등). set_root 이전에 호출.
     pub fn set_watch_ignore(&mut self, prefixes: Vec<PathBuf>) {
         let bytes = prefixes.iter().try_fold(0usize, |total, path| {
-            let display = path.to_string_lossy();
-            if display.is_empty()
-                || display.as_bytes().contains(&0)
-                || display.len() > FILE_TREE_PATH_MAX_BYTES
+            let encoded = path.as_os_str().as_encoded_bytes();
+            if encoded.is_empty()
+                || encoded.contains(&0)
+                || encoded.len() > FILE_TREE_PATH_MAX_BYTES
             {
                 return None;
             }
-            total.checked_add(display.len())
+            total.checked_add(encoded.len())
         });
         if prefixes.len() > FILE_TREE_WATCH_IGNORE_MAX_ITEMS
             || bytes.is_none_or(|bytes| bytes > FILE_TREE_WATCH_IGNORE_MAX_BYTES)
@@ -2742,7 +2750,7 @@ impl FileTreeUi {
             });
             ui.weak(catalog.t(
                 "file_tree.location",
-                &[("path", &parent.display().to_string())],
+                &[("path", &super::path_display(parent))],
             ));
         }
         if let Some(EditState::NewFile {
@@ -2773,7 +2781,7 @@ impl FileTreeUi {
             });
             ui.weak(catalog.t(
                 "file_tree.location",
-                &[("path", &parent.display().to_string())],
+                &[("path", &super::path_display(parent))],
             ));
         }
 
@@ -2836,6 +2844,7 @@ impl FileTreeUi {
                         path,
                         buffer,
                         focus,
+                        changed,
                     }) = &mut edit
                         && path == &row.path
                     {
@@ -2846,6 +2855,7 @@ impl FileTreeUi {
                                     .margin(egui::Margin::ZERO) // 고정 행높이 유지 (§9-6)
                                     .desired_width(f32::INFINITY),
                             );
+                            *changed |= resp.changed();
                             if *focus {
                                 resp.request_focus(); // §9-8 — 편집 키가 터미널로 새지 않게
                                 *focus = false;
@@ -3249,22 +3259,25 @@ impl FileTreeUi {
         match edit_done {
             Some(false) => edit = None,
             Some(true) => match edit {
-                Some(EditState::Rename { path, buffer, .. }) => {
-                    let validated = validate_name(&buffer)
-                        .map_err(|_| FileTreeIoErrorCode::InvalidName)
-                        .and_then(|name| {
-                            FileTreePathPayload::try_new(path.clone())
-                                .map(|source| FileTreeIoRequest::Rename { source, name })
-                        });
+                Some(EditState::Rename {
+                    path,
+                    buffer,
+                    changed,
+                    ..
+                }) => {
+                    let prepared = prepare_rename_request(&path, &buffer, changed);
                     let refresh = path.parent().map(Path::to_path_buf).into_iter().collect();
                     let retry = EditState::Rename {
                         path,
                         buffer,
                         focus: true,
+                        changed,
                     };
-                    match validated.and_then(|request| {
-                        self.queue_io(request, refresh, None, Some(retry.clone()))
-                    }) {
+                    let result = prepared.and_then(|request| match request {
+                        Some(request) => self.queue_io(request, refresh, None, Some(retry.clone())),
+                        None => Ok(()),
+                    });
+                    match result {
                         Ok(()) => edit = None,
                         Err(code) => {
                             self.reject_io(code);
@@ -3333,14 +3346,12 @@ impl FileTreeUi {
                 });
             }
             Some(MenuAction::Rename(path)) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                let name = super::path_file_name_display(&path);
                 edit = Some(EditState::Rename {
                     path,
                     buffer: name,
                     focus: true,
+                    changed: false,
                 });
             }
             Some(MenuAction::Delete(path)) => self.spawn_trash(path),
@@ -3372,10 +3383,7 @@ impl FileTreeUi {
 
         // 휴지통 실패 → 영구삭제 확인 (§9-7 — 조용한 영구삭제 금지)
         if let Some(path) = self.confirm_delete.clone() {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
+            let name = super::path_file_name_display(&path);
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 catalog.t("file_tree.permanent_delete_prompt", &[("name", &name)]),
@@ -3847,6 +3855,19 @@ fn validate_name(name: &str) -> Result<String, String> {
         return Err("사용할 수 없는 이름입니다".to_owned());
     }
     Ok(name.to_owned())
+}
+
+fn prepare_rename_request(
+    path: &Path,
+    buffer: &str,
+    changed: bool,
+) -> Result<Option<FileTreeIoRequest>, FileTreeIoErrorCode> {
+    if !changed {
+        return Ok(None);
+    }
+    let name = validate_name(buffer).map_err(|_| FileTreeIoErrorCode::InvalidName)?;
+    let source = FileTreePathPayload::try_new(path.to_path_buf())?;
+    Ok(Some(FileTreeIoRequest::Rename { source, name }))
 }
 
 /// 이름 변경 (덮어쓰기 금지 §9-5 공유). 성공 시 새 경로.
@@ -6518,10 +6539,7 @@ fn read_children(path: &Path, _root: Option<&Path>) -> std::io::Result<Vec<TreeN
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-        nodes.push(TreeNode::new(
-            entry.file_name().to_string_lossy().into_owned(),
-            is_dir,
-        ));
+        nodes.push(TreeNode::new(entry.file_name(), is_dir));
     }
     sort_nodes(&mut nodes);
     Ok(nodes)
@@ -6555,7 +6573,7 @@ fn tree_node_usage(nodes: &[TreeNode]) -> (usize, usize) {
             usage.0.saturating_add(1).saturating_add(child_usage.0),
             usage
                 .1
-                .saturating_add(node.name.len())
+                .saturating_add(node.name.as_encoded_bytes().len())
                 .saturating_add(child_usage.1),
         )
     })
@@ -6564,7 +6582,12 @@ fn tree_node_usage(nodes: &[TreeNode]) -> (usize, usize) {
 /// 정렬: 디렉터리 우선 + 이름 (단순 유니코드 순 — §3, 로케일 비교는 비목표).
 #[cfg(test)]
 fn sort_nodes(nodes: &mut [TreeNode]) {
-    nodes.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    nodes.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 /// 펼친 트리를 가시 행 목록으로 평탄화한다 (숨김 필터 포함). 순수 함수 — 단위 테스트 대상.
@@ -6576,13 +6599,13 @@ fn flatten(
     out: &mut Vec<FlatRow>,
 ) {
     for node in nodes {
-        if !show_hidden && node.name.starts_with('.') {
+        if !show_hidden && node.name.as_encoded_bytes().starts_with(b".") {
             continue;
         }
         let path = base.join(&node.name);
         out.push(FlatRow {
             path: path.clone(),
-            display_name: node.name.nfc().collect(),
+            display_name: node.display_name.clone(),
             depth,
             is_dir: node.is_dir,
             expanded: node.expanded,
@@ -6599,7 +6622,7 @@ fn flatten(
 fn node_mut<'a>(mut nodes: &'a mut Vec<TreeNode>, rel: &Path) -> Option<&'a mut TreeNode> {
     let mut comps = rel.components().peekable();
     while let Some(comp) = comps.next() {
-        let name = comp.as_os_str().to_string_lossy();
+        let name = comp.as_os_str();
         let idx = nodes.iter().position(|n| n.name == name)?;
         if comps.peek().is_none() {
             return Some(&mut nodes[idx]);
@@ -6612,7 +6635,7 @@ fn node_mut<'a>(mut nodes: &'a mut Vec<TreeNode>, rel: &Path) -> Option<&'a mut 
 fn node_ref<'a>(mut nodes: &'a [TreeNode], rel: &Path) -> Option<&'a TreeNode> {
     let mut comps = rel.components().peekable();
     while let Some(comp) = comps.next() {
-        let name = comp.as_os_str().to_string_lossy();
+        let name = comp.as_os_str();
         let node = nodes.iter().find(|n| n.name == name)?;
         if comps.peek().is_none() {
             return Some(node);
@@ -7364,7 +7387,7 @@ mod tests {
             generation: stale.generation,
             result: Ok(FileTreeMaintenanceResult::Listing(
                 FileTreeListingSnapshot::try_new(vec![
-                    FileTreeListingItem::try_new("stale.txt".to_owned(), false).unwrap(),
+                    FileTreeListingItem::try_new(OsString::from("stale.txt"), false).unwrap(),
                 ])
                 .unwrap(),
             )),
@@ -7377,7 +7400,7 @@ mod tests {
     #[test]
     fn cancel_플래그는_같은_epoch에서도_송신을_중단한다() {
         let items = (0..=FILE_TREE_LISTING_MAX_ITEMS)
-            .map(|i| FileTreeListingItem::try_new(format!("f{i}"), false).unwrap())
+            .map(|i| FileTreeListingItem::try_new(OsString::from(format!("f{i}")), false).unwrap())
             .collect();
         assert!(matches!(
             FileTreeListingSnapshot::try_new(items),
@@ -7394,7 +7417,72 @@ mod tests {
     }
 
     fn names(nodes: &[TreeNode]) -> Vec<&str> {
-        nodes.iter().map(|n| n.name.as_str()).collect()
+        nodes.iter().map(|n| n.display_name.as_str()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_rows_keep_distinct_raw_paths() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let first = std::ffi::OsString::from_vec(b"broken-\xfe".to_vec());
+        let second = std::ffi::OsString::from_vec(b"broken-\xff".to_vec());
+        let snapshot = FileTreeListingSnapshot::try_new(vec![
+            FileTreeListingItem::try_new(first.clone(), false).unwrap(),
+            FileTreeListingItem::try_new(second.clone(), false).unwrap(),
+        ])
+        .unwrap();
+        let nodes = snapshot
+            .items()
+            .iter()
+            .map(|item| TreeNode::new(item.name().to_owned(), item.is_dir()))
+            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        flatten(&nodes, Path::new("/root"), 0, true, &mut rows);
+
+        assert_eq!(rows[0].display_name, rows[1].display_name);
+        assert_eq!(rows[0].display_name, "broken-�");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.path.clone())
+                .collect::<HashSet<_>>()
+                .len(),
+            2,
+            "same lossy display must not collapse raw path identity"
+        );
+        let raw_names = rows
+            .iter()
+            .map(|row| row.path.file_name().unwrap().as_bytes().to_vec())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            raw_names,
+            HashSet::from([first.into_vec(), second.into_vec()])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_path_caps_use_encoded_os_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut raw = vec![b'x'; FILE_TREE_PATH_MAX_BYTES];
+        *raw.last_mut().unwrap() = 0xff;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        let expected = path.as_os_str().as_encoded_bytes().len();
+
+        let payload = FileTreePathPayload::try_new(path.clone()).unwrap();
+        assert_eq!(payload.bytes, expected);
+        let list = FileTreePathListPayload::try_new(vec![path.clone()]).unwrap();
+        assert_eq!(list.bytes, expected);
+        let plan = FileTreeWatchPlan::try_new(vec![path.clone()], Vec::new(), false).unwrap();
+        assert_eq!(plan.bytes, expected);
+        let event =
+            FileTreeWatchEvent::try_new(FileTreeWatchEventKind::DirtyDirectory, path.clone())
+                .unwrap();
+        assert_eq!(event.bytes, expected);
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_watch_ignore(vec![path]);
+        assert!(tree.error.is_none());
     }
 
     #[test]
@@ -7692,6 +7780,25 @@ mod tests {
         assert_eq!(validate_name(".env").unwrap(), ".env"); // 숨김 이름은 허용
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn untouched_invalid_utf8_rename_does_not_create_a_native_request() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"broken-\xff".to_vec()));
+
+        assert!(
+            prepare_rename_request(&path, "broken-�", false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prepare_rename_request(&path, "broken-�", true)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn apply_rename_성공과_충돌() {
         let base = temp_root("rename");
@@ -7983,7 +8090,7 @@ mod tests {
             generation: stale.generation,
             result: Ok(FileTreeMaintenanceResult::Listing(
                 FileTreeListingSnapshot::try_new(vec![
-                    FileTreeListingItem::try_new("a.txt".to_owned(), false).unwrap(),
+                    FileTreeListingItem::try_new(OsString::from("a.txt"), false).unwrap(),
                 ])
                 .unwrap(),
             )),
@@ -8118,7 +8225,7 @@ mod tests {
             generation: stale.generation,
             result: Ok(FileTreeMaintenanceResult::Listing(
                 FileTreeListingSnapshot::try_new(vec![
-                    FileTreeListingItem::try_new("child.txt".to_owned(), false).unwrap(),
+                    FileTreeListingItem::try_new(OsString::from("child.txt"), false).unwrap(),
                 ])
                 .unwrap(),
             )),

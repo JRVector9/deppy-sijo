@@ -125,6 +125,7 @@ fn parse_usage(output: &str) -> Option<GrokUsage> {
 
 fn extract_window_remaining(lines: &[&str], label: &str) -> Option<u8> {
     static PERCENT: OnceLock<regex::Regex> = OnceLock::new();
+    static BARE_PERCENT: OnceLock<regex::Regex> = OnceLock::new();
     static LIMIT: OnceLock<regex::Regex> = OnceLock::new();
     let percent = PERCENT.get_or_init(|| {
         regex::Regex::new(r"(?i)(\d+)(?:\.\d+)?\s*%\s*(used|left|remaining)")
@@ -135,6 +136,9 @@ fn extract_window_remaining(lines: &[&str], label: &str) -> Option<u8> {
             r"(?i)\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:used\s*)?of\s*\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
         )
         .expect("static Grok limit regex")
+    });
+    let bare_percent = BARE_PERCENT.get_or_init(|| {
+        regex::Regex::new(r"(?i)(\d+)(?:\.\d+)?\s*%").expect("static Grok bare percent regex")
     });
     for (index, line) in lines.iter().enumerate().rev() {
         if !compact_label(line).contains(label) {
@@ -157,6 +161,13 @@ fn extract_window_remaining(lines: &[&str], label: &str) -> Option<u8> {
                 let used = parse_usd_minor(captures.get(1)?.as_str())?;
                 let total = parse_usd_minor(captures.get(2)?.as_str())?;
                 return remaining_percent(used, total);
+            }
+            // Grok 1.0.5의 SuperGrok progress bar는 `Weekly limit ... 0%`처럼
+            // used/left 접미사를 생략한다. 이 bare 값은 막대의 소진율이므로, 위의
+            // 명시적 표현과 금액 표현이 아닌 경우에만 남은 비율로 뒤집는다.
+            if let Some(captures) = bare_percent.captures(candidate) {
+                let used = captures.get(1)?.as_str().parse::<u64>().ok()?.min(100) as u8;
+                return Some(100 - used);
             }
         }
     }
@@ -432,6 +443,20 @@ Usage
                     currency: GrokCurrency::Usd,
                     minor_units: 1_234,
                 }),
+            })
+        );
+    }
+
+    #[test]
+    fn installed_supergrok_progress_bar_percent_is_treated_as_used() {
+        assert_eq!(
+            parse_usage(
+                "Weekly limit (SuperGrok)  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  0%  Resets: August 31, 22:24",
+            ),
+            Some(GrokUsage {
+                weekly_remaining_percent: Some(100),
+                monthly_remaining_percent: None,
+                credits_left: None,
             })
         );
     }
@@ -736,6 +761,9 @@ Credits left: $1,234.50
             return;
         };
         let usage = fetch_grok_usage(&path, None).expect("bounded Grok probe");
+        if std::env::var_os("DEPPY_GROK_EXPECT_USAGE").is_some() {
+            assert!(usage.is_some(), "현재 계정에서 Grok usage 숫자를 기대했다");
+        }
         assert!(usage.is_none_or(|value| {
             value.weekly_remaining_percent.is_some()
                 || value.monthly_remaining_percent.is_some()

@@ -7322,7 +7322,7 @@ fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
 
 /// 사용량 바 폭 — 실제로 그려지는 provider 칸 수에 따라 정해진다. 원래 코드는 칸이
 /// Claude·Codex(항상 표시) + Kimi(값 있을 때만) 두 경우뿐이라 상수 두 개(430/620)로
-/// 충분했다. 이제 Grok까지 조건부로 붙어 칸 수가 0~4까지 늘었으므로, 그 두 상수(칸 2개→430,
+/// 충분했다. 이제 감지되고 켜진 Grok도 독립 칸으로 붙어 칸 수가 0~4까지 늘었으므로, 그 두 상수(칸 2개→430,
 /// 칸 3개→620, 칸당 +190)를 그대로 외삽해 순수 함수로 뽑았다 — 폭은 egui 컨테이너의
 /// 크기 힌트일 뿐이라 정확한 픽셀보다 "칸 수에 비례해 줄어든다"가 중요하다. 값으로
 /// 테스트한다(0·1·2·3·4칸). 0칸은 상자 자체를 그리지 않으므로(`top_provider_usage`) 0.0 —
@@ -7380,7 +7380,14 @@ pub(crate) struct ProviderUsageInputs<'a> {
     pub(crate) codex: Option<ProviderUsage>,
     pub(crate) codex_meta: Option<&'a crate::ui::agent_sessions::CodexUsageMeta>,
     pub(crate) kimi: Option<ProviderUsage>,
-    pub(crate) grok: Option<crate::grok_usage::GrokUsage>,
+    /// 바깥 `Option`은 설치 감지, 안쪽 `Option`은 숫자 조회 결과다. 감지됐지만 아직
+    /// 값이 없으면 `Some(None)`으로 Codex 옆의 자리표시자를 유지한다.
+    pub(crate) grok: Option<Option<crate::grok_usage::GrokUsage>>,
+}
+
+fn grok_status_visible(disabled: &[String], detected: bool) -> bool {
+    detected
+        && crate::agent_launcher::agent_is_enabled(disabled, crate::agent_launcher::AgentKind::Grok)
 }
 
 /// 런처 카드 스위치 토글 결과로 새 거부 목록을 만든다 — 정규화까지 마친 상태로 돌려주므로
@@ -7401,9 +7408,9 @@ fn toggled_disabled_agents(
 }
 
 /// 하단 사용량 바의 provider 칸들. `disabled`는 usage 값과 분리된 신호다 — 「켜짐인데
-/// 값 없음」(Claude·Codex는 「—」로 자리를 지킨다, 1급 provider 규칙)과 「꺼짐」(모든
-/// 칸 자체가 없다)을 usage 값 하나로는 구분할 수 없어서 나눴다. usage를 미리
-/// `None`으로 지워 두 상태를 뭉개는 대신, 여기서 `agent_is_enabled`로 직접 갈라 그린다.
+/// 값 없음」(Claude·Codex와 감지된 Grok은 「—」로 자리를 지킨다)과 「꺼짐」(모든 칸
+/// 자체가 없다)을 usage 값 하나로는 구분할 수 없어서 나눴다. Grok의 바깥 `Option`은
+/// 설치 감지를, 안쪽 `Option`은 숫자를 나타내며 여기서 활성화 여부까지 함께 판정한다.
 ///
 /// 칸을 하나라도 그렸으면 `true`를 돌려준다 — 호출부(`agent_terminal.rs`)가 이 값으로
 /// 뒤이은 구분선을 그릴지 정한다. 모든 provider 칸이 숨겨지면 상자도 안 그리고 `false`를
@@ -7528,12 +7535,21 @@ pub(crate) fn top_provider_usage(
 
     fn grok_provider(
         ui: &mut egui::Ui,
-        usage: crate::grok_usage::GrokUsage,
+        usage: Option<crate::grok_usage::GrokUsage>,
         catalog: &i18n::Catalog,
     ) {
         let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
         crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, "Grok");
-        let (visible, accessibility, hover) = grok_usage_labels(usage, catalog);
+        let (visible, accessibility, hover) = usage.map_or_else(
+            || {
+                (
+                    "—".to_owned(),
+                    catalog.t("status_bar.grok.unavailable", &[]),
+                    catalog.t("status_bar.grok.unavailable_hover", &[]),
+                )
+            },
+            |usage| grok_usage_labels(usage, catalog),
+        );
         let response = ui
             .label(egui::RichText::new(visible).size(13.0).strong())
             .on_hover_text(hover);
@@ -7546,12 +7562,12 @@ pub(crate) fn top_provider_usage(
     use crate::agent_launcher::{AgentKind, agent_is_enabled};
     // 꺼진 provider는 칸 자체가 사라진다(사용자 요청) — 모든 provider에 같은
     // 규칙이다. Claude/Codex는 이 앱의 1급 provider라 켜져 있으면 값이 없어도 「—」로
-    // 자리를 지키지만, Kimi와 Grok은 **쓰는 사람에게만** 보여야 하므로 켜져 있어도
-    // 각 usage 값이 없으면 칸 자체를 안 그린다.
+    // 자리를 지킨다. Kimi는 설치·사용이 확인된 값이 있을 때만 보이지만, Grok은 런처에서
+    // 켜져 있으면 probe 중/실패에도 Codex 옆의 「—」 칸을 유지한다.
     let claude_shown = agent_is_enabled(disabled, AgentKind::Claude);
     let codex_shown = agent_is_enabled(disabled, AgentKind::Codex);
     let kimi_shown = agent_is_enabled(disabled, AgentKind::Kimi) && kimi_usage.is_some();
-    let grok_shown = agent_is_enabled(disabled, AgentKind::Grok) && grok_usage.is_some();
+    let grok_shown = grok_status_visible(disabled, grok_usage.is_some());
     let visible_count = usize::from(claude_shown)
         + usize::from(codex_shown)
         + usize::from(kimi_shown)
@@ -7593,6 +7609,15 @@ pub(crate) fn top_provider_usage(
                 );
                 drawn = true;
             }
+            if grok_shown {
+                if drawn {
+                    ui.add_space(4.0);
+                    separator(ui, 18.0);
+                    ui.add_space(4.0);
+                }
+                grok_provider(ui, grok_usage.flatten(), catalog);
+                drawn = true;
+            }
             if kimi_shown {
                 if drawn {
                     ui.add_space(4.0);
@@ -7606,15 +7631,6 @@ pub(crate) fn top_provider_usage(
                     kimi_usage,
                     None,
                 );
-                drawn = true;
-            }
-            if grok_shown {
-                if drawn {
-                    ui.add_space(4.0);
-                    separator(ui, 18.0);
-                    ui.add_space(4.0);
-                }
-                grok_provider(ui, grok_usage.expect("grok_shown requires usage"), catalog);
             }
         },
     );
@@ -26995,13 +27011,17 @@ impl eframe::App for App {
                 )
                 .then(|| crate::grok_usage::current(ui.ctx(), grok_agent))
                 .flatten();
+                // 바깥 Option은 설치 감지, 안쪽 Option은 probe 숫자다. 설치된 Grok의
+                // 첫 probe/일시 실패는 `Some(None)`으로 넘겨 Codex 옆 칸을 유지하되,
+                // 미설치 상태는 `None`이라 칸 자체를 만들지 않는다.
+                let grok_status = grok_agent.map(|_| grok_usage);
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage,
                     codex_usage,
                     self.agent_sessions_ui.codex_usage_meta(),
                     kimi_usage,
-                    grok_usage,
+                    grok_status,
                     // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — usage 값은
                     // 그대로 넘기고 「꺼짐」만 별도 신호로 보내, top_provider_usage가
                     // "켜짐인데 값 없음"(—로 자리 유지)과 "꺼짐"(칸 자체 없음)을
@@ -42692,8 +42712,8 @@ mod tests {
     #[test]
     fn 사용량_바_폭은_그려지는_칸_수에_비례한다() {
         // 원래 상수 두 개(칸 2개→430, 칸 3개→620, 칸당 +190)를 1칸으로 외삽한
-        // 값을 고정한다 — claude·codex는 활성화 여부, kimi·grok은 활성화 여부와
-        // usage 값에 따라 칸 수가 0~4 전 구간을 오갈 수 있다.
+        // 값을 고정한다 — claude·codex는 활성화 여부, kimi는 활성화와 usage 값,
+        // grok은 설치 감지와 활성화 여부에 따라 칸 수가 0~4 전 구간을 오갈 수 있다.
         // 0칸은 `top_provider_usage`가 상자 자체를 안 그리므로 0.0 — 50.0을
         // 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
         assert_eq!(provider_usage_bar_width(0), 0.0);
@@ -42707,7 +42727,12 @@ mod tests {
     fn 칸이_없으면_top_provider_usage는_아무것도_그리지_않았다고_보고한다() {
         // 반환값이 호출부(`agent_terminal.rs`)가 뒤이은 구분선을 그릴지 정하는
         // 신호다 — 모든 provider 칸이 숨겨지면 상자도 구분선도 남지 않아야 한다.
-        let all_disabled = vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()];
+        let all_disabled = vec![
+            "claude".to_owned(),
+            "codex".to_owned(),
+            "kimi".to_owned(),
+            "grok".to_owned(),
+        ];
         let ctx = egui::Context::default();
         let mut drew_nothing = true;
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -42752,9 +42777,9 @@ mod tests {
 
     #[test]
     fn 거부_목록은_kimi의_값_유무_규칙과_별개로_칸_표시를_결정한다() {
-        // 기존 Kimi 칸 조건을 값으로 고정한다. Claude·Codex는 값과 무관하게 "켜짐"만
-        // 보고, Kimi는 "켜짐 AND 값 있음"을 본다. 같은 Grok 조건은 상태바 kittest가
-        // 고정한다.
+        // 기존 Kimi 칸 조건을 값으로 고정한다. Claude·Codex·Grok은 값과 무관하게
+        // "켜짐"만 보고, Kimi는 "켜짐 AND 값 있음"을 본다. Grok의 값 없음/꺼짐
+        // 렌더링 계약과 provider 순서는 상태바 kittest가 고정한다.
         use crate::agent_launcher::{AgentKind, agent_is_enabled};
 
         let none: &[String] = &[];
@@ -42780,6 +42805,13 @@ mod tests {
         assert!(!kimi_shown, "꺼졌으면 값이 있어도 칸을 그리면 안 된다");
         let kimi_shown = agent_is_enabled(none, AgentKind::Kimi) && kimi_usage.is_some();
         assert!(kimi_shown, "켜져 있고 값도 있으면 칸을 그려야 한다");
+    }
+
+    #[test]
+    fn grok_칸은_설치_감지와_활성화가_모두_필요하다() {
+        assert!(grok_status_visible(&[], true));
+        assert!(!grok_status_visible(&[], false));
+        assert!(!grok_status_visible(&["grok".to_owned()], true));
     }
 
     #[test]

@@ -301,9 +301,11 @@ impl AgentTerminalUi {
         // `kimi_usage`: 값이 없으면(설치 안 했거나 안 씀) 켜져 있어도 칸 자체를 안
         // 그린다 — Kimi 전용 규칙(2026-08-10)이라 `disabled_agents`와는 별개다.
         kimi_usage: Option<crate::app::ProviderUsage>,
-        grok_usage: Option<crate::grok_usage::GrokUsage>,
+        // 바깥 `Option`은 Grok 설치 감지, 안쪽 `Option`은 숫자 조회 결과다.
+        // `Some(None)`이면 조회 중/실패 자리표시자를 유지하고 `None`이면 칸을 숨긴다.
+        grok_usage: Option<Option<crate::grok_usage::GrokUsage>>,
         // `disabled_agents`: 런처 카드 스위치로 끈 에이전트 id 목록. usage 값과는
-        // 분리된 신호다 — "켜짐인데 값 없음"(Claude·Codex는 「—」로 자리를 지킨다)과
+        // 분리된 신호다 — "켜짐인데 값 없음"(Claude·Codex·감지된 Grok은 「—」로 자리를 지킨다)과
         // "꺼짐"(모든 칸이 사라진다)을 값 하나로는 구분할 수 없기 때문이다
         // (`crate::app::top_provider_usage`가 이 둘을 여기서 갈라 그린다).
         disabled_agents: &[String],
@@ -1377,7 +1379,8 @@ mod tests {
     }
 
     /// 표: 켜짐+값 있음 → 값, 켜짐+값 없음 → Claude·Codex는 "—"로 자리 유지(1급
-    /// provider 규칙)/Kimi·Grok은 칸 없음(조건부 규칙), 꺼짐 → 해당 칸 없음.
+    /// provider 규칙)/Grok도 Codex 옆에 "—"로 자리 유지/Kimi는 칸 없음(조건부 규칙),
+    /// 꺼짐 → 해당 칸 없음.
     /// 로고는 `paint_announcement_provider_logo`가 "{provider} logo"로 라벨을 다는
     /// `Image` 위젯이라, 칸이 그려졌는지를 클릭 없이도 값으로 확인할 수 있다.
     #[test]
@@ -1390,7 +1393,7 @@ mod tests {
             claude: Option<crate::app::ProviderUsage>,
             codex: Option<crate::app::ProviderUsage>,
             kimi: Option<crate::app::ProviderUsage>,
-            grok: Option<crate::grok_usage::GrokUsage>,
+            grok: Option<Option<crate::grok_usage::GrokUsage>>,
             disabled: Vec<String>,
         ) -> egui_kittest::Harness<'static, bool> {
             let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -1433,8 +1436,8 @@ mod tests {
             harness
         }
 
-        // 켜짐+값 없음(Claude) / 켜짐+값 있음(Codex) / 값 없어서 칸 없음(Kimi, 기존 규칙).
-        let harness = run(None, some_usage, None, None, Vec::new());
+        // 켜짐+값 없음(Claude/Grok) / 켜짐+값 있음(Codex) / 값 없어서 칸 없음(Kimi).
+        let harness = run(None, some_usage, None, Some(None), Vec::new());
         assert!(
             harness.query_by_label("Anthropic logo").is_some(),
             "값이 없어도 켜져 있으면 Claude 칸은 남아야 한다"
@@ -1446,6 +1449,10 @@ mod tests {
         assert!(
             harness.query_by_label("Kimi logo").is_none(),
             "Kimi는 값이 없으면 켜져 있어도 칸을 안 그린다(기존 규칙)"
+        );
+        assert!(
+            harness.query_by_label("Grok logo").is_some(),
+            "Grok은 값을 불러오는 중이어도 Codex 옆의 칸을 유지해야 한다"
         );
 
         // 꺼짐이 "값 있음"보다 우선한다 — Claude를 꺼도 값은 여전히 있다.
@@ -1469,7 +1476,7 @@ mod tests {
             "꺼진 Kimi는 값이 있어도 칸이 사라져야 한다"
         );
 
-        // 기존 세 provider를 모두 끄고 Grok 값도 없으면 로고가 하나도 안 남는다 — 칸이 0개일 때
+        // 모든 provider를 끄면 Grok 값도 없고 로고가 하나도 안 남는다 — 칸이 0개일 때
         // 빈 상자·구분선이 남지 않는지는 app.rs의
         // `칸이_없으면_top_provider_usage는_아무것도_그리지_않았다고_보고한다`가
         // 반환값으로 고정한다.
@@ -1478,11 +1485,17 @@ mod tests {
             some_usage,
             some_usage,
             None,
-            vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()],
+            vec![
+                "claude".to_owned(),
+                "codex".to_owned(),
+                "kimi".to_owned(),
+                "grok".to_owned(),
+            ],
         );
         assert!(harness.query_by_label("Anthropic logo").is_none());
         assert!(harness.query_by_label("Codex logo").is_none());
         assert!(harness.query_by_label("Kimi logo").is_none());
+        assert!(harness.query_by_label("Grok logo").is_none());
 
         let grok = crate::grok_usage::GrokUsage {
             weekly_remaining_percent: Some(70),
@@ -1492,7 +1505,7 @@ mod tests {
                 minor_units: 1_234,
             }),
         };
-        let harness = run(None, some_usage, None, Some(grok), Vec::new());
+        let harness = run(None, some_usage, None, Some(Some(grok)), Vec::new());
         assert!(harness.query_by_label("Grok logo").is_some());
         harness.get_by_label("Grok remaining usage: W 70% · M 85% · $12.34");
 
@@ -1501,27 +1514,49 @@ mod tests {
             monthly_remaining_percent: None,
             credits_left: None,
         };
-        let harness = run(None, some_usage, None, Some(partial), Vec::new());
+        let harness = run(None, some_usage, None, Some(Some(partial)), Vec::new());
         harness.get_by_label("Grok remaining usage: W 70%");
 
+        let harness = run(None, some_usage, None, Some(None), Vec::new());
+        assert!(harness.query_by_label("Grok logo").is_some());
+        harness.get_by_label("Grok usage —");
+
         let harness = run(None, some_usage, None, None, Vec::new());
+        assert!(
+            harness.query_by_label("Grok logo").is_none(),
+            "설치 감지가 없으면 Grok 칸을 만들면 안 된다"
+        );
+
+        let harness = run(
+            None,
+            some_usage,
+            None,
+            Some(Some(grok)),
+            vec!["grok".to_owned()],
+        );
         assert!(harness.query_by_label("Grok logo").is_none());
 
-        let harness = run(None, some_usage, None, Some(grok), vec!["grok".to_owned()]);
-        assert!(harness.query_by_label("Grok logo").is_none());
+        // provider 순서는 언제나 Codex → Grok → Kimi다. Kimi가 켜져도 Grok이
+        // Codex 바로 옆에서 밀려나면 안 된다.
+        let harness = run(None, some_usage, some_usage, Some(Some(grok)), Vec::new());
+        let codex = harness.get_by_label("Codex logo").rect();
+        let grok_rect = harness.get_by_label("Grok logo").rect();
+        let kimi = harness.get_by_label("Kimi logo").rect();
+        assert!(codex.right() < grok_rect.left());
+        assert!(grok_rect.right() < kimi.left());
 
-        // Claude/Codex가 없어도 Kimi를 그린 뒤 `drawn`을 갱신해 Grok이 그 오른쪽의
-        // 다음 provider 칸에 놓인다. 이 조합이 Kimi→Grok 구분선 경로를 직접 지난다.
+        // Claude/Codex가 없어도 Grok이 Kimi 왼쪽 provider 칸에 놓인다. 이 조합이
+        // Grok→Kimi 구분선 경로를 직접 지난다.
         let harness = run(
             None,
             None,
             some_usage,
-            Some(grok),
+            Some(Some(grok)),
             vec!["claude".to_owned(), "codex".to_owned()],
         );
-        let kimi = harness.get_by_label("Kimi logo").rect();
         let grok = harness.get_by_label("Grok logo").rect();
-        assert!(grok.left() > kimi.right());
+        let kimi = harness.get_by_label("Kimi logo").rect();
+        assert!(kimi.left() > grok.right());
     }
 
     #[test]

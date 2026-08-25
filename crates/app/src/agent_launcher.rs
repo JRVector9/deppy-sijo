@@ -586,6 +586,10 @@ impl DetectedAgent {
         &self.executable
     }
 
+    pub(crate) fn launch_path(&self) -> Option<&str> {
+        self.launch_path.as_deref()
+    }
+
     pub(crate) fn models(&self) -> &[ModelChoice] {
         &self.models
     }

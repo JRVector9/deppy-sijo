@@ -301,9 +301,10 @@ impl AgentTerminalUi {
         // `kimi_usage`: 값이 없으면(설치 안 했거나 안 씀) 켜져 있어도 칸 자체를 안
         // 그린다 — Kimi 전용 규칙(2026-08-10)이라 `disabled_agents`와는 별개다.
         kimi_usage: Option<crate::app::ProviderUsage>,
+        grok_usage: Option<crate::grok_usage::GrokUsage>,
         // `disabled_agents`: 런처 카드 스위치로 끈 에이전트 id 목록. usage 값과는
         // 분리된 신호다 — "켜짐인데 값 없음"(Claude·Codex는 「—」로 자리를 지킨다)과
-        // "꺼짐"(셋 다 칸 자체가 없다)을 값 하나로는 구분할 수 없기 때문이다
+        // "꺼짐"(모든 칸이 사라진다)을 값 하나로는 구분할 수 없기 때문이다
         // (`crate::app::top_provider_usage`가 이 둘을 여기서 갈라 그린다).
         disabled_agents: &[String],
         rows: &[ActivityWorkspaceRow],
@@ -336,15 +337,19 @@ impl AgentTerminalUi {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
-                // 칸이 하나도 없으면(claude·codex·kimi 셋 다 꺼짐) 상자도 이 뒤의
+                // 칸이 하나도 없으면 상자도 이 뒤의
                 // 구분선도 그리지 않는다 — 반환값이 그 신호다(app.rs 주석 참고).
                 let usage_shown = crate::app::top_provider_usage(
                     ui,
-                    claude_usage,
-                    codex_usage,
-                    codex_meta.as_ref(),
-                    kimi_usage,
+                    crate::app::ProviderUsageInputs {
+                        claude: claude_usage,
+                        codex: codex_usage,
+                        codex_meta: codex_meta.as_ref(),
+                        kimi: kimi_usage,
+                        grok: grok_usage,
+                    },
                     disabled_agents,
+                    catalog,
                 );
                 if usage_shown {
                     crate::ui::designall::vertical_separator(ui, 14.0);
@@ -1329,6 +1334,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     2,
@@ -1371,7 +1377,7 @@ mod tests {
     }
 
     /// 표: 켜짐+값 있음 → 값, 켜짐+값 없음 → Claude·Codex는 "—"로 자리 유지(1급
-    /// provider 규칙)/Kimi는 칸 없음(기존 규칙, 2026-08-10), 꺼짐 → 셋 다 칸 없음.
+    /// provider 규칙)/Kimi·Grok은 칸 없음(조건부 규칙), 꺼짐 → 해당 칸 없음.
     /// 로고는 `paint_announcement_provider_logo`가 "{provider} logo"로 라벨을 다는
     /// `Image` 위젯이라, 칸이 그려졌는지를 클릭 없이도 값으로 확인할 수 있다.
     #[test]
@@ -1384,6 +1390,7 @@ mod tests {
             claude: Option<crate::app::ProviderUsage>,
             codex: Option<crate::app::ProviderUsage>,
             kimi: Option<crate::app::ProviderUsage>,
+            grok: Option<crate::grok_usage::GrokUsage>,
             disabled: Vec<String>,
         ) -> egui_kittest::Harness<'static, bool> {
             let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -1398,6 +1405,7 @@ mod tests {
                         codex,
                         None,
                         kimi,
+                        grok,
                         &disabled,
                         &[],
                         0,
@@ -1426,7 +1434,7 @@ mod tests {
         }
 
         // 켜짐+값 없음(Claude) / 켜짐+값 있음(Codex) / 값 없어서 칸 없음(Kimi, 기존 규칙).
-        let harness = run(None, some_usage, None, Vec::new());
+        let harness = run(None, some_usage, None, None, Vec::new());
         assert!(
             harness.query_by_label("Anthropic logo").is_some(),
             "값이 없어도 켜져 있으면 Claude 칸은 남아야 한다"
@@ -1441,7 +1449,13 @@ mod tests {
         );
 
         // 꺼짐이 "값 있음"보다 우선한다 — Claude를 꺼도 값은 여전히 있다.
-        let harness = run(some_usage, some_usage, None, vec!["claude".to_owned()]);
+        let harness = run(
+            some_usage,
+            some_usage,
+            None,
+            None,
+            vec!["claude".to_owned()],
+        );
         assert!(
             harness.query_by_label("Anthropic logo").is_none(),
             "꺼진 Claude는 값이 있어도 칸이 사라져야 한다"
@@ -1449,13 +1463,13 @@ mod tests {
         assert!(harness.query_by_label("Codex logo").is_some());
 
         // 꺼짐이 Kimi의 "값 있으면 보인다" 규칙보다도 우선한다.
-        let harness = run(None, some_usage, some_usage, vec!["kimi".to_owned()]);
+        let harness = run(None, some_usage, some_usage, None, vec!["kimi".to_owned()]);
         assert!(
             harness.query_by_label("Kimi logo").is_none(),
             "꺼진 Kimi는 값이 있어도 칸이 사라져야 한다"
         );
 
-        // 셋 다 꺼지면(재현 시나리오) 로고가 하나도 안 남는다 — 칸이 0개일 때
+        // 기존 세 provider를 모두 끄고 Grok 값도 없으면 로고가 하나도 안 남는다 — 칸이 0개일 때
         // 빈 상자·구분선이 남지 않는지는 app.rs의
         // `칸이_없으면_top_provider_usage는_아무것도_그리지_않았다고_보고한다`가
         // 반환값으로 고정한다.
@@ -1463,11 +1477,51 @@ mod tests {
             some_usage,
             some_usage,
             some_usage,
+            None,
             vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()],
         );
         assert!(harness.query_by_label("Anthropic logo").is_none());
         assert!(harness.query_by_label("Codex logo").is_none());
         assert!(harness.query_by_label("Kimi logo").is_none());
+
+        let grok = crate::grok_usage::GrokUsage {
+            weekly_remaining_percent: Some(70),
+            monthly_remaining_percent: Some(85),
+            credits_left: Some(crate::grok_usage::GrokCredits {
+                currency: crate::grok_usage::GrokCurrency::Usd,
+                minor_units: 1_234,
+            }),
+        };
+        let harness = run(None, some_usage, None, Some(grok), Vec::new());
+        assert!(harness.query_by_label("Grok logo").is_some());
+        harness.get_by_label("Grok remaining usage: W 70% · M 85% · $12.34");
+
+        let partial = crate::grok_usage::GrokUsage {
+            weekly_remaining_percent: Some(70),
+            monthly_remaining_percent: None,
+            credits_left: None,
+        };
+        let harness = run(None, some_usage, None, Some(partial), Vec::new());
+        harness.get_by_label("Grok remaining usage: W 70%");
+
+        let harness = run(None, some_usage, None, None, Vec::new());
+        assert!(harness.query_by_label("Grok logo").is_none());
+
+        let harness = run(None, some_usage, None, Some(grok), vec!["grok".to_owned()]);
+        assert!(harness.query_by_label("Grok logo").is_none());
+
+        // Claude/Codex가 없어도 Kimi를 그린 뒤 `drawn`을 갱신해 Grok이 그 오른쪽의
+        // 다음 provider 칸에 놓인다. 이 조합이 Kimi→Grok 구분선 경로를 직접 지난다.
+        let harness = run(
+            None,
+            None,
+            some_usage,
+            Some(grok),
+            vec!["claude".to_owned(), "codex".to_owned()],
+        );
+        let kimi = harness.get_by_label("Kimi logo").rect();
+        let grok = harness.get_by_label("Grok logo").rect();
+        assert!(grok.left() > kimi.right());
     }
 
     #[test]
@@ -1484,6 +1538,7 @@ mod tests {
                 }
                 terminal.status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,
@@ -1540,6 +1595,7 @@ mod tests {
                 let mut terminal = shared.lock().unwrap();
                 let intent = terminal.status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,
@@ -1625,6 +1681,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                         &[],
                         &[],
                         approvals,
@@ -1677,6 +1734,7 @@ mod tests {
                 }
                 shared.lock().unwrap().status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,
@@ -1742,6 +1800,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     0,
@@ -1802,6 +1861,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     0,
@@ -1853,6 +1913,7 @@ mod tests {
                     }
                     if let Some(intent) = terminal.status_bar_with_managers(
                         ui,
+                        None,
                         None,
                         None,
                         None,
@@ -1933,6 +1994,7 @@ mod tests {
                 }
                 if let Some(intent) = terminal.status_bar_with_managers(
                     ui,
+                    None,
                     None,
                     None,
                     None,

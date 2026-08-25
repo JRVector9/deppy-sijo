@@ -7322,10 +7322,10 @@ fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
 
 /// 사용량 바 폭 — 실제로 그려지는 provider 칸 수에 따라 정해진다. 원래 코드는 칸이
 /// Claude·Codex(항상 표시) + Kimi(값 있을 때만) 두 경우뿐이라 상수 두 개(430/620)로
-/// 충분했다. 이제 셋 다 꺼질 수 있어 칸 수가 0~3까지 늘었으므로, 그 두 상수(칸 2개→430,
+/// 충분했다. 이제 Grok까지 조건부로 붙어 칸 수가 0~4까지 늘었으므로, 그 두 상수(칸 2개→430,
 /// 칸 3개→620, 칸당 +190)를 그대로 외삽해 순수 함수로 뽑았다 — 폭은 egui 컨테이너의
 /// 크기 힌트일 뿐이라 정확한 픽셀보다 "칸 수에 비례해 줄어든다"가 중요하다. 값으로
-/// 테스트한다(0·1·2·3칸). 0칸은 상자 자체를 그리지 않으므로(`top_provider_usage`) 0.0 —
+/// 테스트한다(0·1·2·3·4칸). 0칸은 상자 자체를 그리지 않으므로(`top_provider_usage`) 0.0 —
 /// 50.0을 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
 fn provider_usage_bar_width(visible_count: usize) -> f32 {
     if visible_count == 0 {
@@ -7333,6 +7333,54 @@ fn provider_usage_bar_width(visible_count: usize) -> f32 {
     } else {
         50.0 + 190.0 * visible_count as f32
     }
+}
+
+fn format_grok_credits(credits: crate::grok_usage::GrokCredits) -> String {
+    match credits.currency {
+        crate::grok_usage::GrokCurrency::Usd => format!(
+            "${}.{:02}",
+            credits.minor_units / 100,
+            credits.minor_units % 100
+        ),
+    }
+}
+
+fn grok_usage_labels(
+    usage: crate::grok_usage::GrokUsage,
+    catalog: &i18n::Catalog,
+) -> (String, String, String) {
+    let mut parts = Vec::with_capacity(3);
+    if let Some(value) = usage.weekly_remaining_percent {
+        parts.push(catalog.t(
+            "status_bar.grok.weekly_short",
+            &[("value", &value.to_string())],
+        ));
+    }
+    if let Some(value) = usage.monthly_remaining_percent {
+        parts.push(catalog.t(
+            "status_bar.grok.monthly_short",
+            &[("value", &value.to_string())],
+        ));
+    }
+    if let Some(credits) = usage.credits_left {
+        let value = format_grok_credits(credits);
+        parts.push(catalog.t("status_bar.grok.credits_short", &[("value", &value)]));
+    }
+    let visible = parts.join(" · ");
+    let accessibility = catalog.t(
+        "status_bar.grok.accessibility",
+        &[("values", visible.as_str())],
+    );
+    let hover = catalog.t("status_bar.grok.hover", &[("values", visible.as_str())]);
+    (visible, accessibility, hover)
+}
+
+pub(crate) struct ProviderUsageInputs<'a> {
+    pub(crate) claude: Option<ProviderUsage>,
+    pub(crate) codex: Option<ProviderUsage>,
+    pub(crate) codex_meta: Option<&'a crate::ui::agent_sessions::CodexUsageMeta>,
+    pub(crate) kimi: Option<ProviderUsage>,
+    pub(crate) grok: Option<crate::grok_usage::GrokUsage>,
 }
 
 /// 런처 카드 스위치 토글 결과로 새 거부 목록을 만든다 — 정규화까지 마친 상태로 돌려주므로
@@ -7353,21 +7401,26 @@ fn toggled_disabled_agents(
 }
 
 /// 하단 사용량 바의 provider 칸들. `disabled`는 usage 값과 분리된 신호다 — 「켜짐인데
-/// 값 없음」(Claude·Codex는 「—」로 자리를 지킨다, 1급 provider 규칙)과 「꺼짐」(셋 다
+/// 값 없음」(Claude·Codex는 「—」로 자리를 지킨다, 1급 provider 규칙)과 「꺼짐」(모든
 /// 칸 자체가 없다)을 usage 값 하나로는 구분할 수 없어서 나눴다. usage를 미리
 /// `None`으로 지워 두 상태를 뭉개는 대신, 여기서 `agent_is_enabled`로 직접 갈라 그린다.
 ///
 /// 칸을 하나라도 그렸으면 `true`를 돌려준다 — 호출부(`agent_terminal.rs`)가 이 값으로
-/// 뒤이은 구분선을 그릴지 정한다. 셋 다 꺼져 칸이 0개면 상자도 안 그리고 `false`를
+/// 뒤이은 구분선을 그릴지 정한다. 모든 provider 칸이 숨겨지면 상자도 안 그리고 `false`를
 /// 돌려줘, "빈 50px 상자 + 오른쪽에 아무것도 안 나누는 구분선"이 남지 않게 한다.
 pub(crate) fn top_provider_usage(
     ui: &mut egui::Ui,
-    claude_usage: Option<ProviderUsage>,
-    codex_usage: Option<ProviderUsage>,
-    codex_meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
-    kimi_usage: Option<ProviderUsage>,
+    usage: ProviderUsageInputs<'_>,
     disabled: &[String],
+    catalog: &i18n::Catalog,
 ) -> bool {
+    let ProviderUsageInputs {
+        claude: claude_usage,
+        codex: codex_usage,
+        codex_meta,
+        kimi: kimi_usage,
+        grok: grok_usage,
+    } = usage;
     let sidebar_font = crate::fonts::sidebar_font(ui.ctx(), 13.0);
     for text_style in [
         egui::TextStyle::Body,
@@ -7473,16 +7526,36 @@ pub(crate) fn top_provider_usage(
         }
     }
 
+    fn grok_provider(
+        ui: &mut egui::Ui,
+        usage: crate::grok_usage::GrokUsage,
+        catalog: &i18n::Catalog,
+    ) {
+        let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
+        crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, "Grok");
+        let (visible, accessibility, hover) = grok_usage_labels(usage, catalog);
+        let response = ui
+            .label(egui::RichText::new(visible).size(13.0).strong())
+            .on_hover_text(hover);
+        let enabled = ui.is_enabled();
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, accessibility.as_str())
+        });
+    }
+
     use crate::agent_launcher::{AgentKind, agent_is_enabled};
-    // 꺼진 provider는 칸 자체가 사라진다(사용자 요청) — claude·codex·kimi 셋 다 같은
+    // 꺼진 provider는 칸 자체가 사라진다(사용자 요청) — 모든 provider에 같은
     // 규칙이다. Claude/Codex는 이 앱의 1급 provider라 켜져 있으면 값이 없어도 「—」로
-    // 자리를 지키지만, Kimi는 **쓰는 사람에게만** 보여야 한다(2026-08-10 사용자 요구)는
-    // 별도 규칙이 여전히 얹혀서, 켜져 있어도 값이 없으면 칸 자체를 안 그린다.
+    // 자리를 지키지만, Kimi와 Grok은 **쓰는 사람에게만** 보여야 하므로 켜져 있어도
+    // 각 usage 값이 없으면 칸 자체를 안 그린다.
     let claude_shown = agent_is_enabled(disabled, AgentKind::Claude);
     let codex_shown = agent_is_enabled(disabled, AgentKind::Codex);
     let kimi_shown = agent_is_enabled(disabled, AgentKind::Kimi) && kimi_usage.is_some();
-    let visible_count =
-        usize::from(claude_shown) + usize::from(codex_shown) + usize::from(kimi_shown);
+    let grok_shown = agent_is_enabled(disabled, AgentKind::Grok) && grok_usage.is_some();
+    let visible_count = usize::from(claude_shown)
+        + usize::from(codex_shown)
+        + usize::from(kimi_shown)
+        + usize::from(grok_shown);
     if visible_count == 0 {
         // 그릴 칸이 없으면 상자 자체를 할당하지 않는다 — 빈 50px 상자가 남으면
         // 호출부가 그 오른쪽에 붙이는 구분선도 아무것도 안 나누는 채로 남는다.
@@ -7533,6 +7606,15 @@ pub(crate) fn top_provider_usage(
                     kimi_usage,
                     None,
                 );
+                drawn = true;
+            }
+            if grok_shown {
+                if drawn {
+                    ui.add_space(4.0);
+                    separator(ui, 18.0);
+                    ui.add_space(4.0);
+                }
+                grok_provider(ui, grok_usage.expect("grok_shown requires usage"), catalog);
             }
         },
     );
@@ -12771,7 +12853,7 @@ impl App {
             agent_launcher_snapshot: None,
             claude_direct_defaults: ClaudeDirectDefaults::default(),
             claude_direct_defaults_ignore_next_completion: false,
-            agent_launcher_detection_requested: false,
+            agent_launcher_detection_requested: true,
             agent_launcher_detection_in_flight: false,
             pending_agent_launcher_intent: None,
             next_agent_launcher_request_id: 0,
@@ -26895,12 +26977,23 @@ impl eframe::App for App {
                     claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx()));
                 let codex_usage =
                     supplement_codex_five_hour(codex_server_usage, codex_backend_five_hour);
+                let grok_agent = self
+                    .agent_launcher_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Grok));
+                let grok_usage = crate::agent_launcher::agent_is_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Grok,
+                )
+                .then(|| crate::grok_usage::current(ui.ctx(), grok_agent))
+                .flatten();
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage,
                     codex_usage,
                     self.agent_sessions_ui.codex_usage_meta(),
                     kimi_usage,
+                    grok_usage,
                     // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — usage 값은
                     // 그대로 넘기고 「꺼짐」만 별도 신호로 보내, top_provider_usage가
                     // "켜짐인데 값 없음"(—로 자리 유지)과 "꺼짐"(칸 자체 없음)을
@@ -42486,25 +42579,37 @@ mod tests {
     #[test]
     fn 사용량_바_폭은_그려지는_칸_수에_비례한다() {
         // 원래 상수 두 개(칸 2개→430, 칸 3개→620, 칸당 +190)를 1칸으로 외삽한
-        // 값을 고정한다 — claude·codex·kimi가 각각 꺼질 수 있게 되면서 칸 수가
-        // 0~3 전 구간을 오갈 수 있다(예전엔 kimi만 빠질 수 있어 2·3만 있었다).
+        // 값을 고정한다 — claude·codex는 활성화 여부, kimi·grok은 활성화 여부와
+        // usage 값에 따라 칸 수가 0~4 전 구간을 오갈 수 있다.
         // 0칸은 `top_provider_usage`가 상자 자체를 안 그리므로 0.0 — 50.0을
         // 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
         assert_eq!(provider_usage_bar_width(0), 0.0);
         assert_eq!(provider_usage_bar_width(1), 240.0);
         assert_eq!(provider_usage_bar_width(2), 430.0);
         assert_eq!(provider_usage_bar_width(3), 620.0);
+        assert_eq!(provider_usage_bar_width(4), 810.0);
     }
 
     #[test]
     fn 칸이_없으면_top_provider_usage는_아무것도_그리지_않았다고_보고한다() {
         // 반환값이 호출부(`agent_terminal.rs`)가 뒤이은 구분선을 그릴지 정하는
-        // 신호다 — 셋 다 꺼지면 상자도 구분선도 남지 않아야 한다.
+        // 신호다 — 모든 provider 칸이 숨겨지면 상자도 구분선도 남지 않아야 한다.
         let all_disabled = vec!["claude".to_owned(), "codex".to_owned(), "kimi".to_owned()];
         let ctx = egui::Context::default();
         let mut drew_nothing = true;
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            drew_nothing = top_provider_usage(ui, None, None, None, None, &all_disabled);
+            drew_nothing = top_provider_usage(
+                ui,
+                ProviderUsageInputs {
+                    claude: None,
+                    codex: None,
+                    codex_meta: None,
+                    kimi: None,
+                    grok: None,
+                },
+                &all_disabled,
+                &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+            );
         });
         assert!(
             !drew_nothing,
@@ -42513,7 +42618,18 @@ mod tests {
 
         let mut drew_something = false;
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            drew_something = top_provider_usage(ui, None, None, None, None, &[]);
+            drew_something = top_provider_usage(
+                ui,
+                ProviderUsageInputs {
+                    claude: None,
+                    codex: None,
+                    codex_meta: None,
+                    kimi: None,
+                    grok: None,
+                },
+                &[],
+                &i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap(),
+            );
         });
         assert!(
             drew_something,
@@ -42523,10 +42639,9 @@ mod tests {
 
     #[test]
     fn 거부_목록은_kimi의_값_유무_규칙과_별개로_칸_표시를_결정한다() {
-        // top_provider_usage가 칸을 그릴지 정하는 조건을 값으로 고정한다.
-        // claude·codex는 값과 무관하게 "켜짐"만 보고, kimi는 "켜짐 AND 값 있음"을
-        // 본다 — 꺼짐이 kimi의 기존 "값 있으면 보인다" 규칙보다 항상 우선해야
-        // "꺼짐"과 "켜짐인데 값 없음"이 값 하나로 뭉개지지 않는다.
+        // 기존 Kimi 칸 조건을 값으로 고정한다. Claude·Codex는 값과 무관하게 "켜짐"만
+        // 보고, Kimi는 "켜짐 AND 값 있음"을 본다. 같은 Grok 조건은 상태바 kittest가
+        // 고정한다.
         use crate::agent_launcher::{AgentKind, agent_is_enabled};
 
         let none: &[String] = &[];

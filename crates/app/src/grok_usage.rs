@@ -54,9 +54,12 @@ fn last_request_after_spawn(attempted: Instant) -> Instant {
     attempted
 }
 
-pub(crate) fn current(ctx: &egui::Context, executable: Option<&Path>) -> Option<GrokUsage> {
+pub(crate) fn current(
+    ctx: &egui::Context,
+    agent: Option<&crate::agent_launcher::DetectedAgent>,
+) -> Option<GrokUsage> {
     static STATE: OnceLock<Mutex<UsageState>> = OnceLock::new();
-    let executable = executable?.to_path_buf();
+    let agent = agent?;
     let state = STATE.get_or_init(|| Mutex::new(UsageState::default()));
     let Ok(mut state) = state.lock() else {
         return None;
@@ -73,13 +76,19 @@ pub(crate) fn current(ctx: &egui::Context, executable: Option<&Path>) -> Option<
     }
     let since_last_request = state.last_request.map(|requested| requested.elapsed());
     if should_start_probe(true, state.pending.is_some(), since_last_request) {
+        // 감지 스냅샷의 PATH는 최대 32KiB다. 상태바 렌더 때마다 복사하지 않고 실제로
+        // 60초 admission을 통과해 probe를 띄울 때만 worker 소유 값으로 만든다.
+        let executable = agent.executable().to_path_buf();
+        let detected_launch_path = agent.launch_path().map(std::ffi::OsString::from);
         let (sender, receiver) = mpsc::sync_channel(1);
         let repaint = ctx.clone();
         let attempted = Instant::now();
         let spawned = std::thread::Builder::new()
             .name("grok-usage-probe".to_owned())
             .spawn(move || {
-                let usage = fetch_grok_usage(&executable).ok().flatten();
+                let usage = fetch_grok_usage(&executable, detected_launch_path.as_deref())
+                    .ok()
+                    .flatten();
                 let _ = sender.send(usage);
                 repaint.request_repaint();
             })
@@ -124,11 +133,9 @@ fn extract_window_remaining(lines: &[&str], label: &str) -> Option<u8> {
         if !compact_label(line).contains(label) {
             continue;
         }
-        for candidate in lines.iter().skip(index).take(4) {
+        for (offset, candidate) in lines.iter().skip(index).take(4).enumerate() {
             let compact = compact_label(candidate);
-            if candidate != line
-                && (compact.contains("weeklylimit") || compact.contains("monthlylimit"))
-            {
+            if offset > 0 && usage_section_boundary(&compact) {
                 break;
             }
             if let Some(captures) = percent.captures(candidate) {
@@ -155,16 +162,12 @@ fn extract_credits_left(lines: &[&str]) -> Option<GrokCredits> {
         regex::Regex::new(r"\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)").expect("static Grok money regex")
     });
     for (index, line) in lines.iter().enumerate().rev() {
-        if !compact_label(line).contains("creditsleft") {
+        if !credits_label(&compact_label(line)) {
             continue;
         }
-        for candidate in lines.iter().skip(index).take(4) {
+        for (offset, candidate) in lines.iter().skip(index).take(4).enumerate() {
             let compact = compact_label(candidate);
-            if candidate != line
-                && (compact.contains("weeklylimit")
-                    || compact.contains("monthlylimit")
-                    || compact.contains("creditsleft"))
-            {
+            if offset > 0 && usage_section_boundary(&compact) {
                 break;
             }
             if let Some(captures) = money.captures(candidate) {
@@ -178,7 +181,34 @@ fn extract_credits_left(lines: &[&str]) -> Option<GrokCredits> {
     None
 }
 
+fn credits_label(compact: &str) -> bool {
+    ["creditsleft", "credits"].into_iter().any(|prefix| {
+        compact
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+fn usage_section_boundary(compact: &str) -> bool {
+    compact.contains("weeklylimit")
+        || compact.contains("monthlylimit")
+        || compact.starts_with("credits")
+        || compact.contains("autotopup")
+        || compact.contains("payasyougo")
+        || compact.contains("context")
+        || compact.contains("token")
+        || compact.contains("compression")
+        || compact.contains("compaction")
+}
+
 fn usage_panel_rendered(lower: &str) -> bool {
+    if lower
+        .lines()
+        .map(compact_label)
+        .any(|line| credits_label(&line))
+    {
+        return true;
+    }
     let compact = compact_label(lower);
     [
         "weeklylimit",
@@ -192,23 +222,27 @@ fn usage_panel_rendered(lower: &str) -> bool {
     .any(|needle| compact.contains(needle))
 }
 
-fn fetch_grok_usage(executable: &Path) -> anyhow::Result<Option<GrokUsage>> {
-    let program = executable
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Grok executable path is not UTF-8"))?;
+fn fetch_grok_usage(
+    executable: &Path,
+    detected_launch_path: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<Option<GrokUsage>> {
     let probe_dir = crate::paths::home_dir()
         .map(|home| home.join(".deppy-sijo").join("usage-probe"))
         .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&probe_dir)?;
-    let command = pty::CommandSpec {
-        program: program.to_owned(),
-        args: Vec::new(),
-        env: vec![("TERM".to_owned(), "xterm-256color".to_owned())],
-        cwd: Some(probe_dir),
-    };
+    let inherited_path = std::env::var_os("PATH");
+    let command = grok_probe_command(
+        executable,
+        probe_dir,
+        detected_launch_path,
+        inherited_path.as_deref(),
+    )?;
     let backend = pty::PortablePtyBackend;
     let mut session = backend.spawn(&command, 120, 40)?;
-    let result = run_grok_usage_probe(&mut *session);
+    // 전체 child 수명 예산은 startup 대기를 포함한다. spawn 직후 deadline을 고정해야
+    // STARTUP_DELAY 2초 + PROBE_TIMEOUT 25초로 늘어나지 않는다.
+    let deadline = probe_deadline(Instant::now());
+    let result = run_grok_usage_probe(&mut *session, deadline);
     let kill_result = session.kill();
     match (result, kill_result) {
         (Ok(usage), Ok(())) => Ok(usage),
@@ -217,19 +251,73 @@ fn fetch_grok_usage(executable: &Path) -> anyhow::Result<Option<GrokUsage>> {
     }
 }
 
-fn run_grok_usage_probe(session: &mut dyn pty::PtySession) -> anyhow::Result<Option<GrokUsage>> {
+fn grok_probe_command(
+    executable: &Path,
+    probe_dir: std::path::PathBuf,
+    detected_launch_path: Option<&std::ffi::OsStr>,
+    inherited_path: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<pty::CommandSpec> {
+    let program = executable
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Grok executable path is not UTF-8"))?;
+    let search_path = if let Some(path) = detected_launch_path {
+        // 감지 PATH는 실행 파일 디렉터리와 NVM 등 런타임 디렉터리를 이미 포함하며
+        // 생성 시 32KiB로 제한된다. 그대로 전달해 중복·상한 초과를 만들지 않는다.
+        path.to_os_string()
+    } else {
+        let mut search_paths = executable
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        if let Some(path) = inherited_path {
+            search_paths.extend(std::env::split_paths(path));
+        }
+        std::env::join_paths(search_paths)
+            .map_err(|_| anyhow::anyhow!("Grok probe PATH could not be constructed"))?
+    }
+    .into_string()
+    .map_err(|_| anyhow::anyhow!("Grok probe PATH is not UTF-8"))?;
+    Ok(pty::CommandSpec {
+        program: program.to_owned(),
+        args: Vec::new(),
+        env: vec![
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("PATH".to_owned(), search_path),
+        ],
+        cwd: Some(probe_dir),
+    })
+}
+
+fn probe_deadline(spawned_at: Instant) -> Instant {
+    spawned_at + PROBE_TIMEOUT
+}
+
+fn run_grok_usage_probe(
+    session: &mut dyn pty::PtySession,
+    deadline: Instant,
+) -> anyhow::Result<Option<GrokUsage>> {
     let output = session
         .take_output()
         .ok_or_else(|| anyhow::anyhow!("Grok usage PTY output unavailable"))?;
-    std::thread::sleep(STARTUP_DELAY);
+    std::thread::sleep(STARTUP_DELAY.min(deadline.saturating_duration_since(Instant::now())));
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
     write_required_input(session, b"/usage\r")?;
 
-    let started = Instant::now();
     let mut settle_at = None;
     let mut trusted = false;
     let mut bytes = Vec::new();
-    while started.elapsed() < PROBE_TIMEOUT {
-        match output.recv_timeout(Duration::from_millis(100)) {
+    while Instant::now() < deadline {
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        if wait.is_zero() {
+            break;
+        }
+        match output.recv_timeout(wait) {
             Ok(chunk) => {
                 bytes.extend_from_slice(&chunk);
                 if bytes.len() > MAX_OUTPUT_BYTES {
@@ -384,6 +472,39 @@ Credits left: $1,234.50
     }
 
     #[test]
+    fn installed_credits_label_is_parsed_without_capturing_auto_topup_money() {
+        assert_eq!(
+            parse_usage("Credits: $12.34\n"),
+            Some(GrokUsage {
+                weekly_remaining_percent: None,
+                monthly_remaining_percent: None,
+                credits_left: Some(GrokCredits {
+                    currency: GrokCurrency::Usd,
+                    minor_units: 1_234,
+                }),
+            })
+        );
+        assert_eq!(
+            parse_usage(
+                "Credits:\nAuto topup: $50.00\nMonthly limit $15.00 used of $100.00 limit\n",
+            ),
+            Some(GrokUsage {
+                weekly_remaining_percent: None,
+                monthly_remaining_percent: Some(85),
+                credits_left: None,
+            })
+        );
+        assert_eq!(parse_usage("Credits used: $12.34\n"), None);
+        assert_eq!(parse_usage("Weekly limit\nCredits used: 40% used\n"), None);
+    }
+
+    #[test]
+    fn credit_only_panel_is_detected_without_waiting_for_the_probe_timeout() {
+        assert!(usage_panel_rendered("Credits: $12.34\n"));
+        assert!(!usage_panel_rendered("Credits used: $12.34\n"));
+    }
+
+    #[test]
     fn ansi_is_removed_and_percentages_are_clamped_without_context_false_positives() {
         assert_eq!(
             parse_usage("\u{1b}[31mWeekly limit 999% used\u{1b}[0m"),
@@ -393,6 +514,11 @@ Credits left: $1,234.50
                 credits_left: None,
             })
         );
+    }
+
+    #[test]
+    fn a_context_section_after_a_limit_label_is_not_usage() {
+        assert_eq!(parse_usage("Weekly limit\nContext window 41% used\n"), None);
     }
 
     #[test]
@@ -453,13 +579,95 @@ Credits left: $1,234.50
     }
 
     #[test]
+    fn probe_deadline_includes_the_startup_delay_in_the_25_second_budget() {
+        let spawned_at = Instant::now();
+        assert_eq!(
+            probe_deadline(spawned_at).duration_since(spawned_at),
+            PROBE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn inherited_path_fallback_prepends_the_detected_executable_parent() {
+        let executable = Path::new("/Users/test/.nvm/versions/node/v24.0.0/bin/grok");
+        let inherited =
+            std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).expect("test PATH");
+        let command = grok_probe_command(
+            executable,
+            std::path::PathBuf::from("/tmp/deppy-grok-probe"),
+            None,
+            Some(inherited.as_os_str()),
+        )
+        .expect("Grok probe command");
+        let path = command
+            .env
+            .iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value))
+            .expect("probe PATH");
+        let entries = std::env::split_paths(std::ffi::OsStr::new(path)).collect::<Vec<_>>();
+
+        assert_eq!(
+            entries.first().map(std::path::PathBuf::as_path),
+            executable.parent()
+        );
+        assert_eq!(
+            entries.get(1).map(std::path::PathBuf::as_path),
+            Some(Path::new("/usr/bin"))
+        );
+        assert_eq!(
+            entries.get(2).map(std::path::PathBuf::as_path),
+            Some(Path::new("/bin"))
+        );
+    }
+
+    #[test]
+    fn detected_launch_path_keeps_node_available_for_a_shim_executable() {
+        let executable = Path::new("/Users/test/Library/pnpm/grok");
+        let detected = std::env::join_paths([
+            Path::new("/Users/test/Library/pnpm"),
+            Path::new("/Users/test/.nvm/versions/node/v24.0.0/bin"),
+            Path::new("/usr/bin"),
+        ])
+        .expect("detected launch PATH");
+        let inherited =
+            std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).expect("Finder PATH");
+
+        let command = grok_probe_command(
+            executable,
+            std::path::PathBuf::from("/tmp/deppy-grok-probe"),
+            Some(detected.as_os_str()),
+            Some(inherited.as_os_str()),
+        )
+        .expect("Grok probe command");
+        let path = command
+            .env
+            .iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value))
+            .expect("probe PATH");
+        let entries = std::env::split_paths(std::ffi::OsStr::new(path)).collect::<Vec<_>>();
+
+        assert_eq!(
+            entries.first().map(std::path::PathBuf::as_path),
+            Some(Path::new("/Users/test/Library/pnpm"))
+        );
+        assert_eq!(
+            entries.get(1).map(std::path::PathBuf::as_path),
+            Some(Path::new("/Users/test/.nvm/versions/node/v24.0.0/bin"))
+        );
+        assert_eq!(
+            entries.get(2).map(std::path::PathBuf::as_path),
+            Some(Path::new("/usr/bin"))
+        );
+    }
+
+    #[test]
     #[ignore = "실제 Grok CLI를 최대 25초 띄운다"]
     fn grok_실측_프로브는_민감한_원문_없이_끝난다() {
         let Some(path) = std::env::var_os("DEPPY_GROK_EXECUTABLE").map(std::path::PathBuf::from)
         else {
             return;
         };
-        let usage = fetch_grok_usage(&path).expect("bounded Grok probe");
+        let usage = fetch_grok_usage(&path, None).expect("bounded Grok probe");
         assert!(usage.is_none_or(|value| {
             value.weekly_remaining_percent.is_some()
                 || value.monthly_remaining_percent.is_some()

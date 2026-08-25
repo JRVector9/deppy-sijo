@@ -10,6 +10,7 @@
 - Failed approaches: none in this implementation phase yet.
 - Remaining work: self-review and commit this approved design; write the TDD implementation plan; run two disjoint implementation lanes; integrate/review/correct; run focused and full gates; commit/journal; signed package verification; exact-bundle relaunch.
 - Exact next commands: scan the design for placeholders/contradictions; commit the design and handoff; create `docs/superpowers/plans/2026-08-25-grok-usage-and-unicode-corrections.md`; dispatch disjoint Grok and file-identity/display TDD lanes.
+- Plan status: the complete TDD plan is now `docs/superpowers/plans/2026-08-25-grok-usage-and-unicode-corrections.md`. It separates the Grok-only file from the coordinated raw-name/NFC UI lane and reserves integration gates, Codex review, journal, signing, and exact relaunch for root.
 
 ## Current task — Grok bottom usage and Korean folder/terminal review (2026-08-25)
 

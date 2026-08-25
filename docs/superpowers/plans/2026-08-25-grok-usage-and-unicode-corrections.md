@@ -377,7 +377,7 @@ codex review --uncommitted
 
 Critical/High는 전부 수정하고 Medium은 범위 내에서 수정한다. 모든 수정은 새 RED를 먼저 관찰하고 focused GREEN 뒤 전체 게이트를 다시 실행한다.
 
-- [ ] **Step 4: source 커밋과 Obsidian 일지**
+- [x] **Step 4: source 커밋과 Obsidian 일지**
 
 ```bash
 git add crates/app/src/grok_usage.rs crates/app/src/app.rs crates/app/src/ui/mod.rs crates/app/src/ui/file_tree.rs crates/app/src/ui/workspace.rs docs/CODEX_HANDOFF.md docs/superpowers/plans/2026-08-25-grok-usage-and-unicode-corrections.md
@@ -386,7 +386,7 @@ git commit -m "fix(app): Grok 사용량과 파일명 표시 교정"
 
 일지에는 RED/GREEN, Codex findings/반영, 최종 SHA, 패키징 해시를 기록한다.
 
-- [ ] **Step 5: Developer-ID 서명 재빌드·검증**
+- [x] **Step 5: Developer-ID 서명 재빌드·검증**
 
 ```bash
 DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh scripts/package-macos.sh
@@ -398,7 +398,7 @@ shasum -a 256 'target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo' 'target/b
 
 Expected: package script, deep/strict signature, archive test exit 0; identifier `app.vector9.deppy-sijo`, team `ZDTU5LS35K`.
 
-- [ ] **Step 6: exact bundle 재실행**
+- [x] **Step 6: exact bundle 재실행**
 
 현재 exact executable PID를 다시 조회·검증한 뒤 SIGTERM으로 종료하고 bounded wait 후 새 bundle을 `open -n`으로 실행한다. 새 PID가 exact executable, PPID 1, 두 번의 생존 검사에서 유지되는지 확인한다.
 

@@ -292,6 +292,24 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "런처 감지와 실제 Kimi CLI를 최대 25초 실행한다"]
+    fn kimi_실측_프로브는_런처_감지_경로로_끝난다() {
+        let excluded = crate::agent_shim::shim_path();
+        let snapshot = crate::agent_launcher::detect_installed_agents(excluded.as_deref());
+        let agent = snapshot
+            .find(crate::agent_launcher::AgentKind::Kimi)
+            .expect("현재 계정에서 설치된 Kimi를 감지해야 한다");
+        assert_eq!(
+            std::path::Path::new(&resolve_kimi_command()),
+            agent.executable(),
+            "usage probe와 launcher가 서로 다른 Kimi 실행 파일을 선택한다"
+        );
+
+        let usage = fetch_kimi_usage().expect("launcher-detected bounded Kimi probe");
+        assert!(usage.is_some(), "현재 계정에서 Kimi usage 숫자를 기대했다");
+    }
+
     /// 2026-08-10 실측 화면 그대로. 라벨·퍼센트 표기가 바뀌면 여기서 깨져야 한다 —
     /// 조용히 None이 되면 상태바에서 Kimi만 사라지고 이유를 알 수 없다.
     const REAL_PANEL: &str = "\

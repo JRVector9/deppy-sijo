@@ -7340,6 +7340,20 @@ fn provider_usage_bar_width(visible_count: usize) -> f32 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderUsageDensity {
+    Full,
+    Compact,
+}
+
+fn provider_usage_density(available_width: f32, visible_count: usize) -> ProviderUsageDensity {
+    if available_width >= provider_usage_bar_width(visible_count) {
+        ProviderUsageDensity::Full
+    } else {
+        ProviderUsageDensity::Compact
+    }
+}
+
 fn format_grok_credits(credits: crate::grok_usage::GrokCredits) -> String {
     match credits.currency {
         crate::grok_usage::GrokCurrency::Usd => format!(
@@ -7469,9 +7483,33 @@ pub(crate) fn top_provider_usage(
         accent: egui::Color32,
         usage: Option<ProviderUsage>,
         meta: Option<&crate::ui::agent_sessions::CodexUsageMeta>,
+        density: ProviderUsageDensity,
     ) {
         let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
         crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, name);
+
+        if density == ProviderUsageDensity::Compact {
+            let prioritized = usage.and_then(|(five_hour, weekly)| weekly.or(five_hour));
+            let (text, weak) = prioritized
+                .map(|value| (format!("{value}%"), false))
+                .unwrap_or_else(|| ("—".to_owned(), true));
+            let mut label = egui::RichText::new(text.clone()).size(13.0);
+            label = if weak {
+                label.weak()
+            } else {
+                label.color(accent).strong()
+            };
+            let response = ui.label(label);
+            let enabled = ui.is_enabled();
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Label,
+                    enabled,
+                    format!("{name} usage {text}"),
+                )
+            });
+            return;
+        }
 
         // 구독 플랜 — 있으면 로고 옆에 약하게 (orca "Codex · Pro" 대응).
         if let Some(plan) = meta
@@ -7560,10 +7598,11 @@ pub(crate) fn top_provider_usage(
         ui: &mut egui::Ui,
         usage: Option<crate::grok_usage::GrokUsage>,
         catalog: &i18n::Catalog,
+        density: ProviderUsageDensity,
     ) {
         let (logo, _) = ui.allocate_exact_size(egui::vec2(14.5, 14.5), egui::Sense::hover());
         crate::ui::agent_terminal::paint_announcement_provider_logo(ui, logo, "Grok");
-        let (visible, accessibility, hover) = usage.map_or_else(
+        let (full_visible, accessibility, hover) = usage.map_or_else(
             || {
                 (
                     "—".to_owned(),
@@ -7573,6 +7612,19 @@ pub(crate) fn top_provider_usage(
             },
             |usage| grok_usage_labels(usage, catalog),
         );
+        let visible = if density == ProviderUsageDensity::Compact {
+            usage
+                .and_then(|usage| {
+                    usage
+                        .weekly_remaining_percent
+                        .or(usage.monthly_remaining_percent)
+                        .map(|value| format!("{value}%"))
+                        .or_else(|| usage.credits_left.map(format_grok_credits))
+                })
+                .unwrap_or_else(|| "—".to_owned())
+        } else {
+            full_visible
+        };
         let response = ui
             .label(egui::RichText::new(visible).size(13.0).strong())
             .on_hover_text(hover);
@@ -7600,12 +7652,19 @@ pub(crate) fn top_provider_usage(
         // 호출부가 그 오른쪽에 붙이는 구분선도 아무것도 안 나누는 채로 남는다.
         return false;
     }
-    let width = provider_usage_bar_width(visible_count);
+    let available_width = ui.available_width().max(0.0);
+    let preferred_width = provider_usage_bar_width(visible_count);
+    let density = provider_usage_density(available_width, visible_count);
+    let width = preferred_width.min(available_width);
     ui.allocate_ui_with_layout(
         egui::vec2(width, 20.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.spacing_mut().item_spacing.x = if density == ProviderUsageDensity::Compact {
+                3.0
+            } else {
+                5.0
+            };
             let mut drawn = false;
             if claude_shown {
                 provider(
@@ -7614,6 +7673,7 @@ pub(crate) fn top_provider_usage(
                     egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
                     claude_usage,
                     None,
+                    density,
                 );
                 drawn = true;
             }
@@ -7629,6 +7689,7 @@ pub(crate) fn top_provider_usage(
                     ui.visuals().hyperlink_color,
                     codex_usage,
                     codex_meta,
+                    density,
                 );
                 drawn = true;
             }
@@ -7638,7 +7699,7 @@ pub(crate) fn top_provider_usage(
                     separator(ui, 18.0);
                     ui.add_space(4.0);
                 }
-                grok_provider(ui, grok_usage.flatten(), catalog);
+                grok_provider(ui, grok_usage.flatten(), catalog, density);
                 drawn = true;
             }
             if kimi_shown {
@@ -7653,6 +7714,7 @@ pub(crate) fn top_provider_usage(
                     egui::Color32::from_rgb(0x6b, 0x8a, 0xff),
                     kimi_usage.flatten(),
                     None,
+                    density,
                 );
             }
         },

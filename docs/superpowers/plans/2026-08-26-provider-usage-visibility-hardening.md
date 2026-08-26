@@ -226,19 +226,19 @@ Expected: PASS.
 - Modify: `crates/app/src/app.rs:7328-7605`
 - Test: `crates/app/src/ui/agent_terminal.rs:1418-1597`
 
-- [ ] **Step 1: Write the narrow-width RED test**
+- [x] **Step 1: Write the narrow-width RED test**
 
 Render all four detected/available providers at widths 300, 430, 620, 810, and 1,200. For every width assert that each provider accessibility node intersects the root clip rect and that Kimi's right edge does not exceed it.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run the focused status-bar test. Expected: at least the 300pt case fails because Kimi is drawn last in an overflowing single row.
 
-- [ ] **Step 3: Implement deterministic compact modes**
+- [x] **Step 3: Implement deterministic compact modes**
 
 Compute a compact level from `ui.available_width()` and visible provider count. Preserve logo plus one numeric/placeholder label for every provider first. Show 5h bar, secondary window label, and plan label only as space permits. Keep one line and do not add a timer or horizontal scroll.
 
-- [ ] **Step 4: Run the width sweep and status UI group**
+- [x] **Step 4: Run the width sweep and status UI group**
 
 Expected: all provider nodes remain inside the clip rect at every tested width and the existing wide layout/order assertions pass.
 

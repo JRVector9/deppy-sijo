@@ -1432,6 +1432,17 @@ mod tests {
             grok: Option<Option<crate::grok_usage::GrokUsage>>,
             disabled: Vec<String>,
         ) -> egui_kittest::Harness<'static, bool> {
+            run_at_width(claude, codex, kimi, grok, disabled, 1400.0)
+        }
+
+        fn run_at_width(
+            claude: Option<crate::app::ProviderUsage>,
+            codex: Option<crate::app::ProviderUsage>,
+            kimi: Option<Option<crate::app::ProviderUsage>>,
+            grok: Option<Option<crate::grok_usage::GrokUsage>>,
+            disabled: Vec<String>,
+            width: f32,
+        ) -> egui_kittest::Harness<'static, bool> {
             let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
             let mut harness = egui_kittest::Harness::new_ui_state(
                 move |ui, fonts_ready| {
@@ -1465,7 +1476,7 @@ mod tests {
                 },
                 false,
             );
-            harness.set_size(egui::vec2(1400.0, 100.0));
+            harness.set_size(egui::vec2(width, 100.0));
             install_sidebar_test_fonts(&harness.ctx);
             *harness.state_mut() = true;
             harness.run();
@@ -1606,6 +1617,31 @@ mod tests {
         let grok = harness.get_by_label("Grok logo").rect();
         let kimi = harness.get_by_label("Kimi logo").rect();
         assert!(kimi.left() > grok.right());
+
+        for width in [300.0, 430.0, 620.0, 810.0, 1200.0] {
+            let harness = run_at_width(
+                some_usage,
+                some_usage,
+                Some(some_usage),
+                Some(Some(crate::grok_usage::GrokUsage {
+                    weekly_remaining_percent: Some(70),
+                    monthly_remaining_percent: Some(85),
+                    credits_left: Some(crate::grok_usage::GrokCredits {
+                        currency: crate::grok_usage::GrokCurrency::Usd,
+                        minor_units: 1_234,
+                    }),
+                })),
+                Vec::new(),
+                width,
+            );
+            for provider in ["Anthropic logo", "Codex logo", "Grok logo", "Kimi logo"] {
+                let rect = harness.get_by_label(provider).rect();
+                assert!(
+                    rect.left() >= 0.0 && rect.right() <= width,
+                    "{provider}가 {width}pt 상태바 밖으로 잘렸다: {rect:?}"
+                );
+            }
+        }
     }
 
     #[test]

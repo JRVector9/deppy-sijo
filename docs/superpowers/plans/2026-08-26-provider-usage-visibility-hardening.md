@@ -67,7 +67,7 @@ Read all of `crates/app/src/grok_usage.rs` and verify the relevant differences: 
 - Modify: `crates/app/src/ui/agent_terminal.rs:295-356`
 - Test: `crates/app/src/ui/agent_terminal.rs:1418-1597`
 
-- [ ] **Step 1: Write the Kimi placeholder RED test**
+- [x] **Step 1: Write the Kimi placeholder RED test**
 
 Change the status-bar test helper's Kimi input to `Option<Option<ProviderUsage>>` and assert:
 
@@ -79,7 +79,7 @@ harness.get_by_label("—");
 
 Also preserve explicit cases for `None` (undetected) and disabled (hidden).
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -90,7 +90,7 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test -p deppy-sijo --bin deppy-sijo
 
 Expected: compile or assertion failure because Kimi currently accepts only one `Option` and hides no-value state.
 
-- [ ] **Step 3: Implement the minimal detected/no-value boundary**
+- [x] **Step 3: Implement the minimal detected/no-value boundary**
 
 Use the same bounded representation as Grok at the App-to-status boundary:
 
@@ -106,7 +106,7 @@ pub(crate) struct ProviderUsageInputs<'a> {
 
 `Some(None)` is detected but unavailable, `Some(Some(value))` is numeric, and `None` is undetected. Disabled configuration still wins.
 
-- [ ] **Step 4: Run the focused UI test and verify GREEN**
+- [x] **Step 4: Run the focused UI test and verify GREEN**
 
 Run the command from Step 2. Expected: PASS.
 

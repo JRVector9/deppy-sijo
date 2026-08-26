@@ -1,9 +1,8 @@
-//! ChatGPT 백엔드 사용량 보충 — Codex app-server가 5시간 창을 보고하지 않을 때
-//! Codex CLI가 쓰는 백엔드 REST 엔드포인트를 직접 읽어 빠진 창만 메운다.
+//! ChatGPT 백엔드 사용량 보충 — Codex app-server가 아직 응답하지 않았거나 일부 창을
+//! 보고하지 않을 때 Codex CLI가 쓰는 백엔드 REST 엔드포인트를 읽어 빈 창만 메운다.
 //! stablyai/orca의 `withBackendSessionWindow`와 같은 전략·같은 요청 형태다.
 //!
-//! app-server 응답에 5시간 창이 이미 있으면 이 모듈은 호출조차 되지 않는다
-//! (app.rs의 merge 지점이 구멍이 있을 때만 `current`를 부른다). 토큰은
+//! app-server 응답에 두 창이 모두 있으면 이 모듈은 호출조차 되지 않는다. 토큰은
 //! `~/.codex/auth.json`에서 읽어 요청 헤더에만 쓰고 어디에도 남기지 않는다.
 
 use std::io::Read as _;

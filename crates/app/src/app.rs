@@ -7269,16 +7269,21 @@ fn claude_usage_snapshot() -> Option<ProviderUsage> {
     usage
 }
 
-/// app-server가 5시간 창 없이 주간만 준 결과에 백엔드 보충값을 접붙인다.
-/// 5시간 창이 이미 있거나 서버 결과 자체가 없으면 보충하지 않는다 (orca의
-/// `withBackendSessionWindow`와 같은 조건).
-pub(crate) fn supplement_codex_five_hour(
+/// app-server 값이 있으면 우선하고, 아직 응답이 없거나 일부 창만 보고했으면
+/// 인증된 백엔드 값으로 빈 창만 채운다.
+pub(crate) fn merge_codex_usage(
     server: Option<ProviderUsage>,
-    backend_five_hour: Option<u8>,
+    backend: Option<crate::codex_backend_usage::BackendUsage>,
 ) -> Option<ProviderUsage> {
-    match server {
-        Some((None, weekly @ Some(_))) => Some((backend_five_hour, weekly)),
-        other => other,
+    match (server, backend) {
+        (Some((server_five_hour, server_weekly)), Some(backend)) => Some((
+            server_five_hour.or(backend.five_hour),
+            server_weekly.or(backend.weekly),
+        )),
+        (None, Some(backend)) if backend.five_hour.is_some() || backend.weekly.is_some() => {
+            Some((backend.five_hour, backend.weekly))
+        }
+        (server, _) => server,
     }
 }
 
@@ -7379,7 +7384,9 @@ pub(crate) struct ProviderUsageInputs<'a> {
     pub(crate) claude: Option<ProviderUsage>,
     pub(crate) codex: Option<ProviderUsage>,
     pub(crate) codex_meta: Option<&'a crate::ui::agent_sessions::CodexUsageMeta>,
-    pub(crate) kimi: Option<ProviderUsage>,
+    /// 바깥 `Option`은 설치 감지, 안쪽 `Option`은 숫자 조회 결과다. 감지됐지만 아직
+    /// 값이 없으면 `Some(None)`으로 자리표시자를 유지한다.
+    pub(crate) kimi: Option<Option<ProviderUsage>>,
     /// 바깥 `Option`은 설치 감지, 안쪽 `Option`은 숫자 조회 결과다. 감지됐지만 아직
     /// 값이 없으면 `Some(None)`으로 Codex 옆의 자리표시자를 유지한다.
     pub(crate) grok: Option<Option<crate::grok_usage::GrokUsage>>,
@@ -7408,8 +7415,8 @@ fn toggled_disabled_agents(
 }
 
 /// 하단 사용량 바의 provider 칸들. `disabled`는 usage 값과 분리된 신호다 — 「켜짐인데
-/// 값 없음」(Claude·Codex와 감지된 Grok은 「—」로 자리를 지킨다)과 「꺼짐」(모든 칸
-/// 자체가 없다)을 usage 값 하나로는 구분할 수 없어서 나눴다. Grok의 바깥 `Option`은
+/// 값 없음」(Claude·Codex와 감지된 Kimi·Grok은 「—」로 자리를 지킨다)과 「꺼짐」(모든 칸
+/// 자체가 없다)을 usage 값 하나로는 구분할 수 없어서 나눴다. Kimi/Grok의 바깥 `Option`은
 /// 설치 감지를, 안쪽 `Option`은 숫자를 나타내며 여기서 활성화 여부까지 함께 판정한다.
 ///
 /// 칸을 하나라도 그렸으면 `true`를 돌려준다 — 호출부(`agent_terminal.rs`)가 이 값으로
@@ -7520,7 +7527,15 @@ pub(crate) fn top_provider_usage(
                 value.on_hover_text(hover);
             }
         } else if five_hour.is_none() {
-            ui.label(egui::RichText::new("—").size(13.0).weak());
+            let response = ui.label(egui::RichText::new("—").size(13.0).weak());
+            let enabled = ui.is_enabled();
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Label,
+                    enabled,
+                    format!("{name} usage —"),
+                )
+            });
         }
 
         // 사용량 리셋 크레딧 — 있을 때만 작은 표식으로 (orca는 redeem까지 있지만
@@ -7562,8 +7577,8 @@ pub(crate) fn top_provider_usage(
     use crate::agent_launcher::{AgentKind, agent_is_enabled};
     // 꺼진 provider는 칸 자체가 사라진다(사용자 요청) — 모든 provider에 같은
     // 규칙이다. Claude/Codex는 이 앱의 1급 provider라 켜져 있으면 값이 없어도 「—」로
-    // 자리를 지킨다. Kimi는 설치·사용이 확인된 값이 있을 때만 보이지만, Grok은 런처에서
-    // 켜져 있으면 probe 중/실패에도 Codex 옆의 「—」 칸을 유지한다.
+    // 자리를 지킨다. Kimi/Grok은 런처에서 감지되고 켜져 있으면 probe 중/실패에도
+    // 각각의 「—」 칸을 유지한다.
     let claude_shown = agent_is_enabled(disabled, AgentKind::Claude);
     let codex_shown = agent_is_enabled(disabled, AgentKind::Codex);
     let kimi_shown = agent_is_enabled(disabled, AgentKind::Kimi) && kimi_usage.is_some();
@@ -7628,7 +7643,7 @@ pub(crate) fn top_provider_usage(
                     ui,
                     "Kimi",
                     egui::Color32::from_rgb(0x6b, 0x8a, 0xff),
-                    kimi_usage,
+                    kimi_usage.flatten(),
                     None,
                 );
             }
@@ -26984,13 +26999,19 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
-                // app-server가 5시간 창 없이 주간만 줬을 때만 백엔드 보충을 깨운다 —
-                // 5시간 창이 있는 계정은 백엔드를 아예 두드리지 않는다.
+                // app-server가 아직 없거나 일부 창만 줬을 때만 백엔드 보충을 깨운다.
+                // Finder 실행 환경에서 app-server 시작이 늦어져도 인증된 계정 사용량은
+                // 하단 바에 표시하고, app-server 값이 도착하면 그 값이 우선한다.
                 let codex_server_usage = self.agent_sessions_ui.codex_usage();
-                let codex_backend_five_hour = matches!(codex_server_usage, Some((None, Some(_))))
+                let codex_enabled = crate::agent_launcher::agent_is_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Codex,
+                );
+                let codex_needs_backend = codex_server_usage
+                    .is_none_or(|(five_hour, weekly)| five_hour.is_none() || weekly.is_none());
+                let codex_backend = (codex_enabled && codex_needs_backend)
                     .then(|| crate::codex_backend_usage::current(ui.ctx()))
-                    .flatten()
-                    .and_then(|backend| backend.five_hour);
+                    .flatten();
                 // 사용량은 계정 단위 값이라 워크스페이스와 무관하다. 「안 쓰는 사용자에게
                 // 걸지 않는다」는 kimi_usage가 설치 여부로 스스로 판정한다 —
                 // agent_kinds는 **활성 워크스페이스만** 담아서, 다른 워크스페이스에서
@@ -26999,8 +27020,7 @@ impl eframe::App for App {
                 let kimi_usage = crate::kimi_usage::current(ui.ctx());
                 let claude_usage =
                     claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx()));
-                let codex_usage =
-                    supplement_codex_five_hour(codex_server_usage, codex_backend_five_hour);
+                let codex_usage = merge_codex_usage(codex_server_usage, codex_backend);
                 let grok_agent = self
                     .agent_launcher_snapshot
                     .as_ref()
@@ -27020,7 +27040,7 @@ impl eframe::App for App {
                     claude_usage,
                     codex_usage,
                     self.agent_sessions_ui.codex_usage_meta(),
-                    kimi_usage,
+                    kimi_usage.map(Some),
                     grok_status,
                     // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — usage 값은
                     // 그대로 넘기고 「꺼짐」만 별도 신호로 보내, top_provider_usage가
@@ -32672,50 +32692,59 @@ mod tests {
         );
     }
 
-    /// 백엔드 보충은 "5시간만 빠진 구멍"에만 끼운다 — 그 외에는 서버 값 그대로.
+    /// app-server가 아직 없거나 일부 창만 보고해도 백엔드가 읽은 창으로 빈칸만
+    /// 채운다. app-server 값이 있으면 언제나 그 값이 우선한다.
     #[test]
-    fn 백엔드_보충은_5시간_구멍에만_끼운다() {
-        /// (설명, 서버 값, 백엔드 보충값, 기대 결과) — 튜플이 길어 clippy
+    fn codex_백엔드는_server의_빈_사용량_창만_채운다() {
+        /// (설명, 서버 값, 백엔드 값, 기대 결과) — 튜플이 길어 clippy
         /// `type_complexity`에 걸린다. 표를 그대로 두면서 이름만 붙인다.
         type Case = (
             &'static str,
             Option<ProviderUsage>,
-            Option<u8>,
+            Option<crate::codex_backend_usage::BackendUsage>,
             Option<ProviderUsage>,
         );
         let cases: &[Case] = &[
             (
-                "구멍 + 보충값 → 접붙임",
+                "server 없음 + backend 주간 → backend 표시",
+                None,
+                Some(crate::codex_backend_usage::BackendUsage {
+                    five_hour: None,
+                    weekly: Some(2),
+                }),
+                Some((None, Some(2))),
+            ),
+            (
+                "server 주간만 + backend 양쪽 → 5시간만 보충",
                 Some((None, Some(91))),
-                Some(24),
+                Some(crate::codex_backend_usage::BackendUsage {
+                    five_hour: Some(24),
+                    weekly: Some(99),
+                }),
                 Some((Some(24), Some(91))),
             ),
             (
-                "구멍인데 보충도 없음 → 그대로",
-                Some((None, Some(91))),
-                None,
-                Some((None, Some(91))),
-            ),
-            (
-                "서버가 이미 5시간을 줌 → 보충 무시",
+                "server 양쪽 + backend 양쪽 → server 유지",
                 Some((Some(12), Some(91))),
-                Some(99),
+                Some(crate::codex_backend_usage::BackendUsage {
+                    five_hour: Some(99),
+                    weekly: Some(98),
+                }),
                 Some((Some(12), Some(91))),
             ),
             (
-                "주간이 없으면 구멍이 아니다 → 그대로",
-                Some((None, None)),
-                Some(24),
-                Some((None, None)),
+                "server 5시간만 + backend 주간 → 주간만 보충",
+                Some((Some(12), None)),
+                Some(crate::codex_backend_usage::BackendUsage {
+                    five_hour: Some(99),
+                    weekly: Some(88),
+                }),
+                Some((Some(12), Some(88))),
             ),
-            ("서버 응답 자체가 없음 → 그대로", None, Some(24), None),
+            ("양쪽 모두 없음", None, None, None),
         ];
         for (name, server, backend, expected) in cases {
-            assert_eq!(
-                supplement_codex_five_hour(*server, *backend),
-                *expected,
-                "{name}"
-            );
+            assert_eq!(merge_codex_usage(*server, *backend), *expected, "{name}");
         }
     }
 

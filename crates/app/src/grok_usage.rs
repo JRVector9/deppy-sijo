@@ -306,6 +306,13 @@ fn grok_probe_command(
         env: vec![
             ("TERM".to_owned(), "xterm-256color".to_owned()),
             ("PATH".to_owned(), search_path),
+            // Grok TUI는 Finder처럼 터미널 호스트 변수가 없는 환경에서 초기 화면을
+            // 내보내지 않는다. xAI가 읽는 호스트 bundle-id 신호에 실제 Deppy 식별자를
+            // 넣어, 다른 터미널을 사칭하지 않고 headless `/usage` PTY를 활성화한다.
+            (
+                "CMUX_BUNDLE_ID".to_owned(),
+                "app.vector9.deppy-sijo".to_owned(),
+            ),
         ],
         cwd: Some(probe_dir),
     })
@@ -754,6 +761,23 @@ Credits left: $1,234.50
     }
 
     #[test]
+    fn finder_probe_identifies_deppy_as_the_grok_terminal_host() {
+        let command = grok_probe_command(
+            Path::new("/Users/test/.grok/bin/grok"),
+            std::path::PathBuf::from("/tmp/deppy-grok-probe"),
+            None,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+        )
+        .expect("Grok probe command");
+
+        assert!(
+            command.env.iter().any(|(key, value)| {
+                key == "CMUX_BUNDLE_ID" && value == "app.vector9.deppy-sijo"
+            })
+        );
+    }
+
+    #[test]
     #[ignore = "실제 Grok CLI를 최대 25초 띄운다"]
     fn grok_실측_프로브는_민감한_원문_없이_끝난다() {
         let Some(path) = std::env::var_os("DEPPY_GROK_EXECUTABLE").map(std::path::PathBuf::from)
@@ -769,5 +793,21 @@ Credits left: $1,234.50
                 || value.monthly_remaining_percent.is_some()
                 || value.credits_left.is_some()
         }));
+    }
+
+    #[test]
+    #[ignore = "런처 감지와 실제 Grok CLI를 최대 25초 실행한다"]
+    fn grok_실측_프로브는_런처가_감지한_실행경로와_path로_끝난다() {
+        let excluded = crate::agent_shim::shim_path();
+        let snapshot = crate::agent_launcher::detect_installed_agents(excluded.as_deref());
+        let agent = snapshot
+            .find(crate::agent_launcher::AgentKind::Grok)
+            .expect("현재 계정에서 설치된 Grok을 감지해야 한다");
+        let usage = fetch_grok_usage(
+            agent.executable(),
+            agent.launch_path().map(std::ffi::OsStr::new),
+        )
+        .expect("launcher-detected bounded Grok probe");
+        assert!(usage.is_some(), "현재 계정에서 Grok usage 숫자를 기대했다");
     }
 }

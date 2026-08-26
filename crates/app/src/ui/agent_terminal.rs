@@ -298,9 +298,9 @@ impl AgentTerminalUi {
         claude_usage: Option<crate::app::ProviderUsage>,
         codex_usage: Option<crate::app::ProviderUsage>,
         codex_meta: Option<crate::ui::agent_sessions::CodexUsageMeta>,
-        // `kimi_usage`: 값이 없으면(설치 안 했거나 안 씀) 켜져 있어도 칸 자체를 안
-        // 그린다 — Kimi 전용 규칙(2026-08-10)이라 `disabled_agents`와는 별개다.
-        kimi_usage: Option<crate::app::ProviderUsage>,
+        // 바깥 `Option`은 Kimi 설치 감지, 안쪽 `Option`은 숫자 조회 결과다.
+        // `Some(None)`이면 조회 중/실패 자리표시자를 유지하고 `None`이면 칸을 숨긴다.
+        kimi_usage: Option<Option<crate::app::ProviderUsage>>,
         // 바깥 `Option`은 Grok 설치 감지, 안쪽 `Option`은 숫자 조회 결과다.
         // `Some(None)`이면 조회 중/실패 자리표시자를 유지하고 `None`이면 칸을 숨긴다.
         grok_usage: Option<Option<crate::grok_usage::GrokUsage>>,
@@ -1415,9 +1415,8 @@ mod tests {
         harness.get_by_label("Ports —");
     }
 
-    /// 표: 켜짐+값 있음 → 값, 켜짐+값 없음 → Claude·Codex는 "—"로 자리 유지(1급
-    /// provider 규칙)/Grok도 Codex 옆에 "—"로 자리 유지/Kimi는 칸 없음(조건부 규칙),
-    /// 꺼짐 → 해당 칸 없음.
+    /// 표: 켜짐+값 있음 → 값, 켜짐+값 없음 → 모든 감지된 provider는 "—"로 자리 유지,
+    /// 미감지 또는 꺼짐 → 해당 칸 없음.
     /// 로고는 `paint_announcement_provider_logo`가 "{provider} logo"로 라벨을 다는
     /// `Image` 위젯이라, 칸이 그려졌는지를 클릭 없이도 값으로 확인할 수 있다.
     #[test]
@@ -1429,7 +1428,7 @@ mod tests {
         fn run(
             claude: Option<crate::app::ProviderUsage>,
             codex: Option<crate::app::ProviderUsage>,
-            kimi: Option<crate::app::ProviderUsage>,
+            kimi: Option<Option<crate::app::ProviderUsage>>,
             grok: Option<Option<crate::grok_usage::GrokUsage>>,
             disabled: Vec<String>,
         ) -> egui_kittest::Harness<'static, bool> {
@@ -1473,8 +1472,8 @@ mod tests {
             harness
         }
 
-        // 켜짐+값 없음(Claude/Grok) / 켜짐+값 있음(Codex) / 값 없어서 칸 없음(Kimi).
-        let harness = run(None, some_usage, None, Some(None), Vec::new());
+        // 켜짐+값 없음(Claude/Kimi/Grok) / 켜짐+값 있음(Codex).
+        let harness = run(None, some_usage, Some(None), Some(None), Vec::new());
         assert!(
             harness.query_by_label("Anthropic logo").is_some(),
             "값이 없어도 켜져 있으면 Claude 칸은 남아야 한다"
@@ -1484,9 +1483,10 @@ mod tests {
             "값이 있으면 Codex 칸이 그려져야 한다"
         );
         assert!(
-            harness.query_by_label("Kimi logo").is_none(),
-            "Kimi는 값이 없으면 켜져 있어도 칸을 안 그린다(기존 규칙)"
+            harness.query_by_label("Kimi logo").is_some(),
+            "감지된 Kimi는 값을 불러오지 못해도 칸을 유지해야 한다"
         );
+        harness.get_by_label("Kimi usage —");
         assert!(
             harness.query_by_label("Grok logo").is_some(),
             "Grok은 값을 불러오는 중이어도 Codex 옆의 칸을 유지해야 한다"
@@ -1507,7 +1507,13 @@ mod tests {
         assert!(harness.query_by_label("Codex logo").is_some());
 
         // 꺼짐이 Kimi의 "값 있으면 보인다" 규칙보다도 우선한다.
-        let harness = run(None, some_usage, some_usage, None, vec!["kimi".to_owned()]);
+        let harness = run(
+            None,
+            some_usage,
+            Some(some_usage),
+            None,
+            vec!["kimi".to_owned()],
+        );
         assert!(
             harness.query_by_label("Kimi logo").is_none(),
             "꺼진 Kimi는 값이 있어도 칸이 사라져야 한다"
@@ -1520,7 +1526,7 @@ mod tests {
         let harness = run(
             some_usage,
             some_usage,
-            some_usage,
+            Some(some_usage),
             None,
             vec![
                 "claude".to_owned(),
@@ -1575,7 +1581,13 @@ mod tests {
 
         // provider 순서는 언제나 Codex → Grok → Kimi다. Kimi가 켜져도 Grok이
         // Codex 바로 옆에서 밀려나면 안 된다.
-        let harness = run(None, some_usage, some_usage, Some(Some(grok)), Vec::new());
+        let harness = run(
+            None,
+            some_usage,
+            Some(some_usage),
+            Some(Some(grok)),
+            Vec::new(),
+        );
         let codex = harness.get_by_label("Codex logo").rect();
         let grok_rect = harness.get_by_label("Grok logo").rect();
         let kimi = harness.get_by_label("Kimi logo").rect();
@@ -1587,7 +1599,7 @@ mod tests {
         let harness = run(
             None,
             None,
-            some_usage,
+            Some(some_usage),
             Some(Some(grok)),
             vec!["claude".to_owned(), "codex".to_owned()],
         );

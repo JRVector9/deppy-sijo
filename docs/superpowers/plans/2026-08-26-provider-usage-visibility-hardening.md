@@ -248,11 +248,11 @@ Expected: all provider nodes remain inside the clip rect at every tested width a
 - Modify: `docs/CODEX_HANDOFF.md`
 - Create: Obsidian journal under `프로젝트 일지/deppy-sijo/`
 
-- [ ] **Step 1: Run live provider regressions**
+- [x] **Step 1: Run live provider regressions**
 
 Run launcher-detected Kimi and Grok tests in the Finder-minimal environment. The Kimi diagnostic may report a typed unavailable state when the installed account does not expose managed plan data; require numeric usage only when `DEPPY_KIMI_EXPECT_USAGE=1` is explicitly set. In both cases the persistent UI placeholder must pass without inventing numbers. Grok must remain numeric.
 
-- [ ] **Step 2: Run focused and repository gates**
+- [x] **Step 2: Run focused and repository gates**
 
 ```bash
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test -p deppy-sijo --locked
@@ -263,10 +263,10 @@ cargo run --locked -p xtask -- i18n-check
 cargo run --locked -p xtask -- check-boundary
 ```
 
-- [ ] **Step 3: Run independent Codex review**
+- [x] **Step 3: Run independent Codex review**
 
 Review only changed Rust source with `codex review --uncommitted`. Apply every Critical/High and relevant Medium issue, then rerun affected tests.
 
-- [ ] **Step 4: Update handoff and commit**
+- [x] **Step 4: Update handoff and commit**
 
 Record exact commands/results in `docs/CODEX_HANDOFF.md`, create the Workstep Obsidian journal, and commit the implementation with a Korean Conventional Commit message. Do not push, package, replace the Desktop bundle, or relaunch without an explicit user request.

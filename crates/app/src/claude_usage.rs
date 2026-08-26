@@ -11,9 +11,11 @@ const SETTLE_DELAY: Duration = Duration::from_secs(2);
 const ENTER_INTERVAL: Duration = Duration::from_millis(800);
 const MAX_OUTPUT_BYTES: usize = 100_000;
 
+type CompletedProbe = Option<(Instant, crate::app::ProviderUsage)>;
+
 #[derive(Default)]
 struct UsageState {
-    pending: Option<mpsc::Receiver<Option<crate::app::ProviderUsage>>>,
+    pending: Option<mpsc::Receiver<CompletedProbe>>,
     /// 마지막으로 성공한 프로브 값과 **잰 시각**. 시각을 같이 들고 있어야 프로브가
     /// 계속 실패할 때 옛 값이 현재값 행세를 하며 굳는 것을 막는다.
     usage: Option<(Instant, crate::app::ProviderUsage)>,
@@ -31,18 +33,7 @@ pub(crate) fn current(
         return None;
     };
 
-    if let Some(receiver) = state.pending.as_ref() {
-        match receiver.try_recv() {
-            Ok(usage) => {
-                if let Some(usage) = usage {
-                    state.usage = Some((Instant::now(), usage));
-                }
-                state.pending = None;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => state.pending = None,
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-    }
+    receive_pending_probe(&mut state);
 
     let refresh_due = state
         .last_request
@@ -59,7 +50,7 @@ pub(crate) fn current(
                 let usage = fetch_claude_usage(&executable, detected_launch_path.as_deref())
                     .ok()
                     .flatten();
-                let _ = sender.send(usage);
+                let _ = sender.send(usage.map(|usage| (Instant::now(), usage)));
                 repaint.request_repaint();
             })
             .is_ok();
@@ -74,6 +65,20 @@ pub(crate) fn current(
 
 fn last_request_after_spawn(attempted: Instant) -> Instant {
     attempted
+}
+
+fn receive_pending_probe(state: &mut UsageState) {
+    let Some(receiver) = state.pending.as_ref() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(Some(completed)) => {
+            state.usage = Some(completed);
+            state.pending = None;
+        }
+        Ok(None) | Err(mpsc::TryRecvError::Disconnected) => state.pending = None,
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
 }
 
 fn fetch_claude_usage(
@@ -150,9 +155,8 @@ fn claude_probe_command(
     probe_dir: std::path::PathBuf,
     detected_launch_path: Option<&std::ffi::OsStr>,
 ) -> anyhow::Result<pty::CommandSpec> {
-    let program = executable
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Claude executable path is not UTF-8"))?;
+    let (program, args) =
+        crate::provider_usage_command::probe_program_and_args(executable, cfg!(windows), "Claude")?;
     let search_path = if let Some(path) = detected_launch_path {
         path.to_os_string()
     } else {
@@ -171,8 +175,8 @@ fn claude_probe_command(
     .into_string()
     .map_err(|_| anyhow::anyhow!("Claude probe PATH is not UTF-8"))?;
     Ok(pty::CommandSpec {
-        program: program.to_owned(),
-        args: Vec::new(),
+        program,
+        args,
         env: vec![
             ("TERM".to_owned(), "xterm-256color".to_owned()),
             ("PATH".to_owned(), search_path),
@@ -311,6 +315,36 @@ mod tests {
     }
 
     #[test]
+    fn windows_cmd_shim은_cmd_exe로_감싸서_실행한다() {
+        let (program, args) = crate::provider_usage_command::probe_program_and_args(
+            std::path::Path::new(
+                r"C:\Program Files (x86)\A&B\%SDK%\Preview=One\Caret^Name\claude.cmd",
+            ),
+            true,
+            "Claude",
+        )
+        .expect("Windows Claude probe executable");
+
+        assert_eq!(
+            std::path::PathBuf::from(&program),
+            crate::provider_usage_command::trusted_windows_command_processor_for_test()
+                .expect("trusted Windows command processor"),
+            "Win32가 알려 준 시스템 디렉터리의 cmd.exe여야 한다"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "/d".to_owned(),
+                "/e:on".to_owned(),
+                "/v:off".to_owned(),
+                "/s".to_owned(),
+                "/c".to_owned(),
+                r"C:\Program^ Files^ ^(x86^)\A^&B\%%cd:~,%%SDK%%cd:~,%%\Preview^=One\Caret^^Name\claude.cmd".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn 필수_pty_입력은_backpressure를_성공으로_취급하지_않는다() {
         assert!(required_input_result(pty::PtyInputEnqueueResult::Accepted).is_ok());
         assert!(required_input_result(backpressured_input()).is_err());
@@ -320,6 +354,23 @@ mod tests {
     fn worker_spawn_실패도_마지막_시도_시각을_기록한다() {
         let attempted = Instant::now();
         assert_eq!(last_request_after_spawn(attempted), attempted);
+    }
+
+    #[test]
+    fn 완료된_probe의_측정시각을_ui수신시각으로_바꾸지_않는다() {
+        let measured_at = Instant::now() - Duration::from_secs(60);
+        let usage = (Some(10), Some(20));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(Some((measured_at, usage))).unwrap();
+        let mut state = UsageState {
+            pending: Some(receiver),
+            ..UsageState::default()
+        };
+
+        receive_pending_probe(&mut state);
+
+        assert_eq!(state.usage, Some((measured_at, usage)));
+        assert!(state.pending.is_none());
     }
 
     #[test]

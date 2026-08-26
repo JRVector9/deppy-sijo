@@ -43,6 +43,7 @@ mod port_inventory;
 mod proc_info;
 mod process_storm;
 mod prompt_library;
+mod provider_usage_command;
 mod pty_effort;
 mod shortcuts;
 mod status_feed;

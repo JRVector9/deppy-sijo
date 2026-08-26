@@ -141,7 +141,10 @@ objc2 = "0.6"
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }
 
 [dev-dependencies]
 # egui 공식 테스트 하네스 — AccessKit 트리로 버튼/입력을 찾아 실제 클릭·타이핑을

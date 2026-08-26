@@ -1074,7 +1074,10 @@ fn push_detection_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, pa
 /// `--dangerously-bypass-hook-trust` 같은 플래그가 두 번 전달돼 codex가 시작을 거부한다
 /// (실측 재현: cmux의 codex wrapper가 동일 패턴으로 hook을 주입한다).
 fn push_path_env_entry(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
-    if is_transient_shim_directory(&path) {
+    // 상대 PATH 항목은 현재 작업 디렉터리에 따라 다른 파일을 가리킨다. 런처는 나중에
+    // 절대 실행경로만 허용하고 사용량 프로브도 같은 감지값을 공유하므로, 감지 경계에서
+    // 제거해 두 경로의 계약을 일치시킨다.
+    if !path.is_absolute() || is_transient_shim_directory(&path) {
         return;
     }
     push_detection_path(paths, seen, path);
@@ -1972,6 +1975,19 @@ mod tests {
             paths,
             [real],
             "임시 디렉터리 아래 PATH 항목(다른 도구의 세션별 hook shim)은 실제 설치 위치가 아니므로 걸러야 한다"
+        );
+    }
+
+    #[test]
+    fn 상대_path_항목은_절대_실행경로_계약에서_제외한다() {
+        let mut paths = Vec::new();
+        let mut seen = HashSet::new();
+
+        push_path_env_entry(&mut paths, &mut seen, PathBuf::from("relative/bin"));
+
+        assert!(
+            paths.is_empty(),
+            "런처·사용량 프로브가 공유하는 감지 실행경로는 절대 경로여야 한다"
         );
     }
 }

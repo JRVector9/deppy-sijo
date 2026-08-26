@@ -7326,7 +7326,7 @@ fn relative_reset_label(resets_at: i64, now: i64) -> Option<String> {
 }
 
 /// 사용량 바 폭 — 실제로 그려지는 provider 칸 수에 따라 정해진다. 원래 코드는 칸이
-/// Claude·Codex(항상 표시) + Kimi(값 있을 때만) 두 경우뿐이라 상수 두 개(430/620)로
+/// Claude·Codex(항상 표시) + Kimi(감지됐을 때) 두 경우뿐이라 상수 두 개(430/620)로
 /// 충분했다. 이제 감지되고 켜진 Grok도 독립 칸으로 붙어 칸 수가 0~4까지 늘었으므로, 그 두 상수(칸 2개→430,
 /// 칸 3개→620, 칸당 +190)를 그대로 외삽해 순수 함수로 뽑았다 — 폭은 egui 컨테이너의
 /// 크기 힌트일 뿐이라 정확한 픽셀보다 "칸 수에 비례해 줄어든다"가 중요하다. 값으로
@@ -27082,11 +27082,10 @@ impl eframe::App for App {
                 let codex_backend = (codex_enabled && codex_needs_backend)
                     .then(|| crate::codex_backend_usage::current(ui.ctx()))
                     .flatten();
-                // 사용량은 계정 단위 값이라 워크스페이스와 무관하다. 「안 쓰는 사용자에게
-                // 걸지 않는다」는 kimi_usage가 설치 여부로 스스로 판정한다 —
-                // agent_kinds는 **활성 워크스페이스만** 담아서, 다른 워크스페이스에서
-                // Kimi를 쓰면 게이트가 조용히 막았다(2026-08-10 실증: 프로브가 한 번도
-                // 안 돌았다). claude 경로와 같은 모양으로 무조건 부른다.
+                // 사용량은 계정 단위 값이라 워크스페이스와 무관하다. 전역 런처 스냅샷이
+                // 감지한 정확한 실행 경로가 있고 provider도 켜진 경우에만 프로브한다.
+                // 활성 워크스페이스의 agent_kinds로 게이트하던 과거 구현은 다른
+                // 워크스페이스의 Kimi를 놓쳤다(2026-08-10 실증).
                 let launcher_snapshot = self.agent_launcher_snapshot.as_ref();
                 let kimi_agent = launcher_snapshot
                     .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Kimi));
@@ -42829,7 +42828,7 @@ mod tests {
     #[test]
     fn 사용량_바_폭은_그려지는_칸_수에_비례한다() {
         // 원래 상수 두 개(칸 2개→430, 칸 3개→620, 칸당 +190)를 1칸으로 외삽한
-        // 값을 고정한다 — claude·codex는 활성화 여부, kimi는 활성화와 usage 값,
+        // 값을 고정한다 — claude·codex는 활성화 여부, kimi는 활성화와 설치 감지,
         // grok은 설치 감지와 활성화 여부에 따라 칸 수가 0~4 전 구간을 오갈 수 있다.
         // 0칸은 `top_provider_usage`가 상자 자체를 안 그리므로 0.0 — 50.0을
         // 남기면 빈 상자가 폭만큼 자리를 차지해 버린다.
@@ -42893,10 +42892,10 @@ mod tests {
     }
 
     #[test]
-    fn 거부_목록은_kimi의_값_유무_규칙과_별개로_칸_표시를_결정한다() {
-        // 기존 Kimi 칸 조건을 값으로 고정한다. Claude·Codex·Grok은 값과 무관하게
-        // "켜짐"만 보고, Kimi는 "켜짐 AND 값 있음"을 본다. Grok의 값 없음/꺼짐
-        // 렌더링 계약과 provider 순서는 상태바 kittest가 고정한다.
+    fn 거부_목록은_kimi의_감지_여부와_함께_칸_표시를_결정한다() {
+        // Kimi 칸은 숫자 유무가 아니라 "켜짐 AND 런처 감지"를 본다. 감지된 무료
+        // 계정도 바깥 Option을 유지해 `—`로 표시한다. 숫자/꺼짐 렌더링 계약과 provider
+        // 순서는 상태바 kittest가 고정한다.
         use crate::agent_launcher::{AgentKind, agent_is_enabled};
 
         let none: &[String] = &[];
@@ -42915,13 +42914,18 @@ mod tests {
         assert!(agent_is_enabled(&kimi_only, AgentKind::Codex));
         assert!(!agent_is_enabled(&kimi_only, AgentKind::Kimi));
 
-        // kimi_shown = enabled && usage.is_some() — 값이 있어도 꺼져 있으면 안 보인다는
-        // 조합을 여기서 직접 고정한다(top_provider_usage 안의 계산과 동일한 식).
-        let kimi_usage: Option<ProviderUsage> = Some((Some(10), Some(20)));
-        let kimi_shown = agent_is_enabled(&kimi_only, AgentKind::Kimi) && kimi_usage.is_some();
-        assert!(!kimi_shown, "꺼졌으면 값이 있어도 칸을 그리면 안 된다");
-        let kimi_shown = agent_is_enabled(none, AgentKind::Kimi) && kimi_usage.is_some();
-        assert!(kimi_shown, "켜져 있고 값도 있으면 칸을 그려야 한다");
+        // kimi_shown = enabled && detected.is_some() — 감지돼도 꺼져 있으면 숨고,
+        // 감지된 무료 계정(`Some(None)`)은 자리를 지킨다.
+        let kimi_detected_without_numeric_usage: Option<Option<ProviderUsage>> = Some(None);
+        let kimi_shown = agent_is_enabled(&kimi_only, AgentKind::Kimi)
+            && kimi_detected_without_numeric_usage.is_some();
+        assert!(!kimi_shown, "꺼졌으면 감지돼도 칸을 그리면 안 된다");
+        let kimi_shown = agent_is_enabled(none, AgentKind::Kimi)
+            && kimi_detected_without_numeric_usage.is_some();
+        assert!(
+            kimi_shown,
+            "켜져 있고 감지됐으면 숫자가 없어도 칸을 그려야 한다"
+        );
     }
 
     #[test]

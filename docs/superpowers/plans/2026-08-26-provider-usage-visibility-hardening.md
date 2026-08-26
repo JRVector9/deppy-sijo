@@ -183,7 +183,7 @@ Run the commands from Step 2. Expected: all non-live tests pass, live tests rema
 - Modify: `crates/app/src/app.rs:26992-27039`
 - Test: `crates/app/src/app.rs` source-law/pure tests
 
-- [ ] **Step 1: Write probe-admission RED tests**
+- [x] **Step 1: Write probe-admission RED tests**
 
 Extract and test a pure gate:
 
@@ -195,7 +195,7 @@ assert!(provider_probe_enabled(&[], AgentKind::Kimi, true));
 
 Add a source-law assertion that `kimi_usage::current` and `claude_usage::current` occur only behind this gate and receive the launcher-detected agent.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -205,11 +205,11 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test -p deppy-sijo --bin deppy-sijo
 
 Expected: FAIL because the gate does not exist and App calls Kimi unconditionally.
 
-- [ ] **Step 3: Implement App gating**
+- [x] **Step 3: Implement App gating**
 
 Resolve `claude_agent`, `kimi_agent`, and `grok_agent` once from `agent_launcher_snapshot`. Call Claude/Kimi PTY fallbacks only when the corresponding agent is detected and enabled. Construct Kimi status as `kimi_agent.map(|_| kimi_usage)` so detected no-value remains visible.
 
-- [ ] **Step 4: Run focused App and status tests and verify GREEN**
+- [x] **Step 4: Run focused App and status tests and verify GREEN**
 
 Run:
 

@@ -7397,6 +7397,14 @@ fn grok_status_visible(disabled: &[String], detected: bool) -> bool {
         && crate::agent_launcher::agent_is_enabled(disabled, crate::agent_launcher::AgentKind::Grok)
 }
 
+fn provider_probe_enabled(
+    disabled: &[String],
+    kind: crate::agent_launcher::AgentKind,
+    detected: bool,
+) -> bool {
+    detected && crate::agent_launcher::agent_is_enabled(disabled, kind)
+}
+
 /// 런처 카드 스위치 토글 결과로 새 거부 목록을 만든다 — 정규화까지 마친 상태로 돌려주므로
 /// 호출부(`handle_agent_launcher_intent`)는 그대로 `config.agents.disabled`에 대입하면
 /// 된다. 저장은 호출부 책임(config는 여기서 건드리지 않는다 — 순수 함수라 값으로 테스트한다).
@@ -27022,9 +27030,23 @@ impl eframe::App for App {
                     .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Kimi));
                 let claude_agent = launcher_snapshot
                     .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Claude));
-                let kimi_usage = crate::kimi_usage::current(ui.ctx(), kimi_agent);
-                let claude_usage = claude_usage_snapshot()
-                    .or_else(|| crate::claude_usage::current(ui.ctx(), claude_agent));
+                let kimi_usage = provider_probe_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Kimi,
+                    kimi_agent.is_some(),
+                )
+                .then(|| crate::kimi_usage::current(ui.ctx(), kimi_agent))
+                .flatten();
+                let claude_usage = provider_probe_enabled(
+                    &self.config.agents.disabled,
+                    crate::agent_launcher::AgentKind::Claude,
+                    claude_agent.is_some(),
+                )
+                .then(|| {
+                    claude_usage_snapshot()
+                        .or_else(|| crate::claude_usage::current(ui.ctx(), claude_agent))
+                })
+                .flatten();
                 let codex_usage = merge_codex_usage(codex_server_usage, codex_backend);
                 let grok_agent = launcher_snapshot
                     .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Grok));
@@ -27038,12 +27060,13 @@ impl eframe::App for App {
                 // 첫 probe/일시 실패는 `Some(None)`으로 넘겨 Codex 옆 칸을 유지하되,
                 // 미설치 상태는 `None`이라 칸 자체를 만들지 않는다.
                 let grok_status = grok_agent.map(|_| grok_usage);
+                let kimi_status = kimi_agent.map(|_| kimi_usage);
                 status_intent = self.agent_terminal_ui.status_bar_with_managers(
                     ui,
                     claude_usage,
                     codex_usage,
                     self.agent_sessions_ui.codex_usage_meta(),
-                    kimi_usage.map(Some),
+                    kimi_status,
                     grok_status,
                     // 런처에서 끈 에이전트는 사용량 바에서도 권하지 않는다 — usage 값은
                     // 그대로 넘기고 「꺼짐」만 별도 신호로 보내, top_provider_usage가
@@ -42844,6 +42867,46 @@ mod tests {
         assert!(grok_status_visible(&[], true));
         assert!(!grok_status_visible(&[], false));
         assert!(!grok_status_visible(&["grok".to_owned()], true));
+    }
+
+    #[test]
+    fn provider_probe_enabled는_감지와_활성화를_모두_요구한다() {
+        use crate::agent_launcher::AgentKind;
+
+        assert!(!provider_probe_enabled(
+            &["kimi".to_owned()],
+            AgentKind::Kimi,
+            true,
+        ));
+        assert!(!provider_probe_enabled(&[], AgentKind::Kimi, false));
+        assert!(provider_probe_enabled(&[], AgentKind::Kimi, true));
+        assert!(!provider_probe_enabled(
+            &["claude".to_owned()],
+            AgentKind::Claude,
+            true,
+        ));
+    }
+
+    #[test]
+    fn provider_probe는_런처_감지값과_admission_gate_뒤에서만_호출된다() {
+        let source = include_str!("app.rs");
+        let status = source
+            .split_once("let launcher_snapshot = self.agent_launcher_snapshot.as_ref();")
+            .and_then(|(_, tail)| tail.split_once("let codex_usage = merge_codex_usage"))
+            .map(|(body, _)| body)
+            .expect("provider usage status block");
+        for provider in ["kimi", "claude"] {
+            assert!(
+                status.contains(&format!("provider_probe_enabled(\n                    &self.config.agents.disabled,\n                    crate::agent_launcher::AgentKind::{},", if provider == "kimi" { "Kimi" } else { "Claude" })),
+                "{provider} probe가 disabled/detected admission gate 뒤에 있지 않다: {status}"
+            );
+            assert!(
+                status.contains(&format!(
+                    "crate::{provider}_usage::current(ui.ctx(), {provider}_agent)"
+                )),
+                "{provider} probe가 launcher-detected agent를 받지 않는다: {status}"
+            );
+        }
     }
 
     #[test]

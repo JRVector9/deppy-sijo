@@ -117,7 +117,7 @@ Run the command from Step 2. Expected: PASS.
 - Modify: `crates/app/src/claude_usage.rs:22-152`
 - Test: both files' `#[cfg(test)]` modules
 
-- [ ] **Step 1: Write command-construction RED tests**
+- [x] **Step 1: Write command-construction RED tests**
 
 For each provider, create a pure command builder and assert the launcher path wins:
 
@@ -133,7 +133,7 @@ assert!(command.env.iter().any(|(k, v)| k == "PATH" && v.starts_with("/custom/bi
 
 Repeat for Claude. Add a pure assertion that a non-accepted `PtyInputEnqueueResult` is rejected.
 
-- [ ] **Step 2: Run both module test groups and verify RED**
+- [x] **Step 2: Run both module test groups and verify RED**
 
 Run:
 
@@ -144,7 +144,7 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test -p deppy-sijo --bin deppy-sijo
 
 Expected: FAIL because the desired builders/signatures do not exist and Claude currently has no module tests.
 
-- [ ] **Step 3: Implement launcher-owned command construction**
+- [x] **Step 3: Implement launcher-owned command construction**
 
 Change both entry points to:
 
@@ -157,7 +157,7 @@ pub(crate) fn current(
 
 Clone the detected executable and launch PATH only when probe admission succeeds. Build `CommandSpec` with absolute `program`, `TERM=xterm-256color`, and the detected bounded `PATH` when present. Delete the duplicate `resolve_*_command` and `*_command_path` functions.
 
-- [ ] **Step 4: Validate required input**
+- [x] **Step 4: Validate required input**
 
 Add provider-local helpers matching Grok's contract:
 
@@ -173,7 +173,7 @@ Use this for slash commands and trust/menu confirmation. Do not silently discard
 
 Also record `last_request` for a failed worker-thread spawn, matching Grok, so a resource-exhaustion failure cannot retry on every frame. Pin this with a pure state/helper test.
 
-- [ ] **Step 5: Run both module groups and verify GREEN**
+- [x] **Step 5: Run both module groups and verify GREEN**
 
 Run the commands from Step 2. Expected: all non-live tests pass, live tests remain explicitly ignored.
 

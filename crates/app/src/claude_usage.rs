@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,11 @@ struct UsageState {
     last_request: Option<Instant>,
 }
 
-pub fn current(ctx: &egui::Context) -> Option<crate::app::ProviderUsage> {
+pub(crate) fn current(
+    ctx: &egui::Context,
+    agent: Option<&crate::agent_launcher::DetectedAgent>,
+) -> Option<crate::app::ProviderUsage> {
+    let agent = agent?;
     static STATE: OnceLock<Mutex<UsageState>> = OnceLock::new();
     let state = STATE.get_or_init(|| Mutex::new(UsageState::default()));
     let Ok(mut state) = state.lock() else {
@@ -43,57 +48,58 @@ pub fn current(ctx: &egui::Context) -> Option<crate::app::ProviderUsage> {
         .last_request
         .is_none_or(|requested| requested.elapsed() >= REFRESH_INTERVAL);
     if state.pending.is_none() && refresh_due {
+        let executable = agent.executable().to_path_buf();
+        let detected_launch_path = agent.launch_path().map(std::ffi::OsString::from);
         let (sender, receiver) = mpsc::sync_channel(1);
         let repaint = ctx.clone();
-        if std::thread::Builder::new()
+        let attempted = Instant::now();
+        let spawned = std::thread::Builder::new()
             .name("claude-usage-probe".to_owned())
             .spawn(move || {
-                let usage = fetch_claude_usage().ok().flatten();
+                let usage = fetch_claude_usage(&executable, detected_launch_path.as_deref())
+                    .ok()
+                    .flatten();
                 let _ = sender.send(usage);
                 repaint.request_repaint();
             })
-            .is_ok()
-        {
+            .is_ok();
+        state.last_request = Some(last_request_after_spawn(attempted));
+        if spawned {
             state.pending = Some(receiver);
-            state.last_request = Some(Instant::now());
         }
     }
     let (measured_at, usage) = state.usage?;
     crate::app::fresh_usage_after(usage, measured_at.elapsed())
 }
 
-fn fetch_claude_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
+fn last_request_after_spawn(attempted: Instant) -> Instant {
+    attempted
+}
+
+fn fetch_claude_usage(
+    executable: &Path,
+    detected_launch_path: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<Option<crate::app::ProviderUsage>> {
     let backend = pty::PortablePtyBackend;
     let probe_dir = crate::paths::home_dir()
         .map(|home| home.join(".deppy-sijo").join("usage-probe"))
         .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&probe_dir)?;
 
-    #[cfg(windows)]
-    let command = pty::CommandSpec {
-        program: "cmd.exe".to_owned(),
-        args: vec!["/d".to_owned(), "/c".to_owned(), "claude".to_owned()],
-        env: vec![("TERM".to_owned(), "xterm-256color".to_owned())],
-        cwd: Some(probe_dir),
-    };
-    #[cfg(not(windows))]
-    let command = pty::CommandSpec {
-        program: resolve_claude_command(),
-        args: Vec::new(),
-        env: vec![("TERM".to_owned(), "xterm-256color".to_owned())],
-        cwd: Some(probe_dir),
-    };
+    let command = claude_probe_command(executable, probe_dir, detected_launch_path)?;
 
     let mut session = backend.spawn(&command, 120, 40)?;
     let output = session
         .take_output()
         .ok_or_else(|| anyhow::anyhow!("Claude usage PTY output unavailable"))?;
     std::thread::sleep(STARTUP_DELAY);
-    session.write_input(b"/usage\r")?;
+    write_required_input(session.as_mut(), b"/usage\r")?;
 
     let started = Instant::now();
     let mut next_enter = Instant::now() + ENTER_INTERVAL;
     let mut settle_at = None;
+    let mut trust_confirmed = false;
+    let mut plan_confirmed = false;
     let mut bytes = Vec::new();
     while started.elapsed() < PROBE_TIMEOUT {
         match output.recv_timeout(Duration::from_millis(100)) {
@@ -104,14 +110,19 @@ fn fetch_claude_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
                 }
                 let clean = strip_terminal_control_sequences(&String::from_utf8_lossy(&bytes));
                 let lower = clean.to_ascii_lowercase();
-                if lower.contains("do you trust")
-                    || lower.contains("trust the files")
-                    || lower.contains("safety check")
+                if !trust_confirmed
+                    && (lower.contains("do you trust")
+                        || lower.contains("trust the files")
+                        || lower.contains("safety check"))
                 {
-                    let _ = session.write_input(b"y\r");
+                    write_required_input(session.as_mut(), b"y\r")?;
+                    trust_confirmed = true;
                 }
-                if lower.contains("show plan") || lower.contains("usage limits") {
-                    let _ = session.write_input(b"\r");
+                if !plan_confirmed
+                    && (lower.contains("show plan") || lower.contains("usage limits"))
+                {
+                    write_required_input(session.as_mut(), b"\r")?;
+                    plan_confirmed = true;
                 }
                 if settle_at.is_none() && usage_panel_rendered(&lower) {
                     settle_at = Some(Instant::now() + SETTLE_DELAY);
@@ -124,7 +135,7 @@ fn fetch_claude_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
             break;
         }
         if settle_at.is_none() && Instant::now() >= next_enter {
-            let _ = session.write_input(b"\r");
+            write_required_input(session.as_mut(), b"\r")?;
             next_enter = Instant::now() + ENTER_INTERVAL;
         }
     }
@@ -134,21 +145,52 @@ fn fetch_claude_usage() -> anyhow::Result<Option<crate::app::ProviderUsage>> {
     Ok(parse_usage(&clean))
 }
 
-#[cfg(not(windows))]
-fn resolve_claude_command() -> String {
-    let mut candidates = Vec::new();
-    if let Some(home) = crate::paths::home_dir() {
-        candidates.push(home.join(".local/bin/claude"));
+fn claude_probe_command(
+    executable: &Path,
+    probe_dir: std::path::PathBuf,
+    detected_launch_path: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<pty::CommandSpec> {
+    let program = executable
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Claude executable path is not UTF-8"))?;
+    let search_path = if let Some(path) = detected_launch_path {
+        path.to_os_string()
+    } else {
+        let mut paths = executable
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        std::env::join_paths(paths)
+            .map_err(|_| anyhow::anyhow!("Claude probe PATH could not be constructed"))?
     }
-    candidates.extend([
-        std::path::PathBuf::from("/opt/homebrew/bin/claude"),
-        std::path::PathBuf::from("/usr/local/bin/claude"),
-    ]);
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "claude".to_owned())
+    .into_string()
+    .map_err(|_| anyhow::anyhow!("Claude probe PATH is not UTF-8"))?;
+    Ok(pty::CommandSpec {
+        program: program.to_owned(),
+        args: Vec::new(),
+        env: vec![
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("PATH".to_owned(), search_path),
+        ],
+        cwd: Some(probe_dir),
+    })
+}
+
+fn required_input_result(result: pty::PtyInputEnqueueResult) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        result.is_accepted(),
+        "Claude usage PTY input was not accepted"
+    );
+    Ok(())
+}
+
+fn write_required_input(session: &mut dyn pty::PtySession, bytes: &[u8]) -> anyhow::Result<()> {
+    required_input_result(session.write_input(bytes)?)
 }
 
 fn usage_panel_rendered(lower: &str) -> bool {
@@ -231,4 +273,58 @@ fn strip_terminal_control_sequences(output: &str) -> String {
         .get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("static CSI regex"));
     csi.replace_all(&osc.replace_all(output, ""), "")
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backpressured_input() -> pty::PtyInputEnqueueResult {
+        pty::PtyInputEnqueueResult::Backpressured {
+            pressure: pty::PtyInputPressure {
+                attempted_bytes: 8,
+                queued_bytes: 8,
+                queued_messages: 1,
+                max_bytes: 8,
+                max_messages: 1,
+                reason: pty::PtyInputRejectReason::QueueFull,
+            },
+        }
+    }
+
+    #[test]
+    fn probe_command는_런처가_감지한_claude와_path를_쓴다() {
+        let command = claude_probe_command(
+            std::path::Path::new("/custom/bin/claude"),
+            std::path::PathBuf::from("/tmp/deppy-claude-probe"),
+            Some(std::ffi::OsStr::new("/custom/bin:/usr/bin:/bin")),
+        )
+        .expect("Claude probe command");
+
+        assert_eq!(command.program, "/custom/bin/claude");
+        assert!(
+            command
+                .env
+                .iter()
+                .any(|(key, value)| { key == "PATH" && value.starts_with("/custom/bin:") })
+        );
+    }
+
+    #[test]
+    fn 필수_pty_입력은_backpressure를_성공으로_취급하지_않는다() {
+        assert!(required_input_result(pty::PtyInputEnqueueResult::Accepted).is_ok());
+        assert!(required_input_result(backpressured_input()).is_err());
+    }
+
+    #[test]
+    fn worker_spawn_실패도_마지막_시도_시각을_기록한다() {
+        let attempted = Instant::now();
+        assert_eq!(last_request_after_spawn(attempted), attempted);
+    }
+
+    #[test]
+    fn usage_화면에서_세션과_주간_사용률을_읽는다() {
+        let output = "Current session\n  12% used\nCurrent week (all models)\n  34% used\n";
+        assert_eq!(parse_usage(output), Some((Some(12), Some(34))));
+    }
 }

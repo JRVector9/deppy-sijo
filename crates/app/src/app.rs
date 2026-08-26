@@ -27017,13 +27017,16 @@ impl eframe::App for App {
                 // agent_kinds는 **활성 워크스페이스만** 담아서, 다른 워크스페이스에서
                 // Kimi를 쓰면 게이트가 조용히 막았다(2026-08-10 실증: 프로브가 한 번도
                 // 안 돌았다). claude 경로와 같은 모양으로 무조건 부른다.
-                let kimi_usage = crate::kimi_usage::current(ui.ctx());
-                let claude_usage =
-                    claude_usage_snapshot().or_else(|| crate::claude_usage::current(ui.ctx()));
+                let launcher_snapshot = self.agent_launcher_snapshot.as_ref();
+                let kimi_agent = launcher_snapshot
+                    .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Kimi));
+                let claude_agent = launcher_snapshot
+                    .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Claude));
+                let kimi_usage = crate::kimi_usage::current(ui.ctx(), kimi_agent);
+                let claude_usage = claude_usage_snapshot()
+                    .or_else(|| crate::claude_usage::current(ui.ctx(), claude_agent));
                 let codex_usage = merge_codex_usage(codex_server_usage, codex_backend);
-                let grok_agent = self
-                    .agent_launcher_snapshot
-                    .as_ref()
+                let grok_agent = launcher_snapshot
                     .and_then(|snapshot| snapshot.find(crate::agent_launcher::AgentKind::Grok));
                 let grok_usage = crate::agent_launcher::agent_is_enabled(
                     &self.config.agents.disabled,

@@ -215,7 +215,10 @@ mod tests {
         let viewer_open = html
             .find(r#"<section id="viewer""#)
             .expect("viewer section 없음");
-        assert!(viewer_open > main_close, "viewer는 inert dashboard 뒤의 형제여야 함");
+        assert!(
+            viewer_open > main_close,
+            "viewer는 inert dashboard 뒤의 형제여야 함"
+        );
         for marker in [
             r#"<main id="dashboard-shell" class="app">"#,
             r#"class="viewer-shell""#,
@@ -229,11 +232,17 @@ mod tests {
             r#"role="group" aria-label="터미널 특수키""#,
             r#"aria-label="터미널에 보낼 메시지""#,
         ] {
-            assert!(html.contains(marker), "전체화면 viewer marker 누락: {marker}");
+            assert!(
+                html.contains(marker),
+                "전체화면 viewer marker 누락: {marker}"
+            );
         }
         let js = std::str::from_utf8(APP_JS).unwrap();
         assert!(js.contains("'viewer-back'"), "새 back listener 누락");
-        assert!(!js.contains("'viewer-close'"), "삭제한 close listener가 남음");
+        assert!(
+            !js.contains("'viewer-close'"),
+            "삭제한 close listener가 남음"
+        );
     }
 
     #[test]
@@ -293,9 +302,15 @@ mod tests {
             "viewer.pendingClose = options",
             "setViewerClosing(true)",
         ] {
-            assert!(js.contains(marker), "viewer lifecycle marker 누락: {marker}");
+            assert!(
+                js.contains(marker),
+                "viewer lifecycle marker 누락: {marker}"
+            );
         }
-        assert!(!js.contains("scrollIntoView"), "inline viewer 스크롤 진입이 남아 있음");
+        assert!(
+            !js.contains("scrollIntoView"),
+            "inline viewer 스크롤 진입이 남아 있음"
+        );
     }
 
     #[test]
@@ -359,7 +374,10 @@ mod tests {
             "function projectVisibility()",
             "if (document.hidden) projectVisibility();",
         ] {
-            assert!(js.contains(marker), "connection safety marker 누락: {marker}");
+            assert!(
+                js.contains(marker),
+                "connection safety marker 누락: {marker}"
+            );
         }
         assert!(
             js.matches("if (!isCurrentSocket(socket)) return;").count() >= 2,
@@ -422,9 +440,15 @@ mod tests {
             "if (renderKey === lastViewerRenderKey) return;",
             "ctx.setTransform(dpr, 0, 0, dpr, 0, 0)",
         ] {
-            assert!(js.contains(marker), "viewport renderer marker 누락: {marker}");
+            assert!(
+                js.contains(marker),
+                "viewport renderer marker 누락: {marker}"
+            );
         }
-        assert!(!js.contains("drawScreen()"), "legacy direct drawScreen call이 남아 있음");
+        assert!(
+            !js.contains("drawScreen()"),
+            "legacy direct drawScreen call이 남아 있음"
+        );
         assert!(
             !js.contains("if (hasViewerResizeObserver) return;"),
             "ResizeObserver callback은 현재 paint 뒤 frame이라 layout change immediate schedule을 생략하면 안 됨"
@@ -441,7 +465,10 @@ mod tests {
             "overflow-y: auto;",
             "max-height: var(--viewer-composer-max-height",
         ] {
-            assert!(css.contains(marker), "short viewport controls marker 누락: {marker}");
+            assert!(
+                css.contains(marker),
+                "short viewport controls marker 누락: {marker}"
+            );
         }
     }
 

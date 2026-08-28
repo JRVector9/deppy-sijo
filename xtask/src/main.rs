@@ -910,13 +910,29 @@ fn top_level_item_is_test_only(compact_tokens: &str) -> bool {
     false
 }
 
+/// 구체 저장소를 소유해도 되는 파일 목록. **정확히 이 둘뿐이다.**
+///
+/// - `app.rs`: loopback/Tailscale 경로의 합성 루트.
+/// - `relay_repository.rs`: Relay 영속 어댑터. 계획
+///   `docs/superpowers/plans/2026-08-28-production-relay.md` Task 2가 요구하는 분리다 —
+///   `web-remote`가 SQLite를 열지 않게 하려면 앱이 소유해야 하고, 동시에 Relay 의존성을
+///   `app.rs`에 밀어 넣지 않아야 두 전송 경로가 독립적으로 유지된다. 이 모듈은 앱의 다른
+///   모듈을 하나도 import하지 않는다(해당 크레이트의 소스 법칙 테스트가 고정한다).
+const APP_COMPOSITION_ROOTS: &[&str] = &["app.rs", "relay_repository.rs"];
+
 fn check_app_composition_root_boundary(
     root: &Path,
     violations: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    let app_rs = root.join("crates/app/src/app.rs");
     for path in rust_files_under(&root.join("crates/app/src"))? {
-        if path == app_rs {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                path.parent() == Some(root.join("crates/app/src").as_path())
+                    && APP_COMPOSITION_ROOTS.contains(&name)
+            })
+        {
             continue;
         }
         let rel = rel_path(root, &path)?;
@@ -1551,6 +1567,19 @@ mod tests {
         violations.clear();
         check_leaf_semantic_boundary("fixture.rs", tests_only, &mut violations).unwrap();
         assert!(violations.is_empty());
+    }
+
+    /// 합성 루트는 정확히 둘이다. 세 번째가 조용히 늘어나면 이 테스트가 먼저 깨진다.
+    #[test]
+    fn 합성_루트는_app_rs와_relay_repository_둘뿐이다() {
+        assert_eq!(APP_COMPOSITION_ROOTS, &["app.rs", "relay_repository.rs"]);
+        let root = workspace_root().unwrap();
+        for name in APP_COMPOSITION_ROOTS {
+            assert!(
+                root.join("crates/app/src").join(name).exists(),
+                "{name} 이(가) 없는데 예외로 남아 있다"
+            );
+        }
     }
 
     #[test]

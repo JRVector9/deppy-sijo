@@ -664,6 +664,9 @@ fn 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한�
         "composerText.maxLength = MAX_DRAFT_CHARS",
         "const recoveredDraftSessions = new Set()",
         "const evictedDraftSessions = new Set()",
+        "evictedDraftSessions.delete(composerSession);",
+        "let composerRecoveryWarningSession = null;",
+        "composerRecoveryWarningSession !== msg.session",
         "let draftCacheNotice = ''",
         "const closeNotices = [notice, draftCacheNotice]",
         "const RECENT_SEND_TTL_MS = 30_000",
@@ -675,6 +678,11 @@ fn 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한�
         "const recentSentBySession = new Map()",
         "function canRememberRecentSent(",
         "if (!canRememberRecentSent(target, text))",
+        "const utf8Encoder = new TextEncoder()",
+        "const MAX_INPUT_FRAME_BYTES = 512 * 1024",
+        "function sendSerialized(",
+        "utf8Encoder.encode(text).byteLength",
+        "utf8Encoder.encode(serializedInput).byteLength",
         "function restoreDraft(note, sessionId)",
         "if (inputBlocked && !restoreDraft(",
         "연결이 바뀌어 최근 입력을 복원했습니다",
@@ -682,6 +690,8 @@ fn 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한�
         "let pickerSession = null;",
         "let pendingUploadSelection = null;",
         "function consumePendingUploadSelection()",
+        "consumePendingUploadSelection(); // pressure resolved",
+        "recentSentBySession.delete(msg.session); // stale pressure resolved",
         "pickerSession = viewer.watching;",
         "viewer.watching !== uploadSession",
         "function cancelActiveUpload()",
@@ -866,6 +876,38 @@ function sendKey(key) {
 
 Change `sendComposer`'s initial guard to `if (!target || !remoteInputReady()) return;`. No connection transition may clear `composerText.value`.
 
+The server enforces UTF-8 byte limits (`256 KiB` input text and `512 KiB` serialized input frame), while JavaScript `String.length` and `JSON.stringify(...).length` count UTF-16 code units. Add exact serialized sending and shared client constants:
+
+```javascript
+const utf8Encoder = new TextEncoder();
+const MAX_INPUT_BYTES = 256 * 1024;
+const MAX_INPUT_FRAME_BYTES = 512 * 1024;
+
+function sendSerialized(serialized) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(serialized);
+  return true;
+}
+
+function send(msg) {
+  return sendSerialized(JSON.stringify(msg));
+}
+```
+
+In `sendComposer`, construct the message once and reject either actual server boundary before journal admission or textarea clearing:
+
+```javascript
+const inputMessage = { type: 'input', session: target, text, submit: true };
+const serializedInput = JSON.stringify(inputMessage);
+if (utf8Encoder.encode(text).byteLength > MAX_INPUT_BYTES
+    || utf8Encoder.encode(serializedInput).byteLength > MAX_INPUT_FRAME_BYTES) {
+  setComposerNote('입력이 너무 큽니다 (256KB 초과)');
+  return;
+}
+```
+
+Then call `sendSerialized(serializedInput)`. This is required for Korean and other multibyte input: code-unit checks can pass text the Rust server silently drops by UTF-8 byte length.
+
 The composer draft belongs to a session, not to the viewer DOM. Add a bounded per-session draft store next to the composer state:
 
 ```javascript
@@ -884,6 +926,7 @@ const evictedDraftSessions = new Set();
 let draftCacheNotice = '';
 const RECENT_SEND_TTL_MS = 30_000;
 let composerSession = null;
+let composerRecoveryWarningSession = null;
 composerText.maxLength = MAX_DRAFT_CHARS;
 
 function setBoundedSessionValue(store, sessionId, value) {
@@ -911,6 +954,12 @@ function setBoundedSessionValue(store, sessionId, value) {
 function saveComposerDraft() {
   if (!composerSession) return;
   setBoundedSessionValue(viewerDrafts, composerSession, composerText.value);
+  // If an active entry was evicted while its authoritative textarea remained mounted,
+  // successfully caching that DOM value means no draft was lost for this session.
+  evictedDraftSessions.delete(composerSession);
+  if (composerRecoveryWarningSession === composerSession) {
+    recoveredDraftSessions.add(composerSession);
+  }
 }
 
 function preserveComposerDraftForTransition() {
@@ -922,6 +971,7 @@ function preserveComposerDraftForTransition() {
 
 function loadComposerDraft(sessionId) {
   composerSession = sessionId;
+  composerRecoveryWarningSession = null;
   composerText.value = viewerDrafts.get(sessionId) || '';
   autoGrow();
   const notices = [];
@@ -934,6 +984,7 @@ function loadComposerDraft(sessionId) {
   }
   if (recoveredDraftSessions.delete(sessionId)) {
     notices.push('최근 입력을 복원했습니다 — 중복 여부를 확인하세요.');
+    composerRecoveryWarningSession = sessionId;
   }
   if (notices.length) setComposerNote(notices.join(' '));
 }
@@ -943,6 +994,9 @@ function discardSessionDraft(sessionId) {
   recentSentBySession.delete(sessionId);
   recoveredDraftSessions.delete(sessionId);
   evictedDraftSessions.delete(sessionId);
+  if (composerRecoveryWarningSession === sessionId) {
+    composerRecoveryWarningSession = null;
+  }
 }
 
 function pruneRecentSent(now = Date.now()) {
@@ -1014,6 +1068,7 @@ function restoreDraft(note, sessionId) {
     composerText.value = restored;
     autoGrow();
     setComposerNote(note);
+    composerRecoveryWarningSession = sessionId;
   } else {
     recoveredDraftSessions.delete(sessionId);
     recoveredDraftSessions.add(sessionId);
@@ -1037,9 +1092,9 @@ Pass `msg.session` into every `restoreDraft` call. If an `input_pressure` messag
 case 'input_pressure':
   if (!msg.session) break;
   if (msg.session !== viewer.watching) {
-    if (msg.reason !== 'queue_full' || (msg.queued || 0) > 0) {
-      restoreDraft('', msg.session);
-    }
+    if (msg.reason === 'queue_full' && (msg.queued || 0) === 0) {
+      recentSentBySession.delete(msg.session); // stale pressure resolved
+    } else restoreDraft('', msg.session);
     break;
   }
   handleInputPressure(msg);
@@ -1061,6 +1116,22 @@ if (inputBlocked && !restoreDraft(
 ```
 
 `queue_full` with `queued == 0` is a resolution event, not proof that the latest input was rejected. Restoring on that frame would duplicate an accepted command.
+
+Do not clear a visible uncertain-recovery warning merely because queue pressure resolved:
+
+```javascript
+if (composerRecoveryWarningSession !== msg.session) setComposerNote('');
+```
+
+Clear `composerRecoveryWarningSession` after a successful composer send, when closing/clearing the composer, and when the user edits the textarea. The input listener may clear the warning note and flag before calling `autoGrow()`. If the user switches away without editing, `saveComposerDraft` copies the flag back to `recoveredDraftSessions`, so the warning reappears with the cached draft on return.
+
+After the common `updateComposerEnabled()` at the end of `handleInputPressure`, call:
+
+```javascript
+consumePendingUploadSelection(); // pressure resolved
+```
+
+The call is a no-op until `remoteInputReady()` becomes true. It covers a native picker opened while ready whose `change` arrives during a short queue-pressure block; resolving that block must consume the retained same-session File without waiting for an unrelated reconnect.
 
 Gate scrolling at enqueue, flush, and the bottom button. Replace the start of `queueScroll` and its send condition with:
 
@@ -1270,6 +1341,7 @@ git commit -m "fix(web-remote): lock viewer input during reconnect"
 **Files:**
 - Modify: `crates/web-remote/src/static_srv.rs:220-490`
 - Modify: `crates/web-remote/assets/app.js:250-430,620-650`
+- Modify: `crates/web-remote/assets/app.css:130-245`
 
 - [ ] **Step 1: Write the failing renderer contract**
 
@@ -1279,6 +1351,9 @@ fn 전체화면_렌더러는_visual_viewport와_단일_frame_스케줄러를_사
     let js = std::str::from_utf8(APP_JS).unwrap();
     for marker in [
         "function scheduleViewerRender()",
+        "function scheduleViewportSettle()",
+        "function cancelScheduledViewerRender()",
+        "function scheduleViewerRenderForLayoutChange(",
         "requestAnimationFrame",
         "window.visualViewport",
         "visualViewport.addEventListener('resize'",
@@ -1286,13 +1361,26 @@ fn 전체화면_렌더러는_visual_viewport와_단일_frame_스케줄러를_사
         "new ResizeObserver",
         "visualViewport.offsetLeft",
         "visualViewport.width",
+        "visualViewport.scale",
         "viewer.el.style.setProperty('--viewer-left'",
         "viewer.el.style.setProperty('--viewer-width'",
+        "viewer.el.style.setProperty('--viewer-controls-max-height'",
+        "viewer.el.style.setProperty('--viewer-composer-max-height'",
         "availableHeight / (screen.rows * CELL_ASPECT_RATIO)",
+        "const MAX_CANVAS_PIXELS = 8 * 1024 * 1024",
+        "viewerScreenRevision += 1",
+        "if (renderKey === lastViewerRenderKey) return;",
         "ctx.setTransform(dpr, 0, 0, dpr, 0, 0)",
-        "scheduleViewerRender(); // composer layout changed",
     ] {
         assert!(js.contains(marker), "viewport renderer marker 누락: {marker}");
+    }
+    let css = std::str::from_utf8(APP_CSS).unwrap();
+    for marker in [
+        "max-height: var(--viewer-controls-max-height",
+        "overflow-y: auto;",
+        "max-height: var(--viewer-composer-max-height",
+    ] {
+        assert!(css.contains(marker), "short viewport controls marker 누락: {marker}");
     }
 }
 ```
@@ -1311,18 +1399,31 @@ Add before the renderer:
 
 ```javascript
 const CELL_ASPECT_RATIO = 2;
+const MAX_CANVAS_PIXELS = 8 * 1024 * 1024;
 let viewerRenderFrame = 0;
+let viewerViewportSettleTimer = 0;
+let viewerScreenRevision = 0;
+let lastViewerRenderKey = '';
 
 function syncViewerViewport() {
   const visualViewport = window.visualViewport;
-  const top = visualViewport ? visualViewport.offsetTop : 0;
-  const left = visualViewport ? visualViewport.offsetLeft : 0;
-  const width = visualViewport ? visualViewport.width : window.innerWidth;
-  const height = visualViewport ? visualViewport.height : window.innerHeight;
+  const pinched = !!(visualViewport && visualViewport.scale > 1.01);
+  // Pinch zoom is accessibility magnification. Use current layout geometry instead of
+  // stale inline vars or the narrower visual viewport, then let native zoom/pan own it.
+  const top = pinched ? 0 : (visualViewport ? visualViewport.offsetTop : 0);
+  const left = pinched ? 0 : (visualViewport ? visualViewport.offsetLeft : 0);
+  const width = pinched
+    ? document.documentElement.clientWidth
+    : (visualViewport ? visualViewport.width : window.innerWidth);
+  const height = pinched
+    ? document.documentElement.clientHeight
+    : (visualViewport ? visualViewport.height : window.innerHeight);
   const topPx = Math.max(0, Math.round(top)) + 'px';
   const leftPx = Math.max(0, Math.round(left)) + 'px';
   const widthPx = Math.max(1, Math.round(width)) + 'px';
   const heightPx = Math.max(1, Math.round(height)) + 'px';
+  const controlsMaxHeightPx = Math.max(88, Math.floor(height * 0.45)) + 'px';
+  const composerMaxHeightPx = height <= 500 ? '66px' : '130px';
   if (viewer.el.style.getPropertyValue('--viewer-top') !== topPx) {
     viewer.el.style.setProperty('--viewer-top', topPx);
   }
@@ -1335,6 +1436,14 @@ function syncViewerViewport() {
   if (viewer.el.style.getPropertyValue('--viewer-width') !== widthPx) {
     viewer.el.style.setProperty('--viewer-width', widthPx);
   }
+  if (viewer.el.style.getPropertyValue('--viewer-controls-max-height')
+      !== controlsMaxHeightPx) {
+    viewer.el.style.setProperty('--viewer-controls-max-height', controlsMaxHeightPx);
+  }
+  if (viewer.el.style.getPropertyValue('--viewer-composer-max-height')
+      !== composerMaxHeightPx) {
+    viewer.el.style.setProperty('--viewer-composer-max-height', composerMaxHeightPx);
+  }
 }
 
 function scheduleViewerRender() {
@@ -1345,7 +1454,27 @@ function scheduleViewerRender() {
     drawScreenNow();
   });
 }
+
+function scheduleViewportSettle() {
+  scheduleViewerRender();
+  if (viewerViewportSettleTimer) clearTimeout(viewerViewportSettleTimer);
+  viewerViewportSettleTimer = setTimeout(() => {
+    viewerViewportSettleTimer = 0;
+    scheduleViewerRender();
+  }, 64);
+}
+
+function cancelScheduledViewerRender() {
+  if (viewerRenderFrame) cancelAnimationFrame(viewerRenderFrame);
+  if (viewerViewportSettleTimer) clearTimeout(viewerViewportSettleTimer);
+  viewerRenderFrame = 0;
+  viewerViewportSettleTimer = 0;
+}
 ```
+
+The immediate frame keeps normal rotation/keyboard response fast. The single bounded 64 ms settled sample covers iOS standalone WebKit builds that report an early stale `visualViewport.offsetTop` during keyboard resize and do not guarantee another event. Call `cancelScheduledViewerRender()` in central `finishCloseViewer` so neither hidden draw work nor a settled viewport timer survives viewer close.
+
+At pinch scale greater than 1, native page zoom owns magnification and panning; `syncViewerViewport` explicitly refreshes top/left zero plus the current layout-viewport dimensions. This avoids reusing stale portrait inline variables if the viewer was closed during rotation and then opened while pinched. The renderer still raises its effective backing-store DPR (within a pixel budget) so the magnified terminal remains sharp. Do not resize the shell to the narrowed pinch visual viewport, which would fit all columns again and defeat accessibility zoom.
 
 Add `scheduleViewerRender();` after `viewer.back.focus();` in `openViewer`, before the connection-gated watch.
 
@@ -1358,7 +1487,6 @@ function drawScreenNow() {
   const screen = viewer.screen;
   if (!screen || viewer.el.hidden) return;
   const canvas = viewer.canvas;
-  const dpr = window.devicePixelRatio || 1;
   const availableWidth = viewer.wrap.clientWidth;
   const availableHeight = viewer.wrap.clientHeight;
   if (availableWidth <= 0 || availableHeight <= 0 || screen.cols <= 0 || screen.rows <= 0) return;
@@ -1370,6 +1498,18 @@ function drawScreenNow() {
   viewer.cellH = cellH;
   const cssWidth = cellW * screen.cols;
   const cssHeight = cellH * screen.rows;
+  const visualScale = window.visualViewport ? window.visualViewport.scale : 1;
+  const requestedDpr = (window.devicePixelRatio || 1) * Math.max(1, visualScale || 1);
+  const pixelBudgetDpr = Math.sqrt(MAX_CANVAS_PIXELS / Math.max(1, cssWidth * cssHeight));
+  const dpr = Math.min(requestedDpr, pixelBudgetDpr);
+  const renderKey = [
+    viewerScreenRevision,
+    availableWidth.toFixed(2),
+    availableHeight.toFixed(2),
+    dpr.toFixed(3),
+  ].join(':');
+  if (renderKey === lastViewerRenderKey) return;
+  lastViewerRenderKey = renderKey;
   const pixelWidth = Math.max(1, Math.round(cssWidth * dpr));
   const pixelHeight = Math.max(1, Math.round(cssHeight * dpr));
   if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
@@ -1437,7 +1577,14 @@ function drawScreenNow() {
 }
 ```
 
-Change `handleViewport`'s final draw call to `scheduleViewerRender()`.
+Increment the model revision only after a matching viewport message has been applied, then schedule:
+
+```javascript
+viewerScreenRevision += 1;
+scheduleViewerRender();
+```
+
+The render key makes the ResizeObserver frame following a visual-viewport frame cheap: if wrap geometry, effective DPR, and screen revision are unchanged, no canvas resize, clear, or text draw runs. The effective DPR includes pinch scale for sharpness but is capped by an 8-megapixel backing-store budget to avoid zoom-driven mobile memory spikes.
 
 - [ ] **Step 5: Replace direct resize draws with coalesced observers**
 
@@ -1446,21 +1593,46 @@ Remove `window.addEventListener('resize', () => drawScreen())` and add:
 ```javascript
 window.addEventListener('resize', scheduleViewerRender);
 if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', scheduleViewerRender);
+  window.visualViewport.addEventListener('resize', scheduleViewportSettle);
   window.visualViewport.addEventListener('scroll', scheduleViewerRender);
 }
-if ('ResizeObserver' in window) {
+const hasViewerResizeObserver = 'ResizeObserver' in window;
+if (hasViewerResizeObserver) {
   new ResizeObserver(scheduleViewerRender).observe(viewer.wrap);
 }
 ```
 
-Also schedule after footer height changes so the window-only fallback remains correct. Append this exact line at the end of both `autoGrow()` and `setComposerNote()`:
+The ResizeObserver is authoritative for footer-induced stage changes. For older browsers only, compare actual wrap height before and after a composer layout mutation:
 
 ```javascript
-scheduleViewerRender(); // composer layout changed
+function scheduleViewerRenderForLayoutChange(previousWrapHeight) {
+  if (hasViewerResizeObserver) return;
+  if (viewer.wrap.clientHeight !== previousWrapHeight) scheduleViewerRender();
+}
 ```
 
-- [ ] **Step 6: Run renderer, static, and syntax tests**
+Capture `const previousWrapHeight = viewer.wrap.clientHeight;` at the start of `autoGrow()` and `setComposerNote()`, then call `scheduleViewerRenderForLayoutChange(previousWrapHeight)` at the end. Do not unconditionally schedule on every textarea keystroke or repeated note update: when computed footer height is unchanged, that would redraw the entire terminal for no visual geometry change.
+
+- [ ] **Step 6: Keep controls reachable in a short keyboard viewport**
+
+Add these authoritative CSS rules:
+
+```css
+.viewer-controls {
+  min-height: 0;
+  max-height: var(--viewer-controls-max-height, 45dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.composer textarea {
+  max-height: var(--viewer-composer-max-height, 130px);
+}
+```
+
+The values come from the measured visual-viewport height, not a layout-viewport media query: mobile OS keyboards often shrink only the visual viewport. The grid stage remains the flexible row, while the controls row receives a non-cyclic pixel cap of about 45% of the shell and scrolls internally. Thus short landscape plus the on-screen keyboard cannot push the composer/send control outside the shell's `overflow:hidden`; direct touch targets remain 44px and the textarea is capped to roughly two to three lines below 500px.
+
+- [ ] **Step 7: Run renderer, static, and syntax tests**
 
 ```bash
 cargo test -p web-remote --locked 전체화면_렌더러는_visual_viewport와_단일_frame_스케줄러를_사용한다 -- --nocapture
@@ -1470,10 +1642,10 @@ node --check crates/web-remote/assets/app.js
 
 Expected: focused and static tests PASS; Node exits 0 without output.
 
-- [ ] **Step 7: Commit the coalesced renderer**
+- [ ] **Step 8: Commit the coalesced renderer**
 
 ```bash
-git add crates/web-remote/src/static_srv.rs crates/web-remote/assets/app.js
+git add crates/web-remote/src/static_srv.rs crates/web-remote/assets/app.js crates/web-remote/assets/app.css
 git commit -m "perf(web-remote): coalesce full-screen terminal rendering"
 ```
 
@@ -1558,7 +1730,7 @@ With a non-empty composer draft, interrupt the existing WebSocket connection. Ve
 
 Perform a quick background→foreground transition so the intentionally closed old socket can deliver its `close` after the new socket starts. Expected: the late old event is ignored and does not return the connected viewer to `reconnecting`.
 
-Start an arrow-key long press and a coalesced scroll, then interrupt the connection before their timers fire. Expected: repeat and scroll timers are canceled and no stale command is emitted after reconnection. Open the file picker while connected, disconnect before selecting a file, then return from the picker. Expected: no upload begins and the UI asks for reconnection.
+Start an arrow-key long press and a coalesced scroll, then interrupt the connection before their timers fire. Expected: repeat and scroll timers are canceled and no stale command is emitted after reconnection. Open the file picker while connected, let the native picker hide/pause the page, select one valid file, and return before WebSocket `welcome`. Expected: no upload begins while disconnected; exactly one bounded selection is retained and begins only after the same session reconnects. Repeat but switch/close the session before `welcome`; expected: the retained selection is discarded and never uploaded into the new session.
 
 Trigger a real background/foreground transition where supported. Verify the privacy curtain appears before disconnect and hides on return. If the environment cannot create a genuine visibility transition, record it as unverified.
 

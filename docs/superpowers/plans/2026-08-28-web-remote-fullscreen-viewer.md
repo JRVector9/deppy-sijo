@@ -649,20 +649,58 @@ fn 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한�
     for marker in [
         "function setViewerConnection(",
         "viewer.connection === 'connected'",
+        "&& !document.hidden",
+        "inputBlocked = false; // reset per connection generation",
         "viewer.overlay.hidden = connected",
         "viewer.privacy.hidden = false",
         "viewer.privacy.hidden = true",
         "setViewerConnection('reconnecting')",
         "setViewerConnection('paused')",
         "intentionallyClosedSockets.has(socket)",
+        "function isCurrentSocket(",
         "function stopAllKeyRepeats()",
         "if (!remoteInputReady()) return;",
-        "const uploadSession = viewer.watching",
+        "const viewerDrafts = new Map()",
+        "composerText.maxLength = MAX_DRAFT_CHARS",
+        "const recoveredDraftSessions = new Set()",
+        "const evictedDraftSessions = new Set()",
+        "let draftCacheNotice = ''",
+        "const closeNotices = [notice, draftCacheNotice]",
+        "const RECENT_SEND_TTL_MS = 30_000",
+        "function saveComposerDraft()",
+        "function preserveComposerDraftForTransition()",
+        "function loadComposerDraft(",
+        "function discardSessionDraft(",
+        "discardDraft: !!(watched && watched.exited)",
+        "const recentSentBySession = new Map()",
+        "function canRememberRecentSent(",
+        "if (!canRememberRecentSent(target, text))",
+        "function restoreDraft(note, sessionId)",
+        "if (inputBlocked && !restoreDraft(",
+        "연결이 바뀌어 최근 입력을 복원했습니다",
+        "const uploadSession = pickerSession",
+        "let pickerSession = null;",
+        "let pendingUploadSelection = null;",
+        "function consumePendingUploadSelection()",
+        "pickerSession = viewer.watching;",
+        "viewer.watching !== uploadSession",
         "function cancelActiveUpload()",
         "signal: upload.controller.signal",
+        "if (activeUpload !== upload) return;",
+        "if (nextComposerValue.length > MAX_DRAFT_CHARS)",
+        "function projectVisibility()",
+        "if (document.hidden) projectVisibility();",
     ] {
         assert!(js.contains(marker), "connection safety marker 누락: {marker}");
     }
+    assert!(
+        js.matches("if (!isCurrentSocket(socket)) return;").count() >= 2,
+        "old socket open/message generation guard 누락"
+    );
+    assert!(
+        js.matches("if (activeUpload !== upload) return;").count() >= 3,
+        "stale upload continuation guard 누락"
+    );
 }
 ```
 
@@ -709,8 +747,16 @@ function setViewerConnection(state) {
     stopAllKeyRepeats();
     resetScroll();
     cancelActiveUpload();
+    if (viewer.watching) {
+      restoreDraft(
+        '연결이 바뀌어 최근 입력을 복원했습니다 — 중복 여부를 확인하세요',
+        viewer.watching,
+      );
+    }
+    inputBlocked = false; // reset per connection generation
   }
   updateComposerEnabled();
+  if (connected) consumePendingUploadSelection();
 }
 ```
 
@@ -722,6 +768,10 @@ Declare this next to the socket state:
 
 ```javascript
 const intentionallyClosedSockets = new WeakSet();
+
+function isCurrentSocket(socket) {
+  return ws === socket && !intentionallyClosedSockets.has(socket);
+}
 ```
 
 ```javascript
@@ -739,6 +789,23 @@ if (viewer.watching) {
 ```
 
 ```javascript
+socket.addEventListener('open', () => {
+  if (!isCurrentSocket(socket)) return;
+  reconnectDelay = 1000;
+  socket.send(JSON.stringify({ type: 'auth', v: PROTOCOL_VERSION, token }));
+});
+
+socket.addEventListener('message', (event) => {
+  if (!isCurrentSocket(socket)) return;
+  let msg;
+  try {
+    msg = JSON.parse(event.data);
+  } catch {
+    return;
+  }
+  handleMessage(msg);
+});
+
 socket.addEventListener('close', () => {
   const wasCurrent = ws === socket;
   if (wasCurrent) ws = null;
@@ -748,6 +815,8 @@ socket.addEventListener('close', () => {
   scheduleReconnect();
 });
 ```
+
+The current-socket guard is required on both `open` and `message`, not only `close`: a deliberately closed or replaced socket may already have queued an event, and that event must not authenticate, mark the viewer connected, render an old dashboard, or apply stale input pressure to the new generation.
 
 Replace the socket-close part of `disconnect()` so intentional ownership belongs to that exact socket even if a new connection starts before its late close event:
 
@@ -776,6 +845,7 @@ Replace the enabling and key guards with:
 function remoteInputReady() {
   return !!viewer.watching
     && !viewer.closing
+    && !document.hidden
     && viewer.connection === 'connected'
     && !inputBlocked;
 }
@@ -795,6 +865,202 @@ function sendKey(key) {
 ```
 
 Change `sendComposer`'s initial guard to `if (!target || !remoteInputReady()) return;`. No connection transition may clear `composerText.value`.
+
+The composer draft belongs to a session, not to the viewer DOM. Add a bounded per-session draft store next to the composer state:
+
+```javascript
+const MAX_CACHED_DRAFTS = 20;
+const MAX_EVICTED_DRAFT_FLAGS = 256;
+const MAX_DRAFT_CHARS = 256 * 1024;
+const MAX_RECENT_SENDS_PER_SESSION = 32;
+const MAX_RECENT_SENT_CHARS = MAX_DRAFT_CHARS * 2;
+const MAX_STORED_DRAFT_CHARS = MAX_DRAFT_CHARS
+  + MAX_RECENT_SENT_CHARS
+  + MAX_RECENT_SENDS_PER_SESSION;
+const viewerDrafts = new Map();
+const recentSentBySession = new Map();
+const recoveredDraftSessions = new Set();
+const evictedDraftSessions = new Set();
+let draftCacheNotice = '';
+const RECENT_SEND_TTL_MS = 30_000;
+let composerSession = null;
+composerText.maxLength = MAX_DRAFT_CHARS;
+
+function setBoundedSessionValue(store, sessionId, value) {
+  store.delete(sessionId);
+  const bounded = typeof value === 'string'
+    ? value.slice(0, MAX_STORED_DRAFT_CHARS)
+    : value;
+  if (bounded) store.set(sessionId, bounded);
+  else if (store === viewerDrafts) recoveredDraftSessions.delete(sessionId);
+  while (store.size > MAX_CACHED_DRAFTS) {
+    const evicted = store.keys().next().value;
+    store.delete(evicted);
+    if (store === viewerDrafts) {
+      recoveredDraftSessions.delete(evicted);
+      evictedDraftSessions.delete(evicted);
+      evictedDraftSessions.add(evicted);
+      while (evictedDraftSessions.size > MAX_EVICTED_DRAFT_FLAGS) {
+        evictedDraftSessions.delete(evictedDraftSessions.values().next().value);
+      }
+      draftCacheNotice = '메모리 제한으로 가장 오래된 세션 초안 1개를 정리했습니다.';
+    }
+  }
+}
+
+function saveComposerDraft() {
+  if (!composerSession) return;
+  setBoundedSessionValue(viewerDrafts, composerSession, composerText.value);
+}
+
+function preserveComposerDraftForTransition() {
+  if (!composerSession) return;
+  const outgoing = lastSessions.find((session) => session.id === composerSession);
+  if (outgoing && outgoing.exited) discardSessionDraft(composerSession);
+  else saveComposerDraft();
+}
+
+function loadComposerDraft(sessionId) {
+  composerSession = sessionId;
+  composerText.value = viewerDrafts.get(sessionId) || '';
+  autoGrow();
+  const notices = [];
+  if (draftCacheNotice) {
+    notices.push(draftCacheNotice);
+    draftCacheNotice = '';
+  }
+  if (evictedDraftSessions.delete(sessionId)) {
+    notices.push('이 세션의 이전 초안을 복원하지 못했습니다.');
+  }
+  if (recoveredDraftSessions.delete(sessionId)) {
+    notices.push('최근 입력을 복원했습니다 — 중복 여부를 확인하세요.');
+  }
+  if (notices.length) setComposerNote(notices.join(' '));
+}
+
+function discardSessionDraft(sessionId) {
+  viewerDrafts.delete(sessionId);
+  recentSentBySession.delete(sessionId);
+  recoveredDraftSessions.delete(sessionId);
+  evictedDraftSessions.delete(sessionId);
+}
+
+function pruneRecentSent(now = Date.now()) {
+  const cutoff = now - RECENT_SEND_TTL_MS;
+  for (const [sessionId, entries] of recentSentBySession) {
+    const recent = entries.filter((item) => item.at >= cutoff);
+    if (recent.length) recentSentBySession.set(sessionId, recent);
+    else recentSentBySession.delete(sessionId);
+  }
+}
+
+function canRememberRecentSent(sessionId, text) {
+  pruneRecentSent();
+  const recent = recentSentBySession.get(sessionId) || [];
+  if (!recentSentBySession.has(sessionId)
+      && recentSentBySession.size >= MAX_CACHED_DRAFTS) return false;
+  if (recent.length >= MAX_RECENT_SENDS_PER_SESSION) return false;
+  return recent.reduce((sum, item) => sum + item.text.length, 0) + text.length
+    <= MAX_RECENT_SENT_CHARS;
+}
+
+function rememberRecentSent(sessionId, text) {
+  const cutoff = Date.now() - RECENT_SEND_TTL_MS;
+  const recent = (recentSentBySession.get(sessionId) || [])
+    .filter((item) => item.at >= cutoff);
+  recent.push({ text, at: Date.now() });
+  recentSentBySession.delete(sessionId);
+  recentSentBySession.set(sessionId, recent);
+}
+```
+
+At the start of an accepted `openViewer` transition, call `preserveComposerDraftForTransition()` before changing `viewer.watching`, then use the exact note/load order `setComposerNote(''); loadComposerDraft(sessionId);`. The transition helper discards an outgoing session that the latest dashboard explicitly marks exited; otherwise it saves. This matters when the same dashboard render queues A's disappearance cleanup but synchronously consumes a pending deep link to B: B's transition must not reinsert A's dead draft before the stale close microtask returns. The note/load order clears an old session's note first and lets `loadComposerDraft` install a pending recovery warning afterward. In `finishCloseViewer`, save the current draft unless its explicit `discardDraft` option is set, clear `composerSession` and the visible textarea, and keep live-session drafts so reopening the same session restores them. Connection-only transitions preserve the current draft untouched.
+
+Extend `finishCloseViewer` with `discardDraft = false`. For a confirmed exited session, call `discardSessionDraft(returnSession)` instead of saving; ordinary Back and a merely missing session keep their draft because another workspace can make that session temporarily absent. In the disappearance request use:
+
+```javascript
+discardDraft: !!(watched && watched.exited),
+```
+
+While rendering dashboard sessions, purge draft/recent/recovery metadata for every explicit `session.exited` row as well. This prevents permanently dead sessions from occupying bounded cache slots and evicting an older live unsent draft.
+
+In `finishCloseViewer`, after removing dashboard inertness and before returning focus, consume a cache notice into the now-visible dashboard banner without overwriting a lifecycle notice:
+
+```javascript
+const closeNotices = [notice, draftCacheNotice].filter(Boolean);
+draftCacheNotice = '';
+if (closeNotices.length) showNotice(closeNotices.join(' '));
+```
+
+Do not emit this notice immediately from the cache helper: during A→B viewer transitions the dashboard banner is inert, aria-hidden, and covered by the fixed viewer. `loadComposerDraft` consumes it into the visible composer; a close consumes it only after the dashboard is visible.
+
+Replace the single `lastSent` slot with the bounded per-session recent-send journal. Before `send()`, require `canRememberRecentSent(target, text)`; if it is false, leave the textarea unchanged and show `최근 전송 확인 중입니다 — 잠시 후 다시 보내세요`. Only after `send()` returns true, call `rememberRecentSent(target, text)` and clear the textarea. A pressure event has no client message id and may coalesce multiple rejections, so overwriting or evicting an unconfirmed candidate can silently lose an earlier rapid send. The pre-send admission guard bounds both entry count and characters without dropping admitted input. Restore every still-recent candidate for that session without discarding text the user typed afterward:
+
+```javascript
+function restoreDraft(note, sessionId) {
+  const cutoff = Date.now() - RECENT_SEND_TTL_MS;
+  const recent = (recentSentBySession.get(sessionId) || [])
+    .filter((item) => item.at >= cutoff);
+  recentSentBySession.delete(sessionId);
+  if (!recent.length) return false;
+  const uncertain = recent.map((item) => item.text).join('\n');
+  const current = composerSession === sessionId
+    ? composerText.value
+    : (viewerDrafts.get(sessionId) || '');
+  const separator = uncertain && current && !/\s$/.test(uncertain) ? '\n' : '';
+  const restored = uncertain + separator + current;
+  setBoundedSessionValue(viewerDrafts, sessionId, restored);
+  if (composerSession === sessionId) {
+    composerText.value = restored;
+    autoGrow();
+    setComposerNote(note);
+  } else {
+    recoveredDraftSessions.delete(sessionId);
+    recoveredDraftSessions.add(sessionId);
+    while (recoveredDraftSessions.size > MAX_CACHED_DRAFTS) {
+      recoveredDraftSessions.delete(recoveredDraftSessions.values().next().value);
+    }
+  }
+  return true;
+}
+```
+
+Because the protocol does not acknowledge individual inputs, this journal is deliberately described as recent input that may need review before resending; it prefers visible recovery over silent loss. Both the per-session entry count and session count are bounded so repeated switching cannot create an unbounded client-side retention path.
+
+`MAX_DRAFT_CHARS` bounds direct textarea input. The recent-send character budget, current maximum-size draft, and join separators fit `MAX_STORED_DRAFT_CHARS`; the storage helper enforces that per-entry ceiling as a final defense. Together with `MAX_CACHED_DRAFTS`, both the number and size of retained values are bounded rather than merely the number of `Map` keys. If the 21st nonempty live draft evicts the oldest, the app immediately surfaces a global notice and keeps a bounded per-session eviction flag so returning to that session cannot misleadingly look like an intact empty draft.
+
+Protocol v3 has no per-input acknowledgement, so exact accepted-versus-rejected classification is impossible without a protocol revision. Keep candidates for a conservative bounded 30 seconds (longer than the 15-second reconnect ceiling), recover them immediately on connection generation change or rejection pressure, and block additional sends when the count/character journal is full. This slice does not claim exactly-once delivery under an indefinitely throttled-but-open tab; that requires a later client sequence/ack protocol change rather than more client inference.
+
+Pass `msg.session` into every `restoreDraft` call. If an `input_pressure` message belongs to a no-longer-watched session, restore its matching cached draft without changing the current session's `inputBlocked` or note; do not silently discard it at the old top-level session guard. This preserves A's rejected input even after the user has switched to B.
+
+```javascript
+case 'input_pressure':
+  if (!msg.session) break;
+  if (msg.session !== viewer.watching) {
+    if (msg.reason !== 'queue_full' || (msg.queued || 0) > 0) {
+      restoreDraft('', msg.session);
+    }
+    break;
+  }
+  handleInputPressure(msg);
+  break;
+```
+
+In `handleInputPressure`, the `queue_full` branch must restore only while `queued > 0`:
+
+```javascript
+inputBlocked = queued > 0;
+if (inputBlocked && !restoreDraft(
+    '입력 대기열이 차 최근 입력을 복원했습니다 — 중복 여부를 확인하세요',
+    msg.session)) {
+  setComposerNote('입력 대기열이 찼습니다 — 잠시 후 다시 보내세요');
+} else if (!inputBlocked) {
+  recentSentBySession.delete(msg.session);
+  setComposerNote('');
+}
+```
+
+`queue_full` with `queued == 0` is a resolution event, not proof that the latest input was rejected. Restoring on that frame would duplicate an accepted command.
 
 Gate scrolling at enqueue, flush, and the bottom button. Replace the start of `queueScroll` and its send condition with:
 
@@ -822,27 +1088,76 @@ Add upload ownership next to `uploadBusy`:
 
 ```javascript
 let activeUpload = null;
+let pickerSession = null;
+let pendingUploadSelection = null;
 
 function cancelActiveUpload() {
   if (!activeUpload) return;
   activeUpload.controller.abort();
   activeUpload = null;
   uploadBusy = false;
+  setComposerNote('');
   updateComposerEnabled();
 }
-```
 
-Call `cancelActiveUpload()` at the start of an accepted new `openViewer` transition and immediately after the guards in `requestCloseViewer`, so session changes and close requests cannot leave an orphan upload.
-
-At the start of the file-input `change` handler, after confirming `file` exists, capture and validate the exact session:
-
-```javascript
-const uploadSession = viewer.watching;
-if (!uploadSession || !remoteInputReady()) {
-  setComposerNote('연결이 끊겼습니다 — 재연결 후 파일을 선택하세요');
-  return;
+function cancelPendingUploadSelection() {
+  pickerSession = null;
+  pendingUploadSelection = null;
 }
 ```
+
+Call `cancelActiveUpload()` and `cancelPendingUploadSelection()` at the start of an accepted new `openViewer` transition and immediately after the guards in `requestCloseViewer`, so session changes and close requests cannot leave an orphan upload or delayed file selection. Also call both from central `finishCloseViewer`: native browser Back enters through `popstate` and bypasses `requestCloseViewer`, so cleanup must be idempotent at the convergence point. Clearing the note is part of active-upload cancellation ownership, preventing stale `업로드 중…` copy after reconnect.
+
+Capture delayed file-picker ownership when the picker opens, not when its later `change` event fires:
+
+```javascript
+composerAttach.addEventListener('click', () => {
+  if (composerAttach.disabled) return;
+  pickerSession = viewer.watching;
+  composerFile.click();
+});
+```
+
+At the start of the file-input `change` handler, consume the click-time owner before reading the file, then validate both the file and exact session. Validate the 10 MiB limit before retaining the `File`. If the native picker temporarily hid the page and the WebSocket has not welcomed the foreground connection yet, retain exactly one bounded selection instead of rejecting it:
+
+```javascript
+const uploadSession = pickerSession;
+pickerSession = null;
+const file = composerFile.files && composerFile.files[0];
+composerFile.value = '';
+if (!file) return;
+if (!uploadSession || viewer.watching !== uploadSession) {
+  setComposerNote('세션이 바뀌어 선택한 파일을 업로드하지 않았습니다');
+  return;
+}
+if (file.size > MAX_UPLOAD_BYTES) {
+  setComposerNote('파일이 너무 큽니다 (10MB 초과)');
+  return;
+}
+if (!remoteInputReady()) {
+  pendingUploadSelection = { session: uploadSession, file };
+  setComposerNote('재연결 후 선택한 파일을 업로드합니다…');
+  return;
+}
+beginSelectedUpload(uploadSession, file);
+```
+
+Move the existing async fetch body into `async function beginSelectedUpload(uploadSession, file)`. It must revalidate the same session and `remoteInputReady()` before creating `activeUpload`.
+
+```javascript
+function consumePendingUploadSelection() {
+  if (!pendingUploadSelection || !remoteInputReady()) return;
+  const pending = pendingUploadSelection;
+  if (viewer.watching !== pending.session) {
+    pendingUploadSelection = null;
+    return;
+  }
+  pendingUploadSelection = null;
+  beginSelectedUpload(pending.session, pending.file);
+}
+```
+
+The pending slot holds at most one already-size-checked `File` and is preserved only across connection/visibility transitions. Session switch and every close path clear it. Do not clear `pickerSession` merely because `visibilitychange` projected `paused`: mobile native file pickers commonly hide the document, and their `change` can arrive before WebSocket `welcome` on return.
 
 Before setting `uploadBusy`, create exact ownership:
 
@@ -857,19 +1172,46 @@ Add the signal to fetch:
 signal: upload.controller.signal,
 ```
 
+An abort may race with an already-resolved fetch or response-body parse. After each `await` and before any upload-owned note or composer mutation, require exact ownership:
+
+```javascript
+const res = await fetch(/* ... */);
+if (activeUpload !== upload) return;
+// validate res
+const result = await res.json();
+if (activeUpload !== upload) return;
+// validate and insert result
+```
+
 After validating `result.path` and before inserting it into the composer, revalidate:
 
 ```javascript
+if (activeUpload !== upload) return;
 if (viewer.watching !== uploadSession || !remoteInputReady()) {
   setComposerNote('연결 또는 세션이 바뀌어 업로드 경로를 입력하지 않았습니다');
   return;
 }
 ```
 
+Programmatic `.value` assignment is not constrained by `textarea.maxLength`. Build and check the upload-path mutation before assigning it:
+
+```javascript
+const separator = composerText.value && !/\s$/.test(composerText.value) ? '\n' : '';
+const nextComposerValue = composerText.value + separator + result.path + ' ';
+if (nextComposerValue.length > MAX_DRAFT_CHARS) {
+  setComposerNote('입력이 너무 길어 업로드 경로를 추가하지 않았습니다');
+  return;
+}
+composerText.value = nextComposerValue;
+```
+
+This keeps both direct input and upload-appended composer content inside the same per-session cache bound.
+
 Use a named catch value and ownership-aware finalization:
 
 ```javascript
 } catch (error) {
+  if (activeUpload !== upload) return;
   if (!(error && error.name === 'AbortError')) {
     setComposerNote('업로드 실패 — 네트워크를 확인하세요');
   }
@@ -884,10 +1226,10 @@ Use a named catch value and ownership-aware finalization:
 
 - [ ] **Step 7: Show privacy before background disconnect**
 
-Replace the existing visibility handler:
+Replace the existing visibility handler with one projection function and invoke it for an initially hidden document as well:
 
 ```javascript
-document.addEventListener('visibilitychange', () => {
+function projectVisibility() {
   if (document.hidden) {
     if (viewer.watching) viewer.privacy.hidden = false;
     setViewerConnection('paused');
@@ -898,8 +1240,14 @@ document.addEventListener('visibilitychange', () => {
     setViewerConnection('connecting');
     connect();
   }
-});
+}
+
+document.addEventListener('visibilitychange', projectVisibility);
+if (document.hidden) projectVisibility();
+else connect();
 ```
+
+Remove the old unconditional final `connect()`. A page restored or opened in the background must begin paused, disconnected, and privacy-projected without waiting for a visibility event that may never fire.
 
 - [ ] **Step 8: Run the focused and static tests**
 

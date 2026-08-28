@@ -123,8 +123,6 @@ pub struct WebRemoteServer {
     /// 이 코어를 이 서버가 만들었는가. 공유받은 코어는 서버가 멈추지 않는다 —
     /// 그러지 않으면 Tailscale을 끄는 것만으로 Relay의 대시보드까지 죽는다.
     owns_core: bool,
-    /// 웹푸시 발송 매니저(P4) — 전용 스레드 소유. shutdown 시 stop+join. 비활성 시 None.
-    push: Option<push::PushManager>,
 }
 
 impl WebRemoteServer {
@@ -169,39 +167,29 @@ impl WebRemoteServer {
         // WS 대시보드 브리지 스레드. OFF(서버 미생성)면 이 스레드도 없다 — 리소스 0.
         // 공유 코어를 받았으면 새로 띄우지 않는다.
         let owns_core = shared_core.is_none();
-        // 공유 코어에 이 서버가 소유한 발송 싱크를 심으면, 서버를 끄는 순간 코어가 죽은 싱크를
-        // 가리키게 된다 — Tailscale을 끄는 것만으로 Relay 쪽 코어가 망가지는 길이다. 조용히
-        // 무시하지 않고 명시적으로 거절한다. 공유 배치에서 웹푸시 소유권을 어디에 둘지는
-        // 아직 정해지지 않았고, 정해질 때 이 자리에서 결정하면 된다.
+        // 웹푸시 발송기는 **코어가 소유한다**. 공유 코어에 서버가 소유한 싱크를 심으면, 서버를
+        // 끄는 순간 코어가 죽은 싱크를 가리킨다 — Tailscale을 끄는 것만으로 Relay 쪽 코어가
+        // 망가지는 길이다. 공유 배치에서는 소유자가 `spawn_with_push`로 만들어 오고, 여기서는
+        // 그 핸들만 빌린다. 그래도 VAPID 키를 함께 넘기면 소유권이 둘로 갈리므로 거절한다.
         anyhow::ensure!(
             shared_core.is_none() || options.vapid.is_none(),
-            "공유 코어에는 서버 소유 웹푸시 싱크를 붙일 수 없다 — 소유권이 정해지지 않았다"
+            "공유 코어의 웹푸시는 코어 소유자가 만든다 — 서버에 VAPID 키를 함께 넘길 수 없다"
         );
-        let core = shared_core
-            .unwrap_or_else(|| session_core::SessionCore::spawn(options.repository.clone()));
-        let dashboard = core.dashboard().clone();
-        // 웹푸시(P4) — VAPID 키 + 저장소 포트가 모두 있을 때만 발송 스레드를 띄운다.
-        let push = match (options.repository, options.vapid) {
-            (Some(repository), Some(vapid)) => match push::PushManager::spawn(repository, vapid) {
-                Ok(manager) => {
-                    dashboard.set_push_sink(manager.handle());
-                    Some(manager)
-                }
-                Err(e) => {
-                    tracing::warn!("web-remote 웹푸시 비활성(발송 스레드 생성 실패): {e:#}");
-                    None
-                }
-            },
-            _ => None,
+        let core = match shared_core {
+            Some(shared) => shared,
+            None => session_core::SessionCore::spawn_with_push(
+                options.repository.clone(),
+                options.vapid,
+            ),
         };
-        let push_handle = push.as_ref().map(|manager| manager.handle());
+        let push_handle = core.push_handle();
         let ctx = Arc::new(ConnCtx {
             token: options.token,
             allowed_host: options
                 .allowed_host
                 .map(|host| host.trim().to_ascii_lowercase())
                 .filter(|host| !host.is_empty()),
-            dashboard: dashboard.clone(),
+            dashboard: core.dashboard().clone(),
             push: push_handle,
             uploads_dir: options.uploads_dir,
             stop: Arc::clone(&stop),
@@ -216,7 +204,6 @@ impl WebRemoteServer {
             connections,
             core,
             owns_core,
-            push,
         })
     }
 
@@ -313,12 +300,9 @@ impl WebRemoteServer {
         // 접속 스레드가 모두 끝난 뒤(ConnectionGuard drop 완료) 대시보드 스레드를 정지·join한다.
         // 공유받은 코어라면 소유자(앱)가 멈춘다 — 여기서 멈추면 Tailscale을 끄는 것만으로
         // Relay의 대시보드까지 함께 죽는다.
+        // 발송 스레드도 코어가 함께 정지·join한다(발송 중이던 요청은 타임아웃까지 이어질 수 있다).
         if self.owns_core {
             self.core.shutdown();
-        }
-        // 웹푸시 발송 스레드도 정지·join한다(발송 중이던 요청은 타임아웃까지 이어질 수 있다).
-        if let Some(push) = self.push.take() {
-            push.stop_and_join();
         }
         tracing::info!(addr = %self.addr, "web-remote 서버 정지");
     }
@@ -1972,6 +1956,81 @@ mod tests {
         drop(guard);
         assert!(rebuilt, "거절된 조합이 공유 코어를 멈추면 안 된다");
         core.shutdown();
+    }
+
+    /// 「둘 다 켬」 배치: 코어가 웹푸시를 소유하고 서버는 핸들만 빌린다. 서버를 꺼도 코어와
+    /// 발송기는 살아 있어야 한다 — Tailscale을 끄는 것이 Relay 쪽 푸시를 죽이면 안 된다.
+    #[test]
+    fn 공유_코어가_웹푸시를_소유하고_서버_종료에도_살아남는다() {
+        let db_path = temp_db_path();
+        let repository = repository::StorageTestRepository::open(&db_path)
+            as Arc<dyn repository::WebRemoteRepository>;
+        let core = session_core::SessionCore::spawn_with_push(
+            Some(repository.clone()),
+            Some(push::VapidKey::generate()),
+        );
+        assert!(
+            core.push_handle().is_some(),
+            "코어가 발송기를 소유해야 한다"
+        );
+
+        let server = WebRemoteServer::serve_with_core(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ServeOptions {
+                token: TEST_TOKEN.to_owned(),
+                allowed_host: None,
+                repository: Some(repository),
+                // 소유권은 코어에 있으므로 서버에는 키를 넘기지 않는다.
+                vapid: None,
+                uploads_dir: None,
+            },
+            Arc::clone(&core),
+        )
+        .unwrap();
+        assert!(
+            server.core().push_handle().is_some(),
+            "서버가 핸들을 빌린다"
+        );
+
+        server.shutdown();
+        assert!(
+            core.push_handle().is_some(),
+            "서버 종료가 코어의 발송기를 죽이면 안 된다"
+        );
+
+        core.shutdown();
+        assert!(
+            core.push_handle().is_none(),
+            "코어 소유자가 멈추면 발송기도 함께 정리된다"
+        );
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Relay를 먼저 켜면 코어가 VAPID 키 없이 만들어진다. 그 뒤 web을 켤 때 기존 코어를
+    /// 재사용하면서 발송기를 보정하지 않으면, 키가 있는데도 웹푸시가 영영 꺼진 채로 남는다.
+    #[test]
+    fn ensure_push는_키_없이_만들어진_코어를_나중에_보정한다() {
+        let db_path = temp_db_path();
+        let repository = repository::StorageTestRepository::open(&db_path)
+            as Arc<dyn repository::WebRemoteRepository>;
+
+        // Relay가 먼저 켜진 상황 — 키 없이 만들어진다.
+        let core = session_core::SessionCore::spawn(Some(repository.clone()));
+        assert!(core.push_handle().is_none());
+
+        // 나중에 web이 켜지며 키를 들고 온다.
+        core.ensure_push(Some(repository.clone()), Some(push::VapidKey::generate()));
+        assert!(
+            core.push_handle().is_some(),
+            "키가 생겼는데도 푸시가 꺼진 채면 안 된다"
+        );
+
+        // 두 번 불러도 발송기를 갈아 끼우지 않는다.
+        core.ensure_push(Some(repository), Some(push::VapidKey::generate()));
+        assert!(core.push_handle().is_some());
+
+        core.shutdown();
+        let _ = std::fs::remove_file(&db_path);
     }
 
     fn start_with_push(db_path: PathBuf) -> WebRemoteServer {

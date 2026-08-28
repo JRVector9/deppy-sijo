@@ -1,5 +1,46 @@
 # Codex handoff
 
+## Task 4 COMPLETE — application wiring (2026-08-29)
+
+- Task 4 of `docs/superpowers/plans/2026-08-28-production-relay.md` is now implemented, tested,
+  reviewed across two rounds, and committed. The user authorised editing `crates/app/src/app.rs`
+  and authorised the push; commits through this slice are on `origin/main`.
+- Wiring shape: the **application owns** the transport-neutral `SessionCore`. `start_web` shares it
+  through `serve_with_core`; `relay_enable` reuses the same one. The core is released only when
+  **both** transports are off, so stopping one never kills the other's dashboard. Web push
+  ownership moved from the server into the core, because a server-owned sink dies with the server
+  and would leave a shared core pointing at it.
+- `relay_enable` validates the endpoint **before** spawning a worker. The production endpoint
+  constant is still `None` (BLOCKED), so enabling Relay today fails with `EndpointError::NotAssigned`
+  and that failure is reported in `relay_error`, entirely separate from `web_error`. Tailscale, its
+  token, the Host allowlist, and the loopback listener are untouched — a source law asserts
+  `relay_enable` does not even name them.
+- `RelayDashboardSink` passes every decrypted frame through the permission adapter before any side
+  effect. The first release is fixed view-only, so only watch/unwatch reach the core today.
+- Review round 1 found three defects, all real, all fixed:
+  1. **medium** — a failed web bind leaked the freshly created shared core, leaving bridge threads
+     alive with both transports off.
+  2. **medium** — starting Relay first created a core without a push manager, and a later web start
+     reused it without topping up, so web push stayed dead despite a VAPID key being present. Fixed
+     with an idempotent `SessionCore::ensure_push`.
+  3. **medium** — a `CloseChannel` admission only logged, so a peer past the violation limit kept
+     its channel. `RelayFrameSink::accept` now returns `SinkOutcome`, and the worker closes the
+     session and backs off.
+  Round 2 confirmed all three closed and found one more **medium**: a failed web bind could leave a
+  newly attached push manager running on a Relay-retained core. Investigating it showed the same
+  leak on the **normal `web_disable` path**, which the reviewer had not flagged — turning mobile web
+  off would have kept sending push notifications to the phone. Web push is now explicitly tied to
+  the web transport's lifetime through `SessionCore::stop_push` and `App::web_transport_stopped`.
+- Gates: app crate 2030 + 38, workspace 3786 passed / 0 failed, workspace clippy `-D warnings`
+  exit 0, `cargo fmt --all -- --check`, `check-boundary`, `check-deps`, and both whitespace scans
+  clean.
+- `crates/app/src/app.rs` edit safety: the user's three uncommitted hunks (around lines 4075,
+  12748, and 39746) were left untouched; every change of ours is in a separate hunk. `rustfmt` was
+  run on the file only after confirming its diff was confined to our own added lines.
+- Carried into Task 5: `relay_disable` and `relay_error` are written but not yet read — the
+  settings switch and error display are Task 5's, and both carry an `#[allow(dead_code)]` naming
+  that task. Task 5 also owns the pairing UI, device list, and five-locale i18n.
+
 ## Task 4 IN PROGRESS — third slice: permission enforcement adapter (2026-08-29)
 
 - **Task 4 is still NOT complete.** Steps 1-3 of the plan are now implemented. What remains is the

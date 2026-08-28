@@ -1,5 +1,59 @@
 # Codex handoff
 
+## Task 4 IN PROGRESS — first slice only (2026-08-29)
+
+- **Task 4 is NOT complete.** This slice covers Step 1 (transport-neutral core extraction,
+  independent `RelayConfig`, endpoint policy) and the I/O-free half of Step 2 (backoff and the
+  reconnect state machine). The socket worker, TLS, the permission-enforcing message adapter,
+  and app startup wiring are **not written yet**. Do not report Task 4 as passing.
+- What landed:
+  - `crates/web-remote/src/session_core.rs` — `SessionCore` owns the dashboard bridge without a
+    listener. `WebRemoteServer::serve` still creates and owns one (behaviour unchanged, all
+    existing tests untouched); the new `serve_with_core` shares an app-owned one and, crucially,
+    does **not** stop it on shutdown. `serve` gained no new `ServeOptions` field on purpose —
+    adding one would have forced an edit to the dirty `crates/app/src/app.rs`.
+  - `crates/web-remote/src/relay_client/lifecycle.rs` — `RelayEndpoint` policy, `BackoffPolicy`,
+    and `RelayLifecycle`. No I/O at all (a source law asserts it), so revocation and
+    authentication-failure behaviour is deterministic without a network.
+  - `crates/app/src/config.rs` — `RelayConfig { enabled }`, default off, independent of
+    `config.web`. A test asserts no transport-mode enum is ever serialised and that a legacy
+    config without a `[relay]` section still loads with Relay disabled.
+  - `crates/web-remote/tests/transport_independence.rs` — the three arrangements
+    (Tailscale-only, Relay-only, both) plus server-start failure and repeated restart, all
+    proving neither transport disturbs the other's core.
+- Direct review (one round, scoped to this slice) found three real defects, all fixed:
+  1. **high** — `serve_with_core` installed a *server-owned* push sink into the *shared* core,
+     so stopping the loopback server left Relay's core pointing at a stopped sink. That is
+     exactly the cross-transport mutation this slice exists to prevent. Now the combination is
+     refused outright; web-push ownership under a shared core is an open decision for the app
+     wiring, and refusing loudly beats silently dropping push.
+  2. **medium** — `connecting()` could move to `Connecting` while still inside the backoff
+     window. Replaced with `begin_connect(now) -> bool`, which folds the deadline check and the
+     transition into one call so "checked but transitioned anyway" cannot be written.
+  3. **medium** — host validation accepted non-DNS labels (`-relay.example.test`,
+     `relay-.example.test`, 64-byte labels). Now every label is 1..=63 bytes and may not begin
+     or end with a hyphen.
+- Gates after the fixes: `web-remote` 236 + 3 + 5, workspace 3746 passed / 0 failed, workspace
+  clippy `-D warnings` exit 0, `cargo fmt --all -- --check`, `check-boundary`, `check-deps`,
+  and both whitespace scans all clean.
+- **Blocked on a decision, not on work:** Task 4's remaining steps need
+  `crates/app/src/app.rs`, which carries 58 lines of the user's uncommitted changes. Everything
+  above was built specifically to avoid touching it. The wiring is one composition-root edit —
+  construct `SessionCore`, pass it to `serve_with_core` when the web transport is on, and hand
+  the same core to the Relay client — and it should be applied only with the user's agreement,
+  or after their `app.rs` work is committed.
+- Remaining Task 4 work, in order: the bounded reconnect worker (one owner thread,
+  cancellation-aware DNS/connect/read/write deadlines, bounded command queue, stop-and-join on
+  disable/shutdown) with `tungstenite` rustls restricted to `rustls-tls-webpki-roots` and no
+  native-TLS/private-CA/insecure-verifier fallback; the decrypted-message adapter enforcing
+  view-only permissions before any side effect, with a bounded violation counter that closes the
+  channel; immediate termination or re-authorisation of a live channel on revocation or
+  permission downgrade; and the coexistence tests listed in the plan's Step 4. The Relay-only
+  Keychain lifecycle isolation test deferred from Task 2 also lands here.
+- Also still open from Task 3: nothing enforces that
+  `relay_protocol::MAX_CIPHERTEXT_BYTES` equals `web_remote::relay::crypto::MAX_RELAY_CIPHERTEXT_BYTES`.
+  Add that assertion when `web-remote` gains the `relay-protocol` dependency in the worker step.
+
 ## Task 3 complete — untrusted Relay data plane (2026-08-29)
 
 - Status: Task 3 of `docs/superpowers/plans/2026-08-28-production-relay.md` is implemented,

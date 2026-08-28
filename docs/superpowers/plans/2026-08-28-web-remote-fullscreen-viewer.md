@@ -454,6 +454,7 @@ function requestCloseViewer(options = {}) {
 
 function openViewer(sessionId, title) {
   if (!sessionId || viewer.closing || viewer.watching === sessionId) return false;
+  stopAllKeyRepeats();
   setViewerClosing(false);
   viewer.watching = sessionId;
   viewer.returnSession = sessionId;

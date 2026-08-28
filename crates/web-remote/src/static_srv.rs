@@ -394,6 +394,58 @@ mod tests {
     }
 
     #[test]
+    fn 전체화면_렌더러는_visual_viewport와_단일_frame_스케줄러를_사용한다() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        for marker in [
+            "function scheduleViewerRender()",
+            "function scheduleViewportSettle()",
+            "function cancelScheduledViewerRender()",
+            "function scheduleViewerRenderForLayoutChange(",
+            "if (!viewer.watching) return; // do not arm settle after close",
+            "cancelScheduledViewerRender(); // central viewer close",
+            "scheduleViewerRender(); // first full-screen frame",
+            "requestAnimationFrame",
+            "window.visualViewport",
+            "visualViewport.addEventListener('resize'",
+            "visualViewport.addEventListener('scroll'",
+            "new ResizeObserver",
+            "visualViewport.offsetLeft",
+            "visualViewport.width",
+            "visualViewport.scale",
+            "viewer.el.style.setProperty('--viewer-left'",
+            "viewer.el.style.setProperty('--viewer-width'",
+            "viewer.el.style.setProperty('--viewer-controls-max-height'",
+            "viewer.el.style.setProperty('--viewer-composer-max-height'",
+            "availableHeight / (screen.rows * CELL_ASPECT_RATIO)",
+            "const MAX_CANVAS_PIXELS = 8 * 1024 * 1024",
+            "viewerScreenRevision += 1",
+            "if (renderKey === lastViewerRenderKey) return;",
+            "ctx.setTransform(dpr, 0, 0, dpr, 0, 0)",
+        ] {
+            assert!(js.contains(marker), "viewport renderer marker 누락: {marker}");
+        }
+        assert!(!js.contains("drawScreen()"), "legacy direct drawScreen call이 남아 있음");
+        assert!(
+            !js.contains("if (hasViewerResizeObserver) return;"),
+            "ResizeObserver callback은 현재 paint 뒤 frame이라 layout change immediate schedule을 생략하면 안 됨"
+        );
+        assert!(
+            js.matches("scheduleViewerRenderForLayoutChange(previousWrapHeight);")
+                .count()
+                >= 2,
+            "composer layout change scheduler 연결 누락"
+        );
+        let css = std::str::from_utf8(APP_CSS).unwrap();
+        for marker in [
+            "max-height: var(--viewer-controls-max-height",
+            "overflow-y: auto;",
+            "max-height: var(--viewer-composer-max-height",
+        ] {
+            assert!(css.contains(marker), "short viewport controls marker 누락: {marker}");
+        }
+    }
+
+    #[test]
     fn 토큰_일치는_앱셸_200() {
         let response = respond("/", &format!("token={TOKEN}"), TOKEN);
         assert_eq!(response.status, 200);

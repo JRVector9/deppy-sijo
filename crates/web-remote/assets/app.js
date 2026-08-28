@@ -350,6 +350,7 @@
     if (!viewer.watching) return;
     setViewerClosing(true);
     stopAllKeyRepeats();
+    cancelScheduledViewerRender(); // central viewer close
     const returnSession = viewer.returnSession;
     if (discardDraft) discardSessionDraft(returnSession);
     else saveComposerDraft();
@@ -421,6 +422,7 @@
     }
     updateComposerEnabled();
     viewer.back.focus();
+    scheduleViewerRender(); // first full-screen frame
     if (viewer.connection === 'connected') {
       send({ type: 'watch', session: sessionId });
     }
@@ -453,7 +455,8 @@
     viewer.screen.alt = !!msg.alt;
     viewer.screen.offset = msg.offset | 0;
     updateScrollNote();
-    drawScreen();
+    viewerScreenRevision += 1;
+    scheduleViewerRender();
   }
 
   // ── 스크롤백 열람 — 터치/휠을 줄 단위 delta로 바꿔 보낸다 (양수 = 과거로).
@@ -520,73 +523,166 @@
     }
   });
 
-  function drawScreen() {
+  const CELL_ASPECT_RATIO = 2;
+  const MAX_CANVAS_PIXELS = 8 * 1024 * 1024;
+  let viewerRenderFrame = 0;
+  let viewerViewportSettleTimer = 0;
+  let viewerScreenRevision = 0;
+  let lastViewerRenderKey = '';
+
+  function syncViewerViewport() {
+    const visualViewport = window.visualViewport;
+    const pinched = !!(visualViewport && visualViewport.scale > 1.01);
+    // Pinch zoom is accessibility magnification. Use current layout geometry instead of
+    // stale inline vars or the narrower visual viewport, then let native zoom/pan own it.
+    const top = pinched ? 0 : (visualViewport ? visualViewport.offsetTop : 0);
+    const left = pinched ? 0 : (visualViewport ? visualViewport.offsetLeft : 0);
+    const width = pinched
+      ? document.documentElement.clientWidth
+      : (visualViewport ? visualViewport.width : window.innerWidth);
+    const height = pinched
+      ? document.documentElement.clientHeight
+      : (visualViewport ? visualViewport.height : window.innerHeight);
+    const topPx = Math.max(0, Math.round(top)) + 'px';
+    const leftPx = Math.max(0, Math.round(left)) + 'px';
+    const widthPx = Math.max(1, Math.round(width)) + 'px';
+    const heightPx = Math.max(1, Math.round(height)) + 'px';
+    const controlsMaxHeightPx = Math.max(88, Math.floor(height * 0.45)) + 'px';
+    const composerMaxHeightPx = height <= 500 ? '66px' : '130px';
+    if (viewer.el.style.getPropertyValue('--viewer-top') !== topPx) {
+      viewer.el.style.setProperty('--viewer-top', topPx);
+    }
+    if (viewer.el.style.getPropertyValue('--viewer-height') !== heightPx) {
+      viewer.el.style.setProperty('--viewer-height', heightPx);
+    }
+    if (viewer.el.style.getPropertyValue('--viewer-left') !== leftPx) {
+      viewer.el.style.setProperty('--viewer-left', leftPx);
+    }
+    if (viewer.el.style.getPropertyValue('--viewer-width') !== widthPx) {
+      viewer.el.style.setProperty('--viewer-width', widthPx);
+    }
+    if (viewer.el.style.getPropertyValue('--viewer-controls-max-height')
+        !== controlsMaxHeightPx) {
+      viewer.el.style.setProperty('--viewer-controls-max-height', controlsMaxHeightPx);
+    }
+    if (viewer.el.style.getPropertyValue('--viewer-composer-max-height')
+        !== composerMaxHeightPx) {
+      viewer.el.style.setProperty('--viewer-composer-max-height', composerMaxHeightPx);
+    }
+  }
+
+  function scheduleViewerRender() {
+    if (!viewer.watching || viewerRenderFrame) return;
+    viewerRenderFrame = requestAnimationFrame(() => {
+      viewerRenderFrame = 0;
+      syncViewerViewport();
+      drawScreenNow();
+    });
+  }
+
+  function scheduleViewportSettle() {
+    if (!viewer.watching) return; // do not arm settle after close
+    scheduleViewerRender();
+    if (viewerViewportSettleTimer) clearTimeout(viewerViewportSettleTimer);
+    viewerViewportSettleTimer = setTimeout(() => {
+      viewerViewportSettleTimer = 0;
+      scheduleViewerRender();
+    }, 64);
+  }
+
+  function cancelScheduledViewerRender() {
+    if (viewerRenderFrame) cancelAnimationFrame(viewerRenderFrame);
+    if (viewerViewportSettleTimer) clearTimeout(viewerViewportSettleTimer);
+    viewerRenderFrame = 0;
+    viewerViewportSettleTimer = 0;
+  }
+
+  function drawScreenNow() {
     const screen = viewer.screen;
-    if (!screen) return;
+    if (!screen || viewer.el.hidden) return;
     const canvas = viewer.canvas;
-    const dpr = window.devicePixelRatio || 1;
-    // 폭에 맞춰 셀 크기 산출 — 80열이 폰 폭에 들어가게 축소 렌더(현재 화면 열람이 목적).
-    const cssWidth = canvas.parentElement.clientWidth || 320;
-    const cellW = cssWidth / screen.cols;
-    const cellH = cellW * 2; // 모노스페이스 종횡비 근사
-    viewer.cellH = cellH; // 터치/휠 → 줄 delta 환산용
+    const availableWidth = viewer.wrap.clientWidth;
+    const availableHeight = viewer.wrap.clientHeight;
+    if (availableWidth <= 0 || availableHeight <= 0 || screen.cols <= 0 || screen.rows <= 0) return;
+    const cellW = Math.min(
+      availableWidth / screen.cols,
+      availableHeight / (screen.rows * CELL_ASPECT_RATIO),
+    );
+    const cellH = cellW * CELL_ASPECT_RATIO;
+    viewer.cellH = cellH;
+    const cssWidth = cellW * screen.cols;
     const cssHeight = cellH * screen.rows;
-    canvas.width = Math.round(cssWidth * dpr);
-    canvas.height = Math.round(cssHeight * dpr);
+    const visualScale = window.visualViewport ? window.visualViewport.scale : 1;
+    const requestedDpr = (window.devicePixelRatio || 1) * Math.max(1, visualScale || 1);
+    const pixelBudgetDpr = Math.sqrt(MAX_CANVAS_PIXELS / Math.max(1, cssWidth * cssHeight));
+    const dpr = Math.min(requestedDpr, pixelBudgetDpr);
+    const renderKey = [
+      viewerScreenRevision,
+      availableWidth.toFixed(2),
+      availableHeight.toFixed(2),
+      dpr.toFixed(3),
+    ].join(':');
+    if (renderKey === lastViewerRenderKey) return;
+    lastViewerRenderKey = renderKey;
+    const pixelWidth = Math.max(1, Math.round(cssWidth * dpr));
+    const pixelHeight = Math.max(1, Math.round(cssHeight * dpr));
+    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
     canvas.style.width = cssWidth + 'px';
     canvas.style.height = cssHeight + 'px';
     const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, cssWidth, cssHeight);
-    // SGR 속성 비트 (B-1) — 서버 CellAttrs와 동일. run.a가 없으면 0(속성 없음).
-    const A_BOLD = 1, A_ITALIC = 2, A_UNDERLINE = 4, A_STRIKE = 8, A_DIM = 16;
+    const A_BOLD = 1;
+    const A_ITALIC = 2;
+    const A_UNDERLINE = 4;
+    const A_STRIKE = 8;
+    const A_DIM = 16;
     const fontPx = (cellH * 0.82).toFixed(2);
-    const fontFor = (a) => {
-      const style = a & A_ITALIC ? 'italic ' : '';
-      const weight = a & A_BOLD ? '700 ' : '';
+    const fontFor = (attrs) => {
+      const style = attrs & A_ITALIC ? 'italic ' : '';
+      const weight = attrs & A_BOLD ? '700 ' : '';
       return style + weight + fontPx + 'px ui-monospace, Menlo, monospace';
     };
-    // dim(SGR 2)은 색을 60%로 낮춘다 — 데스크톱 렌더러와 같은 관례.
     const dimmed = (hex) => {
-      const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
-      if (!m) return hex;
-      const n = parseInt(m[1], 16);
-      const f = (v) => Math.round(v * 0.6);
-      return `rgb(${f((n >> 16) & 255)},${f((n >> 8) & 255)},${f(n & 255)})`;
+      const match = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+      if (!match) return hex;
+      const value = parseInt(match[1], 16);
+      const fade = (channel) => Math.round(channel * 0.6);
+      return `rgb(${fade((value >> 16) & 255)},${fade((value >> 8) & 255)},${fade(value & 255)})`;
     };
     ctx.font = fontFor(0);
     ctx.textBaseline = 'middle';
     for (let row = 0; row < screen.rows; row++) {
       const runs = screen.lines[row];
-      if (!runs) continue; // keyframe 이후 아직 갱신 안 된 행 없음(전체 수신) — 방어
+      if (!runs) continue;
       const y = row * cellH;
       for (const run of runs) {
         const advance = run.w ? cellW * 2 : cellW;
         const chars = Array.from(run.t || '');
         const attrs = run.a || 0;
-        // run 배경 — 시작 열부터 글자 수 × 폭
         ctx.fillStyle = run.bg || '#000000';
         ctx.fillRect(run.s * cellW, y, chars.length * advance, cellH);
-        const fg = attrs & A_DIM ? dimmed(run.fg || '#d4d4d4') : (run.fg || '#d4d4d4');
-        ctx.fillStyle = fg;
+        const foreground = attrs & A_DIM
+          ? dimmed(run.fg || '#d4d4d4')
+          : (run.fg || '#d4d4d4');
+        ctx.fillStyle = foreground;
         ctx.font = fontFor(attrs);
-        for (let i = 0; i < chars.length; i++) {
-          if (chars[i] === ' ') continue;
-          ctx.fillText(chars[i], run.s * cellW + i * advance, y + cellH / 2, advance);
+        for (let index = 0; index < chars.length; index++) {
+          if (chars[index] === ' ') continue;
+          ctx.fillText(chars[index], run.s * cellW + index * advance, y + cellH / 2, advance);
         }
-        // underline/strikeout — run 폭 전체에 1px 선(데스크톱과 동일 의미).
         if (attrs & (A_UNDERLINE | A_STRIKE)) {
-          const x0 = run.s * cellW;
-          const w = chars.length * advance;
-          ctx.fillStyle = fg;
-          if (attrs & A_UNDERLINE) ctx.fillRect(x0, y + cellH - 1.5, w, 1);
-          if (attrs & A_STRIKE) ctx.fillRect(x0, y + cellH / 2, w, 1);
+          const x = run.s * cellW;
+          const width = chars.length * advance;
+          ctx.fillStyle = foreground;
+          if (attrs & A_UNDERLINE) ctx.fillRect(x, y + cellH - 1.5, width, 1);
+          if (attrs & A_STRIKE) ctx.fillRect(x, y + cellH / 2, width, 1);
         }
       }
     }
     ctx.font = fontFor(0);
-    // 커서 — 반투명 블록 오버레이 (모양 구분은 v1 비범위)
     const cursor = screen.cursor;
     if (cursor && cursor.visible) {
       ctx.fillStyle = 'rgba(212, 212, 212, 0.45)';
@@ -727,13 +823,16 @@
   }
 
   function autoGrow() {
+    const previousWrapHeight = viewer.wrap.clientHeight;
     composerText.style.height = 'auto';
     // 최대 5행 — 그 이상은 내부 스크롤
     const max = 5 * 22 + 16;
     composerText.style.height = Math.min(composerText.scrollHeight, max) + 'px';
+    scheduleViewerRenderForLayoutChange(previousWrapHeight);
   }
 
   function setComposerNote(text) {
+    const previousWrapHeight = viewer.wrap.clientHeight;
     const notices = text ? [text] : [];
     if (composerRecoveryWarningSession === composerSession
         && !text.includes(RECOVERY_WARNING)) {
@@ -742,6 +841,7 @@
     const message = notices.join(' ');
     composerNote.hidden = !message;
     composerNote.textContent = message;
+    scheduleViewerRenderForLayoutChange(previousWrapHeight);
   }
 
   function remoteInputReady() {
@@ -1063,9 +1163,19 @@
     }
   }
 
-  // 회전/리사이즈 시 현재 화면 모델로 canvas를 다시 맞춘다 — 다음 프레임을 기다리지
-  // 않는다 (유휴 세션이면 무기한 옛 폭 고정, P5 리뷰 P3). screen 없으면 no-op.
-  window.addEventListener('resize', () => drawScreen());
+  window.addEventListener('resize', scheduleViewerRender);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', scheduleViewportSettle);
+    window.visualViewport.addEventListener('scroll', scheduleViewerRender);
+  }
+  const hasViewerResizeObserver = 'ResizeObserver' in window;
+  if (hasViewerResizeObserver) {
+    new ResizeObserver(scheduleViewerRender).observe(viewer.wrap);
+  }
+
+  function scheduleViewerRenderForLayoutChange(previousWrapHeight) {
+    if (viewer.wrap.clientHeight !== previousWrapHeight) scheduleViewerRender();
+  }
 
   function renderApprovals(pending) {
     approvalsCount.textContent = String(pending.length);

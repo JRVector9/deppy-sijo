@@ -335,6 +335,14 @@ fn 전체화면_뷰어_js는_단일_lifecycle과_back_계약을_포함한다() {
         "function stopAllKeyRepeats()",
         "if (viewer.closing) return false;",
         "if (!openViewer(id",
+        "queueMicrotask(() => consumePendingWatch(lastSessions))",
+        "if (pendingWatch === viewer.watching)",
+        "if (!target || target.exited)",
+        "if (viewer.watching !== endedSession) return;",
+        "queueMicrotask(() => {",
+        "if (s.id && !s.exited)",
+        "let pointerActive = false;",
+        "repeated = repeated || pointerActive;",
     ] {
         assert!(js.contains(marker), "viewer lifecycle marker 누락: {marker}");
     }
@@ -418,6 +426,8 @@ function restoreViewerFocus(sessionId) {
 
 function finishCloseViewer({ rerender = true, notice = '' } = {}) {
   if (!viewer.watching) return;
+  setViewerClosing(true);
+  stopAllKeyRepeats();
   const returnSession = viewer.returnSession;
   send({ type: 'unwatch' });
   viewer.watching = null;
@@ -432,10 +442,11 @@ function finishCloseViewer({ rerender = true, notice = '' } = {}) {
   document.body.classList.remove('viewer-open');
   dashboardShell.inert = false;
   dashboardShell.removeAttribute('aria-hidden');
-  setViewerClosing(false);
   if (rerender) renderWorkspaces(lastWorkspaces, lastResource);
   if (notice) showNotice(notice);
+  setViewerClosing(false);
   restoreViewerFocus(returnSession);
+  queueMicrotask(() => consumePendingWatch(lastSessions));
 }
 
 function requestCloseViewer(options = {}) {
@@ -493,6 +504,7 @@ In the existing special-key loop, move `let repeated = false` before `stopRepeat
 
 ```javascript
 let repeated = false;
+let pointerActive = false;
 const stopRepeat = () => {
   clearTimeout(repeatTimer);
   clearInterval(repeatInterval);
@@ -500,12 +512,29 @@ const stopRepeat = () => {
   repeatInterval = null;
 };
 keyRepeatCancels.push(() => {
+  repeated = repeated || pointerActive;
+  pointerActive = false;
   stopRepeat();
-  repeated = false;
 });
 ```
 
-Remove the later duplicate `let repeated = false`. Pointer-up/leave/cancel continue to call `stopRepeat`, preserving trailing-click suppression for a real long press.
+Remove the later duplicate `let repeated = false`. Set `pointerActive = true` at the start of `startRepeat`. Replace pointer termination listeners with:
+
+```javascript
+btn.addEventListener('pointerup', () => {
+  pointerActive = false;
+  stopRepeat();
+});
+for (const eventName of ['pointerleave', 'pointercancel']) {
+  btn.addEventListener(eventName, () => {
+    pointerActive = false;
+    stopRepeat();
+    repeated = false;
+  });
+}
+```
+
+A global session/close cancellation while the pointer is down sets `repeated=true`; if a prior repeat already fired, the OR assignment preserves that suppression during an intervening session transition. The trailing click is therefore consumed by the existing click handler instead of reaching a new session. Pointer leave/cancel clears suppression because those paths do not produce a valid click.
 
 Change `consumePendingWatch` so closing never consumes the pending id and a rejected open leaves it queued:
 
@@ -517,8 +546,15 @@ function consumePendingWatch(sessions) {
     return false;
   }
   if (viewer.closing) return false;
+  if (pendingWatch === viewer.watching) {
+    pendingWatch = null;
+    return true;
+  }
   const target = sessions.find((session) => session.id === pendingWatch);
-  if (!target) return false;
+  if (!target || target.exited) {
+    if (target && target.exited) pendingWatch = null;
+    return false;
+  }
   const id = pendingWatch;
   if (!openViewer(id, target.title || ('세션 ' + id))) return false;
   pendingWatch = null;
@@ -532,19 +568,31 @@ When creating a view button, add:
 viewBtn.dataset.sessionId = s.id;
 ```
 
-Immediately after `lastSessions` is computed in `renderWorkspaces`, add:
+Immediately after `lastSessions` is computed in `renderWorkspaces`, defer disappearance cleanup until the current render has completed. Capture the watched id and guard the microtask so a newer viewer cannot be closed by the stale task:
 
 ```javascript
-const watched = viewer.watching
-  ? lastSessions.find((session) => session.id === viewer.watching)
+const endedSession = viewer.watching;
+const watched = endedSession
+  ? lastSessions.find((session) => session.id === endedSession)
   : null;
-if (viewer.watching && (!watched || watched.exited)) {
-  requestCloseViewer({
-    rerender: true,
-    notice: '선택한 세션이 종료되었습니다 — 세션 목록으로 돌아왔습니다.',
+if (endedSession && (!watched || watched.exited)) {
+  queueMicrotask(() => {
+    if (viewer.watching !== endedSession) return;
+    requestCloseViewer({
+      rerender: true,
+      notice: '선택한 세션이 종료되었습니다 — 세션 목록으로 돌아왔습니다.',
+    });
   });
 }
 ```
+
+Only active sessions may expose the view action:
+
+```javascript
+if (s.id && !s.exited) {
+```
+
+An exited session remains visible with its status badge but cannot open, receive restored focus, or trigger an open-then-close flash.
 
 Because owned-history cleanup is deferred until `popstate`, the current dashboard render finishes first and cleanup then requests one fresh render with cleared `viewer.watching`. The lifecycle notice intentionally runs after that frame and takes priority over a same-frame server notice.
 

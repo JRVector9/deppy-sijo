@@ -1,0 +1,11 @@
+# 신뢰하지 않는 Relay 데이터 평면의 와이어 계약. **의존성이 없다** — 비밀·E2EE·UI·저장소
+# 어느 것도 여기 들어오지 않는다(의존성 법칙 테스트로 고정). Relay 서버와 브라우저 셸이
+# 같은 바이트를 보게 만드는 것이 이 크레이트의 유일한 목적이다.
+[package]
+name = "relay-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,33 @@
+# Deppy Relay 데이터 평면 (production). TLS는 이 유닛 앞의 edge가 종단한다.
+[Unit]
+Description=Deppy Relay data plane (production)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 자격증명은 파일로만 주입한다 — 명령줄 인자로 넘기면 프로세스 목록에 노출된다.
+EnvironmentFile=/etc/deppy-relay/production.env
+ExecStart=/usr/local/bin/relay-server
+Restart=on-failure
+RestartSec=2
+
+# 최소 권한. Relay는 디스크에 아무것도 쓰지 않는다.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target

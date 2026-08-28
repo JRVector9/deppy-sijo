@@ -231,6 +231,8 @@ mod tests {
             r#"aria-labelledby="viewer-title viewer-session""#,
             r#"role="group" aria-label="터미널 특수키""#,
             r#"aria-label="터미널에 보낼 메시지""#,
+            r#"id="viewer-connection-label""#,
+            r#"id="viewer-connection-detail" class="sr-only""#,
         ] {
             assert!(
                 html.contains(marker),
@@ -243,6 +245,58 @@ mod tests {
             !js.contains("'viewer-close'"),
             "삭제한 close listener가 남음"
         );
+        let connection_tag = html
+            .split(r#"<p id="viewer-connection""#)
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("persistent viewer connection tag 없음");
+        for marker in [
+            r#"role="status""#,
+            r#"aria-live="polite""#,
+            r#"aria-atomic="true""#,
+        ] {
+            assert!(
+                connection_tag.contains(marker),
+                "persistent connection a11y marker 누락: {marker}"
+            );
+        }
+        assert!(
+            !connection_tag.contains(r#"aria-hidden="true""#),
+            "persistent connection status가 보조기술에서 숨겨짐"
+        );
+        let overlay_tag = html
+            .split(r#"<div id="viewer-connection-overlay""#)
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("viewer connection overlay tag 없음");
+        assert!(
+            overlay_tag.contains(r#"aria-hidden="true""#),
+            "visual connection overlay가 보조기술에서 숨겨지지 않음"
+        );
+        for duplicate in [r#"role="status""#, "aria-live"] {
+            assert!(
+                !overlay_tag.contains(duplicate),
+                "visual overlay에 중복 live status marker가 남음: {duplicate}"
+            );
+        }
+        let css = std::str::from_utf8(APP_CSS).unwrap();
+        assert!(
+            css.contains(".sr-only"),
+            "screen-reader-only CSS helper 누락"
+        );
+        for marker in [
+            "connectionStatus: document.getElementById('viewer-connection')",
+            "connectionLabel: document.getElementById('viewer-connection-label')",
+            "connectionDetail: document.getElementById('viewer-connection-detail')",
+            "viewer.connectionLabel.textContent = copy[0];",
+            "viewer.connectionDetail.textContent = copy[1];",
+            "viewer.connectionStatus.className = 'viewer-connection ' + state;",
+        ] {
+            assert!(
+                js.contains(marker),
+                "connection live-region JS marker 누락: {marker}"
+            );
+        }
     }
 
     #[test]
@@ -276,6 +330,7 @@ mod tests {
             "function activateViewerShell()",
             "function finishCloseViewer(",
             "function requestCloseViewer(",
+            "function mergeViewerCloseOptions(",
             "function setViewerClosing(",
             "function stopAllKeyRepeats()",
             "if (viewer.closing) return false;",
@@ -300,6 +355,7 @@ mod tests {
             "function clearViewerCanvas()",
             "function clearStaleViewerHistory()",
             "viewer.pendingClose = options",
+            "viewer.pendingClose = mergeViewerCloseOptions(viewer.pendingClose, options); // merge while awaiting popstate",
             "setViewerClosing(true)",
         ] {
             assert!(
@@ -341,6 +397,9 @@ mod tests {
             "let draftCacheNotice = ''",
             "const closeNotices = [notice, draftCacheNotice]",
             "const RECENT_SEND_TTL_MS = 30_000",
+            "let recentSentExpiryTimer = null;",
+            "function scheduleRecentSentExpiry()",
+            "recentSentExpiryTimer = setTimeout",
             "function saveComposerDraft()",
             "function preserveComposerDraftForTransition()",
             "function loadComposerDraft(",
@@ -348,8 +407,11 @@ mod tests {
             "function discardSessionDraft(",
             "discardDraft: !!(watched && watched.exited)",
             "const recentSentBySession = new Map()",
+            "for (const sessionId of Array.from(recentSentBySession.keys()))",
+            "sessionId === viewer.watching",
             "function canRememberRecentSent(",
             "if (!canRememberRecentSent(target, text))",
+            "scheduleRecentSentExpiry(); // arm journal expiry",
             "const utf8Encoder = new TextEncoder()",
             "const MAX_INPUT_FRAME_BYTES = 512 * 1024",
             "function sendSerialized(",
@@ -358,6 +420,20 @@ mod tests {
             "function restoreDraft(note, sessionId)",
             "if (inputBlocked && !restoreDraft(",
             "연결이 바뀌어 최근 입력을 복원했습니다",
+            "const MAX_TERMINAL_INPUT_LOCKS = 256;",
+            "const TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE =",
+            "const terminalInputBlockedSessions = new Set();",
+            "let terminalInputLockOverflow = false;",
+            "function rememberTerminalInputLock(sessionId)",
+            "terminalInputBlockedSessions.size >= MAX_TERMINAL_INPUT_LOCKS",
+            "terminalInputLockOverflow = true; // fail closed without growing memory",
+            "&& !text.includes(TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE)",
+            "notices.push(TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE);",
+            "&& !terminalInputLockOverflow",
+            "&& !terminalInputBlockedSessions.has(viewer.watching)",
+            "rememberTerminalInputLock(msg.session); // remember non-current terminal lock",
+            "rememberTerminalInputLock(msg.session); // terminal input lock",
+            "terminalInputBlockedSessions.delete(sessionId);",
             "const uploadSession = pickerSession",
             "let pickerSession = null;",
             "let pendingUploadSelection = null;",
@@ -439,6 +515,9 @@ mod tests {
             "viewerScreenRevision += 1",
             "if (renderKey === lastViewerRenderKey) return;",
             "ctx.setTransform(dpr, 0, 0, dpr, 0, 0)",
+            "if (window.visualViewport && window.visualViewport.scale > 1.01) {",
+            "return; // native pan while zoomed",
+            "if (e.ctrlKey) return; // preserve browser pinch zoom",
         ] {
             assert!(
                 js.contains(marker),
@@ -464,12 +543,22 @@ mod tests {
             "max-height: var(--viewer-controls-max-height",
             "overflow-y: auto;",
             "max-height: var(--viewer-composer-max-height",
+            "touch-action: pan-x pan-y pinch-zoom;",
         ] {
             assert!(
                 css.contains(marker),
                 "short viewport controls marker 누락: {marker}"
             );
         }
+        let viewer_canvas_css = css
+            .split(".viewer-wrap canvas {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("viewer canvas CSS block 없음");
+        assert!(
+            !viewer_canvas_css.contains("touch-action: none"),
+            "viewer canvas가 native pinch zoom을 차단함"
+        );
     }
 
     #[test]

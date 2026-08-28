@@ -19,6 +19,10 @@ body {
 .placeholder { font-size: 14px; color: #aaaaaa; line-height: 1.6; margin-bottom: 18px; }
 .hint { font-size: 13px; color: #8a8a8a; }
 .hidden { display: none; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
 
 /* 공통 브랜드/상태 */
 .brand { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -177,7 +181,7 @@ body.viewer-open { overflow: hidden; overscroll-behavior: none; }
   width: 100%; height: 100%; display: flex; align-items: center;
   justify-content: center; overflow: hidden; background: #000;
 }
-.viewer-wrap canvas { display: block; flex: none; touch-action: none; }
+.viewer-wrap canvas { display: block; flex: none; touch-action: pan-x pan-y pinch-zoom; }
 .viewer-overlay, .viewer-privacy-curtain {
   position: absolute; inset: 0; z-index: 3; display: flex;
   flex-direction: column; align-items: center; justify-content: center;

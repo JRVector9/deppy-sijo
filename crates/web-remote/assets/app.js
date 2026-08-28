@@ -216,8 +216,12 @@
         // PTY 입력 큐 압박/거부 — 사유별로 다르게 다룬다 (리뷰 P2-2, P3-1).
         if (!msg.session) break;
         if (msg.session !== viewer.watching) {
+          if (msg.reason === 'closed' || msg.reason === 'unavailable') {
+            rememberTerminalInputLock(msg.session); // remember non-current terminal lock
+          }
           if (msg.reason === 'queue_full' && (msg.queued || 0) === 0) {
             recentSentBySession.delete(msg.session); // stale pressure resolved
+            scheduleRecentSentExpiry();
           } else restoreDraft('', msg.session);
           break;
         }
@@ -271,7 +275,9 @@
     closing: false,
     pendingClose: null,
     connection: 'connecting',
-    connectionLabel: document.getElementById('viewer-connection'),
+    connectionStatus: document.getElementById('viewer-connection'),
+    connectionLabel: document.getElementById('viewer-connection-label'),
+    connectionDetail: document.getElementById('viewer-connection-detail'),
     overlay: document.getElementById('viewer-connection-overlay'),
     overlayTitle: document.getElementById('viewer-overlay-title'),
     overlayDetail: document.getElementById('viewer-overlay-detail'),
@@ -303,7 +309,8 @@
     const connected = state === 'connected';
     const copy = connected ? ['연결됨', ''] : VIEWER_CONNECTION_COPY[state];
     viewer.connectionLabel.textContent = copy[0];
-    viewer.connectionLabel.className = 'viewer-connection ' + state;
+    viewer.connectionDetail.textContent = copy[1];
+    viewer.connectionStatus.className = 'viewer-connection ' + state;
     viewer.overlay.hidden = connected;
     if (!connected) {
       viewer.overlayTitle.textContent = copy[0];
@@ -311,10 +318,12 @@
       stopAllKeyRepeats();
       resetScroll();
       cancelActiveUpload();
-      if (viewer.watching) {
+      for (const sessionId of Array.from(recentSentBySession.keys())) {
         restoreDraft(
-          '연결이 바뀌어 최근 입력을 복원했습니다 — 중복 여부를 확인하세요',
-          viewer.watching,
+          sessionId === viewer.watching
+            ? '연결이 바뀌어 최근 입력을 복원했습니다 — 중복 여부를 확인하세요'
+            : '',
+          sessionId,
         );
       }
       inputBlocked = false; // reset per connection generation
@@ -382,8 +391,20 @@
     queueMicrotask(() => consumePendingWatch(lastSessions));
   }
 
+  function mergeViewerCloseOptions(current = {}, incoming = {}) {
+    return {
+      rerender: current.rerender !== false && incoming.rerender !== false,
+      notice: [current.notice, incoming.notice].filter(Boolean).join(' '),
+      discardDraft: !!(current.discardDraft || incoming.discardDraft),
+    };
+  }
+
   function requestCloseViewer(options = {}) {
-    if (!viewer.watching || viewer.closing) return;
+    if (!viewer.watching) return;
+    if (viewer.closing) {
+      viewer.pendingClose = mergeViewerCloseOptions(viewer.pendingClose, options); // merge while awaiting popstate
+      return;
+    }
     cancelActiveUpload();
     cancelPendingUploadSelection();
     const ownsHistory = !!(history.state && history.state.deppyViewer);
@@ -501,6 +522,10 @@
     if (e.touches.length === 1) lastTouchY = e.touches[0].clientY;
   }, { passive: true });
   viewer.canvas.addEventListener('touchmove', (e) => {
+    if (window.visualViewport && window.visualViewport.scale > 1.01) {
+      lastTouchY = null;
+      return; // native pan while zoomed
+    }
     if (lastTouchY == null || e.touches.length !== 1) return;
     e.preventDefault(); // 페이지 스크롤 대신 터미널 스크롤백
     const y = e.touches[0].clientY;
@@ -511,6 +536,7 @@
   }, { passive: false });
   viewer.canvas.addEventListener('touchend', () => { lastTouchY = null; }, { passive: true });
   viewer.canvas.addEventListener('wheel', (e) => {
+    if (e.ctrlKey) return; // preserve browser pinch zoom
     e.preventDefault();
     // 휠 위(deltaY<0) = 과거로(양수 delta).
     queueScroll(-e.deltaY / (viewer.cellH || 16));
@@ -706,6 +732,11 @@
   const composerAttach = document.getElementById('composer-attach');
   const composerFile = document.getElementById('composer-file');
   let inputBlocked = false;
+  const MAX_TERMINAL_INPUT_LOCKS = 256;
+  const TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE =
+    '세션 종료 상태가 너무 많아 입력을 차단했습니다 — 페이지를 새로고침하세요';
+  const terminalInputBlockedSessions = new Set();
+  let terminalInputLockOverflow = false;
   const MAX_CACHED_DRAFTS = 20;
   const MAX_EVICTED_DRAFT_FLAGS = 256;
   const MAX_DRAFT_CHARS = 256 * 1024;
@@ -720,6 +751,7 @@
   const evictedDraftSessions = new Set();
   let draftCacheNotice = '';
   const RECENT_SEND_TTL_MS = 30_000;
+  let recentSentExpiryTimer = null;
   let composerSession = null;
   let composerRecoveryWarningSession = null;
   const RECOVERY_WARNING = '최근 입력을 복원했습니다 — 중복 여부를 확인하세요.';
@@ -787,20 +819,49 @@
   function discardSessionDraft(sessionId) {
     viewerDrafts.delete(sessionId);
     recentSentBySession.delete(sessionId);
+    scheduleRecentSentExpiry();
     recoveredDraftSessions.delete(sessionId);
     evictedDraftSessions.delete(sessionId);
+    terminalInputBlockedSessions.delete(sessionId);
     if (composerRecoveryWarningSession === sessionId) {
       composerRecoveryWarningSession = null;
     }
   }
 
+  function rememberTerminalInputLock(sessionId) {
+    if (terminalInputBlockedSessions.has(sessionId)) return;
+    if (terminalInputBlockedSessions.size >= MAX_TERMINAL_INPUT_LOCKS) {
+      terminalInputLockOverflow = true; // fail closed without growing memory
+      setComposerNote(TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE);
+      updateComposerEnabled();
+      return;
+    }
+    terminalInputBlockedSessions.add(sessionId);
+  }
+
   function pruneRecentSent(now = Date.now()) {
     const cutoff = now - RECENT_SEND_TTL_MS;
     for (const [sessionId, entries] of recentSentBySession) {
-      const recent = entries.filter((item) => item.at >= cutoff);
+      const recent = entries.filter((item) => item.at > cutoff);
       if (recent.length) recentSentBySession.set(sessionId, recent);
       else recentSentBySession.delete(sessionId);
     }
+    scheduleRecentSentExpiry();
+  }
+
+  function scheduleRecentSentExpiry() {
+    if (recentSentExpiryTimer) clearTimeout(recentSentExpiryTimer);
+    recentSentExpiryTimer = null;
+    let earliest = Infinity;
+    for (const entries of recentSentBySession.values()) {
+      for (const item of entries) earliest = Math.min(earliest, item.at);
+    }
+    if (!Number.isFinite(earliest)) return;
+    const delay = Math.max(0, earliest + RECENT_SEND_TTL_MS - Date.now());
+    recentSentExpiryTimer = setTimeout(() => {
+      recentSentExpiryTimer = null;
+      pruneRecentSent();
+    }, delay);
   }
 
   function canRememberRecentSent(sessionId, text) {
@@ -820,6 +881,7 @@
     recent.push({ text, at: Date.now() });
     recentSentBySession.delete(sessionId);
     recentSentBySession.set(sessionId, recent);
+    scheduleRecentSentExpiry(); // arm journal expiry
   }
 
   function autoGrow() {
@@ -838,6 +900,10 @@
         && !text.includes(RECOVERY_WARNING)) {
       notices.push(RECOVERY_WARNING);
     }
+    if (terminalInputLockOverflow
+        && !text.includes(TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE)) {
+      notices.push(TERMINAL_INPUT_LOCK_OVERFLOW_NOTICE);
+    }
     const message = notices.join(' ');
     composerNote.hidden = !message;
     composerNote.textContent = message;
@@ -849,6 +915,8 @@
       && !viewer.closing
       && !document.hidden
       && viewer.connection === 'connected'
+      && !terminalInputLockOverflow
+      && !terminalInputBlockedSessions.has(viewer.watching)
       && !inputBlocked;
   }
 
@@ -893,8 +961,9 @@
   function restoreDraft(note, sessionId) {
     const cutoff = Date.now() - RECENT_SEND_TTL_MS;
     const recent = (recentSentBySession.get(sessionId) || [])
-      .filter((item) => item.at >= cutoff);
+      .filter((item) => item.at > cutoff);
     recentSentBySession.delete(sessionId);
+    scheduleRecentSentExpiry();
     if (!recent.length) return false;
     const uncertain = recent.map((item) => item.text).join('\n');
     const current = composerSession === sessionId
@@ -932,6 +1001,7 @@
           setComposerNote('입력 대기열이 찼습니다 — 잠시 후 다시 보내세요');
         } else if (!inputBlocked) {
           recentSentBySession.delete(msg.session);
+          scheduleRecentSentExpiry();
           if (composerRecoveryWarningSession !== msg.session) setComposerNote('');
           consumePendingUploadSelection(); // pressure resolved
         }
@@ -940,6 +1010,7 @@
       case 'unavailable':
         // 세션이 끝났거나 쓸 수 없다 — 재시도해도 소용없으니 차단하지 않고 알리기만 한다.
         inputBlocked = false;
+        rememberTerminalInputLock(msg.session); // terminal input lock
         cancelActiveUpload(); // terminal session cannot accept upload
         cancelPendingUploadSelection(); // terminal pressure cannot resume pending upload
         if (!restoreDraft('세션이 종료되어 입력이 전달되지 않았습니다', msg.session)) {

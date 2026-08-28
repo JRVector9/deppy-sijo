@@ -1,5 +1,39 @@
 # Codex handoff
 
+## Task 4 IN PROGRESS — third slice: permission enforcement adapter (2026-08-29)
+
+- **Task 4 is still NOT complete.** Steps 1-3 of the plan are now implemented. What remains is the
+  app startup wiring (`crates/app/src/app.rs`, blocked on the user's uncommitted changes there) and
+  the end-to-end coexistence tests that need that wiring to exist.
+- `relay_client/adapter.rs` enforces device permissions on the Mac **before any side effect**.
+  Hiding controls in the browser is not enforcement — a forged message never touches the UI. Every
+  decrypted command passes through `admit`, and only an `Allow` may reach a runtime command sink,
+  the upload path, or the approval repository. `may_emit` filters the outbound direction so a
+  view-only device never receives approval data, neither the snapshot present at connection time
+  nor any later update.
+- Enforced properties, each with a test: view-only still gets dashboard/viewport/input-pressure
+  traffic; forged input/key/scroll/switch/resolve/upload are refused with a recording executor
+  proving no sink was touched; granting input never implies upload or approval; ordinary allowed
+  traffic does not consume the violation budget; repeated forbidden commands close the channel at
+  exactly `MAX_PERMISSION_VIOLATIONS`; revocation and permission downgrade both apply to the
+  already-open channel immediately; and a protocol-v3 `auth` frame is refused over Relay no matter
+  how broad the device's permissions are.
+- Review round found two items:
+  - **medium, fixed** — `admit_upload()` returned `Allow(ClientMsg::Unwatch)`, so a caller
+    following the contract literally ("execute the allowed command") would have performed an
+    unrelated unwatch. Upload admission now has its own `RelayAdmission::AllowUpload` shape.
+  - **high, rejected as a false positive** — the reviewer proposed splitting `RelayPermissions`
+    so input, key, scroll, and switch each need their own grant. The plan's first-release
+    capability matrix deliberately groups them ("future input grant | key, input, scroll,
+    switch"), and Task 1's contract shipped that way in `e3617ea`. Splitting them would
+    contradict the approved design, so the grouping stands; a test now pins it and cites the
+    matrix so it cannot later be mistaken for an oversight. **If that grouping is ever to change,
+    change the plan first.**
+- Gates: `web-remote` 265 + 3 + 5, workspace 3775 passed / 0 failed across 59 binaries, workspace
+  clippy `-D warnings` exit 0, `cargo fmt --all -- --check`, and both whitespace scans clean.
+- Process note: two `cargo test --workspace` runs were briefly launched writing to the same log
+  file, which produced a nonsense "636 passed" reading. Give each background run its own log path.
+
 ## Task 4 IN PROGRESS — second slice: reconnect worker and WSS transport (2026-08-29)
 
 - **Task 4 is still NOT complete.** This slice adds the bounded reconnect worker and the outbound

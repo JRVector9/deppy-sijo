@@ -299,6 +299,101 @@ mod tests {
     }
 
     #[test]
+    fn 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한다() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        for marker in [
+            "function setViewerConnection(",
+            "viewer.connection === 'connected'",
+            "&& !document.hidden",
+            "inputBlocked = false; // reset per connection generation",
+            "viewer.overlay.hidden = connected",
+            "viewer.privacy.hidden = false",
+            "viewer.privacy.hidden = true",
+            "setViewerConnection('reconnecting')",
+            "setViewerConnection('paused')",
+            "intentionallyClosedSockets.has(socket)",
+            "function isCurrentSocket(",
+            "function stopAllKeyRepeats()",
+            "if (!remoteInputReady()) return;",
+            "const viewerDrafts = new Map()",
+            "composerText.maxLength = MAX_DRAFT_CHARS",
+            "const recoveredDraftSessions = new Set()",
+            "const evictedDraftSessions = new Set()",
+            "evictedDraftSessions.delete(composerSession);",
+            "let composerRecoveryWarningSession = null;",
+            "composerRecoveryWarningSession !== msg.session",
+            "const RECOVERY_WARNING = '최근 입력을 복원했습니다 — 중복 여부를 확인하세요.';",
+            "let draftCacheNotice = ''",
+            "const closeNotices = [notice, draftCacheNotice]",
+            "const RECENT_SEND_TTL_MS = 30_000",
+            "function saveComposerDraft()",
+            "function preserveComposerDraftForTransition()",
+            "function loadComposerDraft(",
+            "setComposerNote(notices.join(' ')); // clear stale note",
+            "function discardSessionDraft(",
+            "discardDraft: !!(watched && watched.exited)",
+            "const recentSentBySession = new Map()",
+            "function canRememberRecentSent(",
+            "if (!canRememberRecentSent(target, text))",
+            "const utf8Encoder = new TextEncoder()",
+            "const MAX_INPUT_FRAME_BYTES = 512 * 1024",
+            "function sendSerialized(",
+            "utf8Encoder.encode(text).byteLength",
+            "utf8Encoder.encode(serializedInput).byteLength",
+            "function restoreDraft(note, sessionId)",
+            "if (inputBlocked && !restoreDraft(",
+            "연결이 바뀌어 최근 입력을 복원했습니다",
+            "const uploadSession = pickerSession",
+            "let pickerSession = null;",
+            "let pendingUploadSelection = null;",
+            "function consumePendingUploadSelection()",
+            "consumePendingUploadSelection(); // pressure resolved",
+            "recentSentBySession.delete(msg.session); // stale pressure resolved",
+            "pickerSession = viewer.watching;",
+            "viewer.watching !== uploadSession",
+            "function cancelActiveUpload()",
+            "cancelActiveUpload(); // terminal session cannot accept upload",
+            "signal: upload.controller.signal",
+            "if (activeUpload !== upload) return;",
+            "if (nextComposerValue.length > MAX_DRAFT_CHARS)",
+            "function projectVisibility()",
+            "if (document.hidden) projectVisibility();",
+        ] {
+            assert!(js.contains(marker), "connection safety marker 누락: {marker}");
+        }
+        assert!(
+            js.matches("if (!isCurrentSocket(socket)) return;").count() >= 2,
+            "old socket open/message generation guard 누락"
+        );
+        assert!(
+            js.matches("if (activeUpload !== upload) return;").count() >= 3,
+            "stale upload continuation guard 누락"
+        );
+        assert!(
+            js.matches(
+                "cancelPendingUploadSelection(); // terminal pressure cannot resume pending upload"
+            )
+            .count()
+                >= 2,
+            "terminal pressure pending upload cancel 누락"
+        );
+        let set_note = js
+            .split("function setComposerNote(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("setComposerNote body 없음");
+        for marker in [
+            "composerRecoveryWarningSession === composerSession",
+            "composerNote.textContent = message;",
+        ] {
+            assert!(
+                set_note.contains(marker),
+                "setComposerNote recovery 합성 marker 누락: {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn 토큰_일치는_앱셸_200() {
         let response = respond("/", &format!("token={TOKEN}"), TOKEN);
         assert_eq!(response.status, 200);

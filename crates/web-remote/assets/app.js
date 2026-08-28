@@ -90,6 +90,11 @@
   let reconnectDelay = 1000;
   let reconnectTimer = null;
   let manualClose = false;
+  const intentionallyClosedSockets = new WeakSet();
+
+  function isCurrentSocket(socket) {
+    return ws === socket && !intentionallyClosedSockets.has(socket);
+  }
 
   function setStatus(cls, text) {
     dot.className = 'dot ' + cls;
@@ -111,6 +116,7 @@
     }
     manualClose = false;
     setStatus('', '연결 중…');
+    setViewerConnection('connecting');
     let socket;
     try {
       socket = new WebSocket(wsUrl());
@@ -121,11 +127,13 @@
     ws = socket;
 
     socket.addEventListener('open', () => {
+      if (!isCurrentSocket(socket)) return;
       reconnectDelay = 1000;
       socket.send(JSON.stringify({ type: 'auth', v: PROTOCOL_VERSION, token }));
     });
 
     socket.addEventListener('message', (event) => {
+      if (!isCurrentSocket(socket)) return;
       let msg;
       try {
         msg = JSON.parse(event.data);
@@ -136,11 +144,12 @@
     });
 
     socket.addEventListener('close', () => {
-      if (ws === socket) ws = null;
-      if (!manualClose) {
-        setStatus('bad', '연결 끊김 — 재연결 중…');
-        scheduleReconnect();
-      }
+      const wasCurrent = ws === socket;
+      if (wasCurrent) ws = null;
+      if (!wasCurrent || intentionallyClosedSockets.has(socket)) return;
+      setStatus('bad', '연결 끊김 — 재연결 중…');
+      setViewerConnection('reconnecting');
+      scheduleReconnect();
     });
 
     socket.addEventListener('error', () => {
@@ -164,8 +173,10 @@
       reconnectTimer = null;
     }
     if (ws) {
-      try { ws.close(); } catch {}
+      const socket = ws;
       ws = null;
+      intentionallyClosedSockets.add(socket);
+      try { socket.close(); } catch {}
     }
   }
 
@@ -181,6 +192,7 @@
           return;
         }
         setStatus('ok', '연결됨');
+        setViewerConnection('connected');
         // 재연결이면 서버 접속 상태(시청)가 초기화됐다 — 보던 세션을 다시 watch한다.
         // 식별자가 영속 UUID라 재시작 뒤에도 같은 세션이 잡힌다 (I1).
         if (viewer.watching) {
@@ -202,7 +214,13 @@
         break;
       case 'input_pressure':
         // PTY 입력 큐 압박/거부 — 사유별로 다르게 다룬다 (리뷰 P2-2, P3-1).
-        if (msg.session !== viewer.watching) break;
+        if (!msg.session) break;
+        if (msg.session !== viewer.watching) {
+          if (msg.reason === 'queue_full' && (msg.queued || 0) === 0) {
+            recentSentBySession.delete(msg.session); // stale pressure resolved
+          } else restoreDraft('', msg.session);
+          break;
+        }
         handleInputPressure(msg);
         break;
       case 'error':
@@ -211,10 +229,18 @@
     }
   }
 
-  function send(msg) {
+  const utf8Encoder = new TextEncoder();
+  const MAX_INPUT_BYTES = 256 * 1024;
+  const MAX_INPUT_FRAME_BYTES = 512 * 1024;
+
+  function sendSerialized(serialized) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify(msg));
+    ws.send(serialized);
     return true;
+  }
+
+  function send(msg) {
+    return sendSerialized(JSON.stringify(msg));
   }
 
   // ── 터미널 뷰어 (P5d) — 읽기 전용 canvas + 최소 제어(Ctrl-C/Enter) ──
@@ -244,6 +270,18 @@
     screen: null,
     closing: false,
     pendingClose: null,
+    connection: 'connecting',
+    connectionLabel: document.getElementById('viewer-connection'),
+    overlay: document.getElementById('viewer-connection-overlay'),
+    overlayTitle: document.getElementById('viewer-overlay-title'),
+    overlayDetail: document.getElementById('viewer-overlay-detail'),
+    privacy: document.getElementById('viewer-privacy-curtain'),
+  };
+
+  const VIEWER_CONNECTION_COPY = {
+    connecting: ['연결 중', '터미널 화면을 준비하고 있습니다.'],
+    reconnecting: ['재연결 중', '마지막 화면을 유지합니다. 연결되기 전에는 입력할 수 없습니다.'],
+    paused: ['일시정지', '앱으로 돌아오면 다시 연결합니다.'],
   };
 
   const keyRepeatCancels = [];
@@ -258,6 +296,31 @@
     inputBlocked = closing;
     for (const button of viewer.keys) button.disabled = closing;
     updateComposerEnabled();
+  }
+
+  function setViewerConnection(state) {
+    viewer.connection = state;
+    const connected = state === 'connected';
+    const copy = connected ? ['연결됨', ''] : VIEWER_CONNECTION_COPY[state];
+    viewer.connectionLabel.textContent = copy[0];
+    viewer.connectionLabel.className = 'viewer-connection ' + state;
+    viewer.overlay.hidden = connected;
+    if (!connected) {
+      viewer.overlayTitle.textContent = copy[0];
+      viewer.overlayDetail.textContent = copy[1];
+      stopAllKeyRepeats();
+      resetScroll();
+      cancelActiveUpload();
+      if (viewer.watching) {
+        restoreDraft(
+          '연결이 바뀌어 최근 입력을 복원했습니다 — 중복 여부를 확인하세요',
+          viewer.watching,
+        );
+      }
+      inputBlocked = false; // reset per connection generation
+    }
+    updateComposerEnabled();
+    if (connected) consumePendingUploadSelection();
   }
 
   function clearViewerCanvas() {
@@ -283,16 +346,24 @@
     });
   }
 
-  function finishCloseViewer({ rerender = true, notice = '' } = {}) {
+  function finishCloseViewer({ rerender = true, notice = '', discardDraft = false } = {}) {
     if (!viewer.watching) return;
     setViewerClosing(true);
     stopAllKeyRepeats();
     const returnSession = viewer.returnSession;
+    if (discardDraft) discardSessionDraft(returnSession);
+    else saveComposerDraft();
+    cancelActiveUpload();
+    cancelPendingUploadSelection();
     send({ type: 'unwatch' });
     viewer.watching = null;
     viewer.returnSession = null;
     viewer.screen = null;
     viewer.pendingClose = null;
+    composerRecoveryWarningSession = null;
+    composerSession = null;
+    composerText.value = '';
+    autoGrow();
     resetScroll();
     updateScrollNote();
     inputBlocked = false;
@@ -302,7 +373,9 @@
     dashboardShell.inert = false;
     dashboardShell.removeAttribute('aria-hidden');
     if (rerender) renderWorkspaces(lastWorkspaces, lastResource);
-    if (notice) showNotice(notice);
+    const closeNotices = [notice, draftCacheNotice].filter(Boolean);
+    draftCacheNotice = '';
+    if (closeNotices.length) showNotice(closeNotices.join(' '));
     setViewerClosing(false);
     restoreViewerFocus(returnSession);
     queueMicrotask(() => consumePendingWatch(lastSessions));
@@ -310,6 +383,8 @@
 
   function requestCloseViewer(options = {}) {
     if (!viewer.watching || viewer.closing) return;
+    cancelActiveUpload();
+    cancelPendingUploadSelection();
     const ownsHistory = !!(history.state && history.state.deppyViewer);
     if (ownsHistory) {
       setViewerClosing(true);
@@ -326,6 +401,9 @@
   function openViewer(sessionId, title) {
     if (!sessionId || viewer.closing || viewer.watching === sessionId) return false;
     stopAllKeyRepeats();
+    preserveComposerDraftForTransition();
+    cancelActiveUpload();
+    cancelPendingUploadSelection();
     setViewerClosing(false);
     viewer.watching = sessionId;
     viewer.returnSession = sessionId;
@@ -335,6 +413,7 @@
     updateScrollNote();
     inputBlocked = false;
     setComposerNote('');
+    loadComposerDraft(sessionId);
     viewer.label.textContent = title || '세션';
     activateViewerShell();
     if (!(history.state && history.state.deppyViewer)) {
@@ -342,7 +421,9 @@
     }
     updateComposerEnabled();
     viewer.back.focus();
-    send({ type: 'watch', session: sessionId });
+    if (viewer.connection === 'connected') {
+      send({ type: 'watch', session: sessionId });
+    }
     return true;
   }
 
@@ -383,13 +464,14 @@
   let lastTouchY = null;
 
   function queueScroll(lines) {
+    if (!remoteInputReady()) return;
     scrollAcc += lines;
     if (scrollTimer) return;
     scrollTimer = setTimeout(() => {
       scrollTimer = null;
       const whole = Math.trunc(scrollAcc);
       scrollAcc -= whole;
-      if (whole !== 0 && viewer.watching) {
+      if (whole !== 0 && remoteInputReady()) {
         send({ type: 'scroll', session: viewer.watching, delta: whole });
       }
     }, 60);
@@ -433,7 +515,7 @@
   document.getElementById('viewer-bottom').addEventListener('click', () => {
     const offset = (viewer.screen && viewer.screen.offset) || 0;
     resetScroll();
-    if (offset > 0 && viewer.watching) {
+    if (offset > 0 && remoteInputReady()) {
       send({ type: 'scroll', session: viewer.watching, delta: -offset });
     }
   });
@@ -513,7 +595,7 @@
   }
 
   function sendKey(key) {
-    if (!viewer.watching) return;
+    if (!remoteInputReady()) return;
     send({ type: 'key', session: viewer.watching, key });
   }
 
@@ -522,15 +604,127 @@
   //   2) 전송 시점에 target을 캡처한다 — 전송 중 세션이 바뀌어도 캡처된 세션으로만 간다.
   //   3) 전송 실패(WS 미연결)면 draft를 비우지 않는다.
   //   4) 큐 압박(InputPressure) 중에는 전송을 막고 배지로 알린다.
-  const MAX_INPUT_BYTES = 256 * 1024; // 서버 상한과 동일
   const composerText = document.getElementById('composer-text');
   const composerSend = document.getElementById('composer-send');
   const composerNote = document.getElementById('composer-note');
   const composerAttach = document.getElementById('composer-attach');
   const composerFile = document.getElementById('composer-file');
   let inputBlocked = false;
-  /// 마지막으로 보낸 입력 — PTY가 거부(backpressure/종료)하면 draft로 되돌린다.
-  let lastSent = null;
+  const MAX_CACHED_DRAFTS = 20;
+  const MAX_EVICTED_DRAFT_FLAGS = 256;
+  const MAX_DRAFT_CHARS = 256 * 1024;
+  const MAX_RECENT_SENDS_PER_SESSION = 32;
+  const MAX_RECENT_SENT_CHARS = MAX_DRAFT_CHARS * 2;
+  const MAX_STORED_DRAFT_CHARS = MAX_DRAFT_CHARS
+    + MAX_RECENT_SENT_CHARS
+    + MAX_RECENT_SENDS_PER_SESSION;
+  const viewerDrafts = new Map();
+  const recentSentBySession = new Map();
+  const recoveredDraftSessions = new Set();
+  const evictedDraftSessions = new Set();
+  let draftCacheNotice = '';
+  const RECENT_SEND_TTL_MS = 30_000;
+  let composerSession = null;
+  let composerRecoveryWarningSession = null;
+  const RECOVERY_WARNING = '최근 입력을 복원했습니다 — 중복 여부를 확인하세요.';
+  composerText.maxLength = MAX_DRAFT_CHARS;
+
+  function setBoundedSessionValue(store, sessionId, value) {
+    store.delete(sessionId);
+    const bounded = typeof value === 'string'
+      ? value.slice(0, MAX_STORED_DRAFT_CHARS)
+      : value;
+    if (bounded) store.set(sessionId, bounded);
+    else if (store === viewerDrafts) recoveredDraftSessions.delete(sessionId);
+    while (store.size > MAX_CACHED_DRAFTS) {
+      const evicted = store.keys().next().value;
+      store.delete(evicted);
+      if (store === viewerDrafts) {
+        recoveredDraftSessions.delete(evicted);
+        evictedDraftSessions.delete(evicted);
+        evictedDraftSessions.add(evicted);
+        while (evictedDraftSessions.size > MAX_EVICTED_DRAFT_FLAGS) {
+          evictedDraftSessions.delete(evictedDraftSessions.values().next().value);
+        }
+        draftCacheNotice = '메모리 제한으로 가장 오래된 세션 초안 1개를 정리했습니다.';
+      }
+    }
+  }
+
+  function saveComposerDraft() {
+    if (!composerSession) return;
+    setBoundedSessionValue(viewerDrafts, composerSession, composerText.value);
+    // 활성 세션의 authoritative textarea를 다시 저장했으므로 이전 eviction 표시는 stale이다.
+    evictedDraftSessions.delete(composerSession);
+    if (composerRecoveryWarningSession === composerSession) {
+      recoveredDraftSessions.add(composerSession);
+    }
+  }
+
+  function preserveComposerDraftForTransition() {
+    if (!composerSession) return;
+    const outgoing = lastSessions.find((session) => session.id === composerSession);
+    if (outgoing && outgoing.exited) discardSessionDraft(composerSession);
+    else saveComposerDraft();
+  }
+
+  function loadComposerDraft(sessionId) {
+    composerSession = sessionId;
+    composerRecoveryWarningSession = null;
+    composerText.value = viewerDrafts.get(sessionId) || '';
+    autoGrow();
+    const notices = [];
+    if (draftCacheNotice) {
+      notices.push(draftCacheNotice);
+      draftCacheNotice = '';
+    }
+    if (evictedDraftSessions.delete(sessionId)) {
+      notices.push('이 세션의 이전 초안을 복원하지 못했습니다.');
+    }
+    if (recoveredDraftSessions.delete(sessionId)) {
+      notices.push(RECOVERY_WARNING);
+      composerRecoveryWarningSession = sessionId;
+    }
+    setComposerNote(notices.join(' ')); // clear stale note
+  }
+
+  function discardSessionDraft(sessionId) {
+    viewerDrafts.delete(sessionId);
+    recentSentBySession.delete(sessionId);
+    recoveredDraftSessions.delete(sessionId);
+    evictedDraftSessions.delete(sessionId);
+    if (composerRecoveryWarningSession === sessionId) {
+      composerRecoveryWarningSession = null;
+    }
+  }
+
+  function pruneRecentSent(now = Date.now()) {
+    const cutoff = now - RECENT_SEND_TTL_MS;
+    for (const [sessionId, entries] of recentSentBySession) {
+      const recent = entries.filter((item) => item.at >= cutoff);
+      if (recent.length) recentSentBySession.set(sessionId, recent);
+      else recentSentBySession.delete(sessionId);
+    }
+  }
+
+  function canRememberRecentSent(sessionId, text) {
+    pruneRecentSent();
+    const recent = recentSentBySession.get(sessionId) || [];
+    if (!recentSentBySession.has(sessionId)
+        && recentSentBySession.size >= MAX_CACHED_DRAFTS) return false;
+    if (recent.length >= MAX_RECENT_SENDS_PER_SESSION) return false;
+    return recent.reduce((sum, item) => sum + item.text.length, 0) + text.length
+      <= MAX_RECENT_SENT_CHARS;
+  }
+
+  function rememberRecentSent(sessionId, text) {
+    const cutoff = Date.now() - RECENT_SEND_TTL_MS;
+    const recent = (recentSentBySession.get(sessionId) || [])
+      .filter((item) => item.at >= cutoff);
+    recent.push({ text, at: Date.now() });
+    recentSentBySession.delete(sessionId);
+    recentSentBySession.set(sessionId, recent);
+  }
 
   function autoGrow() {
     composerText.style.height = 'auto';
@@ -540,55 +734,89 @@
   }
 
   function setComposerNote(text) {
-    composerNote.hidden = !text;
-    if (text) composerNote.textContent = text;
+    const notices = text ? [text] : [];
+    if (composerRecoveryWarningSession === composerSession
+        && !text.includes(RECOVERY_WARNING)) {
+      notices.push(RECOVERY_WARNING);
+    }
+    const message = notices.join(' ');
+    composerNote.hidden = !message;
+    composerNote.textContent = message;
+  }
+
+  function remoteInputReady() {
+    return !!viewer.watching
+      && !viewer.closing
+      && !document.hidden
+      && viewer.connection === 'connected'
+      && !inputBlocked;
   }
 
   function updateComposerEnabled() {
-    const disabled = !viewer.watching || inputBlocked;
-    composerSend.disabled = disabled;
-    composerText.disabled = !viewer.watching;
-    // 첨부(P6d)는 큐 압박과 무관 — 업로드 중에만(uploadBusy) 잠근다.
-    composerAttach.disabled = !viewer.watching || uploadBusy;
+    const ready = remoteInputReady();
+    composerSend.disabled = !ready;
+    composerText.disabled = !ready;
+    composerAttach.disabled = !ready || uploadBusy;
+    for (const button of viewer.keys) button.disabled = !ready;
   }
 
   function sendComposer() {
     // (2) 전송 시점 target 캡처 — 이후 전환돼도 이 세션으로만 간다.
     const target = viewer.watching;
-    if (!target || inputBlocked) return;
+    if (!target || !remoteInputReady()) return;
     const text = composerText.value;
     if (!text) return;
-    // JSON 이스케이프 후 크기로 검사한다 — 제어문자는 \uXXXX로 6배 팽창해 raw 기준
-    // 검사를 통과해도 서버 프레임 상한에 걸려 조용히 버려질 수 있다 (리뷰 P3-2).
-    if (JSON.stringify(text).length > MAX_INPUT_BYTES) {
+    const inputMessage = { type: 'input', session: target, text, submit: true };
+    const serializedInput = JSON.stringify(inputMessage);
+    if (utf8Encoder.encode(text).byteLength > MAX_INPUT_BYTES
+        || utf8Encoder.encode(serializedInput).byteLength > MAX_INPUT_FRAME_BYTES) {
       setComposerNote('입력이 너무 큽니다 (256KB 초과)');
       return;
     }
+    if (!canRememberRecentSent(target, text)) {
+      setComposerNote('최근 전송 확인 중입니다 — 잠시 후 다시 보내세요');
+      return;
+    }
     // (3) 전송 실패면 draft 유지 — send()가 false를 준다(WS 미연결).
-    if (!send({ type: 'input', session: target, text, submit: true })) {
+    if (!sendSerialized(serializedInput)) {
       setComposerNote('연결이 끊겼습니다 — 재연결 후 다시 전송하세요');
       return;
     }
-    // WS 전송 성공 ≠ PTY 수용. 큐가 차 있으면(backpressure) 서버가 입력을 버리고
-    // InputPressure만 보낸다 — 그때 draft를 복원할 수 있게 마지막 본문을 보관한다
-    // (계획 §0.2-3 "전송 실패 시 draft 보존", 리뷰 P2-2).
-    lastSent = { session: target, text, at: Date.now() };
+    rememberRecentSent(target, text);
+    composerRecoveryWarningSession = null;
     setComposerNote('');
     composerText.value = '';
     autoGrow();
   }
 
   /// 큐 거부로 유실된 입력을 composer로 되돌린다(사용자가 재타이핑하지 않게).
-  function restoreDraft(note) {
-    if (!lastSent || lastSent.session !== viewer.watching) return false;
-    // 전송 직후(2s)에 온 거부만 그 입력의 것으로 본다 — 오래된 것은 이미 반영됐다.
-    if (Date.now() - lastSent.at > 2000) return false;
-    if (!composerText.value) {
-      composerText.value = lastSent.text;
+  function restoreDraft(note, sessionId) {
+    const cutoff = Date.now() - RECENT_SEND_TTL_MS;
+    const recent = (recentSentBySession.get(sessionId) || [])
+      .filter((item) => item.at >= cutoff);
+    recentSentBySession.delete(sessionId);
+    if (!recent.length) return false;
+    const uncertain = recent.map((item) => item.text).join('\n');
+    const current = composerSession === sessionId
+      ? composerText.value
+      : (viewerDrafts.get(sessionId) || '');
+    const separator = uncertain && current && !/\s$/.test(uncertain) ? '\n' : '';
+    const restored = uncertain + separator + current;
+    setBoundedSessionValue(viewerDrafts, sessionId, restored);
+    if (composerSession === sessionId) {
+      composerText.value = restored;
       autoGrow();
+      const restoreNotices = [draftCacheNotice, note].filter(Boolean);
+      draftCacheNotice = '';
+      composerRecoveryWarningSession = sessionId;
+      setComposerNote(restoreNotices.join(' '));
+    } else {
+      recoveredDraftSessions.delete(sessionId);
+      recoveredDraftSessions.add(sessionId);
+      while (recoveredDraftSessions.size > MAX_CACHED_DRAFTS) {
+        recoveredDraftSessions.delete(recoveredDraftSessions.values().next().value);
+      }
     }
-    lastSent = null;
-    setComposerNote(note);
     return true;
   }
 
@@ -598,20 +826,33 @@
       case 'queue_full':
         // 큐가 차서 이번 입력이 버려졌다 — 되돌려주고, 빠질 때까지 전송을 막는다.
         inputBlocked = queued > 0;
-        if (!restoreDraft('입력 대기열이 찼습니다 — 잠시 후 다시 보내세요')) {
-          setComposerNote(inputBlocked ? '입력 대기열이 찼습니다 — 잠시 후 다시 보내세요' : '');
+        if (inputBlocked && !restoreDraft(
+            '입력 대기열이 차 최근 입력을 복원했습니다 — 중복 여부를 확인하세요',
+            msg.session)) {
+          setComposerNote('입력 대기열이 찼습니다 — 잠시 후 다시 보내세요');
+        } else if (!inputBlocked) {
+          recentSentBySession.delete(msg.session);
+          if (composerRecoveryWarningSession !== msg.session) setComposerNote('');
+          consumePendingUploadSelection(); // pressure resolved
         }
         break;
       case 'closed':
       case 'unavailable':
         // 세션이 끝났거나 쓸 수 없다 — 재시도해도 소용없으니 차단하지 않고 알리기만 한다.
         inputBlocked = false;
-        restoreDraft('세션이 종료되어 입력이 전달되지 않았습니다');
+        cancelActiveUpload(); // terminal session cannot accept upload
+        cancelPendingUploadSelection(); // terminal pressure cannot resume pending upload
+        if (!restoreDraft('세션이 종료되어 입력이 전달되지 않았습니다', msg.session)) {
+          setComposerNote('세션이 종료되어 입력이 전달되지 않았습니다');
+        }
         break;
       case 'too_large':
         // 해소 이벤트가 오지 않는 종류다(runtime이 재시도 큐에 넣지 않음) — 잠그지 않는다.
         inputBlocked = false;
-        restoreDraft('입력이 너무 커서 전달되지 않았습니다');
+        cancelPendingUploadSelection(); // terminal pressure cannot resume pending upload
+        if (!restoreDraft('입력이 너무 커서 전달되지 않았습니다', msg.session)) {
+          setComposerNote('입력이 너무 커서 전달되지 않았습니다');
+        }
         break;
       default:
         inputBlocked = queued > 0;
@@ -625,6 +866,23 @@
   // 보내지 않는다) — 사용자가 문맥과 함께 전송해야 에이전트에 전달된다(전송은 별도 동작).
   const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 서버 상한과 동일
   let uploadBusy = false;
+  let activeUpload = null;
+  let pickerSession = null;
+  let pendingUploadSelection = null;
+
+  function cancelActiveUpload() {
+    if (!activeUpload) return;
+    activeUpload.controller.abort();
+    activeUpload = null;
+    uploadBusy = false;
+    setComposerNote('');
+    updateComposerEnabled();
+  }
+
+  function cancelPendingUploadSelection() {
+    pickerSession = null;
+    pendingUploadSelection = null;
+  }
 
   function uploadErrorNote(status) {
     if (status === 401) return '인증이 만료됐습니다 — 다시 페어링하세요';
@@ -636,22 +894,30 @@
 
   composerAttach.addEventListener('click', () => {
     if (composerAttach.disabled) return;
+    pickerSession = viewer.watching;
     composerFile.click();
   });
 
-  composerFile.addEventListener('change', async () => {
-    const file = composerFile.files && composerFile.files[0];
-    composerFile.value = ''; // 같은 파일 재선택도 change가 발화하게 초기화
-    if (!file) return;
-    if (file.size > MAX_UPLOAD_BYTES) {
-      setComposerNote('파일이 너무 큽니다 (10MB 초과)');
+  function consumePendingUploadSelection() {
+    if (!pendingUploadSelection || !remoteInputReady()) return;
+    const pending = pendingUploadSelection;
+    if (viewer.watching !== pending.session) {
+      pendingUploadSelection = null;
       return;
     }
+    pendingUploadSelection = null;
+    beginSelectedUpload(pending.session, pending.file);
+  }
+
+  async function beginSelectedUpload(uploadSession, file) {
+    if (viewer.watching !== uploadSession || !remoteInputReady()) return;
     const tokenValue = localStorage.getItem(TOKEN_KEY);
     if (!tokenValue) {
       setComposerNote('토큰이 없습니다 — 다시 페어링하세요');
       return;
     }
+    const upload = { session: uploadSession, controller: new AbortController() };
+    activeUpload = upload;
     uploadBusy = true;
     updateComposerEnabled();
     setComposerNote('업로드 중…');
@@ -660,31 +926,78 @@
         method: 'POST',
         headers: { 'Content-Type': file.type || 'application/octet-stream' },
         body: file,
+        signal: upload.controller.signal,
       });
+      if (activeUpload !== upload) return;
       if (!res.ok) {
         setComposerNote(uploadErrorNote(res.status));
         return;
       }
       const result = await res.json();
+      if (activeUpload !== upload) return;
       if (!result || typeof result.path !== 'string' || !result.path) {
         setComposerNote('업로드 응답이 올바르지 않습니다');
         return;
       }
+      if (activeUpload !== upload) return;
+      if (viewer.watching !== uploadSession || !remoteInputReady()) {
+        setComposerNote('연결 또는 세션이 바뀌어 업로드 경로를 입력하지 않았습니다');
+        return;
+      }
       // 기존 입력에 이어 붙인다(신뢰경계: value 대입만 — innerHTML 아님). 사용자가 문맥과
       // 함께 전송한다(데스크톱 이미지 paste와 동일 종단 — 에이전트가 경로를 읽는다).
-      const sep = composerText.value && !/\s$/.test(composerText.value) ? '\n' : '';
-      composerText.value += sep + result.path + ' ';
+      const separator = composerText.value && !/\s$/.test(composerText.value) ? '\n' : '';
+      const nextComposerValue = composerText.value + separator + result.path + ' ';
+      if (nextComposerValue.length > MAX_DRAFT_CHARS) {
+        setComposerNote('입력이 너무 길어 업로드 경로를 추가하지 않았습니다');
+        return;
+      }
+      composerText.value = nextComposerValue;
       autoGrow();
       setComposerNote('');
-    } catch {
-      setComposerNote('업로드 실패 — 네트워크를 확인하세요');
+    } catch (error) {
+      if (activeUpload !== upload) return;
+      if (!(error && error.name === 'AbortError')) {
+        setComposerNote('업로드 실패 — 네트워크를 확인하세요');
+      }
     } finally {
-      uploadBusy = false;
-      updateComposerEnabled();
+      if (activeUpload === upload) {
+        activeUpload = null;
+        uploadBusy = false;
+        updateComposerEnabled();
+      }
     }
+  }
+
+  composerFile.addEventListener('change', () => {
+    const uploadSession = pickerSession;
+    pickerSession = null;
+    const file = composerFile.files && composerFile.files[0];
+    composerFile.value = '';
+    if (!file) return;
+    if (!uploadSession || viewer.watching !== uploadSession) {
+      setComposerNote('세션이 바뀌어 선택한 파일을 업로드하지 않았습니다');
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setComposerNote('파일이 너무 큽니다 (10MB 초과)');
+      return;
+    }
+    if (!remoteInputReady()) {
+      pendingUploadSelection = { session: uploadSession, file };
+      setComposerNote('재연결 후 선택한 파일을 업로드합니다…');
+      return;
+    }
+    beginSelectedUpload(uploadSession, file);
   });
 
-  composerText.addEventListener('input', autoGrow);
+  composerText.addEventListener('input', () => {
+    if (composerRecoveryWarningSession) {
+      composerRecoveryWarningSession = null;
+      setComposerNote('');
+    }
+    autoGrow();
+  });
   composerText.addEventListener('keydown', (e) => {
     // 모바일: Enter는 줄바꿈(오전송 방지). 데스크톱 브라우저: Cmd/Ctrl-Enter로 전송.
     // IME 조합 중(한글 등)에는 전송하지 않는다 — 미확정 텍스트가 나간다 (리뷰 P3-5).
@@ -936,6 +1249,9 @@
     lastWorkspaces = workspaces;
     if (resource) lastResource = resource;
     lastSessions = workspaces.flatMap((ws) => ws.sessions || []).filter((s) => s.id);
+    for (const session of lastSessions) {
+      if (session.exited) discardSessionDraft(session.id);
+    }
     const endedSession = viewer.watching;
     const watched = endedSession
       ? lastSessions.find((session) => session.id === endedSession)
@@ -946,6 +1262,7 @@
         requestCloseViewer({
           rerender: true,
           notice: '선택한 세션이 종료되었습니다 — 세션 목록으로 돌아왔습니다.',
+          discardDraft: !!(watched && watched.exited),
         });
       });
     }
@@ -1152,14 +1469,20 @@
   }
 
   // 탭 백그라운드 시 스트림 정지(서버 접속 종료 → 0연결 예산 준수). 포그라운드 복귀 시 재연결.
-  document.addEventListener('visibilitychange', () => {
+  function projectVisibility() {
     if (document.hidden) {
+      if (viewer.watching) viewer.privacy.hidden = false;
+      setViewerConnection('paused');
       disconnect();
       setStatus('', '일시정지(백그라운드)');
     } else {
+      viewer.privacy.hidden = true;
+      setViewerConnection('connecting');
       connect();
     }
-  });
+  }
 
-  connect();
+  document.addEventListener('visibilitychange', projectVisibility);
+  if (document.hidden) projectVisibility();
+  else connect();
 })();

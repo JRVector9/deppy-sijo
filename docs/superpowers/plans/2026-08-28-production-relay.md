@@ -162,9 +162,21 @@ trusted-clock, mutex, and single-snapshot changes; a pre-correction GREEN is not
 
 The relay may know protocol version, rendezvous/device routing handle, connection id, sequence, ciphertext length, and liveness timestamps. It must not receive device display names, permissions, session ids, workspace names, terminal contents, input, approval previews, or upload filenames in plaintext. It must not host or proxy the mobile shell.
 
+The pre-E2EE signed identity/ephemeral hello is one bounded opaque handshake record, maximum 512
+bytes, that the Relay forwards byte-for-byte without parsing or logging. Therefore the precise
+invariant is that the Relay never receives **application plaintext**; after activation every
+application record is AES-GCM ciphertext. Do not claim the initial signed hello itself is encrypted
+unless a separate pre-key/HPKE design is added.
+
 ### Step 2: Implement bounded rendezvous and forwarding
 
 Require TLS at the deployment edge. Define a separate opaque Mac admission credential and pairing-ticket admission policy before allocating rendezvous/queue resources; apply per-credential and per-IP rate limits without logging secrets. Bound connections per account/device, frame bytes, idle time, pairing attempts, and outbound queues. Apply backpressure by disconnecting a slow peer; never buffer without limit.
+
+Version 1 is single-instance unless a shared route/ticket/connection store is explicitly selected
+and tested. Before production composition, decide who provisions and rotates the Mac admission
+verifier, plus the exact staging/production domain, registry, TLS edge, trusted Origin, GitHub
+environments, and secret names. Local protocol/server work may proceed without inventing those
+coordinates, but publish/deploy must remain blocked until they exist.
 
 ### Step 3: Add abuse and confidentiality tests
 

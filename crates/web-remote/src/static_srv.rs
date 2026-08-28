@@ -208,6 +208,35 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
+    fn 앱셸은_대시보드와_전체화면_뷰어를_형제로_둔다() {
+        let response = respond("/", &format!("token={TOKEN}"), TOKEN);
+        let html = String::from_utf8(response.body.into_owned()).unwrap();
+        let main_close = html.find("</main>").expect("dashboard </main> 없음");
+        let viewer_open = html
+            .find(r#"<section id="viewer""#)
+            .expect("viewer section 없음");
+        assert!(viewer_open > main_close, "viewer는 inert dashboard 뒤의 형제여야 함");
+        for marker in [
+            r#"<main id="dashboard-shell" class="app">"#,
+            r#"class="viewer-shell""#,
+            r#"role="dialog""#,
+            r#"aria-modal="true""#,
+            r#"id="viewer-back""#,
+            r#"id="viewer-stage""#,
+            r#"id="viewer-connection-overlay""#,
+            r#"id="viewer-privacy-curtain""#,
+            r#"aria-labelledby="viewer-title viewer-session""#,
+            r#"role="group" aria-label="터미널 특수키""#,
+            r#"aria-label="터미널에 보낼 메시지""#,
+        ] {
+            assert!(html.contains(marker), "전체화면 viewer marker 누락: {marker}");
+        }
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        assert!(js.contains("'viewer-back'"), "새 back listener 누락");
+        assert!(!js.contains("'viewer-close'"), "삭제한 close listener가 남음");
+    }
+
+    #[test]
     fn 토큰_일치는_앱셸_200() {
         let response = respond("/", &format!("token={TOKEN}"), TOKEN);
         assert_eq!(response.status, 200);

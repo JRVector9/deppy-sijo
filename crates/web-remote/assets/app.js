@@ -636,7 +636,7 @@
     }
   }
 
-  document.getElementById('viewer-close').addEventListener('click', closeViewer);
+  document.getElementById('viewer-back').addEventListener('click', closeViewer);
   // 회전/리사이즈 시 현재 화면 모델로 canvas를 다시 맞춘다 — 다음 프레임을 기다리지
   // 않는다 (유휴 세션이면 무기한 옛 폭 고정, P5 리뷰 P3). screen 없으면 no-op.
   window.addEventListener('resize', () => drawScreen());

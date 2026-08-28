@@ -25,6 +25,7 @@ Changing the three assets automatically changes the existing shell content hash.
 **Files:**
 - Modify: `crates/web-remote/src/static_srv.rs:220-410`
 - Modify: `crates/web-remote/assets/index.html:20-99`
+- Modify: `crates/web-remote/assets/app.js:630-645`
 
 - [ ] **Step 1: Write the failing sibling and accessibility contract**
 
@@ -52,6 +53,9 @@ fn 앱셸은_대시보드와_전체화면_뷰어를_형제로_둔다() {
     ] {
         assert!(html.contains(marker), "전체화면 viewer marker 누락: {marker}");
     }
+    let js = std::str::from_utf8(APP_JS).unwrap();
+    assert!(js.contains("'viewer-back'"), "새 back listener 누락");
+    assert!(!js.contains("'viewer-close'"), "삭제한 close listener가 남음");
 }
 ```
 
@@ -131,6 +135,12 @@ Remove the old inline viewer section, close `main` after the sessions panel, and
 
 Do not retain `#viewer-close`; `#viewer-back` is the single explicit exit control.
 
+In the same step, keep the current `closeViewer` lifecycle temporarily but move its listener to the new button so the shell remains runnable before Task 3 replaces the lifecycle:
+
+```javascript
+document.getElementById('viewer-back').addEventListener('click', closeViewer);
+```
+
 - [ ] **Step 4: Run the focused test and verify GREEN**
 
 Run the Step 2 command again. Expected: the matching test PASS.
@@ -138,7 +148,7 @@ Run the Step 2 command again. Expected: the matching test PASS.
 - [ ] **Step 5: Commit the DOM boundary**
 
 ```bash
-git add crates/web-remote/src/static_srv.rs crates/web-remote/assets/index.html
+git add crates/web-remote/src/static_srv.rs crates/web-remote/assets/index.html crates/web-remote/assets/app.js
 git commit -m "feat(web-remote): separate full-screen viewer shell"
 ```
 

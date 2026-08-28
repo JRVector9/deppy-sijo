@@ -21,8 +21,14 @@ storage = { path = "../storage" }
 # WS JSON 프로토콜(브라우저 친화) — postcard 바이너리는 데스크톱 원격 전용으로 유지.
 serde = { workspace = true }
 serde_json = { workspace = true }
-# sync WebSocket. default-features=false(TLS off)에 handshake만 켜 derive_accept_key 사용.
-tungstenite = { workspace = true, features = ["handshake"] }
+# sync WebSocket. loopback 경로는 handshake만 쓴다(TLS는 tailscale serve가 종단).
+# Relay 클라이언트(Task 4)는 바깥으로 wss만 연다 — 그래서 rustls를 **컴파일된 WebPKI 루트로만**
+# 켠다. `rustls-tls-native-roots`나 `native-tls`는 절대 켜지 않는다: 시스템 신뢰 저장소를 쓰면
+# 기기에 심어진 임의 CA가 Relay 종단을 가로챌 수 있고, 그건 E2EE 밖의 메타데이터가 새는 길이다.
+tungstenite = { workspace = true, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
 # P4 웹푸시 암호 스택 — RustCrypto **sync** 계열만(tokio/async 크레이트 금지). VAPID JWT(ES256)와
 # RFC 8291 ECDH(P-256)에 p256, HKDF-SHA256에 hkdf, aes128gcm 레코드에 aes-gcm, base64url 인코딩에
 # base64. sha2/ureq는 워크스페이스 lock 기존(HKDF의 SHA-256, 발송 POST). 엔트로피는 getrandom(sync).

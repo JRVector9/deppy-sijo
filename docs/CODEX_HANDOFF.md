@@ -1,5 +1,46 @@
 # Codex handoff
 
+## Task 4 IN PROGRESS — second slice: reconnect worker and WSS transport (2026-08-29)
+
+- **Task 4 is still NOT complete.** This slice adds the bounded reconnect worker and the outbound
+  WSS transport. The permission-enforcing message adapter (Step 3) and the app startup wiring are
+  still missing. Do not report Task 4 as passing.
+- `relay_client/worker.rs` — one owner thread does connect, receive, and retry. The command queue
+  is bounded (32) and rejects rather than growing or blocking. Every wait is cancellable through a
+  condition variable, so disabling mid-backoff does not wait the delay out. `shutdown` sets the
+  stop flag, wakes the thread, and joins; `Drop` does the same and both are safe to call twice.
+  Transport is injected as a trait, so retry, halt, and cancellation behaviour is tested without a
+  network at all.
+- `relay_client/tls.rs` — outbound WSS only. Trust is the **compiled WebPKI root set alone**:
+  `tungstenite` is built with `rustls-tls-webpki-roots` and the connector argument is left `None`
+  so no custom verifier can be introduced. Source laws forbid native-tls, native/system roots,
+  private CAs, and any `dangerous`/`insecure` verifier path, and a manifest law checks the feature
+  selection (reading directives only — the comment there names the forbidden features in order to
+  explain them).
+- Direct review, two rounds. Round 1 found four defects, all real, all fixed:
+  1. **high** — DNS used blocking `to_socket_addrs` with no deadline, so a stalled resolver pinned
+     the owner thread and blocked shutdown. Lookups now run on a short-lived thread while the
+     caller waits with `recv_timeout`.
+  2. **high** — the TLS/WebSocket handshake used fixed socket timeouts, so it could run far past
+     the connect deadline after TCP had consumed most of the budget. The remaining budget is now
+     recomputed immediately before the handshake and applied to both directions.
+  3. **high** — `receive(timeout)` ignored its argument and used a fixed 30-second constant, so a
+     disable or shutdown during a read was not noticed for up to 30 seconds. The session now
+     applies the worker's timeout to the underlying `TcpStream` (reached through `MaybeTlsStream`)
+     and the fixed constant was deleted.
+  4. **medium** — `Wake::wait` lost a signal delivered just before the wait, so a disable racing
+     the wait still slept a full poll interval. It now checks and clears the flag under the lock
+     first.
+  Round 2 confirmed all four closed and found one more **medium**: abandoned DNS threads could
+  grow without bound if the resolver never returned. My own comment had claimed backoff prevented
+  this — it bounds the *rate*, not the outstanding total. There is now a hard cap of two
+  concurrent lookups, checked before the thread is spawned, with the slot returned on completion.
+- Gates after every fix: `web-remote` 251 + 3 + 5, workspace 3763 passed / 0 failed, workspace
+  clippy `-D warnings` exit 0, `cargo fmt --all -- --check`, and both whitespace scans clean.
+- Note for the next slice: `MAX_RELAY_FRAME_BYTES` in `tls.rs` is now asserted equal to
+  `relay::crypto::MAX_RELAY_CIPHERTEXT_BYTES + 52`. The remaining cross-crate gap is with
+  `relay_protocol::MAX_CIPHERTEXT_BYTES`, which still has no compile-time tie.
+
 ## Task 4 IN PROGRESS — first slice only (2026-08-29)
 
 - **Task 4 is NOT complete.** This slice covers Step 1 (transport-neutral core extraction,

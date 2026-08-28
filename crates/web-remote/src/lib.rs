@@ -32,6 +32,7 @@ pub mod http;
 pub mod pairing;
 pub mod protocol;
 pub mod push;
+pub mod relay;
 pub mod repository;
 pub mod static_srv;
 pub mod upload;

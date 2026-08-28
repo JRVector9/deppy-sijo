@@ -140,6 +140,7 @@ dependencies = [
  "cipher",
  "cpubits",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -154,6 +155,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -613,6 +615,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -1224,6 +1227,7 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -1943,6 +1947,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -3733,6 +3738,7 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.0",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -5587,12 +5593,15 @@ dependencies = [
 name = "web-remote"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "anyhow",
  "base64",
  "deppy-core",
  "getrandom 0.4.3",
+ "ghash",
  "hkdf",
+ "hmac",
  "p256",
  "runtime",
  "secret",
@@ -5600,10 +5609,12 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "storage",
+ "subtle",
  "tracing",
  "tungstenite",
  "ureq",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

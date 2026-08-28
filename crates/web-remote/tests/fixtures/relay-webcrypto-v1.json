@@ -1,0 +1,74 @@
+{
+  "connection_id_hex": "636f6e6e656374696f6e2d612d303031",
+  "desktop": {
+    "ephemeral_private_jwk": {
+      "crv": "P-256",
+      "d": "REREREREREREREREREREREREREREREREREREREREREQ",
+      "ext": true,
+      "key_ops": ["deriveBits"],
+      "kty": "EC",
+      "x": "WzaJDay9fJqWu3Sh7iiz0tdbcuCaIO8lz45v2KnwNQ0",
+      "y": "DhS-2NRoKjTYNTi9_1uW6JpmZuwNtXRdAvoSEAct91o"
+    },
+    "ephemeral_public_sec1_hex": "045b36890dacbd7c9a96bb74a1ee28b3d2d75b72e09a20ef25cf8e6fd8a9f0350d0e14bed8d4682a34d83538bdff5b96e89a6666ec0db5745d02fa1210072df75a",
+    "identity_private_jwk": {
+      "crv": "P-256",
+      "d": "ERERERERERERERERERERERERERERERERERERERERERE",
+      "ext": true,
+      "key_ops": ["sign"],
+      "kty": "EC",
+      "x": "AhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0",
+      "y": "GUp968uXcS0t2jyoWqh2Wlb0X8dYWZZS8ol8ZTBuV5Q"
+    },
+    "identity_public_sec1_hex": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+    "role": "desktop",
+    "signature_raw_hex": "56e50c88e78918267993c06cdd01361e8ea25b5a3dc18be4850aa5ad8c398e730a4c9c4fe232bc83fef8c5931d65301fc768f23dacfc31a65fbb4d0a8bdc664e"
+  },
+  "desktop_to_device": {
+    "aad_hex": "64657070792d72656c61792d656e76656c6f70652d6161642d76310000000001636f6e6e656374696f6e2d612d3030312bad0fd610d99eae443e932a26142bca1e5fa995b4518452827e78ef1f317ff06fc66a90486171ca69b512be185d66a763a68ff2d34cda639e78cff9e98caeab01000000000000000000000029",
+    "ciphertext_and_tag_hex": "e6cbdafa516df075c5cf538419bd5c764be79bbc4e71d77f135b05dd76f218f215a4b4f80a30dda24c",
+    "direction": "desktop-to-device",
+    "nonce_hex": "443244560000000000000000",
+    "plaintext_hex": "62726f777365722d64656372797074732d727573742d643264",
+    "sequence": 0
+  },
+  "desktop_to_device_key_hex": "024786538ca93fa028383c919e7a846ace597e157b6bed79d091a82cb17b8263",
+  "device": {
+    "ephemeral_private_jwk": {
+      "crv": "P-256",
+      "d": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU",
+      "ext": true,
+      "key_ops": ["deriveBits"],
+      "kty": "EC",
+      "x": "V-l39tt-M8P-es8oQu2YcAnK9W1FhoL8pEe309diqzQ",
+      "y": "xas3cLpXO9_1QUBlZA_7WzRt-oTexNtNaOX1nMRxwuw"
+    },
+    "ephemeral_public_sec1_hex": "0457e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34c5ab3770ba573bdff5414065640ffb5b346dfa84dec4db4d68e5f59cc471c2ec",
+    "identity_private_jwk": {
+      "crv": "P-256",
+      "d": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+      "ext": true,
+      "key_ops": ["sign"],
+      "kty": "EC",
+      "x": "1lqTl3yqPRsIGFL_V6eeRl8WYFdzBLrq1QXdOkhYnPM",
+      "y": "UBheiVNy32Ih6joTdVfkc_3bZ1XwW9UHw8Uz_OnJEoU"
+    },
+    "identity_public_sec1_hex": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+    "role": "device",
+    "signature_raw_hex": "8e17c4045f449b650d6015ee928904dfcf854594eeabcda59a3a3a6846409934412a1912144e9fa02e937f7ce946bbe630c1885daa9fcca135c26ff41e791862"
+  },
+  "device_to_desktop": {
+    "aad_hex": "64657070792d72656c61792d656e76656c6f70652d6161642d76310000000001636f6e6e656374696f6e2d612d3030316fc66a90486171ca69b512be185d66a763a68ff2d34cda639e78cff9e98caeab2bad0fd610d99eae443e932a26142bca1e5fa995b4518452827e78ef1f317ff002000000000000000000000028",
+    "ciphertext_and_tag_hex": "0b9de8bfb5f5d332c0bc74c3d11700bd4b4fd62c697d9f1daeea7e38891881c52c9c4d3a3686ae4a",
+    "direction": "device-to-desktop",
+    "nonce_hex": "563244530000000000000000",
+    "plaintext_hex": "ebb88ceb9dbcec9ab0eca080ec9980205275737420563244",
+    "sequence": 0
+  },
+  "device_to_desktop_key_hex": "0939da44de5b079bd44ab9e50c86f7c5cf4fb3e21acb33f37427a5d2ff3892fd",
+  "hkdf_salt_hex": "b55f31a2026d3a01648ec332bb27a24086642710a99c2085a06816d23da9ae77",
+  "protocol_version": 1,
+  "sas": "581760",
+  "shared_secret_hex": "f05172058ca0efd6258338b6d64a4efaf0ecf7e65e9d6c51337e3aa3017dc7ed",
+  "transcript_hex": "64657070792d72656c61792d68616e647368616b652d76310000000001636f6e6e656374696f6e2d612d30303101040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045b36890dacbd7c9a96bb74a1ee28b3d2d75b72e09a20ef25cf8e6fd8a9f0350d0e14bed8d4682a34d83538bdff5b96e89a6666ec0db5745d02fa1210072df75a0204d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c912850457e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34c5ab3770ba573bdff5414065640ffb5b346dfa84dec4db4d68e5f59cc471c2ec"
+}

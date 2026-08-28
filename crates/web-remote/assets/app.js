@@ -220,41 +220,140 @@
   // ── 터미널 뷰어 (P5d) — 읽기 전용 canvas + 최소 제어(Ctrl-C/Enter) ──
   // 서버 프레임(P5c): keyframe=전체 행, delta=바뀐 행만. 클라는 행별 run 배열을
   // 화면 모델로 유지하고 매 프레임 전체를 다시 그린다(80×24 fillText는 ~ms — 단순 우선).
+  const dashboardShell = document.getElementById('dashboard-shell');
+  const sessionsTitle = document.getElementById('sessions-title');
+
+  function clearStaleViewerHistory() {
+    if (!(history.state && history.state.deppyViewer)) return;
+    const cleanState = { ...history.state };
+    delete cleanState.deppyViewer;
+    history.replaceState(Object.keys(cleanState).length ? cleanState : null, '', location.href);
+  }
+
+  clearStaleViewerHistory();
+
   const viewer = {
     el: document.getElementById('viewer'),
     label: document.getElementById('viewer-session'),
     canvas: document.getElementById('viewer-canvas'),
-    watching: null, // 시청 중 세션 id
-    screen: null,   // { cols, rows, lines: Array<runs>, cursor, alt } — null이면 keyframe 대기
+    wrap: document.querySelector('#viewer .viewer-wrap'),
+    back: document.getElementById('viewer-back'),
+    keys: Array.from(document.querySelectorAll('.viewer-keys button')),
+    watching: null,
+    returnSession: null,
+    screen: null,
+    closing: false,
+    pendingClose: null,
   };
+
+  const keyRepeatCancels = [];
+
+  function stopAllKeyRepeats() {
+    for (const cancel of keyRepeatCancels) cancel();
+  }
+
+  function setViewerClosing(closing) {
+    viewer.closing = closing;
+    viewer.back.disabled = closing;
+    inputBlocked = closing;
+    for (const button of viewer.keys) button.disabled = closing;
+    updateComposerEnabled();
+  }
+
+  function clearViewerCanvas() {
+    const canvas = viewer.canvas;
+    const context = canvas.getContext('2d');
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.fillStyle = '#000000';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  function activateViewerShell() {
+    dashboardShell.inert = true;
+    dashboardShell.setAttribute('aria-hidden', 'true');
+    document.body.classList.add('viewer-open');
+    viewer.el.hidden = false;
+  }
+
+  function restoreViewerFocus(sessionId) {
+    queueMicrotask(() => {
+      const button = Array.from(document.querySelectorAll('.view-btn'))
+        .find((item) => item.dataset.sessionId === sessionId);
+      (button || sessionsTitle).focus();
+    });
+  }
+
+  function finishCloseViewer({ rerender = true, notice = '' } = {}) {
+    if (!viewer.watching) return;
+    setViewerClosing(true);
+    stopAllKeyRepeats();
+    const returnSession = viewer.returnSession;
+    send({ type: 'unwatch' });
+    viewer.watching = null;
+    viewer.returnSession = null;
+    viewer.screen = null;
+    viewer.pendingClose = null;
+    resetScroll();
+    updateScrollNote();
+    inputBlocked = false;
+    setComposerNote('');
+    viewer.el.hidden = true;
+    document.body.classList.remove('viewer-open');
+    dashboardShell.inert = false;
+    dashboardShell.removeAttribute('aria-hidden');
+    if (rerender) renderWorkspaces(lastWorkspaces, lastResource);
+    if (notice) showNotice(notice);
+    setViewerClosing(false);
+    restoreViewerFocus(returnSession);
+    queueMicrotask(() => consumePendingWatch(lastSessions));
+  }
+
+  function requestCloseViewer(options = {}) {
+    if (!viewer.watching || viewer.closing) return;
+    const ownsHistory = !!(history.state && history.state.deppyViewer);
+    if (ownsHistory) {
+      setViewerClosing(true);
+      viewer.pendingClose = options;
+      stopAllKeyRepeats();
+      resetScroll();
+      history.back();
+      return;
+    }
+    finishCloseViewer(options);
+  }
 
   /// `sessionId`는 영속 UUID 문자열이다 (I1).
   function openViewer(sessionId, title) {
+    if (!sessionId || viewer.closing || viewer.watching === sessionId) return false;
+    stopAllKeyRepeats();
+    setViewerClosing(false);
     viewer.watching = sessionId;
+    viewer.returnSession = sessionId;
     viewer.screen = null;
+    clearViewerCanvas();
     resetScroll();
     updateScrollNote();
     inputBlocked = false;
     setComposerNote('');
-    updateComposerEnabled();
     viewer.label.textContent = title || '세션';
-    viewer.el.hidden = false;
+    activateViewerShell();
+    if (!(history.state && history.state.deppyViewer)) {
+      history.pushState({ ...(history.state || {}), deppyViewer: true }, '', location.href);
+    }
+    updateComposerEnabled();
+    viewer.back.focus();
     send({ type: 'watch', session: sessionId });
-    viewer.el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return true;
   }
 
-  function closeViewer() {
-    if (!viewer.watching) return;
-    viewer.watching = null;
-    viewer.screen = null;
-    resetScroll();
-    updateScrollNote();
-    inputBlocked = false;
-    setComposerNote('');
-    updateComposerEnabled();
-    viewer.el.hidden = true;
-    send({ type: 'unwatch' });
-  }
+  viewer.back.addEventListener('click', () => requestCloseViewer());
+  window.addEventListener('popstate', () => {
+    if (viewer.watching && !(history.state && history.state.deppyViewer)) {
+      finishCloseViewer(viewer.pendingClose || {});
+    } else if (!viewer.watching && history.state && history.state.deppyViewer) {
+      clearStaleViewerHistory();
+    }
+  });
 
   function handleViewport(msg) {
     if (msg.session !== viewer.watching) return; // 전환 직후 이전 세션의 잔여 프레임
@@ -602,15 +701,21 @@
     const key = btn.dataset.key;
     let repeatTimer = null;
     let repeatInterval = null;
+    let repeated = false;
+    let pointerActive = false;
     const stopRepeat = () => {
       clearTimeout(repeatTimer);
       clearInterval(repeatInterval);
       repeatTimer = null;
       repeatInterval = null;
     };
+    keyRepeatCancels.push(() => {
+      repeated = repeated || pointerActive;
+      pointerActive = false;
+      stopRepeat();
+    });
     // 반복이 발화했으면 뒤따르는 click을 무시한다 — 아니면 목표에서 한 칸 오버슛한다
     // (claude 메뉴 ↑↓ 선택이 핵심 사용례라 치명적, 리뷰 P3-4).
-    let repeated = false;
     btn.addEventListener('click', () => {
       if (repeated) {
         repeated = false;
@@ -620,6 +725,7 @@
     });
     if (key === 'up' || key === 'down' || key === 'left' || key === 'right') {
       const startRepeat = () => {
+        pointerActive = true;
         stopRepeat();
         repeated = false;
         repeatTimer = setTimeout(() => {
@@ -630,13 +736,20 @@
         }, 400);
       };
       btn.addEventListener('pointerdown', startRepeat);
-      for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) {
-        btn.addEventListener(ev, stopRepeat);
+      btn.addEventListener('pointerup', () => {
+        pointerActive = false;
+        stopRepeat();
+      });
+      for (const eventName of ['pointerleave', 'pointercancel']) {
+        btn.addEventListener(eventName, () => {
+          pointerActive = false;
+          stopRepeat();
+          repeated = false;
+        });
       }
     }
   }
 
-  document.getElementById('viewer-back').addEventListener('click', closeViewer);
   // 회전/리사이즈 시 현재 화면 모델로 canvas를 다시 맞춘다 — 다음 프레임을 기다리지
   // 않는다 (유휴 세션이면 무기한 옛 폭 고정, P5 리뷰 P3). screen 없으면 no-op.
   window.addEventListener('resize', () => drawScreen());
@@ -702,14 +815,15 @@
     actions.className = 'actions';
     // 승인 전 맥락 확인 — 그 세션 화면을 연다 (I2). session(영속 UUID)이 있을 때만.
     // 서버는 활성 워크스페이스의 승인에만 이 값을 채운다(u64 앨리어싱 방지).
-    if (item.session) {
+    if (known && !known.exited) {
       const view = document.createElement('button');
       view.className = 'approval-view';
       view.type = 'button';
       view.textContent = '화면 보기';
       view.addEventListener('click', () => {
-        const row = lastSessions.find((x) => x.id === item.session);
-        openViewer(item.session, (row && row.title) || (item.session_title || '세션'));
+        const row = lastSessions.find((session) => session.id === item.session);
+        if (!row || row.exited) return;
+        openViewer(item.session, row.title || item.session_title || '세션');
       });
       actions.appendChild(view);
     }
@@ -773,14 +887,22 @@
   function consumePendingWatch(sessions) {
     if (!pendingWatch) return false;
     if (Date.now() > pendingWatchDeadline) {
-      pendingWatch = null; // 기한 초과 — 스테일 딥링크는 폐기한다
+      pendingWatch = null;
       return false;
     }
-    const target = sessions.find((s) => s.id === pendingWatch);
-    if (!target) return false;
+    if (viewer.closing) return false;
+    if (pendingWatch === viewer.watching) {
+      pendingWatch = null;
+      return true;
+    }
+    const target = sessions.find((session) => session.id === pendingWatch);
+    if (!target || target.exited) {
+      if (target && target.exited) pendingWatch = null;
+      return false;
+    }
     const id = pendingWatch;
+    if (!openViewer(id, target.title || ('세션 ' + id))) return false;
     pendingWatch = null;
-    openViewer(id, target.title || ('세션 ' + id));
     return true;
   }
 
@@ -814,6 +936,19 @@
     lastWorkspaces = workspaces;
     if (resource) lastResource = resource;
     lastSessions = workspaces.flatMap((ws) => ws.sessions || []).filter((s) => s.id);
+    const endedSession = viewer.watching;
+    const watched = endedSession
+      ? lastSessions.find((session) => session.id === endedSession)
+      : null;
+    if (endedSession && (!watched || watched.exited)) {
+      queueMicrotask(() => {
+        if (viewer.watching !== endedSession) return;
+        requestCloseViewer({
+          rerender: true,
+          notice: '선택한 세션이 종료되었습니다 — 세션 목록으로 돌아왔습니다.',
+        });
+      });
+    }
     // 그룹별로 "세션 없음"을 표시하므로, 전역 안내는 워크스페이스가 하나도 없을 때만.
     sessionsEmpty.hidden = workspaces.length > 0;
     sessionsEl.textContent = '';
@@ -901,10 +1036,11 @@
       li.appendChild(badge);
     }
 
-    if (s.id) {
+    if (s.id && !s.exited) {
       const viewBtn = document.createElement('button');
       viewBtn.type = 'button';
       viewBtn.className = 'view-btn';
+      viewBtn.dataset.sessionId = s.id;
       viewBtn.textContent = s.id === viewer.watching ? '보는 중' : '보기';
       viewBtn.disabled = s.id === viewer.watching;
       viewBtn.addEventListener('click', () => {
@@ -912,7 +1048,7 @@
         renderWorkspaces(lastWorkspaces, lastResource); // "보는 중" 배지 갱신
       });
       li.appendChild(viewBtn);
-    } else {
+    } else if (!s.id) {
       // 표시 전용 — 이 워크스페이스로 전환해야 볼 수 있다.
       const note = document.createElement('span');
       note.className = 'view-note';

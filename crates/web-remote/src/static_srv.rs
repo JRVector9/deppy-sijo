@@ -261,6 +261,44 @@ mod tests {
     }
 
     #[test]
+    fn 전체화면_뷰어_js는_단일_lifecycle과_back_계약을_포함한다() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        for marker in [
+            "function activateViewerShell()",
+            "function finishCloseViewer(",
+            "function requestCloseViewer(",
+            "function setViewerClosing(",
+            "function stopAllKeyRepeats()",
+            "if (viewer.closing) return false;",
+            "if (!openViewer(id",
+            "queueMicrotask(() => consumePendingWatch(lastSessions))",
+            "if (pendingWatch === viewer.watching)",
+            "if (!target || target.exited)",
+            "if (viewer.watching !== endedSession) return;",
+            "queueMicrotask(() => {",
+            "let pointerActive = false;",
+            "repeated = repeated || pointerActive;",
+            "if (s.id && !s.exited)",
+            "else if (!s.id) {",
+            "if (known && !known.exited) {",
+            "if (!row || row.exited) return;",
+            "history.pushState",
+            "window.addEventListener('popstate'",
+            "dashboardShell.inert = true",
+            "dashboardShell.inert = false",
+            "viewBtn.dataset.sessionId = s.id",
+            "선택한 세션이 종료되었습니다",
+            "function clearViewerCanvas()",
+            "function clearStaleViewerHistory()",
+            "viewer.pendingClose = options",
+            "setViewerClosing(true)",
+        ] {
+            assert!(js.contains(marker), "viewer lifecycle marker 누락: {marker}");
+        }
+        assert!(!js.contains("scrollIntoView"), "inline viewer 스크롤 진입이 남아 있음");
+    }
+
+    #[test]
     fn 토큰_일치는_앱셸_200() {
         let response = respond("/", &format!("token={TOKEN}"), TOKEN);
         assert_eq!(response.status, 200);

@@ -84,7 +84,7 @@ notify = "8"
 libc = "0.2"
 # OAuth PKCE (설계 crate 정책 §oauth2 = "5"). reqwest/tokio 회피 — sync ureq client만
 oauth2 = { version = "5", default-features = false, features = ["ureq"] }
-ureq = "2"
+ureq = "3"
 sha2 = "0.11"
 chacha20poly1305 = "0.11"
 # remote 바이너리 프레이밍 (PR-19 v1+ — JSON Vec<u8> 팽창 해소)

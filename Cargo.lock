@@ -184,7 +184,7 @@ dependencies = [
 name = "alacritty_terminal"
 version = "0.26.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bitflags 2.13.0",
  "home",
  "libc",
@@ -539,7 +539,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
- "ureq",
+ "ureq 3.4.0",
 ]
 
 [[package]]
@@ -559,6 +559,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -1169,7 +1175,7 @@ dependencies = [
  "tracing-subscriber",
  "trash",
  "unicode-normalization",
- "ureq",
+ "ureq 3.4.0",
  "uuid",
  "web-remote",
  "windows-sys 0.61.2",
@@ -2759,7 +2765,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
- "ureq",
+ "ureq 3.4.0",
  "url",
 ]
 
@@ -3097,7 +3103,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -3107,7 +3113,7 @@ dependencies = [
  "serde_path_to_error",
  "sha2 0.10.9",
  "thiserror 1.0.69",
- "ureq",
+ "ureq 2.12.1",
  "url",
 ]
 
@@ -3520,7 +3526,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -5285,7 +5291,7 @@ version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "flate2",
  "log",
  "once_cell",
@@ -5293,6 +5299,35 @@ dependencies = [
  "rustls-pki-types",
  "url",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "ureq"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "972d7902c8735f2695410b8aed7df6ed12a47394aa1c8d7af49f0497b731a94d"
+dependencies = [
+ "base64 0.23.1",
+ "flate2",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots 1.0.8",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da5f78b09e6941e1a0f2e30e695e4b120377b54d5e0aec11b594bb57b3971613"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
 ]
 
 [[package]]
@@ -5313,6 +5348,12 @@ name = "urlencoding"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -5614,7 +5655,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "deppy-core",
  "getrandom 0.4.3",
  "ghash",
@@ -5631,7 +5672,7 @@ dependencies = [
  "subtle",
  "tracing",
  "tungstenite",
- "ureq",
+ "ureq 3.4.0",
  "uuid",
  "zeroize",
 ]

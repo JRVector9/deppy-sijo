@@ -237,6 +237,30 @@ mod tests {
     }
 
     #[test]
+    fn 전체화면_뷰어_css는_viewport와_safe_area_계약을_포함한다() {
+        let css = std::str::from_utf8(APP_CSS).unwrap();
+        for marker in [
+            "body.viewer-open",
+            ".viewer-shell",
+            "position: fixed",
+            "left: var(--viewer-left, 0px)",
+            "width: var(--viewer-width, 100vw)",
+            "height: var(--viewer-height, 100dvh)",
+            "env(safe-area-inset-top)",
+            "env(safe-area-inset-bottom)",
+            "max(12px, env(safe-area-inset-right))",
+            "max(12px, env(safe-area-inset-left))",
+            "max(10px, env(safe-area-inset-right))",
+            "max(10px, env(safe-area-inset-left))",
+            "grid-template-rows: auto minmax(0, 1fr) auto",
+            ".viewer-overlay",
+            ".viewer-privacy-curtain",
+        ] {
+            assert!(css.contains(marker), "전체화면 CSS marker 누락: {marker}");
+        }
+    }
+
+    #[test]
     fn 토큰_일치는_앱셸_200() {
         let response = respond("/", &format!("token={TOKEN}"), TOKEN);
         assert_eq!(response.status, 200);

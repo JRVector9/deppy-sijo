@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#181b20">
-  <title>Deppy Sijo — 모바일 연결 시나리오</title>
+  <title>Deppy Sijo — Tailscale 공존 모바일 연결 시나리오</title>
   <style>
     :root {
       color-scheme: dark;
@@ -260,6 +260,40 @@
     .settings-row:last-of-type { border-bottom: 1px solid var(--border); }
     .row-title { margin-bottom: 3px; color: var(--text-strong); font-weight: 650; }
     .row-copy { margin: 0; color: var(--muted); font-size: 12px; }
+    .transport-options { margin-top: 20px; border-top: 1px solid var(--border); }
+    .transport-option {
+      width: 100%;
+      min-height: 72px;
+      display: grid;
+      grid-template-columns: 20px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 4px;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      background: transparent;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+    .transport-option:hover { background: #1d2228; }
+    .transport-option.is-selected { background: #172630; }
+    .transport-radio { width: 16px; height: 16px; border: 1px solid #606873; border-radius: 50%; }
+    .transport-option.is-selected .transport-radio { border: 5px solid var(--cyan); }
+    .transport-option strong { display: block; color: var(--text-strong); }
+    .transport-option small { display: block; margin-top: 3px; color: var(--muted); }
+    .transport-tag { min-height: 22px; display: inline-flex; align-items: center; padding: 0 7px; border: 1px solid var(--border-strong); color: var(--muted-2); font-size: 10px; font-weight: 700; }
+    .transport-tag.new { border-color: #2b5d70; background: #172933; color: #91d9f2; }
+    .transport-groups { display: grid; gap: 18px; margin-top: 20px; }
+    .transport-group { border: 1px solid var(--border); padding: 0 14px; }
+    .transport-group-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 42px; border-bottom: 1px solid var(--border); }
+    .transport-group-head strong { color: var(--text-strong); font-size: 12px; }
+    .transport-group-head span { color: var(--muted); font-size: 10px; }
+    .transport-tabs { display: flex; gap: 0; margin: 0 0 18px; border: 1px solid var(--border); }
+    .transport-tabs button { flex: 1; min-height: 40px; border: 0; border-right: 1px solid var(--border); background: #171a1f; color: var(--muted); cursor: pointer; }
+    .transport-tabs button:last-child { border-right: 0; }
+    .transport-tabs button.is-active { background: #172630; color: var(--text-strong); box-shadow: inset 0 -2px var(--cyan); }
+    .url-preview { margin: 14px 0 0; padding: 10px; border: 1px solid var(--border); background: #12151a; color: #a9c8d5; font: 11px/1.5 ui-monospace, Menlo, monospace; overflow-wrap: anywhere; }
     .switch {
       position: relative;
       flex: none;
@@ -631,8 +665,8 @@
     <header class="prototype-header">
       <div>
         <p class="eyebrow">Interactive product scenario</p>
-        <h1>Tailscale 없이 모바일에서 세션까지</h1>
-        <p>Mac 연결 활성화부터 일회용 페어링, 세션 선택, 전체화면 터미널과 복구까지 확인합니다.</p>
+        <h1>기존 Tailscale 유지 + 새로운 모바일 접속</h1>
+        <p>Tailscale, Deppy Relay 또는 두 경로를 선택하고 공통 세션 화면과 전체화면 터미널까지 확인합니다.</p>
       </div>
       <span class="prototype-badge">로컬 시뮬레이션 · 실제 연결 없음</span>
     </header>
@@ -695,8 +729,8 @@
       'use strict';
 
       const FLOW = [
-        'access-off',
-        'relay-connecting',
+        'connection-method',
+        'transport-connecting',
         'pairing-qr',
         'pairing-confirm',
         'session-list',
@@ -705,14 +739,23 @@
       ];
 
       const FLOW_META = [
-        { label: '접속 켜기', description: 'Mac에서 모바일 접속을 명시적으로 켭니다.' },
-        { label: '암호화 연결', description: 'Mac이 릴레이로 outbound 연결을 만듭니다.' },
-        { label: 'QR 페어링', description: '5분 만료 일회용 QR로 새 기기를 시작합니다.' },
-        { label: '상호 확인', description: '양쪽 코드를 확인하고 기기 권한을 정합니다.' },
+        { label: '접속 방식', description: '기존 Tailscale을 유지하고 필요한 경우 Relay를 별도로 켭니다.' },
+        { label: '연결 준비', description: '선택한 transport의 상태를 서로 섞지 않고 확인합니다.' },
+        { label: 'QR 페어링', description: 'Tailscale 기존 QR 또는 Relay 일회용 QR로 연결합니다.' },
+        { label: '기기 확인', description: 'Relay는 상호 확인하고, Tailscale은 기존 인증을 유지합니다.' },
         { label: '세션 선택', description: '워크스페이스와 실행 중인 세션을 고릅니다.' },
         { label: '전체화면', description: '선택 즉시 모바일 viewport 전체를 터미널로 사용합니다.' },
         { label: '중단·복구', description: '연결, 권한, 세션 종료 원인에 맞게 복구합니다.' },
       ];
+
+      const TRANSPORT_OPTIONS = [
+        { id: 'tailscale', title: 'Tailscale만', note: '기존 Serve와 ts.net 주소를 그대로 사용' },
+        { id: 'relay', title: 'Deppy Relay만', note: 'Tailscale 없이 외부 네트워크에서 접속' },
+        { id: 'both', title: '둘 다 사용', note: '두 경로를 명시적으로 동시에 활성화' },
+      ];
+
+      const TAILSCALE_PROGRESS = ['Tailscale 상태 확인', 'Serve 상태 확인', 'ts.net HTTPS 준비'];
+      const RELAY_PROGRESS = ['인터넷 연결 확인', 'Deppy 보안 릴레이 연결', '종단 간 암호화 채널 준비'];
 
       const WORKSPACES = [
         {
@@ -744,6 +787,8 @@
         recoveryReason: 'session-ended',
         privacyCurtain: false,
         warmActivated: false,
+        transportMode: 'tailscale',
+        pairingTransport: 'tailscale',
       };
 
       const shell = document.getElementById('prototype-shell');
@@ -800,61 +845,100 @@
         return `<p class="settings-kicker">설정 / 모바일 연결</p><h2>${title}</h2><p class="settings-lead">${lead}</p>`;
       }
 
+      function setTransportMode(mode) {
+        if (!['tailscale', 'relay', 'both'].includes(mode)) return;
+        state.transportMode = mode;
+        if (mode !== 'both') state.pairingTransport = mode;
+        else if (!['tailscale', 'relay'].includes(state.pairingTransport)) state.pairingTransport = 'tailscale';
+        render();
+      }
+
+      function enabledTransports() {
+        if (state.transportMode === 'both') return ['tailscale', 'relay'];
+        return [state.transportMode];
+      }
+
+      function availablePairingTransports() {
+        if (state.transportMode === 'both') return ['tailscale', 'relay'];
+        return [state.transportMode];
+      }
+
+      function transportLabel() {
+        if (state.transportMode === 'both') return 'Tailscale + Relay';
+        return state.transportMode === 'tailscale' ? 'Tailscale' : 'Relay · 종단 간 암호화';
+      }
+
+      function transportOptionsMarkup() {
+        return `<div class="transport-options" role="radiogroup" aria-label="모바일 접속 방식">${TRANSPORT_OPTIONS.map((option) => `
+          <button type="button" class="transport-option ${state.transportMode === option.id ? 'is-selected' : ''}" data-action="select-transport" data-transport="${option.id}" role="radio" aria-checked="${state.transportMode === option.id}">
+            <span class="transport-radio" aria-hidden="true"></span>
+            <span><strong>${option.title}</strong><small>${option.note}</small></span>
+            <span class="transport-tag ${option.id === 'relay' ? 'new' : ''}">${option.id === 'tailscale' ? '기존' : option.id === 'relay' ? '신규' : '고급'}</span>
+          </button>`).join('')}</div>`;
+      }
+
+      function transportProgressGroup(kind) {
+        const tailscale = kind === 'tailscale';
+        const steps = tailscale ? TAILSCALE_PROGRESS : RELAY_PROGRESS;
+        return `<section class="transport-group"><div class="transport-group-head"><strong>${tailscale ? 'Tailscale Serve' : 'Deppy Relay'}</strong><span>${tailscale ? '기존 경로' : '신규 경로'}</span></div><div class="progress-list">
+          ${progressRow(steps[0], '완료', 'is-done', '✓')}
+          ${progressRow(steps[1], '완료', 'is-done', '✓')}
+          ${progressRow(steps[2], '확인 중', 'is-active', '··')}
+        </div></section>`;
+      }
+
+      function pairingTransportTabs() {
+        const available = availablePairingTransports();
+        if (available.length < 2) return '';
+        return `<div class="transport-tabs" aria-label="페어링 경로">${available.map((kind) => `<button type="button" data-action="pairing-transport" data-transport="${kind}" class="${state.pairingTransport === kind ? 'is-active' : ''}">${kind === 'tailscale' ? 'Tailscale QR' : 'Relay QR'}</button>`).join('')}</div>`;
+      }
+
+      function connectedTransportRows() {
+        return enabledTransports().map((kind) => kind === 'tailscale' ? `
+          <div class="settings-row"><div><p class="row-title">Tailscale Serve</p><p class="row-copy">mac.tail.example.ts.net · 기존 설정 유지</p></div><strong style="color:var(--green)">준비됨</strong></div>` : `
+          <div class="settings-row"><div><p class="row-title">Deppy Relay</p><p class="row-copy">relay.deppy.app · outbound WSS · E2EE</p></div><strong style="color:var(--green)">연결됨</strong></div>`).join('');
+      }
+
       function renderDesktop() {
         switch (FLOW[state.step]) {
-          case 'access-off':
-            desktopStage.innerHTML = desktopHeader('모바일 연결', 'Tailscale이나 공유기 포트 설정 없이 휴대폰에서 이 Mac의 세션을 확인합니다.') + `
-              <div class="settings-row">
-                <div><p class="row-title">외부에서 모바일로 접속</p><p class="row-copy">기본값은 꺼짐이며, 켤 때만 암호화 연결을 시작합니다.</p></div>
-                <button type="button" class="switch" data-action="enable-access" aria-label="모바일 접속 켜기" aria-pressed="false"></button>
-              </div>
-              <div class="settings-row">
-                <div><p class="row-title">연결된 기기</p><p class="row-copy">승인된 기기는 여기에서 개별 폐기할 수 있습니다.</p></div>
-                <strong>0대</strong>
-              </div>
-              <div class="callout"><span>↗</span><span>공유기에 inbound 포트를 열지 않습니다. 이 Mac이 암호화된 outbound 연결을 먼저 생성합니다.</span></div>`;
+          case 'connection-method':
+            desktopStage.innerHTML = desktopHeader('모바일 연결 방식', '기존 Tailscale은 그대로 유지됩니다. 필요한 경우 Deppy Relay를 별도로 추가하거나 두 경로를 함께 켤 수 있습니다.') + `
+              ${transportOptionsMarkup()}
+              <div class="callout"><span>↔</span><span>연결 실패 시 다른 경로로 자동 전환하지 않습니다. 접속 주소, 상태와 인증 정보는 transport별로 독립 관리합니다.</span></div>
+              <div class="button-row"><button type="button" class="primary" data-action="transport-start">${transportLabel()}로 계속</button></div>`;
             break;
-          case 'relay-connecting':
-            desktopStage.innerHTML = desktopHeader('보안 연결 준비 중', '브라우저에서 Mac으로 직접 들어오지 않습니다. 양쪽이 고정 HTTPS 릴레이에 연결되고 내용은 종단 간 암호화됩니다.') + `
-              <div class="progress-list">
-                ${progressRow('인터넷 연결 확인', '완료', 'is-done', '✓')}
-                ${progressRow('Deppy 보안 릴레이 연결', '완료', 'is-done', '✓')}
-                ${progressRow('종단 간 암호화 채널 준비', '키 교환 중', 'is-active', '··')}
-              </div>
-              <div class="callout"><span>◇</span><span>릴레이는 어느 세션으로 전달할지만 알며 터미널 화면과 입력 내용은 읽을 수 없습니다.</span></div>
-              <div class="button-row"><button type="button" class="primary" data-action="relay-ready">연결 완료 보기</button><button type="button" class="secondary" data-action="go-step" data-step="0">취소</button></div>`;
+          case 'transport-connecting':
+            desktopStage.innerHTML = desktopHeader(state.transportMode === 'both' ? '두 연결 경로 준비' : `${transportLabel()} 연결 준비`, state.transportMode === 'both' ? 'Tailscale과 Relay 상태를 합치지 않고 각각 확인합니다.' : state.transportMode === 'tailscale' ? '기존 Tailscale Serve와 ts.net HTTPS 상태를 확인합니다.' : 'Mac이 Relay로 outbound WSS를 만들고 기기 간 암호화 채널을 준비합니다.') + `
+              <div class="transport-groups">${enabledTransports().map(transportProgressGroup).join('')}</div>
+              <div class="callout ${state.transportMode === 'both' ? 'warning' : ''}"><span>${state.transportMode === 'both' ? '!' : '◇'}</span><span>${state.transportMode === 'both' ? '두 경로가 모두 켜져 있어도 장애 시 자동 우회하지 않습니다.' : state.transportMode === 'tailscale' ? '현재 Tailscale 설정과 페어링 토큰 동작은 변경되지 않습니다.' : 'Relay는 터미널 화면과 입력 내용을 읽을 수 없습니다.'}</span></div>
+              <div class="button-row"><button type="button" class="primary" data-action="transport-ready">연결 준비 완료</button><button type="button" class="secondary" data-action="go-step" data-step="0">취소</button></div>`;
             break;
           case 'pairing-qr':
-            desktopStage.innerHTML = desktopHeader('새 모바일 기기 연결', '아래 일회용 QR은 5분 뒤 만료되며 한 기기에서 한 번만 사용할 수 있습니다.') + `
+            desktopStage.innerHTML = desktopHeader(state.pairingTransport === 'tailscale' ? 'Tailscale 기존 QR로 연결' : 'Relay 새 기기 연결', state.pairingTransport === 'tailscale' ? '기존 ts.net HTTPS 주소와 모바일 웹 페어링 토큰 흐름을 그대로 사용합니다.' : '아래 일회용 QR은 5분 뒤 만료되며 한 기기에서 한 번만 사용할 수 있습니다.') + `
+              ${pairingTransportTabs()}
               <div class="pairing-grid">
-                <div class="qr-box"><div class="qr-grid" data-qr></div><p class="qr-caption">DEMO · NOT SCANNABLE</p></div>
+                <div class="qr-box"><div class="qr-grid" data-qr></div><p class="qr-caption">${state.pairingTransport === 'tailscale' ? 'TAILSCALE' : 'RELAY'} DEMO · NOT SCANNABLE</p></div>
                 <div>
-                  <p class="row-title">남은 시간</p><p class="countdown">04:38</p>
-                  <ul class="security-list"><li>실제 터미널 토큰을 포함하지 않음</li><li>페어링 완료 즉시 QR 무효화</li><li>기기마다 별도 자격증명 발급</li></ul>
-                  <div class="button-row"><button type="button" class="secondary" data-action="regenerate-qr">QR 재발급</button><button type="button" class="ghost" data-action="go-step" data-step="1">취소</button></div>
+                  ${state.pairingTransport === 'tailscale' ? `<p class="row-title">기존 접속 주소</p><p class="url-preview">https://mac.tail.example.ts.net/?token=••••••••</p><ul class="security-list"><li>Tailscale Serve HTTPS 사용</li><li>현재 web-remote token gate 유지</li><li>Relay 자격증명과 분리</li></ul><div class="button-row"><button type="button" class="secondary" data-action="copy-tailscale-url">주소 복사 시뮬레이션</button><button type="button" class="ghost" data-action="go-step" data-step="1">취소</button></div>` : `<p class="row-title">남은 시간</p><p class="countdown">04:38</p><ul class="security-list"><li>실제 터미널 토큰을 포함하지 않음</li><li>페어링 완료 즉시 QR 무효화</li><li>기기마다 별도 자격증명 발급</li></ul><div class="button-row"><button type="button" class="secondary" data-action="regenerate-qr">QR 재발급</button><button type="button" class="ghost" data-action="go-step" data-step="1">취소</button></div>`}
                 </div>
               </div>`;
             queueMicrotask(renderQrGrids);
             break;
           case 'pairing-confirm':
-            desktopStage.innerHTML = desktopHeader('iPhone 연결 요청', '휴대폰에 표시된 코드와 아래 코드가 같을 때만 이 기기를 승인하세요.') + `
-              <p class="verify-code">741 206</p>
-              <div class="permission-list">
-                ${permissionRow('view', '화면 보기', '세션 목록과 터미널 출력을 봅니다.', true)}
-                ${permissionRow('input', '터미널 입력', '텍스트와 특수키를 현재 세션으로 보냅니다.')}
-                ${permissionRow('approval', '승인 요청 처리', '도구 실행 허용·거부를 처리합니다.')}
-              </div>
-              <div class="settings-row"><div><p class="row-title">접근 기간</p><p class="row-copy">언제든 기기 관리에서 즉시 폐기할 수 있습니다.</p></div><strong>30일</strong></div>
-              <div class="button-row"><button type="button" class="primary" data-action="approve-device">이 기기 승인</button><button type="button" class="danger" data-action="deny-device">거부</button></div>`;
+            desktopStage.innerHTML = state.pairingTransport === 'tailscale' ? desktopHeader('기존 Tailscale 인증 완료', '새 Relay 기기 권한을 만들지 않고 기존 Tailscale 네트워크와 web-remote token으로 연결했습니다.') + `
+              <div class="settings-row"><div><p class="row-title">Tailscale Serve</p><p class="row-copy">mac.tail.example.ts.net</p></div><strong style="color:var(--green)">준비됨</strong></div>
+              <div class="settings-row"><div><p class="row-title">인증 방식</p><p class="row-copy">기존 모바일 웹 페어링 토큰</p></div><strong>유지</strong></div>
+              <div class="callout success"><span>✓</span><span>Relay 권한이나 기기 자격증명을 만들지 않았습니다.</span></div>
+              <div class="button-row"><button type="button" class="primary" data-action="continue-tailscale">세션 목록 열기</button></div>` : desktopHeader('iPhone 연결 요청', '휴대폰에 표시된 코드와 아래 코드가 같을 때만 이 기기를 승인하세요.') + `
+              <p class="verify-code">741 206</p><div class="permission-list">${permissionRow('view', '화면 보기', '세션 목록과 터미널 출력을 봅니다.', true)}${permissionRow('input', '터미널 입력', '텍스트와 특수키를 현재 세션으로 보냅니다.')}${permissionRow('approval', '승인 요청 처리', '도구 실행 허용·거부를 처리합니다.')}</div>
+              <div class="settings-row"><div><p class="row-title">접근 기간</p><p class="row-copy">언제든 기기 관리에서 즉시 폐기할 수 있습니다.</p></div><strong>30일</strong></div><div class="button-row"><button type="button" class="primary" data-action="approve-device">이 기기 승인</button><button type="button" class="danger" data-action="deny-device">거부</button></div>`;
             break;
           default:
-            desktopStage.innerHTML = desktopHeader('모바일 연결됨', '이 Mac은 relay.deppy.app으로 암호화된 outbound 연결을 유지하고 있습니다.') + `
-              <div class="settings-row"><div><p class="row-title">외부에서 모바일로 접속</p><p class="row-copy">모바일 세션과 승인 알림을 사용할 수 있습니다.</p></div><button type="button" class="switch is-on" aria-label="모바일 접속 켜짐" aria-pressed="true"></button></div>
-              <div class="device-list">
-                <div class="device-row"><span class="device-dot"></span><div><strong>기대호의 iPhone</strong><small>지금 접속 중 · 종단 간 암호화</small></div><button type="button" class="secondary" data-action="revoke-device">접근 폐기</button></div>
-              </div>
+            desktopStage.innerHTML = desktopHeader('모바일 연결됨', `${transportLabel()} 경로로 공통 세션 화면과 전체화면 터미널을 사용합니다.`) + `
+              ${connectedTransportRows()}
+              ${enabledTransports().includes('relay') ? `<div class="device-list"><div class="device-row"><span class="device-dot"></span><div><strong>기대호의 iPhone</strong><small>Relay로 접속 중 · 기기별 자격증명</small></div><button type="button" class="secondary" data-action="revoke-device">Relay 접근 폐기</button></div></div>` : `<div class="settings-row"><div><p class="row-title">Tailscale 브라우저 페어링</p><p class="row-copy">기존 token gate로 접속 중</p></div><strong>유지</strong></div>`}
               <div class="settings-row"><div><p class="row-title">허용된 권한</p><p class="row-copy">${permissionSummary()}</p></div><strong>${state.permissions.approval ? '3' : '2'}개</strong></div>
-              <div class="callout success"><span>✓</span><span>공유기 포트 개방 없음 · Tailscale 연결 없음 · 마지막 확인 방금 전</span></div>`;
+              <div class="callout ${state.transportMode === 'both' ? 'warning' : 'success'}"><span>${state.transportMode === 'both' ? '!' : '✓'}</span><span>${state.transportMode === 'both' ? '두 경로가 모두 활성화되어 있지만 장애 시 자동 전환하지 않습니다.' : state.transportMode === 'tailscale' ? '기존 Tailscale 경로가 그대로 활성화되어 있습니다.' : 'Tailscale 없이 Relay 경로만 활성화되어 있습니다.'}</span></div>`;
         }
       }
 
@@ -878,28 +962,32 @@
       function renderPhone() {
         phoneModal.innerHTML = '';
         switch (FLOW[state.step]) {
-          case 'access-off':
-            phoneStage.innerHTML = mobileTop('offline', '연결 안 됨') + `
-              <section class="mobile-hero"><p class="eyebrow">Remote sessions</p><h2>Mac에서 먼저 연결을 켜세요</h2><p>Deppy Sijo 설정의 모바일 연결에서 새 기기 페어링을 시작할 수 있습니다.</p></section>
-              <div class="mobile-actions"><button type="button" class="secondary" data-action="enable-access">Mac 화면에서 켜기</button></div>`;
+          case 'connection-method':
+            phoneStage.innerHTML = mobileTop('pending', '방식 선택 중') + `
+              <section class="mobile-hero"><p class="eyebrow">Connection methods</p><h2>Tailscale은 그대로 유지됩니다</h2><p>Mac에서 기존 Tailscale, 새 Relay 또는 두 경로를 함께 선택할 수 있습니다.</p></section>
+              <div class="chips"><span class="chip secure">현재 선택 · ${transportLabel()}</span></div>
+              <div class="recovery-list">${recoveryRow('Tailscale', '기존 Serve와 ts.net HTTPS 주소')}${recoveryRow('Deppy Relay', 'Tailscale 없이 사용하는 신규 outbound 경로')}</div>
+              <div class="mobile-actions"><button type="button" class="secondary" data-action="transport-start">선택한 방식으로 계속</button></div>`;
             break;
-          case 'relay-connecting':
+          case 'transport-connecting':
             phoneStage.innerHTML = mobileTop('pending', 'Mac 찾는 중') + `
-              <section class="mobile-hero"><p class="eyebrow">Secure relay</p><h2>암호화 채널을 준비합니다</h2><p>같은 Wi-Fi가 아니어도 됩니다. Mac이 온라인이면 자동으로 연결됩니다.</p></section>
-              <div class="progress-list">${progressRow('Deppy 릴레이 연결', '대기', 'is-active', '··')}${progressRow('기기 페어링', '다음 단계', '', '2')}</div>`;
+              <section class="mobile-hero"><p class="eyebrow">${state.transportMode === 'both' ? 'Dual transport' : transportLabel()}</p><h2>${state.transportMode === 'both' ? '두 경로를 각각 준비합니다' : state.transportMode === 'tailscale' ? 'Tailscale 경로를 확인합니다' : 'Relay 암호화 채널을 준비합니다'}</h2><p>${state.transportMode === 'both' ? '두 상태는 독립적이며 실패해도 자동으로 다른 경로를 사용하지 않습니다.' : state.transportMode === 'tailscale' ? '기존 tailnet과 Serve 설정을 그대로 확인합니다.' : '같은 Wi-Fi가 아니어도 Mac이 온라인이면 연결할 수 있습니다.'}</p></section>
+              <div class="progress-list">${enabledTransports().map((kind) => progressRow(kind === 'tailscale' ? 'Tailscale Serve' : 'Deppy Relay', '확인 중', 'is-active', '··')).join('')}${progressRow('기기 페어링', '다음 단계', '', '2')}</div>`;
             break;
           case 'pairing-qr':
             phoneStage.innerHTML = mobileTop('pending', '새 기기') + `
-              <section class="mobile-hero"><p class="eyebrow">One-time pairing</p><h2>Mac의 QR을 스캔하세요</h2><p>QR은 5분 동안 한 번만 유효합니다.</p></section>
-              <div class="phone-qr qr-box"><div class="qr-grid" data-qr></div><p class="qr-caption">DEMO · NOT SCANNABLE</p></div>
+              <section class="mobile-hero"><p class="eyebrow">${state.pairingTransport === 'tailscale' ? 'Tailscale pairing' : 'One-time Relay pairing'}</p><h2>Mac의 ${state.pairingTransport === 'tailscale' ? 'Tailscale' : 'Relay'} QR을 스캔하세요</h2><p>${state.pairingTransport === 'tailscale' ? '기존 ts.net 주소와 모바일 웹 token gate를 사용합니다.' : 'QR은 5분 동안 한 번만 유효합니다.'}</p></section>
+              ${pairingTransportTabs()}
+              <div class="phone-qr qr-box"><div class="qr-grid" data-qr></div><p class="qr-caption">${state.pairingTransport === 'tailscale' ? 'TAILSCALE' : 'RELAY'} DEMO · NOT SCANNABLE</p></div>
               <div class="mobile-actions"><button type="button" class="primary" data-action="qr-scanned">QR 스캔 완료</button><button type="button" class="secondary" data-action="go-step" data-step="1">취소</button></div>`;
             queueMicrotask(renderQrGrids);
             break;
           case 'pairing-confirm':
-            phoneStage.innerHTML = mobileTop('pending', '승인 대기') + `
-              <section class="phone-code"><p class="eyebrow">두 화면의 코드가 같나요?</p><p class="verify-code">741 206</p><p>Mac에서 기기 이름과 권한을 확인한 뒤 승인하세요.</p></section>
-              <div class="chips"><span class="chip secure">종단 간 암호화</span><span class="chip">iPhone · Safari</span></div>
-              <p class="waiting-line">Mac의 승인을 기다리는 중</p>`;
+            phoneStage.innerHTML = state.pairingTransport === 'tailscale' ? mobileTop('', 'Tailscale 연결됨') + `
+              <section class="mobile-hero"><p class="eyebrow">Existing authentication</p><h2>기존 Tailscale 인증이 완료됐습니다</h2><p>Relay 기기 권한을 추가하지 않고 기존 모바일 웹 token으로 연결했습니다.</p></section>
+              <div class="chips"><span class="chip secure">Tailscale</span><span class="chip">ts.net HTTPS</span></div>
+              <div class="mobile-actions"><button type="button" class="primary" data-action="continue-tailscale">세션 목록 열기</button></div>` : mobileTop('pending', '승인 대기') + `
+              <section class="phone-code"><p class="eyebrow">두 화면의 코드가 같나요?</p><p class="verify-code">741 206</p><p>Mac에서 기기 이름과 권한을 확인한 뒤 승인하세요.</p></section><div class="chips"><span class="chip secure">Relay · 종단 간 암호화</span><span class="chip">iPhone · Safari</span></div><p class="waiting-line">Mac의 승인을 기다리는 중</p>`;
             break;
           case 'session-list':
             renderPhoneDashboard();
@@ -911,9 +999,9 @@
             phoneStage.innerHTML = mobileTop('offline', '확인 필요') + `
               <section class="mobile-hero"><p class="eyebrow">Recovery</p><h2>${recoveryTitle()}</h2><p>${recoveryCopy()}</p></section>
               <div class="recovery-list">
-                ${recoveryRow('네트워크·릴레이 장애', '다시 연결하고 작성 중인 문장은 보존합니다.')}
+                ${recoveryRow('선택한 연결 경로 장애', `${transportLabel()} 상태를 다시 확인하고 초안을 보존합니다.`)}
                 ${recoveryRow('Mac 종료·절전', 'Mac을 깨운 뒤 자동 재연결을 시도합니다.')}
-                ${recoveryRow('권한 만료·폐기', '새 일회용 QR로 다시 페어링합니다.')}
+                ${recoveryRow('인증 만료·폐기', state.pairingTransport === 'tailscale' ? '기존 Tailscale QR로 다시 연결합니다.' : '새 일회용 Relay QR로 다시 페어링합니다.')}
                 ${recoveryRow('세션 종료', '세션 목록으로 돌아가 다른 세션을 선택합니다.')}
               </div>
               <div class="mobile-actions"><button type="button" class="primary" data-action="recover-to-sessions">세션 목록으로</button><button type="button" class="secondary" data-action="go-step" data-step="2">다시 페어링</button></div>`;
@@ -927,7 +1015,7 @@
 
       function renderPhoneDashboard() {
         const permissionChips = [
-          '<span class="chip secure">종단 간 암호화</span>',
+          `<span class="chip secure">${transportLabel()}</span>`,
           '<span class="chip permission">화면 보기</span>',
           state.permissions.input ? '<span class="chip permission">입력 가능</span>' : '<span class="chip">보기 전용</span>',
           state.permissions.approval ? '<span class="chip permission">승인 가능</span>' : '',
@@ -1069,7 +1157,7 @@
           <header class="terminal-topbar">
             <button type="button" class="terminal-back" data-action="close-terminal" aria-label="세션 목록으로">‹ 목록</button>
             <div class="terminal-heading"><strong id="terminal-title">${context.workspace} / ${context.title}</strong><span>${context.agent} · ${context.cwd} · 보기 ${state.permissions.input ? '+ 입력' : '전용'}</span></div>
-            <span class="terminal-connection ${disconnected ? 'is-offline' : ''}">${disconnected ? '재연결 중' : '암호화됨'}</span>
+            <span class="terminal-connection ${disconnected ? 'is-offline' : ''}">${disconnected ? '재연결 중' : transportLabel()}</span>
           </header>
           <div class="terminal-stage">
             <div class="terminal-screen" aria-label="시뮬레이션 터미널 출력"><span class="term-muted">Last login: Fri Aug 28 14:02:11 on ttys004</span>
@@ -1158,12 +1246,22 @@ Browser Back returns to the session list without leaving the app.
         else if (action === 'previous-step') setStep(state.step - 1);
         else if (action === 'next-step') setStep(state.step === FLOW.length - 1 ? 0 : state.step + 1);
         else if (action === 'stage') { state.stage = target.dataset.stage; renderStageSelection(); }
-        else if (action === 'enable-access') setStep(1);
-        else if (action === 'relay-ready') setStep(2);
-        else if (action === 'qr-scanned') setStep(3);
+        else if (action === 'select-transport') setTransportMode(target.dataset.transport);
+        else if (action === 'transport-start') setStep(1);
+        else if (action === 'transport-ready') setStep(2);
+        else if (action === 'pairing-transport') { state.pairingTransport = target.dataset.transport; render(); }
+        else if (action === 'qr-scanned') {
+          if (state.pairingTransport === 'tailscale') { state.stage = 'phone'; setStep(4); showToast('기존 Tailscale 경로로 연결했습니다.'); }
+          else setStep(3);
+        }
         else if (action === 'regenerate-qr') showToast('새 일회용 QR을 발급했습니다. 만료 시간이 5분으로 갱신되었습니다.');
+        else if (action === 'copy-tailscale-url') showToast('프로토타입: Tailscale 접속 주소를 표시했습니다. 실제 토큰은 포함하지 않습니다.');
+        else if (action === 'continue-tailscale') { state.stage = 'phone'; setStep(4); showToast('기존 Tailscale 인증으로 세션 화면을 열었습니다.'); }
         else if (action === 'approve-device') { state.stage = 'phone'; setStep(4); showToast('기대호의 iPhone을 승인했습니다.'); }
-        else if (action === 'deny-device') { state.recoveryReason = 'pairing-denied'; state.stage = 'phone'; setStep(6); }
+        else if (action === 'deny-device') {
+          if (state.transportMode === 'both') { state.pairingTransport = 'tailscale'; state.stage = 'phone'; setStep(4); showToast('Relay 요청만 거부했습니다. 기존 Tailscale 경로는 계속 사용할 수 있습니다.'); }
+          else { state.recoveryReason = 'pairing-denied'; state.stage = 'phone'; setStep(6); }
+        }
         else if (action === 'phone-tab') { state.phoneSurface = target.dataset.tab; renderPhone(); }
         else if (action === 'open-terminal' && target.dataset.session) openTerminal(target.dataset.session, target);
         else if (action === 'close-terminal') closeTerminal();
@@ -1177,7 +1275,10 @@ Browser Back returns to the session list without leaving the app.
         else if (action === 'warm-cancel') { state.warmConfirm = false; renderPhone(); }
         else if (action === 'warm-confirm') { state.warmConfirm = false; state.warmActivated = true; showToast('Mac의 활성 워크스페이스를 design-system으로 전환했습니다.'); renderPhone(); }
         else if (action === 'approval-demo') showToast('프로토타입: 승인 결과는 실제 도구 실행에 전달되지 않습니다.');
-        else if (action === 'revoke-device') { state.recoveryReason = 'device-revoked'; state.stage = 'phone'; setStep(6); }
+        else if (action === 'revoke-device') {
+          if (state.transportMode === 'both') { state.transportMode = 'tailscale'; state.pairingTransport = 'tailscale'; render(); showToast('Relay 기기 접근만 폐기했습니다. Tailscale 경로는 유지됩니다.'); }
+          else { state.recoveryReason = 'device-revoked'; state.stage = 'phone'; setStep(6); }
+        }
         else if (action === 'recover-to-sessions') { state.stage = 'phone'; setStep(4); }
       });
 

@@ -331,6 +331,10 @@ fn 전체화면_뷰어_js는_단일_lifecycle과_back_계약을_포함한다() {
         "function clearStaleViewerHistory()",
         "viewer.pendingClose = options",
         "viewer.closing = true",
+        "function setViewerClosing(",
+        "function stopAllKeyRepeats()",
+        "if (viewer.closing) return false;",
+        "if (!openViewer(id",
     ] {
         assert!(js.contains(marker), "viewer lifecycle marker 누락: {marker}");
     }
@@ -367,12 +371,27 @@ const viewer = {
   canvas: document.getElementById('viewer-canvas'),
   wrap: document.querySelector('#viewer .viewer-wrap'),
   back: document.getElementById('viewer-back'),
+  keys: Array.from(document.querySelectorAll('.viewer-keys button')),
   watching: null,
   returnSession: null,
   screen: null,
   closing: false,
   pendingClose: null,
 };
+
+const keyRepeatCancels = [];
+
+function stopAllKeyRepeats() {
+  for (const cancel of keyRepeatCancels) cancel();
+}
+
+function setViewerClosing(closing) {
+  viewer.closing = closing;
+  viewer.back.disabled = closing;
+  inputBlocked = closing;
+  for (const button of viewer.keys) button.disabled = closing;
+  updateComposerEnabled();
+}
 
 function clearViewerCanvas() {
   const canvas = viewer.canvas;
@@ -404,9 +423,7 @@ function finishCloseViewer({ rerender = true, notice = '' } = {}) {
   viewer.watching = null;
   viewer.returnSession = null;
   viewer.screen = null;
-  viewer.closing = false;
   viewer.pendingClose = null;
-  viewer.back.disabled = false;
   resetScroll();
   updateScrollNote();
   inputBlocked = false;
@@ -415,7 +432,7 @@ function finishCloseViewer({ rerender = true, notice = '' } = {}) {
   document.body.classList.remove('viewer-open');
   dashboardShell.inert = false;
   dashboardShell.removeAttribute('aria-hidden');
-  updateComposerEnabled();
+  setViewerClosing(false);
   if (rerender) renderWorkspaces(lastWorkspaces, lastResource);
   if (notice) showNotice(notice);
   restoreViewerFocus(returnSession);
@@ -425,9 +442,10 @@ function requestCloseViewer(options = {}) {
   if (!viewer.watching || viewer.closing) return;
   const ownsHistory = !!(history.state && history.state.deppyViewer);
   if (ownsHistory) {
-    viewer.closing = true;
+    setViewerClosing(true);
     viewer.pendingClose = options;
-    viewer.back.disabled = true;
+    stopAllKeyRepeats();
+    resetScroll();
     history.back();
     return;
   }
@@ -435,7 +453,8 @@ function requestCloseViewer(options = {}) {
 }
 
 function openViewer(sessionId, title) {
-  if (!sessionId || viewer.closing || viewer.watching === sessionId) return;
+  if (!sessionId || viewer.closing || viewer.watching === sessionId) return false;
+  setViewerClosing(false);
   viewer.watching = sessionId;
   viewer.returnSession = sessionId;
   viewer.screen = null;
@@ -452,6 +471,7 @@ function openViewer(sessionId, title) {
   updateComposerEnabled();
   viewer.back.focus();
   send({ type: 'watch', session: sessionId });
+  return true;
 }
 
 viewer.back.addEventListener('click', () => requestCloseViewer());
@@ -464,9 +484,46 @@ window.addEventListener('popstate', () => {
 });
 ```
 
-Remove the old `closeViewer`, `scrollIntoView`, and `#viewer-close` listener.
+Remove the old `closeViewer`, `scrollIntoView`, and `#viewer-back` temporary listener from Task 1; the new listener above is authoritative.
 
-- [ ] **Step 4: Add restorable session ids and non-recursive disappearance cleanup**
+- [ ] **Step 4: Register repeat cancellation, preserve pending deep links, and reconcile sessions**
+
+In the existing special-key loop, move `let repeated = false` before `stopRepeat` and register the exact cancellation used by close and later reconnect handling:
+
+```javascript
+let repeated = false;
+const stopRepeat = () => {
+  clearTimeout(repeatTimer);
+  clearInterval(repeatInterval);
+  repeatTimer = null;
+  repeatInterval = null;
+};
+keyRepeatCancels.push(() => {
+  stopRepeat();
+  repeated = false;
+});
+```
+
+Remove the later duplicate `let repeated = false`. Pointer-up/leave/cancel continue to call `stopRepeat`, preserving trailing-click suppression for a real long press.
+
+Change `consumePendingWatch` so closing never consumes the pending id and a rejected open leaves it queued:
+
+```javascript
+function consumePendingWatch(sessions) {
+  if (!pendingWatch) return false;
+  if (Date.now() > pendingWatchDeadline) {
+    pendingWatch = null;
+    return false;
+  }
+  if (viewer.closing) return false;
+  const target = sessions.find((session) => session.id === pendingWatch);
+  if (!target) return false;
+  const id = pendingWatch;
+  if (!openViewer(id, target.title || ('세션 ' + id))) return false;
+  pendingWatch = null;
+  return true;
+}
+```
 
 When creating a view button, add:
 
@@ -482,13 +539,13 @@ const watched = viewer.watching
   : null;
 if (viewer.watching && (!watched || watched.exited)) {
   requestCloseViewer({
-    rerender: false,
+    rerender: true,
     notice: '선택한 세션이 종료되었습니다 — 세션 목록으로 돌아왔습니다.',
   });
 }
 ```
 
-`rerender: false` lets the current dashboard render finish exactly once.
+Because owned-history cleanup is deferred until `popstate`, the current dashboard render finishes first and cleanup then requests one fresh render with cleared `viewer.watching`. The lifecycle notice intentionally runs after that frame and takes priority over a same-frame server notice.
 
 - [ ] **Step 5: Run lifecycle and static tests**
 
@@ -530,6 +587,8 @@ fn 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한�
         "function stopAllKeyRepeats()",
         "if (!remoteInputReady()) return;",
         "const uploadSession = viewer.watching",
+        "function cancelActiveUpload()",
+        "signal: upload.controller.signal",
     ] {
         assert!(js.contains(marker), "connection safety marker 누락: {marker}");
     }
@@ -555,7 +614,6 @@ overlay: document.getElementById('viewer-connection-overlay'),
 overlayTitle: document.getElementById('viewer-overlay-title'),
 overlayDetail: document.getElementById('viewer-overlay-detail'),
 privacy: document.getElementById('viewer-privacy-curtain'),
-keys: Array.from(document.querySelectorAll('.viewer-keys button')),
 ```
 
 Add:
@@ -566,12 +624,6 @@ const VIEWER_CONNECTION_COPY = {
   reconnecting: ['재연결 중', '마지막 화면을 유지합니다. 연결되기 전에는 입력할 수 없습니다.'],
   paused: ['일시정지', '앱으로 돌아오면 다시 연결합니다.'],
 };
-
-const keyRepeatCancels = [];
-
-function stopAllKeyRepeats() {
-  for (const cancel of keyRepeatCancels) cancel();
-}
 
 function setViewerConnection(state) {
   viewer.connection = state;
@@ -585,6 +637,7 @@ function setViewerConnection(state) {
     viewer.overlayDetail.textContent = copy[1];
     stopAllKeyRepeats();
     resetScroll();
+    cancelActiveUpload();
   }
   updateComposerEnabled();
 }
@@ -650,7 +703,10 @@ Replace the enabling and key guards with:
 
 ```javascript
 function remoteInputReady() {
-  return !!viewer.watching && viewer.connection === 'connected' && !inputBlocked;
+  return !!viewer.watching
+    && !viewer.closing
+    && viewer.connection === 'connected'
+    && !inputBlocked;
 }
 
 function updateComposerEnabled() {
@@ -689,25 +745,23 @@ function queueScroll(lines) {
 
 Use `if (offset > 0 && remoteInputReady())` in the `viewer-bottom` click handler.
 
-- [ ] **Step 6: Cancel long-press repeats and revalidate delayed file selection**
+- [ ] **Step 6: Abort active uploads and revalidate delayed file selection**
 
-In the special-key loop, move `let repeated = false` before `stopRepeat`, then register a cancellation that also clears click suppression:
+Add upload ownership next to `uploadBusy`:
 
 ```javascript
-let repeated = false;
-const stopRepeat = () => {
-  clearTimeout(repeatTimer);
-  clearInterval(repeatInterval);
-  repeatTimer = null;
-  repeatInterval = null;
-};
-keyRepeatCancels.push(() => {
-  stopRepeat();
-  repeated = false;
-});
+let activeUpload = null;
+
+function cancelActiveUpload() {
+  if (!activeUpload) return;
+  activeUpload.controller.abort();
+  activeUpload = null;
+  uploadBusy = false;
+  updateComposerEnabled();
+}
 ```
 
-Remove the later duplicate `let repeated = false`. Existing pointer-up/leave/cancel handlers continue to use `stopRepeat` so a real long-press still suppresses its trailing click.
+Call `cancelActiveUpload()` at the start of an accepted new `openViewer` transition and immediately after the guards in `requestCloseViewer`, so session changes and close requests cannot leave an orphan upload.
 
 At the start of the file-input `change` handler, after confirming `file` exists, capture and validate the exact session:
 
@@ -719,12 +773,41 @@ if (!uploadSession || !remoteInputReady()) {
 }
 ```
 
+Before setting `uploadBusy`, create exact ownership:
+
+```javascript
+const upload = { session: uploadSession, controller: new AbortController() };
+activeUpload = upload;
+```
+
+Add the signal to fetch:
+
+```javascript
+signal: upload.controller.signal,
+```
+
 After validating `result.path` and before inserting it into the composer, revalidate:
 
 ```javascript
 if (viewer.watching !== uploadSession || !remoteInputReady()) {
   setComposerNote('연결 또는 세션이 바뀌어 업로드 경로를 입력하지 않았습니다');
   return;
+}
+```
+
+Use a named catch value and ownership-aware finalization:
+
+```javascript
+} catch (error) {
+  if (!(error && error.name === 'AbortError')) {
+    setComposerNote('업로드 실패 — 네트워크를 확인하세요');
+  }
+} finally {
+  if (activeUpload === upload) {
+    activeUpload = null;
+    uploadBusy = false;
+    updateComposerEnabled();
+  }
 }
 ```
 

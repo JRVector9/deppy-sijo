@@ -341,6 +341,9 @@ fn 전체화면_뷰어_js는_단일_lifecycle과_back_계약을_포함한다() {
         "if (viewer.watching !== endedSession) return;",
         "queueMicrotask(() => {",
         "if (s.id && !s.exited)",
+        "else if (!s.id) {",
+        "if (known && !known.exited) {",
+        "if (!row || row.exited) return;",
         "let pointerActive = false;",
         "repeated = repeated || pointerActive;",
     ] {
@@ -590,9 +593,28 @@ Only active sessions may expose the view action:
 
 ```javascript
 if (s.id && !s.exited) {
+  // view button
+} else if (!s.id) {
+  // inactive workspace note
+}
 ```
 
-An exited session remains visible with its status badge but cannot open, receive restored focus, or trigger an open-then-close flash.
+An exited session remains visible with its status badge but cannot open, receive restored focus, trigger an open-then-close flash, or fall through to the inactive-workspace `대기`/`절전` note.
+
+Apply the same active-session invariant to the approval card's contextual `화면 보기` action. The card can outlive a dashboard update, so gate both initial rendering and click-time execution:
+
+```javascript
+if (known && !known.exited) {
+  // create contextual view button
+  view.addEventListener('click', () => {
+    const row = lastSessions.find((session) => session.id === item.session);
+    if (!row || row.exited) return;
+    openViewer(item.session, row.title || item.session_title || '세션');
+  });
+}
+```
+
+This prevents a stale approval DOM node from opening a black viewer after the final dashboard frame for a disappeared session.
 
 Because owned-history cleanup is deferred until `popstate`, the current dashboard render finishes first and cleanup then requests one fresh render with cleared `viewer.watching`. The lifecycle notice intentionally runs after that frame and takes priority over a same-frame server notice.
 

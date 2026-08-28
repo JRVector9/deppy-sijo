@@ -1,5 +1,79 @@
 # Codex handoff
 
+## Task 2 complete — production Relay persistence (2026-08-29)
+
+- Status: Task 2 of `docs/superpowers/plans/2026-08-28-production-relay.md` is implemented,
+  tested, reviewed, and committed in isolation. Task 1 remains `e3617ea`. Task 3 has not
+  started. No push, no packaging, no deploy, no app relaunch was performed.
+- What Task 2 now owns: `crates/web-remote/src/relay/repository.rs` (storage-neutral port),
+  `crates/app/src/relay_repository.rs` (production adapter owning `storage::Db`), the v37
+  relay schema and relay APIs in `crates/storage/src/db.rs`, the relay exports in
+  `crates/storage/src/lib.rs`, `pub mod repository;` in `crates/web-remote/src/relay/mod.rs`,
+  and one `mod relay_repository;` line in `crates/app/src/main.rs`. Every other dirty file
+  (`Cargo.toml`, `Cargo.lock`, `crates/app/src/app.rs`, `crates/secret/*`, packaging scripts,
+  mockups, prototype plan) was left untouched and unstaged.
+- Findings from the previous stop that are now closed:
+  - **Split expiries.** `RelayPairingLifetime` carries `issued_at`, `pairing_expires_at`
+    (bounded by `PAIRING_TTL_SECS` = 300s) and `device_expires_at` as three typed values;
+    the v37 pending table has both columns with CHECK constraints
+    (`pairing_expires_at - issued_at <= 300`, `device_expires_at >= pairing_expires_at`) and
+    `relay_devices.device_expires_at` is the admitted-device window. Approval fails at the
+    exact pairing deadline and the published device outlives it. Boundary tests exist at the
+    value, SQL, and adapter level.
+  - **Real durable corruption.** The 65-byte `0x04`-prefixed off-curve point is now covered:
+    web-remote rejects it in both record constructors; storage documents that SQLite CHECKs
+    cannot see the curve; the app adapter rejects a tampered pending row before any approval
+    mutation and a tampered device row before admission (real `rusqlite` tampering of the DB
+    file, not a synthetic value).
+  - **Coordinator ordering and crash compensation.** `PendingAdmission` holds the
+    non-cloneable `PairingApproval` and enforces
+    `PairingRegistry::consume -> begin (pending row) -> user approval -> approve (DB commit)
+    -> AuthenticatedHandshake::confirm`. A confirmation failure after the commit revokes the
+    freshly published device; a failed compensating revocation is folded into the error, not
+    swallowed. `AppRelayRepository::open` purges leftover pending rows because a restart
+    destroys every in-memory approval.
+  - **Production adapter.** `AppRelayRepository` is the only SQLite owner; every row passes
+    through the validated `web-remote` constructors. `web-remote` production code contains no
+    `storage::`/`rusqlite` reference (source law test). The old `#[cfg(test)]`
+    `StorageRelayTestRepository` was removed so there is exactly one adapter.
+  - **Single-instance identity.** `create_relay_identity_after_single_instance_lock` requires
+    a `&persist::LockFile`, so identity creation cannot compile before the app's `deppy.lock`
+    is held. A source-law test proves `get_or_create_relay_identity` has exactly one call site
+    in the whole app crate.
+- Direct review round: `codex exec --model gpt-5.5 -c model_reasoning_effort=high
+  --sandbox read-only` with a prompt scoped to the four Task 2 files and explicitly forbidden
+  from reading this handoff (that is what filled the pipe last time). It returned one **High**
+  finding and no others: the adapter validated the pending row in one transaction while
+  storage approved in another, so a row swapped in between could be published and then fail
+  conversion, leaving an unrevoked device row (`PendingAdmission::approve` propagates that
+  error with `?` before compensation). Fixed by passing the validated
+  `expected_identity_public_sec1` into `Db::approve_relay_pending_device` and re-checking it
+  **inside** the approval transaction; a mismatch bails and the transaction rolls back, so
+  nothing is published. Regression test:
+  `db::tests::relay_approval_rejects_a_pending_row_that_changed_after_validation`.
+- Gate evidence, all re-run after that fix (2026-08-29):
+  - `cargo test -p storage --locked -- --test-threads=1` — 324 passed, 0 failed.
+  - `cargo test -p web-remote --locked -- --test-threads=1` — 221 + 3 passed, 0 failed,
+    1 ignored (the Chrome vector, run separately below).
+  - `cargo test -p deppy-sijo --locked relay_repository -- --test-threads=1` — 10 passed.
+  - `cargo test -p web-remote --locked --test relay_webcrypto_vectors -- --ignored` — 1 passed
+    against real Chrome.
+  - `cargo clippy -p web-remote -p storage -p deppy-sijo --locked --all-targets -- -D warnings`
+    — exit 0. Four findings were fixed rather than silenced (two large-enum variants, an
+    8-argument constructor, an explicit auto-deref); the only remaining `#[allow]` is
+    `large_enum_variant` on `AdmissionOutcome`, justified in place because boxing would copy
+    live AES-GCM key material to the heap and leave the stack copy unzeroized.
+  - `cargo fmt --all -- --check` — exit 0. `git diff --check` — exit 0. Untracked whitespace
+    scan — no matches.
+- Deliberately deferred, not skipped: the Relay-only **lifecycle** isolation test (proving a
+  Keychain denial neither starts, stops, nor mutates Tailscale) belongs to **Task 4**, because
+  Task 2 creates no startup wiring by design. What Task 2 does prove is that the denial is a
+  Relay-scoped error, that the repository still opens after it, and that the adapter module
+  imports nothing from the rest of the app (`use crate::` is forbidden by a source law).
+- Next: Task 3 (`relay-protocol` + untrusted `relay-server`). Its production publish stays
+  **BLOCKED** on Mac verifier provisioning, DNS, registry, TLS edge, Origin, GitHub
+  environments, and secret names. Tasks 4-7 checklists are unchanged and still recorded below.
+
 ## Current task — implement provider-usage visibility hardening (2026-08-26)
 
 - Current objective: complete the approved Claude/Codex/Grok/Kimi usage-visibility hardening, push the reviewed commits, rebuild the trusted macOS release, and place the verified app bundle on the Desktop without relaunching it.

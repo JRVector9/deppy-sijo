@@ -117,6 +117,11 @@ Commit only Task 1 files.
 
 The `web-remote` crate owns bounded records and a `RelayRepository` trait; it must not open SQLite directly. Records include device id, public identity keys, display name, explicit permissions, issued/expires/last-seen timestamps, and revoked-at. They never include Tailscale tokens or raw private keys.
 
+Keep the five-minute pairing/approval deadline and the longer-lived admitted-device expiry as two
+different typed fields. A pending row must not reuse one `expires_at` for both lifecycles: approval
+must fail at the pairing deadline, while the admitted device receives its separately selected
+expiry only after approval commits.
+
 ### Step 2: Persist Mac private identity only through `SecretStore`
 
 Use a new versioned Keychain id. Never reuse the VAPID, remote TLS, OAuth, or web pairing key ids. Treat Keychain denial as a Relay-only startup error; do not break Tailscale or app startup.
@@ -125,9 +130,22 @@ Use a new versioned Keychain id. Never reuse the VAPID, remote TLS, OAuth, or we
 
 Approval must atomically consume the pending ticket and create/update one device. Revocation must invalidate new channel admission immediately. Bound pending tickets and devices, and define deterministic eviction/rejection behavior.
 
+Define and test one coordinator-owned ordering across `PairingApproval`, the SQLite transaction,
+and `AuthenticatedHandshake::confirm`. A persisted pending row may be constructed only from the
+matching verified peer fingerprint. App restart must not turn a stale row into sufficient proof of
+pairing, and any failure after the database commit but before channel activation must have an
+explicit fail-closed compensation path. The production App adapter, rather than a `#[cfg(test)]`
+adapter inside `web-remote`, owns `storage::Db` and performs every row conversion through the
+validated `web-remote` value constructors.
+
 ### Step 4: Verify migration, restart, revocation, corruption, and resource bounds
 
 Use repository contract tests plus real SQLite integration. Confirm secrets and terminal payloads never serialize to the DB.
+
+Corruption coverage must include an exact-length 65-byte SEC1 value with the required `0x04`
+prefix that is nevertheless not a valid P-256 point, in both pending and admitted-device rows.
+Oversized-blob-only tests are insufficient. Re-run all focused tests after the final constructor,
+trusted-clock, mutex, and single-snapshot changes; a pre-correction GREEN is not release evidence.
 
 ## Task 3: Define and test the untrusted relay data-plane protocol
 

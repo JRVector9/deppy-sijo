@@ -6,6 +6,7 @@
 pub mod contract;
 pub mod crypto;
 pub mod pairing;
+pub mod repository;
 
 pub use contract::{RelayAction, RelayPermissions};
 pub use crypto::{EncryptedEnvelope, RelayIdentity, RelayRole, SecureChannel};

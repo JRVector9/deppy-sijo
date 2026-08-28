@@ -172,6 +172,8 @@ fn 전체화면_뷰어_css는_viewport와_safe_area_계약을_포함한다() {
         "body.viewer-open",
         ".viewer-shell",
         "position: fixed",
+        "left: var(--viewer-left, 0px)",
+        "width: var(--viewer-width, 100vw)",
         "height: var(--viewer-height, 100dvh)",
         "env(safe-area-inset-top)",
         "env(safe-area-inset-bottom)",
@@ -205,10 +207,13 @@ body.viewer-open { overflow: hidden; overscroll-behavior: none; }
 .viewer-shell[hidden] { display: none; }
 .viewer-shell {
   --viewer-top: 0px;
+  --viewer-left: 0px;
+  --viewer-width: 100vw;
   --viewer-height: 100dvh;
   position: fixed;
-  inset-inline: 0;
+  left: var(--viewer-left, 0px);
   top: var(--viewer-top);
+  width: var(--viewer-width, 100vw);
   height: var(--viewer-height, 100dvh);
   z-index: 1000;
   display: grid;
@@ -322,6 +327,10 @@ fn 전체화면_뷰어_js는_단일_lifecycle과_back_계약을_포함한다() {
         "dashboardShell.inert = false",
         "viewBtn.dataset.sessionId = s.id",
         "선택한 세션이 종료되었습니다",
+        "function clearViewerCanvas()",
+        "function clearStaleViewerHistory()",
+        "viewer.pendingClose = options",
+        "viewer.closing = true",
     ] {
         assert!(js.contains(marker), "viewer lifecycle marker 누락: {marker}");
     }
@@ -342,6 +351,16 @@ Expected: FAIL at `activateViewerShell`; the old source still contains `scrollIn
 ```javascript
 const dashboardShell = document.getElementById('dashboard-shell');
 const sessionsTitle = document.getElementById('sessions-title');
+
+function clearStaleViewerHistory() {
+  if (!(history.state && history.state.deppyViewer)) return;
+  const cleanState = { ...history.state };
+  delete cleanState.deppyViewer;
+  history.replaceState(Object.keys(cleanState).length ? cleanState : null, '', location.href);
+}
+
+clearStaleViewerHistory();
+
 const viewer = {
   el: document.getElementById('viewer'),
   label: document.getElementById('viewer-session'),
@@ -351,7 +370,17 @@ const viewer = {
   watching: null,
   returnSession: null,
   screen: null,
+  closing: false,
+  pendingClose: null,
 };
+
+function clearViewerCanvas() {
+  const canvas = viewer.canvas;
+  const context = canvas.getContext('2d');
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.fillStyle = '#000000';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+}
 
 function activateViewerShell() {
   dashboardShell.inert = true;
@@ -375,6 +404,9 @@ function finishCloseViewer({ rerender = true, notice = '' } = {}) {
   viewer.watching = null;
   viewer.returnSession = null;
   viewer.screen = null;
+  viewer.closing = false;
+  viewer.pendingClose = null;
+  viewer.back.disabled = false;
   resetScroll();
   updateScrollNote();
   inputBlocked = false;
@@ -390,17 +422,24 @@ function finishCloseViewer({ rerender = true, notice = '' } = {}) {
 }
 
 function requestCloseViewer(options = {}) {
-  if (!viewer.watching) return;
+  if (!viewer.watching || viewer.closing) return;
   const ownsHistory = !!(history.state && history.state.deppyViewer);
+  if (ownsHistory) {
+    viewer.closing = true;
+    viewer.pendingClose = options;
+    viewer.back.disabled = true;
+    history.back();
+    return;
+  }
   finishCloseViewer(options);
-  if (ownsHistory) history.back();
 }
 
 function openViewer(sessionId, title) {
-  if (!sessionId || viewer.watching === sessionId) return;
+  if (!sessionId || viewer.closing || viewer.watching === sessionId) return;
   viewer.watching = sessionId;
   viewer.returnSession = sessionId;
   viewer.screen = null;
+  clearViewerCanvas();
   resetScroll();
   updateScrollNote();
   inputBlocked = false;
@@ -418,7 +457,9 @@ function openViewer(sessionId, title) {
 viewer.back.addEventListener('click', () => requestCloseViewer());
 window.addEventListener('popstate', () => {
   if (viewer.watching && !(history.state && history.state.deppyViewer)) {
-    finishCloseViewer();
+    finishCloseViewer(viewer.pendingClose || {});
+  } else if (!viewer.watching && history.state && history.state.deppyViewer) {
+    clearStaleViewerHistory();
   }
 });
 ```
@@ -485,6 +526,10 @@ fn 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한�
         "viewer.privacy.hidden = true",
         "setViewerConnection('reconnecting')",
         "setViewerConnection('paused')",
+        "intentionallyClosedSockets.has(socket)",
+        "function stopAllKeyRepeats()",
+        "if (!remoteInputReady()) return;",
+        "const uploadSession = viewer.watching",
     ] {
         assert!(js.contains(marker), "connection safety marker 누락: {marker}");
     }
@@ -522,6 +567,12 @@ const VIEWER_CONNECTION_COPY = {
   paused: ['일시정지', '앱으로 돌아오면 다시 연결합니다.'],
 };
 
+const keyRepeatCancels = [];
+
+function stopAllKeyRepeats() {
+  for (const cancel of keyRepeatCancels) cancel();
+}
+
 function setViewerConnection(state) {
   viewer.connection = state;
   const connected = state === 'connected';
@@ -532,6 +583,8 @@ function setViewerConnection(state) {
   if (!connected) {
     viewer.overlayTitle.textContent = copy[0];
     viewer.overlayDetail.textContent = copy[1];
+    stopAllKeyRepeats();
+    resetScroll();
   }
   updateComposerEnabled();
 }
@@ -540,6 +593,12 @@ function setViewerConnection(state) {
 - [ ] **Step 4: Wire socket transitions without changing protocol messages**
 
 In `connect()`, call `setViewerConnection('connecting')` after the global connecting status. In `welcome`, call `setViewerConnection('connected')` before the existing reconnect `watch`. In unexpected socket `close`, call `setViewerConnection('reconnecting')` before `scheduleReconnect()`:
+
+Declare this next to the socket state:
+
+```javascript
+const intentionallyClosedSockets = new WeakSet();
+```
 
 ```javascript
 setStatus('', '연결 중…');
@@ -556,10 +615,24 @@ if (viewer.watching) {
 ```
 
 ```javascript
-if (!manualClose) {
+socket.addEventListener('close', () => {
+  const wasCurrent = ws === socket;
+  if (wasCurrent) ws = null;
+  if (!wasCurrent || intentionallyClosedSockets.has(socket)) return;
   setStatus('bad', '연결 끊김 — 재연결 중…');
   setViewerConnection('reconnecting');
   scheduleReconnect();
+});
+```
+
+Replace the socket-close part of `disconnect()` so intentional ownership belongs to that exact socket even if a new connection starts before its late close event:
+
+```javascript
+if (ws) {
+  const socket = ws;
+  ws = null;
+  intentionallyClosedSockets.add(socket);
+  try { socket.close(); } catch {}
 }
 ```
 
@@ -596,7 +669,66 @@ function sendKey(key) {
 
 Change `sendComposer`'s initial guard to `if (!target || !remoteInputReady()) return;`. No connection transition may clear `composerText.value`.
 
-- [ ] **Step 6: Show privacy before background disconnect**
+Gate scrolling at enqueue, flush, and the bottom button. Replace the start of `queueScroll` and its send condition with:
+
+```javascript
+function queueScroll(lines) {
+  if (!remoteInputReady()) return;
+  scrollAcc += lines;
+  if (scrollTimer) return;
+  scrollTimer = setTimeout(() => {
+    scrollTimer = null;
+    const whole = Math.trunc(scrollAcc);
+    scrollAcc -= whole;
+    if (whole !== 0 && remoteInputReady()) {
+      send({ type: 'scroll', session: viewer.watching, delta: whole });
+    }
+  }, 60);
+}
+```
+
+Use `if (offset > 0 && remoteInputReady())` in the `viewer-bottom` click handler.
+
+- [ ] **Step 6: Cancel long-press repeats and revalidate delayed file selection**
+
+In the special-key loop, move `let repeated = false` before `stopRepeat`, then register a cancellation that also clears click suppression:
+
+```javascript
+let repeated = false;
+const stopRepeat = () => {
+  clearTimeout(repeatTimer);
+  clearInterval(repeatInterval);
+  repeatTimer = null;
+  repeatInterval = null;
+};
+keyRepeatCancels.push(() => {
+  stopRepeat();
+  repeated = false;
+});
+```
+
+Remove the later duplicate `let repeated = false`. Existing pointer-up/leave/cancel handlers continue to use `stopRepeat` so a real long-press still suppresses its trailing click.
+
+At the start of the file-input `change` handler, after confirming `file` exists, capture and validate the exact session:
+
+```javascript
+const uploadSession = viewer.watching;
+if (!uploadSession || !remoteInputReady()) {
+  setComposerNote('연결이 끊겼습니다 — 재연결 후 파일을 선택하세요');
+  return;
+}
+```
+
+After validating `result.path` and before inserting it into the composer, revalidate:
+
+```javascript
+if (viewer.watching !== uploadSession || !remoteInputReady()) {
+  setComposerNote('연결 또는 세션이 바뀌어 업로드 경로를 입력하지 않았습니다');
+  return;
+}
+```
+
+- [ ] **Step 7: Show privacy before background disconnect**
 
 Replace the existing visibility handler:
 
@@ -615,7 +747,7 @@ document.addEventListener('visibilitychange', () => {
 });
 ```
 
-- [ ] **Step 7: Run the focused and static tests**
+- [ ] **Step 8: Run the focused and static tests**
 
 ```bash
 cargo test -p web-remote --locked 전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한다 -- --nocapture
@@ -624,7 +756,7 @@ cargo test -p web-remote --locked static_srv::tests -- --nocapture
 
 Expected: the focused test and all static server tests PASS.
 
-- [ ] **Step 8: Commit connection safety**
+- [ ] **Step 9: Commit connection safety**
 
 ```bash
 git add crates/web-remote/src/static_srv.rs crates/web-remote/assets/app.js
@@ -650,8 +782,13 @@ fn 전체화면_렌더러는_visual_viewport와_단일_frame_스케줄러를_사
         "visualViewport.addEventListener('resize'",
         "visualViewport.addEventListener('scroll'",
         "new ResizeObserver",
+        "visualViewport.offsetLeft",
+        "visualViewport.width",
+        "viewer.el.style.setProperty('--viewer-left'",
+        "viewer.el.style.setProperty('--viewer-width'",
         "availableHeight / (screen.rows * CELL_ASPECT_RATIO)",
         "ctx.setTransform(dpr, 0, 0, dpr, 0, 0)",
+        "scheduleViewerRender(); // composer layout changed",
     ] {
         assert!(js.contains(marker), "viewport renderer marker 누락: {marker}");
     }
@@ -677,14 +814,24 @@ let viewerRenderFrame = 0;
 function syncViewerViewport() {
   const visualViewport = window.visualViewport;
   const top = visualViewport ? visualViewport.offsetTop : 0;
+  const left = visualViewport ? visualViewport.offsetLeft : 0;
+  const width = visualViewport ? visualViewport.width : window.innerWidth;
   const height = visualViewport ? visualViewport.height : window.innerHeight;
   const topPx = Math.max(0, Math.round(top)) + 'px';
+  const leftPx = Math.max(0, Math.round(left)) + 'px';
+  const widthPx = Math.max(1, Math.round(width)) + 'px';
   const heightPx = Math.max(1, Math.round(height)) + 'px';
   if (viewer.el.style.getPropertyValue('--viewer-top') !== topPx) {
     viewer.el.style.setProperty('--viewer-top', topPx);
   }
   if (viewer.el.style.getPropertyValue('--viewer-height') !== heightPx) {
     viewer.el.style.setProperty('--viewer-height', heightPx);
+  }
+  if (viewer.el.style.getPropertyValue('--viewer-left') !== leftPx) {
+    viewer.el.style.setProperty('--viewer-left', leftPx);
+  }
+  if (viewer.el.style.getPropertyValue('--viewer-width') !== widthPx) {
+    viewer.el.style.setProperty('--viewer-width', widthPx);
   }
 }
 
@@ -805,6 +952,12 @@ if ('ResizeObserver' in window) {
 }
 ```
 
+Also schedule after footer height changes so the window-only fallback remains correct. Append this exact line at the end of both `autoGrow()` and `setComposerNote()`:
+
+```javascript
+scheduleViewerRender(); // composer layout changed
+```
+
 - [ ] **Step 6: Run renderer, static, and syntax tests**
 
 ```bash
@@ -893,9 +1046,17 @@ Exercise browser Back, then evaluate:
 
 Expected: viewer hidden, body unlocked, dashboard active, and focus restored to the closed session when it still exists. Repeat open measurements in portrait and short landscape viewports and record actual dimensions. Do not report keyboard or standalone PWA behavior as passed unless actually exercised.
 
+Open one session, let it paint a recognizable non-black frame, close it, and open a different session while delaying its first viewport frame. Expected: no pixel from the previous session is visible; the canvas is black until the new keyframe arrives.
+
+Reload once with a synthetic or real `history.state.deppyViewer` marker and exercise browser Forward after closing. Expected: the stale marker is removed, a later open still creates exactly one viewer entry, and its Back returns to the dashboard. While a programmatic close is waiting for `popstate`, confirm the inert dashboard cannot start a second viewer transition.
+
 - [ ] **Step 4: Measure reconnect, draft, and privacy invariants**
 
 With a non-empty composer draft, interrupt the existing WebSocket connection. Verify the connection overlay is visible; every special key, composer send, textarea, and attachment control is disabled; canvas dimensions remain non-zero; and the draft value is unchanged. Restore the connection and verify overlay removal and that the draft was not auto-sent.
+
+Perform a quick background→foreground transition so the intentionally closed old socket can deliver its `close` after the new socket starts. Expected: the late old event is ignored and does not return the connected viewer to `reconnecting`.
+
+Start an arrow-key long press and a coalesced scroll, then interrupt the connection before their timers fire. Expected: repeat and scroll timers are canceled and no stale command is emitted after reconnection. Open the file picker while connected, disconnect before selecting a file, then return from the picker. Expected: no upload begins and the UI asks for reconnection.
 
 Trigger a real background/foreground transition where supported. Verify the privacy curtain appears before disconnect and hides on return. If the environment cannot create a genuine visibility transition, record it as unverified.
 

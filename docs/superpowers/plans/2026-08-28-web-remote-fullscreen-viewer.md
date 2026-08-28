@@ -330,7 +330,7 @@ fn 전체화면_뷰어_js는_단일_lifecycle과_back_계약을_포함한다() {
         "function clearViewerCanvas()",
         "function clearStaleViewerHistory()",
         "viewer.pendingClose = options",
-        "viewer.closing = true",
+        "setViewerClosing(true)",
         "function setViewerClosing(",
         "function stopAllKeyRepeats()",
         "if (viewer.closing) return false;",

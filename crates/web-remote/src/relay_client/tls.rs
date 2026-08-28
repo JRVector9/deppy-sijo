@@ -18,8 +18,8 @@ use tungstenite::{Message, WebSocket};
 use super::lifecycle::RelayEndpoint;
 use super::worker::{RelaySession, RelayTransport, TransportError};
 
-/// 한 프레임의 상한. Relay 데이터 평면의 최대 프레임과 같은 값이어야 한다.
-pub const MAX_RELAY_FRAME_BYTES: usize = 1024 * 1024 + 16 + 52;
+/// 한 프레임의 상한 — 데이터 평면의 값을 그대로 쓴다. 숫자를 따로 적으면 언젠가 갈라진다.
+pub const MAX_RELAY_FRAME_BYTES: usize = relay_protocol::MAX_FRAME_BYTES;
 
 pub struct TlsRelayTransport;
 
@@ -397,13 +397,22 @@ mod tests {
         );
     }
 
+    /// Mac 클라이언트·E2EE 계약·데이터 평면 세 곳의 상한을 **컴파일 타임에** 묶는다.
+    ///
+    /// 세 값이 갈라지면 한쪽이 만든 프레임을 다른 쪽이 거부하는데, 그건 실제 기기를 붙여
+    /// 봐야 드러난다. 숫자를 각자 적어 두는 대신 서로를 참조하게 만든다.
     #[test]
-    fn the_frame_ceiling_matches_the_relay_data_plane() {
-        // relay-protocol의 MAX_FRAME_BYTES와 같은 값이어야 한다(헤더 52 + 1 MiB + 태그 16).
-        assert_eq!(MAX_RELAY_FRAME_BYTES, 52 + 1024 * 1024 + 16);
+    fn the_frame_ceiling_is_tied_to_both_the_e2ee_contract_and_the_wire_protocol() {
         assert_eq!(
             MAX_RELAY_FRAME_BYTES,
-            crate::relay::crypto::MAX_RELAY_CIPHERTEXT_BYTES + 52
+            crate::relay::crypto::MAX_RELAY_CIPHERTEXT_BYTES + relay_protocol::HEADER_BYTES,
+            "E2EE 레코드 상한 + 와이어 헤더가 곧 한 프레임의 상한이다"
         );
+        assert_eq!(
+            crate::relay::crypto::MAX_RELAY_CIPHERTEXT_BYTES,
+            relay_protocol::MAX_CIPHERTEXT_BYTES,
+            "E2EE 계약과 데이터 평면의 암호문 상한이 갈라지면 안 된다"
+        );
+        assert_eq!(MAX_RELAY_FRAME_BYTES, relay_protocol::MAX_FRAME_BYTES);
     }
 }

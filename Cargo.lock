@@ -5621,6 +5621,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "p256",
+ "relay-protocol",
  "runtime",
  "secret",
  "serde",

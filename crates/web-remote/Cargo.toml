@@ -48,3 +48,7 @@ sha2 = { workspace = true, features = ["zeroize"] }
 ureq = { workspace = true }
 # Relay pairing rendezvous secrets require an explicit constant-time equality primitive.
 subtle = "2"
+# Relay 데이터 평면 와이어 계약(의존성 0). Mac 클라이언트가 서버와 **같은 상한**을 쓰는지
+# 컴파일 타임에 묶어 두기 위해 참조한다 — 두 값이 갈라지면 한쪽이 만든 프레임을 다른 쪽이
+# 거부하는데, 그건 실제 기기에서만 드러난다.
+relay-protocol = { path = "../relay-protocol" }

@@ -1,0 +1,1211 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#181b20">
+  <title>Deppy Sijo — 모바일 연결 시나리오</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #181b20;
+      --surface: #20242a;
+      --surface-2: #0f1115;
+      --surface-3: #15181d;
+      --border: #32363e;
+      --border-strong: #454b55;
+      --text: #dcdee2;
+      --text-strong: #f3f5f7;
+      --muted: #828893;
+      --muted-2: #a8adb6;
+      --cyan: #39b8e8;
+      --green: #56d364;
+      --amber: #e0a43a;
+      --red: #ef6671;
+      --blue: #58a6ff;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+    }
+
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    button, input, textarea { font: inherit; }
+    button { min-height: 44px; }
+    button:focus-visible, textarea:focus-visible, input:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 2px;
+    }
+
+    .prototype-shell {
+      min-height: 100vh;
+      padding: max(22px, env(safe-area-inset-top)) 24px max(24px, env(safe-area-inset-bottom));
+    }
+
+    .prototype-header {
+      max-width: 1360px;
+      margin: 0 auto 18px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+    }
+
+    .eyebrow {
+      margin: 0 0 5px;
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    .prototype-header h1 {
+      margin-bottom: 4px;
+      color: var(--text-strong);
+      font-size: clamp(20px, 2.4vw, 30px);
+      font-weight: 720;
+      letter-spacing: -0.025em;
+    }
+
+    .prototype-header p:last-child { margin: 0; color: var(--muted-2); }
+    .prototype-badge {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 34px;
+      padding: 0 11px;
+      border: 1px solid #28566a;
+      color: #8fd9f5;
+      background: #14262e;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .prototype-badge::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--cyan);
+      box-shadow: 0 0 0 3px rgba(57, 184, 232, 0.14);
+    }
+
+    .flow-rail {
+      max-width: 1360px;
+      margin: 0 auto 18px;
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      border: 1px solid var(--border);
+      background: var(--surface-3);
+      overflow-x: auto;
+    }
+
+    .flow-step {
+      position: relative;
+      border: 0;
+      border-right: 1px solid var(--border);
+      border-radius: 0;
+      padding: 10px 12px;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      cursor: pointer;
+      min-width: 130px;
+    }
+
+    .flow-step:last-child { border-right: 0; }
+    .flow-step:hover { background: #1d2127; color: var(--text); }
+    .flow-step[aria-current="step"] { background: #172630; color: var(--text-strong); }
+    .flow-step[aria-current="step"]::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 2px;
+      background: var(--cyan);
+    }
+
+    .flow-index {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--cyan);
+      font: 700 10px/1 ui-monospace, Menlo, monospace;
+      letter-spacing: 0.08em;
+    }
+
+    .flow-label { font-size: 12px; font-weight: 640; white-space: nowrap; }
+
+    .stage-switcher {
+      display: none;
+      max-width: 620px;
+      margin: 0 auto 12px;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--border);
+      padding: 3px;
+      background: var(--surface-3);
+    }
+
+    .stage-switcher button {
+      min-height: 38px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .stage-switcher button.is-active { background: #25303a; color: var(--text-strong); }
+
+    .scenario-stage {
+      max-width: 1360px;
+      min-height: 680px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(590px, 1.55fr) minmax(330px, 0.7fr);
+      gap: 30px;
+      align-items: stretch;
+    }
+
+    .device-caption {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 44px;
+      color: var(--muted-2);
+      font-size: 12px;
+      font-weight: 650;
+      letter-spacing: 0.03em;
+    }
+
+    .device-caption strong { color: var(--text); font-size: 13px; }
+    .device-status { display: inline-flex; align-items: center; gap: 7px; }
+    .device-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+
+    .desktop-wrap, .phone-wrap { min-width: 0; display: flex; flex-direction: column; }
+    .desktop-frame {
+      flex: 1;
+      min-height: 630px;
+      overflow: hidden;
+      border: 1px solid var(--border-strong);
+      background: var(--surface-2);
+      box-shadow: var(--shadow);
+    }
+
+    .window-chrome {
+      height: 42px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--border);
+      background: #24282e;
+    }
+
+    .traffic { width: 10px; height: 10px; border-radius: 50%; background: #555b64; }
+    .window-title { margin-left: 8px; color: var(--muted-2); font-size: 12px; }
+
+    .desktop-body { height: calc(100% - 42px); display: grid; grid-template-columns: 190px minmax(0, 1fr); }
+    .settings-nav { padding: 18px 10px; border-right: 1px solid var(--border); background: #171a1f; }
+    .nav-brand { display: flex; align-items: center; gap: 9px; margin: 0 9px 22px; color: var(--text-strong); font-weight: 700; }
+    .brand-mark {
+      display: inline-grid;
+      place-items: center;
+      width: 26px;
+      height: 26px;
+      color: #071116;
+      background: var(--cyan);
+      font: 900 14px/1 ui-monospace, monospace;
+    }
+
+    .settings-nav button {
+      width: 100%;
+      min-height: 38px;
+      padding: 0 10px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+    }
+
+    .settings-nav button.is-active { color: var(--text-strong); background: #242a31; }
+    .settings-content { padding: clamp(24px, 5vw, 52px); overflow: auto; }
+    .settings-kicker { margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+    .settings-content h2 { margin-bottom: 8px; color: var(--text-strong); font-size: 24px; letter-spacing: -0.02em; }
+    .settings-lead { max-width: 660px; margin-bottom: 26px; color: var(--muted-2); }
+
+    .settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 17px 0;
+      border-top: 1px solid var(--border);
+    }
+
+    .settings-row:last-of-type { border-bottom: 1px solid var(--border); }
+    .row-title { margin-bottom: 3px; color: var(--text-strong); font-weight: 650; }
+    .row-copy { margin: 0; color: var(--muted); font-size: 12px; }
+    .switch {
+      position: relative;
+      flex: none;
+      width: 44px;
+      min-height: 26px;
+      border: 1px solid #4b515a;
+      border-radius: 20px;
+      background: #2a2e34;
+      cursor: pointer;
+    }
+
+    .switch::after {
+      content: "";
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      left: 2px;
+      top: 2px;
+      border-radius: 50%;
+      background: #8d939c;
+      transition: transform 160ms ease, background 160ms ease;
+    }
+
+    .switch.is-on { border-color: #24718e; background: #164357; }
+    .switch.is-on::after { transform: translateX(18px); background: var(--cyan); }
+
+    .callout {
+      display: flex;
+      gap: 11px;
+      margin-top: 20px;
+      padding: 13px 14px;
+      border-left: 3px solid var(--cyan);
+      background: #18252d;
+      color: #b8d9e5;
+      font-size: 12px;
+    }
+
+    .callout.warning { border-color: var(--amber); background: #292317; color: #d9c38c; }
+    .callout.success { border-color: var(--green); background: #17251b; color: #a8d8b0; }
+
+    .primary, .secondary, .danger, .ghost {
+      min-height: 44px;
+      border: 1px solid transparent;
+      padding: 0 16px;
+      font-weight: 680;
+      cursor: pointer;
+    }
+
+    .primary { background: #17627e; border-color: #247d9d; color: #effbff; }
+    .primary:hover { background: #1d718f; }
+    .secondary { background: #292e35; border-color: var(--border-strong); color: var(--text); }
+    .secondary:hover { background: #323840; }
+    .danger { background: #3a2024; border-color: #6c343d; color: #ffb4bc; }
+    .ghost { background: transparent; border-color: transparent; color: var(--muted-2); }
+    .button-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 20px; }
+
+    .progress-list { margin: 22px 0 0; border-top: 1px solid var(--border); }
+    .progress-item {
+      display: grid;
+      grid-template-columns: 24px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      min-height: 58px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .progress-icon {
+      display: grid;
+      place-items: center;
+      width: 20px;
+      height: 20px;
+      border: 1px solid var(--border-strong);
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .progress-item.is-done .progress-icon { border-color: #2f6840; color: var(--green); background: #18291e; }
+    .progress-item.is-active .progress-icon { border-color: #287392; color: var(--cyan); background: #172a33; }
+    .progress-state { color: var(--muted); font-size: 12px; }
+    .progress-item.is-active .progress-state { color: var(--cyan); }
+    .progress-item.is-done .progress-state { color: var(--green); }
+
+    .pairing-grid { display: grid; grid-template-columns: minmax(180px, 230px) minmax(0, 1fr); gap: 26px; align-items: start; }
+    .qr-box { padding: 14px; background: #eef4f5; color: #101418; }
+    .qr-grid { display: grid; grid-template-columns: repeat(21, 1fr); aspect-ratio: 1; gap: 1px; }
+    .qr-grid span { background: transparent; }
+    .qr-grid span.on { background: #101418; }
+    .qr-caption { margin: 10px 0 0; text-align: center; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; }
+    .countdown { color: var(--amber); font: 700 18px/1 ui-monospace, Menlo, monospace; }
+    .security-list { padding: 0; margin: 16px 0 0; list-style: none; }
+    .security-list li { position: relative; padding: 8px 0 8px 20px; border-bottom: 1px solid var(--border); color: var(--muted-2); font-size: 12px; }
+    .security-list li::before { content: "✓"; position: absolute; left: 0; color: var(--green); }
+
+    .verify-code { margin: 18px 0; color: var(--text-strong); font: 760 clamp(28px, 5vw, 46px)/1 ui-monospace, Menlo, monospace; letter-spacing: 0.14em; }
+    .permission-list { margin-top: 18px; border-top: 1px solid var(--border); }
+    .permission-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+    .permission-row input { width: 18px; height: 18px; accent-color: var(--cyan); }
+    .permission-row label { flex: 1; cursor: pointer; }
+    .permission-row small { display: block; color: var(--muted); margin-top: 2px; }
+
+    .device-list { margin-top: 20px; border: 1px solid var(--border); }
+    .device-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 14px; }
+    .device-row + .device-row { border-top: 1px solid var(--border); }
+    .device-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+    .device-row strong { display: block; color: var(--text-strong); }
+    .device-row small { color: var(--muted); }
+
+    .phone-frame {
+      position: relative;
+      width: min(100%, 390px);
+      height: 630px;
+      margin: 0 auto;
+      padding: 11px;
+      border: 1px solid #4a5059;
+      border-radius: 36px;
+      background: #090b0d;
+      box-shadow: var(--shadow);
+    }
+
+    .phone-screen {
+      position: relative;
+      height: 100%;
+      overflow: hidden;
+      border: 1px solid #252a31;
+      border-radius: 27px;
+      background: var(--bg);
+    }
+
+    .phone-statusbar {
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      color: var(--muted-2);
+      font: 650 10px/1 -apple-system, sans-serif;
+    }
+
+    .phone-content { height: calc(100% - 28px); overflow: auto; padding: 15px 16px 22px; }
+    .mobile-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+    .mobile-brand { display: flex; align-items: center; gap: 8px; color: var(--text-strong); font-weight: 740; }
+    .mobile-brand .brand-mark { width: 23px; height: 23px; font-size: 12px; }
+    .mobile-state { display: inline-flex; align-items: center; gap: 6px; color: var(--green); font-size: 11px; }
+    .mobile-state::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .mobile-state.pending { color: var(--amber); }
+    .mobile-state.offline { color: var(--red); }
+
+    .mobile-hero { padding: 24px 0 20px; border-bottom: 1px solid var(--border); }
+    .mobile-hero h2 { margin-bottom: 8px; color: var(--text-strong); font-size: 22px; letter-spacing: -0.025em; }
+    .mobile-hero p { color: var(--muted-2); }
+    .mobile-actions { display: grid; gap: 9px; margin-top: 18px; }
+    .mobile-actions button { width: 100%; }
+
+    .phone-qr { width: min(72%, 220px); margin: 20px auto; }
+    .phone-code { padding: 20px 0; text-align: center; }
+    .phone-code .verify-code { font-size: 30px; }
+    .waiting-line { display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--amber); font-size: 12px; }
+    .waiting-line::before { content: ""; width: 8px; height: 8px; border: 1px solid currentColor; animation: pulse 1.2s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: 0.3; transform: scale(0.75); } }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 16px; }
+    .chip { min-height: 24px; display: inline-flex; align-items: center; padding: 0 8px; border: 1px solid var(--border); color: var(--muted-2); background: #1a1e23; font-size: 10px; font-weight: 650; }
+    .chip.secure { border-color: #285c3a; color: #9dd6a7; background: #17241b; }
+    .chip.permission { border-color: #2b5366; color: #98d1e6; background: #17252c; }
+
+    .tabbar { display: grid; grid-template-columns: 1fr 1fr; margin: 0 -16px 16px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .tabbar button { min-height: 42px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+    .tabbar button.is-active { color: var(--text-strong); box-shadow: inset 0 -2px var(--cyan); }
+    .approval-count { color: var(--amber); }
+
+    .workspace-group + .workspace-group { margin-top: 18px; }
+    .workspace-head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+    .workspace-head strong { color: var(--text-strong); font-size: 12px; }
+    .workspace-state { padding: 2px 6px; color: var(--blue); background: #182536; font-size: 9px; font-weight: 700; text-transform: uppercase; }
+    .workspace-state.warm { color: #d8bd78; background: #2b2518; }
+    .workspace-action { margin-left: auto; min-height: 32px; padding: 0 9px; border: 1px solid #425447; color: #9ed1a7; background: #1a2820; font-size: 10px; cursor: pointer; }
+
+    .session-row {
+      width: 100%;
+      min-height: 58px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 0;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      background: transparent;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .session-row:hover { background: #1d2228; }
+    .session-row:disabled { cursor: default; opacity: 0.55; }
+    .session-title { display: block; color: var(--text-strong); font-weight: 650; }
+    .session-agent { display: block; margin-top: 3px; color: var(--muted); font: 11px/1.35 ui-monospace, Menlo, monospace; }
+    .session-status { padding: 3px 7px; color: var(--blue); background: #182536; font-size: 9px; font-weight: 700; }
+    .session-status.waiting { color: #e3c278; background: #2b2518; }
+    .session-status.idle { color: var(--muted-2); background: #262a30; }
+
+    .approval-item { padding: 13px 0; border-bottom: 1px solid var(--border); }
+    .approval-item strong { color: var(--text-strong); }
+    .approval-item pre { max-height: 100px; overflow: auto; padding: 9px; background: var(--surface-2); color: var(--muted-2); font: 10px/1.45 ui-monospace, monospace; white-space: pre-wrap; }
+
+    .modal-shade { position: absolute; inset: 28px 0 0; display: grid; place-items: end stretch; background: rgba(5, 7, 9, 0.68); z-index: 4; }
+    .mobile-sheet { padding: 20px 16px calc(18px + env(safe-area-inset-bottom)); border-top: 1px solid var(--border-strong); background: #20242a; }
+    .mobile-sheet h3 { margin-bottom: 7px; color: var(--text-strong); font-size: 16px; }
+    .mobile-sheet p { color: var(--muted-2); font-size: 12px; }
+
+    .recovery-list { margin-top: 18px; }
+    .recovery-row { display: grid; grid-template-columns: 9px minmax(0, 1fr); gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--border); }
+    .recovery-row::before { content: ""; width: 7px; height: 7px; margin-top: 6px; background: var(--amber); }
+    .recovery-row strong { display: block; color: var(--text-strong); font-size: 12px; }
+    .recovery-row span { color: var(--muted); font-size: 11px; }
+
+    .stage-controls {
+      max-width: 1360px;
+      margin: 18px auto 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-top: 1px solid var(--border);
+      padding-top: 14px;
+    }
+
+    .stage-controls p { margin: 0; color: var(--muted); font-size: 12px; }
+    .stage-controls .button-row { margin: 0; }
+
+    .terminal-view {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      width: 100%;
+      height: 100vh;
+      height: var(--vv-height, 100dvh);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      overflow: hidden;
+      background: var(--surface-2);
+    }
+
+    body.terminal-open { overflow: hidden; }
+    .terminal-topbar {
+      min-height: 58px;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      padding: calc(7px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 7px calc(12px + env(safe-area-inset-left));
+      border-bottom: 1px solid var(--border);
+      background: #171a1f;
+    }
+
+    .terminal-back { min-width: 44px; min-height: 44px; padding: 0 11px; border: 1px solid var(--border); background: #20242a; color: var(--text); cursor: pointer; }
+    .terminal-heading { min-width: 0; }
+    .terminal-heading strong { display: block; overflow: hidden; color: var(--text-strong); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+    .terminal-heading span { display: block; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+    .terminal-connection { display: inline-flex; align-items: center; gap: 6px; color: var(--green); font-size: 10px; white-space: nowrap; }
+    .terminal-connection::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .terminal-connection.is-offline { color: var(--red); }
+
+    .terminal-stage { position: relative; min-height: 0; overflow: hidden; background: #090b0e; }
+    .terminal-screen {
+      position: absolute;
+      inset: 0;
+      overflow: auto;
+      padding: clamp(13px, 3vw, 24px);
+      color: #d5dae0;
+      font: clamp(10px, 2.2vw, 14px)/1.55 D2Coding, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+      overscroll-behavior: contain;
+    }
+
+    .term-muted { color: #767f89; }
+    .term-cyan { color: #52c8ee; }
+    .term-green { color: #70d984; }
+    .term-amber { color: #e5b75e; }
+    .term-cursor { display: inline-block; width: 0.64em; height: 1.1em; margin-left: 2px; vertical-align: -0.18em; background: #d8dde2; animation: blink 1s steps(1) infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    .terminal-bottom { border-top: 1px solid var(--border); background: #171a1f; }
+    .terminal-tools { display: flex; gap: 6px; overflow-x: auto; padding: 8px calc(10px + env(safe-area-inset-right)) 0 calc(10px + env(safe-area-inset-left)); scrollbar-width: none; touch-action: pan-x; }
+    .terminal-tools::-webkit-scrollbar { display: none; }
+    .terminal-tools button { flex: none; min-width: 46px; min-height: 42px; border: 1px solid var(--border); background: #24282e; color: var(--text); cursor: pointer; }
+    .terminal-tools button:disabled { opacity: 0.38; cursor: not-allowed; }
+
+    .terminal-composer { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: end; gap: 7px; padding: 8px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left)); }
+    .terminal-composer textarea { min-height: 44px; max-height: 110px; resize: none; border: 1px solid var(--border-strong); border-radius: 0; padding: 10px 11px; background: #0f1216; color: var(--text); font-size: 16px; }
+    .terminal-composer button { min-width: 48px; border: 1px solid var(--border-strong); background: #252a31; color: var(--text); cursor: pointer; }
+    .terminal-composer .send { background: #17627e; border-color: #247d9d; color: #fff; }
+    .terminal-composer button:disabled, .terminal-composer textarea:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .permission-request { min-height: 62px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px calc(12px + env(safe-area-inset-right)) calc(9px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left)); }
+    .permission-request p { margin: 0; color: var(--muted-2); font-size: 12px; }
+    .permission-request button { flex: none; }
+
+    .terminal-debug {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      display: flex;
+      gap: 7px;
+      z-index: 2;
+    }
+
+    .terminal-debug button { min-height: 34px; padding: 0 9px; border: 1px solid #3a414b; background: rgba(24, 28, 34, 0.92); color: var(--muted-2); font-size: 10px; cursor: pointer; }
+    .disconnect-overlay { position: absolute; inset: 0; z-index: 4; display: grid; place-items: center; padding: 24px; background: rgba(9, 11, 14, 0.78); backdrop-filter: blur(3px); }
+    .disconnect-box { width: min(100%, 410px); border: 1px solid #5c3c42; background: #21181b; padding: 22px; box-shadow: var(--shadow); }
+    .disconnect-box .offline-icon { width: 34px; height: 34px; display: grid; place-items: center; margin-bottom: 16px; border: 1px solid #75444d; color: var(--red); }
+    .disconnect-box h2 { margin-bottom: 7px; color: var(--text-strong); font-size: 19px; }
+    .disconnect-box p { color: var(--muted-2); }
+    .last-seen { color: var(--muted); font: 11px/1.4 ui-monospace, Menlo, monospace; }
+    .privacy-curtain { position: absolute; inset: 0; z-index: 6; display: grid; place-items: center; padding: 24px; background: #0b0d10; color: var(--muted-2); text-align: center; }
+    .privacy-curtain strong { display: block; margin-bottom: 7px; color: var(--text-strong); font-size: 17px; }
+
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: calc(22px + env(safe-area-inset-bottom));
+      z-index: 140;
+      max-width: min(90vw, 440px);
+      transform: translateX(-50%);
+      border: 1px solid var(--border-strong);
+      background: #242a31;
+      color: var(--text);
+      padding: 10px 13px;
+      box-shadow: var(--shadow);
+      font-size: 12px;
+    }
+
+    @media (max-width: 919px) {
+      .prototype-shell { padding-left: 12px; padding-right: 12px; }
+      .prototype-header { align-items: stretch; flex-direction: column; }
+      .prototype-badge { align-self: flex-start; }
+      .flow-rail { grid-template-columns: repeat(7, 132px); }
+      .stage-switcher { display: grid; }
+      .scenario-stage { display: block; min-height: 0; }
+      .desktop-wrap, .phone-wrap { display: none; }
+      .desktop-wrap.is-mobile-active, .phone-wrap.is-mobile-active { display: flex; }
+      .desktop-frame { min-height: 620px; }
+      .phone-frame { height: min(690px, calc(100dvh - 210px)); min-height: 520px; }
+      .stage-controls { align-items: flex-start; flex-direction: column; }
+    }
+
+    @media (max-width: 620px) {
+      .desktop-body { grid-template-columns: 1fr; }
+      .settings-nav { display: none; }
+      .settings-content { padding: 24px 18px; }
+      .pairing-grid { grid-template-columns: 1fr; }
+      .qr-box { width: min(100%, 230px); }
+      .desktop-frame { min-height: 600px; }
+    }
+
+    @media (max-height: 480px) {
+      .terminal-topbar { min-height: 48px; padding-top: calc(4px + env(safe-area-inset-top)); padding-bottom: 4px; }
+      .terminal-tools { padding-top: 5px; }
+      .terminal-composer { padding-top: 5px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <main id="prototype-shell" class="prototype-shell">
+    <header class="prototype-header">
+      <div>
+        <p class="eyebrow">Interactive product scenario</p>
+        <h1>Tailscale 없이 모바일에서 세션까지</h1>
+        <p>Mac 연결 활성화부터 일회용 페어링, 세션 선택, 전체화면 터미널과 복구까지 확인합니다.</p>
+      </div>
+      <span class="prototype-badge">로컬 시뮬레이션 · 실제 연결 없음</span>
+    </header>
+
+    <nav id="flow-rail" class="flow-rail" aria-label="연결부터 사용까지"></nav>
+
+    <div class="stage-switcher" aria-label="미리보기 기기 선택">
+      <button type="button" class="is-active" data-action="stage" data-stage="desktop">Mac</button>
+      <button type="button" data-action="stage" data-stage="phone">모바일</button>
+    </div>
+
+    <section class="scenario-stage" aria-label="연결 시나리오 미리보기">
+      <div id="desktop-wrap" class="desktop-wrap is-mobile-active">
+        <div class="device-caption"><strong>Deppy Sijo · Mac</strong><span class="device-status">이 Mac에서 발신 연결</span></div>
+        <section class="desktop-frame" aria-label="Mac 설정 화면">
+          <div class="window-chrome" aria-hidden="true">
+            <span class="traffic"></span><span class="traffic"></span><span class="traffic"></span>
+            <span class="window-title">Deppy Sijo — 설정</span>
+          </div>
+          <div class="desktop-body">
+            <aside class="settings-nav" aria-label="설정 카테고리">
+              <div class="nav-brand"><span class="brand-mark">D</span> Deppy Sijo</div>
+              <button type="button">일반</button>
+              <button type="button">에이전트</button>
+              <button type="button" class="is-active">모바일 연결</button>
+              <button type="button">보안</button>
+              <button type="button">알림</button>
+            </aside>
+            <div id="desktop-stage" class="settings-content"></div>
+          </div>
+        </section>
+      </div>
+
+      <div id="phone-wrap" class="phone-wrap">
+        <div class="device-caption"><strong>모바일 웹 · PWA</strong><span>390 × 844 기준</span></div>
+        <section class="phone-frame" aria-label="모바일 화면">
+          <div class="phone-screen">
+            <div class="phone-statusbar" aria-hidden="true"><span>9:41</span><span>5G&nbsp;&nbsp;●●●&nbsp;&nbsp;92%</span></div>
+            <div id="phone-stage" class="phone-content"></div>
+            <div id="phone-modal"></div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <footer class="stage-controls">
+      <p id="step-description"></p>
+      <div class="button-row">
+        <button type="button" class="secondary" data-action="previous-step">이전</button>
+        <button type="button" class="primary" data-action="next-step">다음 화면</button>
+      </div>
+    </footer>
+  </main>
+
+  <section id="terminal-view" class="terminal-view" role="dialog" aria-modal="true" aria-labelledby="terminal-title" hidden></section>
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const FLOW = [
+        'access-off',
+        'relay-connecting',
+        'pairing-qr',
+        'pairing-confirm',
+        'session-list',
+        'terminal',
+        'recovery',
+      ];
+
+      const FLOW_META = [
+        { label: '접속 켜기', description: 'Mac에서 모바일 접속을 명시적으로 켭니다.' },
+        { label: '암호화 연결', description: 'Mac이 릴레이로 outbound 연결을 만듭니다.' },
+        { label: 'QR 페어링', description: '5분 만료 일회용 QR로 새 기기를 시작합니다.' },
+        { label: '상호 확인', description: '양쪽 코드를 확인하고 기기 권한을 정합니다.' },
+        { label: '세션 선택', description: '워크스페이스와 실행 중인 세션을 고릅니다.' },
+        { label: '전체화면', description: '선택 즉시 모바일 viewport 전체를 터미널로 사용합니다.' },
+        { label: '중단·복구', description: '연결, 권한, 세션 종료 원인에 맞게 복구합니다.' },
+      ];
+
+      const WORKSPACES = [
+        {
+          name: 'deppy-sijo',
+          state: 'active',
+          sessions: [
+            { id: 'codex-review', title: '코드 리뷰', agent: 'Codex · 작업 중', status: 'running' },
+            { id: 'release-build', title: '릴리즈 빌드', agent: 'Shell', status: 'waiting' },
+          ],
+        },
+        {
+          name: 'design-system',
+          state: 'warm',
+          sessions: [
+            { id: null, title: '모바일 화면 설계', agent: 'Claude', status: 'idle' },
+          ],
+        },
+      ];
+
+      const state = {
+        step: 0,
+        stage: 'desktop',
+        phoneSurface: 'sessions',
+        permissions: { view: true, input: true, approval: false },
+        terminalMode: 'connected',
+        selectedSession: null,
+        warmConfirm: false,
+        draft: '현재 변경사항을 요약해줘',
+        recoveryReason: 'session-ended',
+        privacyCurtain: false,
+        warmActivated: false,
+      };
+
+      const shell = document.getElementById('prototype-shell');
+      const rail = document.getElementById('flow-rail');
+      const desktopStage = document.getElementById('desktop-stage');
+      const phoneStage = document.getElementById('phone-stage');
+      const phoneModal = document.getElementById('phone-modal');
+      const terminalView = document.getElementById('terminal-view');
+      const toast = document.getElementById('toast');
+      let terminalReturnFocus = null;
+      let terminalReturnSession = null;
+      let toastTimer = null;
+
+      history.replaceState({ deppyView: 'scenario' }, '');
+
+      function setStep(index) {
+        const next = Math.max(0, Math.min(FLOW.length - 1, index));
+        if (state.selectedSession && next !== 5) {
+          closeTerminal({ fromHistory: false, nextStep: next });
+          return;
+        }
+        state.step = next;
+        if (next === 5 && !state.selectedSession) {
+          const trigger = document.querySelector('[data-session="codex-review"]');
+          openTerminal('codex-review', trigger);
+          return;
+        }
+        render();
+      }
+
+      function render() {
+        renderRail();
+        renderDesktop();
+        renderPhone();
+        renderStageSelection();
+        syncTerminalView();
+        document.getElementById('step-description').textContent = FLOW_META[state.step].description;
+        const previous = document.querySelector('[data-action="previous-step"]');
+        const next = document.querySelector('[data-action="next-step"]');
+        previous.disabled = state.step === 0;
+        next.textContent = state.step === FLOW.length - 1 ? '처음부터' : state.step === 4 ? '전체화면 보기' : '다음 화면';
+      }
+
+      function renderRail() {
+        rail.innerHTML = FLOW_META.map((item, index) => `
+          <button type="button" class="flow-step" data-action="go-step" data-step="${index}" ${index === state.step ? 'aria-current="step"' : ''}>
+            <span class="flow-index">0${index + 1}</span>
+            <span class="flow-label">${item.label}</span>
+          </button>
+        `).join('');
+      }
+
+      function desktopHeader(title, lead) {
+        return `<p class="settings-kicker">설정 / 모바일 연결</p><h2>${title}</h2><p class="settings-lead">${lead}</p>`;
+      }
+
+      function renderDesktop() {
+        switch (FLOW[state.step]) {
+          case 'access-off':
+            desktopStage.innerHTML = desktopHeader('모바일 연결', 'Tailscale이나 공유기 포트 설정 없이 휴대폰에서 이 Mac의 세션을 확인합니다.') + `
+              <div class="settings-row">
+                <div><p class="row-title">외부에서 모바일로 접속</p><p class="row-copy">기본값은 꺼짐이며, 켤 때만 암호화 연결을 시작합니다.</p></div>
+                <button type="button" class="switch" data-action="enable-access" aria-label="모바일 접속 켜기" aria-pressed="false"></button>
+              </div>
+              <div class="settings-row">
+                <div><p class="row-title">연결된 기기</p><p class="row-copy">승인된 기기는 여기에서 개별 폐기할 수 있습니다.</p></div>
+                <strong>0대</strong>
+              </div>
+              <div class="callout"><span>↗</span><span>공유기에 inbound 포트를 열지 않습니다. 이 Mac이 암호화된 outbound 연결을 먼저 생성합니다.</span></div>`;
+            break;
+          case 'relay-connecting':
+            desktopStage.innerHTML = desktopHeader('보안 연결 준비 중', '브라우저에서 Mac으로 직접 들어오지 않습니다. 양쪽이 고정 HTTPS 릴레이에 연결되고 내용은 종단 간 암호화됩니다.') + `
+              <div class="progress-list">
+                ${progressRow('인터넷 연결 확인', '완료', 'is-done', '✓')}
+                ${progressRow('Deppy 보안 릴레이 연결', '완료', 'is-done', '✓')}
+                ${progressRow('종단 간 암호화 채널 준비', '키 교환 중', 'is-active', '··')}
+              </div>
+              <div class="callout"><span>◇</span><span>릴레이는 어느 세션으로 전달할지만 알며 터미널 화면과 입력 내용은 읽을 수 없습니다.</span></div>
+              <div class="button-row"><button type="button" class="primary" data-action="relay-ready">연결 완료 보기</button><button type="button" class="secondary" data-action="go-step" data-step="0">취소</button></div>`;
+            break;
+          case 'pairing-qr':
+            desktopStage.innerHTML = desktopHeader('새 모바일 기기 연결', '아래 일회용 QR은 5분 뒤 만료되며 한 기기에서 한 번만 사용할 수 있습니다.') + `
+              <div class="pairing-grid">
+                <div class="qr-box"><div class="qr-grid" data-qr></div><p class="qr-caption">DEMO · NOT SCANNABLE</p></div>
+                <div>
+                  <p class="row-title">남은 시간</p><p class="countdown">04:38</p>
+                  <ul class="security-list"><li>실제 터미널 토큰을 포함하지 않음</li><li>페어링 완료 즉시 QR 무효화</li><li>기기마다 별도 자격증명 발급</li></ul>
+                  <div class="button-row"><button type="button" class="secondary" data-action="regenerate-qr">QR 재발급</button><button type="button" class="ghost" data-action="go-step" data-step="1">취소</button></div>
+                </div>
+              </div>`;
+            queueMicrotask(renderQrGrids);
+            break;
+          case 'pairing-confirm':
+            desktopStage.innerHTML = desktopHeader('iPhone 연결 요청', '휴대폰에 표시된 코드와 아래 코드가 같을 때만 이 기기를 승인하세요.') + `
+              <p class="verify-code">741 206</p>
+              <div class="permission-list">
+                ${permissionRow('view', '화면 보기', '세션 목록과 터미널 출력을 봅니다.', true)}
+                ${permissionRow('input', '터미널 입력', '텍스트와 특수키를 현재 세션으로 보냅니다.')}
+                ${permissionRow('approval', '승인 요청 처리', '도구 실행 허용·거부를 처리합니다.')}
+              </div>
+              <div class="settings-row"><div><p class="row-title">접근 기간</p><p class="row-copy">언제든 기기 관리에서 즉시 폐기할 수 있습니다.</p></div><strong>30일</strong></div>
+              <div class="button-row"><button type="button" class="primary" data-action="approve-device">이 기기 승인</button><button type="button" class="danger" data-action="deny-device">거부</button></div>`;
+            break;
+          default:
+            desktopStage.innerHTML = desktopHeader('모바일 연결됨', '이 Mac은 relay.deppy.app으로 암호화된 outbound 연결을 유지하고 있습니다.') + `
+              <div class="settings-row"><div><p class="row-title">외부에서 모바일로 접속</p><p class="row-copy">모바일 세션과 승인 알림을 사용할 수 있습니다.</p></div><button type="button" class="switch is-on" aria-label="모바일 접속 켜짐" aria-pressed="true"></button></div>
+              <div class="device-list">
+                <div class="device-row"><span class="device-dot"></span><div><strong>기대호의 iPhone</strong><small>지금 접속 중 · 종단 간 암호화</small></div><button type="button" class="secondary" data-action="revoke-device">접근 폐기</button></div>
+              </div>
+              <div class="settings-row"><div><p class="row-title">허용된 권한</p><p class="row-copy">${permissionSummary()}</p></div><strong>${state.permissions.approval ? '3' : '2'}개</strong></div>
+              <div class="callout success"><span>✓</span><span>공유기 포트 개방 없음 · Tailscale 연결 없음 · 마지막 확인 방금 전</span></div>`;
+        }
+      }
+
+      function progressRow(title, status, cls, icon) {
+        return `<div class="progress-item ${cls}"><span class="progress-icon">${icon}</span><strong>${title}</strong><span class="progress-state">${status}</span></div>`;
+      }
+
+      function permissionRow(key, title, copy, locked = false) {
+        const checked = state.permissions[key] ? 'checked' : '';
+        const disabled = locked ? 'disabled' : '';
+        return `<div class="permission-row"><input id="permission-${key}" type="checkbox" data-action="permission" data-permission="${key}" ${checked} ${disabled}><label for="permission-${key}">${title}<small>${copy}</small></label></div>`;
+      }
+
+      function permissionSummary() {
+        const values = ['화면 보기'];
+        if (state.permissions.input) values.push('터미널 입력');
+        if (state.permissions.approval) values.push('승인 처리');
+        return values.join(' · ');
+      }
+
+      function renderPhone() {
+        phoneModal.innerHTML = '';
+        switch (FLOW[state.step]) {
+          case 'access-off':
+            phoneStage.innerHTML = mobileTop('offline', '연결 안 됨') + `
+              <section class="mobile-hero"><p class="eyebrow">Remote sessions</p><h2>Mac에서 먼저 연결을 켜세요</h2><p>Deppy Sijo 설정의 모바일 연결에서 새 기기 페어링을 시작할 수 있습니다.</p></section>
+              <div class="mobile-actions"><button type="button" class="secondary" data-action="enable-access">Mac 화면에서 켜기</button></div>`;
+            break;
+          case 'relay-connecting':
+            phoneStage.innerHTML = mobileTop('pending', 'Mac 찾는 중') + `
+              <section class="mobile-hero"><p class="eyebrow">Secure relay</p><h2>암호화 채널을 준비합니다</h2><p>같은 Wi-Fi가 아니어도 됩니다. Mac이 온라인이면 자동으로 연결됩니다.</p></section>
+              <div class="progress-list">${progressRow('Deppy 릴레이 연결', '대기', 'is-active', '··')}${progressRow('기기 페어링', '다음 단계', '', '2')}</div>`;
+            break;
+          case 'pairing-qr':
+            phoneStage.innerHTML = mobileTop('pending', '새 기기') + `
+              <section class="mobile-hero"><p class="eyebrow">One-time pairing</p><h2>Mac의 QR을 스캔하세요</h2><p>QR은 5분 동안 한 번만 유효합니다.</p></section>
+              <div class="phone-qr qr-box"><div class="qr-grid" data-qr></div><p class="qr-caption">DEMO · NOT SCANNABLE</p></div>
+              <div class="mobile-actions"><button type="button" class="primary" data-action="qr-scanned">QR 스캔 완료</button><button type="button" class="secondary" data-action="go-step" data-step="1">취소</button></div>`;
+            queueMicrotask(renderQrGrids);
+            break;
+          case 'pairing-confirm':
+            phoneStage.innerHTML = mobileTop('pending', '승인 대기') + `
+              <section class="phone-code"><p class="eyebrow">두 화면의 코드가 같나요?</p><p class="verify-code">741 206</p><p>Mac에서 기기 이름과 권한을 확인한 뒤 승인하세요.</p></section>
+              <div class="chips"><span class="chip secure">종단 간 암호화</span><span class="chip">iPhone · Safari</span></div>
+              <p class="waiting-line">Mac의 승인을 기다리는 중</p>`;
+            break;
+          case 'session-list':
+            renderPhoneDashboard();
+            break;
+          case 'terminal':
+            renderPhoneDashboard();
+            break;
+          case 'recovery':
+            phoneStage.innerHTML = mobileTop('offline', '확인 필요') + `
+              <section class="mobile-hero"><p class="eyebrow">Recovery</p><h2>${recoveryTitle()}</h2><p>${recoveryCopy()}</p></section>
+              <div class="recovery-list">
+                ${recoveryRow('네트워크·릴레이 장애', '다시 연결하고 작성 중인 문장은 보존합니다.')}
+                ${recoveryRow('Mac 종료·절전', 'Mac을 깨운 뒤 자동 재연결을 시도합니다.')}
+                ${recoveryRow('권한 만료·폐기', '새 일회용 QR로 다시 페어링합니다.')}
+                ${recoveryRow('세션 종료', '세션 목록으로 돌아가 다른 세션을 선택합니다.')}
+              </div>
+              <div class="mobile-actions"><button type="button" class="primary" data-action="recover-to-sessions">세션 목록으로</button><button type="button" class="secondary" data-action="go-step" data-step="2">다시 페어링</button></div>`;
+            break;
+        }
+      }
+
+      function mobileTop(statusClass, statusText) {
+        return `<div class="mobile-top"><div class="mobile-brand"><span class="brand-mark">D</span>Deppy Sijo</div><span class="mobile-state ${statusClass}">${statusText}</span></div>`;
+      }
+
+      function renderPhoneDashboard() {
+        const permissionChips = [
+          '<span class="chip secure">종단 간 암호화</span>',
+          '<span class="chip permission">화면 보기</span>',
+          state.permissions.input ? '<span class="chip permission">입력 가능</span>' : '<span class="chip">보기 전용</span>',
+          state.permissions.approval ? '<span class="chip permission">승인 가능</span>' : '',
+        ].join('');
+        phoneStage.innerHTML = mobileTop('', 'Mac 온라인') + `
+          <div class="chips">${permissionChips}</div>
+          <div class="tabbar"><button type="button" data-action="phone-tab" data-tab="sessions" class="${state.phoneSurface === 'sessions' ? 'is-active' : ''}">세션</button><button type="button" data-action="phone-tab" data-tab="approvals" class="${state.phoneSurface === 'approvals' ? 'is-active' : ''}">승인 <span class="approval-count">1</span></button></div>
+          ${state.phoneSurface === 'sessions' ? sessionListMarkup() : approvalsMarkup()}`;
+
+        if (state.warmConfirm) {
+          phoneModal.innerHTML = `<div class="modal-shade"><section class="mobile-sheet" role="dialog" aria-modal="true" aria-labelledby="warm-title"><h3 id="warm-title">Mac 화면도 전환됩니다</h3><p>design-system 워크스페이스를 깨우면 Mac의 활성 워크스페이스도 함께 바뀝니다.</p><div class="mobile-actions"><button type="button" class="primary" data-action="warm-confirm">전환하고 이어서 작업</button><button type="button" class="secondary" data-action="warm-cancel">취소</button></div></section></div>`;
+        }
+      }
+
+      function sessionListMarkup() {
+        const workspaces = state.warmActivated ? [
+          {
+            name: 'design-system',
+            state: 'active',
+            sessions: [{ id: 'mobile-design', title: '모바일 화면 설계', agent: 'Claude · 작업 중', status: 'running' }],
+          },
+          {
+            name: 'deppy-sijo',
+            state: 'warm',
+            sessions: [{ id: null, title: '코드 리뷰', agent: 'Codex', status: 'idle' }],
+          },
+        ] : WORKSPACES;
+        return workspaces.map((workspace) => `
+          <section class="workspace-group">
+            <div class="workspace-head"><strong>${workspace.name}</strong><span class="workspace-state ${workspace.state}">${workspace.state === 'active' ? '활성' : '대기'}</span>${workspace.state === 'warm' ? '<button type="button" class="workspace-action" data-action="warm-confirm-open">이어서 작업</button>' : ''}</div>
+            ${workspace.sessions.map((session) => `
+              <button type="button" class="session-row" data-action="open-terminal" data-session="${session.id || ''}" ${session.id ? '' : 'disabled'}>
+                <span><span class="session-title">${session.title}</span><span class="session-agent">${session.agent}</span></span>
+                <span class="session-status ${session.status}">${statusLabel(session.status)}</span>
+              </button>
+            `).join('')}
+          </section>
+        `).join('');
+      }
+
+      function approvalsMarkup() {
+        return `<section><p class="eyebrow">승인 대기 1</p><div class="approval-item"><strong>filesystem · read_file</strong><pre>/Users/jr/Desktop/projects/deppy-sijo/docs/CODEX_HANDOFF.md</pre><div class="button-row"><button type="button" class="primary" data-action="approval-demo">허용</button><button type="button" class="danger" data-action="approval-demo">거부</button></div></div></section>`;
+      }
+
+      function statusLabel(status) {
+        return ({ running: '작업 중', waiting: '입력 대기', idle: '유휴' })[status] || status;
+      }
+
+      function recoveryRow(title, copy) {
+        return `<div class="recovery-row"><div><strong>${title}</strong><span>${copy}</span></div></div>`;
+      }
+
+      function recoveryTitle() {
+        if (state.recoveryReason === 'device-revoked') return '이 기기의 접근이 폐기되었습니다';
+        if (state.recoveryReason === 'pairing-denied') return '연결 요청이 거부되었습니다';
+        return '세션이 종료되어 목록으로 돌아왔습니다';
+      }
+
+      function recoveryCopy() {
+        if (state.recoveryReason === 'device-revoked') return '다시 사용하려면 Mac에서 새 QR을 발급해야 합니다.';
+        if (state.recoveryReason === 'pairing-denied') return 'Mac 사용자에게 새 페어링 요청을 시작해 달라고 요청하세요.';
+        return '작성 중이던 문장은 전송되지 않았으며 다른 활성 세션을 선택할 수 있습니다.';
+      }
+
+      function renderStageSelection() {
+        const desktopWrap = document.getElementById('desktop-wrap');
+        const phoneWrap = document.getElementById('phone-wrap');
+        desktopWrap.classList.toggle('is-mobile-active', state.stage === 'desktop');
+        phoneWrap.classList.toggle('is-mobile-active', state.stage === 'phone');
+        document.querySelectorAll('[data-action="stage"]').forEach((button) => {
+          button.classList.toggle('is-active', button.dataset.stage === state.stage);
+          button.setAttribute('aria-pressed', String(button.dataset.stage === state.stage));
+        });
+      }
+
+      function renderQrGrids() {
+        document.querySelectorAll('[data-qr]').forEach((grid) => {
+          if (grid.childElementCount) return;
+          for (let row = 0; row < 21; row++) {
+            for (let col = 0; col < 21; col++) {
+              const finder = inFinder(row, col, 0, 0) || inFinder(row, col, 0, 14) || inFinder(row, col, 14, 0);
+              const data = ((row * 17 + col * 11 + row * col) % 7) < 3;
+              const cell = document.createElement('span');
+              if (finder || data) cell.className = 'on';
+              grid.appendChild(cell);
+            }
+          }
+        });
+      }
+
+      function inFinder(row, col, top, left) {
+        if (row < top || row > top + 6 || col < left || col > left + 6) return false;
+        const r = row - top;
+        const c = col - left;
+        return r === 0 || r === 6 || c === 0 || c === 6 || (r >= 2 && r <= 4 && c >= 2 && c <= 4);
+      }
+
+      function openTerminal(sessionId, trigger) {
+        const wasClosed = !state.selectedSession;
+        terminalReturnFocus = trigger || document.activeElement;
+        terminalReturnSession = sessionId;
+        state.selectedSession = sessionId;
+        state.terminalMode = 'connected';
+        state.privacyCurtain = false;
+        state.stage = 'phone';
+        state.step = 5;
+        document.body.classList.add('terminal-open');
+        if (wasClosed && history.state?.deppyView !== 'terminal') history.pushState({ deppyView: 'terminal' }, '');
+        render();
+        requestAnimationFrame(() => document.querySelector('[data-action="close-terminal"]')?.focus());
+      }
+
+      function closeTerminal({ fromHistory = false, nextStep = 4 } = {}) {
+        if (!state.selectedSession) return;
+        state.selectedSession = null;
+        state.step = nextStep;
+        state.terminalMode = 'connected';
+        state.privacyCurtain = false;
+        document.body.classList.remove('terminal-open');
+        render();
+        if (!fromHistory && history.state?.deppyView === 'terminal') history.back();
+        requestAnimationFrame(() => {
+          if (terminalReturnFocus?.isConnected) terminalReturnFocus.focus();
+          else document.querySelector(`[data-session="${terminalReturnSession || ''}"]`)?.focus();
+        });
+      }
+
+      function syncTerminalView() {
+        const open = Boolean(state.selectedSession);
+        terminalView.hidden = !open;
+        shell.inert = open;
+        if (open) shell.setAttribute('aria-hidden', 'true');
+        else shell.removeAttribute('aria-hidden');
+        if (!open) return;
+
+        const disconnected = state.terminalMode === 'disconnected';
+        const context = terminalContext();
+        terminalView.innerHTML = `
+          <header class="terminal-topbar">
+            <button type="button" class="terminal-back" data-action="close-terminal" aria-label="세션 목록으로">‹ 목록</button>
+            <div class="terminal-heading"><strong id="terminal-title">${context.workspace} / ${context.title}</strong><span>${context.agent} · ${context.cwd} · 보기 ${state.permissions.input ? '+ 입력' : '전용'}</span></div>
+            <span class="terminal-connection ${disconnected ? 'is-offline' : ''}">${disconnected ? '재연결 중' : '암호화됨'}</span>
+          </header>
+          <div class="terminal-stage">
+            <div class="terminal-screen" aria-label="시뮬레이션 터미널 출력"><span class="term-muted">Last login: Fri Aug 28 14:02:11 on ttys004</span>
+<span class="term-cyan">jr@Mac</span> <span class="term-green">deppy-sijo</span> % codex review
+
+<span class="term-muted">› Reading current changes...</span>
+  ✓ mobile relay boundary inspected
+  ✓ one-time pairing flow specified
+  ✓ full-viewport session layout prepared
+
+<span class="term-amber">Reviewing</span>  docs/mockups/mobile-relay-fullscreen-scenario.html
+
+The selected session now occupies the complete mobile viewport.
+Browser Back returns to the session list without leaving the app.
+
+<span class="term-cyan">jr@Mac</span> <span class="term-green">deppy-sijo</span> % <span class="term-cursor"></span></div>
+            <div class="terminal-debug">
+              <button type="button" data-action="simulate-disconnect">연결 끊김 시뮬레이션</button>
+              <button type="button" data-action="simulate-session-end">세션 종료 시뮬레이션</button>
+            </div>
+            ${disconnected ? disconnectOverlay() : ''}
+            ${state.privacyCurtain ? '<div class="privacy-curtain" role="status"><div><strong>터미널 화면을 가렸습니다</strong><span>Deppy Sijo로 돌아오면 같은 세션을 계속 볼 수 있습니다.</span></div></div>' : ''}
+          </div>
+          <footer class="terminal-bottom">
+            <div class="terminal-tools" aria-label="터미널 특수키">
+              ${['Esc', 'Tab', '↑', '↓', '←', '→', 'Ctrl-C', 'Enter'].map((key) => `<button type="button" data-action="terminal-key" ${disconnected || !state.permissions.input ? 'disabled' : ''}>${key}</button>`).join('')}
+            </div>
+            ${state.permissions.input ? `
+              <div class="terminal-composer">
+                <button type="button" aria-label="파일 첨부" ${disconnected ? 'disabled' : ''}>＋</button>
+                <textarea id="terminal-draft" rows="1" placeholder="메시지 입력…" ${disconnected ? 'disabled' : ''}></textarea>
+                <button type="button" class="send" data-action="send-draft" ${disconnected ? 'disabled' : ''}>전송</button>
+              </div>` : `
+              <div class="permission-request"><p>이 기기는 보기 전용입니다. Mac에서 입력 권한을 추가해야 합니다.</p><button type="button" class="secondary" data-action="request-input">입력 권한 요청</button></div>`}
+          </footer>`;
+        const draft = document.getElementById('terminal-draft');
+        if (draft) draft.value = state.draft;
+      }
+
+      function terminalContext() {
+        if (state.selectedSession === 'release-build') return { workspace: 'deppy-sijo', title: '릴리즈 빌드', agent: 'Shell', cwd: 'target/release' };
+        if (state.selectedSession === 'mobile-design') return { workspace: 'design-system', title: '모바일 화면 설계', agent: 'Claude', cwd: 'design/mobile' };
+        return { workspace: 'deppy-sijo', title: '코드 리뷰', agent: 'Codex', cwd: 'docs/mockups' };
+      }
+
+      function disconnectOverlay() {
+        return `<div class="disconnect-overlay"><section class="disconnect-box" role="alertdialog" aria-labelledby="disconnect-title"><div class="offline-icon">!</div><h2 id="disconnect-title">연결을 복구하고 있습니다</h2><p>마지막 화면을 유지했습니다. 연결이 돌아올 때까지 입력과 특수키는 전송되지 않습니다.</p><p class="last-seen">마지막 수신 21:04:18 · draft 자동 전송 안 함</p><div class="button-row"><button type="button" class="primary" data-action="reconnect-terminal">다시 연결</button><button type="button" class="secondary" data-action="close-terminal">세션 목록으로</button></div></section></div>`;
+      }
+
+      function endSession() {
+        state.selectedSession = null;
+        state.terminalMode = 'connected';
+        state.privacyCurtain = false;
+        state.step = 6;
+        state.recoveryReason = 'session-ended';
+        document.body.classList.remove('terminal-open');
+        if (history.state?.deppyView === 'terminal') history.back();
+        render();
+        showToast('세션이 종료되었습니다. 입력 초안은 전송되지 않았습니다.');
+      }
+
+      function showToast(message) {
+        if (toastTimer) clearTimeout(toastTimer);
+        toast.textContent = message;
+        toast.hidden = false;
+        toastTimer = setTimeout(() => { toast.hidden = true; }, 3600);
+      }
+
+      document.addEventListener('input', (event) => {
+        if (event.target.id === 'terminal-draft') state.draft = event.target.value;
+      });
+
+      document.addEventListener('change', (event) => {
+        const input = event.target.closest('[data-action="permission"]');
+        if (!input) return;
+        state.permissions[input.dataset.permission] = input.checked;
+        render();
+      });
+
+      document.addEventListener('click', (event) => {
+        const target = event.target.closest('[data-action]');
+        if (!target) return;
+        const action = target.dataset.action;
+
+        if (action === 'go-step') setStep(Number(target.dataset.step));
+        else if (action === 'previous-step') setStep(state.step - 1);
+        else if (action === 'next-step') setStep(state.step === FLOW.length - 1 ? 0 : state.step + 1);
+        else if (action === 'stage') { state.stage = target.dataset.stage; renderStageSelection(); }
+        else if (action === 'enable-access') setStep(1);
+        else if (action === 'relay-ready') setStep(2);
+        else if (action === 'qr-scanned') setStep(3);
+        else if (action === 'regenerate-qr') showToast('새 일회용 QR을 발급했습니다. 만료 시간이 5분으로 갱신되었습니다.');
+        else if (action === 'approve-device') { state.stage = 'phone'; setStep(4); showToast('기대호의 iPhone을 승인했습니다.'); }
+        else if (action === 'deny-device') { state.recoveryReason = 'pairing-denied'; state.stage = 'phone'; setStep(6); }
+        else if (action === 'phone-tab') { state.phoneSurface = target.dataset.tab; renderPhone(); }
+        else if (action === 'open-terminal' && target.dataset.session) openTerminal(target.dataset.session, target);
+        else if (action === 'close-terminal') closeTerminal();
+        else if (action === 'simulate-disconnect') { state.terminalMode = 'disconnected'; syncTerminalView(); }
+        else if (action === 'reconnect-terminal') { state.terminalMode = 'connected'; syncTerminalView(); showToast('암호화 연결이 복구되었습니다. 초안은 자동 전송하지 않았습니다.'); }
+        else if (action === 'simulate-session-end') endSession();
+        else if (action === 'send-draft') { state.draft = ''; syncTerminalView(); showToast('프로토타입: 실제 전송 없이 입력만 초기화했습니다.'); }
+        else if (action === 'terminal-key') showToast(`프로토타입: ${target.textContent} 키는 실제 세션으로 전송되지 않습니다.`);
+        else if (action === 'request-input') showToast('Mac으로 입력 권한 요청을 보냈습니다.');
+        else if (action === 'warm-confirm-open') { state.warmConfirm = true; renderPhone(); }
+        else if (action === 'warm-cancel') { state.warmConfirm = false; renderPhone(); }
+        else if (action === 'warm-confirm') { state.warmConfirm = false; state.warmActivated = true; showToast('Mac의 활성 워크스페이스를 design-system으로 전환했습니다.'); renderPhone(); }
+        else if (action === 'approval-demo') showToast('프로토타입: 승인 결과는 실제 도구 실행에 전달되지 않습니다.');
+        else if (action === 'revoke-device') { state.recoveryReason = 'device-revoked'; state.stage = 'phone'; setStep(6); }
+        else if (action === 'recover-to-sessions') { state.stage = 'phone'; setStep(4); }
+      });
+
+      window.addEventListener('popstate', () => {
+        if (state.selectedSession) closeTerminal({ fromHistory: true, nextStep: 4 });
+      });
+
+      function syncVisualViewport() {
+        const height = window.visualViewport?.height || window.innerHeight;
+        document.documentElement.style.setProperty('--vv-height', `${Math.round(height)}px`);
+      }
+
+      syncVisualViewport();
+      window.addEventListener('resize', syncVisualViewport, { passive: true });
+      window.visualViewport?.addEventListener('resize', syncVisualViewport, { passive: true });
+
+      document.addEventListener('visibilitychange', () => {
+        if (!state.selectedSession) return;
+        state.privacyCurtain = document.hidden;
+        syncTerminalView();
+      });
+
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && state.selectedSession) closeTerminal();
+      });
+
+      render();
+    })();
+  </script>
+</body>
+</html>

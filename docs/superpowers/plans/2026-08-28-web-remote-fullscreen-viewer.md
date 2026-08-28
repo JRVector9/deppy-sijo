@@ -46,10 +46,13 @@ fn 앱셸은_대시보드와_전체화면_뷰어를_형제로_둔다() {
         r#"class="viewer-shell""#,
         r#"role="dialog""#,
         r#"aria-modal="true""#,
+        r#"aria-labelledby="viewer-title viewer-session""#,
         r#"id="viewer-back""#,
         r#"id="viewer-stage""#,
         r#"id="viewer-connection-overlay""#,
         r#"id="viewer-privacy-curtain""#,
+        r#"role="group" aria-label="터미널 특수키""#,
+        r#"aria-label="터미널에 보낼 메시지""#,
     ] {
         assert!(html.contains(marker), "전체화면 viewer marker 누락: {marker}");
     }
@@ -84,7 +87,7 @@ Remove the old inline viewer section, close `main` after the sessions panel, and
 
 ```html
 <section id="viewer" class="viewer-shell" role="dialog" aria-modal="true"
-         aria-labelledby="viewer-title" hidden>
+         aria-labelledby="viewer-title viewer-session" hidden>
   <header class="viewer-header">
     <button id="viewer-back" class="viewer-back" type="button"
             aria-label="세션 목록으로 돌아가기">‹</button>
@@ -109,7 +112,7 @@ Remove the old inline viewer section, close `main` after the sessions panel, and
          aria-hidden="true" hidden><span>화면이 보호되었습니다</span></div>
   </div>
   <footer class="viewer-controls">
-    <div class="viewer-keys" aria-label="터미널 특수키">
+    <div class="viewer-keys" role="group" aria-label="터미널 특수키">
       <button type="button" data-key="esc">Esc</button>
       <button type="button" data-key="tab">Tab</button>
       <button type="button" data-key="up">↑</button>
@@ -125,6 +128,7 @@ Remove the old inline viewer section, close `main` after the sessions panel, and
              accept="image/png,image/jpeg,image/gif,image/webp,image/heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md">
       <button id="composer-attach" type="button" class="composer-attach" aria-label="파일 첨부">📎</button>
       <textarea id="composer-text" rows="1" placeholder="메시지 입력…"
+                aria-label="터미널에 보낼 메시지"
                 autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
       <button id="composer-send" type="button">전송</button>
     </div>
@@ -171,6 +175,10 @@ fn 전체화면_뷰어_css는_viewport와_safe_area_계약을_포함한다() {
         "height: var(--viewer-height, 100dvh)",
         "env(safe-area-inset-top)",
         "env(safe-area-inset-bottom)",
+        "max(12px, env(safe-area-inset-right))",
+        "max(12px, env(safe-area-inset-left))",
+        "max(10px, env(safe-area-inset-right))",
+        "max(10px, env(safe-area-inset-left))",
         "grid-template-rows: auto minmax(0, 1fr) auto",
         ".viewer-overlay",
         ".viewer-privacy-curtain",
@@ -216,7 +224,8 @@ body.viewer-open { overflow: hidden; overscroll-behavior: none; }
   align-items: center;
   gap: 10px;
   min-height: calc(54px + env(safe-area-inset-top));
-  padding: env(safe-area-inset-top) 12px 8px;
+  padding: env(safe-area-inset-top) max(12px, env(safe-area-inset-right)) 8px
+    max(12px, env(safe-area-inset-left));
   border-bottom: 1px solid #303030;
   background: #1b1b1b;
 }
@@ -260,15 +269,25 @@ body.viewer-open { overflow: hidden; overscroll-behavior: none; }
   font-size: 12px; font-weight: 600; cursor: pointer;
 }
 .viewer-controls {
-  min-width: 0; padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  min-width: 0;
+  padding: 8px max(10px, env(safe-area-inset-right))
+    calc(8px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
   border-top: 1px solid #303030; background: #1b1b1b;
 }
-.viewer-keys { margin-top: 0; }
-.composer { margin-top: 8px; }
-.composer textarea { font-size: 16px; }
+.viewer-keys {
+  display: flex; gap: 6px; margin-top: 0; overflow-x: auto;
+  -webkit-overflow-scrolling: touch; padding-bottom: 2px;
+}
+.composer { display: flex; gap: 8px; align-items: flex-end; margin-top: 8px; }
+.composer textarea {
+  flex: 1; min-height: 44px; max-height: 130px; resize: none;
+  padding: 10px 12px; border-radius: 9px; line-height: 22px;
+  background: #1b1b1b; color: #e4e4e4; border: 1px solid #454545;
+  font-family: inherit; font-size: 16px;
+}
 ```
 
-Remove `.viewer-actions` and `.viewer-close`. Leave the existing key/composer rules that follow this replacement in place, apart from the explicit margin and font-size overrides above.
+Remove `.viewer-actions` and `.viewer-close`. Replace the later existing `.viewer-keys`, `.composer`, and `.composer textarea` blocks with the complete versions above instead of adding earlier duplicates; leave their button, focus, disabled, attachment, and note rules in place.
 
 - [ ] **Step 4: Run the focused test and verify GREEN**
 

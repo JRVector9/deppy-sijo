@@ -19,6 +19,10 @@ export const MAX_PLAINTEXT_BYTES = 1024 * 1024;
 export const AES_GCM_TAG_BYTES = 16;
 export const MAX_CIPHERTEXT_BYTES = MAX_PLAINTEXT_BYTES + AES_GCM_TAG_BYTES;
 
+// WebCrypto 대기를 포함한 방향별 상한. 메시지 수와 보관 바이트를 함께 제한한다.
+const MAX_PENDING_CHANNEL_FRAMES = 32;
+const MAX_PENDING_CHANNEL_BYTES = 4 * MAX_CIPHERTEXT_BYTES;
+
 export const MAGIC = "DRLY";
 export const HEADER_BYTES = 52;
 export const MAX_HELLO_BYTES = 512;
@@ -748,6 +752,8 @@ export class RelaySecureChannel {
   #sendSequence = 0n;
   #receiveSequence = 0n;
   #closed = false;
+  #sendQueue = { tail: Promise.resolve(), frames: 0, bytes: 0 };
+  #receiveQueue = { tail: Promise.resolve(), frames: 0, bytes: 0 };
 
   constructor({
     protocolVersion,
@@ -785,11 +791,49 @@ export class RelaySecureChannel {
     return this.#receiveSequence;
   }
 
+  async #enqueue(queue, source, operation) {
+    if (this.#closed) throw new Error("닫힌 채널에는 작업을 넣을 수 없다");
+    // 복사나 Promise 연결보다 먼저 제한한다. 느린 암호화가 무한 버퍼가 되어서는 안 된다.
+    if (queue.frames >= MAX_PENDING_CHANNEL_FRAMES ||
+        queue.bytes + source.length > MAX_PENDING_CHANNEL_BYTES) {
+      this.close();
+      throw new RangeError("암호 채널 대기열이 고정 상한을 넘었다");
+    }
+    const bytes = new Uint8Array(source);
+    queue.frames += 1;
+    queue.bytes += bytes.length;
+    const result = queue.tail.then(async () => {
+      if (this.#closed) throw new Error("대기 중 채널이 닫혔다");
+      try {
+        const value = await operation(bytes);
+        // close는 WebCrypto 호출을 취소하지 못한다. 뒤늦은 결과는 외부로 넘기지 않는다.
+        if (this.#closed) throw new Error("암호 처리 도중 채널이 닫혔다");
+        return value;
+      } catch (error) {
+        this.close();
+        throw error;
+      }
+    });
+    // 거절도 다음 대기 작업에 전달한다. 각 작업은 닫힘을 확인한 뒤 자기 Promise를 거절한다.
+    queue.tail = result.then(() => undefined, () => undefined);
+    try {
+      return await result;
+    } finally {
+      queue.frames -= 1;
+      queue.bytes -= bytes.length;
+      bytes.fill(0);
+    }
+  }
+
   async seal(plaintext) {
     if (this.#closed) throw new Error("닫힌 채널로는 봉인할 수 없다");
     const body = asBytes(plaintext);
     // 상한 검사가 암호화·할당보다 먼저다.
     if (body.length > MAX_PLAINTEXT_BYTES) throw new RangeError("평문이 고정 상한을 넘었다");
+    return this.#enqueue(this.#sendQueue, body, (bytes) => this.#seal(bytes));
+  }
+
+  async #seal(body) {
     if (this.#sendSequence >= U64_MAX) throw new RangeError("송신 시퀀스가 소진됐다");
     const sequence = this.#sendSequence;
     const ciphertextLength = body.length + AES_GCM_TAG_BYTES;
@@ -831,6 +875,11 @@ export class RelaySecureChannel {
       this.close();
       throw new RangeError("봉투 방향이 어긋났다");
     }
+    return this.#enqueue(this.#receiveQueue, body, (bytes) =>
+      this.#open({ sequence, direction, body: bytes }));
+  }
+
+  async #open({ sequence, direction, body }) {
     const expected = this.#receiveSequence;
     if (expected >= U64_MAX) {
       this.close();

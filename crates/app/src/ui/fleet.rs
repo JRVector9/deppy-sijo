@@ -1753,7 +1753,8 @@ mod tests {
 
         let outer = catalog();
         let approve = outer.t("inbox.approval.approve", &[]);
-        let skip_label = outer.t("fleet.hero.skip", &[]);
+        // 삭제된 버튼의 예전 문구를 고정해 번역 키 없이도 재등장을 검사한다.
+        let skip_label = "Skip";
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1100.0, 600.0))
             .build_ui(|ui| {
@@ -1799,7 +1800,7 @@ mod tests {
             "오래 막힌 쪽이 위(펼침)여야 한다"
         );
         assert!(
-            harness.query_by_label(&skip_label).is_none(),
+            harness.query_by_label(skip_label).is_none(),
             "「{skip_label}」 버튼은 없어야 한다"
         );
     }

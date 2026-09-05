@@ -1,5 +1,77 @@
 # Codex handoff
 
+## 진행 중 — Relay 보강·i18n 정리 완료, 리사이즈·IME 별도 PR 준비 (2026-09-06)
+
+- 목표: PR #146의 Relay 개발을 이어가고 미사용 fleet 키를 삭제한다. 리사이즈 깜빡임과
+  빠른 한글 입력을 별도 PR로 수정한 뒤, **기존 글의 리사이즈 레이아웃 보존**을 별도 PR로
+  진행한다. 마지막 레이아웃 작업은 아직 시작하지 않았다.
+- 최신 지시: 앱 재빌드·재실행하지 말고 작업 후 대기. 실행 앱 PID 16348, 시작 00:25:04를
+  유지했다. 다만 넓은 `cargo test -p deppy-sijo`가 통합 테스트용 앱 실행 파일을 자동 갱신했다
+  (08:18:40). 사용자에게 알렸고 이후 앱 테스트를 **`--bin deppy-sijo`로 제한**했다.
+  재실행/종료/머지/rebase/force-push 없음. 화면 확인은 대기이며 PASS로 표시하지 않는다.
+- 루트: `feat/fleet-one-list-and-relay-wip`, PR #146 OPEN. 시작 HEAD `e960004`.
+  Opus/high CLI 3개로 병렬 작업. 로그·프롬프트·검증 래퍼는 `/tmp/deppy-sijo-agents-20260906/`.
+- 완료: 로케일 5개의 `fleet.hero.now/next/clear/sessions/skip` 25줄 삭제. fleet 버튼 부재
+  테스트는 예전 영어 문구 `Skip`을 직접 검사한다. approval/needs_input/blocked_for는 유지.
+- 완료: RelaySecureChannel의 동시 송신 nonce 재사용과 동시 replay 성공을 실제 재현하고
+  방향별 bounded queue로 수정했다. 실패/상한/닫힘 뒤 늦은 출력도 거부한다. Node 회귀 8개
+  추가 및 CI 연결. 브라우저 벡터 러너가 실제 배포 암호 모듈을 import하도록 교체했다.
+- 완료: 신뢰 셸 staging/production 예제·CSP 헤더·릴리스 워크플로·매니페스트 테스트 추가.
+  도메인/DNS/TLS/CDN/배포 자격증명이 없으므로 publish/deploy는 **BLOCKED**.
+- Relay 범위: 이후 기록과 코드상 Task 2/3/4는 구현되어 있다. 이번 변경은 Task 6 일부 보강이다.
+  알려진 기기 재접속은 미완성: Mac이 발급한 id를 기기에 전달하는 암호 메시지 및 재접속
+  입장권/인증 흐름이 필요하다. `rememberDeviceId`만 호출해서 해결할 수 없다. Task 7의
+  실기기/24시간 soak/외부 배포 검증도 BLOCKED. 전체 Relay 운영 준비 완료를 주장하지 않는다.
+- 루트 수정 파일: `crates/app/src/ui/fleet.rs`, 로케일 5개, `web/relay-shell/relay-crypto.js`,
+  `web/relay-shell/tests/channel-concurrency.test.mjs`, `crates/web-remote/tests/relay_webcrypto_vectors.rs`,
+  `tests/fixtures/relay-webcrypto-v1.js`, `tests/relay_shell_deploy.rs`, `deploy/relay-shell/**`,
+  `.github/workflows/{build-test,relay-shell-release}.yml`, 이 핸드오프 및 상세 작업 기록.
+- 최종 루트 검증(실제 실행): fmt, `cargo clippy --workspace --all-targets -- -D warnings`,
+  diff-check PASS. 실제 루트 소스를 재컴파일한 `cargo test -p deppy-sijo --bin deppy-sijo
+  --locked`: **2104 PASS / 14 ignored**. i18n 8 PASS, 실제 xtask 키 검사 1 PASS(1103 리터럴,
+  64 동적, 5 로케일). 전체 i18n-check 원명령은 앱 자동 빌드 방지를 위해 재실행하지 않았다.
+- Relay 검증: Node 8 PASS. 실제 `relay_shell_deploy.rs` standalone rustc 테스트 10 PASS.
+  실제 변경된 `relay_webcrypto_vectors.rs` standalone 테스트 **Chrome 포함 5 PASS**.
+  원래 `relay_shell_chrome.rs`를 기존 rlib로 컴파일해 최초 60초 timeout 후 3회 PASS.
+  Cargo로 전체 web-remote 테스트를 돌렸다고 주장하지 않는다.
+- 중요 환경 함정: 공유 target이 다른 worktree의 더 최신 testbinary를 재사용했다.
+  루트에 없는 느린 드래그 테스트가 실행된 `root-app-tests.log`의 2105 PASS와 IME의 초기
+  `app-ime.log` 57 PASS는 **해당 브랜치 검증으로 무효**. 최신 래퍼는 잠금을 얻은 후
+  app/terminal/i18n 진입 소스 및 현재 변경된 rs의 mtime을 갱신해 실제 컴파일을 강제한다.
+  올바른 루트 결과는 `root-app-tests-fresh.log`이며 Compiling 경로와 테스트 목록도 확인했다.
+- 리사이즈 worktree: `/Users/jr/Desktop/projects/deppy-sijo-resize-20260906`,
+  `fix/resize-flicker-20260906`. 첫 세션 크기만 즉시 전송하고 이후 크기는 120ms 안정 후 전송.
+  실제 RED 후 1차 수정 workspace 229 PASS. 최종 clear/redraw를 숨기는 기존 bounded fence를
+  창 Resize에도 적용하는 추가 수정 진행 중. 이 추가 변경은 별도 검증 필요.
+- IME worktree: `/Users/jr/Desktop/projects/deppy-sijo-ime-20260906`, `fix/korean-ime-20260906`.
+  draw와 입력 수신 관문이 이번 프레임의 비어 있지 않은 Preedit도 고려하도록 수정.
+  실제 terminal 원본 소스를 rustc --test로 컴파일: RED 1 실패 → 전체 86 PASS / 4 ignored.
+  새 app workspace 검사 `ime-workspace-fresh.log`, clippy `ime-clippy.log` 진행 중.
+  cmux @7d5d308450eac2991e748c6387d8718704be891a의 GhosttyTerminalView.swift를 설계 대조에
+  참고했으며 코드는 복사하지 않았다. 실제 macOS 빠른 타이핑에서의 해결 여부는 미확인.
+- fleet 사용자 확인: 중복 없음 / 세션 0+승인 카드와 빈 안내 동시 표시 / 좁은 창 안 표시 확인.
+  막힌 항목이 없어 맨 위 하나만 펼침은 미확인. `waiting_ui.render` 매 프레임 호출과
+  세션 0+승인 계약 및 기존 회귀 테스트는 보존한다.
+- 상세 실패·환경 대응 기록: `docs/handoff/2026-09-06-parallel-work-log.md`.
+  swap/프로시저 매크로 dylib 로딩 지연을 구분한다. `/tmp/deppy-sijo-target-20260906/debug`는
+  중지한 불완전 clone이므로 사용하지 않는다. 최신 rlib를 임의로 골라 app을 직접 링크하는
+  시도도 StableCrateId 충돌로 실패했다. 정확한 Cargo 의존성 그래프를 사용한다.
+- 남은 일: 루트 PR 갱신, IME/리사이즈 최종 검증·리뷰·각 별도 PR 생성, 그 다음 기존 글
+  레이아웃 보존 작업과 별도 PR. 앱 재빌드·재실행은 계속 대기한다.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo
+cat AGENTS.md
+cat CLAUDE.md
+sed -n '1,90p' docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff --stat
+git worktree list
+# 공유 캐시를 쓸 때는 /tmp/deppy-sijo-agents-20260906/cargo-serial 최신 래퍼만 쓴다.
+# 래퍼가 사라졌다면 worktree별 target을 분리한다. 앱 검사는 반드시 --bin으로 제한한다.
+CARGO_BUILD_JOBS=1 cargo test -p deppy-sijo --bin deppy-sijo --locked
+```
+
 ## Fleet view: one list, top blocked item expanded in place (2026-09-05)
 
 - **The 작업(fleet) page no longer splits into a 「지금 처리」 hero column and a 「세션」

@@ -1,5 +1,41 @@
 # Codex handoff
 
+## 빠른 한글 입력 — 조합 시작 프레임의 IME 중단 수정 (2026-09-06)
+
+- 현재 목표: 빠른 한글 입력 중 조합이 분리되는 경로를 수정하는 별도 PR.
+  브랜치 `fix/korean-ime-preedit`, PR #146의 `3db4952`를 기반으로 한다.
+  원본 작업은 `fix/korean-ime-20260906` worktree의 Opus/high 담당자가 수행했다.
+- 완료 파일: `crates/terminal/src/renderer_egui.rs`, `crates/app/src/ui/workspace.rs`, 이 문서.
+  렌더러와 입력 수신 관문이 이번 프레임의 비어 있지 않은 Preedit도 조합 근거로 본다.
+  draw 뒤에 갱신되는 이전 preedit 값만 보고 request_focus를 호출해 IME를 중단하던 경로를 막는다.
+  조합 종료 후 포커스 복구, 다른 TextEdit·팝업·모달의 소유권은 유지한다.
+- 실제 재현: 첫 Preedit이 온 프레임에 저장된 preedit이 비고 비-TextEdit 위젯이 포커스를 쥐면,
+  기존 draw가 `should_interrupt_composition`을 켰다. 수정 전 실제 terminal 테스트 1개 FAIL,
+  수정 후 PASS. 이는 소스 계약 재현이며 사용자의 실제 빠른 타이핑 증상이 모두 사라졌다는
+  증거는 아니다. 앱 재실행과 macOS 화면/타이핑 검증은 사용자 지시에 따라 대기한다.
+- 참고: cmux @7d5d308450eac2991e748c6387d8718704be891a의
+  `Sources/GhosttyTerminalView.swift` keyDown/insertText/syncPreedit. 코드 복사 없이
+  조합 표시와 입력 소유권 처리를 대조했다.
+- 검증: 실제 terminal 소스를 rustc --test로 컴파일해 **86 PASS / 4 ignored**.
+  현재 IME worktree의 app/terminal/i18n을 실제 재컴파일한 workspace 테스트 **229 PASS**;
+  새 `조합이_시작되는_프레임은_소유권과_직전_preedit이_없어도_받는다` 실행을 확인했다.
+  `cargo clippy -p deppy-sijo -p terminal --all-targets -- -D warnings` PASS(6m33초),
+  fmt / diff-check PASS. PR용 worktree의 두 코드 파일은 검증한 원본과 바이트가 같다.
+- 폐기한 결과: 공유 target의 이전 `app-ime.log` 57 PASS는 다른 worktree의 바이너리였고
+  필터 `ime`도 새 회귀 테스트를 잡지 못했다. 검증으로 인정하지 않는다. 기존 코드에서도
+  통과하는 일반 always-focused probe는 제거했다. 새 검증 로그는
+  `/tmp/deppy-sijo-agents-20260906/{ime-workspace-fresh,ime-clippy}.log`.
+- 남은 일: 별도 draft PR 생성, 승인된 시점의 실제 한글 입력 확인. 앱 재빌드·재실행·머지 금지.
+  전체 작업에서는 리사이즈 PR까지 종료한 뒤 기존 글 레이아웃 보존을 별도 PR로 진행한다.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-ime-pr-20260906
+git status --short --branch
+git diff --stat
+# 공유 target 검증 시 최신 직렬 래퍼가 현재 소스의 컴파일을 강제한다.
+/tmp/deppy-sijo-agents-20260906/cargo-serial test -p deppy-sijo --bin deppy-sijo --locked ui::workspace::tests -- --test-threads=1
+```
+
 ## 진행 중 — Relay 보강·i18n 정리 완료, 리사이즈·IME 별도 PR 준비 (2026-09-06)
 
 - 목표: PR #146의 Relay 개발을 이어가고 미사용 fleet 키를 삭제한다. 리사이즈 깜빡임과

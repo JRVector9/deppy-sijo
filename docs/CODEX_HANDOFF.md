@@ -72,6 +72,41 @@ git worktree list
 CARGO_BUILD_JOBS=1 cargo test -p deppy-sijo --bin deppy-sijo --locked
 ```
 
+## 창 리사이즈 깜빡임 — 중간 크기 전송과 최종 redraw 수정 (2026-09-06)
+
+- 목표: 창 테두리를 늘리거나 줄일 때 발생하는 터미널 깜빡임 수정. 브랜치
+  `fix/window-resize-flicker`, PR #146의 `3db4952` 기반. 기존 글 레이아웃 보존은 후속 PR이다.
+- 변경 파일: `crates/app/src/ui/workspace.rs`, 이 문서.
+- 완료 A: `queue_terminal_resize_debounced`가 최초 전송 여부를 `sent_sizes`로 판단한다.
+  세션 첫 크기는 즉시, 그 이후 크기 변경은 120ms 안정 후 전송한다. 기존에는 목표가
+  직전 전송 크기에 머무는 프레임이 보류를 지워, 다음 한 칸 변경도 최초로 오인해 전송했다.
+  수정 전 느린 드래그 테스트가 기대 (80,24)와 실제 (81,24)의 차이로 실패했다.
+- 완료 B: 창 Resize의 성공 처리에도 기존 bounded presentation fence를 arm하거나 retarget한다.
+  이전 화면을 유지하다 새 목표의 출력이 32ms 안정되면 표시하며, 250ms hard deadline은
+  연장하지 않는다. 스냅샷이 없는 세션에는 fence를 걸지 않아 첫 화면을 지연시키지 않는다.
+  수정 전 `창_리사이즈_전송도_안정_화면을_fence로_지킨다`가 fence 없음으로 실패했다.
+- 시점 결정: UI 호스트는 명령 전송 직후 동기적으로 complete_protocol을 호출하며,
+  새 Viewport를 UI가 처리하는 것은 그 이후다. 따라서 성공 처리에서 이전 화면을 보존한다.
+  busy/reject 재시도·롤백, split 최종 경로, target 변경 때의 기존 deadline 계약은 유지한다.
+  세션 생성 후 최대화·사이드바 토글 같은 단발 크기 변경에도 120ms 지연이 적용된다.
+- 검증: 실제 현재 소스를 컴파일한 workspace 테스트 **231 PASS / 0 FAIL**.
+  fmt / diff-check PASS. `cargo clippy -p deppy-sijo --all-targets -- -D warnings` PASS
+  (3m04초, `/tmp/deppy-sijo-agents-20260906/resize-clippy.log`).
+  원본 작업 트리 `/Users/jr/Desktop/projects/deppy-sijo-resize-20260906`와 PR용 코드가 같다.
+- 실패 기록: 공유 target이 새 테스트를 포함하지 않은 바이너리를 재사용했다. 테스트 목록과
+  컴파일 로그로 발견하고 소스 mtime을 갱신해 재컴파일한 결과만 인정했다.
+  기존 229 PASS는 A만 검증했고, 최종 231 PASS가 A+B를 포함한다.
+- 남은 일: 별도 draft PR 생성. 실제 창 드래그 화면은 사용자 지시에 따라
+  재빌드·재실행하지 않고 대기한다. 이후 기존 글의 레이아웃 보존 작업을 별도 PR로 진행한다.
+- 화면 확인 절차: 출력이 있는 세션에서 천천히/빠르게 창 테두리를 끌고, 멈췄을 때 빈 화면이
+  끼지 않는지 본다. 세션 첫 화면과 분할선 드래그도 확인한다. 현재 화면 PASS를 주장하지 않는다.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-resize-pr-20260906
+git status --short --branch
+/tmp/deppy-sijo-agents-20260906/cargo-serial test -p deppy-sijo --bin deppy-sijo --locked ui::workspace::tests -- --test-threads=1
+```
+
 ## Fleet view: one list, top blocked item expanded in place (2026-09-05)
 
 - **The 작업(fleet) page no longer splits into a 「지금 처리」 hero column and a 「세션」

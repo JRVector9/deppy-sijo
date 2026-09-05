@@ -285,6 +285,10 @@ pub struct SidebarSnapshot<'a> {
 /// 사이드바에서 App으로 올라가는 액션.
 pub enum SidebarAction {
     SwitchWorkspace(String),
+    /// 사이드바에서 워크스페이스를 드래그해 순서를 바꿨다. 그 시점 사이드바 목록 전체를
+    /// 새 순서로 담아 보내므로, App은 이 목록을 그대로 config에 저장하면 된다
+    /// (지워진 id는 목록에 없으니 저절로 빠진다).
+    ReorderWorkspaces(Vec<String>),
     ActivatePersistedSession {
         workspace_id: String,
         pane: runtime::MuxPaneId,
@@ -950,11 +954,24 @@ enum PendingFileTreeMaintenance {
     },
 }
 
+/// 삭제 대상 — **행에서 한 번 확정한 값**을 확인 문구까지 그대로 들고 간다.
+/// 경로만 넘기고 표시 문자열을 확인 시점에 다시 만들면 "보여준 것"과 "지우는 것"이
+/// 갈라진다. 실제로 갈라졌었다: 확인 문구는 `path.file_name()`만 뽑아 써서
+/// `src/mod.rs`와 `tests/mod.rs`가 똑같이 `'mod.rs'`로 보였고, 폴더인지 파일인지도
+/// 구분되지 않았다(영구 삭제는 폴더면 안의 내용까지 통째로 지운다).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeleteTarget {
+    path: PathBuf,
+    /// 확인 문구에 그대로 쓰는 표시 이름 — 루트 기준 상대 경로.
+    label: String,
+    is_dir: bool,
+}
+
 struct PendingFileTreeIo {
     operation: FileTreeIoOperation,
     generation: u64,
     refresh: Vec<PathBuf>,
-    trash_target: Option<PathBuf>,
+    trash_target: Option<DeleteTarget>,
     retry_edit: Option<EditState>,
 }
 
@@ -1045,8 +1062,9 @@ pub struct FileTreeUi {
     /// 백그라운드 완료 시 UI를 깨우기 위한 컨텍스트.
     /// 인라인 편집 상태 (이름 변경/새 폴더, FT-3).
     edit: Option<EditState>,
-    /// 휴지통 이동 실패 → 영구삭제 확인 대기 중인 경로 (§9-7).
-    confirm_delete: Option<PathBuf>,
+    /// 휴지통 이동 실패 → 영구삭제 확인 대기 중인 대상 (§9-7). 경로가 아니라
+    /// `DeleteTarget`을 들고 있어야 확인 문구와 실제 삭제 경로가 같은 값에서 나온다.
+    confirm_delete: Option<DeleteTarget>,
     /// 실측 행높이 (show_rows 자기보정). show_rows는 "모든 행 = 선언 높이" 계약인데
     /// 실제 행높이는 폰트 메트릭(한글 폰트 라인높이 등)에 따라 선언값과 어긋날 수 있고,
     /// 어긋나면 스크롤 위치·가시 범위가 리빌드마다 밀려 클릭이 다른 행에 떨어진다
@@ -1063,6 +1081,25 @@ pub struct FileTreeUi {
     /// 활성 변경을 감지해 이전 활성의 기본-open 상태를 map에 고정한다. 이 기록이 없으면
     /// 명시값이 없던 이전 workspace가 inactive가 되는 순간 default false로 닫힌다.
     last_sidebar_active_workspace: Option<String>,
+    /// 폴더 트리 다중선택. 비어 있으면 "선택 없음"이고, 단축키는 예전처럼 포인터 밑
+    /// 행 하나로 떨어진다 — 선택을 쓰기 시작하기 전 동작을 그대로 보존한다.
+    selected: BTreeSet<PathBuf>,
+    /// Shift 범위 선택의 기준점 — 마지막으로 단독 선택하거나 토글한 행.
+    select_anchor: Option<PathBuf>,
+    /// 선택 사각형 드래그 중 상태.
+    marquee: Option<MarqueeDrag>,
+    /// 트리가 마지막으로 클릭된 곳인가. ⌘⌫는 이것이 참일 때만 받는다 — 포인터 위치만
+    /// 보면 터미널에 포커스가 있어도 포인터가 트리 위에 놓였다는 이유로 파일이 지워진다
+    /// (2026-09-04 리뷰 H4). 터미널은 egui TextEdit이 아니라 `text_edit_focused()`
+    /// 가드에 걸리지 않는다.
+    tree_focused: bool,
+    /// 마지막 삭제 제스처 시각 — ⌘C·⌘V와 같은 이유로 키 리피트를 한 제스처로 묶는다.
+    last_delete_gesture: Option<std::time::Instant>,
+    /// 다중 삭제 대기열. IO 큐가 capacity-1이라 완료될 때마다 하나씩 보낸다.
+    trash_queue: Vec<DeleteTarget>,
+    /// 순서 변경 드래그 중인 워크스페이스 id. 드롭 위치는 매 프레임 포인터 y로 다시 구하므로
+    /// 여기엔 "무엇을 들고 있는가"만 남긴다.
+    workspace_drag: Option<String>,
     /// 마지막 외부 파일 붙여넣기(⌘V) 처리 시각 — 같은 제스처의 press(native)와
     /// release(egui fallback)가 두 번 복사하는 것을 막는다(터미널 PASTE_GESTURE 관례).
     last_external_paste: Option<std::time::Instant>,
@@ -1139,6 +1176,13 @@ impl FileTreeUi {
             session_name_edit: None,
             workspace_sessions_expanded: HashMap::new(),
             last_sidebar_active_workspace: None,
+            selected: BTreeSet::new(),
+            select_anchor: None,
+            marquee: None,
+            trash_queue: Vec::new(),
+            tree_focused: false,
+            last_delete_gesture: None,
+            workspace_drag: None,
             last_external_paste: None,
             last_external_copy: None,
             consumed_paste_shortcut: false,
@@ -1177,7 +1221,7 @@ impl FileTreeUi {
         &mut self,
         request: FileTreeIoRequest,
         refresh: Vec<PathBuf>,
-        trash_target: Option<PathBuf>,
+        trash_target: Option<DeleteTarget>,
         retry_edit: Option<EditState>,
     ) -> Result<(), FileTreeIoErrorCode> {
         debug_assert_eq!(FILE_TREE_IO_QUEUE_CAP, 1);
@@ -1233,8 +1277,24 @@ impl FileTreeUi {
                 for dir in pending.refresh {
                     self.reload_dir(&dir);
                 }
+                // 다중 삭제는 capacity-1 큐를 하나씩 통과한다.
+                //
+                // **직전 완료가 삭제였을 때만** 잇는다. 완료 종류를 안 보면 붙여넣기·복사·
+                // 이름변경 같은 무관한 IO가 성공하는 순간 대기열이 풀려, 사용자가 고른 적
+                // 없는 시점에 파일이 사라진다(2026-09-04 리뷰 H1/H2). `trash_target`은
+                // `spawn_trash`만 채우므로 그것이 곧 "이 완료가 삭제였다"는 증거다.
+                if pending.trash_target.is_some()
+                    && let Some(next) =
+                        (!self.trash_queue.is_empty()).then(|| self.trash_queue.remove(0))
+                {
+                    self.spawn_trash(next);
+                }
             }
             Err(FileTreeIoErrorCode::TrashUnavailable) => {
+                // 남은 대상은 보내지 않는다. 영구삭제 확인이 뜬 채로 뒤 대상이 계속
+                // 지워지면, 사용자가 보고 있는 확인 문구와 실제로 사라지는 파일이
+                // 갈라진다. 남은 것들은 트리에 그대로 남아 눈으로 확인된다.
+                self.trash_queue.clear();
                 self.error = Some(
                     file_tree_io_error_message(FileTreeIoErrorCode::TrashUnavailable).to_owned(),
                 );
@@ -1242,6 +1302,7 @@ impl FileTreeUi {
                 self.edit = pending.retry_edit;
             }
             Err(code) => {
+                self.trash_queue.clear();
                 self.edit = pending.retry_edit;
                 self.reject_io(code);
             }
@@ -1504,10 +1565,60 @@ impl FileTreeUi {
         if !self.replace_listing_children(&path, prepared) {
             return;
         }
+        self.invalidate_stale_delete_confirm(&path);
         self.root_error = None;
         self.rebuild_flat();
         for child in self.expanded_direct_child_paths(&path) {
             self.enqueue_refresh_dir(child);
+        }
+    }
+
+    /// 방금 나열한 폴더의 결과로 영구삭제 확인이 아직 유효한지 판정한다.
+    ///
+    /// 확인은 실패한 휴지통 이동이 세워두고 사용자가 누를 때까지 남는다. 그 사이
+    /// 브랜치 전환·빌드·외부 편집이 그 경로를 지우고 **같은 자리에 다른 것**을 만들면,
+    /// 문구는 옛 이름을 말하는데 삭제는 지금 그 자리에 있는 것을 지운다. 종류까지
+    /// 바뀌면(파일 → 폴더) 파일용 문구를 띄운 채 `remove_dir_all`이 폴더를 통째로
+    /// 지운다 — "안의 내용까지 사라진다"는 경고 없이.
+    ///
+    /// **여기가 유일한 판정 지점인 이유**: 트리가 "그 폴더에 무엇이 있는지"를 배우는
+    /// 길은 listing 스냅샷 하나뿐이다. 수동 새로고침·워처 이벤트·`reload_dir`·펼치기가
+    /// 모두 `enqueue_refresh_dir` → maintenance intent → 이 함수의 호출부로 모인다.
+    /// 반대로 `rebuild_flat`은 너무 넓다 — 접힘·숨김 토글처럼 "안 보일 뿐"인 상태와,
+    /// 펼치는 중이라 children이 빈 placeholder인 상태까지 "없어졌다"로 읽는다.
+    ///
+    /// 판정은 **대상의 부모를 방금 나열했을 때만** 한다. 다른 폴더의 나열 결과로는
+    /// 대상의 생사를 알 수 없다. 나열 결과에는 숨김 파일도 들어 있으므로 숨김 토글에는
+    /// 영향받지 않는다.
+    fn invalidate_stale_delete_confirm(&mut self, listed_dir: &Path) {
+        let Some(target) = self.confirm_delete.as_ref() else {
+            return;
+        };
+        if target.path.parent() != Some(listed_dir) {
+            return;
+        }
+        let (Some(root), Some(name)) = (self.root.as_deref(), target.path.file_name()) else {
+            return;
+        };
+        let listed = if listed_dir == root {
+            self.children.as_deref()
+        } else {
+            listed_dir
+                .strip_prefix(root)
+                .ok()
+                .and_then(|rel| self.children.as_deref().and_then(|c| node_ref(c, rel)))
+                .and_then(|node| node.children.as_deref())
+        };
+        let Some(listed) = listed else {
+            return;
+        };
+        // 이름만 같고 종류가 다르면 **다른 것**이다. 파일 문구를 띄운 채 폴더를 지우는
+        // 것이 정확히 이 경우다.
+        let still_there = listed
+            .iter()
+            .any(|node| node.name == name && node.is_dir == target.is_dir);
+        if !still_there {
+            self.confirm_delete = None;
         }
     }
 
@@ -1623,6 +1734,13 @@ impl FileTreeUi {
         self.inaccessible_paths.clear();
         self.edit = None;
         self.confirm_delete = None;
+        // 루트가 바뀌면 선택과 삭제 대기열도 함께 버린다. generation 검사는 **옛 완료**만
+        // 막을 뿐 큐 자체는 살아남아서, 새 워크스페이스에서 아무 IO나 성공하는 순간
+        // 옛 루트의 파일이 지워졌다(2026-09-04 리뷰 H2).
+        self.trash_queue.clear();
+        self.selected.clear();
+        self.select_anchor = None;
+        self.marquee = None;
         self.env_warning_candidates.clear();
         self.watch_plan_dirty = true;
         if let Some(root) = self.root.clone() {
@@ -1646,6 +1764,19 @@ impl FileTreeUi {
         self.flat.clear();
         if let (Some(root), Some(children)) = (&self.root, &self.children) {
             flatten(children, root, 0, self.show_hidden, &mut self.flat);
+        }
+        // 목록에서 사라진 행은 선택에서도 뺀다 — 접힌 폴더 안이나 지워진 파일이 선택에
+        // 남아 있으면, 화면에 아무것도 강조되지 않은 채 ⌫ 하나에 그것들이 지워진다.
+        if !self.selected.is_empty() {
+            let visible: BTreeSet<&PathBuf> = self.flat.iter().map(|row| &row.path).collect();
+            self.selected.retain(|path| visible.contains(path));
+            if self
+                .select_anchor
+                .as_ref()
+                .is_some_and(|anchor| !self.selected.contains(anchor))
+            {
+                self.select_anchor = None;
+            }
         }
         self.watch_plan_dirty = true;
         self.drive_maintenance();
@@ -1969,20 +2100,11 @@ impl FileTreeUi {
                         .iter()
                         .any(|workspace| workspace.id == *workspace_id)
                 });
-                if self.last_sidebar_active_workspace.as_deref()
-                    != Some(sidebar.active_workspace_id)
-                {
-                    if let Some(previous) = self.last_sidebar_active_workspace.as_ref() {
-                        self.workspace_sessions_expanded
-                            .entry(previous.clone())
-                            .or_insert(true);
-                    }
-                    self.workspace_sessions_expanded
-                        .entry(sidebar.active_workspace_id.to_owned())
-                        .or_insert(true);
-                    self.last_sidebar_active_workspace =
-                        Some(sidebar.active_workspace_id.to_owned());
-                }
+                sync_workspace_expansion_on_switch(
+                    &mut self.workspace_sessions_expanded,
+                    &mut self.last_sidebar_active_workspace,
+                    sidebar.active_workspace_id,
+                );
                 if sidebar.workspaces.is_empty() {
                     ui.add_space(3.0);
                     // 빈 상태 — 워크스페이스가 하나도 없으면(종료 숨김 반영) 헤더/목록 대신
@@ -2034,6 +2156,10 @@ impl FileTreeUi {
                     // 하나의 bounded 스크롤 영역이 공유한다. 상한은 기존 워크스페이스 목록 예산에
                     // 활성 행(46px)과 세션 블록 예산을 더한 값 — before가 없던 기존 화면과 동일한
                     // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
+                    // 순서 변경 드래그는 세 구간(활성 앞/활성/활성 뒤)이 상태를 공유한다.
+                    // 그룹 rect는 그린 순서 그대로 쌓여 그대로 드롭 위치 계산의 기준이 된다.
+                    let mut group_rects: Vec<(String, egui::Rect)> = Vec::new();
+                    let mut drag_released = false;
                     egui::ScrollArea::vertical()
                         .id_salt("workspace_list_scroll")
                         .auto_shrink([false, false])
@@ -2058,10 +2184,24 @@ impl FileTreeUi {
                                         Some(expanded),
                                         catalog,
                                     );
-                                    workspace_context_menu(&resp, workspace, catalog, &mut action);
-                                    if resp.clicked() {
+                                    let row = &resp.row;
+                                    workspace_context_menu(row, workspace, catalog, &mut action);
+                                    if track_workspace_drag(
+                                        row,
+                                        &workspace.id,
+                                        &mut self.workspace_drag,
+                                    ) {
+                                        drag_released = true;
+                                    }
+                                    // chevron은 **전환 없이** 여닫는다 — 비활성 워크스페이스를
+                                    // 펼쳐 둘 수 있어야 그 세션을 현재 화면 옆에 열 수 있다.
+                                    if resp.disclosure_clicked {
                                         self.workspace_sessions_expanded
-                                            .insert(workspace.id.clone(), true);
+                                            .insert(workspace.id.clone(), !expanded);
+                                    } else if row.clicked() {
+                                        // 펼침은 전환이 **실제로 반영될 때** sync가 켠다. 여기서
+                                        // 미리 켜면 전환이 거부됐을 때(warm 한도 초과 등) 펼친
+                                        // 채로 남아 두 곳이 동시에 열린 것처럼 보인다.
                                         action = Some(SidebarAction::SwitchWorkspace(
                                             workspace.id.clone(),
                                         ));
@@ -2085,9 +2225,13 @@ impl FileTreeUi {
                                     }
                                 });
                                 paint_workspace_group_separator(ui, inner.response.rect);
+                                group_rects.push((workspace.id.clone(), inner.response.rect));
                             }
                             let active_color =
                                 workspace_accent(sidebar.workspaces, sidebar.active_workspace_id);
+                            // 활성 그룹 배경 자리. 내용보다 **먼저** painter에 넣어 두고
+                            // 크기가 정해진 뒤 실제 도형으로 바꾼다 — 나중에 그리면 글자를 덮는다.
+                            let active_background = ui.painter().add(egui::Shape::Noop);
                             let active_inner = ui.scope(|ui| {
                                 if let Some(active) = active {
                                     let expanded = self
@@ -2103,8 +2247,16 @@ impl FileTreeUi {
                                         Some(expanded),
                                         catalog,
                                     );
-                                    workspace_context_menu(&resp, active, catalog, &mut action);
-                                    if resp.clicked() {
+                                    let row = &resp.row;
+                                    workspace_context_menu(row, active, catalog, &mut action);
+                                    if track_workspace_drag(row, &active.id, &mut self.workspace_drag)
+                                    {
+                                        drag_released = true;
+                                    }
+                                    if resp.disclosure_clicked {
+                                        self.workspace_sessions_expanded
+                                            .insert(active.id.clone(), !expanded);
+                                    } else if row.clicked() {
                                         self.workspace_sessions_expanded
                                             .insert(active.id.clone(), !expanded);
                                         // Home/작업/Agents에서 현재 활성 워크스페이스를 다시 눌러도
@@ -2393,7 +2545,22 @@ impl FileTreeUi {
                                         });
                                 }
                             });
+                            if active.is_some() {
+                                paint_active_group_background(
+                                    ui,
+                                    ui.ctx().pixels_per_point(),
+                                    active_background,
+                                    active_inner.response.rect,
+                                    active_color,
+                                );
+                            }
                             paint_workspace_group_separator(ui, active_inner.response.rect);
+                            if active.is_some() {
+                                group_rects.push((
+                                    sidebar.active_workspace_id.to_owned(),
+                                    active_inner.response.rect,
+                                ));
+                            }
                             for workspace in after_active {
                                 let inner = ui.scope(|ui| {
                                     let color = workspace_accent(sidebar.workspaces, &workspace.id);
@@ -2410,10 +2577,24 @@ impl FileTreeUi {
                                         Some(expanded),
                                         catalog,
                                     );
-                                    workspace_context_menu(&resp, workspace, catalog, &mut action);
-                                    if resp.clicked() {
+                                    let row = &resp.row;
+                                    workspace_context_menu(row, workspace, catalog, &mut action);
+                                    if track_workspace_drag(
+                                        row,
+                                        &workspace.id,
+                                        &mut self.workspace_drag,
+                                    ) {
+                                        drag_released = true;
+                                    }
+                                    // chevron은 **전환 없이** 여닫는다 — 비활성 워크스페이스를
+                                    // 펼쳐 둘 수 있어야 그 세션을 현재 화면 옆에 열 수 있다.
+                                    if resp.disclosure_clicked {
                                         self.workspace_sessions_expanded
-                                            .insert(workspace.id.clone(), true);
+                                            .insert(workspace.id.clone(), !expanded);
+                                    } else if row.clicked() {
+                                        // 펼침은 전환이 **실제로 반영될 때** sync가 켠다. 여기서
+                                        // 미리 켜면 전환이 거부됐을 때(warm 한도 초과 등) 펼친
+                                        // 채로 남아 두 곳이 동시에 열린 것처럼 보인다.
                                         action = Some(SidebarAction::SwitchWorkspace(
                                             workspace.id.clone(),
                                         ));
@@ -2437,6 +2618,68 @@ impl FileTreeUi {
                                     }
                                 });
                                 paint_workspace_group_separator(ui, inner.response.rect);
+                                group_rects.push((workspace.id.clone(), inner.response.rect));
+                            }
+                            // ── 순서 변경 드래그: 놓일 자리 표시, 놓는 순간 확정 ──
+                            if let Some(dragged) = self.workspace_drag.clone() {
+                                if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                                    let centers: Vec<f32> = group_rects
+                                        .iter()
+                                        .map(|(_, rect)| rect.center().y)
+                                        .collect();
+                                    let insert_at = workspace_drop_index(&centers, pointer.y);
+                                    // 목록 **밖**에서는 표시선도 내지 않는다 — 밖에서 놓으면
+                                    // 취소인데 선을 그리면 "여기 들어간다"고 거짓말이 된다.
+                                    let list_rect = ui.clip_rect();
+                                    let inside_list = list_rect.contains(pointer);
+                                    if inside_list {
+                                        paint_workspace_drop_indicator(
+                                            ui,
+                                            &group_rects,
+                                            insert_at,
+                                            active_color,
+                                        );
+                                    }
+                                    // 드래그 중에는 휠도 스크롤바도 막혀 있어(egui가 드래그
+                                    // 중 둘 다 끈다) 목록을 스크롤할 방법이 아예 없었다 —
+                                    // 화면 밖 자리로는 워크스페이스를 옮길 수 없었다.
+                                    // 가장자리에 다가가면 목록이 스스로 흐르게 한다.
+                                    let autoscroll = drag_autoscroll_delta(
+                                        list_rect.y_range(),
+                                        pointer.y,
+                                        ui.input(|input| input.stable_dt),
+                                    );
+                                    if autoscroll != 0.0 {
+                                        // 프레임마다 그 프레임 몫만 미는 방식이라 애니메이션을
+                                        // 덧씌우면 두 번 완만해진다.
+                                        ui.scroll_with_delta_animation(
+                                            egui::vec2(0.0, autoscroll),
+                                            egui::style::ScrollAnimation::none(),
+                                        );
+                                        // 포인터를 가만히 들고 있어도 계속 흘러야 한다.
+                                        ui.ctx().request_repaint();
+                                    }
+                                    // 목록 **밖에서** 놓으면 취소다(보편적인 "밖에 떨구면
+                                    // 취소"). 예전에는 x를 아예 보지 않고 y만 읽어서 터미널
+                                    // 위나 목록 위쪽에서 놓아도 확정됐고, 위쪽은 insert_at이
+                                    // 0이라 끌던 행이 맨 앞으로 튀었다(2026-09-03 리뷰 M1).
+                                    if drag_released && inside_list {
+                                        let ids: Vec<String> =
+                                            group_rects.iter().map(|(id, _)| id.clone()).collect();
+                                        let reordered =
+                                            reorder_workspace_ids(&ids, &dragged, insert_at);
+                                        if reordered != ids {
+                                            action =
+                                                Some(SidebarAction::ReorderWorkspaces(reordered));
+                                        }
+                                    }
+                                }
+                                // 놓는 프레임이 아니어도 버튼이 이미 올라갔으면 상태를 놓아준다 —
+                                // 드래그하던 행이 사라져 drag_stopped를 못 받는 경우의 안전망.
+                                if drag_released || !ui.ctx().input(|input| input.pointer.any_down())
+                                {
+                                    self.workspace_drag = None;
+                                }
                             }
                         });
                 }
@@ -2798,6 +3041,49 @@ impl FileTreeUi {
             });
         }
 
+        // ── 목록 전체를 설명하는 상태 표시 ──
+        //
+        // **셋 다 스크롤 영역보다 먼저 그린다.** 아래 `ScrollArea`는
+        // `auto_shrink([false,false])`라 남은 높이를 전부 가져가므로, 그 뒤에 놓인
+        // 위젯은 패널 바닥 밖으로 밀려 잘린다 — 700px 패널에서 실측하면 영구삭제
+        // 확인 문구가 y=695/버튼이 y=728, 오류 라벨이 y=717.5, 진행 문구가 y=696.5로
+        // 모두 화면 밖이었다. 무엇이 실패했는지도, 무엇을 지우는지도, 지금 뭘 하고
+        // 있는지도 보이지 않았다(§조용한 실패 금지).
+        //
+        // 쌓는 순서는 오류(왜 멈췄나) → 영구삭제 확인(그래서 뭘 고를까) → 진행
+        // 표시(지금 뭘 하고 있나)다. 셋은 동시에 뜰 수 있고(휴지통 실패 직후 다른
+        // 파일 조작을 걸면 그렇다) 이 순서면 원인 → 선택 → 현재로 읽힌다. 진행
+        // 표시는 자기가 바꾸는 목록 바로 위에 붙는다.
+        //
+        // 그리고 나서 바뀐 상태는 이번 프레임에 실을 수 없으므로 아래에서 한 프레임을
+        // 더 요청한다(`status_*` 스냅샷).
+        let status_error = self.error.clone();
+        let status_busy = self.in_flight > 0;
+        let status_listing =
+            self.pending_maintenance.is_some() || self.maintenance_intent.is_some();
+        if let Some(err) = status_error.clone() {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().error_fg_color, err);
+                if ui.small_button("×").clicked() {
+                    self.error = None;
+                }
+            });
+        }
+        // 휴지통 실패 → 영구삭제 확인 (§9-7 — 조용한 영구삭제 금지).
+        self.permanent_delete_confirm(ui, catalog);
+        if status_busy {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.weak(catalog.t("file_tree.file_operation_running", &[]));
+            });
+        }
+        if status_listing {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.weak(catalog.t("file_tree.listing_folders", &[]));
+            });
+        }
+
         // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
         // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
         let row_height = self.measured_row_height.unwrap_or(25.0);
@@ -2833,9 +3119,34 @@ impl FileTreeUi {
         let mut hover_row_path: Option<PathBuf> = None;
         let mut drop_target_dir: Option<PathBuf> = None;
         let mut drag_row_highlighted = false;
+        // ── 다중선택 ──
+        // 0번 행의 위쪽 y. 선택 사각형은 가상화로 그리지 않은 행도 덮어야 해서 행 index를
+        // 산술로 구하는데, 그 기준점이다.
+        let mut content_top: Option<f32> = None;
+        // 이름 오른쪽 빈 자리에서 드래그가 시작됐다 — 파일 이동이 아니라 선택 사각형.
+        let mut marquee_start: Option<egui::Pos2> = None;
+        // 선택을 바꾸는 클릭. `row`가 self를 빌리고 있어 루프 밖에서 적용한다(기존 관례).
+        let mut select_click: Option<(PathBuf, SelectionClick)> = None;
+        // 빈 영역을 클릭했다 — 선택 해제.
+        let mut clear_selection = false;
         let scroll_output = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
+                // 빈 영역 배경. 행보다 **먼저** 등록해 행이 있는 자리에서는 행이 이긴다.
+                // 이것이 있어야 (a) 목록 아래 빈 곳에서 선택 사각형을 시작할 수 있고
+                // (b) 빈 곳 클릭으로 선택을 해제할 수 있다. 예전에는 둘 다 불가능해서
+                // 선택을 비울 방법 자체가 없었다(2026-09-04 리뷰 H2·H4).
+                let background = ui.interact(
+                    ui.clip_rect(),
+                    ui.id().with("tree_background"),
+                    egui::Sense::click_and_drag(),
+                );
+                if background.clicked() {
+                    clear_selection = true;
+                }
+                if background.drag_started_by(egui::PointerButton::Primary) {
+                    marquee_start = ui.input(|input| input.pointer.press_origin());
+                }
                 for index in range {
                     let row = &self.flat[index];
                     let inaccessible = self.inaccessible_paths.contains(&row.path);
@@ -2881,6 +3192,31 @@ impl FileTreeUi {
                     // show_rows가 그 값을 곱해 행 top을 잡아 행마다 배경 테두리가 다르게
                     // 뭉갠다. 판정(rect_contains_pointer/contains)은 원본 rect를 쓴다.
                     let hover_paint_rect = crate::ui::snap_rect_to_pixel(ppp, hover_rect);
+                    if content_top.is_none() {
+                        content_top =
+                            Some(row_top - index as f32 * tree_row_pitch(row_height, ui.spacing()));
+                    }
+                    // 선택 배경은 hover보다 **먼저** 깐다 — 선택한 행 위에 포인터를 올리면
+                    // hover가 덧칠돼 "여기 있다"가 더 밝아진다.
+                    if self.selected.contains(&row.path)
+                        && let Some(fill) = crate::ui::designall::row_fill(
+                            crate::ui::designall::tokens(ui.visuals()),
+                            true,
+                            false,
+                        )
+                    {
+                        // 채움은 **피치** 높이로. row_height만 덮으면 연속 선택이 하나의
+                        // 덩어리가 아니라 3px씩 끊긴 막대로 보인다(2026-09-04 리뷰).
+                        let pitch = tree_row_pitch(row_height, ui.spacing());
+                        let selected_rect = crate::ui::snap_rect_to_pixel(
+                            ppp,
+                            egui::Rect::from_min_max(
+                                hover_rect.left_top(),
+                                egui::pos2(hover_rect.right(), row_top + pitch),
+                            ),
+                        );
+                        ui.painter().rect_filled(selected_rect, 1.0, fill);
+                    }
                     // 워크스페이스·폴더 트리 경계선 드래그 중엔 hover 판정을 끈다 —
                     // 리사이즈로 행이 포인터 밑에 밀려 들어오면 클릭 가능한 것처럼
                     // 하이라이트되어 오클릭처럼 보였다(2026-07-24 사용자 보고).
@@ -2895,6 +3231,22 @@ impl FileTreeUi {
                             hover_target_dir = Some(row_target_dir(row, self.root.as_deref()));
                             hover_row_path = Some(row.path.clone());
                         }
+                    }
+                    // 영구삭제 확인이 가리키는 행을 경고색으로 덮는다. 확인 문구는 패널
+                    // 맨 아래에 뜨므로, 행 쪽 표시가 없으면 "지금 어느 행 이야기냐"를
+                    // 문구의 이름만 보고 맞춰야 했다 — 트리와 문구가 같은 대상을 함께
+                    // 가리키게 한다. hover 면 **뒤에** 그린다(hover는 불투명이라 앞에
+                    // 그리면 포인터를 얹는 순간 대상 표시가 사라진다).
+                    if self
+                        .confirm_delete
+                        .as_ref()
+                        .is_some_and(|target| target.path == row.path)
+                    {
+                        ui.painter().rect_filled(
+                            hover_paint_rect,
+                            1.0,
+                            ui.visuals().warn_fg_color.gamma_multiply(0.22),
+                        );
                     }
                     // Finder 드래그 대상: 폴더 행 하이라이트 + 드롭 대상 기록 (§과제①).
                     // 드래그 중엔 egui 포인터가 멎으므로 drag_pos(AppKit 위치)로 판정한다.
@@ -3042,8 +3394,19 @@ impl FileTreeUi {
                     } else {
                         row_resp
                     };
-                    if !inaccessible && row_resp.drag_started() {
-                        row_resp.dnd_set_drag_payload(row.path.clone());
+                    // 주 버튼만 받는다. egui는 드래그 시작을 버튼으로 가리지 않아,
+                    // 우클릭으로 메뉴를 열려다 손이 몇 px 흔들리면 새 사각형이 시작돼
+                    // 골라둔 선택이 통째로 날아갔다(2026-09-04 리뷰).
+                    if !inaccessible && row_resp.drag_started_by(egui::PointerButton::Primary) {
+                        // 행은 패널 폭 전체지만 이름은 그 일부만 쓴다. 이름 오른쪽 빈
+                        // 자리에서 시작한 드래그는 **선택 사각형**이고, 이름·아이콘 위는
+                        // 예전 그대로 파일 이동 소스다(2026-09-03 사용자 확정) — 한 행이
+                        // 두 제스처를 갖되 시작 지점으로 갈린다.
+                        let press = ui.input(|input| input.pointer.press_origin());
+                        match press.filter(|pos| pos.x > response.rect.right() + MARQUEE_NAME_GAP) {
+                            Some(pos) => marquee_start = Some(pos),
+                            None => row_resp.dnd_set_drag_payload(row.path.clone()),
+                        }
                     }
                     // 행높이 실측 (드래그 중엔 행이 tooltip 레이어로 빠져 rect가 다름 — 제외)
                     if observed_row_height.is_none()
@@ -3101,10 +3464,18 @@ impl FileTreeUi {
                             drop_action = Some(((*payload).clone(), destination));
                         }
                     }
+                    let single_clicked =
+                        !inaccessible && (row_resp.clicked() || label_resp.clicked());
+                    let click_kind = selection_click_kind(ui.input(|input| input.modifiers));
+                    if single_clicked {
+                        select_click = Some((row.path.clone(), click_kind));
+                    }
                     if row.is_dir && !inaccessible {
                         if row_resp.double_clicked() || label_resp.double_clicked() {
                             navigate_root = Some(row.path.clone());
-                        } else if row_resp.clicked() || label_resp.clicked() {
+                        } else if single_clicked && click_kind == SelectionClick::Replace {
+                            // ⌘/Shift 클릭은 고르기만 한다 — 범위를 잡는 중에 폴더가
+                            // 펼쳐지면 그 아래 행이 밀려 방금 고른 구간이 어긋난다.
                             toggle = Some(row.path.clone());
                         }
                     } else if row_resp.double_clicked() || label_resp.double_clicked() {
@@ -3159,7 +3530,13 @@ impl FileTreeUi {
                                 .button(catalog.t("file_tree.move_to_trash", &[]))
                                 .clicked()
                             {
-                                menu_action = Some(MenuAction::Delete(row.path.clone()));
+                                // 삭제 대상은 **이 행**에서 확정한다 — 나중에 경로만
+                                // 보고 이름/종류를 다시 유추하지 않는다(DeleteTarget 주석).
+                                menu_action = Some(MenuAction::Delete(DeleteTarget {
+                                    path: row.path.clone(),
+                                    label: delete_target_label(self.root.as_deref(), &row.path),
+                                    is_dir: row.is_dir,
+                                }));
                                 ui.close();
                             }
                             ui.separator();
@@ -3230,6 +3607,24 @@ impl FileTreeUi {
 
         // ── Finder → 트리 반입: OS 드롭(①)·클립보드 ⌘V(②) — 원본 보존 복사 ──
         // 반입 영역 = 파일 헤더 + 행 목록 (워크스페이스 목록/하단 nav 제외).
+        // 트리 안에서 일어난 클릭·드래그는 포커스를 준다(⌘⌫ 가드의 반대쪽).
+        if clear_selection || select_click.is_some() || marquee_start.is_some() {
+            self.tree_focused = true;
+        }
+        if clear_selection {
+            self.selected.clear();
+            self.select_anchor = None;
+        }
+        if let Some((path, kind)) = select_click {
+            self.apply_selection_click(&path, kind);
+        }
+        self.update_marquee(
+            ui,
+            marquee_start,
+            scroll_output.inner_rect,
+            content_top,
+            tree_row_pitch(row_height, ui.spacing()),
+        );
         let tree_area = header_rect.union(scroll_output.inner_rect);
         if os_drag_active && drag_pos.is_some_and(|pos| tree_area_owns_os_drop(tree_area, pos)) {
             if !drag_row_highlighted {
@@ -3354,8 +3749,24 @@ impl FileTreeUi {
                     changed: false,
                 });
             }
-            Some(MenuAction::Delete(path)) => self.spawn_trash(path),
-            Some(MenuAction::CopyFile(path)) => self.copy_files_to_clipboard(&[path]),
+            // 선택 안의 행을 우클릭했으면 선택 전체가 대상이다 — 여러 개를 골라 놓고
+            // 그중 하나를 우클릭했는데 그 하나만 지워지면 고른 것이 조용히 무시된다.
+            // 선택 밖의 행을 우클릭한 경우는 그 행 하나만 (선택은 건드리지 않는다).
+            Some(MenuAction::Delete(target)) => {
+                if self.selected.contains(&target.path) {
+                    self.spawn_trash_selection(None);
+                } else {
+                    self.spawn_trash(target);
+                }
+            }
+            Some(MenuAction::CopyFile(path)) => {
+                let paths = if self.selected.contains(&path) {
+                    self.selection_or(None)
+                } else {
+                    vec![path]
+                };
+                self.copy_files_to_clipboard(&paths);
+            }
             Some(MenuAction::CopyPath(path)) => ui.ctx().copy_text(path.display().to_string()),
             Some(MenuAction::InsertPath(path)) => match FileTreePathPayload::try_new(path) {
                 Ok(path) => action = Some(SidebarAction::InsertPath(path)),
@@ -3381,54 +3792,16 @@ impl FileTreeUi {
         }
         self.edit = edit;
 
-        // 휴지통 실패 → 영구삭제 확인 (§9-7 — 조용한 영구삭제 금지)
-        if let Some(path) = self.confirm_delete.clone() {
-            let name = super::path_file_name_display(&path);
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                catalog.t("file_tree.permanent_delete_prompt", &[("name", &name)]),
-            );
-            ui.horizontal(|ui| {
-                if ui
-                    .button(catalog.t("file_tree.permanent_delete", &[]))
-                    .clicked()
-                {
-                    self.confirm_delete = None;
-                    let refresh: Vec<PathBuf> =
-                        path.parent().map(Path::to_path_buf).into_iter().collect();
-                    let request = FileTreePathPayload::try_new(path.clone())
-                        .map(|target| FileTreeIoRequest::DeletePermanently { target });
-                    if let Err(code) =
-                        request.and_then(|request| self.queue_io(request, refresh, None, None))
-                    {
-                        self.reject_io(code);
-                    }
-                }
-                if ui.button(catalog.t("action.cancel", &[])).clicked() {
-                    self.confirm_delete = None;
-                }
-            });
-        }
-
-        if self.in_flight > 0 {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.0));
-                ui.weak(catalog.t("file_tree.file_operation_running", &[]));
-            });
-        }
-        if self.pending_maintenance.is_some() || self.maintenance_intent.is_some() {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.0));
-                ui.weak(catalog.t("file_tree.listing_folders", &[]));
-            });
-        }
-        if let Some(err) = self.error.clone() {
-            ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().error_fg_color, err);
-                if ui.small_button("×").clicked() {
-                    self.error = None;
-                }
-            });
+        // 상태 표시는 위(스크롤 영역 앞)에서 이미 그렸다. 행 클릭·메뉴 처리가 그 뒤에
+        // 오류를 세우거나 작업을 큐에 넣었으면 이번 프레임 화면에는 없다 — 입력이
+        // 끊기면 다음 프레임이 안 올 수 있으므로 한 번만 더 요청한다. 상태가 그대로면
+        // 요청도 없어 상시 repaint로 번지지 않는다.
+        if status_error != self.error
+            || status_busy != (self.in_flight > 0)
+            || status_listing
+                != (self.pending_maintenance.is_some() || self.maintenance_intent.is_some())
+        {
+            ui.ctx().request_repaint();
         }
         action
     }
@@ -3558,6 +3931,21 @@ impl FileTreeUi {
         target_dir: Option<PathBuf>,
         row_path: Option<PathBuf>,
     ) {
+        // 트리 밖을 클릭하면 포커스를 잃는다 — 위 ⌘⌫ 가드의 근거이자, 선택을 들고 다른
+        // 곳으로 옮겨간 사용자가 단축키에 걸리지 않게 하는 장치다. 조기 반환보다 **앞에**
+        // 둬야 루트가 없거나 팝업이 열린 프레임에도 갱신된다.
+        if let Some(click) = ui
+            .input(|input| {
+                input
+                    .pointer
+                    .any_click()
+                    .then(|| input.pointer.interact_pos())
+            })
+            .flatten()
+            && !tree_area.contains(click)
+        {
+            self.tree_focused = false;
+        }
         let Some(root) = self.root.clone() else {
             return;
         };
@@ -3575,7 +3963,34 @@ impl FileTreeUi {
         // WorkspaceUi drain 전에 트리가 소유권을 확정한다.
         let egui_copy = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
         let native_copy = crate::native_key_monitor::peek_clipboard_copy();
-        self.handle_copy_shortcut_signal(row_path, native_copy, egui_copy);
+        self.handle_copy_shortcut_signal(row_path.clone(), native_copy, egui_copy);
+        // ⌘⌫ / ⌘Delete: 선택(없으면 포인터 밑 행)을 휴지통으로. 우클릭 메뉴와 같은 길을
+        // 타므로 실패 시 영구삭제 확인까지 그대로 적용된다.
+        //
+        // **수식키 없는 ⌫는 받지 않는다.** 위 가드의 `text_edit_focused()`는 egui
+        // TextEdit만 본다 — 터미널은 커스텀 위젯이라 거기에 안 걸린다. 맨 ⌫를 받으면
+        // 포인터가 트리 위에 놓인 채 터미널에서 지우기를 누를 때마다 파일이 사라진다.
+        // ⌘⌫는 Finder 관례이기도 하다.
+        if ui.input(|input| {
+            input.modifiers.command
+                && (input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace))
+        }) {
+            // 트리가 마지막으로 클릭된 곳일 때만. 포인터가 트리 위에 있다는 것만으로는
+            // 부족하다 — 터미널에서 ⌘⌫로 줄을 지우던 손이 파일을 지운다(리뷰 H4).
+            if !self.tree_focused {
+                return;
+            }
+            // 키 리피트는 한 제스처다(리뷰 H3).
+            if self
+                .last_delete_gesture
+                .is_some_and(|at| at.elapsed() < DELETE_GESTURE_WINDOW)
+            {
+                return;
+            }
+            self.last_delete_gesture = Some(std::time::Instant::now());
+            self.spawn_trash_selection(row_path);
+            return;
+        }
         // ⌘V(②): 클립보드 파일 목록을 대상 폴더로 복사. macOS는 press가 native
         // key-down(peek)으로, 텍스트 표현이 있으면 Event::Paste로, release가 V key-up
         // fallback으로 온다(터미널 관례) — 어느 쪽이든 한 제스처는 한 번만 처리한다.
@@ -3611,6 +4026,9 @@ impl FileTreeUi {
         native_copy: bool,
         egui_copy: bool,
     ) {
+        // 예전처럼 **포인터 밑에 행이 있을 때만** 받는다. 선택이 있다고 행 밖에서도
+        // 받으면, 터미널에서 텍스트를 고른 뒤 마우스가 사이드바에 있는 채 ⌘C를 누를 때
+        // 트리가 그것을 가로채고 소비 표시까지 해 터미널 복사를 막는다(2026-09-04 리뷰 M3).
         let Some(path) = row_path else {
             return;
         };
@@ -3625,7 +4043,9 @@ impl FileTreeUi {
             return;
         }
         self.last_external_copy = Some(std::time::Instant::now());
-        self.copy_files_to_clipboard(std::slice::from_ref(&path));
+        // 선택이 있으면 선택 전체를, 없으면 예전처럼 포인터 밑 행 하나를 복사한다.
+        let paths = self.selection_or(Some(path));
+        self.copy_files_to_clipboard(&paths);
     }
 
     /// 파일 URL pasteboard 쓰기 — 실패는 하단 에러 라벨로 표면화(조용한 실패 금지).
@@ -3638,15 +4058,233 @@ impl FileTreeUi {
         }
     }
 
+    /// 휴지통 이동이 실패한 대상의 영구삭제 확인 (§9-7 — 조용한 영구삭제 금지).
+    ///
+    /// 문구도 삭제 경로도 `DeleteTarget` **하나**에서 나온다. 경로를 들고 다니다가
+    /// 확인 시점에 이름을 다시 만들면 보여준 것과 지우는 것이 갈라진다.
+    fn permanent_delete_confirm(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
+        let Some(target) = self.confirm_delete.clone() else {
+            return;
+        };
+        // 폴더는 "안의 내용까지 사라진다"를 말해주는 별도 문구를 쓴다 — 영구 삭제는
+        // 디렉터리면 통째로 지운다.
+        // 키를 변수로 묶지 않는 이유: xtask i18n-check의 키 커버리지는 **리터럴** 호출만
+        // 대조한다. 변수로 넘기면 dynamic으로 세어 넘어가 로케일 누락을 못 잡는다.
+        let prompt = if target.is_dir {
+            catalog.t(
+                "file_tree.permanent_delete_folder_prompt",
+                &[("name", &target.label)],
+            )
+        } else {
+            catalog.t(
+                "file_tree.permanent_delete_prompt",
+                &[("name", &target.label)],
+            )
+        };
+        ui.colored_label(ui.visuals().warn_fg_color, prompt);
+        ui.horizontal(|ui| {
+            if ui
+                .button(catalog.t("file_tree.permanent_delete", &[]))
+                .clicked()
+            {
+                let path = target.path.clone();
+                let refresh: Vec<PathBuf> =
+                    path.parent().map(Path::to_path_buf).into_iter().collect();
+                let request = FileTreePathPayload::try_new(path)
+                    .map(|target| FileTreeIoRequest::DeletePermanently { target });
+                // 확인은 삭제를 **접수했을 때만** 소비한다. 먼저 닫아버리면 큐가 거절할
+                // 때(capacity-1 `Busy` 등) 아무것도 안 지운 채 확인만 사라져, 오류 문구
+                // 하나 남기고 다시 누를 화면이 없어진다. 위 `spawn_trash`가 제스처마다
+                // 무조건 닫는 것과 방향이 반대인 이유: 저기서는 **새 대상**이 옛 확인을
+                // 무효로 만들지만, 여기서는 같은 대상이 아직 지워지지 않은 채 남아 있다.
+                match request.and_then(|request| self.queue_io(request, refresh, None, None)) {
+                    Ok(()) => self.confirm_delete = None,
+                    Err(code) => self.reject_io(code),
+                }
+            }
+            if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                self.confirm_delete = None;
+            }
+        });
+    }
+
     /// 휴지통 이동 intent. 실패 completion만 영구삭제 확인으로 승격한다.
-    fn spawn_trash(&mut self, path: PathBuf) {
-        let refresh: Vec<PathBuf> = path.parent().map(Path::to_path_buf).into_iter().collect();
-        let target = path.clone();
-        let request =
-            FileTreePathPayload::try_new(path).map(|target| FileTreeIoRequest::Trash { target });
+    /// 클릭 한 번을 선택에 반영한다.
+    fn apply_selection_click(&mut self, path: &Path, kind: SelectionClick) {
+        match kind {
+            SelectionClick::Replace => {
+                self.selected.clear();
+                self.selected.insert(path.to_path_buf());
+                self.select_anchor = Some(path.to_path_buf());
+            }
+            SelectionClick::Toggle => {
+                if !self.selected.remove(path) {
+                    self.selected.insert(path.to_path_buf());
+                }
+                self.select_anchor = Some(path.to_path_buf());
+            }
+            SelectionClick::Range => {
+                let paths: Vec<PathBuf> = self.flat.iter().map(|row| row.path.clone()).collect();
+                let anchor = self
+                    .select_anchor
+                    .clone()
+                    .unwrap_or_else(|| path.to_path_buf());
+                self.selected = selection_range(&paths, &anchor, path).into_iter().collect();
+                // 기준점은 그대로 둔다 — Shift로 범위를 늘였다 줄였다 할 수 있어야 한다.
+            }
+        }
+    }
+
+    /// 선택 사각형을 시작·갱신·종료하고 그린다.
+    fn update_marquee(
+        &mut self,
+        ui: &egui::Ui,
+        start: Option<egui::Pos2>,
+        viewport: egui::Rect,
+        content_top: Option<f32>,
+        row_pitch: f32,
+    ) {
+        if let Some(origin) = start {
+            let modifiers = ui.input(|input| input.modifiers);
+            self.marquee = Some(MarqueeDrag {
+                origin,
+                base: self.selected.clone(),
+                additive: modifiers.command || modifiers.shift,
+            });
+        }
+        let Some(marquee) = self.marquee.as_ref() else {
+            return;
+        };
+        // Esc는 취소 — 시작 전 선택으로 되돌린다. 워크스페이스 순서 드래그에서 Esc가
+        // 오히려 확정시키던 결함(2026-09-03 리뷰)과 같은 종류를 여기서 미리 막는다.
+        // 키를 **소비**한다. 안 그러면 같은 Esc가 인라인 이름변경 취소까지 함께 눌러,
+        // 사각형만 물리려던 손이 입력 중이던 이름을 날린다(2026-09-04 리뷰).
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.selected = marquee.base.clone();
+            self.marquee = None;
+            return;
+        }
+        // 버튼이 올라갔으면 끝 — 마지막 프레임에 정한 선택을 그대로 남긴다.
+        if !ui.input(|input| input.pointer.any_down()) {
+            self.marquee = None;
+            return;
+        }
+        let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) else {
+            return;
+        };
+        let rect = egui::Rect::from_two_pos(marquee.origin, pointer);
+        if let Some(content_top) = content_top {
+            // 선택도 뷰포트로 자른다. 그리기만 클립하면 창 밖으로 끌었을 때 **보이지도
+            // 않는 행**이 수천 개 선택되고, 그대로 ⌘⌫를 누르면 지워진다(리뷰 M1).
+            let visible = rect.intersect(viewport);
+            let range =
+                marquee_row_range(content_top, row_pitch, self.flat.len(), visible.y_range());
+            let mut next: BTreeSet<PathBuf> = if marquee.additive {
+                marquee.base.clone()
+            } else {
+                BTreeSet::new()
+            };
+            // 사각형이 끝난 행을 기준점으로 남긴다. 안 그러면 마퀴 직후 Shift-클릭이
+            // 옛 기준점(또는 없음)으로 떨어져 방금 고른 것을 통째로 버린다(리뷰 M3).
+            let last = self.flat[range.clone()].last().map(|row| row.path.clone());
+            next.extend(self.flat[range].iter().map(|row| row.path.clone()));
+            self.selected = next;
+            if let Some(last) = last {
+                self.select_anchor = Some(last);
+            }
+        }
+        // 뷰포트 밖으로 나간 부분은 그리지 않는다 — 헤더나 파일 목록 밖까지 사각형이
+        // 삐져나오면 그 영역도 고르는 것처럼 보인다.
+        let painter = ui.painter().with_clip_rect(viewport);
+        let stroke = ui.visuals().selection.stroke;
+        painter.rect_filled(rect, 2.0, stroke.color.gamma_multiply(0.18));
+        painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+    }
+
+    /// 선택된 경로를 **트리에 보이는 순서**로. 선택이 비어 있으면 `fallback` 하나.
+    fn selection_or(&self, fallback: Option<PathBuf>) -> Vec<PathBuf> {
+        if self.selected.is_empty() {
+            return fallback.into_iter().collect();
+        }
+        self.flat
+            .iter()
+            .filter(|row| self.selected.contains(&row.path))
+            .map(|row| row.path.clone())
+            .collect()
+    }
+
+    /// 선택(없으면 `fallback`)을 휴지통으로. IO 큐가 capacity-1이라 첫 대상만 바로
+    /// 보내고 나머지는 대기열에 쌓아 완료될 때마다 하나씩 이어 보낸다.
+    /// `hovered`가 선택 **밖**이면 그 행 하나만 지운다 — 우클릭 메뉴와 같은 규칙이다.
+    /// 두 진입점이 다르면, 5개를 골라둔 채 다른 파일 위에서 ⌘⌫를 누른 사용자가
+    /// 그 파일 대신 골라둔 5개를 잃는다(2026-09-04 리뷰 M4).
+    fn spawn_trash_selection(&mut self, fallback: Option<PathBuf>) {
+        let root = self.root.clone();
+        let is_dir = |path: &Path| {
+            self.flat
+                .iter()
+                .find(|row| row.path == path)
+                .is_some_and(|row| row.is_dir)
+        };
+        let chosen = match &fallback {
+            Some(hovered) if !self.selected.contains(hovered) => vec![hovered.clone()],
+            _ => self.selection_or(fallback.clone()),
+        };
+        // 조상 폴더가 함께 골라졌으면 그 안의 것은 뺀다 — 폴더가 먼저 휴지통으로 가면
+        // 뒤따르는 자식 요청은 없는 경로를 지우려다 반드시 실패하고, 그 실패가 배치 전체를
+        // 폐기시킨다(2026-09-04 리뷰 M5).
+        let mut targets: Vec<DeleteTarget> = chosen
+            .iter()
+            .filter(|path| {
+                !chosen
+                    .iter()
+                    .any(|other| other != *path && path.starts_with(other))
+            })
+            .cloned()
+            .map(|path| DeleteTarget {
+                label: delete_target_label(root.as_deref(), &path),
+                is_dir: is_dir(&path),
+                path,
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let first = targets.remove(0);
+        self.trash_queue = targets;
+        self.selected.clear();
+        self.select_anchor = None;
+        self.spawn_trash(first);
+    }
+
+    /// 접수됐으면 `true`. capacity-1 큐가 차 있으면(`Busy`) 거절되는데, 그때 대기열을
+    /// 무장한 채 두면 **무관한 IO가 성공하는 순간** 뒤 대상들이 조용히 지워진다
+    /// (2026-09-04 리뷰 H1).
+    fn spawn_trash(&mut self, target: DeleteTarget) -> bool {
+        // 새 삭제 제스처를 접수했으면 직전 실패가 남긴 영구삭제 확인은 닫는다.
+        // 남겨두면 방금 고른 파일이 아니라 **예전 대상** 이름이 패널 아래에 그대로
+        // 떠 있고, 그 확인을 누르는 순간 엉뚱한 파일이 영구 삭제된다.
+        //
+        // 큐가 이 요청을 받아줬는지는 보지 않는다. 확인을 무효로 만드는 것은 **제스처**
+        // 자체이지 큐 수용 여부가 아니다 — capacity-1 IO 큐가 차 있으면(⌘C 복사, Finder
+        // 드롭, 트리 내 이동, 더블클릭 열기 중 하나라도) `queue_io`가 `Busy`를 돌려주는데,
+        // 그때 확인을 남겨두면 "파일 작업이 진행 중입니다" 바로 아래에 **예전 대상**
+        // 확인이 서서 방금 고른 파일 이야기처럼 읽힌다.
+        self.confirm_delete = None;
+        let refresh: Vec<PathBuf> = target
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect();
+        let request = FileTreePathPayload::try_new(target.path.clone())
+            .map(|payload| FileTreeIoRequest::Trash { target: payload });
         match request.and_then(|request| self.queue_io(request, refresh, Some(target), None)) {
-            Ok(()) => {}
-            Err(code) => self.reject_io(code),
+            Ok(()) => true,
+            Err(code) => {
+                self.reject_io(code);
+                false
+            }
         }
     }
 
@@ -3827,11 +4465,103 @@ fn relevant_fs_event(kind: &notify::EventKind) -> bool {
     !matches!(kind, notify::EventKind::Access(_))
 }
 
+/// 이름 갤리 오른쪽으로 이만큼 떨어져야 "빈 자리"로 본다 — 이름 끝에 바싹 붙은
+/// 픽셀에서 이동을 시작하려던 손이 선택으로 새지 않게 하는 여유.
+const MARQUEE_NAME_GAP: f32 = 6.0;
+
+/// 같은 ⌘⌫ 제스처로 묶는 시간. macOS는 ⌘ 조합도 오토리피트하고 egui `key_pressed`는
+/// 리피트를 그대로 흘린다 — 없으면 한 번 누르고 있는 동안 대상이 계속 바뀐다.
+const DELETE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// 이름 오른쪽 빈 공간에서 시작한 선택 사각형.
+///
+/// 행은 패널 폭 전체를 차지하고 그 드래그는 **파일 이동**이 이미 쓰고 있다. 그래서
+/// 사각형 선택은 이름 갤리 오른쪽 빈 자리와 목록 아래 빈 영역에서만 시작한다
+/// (Windows 탐색기 규칙, 2026-09-03 사용자 확정) — 기존 이동 제스처를 뺏지 않는다.
+struct MarqueeDrag {
+    /// 누른 지점(화면 좌표).
+    origin: egui::Pos2,
+    /// 드래그 시작 시점의 선택 — 더하기 모드면 여기에 얹는다.
+    base: BTreeSet<PathBuf>,
+    /// ⌘/Shift를 누른 채 시작했는가.
+    additive: bool,
+}
+
+/// 클릭 한 번이 선택을 어떻게 바꾸는지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionClick {
+    /// 이 행 하나만 남긴다.
+    Replace,
+    /// 이 행만 넣거나 뺀다.
+    Toggle,
+    /// 기준점부터 이 행까지 구간.
+    Range,
+}
+
+/// macOS 관례: ⌘ = 개별 토글, Shift = 구간. 둘 다면 구간이 이긴다(Finder와 같다).
+fn selection_click_kind(modifiers: egui::Modifiers) -> SelectionClick {
+    if modifiers.shift {
+        SelectionClick::Range
+    } else if modifiers.command {
+        SelectionClick::Toggle
+    } else {
+        SelectionClick::Replace
+    }
+}
+
+/// 선택 사각형이 덮는 행 index 구간.
+///
+/// **산술로 구한다** — `show_rows` 가상화 때문에 화면 밖 행은 위젯이 없지만, 사각형에
+/// 들어왔으면 선택돼야 한다. 행 높이가 균일하다는 사실이 그것을 가능하게 한다.
+/// `content_top`은 0번 행의 위쪽 y(화면 좌표).
+fn marquee_row_range(
+    content_top: f32,
+    row_pitch: f32,
+    total: usize,
+    y: egui::Rangef,
+) -> std::ops::Range<usize> {
+    if total == 0 || row_pitch <= 0.0 {
+        return 0..0;
+    }
+    // `floor`여야 한다. `round`면 사각형이 행의 절반을 넘게 지나칠 때 **닿지도 않은**
+    // 다음 행이 딸려오고, 절반이 안 되면 눈에 보이게 덮인 행이 빠진다.
+    let first = ((y.min - content_top) / row_pitch).floor();
+    // 아래 경계는 그 y가 걸친 행까지 포함한다 — 사각형이 행의 1px만 덮어도 사용자는
+    // 그 행을 고른 것으로 본다.
+    let last = ((y.max - content_top) / row_pitch).floor();
+    if last < 0.0 || first >= total as f32 {
+        return 0..0;
+    }
+    let first = first.max(0.0) as usize;
+    let last = (last as usize).min(total - 1);
+    first..last + 1
+}
+
+/// `ScrollArea::show_rows`가 행 하나에 쓰는 실제 세로 간격 — egui는 행 높이에
+/// `item_spacing.y`를 더해 배치한다. `diff_viewer::scroll_row_pitch`와 같은 규칙이다.
+///
+/// 이걸 빼먹으면 행마다 `item_spacing.y`(기본 3px)씩 어긋나 아래로 갈수록 누적된다 —
+/// 사각형이 감싸지 않은 행이 선택되고, 그대로 ⌘⌫를 누르면 지워진다(2026-09-04 리뷰).
+fn tree_row_pitch(row_height: f32, spacing: &egui::style::Spacing) -> f32 {
+    row_height + spacing.item_spacing.y
+}
+
+/// 정렬된 경로 목록에서 두 경로 사이 구간(양끝 포함). 어느 쪽이 앞인지는 보지 않는다.
+/// 둘 중 하나라도 목록에 없으면 대상 하나만 돌려준다 — 기준점이 접히거나 지워져
+/// 사라졌을 때 아무것도 선택되지 않는 것보다 낫다.
+fn selection_range(paths: &[PathBuf], anchor: &Path, target: &Path) -> Vec<PathBuf> {
+    let index = |needle: &Path| paths.iter().position(|path| path == needle);
+    match (index(anchor), index(target)) {
+        (Some(a), Some(b)) => paths[a.min(b)..=a.max(b)].to_vec(),
+        _ => vec![target.to_path_buf()],
+    }
+}
+
 /// 우클릭 컨텍스트 메뉴 동작 (FT-3) — flat 순회 밖에서 처리한다.
 enum MenuAction {
     NewFolder(PathBuf),
     Rename(PathBuf),
-    Delete(PathBuf),
+    Delete(DeleteTarget),
     /// 파일/폴더를 pasteboard에 파일 URL로 복사 — Finder ⌘V 대상(§과제③).
     CopyFile(PathBuf),
     CopyPath(PathBuf),
@@ -3840,6 +4570,16 @@ enum MenuAction {
     /// 문서 대상 파일을 OS 기본 앱으로 연다 — 더블클릭이 문서 탭으로 가로챈 뒤에도
     /// 남겨두는 우회로(설계 §3.1).
     OpenWithOs(PathBuf),
+}
+
+/// 삭제 확인에 쓸 표시 이름 — **루트 기준 상대 경로**. 파일명만 쓰면 `mod.rs`,
+/// `index.ts`처럼 여러 폴더에 같은 이름이 있는 저장소에서 어느 것을 지우는지
+/// 확인 문구만 보고는 알 수 없다. 루트 밖(또는 루트 미설정)이면 전체 경로로 떨어진다.
+fn delete_target_label(root: Option<&Path>, path: &Path) -> String {
+    root.and_then(|root| path.strip_prefix(root).ok())
+        .map(super::path_display)
+        .filter(|rel| !rel.is_empty())
+        .unwrap_or_else(|| super::path_display(path))
 }
 
 /// 이름 검증 (§5): 빈 이름·경로 구분자·'.'/'..' 거부. Ok = 트림된 이름.
@@ -3976,6 +4716,10 @@ fn workspace_row_style(
     }
 }
 
+/// 접힌 워크스페이스 상태 점의 반지름과, 배경색으로 두르는 테두리 두께.
+const STATUS_DOT_RADIUS: f32 = 3.0;
+const STATUS_DOT_RING: f32 = 1.5;
+
 pub const WORKSPACE_AVATAR_LEFT_INSET: f32 = 10.0;
 const WORKSPACE_AVATAR_SIZE: f32 = 18.0;
 
@@ -3989,6 +4733,19 @@ fn workspace_avatar_rect(row: egui::Rect) -> egui::Rect {
     )
 }
 
+/// `workspace_row`가 돌려주는 두 제스처.
+///
+/// 행 전체와 chevron은 **다른 일을 한다** — 행을 누르면 그 워크스페이스로 전환하고,
+/// chevron을 누르면 전환 없이 세션 목록만 여닫는다. 이 둘을 한 Response로 묶어 두면
+/// "펼쳐져 있으면서 비활성"인 상태를 만들 방법이 없어지고, 그 상태에서만 보이는
+/// 「다른 워크스페이스 세션을 옆에 열기」 진입점 세 개가 통째로 사라진다
+/// (2026-09-03 리뷰: multi-cross-workspace-pane 스펙의 승인된 진입점 전부).
+struct WorkspaceRowResponse {
+    row: egui::Response,
+    /// chevron을 눌렀다 — 호출자는 펼침만 토글하고 전환은 방출하지 않는다.
+    disclosure_clicked: bool,
+}
+
 fn workspace_row(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
@@ -3996,15 +4753,18 @@ fn workspace_row(
     active: bool,
     expanded: Option<bool>,
     catalog: &i18n::Catalog,
-) -> egui::Response {
+) -> WorkspaceRowResponse {
     // 2026-07-26 사용자: 워크스페이스 헤더와 아바타를 다시 10% 축소한다.
     // 축소는 기존 값에 0.9를 곱해 처리돼 29.19가 됐는데, 그 값은 물리 픽셀에 안 맞아
     // 행이 쌓일수록 원점이 밀렸다(2x에서 행마다 0.38px 누적 → 행마다 선명도가 달랐다).
     // 축소 의도는 유지하면서 가장 가까운 정렬값으로 내린다(29.0 × 2 = 58px 정수).
     let row_height = 29.0;
+    // 클릭(전환/펼침)에 더해 드래그도 받는다 — 사이드바에서 워크스페이스를 끌어 순서를
+    // 바꾼다(2026-09-03 사용자). egui는 드래그 임계값을 넘으면 clicked()를 내지 않으므로
+    // 두 제스처가 서로를 삼키지 않는다.
     let (full_rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_height),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
     // 이름은 painter galley라 행 Response에 명시적으로 연결해야 키보드/스크린리더가
     // workspace 선택 대상을 식별할 수 있다(세션 행과 같은 접근성 계약).
@@ -4016,7 +4776,10 @@ fn workspace_row(
         )
     });
     if !ui.is_rect_visible(full_rect) {
-        return response;
+        return WorkspaceRowResponse {
+            row: response,
+            disclosure_clicked: false,
+        };
     }
     // 여기부터는 **그리기 좌표**만 물리 픽셀에 맞춘다 (클릭 판정은 위 response가 원래
     // rect를 그대로 쓴다). 행 높이를 정렬값으로 바꿔 누적 드리프트는 없앴지만, 스크롤
@@ -4074,6 +4837,29 @@ fn workspace_row(
         crate::fonts::sidebar_font(ui.ctx(), 9.0),
         egui::Color32::WHITE,
     );
+    // 접힌 행에만 상태 점. 아바타 오른쪽 위 모서리에 얹고 배경색 테두리로 떼어 내
+    // 어떤 워크스페이스 고유색 위에서도 읽히게 한다.
+    if expanded == Some(false)
+        && let Some(state) = collapsed_status_dot(workspace.summary)
+    {
+        let center = egui::pos2(avatar.right(), avatar.top());
+        let behind = if active {
+            crate::ui::designall::mix(
+                crate::ui::designall::tokens(ui.visuals()).selected_background,
+                color,
+                WORKSPACE_SELECTED_TINT,
+            )
+        } else {
+            crate::ui::designall::tokens(ui.visuals()).workspace_background
+        };
+        ui.painter()
+            .circle_filled(center, STATUS_DOT_RADIUS + STATUS_DOT_RING, behind);
+        ui.painter().circle_filled(
+            center,
+            STATUS_DOT_RADIUS,
+            crate::ui::agent_visuals::status_color(state),
+        );
+    }
     let summary_mode = workspace_summary_mode(rect.width());
     let show_summary = summary_mode != WorkspaceSummaryMode::IconOnly;
     let show_disclosure = expanded.is_some() && rect.width() >= 56.0;
@@ -4149,15 +4935,55 @@ fn workspace_row(
             badge_color,
         );
     }
+    let mut disclosure_clicked = false;
     if show_disclosure && let Some(expanded) = expanded {
         let center = egui::pos2(rect.right() - 12.0, rect.center().y);
+        // chevron은 행 위에 **나중에** 등록해 그 자리에서는 행보다 먼저 클릭을 받는다.
+        // 행보다 넓은 손가락 크기 표적을 주되 행 높이를 넘지 않는다.
+        let hit = egui::Rect::from_min_max(
+            egui::pos2(center.x - 11.0, full_rect.top()),
+            egui::pos2(center.x + 11.0, full_rect.bottom()),
+        );
+        let disclosure = ui.interact(
+            hit,
+            response.id.with("workspace_disclosure"),
+            egui::Sense::click(),
+        );
+        let label = catalog.t(
+            if expanded {
+                "file_tree.workspace_sessions_collapse"
+            } else {
+                "file_tree.workspace_sessions_expand"
+            },
+            &[("workspace", workspace.name.as_str())],
+        );
+        disclosure.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                expanded,
+                label.clone(),
+            )
+        });
+        let disclosure = disclosure.on_hover_text(label);
+        if disclosure.hovered() {
+            ui.painter().rect_filled(
+                hit.shrink2(egui::vec2(2.0, 6.0)),
+                3.0,
+                ui.visuals().weak_text_color().gamma_multiply(0.16),
+            );
+        }
+        disclosure_clicked = disclosure.clicked();
         let points = disclosure_chevron_points(center, expanded);
         ui.painter().add(egui::Shape::line(
             points.to_vec(),
             egui::Stroke::new(1.0, ui.visuals().weak_text_color().gamma_multiply(0.82)),
         ));
     }
-    response
+    WorkspaceRowResponse {
+        row: response,
+        disclosure_clicked,
+    }
 }
 
 /// 레일 행 높이. 58일 땐 아이콘+라벨(약 30)이 가운데 놓여 **첫 행 위에만 13.5px**의
@@ -4279,6 +5105,202 @@ fn workspace_context_menu_items(
         *action = Some(SidebarAction::CloseWorkspace(workspace.id.clone()));
         ui.close();
     }
+}
+
+/// 접힌 워크스페이스 행이 찍을 상태 점. 없으면 `None`.
+///
+/// **접혔을 때만 찍는다** — 펼치면 세션 행마다 이미 점이 있어 같은 사실을 두 번 말한다.
+/// 2026-07-25에 넣었던 상태 점을 2026-08-11에 뺀 이유가 바로 그 중복이었고, chevron이
+/// 생겨 목록이 기본으로 접힌 지금은 접힌 행이 그 워크스페이스에 대해 화면이 말해주는
+/// 유일한 것이다(2026-09-04 사용자 확정).
+///
+/// 우선순위는 **대기 → 오류 → 실행 → 완료**다. 대기가 맨 앞인 것은 그것만이 사용자가
+/// 움직여야 풀리는 상태이기 때문이다. 유휴·비활성은 찍지 않는다 — 아무 일도 안 하는
+/// 세션이 화면에서 신호를 내면 진짜 신호를 가린다.
+fn collapsed_status_dot(
+    summary: SidebarSessionSummary,
+) -> Option<crate::agent_surface::AgentVisualState> {
+    use crate::agent_surface::AgentVisualState as S;
+    if summary.waiting > 0 {
+        Some(S::Waiting)
+    } else if summary.error > 0 {
+        Some(S::Error)
+    } else if summary.running > 0 {
+        Some(S::Active)
+    } else if summary.done > 0 {
+        Some(S::Complete)
+    } else {
+        None
+    }
+}
+
+/// 지금 작업 중인 워크스페이스 **그룹 전체**(헤더 + 세션 목록)에 배경을 깐다.
+///
+/// 예전에는 29px 헤더 한 줄만 칠했다. 그런데 비활성 행의 hover 색과 밝기가 거의 같아,
+/// 워크스페이스 두 곳이 함께 펼쳐지면 어느 쪽에서 일하고 있는지 화면이 말해주지 못했다
+/// (2026-09-03 신고 → 2026-09-04에 원인 확정). 헤더보다 **약하게** 칠해 헤더가 여전히
+/// 그룹의 머리로 읽히게 하고, 워크스페이스 고유색을 옅게 섞어 "이 색의 작업 공간"임을 잇는다.
+fn paint_active_group_background(
+    ui: &egui::Ui,
+    ppp: f32,
+    slot: egui::layers::ShapeIdx,
+    rect: egui::Rect,
+    accent: egui::Color32,
+) {
+    if rect.height() <= 0.0 || rect.width() <= 0.0 {
+        return;
+    }
+    let fill = active_group_fill(crate::ui::designall::tokens(ui.visuals()), accent);
+    ui.painter().set(
+        slot,
+        egui::Shape::rect_filled(crate::ui::snap_rect_to_pixel(ppp, rect), 3.0, fill),
+    );
+}
+
+/// 활성 그룹 배경색. 사다리(`사이드바_밝기_사다리는_보고_있는_것을_가장_밝게_둔다`)가
+/// 이 값을 직접 재기 때문에 그리기와 분리해 둔다.
+fn active_group_fill(tokens: crate::ui::designall::Tokens, accent: egui::Color32) -> egui::Color32 {
+    let base = crate::ui::designall::mix(
+        tokens.workspace_background,
+        tokens.selected_background,
+        ACTIVE_GROUP_LIFT,
+    );
+    crate::ui::designall::mix(base, accent, ACTIVE_GROUP_ACCENT_TINT)
+}
+
+/// 활성 그룹 배경이 사이드바 바탕에서 얼마나 들리는지. 헤더의 틴트보다 낮아야 헤더가
+/// 그룹 안에서 여전히 구분된다.
+const ACTIVE_GROUP_LIFT: f32 = 0.55;
+/// 그 위에 섞는 워크스페이스 고유색의 양. 색을 알아볼 수 있되 글자 대비를 해치지 않는 선.
+const ACTIVE_GROUP_ACCENT_TINT: f32 = 0.05;
+
+/// 활성 워크스페이스가 바뀌었을 때 사이드바의 세션 펼침 상태를 정리한다.
+///
+/// **떠나는 워크스페이스는 접지 않는다.** 실행 중인 세션은 다른 곳으로 옮겨가도 계속 보여야
+/// 한다(2026-09-04 사용자). 두 곳이 동시에 펼쳐지는 것 자체는 문제가 아니었다 — 2026-09-03에
+/// 신고된 "어느 쪽을 보고 있는지 모르겠다"의 원인은 펼침이 아니라 **배경색**이었고, 그건
+/// 활성 그룹 전체를 칠하는 것으로 따로 고쳤다(`paint_active_group_background`).
+///
+/// 활성이 **바뀌는 순간에만** 돈다 — 전환 사이에 사용자가 직접 접거나 편 것은 그대로 산다.
+fn sync_workspace_expansion_on_switch(
+    expanded: &mut HashMap<String, bool>,
+    last_active: &mut Option<String>,
+    active_id: &str,
+) {
+    if last_active.as_deref() == Some(active_id) {
+        return;
+    }
+    // 떠나는 쪽은 **기본값을 고정**만 한다. 비활성의 기본은 접힘이라, 명시값 없이 활성
+    // 기본값(펼침)으로 보이던 워크스페이스가 떠나는 순간 저절로 닫혀 버린다.
+    if let Some(previous) = last_active.as_ref() {
+        expanded.entry(previous.clone()).or_insert(true);
+    }
+    // 오는 쪽은 **아직 정해진 게 없을 때만** 편다. chevron이 생긴 뒤로는 보고 있는
+    // 워크스페이스를 일부러 접을 수 있는데, 떠났다 돌아왔다고 다시 펴면 사용자가 접은
+    // 뜻이 사라진다(2026-09-03 리뷰 M2).
+    expanded.entry(active_id.to_owned()).or_insert(true);
+    *last_active = Some(active_id.to_owned());
+}
+
+/// 드래그 중인 워크스페이스가 놓일 자리 — 각 그룹의 세로 중심선을 지날 때마다 한 칸씩 민다.
+///
+/// `centers`는 화면에 그려진 순서 그대로의 그룹 중심 y다. 반환값은 "몇 번째 **앞에**
+/// 넣는가"라서 0..=centers.len() 범위를 갖는다(맨 끝에 놓으면 len).
+fn workspace_drop_index(centers: &[f32], pointer_y: f32) -> usize {
+    centers.iter().filter(|center| **center < pointer_y).count()
+}
+
+/// 드래그 중 목록 가장자리에 다가갔을 때 이번 프레임에 밀 스크롤 양.
+///
+/// 드래그 중에는 목록을 스크롤할 방법이 하나도 없다 — egui는 무언가를 끄는 동안 휠
+/// 스크롤을 끄고(`scroll_area.rs`의 `dragged_id().is_none()`), drag-to-scroll은 데스크톱에서
+/// 꺼져 있으며, 드래그 중에는 hover가 끌던 위젯에 고정돼 스크롤바도 잡히지 않는다. 그래서
+/// 지금 보이지 않는 자리로는 워크스페이스를 옮길 수가 없었다(2026-09-03 리뷰 H2).
+///
+/// 반환값의 부호는 `Ui::scroll_with_delta`를 따른다 — **양수면 목록의 앞쪽**(위)이, 음수면
+/// 뒤쪽이 보인다. 가장자리 안으로 들어간 깊이에 비례해 빨라지고 밖으로 나가면 최대 속도로
+/// 고정된다. 가운데에서는 정확히 0이라 평소 드래그는 목록을 건드리지 않는다.
+fn drag_autoscroll_delta(viewport: egui::Rangef, pointer_y: f32, dt: f32) -> f32 {
+    /// 가장자리로 인정하는 두께(pt) — 행 하나(29pt)보다 약간 작아 실수로 걸리지 않는다.
+    const EDGE: f32 = 24.0;
+    /// 최대 속도(pt/s) — 화면 하나를 1초 남짓에 훑는 정도.
+    const MAX_SPEED: f32 = 600.0;
+
+    // 뷰포트가 가장자리 둘을 담지 못할 만큼 짧으면 위·아래 구역이 겹쳐 방향이 튄다.
+    let edge = EDGE.min(viewport.span() / 3.0);
+    if edge <= 0.0 {
+        return 0.0;
+    }
+    let ratio = if pointer_y < viewport.min + edge {
+        ((viewport.min + edge - pointer_y) / edge).min(1.0)
+    } else if pointer_y > viewport.max - edge {
+        -((pointer_y - (viewport.max - edge)) / edge).min(1.0)
+    } else {
+        return 0.0;
+    };
+    ratio * MAX_SPEED * dt
+}
+
+/// `dragged`를 목록에서 빼고 `insert_at` 자리에 다시 넣는다.
+///
+/// `insert_at`은 **빼기 전** 목록 기준의 자리라, 원래 자리보다 뒤로 보낼 때는 빠진 한 칸만큼
+/// 당겨야 사용자가 가리킨 틈에 정확히 들어간다. 목록에 없는 id면 그대로 돌려준다.
+fn reorder_workspace_ids(ids: &[String], dragged: &str, insert_at: usize) -> Vec<String> {
+    let Some(from) = ids.iter().position(|id| id == dragged) else {
+        return ids.to_vec();
+    };
+    let mut reordered = ids.to_vec();
+    let moved = reordered.remove(from);
+    let target = if insert_at > from {
+        insert_at - 1
+    } else {
+        insert_at
+    };
+    reordered.insert(target.min(reordered.len()), moved);
+    reordered
+}
+
+/// 이 행에서 시작하거나 끝난 순서 변경 드래그를 상태에 반영한다. 놓는 순간에만 true.
+fn track_workspace_drag(
+    response: &egui::Response,
+    workspace_id: &str,
+    drag: &mut Option<String>,
+) -> bool {
+    if response.drag_started() {
+        *drag = Some(workspace_id.to_owned());
+    }
+    if response.dragged() {
+        response.ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    // Escape로 **취소한** 드래그도 `drag_stopped`를 낸다 — egui는 Escape에서 dragged id를
+    // 지우기 때문이다(egui 0.35 `interaction.rs`). 버튼이 실제로 떨어졌는지까지 보는
+    // `drag_stopped_by`만이 취소와 드롭을 가른다. 덤으로 왼쪽 버튼으로 놓은 것만 확정돼
+    // 오른쪽 버튼으로 끌다 뗀 것이 순서를 바꾸지 않는다(2026-09-03 리뷰 H1).
+    response.drag_stopped_by(egui::PointerButton::Primary) && drag.as_deref() == Some(workspace_id)
+}
+
+/// 드래그 중 놓일 자리를 그룹과 그룹 사이 가로선으로 표시한다.
+fn paint_workspace_drop_indicator(
+    ui: &egui::Ui,
+    groups: &[(String, egui::Rect)],
+    insert_at: usize,
+    color: egui::Color32,
+) {
+    let Some((_, first)) = groups.first() else {
+        return;
+    };
+    let y = match insert_at.checked_sub(1) {
+        None => first.top(),
+        Some(above) => groups[above.min(groups.len() - 1)].1.bottom(),
+    };
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(first.left(), y - 1.0),
+            egui::pos2(first.right(), y + 1.0),
+        ),
+        1.0,
+        color,
+    );
 }
 
 fn workspace_creation_order_partition<'a>(
@@ -4901,6 +5923,15 @@ struct SessionRowFill {
     full_bleed: bool,
 }
 
+/// 「보고 있는 세션」 면이 `selected_background`에서 글자색 쪽으로 더 들리는 양.
+///
+/// **활성 그룹 배경보다 확실히 밝아야 한다.** 2026-09-04에 활성 그룹 배경을 넣으면서
+/// 그 값(L 38.5)이 `selected_background`(L 35.9)를 **넘어서**, 보고 있는 세션 행이
+/// 오히려 주변보다 어두운 얼룩이 됐다 — 2026-08-20에 이 표시를 넣은 이유가 그대로
+/// 되살아났다(사용자: 어느 것을 보고 있는지 화면이 말해주지 않는다). 사다리는
+/// `사이드바_밝기_사다리는_보고_있는_것을_가장_밝게_둔다`가 8색 accent 전부에서 고정한다.
+const SESSION_FOCUSED_LIFT: f32 = 0.06;
+
 fn session_row_fill(
     tokens: crate::ui::designall::Tokens,
     hovered: bool,
@@ -4923,7 +5954,11 @@ fn session_row_fill(
     // 같은 색이면 계층이 뭉개진다.
     if focused {
         return Some(SessionRowFill {
-            color: tokens.selected_background,
+            color: crate::ui::designall::mix(
+                tokens.selected_background,
+                tokens.text,
+                SESSION_FOCUSED_LIFT,
+            ),
             full_bleed: true,
         });
     }
@@ -5620,10 +6655,11 @@ const WORKSPACE_ACCENT_PALETTE: [(u8, u8, u8); 8] = [
     (0x3b, 0xa3, 0xa0), // teal
 ];
 
-/// 안정 ID가 DB 생성순 목록에서 차지하는 slot으로 색을 배정한다. palette 앞쪽 여섯
-/// 계열은 녹색·주황·보라·빨강·금색·파랑 순으로 의도적으로 떨어뜨렸다. 따라서 선택/
-/// 접힘으로 렌더 순서가 바뀌어도 색은 유지되고, 같은 이니셜도 서로 다른 계열을 갖는다.
-/// 생성순 목록 끝에 새 워크스페이스를 추가해도 기존 배정은 변하지 않는다.
+/// 사이드바 목록에서 차지하는 slot으로 색을 배정한다. palette 앞쪽 여섯 계열은
+/// 녹색·주황·보라·빨강·금색·파랑 순으로 의도적으로 떨어뜨렸다. 따라서 선택/접힘으로
+/// 렌더 순서가 바뀌어도 색은 유지되고, 같은 이니셜도 서로 다른 계열을 갖는다.
+/// 목록 끝에 새 워크스페이스를 추가해도 기존 배정은 변하지 않는다. 다만 **색은 자리에
+/// 딸린 것이라** 사용자가 드래그로 순서를 바꾸면 색도 함께 따라간다(2026-09-03).
 pub(crate) fn workspace_accent(
     workspaces: &[SidebarWorkspaceEntry],
     workspace_id: &str,
@@ -7288,6 +8324,58 @@ mod tests {
         assert_eq!(fill.bottom(), rect.bottom(), "면이 행 아래에 여백을 남겼다");
     }
 
+    /// 사이드바 밝기 사다리 — **지금 보고 있는 것이 가장 밝다**.
+    ///
+    /// 바탕 < 비활성 hover < 활성 그룹 배경 < 보고 있는 세션 행 < 활성 워크스페이스 헤더.
+    /// 2026-09-04에 활성 그룹 배경을 넣으면서 이 순서가 뒤집혀(그룹 38.5 > 포커스 행 35.9)
+    /// 보고 있는 세션이 화면에서 사라졌다. 사람 눈으로는 "좀 칙칙하네" 정도라 놓치기
+    /// 쉬우므로 숫자로 고정한다. accent 8색 **전부**에서 성립해야 한다 — 그룹 배경과
+    /// 헤더는 워크스페이스 고유색을 섞으므로 색마다 밝기가 다르다.
+    #[test]
+    fn 사이드바_밝기_사다리는_보고_있는_것을_가장_밝게_둔다() {
+        fn luminance(color: egui::Color32) -> f32 {
+            0.2126 * f32::from(color.r())
+                + 0.7152 * f32::from(color.g())
+                + 0.0722 * f32::from(color.b())
+        }
+
+        let tokens = crate::ui::designall::DARK;
+        let status =
+            crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::Idle);
+        let ground = luminance(tokens.workspace_background);
+        let hover = luminance(tokens.hover_background);
+        let focused = luminance(
+            session_row_fill(tokens, false, false, true, status)
+                .expect("보고 있는 행에는 면이 있다")
+                .color,
+        );
+
+        assert!(ground < hover, "바탕 {ground} < hover {hover}");
+
+        for (index, (r, g, b)) in WORKSPACE_ACCENT_PALETTE.iter().enumerate() {
+            let accent = egui::Color32::from_rgb(*r, *g, *b);
+            let group = luminance(active_group_fill(tokens, accent));
+            let header = luminance(
+                workspace_row_style(tokens, accent, true, false)
+                    .fill
+                    .expect("활성 헤더에는 면이 있다"),
+            );
+
+            assert!(
+                hover < group,
+                "accent {index}: 활성 그룹({group})이 비활성 hover({hover})와 구분되지 않는다"
+            );
+            assert!(
+                group + 4.0 < focused,
+                "accent {index}: 보고 있는 세션({focused})이 활성 그룹({group}) 위로 충분히 뜨지 않는다"
+            );
+            assert!(
+                focused < header,
+                "accent {index}: 세션 행({focused})이 워크스페이스 헤더({header})보다 밝아 계층이 뒤집혔다"
+            );
+        }
+    }
+
     #[test]
     fn 보고있는_세션은_면을_갖고_승인은_그보다_우선한다() {
         let tokens = crate::ui::designall::DARK;
@@ -7300,10 +8388,15 @@ mod tests {
         // 2026-08-20 갱신: **지금 보고 있는 세션**은 면을 갖는다. 예전엔 글자 밝기로만
         // 날라서, 선택된 워크스페이스만 배경이 있고 그 안에서 실제로 보고 있는 세션은
         // 표시가 없었다(사용자 보고).
+        let focused_fill = crate::ui::designall::mix(
+            tokens.selected_background,
+            tokens.text,
+            SESSION_FOCUSED_LIFT,
+        );
         assert_eq!(
             session_row_fill(tokens, false, false, true, status),
             Some(SessionRowFill {
-                color: tokens.selected_background,
+                color: focused_fill,
                 full_bleed: true,
             })
         );
@@ -7312,7 +8405,7 @@ mod tests {
             session_row_fill(tokens, true, false, true, status)
                 .expect("보고있는 행에 면이 없다")
                 .color,
-            tokens.selected_background,
+            focused_fill,
             "hover 면이 '보고 있는 세션' 표시를 덮었다"
         );
         // 승인·입력 대기만 면을 가진다 — 「혼자만 면을 가져」 최대로 튄다.
@@ -8864,8 +9957,197 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    /// 사이드바 펼침 계약: **전환해도 지나온 워크스페이스는 펼친 채 남는다.** 실행 중인
+    /// 세션이 화면에서 사라지면 안 되기 때문이다(2026-09-04 사용자). 다만 전환이 **거부되면**
+    /// 아무것도 새로 펼쳐지지 않아야 한다 — 그때 펼치면 사용자가 가지도 않은 곳이 열린다.
     #[test]
-    fn kittest_워크스페이스_포커스이동은_기존_세션트리를_닫지않는다() {
+    fn kittest_전환해도_지나온_워크스페이스는_펼친_채_남는다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            tree: FileTreeUi,
+            active: String,
+            switch_target: Option<String>,
+            focus_target: Option<String>,
+            fonts_ready: bool,
+            /// 전환이 **거부되는** 경우를 재현한다. App은 warm 한도를 넘으면
+            /// `switch_workspace`에서 경고만 세우고 돌아가고(app.rs), staging 슬롯이
+            /// 차 있으면 액션을 조용히 버린다 — 둘 다 활성이 그대로인 채 끝난다.
+            refuse_switch: bool,
+        }
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![
+            SidebarWorkspaceEntry {
+                id: "workspace-a".to_owned(),
+                name: "Workspace A".to_owned(),
+                state: SidebarWorkspaceState::Active,
+                summary: SidebarSessionSummary::default(),
+            },
+            SidebarWorkspaceEntry {
+                id: "workspace-b".to_owned(),
+                name: "Workspace B".to_owned(),
+                state: SidebarWorkspaceState::Warm,
+                summary: SidebarSessionSummary::default(),
+            },
+        ];
+        let session = |workspace: &str, title: &str| {
+            SidebarSessionRow::from_live(
+                format!("workspace-{workspace}"),
+                2,
+                SessionEntry {
+                    tab: runtime::MuxTabId(format!("tab-{workspace}")),
+                    pane: runtime::MuxPaneId(format!("pane-{workspace}")),
+                    session: Some(runtime::SessionId(1)),
+                    title: title.to_owned(),
+                    status: None,
+                    summary: String::new(),
+                    focused: false,
+                    attention: false,
+                    pulse: None,
+                    agent_line: None,
+                    status_label: None,
+                    resumable: false,
+                    has_cwd: false,
+                    in_worktree: false,
+                    status_line: None,
+                    last_output_at: None,
+                },
+            )
+        };
+        let sessions = std::collections::HashMap::from([
+            ("workspace-a".to_owned(), vec![session("a", "Session A")]),
+            ("workspace-b".to_owned(), vec![session("b", "Session B")]),
+        ]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .with_step_dt(0.05)
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    if !state.fonts_ready {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: &state.active,
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_count: 0,
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    match state.tree.panel(ui, &sessions, &snapshot, &catalog) {
+                        Some(SidebarAction::SwitchWorkspace(workspace_id)) => {
+                            state.switch_target = Some(workspace_id.clone());
+                            if !state.refuse_switch {
+                                state.active = workspace_id;
+                            }
+                        }
+                        Some(SidebarAction::FocusSession { workspace_id, .. }) => {
+                            state.focus_target = Some(workspace_id.clone());
+                            state.active = workspace_id;
+                        }
+                        _ => {}
+                    }
+                },
+                State {
+                    tree: FileTreeUi::new(egui::Context::default()),
+                    active: "workspace-a".to_owned(),
+                    switch_target: None,
+                    focus_target: None,
+                    fonts_ready: false,
+                    refuse_switch: false,
+                },
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().fonts_ready = true;
+        harness.run();
+
+        harness.get_by_label("Session A");
+        assert!(harness.query_by_label("Session B").is_none());
+
+        // 전환해도 떠난 워크스페이스는 **펼친 채 남는다** — 돌던 세션이 화면에서
+        // 사라지면 안 된다(2026-09-04 사용자). 어느 쪽에서 일하는지는 배경색이 말한다.
+        harness.get_by_label("Workspace B").click();
+        harness.run();
+        assert_eq!(harness.state().active, "workspace-b");
+        harness.get_by_label("Session A");
+        harness.get_by_label("Session B");
+
+        // 활성 행을 다시 누르면 접기와 함께 SwitchWorkspace(B)를 다시 방출한다. App은
+        // 같은 runtime 전환은 생략하되 Home/작업에서 Terminal view로 복귀한다.
+        harness.state_mut().switch_target = None;
+        harness.get_by_label("Workspace B").click();
+        harness.run();
+        assert_eq!(
+            harness.state().switch_target.as_deref(),
+            Some("workspace-b")
+        );
+        assert!(harness.query_by_label("Session B").is_none());
+
+        // 실제 App의 workspace 전환은 파일 트리 루트도 바꾼다. 루트 교체가 sidebar
+        // 인스턴스/확장 map을 초기화하면 활성 B가 기본값(펼침)으로 되살아나 방금 접은 것이
+        // 저절로 다시 열린다 — 그 회귀를 여기서 잡는다.
+        let root = std::env::temp_dir().join(format!(
+            "deppy-ft-multi-workspace-root-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        harness.state_mut().tree.set_root(Some(root.clone()));
+        drain_listings(&mut harness.state_mut().tree);
+        harness.run();
+        assert!(
+            harness.query_by_label("Session B").is_none(),
+            "루트 교체가 사용자가 접은 상태를 되돌리지 않는다"
+        );
+
+        harness.get_by_label("Workspace B").click();
+        harness.run();
+        harness.get_by_label("Session B");
+
+        // 전환이 **거부되면** 아무것도 펼쳐지지 않아야 한다. 예전에는 행을 누른 자리에서
+        // 곧바로 `expanded = true`를 써서, warm 한도 초과처럼 전환이 거부되는 경우
+        // 활성은 그대로인데 누른 쪽만 펼쳐진 채 영구히 남았다 — 신고된 "두 개가 동시에
+        // 열려 보인다"가 그대로 재현되는 경로였다(2026-09-03 리뷰 H2).
+        // 전제를 만든다 — A를 chevron으로 **직접** 접는다(전환 없이 접히는 유일한 길).
+        harness
+            .get_by_label("Collapse Workspace A sessions")
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label("Session A").is_none(),
+            "전제: A는 접혀 있다"
+        );
+
+        harness.state_mut().refuse_switch = true;
+        harness.state_mut().switch_target = None;
+        harness.get_by_label("Workspace A").click();
+        harness.run();
+        assert_eq!(harness.state().active, "workspace-b", "전환은 거부됐다");
+        assert_eq!(
+            harness.state().switch_target.as_deref(),
+            Some("workspace-a"),
+            "거부돼도 액션 자체는 방출된다"
+        );
+        assert!(
+            harness.query_by_label("Session A").is_none(),
+            "전환이 거부되면 펼쳐지지도 않는다"
+        );
+        harness.state_mut().refuse_switch = false;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// chevron은 **전환 없이** 세션 목록만 여닫는다.
+    ///
+    /// 이 상태 — 펼쳐져 있으면서 비활성 — 가 있어야
+    /// `docs/superpowers/specs/2026-07-29-multi-cross-workspace-pane-design.md`의 승인된
+    /// 진입점 세 개(세션 행 드래그 / hover ↗ / 우클릭 "옆에 열기")가 화면에 나온다.
+    /// 행 전체가 하나의 Response였을 때는 누르는 즉시 전환돼 이 상태를 만들 수 없었고,
+    /// 진입점이 통째로 사라졌다(2026-09-03 리뷰 H1).
+    #[test]
+    fn kittest_chevron은_전환없이_비활성_워크스페이스를_펼친다() {
         use egui_kittest::kittest::Queryable;
 
         struct State {
@@ -8965,53 +10247,38 @@ mod tests {
         harness.get_by_label("Session A");
         assert!(harness.query_by_label("Session B").is_none());
 
-        harness.get_by_label("Workspace B").click();
+        // 비활성 B의 chevron — 전환은 일어나지 않고 세션 목록만 열린다.
+        harness.get_by_label("Expand Workspace B sessions").click();
         harness.run();
-        assert_eq!(harness.state().active, "workspace-b");
+        assert_eq!(
+            harness.state().active,
+            "workspace-a",
+            "chevron은 워크스페이스를 전환하지 않는다"
+        );
+        assert_eq!(
+            harness.state().switch_target,
+            None,
+            "chevron은 SwitchWorkspace를 방출하지 않는다"
+        );
         harness.get_by_label("Session A");
         harness.get_by_label("Session B");
 
-        // 실제 App의 workspace 전환은 파일 트리 루트도 바꾼다. 루트 교체가 sidebar
-        // 인스턴스/확장 map을 초기화하면 이 시점에 A가 다시 닫히는 회귀가 생긴다.
-        let root = std::env::temp_dir().join(format!(
-            "deppy-ft-multi-workspace-root-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        harness.state_mut().tree.set_root(Some(root.clone()));
-        drain_listings(&mut harness.state_mut().tree);
+        // 같은 chevron을 다시 누르면 접힌다 — 여전히 전환은 없다.
+        harness
+            .get_by_label("Collapse Workspace B sessions")
+            .click();
         harness.run();
-        harness.get_by_label("Session A");
-        harness.get_by_label("Session B");
-
-        harness.get_by_label("Workspace A").click();
-        harness.run();
+        assert!(harness.query_by_label("Session B").is_none());
         assert_eq!(harness.state().active, "workspace-a");
-        assert_eq!(
-            harness.state().switch_target.as_deref(),
-            Some("workspace-a")
-        );
-        harness.get_by_label("Session A");
-        harness.get_by_label("Session B");
+        assert_eq!(harness.state().switch_target, None);
 
-        // 활성 행을 다시 누르면 접기와 함께 SwitchWorkspace(A)를 다시 방출한다. App은
-        // 같은 runtime 전환은 생략하되 Home/작업에서 Terminal view로 복귀한다.
-        harness.state_mut().switch_target = None;
-        harness.get_by_label("Workspace A").click();
+        // 다시 펼쳐 두고, 여기서만 나오는 진입점을 쓴다 — 비활성 워크스페이스의 세션을
+        // 눌러 이동한다. 이 경로가 살아 있어야 「옆에 열기」 진입점 세 개가 의미를 갖는다.
+        harness.get_by_label("Expand Workspace B sessions").click();
         harness.run();
-        assert_eq!(
-            harness.state().switch_target.as_deref(),
-            Some("workspace-a")
-        );
-        assert!(harness.query_by_label("Session A").is_none());
-        harness.get_by_label("Session B");
-
-        // 열린 비활성 세션 클릭은 workspace뿐 아니라 정확한 세션 focus 요청을 낸다.
         harness.get_by_label("Session B").click();
         harness.run();
-        assert_eq!(harness.state().active, "workspace-b");
         assert_eq!(harness.state().focus_target.as_deref(), Some("workspace-b"));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// codex 리뷰 P2 회귀: 활성 워크스페이스가 생성순 뒤쪽이면 이전 구현은
@@ -9191,6 +10458,1395 @@ mod tests {
             }
             other => panic!("unexpected request: {other:?}"),
         }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 떠나는 워크스페이스는 **접지 않는다** — 실행 중인 세션은 다른 곳으로 옮겨가도 계속
+    /// 보여야 한다(2026-09-04 사용자). 두 곳이 동시에 펼쳐지는 것 자체는 문제가 아니었고,
+    /// "어느 쪽을 보고 있는지 모르겠다"는 신고의 원인은 배경색이었다.
+    #[test]
+    fn 전환해도_떠나는_워크스페이스는_펼친_채_남는다() {
+        let mut expanded: HashMap<String, bool> = HashMap::new();
+        let mut last: Option<String> = None;
+
+        sync_workspace_expansion_on_switch(&mut expanded, &mut last, "a");
+        assert_eq!(expanded.get("a"), Some(&true));
+
+        sync_workspace_expansion_on_switch(&mut expanded, &mut last, "b");
+        assert_eq!(
+            expanded.get("a"),
+            Some(&true),
+            "떠나도 접히지 않는다 — 돌던 세션이 화면에서 사라지면 안 된다"
+        );
+        assert_eq!(expanded.get("b"), Some(&true));
+
+        sync_workspace_expansion_on_switch(&mut expanded, &mut last, "c");
+        let open: Vec<&String> = {
+            let mut open: Vec<&String> = expanded
+                .iter()
+                .filter(|(_, is_open)| **is_open)
+                .map(|(id, _)| id)
+                .collect();
+            open.sort();
+            open
+        };
+        assert_eq!(open, vec!["a", "b", "c"], "지나온 곳이 모두 열린 채 남는다");
+
+        // chevron으로 **일부러 접은 것**은 그대로 살아야 한다. 활성인 c를 접고 → a로
+        // 떠났다가 → c로 돌아온다.
+        expanded.insert("c".to_owned(), false);
+        sync_workspace_expansion_on_switch(&mut expanded, &mut last, "a");
+        sync_workspace_expansion_on_switch(&mut expanded, &mut last, "c");
+        assert_eq!(
+            expanded.get("c"),
+            Some(&false),
+            "사용자가 접어 둔 워크스페이스는 돌아와도 접힌 채로 남는다"
+        );
+    }
+
+    /// 접힌 워크스페이스 행이 찍는 상태 점의 우선순위. 대기가 맨 앞인 것은 그것만이
+    /// 사용자가 움직여야 풀리는 상태이기 때문이다. 유휴는 찍지 않는다 — 아무 일도 안 하는
+    /// 세션이 신호를 내면 진짜 신호를 가린다.
+    #[test]
+    fn 접힌_워크스페이스_상태점은_대기를_가장_앞에_둔다() {
+        use crate::agent_surface::AgentVisualState as S;
+        let summary = |waiting, error, running, done, idle| SidebarSessionSummary {
+            running,
+            waiting,
+            done,
+            error,
+            idle,
+            inactive: 0,
+            no_sessions: false,
+        };
+
+        // 넷이 다 섞여 있어도 대기가 이긴다 — 하나만 찍을 수 있으므로 순위가 곧 계약이다.
+        assert_eq!(
+            collapsed_status_dot(summary(1, 1, 1, 1, 1)),
+            Some(S::Waiting)
+        );
+        assert_eq!(collapsed_status_dot(summary(0, 1, 1, 1, 1)), Some(S::Error));
+        assert_eq!(
+            collapsed_status_dot(summary(0, 0, 1, 1, 1)),
+            Some(S::Active)
+        );
+        assert_eq!(
+            collapsed_status_dot(summary(0, 0, 0, 1, 1)),
+            Some(S::Complete)
+        );
+        assert_eq!(
+            collapsed_status_dot(summary(0, 0, 0, 0, 3)),
+            None,
+            "유휴만 있으면 찍지 않는다"
+        );
+        assert_eq!(
+            collapsed_status_dot(SidebarSessionSummary::default()),
+            None,
+            "세션이 없으면 찍지 않는다"
+        );
+    }
+
+    /// 놓을 자리는 그룹의 **세로 중심선**이 가른다 — 위 절반이면 그 앞, 아래 절반이면 그 뒤.
+    #[test]
+    fn 드롭_위치는_그룹_중심선을_지날_때마다_한_칸씩_밀린다() {
+        // 세 그룹의 중심 y = 10 / 30 / 50 (그룹 높이 20 가정)
+        let centers = [10.0_f32, 30.0, 50.0];
+
+        assert_eq!(workspace_drop_index(&centers, 0.0), 0, "맨 위");
+        assert_eq!(workspace_drop_index(&centers, 9.9), 0, "첫 그룹 위 절반");
+        assert_eq!(workspace_drop_index(&centers, 10.1), 1, "첫 그룹 아래 절반");
+        assert_eq!(workspace_drop_index(&centers, 29.9), 1);
+        assert_eq!(workspace_drop_index(&centers, 30.1), 2);
+        assert_eq!(workspace_drop_index(&centers, 999.0), 3, "맨 아래");
+        assert_eq!(workspace_drop_index(&[], 5.0), 0, "목록이 비면 0");
+    }
+
+    /// 뒤로 보낼 때 자기 자리가 먼저 빠지므로 목표 index를 한 칸 당겨야 사용자가 가리킨
+    /// 틈에 정확히 들어간다. 이 보정이 없으면 아래로 끌 때마다 한 칸씩 덜 간다.
+    #[test]
+    fn 워크스페이스를_끌어_놓으면_가리킨_틈에_들어간다() {
+        let ids: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+
+        // a를 c와 d 사이(index 3)로 — 자기 자리가 빠지므로 실제 삽입은 2번째 뒤.
+        assert_eq!(reorder_workspace_ids(&ids, "a", 3), ["b", "c", "a", "d"]);
+        // d를 맨 위로.
+        assert_eq!(reorder_workspace_ids(&ids, "d", 0), ["d", "a", "b", "c"]);
+        // c를 맨 아래로.
+        assert_eq!(reorder_workspace_ids(&ids, "c", 4), ["a", "b", "d", "c"]);
+        // 제자리에 놓으면 그대로 — App이 config 쓰기를 건너뛰는 근거다.
+        assert_eq!(reorder_workspace_ids(&ids, "b", 1), ["a", "b", "c", "d"]);
+        assert_eq!(reorder_workspace_ids(&ids, "b", 2), ["a", "b", "c", "d"]);
+        // 목록에 없는 id는 목록을 건드리지 않는다.
+        assert_eq!(reorder_workspace_ids(&ids, "zz", 0), ["a", "b", "c", "d"]);
+    }
+
+    /// 드래그 중에는 휠·스크롤바가 모두 막혀 목록을 스크롤할 방법이 없었다. 가장자리에
+    /// 다가가면 목록이 스스로 흘러야 화면 밖 자리로도 옮길 수 있다(2026-09-03 리뷰 H2).
+    #[test]
+    fn 드래그_자동스크롤은_가장자리에서만_방향을_갖는다() {
+        let viewport = egui::Rangef::new(100.0, 400.0);
+        let dt = 1.0 / 60.0;
+
+        // 가운데는 정확히 0 — 평소 드래그는 목록을 건드리지 않는다.
+        assert_eq!(drag_autoscroll_delta(viewport, 250.0, dt), 0.0);
+
+        // 위쪽: 양수(= 목록 앞쪽이 보인다). 밖으로 나가면 최대 속도로 고정된다.
+        let near_top = drag_autoscroll_delta(viewport, 110.0, dt);
+        let above_top = drag_autoscroll_delta(viewport, 60.0, dt);
+        assert!(near_top > 0.0, "위 가장자리에서는 앞쪽으로 흐른다");
+        assert!(above_top > near_top, "밖으로 나갈수록 빠르다");
+        assert_eq!(
+            drag_autoscroll_delta(viewport, -500.0, dt),
+            above_top,
+            "최대 속도에서 멈춘다"
+        );
+
+        // 아래쪽: 부호가 반대고 크기 규칙은 같다.
+        let near_bottom = drag_autoscroll_delta(viewport, 390.0, dt);
+        let below_bottom = drag_autoscroll_delta(viewport, 440.0, dt);
+        assert!(near_bottom < 0.0, "아래 가장자리에서는 뒤쪽으로 흐른다");
+        assert!(below_bottom < near_bottom);
+        assert_eq!(near_bottom, -near_top, "위아래가 대칭이다");
+        assert_eq!(below_bottom, -above_top);
+
+        // 뷰포트가 가장자리 둘을 담기엔 너무 짧아도 방향이 튀지 않는다.
+        let tiny = egui::Rangef::new(0.0, 9.0);
+        assert_eq!(drag_autoscroll_delta(tiny, 4.5, dt), 0.0);
+        assert!(drag_autoscroll_delta(tiny, 0.0, dt) > 0.0);
+        assert!(drag_autoscroll_delta(tiny, 9.0, dt) < 0.0);
+    }
+
+    /// 순서 변경 드래그를 **진짜 포인터 이벤트**로 몰기 위한 최소 하네스 —
+    /// 워크스페이스 셋(a 활성 · b · c), 세션 없음. 방출된 순서만 들고 있는다.
+    struct WorkspaceReorderState {
+        tree: FileTreeUi,
+        reordered: Option<Vec<String>>,
+        fonts_ready: bool,
+    }
+
+    fn workspace_reorder_harness(
+        count: usize,
+    ) -> egui_kittest::Harness<'static, WorkspaceReorderState> {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces: Vec<SidebarWorkspaceEntry> = (0..count)
+            .map(|index| SidebarWorkspaceEntry {
+                id: format!("workspace-{index:02}"),
+                name: format!("Workspace {index:02}"),
+                state: if index == 0 {
+                    SidebarWorkspaceState::Active
+                } else {
+                    SidebarWorkspaceState::Idle
+                },
+                summary: SidebarSessionSummary::default(),
+            })
+            .collect();
+        let sessions: HashMap<String, Vec<SidebarSessionRow>> = HashMap::new();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .with_step_dt(0.05)
+            .build_ui_state(
+                move |ui, state: &mut WorkspaceReorderState| {
+                    if !state.fonts_ready {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "workspace-00",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_count: 0,
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    if let Some(SidebarAction::ReorderWorkspaces(order)) =
+                        state.tree.panel(ui, &sessions, &snapshot, &catalog)
+                    {
+                        state.reordered = Some(order);
+                    }
+                },
+                WorkspaceReorderState {
+                    tree: FileTreeUi::new(egui::Context::default()),
+                    reordered: None,
+                    fonts_ready: false,
+                },
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().fonts_ready = true;
+        harness.run();
+        harness
+    }
+
+    /// 누르고 → 끌고 → 놓는 제스처가 실제로 `ReorderWorkspaces`를 낸다. 순서 변경은
+    /// 산술 테스트만 있었어서 배선(어느 행이 drag를 잡고 어디서 확정하는지)은 한 번도
+    /// 실행된 적이 없었다(2026-09-03 리뷰 M3).
+    #[test]
+    fn kittest_워크스페이스를_아래로_끌어놓으면_순서_액션이_나온다() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = workspace_reorder_harness(3);
+        let from = harness.get_by_label("Workspace 00").rect().center();
+        let below_last =
+            harness.get_by_label("Workspace 02").rect().center() + egui::vec2(0.0, 2.0);
+
+        harness.hover_at(from);
+        harness.drag_at(from);
+        harness.step();
+        harness.hover_at(below_last);
+        harness.step();
+        harness.drop_at(below_last);
+        harness.step();
+
+        assert_eq!(
+            harness.state().reordered,
+            Some(vec![
+                "workspace-01".to_owned(),
+                "workspace-02".to_owned(),
+                "workspace-00".to_owned(),
+            ])
+        );
+    }
+
+    /// 드래그 중에는 휠도 스크롤바도 막혀 있어(egui가 둘 다 끈다) 지금 보이는 자리 밖으로는
+    /// 워크스페이스를 옮길 수가 없었다. 가장자리 밖으로 끌면 목록이 스스로 흘러야 한다
+    /// (2026-09-03 리뷰 H2). 순수 함수가 아니라 **배선**이 사는지 보는 테스트다.
+    #[test]
+    fn kittest_드래그_중_아래_가장자리에서는_목록이_따라_흐른다() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = workspace_reorder_harness(20);
+        let from = harness.get_by_label("Workspace 00").rect().center();
+        let before = harness.get_by_label("Workspace 19").rect().top();
+
+        harness.hover_at(from);
+        harness.drag_at(from);
+        harness.step();
+        // 목록 아래 가장자리 **밖** — 포인터를 가만히 둬도 프레임마다 흘러야 한다.
+        harness.hover_at(egui::pos2(from.x, 690.0));
+        for _ in 0..5 {
+            harness.step();
+        }
+
+        let after = harness.get_by_label("Workspace 19").rect().top();
+        assert!(
+            after < before - 20.0,
+            "목록이 위로 흘러 뒤쪽 워크스페이스가 올라온다 (before={before}, after={after})"
+        );
+    }
+
+    /// Escape는 드래그를 **취소**한다. egui는 Escape에서 dragged id를 지우고
+    /// (`interaction.rs`) 그 프레임에 `drag_stopped`가 뜨는데, 그것만 보면 취소와 드롭이
+    /// 구별되지 않아 취소가 그대로 순서를 확정했다(2026-09-03 리뷰 H1).
+    #[test]
+    fn kittest_드래그_중_escape는_순서를_바꾸지_않는다() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = workspace_reorder_harness(3);
+        let from = harness.get_by_label("Workspace 00").rect().center();
+        let below_last =
+            harness.get_by_label("Workspace 02").rect().center() + egui::vec2(0.0, 2.0);
+
+        harness.hover_at(from);
+        harness.drag_at(from);
+        harness.step();
+        harness.hover_at(below_last);
+        harness.step();
+        harness.key_press(egui::Key::Escape);
+        harness.step();
+        assert_eq!(harness.state().reordered, None, "Escape는 취소다");
+
+        harness.drop_at(below_last);
+        harness.step();
+        assert_eq!(
+            harness.state().reordered,
+            None,
+            "취소한 뒤 손을 떼도 확정되지 않는다"
+        );
+    }
+
+    /// 목록 **밖에서** 손을 떼면 취소다. 예전에는 x를 아예 보지 않고 y만 읽어서 터미널
+    /// 위나 목록 위쪽에서 놓아도 순서가 바뀌었다 — 목록 위쪽은 insert_at = 0이라
+    /// 끌던 행이 맨 앞으로 튀었다(2026-09-03 리뷰 M1).
+    #[test]
+    fn kittest_목록_밖에서_놓으면_순서가_그대로다() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = workspace_reorder_harness(3);
+        let from = harness.get_by_label("Workspace 02").rect().center();
+        let above_list = egui::pos2(
+            from.x,
+            harness.get_by_label("Workspace 00").rect().top() - 40.0,
+        );
+
+        harness.hover_at(from);
+        harness.drag_at(from);
+        harness.step();
+        harness.hover_at(above_list);
+        harness.step();
+        harness.drop_at(above_list);
+        harness.step();
+
+        assert_eq!(harness.state().reordered, None);
+    }
+
+    /// 수식키 규칙 — Finder와 같다. 둘 다 눌렀으면 구간이 이긴다.
+    #[test]
+    fn 선택_클릭은_수식키로_갈린다() {
+        let none = egui::Modifiers::default();
+        let command = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let both = egui::Modifiers {
+            command: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(selection_click_kind(none), SelectionClick::Replace);
+        assert_eq!(selection_click_kind(command), SelectionClick::Toggle);
+        assert_eq!(selection_click_kind(shift), SelectionClick::Range);
+        assert_eq!(selection_click_kind(both), SelectionClick::Range);
+    }
+
+    /// 구간은 방향을 가리지 않고 양끝을 포함한다. 기준점이 사라졌으면(접힘·삭제)
+    /// 아무것도 못 고르는 대신 누른 행 하나로 떨어진다.
+    #[test]
+    fn 구간_선택은_양끝을_포함하고_방향을_가리지_않는다() {
+        let paths: Vec<PathBuf> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| PathBuf::from(format!("/root/{name}")))
+            .collect();
+        let at = |name: &str| PathBuf::from(format!("/root/{name}"));
+
+        assert_eq!(
+            selection_range(&paths, &at("b"), &at("d")),
+            vec![at("b"), at("c"), at("d")]
+        );
+        assert_eq!(
+            selection_range(&paths, &at("d"), &at("b")),
+            vec![at("b"), at("c"), at("d")],
+            "위로 끌어도 같은 구간이다"
+        );
+        assert_eq!(selection_range(&paths, &at("c"), &at("c")), vec![at("c")]);
+        assert_eq!(
+            selection_range(&paths, &at("사라짐"), &at("c")),
+            vec![at("c")],
+            "기준점이 목록에 없으면 누른 행 하나"
+        );
+    }
+
+    /// 사각형이 덮는 행은 **산술로** 구한다 — `show_rows` 가상화 때문에 화면 밖 행은
+    /// 위젯이 없지만, 사각형에 들어왔으면 선택돼야 한다.
+    #[test]
+    fn 선택_사각형은_화면_밖_행까지_덮는다() {
+        // 0번 행 top = 100.0, 행 높이 20, 전체 10행 (100..300)
+        let range =
+            |min: f32, max: f32| marquee_row_range(100.0, 20.0, 10, egui::Rangef::new(min, max));
+
+        // floor를 고정한다. `round`면 소수부 0.75가 올림돼 **닿지도 않은** 3번 행이
+        // 딸려오고, `trunc`면 content_top 바로 위에서 끝나는 사각형이 -0.0을 통과시켜
+        // 0번 행을 고른다. 예전 입력은 소수부가 0/0.25뿐이라 셋을 구분하지 못했다.
+        assert_eq!(
+            range(105.0, 155.0),
+            0..3,
+            "소수부 0.75 — round면 0..4가 된다"
+        );
+        assert_eq!(
+            range(80.0, 99.0),
+            0..0,
+            "content_top 위에서 끝나면 아무것도 아니다"
+        );
+        assert_eq!(range(100.0, 100.0), 0..1, "첫 행 맨 위 한 점");
+        assert_eq!(range(105.0, 145.0), 0..3, "1픽셀만 걸쳐도 그 행까지");
+        assert_eq!(range(140.0, 160.0), 2..4);
+        // 뷰포트를 한참 벗어나게 끌어도 목록 끝에서 멈춘다.
+        assert_eq!(range(-500.0, 5000.0), 0..10);
+        assert_eq!(range(0.0, 50.0), 0..0, "목록 위쪽 바깥");
+        assert_eq!(range(400.0, 500.0), 0..0, "목록 아래쪽 바깥");
+        assert_eq!(
+            marquee_row_range(100.0, 20.0, 0, egui::Rangef::new(0.0, 999.0)),
+            0..0,
+            "행이 없으면 빈 구간"
+        );
+    }
+
+    /// 삭제 확인 라벨은 **루트 기준 상대 경로**다. 파일명만 뽑아 쓰던 예전 문구는
+    /// `src/mod.rs`와 `tests/mod.rs`를 똑같이 `'mod.rs'`로 보여줘, 확인 문구만 보고는
+    /// 어느 쪽이 지워지는지 알 수 없었다.
+    #[test]
+    fn delete_target_label은_루트_기준_상대경로다() {
+        let root = Path::new("/root");
+        assert_eq!(
+            delete_target_label(Some(root), &root.join("src/mod.rs")),
+            "src/mod.rs"
+        );
+        assert_eq!(
+            delete_target_label(Some(root), &root.join("tests/mod.rs")),
+            "tests/mod.rs"
+        );
+        // 루트 밖·루트 미설정은 전체 경로로 떨어진다 (조용히 이름만 남기지 않는다).
+        assert_eq!(
+            delete_target_label(Some(root), Path::new("/other/mod.rs")),
+            "/other/mod.rs"
+        );
+        assert_eq!(
+            delete_target_label(None, Path::new("/other/mod.rs")),
+            "/other/mod.rs"
+        );
+        // 루트 자신은 상대 경로가 비므로 전체 경로.
+        assert_eq!(delete_target_label(Some(root), root), "/root");
+        // 트리 행과 같은 NFC 표기 (행은 "한글.md", 확인 문구는 NFD면 다른 이름처럼 보인다).
+        let nfd = Path::new("/root/\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}.md");
+        assert_eq!(delete_target_label(Some(root), nfd), "한글.md");
+    }
+
+    /// 새 삭제 제스처는 직전 실패가 남긴 영구삭제 확인을 닫는다. 닫지 않으면 패널
+    /// 아래에 **예전 대상** 이름이 그대로 떠 있고, 방금 고른 파일 이야기인 줄 알고
+    /// [영구 삭제]를 누르면 엉뚱한 파일이 영구 삭제된다.
+    /// 폴더를 접으면 그 안의 선택이 함께 빠진다. 남겨두면 화면에는 아무것도 강조되지
+    /// 않은 채 ⌘⌫ 한 번에 보이지 않는 파일이 지워지고, 다시 펼치면 유령 선택이 되살아난다.
+    #[test]
+    fn 접힌_폴더_안의_선택은_함께_빠진다() {
+        let base = temp_root("collapse-prune");
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub/inner.txt"), b"x").unwrap();
+        let base = base.canonicalize().unwrap();
+
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.toggle_dir(&base.join("sub"));
+        drain_listings(&mut tree);
+
+        let inner = base.join("sub/inner.txt");
+        assert!(
+            tree.flat.iter().any(|row| row.path == inner),
+            "펼친 상태에서는 자식이 보인다"
+        );
+        tree.selected = BTreeSet::from([inner.clone()]);
+        tree.select_anchor = Some(inner);
+
+        tree.toggle_dir(&base.join("sub"));
+
+        assert!(tree.selected.is_empty(), "안 보이는 것은 선택에서 뺀다");
+        assert!(tree.select_anchor.is_none(), "기준점도 함께 버린다");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `apply_selection_click`의 상태 전이. 순수 함수 둘(`selection_click_kind`,
+    /// `selection_range`)은 잠겨 있었지만 그것을 **조합하고 기준점을 관리하는** 이 코드는
+    /// 한 번도 실행되지 않아, ⌘클릭이 해제를 못 해도 테스트가 통과했다(2026-09-04 리뷰).
+    #[test]
+    fn 선택_클릭은_기준점을_옳게_관리한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let at = |name: &str| PathBuf::from(format!("/root/{name}"));
+        tree.flat = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| FlatRow {
+                path: at(name),
+                display_name: (*name).to_owned(),
+                depth: 0,
+                is_dir: false,
+                expanded: false,
+            })
+            .collect();
+
+        tree.apply_selection_click(&at("b"), SelectionClick::Replace);
+        assert_eq!(tree.selected, BTreeSet::from([at("b")]));
+        assert_eq!(tree.select_anchor.as_deref(), Some(at("b").as_path()));
+
+        // ⌘클릭은 **토글**이다 — 넣기만 하면 선택을 뺄 수 없다.
+        tree.apply_selection_click(&at("d"), SelectionClick::Toggle);
+        assert_eq!(tree.selected, BTreeSet::from([at("b"), at("d")]));
+        tree.apply_selection_click(&at("d"), SelectionClick::Toggle);
+        assert_eq!(
+            tree.selected,
+            BTreeSet::from([at("b")]),
+            "다시 누르면 빠진다"
+        );
+
+        // Shift는 기준점을 **움직이지 않는다** — 범위를 늘였다 줄였다 할 수 있어야 한다.
+        tree.apply_selection_click(&at("b"), SelectionClick::Replace);
+        tree.apply_selection_click(&at("d"), SelectionClick::Range);
+        assert_eq!(tree.selected, BTreeSet::from([at("b"), at("c"), at("d")]));
+        assert_eq!(
+            tree.select_anchor.as_deref(),
+            Some(at("b").as_path()),
+            "Shift 클릭이 기준점을 옮기면 범위를 줄일 수 없다"
+        );
+        tree.apply_selection_click(&at("c"), SelectionClick::Range);
+        assert_eq!(
+            tree.selected,
+            BTreeSet::from([at("b"), at("c")]),
+            "같은 기준점에서 범위가 줄어든다"
+        );
+    }
+
+    /// 다중 삭제는 capacity-1 IO 큐를 **하나씩** 통과한다. 한 번에 다 보내면 두 번째
+    /// 요청부터 `Busy`로 조용히 버려져, 고른 것 중 하나만 지워지고 나머지는 남는다.
+    ///
+    /// 순서는 **트리에 보이는 순서**다 — 확인/에러 문구가 위에서부터 차례로 나와야
+    /// 사용자가 어디까지 지워졌는지 눈으로 따라갈 수 있다.
+    #[test]
+    fn 다중_삭제는_트리_순서대로_하나씩_이어_보낸다() {
+        let base =
+            std::env::temp_dir().join(format!("deppy-ft-multi-trash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // **트리 순서와 경로 정렬 순서가 갈리는** fixture여야 한다. flat은 디렉터리를
+        // 먼저 놓으므로 `zz/` → `a.txt`인데, 경로 정렬은 `a.txt` → `zz/`다. 예전 fixture는
+        // a/b/c.txt뿐이라 두 순서가 우연히 같아 "트리 순서" 단언이 공허했다.
+        std::fs::create_dir_all(base.join("zz")).unwrap();
+        for name in ["a.txt", "m.txt"] {
+            std::fs::write(base.join(name), b"x").unwrap();
+        }
+        let base = base.canonicalize().unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+
+        tree.selected = BTreeSet::from([base.join("a.txt"), base.join("m.txt"), base.join("zz")]);
+        tree.spawn_trash_selection(None);
+
+        // 세 개를 순서대로 확인해야 "하나씩"이 고정된다 — 두 개면 큐 길이가 늘 1이라
+        // `remove(0)`을 `pop()`으로 바꿔도 통과한다.
+        let expected = [base.join("zz"), base.join("a.txt"), base.join("m.txt")];
+        let mut remaining = expected.len();
+        for (step, want) in expected.iter().enumerate() {
+            let intent = tree
+                .take_io_intent()
+                .unwrap_or_else(|| panic!("{step}번째 삭제 intent가 없다"));
+            match &intent.request {
+                FileTreeIoRequest::Trash { target } => {
+                    assert_eq!(target.as_path(), want.as_path(), "{step}번째 대상")
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+            remaining -= 1;
+            assert_eq!(
+                tree.trash_queue.len(),
+                remaining,
+                "{step}번째 뒤 남은 대기열"
+            );
+            assert!(
+                tree.take_io_intent().is_none(),
+                "capacity-1 큐에 두 번째를 겹쳐 보내면 안 된다"
+            );
+            if step == 0 {
+                assert!(tree.selected.is_empty(), "삭제를 접수했으면 선택은 비운다");
+                assert!(tree.select_anchor.is_none(), "기준점도 함께 버린다");
+            }
+            tree.complete_io(FileTreeIoCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result: Ok(()),
+            });
+        }
+        assert!(tree.trash_queue.is_empty());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 삭제가 아닌 IO의 성공에는 대기열이 풀리면 안 된다. 예전엔 완료 종류를 안 봐서,
+    /// 붙여넣기 하나가 끝나는 순간 사용자가 고른 적 없는 시점에 파일이 사라졌다.
+    #[test]
+    fn 대기열은_삭제_완료에만_이어진다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.trash_queue = vec![DeleteTarget {
+            path: PathBuf::from("/root/b.txt"),
+            label: "b.txt".to_owned(),
+            is_dir: false,
+        }];
+        // 삭제가 아닌 요청 하나를 큐에 태우고 성공시킨다.
+        tree.copy_files_to_clipboard(&[PathBuf::from("/root/x.txt")]);
+        let intent = tree.take_io_intent().expect("복사 intent");
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Ok(()),
+        });
+        assert!(
+            tree.take_io_intent().is_none(),
+            "복사 성공이 삭제 대기열을 풀었다"
+        );
+        assert_eq!(tree.trash_queue.len(), 1, "대기열은 그대로 남는다");
+    }
+
+    /// 루트가 바뀌면 선택과 대기열을 함께 버린다. generation 검사는 옛 **완료**만 막을
+    /// 뿐 큐 자체는 살아남아, 새 워크스페이스의 아무 성공에나 옛 루트 파일이 지워졌다.
+    #[test]
+    fn 루트가_바뀌면_선택과_삭제_대기열을_버린다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.selected = BTreeSet::from([PathBuf::from("/old/a.txt")]);
+        tree.select_anchor = Some(PathBuf::from("/old/a.txt"));
+        tree.trash_queue = vec![DeleteTarget {
+            path: PathBuf::from("/old/b.txt"),
+            label: "b.txt".to_owned(),
+            is_dir: false,
+        }];
+
+        tree.set_root(Some(PathBuf::from("/new")));
+
+        assert!(tree.trash_queue.is_empty());
+        assert!(tree.selected.is_empty());
+        assert!(tree.select_anchor.is_none());
+    }
+
+    /// 앞이 실패하면 남은 대상은 보내지 않는다. 영구삭제 확인이 뜬 채로 뒤가 계속
+    /// 지워지면, 사용자가 보고 있는 확인 문구와 실제로 사라지는 파일이 갈라진다.
+    #[test]
+    fn 다중_삭제는_실패하면_남은_대상을_보내지_않는다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let target = |name: &str| DeleteTarget {
+            path: PathBuf::from(format!("/root/{name}")),
+            label: name.to_owned(),
+            is_dir: false,
+        };
+        tree.trash_queue = vec![target("b.txt")];
+        tree.spawn_trash(target("a.txt"));
+        let intent = tree.take_io_intent().expect("첫 삭제 intent");
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+
+        assert_eq!(tree.confirm_delete, Some(target("a.txt")));
+        assert!(tree.trash_queue.is_empty(), "남은 대상은 버린다");
+        assert!(tree.take_io_intent().is_none(), "다음을 보내지 않는다");
+
+        // TrashUnavailable이 아닌 실패에서도 같다 — 남겨두면 뒤이은 아무 성공에나 풀린다.
+        tree.trash_queue = vec![target("b.txt")];
+        tree.spawn_trash(target("a.txt"));
+        let intent = tree.take_io_intent().expect("두 번째 삭제 intent");
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::NativeFailure),
+        });
+        assert!(
+            tree.trash_queue.is_empty(),
+            "일반 실패에서도 남은 대상은 버린다"
+        );
+        assert!(tree.take_io_intent().is_none());
+    }
+
+    #[test]
+    fn 새_삭제_제스처는_직전_영구삭제_확인을_닫는다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let first = DeleteTarget {
+            path: PathBuf::from("/root/src/mod.rs"),
+            label: "src/mod.rs".to_owned(),
+            is_dir: false,
+        };
+        tree.spawn_trash(first.clone());
+        let intent = tree.take_io_intent().expect("trash intent");
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        assert_eq!(tree.confirm_delete, Some(first.clone()));
+
+        tree.spawn_trash(DeleteTarget {
+            path: PathBuf::from("/root/tests/mod.rs"),
+            label: "tests/mod.rs".to_owned(),
+            is_dir: false,
+        });
+        assert_eq!(
+            tree.confirm_delete, None,
+            "새 대상의 휴지통 이동을 접수했는데 예전 대상 확인이 그대로 남아 있다"
+        );
+
+        // Busy 갈래: capacity-1 IO 큐가 차 있으면 `queue_io`는 요청을 받지 않는다.
+        // 그때도 확인은 닫혀야 한다 — 확인을 무효로 만드는 것은 큐 수용이 아니라
+        // **제스처**다. 남겨두면 "파일 작업이 진행 중입니다" 바로 아래에 예전 대상
+        // 확인이 서고, 그걸 방금 고른 파일 이야기로 읽은 사용자가 [영구 삭제]를
+        // 누르면 엉뚱한 파일이 사라진다.
+        //
+        // 직전 제스처가 큐에 넣어둔 요청부터 비운다 — 그대로 두면 아래 arm이 Busy로
+        // 거절되어 검증하려던 상태를 만들지 못한다.
+        let queued = tree.take_io_intent().expect("직전 제스처의 trash intent");
+        tree.complete_io(FileTreeIoCompletion {
+            operation: queued.operation,
+            generation: queued.generation,
+            result: Ok(()),
+        });
+        tree.spawn_trash(first.clone());
+        let intent = tree.take_io_intent().expect("second trash intent");
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        assert_eq!(tree.confirm_delete, Some(first));
+        // 다른 파일 조작(⌘C 복사)이 같은 큐를 차지한다 — 트리 내 이동·Finder 드롭·
+        // 더블클릭 열기도 모두 같은 capacity-1 큐다.
+        tree.copy_files_to_clipboard(&[PathBuf::from("/root/src/mod.rs")]);
+        assert!(
+            tree.io_intent.is_some() || tree.pending_io.is_some(),
+            "큐를 점유하지 못해 Busy 갈래를 검증할 수 없다"
+        );
+        tree.spawn_trash(DeleteTarget {
+            path: PathBuf::from("/root/tests/mod.rs"),
+            label: "tests/mod.rs".to_owned(),
+            is_dir: false,
+        });
+        assert_eq!(
+            tree.error.as_deref(),
+            Some(file_tree_io_error_message(FileTreeIoErrorCode::Busy)),
+            "큐가 찬 상태의 삭제 제스처가 Busy로 거절되지 않아 갈래를 잘못 짚었다"
+        );
+        assert_eq!(
+            tree.confirm_delete, None,
+            "큐가 거절했다는 이유로 예전 대상 확인이 살아남았다"
+        );
+    }
+
+    /// 영구삭제 확인은 **대상이 들고 온 label 그대로**를 보여주고, 같은 대상의 경로를
+    /// 지운다. 확인 시점에 경로에서 이름을 다시 만들면 표시와 삭제 대상이 갈라질 수
+    /// 있으므로, 여기서는 파일명과 **다른** label을 일부러 넣어 재유추가 없음을 고정한다.
+    /// 폴더 대상은 "안의 내용까지 지운다"는 별도 문구를 쓴다.
+    #[test]
+    fn kittest_영구삭제_확인은_대상이_들고온_이름을_그대로_지운다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let base = temp_root("delete-confirm");
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/mod.rs"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("docs")).unwrap();
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, bool)| {
+                    // 폰트 설치 전 빌드 프레임은 건너뛴다(사이드바 harness 관례).
+                    if !state.1 {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_count: 0,
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    state
+                        .0
+                        .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog);
+                },
+                (tree, false),
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().1 = true;
+        harness.step();
+        harness.step();
+
+        // 파일 대상 — label은 행이 확정해 넘긴 값이며, 파일명(mod.rs)과 다르다.
+        harness.state_mut().0.spawn_trash(DeleteTarget {
+            path: base.join("src/mod.rs"),
+            label: "src/mod.rs".to_owned(),
+            is_dir: false,
+        });
+        let intent = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("trash intent");
+        match &intent.request {
+            FileTreeIoRequest::Trash { target } => {
+                assert_eq!(target.as_path(), base.join("src/mod.rs"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        harness.step();
+
+        let prompt = catalog.t(
+            "file_tree.permanent_delete_prompt",
+            &[("name", "src/mod.rs")],
+        );
+        assert!(
+            harness.query_by_label(&prompt).is_some(),
+            "확인 문구가 대상 label을 그대로 보여주지 않는다"
+        );
+        let ambiguous = catalog.t("file_tree.permanent_delete_prompt", &[("name", "mod.rs")]);
+        assert!(
+            harness.query_by_label(&ambiguous).is_none(),
+            "파일명만 쓴 옛 문구가 남아 있다 — 같은 이름 파일을 구분할 수 없다"
+        );
+
+        // 라벨 노드는 클립 밖에서도 만들어지므로 존재가 아니라 **위치**를 본다.
+        // 확인 문구를 스크롤 영역 뒤에 두던 시절엔 700px 패널에서 문구가 y=695,
+        // [영구 삭제] 버튼이 y=728이었다 — 무엇을 지우는지도, 누를 버튼도 화면 밖이었다.
+        let prompt_rect = harness.get_by_label(&prompt).rect();
+        let button_rect = harness
+            .get_by_label(&catalog.t("file_tree.permanent_delete", &[]))
+            .rect();
+        assert!(
+            prompt_rect.bottom() <= 700.0 && button_rect.bottom() <= 700.0,
+            "영구삭제 확인이 패널(700px) 밖으로 밀렸다: 문구={prompt_rect:?} 버튼={button_rect:?}"
+        );
+        harness
+            .get_by_label(&catalog.t("file_tree.permanent_delete", &[]))
+            .click();
+        // 버튼 clicked()는 release 프레임에 뜬다 — kittest는 press/release를 다른
+        // 프레임에 재생하므로 intent가 나올 때까지 몇 프레임 돌린다.
+        let deleted = (0..8)
+            .find_map(|_| {
+                harness.step();
+                harness.state_mut().0.take_io_intent()
+            })
+            .expect("delete intent");
+        match &deleted.request {
+            FileTreeIoRequest::DeletePermanently { target } => {
+                assert_eq!(
+                    target.as_path(),
+                    base.join("src/mod.rs"),
+                    "보여준 대상과 실제 삭제 경로가 갈라졌다"
+                );
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: deleted.operation,
+            generation: deleted.generation,
+            result: Ok(()),
+        });
+        harness.step();
+
+        // 폴더 대상 — 영구 삭제는 안의 내용까지 지우므로 문구가 달라야 한다.
+        harness.state_mut().0.spawn_trash(DeleteTarget {
+            path: base.join("docs"),
+            label: "docs".to_owned(),
+            is_dir: true,
+        });
+        let folder = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("folder trash intent");
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: folder.operation,
+            generation: folder.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        harness.step();
+        assert!(
+            harness
+                .query_by_label(&catalog.t(
+                    "file_tree.permanent_delete_folder_prompt",
+                    &[("name", "docs")]
+                ))
+                .is_some(),
+            "폴더 대상인데 파일용 문구를 쓴다 — 안의 내용이 함께 사라지는 것을 말해주지 않는다"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 파일 트리만 그리는 harness (삭제 확인 계열 공용). 워크스페이스 목록은 비운다.
+    fn delete_confirm_harness<'a>(
+        tree: FileTreeUi,
+        catalog: &'a i18n::Catalog,
+    ) -> egui_kittest::Harness<'a, (FileTreeUi, bool)> {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .with_step_dt(0.05)
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, bool)| {
+                    // 폰트 설치 전 빌드 프레임은 건너뛴다(사이드바 harness 관례).
+                    if !state.1 {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_count: 0,
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    state
+                        .0
+                        .panel(ui, &std::collections::HashMap::new(), &snapshot, catalog);
+                },
+                (tree, false),
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().1 = true;
+        harness.step();
+        harness.step();
+        harness
+    }
+
+    /// 행 우클릭 → 「휴지통으로 이동」까지의 **실제 제스처**. 라벨 노드
+    /// `click_secondary()`로 컨텍스트 메뉴를 여는 것은 사이드바 harness 관례와 같다
+    /// (`kittest_사이드바_조작_전반에_widget_id_충돌이_없다`). kittest는 press/release를
+    /// 다른 프레임에 재생하므로 메뉴가 뜰 때까지, 그리고 메뉴 항목의 `clicked()`가
+    /// 뜰 때까지 프레임을 돌린다.
+    fn trash_row_via_context_menu(
+        harness: &mut egui_kittest::Harness<'_, (FileTreeUi, bool)>,
+        row_center: egui::Pos2,
+        menu_label: &str,
+    ) -> FileTreeIoIntent {
+        use egui_kittest::kittest::Queryable as _;
+        harness.event(egui::Event::PointerMoved(row_center));
+        harness.event(egui::Event::PointerButton {
+            pos: row_center,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: row_center,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.get_by_label(menu_label).click();
+        (0..8)
+            .find_map(|_| {
+                harness.step();
+                harness.state_mut().0.take_io_intent()
+            })
+            .unwrap_or_else(|| {
+                panic!("행 우클릭 「휴지통으로 이동」이 IO intent를 내지 않음: {row_center:?}")
+            })
+    }
+
+    /// 같은 파일명이 여러 행에 있을 수 있으므로(루트의 `mod.rs` vs `src/mod.rs`) 라벨만
+    /// 보고 고르지 않고 **위에서 첫 번째** 행을 집는다. 정렬이 디렉터리 우선이라
+    /// `src` 하위 행들이 루트의 파일 행보다 항상 위에 온다(`정렬은_디렉터리_우선_이름순`).
+    fn topmost_row_center(
+        harness: &egui_kittest::Harness<'_, (FileTreeUi, bool)>,
+        label: &str,
+        expected_rows: usize,
+    ) -> egui::Pos2 {
+        use egui_kittest::kittest::Queryable as _;
+        let mut rects: Vec<egui::Rect> = harness
+            .query_all_by_label(label)
+            .map(|node| node.rect())
+            .collect();
+        assert_eq!(
+            rects.len(),
+            expected_rows,
+            "'{label}' 행 수가 예상과 달라 어느 행을 우클릭하는지 확정할 수 없다"
+        );
+        rects.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        rects.first().expect("행 rect").center()
+    }
+
+    /// 회귀: 행 → 확인 문구를 잇는 **제스처 전체**가 어떤 테스트로도 잠기지 않았던 것.
+    ///
+    /// 확인 라벨을 만드는 프로덕션 지점은 우클릭 메뉴의 `MenuAction::Delete` 한 곳뿐인데,
+    /// 기존 삭제 테스트는 모두 `DeleteTarget`을 손으로 만들어 `spawn_trash`에 직접
+    /// 넣었다 — 그 한 줄을 옛 `path_file_name_display`로 되돌려 `src/mod.rs`와
+    /// `tests/mod.rs`가 다시 똑같이 `'mod.rs'`로 보이게 해도 전부 통과했다. 여기서는
+    /// 행이 확정하는 label과 is_dir이 실제 메뉴 경로를 지나 문구에 닿는지를 본다.
+    #[test]
+    fn kittest_행_우클릭_삭제는_행이_확정한_이름과_종류로_확인을_세운다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let base = temp_root("trash-gesture");
+        std::fs::create_dir_all(base.join("src/inner")).unwrap();
+        std::fs::write(base.join("src/mod.rs"), b"x").unwrap();
+        // 루트에도 같은 파일명을 둬, 파일명만 쓰는 옛 문구로는 두 행을 구분할 수 없게 한다.
+        std::fs::write(base.join("mod.rs"), b"x").unwrap();
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = delete_confirm_harness(tree, &catalog);
+
+        // `src`를 펼쳐 하위 행(`src/mod.rs`, `src/inner`)을 화면에 올린다.
+        harness.get_by_label("src").click();
+        harness.step();
+        drain_listings(&mut harness.state_mut().0);
+        for _ in 0..30 {
+            harness.step();
+            if harness.query_by_label("inner").is_some() {
+                break;
+            }
+        }
+        assert!(
+            harness.query_by_label("inner").is_some(),
+            "src 펼치기가 하위 행을 올리지 못해 제스처를 재현할 수 없다"
+        );
+
+        // 파일 행: 루트의 mod.rs가 아니라 **이 행**(src/mod.rs)을 지운다.
+        let file_row = topmost_row_center(&harness, "mod.rs", 2);
+        let file_intent = trash_row_via_context_menu(
+            &mut harness,
+            file_row,
+            &catalog.t("file_tree.move_to_trash", &[]),
+        );
+        match &file_intent.request {
+            FileTreeIoRequest::Trash { target } => {
+                assert_eq!(
+                    target.as_path(),
+                    base.join("src/mod.rs"),
+                    "메뉴가 우클릭한 행이 아닌 다른 경로를 지우려 한다"
+                );
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: file_intent.operation,
+            generation: file_intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        harness.step();
+
+        assert!(
+            harness
+                .query_by_label(&catalog.t(
+                    "file_tree.permanent_delete_prompt",
+                    &[("name", "src/mod.rs")]
+                ))
+                .is_some(),
+            "확인 문구가 루트 기준 이름을 쓰지 않는다 — 행에서 확정한 label이 메뉴 경로에서 끊겼다"
+        );
+        assert!(
+            harness
+                .query_by_label(
+                    &catalog.t("file_tree.permanent_delete_prompt", &[("name", "mod.rs")])
+                )
+                .is_none(),
+            "파일명만 쓴 옛 문구가 돌아왔다 — 루트의 mod.rs와 src/mod.rs를 구분할 수 없다"
+        );
+
+        // 폴더 행: 종류(is_dir)도 같은 길로 흘러야 "안의 내용까지" 문구가 나온다.
+        let folder_row = topmost_row_center(&harness, "inner", 1);
+        let folder_intent = trash_row_via_context_menu(
+            &mut harness,
+            folder_row,
+            &catalog.t("file_tree.move_to_trash", &[]),
+        );
+        match &folder_intent.request {
+            FileTreeIoRequest::Trash { target } => {
+                assert_eq!(target.as_path(), base.join("src/inner"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: folder_intent.operation,
+            generation: folder_intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        harness.step();
+
+        assert!(
+            harness
+                .query_by_label(&catalog.t(
+                    "file_tree.permanent_delete_folder_prompt",
+                    &[("name", "src/inner")]
+                ))
+                .is_some(),
+            "폴더 행인데 폴더용 문구가 뜨지 않는다 — 안의 내용이 함께 사라지는 것을 말해주지 않는다"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 회귀: [영구 삭제]가 `queue_io`보다 **먼저** 확인을 닫아, capacity-1 큐가 거절하면
+    /// 아무것도 지우지 않은 채 확인만 사라지던 것. 사용자에게는 "지워진 건가?"만 남고
+    /// 다시 누를 화면이 없었다. 확인은 삭제를 접수했을 때만 소비해야 한다.
+    #[test]
+    fn kittest_영구삭제_버튼은_큐가_거절하면_확인을_남긴다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let base = temp_root("permanent-delete-busy");
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/mod.rs"), b"x").unwrap();
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        let mut harness = delete_confirm_harness(tree, &catalog);
+
+        let target = DeleteTarget {
+            path: base.join("src/mod.rs"),
+            label: "src/mod.rs".to_owned(),
+            is_dir: false,
+        };
+        harness.state_mut().0.spawn_trash(target.clone());
+        let intent = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("trash intent");
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        // 다른 파일 조작(⌘C 복사)이 capacity-1 큐를 차지한다 — intent를 꺼내지 않아
+        // 클릭하는 동안 계속 점유 상태다.
+        harness
+            .state_mut()
+            .0
+            .copy_files_to_clipboard(&[base.join("src/mod.rs")]);
+        harness.step();
+
+        harness
+            .get_by_label(&catalog.t("file_tree.permanent_delete", &[]))
+            .click();
+        for _ in 0..8 {
+            harness.step();
+        }
+
+        assert_eq!(
+            harness.state().0.error.as_deref(),
+            Some(file_tree_io_error_message(FileTreeIoErrorCode::Busy)),
+            "거절 사유가 Busy가 아니라 다른 갈래를 짚었다"
+        );
+        assert_eq!(
+            harness.state().0.confirm_delete,
+            Some(target),
+            "큐가 거절해 아무것도 지우지 않았는데 확인이 사라졌다 — 다시 누를 화면이 없다"
+        );
+        let queued = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("점유 중이던 복사 intent");
+        assert!(
+            matches!(queued.request, FileTreeIoRequest::CopyFileUrls { .. }),
+            "거절됐어야 할 영구 삭제가 큐에 들어갔다: {:?}",
+            queued.request
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 회귀: 영구삭제 확인이 트리 갱신으로는 **한 번도** 무효화되지 않던 것(경로 TOCTOU).
+    ///
+    /// 확인은 사용자가 누를 때까지 남는다. 그 사이 브랜치 전환·빌드·외부 편집이 그
+    /// 경로를 지우고 **같은 자리에 다른 것**을 만들면, 문구는 옛 이름을 말하는데 삭제는
+    /// 지금 그 자리에 있는 것을 지웠다. 종류까지 바뀌면 파일용 문구를 띄운 채
+    /// `remove_dir_all`이 폴더를 통째로 지운다. 반대로 폴더를 접었을 뿐인데 확인이
+    /// 닫히면 사용자가 놀라므로, "안 보인다"와 "없어졌다"를 갈라 놓는 것까지 함께 고정한다.
+    #[test]
+    fn 영구삭제_확인은_나열에서_사라지면_닫히고_접기로는_닫히지_않는다() {
+        let base = temp_root("confirm-toctou");
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/gone.rs"), b"x").unwrap();
+        std::fs::write(base.join("src/flip.rs"), b"x").unwrap();
+        std::fs::write(base.join("src/keep.rs"), b"x").unwrap();
+
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+        tree.toggle_dir(&base.join("src"));
+        drain_listings(&mut tree);
+
+        // 확인을 세우는 유일한 길은 휴지통 이동 실패다.
+        let arm = |tree: &mut FileTreeUi, name: &str, is_dir: bool| {
+            tree.spawn_trash(DeleteTarget {
+                path: base.join("src").join(name),
+                label: format!("src/{name}"),
+                is_dir,
+            });
+            let intent = tree.take_io_intent().expect("trash intent");
+            tree.complete_io(FileTreeIoCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result: Err(FileTreeIoErrorCode::TrashUnavailable),
+            });
+            assert!(
+                tree.confirm_delete.is_some(),
+                "확인이 서지 않아 검증 전제가 깨졌다"
+            );
+        };
+
+        // ① 대상이 정말 사라졌다 — 재나열이 확인을 닫는다.
+        arm(&mut tree, "gone.rs", false);
+        std::fs::remove_file(base.join("src/gone.rs")).unwrap();
+        tree.reload_dir(&base.join("src"));
+        drain_listings(&mut tree);
+        assert_eq!(
+            tree.confirm_delete, None,
+            "대상이 나열에서 사라졌는데 확인이 남아 있다 — 지금 그 자리에 있는 것이 지워진다"
+        );
+
+        // ② 같은 자리에 **다른 종류**가 들어왔다 — 파일용 문구가 폴더를 지우면 안 된다.
+        arm(&mut tree, "flip.rs", false);
+        std::fs::remove_file(base.join("src/flip.rs")).unwrap();
+        std::fs::create_dir(base.join("src/flip.rs")).unwrap();
+        tree.reload_dir(&base.join("src"));
+        drain_listings(&mut tree);
+        assert_eq!(
+            tree.confirm_delete, None,
+            "파일 자리에 폴더가 들어왔는데 파일용 확인이 그대로다 — 경고 없이 폴더가 통째로 지워진다"
+        );
+
+        // ③ 접기·다시 펼치기는 닫지 않는다. `flat`에서 사라지는 것은 "안 보인다"일 뿐이다.
+        arm(&mut tree, "keep.rs", false);
+        tree.toggle_dir(&base.join("src"));
+        assert!(
+            tree.flat
+                .iter()
+                .all(|row| row.path != base.join("src/keep.rs")),
+            "접기로 대상 행이 사라지지 않아 ③의 전제가 깨졌다"
+        );
+        assert!(
+            tree.confirm_delete.is_some(),
+            "폴더를 접었을 뿐인데 확인이 닫혔다 — 안 보이는 것과 없어진 것은 다르다"
+        );
+        tree.toggle_dir(&base.join("src"));
+        drain_listings(&mut tree);
+        assert!(
+            tree.confirm_delete.is_some(),
+            "대상이 그대로 있는데 재나열이 확인을 닫았다"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 회귀: IO 오류 라벨과 진행 스피너가 패널 밖으로 밀려 보이지 않던 것.
+    ///
+    /// 목록 `ScrollArea`는 `auto_shrink([false,false])`라 남은 높이를 전부 가져간다 —
+    /// 그 **뒤에** 그린 상태 표시는 패널 바닥 밖으로 나간다. 420×700 패널에서 실측하면
+    /// 오류 라벨이 y=717.5..732.5, 진행 문구가 y=696.5..711.5였다 — 둘 다 바닥(700)을
+    /// 넘어 잘렸다. 파일 조작이 실패해도 오래 걸려도 화면에는 아무 표시가 없었다
+    /// (§조용한 실패 금지).
+    ///
+    /// 오류·영구삭제 확인·진행 표시는 동시에 뜰 수 있으므로 셋이 헤더 아래에
+    /// 겹치지 않고 순서대로 쌓이는 것까지 함께 고정한다.
+    #[test]
+    fn kittest_오류와_진행표시는_패널_안에_쌓인다() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let base = temp_root("io-status-visible");
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/mod.rs"), b"x").unwrap();
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, bool)| {
+                    // 폰트 설치 전 빌드 프레임은 건너뛴다(사이드바 harness 관례).
+                    if !state.1 {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_count: 0,
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    state
+                        .0
+                        .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog);
+                },
+                (tree, false),
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().1 = true;
+        harness.step();
+        harness.step();
+
+        // 휴지통 실패 → 오류 + 영구삭제 확인이 동시에 선다.
+        harness.state_mut().0.spawn_trash(DeleteTarget {
+            path: base.join("src/mod.rs"),
+            label: "src/mod.rs".to_owned(),
+            is_dir: false,
+        });
+        let intent = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("trash intent");
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+        });
+        // 그 위에 새 파일 조작을 얹어 진행 표시까지 셋이 동시에 뜨게 한다.
+        harness
+            .state_mut()
+            .0
+            .copy_files_to_clipboard(&[base.join("src/mod.rs")]);
+        assert!(
+            harness.state().0.in_flight > 0,
+            "진행 중 상태를 만들지 못해 스피너 배치를 검증할 수 없다"
+        );
+        harness.step();
+
+        // 오류 문구는 **실제로 보고된 것**을 그대로 쓴다. 테스트가 코드를 재현해
+        // 만들면 라벨과 상태가 갈라져도 통과한다.
+        let reported = harness
+            .state()
+            .0
+            .error
+            .clone()
+            .expect("휴지통 실패가 오류 상태로 남지 않았다");
+        let running = catalog.t("file_tree.file_operation_running", &[]);
+        let prompt = catalog.t(
+            "file_tree.permanent_delete_prompt",
+            &[("name", "src/mod.rs")],
+        );
+
+        // 라벨 노드는 클립 밖에서도 만들어지므로 존재가 아니라 **위치**를 본다.
+        let error_rect = harness.get_by_label(&reported).rect();
+        let running_rect = harness.get_by_label(&running).rect();
+        let prompt_rect = harness.get_by_label(&prompt).rect();
+        assert!(
+            error_rect.bottom() <= 700.0,
+            "오류 라벨이 패널(700px) 밖으로 밀렸다: {error_rect:?}"
+        );
+        assert!(
+            running_rect.bottom() <= 700.0,
+            "진행 표시가 패널(700px) 밖으로 밀렸다: {running_rect:?}"
+        );
+
+        // 셋이 겹치지 않고 오류 → 영구삭제 확인 → 진행 표시 순으로 쌓인다.
+        assert!(
+            error_rect.bottom() <= prompt_rect.top(),
+            "오류와 영구삭제 확인이 겹친다: 오류={error_rect:?} 문구={prompt_rect:?}"
+        );
+        assert!(
+            prompt_rect.bottom() <= running_rect.top(),
+            "영구삭제 확인과 진행 표시가 겹친다: 문구={prompt_rect:?} 진행={running_rect:?}"
+        );
+
         std::fs::remove_dir_all(&base).unwrap();
     }
 

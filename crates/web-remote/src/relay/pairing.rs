@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use hmac::{Hmac, Mac as _};
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use super::contract::{ConnectionId, PairingId};
@@ -9,6 +11,8 @@ pub const PAIRING_TTL_SECS: u64 = 5 * 60;
 pub const MAX_SECRET_ATTEMPTS: u8 = 5;
 pub const PAIRING_SECRET_BYTES: usize = 32;
 pub const MAX_PAIRING_RECORDS: usize = 256;
+/// HMAC-SHA256 소유 증명 하나의 크기.
+pub const PAIRING_PROOF_BYTES: usize = 32;
 const MAX_PAIRING_ISSUE_ATTEMPTS: usize = 8;
 
 pub struct PairingSecret([u8; PAIRING_SECRET_BYTES]);
@@ -18,6 +22,12 @@ impl PairingSecret {
         let secret = Self(*bytes);
         erase_secret_bytes(bytes);
         secret
+    }
+
+    /// 기기에 전달할 원바이트. **기기 링크/QR 생성기만** 부른다 — 화면 텍스트·로그·`Debug`에는
+    /// 절대 실리지 않는다(아래 `Debug` 구현이 가린다).
+    pub const fn expose(&self) -> &[u8; PAIRING_SECRET_BYTES] {
+        &self.0
     }
 
     pub fn generate() -> Result<Self, getrandom::Error> {
@@ -99,6 +109,30 @@ impl PairingBinding {
     pub const fn transcript_hash(&self) -> [u8; 32] {
         self.transcript_hash
     }
+}
+
+/// 이 페어링에 대한 소유 증명. 기기는 비밀 원바이트 대신 이 값을 보낸다.
+///
+/// Relay는 비밀을 절대 보지 못하고, 증명은 **이 연결·이 transcript·이 기기 신원**에만
+/// 유효하다 — 다른 연결로 되쏘면 binding이 달라져 HMAC이 어긋난다. 비밀을 손에 쥔 쪽(기기,
+/// 그리고 QR/링크를 만든 Mac)만 계산할 수 있다.
+pub fn pairing_proof(
+    secret: &PairingSecret,
+    binding: &PairingBinding,
+) -> [u8; PAIRING_PROOF_BYTES] {
+    pairing_proof_from_secret_bytes(&secret.0, binding)
+}
+
+fn pairing_proof_from_secret_bytes(
+    secret: &[u8; PAIRING_SECRET_BYTES],
+    binding: &PairingBinding,
+) -> [u8; PAIRING_PROOF_BYTES] {
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(&binding.transcript_hash);
+    mac.update(binding.connection_id.as_bytes());
+    mac.update(&binding.peer_identity_fingerprint);
+    mac.finalize().into_bytes().into()
 }
 
 pub struct PairingApproval {
@@ -203,13 +237,38 @@ impl PendingPairing {
         unix_secs: u64,
         binding: PairingBinding,
     ) -> Result<(), PairingError> {
+        self.settle(unix_secs, binding, |stored| {
+            constant_time_secret_eq(stored, &candidate.0)
+        })
+    }
+
+    /// 비밀 원바이트 대신 HMAC 소유 증명을 받는 경로. 판정·계수·종료 상태는
+    /// [`Self::verify_secret_for_binding`]와 **정확히 같다** — 한쪽만 세면 상한이 우회된다.
+    fn verify_proof_for_binding(
+        &mut self,
+        proof: &[u8; PAIRING_PROOF_BYTES],
+        unix_secs: u64,
+        binding: PairingBinding,
+    ) -> Result<(), PairingError> {
+        self.settle(unix_secs, binding, |stored| {
+            constant_time_proof_eq(&pairing_proof_from_secret_bytes(stored, &binding), proof)
+        })
+    }
+
+    /// 두 제시 경로가 공유하는 판정. 저장된 비밀은 이 함수 밖으로 나가지 않는다.
+    fn settle(
+        &mut self,
+        unix_secs: u64,
+        binding: PairingBinding,
+        matches: impl FnOnce(&[u8; PAIRING_SECRET_BYTES]) -> bool,
+    ) -> Result<(), PairingError> {
         self.require_active(unix_secs)?;
 
         if self.state == PairingState::Verified {
             return Err(PairingError::AlreadyVerified);
         }
 
-        if constant_time_secret_eq(&self.secret.0, &candidate.0) {
+        if matches(&self.secret.0) {
             self.state = PairingState::Verified;
             self.verified_binding = Some(binding);
             self.secret.clear();
@@ -403,6 +462,19 @@ impl PairingRegistry {
         unix_secs: u64,
         binding: PairingBinding,
     ) -> Result<(), PairingRegistryError> {
+        self.verify_with(unix_secs, id, |pairing| {
+            pairing.verify_secret_for_binding(candidate, unix_secs, binding)
+        })
+    }
+
+    /// 두 제시 경로가 공유하는 레지스트리 배선: 시계 역행 → tombstone → 대상 조회 →
+    /// 판정 → 종료 상태 승격. 한쪽만 이 순서를 어기면 만료·소진이 새는 경로가 생긴다.
+    fn verify_with(
+        &mut self,
+        unix_secs: u64,
+        id: PairingId,
+        verify: impl FnOnce(&mut PendingPairing) -> Result<(), PairingError>,
+    ) -> Result<(), PairingRegistryError> {
         if self.prepare(unix_secs) {
             return Err(self.expire_target_after_clock_rollback(id, unix_secs));
         }
@@ -414,10 +486,7 @@ impl PairingRegistry {
                 .pending
                 .get_mut(&id)
                 .ok_or(PairingRegistryError::NotFound)?;
-            (
-                pairing.deadline(),
-                pairing.verify_secret_for_binding(candidate, unix_secs, binding),
-            )
+            (pairing.deadline(), verify(pairing))
         };
         if let Err(error) = result {
             if is_terminal(error) {
@@ -426,6 +495,22 @@ impl PairingRegistry {
             return Err(PairingRegistryError::Pairing(error));
         }
         Ok(())
+    }
+
+    /// 기기가 제시한 HMAC 소유 증명을 저장된 비밀로 다시 계산해 상수 시간으로 대조한다.
+    ///
+    /// Relay는 비밀 원바이트를 절대 보지 못한다. 시도 계수·소진·만료·tombstone 처리는
+    /// [`Self::verify_secret_for_binding`]와 같은 경로를 지난다.
+    pub fn verify_proof_for_binding(
+        &mut self,
+        id: PairingId,
+        proof: &[u8; PAIRING_PROOF_BYTES],
+        unix_secs: u64,
+        binding: PairingBinding,
+    ) -> Result<(), PairingRegistryError> {
+        self.verify_with(unix_secs, id, |pairing| {
+            pairing.verify_proof_for_binding(proof, unix_secs, binding)
+        })
     }
 
     #[cfg(test)]
@@ -574,6 +659,13 @@ fn constant_time_secret_eq(
     bool::from(expected.ct_eq(candidate))
 }
 
+fn constant_time_proof_eq(
+    expected: &[u8; PAIRING_PROOF_BYTES],
+    candidate: &[u8; PAIRING_PROOF_BYTES],
+) -> bool {
+    bool::from(expected.ct_eq(candidate))
+}
+
 fn erase_secret_bytes(bytes: &mut [u8]) {
     for byte in bytes {
         // SAFETY: `byte` is exclusively borrowed from an owned secret buffer.
@@ -609,6 +701,10 @@ mod tests {
         let mut bytes = [0u8; RELAY_ID_BYTES];
         bytes[..2].copy_from_slice(&value.to_be_bytes());
         PairingId::from_bytes(bytes)
+    }
+
+    fn pairing_connection(byte: u8) -> ConnectionId {
+        ConnectionId::from_bytes([byte; RELAY_ID_BYTES])
     }
 
     fn consume_pending(
@@ -1055,6 +1151,142 @@ mod tests {
             "the helper must use a constant-time equality primitive"
         );
         assert!(!production.contains("SystemTime::now"));
+    }
+
+    /// 소유 증명은 **이 binding에만** 유효하다. 비밀 원바이트는 와이어에 오르지 않는다.
+    #[test]
+    fn a_pairing_proof_verifies_only_against_the_binding_it_was_computed_for() {
+        let id = pairing_id(20);
+        let mut registry = PairingRegistry::new();
+        registry
+            .create_for_test(id, secret(GOOD_SECRET_BYTE), ISSUED_AT)
+            .unwrap();
+        let binding = PairingBinding::new(CONNECTION, PEER_IDENTITY_FINGERPRINT, TRANSCRIPT_HASH);
+        let proof = pairing_proof(&secret(GOOD_SECRET_BYTE), &binding);
+
+        // 다른 연결로 되쏘면 binding이 달라져 증명이 어긋난다.
+        let other_connection = PairingBinding::new(
+            pairing_connection(0x99),
+            PEER_IDENTITY_FINGERPRINT,
+            TRANSCRIPT_HASH,
+        );
+        assert_eq!(
+            registry.verify_proof_for_binding(id, &proof, ISSUED_AT, other_connection),
+            Err(PairingRegistryError::Pairing(PairingError::InvalidSecret))
+        );
+        // 다른 기기 신원, 다른 transcript도 마찬가지다.
+        let other_peer = PairingBinding::new(CONNECTION, [0x99; 32], TRANSCRIPT_HASH);
+        assert_eq!(
+            registry.verify_proof_for_binding(id, &proof, ISSUED_AT, other_peer),
+            Err(PairingRegistryError::Pairing(PairingError::InvalidSecret))
+        );
+        let other_transcript =
+            PairingBinding::new(CONNECTION, PEER_IDENTITY_FINGERPRINT, [0x99; 32]);
+        assert_eq!(
+            registry.verify_proof_for_binding(id, &proof, ISSUED_AT, other_transcript),
+            Err(PairingRegistryError::Pairing(PairingError::InvalidSecret))
+        );
+
+        assert_eq!(
+            registry.verify_proof_for_binding(id, &proof, ISSUED_AT, binding),
+            Ok(())
+        );
+        assert_eq!(registry.consume(id, ISSUED_AT).unwrap().binding(), binding);
+    }
+
+    /// 틀린 증명도 비밀과 **같은 계수**로 센다. 한쪽만 세면 상한이 우회된다.
+    #[test]
+    fn a_wrong_pairing_proof_consumes_attempts_exactly_like_a_wrong_secret() {
+        let id = pairing_id(21);
+        let mut registry = PairingRegistry::new();
+        registry
+            .create_for_test(id, secret(GOOD_SECRET_BYTE), ISSUED_AT)
+            .unwrap();
+        let binding = PairingBinding::new(CONNECTION, PEER_IDENTITY_FINGERPRINT, TRANSCRIPT_HASH);
+        let wrong = pairing_proof(&secret(b'X'), &binding);
+
+        for _ in 1..MAX_SECRET_ATTEMPTS {
+            assert_eq!(
+                registry.verify_proof_for_binding(id, &wrong, ISSUED_AT, binding),
+                Err(PairingRegistryError::Pairing(PairingError::InvalidSecret))
+            );
+        }
+        assert_eq!(
+            registry.verify_proof_for_binding(id, &wrong, ISSUED_AT, binding),
+            Err(PairingRegistryError::Pairing(
+                PairingError::AttemptsExhausted
+            ))
+        );
+        // 소진된 뒤에는 올바른 증명도 통과하지 못한다.
+        let good = pairing_proof(&secret(GOOD_SECRET_BYTE), &binding);
+        assert_eq!(
+            registry.verify_proof_for_binding(id, &good, ISSUED_AT, binding),
+            Err(PairingRegistryError::Pairing(
+                PairingError::AttemptsExhausted
+            ))
+        );
+    }
+
+    /// 만료·미등록·이미 검증됨 같은 종료 판정도 비밀 경로와 같은 답을 낸다.
+    #[test]
+    fn pairing_proof_shares_the_terminal_decisions_of_the_secret_path() {
+        let binding = PairingBinding::new(CONNECTION, PEER_IDENTITY_FINGERPRINT, TRANSCRIPT_HASH);
+        let proof = pairing_proof(&secret(GOOD_SECRET_BYTE), &binding);
+        let id = pairing_id(22);
+
+        let mut registry = PairingRegistry::new();
+        assert_eq!(
+            registry.verify_proof_for_binding(id, &proof, ISSUED_AT, binding),
+            Err(PairingRegistryError::NotFound)
+        );
+
+        // 마감이 지난 티켓은 두 경로가 **같은 답**을 낸다. 비밀 경로와 나란히 확인한다 —
+        // 한쪽만 만료를 흘리면 소유 증명이 우회로가 된다.
+        let secret_path = pairing_id(24);
+        registry
+            .create_for_test(secret_path, secret(GOOD_SECRET_BYTE), ISSUED_AT)
+            .unwrap();
+        registry
+            .create_for_test(id, secret(GOOD_SECRET_BYTE), ISSUED_AT)
+            .unwrap();
+        let expired_at = ISSUED_AT + PAIRING_TTL_SECS;
+        assert_eq!(
+            registry.verify_proof_for_binding(id, &proof, expired_at, binding),
+            registry.verify_secret_for_binding(
+                secret_path,
+                &secret(GOOD_SECRET_BYTE),
+                expired_at,
+                binding
+            )
+        );
+
+        let fresh = pairing_id(23);
+        registry
+            .create_for_test(
+                fresh,
+                secret(GOOD_SECRET_BYTE),
+                ISSUED_AT + PAIRING_TTL_SECS,
+            )
+            .unwrap();
+        let proof = pairing_proof(&secret(GOOD_SECRET_BYTE), &binding);
+        assert_eq!(
+            registry.verify_proof_for_binding(fresh, &proof, ISSUED_AT + PAIRING_TTL_SECS, binding),
+            Ok(())
+        );
+        assert_eq!(
+            registry.verify_proof_for_binding(fresh, &proof, ISSUED_AT + PAIRING_TTL_SECS, binding),
+            Err(PairingRegistryError::Pairing(PairingError::AlreadyVerified))
+        );
+    }
+
+    /// 증명은 결정적이고, 서로 다른 비밀은 서로 다른 증명을 낸다.
+    #[test]
+    fn pairing_proof_is_deterministic_and_keyed_by_the_secret() {
+        let binding = PairingBinding::new(CONNECTION, PEER_IDENTITY_FINGERPRINT, TRANSCRIPT_HASH);
+        let first = pairing_proof(&secret(GOOD_SECRET_BYTE), &binding);
+        assert_eq!(first, pairing_proof(&secret(GOOD_SECRET_BYTE), &binding));
+        assert_ne!(first, pairing_proof(&secret(b'X'), &binding));
+        assert_eq!(first.len(), PAIRING_PROOF_BYTES);
     }
 
     #[test]

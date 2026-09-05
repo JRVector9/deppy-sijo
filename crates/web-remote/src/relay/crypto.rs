@@ -7,6 +7,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::contract::ConnectionId;
 use super::pairing::{PairingApproval, PairingBinding};
+use super::repository::RelayDeviceRecord;
 
 /// First independently authenticated Relay wire contract.
 pub const RELAY_PROTOCOL_VERSION: u32 = 1;
@@ -94,8 +95,10 @@ impl RelayIdentity {
         Self::take_from_private_scalar(&mut private_scalar)
     }
 
+    /// Test-only deterministic identity. Production callers must go through the keychain-backed
+    /// `get_or_create_relay_identity`, which never lets a caller choose the scalar.
     #[cfg(test)]
-    fn from_private_scalar(mut private_scalar: [u8; 32]) -> anyhow::Result<Self> {
+    pub(crate) fn from_private_scalar(mut private_scalar: [u8; 32]) -> anyhow::Result<Self> {
         Self::take_from_private_scalar(&mut private_scalar)
     }
 
@@ -124,6 +127,33 @@ pub struct RelayOffer {
 }
 
 impl RelayOffer {
+    /// 와이어에서 받은 서명 없는 제시. 신원키·임시키는 곡선 위의 서로 다른 점이어야 한다 —
+    /// 서명된 hello와 같은 검증을 받는다.
+    pub fn from_webcrypto_parts(
+        version: u32,
+        role: RelayRole,
+        connection_id: ConnectionId,
+        identity_public_sec1: &[u8],
+        ephemeral_public_sec1: &[u8],
+    ) -> anyhow::Result<Self> {
+        let identity_public_sec1 =
+            validated_public_sec1(identity_public_sec1, "relay offer identity key")?;
+        let ephemeral_public_sec1 =
+            validated_public_sec1(ephemeral_public_sec1, "relay offer ephemeral key")?;
+        ensure_distinct_handshake_keys(
+            &identity_public_sec1,
+            &ephemeral_public_sec1,
+            "relay offer",
+        )?;
+        Ok(Self {
+            version,
+            role,
+            connection_id,
+            identity_public_sec1,
+            ephemeral_public_sec1,
+        })
+    }
+
     pub fn version(&self) -> u32 {
         self.version
     }
@@ -152,6 +182,12 @@ pub struct RelayHello {
 }
 
 impl RelayHello {
+    /// The offer half of this hello. The peer's signature is over the canonical transcript of
+    /// both offers, so the local side needs this value to sign its own hello.
+    pub fn offer(&self) -> &RelayOffer {
+        &self.offer
+    }
+
     pub fn from_webcrypto_parts(
         version: u32,
         role: RelayRole,
@@ -298,8 +334,10 @@ impl PendingHandshake {
         })
     }
 
+    /// Test-only deterministic ephemeral. Production callers get a fresh OS-random scalar; a
+    /// caller-chosen ephemeral would destroy forward secrecy, so this never leaves `cfg(test)`.
     #[cfg(test)]
-    fn begin_with_ephemeral_for_test(
+    pub(crate) fn begin_with_ephemeral_for_test(
         identity: RelayIdentity,
         expected_peer_identity_sec1: Vec<u8>,
         role: RelayRole,
@@ -449,8 +487,35 @@ impl AuthenticatedHandshake {
         Ok(self.activate())
     }
 
+    /// Activate the channel for a device that is already paired, without a pairing ticket.
+    ///
+    /// This is the revocation boundary. A stored row is never proof on its own: the record's
+    /// identity key must hash to the fingerprint this handshake authenticated, and the record
+    /// must still be admitted at `now` — not revoked, inside its authorization window. Both are
+    /// re-checked here, on every reconnection, because a device that was admissible yesterday
+    /// may have been revoked since.
+    pub fn confirm_admitted(
+        self,
+        device: &RelayDeviceRecord,
+        now: u64,
+    ) -> anyhow::Result<SecureChannel> {
+        anyhow::ensure!(
+            self.role == RelayRole::Desktop,
+            "only the desktop Relay role admits a stored device"
+        );
+        anyhow::ensure!(
+            sha256(device.identity_public_sec1()) == self.peer_identity_fingerprint,
+            "stored Relay device identity does not match the authenticated peer"
+        );
+        anyhow::ensure!(
+            device.is_admitted(device.identity_public_sec1(), now),
+            "stored Relay device is revoked or outside its authorization window"
+        );
+        Ok(self.activate())
+    }
+
     #[cfg(test)]
-    fn confirm_device_for_test(self) -> SecureChannel {
+    pub(crate) fn confirm_device_for_test(self) -> SecureChannel {
         assert_eq!(self.role, RelayRole::Device);
         self.activate()
     }
@@ -560,6 +625,13 @@ pub struct SecureChannel {
 }
 
 impl SecureChannel {
+    /// The connection this channel was derived for. The session gate reads it from the channel
+    /// itself rather than accepting it as a separate argument, so a channel can never be hung on
+    /// a connection id other than the one its handshake was bound to.
+    pub const fn connection_id(&self) -> ConnectionId {
+        self.connection_id
+    }
+
     pub fn seal(&mut self, plaintext: &[u8]) -> anyhow::Result<EncryptedEnvelope> {
         anyhow::ensure!(!self.closed, "relay channel is closed");
         anyhow::ensure!(
@@ -1337,6 +1409,88 @@ mod tests {
             .expect("production crypto source");
         assert!(!production.contains("pub fn confirm(mut self) -> SecureChannel"));
         assert!(production.contains("pub fn confirm(self, approval: PairingApproval)"));
+    }
+
+    /// 이미 페어링된 기기는 티켓 없이 붙는다. 그 대신 **매 재접속마다** 저장된 레코드가
+    /// 이 핸드셰이크의 상대와 같은 신원인지, 그리고 아직 인가돼 있는지를 다시 확인한다.
+    #[test]
+    fn admitted_device_channel은_저장된_신원과_취소_상태를_매번_다시_확인한다() {
+        use crate::relay::contract::{DeviceId, RelayPermissions};
+        use crate::relay::repository::RelayDeviceRecord;
+
+        const NOW: u64 = 1_800_000_000;
+
+        fn record(identity_public_sec1: [u8; 65], revoked_at: Option<u64>) -> RelayDeviceRecord {
+            RelayDeviceRecord::new(
+                DeviceId::from_bytes([0x51; 16]),
+                identity_public_sec1,
+                "phone".to_owned(),
+                RelayPermissions::default(),
+                NOW - 10,
+                NOW + 1_000,
+                None,
+                revoked_at,
+            )
+            .unwrap()
+        }
+
+        let device_public = *RelayIdentity::from_private_scalar(DEVICE_IDENTITY)
+            .unwrap()
+            .public_key_sec1();
+        let rogue_public = *RelayIdentity::from_private_scalar(ROGUE_IDENTITY)
+            .unwrap()
+            .public_key_sec1();
+
+        // 다른 기기의 공개키가 든 레코드로는 열리지 않는다 — 지문이 어긋난다.
+        let pair = signed_pair();
+        let desktop = pair.desktop.finish(pair.device_hello).unwrap();
+        assert!(
+            desktop
+                .confirm_admitted(&record(rogue_public, None), NOW)
+                .is_err()
+        );
+
+        // 취소된 기기는 저장된 행이 남아 있어도 채널을 얻지 못한다.
+        let pair = signed_pair();
+        let desktop = pair.desktop.finish(pair.device_hello).unwrap();
+        assert!(
+            desktop
+                .confirm_admitted(&record(device_public, Some(NOW)), NOW)
+                .is_err()
+        );
+
+        // 인가 창을 벗어난 시각도 마찬가지다.
+        let pair = signed_pair();
+        let desktop = pair.desktop.finish(pair.device_hello).unwrap();
+        assert!(
+            desktop
+                .confirm_admitted(&record(device_public, None), NOW + 1_000)
+                .is_err()
+        );
+
+        // 기기 역할은 이 경로를 쓸 수 없다.
+        let pair = signed_pair();
+        let device = pair.device.finish(pair.desktop_hello).unwrap();
+        assert!(
+            device
+                .confirm_admitted(&record(device_public, None), NOW)
+                .is_err()
+        );
+
+        // 신원이 맞고 아직 인가돼 있으면 티켓 없이 열린다.
+        let pair = signed_pair();
+        let desktop = pair.desktop.finish(pair.device_hello).unwrap();
+        let mut desktop = desktop
+            .confirm_admitted(&record(device_public, None), NOW)
+            .unwrap();
+        let mut device = pair
+            .device
+            .finish(pair.desktop_hello)
+            .unwrap()
+            .confirm_device_for_test();
+        let sealed = device.seal(b"already paired").unwrap();
+        assert_eq!(desktop.open(&sealed).unwrap(), b"already paired");
+        assert_eq!(desktop.connection_id(), CONNECTION_A);
     }
 
     #[test]

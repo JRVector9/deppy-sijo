@@ -3441,6 +3441,9 @@ impl std::fmt::Debug for RelayDeviceRow {
 pub enum RelayPendingInsert {
     Stored,
     LimitReached,
+    /// 다른 주체의 미완 의식과 id 또는 키가 겹친다. 같은 기기의 재시도는 대체되므로
+    /// 여기 오지 않는다.
+    Conflict,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -9915,7 +9918,19 @@ impl Db {
             [trusted_now],
         )
         .context("relay pending device expiry cleanup failed")?;
-        let duplicate: bool = tx.query_row(
+        // 같은 기기(device_id **그리고** 공개키가 모두 같음)가 미완의 의식을 버리고 다시
+        // 페어링하는 경우는 새 검증 승인이 옛것을 대체한다 — 5분을 기다리게 할 이유가 없다.
+        // 그 밖의 부분 겹침(id만 같거나 키만 같음)은 다른 주체가 끼어든 것이므로 결정적으로
+        // 거절한다. 불투명 오류가 아니라 호출자가 분기할 수 있는 값이다.
+        let superseded = tx.execute(
+            "DELETE FROM relay_pending_devices
+             WHERE device_id = ?1 AND identity_public_sec1 = ?2",
+            rusqlite::params![
+                pending.device_id.as_slice(),
+                pending.identity_public_sec1.as_slice(),
+            ],
+        )?;
+        let conflict: bool = tx.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM relay_pending_devices
                  WHERE pairing_id = ?1 OR device_id = ?2 OR identity_public_sec1 = ?3
@@ -9927,7 +9942,11 @@ impl Db {
             ],
             |row| row.get(0),
         )?;
-        anyhow::ensure!(!duplicate, "relay pending device already exists");
+        if conflict {
+            // 대체로 지운 행이 있었더라도 롤백된다 — 트랜잭션이 커밋되지 않는다.
+            let _ = superseded;
+            return Ok(RelayPendingInsert::Conflict);
+        }
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM relay_pending_devices", [], |row| {
             row.get(0)
         })?;
@@ -10012,13 +10031,45 @@ impl Db {
             [pending.device_id.as_slice()],
             |row| row.get(0),
         )?;
+        // 같은 공개키를 가진 옛 행(다른 device_id)은 같은 폰의 이전 페어링이다. 취소된 뒤
+        // 새 device_id로 다시 페어링하는 정상 경로이므로 옛 행을 지우고 새로 발행한다 —
+        // 그러지 않으면 identity UNIQUE에 걸려 불투명하게 실패하고 pending 행만 남는다.
+        tx.execute(
+            "DELETE FROM relay_devices
+             WHERE identity_public_sec1 = ?1 AND device_id != ?2",
+            rusqlite::params![
+                pending.identity_public_sec1.as_slice(),
+                pending.device_id.as_slice(),
+            ],
+        )?;
         if !existing {
-            let count: i64 =
-                tx.query_row("SELECT COUNT(*) FROM relay_devices", [], |row| row.get(0))?;
-            if usize::try_from(count).context("relay device count invalid")?
+            // 상한은 **살아 있는** 기기 수다. 취소된 행까지 세면 64대를 페어링하고 전부
+            // 취소한 뒤 65번째부터 영영 막힌다. 표 자체의 크기도 상한을 지키도록, 자리가
+            // 없으면 가장 오래전에 취소된 행부터 필요한 만큼만 지운다.
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM relay_devices WHERE revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            if usize::try_from(active).context("relay device count invalid")?
                 >= RELAY_DEVICE_ROWS_MAX
             {
                 return Ok(RelayDeviceApproval::DeviceLimitReached);
+            }
+            let total: i64 =
+                tx.query_row("SELECT COUNT(*) FROM relay_devices", [], |row| row.get(0))?;
+            let total = usize::try_from(total).context("relay device count invalid")?;
+            if total >= RELAY_DEVICE_ROWS_MAX {
+                let reclaim = i64::try_from(total - RELAY_DEVICE_ROWS_MAX + 1)?;
+                tx.execute(
+                    "DELETE FROM relay_devices WHERE device_id IN (
+                         SELECT device_id FROM relay_devices
+                         WHERE revoked_at IS NOT NULL
+                         ORDER BY revoked_at ASC, device_id ASC
+                         LIMIT ?1
+                     )",
+                    [reclaim],
+                )?;
             }
         }
 
@@ -11920,11 +11971,17 @@ mod tests {
             db.relay_pending_device_count().unwrap(),
             RELAY_PENDING_DEVICE_ROWS_MAX
         );
-        // 중복(pairing/device/공개키)은 상한과 무관하게 항상 거절이며 조용한 교체가 아니다.
-        let duplicate = relay_filler_row(0);
-        assert!(
-            db.insert_relay_pending_device(&duplicate, duplicate.issued_at)
-                .is_err()
+        // 같은 기기(device_id·공개키 동일)의 재시도는 옛 pending 행을 대체한다 — 행 수는
+        // 그대로다. 상한에 닿아 있어도 대체는 새 행을 늘리지 않으므로 통과한다.
+        let retry = relay_filler_row(0);
+        assert_eq!(
+            db.insert_relay_pending_device(&retry, retry.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Stored
+        );
+        assert_eq!(
+            db.relay_pending_device_count().unwrap(),
+            RELAY_PENDING_DEVICE_ROWS_MAX
         );
 
         for index in 0..RELAY_DEVICE_ROWS_MAX {
@@ -12010,6 +12067,176 @@ mod tests {
             .unwrap(),
             RelayDeviceApproval::Approved(_)
         ));
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 취소된 기기는 상한을 차지하지 않는다. 64대를 페어링하고 전부 취소한 뒤에도 65번째가
+    /// 들어오고, 표 크기는 상한을 지킨다(가장 오래전 취소된 행이 회수된다).
+    #[test]
+    fn relay_revoked_devices_do_not_hold_the_device_limit() {
+        let (dir, _path, db) = file_db("relay-revoked-reclaim");
+        for index in 0..RELAY_DEVICE_ROWS_MAX {
+            let row = relay_filler_row(index);
+            db.insert_relay_pending_device(&row, row.issued_at).unwrap();
+            db.approve_relay_pending_device(
+                &row.pairing_id,
+                &row.identity_public_sec1,
+                row.issued_at + 1,
+            )
+            .unwrap();
+            db.revoke_relay_device(&row.device_id, row.issued_at + 2 + index as i64)
+                .unwrap();
+        }
+        let next = relay_filler_row(RELAY_DEVICE_ROWS_MAX);
+        db.insert_relay_pending_device(&next, next.issued_at)
+            .unwrap();
+        assert!(matches!(
+            db.approve_relay_pending_device(
+                &next.pairing_id,
+                &next.identity_public_sec1,
+                next.issued_at + 1,
+            )
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        let rows = db
+            .list_relay_devices_bounded(RELAY_DEVICE_ROWS_MAX)
+            .unwrap();
+        assert_eq!(rows.len(), RELAY_DEVICE_ROWS_MAX, "표 크기는 상한을 지킨다");
+        assert!(
+            rows.iter().any(|row| row.device_id == next.device_id),
+            "새 기기가 발행됐다"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.device_id == relay_filler_row(0).device_id),
+            "가장 오래전에 취소된 행이 회수된다"
+        );
+
+        // 살아 있는 기기가 상한이면 여전히 거절한다.
+        let (dir2, _path2, db2) = file_db("relay-active-limit");
+        for index in 0..RELAY_DEVICE_ROWS_MAX {
+            let row = relay_filler_row(index);
+            db2.insert_relay_pending_device(&row, row.issued_at)
+                .unwrap();
+            db2.approve_relay_pending_device(
+                &row.pairing_id,
+                &row.identity_public_sec1,
+                row.issued_at + 1,
+            )
+            .unwrap();
+        }
+        let extra = relay_filler_row(RELAY_DEVICE_ROWS_MAX);
+        db2.insert_relay_pending_device(&extra, extra.issued_at)
+            .unwrap();
+        assert_eq!(
+            db2.approve_relay_pending_device(
+                &extra.pairing_id,
+                &extra.identity_public_sec1,
+                extra.issued_at + 1,
+            )
+            .unwrap(),
+            RelayDeviceApproval::DeviceLimitReached
+        );
+        drop(db);
+        drop(db2);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(dir2).unwrap();
+    }
+
+    /// 같은 폰(같은 공개키)이 새 device_id로 다시 페어링하면 옛 행이 대체된다 —
+    /// identity UNIQUE에 걸려 불투명하게 실패하지 않는다.
+    #[test]
+    fn relay_repairing_the_same_phone_under_a_new_device_id_replaces_the_old_row() {
+        let (dir, _path, db) = file_db("relay-repair");
+        let first = relay_pending_row(21, 21, 21);
+        db.insert_relay_pending_device(&first, first.issued_at)
+            .unwrap();
+        db.approve_relay_pending_device(
+            &first.pairing_id,
+            &first.identity_public_sec1,
+            first.issued_at + 1,
+        )
+        .unwrap();
+        db.revoke_relay_device(&first.device_id, first.issued_at + 2)
+            .unwrap();
+
+        let mut again = relay_pending_row(22, 22, 21); // 같은 키, 새 device_id
+        again.display_name = "same phone".to_owned();
+        db.insert_relay_pending_device(&again, again.issued_at)
+            .unwrap();
+        assert!(matches!(
+            db.approve_relay_pending_device(
+                &again.pairing_id,
+                &again.identity_public_sec1,
+                again.issued_at + 3,
+            )
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        assert!(db.relay_device(&first.device_id).unwrap().is_none());
+        let current = db.relay_device(&again.device_id).unwrap().unwrap();
+        assert_eq!(current.display_name, "same phone");
+        assert_eq!(current.revoked_at, None);
+        assert_eq!(db.relay_pending_device_count().unwrap(), 0);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 미완의 의식을 버리고 다시 시도하는 같은 기기는 대체되고, 다른 주체의 부분 겹침은
+    /// 결정적으로 거절된다.
+    #[test]
+    fn relay_pending_retry_supersedes_and_partial_overlap_conflicts() {
+        let (dir, _path, db) = file_db("relay-pending-retry");
+        let abandoned = relay_pending_row(31, 31, 31);
+        db.insert_relay_pending_device(&abandoned, abandoned.issued_at)
+            .unwrap();
+
+        // 같은 기기의 새 의식(새 pairing_id) → 대체.
+        let retry = relay_pending_row(32, 31, 31);
+        assert_eq!(
+            db.insert_relay_pending_device(&retry, retry.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Stored
+        );
+        assert_eq!(db.relay_pending_device_count().unwrap(), 1);
+        assert!(
+            db.relay_pending_device(&abandoned.pairing_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.relay_pending_device(&retry.pairing_id)
+                .unwrap()
+                .is_some()
+        );
+
+        // 키만 같은 다른 device_id → 충돌.
+        let key_clash = relay_pending_row(33, 34, 31);
+        assert_eq!(
+            db.insert_relay_pending_device(&key_clash, key_clash.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Conflict
+        );
+        // device_id만 같은 다른 키 → 충돌.
+        let id_clash = relay_pending_row(35, 31, 36);
+        assert_eq!(
+            db.insert_relay_pending_device(&id_clash, id_clash.issued_at)
+                .unwrap(),
+            RelayPendingInsert::Conflict
+        );
+        assert_eq!(
+            db.relay_pending_device_count().unwrap(),
+            1,
+            "충돌은 아무것도 바꾸지 않는다"
+        );
+        assert!(
+            db.relay_pending_device(&retry.pairing_id)
+                .unwrap()
+                .is_some()
+        );
         drop(db);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -12241,7 +12468,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_approval_unique_conflict_rolls_back_pending_and_existing_device() {
+    fn relay_approval_with_a_known_key_replaces_the_previous_device_row() {
         let (dir, _path, db) = file_db("relay-approval-conflict");
         let first = relay_pending_row(2, 2, 2);
         db.insert_relay_pending_device(&first, first.issued_at)
@@ -12256,28 +12483,31 @@ mod tests {
             RelayDeviceApproval::Approved(_)
         ));
 
-        let mut conflicting = relay_pending_row(3, 3, 3);
-        conflicting.identity_public_sec1 = first.identity_public_sec1;
-        db.insert_relay_pending_device(&conflicting, conflicting.issued_at)
+        // 같은 공개키의 새 device_id는 **같은 폰의 재페어링**이다 — pending 행은 검증된
+        // 승인(키 보유 증명) 뒤에만 존재하므로 옛 행을 대체한다. 결과는 언제나 기기 하나.
+        let mut repaired = relay_pending_row(3, 3, 3);
+        repaired.identity_public_sec1 = first.identity_public_sec1;
+        db.insert_relay_pending_device(&repaired, repaired.issued_at)
             .unwrap();
-        assert!(
+        assert!(matches!(
             db.approve_relay_pending_device(
-                &conflicting.pairing_id,
-                &conflicting.identity_public_sec1,
-                conflicting.issued_at + 1
+                &repaired.pairing_id,
+                &repaired.identity_public_sec1,
+                repaired.issued_at + 1
             )
-            .is_err()
-        );
-        assert_eq!(db.relay_pending_device_count().unwrap(), 1);
-        assert!(db.relay_device(&conflicting.device_id).unwrap().is_none());
-        let unchanged = db.relay_device(&first.device_id).unwrap().unwrap();
-        assert_eq!(unchanged.identity_public_sec1, first.identity_public_sec1);
-        assert_eq!(unchanged.display_name, first.display_name);
+            .unwrap(),
+            RelayDeviceApproval::Approved(_)
+        ));
+        assert_eq!(db.relay_pending_device_count().unwrap(), 0);
+        assert!(db.relay_device(&first.device_id).unwrap().is_none());
+        let current = db.relay_device(&repaired.device_id).unwrap().unwrap();
+        assert_eq!(current.identity_public_sec1, first.identity_public_sec1);
         assert_eq!(
             db.list_relay_devices_bounded(RELAY_DEVICE_ROWS_MAX)
                 .unwrap()
                 .len(),
-            1
+            1,
+            "같은 키는 언제나 기기 하나로만 존재한다"
         );
         drop(db);
         fs::remove_dir_all(dir).unwrap();

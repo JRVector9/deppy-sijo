@@ -51,6 +51,7 @@ pub enum AgentKind {
     Claude,
     Codex,
     Kimi,
+    Grok,
 }
 
 /// 세션에 바인딩된 에이전트 — transcript 경로까지 확정된 상태.
@@ -365,7 +366,8 @@ fn agent_kinds_from_rows(
                     classify(&row.command).map(|(kind, _)| RunningAgent {
                         kind,
                         model: argv_flag_value(&row.command, "--model"),
-                        effort: argv_flag_value(&row.command, "--effort"),
+                        effort: effort_flag(kind)
+                            .and_then(|flag| argv_flag_value(&row.command, flag)),
                     })
                 })
                 .map(|agent| (*sid, agent))
@@ -373,11 +375,29 @@ fn agent_kinds_from_rows(
         .collect()
 }
 
+/// kind별 **강도 플래그 이름**. `agent_launcher`가 실제로 붙이는 이름과 짝이 맞아야 한다 —
+/// 어긋나면 강도가 조용히 `None`이 된다(2026-09-03: Grok이 그 상태였다. 런처는
+/// `--reasoning-effort`를 붙이는데 여기서는 `--effort`를 찾고 있었고, Grok은 transcript
+/// 파서도 statusLine도 없어 argv가 **유일한** 강도 출처라 강도 칸이 늘 비었다).
+///
+/// Codex는 `--config model_reasoning_effort="..."`, Kimi는 `KIMI_MODEL_THINKING_EFFORT`
+/// env로 넘어가 argv에 뽑을 플래그 자체가 없다 — 둘의 강도는 transcript 파서가 읽는다
+/// (`agent_transcript::parse_codex`의 `turn_context.payload.effort`, `parse_kimi`의 wire).
+fn effort_flag(kind: AgentKind) -> Option<&'static str> {
+    match kind {
+        AgentKind::Claude => Some("--effort"),
+        AgentKind::Grok => Some("--reasoning-effort"),
+        AgentKind::Codex | AgentKind::Kimi => None,
+    }
+}
+
 /// `--model opus[1m]` 처럼 **공백으로 분리된** 플래그 값을 argv 문자열에서 뽑는다.
 ///
 /// `ps`가 준 한 줄이라 인용 정보가 없다. 값에 공백이 있으면 잘리는데, 우리가 읽는
-/// `--model`/`--effort`는 공백 없는 토큰이라 문제되지 않는다. `--model=x` 형태는
-/// 이 런처가 쓰지 않으므로 다루지 않는다 — 쓰게 되면 여기서 함께 처리해야 한다.
+/// `--model`/`--effort`/`--reasoning-effort` 값은 공백 없는 토큰이라 문제되지 않는다.
+/// `--model=x` 형태는 이 런처가 쓰지 않으므로 다루지 않는다(2026-09-03 재확인: Grok도
+/// `--model`·`--reasoning-effort`를 값과 별개 토큰으로 push한다) — 쓰게 되면 여기서
+/// 함께 처리해야 한다.
 fn argv_flag_value(command: &str, flag: &str) -> Option<String> {
     let mut parts = command.split_whitespace();
     while let Some(part) = parts.next() {
@@ -584,6 +604,7 @@ pub fn agent_state(binding: &AgentBinding) -> Option<agent_transcript::Transcrip
         AgentKind::Claude => agent_transcript::parse_claude(&binding.transcript),
         AgentKind::Codex => agent_transcript::parse_codex(&binding.transcript),
         AgentKind::Kimi => agent_transcript::parse_kimi(&binding.transcript),
+        AgentKind::Grok => agent_transcript::parse_grok(&binding.transcript),
     }
 }
 
@@ -703,6 +724,13 @@ fn classify(command: &str) -> Option<(AgentKind, Option<String>)> {
     if is("kimi") || is("kimi-code") {
         return Some((AgentKind::Kimi, None));
     }
+    // Grok CLI는 `~/.nvm/.../bin/grok`(node 트램폴린)이 `$GROK_HOME/bin/grok`을 exec한다 —
+    // 두 단계 모두 파일명이 `grok`이라 이 검사 하나로 잡힌다. Grok을 여기서 분류하지 않으면
+    // 그 세션은 **바인딩이 없는 셸**로 보이고, 같은 pane에서 앞서 돌던 에이전트의 마지막
+    // 표시가 그대로 남아 "Grok을 돌리는데 Codex로 보이는" 상태가 된다(2026-09-01 사용자 신고).
+    if is("grok") {
+        return Some((AgentKind::Grok, None));
+    }
     None
 }
 
@@ -758,6 +786,7 @@ fn valid_transcript_path(kind: AgentKind, path: &Path) -> bool {
         AgentKind::Claude => home.join(".claude/projects"),
         AgentKind::Codex => home.join(".codex/sessions"),
         AgentKind::Kimi => home.join(".kimi-code/sessions"),
+        AgentKind::Grok => home.join(".grok/sessions"),
     };
     let Ok(root) = std::fs::canonicalize(root) else {
         return false;
@@ -788,9 +817,37 @@ fn bind_transcript(
     budget: &mut DetectionBudget,
 ) -> Option<(AgentBinding, bool)> {
     match kind {
-        // transcript 바인딩은 파서가 있어야 의미가 있다. Kimi는 아직 없으므로
-        // 프로세스 감지(agent_kinds)까지만 남고 바인딩은 만들지 않는다.
+        // transcript 바인딩은 파서가 있어야 의미가 있다. Kimi는 아직 없으므로 프로세스
+        // 감지(agent_kinds)까지만 남고 바인딩은 만들지 않는다.
         AgentKind::Kimi => None,
+        AgentKind::Grok => {
+            // 1순위: `~/.grok/active_sessions.json`이 **pid → 세션 id·cwd**를 준다 — 결정적
+            // (같은 cwd에 grok이 둘이어도 정확). 2026-09-04 실측(grok 1.0.13).
+            if let Some((session_id, cwd)) = grok_active_session(pid)
+                && let Some(transcript) = grok_session_transcript(&cwd, &session_id)
+            {
+                return Some((
+                    AgentBinding {
+                        kind,
+                        session_id,
+                        transcript,
+                    },
+                    true,
+                ));
+            }
+            // fallback: 프로세스 cwd의 세션 디렉터리 중 최신 — 휴리스틱(codex cwd 폴백과
+            // 같은 한계: 같은 cwd 다중 세션이면 최신 쪽으로 모인다).
+            let cwd = process_cwd(pid, budget)?;
+            let (session_id, transcript) = find_grok_transcript_by_cwd(&cwd)?;
+            Some((
+                AgentBinding {
+                    kind,
+                    session_id,
+                    transcript,
+                },
+                false,
+            ))
+        }
         AgentKind::Claude => {
             // 1순위: argv --session-id (결정적 — cmux/자동화 실행 케이스).
             if let Some(sid) = sid_hint {
@@ -876,6 +933,7 @@ impl TranscriptFinder {
         }
         match kind {
             AgentKind::Kimi => None,
+            AgentKind::Grok => find_grok_transcript(session_id),
             AgentKind::Claude => find_claude_transcript(session_id),
             AgentKind::Codex => {
                 let files = self.codex_files.get_or_insert_with(|| {
@@ -1130,6 +1188,7 @@ pub fn kind_from_str(s: &str) -> Option<AgentKind> {
         "claude" => Some(AgentKind::Claude),
         "codex" => Some(AgentKind::Codex),
         "kimi" => Some(AgentKind::Kimi),
+        "grok" => Some(AgentKind::Grok),
         _ => None,
     }
 }
@@ -1238,9 +1297,14 @@ fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
 /// 세션ID로 직접 매칭한다(위 `TranscriptFinder` 문서 참고) — 그걸 그대로 우선 쓰고,
 /// 스캔 상한에 걸리는 등 못 찾을 때만 행의 cwd로 `find_codex_transcript`에 폴백한다.
 ///
-/// **세 kind를 모두 덮어야 한다.** 하나라도 `None`으로 두면 그 에이전트로 돌린 이력은
-/// 원문 보기가 통째로 죽는데, 화면에는 「파일을 찾지 못했습니다」만 떠서 원인이
+/// **모든 kind를 덮어야 한다.** 하나라도 해석기 없이 `None`으로 두면 그 에이전트로 돌린
+/// 이력은 원문 보기가 통째로 죽는데, 화면에는 「파일을 찾지 못했습니다」만 떠서 원인이
 /// 드러나지 않는다(2026-08-18: kimi가 그 상태였다).
+///
+/// Grok은 2026-09-01엔 `~/.grok/sessions/<URL 인코딩된 cwd>/prompt_history.jsonl` 하나뿐이라
+/// 세션 id로 맞출 대상이 없어 예외로 뒀다. 2026-09-04 재실측(grok 1.0.13): 이제 그 아래에
+/// `<세션 id>/chat_history.jsonl` + `summary.json`을 세션마다 만든다 — 예외는 사라졌고
+/// `find_grok_transcript`가 Kimi와 같은 한 겹 훑기로 찾는다.
 pub(crate) fn transcript_path_for(
     kind: AgentKind,
     session_id: &str,
@@ -1252,6 +1316,7 @@ pub(crate) fn transcript_path_for(
             .find(AgentKind::Codex, session_id)
             .or_else(|| cwd.and_then(|cwd| find_codex_transcript(cwd).map(|(_, path)| path))),
         AgentKind::Kimi => find_kimi_transcript(session_id),
+        AgentKind::Grok => find_grok_transcript(session_id),
     }
 }
 
@@ -1288,6 +1353,123 @@ fn find_kimi_transcript(session_id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// `~/.grok/sessions`. Grok은 작업 폴더를 **URL 인코딩한 이름**의 디렉터리로 나눈다.
+fn grok_sessions_root() -> Option<PathBuf> {
+    Some(crate::paths::home_dir()?.join(".grok/sessions"))
+}
+
+/// Grok이 세션 디렉터리 이름에 쓰는 cwd 인코딩 — RFC 3986 unreserved(`A-Za-z0-9-._~`)만
+/// 남기고 나머지는 UTF-8 바이트마다 `%XX`(대문자). 실측: `/Users/jr/x` →
+/// `%2FUsers%2Fjr%2Fx`, 공백 → `%20`, 한글(NFD) → `%E1%84%82…`.
+fn grok_encode_cwd(cwd: &str) -> String {
+    let mut out = String::with_capacity(cwd.len() * 3);
+    for byte in cwd.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// 세션 디렉터리의 transcript 경로 — 파일이 실제로 있을 때만.
+fn grok_session_transcript(cwd: &str, session_id: &str) -> Option<PathBuf> {
+    if !valid_session_id(session_id) || !valid_absolute_path(cwd) {
+        return None;
+    }
+    let candidate = grok_sessions_root()?
+        .join(grok_encode_cwd(cwd))
+        .join(session_id)
+        .join("chat_history.jsonl");
+    std::fs::symlink_metadata(&candidate)
+        .ok()
+        .filter(|meta| meta.file_type().is_file())
+        .map(|_| candidate)
+}
+
+/// `active_sessions.json`의 크기 상한 — 항목 몇 개짜리 목록이다.
+const GROK_ACTIVE_SESSIONS_MAX_BYTES: u64 = 64 * 1024;
+
+/// `~/.grok/active_sessions.json`에서 이 pid의 (세션 id, cwd). grok이 살아 있는 동안만
+/// 항목이 있다 — 결정적 바인딩의 근거.
+fn grok_active_session(pid: u32) -> Option<(String, String)> {
+    let path = crate::paths::home_dir()?.join(".grok/active_sessions.json");
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > GROK_ACTIVE_SESSIONS_MAX_BYTES {
+        return None;
+    }
+    grok_active_session_in(&std::fs::read_to_string(path).ok()?, pid)
+}
+
+/// `active_sessions.json` 본문에서 pid 항목을 찾는다 — 파일 IO와 분리해 테스트한다.
+fn grok_active_session_in(text: &str, pid: u32) -> Option<(String, String)> {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
+    entries.iter().find_map(|entry| {
+        (entry.get("pid")?.as_u64()? == u64::from(pid)).then(|| {
+            let session_id = entry.get("session_id")?.as_str()?.to_owned();
+            let cwd = entry.get("cwd")?.as_str()?.to_owned();
+            valid_session_id(&session_id).then_some((session_id, cwd))
+        })?
+    })
+}
+
+/// 세션 id로 Grok transcript를 찾는다 — `~/.grok/sessions/<cwd>/<sid>/chat_history.jsonl`.
+/// cwd 디렉터리 이름은 세션 id만으로는 알 수 없어 한 겹 훑는다(Kimi와 같은 모양).
+fn find_grok_transcript(session_id: &str) -> Option<PathBuf> {
+    if !valid_session_id(session_id) {
+        return None;
+    }
+    let mut entries = std::fs::read_dir(grok_sessions_root()?).ok()?;
+    for _ in 0..MAX_DIRECTORY_ENTRIES {
+        let Some(workdir) = entries.next() else {
+            break;
+        };
+        let Ok(workdir) = workdir else { return None };
+        if !workdir.file_type().ok().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let candidate = workdir.path().join(session_id).join("chat_history.jsonl");
+        if std::fs::symlink_metadata(&candidate)
+            .ok()
+            .is_some_and(|meta| meta.file_type().is_file())
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// cwd의 세션 디렉터리 중 **가장 최근에 갱신된** 것 — 휴리스틱 폴백.
+fn find_grok_transcript_by_cwd(cwd: &str) -> Option<(String, PathBuf)> {
+    if !valid_absolute_path(cwd) {
+        return None;
+    }
+    let dir = grok_sessions_root()?.join(grok_encode_cwd(cwd));
+    let mut entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
+    for _ in 0..MAX_DIRECTORY_ENTRIES {
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        let Ok(entry) = entry else { return None };
+        let Some(session_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !valid_session_id(&session_id) {
+            continue;
+        }
+        let transcript = entry.path().join("chat_history.jsonl");
+        let Ok(modified) = std::fs::metadata(&transcript).and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(when, _, _)| modified > *when) {
+            best = Some((modified, session_id, transcript));
+        }
+    }
+    best.map(|(_, session_id, transcript)| (session_id, transcript))
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
@@ -2674,13 +2856,21 @@ mod tests {
             .expect("해석기가 있어야 한다")
             .1;
         let body = body.split_once("\n}\n").expect("함수 끝").0;
-        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Kimi] {
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Kimi,
+            AgentKind::Grok,
+        ] {
             let arm = format!("AgentKind::{kind:?} =>");
             assert!(body.contains(&arm), "{kind:?} 분기가 없다");
         }
+        // 2026-09-04부터 Grok도 세션 디렉터리를 가지므로(`find_grok_transcript`) 해석기
+        // 없이 `None`으로 두는 분기는 하나도 없어야 한다. 새 kind가 `=> None,`으로
+        // 들어오면 여기서 걸린다 — 그 에이전트 이력은 원문 보기가 통째로 죽는다.
         assert!(
             !body.contains("=> None,"),
-            "어떤 kind도 해석기 없이 None으로 두지 않는다 — 그 에이전트 이력이 통째로 죽는다"
+            "해석기 없이 None으로 두는 분기가 있다 — 그 에이전트 이력은 통째로 죽는다"
         );
     }
 
@@ -2970,6 +3160,27 @@ mod tests {
         assert!(classify("vim claude_notes.md").is_none()); // 인자 언급은 오탐 안 함
     }
 
+    /// Grok CLI는 node 트램폴린(`~/.nvm/.../bin/grok`)이 `$GROK_HOME/bin/grok`을 exec한다 —
+    /// 두 단계 모두 파일명이 `grok`이다. 분류하지 못하면 그 세션은 바인딩 없는 셸로 보이고,
+    /// 같은 pane의 옛 에이전트 표시가 남는다(2026-09-01 사용자 신고).
+    #[test]
+    fn classify는_grok_트램폴린과_실제_바이너리를_모두_잡는다() {
+        for command in [
+            "/Users/jr/.nvm/versions/node/v24.18.0/bin/grok",
+            "node /Users/jr/.grok/bin/grok --model grok-4.6 --reasoning-effort xhigh",
+            "/Users/jr/.grok/bin/grok",
+        ] {
+            assert_eq!(
+                classify(command).map(|(kind, _)| kind),
+                Some(AgentKind::Grok),
+                "{command}"
+            );
+        }
+        // 이름이 grok으로 **끝나기만** 하는 것은 아니다 — 파일명 전체가 일치해야 한다.
+        assert_eq!(classify("/usr/local/bin/not-grok"), None);
+        assert_eq!(classify("/usr/local/bin/grokker"), None);
+    }
+
     /// statusLine은 1시간 창으로 만료된다. 오래 유휴한 세션에서는 argv가 유일한
     /// 근거라, 여기서 값을 못 뽑으면 강도·모델 단축키가 "현재 값을 몰라" 조용히
     /// 아무것도 하지 않는다(2026-08-03 실증).
@@ -3019,6 +3230,122 @@ mod tests {
         assert_eq!(agent.kind, AgentKind::Claude);
         assert_eq!(agent.model.as_deref(), Some("opus[1m]"));
         assert_eq!(agent.effort.as_deref(), Some("high"));
+    }
+
+    /// argv에서 모델·강도까지 뽑혀야 카드 2행이 "Grok · grok-4.6 · xhigh"가 된다.
+    ///
+    /// 명령줄은 **런처가 실제로 만드는 형태 그대로**다 — `agent_launcher`는 Grok에
+    /// `--model <값> --reasoning-effort <값>`을 붙인다(Claude만 `--effort`). Grok은
+    /// transcript 파서도 statusLine도 없어 argv가 유일한 강도 출처라, 여기서 플래그
+    /// 이름이 어긋나면 강도 칸이 영영 빈 채로 남는다(2026-09-03).
+    /// 합성 fixture만 믿지 않는다 — 이 기기에 **실제 Grok 세션이 있으면** `agent_state`
+    /// 경로(바인딩 → `parse_grok`)로 강도·모델이 실제로 읽히는지 본다. 세션이 없는
+    /// 기기(CI)에서는 조용히 건너뛴다(Kimi 실기 테스트와 같은 규칙).
+    #[test]
+    fn 실제_grok_세션이_있으면_agent_state가_강도를_읽는다() {
+        let Some(root) = grok_sessions_root() else {
+            return;
+        };
+        let Ok(workdirs) = std::fs::read_dir(&root) else {
+            return; // Grok 미사용 기기
+        };
+        let mut checked = 0usize;
+        for workdir in workdirs.flatten() {
+            let Ok(sessions) = std::fs::read_dir(workdir.path()) else {
+                continue;
+            };
+            for session in sessions.flatten() {
+                let transcript = session.path().join("chat_history.jsonl");
+                let summary = session.path().join("summary.json");
+                if !transcript.is_file() || !summary.is_file() {
+                    continue;
+                }
+                let session_id = session.file_name().to_string_lossy().into_owned();
+                let binding = AgentBinding {
+                    kind: AgentKind::Grok,
+                    session_id: session_id.clone(),
+                    transcript: transcript.clone(),
+                };
+                let state = agent_state(&binding)
+                    .expect("실제 Grok 세션을 파싱하지 못했다: summary/chat_history 모양이 바뀌었을 수 있다");
+                assert_eq!(state.session_id, session_id);
+                assert!(
+                    state.model.is_some() || state.effort.is_some(),
+                    "summary.json에서 모델도 강도도 못 읽었다"
+                );
+                // 세션 id로 되찾을 수 있어야 원문 보기·복원 확인이 산다.
+                assert_eq!(
+                    find_grok_transcript(&session_id).as_deref(),
+                    Some(transcript.as_path())
+                );
+                checked += 1;
+                if checked >= 5 {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Grok 세션 디렉터리 이름 규칙 — 실측 샘플 그대로. 여기가 틀리면 세션을 못 찾아
+    /// 강도 칸이 조용히 빈다.
+    #[test]
+    fn grok_cwd_인코딩은_실측_디렉터리_이름과_같다() {
+        assert_eq!(
+            grok_encode_cwd("/Users/jr/Desktop/projects/colon35/Design"),
+            "%2FUsers%2Fjr%2FDesktop%2Fprojects%2Fcolon35%2FDesign"
+        );
+        assert_eq!(
+            grok_encode_cwd("/Users/jr/.deppy-sijo/usage-probe"),
+            "%2FUsers%2Fjr%2F.deppy-sijo%2Fusage-probe"
+        );
+        assert_eq!(grok_encode_cwd("/a b/c~d_e"), "%2Fa%20b%2Fc~d_e");
+        // 한글(NFD) — 바이트마다 %XX, 대문자.
+        assert_eq!(grok_encode_cwd("/\u{1102}"), "%2F%E1%84%82");
+    }
+
+    #[test]
+    fn grok_active_sessions에서_pid로_세션과_cwd를_찾는다() {
+        let text = r#"[
+          {"session_id": "01a06c06-0a9e-7ed1-bae5-908c9b49ee97", "pid": 94284,
+           "cwd": "/Users/jr/Desktop/projects/colon35/Design", "opened_at": "2026-09-04T10:45:32Z"},
+          {"session_id": "01a0ffff-0000-7000-8000-000000000000", "pid": 4242, "cwd": "/tmp/x"}
+        ]"#;
+        assert_eq!(
+            grok_active_session_in(text, 94284),
+            Some((
+                "01a06c06-0a9e-7ed1-bae5-908c9b49ee97".to_owned(),
+                "/Users/jr/Desktop/projects/colon35/Design".to_owned()
+            ))
+        );
+        assert_eq!(grok_active_session_in(text, 1), None, "없는 pid");
+        assert_eq!(grok_active_session_in("not json", 94284), None);
+        assert_eq!(
+            grok_active_session_in(r#"[{"session_id": "../evil", "pid": 7, "cwd": "/x"}]"#, 7),
+            None,
+            "세션 id 검증을 통과해야 한다"
+        );
+    }
+
+    #[test]
+    fn grok_세션은_argv에서_모델과_강도를_읽는다() {
+        let rows = vec![
+            ProcRow {
+                pid: 100,
+                ppid: Some(1),
+                command: "/bin/zsh".into(),
+            },
+            ProcRow {
+                pid: 101,
+                ppid: Some(100),
+                command: "node /Users/jr/.grok/bin/grok --model grok-4.6 --reasoning-effort xhigh"
+                    .into(),
+            },
+        ];
+        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows);
+        let agent = found.get(&SessionId(1)).expect("Grok 세션을 찾아야 한다");
+        assert_eq!(agent.kind, AgentKind::Grok);
+        assert_eq!(agent.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(agent.effort.as_deref(), Some("xhigh"));
     }
 
     /// transcript가 없어도 프로세스만으로 종류를 잡아야 한다.

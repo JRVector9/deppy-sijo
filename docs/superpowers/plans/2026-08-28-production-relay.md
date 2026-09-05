@@ -215,6 +215,10 @@ Enable `tungstenite`'s rustls client with the existing `handshake` feature plus 
 
 Reuse dashboard snapshots and runtime command sinks through a transport-neutral adapter. Enforce device permissions before input, key, scroll, switch, resolve, and upload actions. Never pass a Relay credential into protocol-v3 `auth` or the loopback HTTP router.
 
+Revocation and permission downgrade must also terminate or re-authorize an already active Relay
+channel; checking only the next connection is insufficient. Neither operation may stop, rotate, or
+mutate the independent Tailscale server/token lifecycle.
+
 ### Step 4: Test coexistence
 
 Exercise Tailscale-only, Relay-only, and both-enabled lifecycles. Prove failure/disable/credential rotation in one transport does not mutate the other.
@@ -244,10 +248,15 @@ Relay readiness gates pair generation. Pairing UI shows the one-shot expiry and 
 **Files:**
 
 - Create: `web/relay-shell` separate from both Relay data plane and loopback token-gated assets
+- Create: `web/shared/viewer-core.js` and `web/shared/viewer-core.css` for the explicitly shared
+  read-only viewer lifecycle
 - Create: `web/relay-shell/src/relay-crypto.js` as the single production and vector-test WebCrypto implementation
 - Create: `deploy/relay-shell/{staging,production}`
 - Create: CI/build/publish jobs for immutable, versioned shell artifacts
 - Modify: `crates/web-remote/tests/relay_webcrypto_vectors.rs` and `crates/web-remote/tests/fixtures/relay-webcrypto-v1.js` to import the production shell crypto module
+- Modify: the existing loopback `crates/web-remote/assets/{app.js,index.html,sw.js}` and
+  `crates/web-remote/src/static_srv.rs` only as required to consume and integrity-check the shared
+  viewer module without changing protocol-v3 authentication or behavior
 - Reuse the shared full-screen viewer behavior through an explicit transport adapter
 
 ### Step 1: Store non-exportable device private keys in browser storage
@@ -270,7 +279,16 @@ Keep Back/focus, privacy curtain, reconnect draft retention/no auto-send, canvas
 
 Keep transcript construction, ECDSA/ECDH, HKDF, SAS, nonce/AAD, and AES-GCM in one browser crypto module imported by the production shell. The Rust WebCrypto harness must import that same module rather than a copied test implementation. CI emits a sidecar manifest containing the immutable shell archive SHA-256 digest and the imported crypto asset digest.
 
+An unsigned digest manifest alone does not prevent downgrade to an older valid artifact. The Mac
+and Relay must enforce a minimum admitted protocol/shell version, and deployment rollback policy
+must be tested independently of service-worker cache behavior.
+
 ## Task 7: Production verification and release gates
+
+Task 7 has external prerequisites. Record the actual staging/production URLs, DNS and TLS owner,
+artifact registry, deploy credentials/environment names, physical device inventory, and a bounded
+24-hour soak window before starting it. Missing infrastructure is a blocker, never a skipped or
+passing gate.
 
 - For each staging and production shell release, verify the sidecar manifest and exact shell archive SHA-256 digest, then run the Task 1 Rust ↔ browser WebCrypto fixed vectors by importing the crypto module from that exact artifact. Digest mismatch, a source-tree/test-runner fallback, or a different crypto asset is a hard failure.
 - Real untrusted-relay E2E: relay memory/log inspection contains no terminal/input/approval/upload plaintext.

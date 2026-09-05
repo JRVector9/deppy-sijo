@@ -224,6 +224,14 @@ impl AgentLauncherUi {
         self.open
     }
 
+    /// 런처는 자기가 열린 워크스페이스에만 세션을 띄운다(`show`가 내보내는 인텐트가
+    /// `workspace_id`를 그대로 싣는다). 「이 워크스페이스에 세션이 뜰 예정인가」를
+    /// 묻는 쪽은 `is_open`이 아니라 이걸 써야 한다 — 다른 워크스페이스에서 열려
+    /// 있는 런처를 자기 것으로 오해하면 안 된다.
+    pub(crate) fn is_open_for(&self, workspace_id: &str) -> bool {
+        self.open && self.workspace_id == workspace_id
+    }
+
     pub(crate) fn launch_succeeded(&mut self) {
         self.launch_pending = false;
         self.error = None;
@@ -1089,6 +1097,22 @@ mod tests {
         assert!(!ui.yolo);
         assert!(ui.model.is_empty());
         assert!(ui.effort.is_none());
+    }
+
+    /// 런처는 자기가 열린 워크스페이스에만 세션을 띄운다. 「이 워크스페이스에 세션이
+    /// 뜰 예정인가」를 묻는 호출부가 다른 워크스페이스의 런처를 자기 것으로 세면
+    /// 그 워크스페이스는 세션 없이 빈 채로 남는다.
+    #[test]
+    fn is_open_for는_런처가_열린_워크스페이스에만_참이다() {
+        let mut ui = AgentLauncherUi::new();
+        assert!(!ui.is_open_for("workspace-a"));
+
+        ui.open_for("workspace-a".to_owned(), "Project".to_owned());
+        assert!(ui.is_open_for("workspace-a"));
+        assert!(!ui.is_open_for("workspace-b"));
+
+        ui.launch_succeeded();
+        assert!(!ui.is_open_for("workspace-a"));
     }
 
     #[test]

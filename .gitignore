@@ -14,3 +14,9 @@ node_modules/
 /deppy-sijo.log
 /Deppy-Sijo-*.zip
 /.codex/
+
+# Relay 셸 빌드 산출물(build.sh) — 불변 아카이브와 매니페스트는 배포 파이프라인이 만든다
+/web/relay-shell/dist/
+
+# 개발용 Relay 라우트/자격증명 (scripts/relay-dev.sh가 만든다 — 기계마다 다르고 비밀이다)
+/.relay-dev.env

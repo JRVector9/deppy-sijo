@@ -1049,9 +1049,10 @@ impl ComposerUi {
                 let models: &[&str] = match agent {
                     crate::agent_surface::AgentProvider::Claude => CLAUDE_MODELS,
                     crate::agent_surface::AgentProvider::Codex => CODEX_MODELS,
-                    // Kimi의 `/model` 어휘를 실측하지 않았다. 추측 목록을 띄우면
+                    // Kimi·Grok의 `/model` 어휘를 실측하지 않았다. 추측 목록을 띄우면
                     // 고르는 순간 프롬프트로 흘러 턴을 태운다(Codex에서 실증된 사고).
-                    crate::agent_surface::AgentProvider::Kimi => &[],
+                    crate::agent_surface::AgentProvider::Kimi
+                    | crate::agent_surface::AgentProvider::Grok => &[],
                 };
                 let resp = ui
                     .add_enabled(!models.is_empty(), egui::Button::new("/model").small())

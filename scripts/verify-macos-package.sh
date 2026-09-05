@@ -71,6 +71,17 @@ verify_trusted_code() {
     codesign --verify --strict --verbose=2 -R="$requirement" "$code"
 }
 
+verify_gatekeeper() {
+    candidate=$1
+    assessment=$(spctl --assess --type execute --verbose=2 "$candidate" 2>&1) || {
+        echo "$assessment" >&2
+        fail "Gatekeeper rejected bundle: $candidate"
+    }
+    echo "$assessment"
+    echo "$assessment" | grep -q '^source=Notarized Developer ID$' ||
+        fail "Gatekeeper did not identify a notarized Developer ID source: $candidate"
+}
+
 verify_bundle() {
     candidate=$1
     [ -d "$candidate" ] || fail "missing bundle: $candidate"
@@ -94,6 +105,8 @@ verify_bundle() {
         verify_trusted_code "$candidate" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/$BIN_NAME" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/$PROXY_NAME" "$team_id"
+        xcrun stapler validate "$candidate"
+        verify_gatekeeper "$candidate"
     fi
 }
 
@@ -114,7 +127,7 @@ if [ -n "$ARCHIVE" ]; then
 fi
 
 if [ "$REQUIRE_TRUSTED" = "1" ]; then
-    echo "package verification OK: trusted bundle, helper, plist, architecture, signature, archive"
+    echo "package verification OK: notarized trusted bundle, helper, plist, architecture, signature, Gatekeeper, archive"
 else
     echo "package verification OK: explicitly untrusted development bundle"
 fi

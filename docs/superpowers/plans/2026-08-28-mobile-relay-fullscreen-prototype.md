@@ -335,3 +335,48 @@ Then stage only the plan and prototype and commit:
 git add docs/superpowers/plans/2026-08-28-mobile-relay-fullscreen-prototype.md docs/mockups/mobile-relay-fullscreen-scenario.html
 git commit -m "docs: Tailscale 공존 프로토타입 보완"
 ```
+
+### Task 6: Correct authentication, permission, and mobile target-state defects
+
+**Files:**
+
+- Modify: `docs/mockups/mobile-relay-fullscreen-scenario.html`
+- Modify: `docs/CODEX_HANDOFF.md`
+
+- [x] **Step 1: Separate enabled transports from device authentication**
+
+Add a `pairedTransports` record to the local state and update it only after the corresponding QR flow succeeds:
+
+```js
+pairedTransports: { tailscale: false, relay: false },
+```
+
+Tailscale QR completion marks only `tailscale`; Relay approval marks only `relay`. Connected device rows must derive from this record, while transport service rows continue to derive from `transportMode`.
+
+- [x] **Step 2: Keep rejected and revoked devices outside the session list**
+
+Relay rejection in dual mode returns to the Tailscale QR instead of assuming Tailscale authentication. Relay rejection or revocation in single mode shows a recovery screen whose only valid continuation is re-pairing. `recover-to-sessions` must ignore authentication-failure reasons, and the desktop recovery stage must not render a rejected or revoked device as connected.
+
+- [x] **Step 3: Enforce the permission model in every surface**
+
+Set the initial Relay permission state to view-only:
+
+```js
+permissions: { view: true, input: false, approval: false },
+```
+
+Hide the approval tab when `approval` is false, force `phoneSurface` back to `sessions` if approval is removed, and guard both the tab event and approval action event against unauthorized state.
+
+- [x] **Step 4: Restore the 44px mobile touch-target contract**
+
+Change every button-specific `min-height` override below 44px to 44px, including the compact device switcher and pairing transport tabs.
+
+- [x] **Step 5: Record static verification and reopen the prototype**
+
+Per the user's explicit prototype constraint, do not run automated tests, browser tests, HTML validators, or interaction automation. Perform read-only source inspection, update `docs/CODEX_HANDOFF.md`, and deliver with:
+
+```bash
+open docs/mockups/mobile-relay-fullscreen-scenario.html
+```
+
+Opening the file is delivery only and must not be reported as visual or functional verification. Do not commit unless the user explicitly asks.

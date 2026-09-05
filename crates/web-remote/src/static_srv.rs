@@ -9,8 +9,31 @@ use std::sync::OnceLock;
 use crate::http::Response;
 
 // 임베드 자산 바이트 — 한 번만 `include_bytes!`하고 ASSETS/SHELL에서 재사용한다(중복 임베드 방지).
-const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
-const APP_JS: &[u8] = include_bytes!("../assets/app.js");
+//
+// `/app.js`·`/app.css`만 예외로 **합성 번들**이다: 공용 읽기 전용 뷰어 코어(`web/shared`)를
+// 앞에 이어 붙인다. 루프백 셸과 Relay 셸이 같은 뷰어 소스를 쓰게 하려는 것이고, 이어 붙인
+// 결과가 하나의 ES 모듈이라 문서들은 `type="module"`로 로드한다. 공용 부분은 번들의
+// **접두사**이므로 사본이 존재할 수 없고, 소스 트리와의 drift는 SHA-256 매니페스트
+// (`/shared-integrity.json`)와 테스트가 함께 막는다.
+const VIEWER_CORE_JS_LEN: usize = include_str!("../../../web/shared/viewer-core.js").len();
+const VIEWER_CORE_CSS_LEN: usize = include_str!("../../../web/shared/viewer-core.css").len();
+const APP_JS_BUNDLE: &str = concat!(
+    include_str!("../../../web/shared/viewer-core.js"),
+    "\n",
+    include_str!("../assets/app.js"),
+);
+const APP_CSS_BUNDLE: &str = concat!(
+    include_str!("../../../web/shared/viewer-core.css"),
+    "\n",
+    // 모바일 공용 테마(토큰·부품). Relay 셸과 같은 파일을 쓴다 — 두 모바일 화면의 톤이
+    // 갈라지지 않게 하려는 것이다. 뷰어 코어 **뒤**에 온다: 앞부분 슬라이스가 곧 뷰어 코어
+    // 소스라는 규약(`viewer_core_css`)을 깨지 않기 위해서다.
+    include_str!("../../../web/shared/mobile-theme.css"),
+    "\n",
+    include_str!("../assets/app.css"),
+);
+const APP_CSS: &[u8] = APP_CSS_BUNDLE.as_bytes();
+const APP_JS: &[u8] = APP_JS_BUNDLE.as_bytes();
 const MANIFEST: &[u8] = include_bytes!("../assets/manifest.webmanifest");
 const OFFLINE_HTML: &[u8] = include_bytes!("../assets/offline.html");
 const ICON_192: &[u8] = include_bytes!("../assets/icon-192.png");
@@ -90,6 +113,14 @@ pub fn respond(path: &str, query: &str, expected_token: &str) -> Response {
         },
         // 서비스 워커 — 버전 키를 서빙 시점에 셸 해시로 주입한다(토큰 게이트 없음, 비밀 없음).
         "/sw.js" => sw_js_response(),
+        // 공용 뷰어 모듈 무결성 — 서빙 번들에 실제로 들어간 `web/shared/*`의 SHA-256.
+        // 토큰 게이트 없음: 공개 셸 코드의 해시일 뿐이고, 배포된 셸과 소스 트리의 drift를
+        // 릴리스 검증이 **응답으로** 대조할 수 있어야 한다.
+        "/shared-integrity.json" => Response {
+            status: 200,
+            content_type: "application/json",
+            body: Cow::Borrowed(shared_integrity_json().as_bytes()),
+        },
         _ => ASSETS
             .iter()
             .find(|(asset_path, _, _)| *asset_path == path)
@@ -152,6 +183,43 @@ fn versioned_asset(path: &str) -> Option<Response> {
         content_type: mime,
         body: Cow::Borrowed(bytes),
     })
+}
+
+/// 서빙 번들 앞부분에 그대로 들어있는 공용 뷰어 코어 소스(`web/shared/viewer-core.js`).
+/// 슬라이스라 사본이 아니다 — 번들과 이 값이 갈라지는 경우가 구조적으로 없다.
+fn viewer_core_js() -> &'static str {
+    &APP_JS_BUNDLE[..VIEWER_CORE_JS_LEN]
+}
+
+/// `web/shared/viewer-core.css` — [`viewer_core_js`]와 같은 규약.
+fn viewer_core_css() -> &'static str {
+    &APP_CSS_BUNDLE[..VIEWER_CORE_CSS_LEN]
+}
+
+/// 공용 뷰어 모듈 무결성 매니페스트(JSON). lazy 1회 계산 후 재사용한다.
+fn shared_integrity_json() -> &'static str {
+    static JSON: OnceLock<String> = OnceLock::new();
+    JSON.get_or_init(|| {
+        format!(
+            r#"{{"viewer-core.js":"{}","viewer-core.css":"{}"}}"#,
+            sha256_hex(viewer_core_js().as_bytes()),
+            sha256_hex(viewer_core_css().as_bytes()),
+        )
+    })
+}
+
+/// SHA-256 16진 소문자. 셸 버전 키(FNV-1a)와 달리 이건 **배포 무결성 대조용**이라
+/// 암호학적 해시를 쓴다.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 /// SW 캐시 버전 키 — 프리캐시 셸 자산 바이트의 FNV-1a 해시(16진 16자리). 보안용이 아니라
@@ -752,6 +820,106 @@ mod tests {
         let response = respond("/healthz", "", TOKEN);
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "application/json");
+    }
+
+    /// 공유 계약의 핵심: 소스 트리(`web/shared`)와 **실제 서빙되는 번들**이 갈라지면 실패한다.
+    /// 사본이 생기거나(다른 경로를 임베드) 파일을 고치고 번들을 안 바꾸면 여기서 잡힌다.
+    #[test]
+    fn 공용_뷰어_모듈은_서빙_번들의_접두사이고_다이제스트가_일치한다() {
+        let shared = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/shared");
+        let manifest = respond("/shared-integrity.json", "", TOKEN)
+            .body
+            .into_owned();
+        let manifest = String::from_utf8(manifest).expect("무결성 매니페스트 UTF-8");
+        for (name, served, asset_path) in [
+            ("viewer-core.js", viewer_core_js(), "/app.js"),
+            ("viewer-core.css", viewer_core_css(), "/app.css"),
+        ] {
+            let disk = std::fs::read_to_string(shared.join(name))
+                .unwrap_or_else(|error| panic!("web/shared/{name} 읽기 실패: {error}"));
+            assert_eq!(disk, served, "{name}: 소스 트리와 서빙 번들이 다름");
+            let body = respond(asset_path, "", TOKEN).body.into_owned();
+            assert!(
+                body.starts_with(disk.as_bytes()),
+                "{asset_path} 번들이 {name} 내용으로 시작하지 않음"
+            );
+            let expected = sha256_hex(disk.as_bytes());
+            assert!(
+                manifest.contains(&format!(r#""{name}":"{expected}""#)),
+                "{name} 다이제스트 불일치: {manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn 무결성_매니페스트는_토큰_없이_200_json이고_두_다이제스트를_담는다() {
+        let response = respond("/shared-integrity.json", "", TOKEN);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/json");
+        let json: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("무결성 매니페스트 JSON 파싱 실패");
+        for name in ["viewer-core.js", "viewer-core.css"] {
+            let digest = json[name].as_str().unwrap_or_else(|| panic!("{name} 없음"));
+            assert_eq!(digest.len(), 64, "{name}: SHA-256 16진 64자 아님");
+            assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        }
+    }
+
+    /// 공용 뷰어 코어는 **시청 전용** 계약이다 — 인증·쓰기 경로·서비스 워커를 참조조차
+    /// 하면 안 된다. Relay 셸이 이 모듈만으로 view-only를 만족해야 하기 때문이다.
+    #[test]
+    fn 공용_뷰어_코어는_인증과_쓰기경로를_모른다() {
+        let source = viewer_core_js().to_ascii_lowercase();
+        for forbidden in [
+            "token",
+            "auth",
+            "input",
+            "upload",
+            "approval",
+            "resolve",
+            "serviceworker",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "viewer-core.js가 금지된 개념을 참조함: {forbidden}"
+            );
+        }
+        // 공개 API가 사라지면 Relay 셸이 소비할 수 없다.
+        assert!(
+            source.contains("export function createviewer("),
+            "createViewer 공개 API 누락"
+        );
+        for contract in ["'watch'", "'unwatch'", "'request_keyframe'"] {
+            assert!(
+                viewer_core_js().contains(contract),
+                "읽기 전용 전송 계약 누락: {contract}"
+            );
+        }
+    }
+
+    /// 번들이 ES 모듈이므로 셸 문서 세 개가 모두 `type="module"`로 로드해야 한다 —
+    /// 하나라도 빠지면 그 화면에서 SyntaxError로 셸이 통째로 죽는다.
+    #[test]
+    fn 셸_문서들은_합성_번들을_es_모듈로_로드한다() {
+        let version = shell_version();
+        for html in [
+            String::from_utf8(
+                respond("/", &format!("token={TOKEN}"), TOKEN)
+                    .body
+                    .into_owned(),
+            )
+            .unwrap(),
+            String::from_utf8(respond("/", "", TOKEN).body.into_owned()).unwrap(),
+            String::from_utf8(respond("/offline.html", "", TOKEN).body.into_owned()).unwrap(),
+        ] {
+            assert!(
+                html.contains(r#"<script type="module" src="/app."#),
+                "모듈 로드가 아님: {html}"
+            );
+        }
+        // 버전 경로도 같은 합성 번들이어야 한다(HTML이 참조하는 경로).
+        let versioned = respond(&format!("/app.{version}.js"), "", TOKEN);
+        assert_eq!(versioned.body.into_owned(), APP_JS);
     }
 
     #[test]

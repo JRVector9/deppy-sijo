@@ -848,6 +848,113 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
 /// codex rollout(`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`) 파싱.
 /// 세션 ID는 파일명 내 UUID, cwd는 session_meta(첫 줄). 상태는 마지막 event_msg로:
 /// `task_complete`/`turn_aborted` → Idle, 그 외(task_started/agent_message 등) → Working.
+/// Grok 세션 파서 (1.0.13 실측, 2026-09-04). 경로는 `<sessionDir>/chat_history.jsonl`이고
+/// sessionDir 이름이 세션 id다. 모델·강도는 형제 `summary.json`의 `current_model_id`·
+/// `reasoning_effort`에서 읽는다 — argv 플래그가 없거나 세션 중 `/model`로 바꿔도 여기엔
+/// 남는다(2026-09-04 사용자: 세션 행에 강도가 안 보였다). 활동은 마지막 레코드의 `type`
+/// 으로 판정한다: `assistant`면 답을 끝낸 Idle, `user`/`reasoning`/`tool_result`면 Working.
+///
+/// 2026-09-01엔 `sessions/<cwd>/prompt_history.jsonl` 하나뿐이라 세션 단위 파일이 없다고
+/// 실측했는데, 지금 버전은 세션 디렉터리를 따로 만든다 — 그 측정은 더 이상 유효하지 않다.
+pub fn parse_grok(path: &Path) -> Option<TranscriptState> {
+    let session_dir = path.parent()?;
+    let session_id = session_dir.file_name()?.to_str()?.to_owned();
+    let summary = read_small_json(&session_dir.join("summary.json"), GROK_SUMMARY_MAX_BYTES)?;
+    let model = summary
+        .get("current_model_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let effort = summary
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let cwd = summary
+        .pointer("/info/cwd")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let snapshot = tail_snapshot(path, TAIL_BYTES).ok()?;
+    let mut activity = AgentActivity::Idle;
+    let mut last_agent_summary = None;
+    let mut user_instruction = None;
+    // tail이 줄 중간에서 시작했으면 첫 조각은 온전한 레코드가 아니다.
+    let lines = snapshot
+        .text
+        .lines()
+        .skip(usize::from(snapshot.base_offset != 0));
+    for line in lines {
+        if line.len() > MAX_TRANSCRIPT_LINE_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                activity = AgentActivity::Working;
+                if let Some(summary) = grok_user_summary(&value) {
+                    user_instruction = Some(summary);
+                }
+            }
+            Some("assistant") => {
+                activity = AgentActivity::Idle;
+                if let Some(summary) = value
+                    .get("content")
+                    .and_then(message_content_summary)
+                    .and_then(|text| clean_agent_summary(&text))
+                {
+                    last_agent_summary = Some(summary);
+                }
+            }
+            Some("reasoning" | "tool_result" | "backend_tool_call") => {
+                activity = AgentActivity::Working;
+            }
+            _ => {}
+        }
+    }
+    Some(TranscriptState {
+        session_id,
+        cwd,
+        activity,
+        model,
+        effort,
+        context_pct: None,
+        last_agent_summary,
+        user_instruction,
+        recent_turns: Vec::new(),
+    })
+}
+
+/// `summary.json`은 몇백 바이트다 — 그 이상이면 우리가 아는 파일이 아니다.
+const GROK_SUMMARY_MAX_BYTES: u64 = 64 * 1024;
+
+/// 크기 상한 안의 JSON 파일 하나를 읽는다. 상한을 넘거나 못 읽으면 `None`.
+fn read_small_json(path: &Path, max_bytes: u64) -> Option<Value> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > max_bytes {
+        return None;
+    }
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Grok `user` 레코드의 지시 요약. content는 text 항목 배열인데 앞쪽에 하네스가 넣은
+/// `<system-reminder>` 블록이 섞여 있어 그건 걸러야 사용자가 실제로 친 말이 남는다.
+fn grok_user_summary(value: &Value) -> Option<String> {
+    let items: Vec<Value> = value
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .is_none_or(|text| !text.trim_start().starts_with("<system-reminder>"))
+        })
+        .cloned()
+        .collect();
+    text_items_summary(&items)
+}
+
 /// Kimi `wire.jsonl` 파서 (0.34.0 실측).
 ///
 /// Claude/Codex와 달리 레코드가 **명시적 타입 태그**를 달고 있어 추측할 게 없다:
@@ -1292,6 +1399,65 @@ mod kimi_tests {
                 }
             }
         }
+    }
+
+    /// Grok `summary.json` + `chat_history.jsonl` fixture(2026-09-04 실측 모양). 강도·모델은
+    /// summary에서, 활동은 마지막 레코드 type에서 — assistant로 끝나면 Idle, user로 끝나면
+    /// Working. `<system-reminder>` 블록은 사용자 지시에서 걸러진다.
+    #[test]
+    fn parse_grok은_summary와_마지막_레코드로_상태를_만든다() {
+        let dir = temp_root("grok-parse").join("01a06c06-0a9e-7ed1-bae5-908c9b49ee97");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"01a06c06-0a9e-7ed1-bae5-908c9b49ee97","cwd":"/Users/jr/Desktop/projects/colon35/Design"},"current_model_id":"grok-4.6","reasoning_effort":"xhigh"}"#,
+        )
+        .unwrap();
+        let path = dir.join("chat_history.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, r#"{{"type":"system","content":"sys"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","content":[{{"type":"text","text":"\n\n<system-reminder>\nnoise\n</system-reminder>"}},{{"type":"text","text":"매거진 디자인이 별도로 있어?"}}]}}"#
+        )
+        .unwrap();
+        writeln!(file, r#"{{"type":"reasoning","content":"..."}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","content":"별도 매거진 디자인은 없습니다."}}"#
+        )
+        .unwrap();
+
+        let state = parse_grok(&path).expect("파싱돼야 한다");
+        assert_eq!(state.session_id, "01a06c06-0a9e-7ed1-bae5-908c9b49ee97");
+        assert_eq!(
+            state.cwd.as_deref(),
+            Some("/Users/jr/Desktop/projects/colon35/Design")
+        );
+        assert_eq!(state.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(state.effort.as_deref(), Some("xhigh"));
+        assert_eq!(state.activity, AgentActivity::Idle, "assistant로 끝났다");
+        assert_eq!(
+            state.user_instruction.as_deref(),
+            Some("매거진 디자인이 별도로 있어?"),
+            "system-reminder는 걸러진다"
+        );
+        assert!(state.last_agent_summary.is_some());
+
+        // 사용자 턴이 마지막이면 일하는 중이다.
+        writeln!(
+            file,
+            r#"{{"type":"user","content":[{{"type":"text","text":"고마워"}}]}}"#
+        )
+        .unwrap();
+        let state = parse_grok(&path).expect("파싱돼야 한다");
+        assert_eq!(state.activity, AgentActivity::Working);
+        assert_eq!(state.user_instruction.as_deref(), Some("고마워"));
+
+        // summary가 없으면 세션을 만들지 않는다 — 강도 없는 상태를 지어내지 않는다.
+        std::fs::remove_file(dir.join("summary.json")).unwrap();
+        assert!(parse_grok(&path).is_none());
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     /// 경로 모양이 다르면 세션 id를 못 만든다 — 엉뚱한 id로 바인딩하면 안 된다.
@@ -1810,6 +1976,44 @@ fn codex_conversation_messages(snapshot: &TailSnapshot, builder: &mut Conversati
 /// kimi `wire.jsonl`에서 user/assistant 메시지만 뽑는다. `turn.prompt`가 사용자,
 /// `context.append_message`가 에이전트다 — hook_result/system 기원과 user role은 버린다
 /// (`kimi_recent_turns`와 같은 판정).
+/// Grok `chat_history.jsonl`의 대화 — `user`(text 항목 배열, 하네스가 넣은 system-reminder
+/// 는 걸러냄)와 `assistant`(문자열)만. 시각 필드가 없어 `at`은 비운다(2026-09-04 실측).
+fn grok_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
+    for (offset, line) in snapshot_lines(snapshot) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                let Some(items) = value.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                let filtered: Vec<Value> = items
+                    .iter()
+                    .filter(|item| {
+                        item.get("text")
+                            .and_then(Value::as_str)
+                            .is_none_or(|text| !text.trim_start().starts_with("<system-reminder>"))
+                    })
+                    .cloned()
+                    .collect();
+                if let Some(text) = conversation_content_text(&Value::Array(filtered)) {
+                    builder.push(ConversationRole::User, text, None, offset);
+                }
+            }
+            Some("assistant") => {
+                let Some(content) = value.get("content") else {
+                    continue;
+                };
+                if let Some(text) = conversation_content_text(content) {
+                    builder.push(ConversationRole::Assistant, text, None, offset);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn kimi_conversation_messages(snapshot: &TailSnapshot, builder: &mut ConversationBuilder) {
     for (offset, line) in snapshot_lines(snapshot) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -1878,6 +2082,7 @@ pub fn read_conversation(
         agent_detect::AgentKind::Claude => claude_conversation_messages(&snapshot, &mut builder),
         agent_detect::AgentKind::Codex => codex_conversation_messages(&snapshot, &mut builder),
         agent_detect::AgentKind::Kimi => kimi_conversation_messages(&snapshot, &mut builder),
+        agent_detect::AgentKind::Grok => grok_conversation_messages(&snapshot, &mut builder),
     }
     let (messages, truncated) = builder.finish();
     Ok(TranscriptConversation {

@@ -161,7 +161,7 @@
     }
 
     .stage-switcher button {
-      min-height: 38px;
+      min-height: 44px;
       border: 0;
       background: transparent;
       color: var(--muted);
@@ -234,7 +234,7 @@
 
     .settings-nav button {
       width: 100%;
-      min-height: 38px;
+      min-height: 44px;
       padding: 0 10px;
       border: 0;
       background: transparent;
@@ -290,7 +290,7 @@
     .transport-group-head strong { color: var(--text-strong); font-size: 12px; }
     .transport-group-head span { color: var(--muted); font-size: 10px; }
     .transport-tabs { display: flex; gap: 0; margin: 0 0 18px; border: 1px solid var(--border); }
-    .transport-tabs button { flex: 1; min-height: 40px; border: 0; border-right: 1px solid var(--border); background: #171a1f; color: var(--muted); cursor: pointer; }
+    .transport-tabs button { flex: 1; min-height: 44px; border: 0; border-right: 1px solid var(--border); background: #171a1f; color: var(--muted); cursor: pointer; }
     .transport-tabs button:last-child { border-right: 0; }
     .transport-tabs button.is-active { background: #172630; color: var(--text-strong); box-shadow: inset 0 -2px var(--cyan); }
     .url-preview { margin: 14px 0 0; padding: 10px; border: 1px solid var(--border); background: #12151a; color: #a9c8d5; font: 11px/1.5 ui-monospace, Menlo, monospace; overflow-wrap: anywhere; }
@@ -460,7 +460,8 @@
     .chip.permission { border-color: #2b5366; color: #98d1e6; background: #17252c; }
 
     .tabbar { display: grid; grid-template-columns: 1fr 1fr; margin: 0 -16px 16px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
-    .tabbar button { min-height: 42px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+    .tabbar.is-single { grid-template-columns: 1fr; }
+    .tabbar button { min-height: 44px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
     .tabbar button.is-active { color: var(--text-strong); box-shadow: inset 0 -2px var(--cyan); }
     .approval-count { color: var(--amber); }
 
@@ -469,7 +470,7 @@
     .workspace-head strong { color: var(--text-strong); font-size: 12px; }
     .workspace-state { padding: 2px 6px; color: var(--blue); background: #182536; font-size: 9px; font-weight: 700; text-transform: uppercase; }
     .workspace-state.warm { color: #d8bd78; background: #2b2518; }
-    .workspace-action { margin-left: auto; min-height: 32px; padding: 0 9px; border: 1px solid #425447; color: #9ed1a7; background: #1a2820; font-size: 10px; cursor: pointer; }
+    .workspace-action { margin-left: auto; min-height: 44px; padding: 0 9px; border: 1px solid #425447; color: #9ed1a7; background: #1a2820; font-size: 10px; cursor: pointer; }
 
     .session-row {
       width: 100%;
@@ -579,7 +580,7 @@
     .terminal-bottom { border-top: 1px solid var(--border); background: #171a1f; }
     .terminal-tools { display: flex; gap: 6px; overflow-x: auto; padding: 8px calc(10px + env(safe-area-inset-right)) 0 calc(10px + env(safe-area-inset-left)); scrollbar-width: none; touch-action: pan-x; }
     .terminal-tools::-webkit-scrollbar { display: none; }
-    .terminal-tools button { flex: none; min-width: 46px; min-height: 42px; border: 1px solid var(--border); background: #24282e; color: var(--text); cursor: pointer; }
+    .terminal-tools button { flex: none; min-width: 46px; min-height: 44px; border: 1px solid var(--border); background: #24282e; color: var(--text); cursor: pointer; }
     .terminal-tools button:disabled { opacity: 0.38; cursor: not-allowed; }
 
     .terminal-composer { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: end; gap: 7px; padding: 8px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left)); }
@@ -601,7 +602,7 @@
       z-index: 2;
     }
 
-    .terminal-debug button { min-height: 34px; padding: 0 9px; border: 1px solid #3a414b; background: rgba(24, 28, 34, 0.92); color: var(--muted-2); font-size: 10px; cursor: pointer; }
+    .terminal-debug button { min-height: 44px; padding: 0 9px; border: 1px solid #3a414b; background: rgba(24, 28, 34, 0.92); color: var(--muted-2); font-size: 10px; cursor: pointer; }
     .disconnect-overlay { position: absolute; inset: 0; z-index: 4; display: grid; place-items: center; padding: 24px; background: rgba(9, 11, 14, 0.78); backdrop-filter: blur(3px); }
     .disconnect-box { width: min(100%, 410px); border: 1px solid #5c3c42; background: #21181b; padding: 22px; box-shadow: var(--shadow); }
     .disconnect-box .offline-icon { width: 34px; height: 34px; display: grid; place-items: center; margin-bottom: 16px; border: 1px solid #75444d; color: var(--red); }
@@ -779,7 +780,7 @@
         step: 0,
         stage: 'desktop',
         phoneSurface: 'sessions',
-        permissions: { view: true, input: true, approval: false },
+        permissions: { view: true, input: false, approval: false },
         terminalMode: 'connected',
         selectedSession: null,
         warmConfirm: false,
@@ -789,6 +790,7 @@
         warmActivated: false,
         transportMode: 'tailscale',
         pairingTransport: 'tailscale',
+        pairedTransports: { tailscale: false, relay: false },
       };
 
       const shell = document.getElementById('prototype-shell');
@@ -817,6 +819,32 @@
           return;
         }
         render();
+      }
+
+      function completePairing(kind) {
+        if (kind !== 'tailscale' && kind !== 'relay') return;
+        state.pairedTransports[kind] = true;
+        state.recoveryReason = 'session-ended';
+      }
+
+      function advanceStep() {
+        if (state.step === FLOW.length - 1) {
+          setStep(0);
+          return;
+        }
+        if (FLOW[state.step] === 'pairing-qr' && state.pairingTransport === 'tailscale') {
+          completePairing('tailscale');
+          state.stage = 'phone';
+          setStep(4);
+          return;
+        }
+        if (FLOW[state.step] === 'pairing-confirm') {
+          completePairing(state.pairingTransport);
+          state.stage = 'phone';
+          setStep(4);
+          return;
+        }
+        setStep(state.step + 1);
       }
 
       function render() {
@@ -868,6 +896,12 @@
         return state.transportMode === 'tailscale' ? 'Tailscale' : 'Relay · 종단 간 암호화';
       }
 
+      function isAuthenticationRecovery() {
+        const authenticationFailed = state.recoveryReason === 'pairing-denied' || state.recoveryReason === 'device-revoked';
+        const alternateAuthenticated = enabledTransports().some((kind) => state.pairedTransports[kind]);
+        return authenticationFailed && !alternateAuthenticated;
+      }
+
       function transportOptionsMarkup() {
         return `<div class="transport-options" role="radiogroup" aria-label="모바일 접속 방식">${TRANSPORT_OPTIONS.map((option) => `
           <button type="button" class="transport-option ${state.transportMode === option.id ? 'is-selected' : ''}" data-action="select-transport" data-transport="${option.id}" role="radio" aria-checked="${state.transportMode === option.id}">
@@ -896,7 +930,20 @@
       function connectedTransportRows() {
         return enabledTransports().map((kind) => kind === 'tailscale' ? `
           <div class="settings-row"><div><p class="row-title">Tailscale Serve</p><p class="row-copy">mac.tail.example.ts.net · 기존 설정 유지</p></div><strong style="color:var(--green)">준비됨</strong></div>` : `
-          <div class="settings-row"><div><p class="row-title">Deppy Relay</p><p class="row-copy">relay.deppy.app · outbound WSS · E2EE</p></div><strong style="color:var(--green)">연결됨</strong></div>`).join('');
+          <div class="settings-row"><div><p class="row-title">Deppy Relay</p><p class="row-copy">relay.deppy.app · outbound WSS · E2EE</p></div><strong style="color:var(--green)">서비스 연결됨</strong></div>`).join('');
+      }
+
+      function connectedDeviceRows() {
+        return enabledTransports().map((kind) => {
+          const paired = state.pairedTransports[kind];
+          if (kind === 'tailscale') {
+            return `<div class="settings-row"><div><p class="row-title">Tailscale 브라우저 인증</p><p class="row-copy">${paired ? '기존 token gate로 접속 중' : 'Serve는 준비됐지만 이 기기는 아직 인증하지 않음'}</p></div><strong>${paired ? '인증됨' : '미인증'}</strong></div>`;
+          }
+          if (paired) {
+            return `<div class="device-list"><div class="device-row"><span class="device-dot"></span><div><strong>기대호의 iPhone</strong><small>Relay로 접속 중 · 기기별 자격증명</small></div><button type="button" class="secondary" data-action="revoke-device">Relay 접근 폐기</button></div></div>`;
+          }
+          return `<div class="settings-row"><div><p class="row-title">Relay 모바일 기기</p><p class="row-copy">Relay 서비스는 활성 상태지만 이 기기는 아직 페어링하지 않음</p></div><strong>미페어링</strong></div>`;
+        }).join('');
       }
 
       function renderDesktop() {
@@ -933,11 +980,21 @@
               <p class="verify-code">741 206</p><div class="permission-list">${permissionRow('view', '화면 보기', '세션 목록과 터미널 출력을 봅니다.', true)}${permissionRow('input', '터미널 입력', '텍스트와 특수키를 현재 세션으로 보냅니다.')}${permissionRow('approval', '승인 요청 처리', '도구 실행 허용·거부를 처리합니다.')}</div>
               <div class="settings-row"><div><p class="row-title">접근 기간</p><p class="row-copy">언제든 기기 관리에서 즉시 폐기할 수 있습니다.</p></div><strong>30일</strong></div><div class="button-row"><button type="button" class="primary" data-action="approve-device">이 기기 승인</button><button type="button" class="danger" data-action="deny-device">거부</button></div>`;
             break;
+          case 'recovery':
+            if (isAuthenticationRecovery()) {
+              desktopStage.innerHTML = desktopHeader('모바일 인증 필요', state.recoveryReason === 'device-revoked' ? '이 기기의 Relay 자격증명이 폐기되었습니다. 다시 사용하려면 새 QR로 페어링하세요.' : 'Relay 연결 요청을 승인하지 않았습니다. 세션을 열려면 새 QR로 다시 인증해야 합니다.') + `
+                ${connectedTransportRows()}
+                ${connectedDeviceRows()}
+                <div class="callout warning"><span>!</span><span>인증되지 않은 기기에는 세션 목록과 터미널을 표시하지 않습니다.</span></div>
+                <div class="button-row"><button type="button" class="primary" data-action="go-step" data-step="2">새 QR로 페어링</button></div>`;
+              break;
+            }
+            // A terminal session can end while the authenticated transport remains connected.
           default:
             desktopStage.innerHTML = desktopHeader('모바일 연결됨', `${transportLabel()} 경로로 공통 세션 화면과 전체화면 터미널을 사용합니다.`) + `
               ${connectedTransportRows()}
-              ${enabledTransports().includes('relay') ? `<div class="device-list"><div class="device-row"><span class="device-dot"></span><div><strong>기대호의 iPhone</strong><small>Relay로 접속 중 · 기기별 자격증명</small></div><button type="button" class="secondary" data-action="revoke-device">Relay 접근 폐기</button></div></div>` : `<div class="settings-row"><div><p class="row-title">Tailscale 브라우저 페어링</p><p class="row-copy">기존 token gate로 접속 중</p></div><strong>유지</strong></div>`}
-              <div class="settings-row"><div><p class="row-title">허용된 권한</p><p class="row-copy">${permissionSummary()}</p></div><strong>${state.permissions.approval ? '3' : '2'}개</strong></div>
+              ${connectedDeviceRows()}
+              <div class="settings-row"><div><p class="row-title">허용된 권한</p><p class="row-copy">${permissionSummary()}</p></div><strong>${permissionCount()}개</strong></div>
               <div class="callout ${state.transportMode === 'both' ? 'warning' : 'success'}"><span>${state.transportMode === 'both' ? '!' : '✓'}</span><span>${state.transportMode === 'both' ? '두 경로가 모두 활성화되어 있지만 장애 시 자동 전환하지 않습니다.' : state.transportMode === 'tailscale' ? '기존 Tailscale 경로가 그대로 활성화되어 있습니다.' : 'Tailscale 없이 Relay 경로만 활성화되어 있습니다.'}</span></div>`;
         }
       }
@@ -957,6 +1014,10 @@
         if (state.permissions.input) values.push('터미널 입력');
         if (state.permissions.approval) values.push('승인 처리');
         return values.join(' · ');
+      }
+
+      function permissionCount() {
+        return 1 + Number(state.permissions.input) + Number(state.permissions.approval);
       }
 
       function renderPhone() {
@@ -995,7 +1056,8 @@
           case 'terminal':
             renderPhoneDashboard();
             break;
-          case 'recovery':
+          case 'recovery': {
+            const authenticationRecovery = isAuthenticationRecovery();
             phoneStage.innerHTML = mobileTop('offline', '확인 필요') + `
               <section class="mobile-hero"><p class="eyebrow">Recovery</p><h2>${recoveryTitle()}</h2><p>${recoveryCopy()}</p></section>
               <div class="recovery-list">
@@ -1004,8 +1066,9 @@
                 ${recoveryRow('인증 만료·폐기', state.pairingTransport === 'tailscale' ? '기존 Tailscale QR로 다시 연결합니다.' : '새 일회용 Relay QR로 다시 페어링합니다.')}
                 ${recoveryRow('세션 종료', '세션 목록으로 돌아가 다른 세션을 선택합니다.')}
               </div>
-              <div class="mobile-actions"><button type="button" class="primary" data-action="recover-to-sessions">세션 목록으로</button><button type="button" class="secondary" data-action="go-step" data-step="2">다시 페어링</button></div>`;
+              <div class="mobile-actions">${authenticationRecovery ? '' : '<button type="button" class="primary" data-action="recover-to-sessions">세션 목록으로</button>'}<button type="button" class="${authenticationRecovery ? 'primary' : 'secondary'}" data-action="go-step" data-step="2">다시 페어링</button></div>`;
             break;
+          }
         }
       }
 
@@ -1014,6 +1077,7 @@
       }
 
       function renderPhoneDashboard() {
+        if (!state.permissions.approval && state.phoneSurface === 'approvals') state.phoneSurface = 'sessions';
         const permissionChips = [
           `<span class="chip secure">${transportLabel()}</span>`,
           '<span class="chip permission">화면 보기</span>',
@@ -1022,7 +1086,7 @@
         ].join('');
         phoneStage.innerHTML = mobileTop('', 'Mac 온라인') + `
           <div class="chips">${permissionChips}</div>
-          <div class="tabbar"><button type="button" data-action="phone-tab" data-tab="sessions" class="${state.phoneSurface === 'sessions' ? 'is-active' : ''}">세션</button><button type="button" data-action="phone-tab" data-tab="approvals" class="${state.phoneSurface === 'approvals' ? 'is-active' : ''}">승인 <span class="approval-count">1</span></button></div>
+          <div class="tabbar ${state.permissions.approval ? '' : 'is-single'}"><button type="button" data-action="phone-tab" data-tab="sessions" class="${state.phoneSurface === 'sessions' ? 'is-active' : ''}">세션</button>${state.permissions.approval ? `<button type="button" data-action="phone-tab" data-tab="approvals" class="${state.phoneSurface === 'approvals' ? 'is-active' : ''}">승인 <span class="approval-count">1</span></button>` : ''}</div>
           ${state.phoneSurface === 'sessions' ? sessionListMarkup() : approvalsMarkup()}`;
 
         if (state.warmConfirm) {
@@ -1244,25 +1308,33 @@ Browser Back returns to the session list without leaving the app.
 
         if (action === 'go-step') setStep(Number(target.dataset.step));
         else if (action === 'previous-step') setStep(state.step - 1);
-        else if (action === 'next-step') setStep(state.step === FLOW.length - 1 ? 0 : state.step + 1);
+        else if (action === 'next-step') advanceStep();
         else if (action === 'stage') { state.stage = target.dataset.stage; renderStageSelection(); }
         else if (action === 'select-transport') setTransportMode(target.dataset.transport);
         else if (action === 'transport-start') setStep(1);
         else if (action === 'transport-ready') setStep(2);
         else if (action === 'pairing-transport') { state.pairingTransport = target.dataset.transport; render(); }
         else if (action === 'qr-scanned') {
-          if (state.pairingTransport === 'tailscale') { state.stage = 'phone'; setStep(4); showToast('기존 Tailscale 경로로 연결했습니다.'); }
+          if (state.pairingTransport === 'tailscale') { completePairing('tailscale'); state.stage = 'phone'; setStep(4); showToast('기존 Tailscale 경로로 연결했습니다.'); }
           else setStep(3);
         }
         else if (action === 'regenerate-qr') showToast('새 일회용 QR을 발급했습니다. 만료 시간이 5분으로 갱신되었습니다.');
         else if (action === 'copy-tailscale-url') showToast('프로토타입: Tailscale 접속 주소를 표시했습니다. 실제 토큰은 포함하지 않습니다.');
-        else if (action === 'continue-tailscale') { state.stage = 'phone'; setStep(4); showToast('기존 Tailscale 인증으로 세션 화면을 열었습니다.'); }
-        else if (action === 'approve-device') { state.stage = 'phone'; setStep(4); showToast('기대호의 iPhone을 승인했습니다.'); }
+        else if (action === 'continue-tailscale') { completePairing('tailscale'); state.stage = 'phone'; setStep(4); showToast('기존 Tailscale 인증으로 세션 화면을 열었습니다.'); }
+        else if (action === 'approve-device') { completePairing('relay'); state.stage = 'phone'; setStep(4); showToast('기대호의 iPhone을 승인했습니다.'); }
         else if (action === 'deny-device') {
-          if (state.transportMode === 'both') { state.pairingTransport = 'tailscale'; state.stage = 'phone'; setStep(4); showToast('Relay 요청만 거부했습니다. 기존 Tailscale 경로는 계속 사용할 수 있습니다.'); }
-          else { state.recoveryReason = 'pairing-denied'; state.stage = 'phone'; setStep(6); }
+          state.pairedTransports.relay = false;
+          state.recoveryReason = 'pairing-denied';
+          state.stage = 'phone';
+          if (state.transportMode === 'both' && state.pairedTransports.tailscale) { state.pairingTransport = 'tailscale'; setStep(4); showToast('Relay 요청을 거부했습니다. 인증된 Tailscale 경로는 계속 사용할 수 있습니다.'); }
+          else if (state.transportMode === 'both') { state.pairingTransport = 'tailscale'; setStep(2); showToast('Relay 요청을 거부했습니다. 계속하려면 기존 Tailscale QR로 인증하세요.'); }
+          else setStep(6);
         }
-        else if (action === 'phone-tab') { state.phoneSurface = target.dataset.tab; renderPhone(); }
+        else if (action === 'phone-tab') {
+          if (target.dataset.tab === 'approvals' && !state.permissions.approval) return;
+          state.phoneSurface = target.dataset.tab;
+          renderPhone();
+        }
         else if (action === 'open-terminal' && target.dataset.session) openTerminal(target.dataset.session, target);
         else if (action === 'close-terminal') closeTerminal();
         else if (action === 'simulate-disconnect') { state.terminalMode = 'disconnected'; syncTerminalView(); }
@@ -1274,12 +1346,14 @@ Browser Back returns to the session list without leaving the app.
         else if (action === 'warm-confirm-open') { state.warmConfirm = true; renderPhone(); }
         else if (action === 'warm-cancel') { state.warmConfirm = false; renderPhone(); }
         else if (action === 'warm-confirm') { state.warmConfirm = false; state.warmActivated = true; showToast('Mac의 활성 워크스페이스를 design-system으로 전환했습니다.'); renderPhone(); }
-        else if (action === 'approval-demo') showToast('프로토타입: 승인 결과는 실제 도구 실행에 전달되지 않습니다.');
+        else if (action === 'approval-demo' && state.permissions.approval) showToast('프로토타입: 승인 결과는 실제 도구 실행에 전달되지 않습니다.');
         else if (action === 'revoke-device') {
-          if (state.transportMode === 'both') { state.transportMode = 'tailscale'; state.pairingTransport = 'tailscale'; render(); showToast('Relay 기기 접근만 폐기했습니다. Tailscale 경로는 유지됩니다.'); }
-          else { state.recoveryReason = 'device-revoked'; state.stage = 'phone'; setStep(6); }
+          state.pairedTransports.relay = false;
+          state.recoveryReason = 'device-revoked';
+          if (state.transportMode === 'both' && state.pairedTransports.tailscale) { render(); showToast('Relay 기기 접근만 폐기했습니다. 인증된 Tailscale 경로는 유지됩니다.'); }
+          else { state.pairingTransport = state.transportMode === 'tailscale' ? 'tailscale' : 'relay'; state.stage = 'phone'; setStep(6); }
         }
-        else if (action === 'recover-to-sessions') { state.stage = 'phone'; setStep(4); }
+        else if (action === 'recover-to-sessions' && !isAuthenticationRecovery()) { state.stage = 'phone'; setStep(4); }
       });
 
       window.addEventListener('popstate', () => {

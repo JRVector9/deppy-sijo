@@ -138,6 +138,73 @@ fn the_outbound_backlog_is_freed_before_the_core_is_told_the_connection_closed()
     );
 }
 
+/// 절단 지시는 채널에만 넣으면 안 된다. 1바이트씩 흘려 넣어 `read()`를 붙잡은 상대는 채널을
+/// 영영 확인하지 않는다 — 소켓을 직접 닫아야 `read()`가 오류로 돌아온다.
+#[test]
+fn a_disconnect_closes_the_socket_so_a_pinned_read_returns() {
+    assert!(
+        TRANSPORT.contains("HashMap<ConnectionKey, (Sender<Outbound>, TcpStream)>"),
+        "registry가 소켓 복제본을 들고 있어야 한다"
+    );
+    let serve = section(TRANSPORT, "fn serve(", "fn pump(");
+    assert!(
+        serve.contains("stream.try_clone()"),
+        "절단용 소켓 복제본이 사라졌다"
+    );
+    let dispatch = section(TRANSPORT, "fn dispatch(", "fn ip_bytes(");
+    let close = dispatch
+        .find("RelayAction::Disconnect { connection, code }")
+        .expect("Disconnect 분기");
+    let shutdown = dispatch[close..]
+        .find("socket.shutdown(Shutdown::Both)")
+        .expect("절단 시 소켓을 닫아야 한다");
+    assert!(shutdown < 600);
+}
+
+/// 스레드는 핸드셰이크 **전에** 상한을 받는다. 코어의 연결 상한은 핸드셰이크 뒤에야
+/// 적용되므로, 그 전 단계에서 스레드가 무한정 생기는 것은 accept 루프가 막아야 한다.
+#[test]
+fn worker_threads_are_capped_before_they_are_spawned() {
+    let main = section(TRANSPORT, "fn main()", "fn route_verifiers_from_env(");
+    let cap = main
+        .find("WorkerSlot::try_acquire(max_workers)")
+        .expect("스레드 상한 확보");
+    let spawn = main
+        .find("std::thread::spawn(move ||")
+        .expect("스레드 생성");
+    assert!(cap < spawn, "상한을 넘으면 스레드를 아예 만들지 않는다");
+    assert!(
+        TRANSPORT.contains("impl Drop for WorkerSlot"),
+        "panic으로 죽어도 자리를 돌려줘야 한다"
+    );
+}
+
+/// SIGTERM은 정지 깃발이 되고, accept 루프는 그 깃발을 볼 수 있어야 한다. 차단 accept는
+/// 깃발을 볼 기회가 없어 `systemctl stop`이 프레임 중간에 프로세스를 죽인다.
+#[test]
+fn shutdown_signals_are_observed_by_a_non_blocking_accept_loop() {
+    // rustfmt가 줄을 나누므로 공백을 지운 뒤 본다.
+    let compact: String = TRANSPORT.chars().filter(|c| !c.is_whitespace()).collect();
+    for signal in ["SIGTERM", "SIGINT"] {
+        assert!(
+            compact.contains(&format!(
+                "libc::signal(libc::{signal},request_shutdownas*const()aslibc::sighandler_t,)"
+            )),
+            "{signal} 핸들러가 설치돼야 한다"
+        );
+    }
+    let main = section(TRANSPORT, "fn main()", "fn route_verifiers_from_env(");
+    assert!(main.contains(".set_nonblocking(true)"), "비차단 accept");
+    assert!(
+        main.contains("!SHUTDOWN_REQUESTED.load(Ordering::SeqCst)"),
+        "accept 루프가 정지 깃발을 확인해야 한다"
+    );
+    // 루프를 빠져나온 뒤에는 코어 shutdown → dispatch → join 순서다.
+    let after = main.find(".shutdown(unix_now())").expect("코어 종료");
+    let join = main[after..].find("worker.join()").expect("스레드 join");
+    assert!(join > 0);
+}
+
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let from = source.find(start).unwrap_or_else(|| panic!("{start}"));
     let to = source[from..].find(end).unwrap_or_else(|| panic!("{end}"));

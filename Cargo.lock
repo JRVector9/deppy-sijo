@@ -1154,6 +1154,7 @@ dependencies = [
  "qrcode",
  "quick-xml",
  "regex",
+ "relay-protocol",
  "rfd",
  "runtime",
  "rusqlite",
@@ -4125,6 +4126,7 @@ name = "relay-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "relay-protocol",
  "tracing",
  "tracing-subscriber",
@@ -4390,7 +4392,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
+ "core-foundation 0.10.1",
  "keyring-core",
+ "security-framework",
  "serde_json",
  "uuid",
  "windows-native-keyring-store",

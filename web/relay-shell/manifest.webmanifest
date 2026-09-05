@@ -1,0 +1,21 @@
+{
+  "id": "./",
+  "name": "시조새 원격 — 보기 전용",
+  "short_name": "시조새 보기",
+  "description": "폰에서 Mac의 에이전트 세션 화면을 종단 간 암호화로 봅니다. 입력·승인·파일 전송 기능은 없습니다.",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#181b20",
+  "theme_color": "#181b20",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20512%20512'%3E%3Crect%20width='512'%20height='512'%20rx='96'%20fill='%23181b20'/%3E%3Ccircle%20cx='256'%20cy='256'%20r='132'%20fill='none'%20stroke='%2339b8e8'%20stroke-width='28'/%3E%3Ccircle%20cx='256'%20cy='256'%20r='44'%20fill='%2339b8e8'/%3E%3C/svg%3E",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

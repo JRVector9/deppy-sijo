@@ -269,6 +269,8 @@ impl std::fmt::Debug for RelayDeviceRecord {
 pub enum PendingInsert {
     Stored,
     PendingLimitReached,
+    /// 다른 주체의 미완 의식과 id 또는 키가 겹친다.
+    Conflict,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -312,6 +314,8 @@ pub trait RelayRepository: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionRejection {
     PendingLimitReached,
+    /// 다른 주체의 미완 의식과 겹친다 — 그쪽이 끝나거나 만료돼야 한다.
+    PendingConflict,
     PendingNotFound,
     PairingDeadlinePassed,
     DeviceLimitReached,
@@ -386,6 +390,9 @@ impl PendingAdmission {
             PendingInsert::PendingLimitReached => Ok(AdmissionStart::Rejected(
                 AdmissionRejection::PendingLimitReached,
             )),
+            PendingInsert::Conflict => Ok(AdmissionStart::Rejected(
+                AdmissionRejection::PendingConflict,
+            )),
         }
     }
 
@@ -399,21 +406,32 @@ impl PendingAdmission {
         handshake: AuthenticatedHandshake,
         approved_at: u64,
     ) -> anyhow::Result<AdmissionOutcome> {
-        let device = match repository.approve_pending(self.pending.pairing_id(), approved_at)? {
-            ApprovalResult::Approved(device) => device,
-            ApprovalResult::NotFound => {
+        // 저장소 오류는 커밋 **뒤**(행 → 레코드 변환 등)에서도 날 수 있다. 그때 그냥 올리면
+        // 승인된 기기가 취소 없이 남는다. 취소는 멱등이고 발행된 것이 없으면 NotFound라서,
+        // 실패 시 무조건 보상해도 안전하다.
+        let device = match repository.approve_pending(self.pending.pairing_id(), approved_at) {
+            Ok(ApprovalResult::Approved(device)) => device,
+            Ok(ApprovalResult::NotFound) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::PendingNotFound,
                 ));
             }
-            ApprovalResult::Expired => {
+            Ok(ApprovalResult::Expired) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::PairingDeadlinePassed,
                 ));
             }
-            ApprovalResult::DeviceLimitReached => {
+            Ok(ApprovalResult::DeviceLimitReached) => {
                 return Ok(AdmissionOutcome::Rejected(
                     AdmissionRejection::DeviceLimitReached,
+                ));
+            }
+            Err(error) => {
+                return Err(self.compensate(
+                    repository,
+                    self.pending.device_id(),
+                    approved_at,
+                    error,
                 ));
             }
         };

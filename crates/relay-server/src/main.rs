@@ -14,8 +14,8 @@
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -32,6 +32,8 @@ use tungstenite::{Message, WebSocket};
 
 /// 읽기 시한. 이 주기로 깨어나 발신 큐를 비우고 시한 만료를 정리한다.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// 비차단 accept 폴링 주기. 정지 깃발이 관측되기까지의 최악 지연이다.
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
 /// 쓰기 시한. 이 시간 안에 받아 가지 못하는 상대는 느린 소비자로 보고 끊는다.
 ///
 /// 시한이 없으면 수신 윈도가 막힌 상대에게 `send`가 무한정 걸린다. 그 스레드는 자기 발신
@@ -50,7 +52,62 @@ enum Outbound {
     Close(RejectionCode),
 }
 
-type Registry = Arc<Mutex<HashMap<ConnectionKey, Sender<Outbound>>>>;
+/// 연결별 발신 채널 **과 소켓 복제본**. 절단 지시를 채널에만 넣으면, `read()`에 갇힌 워커는
+/// 그 지시를 영영 못 본다 — 1바이트씩 흘려 넣는 상대는 읽기 시한을 매번 갱신해 `read()`가
+/// 돌아오지 않게 만들 수 있다. 소켓을 직접 닫아야 그 `read()`가 오류로 돌아온다.
+type Registry = Arc<Mutex<HashMap<ConnectionKey, (Sender<Outbound>, TcpStream)>>>;
+
+/// 살아 있는 접속 스레드 수. accept마다 스레드를 만들기 **전에** 이 값으로 상한을 건다 —
+/// 코어의 `max_connections`는 WebSocket 핸드셰이크 뒤에야 적용되므로, 그 전 단계에서
+/// 스레드가 무한정 생기는 것을 막지 못한다.
+static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// SIGTERM/SIGINT가 올리는 정지 깃발. `systemctl stop`이 프레임 중간에 프로세스를 죽이는
+/// 대신, accept 루프가 이 깃발을 보고 모든 연결을 정확히 한 번씩 닫는다.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn request_shutdown(_signal: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_signal_handlers() {
+    // SAFETY: 핸들러는 원자적 저장 한 번만 수행한다 — async-signal-safe다.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
+/// 접속 스레드 하나의 수명 동안 `LIVE_WORKERS`를 잡는다. panic으로 죽어도 Drop이 되돌린다.
+struct WorkerSlot;
+
+impl WorkerSlot {
+    fn try_acquire(limit: usize) -> Option<Self> {
+        let taken = LIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
+        if taken >= limit {
+            LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self)
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -74,28 +131,41 @@ fn main() -> anyhow::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
 
     let listener = TcpListener::bind(bind).with_context(|| format!("{bind} bind 실패"))?;
+    // 비차단 accept + 폴링. 차단 accept는 정지 깃발을 볼 기회가 없어 SIGTERM이 프레임
+    // 중간에 프로세스를 죽이게 둔다.
     listener
-        .set_nonblocking(false)
+        .set_nonblocking(true)
         .context("listener 설정 실패")?;
+    install_signal_handlers();
+    let max_workers = RelayLimits::default().max_connections;
     tracing::info!(%bind, "Relay 데이터 평면 시작 (TLS는 배포 edge가 종단한다)");
 
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
-    for stream in listener.incoming() {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        let stream = match stream {
-            Ok(stream) => stream,
+    while running.load(Ordering::SeqCst) && !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(%error, "accept 실패");
                 continue;
             }
         };
         workers.retain(|worker| !worker.is_finished());
+        // 스레드를 만들기 **전에** 상한을 건다. 코어의 연결 상한은 핸드셰이크 뒤에야
+        // 적용되므로, 그 전 단계에서 스레드가 무한정 생기는 것은 여기서 막는다.
+        let Some(slot) = WorkerSlot::try_acquire(max_workers) else {
+            tracing::debug!("접속 스레드 상한 — 연결을 받지 않는다");
+            drop(stream);
+            continue;
+        };
         let core = core.clone();
         let registry = registry.clone();
         let running = running.clone();
         workers.push(std::thread::spawn(move || {
+            let _slot = slot;
             if let Err(error) = serve(stream, &core, &registry, &running) {
                 // 오류 문자열에는 프레임 내용이 들어가지 않는다 — 종류만 남긴다.
                 tracing::debug!(%error, "연결 종료");
@@ -168,6 +238,9 @@ fn serve(
     running: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let peer = stream.peer_addr().context("peer 주소를 읽지 못했다")?;
+    // 절단용 복제본. 채널에 넣은 절단 지시는 `read()`에 갇힌 워커가 못 본다 — 소켓을 직접
+    // 닫아야 그 `read()`가 오류로 돌아와 정리 경로에 들어온다.
+    let shutdown_handle = stream.try_clone().context("소켓 복제 실패")?;
     stream
         .set_read_timeout(Some(POLL_INTERVAL))
         .context("읽기 시한 설정 실패")?;
@@ -196,7 +269,7 @@ fn serve(
     registry
         .lock()
         .map_err(|_| anyhow::anyhow!("registry 잠금 오염"))?
-        .insert(key, sender);
+        .insert(key, (sender, shutdown_handle));
 
     let result = pump(&mut socket, core, registry, running, key, &receiver);
 
@@ -350,13 +423,16 @@ fn dispatch(actions: &[RelayAction], registry: &Registry) {
     for action in actions {
         match action {
             RelayAction::Send { connection, frame } => {
-                if let Some(sender) = guard.get(connection) {
+                if let Some((sender, _)) = guard.get(connection) {
                     let _ = sender.send(Outbound::Frame(frame.clone()));
                 }
             }
             RelayAction::Disconnect { connection, code } => {
-                if let Some(sender) = guard.get(connection) {
+                if let Some((sender, socket)) = guard.get(connection) {
                     let _ = sender.send(Outbound::Close(*code));
+                    // 채널만으로는 부족하다. 1바이트씩 흘려 넣어 `read()`를 붙잡은 상대는
+                    // 채널을 영영 확인하지 않는다 — 소켓을 닫아 `read()`를 깨운다.
+                    let _ = socket.shutdown(Shutdown::Both);
                 }
             }
         }

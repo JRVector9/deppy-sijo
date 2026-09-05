@@ -548,6 +548,7 @@ fn agent_kind_id(kind: crate::agent_detect::AgentKind) -> &'static str {
         crate::agent_detect::AgentKind::Claude => "claude",
         crate::agent_detect::AgentKind::Codex => "codex",
         crate::agent_detect::AgentKind::Kimi => "kimi",
+        crate::agent_detect::AgentKind::Grok => "grok",
     }
 }
 
@@ -1549,6 +1550,29 @@ fn runtime_command_creates_session(command: &runtime::RuntimeCommand) -> bool {
             | runtime::RuntimeCommand::SpawnAgent { .. }
             | runtime::RuntimeCommand::SplitPane { .. }
     )
+}
+
+/// 셸/분할 스폰이 dotenv 워커를 **건너뛰어도** 되는가(2026-09-04 사용자: 런처 빈 터미널 딜레이).
+///
+/// 모든 세션 생성은 `.env`를 주입하려고 dotenv 워커(별도 스레드)를 왕복한 뒤에야 PTY로
+/// 간다. 그런데 이 런타임 인스턴스가 이미 기본 env를 받았고(`delivered`) 그 뒤 `.env`가
+/// 바뀌지 않았으면(`current`), 워커는 돌아도 `Ok(None)`(변화 없음)으로 끝난다 — 스레드
+/// 왕복, 30초 idle 뒤 스레드 재생성, 전환 직후 풀 동기화 뒤에 **줄 서는 시간**만 낸다.
+/// 그 경우 명령을 곧장 런타임에 보낸다. 런타임의 기본 env는 sticky라 이전에 전달된 값이
+/// 그대로 새 셸에 들어간다.
+///
+/// 에이전트 스폰은 제외한다 — 승인 티켓·redaction lease가 continuation 성공 경로에
+/// 묶여 있어 그 길을 그대로 타야 한다. 복원 명령은 `runtime_command_creates_session`
+/// 밖이라 자연히 제외된다.
+fn session_spawn_skips_dotenv_worker(
+    command: &runtime::RuntimeCommand,
+    delivered: Option<DotenvState>,
+    current: DotenvState,
+) -> bool {
+    matches!(
+        command,
+        runtime::RuntimeCommand::SpawnShell { .. } | runtime::RuntimeCommand::SplitPane { .. }
+    ) && delivered == Some(current)
 }
 
 fn startup_catalog_blocks_session_creation(
@@ -4693,7 +4717,10 @@ fn new_env_project_rows_worker(db_path: PathBuf, ctx: egui::Context) -> EnvProje
         move || {
             let db_path = db_path.clone();
             let mut db = None;
-            move |job: EnvProjectRowsJob| {
+            move |mut job: EnvProjectRowsJob| {
+                // 넘어온 목록은 사이드바 순서로 정렬돼 있다. 환경 및 API 목록은 사이드바와
+                // 독립 도메인이라 여기서 자기 순서(생성순)를 세운다(2026-09-03 defect 2).
+                App::sort_workspaces_for_env_projects(&mut job.workspaces);
                 let rows = (|| -> anyhow::Result<_> {
                     if db.is_none() {
                         db = Some(Db::open(&db_path)?);
@@ -7892,7 +7919,181 @@ struct WebRemoteState {
     token: String,
 }
 
-/// Relay에서 복호화된 프레임을 받아 공유 코어로 넘기는 싱크.
+/// 승인된 기기의 인가 기간. 1차 릴리스는 고정값이며 편집 UI가 없다.
+const RELAY_DEVICE_AUTHORIZATION_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+fn parse_relay_device_id(hex: &str) -> Option<web_remote::relay::contract::DeviceId> {
+    if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(chunk).ok()?;
+        bytes[index] = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(web_remote::relay::contract::DeviceId::from_bytes(bytes))
+}
+
+/// 워커의 상태 변화를 받아 두는 관찰자. 설정 화면은 이 값만 읽는다.
+#[derive(Default)]
+struct RelayStateProbe {
+    state: std::sync::Mutex<Option<web_remote::relay_client::RelayState>>,
+}
+
+impl RelayStateProbe {
+    fn current(&self) -> Option<web_remote::relay_client::RelayState> {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn is_connected(&self) -> bool {
+        matches!(
+            self.current(),
+            Some(web_remote::relay_client::RelayState::Connected)
+        )
+    }
+}
+
+impl web_remote::relay_client::RelayObserver for RelayStateProbe {
+    fn state_changed(&self, state: web_remote::relay_client::RelayState) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state);
+    }
+}
+
+/// 싱크(워커 스레드)와 앱(UI 스레드) 사이의 우편함. 잠금 하나가 지키는 작은 슬롯들이다.
+///
+/// - 싱크 → 앱: 서명이 검증된 상대의 **새 페어링 주장**. 증명 검증과 사용자 승인은 페어링
+///   비밀을 가진 앱만 할 수 있다.
+/// - 앱 → 싱크: 승인이 끝나 **활성화할 채널**, 또는 거절.
+///
+/// 이미 페어링된 기기의 재접속은 우편함을 거치지 않는다 — 저장소 판정만으로 끝나므로 싱크가
+/// 직접 한다. 세션이 끝나면 슬롯은 전부 비운다: 죽은 세션의 주장을 다음 세션이 승인받아서는
+/// 안 된다.
+#[derive(Default)]
+struct RelayMailbox {
+    inner: std::sync::Mutex<RelayMailboxInner>,
+}
+
+#[derive(Default)]
+struct RelayMailboxInner {
+    claim: Option<web_remote::relay_client::PairingClaim>,
+    activation: Option<web_remote::relay::SecureChannel>,
+    rejected: bool,
+    /// 앱 → 싱크: 기기 입장 티켓 게시/회수. 세션이 끝나도 지우지 않는다 — 티켓은 의식의
+    /// 수명을 따르지 세션의 수명을 따르지 않는다.
+    ticket: RelayTicketCommands,
+}
+
+/// 앱이 싱크에 내린 결정.
+enum RelayDecision {
+    Activate(web_remote::relay::SecureChannel),
+    Reject,
+}
+
+/// 앱이 싱크에 내린 티켓 명령. 회수와 게시를 **따로** 담는다.
+///
+/// 슬롯 하나에 둘 중 하나만 담으면, 취소 직후 재시작(회수 → 게시)에서 나중 게시가 앞선
+/// 회수를 덮어쓴다. 싱크는 대략 1초에 한 번 꺼내 가는데 두 번의 클릭은 그보다 훨씬 가까워
+/// 실제로 그렇게 된다 — 그러면 취소된 핸들이 회수되지 않은 채 서버에서 TTL(5분)을 다
+/// 살아남고, 죽은 줄 알았던 링크로 기기가 그대로 입장한다.
+///
+/// 싱크는 **회수 먼저, 게시 나중**으로 적용한다.
+#[derive(Default)]
+struct RelayTicketCommands {
+    /// 아직 싱크에 닿지 않은 회수 요청. 절대 버리지 않는다.
+    revoke: bool,
+    /// 아직 싱크에 닿지 않은 게시 요청.
+    publish: Option<relay_protocol::AdmissionCredential>,
+}
+
+impl RelayMailbox {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RelayMailboxInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 싱크: 주장을 앱에 넘긴다. 세션당 하나다 — 이전 것이 남아 있으면 버린다.
+    fn post_claim(&self, claim: web_remote::relay_client::PairingClaim) {
+        let mut inner = self.lock();
+        inner.claim = Some(claim);
+        inner.rejected = false;
+    }
+
+    /// 앱: 주장을 꺼낸다.
+    fn take_claim(&self) -> Option<web_remote::relay_client::PairingClaim> {
+        self.lock().claim.take()
+    }
+
+    /// 앱: 승인된 채널을 싱크에 건넨다.
+    fn activate(&self, channel: web_remote::relay::SecureChannel) {
+        let mut inner = self.lock();
+        inner.rejected = false;
+        if let Some(mut stale) = inner.activation.replace(channel) {
+            stale.close();
+        }
+    }
+
+    /// 앱: 주장을 거절했다(증명 실패·사용자 거부·취소). 건네다 만 채널이 있으면 닫는다.
+    fn reject(&self) {
+        let mut inner = self.lock();
+        inner.rejected = true;
+        if let Some(mut channel) = inner.activation.take() {
+            channel.close();
+        }
+    }
+
+    /// 싱크: 앱의 결정을 꺼낸다.
+    fn take_decision(&self) -> Option<RelayDecision> {
+        let mut inner = self.lock();
+        if let Some(channel) = inner.activation.take() {
+            return Some(RelayDecision::Activate(channel));
+        }
+        std::mem::take(&mut inner.rejected).then_some(RelayDecision::Reject)
+    }
+
+    /// 앱: 페어링 의식이 시작됐다 — 기기 입장 티켓을 게시한다. 아직 전달되지 않은 회수는
+    /// 그대로 남는다(싱크가 회수를 먼저 적용한다).
+    fn publish_ticket(&self, handle: relay_protocol::AdmissionCredential) {
+        self.lock().ticket.publish = Some(handle);
+    }
+
+    /// 앱: 의식이 끝났다 — 티켓을 회수한다. 아직 전달되지 않은 게시는 함께 버린다(서버가
+    /// 본 적 없는 핸들이라 회수할 것도 없다). **회수 자체는 절대 버리지 않는다.**
+    fn revoke_ticket(&self) {
+        let mut inner = self.lock();
+        inner.ticket.publish = None;
+        inner.ticket.revoke = true;
+    }
+
+    /// 싱크: 티켓 명령을 꺼낸다.
+    fn take_ticket_commands(&self) -> RelayTicketCommands {
+        std::mem::take(&mut self.lock().ticket)
+    }
+
+    /// 세션이 끝났다 — 이 세션의 주장과 결정은 전부 무효다.
+    fn clear(&self) {
+        let mut inner = self.lock();
+        inner.claim = None;
+        inner.rejected = false;
+        if let Some(mut channel) = inner.activation.take() {
+            channel.close();
+        }
+    }
+}
+
+/// Relay 세션 하나를 끝까지 책임지는 싱크 — 핸드셰이크, 채널 게이트, 권한 강제, 화면 송신.
 ///
 /// **모든 명령이 권한 어댑터를 먼저 지난다.** 브라우저에서 버튼을 숨기는 것은 강제가 아니고,
 /// 위조된 메시지는 UI를 거치지 않기 때문이다. 1차 릴리스의 기기는 view-only이므로 입력·키·
@@ -7902,24 +8103,99 @@ struct WebRemoteState {
 /// `auth` 프레임 자체를 이 전송에서 거부한다.
 struct RelayDashboardSink {
     core: Arc<web_remote::session_core::SessionCore>,
+    /// **활성화된 E2EE 채널 없이는 어떤 바이트도 명령이 되지 않는다.** 워커가 넘기는 것은
+    /// 신뢰하지 않는 Relay를 거친 원시 바이트다. 게이트가 DRLY 프레임을 풀고 채널로 연
+    /// 평문만 아래 어댑터로 내려보낸다. 나가는 화면도 같은 게이트로 봉인한다.
+    gate: web_remote::relay_client::RelaySessionGate,
+    /// 채널이 서기까지의 순서를 강제하는 상태 기계. 게이트는 hello를 해석하지 않는다.
+    handshake: web_remote::relay_client::RelayHandshake,
+    mailbox: Arc<RelayMailbox>,
+    /// 이미 페어링된 기기의 재접속 판정. 승인·취소는 앱이 하고 싱크는 읽기만 한다.
+    repository: Arc<dyn web_remote::relay::repository::RelayRepository>,
     permissions: web_remote::relay_client::RelayMessageAdapter,
+    /// 기기가 시청 중인 세션과 baseline — web 전송의 접속 스레드가 드는 것과 같은 상태다.
+    watched: Option<String>,
+    viewport_seq: u64,
+    baseline: Option<Arc<runtime::TerminalViewportSnapshot>>,
+    last_dash: u64,
 }
 
 impl RelayDashboardSink {
-    fn new(core: Arc<web_remote::session_core::SessionCore>) -> Self {
+    fn new(
+        core: Arc<web_remote::session_core::SessionCore>,
+        route: relay_protocol::RouteId,
+        admission: relay_protocol::AdmissionCredential,
+        identity: web_remote::relay_client::RelayIdentitySupplier,
+        mailbox: Arc<RelayMailbox>,
+        repository: Arc<dyn web_remote::relay::repository::RelayRepository>,
+    ) -> Self {
         Self {
             core,
+            gate: web_remote::relay_client::RelaySessionGate::new(route),
+            handshake: web_remote::relay_client::RelayHandshake::new(
+                route,
+                admission,
+                identity,
+                Box::new(unix_now_secs),
+            ),
+            mailbox,
+            repository,
             // 1차 릴리스는 고정 view-only다. 입력·승인·업로드는 휴면 상태의 미래 권한이다.
             permissions: web_remote::relay_client::RelayMessageAdapter::new(
                 web_remote::relay::contract::RelayPermissions::default(),
             ),
+            watched: None,
+            viewport_seq: 0,
+            baseline: None,
+            last_dash: 0,
         }
     }
-}
 
-impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
-    fn accept(&mut self, frame: &[u8]) -> web_remote::relay_client::SinkOutcome {
-        let Ok(text) = std::str::from_utf8(frame) else {
+    /// 채널을 건다. 첫 화면은 즉시 나간다 — 기기는 첫 암호문을 받아야 승인됐음을 안다.
+    fn activate(&mut self, channel: web_remote::relay::SecureChannel) {
+        self.gate.activate(channel);
+        self.handshake.activated();
+        self.last_dash = 0;
+        self.viewport_seq = 0;
+        self.baseline = None;
+    }
+
+    /// 이미 페어링된 기기의 주장. 저장소 기록이 **지금** 이 신원을 허가할 때만 채널이 선다 —
+    /// 취소·만료·다른 키는 `confirm_admitted`가 거절한다.
+    fn admit_known(
+        &mut self,
+        claim: web_remote::relay_client::KnownDeviceClaim,
+    ) -> web_remote::relay_client::SinkOutcome {
+        let now = unix_now_secs();
+        let record = match self.repository.device(claim.device_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                tracing::info!("Relay: 알 수 없는 기기 id — 세션을 끝낸다");
+                return web_remote::relay_client::SinkOutcome::CloseChannel;
+            }
+            Err(error) => {
+                tracing::warn!("Relay 기기 조회 실패: {error:#}");
+                return web_remote::relay_client::SinkOutcome::CloseChannel;
+            }
+        };
+        let channel = match claim.peer.handshake.confirm_admitted(&record, now) {
+            Ok(channel) => channel,
+            Err(error) => {
+                tracing::info!("Relay: 기기 인가 거절 — {error:#}");
+                return web_remote::relay_client::SinkOutcome::CloseChannel;
+            }
+        };
+        // 마지막 접속 시각은 표시용이다 — 기록 실패가 채널을 막지는 않는다.
+        if let Err(error) = self.repository.touch_device(claim.device_id, now) {
+            tracing::warn!("Relay 기기 접속 시각 기록 실패: {error:#}");
+        }
+        self.activate(channel);
+        web_remote::relay_client::SinkOutcome::Continue
+    }
+
+    /// 채널을 통과한 평문 하나. 권한 어댑터를 지난 것만 코어로 간다.
+    fn command(&mut self, plaintext: &[u8]) -> web_remote::relay_client::SinkOutcome {
+        let Ok(text) = std::str::from_utf8(plaintext) else {
             return web_remote::relay_client::SinkOutcome::Continue;
         };
         let Some(message) = web_remote::protocol::ClientMsg::parse(text) else {
@@ -7929,11 +8205,29 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
             web_remote::relay_client::RelayAdmission::Allow(message) => {
                 // 허용된 것만 코어로 넘어간다. 현재 view-only 집합은 시청 제어뿐이다.
                 match message {
+                    // `rebind_watch`는 refcount 이전이다 — **이전 값을 from으로 넘겨야**
+                    // 옛 세션의 lease가 반납된다. None을 넘기면 시청이 바뀔 때마다 lease가
+                    // 하나씩 영구히 쌓이고, watchers 표도 상한 없이 자란다.
                     web_remote::protocol::ClientMsg::Watch { session } => {
-                        self.core.dashboard().rebind_watch(None, Some(&session));
+                        self.core
+                            .dashboard()
+                            .rebind_watch(self.watched.as_deref(), Some(&session));
+                        self.watched = Some(session);
+                        self.viewport_seq = 0;
+                        self.baseline = None;
                     }
                     web_remote::protocol::ClientMsg::Unwatch => {
-                        self.core.dashboard().rebind_watch(None, None);
+                        let previous = self.watched.take();
+                        self.core
+                            .dashboard()
+                            .rebind_watch(previous.as_deref(), None);
+                        self.viewport_seq = 0;
+                        self.baseline = None;
+                    }
+                    // 클라 렌더 상태 파손 — baseline을 버려 다음 프레임을 keyframe으로.
+                    web_remote::protocol::ClientMsg::RequestKeyframe => {
+                        self.viewport_seq = 0;
+                        self.baseline = None;
                     }
                     _ => {}
                 }
@@ -7954,8 +8248,145 @@ impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
         }
     }
 
+    /// 활성 채널로 나갈 화면. web 전송과 같은 스냅샷·같은 인코더이며, 봉인만 다르다.
+    fn push_view(&mut self, frames: &mut Vec<Vec<u8>>) {
+        if let Some((version, json)) = self.core.dashboard().dashboard_if_newer(self.last_dash) {
+            let Some(frame) = self.gate.seal(json.as_bytes()) else {
+                return;
+            };
+            frames.push(frame);
+            self.last_dash = version;
+        }
+        if let Some(session) = self.watched.clone()
+            && let Some((seq, snapshot)) = self
+                .core
+                .dashboard()
+                .viewport_if_newer(&session, self.viewport_seq)
+        {
+            let message = web_remote::protocol::encode_viewport(
+                &session,
+                seq,
+                &snapshot,
+                self.baseline.as_deref(),
+            )
+            .encode();
+            let Some(frame) = self.gate.seal(message.as_bytes()) else {
+                return;
+            };
+            frames.push(frame);
+            self.viewport_seq = seq;
+            self.baseline = Some(snapshot);
+        }
+    }
+}
+
+impl web_remote::relay_client::RelayFrameSink for RelayDashboardSink {
+    fn accept(&mut self, frame: &[u8]) -> web_remote::relay_client::SinkOutcome {
+        // 원시 바이트 → 게이트. 평문으로 나온 것만 명령 후보고, 나머지는 핸드셰이크의 몫이다.
+        let step = match self.gate.receive(frame) {
+            web_remote::relay_client::GateOutcome::Plaintext(plaintext) => {
+                return self.command(&plaintext);
+            }
+            web_remote::relay_client::GateOutcome::Close => {
+                return web_remote::relay_client::SinkOutcome::CloseChannel;
+            }
+            web_remote::relay_client::GateOutcome::Dropped(_) => {
+                return web_remote::relay_client::SinkOutcome::Continue;
+            }
+            web_remote::relay_client::GateOutcome::Control {
+                frame_type,
+                connection_id,
+            } => self.handshake.control(frame_type, connection_id),
+            web_remote::relay_client::GateOutcome::Hello {
+                connection_id,
+                record,
+            } => self.handshake.hello(connection_id, &record),
+        };
+        match step {
+            web_remote::relay_client::HandshakeStep::Continue => {
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::HandshakeStep::Fail(failure) => {
+                tracing::info!(?failure, "Relay 핸드셰이크 실패 — 세션을 끝낸다");
+                web_remote::relay_client::SinkOutcome::CloseChannel
+            }
+            // 새 페어링 — 증명 검증과 승인은 비밀을 가진 앱이 한다.
+            web_remote::relay_client::HandshakeStep::Pairing(claim) => {
+                self.mailbox.post_claim(*claim);
+                web_remote::relay_client::SinkOutcome::Continue
+            }
+            web_remote::relay_client::HandshakeStep::Known(claim) => self.admit_known(*claim),
+        }
+    }
+
+    fn session_started(&mut self) {
+        self.handshake.session_started();
+        // 위반 계수는 **상대별**이다. 이월하면 예산을 소진한 기기 뒤에 붙은 다른 기기가
+        // 첫 거부에서 곧바로 채널을 잃는다.
+        self.permissions = web_remote::relay_client::RelayMessageAdapter::new(
+            web_remote::relay::contract::RelayPermissions::default(),
+        );
+        self.watched = None;
+        self.viewport_seq = 0;
+        self.baseline = None;
+        self.last_dash = 0;
+    }
+
     fn session_ended(&mut self) {
-        self.core.dashboard().rebind_watch(None, None);
+        self.gate.deactivate();
+        self.handshake.session_ended();
+        self.mailbox.clear();
+        if let Some(session) = self.watched.take() {
+            self.core.dashboard().rebind_watch(Some(&session), None);
+        }
+    }
+
+    fn poll(&mut self) -> web_remote::relay_client::SinkOutcome {
+        // 게이트가 스스로 채널을 닫았는데(봉인 실패) 상태 기계는 살아 있다면 그 세션은 이미
+        // 죽은 것이다 — 기기의 암호문이 조용히 버려지는 상태로 두지 않는다.
+        if self.handshake.is_active() && !self.gate.is_active() {
+            tracing::info!("Relay: 채널이 닫혔는데 세션이 남아 있다 — 세션을 끝낸다");
+            return web_remote::relay_client::SinkOutcome::CloseChannel;
+        }
+        match self.handshake.tick() {
+            web_remote::relay_client::HandshakeStep::Fail(failure) => {
+                tracing::info!(?failure, "Relay 세션 종료");
+                web_remote::relay_client::SinkOutcome::CloseChannel
+            }
+            _ => web_remote::relay_client::SinkOutcome::Continue,
+        }
+    }
+
+    fn drain_outbound(&mut self) -> Vec<Vec<u8>> {
+        // 회수가 먼저다. 순서가 뒤집히면 방금 게시한 핸들이 곧바로 회수되고, 앞선 의식의
+        // 핸들은 서버에 그대로 남는다.
+        let ticket = self.mailbox.take_ticket_commands();
+        if ticket.revoke {
+            self.handshake.revoke_ticket();
+        }
+        if let Some(handle) = ticket.publish {
+            self.handshake.publish_ticket(handle);
+        }
+        match self.mailbox.take_decision() {
+            Some(RelayDecision::Activate(channel)) => {
+                // 승인된 채널은 그 주장을 낸 세션에만 걸린다. 그 사이 세션이 바뀌었으면 죽은
+                // 세션의 채널이다 — 기기는 다음 접속에서 기존 기기로 바로 들어온다.
+                if self.handshake.proposed_connection() == Some(channel.connection_id()) {
+                    self.activate(channel);
+                } else {
+                    let mut channel = channel;
+                    channel.close();
+                    tracing::info!("Relay: 승인된 채널이 현재 세션의 것이 아니라 버린다");
+                }
+            }
+            Some(RelayDecision::Reject) => self.handshake.rejected(),
+            None => {}
+        }
+        let mut frames = self.handshake.take_outbound();
+        if self.gate.is_active() {
+            self.push_view(&mut frames);
+        }
+        frames
     }
 }
 
@@ -8822,9 +9253,44 @@ pub struct App {
     /// Relay 시작 실패 시 settings에 표시할 에러. `web_error`와 **별개**다 — 한 전송의
     /// 실패가 다른 전송의 표시를 덮어쓰면 사용자가 무엇이 꺼졌는지 알 수 없다.
     ///
-    /// 읽는 쪽(설정 화면)은 계획 Task 5가 붙인다. 지금은 쓰기만 한다.
-    #[allow(dead_code)]
     relay_error: Option<String>,
+    /// 단일 인스턴스 lock. Relay 저장소 열기와 식별키 생성이 이 lock **이후**라는 순서를
+    /// 타입으로 요구한다.
+    run_lock: Arc<persist::LockFile>,
+    /// Relay 영속 어댑터(Task 2). 처음 필요할 때 연다 — 열 때 이전 프로세스의 pending을 지운다.
+    relay_repository: Option<Arc<crate::relay_repository::AppRelayRepository>>,
+    /// 싱크(워커 스레드)와 이 앱 사이의 우편함. 워커가 살아 있을 때만 Some.
+    relay_mailbox: Option<Arc<RelayMailbox>>,
+    /// 진행 중인 의식의 페어링 링크(폰에 줄 1회용 재료). 기다리는 동안만 Some.
+    /// 셸 오리진이 아직 배정되지 않았으면 티켓은 게시돼도 링크는 없다 — 그래서 티켓 회수는
+    /// 이 값이 아니라 `relay_ticket_published`가 판정한다.
+    relay_pairing_link: Option<String>,
+    /// 기기 입장 티켓을 싱크에 게시했는가. 의식이 끝나면 이 값으로 회수를 판정한다.
+    relay_ticket_published: bool,
+    /// 싱크가 **결정을 못 받은 주장**을 붙들고 있는가. 우편함에서 주장을 꺼내는 순간 참이
+    /// 되고, 결정(활성화 또는 거절)을 실제로 건넨 뒤에만 거짓이 된다.
+    ///
+    /// 주장을 꺼내는 것과 무관하게 싱크의 핸드셰이크는 이미 `Proposed`로 옮겨져 있다. 그
+    /// 단계에는 **마감이 없고**(`handshake::expired`) 생존 신호가 세션을 계속 살려 두므로,
+    /// 거절을 한 번이라도 빠뜨리면 그 라우트는 앱을 껐다 켤 때까지 막힌다. 그래서 "사용자가
+    /// 확인 화면을 보고 있는가"가 아니라 "싱크가 답을 기다리는가"가 이 값의 뜻이다.
+    ///
+    /// 거짓이면 취소는 거절을 보내지 않는다 — 붙지도 않은 기기 때문에 살아 있는 세션의
+    /// 핸드셰이크를 죽이지 않기 위해서다.
+    relay_claim_outstanding: bool,
+    /// 페어링 링크 QR 텍스처 캐시. 링크가 바뀔 때만 재생성.
+    relay_qr: ui::settings::WebQrCache,
+    /// Relay 페어링 의식 상태 기계(Task 5).
+    relay_pairing: crate::relay_pairing::RelayPairingCeremony,
+    /// 확인 단계에 들어선 횟수. 설정 화면이 처음 보는 값에서만 거부 버튼에 초점을 둔다.
+    relay_pairing_generation: u64,
+    /// 카운트다운 접근성 안내. 경계(1분·30초·10초·만료)에서만 갈아 끼운다.
+    relay_announcement: Option<String>,
+    /// Relay 연결 상태 관찰자 — 워커가 갱신하고 설정 화면이 읽는다.
+    relay_state: Arc<RelayStateProbe>,
+    /// 승인된 기기 목록 캐시. 설정 화면이 열려 있을 때 스로틀해 갱신한다.
+    relay_devices: Vec<ui::settings::RelayDeviceView>,
+    last_relay_devices_sync: Option<std::time::Instant>,
     /// settings의 접속 URL 표시(reveal) 토글 — URL에 페어링 토큰이 실리므로 기본 마스킹.
     web_reveal_url: bool,
     /// 접속 URL QR 텍스처 캐시 — URL이 바뀔 때만 재생성, 설정창 닫으면 반환.
@@ -8963,23 +9429,52 @@ fn carry_forward_agent_activity(
     }
 }
 
-/// 새로 넣는 항목은 `RunningAgent`가 **argv에서 뽑아둔** model/effort를 그대로 쓴다 —
-/// 런처가 넘긴 값이라 실행 순간의 진실이고, `--model`/`--effort` 파싱은 provider와
-/// 무관하게 일반적이라 Kimi의 `--model kimi-code/k3`도 그대로 잡힌다.
+/// 저장된 표시값(`agent_info`)과 지금 돌고 있는 프로세스로 **하나의 표시값**을 고른다.
+///
+/// **지금 돌고 있는 프로세스가 진실이다.** 저장된 표시값의 종류가 `kind`와 다르면 통째로
+/// 버린다 — 같은 pane에서 에이전트를 바꿔 실행하면(예: Codex 종료 후 Grok 실행) 앞
+/// 에이전트의 transcript 유래 값(모델·context%·요약)은 새 에이전트의 것이 아니기 때문이다.
+/// 이전에는 `or_insert_with`라 있는 항목을 건드리지 않아, agent_info가 마지막 값을 일부러
+/// 보존하는 규칙(위 `latest_info` 주석)과 겹쳐 옛 종류가 영영 남았다 — "Grok을 돌리는데
+/// Codex로 보인다"가 그 증상이었다(2026-09-01 사용자 신고).
+///
+/// 종류가 같으면 저장값을 그대로 쓴다: transcript 바인딩이 채운 모델·effort·context·활동
+/// 요약이 프로세스 argv에서 얻는 것보다 정확하다. 갈아 끼울 때는 `RunningAgent`가 **argv
+/// 에서 뽑아둔** model/effort를 그대로 쓴다 — 런처가 넘긴 값이라 실행 순간의 진실이고,
+/// `--model`/`--effort` 파싱은 provider와 무관하게 일반적이라 Kimi의 `--model kimi-code/k3`
+/// 도 그대로 잡힌다.
+///
+/// **사이드바(`push_agent_display`)와 표면(`pty_agent_surfaces`)이 같은 규칙을 써야 한다.**
+/// 표면 쪽이 종류 비교 없이 저장값을 복사하던 동안, Grok pane의 표면이 앞선 Codex 세션의
+/// 값을 그대로 보였고, 그 pane에서 `claude`를 띄우면 `display.kind`가 Grok이라
+/// `apply_claude_statusline`이 그대로 돌아나가 Grok의 `xhigh`가 Claude 사다리에도 있다는
+/// 이유로 `/effort`가 Claude 세션에 실제로 나갔다.
+fn display_for(
+    kind: crate::agent_detect::AgentKind,
+    stored: Option<&crate::agent_detect::AgentDisplay>,
+    running: Option<&crate::agent_detect::RunningAgent>,
+) -> crate::agent_detect::AgentDisplay {
+    match stored {
+        Some(display) if display.kind == kind => display.clone(),
+        _ => crate::agent_detect::AgentDisplay {
+            kind,
+            model: running.and_then(|agent| agent.model.clone()),
+            effort: running.and_then(|agent| agent.effort.clone()),
+            context_pct: None,
+            last_agent_summary: None,
+            user_instruction: None,
+        },
+    }
+}
+
+/// 프로세스로 감지한 에이전트 종류를 표시정보에 반영한다. 규칙은 `display_for`에 있다.
 fn merge_detected_kinds(
     info: &mut std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
     kinds: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::RunningAgent>,
 ) {
     for (session, running) in kinds {
-        info.entry(*session)
-            .or_insert_with(|| crate::agent_detect::AgentDisplay {
-                kind: running.kind,
-                model: running.model.clone(),
-                effort: running.effort.clone(),
-                context_pct: None,
-                last_agent_summary: None,
-                user_instruction: None,
-            });
+        let display = display_for(running.kind, info.get(session), Some(running));
+        info.insert(*session, display);
     }
 }
 
@@ -10161,6 +10656,13 @@ enum AppControllerAction {
     DetectHostname,
     CheckServe,
     ConfigureServe,
+    RelayStart,
+    RelayStop,
+    RelayBeginPairing,
+    RelayCancelPairing,
+    RelayApprovePairing,
+    RelayRejectPairing,
+    RelayRevokeDevice(String),
 }
 
 /// Capacity-one high-level terminal/workspace action emitted by the render pass. Runtime
@@ -10276,6 +10778,34 @@ fn warm_runtime_needs_restore(
     restore_lifecycle: WorkspaceRestoreLifecycle,
 ) -> bool {
     has_persisted_panes && restore_lifecycle == WorkspaceRestoreLifecycle::Idle
+}
+
+/// 방금 만든 워크스페이스에 부트스트랩 셸을 띄울지 결정한다.
+///
+/// **그 워크스페이스에 어차피 세션이 뜰 예정이면** 셸을 띄우지 않는다. 런처가 그
+/// 워크스페이스로 떠 있으면 무엇을 띄울지는 사용자가 **직접** 고른다(에이전트 또는
+/// 「빈 터미널」). 그때 셸을 미리 띄우면 사용자가 고른 세션과 빈 셸이 함께 남아
+/// 세션이 두 개가 된다(2026-09-02 사용자 보고).
+///
+/// 이 질문은 **워크스페이스 단위**여야 한다. 다른 워크스페이스의 런처는 이
+/// 워크스페이스에 세션을 만들어 주지 않으므로, 그걸 보고 셸을 건너뛰면 워크스페이스가
+/// 세션 없이 빈 채로 남는다.
+///
+/// 「런처 실행 요청이 대기 중인가」는 여기서 묻지 않는다. 호출부는 전환이 **실제로**
+/// 일어났을 때만 이 함수를 부르므로 `self.active`는 방금 만들어진 워크스페이스이고,
+/// 대기 중인 실행 요청은 언제나 그 요청을 넣을 당시 활성이던(=이미 존재하던)
+/// 워크스페이스를 가리킨다. 새 uuid와 같을 수 없으므로 답은 늘 「아니오」다. 그리고
+/// 그 답이 옳다 — 다른 워크스페이스로 갈 실행 요청 때문에 이 새 워크스페이스를 세션
+/// 없이 비워 두면 안 된다.
+///
+/// 앱 시작 경로(`ensure_active_runtime_restore`)도 런처를 띄울 때는 셸을 스폰하지
+/// 않는다 — 같은 규칙이다. 런처가 안 뜨는 경로(bench·perf 하네스 등)에서는
+/// 워크스페이스가 세션 없이 비지 않도록 기존대로 셸 하나를 띄운다.
+fn should_bootstrap_created_workspace_shell(
+    created: bool,
+    launcher_open_for_workspace: bool,
+) -> bool {
+    created && !launcher_open_for_workspace
 }
 
 fn restore_lifecycle_after_dotenv_delivery(
@@ -12686,6 +13216,7 @@ impl App {
         data_dir: PathBuf,
         egui_ctx: egui::Context,
         bench: Option<crate::bench::Bench>,
+        run_lock: Arc<persist::LockFile>,
     ) -> anyhow::Result<Self> {
         if secret::init_platform_store().is_err() {
             tracing::warn!(
@@ -12727,6 +13258,7 @@ impl App {
             db_path,
             egui_ctx,
             bench,
+            run_lock,
         ))
     }
 
@@ -12740,6 +13272,7 @@ impl App {
         db_path: PathBuf,
         egui_ctx: egui::Context,
         bench: Option<crate::bench::Bench>,
+        run_lock: Arc<persist::LockFile>,
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
         config.ui.last_workspace_id = Some(workspace_id.clone());
@@ -13290,6 +13823,19 @@ impl App {
             session_core: None,
             relay_worker: None,
             relay_error: None,
+            run_lock,
+            relay_repository: None,
+            relay_mailbox: None,
+            relay_pairing_link: None,
+            relay_ticket_published: false,
+            relay_claim_outstanding: false,
+            relay_qr: None,
+            relay_pairing: crate::relay_pairing::RelayPairingCeremony::new(),
+            relay_pairing_generation: 0,
+            relay_announcement: None,
+            relay_state: Arc::new(RelayStateProbe::default()),
+            relay_devices: Vec::new(),
+            last_relay_devices_sync: None,
             web_reveal_url: false,
             web_qr: None,
             worktree_rx: None,
@@ -15435,21 +15981,14 @@ impl App {
                 let kind = running
                     .map(|agent| agent.kind)
                     .or_else(|| self.agent_bindings.get(&session_id).map(|b| b.kind))?;
-                // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. claude는
-                // transcript에 effort가 아예 없고 statusLine에만 있어서, 병합을 건너뛰면
-                // effort가 영영 None이고 강도 단축키가 조용히 아무것도 안 한다.
-                let mut display = self
-                    .agent_info
-                    .get(&(instance, session_id))
-                    .cloned()
-                    .unwrap_or(crate::agent_detect::AgentDisplay {
-                        kind,
-                        model: None,
-                        effort: None,
-                        context_pct: None,
-                        last_agent_summary: None,
-                        user_instruction: None,
-                    });
+                // 사이드바(`push_agent_display`)와 **같은 병합**을 거쳐야 한다. 규칙은
+                // 한 곳(`display_for`)에만 둔다 — 여기서 종류 비교 없이 저장값을 복사하면
+                // 앞 에이전트의 표시값이 그대로 남아, `apply_claude_statusline`이 옛 종류를
+                // 보고 돌아나가고 옛 강도가 새 에이전트에 전송된다.
+                // 그리고 claude는 transcript에 effort가 아예 없고 statusLine에만 있어서,
+                // 병합을 건너뛰면 effort가 영영 None이고 강도 단축키가 조용히 아무것도 안 한다.
+                let mut display =
+                    display_for(kind, self.agent_info.get(&(instance, session_id)), running);
                 apply_claude_statusline(
                     &mut display,
                     self.statuslines.get(&(instance, session_id)),
@@ -15588,6 +16127,7 @@ impl App {
                     crate::agent_detect::AgentKind::Claude => "claude",
                     crate::agent_detect::AgentKind::Codex => "codex",
                     crate::agent_detect::AgentKind::Kimi => "kimi",
+                    crate::agent_detect::AgentKind::Grok => "grok",
                 };
                 Some((
                     pane.0.clone(),
@@ -17608,6 +18148,10 @@ impl App {
     /// 않았으므로(`deploy/relay/README.md`의 BLOCKED 상태표) 현재는 여기서 실패하며, 그
     /// 실패는 Relay 범위로만 표시된다.
     fn relay_enable(&mut self) {
+        // 이미 켜져 있으면 두 번째 워커를 만들지 않는다 — 소유 스레드와 바깥 연결이 둘이 된다.
+        if self.relay_worker.is_some() {
+            return;
+        }
         let endpoint = match web_remote::relay_client::RelayEndpoint::production() {
             Ok(endpoint) => endpoint,
             Err(error) => {
@@ -17615,6 +18159,27 @@ impl App {
                 self.relay_error = Some(format!("{error}"));
                 return;
             }
+        };
+        // 이 Mac의 라우트 핸들과 승인 자격증명은 함께 provisioning된다 — 그 주체가 아직
+        // 정해지지 않았다(deploy/relay/README.md). 디버그 빌드에서만 개발용 환경변수로
+        // 대신할 수 있다(릴리스 빌드는 항상 None).
+        let route = web_remote::relay_client::PRODUCTION_RELAY_ROUTE.or_else(|| {
+            web_remote::relay_client::lifecycle::dev_override_bytes("DEPPY_RELAY_DEV_ROUTE")
+                .map(relay_protocol::RouteId::from_bytes)
+        });
+        let Some(route) = route else {
+            self.relay_error =
+                Some("Relay 라우트 핸들이 아직 배정되지 않았다 (BLOCKED)".to_owned());
+            return;
+        };
+        let admission = web_remote::relay_client::PRODUCTION_RELAY_ADMISSION.or_else(|| {
+            web_remote::relay_client::lifecycle::dev_override_bytes("DEPPY_RELAY_DEV_ADMISSION")
+                .map(relay_protocol::AdmissionCredential::from_bytes)
+        });
+        let Some(admission) = admission else {
+            self.relay_error =
+                Some("Relay 승인 자격증명이 아직 배정되지 않았다 (BLOCKED)".to_owned());
+            return;
         };
         let repository: Arc<dyn web_remote::repository::WebRemoteRepository> =
             match AppWebRemoteRepository::open(&self.db_path) {
@@ -17625,16 +18190,43 @@ impl App {
                     return;
                 }
             };
+        // 기기 인가 저장소 — 싱크가 기존 기기의 재접속을 판정하는 데 쓴다.
+        let relay_repository = match self.relay_repository() {
+            Ok(repository) => repository,
+            Err(error) => {
+                tracing::warn!("Relay 기기 저장소 열기 실패: {error:#}");
+                self.relay_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        // 세션마다 새 신원 값이 필요하다(핸드셰이크가 소비한다). Keychain 슬롯은 하나이며,
+        // 단일 인스턴스 lock 이후라는 순서를 타입으로 요구한다.
+        let run_lock = Arc::clone(&self.run_lock);
+        let identity: web_remote::relay_client::RelayIdentitySupplier = Box::new(move || {
+            crate::relay_repository::create_relay_identity_after_single_instance_lock(
+                &run_lock,
+                &KeyringSecretStore,
+            )
+        });
+        let mailbox = Arc::new(RelayMailbox::default());
         // 코어는 web과 공유한다. web이 이미 켜져 있으면 그 코어를 그대로 쓴다.
         let core = self.shared_session_core(Some(repository), None);
         let worker = web_remote::relay_client::RelayWorker::spawn(
             endpoint,
             Box::new(web_remote::relay_client::TlsRelayTransport),
-            Box::new(RelayDashboardSink::new(Arc::clone(&core))),
-            Arc::new(web_remote::relay_client::worker::IgnoreObserver),
+            Box::new(RelayDashboardSink::new(
+                Arc::clone(&core),
+                route,
+                admission,
+                identity,
+                Arc::clone(&mailbox),
+                relay_repository,
+            )),
+            Arc::clone(&self.relay_state) as Arc<dyn web_remote::relay_client::RelayObserver>,
             web_remote::relay_client::RelayDeadlines::default(),
             web_remote::relay_client::BackoffPolicy::default(),
         );
+        self.relay_mailbox = Some(mailbox);
         worker.enable();
         self.relay_worker = Some(worker);
         self.relay_error = None;
@@ -17649,13 +18241,18 @@ impl App {
 
     /// Relay를 끈다. Tailscale 서버·토큰·리스너에는 손대지 않는다.
     ///
-    /// 호출부(설정 화면의 Relay 스위치)는 계획 Task 5가 붙인다. 종료 경로는 워커를 직접
-    /// 정지하므로 이 함수에 의존하지 않는다.
-    #[allow(dead_code)]
     fn relay_disable(&mut self) {
         if let Some(mut worker) = self.relay_worker.take() {
             worker.shutdown();
         }
+        self.relay_mailbox = None;
+        self.relay_pairing_link = None;
+        self.relay_ticket_published = false;
+        self.relay_claim_outstanding = false;
+        self.relay_qr = None;
+        // 진행 중이던 의식은 붙을 곳이 없어졌다 — 티켓을 무효화한다.
+        let _ = self.relay_pairing.cancel(unix_now_secs());
+        self.relay_announcement = None;
         self.relay_error = None;
         self.release_session_core_if_idle();
         self.config.relay.enabled = false;
@@ -17664,6 +18261,345 @@ impl App {
             self.relay_error = Some(format!(
                 "Relay는 껐지만 설정 저장 실패 — 다음 실행에 다시 켜질 수 있습니다: {error:#}"
             ));
+        }
+    }
+
+    /// Relay 영속 어댑터. 처음 필요할 때 연다 — 단일 인스턴스 lock 이후라는 순서를 타입으로
+    /// 요구하므로 `run_lock`을 함께 넘긴다.
+    fn relay_repository(
+        &mut self,
+    ) -> anyhow::Result<Arc<crate::relay_repository::AppRelayRepository>> {
+        if self.relay_repository.is_none() {
+            let repository =
+                crate::relay_repository::AppRelayRepository::open(&self.db_path, &self.run_lock)?;
+            self.relay_repository = Some(Arc::new(repository));
+        }
+        Ok(Arc::clone(
+            self.relay_repository
+                .as_ref()
+                .expect("relay repository opened above"),
+        ))
+    }
+
+    fn relay_begin_pairing(&mut self) {
+        let now = unix_now_secs();
+        let connected = self.relay_state.is_connected();
+        self.relay_end_ticket();
+        if let Err(failure) = self.relay_pairing.begin(now, connected) {
+            tracing::info!(?failure, "Relay 페어링 시작 불가");
+            self.relay_announcement = None;
+            return;
+        }
+        self.relay_announcement = None;
+        // 기기 입장 핸들 — 서버가 1회 소비하는 32바이트 난수. uuid v4 둘을 이어 붙인다
+        // (앱은 getrandom을 직접 들지 않는다).
+        let mut handle = [0u8; 32];
+        handle[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        handle[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let handle = relay_protocol::AdmissionCredential::from_bytes(handle);
+        if let Some(mailbox) = &self.relay_mailbox {
+            mailbox.publish_ticket(handle);
+            self.relay_ticket_published = true;
+        }
+        // 링크 = 고정 셸 오리진 + 1회용 재료. 오리진이 아직 배정되지 않았으면(BLOCKED) 링크도
+        // 없다 — 티켓은 게시되지만 폰이 갈 곳이 없다는 사실을 화면이 그대로 말한다.
+        self.relay_pairing_link = web_remote::relay_client::shell_origin().and_then(|origin| {
+            let (pairing_id, secret) = self.relay_pairing.ticket_for_device()?;
+            Some(web_remote::relay_client::encode_pairing_link(
+                &origin, &handle, pairing_id, secret,
+            ))
+        });
+        self.relay_qr = None;
+    }
+
+    /// 의식이 끝났다(취소·거부·만료·승인) — 티켓을 회수하고 링크를 버린다.
+    fn relay_end_ticket(&mut self) {
+        self.relay_pairing_link = None;
+        self.relay_qr = None;
+        if !std::mem::take(&mut self.relay_ticket_published) {
+            return;
+        }
+        if let Some(mailbox) = &self.relay_mailbox {
+            mailbox.revoke_ticket();
+        }
+    }
+
+    fn relay_cancel_pairing(&mut self) {
+        let _ = self.relay_pairing.cancel(unix_now_secs());
+        self.relay_announcement = None;
+        self.relay_reject_claim();
+        self.relay_end_ticket();
+    }
+
+    fn relay_reject_pairing(&mut self) {
+        let _ = self.relay_pairing.reject(unix_now_secs());
+        self.relay_announcement = None;
+        self.relay_reject_claim();
+        self.relay_end_ticket();
+    }
+
+    /// 싱크에 "이 주장은 끝났다"를 알린다. 붙어 있던 기기의 세션은 다음 프레임에서 끝난다.
+    fn relay_reject_claim(&mut self) {
+        if !std::mem::take(&mut self.relay_claim_outstanding) {
+            // 붙은 기기가 없다. 거절을 보내면 살아 있는 세션의 상태 기계가 죽어, 바로 이어
+            // 시작한 페어링의 티켓이 게시되지 못한다.
+            return;
+        }
+        if let Some(mailbox) = &self.relay_mailbox {
+            mailbox.reject();
+        }
+    }
+
+    /// 싱크가 넘긴 새 페어링 주장. 증명이 이 의식의 티켓과 맞으면 확인 단계로 간다 —
+    /// 화면에 코드가 뜨고 사용자가 폰과 대조한다. 틀리면 싱크에 거절을 알린다.
+    fn relay_device_presented(&mut self, claim: web_remote::relay_client::PairingClaim) {
+        let now = unix_now_secs();
+        let binding = claim.peer.handshake.pairing_binding();
+        let fingerprint: String = binding.peer_identity_fingerprint()[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let display_name = self.i18n.t(
+            "settings.relay.devices.default_name",
+            &[("fingerprint", &fingerprint)],
+        );
+        let introduction = crate::relay_pairing::DeviceIntroduction {
+            handshake: claim.peer.handshake,
+            identity_public_sec1: claim.peer.identity_public_sec1,
+            display_name,
+        };
+        match self.relay_pairing.device_presented(
+            now,
+            claim.pairing_id,
+            &claim.proof,
+            binding,
+            introduction,
+        ) {
+            Ok(()) => {
+                self.relay_announcement = None;
+                // `relay_claim_outstanding`은 여기서 세우지 않는다 — 주장을 꺼낸 쪽
+                // (`tick_relay_pairing`)이 이미 세웠다. 여기서 세우면 `Err` 경로에서는
+                // 거짓인 채라 거절이 싱크에 닿지 않는다.
+                // 확인 단계에 막 들어섰다 — 설정 화면이 처음 보는 값이면 거부 버튼에 초점을 둔다.
+                self.relay_pairing_generation = self.relay_pairing_generation.wrapping_add(1);
+            }
+            Err(failure) => {
+                tracing::info!(?failure, "Relay 기기 주장 거절");
+                self.relay_reject_claim();
+            }
+        }
+    }
+
+    /// 사용자가 코드를 대조하고 승인했다. 검증 승인 → pending 행 → DB 승인 → 채널 확정의
+    /// 순서는 Task 2 조정자(`PendingAdmission`)가 강제한다. 실패는 전부 fail-closed다.
+    fn relay_approve_pairing(&mut self) {
+        let now = unix_now_secs();
+        let (approval, introduction) = match self.relay_pairing.approve(now) {
+            Ok(pair) => pair,
+            Err(stale) => {
+                // 오래된 행동 — 기다리는 중이거나 이미 만료됐다. 아무것도 소비되지 않았다.
+                tracing::info!(?stale, "Relay 승인 무시(오래된 행동)");
+                self.relay_announcement = None;
+                return;
+            }
+        };
+        self.relay_announcement = None;
+        // `relay_claim_outstanding`은 아직 내리지 않는다 — 아래 DB 작업이 깨지면 싱크는
+        // 여전히 마감 없는 `Proposed`를 붙들고 있어 거절을 받아야 한다.
+        // 기기는 이미 입장했다(티켓은 소비됐다). 남은 링크는 더 이상 아무것도 열지 못한다.
+        self.relay_end_ticket();
+        let permissions = crate::relay_pairing::RelayPairingCeremony::first_release_permissions();
+        let lifetime = match web_remote::relay::repository::RelayPairingLifetime::new(
+            now,
+            now + web_remote::relay::pairing::PAIRING_TTL_SECS,
+            now + RELAY_DEVICE_AUTHORIZATION_SECS,
+        ) {
+            Ok(lifetime) => lifetime,
+            Err(error) => {
+                self.relay_error = Some(format!("{error:#}"));
+                self.relay_reject_claim();
+                return;
+            }
+        };
+        // 불투명 기기 id — uuid v4의 128비트 난수를 그대로 쓴다(앱은 getrandom을 직접 안 든다).
+        let device_id = *uuid::Uuid::new_v4().as_bytes();
+        let proposal = web_remote::relay::repository::RelayDeviceProposal {
+            device_id: web_remote::relay::contract::DeviceId::from_bytes(device_id),
+            identity_public_sec1: introduction.identity_public_sec1,
+            display_name: introduction.display_name,
+            permissions,
+            lifetime,
+        };
+        let mailbox = self.relay_mailbox.clone();
+        let outcome = (|| -> anyhow::Result<()> {
+            let repository = self.relay_repository()?;
+            let repository: &dyn web_remote::relay::repository::RelayRepository = &*repository;
+            let start = web_remote::relay::repository::PendingAdmission::begin(
+                repository, approval, proposal, now,
+            )?;
+            let admission = match start {
+                web_remote::relay::repository::AdmissionStart::Pending(admission) => admission,
+                web_remote::relay::repository::AdmissionStart::Rejected(rejection) => {
+                    anyhow::bail!("Relay 페어링 거절: {rejection:?}");
+                }
+            };
+            match admission.approve(repository, introduction.handshake, now)? {
+                web_remote::relay::repository::AdmissionOutcome::Admitted { channel, device } => {
+                    tracing::info!(device = ?device.device_id(), "Relay 기기 승인");
+                    // 살아 있는 채널을 워커의 세션 게이트에 건넨다. 워커가 그 사이 죽었으면
+                    // 닫는다 — 기기 행은 이미 발행됐으므로 다음 접속에서 기존 기기로 들어온다.
+                    match &mailbox {
+                        Some(mailbox) => mailbox.activate(channel),
+                        None => {
+                            let mut channel = channel;
+                            channel.close();
+                        }
+                    }
+                    Ok(())
+                }
+                web_remote::relay::repository::AdmissionOutcome::Rejected(rejection) => {
+                    anyhow::bail!("Relay 페어링 거절: {rejection:?}")
+                }
+            }
+        })();
+        match outcome {
+            // 결정을 싱크에 건넸다(활성화). 이제 주장은 해소됐다.
+            Ok(()) => self.relay_claim_outstanding = false,
+            Err(error) => {
+                tracing::warn!("Relay 페어링 승인 실패: {error:#}");
+                self.relay_error = Some(format!("{error:#}"));
+                // `PendingAdmission`이 거절했거나 DB가 깨졌다. 여기서 멈추면 싱크는 답을
+                // 못 받은 `Proposed`로 남고, 그 단계에는 마감이 없어 라우트가 영영 막힌다.
+                self.relay_reject_claim();
+            }
+        }
+        self.last_relay_devices_sync = None;
+    }
+
+    /// 기기 취소 — 즉시 차단. 다음 접속에서만이 아니라 **살아 있는 채널도** 끊는다: 워커를
+    /// 재시작해 세션 게이트가 비워지게 한다.
+    fn relay_revoke_device(&mut self, id_hex: &str) {
+        let Some(device_id) = parse_relay_device_id(id_hex) else {
+            return;
+        };
+        let now = unix_now_secs();
+        let result = self.relay_repository().and_then(|repository| {
+            use web_remote::relay::repository::RelayRepository as _;
+            repository.revoke_device(device_id, now)
+        });
+        match result {
+            Ok(_) => {
+                // 취소된 기기가 붙어 있었을 수 있다 — 세션을 끊는다. 워커를 껐다 켜면 게이트가
+                // 비워지고, 재접속 시 이 기기는 admission에서 거부된다.
+                if let Some(mut worker) = self.relay_worker.take() {
+                    // 진행 중이던 의식은 옛 세션에 묶여 있다 — 라우트와 티켓이 함께 사라지므로
+                    // 화면만 카운트다운을 계속하는 상태로 두지 않는다.
+                    let _ = self.relay_pairing.cancel(now);
+                    self.relay_claim_outstanding = false;
+                    self.relay_pairing_link = None;
+                    self.relay_ticket_published = false;
+                    self.relay_qr = None;
+                    self.relay_announcement = None;
+                    worker.shutdown();
+                    self.relay_worker = None;
+                    self.relay_mailbox = None;
+                    self.config.relay.enabled = true;
+                    self.relay_enable();
+                }
+            }
+            Err(error) => {
+                tracing::warn!("Relay 기기 취소 실패: {error:#}");
+                self.relay_error = Some(format!("{error:#}"));
+            }
+        }
+        self.last_relay_devices_sync = None;
+    }
+
+    /// 승인된 기기 목록을 스로틀해 갱신한다(설정 화면이 열려 있을 때만).
+    fn sync_relay_devices(&mut self, now: std::time::Instant) {
+        const RELAY_DEVICES_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some(last) = self.last_relay_devices_sync
+            && now.duration_since(last) < RELAY_DEVICES_SYNC_INTERVAL
+        {
+            return;
+        }
+        self.last_relay_devices_sync = Some(now);
+        // Relay를 한 번도 켠 적이 없으면 저장소를 열지 않는다 — 열면 pending 정리 부수효과가 있다.
+        if self.relay_repository.is_none() && self.relay_worker.is_none() {
+            return;
+        }
+        let listed = self.relay_repository().and_then(|repository| {
+            use web_remote::relay::repository::RelayRepository as _;
+            repository.list_devices(web_remote::relay::repository::MAX_RELAY_DEVICES)
+        });
+        match listed {
+            Ok(devices) => {
+                self.relay_devices = devices
+                    .into_iter()
+                    .map(|device| ui::settings::RelayDeviceView {
+                        id: device
+                            .device_id()
+                            .as_bytes()
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect(),
+                        name: device.display_name().to_owned(),
+                        last_seen_at: device.last_seen_at(),
+                        expires_at: device.device_expires_at(),
+                        revoked_at: device.revoked_at(),
+                    })
+                    .collect();
+            }
+            Err(error) => tracing::warn!("Relay 기기 목록 실패: {error:#}"),
+        }
+    }
+
+    /// 페어링 시계를 흘리고, 경계에서만 접근성 안내를 갈아 끼운다.
+    fn tick_relay_pairing(&mut self, ctx: &egui::Context) {
+        // 의식이 도는 동안에는 프레임을 예약한다. 사용자가 폰으로 QR을 찍는 사이 마우스가
+        // 멎으면 egui는 프레임을 돌리지 않는다 — 그러면 카운트다운이 멈추고, 기기가 붙어도
+        // 확인 코드 화면이 뜨지 않는다.
+        if self.relay_pairing.is_active() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        // 싱크가 넘긴 주장을 소화한다. 확인 단계 진입(=세대 증가)은 이 안에서 일어난다 —
+        // 여기서 전후를 비교하면 이미 전이가 끝난 뒤라 어떤 경로로도 성립하지 않는다.
+        let claim = self
+            .relay_mailbox
+            .as_ref()
+            .and_then(|mailbox| mailbox.take_claim());
+        if let Some(claim) = claim {
+            // 주장을 꺼낸 이 순간부터 싱크는 답을 기다린다 — 싱크의 핸드셰이크는 주장을
+            // 우편함에 넣을 때 이미 마감 없는 `Proposed`로 옮겨져 있다. 검증이 어떻게
+            // 끝나든 결정을 되돌려 줘야 하므로, 표시는 검증 **전에** 세운다.
+            self.relay_claim_outstanding = true;
+            self.relay_device_presented(claim);
+        }
+        let now = unix_now_secs();
+        let was_active = self.relay_pairing.is_active();
+        self.relay_pairing.tick(now);
+        if was_active && !self.relay_pairing.is_active() {
+            // 만료 — 티켓을 회수한다(서버 TTL도 같은 5분이지만 기다릴 이유가 없다).
+            // 확인 단계에서 만료됐다면 싱크는 아직 `Proposed`다. 표시만 내리면 그 세션이
+            // 생존 신호를 타고 살아남아 라우트를 막는다 — 거절을 실제로 건넨다.
+            self.relay_reject_claim();
+            self.relay_end_ticket();
+        }
+        if let Some(boundary) = self.relay_pairing.announcement(now) {
+            let text = &self.i18n;
+            self.relay_announcement = Some(if boundary == 0 {
+                text.t("settings.relay.pairing.expired", &[])
+            } else if boundary >= 60 {
+                text.t(
+                    "settings.relay.pairing.announce.minutes",
+                    &[("minutes", &(boundary / 60).to_string())],
+                )
+            } else {
+                text.t(
+                    "settings.relay.pairing.announce.seconds",
+                    &[("seconds", &boundary.to_string())],
+                )
+            });
         }
     }
 
@@ -18021,8 +18957,10 @@ impl App {
                 if let runtime::RuntimeCommand::WriteInput { session, .. } = &command {
                     self.active.workspace_ui.clear_selection(*session);
                 }
-                if runtime_command_requires_dotenv(&command) {
-                    let runtime_instance = self.active.runtime_instance;
+                let runtime_instance = self.active.runtime_instance;
+                if runtime_command_requires_dotenv(&command)
+                    && !self.session_spawn_skips_dotenv_worker(runtime_instance, &command)
+                {
                     if self
                         .stage_dotenv_continuation(
                             runtime_instance,
@@ -18161,6 +19099,24 @@ impl App {
         }
     }
 
+    /// `session_spawn_skips_dotenv_worker`에 이 인스턴스의 전달 상태와 지금 `.env` 상태를
+    /// 먹인다. `dotenv_state_for_root`는 파일 metadata 몇 개라 UI 스레드에서 재도 된다.
+    fn session_spawn_skips_dotenv_worker(
+        &self,
+        runtime_instance: u64,
+        command: &runtime::RuntimeCommand,
+    ) -> bool {
+        let Some(runtime) = self.runtime_by_instance(runtime_instance) else {
+            return false;
+        };
+        let root = self.workspace_tree_root(&runtime.id);
+        session_spawn_skips_dotenv_worker(
+            command,
+            runtime.dotenv_state,
+            dotenv_state_for_root(root.as_deref()),
+        )
+    }
+
     fn drain_workspace_protocol_intents(&mut self, runtime_instance: u64) {
         while let Some(intent) = self
             .runtime_by_instance_mut(runtime_instance)
@@ -18176,7 +19132,9 @@ impl App {
                 self.cancel_terminal_focus_intents();
                 self.active.workspace_ui.arm_terminal_focus(pane.clone());
             }
-            if runtime_command_requires_dotenv(&command) {
+            if runtime_command_requires_dotenv(&command)
+                && !self.session_spawn_skips_dotenv_worker(runtime_instance, &command)
+            {
                 let continuation = PendingDotenvContinuation::WorkspaceProtocol {
                     operation,
                     generation,
@@ -18751,6 +19709,13 @@ impl App {
                 AppControllerAction::WebStart => self.web_enable(),
                 AppControllerAction::WebStop => self.web_disable(),
                 AppControllerAction::RotateWebToken => self.web_rotate_token(),
+                AppControllerAction::RelayStart => self.relay_enable(),
+                AppControllerAction::RelayStop => self.relay_disable(),
+                AppControllerAction::RelayBeginPairing => self.relay_begin_pairing(),
+                AppControllerAction::RelayCancelPairing => self.relay_cancel_pairing(),
+                AppControllerAction::RelayApprovePairing => self.relay_approve_pairing(),
+                AppControllerAction::RelayRejectPairing => self.relay_reject_pairing(),
+                AppControllerAction::RelayRevokeDevice(id) => self.relay_revoke_device(&id),
                 AppControllerAction::DetectHostname => {
                     if self.ts_detect_rx.is_none() {
                         self.ts_detect_overwrite = true;
@@ -20521,6 +21486,13 @@ impl App {
 
         let plan = match plan {
             Ok(plan) => plan,
+            Err(EffortBlocked::Unsupported) => {
+                self.show_agent_shortcut_feedback(
+                    crate::ui::agent_terminal::AgentShortcutFeedback::Unsupported,
+                );
+                tracing::info!(?kind, provider = ?surface.provider, "PTY 조정: 이 provider는 지원하지 않는다");
+                return;
+            }
             Err(EffortBlocked::UnknownCurrentEffort) => {
                 self.show_agent_shortcut_feedback(
                     crate::ui::agent_terminal::AgentShortcutFeedback::CurrentValueUnknown,
@@ -22601,6 +23573,94 @@ impl App {
         }
     }
 
+    /// 사이드바에 저장된 순서(config)를 앞세워 워크스페이스를 정렬한다.
+    ///
+    /// 저장된 목록에 있는 것끼리는 그 순서대로, 목록에 없는 것은 그 뒤에 생성순으로 붙는다 —
+    /// 사용자가 순서를 정한 뒤 새로 만든 워크스페이스가 중간에 끼어들지 않고 맨 아래로 간다.
+    fn sort_workspaces_for_sidebar(workspaces: &mut [storage::WorkspaceRow], order: &[String]) {
+        workspaces.sort_by(|left, right| {
+            let rank = |id: &String| order.iter().position(|saved| saved == id);
+            match (rank(&left.id), rank(&right.id)) {
+                (Some(left_rank), Some(right_rank)) => left_rank.cmp(&right_rank),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left
+                    .created_at
+                    .cmp(&right.created_at)
+                    .then(left.id.cmp(&right.id)),
+            }
+        });
+    }
+
+    /// 「환경 및 API」 프로젝트 목록의 순서 — **생성순 고정**이다.
+    ///
+    /// 사이드바 목록과 환경 목록은 독립 도메인이라(ui/settings.rs의
+    /// 「설정_네비의_관리그룹은_연결_환경_에이전트_셋뿐이다」 참조) 한쪽 순서가 다른 쪽으로
+    /// 새면 안 된다. 그런데 워커에 넘기는 `self.workspaces`는 이미 사이드바 순서로 정렬돼
+    /// 있어, 그대로 순회하면 드래그가 환경 목록까지 뒤집는다(2026-09-03 리뷰 defect 2).
+    /// 환경 목록은 여기서 자기 순서를 스스로 세운다 — DB의 `ORDER BY created_at, id`와
+    /// 같은 키를 써서 사이드바 정렬 이전의 원래 순서로 되돌린다.
+    fn sort_workspaces_for_env_projects(workspaces: &mut [storage::WorkspaceRow]) {
+        workspaces.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+    }
+
+    /// 드래그가 emit한 순서를 저장된 순서에 **병합**한다(덮어쓰기가 아니다).
+    ///
+    /// `dragged`는 그때 사이드바에 보이던 행만 담는다 — 「워크스페이스 종료」로 숨겼거나
+    /// 생성 시 자동으로 숨겨진 워크스페이스는 빠져 있다. 통째로 덮어쓰면 그 id가 저장된
+    /// 자리를 영영 잃고, 다시 열 때 생성순 맨 아래로 떨어지며 강조색까지 바뀐다
+    /// (2026-09-03 리뷰 defect 1). 그래서 살아 있지만(`known`) emit되지 않은 id는 저장된
+    /// 상대 순서를 지킨 채 **드래그 결과 뒤**에 붙인다 — 화면에 없는 행이라 사용자가 방금
+    /// 만든 순서를 흔들지 않는 자리가 뒤다. `known`에 없는 id(= DB에서 지워진 것)는 떨군다.
+    fn merge_workspace_order(
+        saved: &[String],
+        dragged: &[String],
+        known: &std::collections::HashSet<&str>,
+    ) -> Vec<String> {
+        let mut merged = dragged.to_vec();
+        let preserved: Vec<String> = saved
+            .iter()
+            .filter(|id| {
+                known.contains(id.as_str()) && !merged.iter().any(|kept| kept == id.as_str())
+            })
+            .cloned()
+            .collect();
+        merged.extend(preserved);
+        merged
+    }
+
+    /// 순서 목록에서 **삭제된** 워크스페이스 id만 걷어낸다 — 정리하지 않으면 지운 프로젝트가
+    /// config에 영영 쌓인다(2026-09-03 리뷰 defect 5). 종료(숨김)한 워크스페이스는
+    /// `self.workspaces`에 그대로 있어 `known`에 들므로 살아남는다 — 여기서 같이 지우면
+    /// defect 1(숨긴 워크스페이스가 자리를 잃는 문제)이 그대로 되살아난다.
+    fn prune_workspace_order(order: &mut Vec<String>, known: &std::collections::HashSet<&str>) {
+        order.retain(|id| known.contains(id.as_str()));
+    }
+
+    /// 드래그로 정한 사이드바 순서를 그 자리에서 반영하고 config에 남긴다 — 앱을 다시 켜도
+    /// 같은 순서로 뜬다. 목록은 드래그 시점에 **보이던** 사이드바 행뿐이라, 숨긴 워크스페이스의
+    /// 자리를 지키려면 저장된 순서와 병합해야 한다(`merge_workspace_order`).
+    fn apply_workspace_order(&mut self, order: Vec<String>) {
+        let known = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let merged = Self::merge_workspace_order(&self.config.ui.workspace_order, &order, &known);
+        if self.config.ui.workspace_order == merged {
+            return;
+        }
+        self.config.ui.workspace_order = merged;
+        Self::sort_workspaces_for_sidebar(&mut self.workspaces, &self.config.ui.workspace_order);
+        if let Err(error) = self.config.save(&self.config_path) {
+            tracing::warn!("워크스페이스 순서 저장 실패: {error:#}");
+        }
+    }
+
     fn upsert_workspace_projection(&mut self, row: storage::SettingsWorkspaceProjectionRow) {
         let anchor = row.folder_anchor;
         let workspace = storage::WorkspaceRow {
@@ -22617,11 +23677,7 @@ impl App {
             Some(existing) => *existing = workspace.clone(),
             None => self.workspaces.push(workspace.clone()),
         }
-        self.workspaces.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then(left.id.cmp(&right.id))
-        });
+        Self::sort_workspaces_for_sidebar(&mut self.workspaces, &self.config.ui.workspace_order);
         match anchor {
             Some(anchor) => {
                 self.workspace_anchors.insert(workspace.id, anchor);
@@ -23504,7 +24560,21 @@ impl App {
                             if workspace_id != self.active.id {
                                 self.switch_workspace(&workspace_id);
                             }
-                            if created {
+                            // 전환이 **실제로** 끝났을 때만 셸을 띄운다. `switch_workspace`
+                            // 는 live-warm 상한을 넘으면 경고만 남기고 돌아오고, 그때
+                            // `self.active`는 여전히 옛 워크스페이스다 — 거기에 셸을 띄우면
+                            // 보고 있던 워크스페이스에 난데없는 터미널이 하나 늘고, 정작
+                            // 새로 만든 워크스페이스는 세션 0으로 남는다.
+                            let switched = workspace_id == self.active.id;
+                            // switch_workspace가 이 워크스페이스용 런처를 띄웠는지 본
+                            // 뒤에 결정한다 — 런처가 떴으면 사용자가 고른 세션 하나만
+                            // 뜬다. 셸이 들어갈 자리는 `self.active`이므로 런처도 그
+                            // 워크스페이스 기준으로 묻는다(다른 워크스페이스 것을 보고
+                            // 건너뛰면 여기가 빈 채로 남는다).
+                            let launcher_open = self.agent_launcher_ui.is_open_for(&self.active.id);
+                            if switched
+                                && should_bootstrap_created_workspace_shell(created, launcher_open)
+                            {
                                 self.active
                                     .workspace_ui
                                     .spawn_shell(self.config.terminal.scrollback_lines as usize);
@@ -23783,6 +24853,10 @@ impl App {
                         }
                     })
                     .collect();
+                Self::sort_workspaces_for_sidebar(
+                    &mut self.workspaces,
+                    &self.config.ui.workspace_order,
+                );
                 self.workspace_anchors = anchors;
             }
             Err(_) => tracing::warn!(
@@ -23827,8 +24901,12 @@ impl App {
             .ui
             .hidden_env_project_ids
             .retain(|id| workspaces.iter().any(|workspace| workspace.id == *id));
+        // 표시 순서도 같은 정리 대상이다 — 셋 중 이것만 빠져 있었다(2026-09-03 defect 5).
+        let order_before = self.config.ui.workspace_order.len();
+        Self::prune_workspace_order(&mut self.config.ui.workspace_order, &known_workspace_ids);
         if (self.config.ui.closed_workspace_ids.len() != persisted_before
-            || self.config.ui.hidden_env_project_ids != hidden_env_before)
+            || self.config.ui.hidden_env_project_ids != hidden_env_before
+            || self.config.ui.workspace_order.len() != order_before)
             && let Err(error) = self.config.save(&self.config_path)
         {
             tracing::warn!("삭제 워크스페이스 UI 숨김 표식 정리 저장 실패: {error:#}");
@@ -25990,6 +27068,7 @@ impl App {
                                 crate::agent_detect::AgentKind::Claude => "claude".to_owned(),
                                 crate::agent_detect::AgentKind::Codex => "codex".to_owned(),
                                 crate::agent_detect::AgentKind::Kimi => "kimi".to_owned(),
+                                crate::agent_detect::AgentKind::Grok => "grok".to_owned(),
                             },
                             session_id: binding.session_id.clone(),
                         })
@@ -26659,6 +27738,12 @@ impl eframe::App for App {
         // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
         // 브리지가 변화 없으면 무시하므로(값 비교) 유휴 프레임 비용은 사실상 0이다.
         self.sync_web_workspaces(std::time::Instant::now());
+        // Relay 페어링 시계와 기기 목록. 시계는 항상 흘리고(만료는 화면과 무관), 목록은 설정
+        // 창이 열려 있을 때만 스로틀해 읽는다.
+        self.tick_relay_pairing(ctx);
+        if self.settings_open {
+            self.sync_relay_devices(std::time::Instant::now());
+        }
 
         // 렌더러 A/B 실측 드라이버 (B1) — env 미설정이면 즉시 반환한다.
         self.bench_step(ctx);
@@ -27443,6 +28528,9 @@ impl eframe::App for App {
                     self.stage_workspace_controller_action(
                         WorkspaceControllerAction::SwitchWorkspace(workspace_id),
                     );
+                }
+                Some(ui::file_tree::SidebarAction::ReorderWorkspaces(order)) => {
+                    self.apply_workspace_order(order);
                 }
                 Some(ui::file_tree::SidebarAction::ActivatePersistedSession {
                     workspace_id,
@@ -29536,6 +30624,84 @@ impl eframe::App for App {
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
+        // Relay 뷰모델 — web_view와 **독립**이다. 상태·에러·페어링·기기 목록이 각자 있다.
+        let relay_now = unix_now_secs();
+        let relay_pairing_failed_text;
+        let relay_pairing_view = match self.relay_pairing.projection(relay_now) {
+            crate::relay_pairing::PairingProjection::Idle => {
+                if self.relay_state.is_connected() {
+                    ui::settings::RelayPairingView::Idle
+                } else {
+                    ui::settings::RelayPairingView::NotReady
+                }
+            }
+            crate::relay_pairing::PairingProjection::Waiting { remaining_secs } => {
+                ui::settings::RelayPairingView::Waiting {
+                    remaining_secs,
+                    announcement: self.relay_announcement.as_deref(),
+                    link: self.relay_pairing_link.as_deref(),
+                }
+            }
+            crate::relay_pairing::PairingProjection::Confirm {
+                code,
+                remaining_secs,
+            } => ui::settings::RelayPairingView::Confirm {
+                code,
+                remaining_secs,
+                announcement: self.relay_announcement.as_deref(),
+                generation: self.relay_pairing_generation,
+            },
+            crate::relay_pairing::PairingProjection::Failed(failure) => {
+                use crate::relay_pairing::PairingFailure as F;
+                relay_pairing_failed_text = match failure {
+                    F::RelayNotReady => text.t("settings.relay.pairing.not_ready", &[]),
+                    F::Expired => text.t("settings.relay.pairing.expired", &[]),
+                    F::Rejected => text.t("settings.relay.pairing.rejected", &[]),
+                    F::Cancelled => text.t("settings.relay.pairing.cancelled", &[]),
+                    // 사용자에게 Rust Debug 문자열을 보이지 않는다 — 로그가 그 자리다.
+                    F::InvalidSecret => text.t("settings.relay.pairing.invalid_secret", &[]),
+                    F::Registry(error) => {
+                        tracing::info!(?error, "Relay 페어링 레지스트리 실패");
+                        text.t("settings.relay.pairing.registry_failed", &[])
+                    }
+                };
+                ui::settings::RelayPairingView::Failed(&relay_pairing_failed_text)
+            }
+        };
+        let relay_connection = match (self.relay_worker.is_some(), self.relay_state.current()) {
+            (false, _) if self.relay_error.is_some() => {
+                ui::settings::RelayConnectionView::Blocked("")
+            }
+            (false, _) => ui::settings::RelayConnectionView::Disabled,
+            (true, None) | (true, Some(web_remote::relay_client::RelayState::Connecting)) => {
+                ui::settings::RelayConnectionView::Connecting
+            }
+            (true, Some(web_remote::relay_client::RelayState::Connected)) => {
+                ui::settings::RelayConnectionView::Connected
+            }
+            (true, Some(web_remote::relay_client::RelayState::Backoff { until, .. })) => {
+                ui::settings::RelayConnectionView::Backoff {
+                    seconds: until.saturating_sub(relay_now),
+                }
+            }
+            (true, Some(web_remote::relay_client::RelayState::Halted(reason))) => match reason {
+                web_remote::relay_client::HaltReason::AuthenticationFailed => {
+                    ui::settings::RelayConnectionView::HaltedAuth
+                }
+                web_remote::relay_client::HaltReason::Revoked => {
+                    ui::settings::RelayConnectionView::HaltedRevoked
+                }
+                _ => ui::settings::RelayConnectionView::Disabled,
+            },
+        };
+        let relay_view = ui::settings::RelayView {
+            running: self.relay_worker.is_some(),
+            connection: relay_connection,
+            error: self.relay_error.as_deref(),
+            pairing: relay_pairing_view,
+            devices: &self.relay_devices,
+            now: relay_now,
+        };
         let out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
@@ -29546,6 +30712,8 @@ impl eframe::App for App {
             &web_view,
             &mut self.web_reveal_url,
             &mut self.web_qr,
+            &relay_view,
+            &mut self.relay_qr,
             notif_unread,
             &mut self.settings_search,
             &text,
@@ -30157,6 +31325,26 @@ impl eframe::App for App {
             }
             ui::settings::WebRemoteAction::None => None,
         });
+        // Relay 섹션은 별개 채널이다 — 같은 프레임에 두 섹션이 동작을 내면 먼저 온 것이 이긴다.
+        let relay_controller_action = match out.relay_action {
+            ui::settings::RelayAction::Start => Some(AppControllerAction::RelayStart),
+            ui::settings::RelayAction::Stop => Some(AppControllerAction::RelayStop),
+            ui::settings::RelayAction::BeginPairing => Some(AppControllerAction::RelayBeginPairing),
+            ui::settings::RelayAction::CancelPairing => {
+                Some(AppControllerAction::RelayCancelPairing)
+            }
+            ui::settings::RelayAction::ApprovePairing => {
+                Some(AppControllerAction::RelayApprovePairing)
+            }
+            ui::settings::RelayAction::RejectPairing => {
+                Some(AppControllerAction::RelayRejectPairing)
+            }
+            ui::settings::RelayAction::RevokeDevice(id) if id.len() == 32 => {
+                Some(AppControllerAction::RelayRevokeDevice(id))
+            }
+            ui::settings::RelayAction::RevokeDevice(_) | ui::settings::RelayAction::None => None,
+        };
+        let controller_action = controller_action.or(relay_controller_action);
         if self.pending_app_controller_action.is_none()
             && let Some(action) = controller_action
         {
@@ -30169,6 +31357,7 @@ impl eframe::App for App {
             self.remote_reveal_token = false;
             self.web_reveal_url = false;
             self.web_qr = None;
+            self.relay_qr = None;
         }
         if self.pending_agent_launcher_intent.is_none()
             && let Some(intent) = self.agent_launcher_ui.show(
@@ -31655,6 +32844,157 @@ mod tests {
         );
     }
 
+    /// 주장을 꺼낸 **모든** 경로가 싱크에 결정을 돌려줘야 한다.
+    ///
+    /// 주장이 우편함에 들어온 시점에 싱크의 핸드셰이크는 이미 `Proposed`다. 그 단계에는
+    /// 마감이 없고(`relay_client::handshake`의 `expired`가 `None`을 준다) 생존 신호가
+    /// 세션을 계속 살려 두므로, 예전처럼 서버 유휴 상한이 스스로 치워 주지 않는다. 표시를
+    /// "사용자가 확인 화면을 보고 있는가"로 두면 (1) 증명 실패 (2) 의식 만료 (3) 승인 중
+    /// DB 실패 — 셋 다 거절이 싱크에 닿지 않아 그 라우트가 앱 재시작까지 막힌다.
+    /// 취소 버튼조차 같은 표시를 보므로 손으로도 풀 수 없다.
+    #[test]
+    fn relay_주장은_어느_경로로_끝나도_싱크에_결정을_돌려준다() {
+        let source = include_str!("app.rs");
+
+        // (0) 표시는 주장을 **꺼낸 쪽**에서 세운다.
+        let tick = source
+            .split_once("    fn tick_relay_pairing(&mut self, ctx: &egui::Context) {")
+            .expect("tick_relay_pairing")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        let took = tick.find("mailbox.take_claim()").expect("주장 꺼내기");
+        let raised = tick
+            .find("self.relay_claim_outstanding = true;")
+            .expect("주장을 꺼낸 쪽이 표시를 세워야 한다");
+        assert!(took < raised, "표시는 주장을 꺼낸 직후에 세워야 한다");
+
+        // (2) 만료 — 표시만 내리면 싱크는 답을 못 받은 채 남는다.
+        assert!(
+            !tick.contains("self.relay_claim_outstanding = false"),
+            "만료가 표시만 내리면 마감 없는 Proposed가 라우트를 영영 막는다"
+        );
+        assert!(
+            tick.contains("self.relay_reject_claim();"),
+            "만료도 거절을 실제로 건네야 한다"
+        );
+
+        // (1) 증명 실패 — Ok에서만 표시를 세우면 Err의 거절이 조용히 사라진다.
+        let presented = source
+            .split_once(
+                "    fn relay_device_presented(&mut self, claim: web_remote::relay_client::PairingClaim) {",
+            )
+            .expect("relay_device_presented")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        assert!(
+            !presented.contains("self.relay_claim_outstanding = true"),
+            "Ok 분기에서 표시를 세우면 Err 분기의 거절이 싱크에 닿지 않는다"
+        );
+        assert!(
+            presented.contains("self.relay_reject_claim();"),
+            "증명이 틀린 주장도 거절을 돌려줘야 한다"
+        );
+
+        // (3) 승인 실패 — 표시는 DB 작업이 끝난 뒤에만 내린다.
+        let approve = source
+            .split_once("    fn relay_approve_pairing(&mut self) {")
+            .expect("relay_approve_pairing")
+            .1
+            .split_once("\n    /// ")
+            .expect("함수 끝")
+            .0;
+        let admission = approve
+            .find("PendingAdmission::begin(")
+            .expect("DB 승인 시작");
+        let cleared = approve
+            .find("self.relay_claim_outstanding = false")
+            .expect("활성화에 성공하면 표시를 내려야 한다");
+        assert!(
+            admission < cleared,
+            "DB 작업 전에 표시를 내리면 실패 경로의 거절이 싱크에 닿지 않는다"
+        );
+        assert_eq!(
+            approve.matches("self.relay_reject_claim();").count(),
+            2,
+            "lifetime 실패와 조정자 실패 두 경로 모두 거절을 건네야 한다"
+        );
+
+        // 반대 방향의 성질은 그대로다 — 붙은 기기가 없으면 거절을 보내지 않는다.
+        // (보내면 살아 있는 세션의 상태 기계가 죽어 바로 이어 시작한 의식의 티켓이
+        // 게시되지 못한다.)
+        let reject = source
+            .split_once("    fn relay_reject_claim(&mut self) {")
+            .expect("relay_reject_claim")
+            .1
+            .split_once("\n    }")
+            .expect("함수 끝")
+            .0;
+        assert!(
+            reject.contains("if !std::mem::take(&mut self.relay_claim_outstanding)"),
+            "표시가 없으면 거절을 보내지 않는다는 성질을 유지해야 한다"
+        );
+    }
+
+    /// 취소 직후 재시작(회수 → 게시)에서 **회수가 사라지면 안 된다.**
+    ///
+    /// 싱크는 대략 1초에 한 번 우편함을 비우는데 두 번의 클릭은 그보다 훨씬 가깝다.
+    /// 슬롯 하나에 마지막 명령만 담던 시절에는 나중 게시가 앞선 회수를 덮어써, 취소된
+    /// 핸들이 회수되지 않은 채 서버에서 5분 TTL을 다 살아남았다 — 죽은 줄 알았던 링크로
+    /// 기기가 그대로 입장한다.
+    #[test]
+    fn 티켓_우편함은_게시가_회수를_덮어쓰지_않는다() {
+        let first = relay_protocol::AdmissionCredential::from_bytes([1u8; 32]);
+        let second = relay_protocol::AdmissionCredential::from_bytes([2u8; 32]);
+        let mailbox = RelayMailbox::default();
+
+        // 첫 의식의 티켓은 싱크가 이미 가져갔다.
+        mailbox.publish_ticket(first);
+        let drained = mailbox.take_ticket_commands();
+        assert!(!drained.revoke);
+        assert!(drained.publish.is_some_and(|handle| handle.matches(&first)));
+
+        // 취소 → 곧바로 재시작. 싱크는 그 사이에 한 번도 비우지 못했다.
+        mailbox.revoke_ticket();
+        mailbox.publish_ticket(second);
+        let drained = mailbox.take_ticket_commands();
+        assert!(
+            drained.revoke,
+            "회수가 게시에 덮이면 취소된 핸들이 서버에서 TTL을 다 살아남는다"
+        );
+        assert!(
+            drained
+                .publish
+                .is_some_and(|handle| handle.matches(&second)),
+            "재시작한 의식의 티켓도 함께 전달돼야 한다"
+        );
+
+        // 아직 전달되지 않은 게시는 회수가 삼킨다 — 서버가 본 적 없는 핸들이라 회수할
+        // 것도 없다. 회수 자체는 남아 앞선 의식의 핸들을 치운다.
+        mailbox.publish_ticket(first);
+        mailbox.revoke_ticket();
+        let drained = mailbox.take_ticket_commands();
+        assert!(drained.revoke);
+        assert!(drained.publish.is_none());
+
+        // 싱크는 **회수를 먼저** 적용해야 한다. 뒤집히면 방금 게시한 핸들이 곧바로 회수된다.
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn drain_outbound(&mut self) -> Vec<Vec<u8>> {")
+            .expect("drain_outbound")
+            .1;
+        let revoke = body
+            .find("self.handshake.revoke_ticket()")
+            .expect("회수 적용");
+        let publish = body
+            .find("self.handshake.publish_ticket(")
+            .expect("게시 적용");
+        assert!(revoke < publish, "회수를 게시보다 먼저 적용해야 한다");
+    }
+
     /// 공유 코어는 두 전송 중 하나라도 켜져 있으면 살아 있어야 한다.
     #[test]
     fn 공유_코어는_두_전송이_모두_꺼진_뒤에만_정리된다() {
@@ -32993,6 +34333,158 @@ mod tests {
         assert!(
             body.contains("merge_detected_kinds(&mut merged, &kinds_for_active)"),
             "병합을 부르지 않으면 프로세스로만 감지된 에이전트가 카드에서 셸로 강등된다"
+        );
+    }
+
+    /// 같은 pane에서 에이전트를 바꿔 실행하면 **지금 돌고 있는 것**이 보여야 한다.
+    ///
+    /// agent_info는 감지 결과에 없는 세션의 마지막 값을 일부러 보존한다(대기 세션의 활동
+    /// 문구가 사라지지 않게). 그 보존과 "있으면 건드리지 않는다"가 겹치면 옛 종류가 영영
+    /// 남는다 — Grok을 돌리는데 Codex로 표시되던 실제 신고가 그것이었다.
+    #[test]
+    fn merge_detected_kinds는_다른_에이전트가_돌면_옛_표시를_갈아끼운다() {
+        use crate::agent_detect::{AgentDisplay, AgentKind, RunningAgent};
+        use std::collections::HashMap;
+
+        let session = runtime::SessionId(7);
+        // 앞서 Codex를 돌린 흔적 — transcript에서 온 모델·context·요약까지 들어 있다.
+        let mut info = HashMap::from([(
+            session,
+            AgentDisplay {
+                kind: AgentKind::Codex,
+                model: Some("gpt-5.6-sol".to_owned()),
+                effort: Some("high".to_owned()),
+                context_pct: Some(69),
+                last_agent_summary: Some("**Findings**".to_owned()),
+                user_instruction: Some("코드 리뷰해".to_owned()),
+            },
+        )]);
+        // 지금 이 pane에서 실제로 도는 것은 Grok이다.
+        let kinds = HashMap::from([(
+            session,
+            RunningAgent {
+                kind: AgentKind::Grok,
+                model: Some("grok-4.6".to_owned()),
+                effort: Some("xhigh".to_owned()),
+            },
+        )]);
+
+        merge_detected_kinds(&mut info, &kinds);
+
+        let shown = info.get(&session).expect("항목이 남아야 한다");
+        assert_eq!(shown.kind, AgentKind::Grok, "돌고 있는 에이전트가 진실이다");
+        assert_eq!(shown.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(shown.effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            shown.context_pct, None,
+            "앞 에이전트의 transcript 유래 값은 새 에이전트의 것이 아니다"
+        );
+        assert_eq!(shown.last_agent_summary, None);
+        assert_eq!(shown.user_instruction, None);
+    }
+
+    /// 표면(`pty_agent_surfaces`)도 사이드바와 **같은** 규칙을 써야 한다.
+    ///
+    /// 표면이 종류 비교 없이 `agent_info`를 복사하던 동안 두 가지가 함께 깨졌다.
+    /// (1) Grok pane의 표면이 앞선 Codex 세션의 값(`gpt-5.6-sol`·ctx 69%)을 그대로 보였다.
+    /// (2) 그 pane에서 `claude`를 띄우면 `display.kind`가 Grok이라
+    ///     `apply_claude_statusline`이 곧바로 돌아나가 Claude의 권위값을 못 넣고, 남아 있던
+    ///     Grok의 `xhigh`가 `CLAUDE_LADDER`에도 있는 값이라 `UnknownCurrentEffort`로
+    ///     막히지도 않은 채 `/effort max`가 Claude 세션에 실제로 전송됐다.
+    /// Grok을 감지기에 넣기 전에는 종류도 바인딩도 없어 `?`에서 걸러졌던 경로다.
+    #[test]
+    fn display_for는_돌고_있는_종류가_다르면_옛_표시를_버린다() {
+        use crate::agent_detect::{AgentDisplay, AgentKind, RunningAgent};
+
+        // 앞서 이 pane에서 Codex가 돌았다 — transcript에서 온 값들이 남아 있다.
+        let stale_codex = AgentDisplay {
+            kind: AgentKind::Codex,
+            model: Some("gpt-5.6-sol".to_owned()),
+            effort: Some("high".to_owned()),
+            context_pct: Some(69),
+            last_agent_summary: Some("**Findings**".to_owned()),
+            user_instruction: Some("코드 리뷰해".to_owned()),
+        };
+
+        // 지금 도는 것은 Grok이다. 옛 Codex 값은 통째로 버려야 한다.
+        let grok = RunningAgent {
+            kind: AgentKind::Grok,
+            model: Some("grok-4.6".to_owned()),
+            effort: Some("xhigh".to_owned()),
+        };
+        let shown = display_for(AgentKind::Grok, Some(&stale_codex), Some(&grok));
+        assert_eq!(shown.kind, AgentKind::Grok);
+        assert_eq!(shown.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(shown.effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            shown.context_pct, None,
+            "앞 에이전트의 ctx%가 새 표면에 남으면 안 된다"
+        );
+        assert_eq!(shown.last_agent_summary, None);
+
+        // 같은 pane에 이번엔 `claude`를 직접 띄웠다(argv에 model/effort 없음).
+        // 종류가 갈아 끼워져야 `apply_claude_statusline`이 권위값을 넣을 수 있고,
+        // Grok의 `xhigh`가 Claude 사다리 계산에 흘러 들어가지 않는다.
+        let stale_grok = AgentDisplay {
+            kind: AgentKind::Grok,
+            model: Some("grok-4.6".to_owned()),
+            effort: Some("xhigh".to_owned()),
+            context_pct: Some(12),
+            last_agent_summary: None,
+            user_instruction: None,
+        };
+        let direct_claude = RunningAgent {
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+        };
+        let shown = display_for(AgentKind::Claude, Some(&stale_grok), Some(&direct_claude));
+        assert_eq!(shown.kind, AgentKind::Claude);
+        assert_eq!(
+            shown.effort, None,
+            "Grok의 강도가 남으면 Claude 세션에 그 값 기준의 /effort가 나간다"
+        );
+        assert_eq!(shown.model, None);
+        assert_eq!(shown.context_pct, None);
+
+        // 종류가 같으면 transcript 값이 argv 값보다 정확하다 — 그대로 둔다.
+        let running_codex = RunningAgent {
+            kind: AgentKind::Codex,
+            model: Some("argv-값".to_owned()),
+            effort: None,
+        };
+        let shown = display_for(AgentKind::Codex, Some(&stale_codex), Some(&running_codex));
+        assert_eq!(shown.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(shown.context_pct, Some(69));
+
+        // 저장값이 아예 없으면 argv 값으로 빈칸을 채운다(방금 띄워 transcript가 없는 경우).
+        let shown = display_for(AgentKind::Grok, None, Some(&grok));
+        assert_eq!(shown.model.as_deref(), Some("grok-4.6"));
+        // 프로세스는 안 잡히고 바인딩만 있는 경로(감지가 아직 안 돈 pane)도 성립해야 한다.
+        let shown = display_for(AgentKind::Claude, Some(&stale_grok), None);
+        assert_eq!(shown.kind, AgentKind::Claude);
+        assert_eq!(shown.effort, None);
+
+        // 규칙이 맞아도 **두 호출부가 함께 쓰지 않으면** 다시 갈라진다. 사이드바 쪽은
+        // 이미 못박혀 있으므로(위 테스트) 표면 쪽 배선도 같은 방식으로 고정한다.
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once("    fn pty_agent_surfaces(")
+            .and_then(|(_, tail)| tail.split_once("    fn update_session_alerts("))
+            .map(|(body, _)| body)
+            .expect("pty_agent_surfaces 본문을 찾지 못했다");
+        assert!(
+            body.contains("display_for(kind,"),
+            "표면이 병합 규칙을 건너뛰면 옛 에이전트의 강도가 새 에이전트로 전송된다"
+        );
+        let merge = source
+            .split_once("fn merge_detected_kinds(")
+            .and_then(|(_, tail)| tail.split_once("\n}"))
+            .map(|(body, _)| body)
+            .expect("merge_detected_kinds 본문을 찾지 못했다");
+        assert!(
+            merge.contains("display_for("),
+            "사이드바도 같은 함수를 써야 규칙이 하나로 남는다"
         );
     }
 
@@ -40925,6 +42417,77 @@ mod tests {
         ));
     }
 
+    /// 새 워크스페이스를 런처로 시작하면 사용자가 고른 세션 **하나만** 떠야 한다.
+    /// 예전에는 생성 직후 `if created`로 무조건 빈 셸을 띄워, 런처에서 에이전트를
+    /// 고르면 빈 터미널 + 에이전트 터미널 두 개가 동시에 남았다(2026-09-02 사용자
+    /// 보고). 반대로 「세션이 뜰 예정」을 워크스페이스 구분 없이 물으면 이번 새
+    /// 워크스페이스가 세션 하나 없이 빈 채로 남는다. 결정 함수와 그 호출부 배선을
+    /// 함께 못박는다 — 호출부가 다시 `if created`나 워크스페이스 무관 질의로
+    /// 돌아가면 순수 함수 단언만으로는 회귀를 못 잡는다.
+    #[test]
+    fn 새_워크스페이스는_세션이_이미_예정돼_있으면_빈_셸을_띄우지_않는다() {
+        assert!(!should_bootstrap_created_workspace_shell(true, true));
+        // 런처가 안 뜨는 경로(bench·perf 하네스, 다른 워크스페이스의 런처)에서는
+        // 기존대로 셸 하나를 띄운다.
+        assert!(should_bootstrap_created_workspace_shell(true, false));
+        // 이미 있던 워크스페이스를 다시 여는 건 예나 지금이나 스폰하지 않는다.
+        assert!(!should_bootstrap_created_workspace_shell(false, false));
+        assert!(!should_bootstrap_created_workspace_shell(false, true));
+
+        let source = include_str!("app.rs");
+        let arm = source
+            .split_once("WorkspaceMutationPurpose::SwitchRuntime => {")
+            .unwrap()
+            .1
+            .split_once("SettingsOutcomeKind::WorkspaceMovedPathAccepted")
+            .unwrap()
+            .0;
+        assert!(arm.contains("should_bootstrap_created_workspace_shell("));
+        // 셸이 들어갈 워크스페이스(`self.active`) 기준으로 물어야 한다. 워크스페이스
+        // 무관한 `is_open()`은 다른 워크스페이스의 런처를 보고 셸을 건너뛴다.
+        assert!(arm.contains("self.agent_launcher_ui.is_open_for(&self.active.id)"));
+        assert!(!arm.contains("self.agent_launcher_ui.is_open()"));
+    }
+
+    /// live-warm 상한에 걸리면 `switch_workspace`는 경고만 남기고 **전환하지 않고**
+    /// 돌아온다. 그때 `self.active`는 옛 워크스페이스라, 부트스트랩을 그대로 진행하면
+    /// 사용자가 보고 있던 워크스페이스에 빈 터미널이 하나 늘고 정작 새로 만든
+    /// 워크스페이스는 세션 0으로 남는다. 전환 성사 여부로 게이트했는지 못박는다 —
+    /// 순수 함수는 `created`만 보므로 이 회귀를 잡지 못한다.
+    #[test]
+    fn 전환이_실패하면_옛_워크스페이스에_셸을_띄우지_않는다() {
+        let source = include_str!("app.rs");
+        let arm = source
+            .split_once("WorkspaceMutationPurpose::SwitchRuntime => {")
+            .unwrap()
+            .1
+            .split_once("SettingsOutcomeKind::WorkspaceMovedPathAccepted")
+            .unwrap()
+            .0;
+        assert!(
+            arm.contains("let switched = workspace_id == self.active.id;"),
+            "전환 성사 여부를 `self.active`로 확인해야 한다"
+        );
+        assert!(
+            arm.contains("if switched"),
+            "부트스트랩은 전환이 실제로 일어났을 때만 돌아야 한다"
+        );
+
+        // `switch_workspace_with_preferred_pane`의 비자명 조기 반환이 바로 그 상한이다.
+        // 다른 조기 반환이 생기면 위 게이트의 근거가 바뀌므로 함께 못박는다.
+        let switch = source
+            .split_once("fn switch_workspace_with_preferred_pane(")
+            .unwrap()
+            .1
+            .split_once("\n    fn ")
+            .unwrap()
+            .0;
+        assert!(
+            switch.contains("self.warm_limit_warning = Some("),
+            "상한 경고 경로가 사라지면 게이트의 이유도 다시 써야 한다"
+        );
+    }
+
     #[test]
     fn deferred_workspace_restores_are_keyed_per_runtime_and_strictly_bounded() {
         let mut pending = std::collections::HashMap::new();
@@ -41739,6 +43302,251 @@ mod tests {
 
         assert!(!workspace_visible_after_close(&closed, "closed"));
         assert!(workspace_visible_after_close(&closed, "open"));
+    }
+
+    /// 드래그로 정한 순서가 생성순보다 우선한다. 순서 목록에 없는 워크스페이스(= 사용자가
+    /// 순서를 정한 뒤 새로 만든 것)는 중간에 끼어들지 않고 생성순으로 맨 뒤에 붙는다.
+    #[test]
+    fn 저장된_순서가_생성순보다_먼저다() {
+        let row = |id: &str, created_at: &str| storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/projects/{id}"),
+            created_at: created_at.to_owned(),
+        };
+        // 입력을 일부러 흐트러뜨린다 — 이미 정렬된 벡터를 넣으면 아래 첫 단언이
+        // `Ordering::Equal`만 돌려주는 비교자도 통과시킨다(2026-09-03 리뷰 defect 4).
+        let mut workspaces = vec![
+            row("c", "2026-01-03"),
+            row("newer", "2026-09-04"),
+            row("a", "2026-01-01"),
+            row("new", "2026-09-03"),
+            row("b", "2026-01-02"),
+        ];
+
+        // 저장된 순서가 없으면 예전 그대로 생성순.
+        App::sort_workspaces_for_sidebar(&mut workspaces, &[]);
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c", "new", "newer"]);
+
+        // 사용자가 c → a → b로 끌어 놓은 뒤.
+        let order = ["c".to_owned(), "a".to_owned(), "b".to_owned()];
+        App::sort_workspaces_for_sidebar(&mut workspaces, &order);
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["c", "a", "b", "new", "newer"],
+            "저장된 것은 그 순서대로, 나머지는 생성순으로 뒤에"
+        );
+
+        // 이미 정렬된 목록을 다시 정렬해도 흔들리지 않는다(매 projection 갱신마다 돈다).
+        App::sort_workspaces_for_sidebar(&mut workspaces, &order);
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b", "new", "newer"]);
+
+        // 지워진 워크스페이스 id가 순서 목록에 남아 있어도 남은 것들의 순서는 유지된다.
+        let stale = [
+            "gone".to_owned(),
+            "c".to_owned(),
+            "a".to_owned(),
+            "b".to_owned(),
+        ];
+        App::sort_workspaces_for_sidebar(&mut workspaces, &stale);
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b", "new", "newer"]);
+    }
+
+    /// 저장된 순서가 없을 때의 정렬은 DB의 `ORDER BY created_at, id`
+    /// (`storage::Db::settings_workspace_projection_rows`)와 **바이트 단위로 같아야** 한다.
+    /// 생성시각이 같은 워크스페이스(같은 초에 만든 두 개, 마이그레이션으로 일괄 삽입된 것)는
+    /// id 오름차순 tiebreak이 유일한 결정자다 — 이게 없으면 DB 순서와 화면 순서가 갈린다
+    /// (2026-09-03 리뷰 defect 4: 기존 fixture는 created_at이 모두 달라 이 갈래를 못 밟았다).
+    #[test]
+    fn 저장된_순서가_없으면_생성시각_동률은_id순으로_갈린다() {
+        let row = |id: &str, created_at: &str| storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/projects/{id}"),
+            created_at: created_at.to_owned(),
+        };
+        let mut workspaces = vec![
+            row("ws-c", "2026-01-01T00:00:00Z"),
+            row("ws-a", "2026-01-01T00:00:00Z"),
+            row("ws-b", "2026-01-01T00:00:00Z"),
+        ];
+
+        App::sort_workspaces_for_sidebar(&mut workspaces, &[]);
+
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["ws-a", "ws-b", "ws-c"],
+            "created_at 동률이면 id 오름차순 — SQLite ORDER BY created_at, id와 동일"
+        );
+    }
+
+    /// 사이드바가 넘겨주는 목록은 **그때 보이는 행**뿐이라, 「워크스페이스 종료」로 숨긴
+    /// 워크스페이스는 빠져 있다. 통째로 덮어쓰면 숨긴 워크스페이스가 저장해 둔 자리를 영영
+    /// 잃고, 다시 열 때 생성순 맨 아래로 떨어지며 강조색까지 바뀐다(2026-09-03 리뷰 defect 1).
+    /// 병합 규칙: 드래그 결과가 앞, 살아 있지만 emit되지 않은 id는 저장된 상대 순서를 지킨 채
+    /// **그 뒤**에 붙는다 — 보이지 않는 행이라 눈에 보이는 순서를 흔들지 않는 자리가 뒤다.
+    #[test]
+    fn 숨긴_워크스페이스는_드래그_병합에서_자리를_잃지_않는다() {
+        let known = ["a", "b", "c"].into_iter().collect();
+        let saved = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        // "b"를 종료해 숨긴 상태에서 c를 a 위로 끌어 놓았다 → 사이드바는 c, a만 emit한다.
+        let dragged = ["c".to_owned(), "a".to_owned()];
+
+        let merged = App::merge_workspace_order(&saved, &dragged, &known);
+
+        assert_eq!(
+            merged,
+            ["c", "a", "b"],
+            "숨긴 b는 사라지지 않고 드래그 결과 뒤에 남는다"
+        );
+    }
+
+    /// 병합이 자리를 지켜준다고 **삭제된** 워크스페이스까지 남기면 config가 무한히 자란다.
+    /// `self.workspaces`에 없는 id(= DB에서 지워진 것)는 병합에서 떨어진다(2026-09-03 defect 1).
+    #[test]
+    fn 드래그_병합은_삭제된_워크스페이스_id를_떨군다() {
+        let known = ["a", "c"].into_iter().collect();
+        let saved = ["a".to_owned(), "gone".to_owned(), "c".to_owned()];
+        let dragged = ["c".to_owned(), "a".to_owned()];
+
+        let merged = App::merge_workspace_order(&saved, &dragged, &known);
+
+        assert_eq!(
+            merged,
+            ["c", "a"],
+            "DB에서 지워진 id는 순서 목록에서도 빠진다"
+        );
+    }
+
+    /// 「환경 및 API」 프로젝트 목록은 사이드바 목록과 **독립 도메인**이다
+    /// (ui/settings.rs 「설정_네비의_관리그룹은_연결_환경_에이전트_셋뿐이다」 참조).
+    /// 워커에 넘기는 `self.workspaces`는 사이드바 순서로 정렬돼 있으므로, 그대로 순회하면
+    /// 사이드바 드래그가 환경 목록 순서로 새 나간다(2026-09-03 리뷰 defect 2).
+    /// 환경 목록은 자기 순서(생성순)를 스스로 세운다.
+    #[test]
+    fn 환경_및_api_목록_순서는_사이드바_드래그와_독립이다() {
+        let row = |id: &str, created_at: &str| storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/projects/{id}"),
+            created_at: created_at.to_owned(),
+        };
+        let mut workspaces = vec![
+            row("a", "2026-01-01"),
+            row("b", "2026-01-02"),
+            row("c", "2026-01-03"),
+        ];
+        // 사용자가 사이드바에서 c → a → b로 끌어 놓은 뒤의 self.workspaces 상태.
+        let order = ["c".to_owned(), "a".to_owned(), "b".to_owned()];
+        App::sort_workspaces_for_sidebar(&mut workspaces, &order);
+
+        App::sort_workspaces_for_env_projects(&mut workspaces);
+
+        let ids: Vec<&str> = workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a", "b", "c"],
+            "환경 목록은 사이드바 순서가 아니라 생성순을 쓴다"
+        );
+    }
+
+    /// 워커가 실제로 그 정렬을 통과시키는지 고정한다 — 순수 함수만 테스트하면
+    /// 호출부를 지워도 초록이다. 워커는 DB가 있어야 돌아 소스로 고정한다(2026-09-03 defect 2).
+    #[test]
+    fn env_project_rows_워커는_생성순으로_되돌린_뒤_행을_만든다() {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("fn new_env_project_rows_worker(")
+            .expect("워커 생성 함수를 찾지 못했다");
+        let end = source[start..]
+            .find("\nfn load_approval_snapshot(")
+            .map(|offset| start + offset)
+            .expect("워커 생성 함수의 끝을 찾지 못했다");
+        let worker = &source[start..end];
+        assert!(
+            worker.contains("App::sort_workspaces_for_env_projects(&mut job.workspaces)"),
+            "워커가 사이드바 순서를 그대로 물려받고 있다"
+        );
+    }
+
+    /// `apply_workspace_order`가 (1) 병합 결과를 쓰고 (2) 메모리 목록을 다시 정렬하고
+    /// (3) config에 영속하는지 고정한다. `App`은 egui 컨텍스트와 DB가 있어야 만들어져
+    /// 단위 테스트로 못 세우므로, 판단 로직은 순수 함수로 빼고 배선만 소스로 본다
+    /// (2026-09-03 리뷰 defect 3: 이 함수에 커버리지가 전혀 없어 `config.save`를 지워도 초록이었다).
+    #[test]
+    fn 순서_적용은_병합_재정렬_영속을_모두_한다() {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("    fn apply_workspace_order(&mut self, order: Vec<String>) {")
+            .expect("apply_workspace_order를 찾지 못했다");
+        let end = source[start..]
+            .find("\n    fn upsert_workspace_projection(")
+            .map(|offset| start + offset)
+            .expect("apply_workspace_order의 끝을 찾지 못했다");
+        let body = &source[start..end];
+        assert!(
+            body.contains("Self::merge_workspace_order("),
+            "드래그 목록을 통째로 덮어쓰고 있다 — 저장된 순서와 병합해야 한다"
+        );
+        assert!(
+            body.contains("Self::sort_workspaces_for_sidebar(&mut self.workspaces"),
+            "메모리 목록을 다시 정렬하지 않으면 다음 projection 갱신까지 화면이 안 바뀐다"
+        );
+        assert!(
+            body.contains("self.config.save(&self.config_path)"),
+            "config에 저장하지 않으면 앱을 다시 켤 때 순서가 사라진다"
+        );
+    }
+
+    /// 삭제된 워크스페이스의 UI 숨김 표식 정리에 `workspace_order`도 포함한다 —
+    /// 셋 중 이것만 빠져 있어 지운 프로젝트 id가 config에 영영 남았다(2026-09-03 defect 5).
+    /// **종료(숨김)한 워크스페이스는 `self.workspaces`에 그대로 있으므로 살아남는다** —
+    /// 여기서 같이 지우면 defect 1이 그대로 되살아난다.
+    #[test]
+    fn 순서_정리는_삭제된_id만_걷어내고_숨긴_id는_남긴다() {
+        // "hidden"은 종료로 숨겼을 뿐 DB에 살아 있어 self.workspaces에 그대로 있다.
+        let known = ["a", "hidden", "c"].into_iter().collect();
+        let mut order = vec![
+            "a".to_owned(),
+            "gone".to_owned(),
+            "hidden".to_owned(),
+            "c".to_owned(),
+        ];
+
+        App::prune_workspace_order(&mut order, &known);
+
+        assert_eq!(
+            order,
+            ["a", "hidden", "c"],
+            "삭제된 gone만 빠지고 숨긴 hidden은 자리를 지킨다"
+        );
+    }
+
+    /// 정리 호출과 저장 조건이 실제로 배선돼 있는지 고정한다(2026-09-03 defect 5).
+    #[test]
+    fn refresh_workspaces는_순서_목록도_정리하고_저장한다() {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("    fn refresh_workspaces(&mut self) {")
+            .expect("refresh_workspaces를 찾지 못했다");
+        let end = source[start..]
+            .find("\n    fn fresh_pressure(")
+            .map(|offset| start + offset)
+            .expect("refresh_workspaces의 끝을 찾지 못했다");
+        let body = &source[start..end];
+        assert!(
+            body.contains("Self::prune_workspace_order("),
+            "workspace_order만 정리에서 빠져 있다"
+        );
+        assert!(
+            body.contains("self.config.ui.workspace_order.len() != order_before"),
+            "순서 목록이 줄어든 것만으로는 config를 저장하지 않는다"
+        );
     }
 
     #[test]
@@ -42788,6 +44596,101 @@ mod tests {
         ] {
             assert!(!body.contains(forbidden), "cold path contains {forbidden}");
         }
+    }
+
+    /// 셸/분할 스폰의 dotenv 워커 건너뛰기(2026-09-04). 조건은 딱 하나 — 이 런타임이
+    /// 이미 기본 env를 받았고 그 뒤 `.env`가 바뀌지 않았을 것. 그 밖엔 전부 워커로 간다.
+    #[test]
+    fn 셸_스폰은_env가_이미_전달됐고_안_바뀌었을_때만_dotenv_워커를_건너뛴다() {
+        let shell = runtime::RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 1_000,
+        };
+        let split = runtime::RuntimeCommand::SplitPane {
+            pane: runtime::MuxPaneId("pane-a".to_owned()),
+            direction: runtime::SplitDirection::Horizontal,
+            scrollback_lines: 1_000,
+        };
+        let agent = runtime::RuntimeCommand::SpawnAgent {
+            agent_config_id: None,
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 1_000,
+            command: "claude".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        let stamp = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let fresh: DotenvState = (true, Some(stamp(42)));
+        let changed: DotenvState = (true, Some(stamp(43)));
+
+        assert!(session_spawn_skips_dotenv_worker(
+            &shell,
+            Some(fresh),
+            fresh
+        ));
+        assert!(session_spawn_skips_dotenv_worker(
+            &split,
+            Some(fresh),
+            fresh
+        ));
+        assert!(
+            !session_spawn_skips_dotenv_worker(&shell, None, fresh),
+            "env를 한 번도 못 받은 런타임은 워커로 간다 — 첫 셸은 .env를 실어야 한다"
+        );
+        assert!(
+            !session_spawn_skips_dotenv_worker(&shell, Some(fresh), changed),
+            ".env가 바뀌었으면 워커가 다시 읽어야 한다"
+        );
+        assert!(
+            !session_spawn_skips_dotenv_worker(&agent, Some(fresh), fresh),
+            "에이전트는 승인 티켓·lease가 continuation에 묶여 있어 건너뛰지 않는다"
+        );
+        assert!(
+            !session_spawn_skips_dotenv_worker(
+                &runtime::RuntimeCommand::RestoreWorkspace,
+                Some(fresh),
+                fresh
+            ),
+            "복원은 세션 생성이 아니다"
+        );
+    }
+
+    /// 두 라우팅 지점(프로토콜 큐 배출, controller Runtime)이 **같은** 판단을 써야 한다 —
+    /// 한쪽만 건너뛰면 런처 빈 터미널은 빠른데 ⌘T 새 셸은 느린 식으로 갈린다.
+    #[test]
+    fn 셸_스폰_라우팅_두_지점이_같은_dotenv_건너뛰기를_쓴다() {
+        let source = include_str!("app.rs");
+        let drain = source
+            .split_once("fn drain_workspace_protocol_intents")
+            .unwrap()
+            .1
+            .split_once("fn poll_workspace_protocol_intents")
+            .unwrap()
+            .0;
+        assert!(
+            drain
+                .contains("&& !self.session_spawn_skips_dotenv_worker(runtime_instance, &command)"),
+            "프로토콜 큐 배출이 건너뛰기를 안 본다"
+        );
+        let controller = source
+            .split_once("WorkspaceControllerAction::Runtime(command) => {")
+            .unwrap()
+            .1
+            .split_once("WorkspaceControllerAction::")
+            .unwrap()
+            .0;
+        assert!(
+            controller
+                .contains("&& !self.session_spawn_skips_dotenv_worker(runtime_instance, &command)"),
+            "controller Runtime 분기가 건너뛰기를 안 본다"
+        );
     }
 
     #[test]

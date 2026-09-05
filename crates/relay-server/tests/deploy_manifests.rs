@@ -103,6 +103,13 @@ fn the_units_run_least_privileged_and_never_pass_credentials_on_the_command_line
             "ProtectHome=yes",
             "RestrictAddressFamilies=AF_INET AF_INET6",
             "MemoryDenyWriteExecute=yes",
+            // 스레드·fd 상한과 정지 여유. 코드의 접속 상한 이전에 OS가 먼저 막는다.
+            "TasksMax=640",
+            "LimitNOFILE=4096",
+            "TimeoutStopSec=15",
+            "SystemCallFilter=@system-service",
+            "CapabilityBoundingSet=",
+            "RestrictSUIDSGID=yes",
         ] {
             assert!(unit.contains(required), "{environment}: {required}");
         }

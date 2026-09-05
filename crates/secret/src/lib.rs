@@ -165,7 +165,48 @@ pub struct KeyringSecretStore;
 /// UI(set/delete)와 runtime worker(get)가 겹치지 않도록 프로세스 전역 직렬화.
 static KEYRING_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(target_os = "macos")]
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    static kSecUseAuthenticationUI: core_foundation::string::CFStringRef;
+    static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
+}
+
+/// Builds a legacy-login-keychain query that is guaranteed to fail with
+/// `errSecInteractionNotAllowed` instead of presenting SecurityAgent UI.
+#[cfg(target_os = "macos")]
+fn macos_noninteractive_password_options(
+    id: &str,
+) -> anyhow::Result<security_framework::passwords::PasswordOptions> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    let mut options =
+        security_framework::passwords::PasswordOptions::new_generic_password(KEYRING_SERVICE, id);
+    #[allow(deprecated)]
+    unsafe {
+        options.query.push((
+            CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
+            CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType(),
+        ));
+    }
+    Ok(options)
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn macos_get_password(id: &str) -> anyhow::Result<Vec<u8>> {
+    security_framework::passwords::generic_password(macos_noninteractive_password_options(id)?)
+        .with_context(|| format!("keyring 조회 실패: {id}"))
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn macos_missing(error: &security_framework::base::Error) -> bool {
+    // errSecItemNotFound. `kSecUseAuthenticationUIFail` returns a distinct
+    // errSecInteractionNotAllowed (-25308), so denied access is never mistaken for absence.
+    error.code() == -25_300
+}
+
 impl KeyringSecretStore {
+    #[cfg(any(not(target_os = "macos"), test))]
     fn entry(&self, id: &str) -> anyhow::Result<keyring_core::Entry> {
         keyring_core::Entry::new(KEYRING_SERVICE, id)
             .with_context(|| format!("keyring entry 생성 실패: {id}"))
@@ -175,37 +216,98 @@ impl KeyringSecretStore {
 impl SecretStore for KeyringSecretStore {
     fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        self.entry(id)?
-            .set_password(secret.expose())
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            security_framework::passwords::set_generic_password_options(
+                secret.expose().as_bytes(),
+                macos_noninteractive_password_options(id)?,
+            )
             .with_context(|| format!("keyring 저장 실패: {id}"))
+        }
+        #[cfg(any(not(target_os = "macos"), test))]
+        {
+            self.entry(id)?
+                .set_password(secret.expose())
+                .with_context(|| format!("keyring 저장 실패: {id}"))
+        }
     }
 
     fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        let password = self
-            .entry(id)?
-            .get_password()
-            .with_context(|| format!("keyring 조회 실패: {id}"))?;
-        Ok(SecretString::new(password))
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            let password = macos_get_password(id)?;
+            match String::from_utf8(password) {
+                Ok(password) => Ok(SecretString::new(password)),
+                Err(error) => {
+                    let mut bytes = error.into_bytes();
+                    bytes.fill(0);
+                    anyhow::bail!("keyring 값이 UTF-8 문자열이 아님")
+                }
+            }
+        }
+        #[cfg(any(not(target_os = "macos"), test))]
+        {
+            let password = self
+                .entry(id)?
+                .get_password()
+                .with_context(|| format!("keyring 조회 실패: {id}"))?;
+            Ok(SecretString::new(password))
+        }
     }
 
     fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        match self.entry(id)?.delete_credential() {
-            Ok(()) => Ok(()),
-            // 이미 없는 entry 삭제는 성공으로 취급 (metadata/keyring drift 복구 허용)
-            Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("keyring 삭제 실패: {id}")),
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            match security_framework::passwords::delete_generic_password_options(
+                macos_noninteractive_password_options(id)?,
+            ) {
+                Ok(()) => Ok(()),
+                Err(error) if macos_missing(&error) => Ok(()),
+                Err(error) => Err(error).with_context(|| format!("keyring 삭제 실패: {id}")),
+            }
+        }
+        #[cfg(any(not(target_os = "macos"), test))]
+        {
+            match self.entry(id)?.delete_credential() {
+                Ok(()) => Ok(()),
+                // 이미 없는 entry 삭제는 성공으로 취급 (metadata/keyring drift 복구 허용)
+                Err(keyring_core::Error::NoEntry) => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("keyring 삭제 실패: {id}")),
+            }
         }
     }
 
     fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        match self.entry(id)?.get_password() {
-            Ok(_) => Ok(true),
-            // 확인된 부재만 false — 그 외 오류는 "없음"으로 오인하면 안 된다 (키 덮어쓰기 방지)
-            Err(keyring_core::Error::NoEntry) => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("keyring 존재 확인 실패: {id}")),
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            match macos_get_password(id) {
+                Ok(mut password) => {
+                    password.fill(0);
+                    Ok(true)
+                }
+                Err(error) => {
+                    if error
+                        .downcast_ref::<security_framework::base::Error>()
+                        .is_some_and(macos_missing)
+                    {
+                        Ok(false)
+                    } else {
+                        Err(error).with_context(|| format!("keyring 존재 확인 실패: {id}"))
+                    }
+                }
+            }
+        }
+        #[cfg(any(not(target_os = "macos"), test))]
+        {
+            match self.entry(id)?.get_password() {
+                Ok(_) => Ok(true),
+                // 확인된 부재만 false — 그 외 오류는 "없음"으로 오인하면 안 된다 (키 덮어쓰기 방지)
+                Err(keyring_core::Error::NoEntry) => Ok(false),
+                Err(e) => Err(e).with_context(|| format!("keyring 존재 확인 실패: {id}")),
+            }
         }
     }
 
@@ -215,18 +317,56 @@ impl SecretStore for KeyringSecretStore {
 
     fn list_secret_ids_bounded(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
-        let spec = std::collections::HashMap::from([("service", KEYRING_SERVICE)]);
-        // `Entry::search` returns a platform-owned Vec, so its source allocation cannot be bounded
-        // without a streaming keyring-core API. From the first iterator stage available to us,
-        // nonmatching service/prefix rows are dropped immediately and only limit+1 matching
-        // usernames are retained. The +1 probe proves overflow without retaining the full flood.
-        let matching_users = keyring_core::Entry::search(&spec)
-            .context("keyring entry inventory 조회 실패")?
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+            use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+
+            let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)
+                .context("macOS login keychain 조회 실패")?;
+            let mut options = ItemSearchOptions::new();
+            options
+                .keychains(&[keychain])
+                .class(ItemClass::generic_password())
+                .service(KEYRING_SERVICE)
+                .limit(Limit::All)
+                .load_attributes(true)
+                .skip_authenticated_items(true);
+            let matching_users = match options.search() {
+                Ok(items) => items,
+                Err(error) if macos_missing(&error) => Vec::new(),
+                Err(error) => {
+                    return Err(error).context("keyring entry inventory 조회 실패");
+                }
+            }
             .into_iter()
-            .filter_map(|entry| entry.get_specifiers())
-            .filter_map(|(service, user)| (service == KEYRING_SERVICE).then_some(user))
+            .filter_map(|item| item.simplify_dict())
+            .filter_map(|attributes| {
+                (attributes
+                    .get("svce")
+                    .is_some_and(|service| service == KEYRING_SERVICE))
+                .then(|| attributes.get("acct").cloned())
+                .flatten()
+            })
             .filter(|user| user.starts_with(prefix));
-        collect_bounded_secret_ids(matching_users)
+            collect_bounded_secret_ids(matching_users)
+        }
+        #[cfg(any(not(target_os = "macos"), test))]
+        {
+            let spec = std::collections::HashMap::from([("service", KEYRING_SERVICE)]);
+            // `Entry::search` returns a platform-owned Vec, so its source allocation cannot be
+            // bounded without a streaming keyring-core API. From the first iterator stage
+            // available to us, nonmatching service/prefix rows are dropped immediately and only
+            // limit+1 matching usernames are retained. The +1 probe proves overflow without
+            // retaining the full flood.
+            let matching_users = keyring_core::Entry::search(&spec)
+                .context("keyring entry inventory 조회 실패")?
+                .into_iter()
+                .filter_map(|entry| entry.get_specifiers())
+                .filter_map(|(service, user)| (service == KEYRING_SERVICE).then_some(user))
+                .filter(|user| user.starts_with(prefix));
+            collect_bounded_secret_ids(matching_users)
+        }
     }
 }
 
@@ -305,6 +445,32 @@ mod tests {
         assert_eq!(masked_hint("sk-live-abcdef123456"), "****3456");
         assert_eq!(masked_hint("short"), "****");
         assert_eq!(masked_hint(""), "****");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keyring_query는_인증_ui_fail_policy를_항상_추가한다() {
+        use core_foundation::base::TCFType;
+        use core_foundation::string::CFString;
+
+        let baseline = security_framework::passwords::PasswordOptions::new_generic_password(
+            KEYRING_SERVICE,
+            "policy-test",
+        );
+        let noninteractive = macos_noninteractive_password_options("policy-test").unwrap();
+
+        #[allow(deprecated)]
+        {
+            assert_eq!(noninteractive.query.len(), baseline.query.len() + 1);
+            let (key, value) = noninteractive.query.last().unwrap();
+            assert_eq!(key.as_concrete_TypeRef(), unsafe {
+                kSecUseAuthenticationUI
+            });
+            assert_eq!(
+                value.downcast::<CFString>().unwrap().as_concrete_TypeRef(),
+                unsafe { kSecUseAuthenticationUIFail }
+            );
+        }
     }
 
     #[test]

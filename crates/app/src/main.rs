@@ -48,6 +48,9 @@ mod pty_effort;
 // Task 2 어댑터만 제공한다 — 기동 배선은 Relay 클라이언트를 붙이는 Task 4의 몫이다.
 #[allow(dead_code)]
 mod relay_repository;
+// Relay 페어링 의식 상태 기계(Task 5). 설정 화면이 투영을 읽고, 데이터 평면 배선(Task 6)이
+// 기기 제시 경로를 부른다.
+mod relay_pairing;
 mod shortcuts;
 mod status_feed;
 mod tailscale;
@@ -81,8 +84,13 @@ fn main() -> anyhow::Result<()> {
     // 중복 실행 방지 lock (설계문서 PR-14 crash recovery). config 로드/생성보다
     // 먼저 잡는다 — 두 인스턴스의 config I/O 경쟁도 이 lock이 보호한다 (codex 리뷰).
     // drop 시 자동 해제되므로 main 끝까지 살려 둔다.
-    let _run_lock = persist::LockFile::acquire(&paths.data_dir.join("deppy.lock"))
-        .map_err(|e| anyhow::anyhow!("이미 실행 중이거나 lock 획득 실패: {e:#}"))?;
+    let run_lock = std::sync::Arc::new(
+        persist::LockFile::acquire(&paths.data_dir.join("deppy.lock"))
+            .map_err(|e| anyhow::anyhow!("이미 실행 중이거나 lock 획득 실패: {e:#}"))?,
+    );
+    // App도 같은 lock을 든다 — Relay 저장소·식별키 생성이 "단일 인스턴스 lock 이후"라는
+    // 순서를 타입으로 요구하기 때문이다. 이쪽 참조는 main 끝까지 살려 둔다.
+    let _run_lock = std::sync::Arc::clone(&run_lock);
 
     let config = config::Config::load_or_create(&paths.config_dir)?;
     let config_path = config::config_path(&paths.config_dir);
@@ -166,6 +174,7 @@ fn main() -> anyhow::Result<()> {
                 data_dir,
                 cc.egui_ctx.clone(),
                 bench,
+                run_lock,
             )?))
         }),
     )

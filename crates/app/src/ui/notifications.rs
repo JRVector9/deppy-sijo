@@ -93,12 +93,14 @@ impl AgentNotificationSource {
             Self::Pty(Some(AgentProvider::Codex)) => "[Codex PTY]",
             Self::Pty(Some(AgentProvider::Claude)) => "[Claude PTY]",
             Self::Pty(Some(AgentProvider::Kimi)) => "[Kimi PTY]",
+            Self::Pty(Some(AgentProvider::Grok)) => "[Grok PTY]",
             Self::Pty(None) => "[PTY]",
             Self::App(AgentProvider::Codex) => "[Codex APP]",
             // There is no Claude structured transport today, but preserving the
             // provider in the source keeps this view model transport-neutral.
             Self::App(AgentProvider::Claude) => "[Claude APP]",
             Self::App(AgentProvider::Kimi) => "[Kimi APP]",
+            Self::App(AgentProvider::Grok) => "[Grok APP]",
         }
     }
 }

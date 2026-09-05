@@ -175,6 +175,8 @@ fn check_package_gate_source() -> anyhow::Result<()> {
         "cargo build --release -p deppy-sijo -p mcp-proxy",
         "Developer ID Application:",
         "codesign --force --options runtime --timestamp",
+        "xcrun notarytool submit",
+        "xcrun stapler staple",
         "ditto -c -k --sequesterRsrc --keepParent",
         "verify-macos-package.sh",
     ] {
@@ -187,6 +189,9 @@ fn check_package_gate_source() -> anyhow::Result<()> {
         "REQUIRE_TRUSTED=${DEPPY_REQUIRE_TRUSTED_SIGNING:-1}",
         "ALLOW_UNTRUSTED=${DEPPY_ALLOW_UNTRUSTED_SIGNING:-0}",
         "codesign --verify --deep --strict",
+        "xcrun stapler validate",
+        "spctl --assess --type execute",
+        "source=Notarized Developer ID",
         "lipo -archs",
         "CFBundleIdentifier",
         "TeamIdentifier",
@@ -205,6 +210,19 @@ fn check_package_gate_source() -> anyhow::Result<()> {
             "macOS package verifier missing required check: {required}"
         );
     }
+    let submit = package
+        .find("xcrun notarytool submit")
+        .context("macOS package gate missing notarization submit")?;
+    let staple = package
+        .find("xcrun stapler staple")
+        .context("macOS package gate missing ticket staple")?;
+    let final_archive = package
+        .rfind("ditto -c -k --sequesterRsrc --keepParent")
+        .context("macOS package gate missing final archive")?;
+    anyhow::ensure!(
+        submit < staple && staple < final_archive,
+        "macOS package must submit, staple, then rebuild the distributable archive"
+    );
     anyhow::ensure!(
         workflow.contains("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"),
         "BG01 workflow template must pin checkout to the reviewed commit"
@@ -1646,7 +1664,7 @@ fn production_after_tests() {
     }
 
     #[test]
-    fn macos_package_gate는_trusted_signature와_archive를검증한다() {
+    fn macos_package_gate는_공증_gatekeeper와_archive를검증한다() {
         check_package_gate_source().unwrap();
     }
 

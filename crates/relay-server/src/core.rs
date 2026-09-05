@@ -562,7 +562,7 @@ impl RelayCore {
         // "라우트는 있는데 자격증명이 틀리다"가 걸린 시간으로 구별된다.
         let mut matched = false;
         for verifier in &self.verifiers {
-            let route_matches = verifier.route == route;
+            let route_matches = constant_time_eq_16(verifier.route.as_bytes(), route.as_bytes());
             let credential_matches = credential.matches(&verifier.credential);
             matched |= route_matches & credential_matches;
         }
@@ -612,6 +612,19 @@ impl RelayCore {
         let Some(handle) = frame.admission_credential() else {
             return self.reject(connection, RejectionCode::MalformedFrame);
         };
+        // 연결 id는 **기기가 정한다** — 이 헤더 값이 그대로 라우트 세션 id가 되고, 기기에는
+        // `Admitted`로, Mac에는 `PeerJoined`로 되돌아가 세 당사자가 같은 값에 합의한다.
+        // 전0은 계약상 "연결 없음"이라(Mac이 자기 입장 프레임에 쓰는 값) 세션 id가 될 수
+        // 없다. 받아 주면 Mac의 핸드셰이크가 그 값에 묶여, 이후 어떤 프레임이 어느 세션의
+        // 것인지 구분하지 못한다.
+        if frame
+            .connection_id()
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return self.reject(connection, RejectionCode::MalformedFrame);
+        }
         let route = frame.route_id();
         let ticket_ttl = self.limits.ticket_ttl_secs;
         let Some(entry) = self.routes.get_mut(&route) else {
@@ -683,7 +696,14 @@ impl RelayCore {
             .iter()
             .any(|ticket| ticket.handle.matches(&handle))
         {
-            return self.reject(connection, RejectionCode::TicketConsumed);
+            // 같은 핸들의 재등록은 Mac의 멱등 재시도다. 끊으면 라우트와 붙어 있던 기기까지
+            // 함께 사라진다 — 인접한 용량 경로처럼 치명적이지 않은 제어 프레임으로 답한다.
+            return self.control(
+                connection,
+                FrameType::Rejected,
+                route,
+                RejectionCode::TicketConsumed,
+            );
         }
         if entry.tickets.len() >= maximum {
             // 상한에 닿으면 조용히 밀어내지 않고 거절한다.
@@ -752,32 +772,25 @@ impl RelayCore {
             return Vec::new();
         };
 
-        let Some(target) = self.connections.get_mut(&peer) else {
+        if !self.connections.contains_key(&peer) {
             return Vec::new();
-        };
+        }
         // 예약을 먼저 한다. 상한을 넘기면 보낸 쪽이 아니라 **느린 쪽**을 끊는다 —
         // 그러지 않으면 느린 소비자 하나가 정상적인 상대를 밀어낸다.
-        if target.queued.len() + 1 > self.limits.max_queue_frames
-            || target.queued_bytes + bytes.len() > self.limits.max_queue_bytes
-            || self.total_queued_bytes + self.draining_bytes + bytes.len()
-                > self.limits.max_total_queue_bytes
-        {
-            let mut actions = vec![RelayAction::Disconnect {
-                connection: peer,
-                code: RejectionCode::QueueOverflow,
-            }];
-            actions.extend(self.drop_connection(peer));
-            return actions;
+        match self.enqueue(peer, bytes.to_vec()) {
+            Some(action) => {
+                self.forwarded_frames += 1;
+                vec![action]
+            }
+            None => {
+                let mut actions = vec![RelayAction::Disconnect {
+                    connection: peer,
+                    code: RejectionCode::QueueOverflow,
+                }];
+                actions.extend(self.drop_connection(peer));
+                actions
+            }
         }
-        target.queued.push_back(bytes.len());
-        target.queued_bytes += bytes.len();
-        self.total_queued_bytes += bytes.len();
-        self.forwarded_frames += 1;
-
-        vec![RelayAction::Send {
-            connection: peer,
-            frame: bytes.to_vec(),
-        }]
     }
 
     /// 이 IP의 입장 시도를 창 단위로 센다. 결과와 무관하게 시도 자체를 센다 —
@@ -833,6 +846,26 @@ impl RelayCore {
         }
     }
 
+    /// 발신 프레임 하나를 이 연결의 큐에 **예약하고** 전송 지시를 만든다. 제어 프레임도
+    /// 예외가 아니다 — 예약 없이 내보낸 프레임을 전송 계층이 `queue_flushed`로 세면, 아직
+    /// 안 나간 데이터 프레임의 예약이 풀려 상한이 한 프레임씩 새어 나간다.
+    /// 예산을 넘기면 지시를 만들지 않는다(제어 프레임은 잃어도 되고, 데이터는 `forward`가
+    /// 따로 느린 소비자로 처리한다).
+    fn enqueue(&mut self, connection: ConnectionKey, frame: Vec<u8>) -> Option<RelayAction> {
+        let target = self.connections.get_mut(&connection)?;
+        if target.queued.len() + 1 > self.limits.max_queue_frames
+            || target.queued_bytes + frame.len() > self.limits.max_queue_bytes
+            || self.total_queued_bytes + self.draining_bytes + frame.len()
+                > self.limits.max_total_queue_bytes
+        {
+            return None;
+        }
+        target.queued.push_back(frame.len());
+        target.queued_bytes += frame.len();
+        self.total_queued_bytes += frame.len();
+        Some(RelayAction::Send { connection, frame })
+    }
+
     /// 거절은 언제나 코드 하나를 보내고 즉시 끊는다. 사유 문자열은 와이어에 없다.
     fn reject(&mut self, connection: ConnectionKey, code: RejectionCode) -> Vec<RelayAction> {
         let mut actions = Vec::new();
@@ -853,21 +886,18 @@ impl RelayCore {
         route: RouteId,
         code: RejectionCode,
     ) -> Vec<RelayAction> {
-        RelayFrame::new(
+        let payload = code.to_bytes();
+        let Ok(frame) = RelayFrame::new(
             frame_type,
             route,
             ConnectionId::from_bytes([0; 16]),
             0,
-            &code.to_bytes(),
-        )
-        .ok()
-        .map(|frame| {
-            vec![RelayAction::Send {
-                connection,
-                frame: frame.to_vec(),
-            }]
-        })
-        .unwrap_or_default()
+            &payload,
+        ) else {
+            return Vec::new();
+        };
+        self.enqueue(connection, frame.to_vec())
+            .map_or_else(Vec::new, |action| vec![action])
     }
 
     fn notify(
@@ -878,10 +908,7 @@ impl RelayCore {
         session: ConnectionId,
     ) -> Option<RelayAction> {
         let frame = RelayFrame::new(frame_type, route, session, 0, &[]).ok()?;
-        Some(RelayAction::Send {
-            connection,
-            frame: frame.to_vec(),
-        })
+        self.enqueue(connection, frame.to_vec())
     }
 
     /// 연결 하나를 상태에서 완전히 걷어낸다. 라우트·티켓·큐·IP 카운트를 모두 되돌린다.
@@ -941,6 +968,14 @@ impl RelayCore {
     }
 }
 
+/// 라우트 id 비교도 조기 종료하지 않는다 — 검증자 루프 전체가 분기 없이 돌아야 한다.
+fn constant_time_eq_16(left: &[u8; 16], right: &[u8; 16]) -> bool {
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |accumulator, (a, b)| accumulator | (a ^ b))
+        == 0
+}
+
 const fn decode_rejection(error: DecodeError) -> RejectionCode {
     error.rejection_code()
 }
@@ -983,6 +1018,16 @@ mod tests {
             .to_vec()
     }
 
+    /// 건강한 전송 계층을 흉내 낸다 — 코어가 낸 전송 지시를 전부 즉시 써 낸 것으로 친다.
+    /// 제어 프레임도 큐 예약을 받으므로, 이걸 빼먹으면 예약이 남아 상한 테스트가 어긋난다.
+    fn flush_all(core: &mut RelayCore, actions: &[RelayAction]) {
+        for action in actions {
+            if let RelayAction::Send { connection, .. } = action {
+                core.queue_flushed(*connection, 1);
+            }
+        }
+    }
+
     /// 데스크톱 하나를 입장시키고 그 키를 돌려준다.
     fn admit_desktop(core: &mut RelayCore, now: u64) -> ConnectionKey {
         let key = core.connection_opened(DESKTOP_IP, now).unwrap();
@@ -1001,34 +1046,39 @@ mod tests {
             sent_types(&actions).contains(&FrameType::Admitted),
             "{actions:?}"
         );
+        flush_all(core, &actions);
         key
     }
 
     fn publish_ticket(core: &mut RelayCore, desktop: ConnectionKey, handle: u8, now: u64) {
-        core.frame_received(
-            desktop,
-            &frame(
-                FrameType::TicketPublish,
-                connection_id(1),
-                credential(handle).as_bytes(),
-            ),
-            now,
-        )
-        .unwrap();
+        let actions = core
+            .frame_received(
+                desktop,
+                &frame(
+                    FrameType::TicketPublish,
+                    connection_id(1),
+                    credential(handle).as_bytes(),
+                ),
+                now,
+            )
+            .unwrap();
+        flush_all(core, &actions);
     }
 
     fn admit_device(core: &mut RelayCore, handle: u8, now: u64) -> ConnectionKey {
         let key = core.connection_opened(DEVICE_IP, now).unwrap();
-        core.frame_received(
-            key,
-            &frame(
-                FrameType::DeviceAdmission,
-                connection_id(2),
-                credential(handle).as_bytes(),
-            ),
-            now,
-        )
-        .unwrap();
+        let actions = core
+            .frame_received(
+                key,
+                &frame(
+                    FrameType::DeviceAdmission,
+                    connection_id(2),
+                    credential(handle).as_bytes(),
+                ),
+                now,
+            )
+            .unwrap();
+        flush_all(core, &actions);
         key
     }
 
@@ -1152,6 +1202,63 @@ mod tests {
             )
             .unwrap();
         assert!(sent_types(&actions).contains(&FrameType::Admitted));
+    }
+
+    /// 연결 id는 기기가 정하고 서버는 **양쪽에 같은 값**을 돌려준다. 기기에게 가는
+    /// `Admitted`에 그 값이 없으면 기기는 자기 세션 id를 확인할 길이 없다 —
+    /// 서버는 `PeerJoined`를 Mac에게만 보내기 때문이다(2026-09-03 실측한 페어링 실패).
+    #[test]
+    fn the_device_chooses_the_connection_id_and_both_sides_are_told_the_same_one() {
+        let mut core = new_core();
+        let desktop = admit_desktop(&mut core, START);
+        publish_ticket(&mut core, desktop, 0xa1, START);
+        let device = core.connection_opened(DEVICE_IP, START).unwrap();
+        let chosen = connection_id(0x5c);
+        let actions = core
+            .frame_received(
+                device,
+                &frame(FrameType::DeviceAdmission, chosen, &[0xa1; 32]),
+                START,
+            )
+            .unwrap();
+        let sent: Vec<(ConnectionKey, FrameType, ConnectionId)> = actions
+            .iter()
+            .filter_map(|action| match action {
+                RelayAction::Send { connection, frame } => {
+                    let (decoded, _) = RelayFrame::decode(frame).unwrap();
+                    Some((*connection, decoded.frame_type(), decoded.connection_id()))
+                }
+                RelayAction::Disconnect { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                (device, FrameType::Admitted, chosen),
+                (desktop, FrameType::PeerJoined, chosen),
+            ],
+            "기기에게 Admitted로, Mac에게 PeerJoined로 **같은** 연결 id가 가야 한다"
+        );
+    }
+
+    /// 전0은 "연결 없음"이라 세션 id가 될 수 없다.
+    #[test]
+    fn an_all_zero_connection_id_is_refused_at_device_admission() {
+        let mut core = new_core();
+        let desktop = admit_desktop(&mut core, START);
+        publish_ticket(&mut core, desktop, 0xa1, START);
+        let device = core.connection_opened(DEVICE_IP, START).unwrap();
+        let actions = core
+            .frame_received(
+                device,
+                &frame(FrameType::DeviceAdmission, connection_id(0), &[0xa1; 32]),
+                START,
+            )
+            .unwrap();
+        assert_eq!(
+            disconnects(&actions),
+            vec![(device, RejectionCode::MalformedFrame)]
+        );
     }
 
     #[test]
@@ -1655,6 +1762,8 @@ mod tests {
                 )
                 .unwrap();
             if !disconnects(&actions).is_empty() {
+                // 끊긴 기기 대신 데스크톱에 간 PeerLeft는 건강한 전송이 바로 써 낸다.
+                flush_all(&mut core, &actions);
                 break;
             }
             assert!(core.queued_bytes() <= limits.max_total_queue_bytes);
@@ -1694,6 +1803,7 @@ mod tests {
                 )
                 .unwrap();
             if !disconnects(&actions).is_empty() {
+                flush_all(&mut core, &actions);
                 break;
             }
             reserved = core.queued_bytes();
@@ -1709,6 +1819,60 @@ mod tests {
         // 확인이 오기 전에는 그 예산을 다시 쓸 수 없다.
         core.connection_closed(device, START + 1);
         assert_eq!(core.queued_bytes(), 0);
+    }
+
+    /// 제어 프레임도 큐 예약을 받는다. 예약 없이 나간 프레임을 전송 계층이 세면 데이터
+    /// 프레임의 예약이 풀려 상한이 한 프레임씩 샌다.
+    #[test]
+    fn control_frames_reserve_queue_bytes_like_data_frames() {
+        let mut core = new_core();
+        let key = core.connection_opened(DESKTOP_IP, START).unwrap();
+        assert_eq!(core.queued_bytes(), 0);
+        let actions = core
+            .frame_received(
+                key,
+                &frame(
+                    FrameType::DesktopAdmission,
+                    connection_id(1),
+                    credential(0xd1).as_bytes(),
+                ),
+                START,
+            )
+            .unwrap();
+        assert_eq!(sent_types(&actions), vec![FrameType::Admitted]);
+        assert!(
+            core.queued_bytes() > 0,
+            "Admitted 제어 프레임이 데스크톱 큐에 예약돼야 한다"
+        );
+        // 전송 계층이 실제로 써 낸 만큼만 풀린다.
+        core.queue_flushed(key, 1);
+        assert_eq!(core.queued_bytes(), 0);
+        // 더 풀 것이 없으면 아무 일도 일어나지 않는다.
+        core.queue_flushed(key, 1);
+        assert_eq!(core.queued_bytes(), 0);
+    }
+
+    /// 같은 핸들의 재등록은 멱등 재시도다. 라우트와 기기를 끊으면 안 된다.
+    #[test]
+    fn republishing_a_pending_ticket_is_not_fatal() {
+        let mut core = new_core();
+        let desktop = admit_desktop(&mut core, START);
+        publish_ticket(&mut core, desktop, 0x82, START);
+        let actions = core
+            .frame_received(
+                desktop,
+                &frame(
+                    FrameType::TicketPublish,
+                    connection_id(1),
+                    credential(0x82).as_bytes(),
+                ),
+                START,
+            )
+            .unwrap();
+        assert!(disconnects(&actions).is_empty(), "{actions:?}");
+        assert_eq!(sent_types(&actions), vec![FrameType::Rejected]);
+        assert_eq!(core.route_count(), 1);
+        assert_eq!(core.ticket_count(), 1);
     }
 
     /// 데스크톱과 기기가 같은 바퀴에 함께 만료되면, 데스크톱 정리가 기기를 이미

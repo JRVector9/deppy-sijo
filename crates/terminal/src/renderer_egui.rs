@@ -270,18 +270,29 @@ pub fn cell_size(ctx: &egui::Context, metrics: CellMetrics) -> egui::Vec2 {
     })
 }
 
-/// 글자 사이에 더하는 여백(2026-08-21). 모노 폰트의 원래 advance만 쓰면 글자가 서로
-/// 붙어 읽기 어려웠다.
-///
-/// 셀 폭(`cell_size`)과 갤리 레이아웃(`extra_letter_spacing`)에 **같은 값**이 들어가야
-/// 한다 — 한쪽만 넓히면 run 안에서 글자가 자기 셀에서 조금씩 밀려 커서·선택 영역과
-/// 어긋난다.
+/// 글자 사이에 더하는 여백. 셀 폭(`cell_size`)과 갤리 레이아웃에 **같은 값**이 들어가야
+/// run 안에서 글자가 자기 셀에서 밀리지 않는다.
 fn extra_letter_spacing(font_size: f32) -> f32 {
     (font_size * TERMINAL_LETTER_SPACING_RATIO).round()
 }
 
-/// 폰트 크기 대비 자간 비율 — 크기를 바꿔도 인상이 유지되도록 비례로 둔다.
-const TERMINAL_LETTER_SPACING_RATIO: f32 = 0.08;
+/// 폰트 크기 대비 자간 비율.
+///
+/// **0이어야 한다 — 모노 격자에 가로 자간을 더하면 한글·CJK가 반드시 깨진다**
+/// (2026-09-03 사용자 신고: grok 에이전트 한글이 글자마다 벌어짐).
+///
+/// 자간 `s`는 글자 **뒤에** 붙는 여백이라 셀 폭은 `M + s`가 되는데, wide 글자의 상자는
+/// 2칸이라 `2M + 2s`인 반면 글리프 advance는 `2M + s`에 그친다. 그래서 한글끼리의
+/// 간격만 `2s`가 되어 라틴(`s`)의 **정확히 두 배**로 벌어진다. D2Coding 13.5pt 실측:
+/// 라틴 6.75+1=7.75(셀 폭과 일치, 간격 1px), 한글 13.5+1=14.5 in 15.5(간격 2px).
+///
+/// 글리프를 가로로만 늘리지 않는 한 이 배수는 없앨 수 없고, 그래서 실제 터미널들도
+/// 이 값을 0으로 둔다 — cmux(manaflow-ai/cmux)가 쓰는 xterm.js v6도 `letterSpacing`
+/// 기본값이 0이고 cmux는 이 옵션을 아예 설정하지 않는다.
+///
+/// 글자가 답답하면 **세로 여백(`line_height`)이나 폰트 크기**로 조절한다 — 둘 다 격자의
+/// 1:2 관계를 깨지 않는다.
+const TERMINAL_LETTER_SPACING_RATIO: f32 = 0.0;
 
 /// 밑줄·취소선 두께와, 밑줄을 글자 블록 바닥에서 끌어올리는 양.
 const UNDERLINE_THICKNESS: f32 = 1.0;

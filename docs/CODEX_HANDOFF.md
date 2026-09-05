@@ -1,5 +1,134 @@
 # Codex handoff
 
+## Fleet view: one list, top blocked item expanded in place (2026-09-05)
+
+- **The 작업(fleet) page no longer splits into a 「지금 처리」 hero column and a 「세션」
+  column.** The user found the split meaningless (the same block appeared in both panes). Now
+  there is a single full-width grouped list; in the 「막힌 것」 group the **oldest blocked queue
+  item is rendered expanded in place** (`render_expanded`: badge, title, context, blocked-for,
+  approval arguments, `waiting_ui.render` for needs-input, approve/deny), and everything else is a
+  normal card. `render_hero`, the `skipped` set, 「건너뛰기」 and 「다음 대기」 are gone — the next
+  item is simply the next card.
+- **Join contract (pure, tested):** `BlockedItem.session: Option<BlockedRef>` (Pty
+  `(workspace_id, SessionId)` from the approval session key / waiting card, or Structured
+  `session_id`) and `blocked_rows(queue, blocked_sessions) -> Vec<BlockedRow>`:
+  `Expanded(0)` for the oldest queue item (its matching session card is suppressed so the same
+  block never shows twice), `Card(slot)` for later queue items that have a session card, `Compact(i)`
+  for decisions with no card (unparseable approval session key), then leftover blocked sessions as
+  cards. Test: `막힌_묶음은_같은_막힘을_두_번_그리지_않는다`.
+- **Kept contracts:** `waiting_ui.render` is still called every frame even with an empty queue
+  (stale-buffer cleanup, 2026-07-17 P2); with 0 sessions but a pending approval the expanded card
+  *and* the 「세션 없음」 notice both render (notice moved to the **end** of the list —
+  `세션이_없어도_승인_카드는_그린다` caught the early-return regression). `FleetPageOutput` is
+  unchanged.
+- **Tests rewritten:** `막힌_것이_있을_때만_펼친_항목이_보인다` (blocked group exists only via
+  the queue), `가장_오래_막힌_항목만_펼쳐지고_건너뛰기는_없다` (exactly one approve button,
+  older above newer, no skip button — RED on the old layout), `좁은_폭에서도_펼친_카드가_화면_안에_있다`
+  (300px window, title and approve button inside the viewport).
+- **Left as-is:** i18n keys `fleet.hero.now/next/clear/sessions/skip` are now unreferenced by
+  non-test code (the i18n gate only checks that referenced keys exist). Remove in a follow-up if
+  you prefer a clean catalog; `fleet.hero.approval/needs_input` and `fleet.blocked_for` are still
+  used.
+
+## Grok session parser + Korean spacing investigation (2026-09-04)
+
+- **Grok now has a transcript parser and path resolver — the 2026-09-01 "measured exception" is
+  obsolete.** grok 1.0.13 writes per-session directories:
+  `~/.grok/sessions/<percent-encoded cwd>/<session-id>/{summary.json, chat_history.jsonl, …}`, and
+  `~/.grok/active_sessions.json` maps **pid → session_id + cwd**. `summary.json` carries
+  `current_model_id` and `reasoning_effort`. Wired: `agent_transcript::parse_grok` (model/effort from
+  `summary.json`, activity from the last `chat_history.jsonl` record type — `assistant` ⇒ Idle,
+  `user`/`reasoning`/`tool_result` ⇒ Working; `<system-reminder>` items filtered from the user
+  instruction), `bind_transcript` Grok arm (active_sessions pid match = deterministic, newest session
+  dir under the encoded cwd = heuristic fallback), `transcript_path_for` / `TranscriptFinder::find`
+  via `find_grok_transcript` (one-level scan like Kimi), and `read_conversation` via
+  `grok_conversation_messages`. The cwd encoding is RFC 3986 unreserved-only percent-encoding of
+  UTF-8 bytes (`grok_encode_cwd`, pinned by the real directory names). `resume_plan` still does not
+  recognise Grok as a provider, so a found transcript cannot trigger an unsupported `--resume`.
+  The source law `transcript_경로_해석은_모든_kind를_덮는다` now forbids **any** `=> None,` arm.
+  User-visible effect: the sidebar session row shows Grok's effort/model even when grok was launched
+  without `--reasoning-effort` or changed it via `/model` (2026-09-04 report: "추론 강도가 안 나와").
+- **Korean glyph gaps in grok (2026-09-04 report) — investigated, NOT resolved, pipeline proven
+  correct.** Measured with grok's real bytes from the session log: grok positions words with CHA
+  (`ESC[<col>G`) using width-2 math for Hangul (correct); `AlacrittyBackend` produces wide+spacer
+  cells at exactly those columns; `build_row_cache` with D2Coding yields one galley per Hangul of
+  width 13.500 = 2.00 × cell (6.750) at the right columns with a continuous bg run. So bytes → grid
+  → layout → paint are all right for *reply* text. The gapped **prompt-echo line** ("매 거 진 …"
+  with a bg box per syllable) was **not found in any session log** (searched with escape-tolerant
+  regexes across 20 logs), so its bytes are unknown. **Resolved as upstream (2026-09-04):** the user
+  ran the same grok in Terminal.app and the gaps appear there too, so they are produced by grok's
+  own output (its input-echo widget), not by this terminal. Nothing to fix here; do not re-open the
+  renderer for this report.
+- The 2026-09-03 letter-spacing reversal (`TERMINAL_LETTER_SPACING_RATIO = 0.0`) stands and is part
+  of the above measurement; it removed the 2px-per-syllable doubling but is unrelated to the
+  one-cell-wide gaps in the echo line.
+
+## Sidebar workspace order and expansion (2026-09-03)
+
+- **Chevron is a separate hit area and this is load-bearing — do not collapse it back into the row
+  Response.** `workspace_row` returns `WorkspaceRowResponse { row, disclosure_clicked }`. Pressing
+  the row switches workspace; pressing the chevron toggles that workspace's session list **without
+  switching**. The reason is not cosmetic: `docs/superpowers/specs/2026-07-29-multi-cross-workspace-pane-design.md`
+  has exactly three approved entry points for opening another workspace's session beside the current
+  one (session-row drag, hover `↗`, right-click "open beside"), all of them produced only by
+  `inactive_workspace_sessions`, which renders only for a workspace that is **expanded and not
+  active**. With one Response per row, pressing a row switched to it, so that state was unreachable
+  and all three entry points silently disappeared. Pinned by
+  `kittest_chevron은_전환없이_비활성_워크스페이스를_펼친다`.
+- **A row click no longer pre-sets `expanded = true`.** `sync_workspace_expansion_on_switch` turns it
+  on when the switch actually lands. Writing it at click time left the pressed workspace expanded
+  forever whenever the switch was refused — `switch_workspace` returns early past `max_live_warm`,
+  and `stage_workspace_controller_action` silently drops an action when a slot is already pending —
+  which reproduced the original "two workspaces look expanded" report permanently. Pinned by the
+  `refuse_switch` leg of `kittest_워크스페이스_전환은_보고_있는_것만_펼치고_세션_활성화를_낸다`.
+- On switch, the workspace being left is **collapsed** (`insert(previous, false)`), not re-expanded.
+  That is the 2026-09-03 user report; the old `or_insert(true)` is what stacked open workspaces.
+- Workspace display order is user-draggable and lives in `config.ui.workspace_order` (device display
+  preference, not a workspace property — no DB migration). `App::sort_workspaces_for_sidebar` puts
+  saved ids first in saved order and everything else after by `created_at`/`id`, and is applied at
+  both write sites for `self.workspaces` (`refresh_workspaces`, `upsert_workspace_projection`).
+  Accent colour is slot-derived (`workspace_accent`), so reordering also recolours the sidebar
+  avatar, the focused-pane top rule, and attached cross-workspace panes.
+- **Review round closed (2026-09-03).** Four parallel adversarial reviews raised 5 High and 9 Medium
+  findings against this slice; all fourteen are fixed, each with a regression test proven RED before
+  the fix. What changed, and the invariants those tests now hold:
+  - A reorder drag ends on `drag_stopped_by(PointerButton::Primary)`, not `drag_stopped()`. egui
+    aborts a drag on Escape by clearing the dragged id (`interaction.rs`), which `drag_stopped()`
+    cannot tell apart from a drop — so **Escape used to commit the reorder**. The `_by` form also
+    requires `button_released(Primary)`, which additionally stops a right-button drag from
+    reordering. Do not loosen it back.
+  - Edge auto-scroll: `drag_autoscroll_delta(viewport, pointer_y, dt)` (24pt band, 600pt/s, band
+    shrinks to `span/3` on a short viewport). Needed because egui disables wheel scrolling while any
+    widget is dragged and pins `hovered` to the dragged widget, so **the list was completely frozen
+    mid-drag** and a workspace could not be moved outside the visible viewport. Repaint is requested
+    only when the delta is non-zero — an unconditional request is an idle-repaint loop and blows
+    `Harness::run`'s step cap.
+  - A release outside `ui.clip_rect()` cancels instead of committing, and the drop indicator is
+    painted only inside the list so it cannot promise a slot that will not happen.
+  - `sync_workspace_expansion_on_switch` uses `entry(active).or_insert(true)` again, so a list the
+    user deliberately collapsed via the chevron stays collapsed when they come back.
+    `insert(previous, false)` for the workspace being left stays — that half is the fix, not a bug.
+  - `apply_workspace_order` **merges** instead of replacing (`merge_workspace_order`): ids that are
+    live but absent from the dragged list — i.e. closed-but-not-deleted workspaces, which the
+    sidebar filters out — keep their saved relative order behind the dragged ones. Replacing wholesale
+    silently discarded a hidden workspace's position.
+  - The 「환경 및 API」 project list is **decoupled**, not invalidated: the worker restores creation
+    order (`sort_workspaces_for_env_projects`) before building rows, so a sidebar drag cannot reach
+    it at all. Invalidating would have fixed the stale-then-flips symptom while leaving the two
+    domains coupled.
+  - `workspace_order` is pruned on delete alongside `closed_workspace_ids` and
+    `hidden_env_project_ids`, against `self.workspaces` — hidden workspaces are in that list, so
+    pruning does not evict them.
+  - Coverage added where there was none: `apply_workspace_order` (logic extracted to pure functions
+    and pinned there, wiring pinned by source law) and the drag wiring (kittests driving real
+    press → `PointerMoved` → release through `FileTreePanel::panel`). Two pre-existing assertions
+    were vacuous and were replaced — the sort test fed an input already in the expected order, and
+    the expansion test asserted against a non-active id so the early return satisfied it either way.
+- **Still open, needs eyes on screen, not code**: the auto-scroll band (24pt) and speed (600pt/s) are
+  constants tuned blind; and selecting JetBrains Mono now renders Hangul ~20% larger than Latin,
+  which is the unavoidable cost of matching the fallback's advance to the cell (Kitty and Ghostty do
+  the same). The default D2Coding is unaffected — its match scale is exactly 1.0.
+
 ## Task 4 COMPLETE — application wiring (2026-08-29)
 
 - Task 4 of `docs/superpowers/plans/2026-08-28-production-relay.md` is now implemented, tested,
@@ -333,6 +462,260 @@
   **BLOCKED** on Mac verifier provisioning, DNS, registry, TLS edge, Origin, GitHub
   environments, and secret names. Tasks 4-7 checklists are unchanged and still recorded below.
 
+## STOP HANDOFF — production Relay Task 2 partial implementation (2026-08-28)
+
+- Current objective: work was stopped at the user's request while implementing Task 2 of `docs/superpowers/plans/2026-08-28-production-relay.md`. Task 1 is complete and committed as `e3617ea`; Task 2 is **not complete, not reviewed after the latest fixes, not committed, and not safe to report as passing**. Resume Task 2 only; do not begin Task 3 until Task 2 has a production adapter, current focused/full gates, direct Codex review, an isolated commit, and a journal entry.
+- Completed work before the stop: an uncommitted v37 SQLite schema and storage API now model bounded Relay pending/device public metadata, atomic pending approval into one device, create-or-update, expiry, first-write revocation, last-seen, deterministic 256 pending/64 device rejection, corruption rejection, v36 migration/reopen, and bounded list reads. `web-remote::relay::repository` now defines the storage-neutral records/trait, a distinct `deppy-relay-identity-p256-1` SecretStore key, zeroizing P-256 scalar encoding/decoding, a process-wide identity creation mutex, and a `PendingRelayDevice::from_pairing_approval` constructor that binds the persisted public key fingerprint to the verified non-cloneable `PairingApproval`. The unsafe arbitrary constructor is test-only. Trusted current time is separate from untrusted record timestamps. The latest storage list implementation was changed to one read transaction before allocation. No production App adapter or startup wiring was created.
+- Modified files owned by this partial Task 2: untracked `crates/web-remote/src/relay/repository.rs` (1,137 lines), modified `crates/web-remote/src/relay/mod.rs`, modified `crates/storage/src/db.rs`, and modified `crates/storage/src/lib.rs`. Do not attribute or stage the already-dirty `Cargo.toml`, `Cargo.lock`, `crates/app/src/app.rs`, `crates/secret/*`, packaging scripts, prototype docs, or historical handoff sections. `crates/app/src/main.rs` is still clean and `crates/app/src/relay_repository.rs` does not exist.
+- Key design decisions: SQLite stores only public identity/device metadata and booleans; it never receives a private key, pairing secret, admission credential, Tailscale token, terminal payload, or upload data. A pending persistence record may be created only from a verified pairing approval whose peer fingerprint matches the supplied SEC1 public key. Pending insertion receives a trusted clock separately and rejects `issued_at > trusted_now` or `trusted_now >= expires_at`; cleanup uses only trusted time. Re-approval of an explicitly paired device may update the same device and clear an old revocation. SecretStore failure is intended to disable Relay only; the actual App/Tailscale lifecycle isolation test belongs to the production adapter/Task 4 and is still missing. The process mutex is sufficient only when called after the App's existing single-instance `deppy.lock`; document/enforce that invariant in the production adapter.
+- Tests actually run before the stop: the original missing-symbol RED was `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo check -p web-remote --locked --tests` and exited 101 with 30 expected E0425/E0433 errors; log `/tmp/relay-task2-red-check-2.log`. The **pre-audit-fix** focused web-remote run `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p web-remote --locked --lib relay::repository::tests -- --test-threads=1` passed 14/14; log `/tmp/relay-task2-focused-green-1.log`. The storage run `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p storage --locked --lib relay_ -- --test-threads=1` passed 3/3: v36→v37 reopen, corrupt pending fail-closed, and unique-conflict rollback; log `/tmp/relay-task2-storage-focused-1.log`. A prior `cargo check -p web-remote --locked --tests` also exited 0 before the final audit corrections. The latest pairing/trusted-time/mutex/read-transaction corrections and their newly added tests were **not executed after editing**. At handoff, no Cargo/rustc/Codex process remained. `git diff --check -- crates/storage/src/db.rs crates/storage/src/lib.rs crates/web-remote/src/relay/mod.rs` exited 0, but it does not cover the untracked repository file.
+- Failed approaches: the first focused `cargo test` used the very large web-remote lib-test link and appeared stalled at 0% CPU with no child for 90 seconds; only that exact process was terminated and the RED was re-established with `cargo check`. A later focused link completed normally in 17.36 seconds. An initial resource-bound test generated P-256 scalar zero and would have panicked; the helper was replaced with nonzero u16-derived scalars before the 14-test GREEN. Do not count any source-law test or command selecting zero tests as functional evidence.
+- Direct review findings and current disposition: the read-only persistence audit found six actionable gaps. Verified-pairing identity binding, trusted time, process serialization, and the single read transaction are now present in source but untested after their edits. The production `RelayRepository` implementation is still missing because only `StorageRelayTestRepository` is `#[cfg(test)]`. Actual Relay-only handling of Keychain denial is also untested. Re-review all six; do not assume the interrupted edit is complete or compiling.
+- Remaining Task 2 work: (1) run rustfmt and the focused web/storage tests against the current source; fix only genuine failures with TDD evidence, (2) add an App-owned production adapter without overwriting the dirty `crates/app/src/app.rs`—preferred shape is new `crates/app/src/relay_repository.rs` plus one `mod relay_repository;` line in clean `crates/app/src/main.rs`; the adapter owns `Mutex<storage::Db>`, implements `web_remote::relay::repository::RelayRepository`, validates/converts every row through public constructors, and has an App-crate contract test, (3) prove the adapter reports Keychain/Relay initialization failure without starting/stopping/mutating Tailscale, or explicitly defer that lifecycle test to Task 4 while leaving no startup wiring in Task 2, (4) direct Codex CLI review and correction round, (5) run focused, full `web-remote`, full `storage`, strict Clippy for all touched crates, fmt, and tracked+untracked whitespace checks, (6) update this handoff with final evidence, isolate only Task 2 hunks in a commit, and create the Obsidian project journal. Do not push unless explicitly requested.
+- Task 3/6 design map already completed read-only: Task 3 should allow a maximum-512-byte opaque signed handshake before E2EE and forbid **application plaintext** after activation; a fixed big-endian `DRLY` wire contract plus sync bounded server was mapped. Actual deploy remains blocked on platform/DNS/registry/TLS/GitHub environments and Mac admission verifier provisioning. Task 6 must wait for Tasks 2–5 contracts; it needs a shared read-only viewer module, one production `relay-crypto.js` imported by the exact release vector harness, non-exportable IndexedDB keys, fixed CSP origins, immutable digest artifacts, and minimum-protocol rollback enforcement. Static-host/CDN ownership is still unspecified.
+- Exact resume commands:
+
+```bash
+cd /Users/jr/Desktop/projects/deppy-sijo
+sed -n '1,220p' AGENTS.md
+sed -n '1,220p' docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff -- crates/storage/src/db.rs crates/storage/src/lib.rs crates/web-remote/src/relay/mod.rs
+sed -n '1,1250p' crates/web-remote/src/relay/repository.rs
+cargo fmt --all -- --check
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p web-remote --locked --lib relay::repository::tests -- --test-threads=1
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p storage --locked --lib relay_ -- --test-threads=1
+```
+
+  If either focused command fails, stop the gate sequence, preserve the exact output, and repair through one RED/GREEN cycle. After the production adapter is added and focused tests pass, run:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p web-remote --locked -- --test-threads=1
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p storage --locked -- --test-threads=1
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p deppy-sijo --locked relay_repository -- --test-threads=1
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo clippy -p web-remote -p storage -p deppy-sijo --locked --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+git ls-files --others --exclude-standard -z | xargs -0 -r grep -n $'\\r\\|[ \\t]$'
+```
+
+### Fresh stop-state review and complete remaining-work ledger (2026-08-28)
+
+- Review scope and actual results: the repository, Task 1 commit `e3617ea`, current Task 2-owned
+  diff, production plan, and this handoff were reread after the user asked whether every remaining
+  item was documented. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo check -p web-remote -p storage
+  --locked --tests` passed against the current interrupted source in 20.02 seconds. `cargo fmt --all
+  -- --check` failed only on wrapping in the untracked `relay/repository.rs`; no formatting write was
+  made. Focused behavior tests were still not rerun after the last audit edits, so compile success is
+  not a Task 2 pass. A direct read-only Codex review successfully inspected files but filled its
+  output pipe while traversing the historical handoff and never returned a final conclusion; exact
+  PID 2178 was verified and terminated. Do not cite that run as review evidence. The installed
+  `review` skill also could not run its official workflow because its mandatory
+  `/Users/jr/.codex/skills/gstack/review/{checklist.md,greptile-triage.md}` files are absent.
+- New high-confidence Task 2 findings: `PendingRelayDevice` and the v37 schema currently use one
+  `expires_at` both to expire a pending pairing and to expire the published device. That conflates
+  the plan's five-minute one-shot ceremony with longer device authorization and can produce either
+  a 24-hour pairing window (current fixture) or a device that dies at the five-minute ticket
+  deadline. Split it into typed `pairing_expires_at` and `device_expires_at` fields with exact
+  boundary tests. The current web-remote `corrupt_rows_fail_closed_before_materialization` test no
+  longer corrupts SQLite; it constructs a separate invalid key and then asserts the real stored row
+  is still readable. Add real durable-row corruption for exact-length `0x04 || invalid-point`
+  values. Storage's own corruption fixture changes the key to a 4,096-byte blob, so it does not
+  cover a structurally valid-length but invalid P-256 point. The App adapter must validate before
+  device admission and pending approval mutation.
+- Coordinator gap to resolve in Task 2/4: document one state machine for
+  `PairingRegistry::consume -> PendingRelayDevice::from_pairing_approval -> SQLite user approval ->
+  AuthenticatedHandshake::confirm`. Specify crash/restart behavior and the compensation path if DB
+  approval commits but channel confirmation cannot complete. A durable pending row or pairing id
+  alone must never replace the non-cloneable verified approval. Add integration tests for every
+  failure boundary and for immediate active-channel closure on revocation/permission downgrade.
+- Task 2 completion checklist: split the two expiries and migrate the schema/tests; repair real
+  pending/device corruption coverage; add `crates/app/src/relay_repository.rs` and one clean module
+  declaration in `crates/app/src/main.rs`; keep SQLite out of `web-remote` production code; enforce
+  that identity creation happens only after the existing App single-instance lock; demonstrate
+  Relay-only Keychain failure isolation; run focused web/storage/App tests, full suites, real Chrome
+  vector, strict Clippy, fmt, tracked/untracked whitespace, and direct scoped review; fix findings;
+  update handoff; commit only Task 2 files; write the Obsidian journal. No push.
+- Task 3 complete checklist: first commit the corrected protocol decision in the plan. Add
+  `relay-protocol` with fixed big-endian `DRLY` framing, opaque 16-byte ids, borrowed/preflighted
+  decoding, a maximum-512-byte opaque signed hello, and bounded ciphertext records. Add a sync,
+  ciphertext-only `relay-server` with pre-allocation Mac/ticket admission, constant-time verifier,
+  per-IP/per-credential rate limits, one explicit state machine, bounded worker/route/ticket/queue
+  maps, byte+frame queue reservations, slow-consumer disconnect, deadlines/heartbeats, cleanup, and
+  shutdown join. Version 1 is single-instance unless shared state is chosen. Add golden browser wire
+  fixtures, malformed/oversize/cross-route/replay/gap/duplicate/guess/rate/slow-peer/disconnect tests,
+  dependency/source laws proving the server has no secret/E2EE/UI dependency, and a relay-side full
+  scenario plaintext scan. Add local CI/build gates. Production publish remains blocked until Mac
+  verifier provisioning, DNS, registry, TLS edge, Origin, GitHub environments, and secret names are
+  supplied.
+- Task 4 complete checklist: extract the transport-neutral dashboard projection/runtime-command
+  core without changing loopback listener ownership. Add independent disabled-by-default
+  `RelayConfig`, a fixed production WSS constant, strict WebPKI-root/hostname validation, and one
+  cancellation-aware bounded reconnect owner with DNS/connect/read/write deadlines, capped jittered
+  backoff, bounded command queue, exact disable/shutdown join, and fail-closed auth/revocation
+  behavior. Wire the Task 2 App repository and Keychain identity only into Relay. Adapt decrypted
+  view traffic to the shared projection; reject input/key/scroll/switch/resolve/upload both before
+  side effects and after forged/repeated messages. Close active channels on revoke/downgrade. Test
+  Tailscale-only, Relay-only, both, transport failure, credential rotation, disable, shutdown, sleep
+  and wake, plus proof that no Relay action mutates protocol-v3 auth, Tailscale Serve, token, Host
+  validation, or listener state.
+- Task 5 complete checklist: add independent flat Tailscale and Relay settings sections; derive
+  `Both` from two switches and never persist a transport enum. Gate ticket creation on Relay
+  readiness. Implement the complete pairing UI state machine with exact five-minute countdown,
+  same transcript SAS on Mac/phone, explicit approve/reject/cancel, safe initial focus, bounded
+  announcement cadence, and no secret/reusable credential rendering. First release approval is
+  fixed view-only. Show bounded device rows with last-seen/expiry/revocation and make revoke close
+  active admission immediately. Do not ship permission editing. Add five-locale i18n, accessibility,
+  focus, stale-action, restart, and independent-transport UI tests.
+- Task 6 complete checklist: wait for Tasks 2–5 wire/lifecycle contracts. Extract only the existing
+  read-only viewer lifecycle into `web/shared/viewer-core.{js,css}` and make both loopback and Relay
+  adapters consume it; keep protocol-v3 auth and all input/approval/upload code out of the Relay
+  shell. Build `web/relay-shell` with a single production `relay-crypto.js`, non-exportable ECDSA
+  private `CryptoKey` in IndexedDB, fail-closed corrupt-key recovery, bounded fragment-only ticket
+  parsing followed by immediate URL scrub, authentication-before-session DOM, view-only pairing,
+  session/revocation/recovery screens, restrictive response-header CSP, fixed Relay Origin, and a
+  service worker that never caches credentials/ciphertext/session data/navigation history. Make the
+  Rust Chrome harness import the exact built crypto asset. Produce immutable content-addressed
+  artifacts and a sidecar manifest with archive/crypto/file digests, protocol version, origins, and
+  git revision. Enforce minimum version outside the service worker. Add actual Chrome tests for
+  non-exportability, IndexedDB restart, auth gating, forbidden DOM/frames, viewer lifecycle, CSP,
+  cache policy, digest tamper, no source fallback, and rollback. Deployment remains blocked until
+  the static host/CDN/domain/TLS/credential owner exists.
+- Task 7 complete checklist: for both exact staging and production artifact digests, verify sidecar
+  and crypto digest then rerun Rust/WebCrypto vectors from the artifact, never the source tree. Run
+  real Mac-browser E2E through the untrusted server and inspect Relay memory/logs/stats for terminal,
+  input, approval, and upload plaintext. Exercise DNS/TLS/proxy/captive portal/restart/sleep/wake/
+  phone background, replay/tamper/cross-device/revoked/expired/live-downgrade, slow consumer, device
+  churn, repeated expiry, queue/backoff/thread/heap bounds, and a full bounded 24-hour soak. Run
+  physical iOS Safari/PWA and Android Chrome/PWA pairing, pinch/pan, Back, privacy, and recovery,
+  proving input/approval/upload controls and traffic are absent. Verify DNS/TLS/CSP/Origin,
+  independent rollback, minimum version, existing protocol-v3/Tailscale full regression, signed Mac
+  package, and exact release hashes. Missing external infrastructure, physical hardware, or elapsed
+  soak time is `BLOCKED`, never `PASS`.
+
+### Paste-ready prompt for the next agent
+
+```text
+Continue the production Relay work in /Users/jr/Desktop/projects/deppy-sijo.
+
+First read, in this order:
+1. /Users/jr/Desktop/projects/deppy-sijo/AGENTS.md
+2. /Users/jr/Desktop/projects/deppy-sijo/docs/CODEX_HANDOFF.md, starting at the top STOP HANDOFF
+3. /Users/jr/Desktop/projects/deppy-sijo/docs/superpowers/plans/2026-08-28-production-relay.md
+4. git status --short --branch, git diff, and commit e3617ea
+
+Task 1 is complete in e3617ea. Resume Task 2 only. Do not start Task 3 until Task 2 is tested,
+reviewed, committed in isolation, and journaled. Preserve every unrelated dirty file. In particular,
+do not overwrite or stage the existing dirty Cargo.toml, Cargo.lock, crates/app/src/app.rs,
+crates/secret/*, packaging scripts, prototype docs, or historical handoff changes.
+
+Current Task 2-owned work is uncommitted in:
+- crates/web-remote/src/relay/repository.rs (untracked)
+- crates/web-remote/src/relay/mod.rs
+- crates/storage/src/db.rs
+- crates/storage/src/lib.rs
+
+Known current evidence:
+- current cargo check for web-remote + storage tests passed on 2026-08-28
+- current cargo fmt --check fails in relay/repository.rs
+- all focused GREEN behavior results predate the final audit corrections and must be rerun
+- official gstack review is unavailable because its mandatory checklist files are missing
+- a direct Codex review produced no usable final conclusion after filling its output pipe
+
+Before implementation, reproduce the state. Then use strict TDD to finish Task 2:
+1. split five-minute pairing_expires_at from longer device_expires_at in values, schema, migration,
+   approval, and exact boundary tests;
+2. add real durable pending and device corruption tests using exact-length 65-byte 0x04-prefixed
+   invalid P-256 points, and fail before admission/publish;
+3. define/test the coordinator ordering and crash compensation across PairingApproval, SQLite
+   approval, and AuthenticatedHandshake::confirm; a durable row/id alone is not pairing proof;
+4. add App-owned production RelayRepository adapter in a new relay_repository.rs plus the smallest
+   clean main.rs module declaration; web-remote production code must not open SQLite;
+5. enforce single-instance identity creation and prove Keychain denial disables Relay only without
+   mutating or stopping Tailscale/app startup;
+6. cover bounds, duplicates, restart, expiry, last-seen, immediate revocation, live channel closure,
+   and permission downgrade.
+
+Run focused tests first. If one fails, preserve exact output and repair through RED/GREEN. Then run
+full web-remote/storage/App tests, real Chrome Task 1 vector, strict all-target Clippy, fmt, tracked
+and untracked whitespace checks, and a narrowly scoped direct Codex review whose prompt excludes the
+historical handoff body. Apply confirmed findings and rerun every affected gate.
+
+Update docs/CODEX_HANDOFF.md after each meaningful change/test/failure. Commit only Task 2-owned
+hunks, create the Obsidian 프로젝트 일지/deppy-sijo journal, and do not push, deploy, package, or
+relaunch unless the user explicitly asks. After Task 2 is complete, follow the full Task 3-7 ledger
+already recorded in the handoff and plan. Treat missing DNS/registry/TLS/Origin/deploy credentials,
+physical devices, or 24-hour soak time as explicit blockers, not skipped passes.
+```
+
+## Current task — production Relay view-only first slice (2026-08-28)
+
+- Current objective: Task 1 is complete: preserve the completed Tailscale/protocol-v3 mobile path while landing a dormant, independently authenticated Relay security contract. The first future production release remains view-only; persistence, sockets, desktop controls, the trusted mobile shell, deployment, and production E2E are deliberately not part of this slice.
+- Completed work: `crates/web-remote/src/relay/` now contains independent permission, opaque-id, bounded one-shot pairing, signed P-256 identity/ephemeral handshake, transcript-bound HKDF/SAS, and directional AES-256-GCM contracts. Pairing verification atomically claims the exact connection/peer/transcript binding and produces one non-cloneable approval; desktop channel activation consumes that approval. Active tickets plus tombstones are bounded at 256, rollback is fail-closed, secret comparison is constant-time, owned secrets/scalars/key schedules are zeroized, input/upload/approval grants are independent, clear envelopes omit stable identity fingerprints, and every untrusted byte slice is size-checked before allocation. Identity and ephemeral keys must be distinct on local creation, WebCrypto wire admission, and defensive finish. Pre-channel derived keys remain non-Copy `ChannelKey: ZeroizeOnDrop` owners through HKDF, confirmation, activation, close, error, and Drop. The browser runner independently reconstructs transcript, fingerprints, nonce, AAD, sequence, HKDF, SAS, and ciphertext; verifies Rust ECDSA/AES output; signs the transcript with WebCrypto; and has its raw signature verified by Rust. The production plan now pins workspace-member/lock changes, rustls WebPKI-root policy, and exact release-artifact crypto-module digests.
+- Modified files: Task-owned changes are the `web-remote` dependency entries in `Cargo.lock`, `crates/web-remote/Cargo.toml`, `crates/web-remote/src/lib.rs`, new `crates/web-remote/src/relay/{mod.rs,contract.rs,pairing.rs,crypto.rs}`, new `crates/web-remote/tests/relay_webcrypto_vectors.rs`, new `crates/web-remote/tests/fixtures/relay-webcrypto-v1.{json,js}`, new `docs/superpowers/plans/2026-08-28-production-relay.md`, and this section. Existing dirty root/App/secret/packaging/prototype changes are unrelated and must not be staged, overwritten, or attributed to Relay.
+- Key design decisions: never reuse `web-remote-token-1`, the runtime attach bearer, remote TLS identity, VAPID/push keys, audit key, or OAuth credentials. The Relay data plane is ciphertext-only and never serves executable content; the future trusted shell has a fixed origin/CSP and imports one production crypto module that the release vector harness also imports. Existing `protocol.rs`, `ws_api.rs`, local assets/token gate, `WebConfig`, Tailscale Serve state, Host allowlist, and token rotation are untouched. Task 1 opens no socket, creates no credential, changes no configuration, and is safe while dormant.
+- Test commands and results: final `CARGO_INCREMENTAL=0 cargo test -p web-remote --locked --lib relay:: -- --test-threads=1` passed 46, failed 0, ignored the one fixture-print helper, and filtered 160. Final real-browser `CARGO_INCREMENTAL=0 cargo test -p web-remote --locked --test relay_webcrypto_vectors -- --ignored --nocapture --test-threads=1` passed 1/1 in installed Google Chrome. Final full `CARGO_INCREMENTAL=0 cargo test -p web-remote --locked -- --test-threads=1` passed 206 unit tests with one fixture-print ignore, passed three ordinary WebCrypto integration contracts with the real-browser test ignored in that run, and ran zero doc tests. Final strict all-target Clippy exited 0 with `-D warnings`. `cargo fmt --all -- --check`, `node --check`, `jq -e`, tracked and untracked whitespace checks, and `git diff --check` exited 0. The first direct pairing/permission Codex review ended `CONCLUSION: OK`; the first crypto review found key reuse and plain transient derived-key copies, both went through explicit RED/GREEN, and the final scoped Codex re-review ended `CONCLUSION: OK`.
+- Failed approaches: the initial missing-symbol suite correctly failed before implementation. The intentionally empty browser fixture correctly failed in real Chrome. An early Chrome harness inherited pipes and could hang, then a completion check could match marker text inside the static script; capture files, exact-child timeout/cleanup, executed DOM state, and a Rust-verified signature payload replaced those approaches. The first zeroize test incorrectly required marker forwarding from GHASH/HMAC wrappers; it was corrected to test their actual feature/Drop structure while retaining compile-time markers where exposed. One focused Cargo run blocked because its unconsumed tool pipe filled; only that exact test process was terminated and the command was rerun with file capture. Final review then produced two real defects: key reuse RED accepted both paths, and the pre-channel wrapper RED failed with E0277/E0308; both are now fixed and re-reviewed cleanly.
+- Remaining work: Tasks 2–7 remain: device/pairing/permission/revocation persistence, ciphertext-only relay protocol/server/deployments, outbound rustls Mac client and shared projection, desktop Relay UI, trusted fixed-origin view-only shell, and staging/production release gates including physical iOS/Android and soak tests. No claim of Relay connectivity, deployed endpoint, physical-device pass, package build, app relaunch, commit, or push is valid yet.
+- Exact next commands: begin Task 2 by reading `docs/superpowers/plans/2026-08-28-production-relay.md`, the existing storage migration/repository adapters, and `SecretStore` boundaries; write repository contract RED tests before adding `crates/web-remote/src/relay/repository.rs`. Before any later commit, isolate the mixed `Cargo.lock` hunk from unrelated secret/package changes and rerun the final Task 1 focused/browser/full/Clippy/fmt gates.
+
+## Current task — production mobile full-screen viewer, then Relay (2026-08-28)
+
+- Current objective: complete the existing Tailscale-backed mobile session viewer as a production full-viewport application state, verify it under a real browser renderer, and only then begin the independently deployable outbound Relay/device-identity/E2EE phase.
+- Completed work: the approved design is committed as `0afdc16`; plan corrections run through `3cb6a40`. Task 1 is complete as `ec01e3a`, Task 2 as `09e3ef5`, Task 3 as `d019ff0`, Task 4 as `859b7a5`, Task 5 as `e9d3939`, and the rustfmt gate correction as `59f8478`. Final recovery/accessibility/zoom hardening is committed as `14ce379`: connection status is a single persistent atomic live region; browser pinch/pan is preserved; close options merge across a pending popstate; every session's 30-second uncertain-send journal is restored on disconnect and expires on a single timer; current and non-current terminal-pressure frames use a 256-entry bounded per-session lock set, and overflow stays globally fail-closed with a sticky reload instruction. Three independent read-only review lanes finished with no remaining confirmed finding.
+- Modified files: the production and contract corrections in `crates/web-remote/assets/app.css`, `crates/web-remote/assets/app.js`, `crates/web-remote/assets/index.html`, and `crates/web-remote/src/static_srv.rs` are committed as `14ce379`. This handoff remains uncommitted because it also contains pre-existing task records; preserve all other dirty Keychain, packaging, App, and prototype corrections.
+- Key design decisions: retain Tailscale and protocol v3 unchanged for this product slice; use `viewer.watching` as the selected-session authority; converge close button, browser Back, session disappearance, and explicit exit through one cleanup path; never let a stale microtask, pending notification, exited row, or trailing pointer click target a newer session; avoid the browser Fullscreen API; keep Relay out of this slice.
+- Test commands and results: after the final correction, `CARGO_INCREMENTAL=0 cargo test -p web-remote --locked -- --test-threads=1` passed 160/160 with zero ignored and doc-tests ran 0; `CARGO_INCREMENTAL=0 cargo clippy -p web-remote --locked --all-targets -- -D warnings` exited 0. `node --check`, `cargo fmt --all -- --check`, repository `git diff --check`, and `git diff --exit-code 0afdc16 -- crates/web-remote/src/lib.rs crates/web-remote/src/ws_api.rs` all exited 0. A real headless Chromium 1.62 renderer loaded the current HTML/CSS/JS with a deterministic in-page WebSocket model: portrait viewer/viewport were 390×844 and short landscape 844×390; canvas backing stores were 821,340 and 732,615 pixels and remained inside the stage. Trusted CDP pinch reached scale 1.5 and trusted pan moved visual-viewport offsets from 65/131 to 104/170. Twenty viewport bursts produced one draw and twenty geometry-identical resizes produced zero. Browser Back/focus, black-before-keyframe, stale-history cleanup, reconnect input lock with Korean draft retention/no auto-send, old-socket generation guards, repeat/scroll cancellation, same-session one-shot upload, closed-session zero upload, closed-viewer zero redraw, non-current uncertain-journal recovery, non-current/current terminal locks, exited-session lock cleanup, close/popstate exit-notice merge, 257-ID lock overflow fail-close, sticky overflow guidance after current pressure and session switch, and empty console/page-error lists all passed.
+- Failed approaches: the first single large plan patch was rejected without file changes due to a malformed patch line. An initial Task 1 test name typo and a Task 3 source-marker mismatch were corrected before accepting evidence. Earlier GREENs were held when review found lifecycle, pending-upload, byte-limit, warning, terminal-race, and one-frame composer-crop gaps; each returned through focused RED/GREEN. The first format gate failed only on `static_srv.rs` wrapping and was corrected by formatting that file alone. The first Chromium script incorrectly required Back focus after it had focused the composer. The expanded script initially timed out because the new live region made the parent status `textContent` include hidden detail; the harness was corrected to inspect `viewer-connection-label`. Final review then found and TDD fixed a non-current terminal-pressure race, its unbounded lock Set, and a non-sticky overflow instruction. Python Playwright, the harness, JSON results, and screenshots remain only under `/tmp`.
+- Remaining work: no current Tailscale full-screen-viewer implementation, contract, regression, lint, or deterministic Chromium item remains. Genuine iOS Safari/standalone-PWA pinch zoom, an actual OS keyboard, and a physical background transition were not exercised; the tested visibility/file-picker transitions were deterministic browser simulations and must not be reported as physical-device passes. The separately deployable outbound Relay/device-identity/E2EE production phase remains unimplemented.
+- Exact next commands: inspect commits `fecdfc7`, `1754b94`, `6404cea`, and `8a45688` plus `docs/mockups/mobile-relay-fullscreen-scenario.html`; then write a separate production Relay/device-identity/E2EE implementation plan that leaves the Tailscale/protocol-v3 path unchanged. For a physical-device gate, serve the current build through Tailscale and repeat keyboard, pinch, background/privacy, and native-picker scenarios on iOS Safari before release.
+
+## Current task — Tailscale coexistence mobile access and full-screen session prototype (2026-08-28)
+
+- Current objective: preserve the existing Tailscale mobile path while showing an optional outbound Relay path and a shared full-viewport mobile session experience, with the reviewed authentication, permission, and mobile touch-state defects corrected in the standalone HTML prototype.
+- Completed work: read-only parallel review of the current web server, pairing, settings, WebSocket protocol, dashboard, and mobile assets confirmed the production path is loopback HTTP plus Tailscale Serve TLS, while session viewing already supports watch/unwatch, viewport streaming, input, reconnect, and persistent session IDs. The outbound HTTPS/WSS Relay design and full-viewport mobile viewer were approved and documented in commits `fecdfc7`, `1754b94`, and coexistence clarification `6404cea`; the coexistence plan and original HTML update are committed as `8a45688`. The prototype explicitly offers `Tailscale만`, `Deppy Relay만`, and `둘 다 사용` without silent failover. Follow-up code review found and the current uncommitted correction fixes four state-contract defects: enabled services are now separate from per-device `pairedTransports`; rejected or revoked devices cannot use the recovery action to enter sessions and the Mac renders authentication-required state; Relay permissions start view-only and the approval tab/actions are gated by `approval`; every button-specific touch target override is at least 44px. The shared footer progression now completes the same pairing transition as the QR/approval controls, preventing scenario navigation from skipping device authentication. Both authenticated paths still converge on the same session list, full-viewport terminal, Back/focus restoration, reconnect-with-draft-retention, session-end recovery, safe-area handling, and privacy curtain.
+- Modified files: the current uncommitted review correction is limited to `docs/mockups/mobile-relay-fullscreen-scenario.html`, `docs/superpowers/plans/2026-08-28-mobile-relay-fullscreen-prototype.md`, and this handoff. Previously committed design/spec files remain unchanged. Pre-existing uncommitted Keychain/notarization changes in `Cargo.toml`, `Cargo.lock`, `crates/secret/Cargo.toml`, `crates/secret/src/lib.rs`, `crates/app/src/app.rs`, `scripts/package-macos.sh`, `scripts/verify-macos-package.sh`, and `xtask/src/main.rs` remain untouched.
+- Key design decisions: Relay is additive and opt-in; it does not replace or mutate existing Tailscale state. `transportMode` describes enabled services, while `pairedTransports` is the sole per-device authentication record used for connected-device rendering and recovery gating. A failed Relay pairing in dual mode may continue through Tailscale only when that device already completed Tailscale authentication; otherwise the UI returns to its QR. View-only is the safe permission default, and absent approval permission removes both UI and event behavior. The two transports retain separate status, URL, pairing, credentials, expiry, and errors; dual mode never silently fails over.
+- Test commands and results: per user request, no build, Cargo test, browser test, render test, HTML validator, or automated interaction test was run for the review correction. Read-only source inspection confirmed the four state invariants and found no button-specific `min-height` override below 44px; this is not functional or visual pass evidence. `open docs/mockups/mobile-relay-fullscreen-scenario.html` exited 0 and handed the updated artifact to the default browser, as delivery only.
+- Failed approaches: the brainstorming skill referenced `/Users/jr/.agents/skills/brainstorming/visual-companion.md`, but that file is absent from the installed skill tree; no product action depended on it.
+- Remaining work: no prototype correction remains. Leave the correction uncommitted unless the user explicitly requests a commit. Production Relay networking and production `crates/web-remote` full-screen changes remain outside this prototype task.
+- Exact next commands: `git diff -- docs/mockups/mobile-relay-fullscreen-scenario.html docs/superpowers/plans/2026-08-28-mobile-relay-fullscreen-prototype.md`; commit only on explicit request.
+
+## Current task — suppress macOS Keychain password dialogs (2026-08-27)
+
+- Current objective: ensure installing or starting Deppy Sijo never opens a macOS Keychain authentication/password dialog, while preserving encrypted Keychain storage and fail-closed credential behavior.
+- Completed work: objective complete. Traced every app credential path to `secret::KeyringSecretStore` and proved startup unconditionally probes Keychain for physical-secret reconciliation and the custom Codex API-key presence snapshot. Replaced the macOS production CRUD path with Security.framework password queries carrying exact `kSecUseAuthenticationUI = kSecUseAuthenticationUIFail`; authenticated-item inventory uses `skip_authenticated_items(true)`. ACL-incompatible or locked Keychain access now returns an ordinary error without SecurityAgent UI. Startup reconciliation is best-effort: a Keychain failure logs a static diagnostic and leaves legacy pointers/physical ledger state intact instead of panicking the app; runtime resolution continues to reject un-migrated logical pointers. Built, notarized, stapled, verified, copied, and launched the corrected Desktop delivery.
+- Modified files: `Cargo.toml`, `Cargo.lock`, `crates/secret/Cargo.toml`, `crates/secret/src/lib.rs`, `crates/app/src/app.rs`, and this handoff. The four pre-existing notarization-gate changes in `scripts/package-macos.sh`, `scripts/verify-macos-package.sh`, `xtask/src/main.rs`, and this handoff remain uncommitted and preserved.
+- Key design decisions: never avoid the prompt by storing plaintext, granting broad Keychain ACL access, clearing credentials, or disabling macOS security. Use per-query `UIFail` so accessible credentials retain normal behavior and inaccessible credentials fail immediately. Preserve the User/login Keychain service and account names, serialize all operations, zero the password buffer used only for presence checks, and zero invalid UTF-8 bytes before returning an error. Inventory may omit items that require authentication but never reads their values. Startup data repair is nonfatal because every unresolved credential use remains fail-closed and durable retry metadata is not discarded.
+- Test commands and results: TDD RED for the Keychain query policy failed compilation at missing `macos_noninteractive_password_options`; GREEN passes and asserts the exact CoreFoundation key and exact `kSecUseAuthenticationUIFail` value, not only query cardinality. TDD RED for nonfatal bootstrap reconciliation failed compilation at missing `reconcile_startup_secrets_best_effort`; GREEN passes and verifies the legacy pointer remains unchanged after a denied/missing secret. `cargo test -p secret --locked -- --test-threads=1` passes 63/63 plus 0 doc tests. The focused App regression passes 1/1 (2,024 filtered; all zero-selection integration binaries exited 0). Strict all-target `secret` Clippy and strict all-target App Clippy both exit 0; App Clippy completed the dependency-inclusive check in 6m30s. `cargo fmt --all -- --check` and `git diff --check` exit 0. Production packaging completed in 1m43s, Apple notarization was Accepted as submission `2ae226a4-cd37-486d-9b7a-0e2c288be5dd`, and source plus archive-extracted bundles passed deep/strict signing, stapler, exact `source=Notarized Developer ID`, helper, plist, and arm64 gates. A 15-second live launch watch observed zero newly spawned `SecurityAgent` processes; exact Desktop PID `76061` remained alive with PPID 1, and the release binary imports both `kSecUseAuthenticationUI` and `kSecUseAuthenticationUIFail`. The current startup log contains no Keychain deferral or panic entry.
+- Failed approaches: the first implementation wrapped every Keychain operation in the process-global `SecKeychainSetUserInteractionAllowed(false)` guard. Direct timing showed the first policy query took 7.91s and direct suppression took 13.09s in separate test processes, which would trade the dialog for a severe cold-start delay. That implementation and its temporary timing output were removed; no production file retains the global toggle.
+- Delivery evidence: `/Users/jr/Desktop/Sijo.app` and `/Users/jr/Desktop/Sijo.zip` are the new artifacts. The app is notarized Developer ID, stapled, Gatekeeper accepted, and exact source/Desktop main SHA-256 is `b0cee8acbd8dfcf87d63a9f1461a66c2a83713d9079415179c0c3ed05c6e859c`; ZIP SHA-256 is `85adce24e42cadee356170a357aab5f27f9046763b40ffb139c02b46f50f0eb4`. Replaced artifacts remain recoverable at `/Users/jr/.Trash/Sijo.pre-keychain-ui-fix-20260827-112053.app` and `/Users/jr/.Trash/Sijo.pre-keychain-ui-fix-20260827-112053.zip`.
+- Remaining work: no implementation, focused test, strict lint, formatting, packaging, notarization, Desktop replacement, or launch-smoke work remains. Do not commit or push unless the user explicitly asks. The recipient Mac still needs to be Apple Silicon or receive a future universal2 build; this Keychain correction is independent of the previously diagnosed arm64-only compatibility risk.
+- Exact next commands: `ps -p 76061 -o pid=,ppid=,etime=,state=,command=`; `codesign --verify --deep --strict --verbose=2 '/Users/jr/Desktop/Sijo.app'`; `spctl --assess --type execute -vv '/Users/jr/Desktop/Sijo.app'`; `git status --short --branch`; commit/push only on explicit request.
+
+## Current task — diagnose cross-Mac launch failure (2026-08-27)
+
+- Current objective: determine why the notarized Desktop delivery shows Finder's generic “Deppy Sijo 응용 프로그램을 열 수 없습니다” dialog on another Mac, and distinguish packaging format from binary compatibility.
+- Completed work: read-only inspection confirms both `/Users/jr/Desktop/Sijo.app` and `target/bundle/Deppy Sijo.app` contain arm64-only `deppy-sijo` and `deppy-mcp-proxy` executables. Both bundles still pass deep/strict signing, stapler validation, and Gatekeeper assessment as `source=Notarized Developer ID`; their deployment target is macOS 11.0. The build host is arm64 and has no `x86_64-apple-darwin` Rust target installed. Therefore a recipient Intel Mac cannot execute this artifact, and wrapping the same arm64 app in a DMG would not change that compatibility failure.
+- Modified files: this handoff only for the diagnosis; no product, packaging, bundle, or Desktop artifact was changed. The four prior notarization-gate changes remain uncommitted.
+- Key design decisions: treat DMG as an optional distribution/installation container, not an architecture fix. The compatibility fix, if the recipient is Intel, is a universal2 bundle containing both arm64 and x86_64 slices (including the helper) or two separately labeled architecture builds; it must then be signed, notarized, stapled, and verified again.
+- Test commands and results: `lipo -archs` reports `arm64` for both executables in both source and Desktop bundles; `file` reports Mach-O arm64; plist and `otool` report minimum macOS 11.0; `codesign`, `stapler`, and `spctl` all pass. `rustup target list --installed` contains `aarch64-apple-darwin` but not `x86_64-apple-darwin`.
+- Failed approaches: none in this phase. The screenshot alone does not identify the recipient Mac architecture, so Intel incompatibility is proven as a property of the artifact but becomes the exact remote-machine root cause only when that Mac reports `x86_64`.
+- Remaining work: obtain the recipient Mac's `uname -m` and macOS version. If it reports `x86_64`, implement and verify universal2 packaging; if it reports `arm64` and macOS 11+, collect `spctl --assess --type execute -vv '/Applications/Deppy Sijo.app'` and LaunchServices logs from that Mac instead of changing container format.
+- Exact next commands: on the recipient Mac run `uname -m` and `sw_vers -productVersion`; for an Apple Silicon recipient also run `spctl --assess --type execute -vv '/Applications/Deppy Sijo.app'` against the actual installed path.
+
+## Current task — repair Finder launch failure with notarized macOS delivery (2026-08-26)
+
+- Current objective: replace the Desktop Deppy Sijo bundle that Finder initially rejected with a properly notarized and stapled Developer ID release, and harden the packaging gate so an unnotarized release can no longer be reported as verified.
+- Completed work: objective complete. Identified `/Users/jr/Desktop/Sijo.app` as the delivered bundle and proved it was structurally valid but lacked a notarization ticket; `spctl` rejected it as `Unnotarized Developer ID`, and Unified Logging captured the first two Finder starts exiting before application check-in after policy error `-67018`. Production packaging now requires either a notary Keychain profile or explicit API-key credentials before the release build, submits the signed ZIP with a bounded `--wait`, checks `Accepted`, reports the submission ID, staples the app, and rebuilds the distributed ZIP after stapling. Verification now requires both a valid ticket and exact `source=Notarized Developer ID` Gatekeeper assessment on the source bundle and archive-extracted bundle. Apple accepted submission `c23b58e1-e994-49ca-b551-a8ad1f1c835f`. The verified app and ZIP replaced `/Users/jr/Desktop/Sijo.app` and `/Users/jr/Desktop/Sijo.zip`; the previous files remain recoverable in Trash. Exact PID 83688 is running the new Desktop executable. CGWindow ID 196601 remains on-screen on the user's negative-coordinate secondary display with a 1200×800 logical size, and a post-activation exact-window capture shows the complete project/file tree, agent launcher, and Claude/Codex/Grok bottom usage row rather than the Finder error or an empty surface.
+- Modified files: `scripts/package-macos.sh`, `scripts/verify-macos-package.sh`, `xtask/src/main.rs`, and this handoff.
+- Key design decisions: never clear Gatekeeper attributes or disable security policy. Production packaging fails closed without notarization credentials. Keychain-profile and API-key authentication are mutually exclusive; individual API keys may omit issuer while team keys provide it. The upload ZIP is temporary as a distribution artifact because it predates stapling, so the final ZIP is always rebuilt after the ticket is embedded. Gatekeeper verification checks both exit status and the exact notarized Developer ID source, preventing a globally disabled assessment policy from producing a false release pass. Local untrusted development packaging remains an explicit two-variable opt-in and skips production-only notarization gates.
+- Test commands and results: the original faulty app passed deep/strict code signing but `stapler` exited 65 and `spctl` exited 3, proving the old verifier's blind spot. `notarytool history` with API key `V6RFXHMG7N` and the matching issuer succeeds; Apple accepted the new submission. First RED focused xtask test exited 101 at missing `xcrun notarytool submit`; GREEN passed 1/1 after implementation. A second RED exited 101 at missing `source=Notarized Developer ID`; GREEN passed after exact source validation. Final `cargo test -p xtask --locked -- --test-threads=1` passes 14/14. Strict xtask all-target Clippy, rustfmt check, `git diff --check`, `sh -n` for both scripts, and ShellCheck all exit 0. A credential-empty production invocation exits 1 before Cargo with the required notary-credential message. The package script's real notarization run and a separate verifier rerun both pass the signed app/helper/plist/arm64/archive gates plus `stapler` and `spctl` on the source and extracted bundle.
+- Delivery evidence: current Desktop bundle reports `accepted`, `source=Notarized Developer ID`, and origin `Developer ID Application: VectorNine INC (ZDTU5LS35K)`. Main SHA-256 is `03b3407db8b1f371e33036d628bab5b1f4866d01d80aa5ab84e64f20af0d02e5`, helper SHA-256 is `63716e4363dcae9d9a391237d794677e4c19d4f593e9d45a99de75936ab64f7a`, and final ZIP SHA-256 is `74ce32732228b759fdcd9d7af8d771d72e10a29f99eabbeb62d0defc695fab0e`. The replaced files are `/Users/jr/.Trash/Sijo.pre-notarization-20260826-164816.app` and `/Users/jr/.Trash/Sijo.pre-notarization-20260826-164816.zip`.
+- Failed approaches: the first Apple Development diagnostic re-sign selected a valid certificate whose private-key access blocked in `codesign`; the exact diagnostic process was terminated and is not pass evidence. The older downloaded ad-hoc app also fails `spctl` and has no ticket. Keychain profiles `deppy-sijo` and `AC_PASSWORD` do not exist. `notarytool` calls without the team issuer returned 401 even for the usable team API key. The first accessibility-window query later lost Automation permission and falsely reported no usable window; independent CoreGraphics enumeration found the real on-screen window, and bundle-id activation caused the deferred first paint before the exact-window screenshot.
+- Remaining work: no diagnosis, packaging, notarization, replacement, relaunch, visual proof, focused test, lint, or script-verification work remains. The four repository changes are intentionally uncommitted because this phase did not request commit or push.
+- Exact next commands: `git status --short --branch`; `git diff --check`; if explicitly requested, commit the four files and push normally. Future release command: `DEPPY_NOTARY_KEY=/path/to/AuthKey_KEYID.p8 DEPPY_NOTARY_KEY_ID=KEYID DEPPY_NOTARY_ISSUER=ISSUER scripts/package-macos.sh` (or use `DEPPY_NOTARY_KEYCHAIN_PROFILE`).
+
 ## Current task — implement provider-usage visibility hardening (2026-08-26)
 
 - Current objective: complete the approved Claude/Codex/Grok/Kimi usage-visibility hardening, push the reviewed commits, rebuild the trusted macOS release, and place the verified app bundle on the Desktop without relaunching it.
@@ -548,7 +931,26 @@
 - Key design decisions: line runs skip `wide_spacer` cells exactly as `bg_runs` does — this is load-bearing, not cosmetic (see "Review results"). Blank cells are deliberately **not** skipped, because alacritty keeps SGR flags on spaces, which is what makes the underline continuous. Letter spacing is a ratio, not a fixed pixel count, so the look survives font-size changes.
 - Test commands and results: `cargo test -p terminal` 83 passed / 0 failed / 4 ignored (5 new tests this round). `cargo test -p deppy-sijo` 1787 passed / 0 failed / 8 ignored plus integration suites 4/4, 5/5, 14/14, 15/15. `cargo test -p storage` 311, `cargo test -p i18n` 8. `cargo clippy --workspace --all-targets -- -D warnings` 0 warnings, `cargo fmt --all -- --check` 0 diffs, `xtask check-boundary` OK, `xtask i18n-check` OK.
 - Review results — three parallel adversarial reviews (font/letter-spacing, line drawing, pipeline integration) found one real defect and confirmed the rest. **The defect**: the new line-run loop omitted the `wide_spacer` guard that `bg_runs` has. Two symptoms — a wide char's trailing cell pushes an overlapping duplicate run, and the end-of-row `LEADING_WIDE_CHAR_SPACER` filler (owner on the *next* row, no glyph here) carries the pen's underline flag and paints a **phantom underline under an empty cell**. This is the same bug class already fixed once in `selection_covers_cell` on 2026-08-18; its comment there documents the trap. Fixed, with three tests that go RED without the guard. Verified clean by measurement, not assertion: grid alignment is exact (an 80-column run at ppp=2.0 drifts 0.0000px), `cell_size` has only three call sites and every cursor/selection/click-inverse path derives from that single value, and the galley cache behaves identically to the old `layout_no_wrap` path.
-- Accepted trade-offs of letter spacing (user confirmed keeping ratio 0.08): column count drops ~15% (900px pane 162 → 137 columns), and CJK glyphs sit two cells apart so their visual gap is exactly **twice** the Latin gap. The CJK doubling is inherent to a monospace grid — a 2-column glyph inherits 2× the per-column extra — and cannot be fixed without breaking the grid.
+- Accepted trade-offs of letter spacing (user confirmed keeping ratio 0.08): column count drops ~15% (900px pane 162 → 137 columns), and CJK glyphs sit two cells apart so their visual gap is exactly **twice** the Latin gap. The CJK doubling is inherent to a monospace grid — a 2-column glyph inherits 2× the per-column extra — and cannot be fixed without breaking the grid. **REVERSED 2026-09-03 — do not restore 0.08.** The user hit the CJK doubling in practice (grok agent, Korean spaced out glyph-by-glyph) and asked for the root fix, so `TERMINAL_LETTER_SPACING_RATIO` is now `0.0`. The 2026-08-21 analysis above was right that the doubling cannot be removed while the ratio is non-zero; what it got wrong is that the ratio itself is optional. Measured with the user's font (D2Coding 13.5pt): `M`=6.75, `가`=13.50, so at ratio 0 the cell is 6.75 and a Hangul glyph fills its two cells exactly. cmux (manaflow-ai/cmux), which renders terminals with `@xterm/xterm` ^6.0.0 + the WebGL addon, never sets `letterSpacing` at all — real terminals leave the cell pitch equal to the font advance for exactly this reason. The density trade-off is simply back to what it was before 2026-08-21 (~15% narrower columns); the substitute knobs are `line_height` and `font_size`, neither of which breaks the 1:2 relation. Guard: `crates/app/src/fonts.rs::셀_격자는_한글을_정확히_두_칸으로_담는다` goes RED at 0.08.
+- Follow-up, now RESOLVED (2026-09-03): ratio 0 alone fixed only D2Coding. JetBrains Mono has no
+  Hangul, so `가` came from the CJK fallback — JBMono's `M` is 0.6 em against AppleGothic's 1.0 em
+  wide glyph, leaving a 0.2 em shortfall (2.7px at 13.5pt, *larger* than the 2px D2Coding gap that
+  triggered the report). Fixed in `crates/app/src/fonts.rs` by registering a **cell-matched copy** of
+  the CJK fallback (`cjk_mono`) whose `FontTweak::scale` is `2 × M_em(selected mono+weight) ÷
+  wide_em(fallback)`, measured at font-install time by `advance_em` — no hardcoded constants, so a
+  different per-platform `CJK_FONT_CANDIDATES` entry still comes out right. D2Coding's scale is
+  exactly 1.0, so the default path is byte-identical to before. The matched copy is attached only to
+  the two terminal families (`Monospace`, `MONO_BOLD_FAMILY`); `Proportional` keeps the untweaked
+  `cjk`, or sidebar Hangul would grow too. Two epaint facts this depends on: `FontTweak::scale` is
+  **not** reflected in `Fonts::glyph_width` but **is** applied in layout, so the guard test measures
+  galley width, not glyph width; and no `y_offset_factor` correction is needed because epaint already
+  centres a fallback face's height difference. Cost: with JetBrains Mono selected, Hangul renders
+  ~20% larger than Latin — inherent to advance matching, and what Kitty and Ghostty do.
+  The guard test is now driven from `MONO_FONTS` × `mono_weights_for()` × both terminal families, and
+  skips (with a printed reason) only when the mono font lacks Hangul *and* no system CJK font exists.
+  Note the real mechanism for the original doubling: epaint applies `extra_letter_spacing` as
+  **leading** space, skipped for the first glyph in a section, so a wide cell's single-char galley
+  advances `2M`, not `2M + s` — the derived gap (`2s` vs `s`) is unchanged.
 - Failed approaches: fixing only the `MONO_BOLD_FAMILY` comment. The old comment claimed egui falls back to Monospace when the family is unregistered; a reviewer built egui 0.35 and showed it **panics** (`FontFamily::Name("mono_bold") is not bound to any fonts`). Rewriting the comment would have recorded the hazard without removing it, so the renderer now checks registration once per frame and downgrades. A test asserts the fallback and panics without it.
 - Known limitations: no test covers the *vertical position* of the painted lines, only run construction. `UNDERLINE_LIFT` is a fixed 2px, so at the config minimum `font_size=8` the underline sits only 0.48px below the baseline (1.41px at the 11pt default) — real but confined to the smallest size.
 

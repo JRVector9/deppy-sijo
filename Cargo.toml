@@ -75,6 +75,8 @@ unicode-normalization = "0.1"
 rcgen = "0.14"
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
+core-foundation = "0.10"
+security-framework = "3.7"
 windows-native-keyring-store = "1"
 uuid = { version = "1", features = ["v4"] }
 # 파일 트리 (docs/file-tree-design.md): 휴지통 삭제(FT-3) / FSEvents 감시(FT-4) /

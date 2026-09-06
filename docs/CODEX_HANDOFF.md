@@ -1,5 +1,62 @@
 # Codex handoff
 
+## 완료 — 추가 개발 없는 PR main 착지 및 브랜치 정리 (2026-09-07)
+
+- Current objective completed: 추가 개발이 필요한 PR은 제외하고 현재 상태로 착지 가능한
+  PR을 `main`에 머지하고, 병합이 끝난 브랜치와 임시 worktree를 정리했다.
+- 이번 정리에서 `main`에 착지한 PR과 merge commit:
+  - #150 한글 IME·창 리사이즈 안정화 — `c4d662c4424cba6f28f82b94df747586d77c9ccc`
+  - #145 `actions/upload-artifact` 4→7 — `7b4550fbbb0f9e3bbc3e2287dd8748b4e3146f00`
+  - #140 `syn` 2.0.118→3.0.4 — `a1ed0d1522a87ee8ca9cfbc75330079783949666`
+  - #139 `libghostty-vt` 0.1.1→0.2.1 — `b03e8e122623ccc5073b5a46b21859dedd662bae`
+  - #144 Rust patch/minor lock 갱신 — `6060e33c85e4ae5d19d6d429a34122d9890b37c4`
+- #144는 정확한 HEAD `403a02059dccb40920d8de90681675fd41416f26`을 detached
+  worktree에서 검증하고 `--match-head-commit`으로 고정한 뒤 squash merge했다. `main`의
+  실제 변경은 `Cargo.lock` 하나뿐이며 테스트한 lockfile과 병합된 lockfile이 같다.
+  최종 버전은 `rusqlite 0.40.2`, `libsqlite3-sys 0.38.2`, `rcgen 0.14.10`,
+  `pem 4.0.0`, `uuid 1.26.0`, 새 `base64 0.23.1`이다.
+- #144 로컬 대체 게이트(모두 실제 실행 PASS): `cargo fmt --all --check`, 루트와
+  `origin/main...HEAD`의 `git diff --check`, `cargo run --locked -p xtask -- check-boundary`,
+  `cargo deny check bans licenses sources`, `cargo audit`, Relay strict clippy·55 tests·release
+  binary build, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo test --workspace --locked -- --test-threads=1`. 전체 워크스페이스 테스트 명령은
+  exit 0으로 끝났고 주요 결과는 app 2,035 PASS/14 ignored, PTY 40 PASS/1 ignored,
+  runtime 277 PASS, storage 324 PASS, terminal 86 PASS/4 ignored, web-remote 269 PASS/1 ignored다.
+- #144 최신 GitHub Actions의 실패 5개는 모두 `runner_id=0`, `steps=[]`이며 계정 결제 또는
+  spending limit 때문에 job이 시작되지 않았다는 annotation을 반환했다. 독립 GitGuardian은
+  PASS했다. 머지 직후 main의 build/security run도 `steps=[]`로 종료됐다. 저장소가 비공개
+  무료 플랜이라 branch protection과 ruleset API는 HTTP 403을 반환해 조회할 수 없었다.
+  검증되지 않은 GitHub 실패를 PASS로 바꾸지 않고 위 로컬 대체 게이트를 실제 착지 기준으로
+  사용했다.
+- Relay release workflow는 `workflow_dispatch` 전용이며 main 머지로 실행된 release/deploy
+  run은 0건이다. DNS·TLS·레지스트리·배포 자격증명이 없으므로 외부 Relay 배포 검증은 계속
+  **BLOCKED**이고 PASS로 기록하지 않는다.
+- Cleanup: #139/#140/#144 원격 Dependabot 브랜치는 GitHub에서 삭제된 것을
+  `git fetch --prune origin`으로 확인했다. `/private/tmp/deppy-pr144-land`를 제거하고 stale
+  worktree 메타데이터를 prune했다. `origin/main`에 완전히 포함되고 어느 worktree에서도
+  사용하지 않는 로컬 브랜치 27개도 `git branch -d`로 삭제했다. `main`과 `origin/main`은
+  모두 `6060e33`을 가리킨다. #149 결함 재현이 남아 있는
+  `/private/tmp/deppy-sijo-review-149/repro`의 dirty 검사 파일은 증거 보존을 위해 삭제하지 않았다.
+- 추가 개발이 남아 보존한 PR:
+  - #146: known-device 재접속 인증/입장권 흐름과 실기기·외부 배포 검증이 남음.
+  - #149 draft: 보존된 터미널 그리드 오른쪽 빈 영역에서 휠 입력이 누락되는 결함과 화면
+    검증이 남음. base `fix/window-resize-flicker`도 보존.
+  - #141: `ureq` 3.4 API 이관이 필요하고 현재 auth/mcp에서 34개 compile 오류가 남음.
+  - #142: egui 0.36의 새 `IMEOutput.purpose` 필드 대응이 필요해 현재 compile되지 않음.
+- Failed approaches/evidence: #144 exact-head worktree를 만들기 전 원격 갱신 ref를 fetch하지
+  않아 최초 `git worktree add`가 `invalid reference`로 실패했고, 해당 브랜치를 fetch한 뒤
+  재시도해 해결했다. #139/#144 이전 CI에서는 서로 다른 기존 PTY·runtime 타이밍 검사가
+  번갈아 실패했으나, #139를 최신 main 위에 갱신한 실행은 전체 green이었고 #144 exact-head
+  로컬 직렬 전체 테스트에서는 두 검사 모두 통과했다.
+- Modified files: 병합된 main에는 각 PR의 소스/워크플로/Cargo 변경이 들어갔다. 현재
+  #146 worktree에서 이번 단계가 직접 수정한 파일은 이 `docs/CODEX_HANDOFF.md`뿐이다.
+- 앱을 재빌드하거나 재실행하지 않았다. 현재 사용자가 보고 있는 실행 앱 상태는 그대로다.
+- Exact next commands:
+  `git status --short --branch`; `git rev-parse main origin/main`;
+  `gh pr list --state open`; #146은 known-device reconnect 설계·구현부터 재개하고 배포는
+  BLOCKED로 유지한다. #149는 dirty repro의 휠 검사를 제품 회귀 테스트로 옮긴 뒤 pane 본문
+  전체에 휠 입력을 라우팅하고, 사용자 승인 후 앱을 재빌드·재실행해 화면 검증한다.
+
 ## 완료 — 독립 IME/리사이즈 변경 main 착지 및 브랜치 정리 (2026-09-06)
 
 - Current objective completed: 추가 개발이 필요한 Relay 재접속과 터미널 레이아웃 작업을 제외하고, 완료된 한글 IME와 창 리사이즈 수정만 `main`에 착지했다.

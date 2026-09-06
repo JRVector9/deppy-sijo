@@ -6480,6 +6480,7 @@ impl WorkspaceUi {
             terminal_keyboard_active,
             terminal_owns_ime_events,
             !self.preedit.is_empty(),
+            renderer_egui::frame_has_active_preedit(ui.ctx()),
             ui.ctx().text_edit_focused(),
             ui.ctx().any_popup_open(),
             any_blocking_window_visible,
@@ -8230,10 +8231,17 @@ fn terminal_keyboard_input_allowed(
     !popup_open && !top_window_open && (terminal_refocus_pending || !text_edit_focused)
 }
 
+/// `frame_has_active_preedit`은 이번 프레임 raw 입력에 비어 있지 않은 preedit이 있다는
+/// 뜻이다. 조합이 시작되는 프레임에는 egui 공식 소유권도 `self.preedit`도 아직 없어
+/// 나머지 두 근거가 모두 false다. 그 프레임을 거절하면 `self.preedit`이 영영 안 차고,
+/// renderer는 뒤이은 **입력 없는 프레임**에서 조합이 끝난 줄 알고 포커스를 복구하다가
+/// IME를 강제 중단한다(자모 분리). 관문은 `terminal_keyboard_active`와 TextEdit·팝업
+/// 배제 조건이 그대로 지키므로 다른 입력창의 조합을 가로채지 않는다.
 fn terminal_accepts_ime_events(
     terminal_keyboard_active: bool,
     owns_ime_events: bool,
     preedit_active: bool,
+    frame_has_active_preedit: bool,
     text_edit_focused: bool,
     popup_open: bool,
     blocking_window_open: bool,
@@ -8242,7 +8250,7 @@ fn terminal_accepts_ime_events(
         && !text_edit_focused
         && !popup_open
         && !blocking_window_open
-        && (owns_ime_events || preedit_active)
+        && (owns_ime_events || preedit_active || frame_has_active_preedit)
 }
 
 fn terminal_should_copy_selection(
@@ -15841,25 +15849,55 @@ https://example.test/login \
     #[test]
     fn 진행중_ime는_일시적_비textedit_포커스에서도_이벤트를_계속_받는다() {
         assert!(terminal_accepts_ime_events(
-            true, false, true, false, false, false
+            true, false, true, false, false, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, true, false, false
+            true, false, true, false, true, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, false, true, false
+            true, false, true, false, false, true, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, false, false, true
+            true, false, true, false, false, false, true
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, true, false, false
+            true, true, true, false, true, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, false, true, false
+            true, true, true, false, false, true, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, false, false, true
+            true, true, true, false, false, false, true
+        ));
+    }
+
+    /// 조합이 **시작되는** 프레임은 egui 공식 소유권도 직전 프레임 preedit도 없다.
+    /// 그 프레임을 거절하면 `self.preedit`이 채워지지 않고, renderer가 뒤이은 입력 없는
+    /// 프레임에서 조합이 끝난 줄 알고 포커스를 복구하다 IME를 강제 중단한다(자모 분리).
+    #[test]
+    fn 조합이_시작되는_프레임은_소유권과_직전_preedit이_없어도_받는다() {
+        // 이번 프레임 preedit만 근거인 경우 — 받아야 한다.
+        assert!(terminal_accepts_ime_events(
+            true, false, false, true, false, false, false
+        ));
+        // 근거가 하나도 없으면 종전대로 받지 않는다.
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, false, false, false, false
+        ));
+        // TextEdit·팝업·모달 배제는 이번 프레임 preedit이 있어도 그대로 우선한다 —
+        // 다른 입력창의 조합을 터미널이 가로채면 안 된다.
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, true, false, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, false, true, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, false, false, true
+        ));
+        // 터미널이 키보드 소유자가 아니면 무조건 거절한다.
+        assert!(!terminal_accepts_ime_events(
+            false, false, false, true, false, false, false
         ));
     }
 

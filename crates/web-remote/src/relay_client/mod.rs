@@ -19,5 +19,5 @@ pub use lifecycle::{
 pub use tls::{MAX_RELAY_FRAME_BYTES, TlsRelayTransport};
 pub use worker::{
     MAX_PENDING_COMMANDS, RelayCommand, RelayDeadlines, RelayFrameSink, RelayObserver,
-    RelaySession, RelayTransport, RelayWorker, TransportError,
+    RelaySession, RelayTransport, RelayWorker, SinkOutcome, TransportError,
 };

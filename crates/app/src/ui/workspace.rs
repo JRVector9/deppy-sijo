@@ -1863,11 +1863,12 @@ pub struct WorkspaceUi {
     last_native_paste: Option<std::time::Instant>,
     /// 세션별 마지막 전송한 (cols, rows) — 변화 시에만 Resize 전송
     sent_sizes: HashMap<SessionId, (u16, u16)>,
-    /// 세션별 「아직 확정되지 않은」 resize 목표 — (cols, rows, 그 목표가 안정되기 시작한 시각).
-    /// 창 드래그로 pane 크기가 프레임마다 바뀌는 동안 목표도 프레임마다 바뀌므로 계속
-    /// 갱신되고, RESIZE_DRAG_DEBOUNCE만큼 같은 목표가 유지돼야 비로소 전송된다
+    /// 세션별 「아직 확정되지 않은」 resize 목표 —
+    /// (cols, rows, viewport 크기, 그 목표가 안정되기 시작한 시각).
+    /// 창 드래그로 pane 크기가 프레임마다 바뀌는 동안 목표나 viewport 크기도 계속
+    /// 갱신되고, RESIZE_DRAG_DEBOUNCE만큼 둘 다 유지돼야 비로소 전송된다
     /// (queue_terminal_resize_debounced 참고).
-    pending_resize_target: HashMap<SessionId, (u16, u16, std::time::Instant)>,
+    pending_resize_target: HashMap<SessionId, (u16, u16, Option<egui::Vec2>, std::time::Instant)>,
     /// 트랙패드 미세 스크롤 누적 (focused pane 기준)
     scroll_residual: f32,
     /// 드래그 선택 오토스크롤 행 누적 — 경계 초과 속도(행/초)×dt의 소수부 보관 (T4)
@@ -2353,6 +2354,25 @@ impl SessionView {
         });
     }
 
+    /// 창 리사이즈로 나간 Resize도 split 최종 Resize와 같은 fence를 쓴다. fence가 이미
+    /// 있으면 목표만 갈아끼워 hard deadline을 늘리지 않는다(기존 계약).
+    ///
+    /// 지킬 안정 화면이 **없으면**(스냅샷 미도착) 걸지 않는다 — `buffer_resize_snapshot`은
+    /// fence가 있는 동안 target과 모양이 다른 viewport를 통째로 버리므로, 세션 생성 직후
+    /// 첫 Resize에 걸면 첫 화면이 사라져 「연결 중」이 최대 250ms 남는다.
+    fn arm_or_retarget_resize_presentation(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        now: std::time::Instant,
+    ) {
+        if self.resize_presentation.is_some() {
+            self.retarget_resize_presentation(cols, rows);
+        } else if self.snapshot.is_some() {
+            self.arm_resize_presentation(cols, rows, now);
+        }
+    }
+
     fn retarget_resize_presentation(&mut self, cols: u16, rows: u16) {
         let Some(fence) = self.resize_presentation.as_mut() else {
             return;
@@ -2801,13 +2821,19 @@ impl WorkspaceUi {
 
     /// `queue_terminal_resize`의 디바운스 래퍼 — pane 렌더 호출부는 매 프레임 이걸 부른다.
     ///
-    /// 이 세션에 대한 **첫 mismatch**(세션 생성, split 등 1회성 변경)는 지연 없이 즉시
-    /// 보낸다 — 기존 동작과 동일하고, 이 경로에 걸리는 대다수 테스트/시나리오가 지연을
-    /// 겪지 않는다. 그 뒤 **연속으로 목표가 또 바뀌면**(=창 드래그로 avail이 프레임마다
-    /// 바뀌는 중) 그때부터 전송을 미루고 `pending_resize_target`에 목표만 갱신한다 —
-    /// 그러지 않으면 매 중간 크기마다 PTY가 실제로 reflow하고 자식 프로세스가 SIGWINCH로
-    /// 화면을 다시 그려 드래그 내내 깜빡인다. 같은 목표가 `RESIZE_DRAG_DEBOUNCE`만큼
-    /// 유지되면(=드래그가 그 크기에서 멈췄다) 그제서야 한 번 더 보낸다.
+    /// 이 세션의 **첫 크기**(세션 생성·복원 — `sent_sizes`에 항목이 없는 경우)만 지연
+    /// 없이 즉시 보낸다. 그 뒤의 모든 크기 변경은 전송을 미루고 `pending_resize_target`에
+    /// 목표만 갱신한다 — 그러지 않으면 매 중간 크기마다 PTY가 실제로 reflow하고 자식
+    /// 프로세스가 SIGWINCH로 화면을 다시 그려 드래그 내내 깜빡인다. 같은 목표가
+    /// `RESIZE_DRAG_DEBOUNCE`만큼 유지되면(=드래그가 그 크기에서 멈췄다) 그제서야 보낸다.
+    ///
+    /// 「첫 mismatch」의 판정 기준이 **보류 유무가 아니라 `sent_sizes` 유무**인 것이
+    /// 핵심이다. 보류를 기준으로 삼으면, 목표가 직전 전송값과 같은 프레임에서 아래
+    /// 최상단 가드가 보류를 지우기 때문에 **다음 변경이 매번 「첫 mismatch」로 오인**된다.
+    /// 사람이 실제로 창을 끄는 속도에서는 한 칸마다 그렇게 머무는 프레임이 생겨,
+    /// 그리드 한 칸 옮길 때마다 SIGWINCH가 나가 화면이 심하게 깜빡였다(2026-09-06 보고).
+    /// 빠른 드래그는 머무는 프레임이 없어 증상이 나타나지 않는다 — 그래서 2026-08-18에
+    /// 디바운스를 넣고도 잡히지 않았다.
     ///
     /// 드래그가 끝나 더 이상 새 프레임이 오지 않아도 최종 목표가 유실되지 않도록, 목표를
     /// 갱신할 때마다 `request_repaint_after`로 debounce 만료 시점에 다시 확인하러 오는
@@ -2824,16 +2850,26 @@ impl WorkspaceUi {
             return false;
         }
         let now = std::time::Instant::now();
+        let viewport_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
         match self.pending_resize_target.get(&session).copied() {
-            None => {
-                // 첫 mismatch — 지연 없이 즉시 보낸다. 이후 프레임에서 목표가 또 바뀌면
-                // (아래 Some(_) 분기) 그때부터 디바운스가 걸린다.
+            None if !self.sent_sizes.contains_key(&session) => {
+                // 이 세션에 아직 한 번도 크기를 보낸 적이 없다 — 세션 생성/복원처럼 진짜
+                // 1회성이라 지연 없이 즉시 보낸다.
                 self.pending_resize_target
-                    .insert(session, (cols, rows, now));
+                    .insert(session, (cols, rows, viewport_size, now));
                 self.queue_terminal_resize(session, cols, rows)
             }
-            Some((pending_cols, pending_rows, since))
-                if (pending_cols, pending_rows) == (cols, rows) =>
+            None => {
+                // 이미 크기를 보낸 세션의 새 목표 — 드래그의 첫 칸일 수 있다. 목표만
+                // 기록하고 안정될 때까지 기다린다(아래 Some 분기와 동일한 시계).
+                self.pending_resize_target
+                    .insert(session, (cols, rows, viewport_size, now));
+                ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE);
+                false
+            }
+            Some((pending_cols, pending_rows, pending_viewport_size, since))
+                if (pending_cols, pending_rows) == (cols, rows)
+                    && pending_viewport_size == viewport_size =>
             {
                 // 직전과 같은 목표 — 안정 여부만 판정한다.
                 let elapsed = now.duration_since(since);
@@ -2858,7 +2894,7 @@ impl WorkspaceUi {
                 // 목표가 직전 프레임과 또 달라졌다 — 드래그가 계속되는 중. 디바운스
                 // 시계를 새로 시작한다(전송하지 않는다).
                 self.pending_resize_target
-                    .insert(session, (cols, rows, now));
+                    .insert(session, (cols, rows, viewport_size, now));
                 ctx.request_repaint_after(RESIZE_DRAG_DEBOUNCE);
                 false
             }
@@ -3284,10 +3320,17 @@ impl WorkspaceUi {
                 if let Some(rollback) = resize_rollback {
                     self.failed_resize_targets.remove(&rollback.session);
                     self.resize_retry.remove(&rollback.session);
+                    // split 최종이 아닌 Resize = 창/기하 변경으로 나간 것. 이것도 안정
+                    // 화면을 fence로 지켜야 reflow 뒤 clear→redraw 중간 viewport가
+                    // 그대로 올라와 번쩍이지 않는다(2026-09-06).
                     if final_resize.is_none()
                         && let Some(view) = self.sessions.get_mut(&rollback.session)
                     {
-                        view.retarget_resize_presentation(rollback.target.0, rollback.target.1);
+                        view.arm_or_retarget_resize_presentation(
+                            rollback.target.0,
+                            rollback.target.1,
+                            std::time::Instant::now(),
+                        );
                     }
                 }
                 if let Some((session, cols, rows)) = final_resize {
@@ -6480,6 +6523,7 @@ impl WorkspaceUi {
             terminal_keyboard_active,
             terminal_owns_ime_events,
             !self.preedit.is_empty(),
+            renderer_egui::frame_has_active_preedit(ui.ctx()),
             ui.ctx().text_edit_focused(),
             ui.ctx().any_popup_open(),
             any_blocking_window_visible,
@@ -8230,10 +8274,17 @@ fn terminal_keyboard_input_allowed(
     !popup_open && !top_window_open && (terminal_refocus_pending || !text_edit_focused)
 }
 
+/// `frame_has_active_preedit`은 이번 프레임 raw 입력에 비어 있지 않은 preedit이 있다는
+/// 뜻이다. 조합이 시작되는 프레임에는 egui 공식 소유권도 `self.preedit`도 아직 없어
+/// 나머지 두 근거가 모두 false다. 그 프레임을 거절하면 `self.preedit`이 영영 안 차고,
+/// renderer는 뒤이은 **입력 없는 프레임**에서 조합이 끝난 줄 알고 포커스를 복구하다가
+/// IME를 강제 중단한다(자모 분리). 관문은 `terminal_keyboard_active`와 TextEdit·팝업
+/// 배제 조건이 그대로 지키므로 다른 입력창의 조합을 가로채지 않는다.
 fn terminal_accepts_ime_events(
     terminal_keyboard_active: bool,
     owns_ime_events: bool,
     preedit_active: bool,
+    frame_has_active_preedit: bool,
     text_edit_focused: bool,
     popup_open: bool,
     blocking_window_open: bool,
@@ -8242,7 +8293,7 @@ fn terminal_accepts_ime_events(
         && !text_edit_focused
         && !popup_open
         && !blocking_window_open
-        && (owns_ime_events || preedit_active)
+        && (owns_ime_events || preedit_active || frame_has_active_preedit)
 }
 
 fn terminal_should_copy_selection(
@@ -9700,6 +9751,101 @@ mod tests {
                 .map(|fence| fence.target),
             Some((120, 40)),
             "the fence must match the command that actually reached the runtime"
+        );
+    }
+
+    /// 창 리사이즈로 나가는 Resize는 split 최종 Resize가 아니라 fence를 한 번도 얻지
+    /// 못했다. 그래서 PTY reflow 뒤 자식 TUI의 clear→redraw 중간 viewport가 그대로
+    /// 화면에 올라가 리사이즈가 끝나는 순간 한 번 번쩍였다(2026-09-06). 안정 화면은
+    /// target 모양의 viewport가 조용해질 때까지 유지돼야 한다.
+    #[test]
+    fn 창_리사이즈_전송도_안정_화면을_fence로_지킨다() {
+        let session = SessionId(66);
+        let mut ui = WorkspaceUi::new();
+        let stable = shaped_snapshot(80, 24, "이미 있던 출력");
+        ui.sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(Arc::clone(&stable));
+        ui.sent_sizes.insert(session, (80, 24));
+
+        // 창 드래그가 멈춰 최종 크기가 나간다 — split 경로가 아니다.
+        assert!(ui.queue_terminal_resize(session, 100, 30));
+        drain_protocol(&mut ui);
+        assert!(!ui.split_final_resize_sessions.contains(&session));
+
+        let started = ui.sessions[&session]
+            .resize_presentation
+            .as_ref()
+            .expect("창 리사이즈에도 fence가 걸려야 한다")
+            .started_at;
+        assert_eq!(
+            ui.sessions[&session]
+                .resize_presentation
+                .as_ref()
+                .map(|fence| fence.target),
+            Some((100, 30))
+        );
+
+        // clear 직후의 빈 중간 viewport는 안정 화면을 덮지 못한다.
+        assert!(
+            ui.sessions
+                .get_mut(&session)
+                .unwrap()
+                .buffer_resize_snapshot(
+                    shaped_snapshot(100, 30, ""),
+                    started + std::time::Duration::from_millis(1),
+                )
+        );
+        assert!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(40),
+            )
+            .is_some()
+        );
+        assert!(
+            Arc::ptr_eq(ui.sessions[&session].snapshot.as_ref().unwrap(), &stable),
+            "clear 직후의 빈 화면이 표시됐다"
+        );
+
+        // 실제로 다시 그려진 화면이 조용해지면 그때 승격된다.
+        assert!(
+            ui.sessions
+                .get_mut(&session)
+                .unwrap()
+                .buffer_resize_snapshot(
+                    shaped_snapshot(100, 30, "다시 그린 출력"),
+                    started + std::time::Duration::from_millis(50),
+                )
+        );
+        assert_eq!(
+            ui.settle_session_resize_presentation(
+                session,
+                started + std::time::Duration::from_millis(82),
+            ),
+            None
+        );
+        assert_eq!(ui.sessions[&session].snapshot.as_ref().unwrap().cols, 100);
+        assert!(ui.sessions[&session].resize_presentation.is_none());
+    }
+
+    /// 스냅샷이 아직 하나도 없는 세션(생성 직후 첫 Resize)에는 fence를 걸지 않는다.
+    /// 지킬 안정 화면이 없는데 걸면 target과 모양이 다른 첫 viewport가 통째로 버려져
+    /// 「연결 중」이 최대 250ms 남는다.
+    #[test]
+    fn 첫_화면이_없는_세션의_리사이즈는_fence를_걸지_않는다() {
+        let session = SessionId(67);
+        let mut ui = WorkspaceUi::new();
+
+        assert!(ui.queue_terminal_resize(session, 100, 30));
+        drain_protocol(&mut ui);
+
+        assert!(
+            ui.sessions
+                .get(&session)
+                .and_then(|view| view.resize_presentation.as_ref())
+                .is_none()
         );
     }
 
@@ -14867,6 +15013,89 @@ mod tests {
         ));
     }
 
+    /// 창 테두리를 **사람이 실제로 끄는 속도**로 드래그하면 같은 cols/rows가 한 프레임
+    /// 이상 유지되다가 다음 칸으로 넘어간다. 그 "머무는" 프레임에서 보류가 지워지면
+    /// 다음 칸이 「첫 mismatch」로 오인돼 즉시 전송되고, 그리드 한 칸마다 PTY가 reflow하며
+    /// 자식이 SIGWINCH로 화면을 전부 다시 그린다 — 그것이 창 리사이즈 깜빡임이다
+    /// (2026-09-06 사용자 보고). 첫 크기를 이미 보낸 세션의 그 뒤 변경은 목표가 안정될
+    /// 때까지 단 한 번도 전송되면 안 된다.
+    #[test]
+    fn 느린_창_드래그는_칸마다_머물러도_중간_크기를_보내지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(14);
+        let ctx = egui::Context::default();
+
+        // 세션이 처음 나타날 때의 크기 — 지연 없이 즉시 나간다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        drain_protocol(&mut ui);
+        // 창이 그 크기에 머무는 평범한 프레임 — 최상단 가드가 보류를 지운다. 드래그를
+        // 시작하기 전의 앱은 항상 이 상태다.
+        ui.queue_terminal_resize_debounced(&ctx, session, 80, 24);
+
+        // 느린 드래그 — 한 칸 바뀌고, 그 크기로 프레임이 몇 번 더 지나가고, 또 한 칸.
+        for cols in [81u16, 82, 83] {
+            for _ in 0..3 {
+                ui.queue_terminal_resize_debounced(&ctx, session, cols, 24);
+            }
+            assert_eq!(
+                ui.sent_sizes.get(&session),
+                Some(&(80, 24)),
+                "느린 드래그의 중간 크기 {cols}가 전송됐다"
+            );
+            assert!(
+                ui.protocol_intents.is_empty(),
+                "느린 드래그의 중간 크기 {cols}가 큐에 들어갔다"
+            );
+        }
+
+        // 드래그가 멈추면 최종 크기 하나만 전달된다.
+        std::thread::sleep(RESIZE_DRAG_DEBOUNCE + std::time::Duration::from_millis(30));
+        ui.queue_terminal_resize_debounced(&ctx, session, 83, 24);
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(83, 24)));
+        assert!(matches!(
+            &drain_protocol(&mut ui)[0],
+            RuntimeCommand::Resize { session: s, cols: 83, rows: 24 } if *s == session
+        ));
+    }
+
+    /// 창 폭이 계속 바뀌어도 문자 격자로 반올림한 cols/rows는 한동안 같을 수 있다.
+    /// 이 구간을 드래그 종료로 오인하면 debounce 만료 직후 중간 Resize가 나간다.
+    #[test]
+    fn 같은_격자_안에서_viewport가_움직이면_리사이즈를_확정하지_않는다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(15);
+        let ctx = egui::Context::default();
+        ui.sent_sizes.insert(session, (80, 24));
+
+        let run_resize = |ui: &mut WorkspaceUi, viewport_width: f32| {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .expect("root viewport")
+                .inner_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(viewport_width, 600.0),
+            ));
+            let _ = ctx.run_ui(input, |viewport_ui| {
+                ui.queue_terminal_resize_debounced(viewport_ui.ctx(), session, 81, 24);
+            });
+        };
+
+        run_resize(&mut ui, 800.0);
+        ui.pending_resize_target.get_mut(&session).unwrap().3 = std::time::Instant::now()
+            .checked_sub(RESIZE_DRAG_DEBOUNCE + std::time::Duration::from_millis(1))
+            .unwrap();
+        run_resize(&mut ui, 801.0);
+
+        assert_eq!(ui.sent_sizes.get(&session), Some(&(80, 24)));
+        assert!(
+            ui.protocol_intents.is_empty(),
+            "같은 문자 격자 안의 viewport 이동을 드래그 종료로 오인했다"
+        );
+    }
+
     /// 세션이 막 생기거나 split 직후처럼 크기가 한 번만 바뀌는 경우(드래그가 아님)는
     /// 지연 없이 즉시 전송돼야 한다 — 모든 resize에 디바운스 지연을 강제하지 않는다.
     #[test]
@@ -14926,7 +15155,7 @@ mod tests {
         assert_eq!(
             ui.pending_resize_target
                 .get(&session)
-                .map(|(cols, rows, _)| (*cols, *rows)),
+                .map(|(cols, rows, _, _)| (*cols, *rows)),
             Some((100, 30)),
             "전송이 삼켜졌으면 보류가 남아야 한다"
         );
@@ -15841,25 +16070,55 @@ https://example.test/login \
     #[test]
     fn 진행중_ime는_일시적_비textedit_포커스에서도_이벤트를_계속_받는다() {
         assert!(terminal_accepts_ime_events(
-            true, false, true, false, false, false
+            true, false, true, false, false, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, true, false, false
+            true, false, true, false, true, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, false, true, false
+            true, false, true, false, false, true, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, false, true, false, false, true
+            true, false, true, false, false, false, true
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, true, false, false
+            true, true, true, false, true, false, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, false, true, false
+            true, true, true, false, false, true, false
         ));
         assert!(!terminal_accepts_ime_events(
-            true, true, true, false, false, true
+            true, true, true, false, false, false, true
+        ));
+    }
+
+    /// 조합이 **시작되는** 프레임은 egui 공식 소유권도 직전 프레임 preedit도 없다.
+    /// 그 프레임을 거절하면 `self.preedit`이 채워지지 않고, renderer가 뒤이은 입력 없는
+    /// 프레임에서 조합이 끝난 줄 알고 포커스를 복구하다 IME를 강제 중단한다(자모 분리).
+    #[test]
+    fn 조합이_시작되는_프레임은_소유권과_직전_preedit이_없어도_받는다() {
+        // 이번 프레임 preedit만 근거인 경우 — 받아야 한다.
+        assert!(terminal_accepts_ime_events(
+            true, false, false, true, false, false, false
+        ));
+        // 근거가 하나도 없으면 종전대로 받지 않는다.
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, false, false, false, false
+        ));
+        // TextEdit·팝업·모달 배제는 이번 프레임 preedit이 있어도 그대로 우선한다 —
+        // 다른 입력창의 조합을 터미널이 가로채면 안 된다.
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, true, false, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, false, true, false
+        ));
+        assert!(!terminal_accepts_ime_events(
+            true, false, false, true, false, false, true
+        ));
+        // 터미널이 키보드 소유자가 아니면 무조건 거절한다.
+        assert!(!terminal_accepts_ime_events(
+            false, false, false, true, false, false, false
         ));
     }
 

@@ -1,5 +1,46 @@
 # Codex handoff
 
+## Task 4 COMPLETE — application wiring (2026-08-29)
+
+- Task 4 of `docs/superpowers/plans/2026-08-28-production-relay.md` is now implemented, tested,
+  reviewed across two rounds, and committed. The user authorised editing `crates/app/src/app.rs`
+  and authorised the push; commits through this slice are on `origin/main`.
+- Wiring shape: the **application owns** the transport-neutral `SessionCore`. `start_web` shares it
+  through `serve_with_core`; `relay_enable` reuses the same one. The core is released only when
+  **both** transports are off, so stopping one never kills the other's dashboard. Web push
+  ownership moved from the server into the core, because a server-owned sink dies with the server
+  and would leave a shared core pointing at it.
+- `relay_enable` validates the endpoint **before** spawning a worker. The production endpoint
+  constant is still `None` (BLOCKED), so enabling Relay today fails with `EndpointError::NotAssigned`
+  and that failure is reported in `relay_error`, entirely separate from `web_error`. Tailscale, its
+  token, the Host allowlist, and the loopback listener are untouched — a source law asserts
+  `relay_enable` does not even name them.
+- `RelayDashboardSink` passes every decrypted frame through the permission adapter before any side
+  effect. The first release is fixed view-only, so only watch/unwatch reach the core today.
+- Review round 1 found three defects, all real, all fixed:
+  1. **medium** — a failed web bind leaked the freshly created shared core, leaving bridge threads
+     alive with both transports off.
+  2. **medium** — starting Relay first created a core without a push manager, and a later web start
+     reused it without topping up, so web push stayed dead despite a VAPID key being present. Fixed
+     with an idempotent `SessionCore::ensure_push`.
+  3. **medium** — a `CloseChannel` admission only logged, so a peer past the violation limit kept
+     its channel. `RelayFrameSink::accept` now returns `SinkOutcome`, and the worker closes the
+     session and backs off.
+  Round 2 confirmed all three closed and found one more **medium**: a failed web bind could leave a
+  newly attached push manager running on a Relay-retained core. Investigating it showed the same
+  leak on the **normal `web_disable` path**, which the reviewer had not flagged — turning mobile web
+  off would have kept sending push notifications to the phone. Web push is now explicitly tied to
+  the web transport's lifetime through `SessionCore::stop_push` and `App::web_transport_stopped`.
+- Gates: app crate 2030 + 38, workspace 3786 passed / 0 failed, workspace clippy `-D warnings`
+  exit 0, `cargo fmt --all -- --check`, `check-boundary`, `check-deps`, and both whitespace scans
+  clean.
+- `crates/app/src/app.rs` edit safety: the user's three uncommitted hunks (around lines 4075,
+  12748, and 39746) were left untouched; every change of ours is in a separate hunk. `rustfmt` was
+  run on the file only after confirming its diff was confined to our own added lines.
+- Carried into Task 5: `relay_disable` and `relay_error` are written but not yet read — the
+  settings switch and error display are Task 5's, and both carry an `#[allow(dead_code)]` naming
+  that task. Task 5 also owns the pairing UI, device list, and five-locale i18n.
+
 ## Task 4 IN PROGRESS — third slice: permission enforcement adapter (2026-08-29)
 
 - **Task 4 is still NOT complete.** Steps 1-3 of the plan are now implemented. What remains is the
@@ -2095,3 +2136,15 @@
 - Build result: `DEPPY_SIGN_IDENTITY='Developer ID Application: VectorNine INC (ZDTU5LS35K)' CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 sh scripts/package-macos.sh` completed; independent `codesign --verify --deep --strict --verbose=2` and `unzip -tq` passed. Bundle: `/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.app`; archive: `/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.zip`.
 - Remaining work: visually exercise the resource and port popovers in the signed bundle, then commit/push only when explicitly requested. The current implementation files and handoff remain uncommitted.
 - Exact next commands: `open -n '/private/tmp/deppy-sf06-integration/target/bundle/Deppy Sijo.app'`; `git -C /private/tmp/deppy-sf06-integration status --short --branch`; `git -C /private/tmp/deppy-sf06-integration diff --check`; `git -C /private/tmp/deppy-sf06-integration diff -- crates/app/src/app.rs crates/app/src/ui/activity.rs crates/app/src/ui/agent_terminal.rs crates/app/src/ui/resource_manager.rs docs/CODEX_HANDOFF.md`.
+
+## 2026-09-06 completed IME and resize changes clean landing
+
+- Current objective: land only the completed Korean IME and window-resize fixes on `main`, without the unfinished Relay reconnect work in PR #146 or the unfinished terminal-layout work in PR #149.
+- Completed work: created `land/ime-resize-ready-20260906` directly from `origin/main` (`12ee4c7`); extracted the completed IME/CJK rendering changes as `4903b39`; extracted the completed resize debounce and presentation-fence changes as `bbead4f`; found and fixed one review defect where a viewport could keep moving inside the same rounded terminal grid after the 120 ms debounce expired.
+- Modified files: `crates/app/src/ui/workspace.rs`, `crates/terminal/src/renderer_egui.rs`, and this handoff.
+- Key design decisions: the first terminal size is still sent immediately; later resize targets require `(cols, rows)` and the root viewport size to remain stable for 120 ms; successful ordinary window resize delivery uses the same bounded stable-snapshot presentation fence as split resize; the five unused Fleet keys were not removed here because current `main` still references them and their safe removal depends on the Fleet UI portion of PR #146.
+- Code review: the first bounded IME review found no actual bug. The first resize review found the rounded-grid debounce defect. A RED test reproduced it, the viewport-size stability fix made it GREEN, and a second bounded review found no remaining correctness, race, or state-machine bug in the final diff.
+- Test commands and results: `cargo test -p deppy-sijo --bin deppy-sijo --locked '같은_격자_안에서_viewport가_움직이면_리사이즈를_확정하지_않는다' -- --nocapture` first failed with `sent_sizes = (81, 24)` and then passed after the fix; `cargo test -p deppy-sijo --bin deppy-sijo --locked ui::workspace::tests -- --test-threads=1` passed 233 tests; `cargo clippy -p terminal -p deppy-sijo --all-targets --locked -- -D warnings` passed; `cargo test -p deppy-sijo --bin deppy-sijo --locked` passed 2,035 tests with 14 ignored; `cargo test -p terminal --locked` passed 86 tests with 4 ignored; final `cargo fmt --all -- --check` and `git diff --check` passed.
+- Failed approaches: an initial unbounded `codex review --uncommitted` ran extensive checks but never produced a final review and was stopped by exact PID; it also attempted the invalid `cargo test -p deppy-sijo --lib` command even though the app has no library target. The first RED-test draft used unavailable `Context::run`, then captured `WorkspaceUi` too broadly; both compile-only mistakes were corrected before the intended RED assertion was observed. The first final format check found one line-wrap difference; `cargo fmt --all` corrected it and the rerun passed.
+- Remaining work: push this clean landing branch, create a PR to `main`, wait for required checks, merge only if green, close superseded PRs #147 and #148, and preserve PRs #146 and #149 plus their dependent remote branches for further development.
+- Exact next commands: `git push -u origin land/ime-resize-ready-20260906`; create a `main` PR for commits `4903b39` and `bbead4f`; run `gh pr checks <new-pr> --watch`; merge the new PR after all required checks pass; close #147 and #148 without deleting the `fix/window-resize-flicker` branch because PR #149 still targets it.

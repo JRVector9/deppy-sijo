@@ -48,9 +48,19 @@ pub trait RelaySession: Send {
     fn close(&mut self);
 }
 
+/// 프레임 하나를 처리한 뒤 워커가 무엇을 해야 하는가.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SinkOutcome {
+    /// 계속 받는다.
+    Continue,
+    /// 이 채널을 닫는다. 권한 위반이 상한을 넘었을 때처럼, 상대를 더 받아 줄 이유가
+    /// 없어진 경우다. 로그만 남기고 계속 받으면 상한이 아무것도 강제하지 못한다.
+    CloseChannel,
+}
+
 /// 워커가 받은 프레임을 넘길 곳. 권한 강제 어댑터가 이 자리에 들어온다.
 pub trait RelayFrameSink: Send {
-    fn accept(&mut self, frame: &[u8]);
+    fn accept(&mut self, frame: &[u8]) -> SinkOutcome;
     /// 세션이 끝났다. 어댑터가 세션 상태를 버릴 기회다.
     fn session_ended(&mut self) {}
 }
@@ -300,7 +310,16 @@ fn pump(
         }
 
         match session.receive(deadlines.read) {
-            Ok(Some(frame)) => sink.accept(&frame),
+            Ok(Some(frame)) => {
+                if sink.accept(&frame) == SinkOutcome::CloseChannel {
+                    // 정책 위반으로 닫는다. 전송 실패와 같은 경로로 물러나므로 즉시
+                    // 다시 붙지 않고 백오프를 탄다.
+                    session.close();
+                    record_failure(lifecycle, TransportError::Unavailable, observer);
+                    wake.signal();
+                    return;
+                }
+            }
             // 시한만 지났다. 명령을 다시 확인하고 계속 기다린다.
             Ok(None) => {}
             Err(error) => {
@@ -460,11 +479,12 @@ mod tests {
     }
 
     impl RelayFrameSink for RecordingSink {
-        fn accept(&mut self, frame: &[u8]) {
+        fn accept(&mut self, frame: &[u8]) -> SinkOutcome {
             self.frames
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(frame.to_vec());
+            SinkOutcome::Continue
         }
     }
 
@@ -668,6 +688,71 @@ mod tests {
         let started = Instant::now();
         wake.wait(Duration::from_millis(50));
         assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    /// 싱크가 닫으라고 하면 실제로 닫힌다. 로그만 남기고 계속 받으면 위반 상한이
+    /// 아무것도 강제하지 못한다.
+    #[test]
+    fn a_sink_that_asks_to_close_actually_ends_the_session() {
+        /// 첫 프레임에서 바로 닫으라고 한다.
+        struct ClosingSink {
+            closed: Arc<AtomicUsize>,
+        }
+
+        impl RelayFrameSink for ClosingSink {
+            fn accept(&mut self, _frame: &[u8]) -> SinkOutcome {
+                SinkOutcome::CloseChannel
+            }
+
+            fn session_ended(&mut self) {
+                self.closed.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// 프레임 하나를 계속 흘려보내는 세션.
+        struct TalkingSession;
+
+        impl RelaySession for TalkingSession {
+            fn receive(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+                Ok(Some(b"frame".to_vec()))
+            }
+
+            fn send(&mut self, _frame: &[u8]) -> Result<(), TransportError> {
+                Ok(())
+            }
+
+            fn close(&mut self) {}
+        }
+
+        struct TalkingTransport;
+
+        impl RelayTransport for TalkingTransport {
+            fn connect(
+                &mut self,
+                _endpoint: &RelayEndpoint,
+                _deadline: Duration,
+            ) -> Result<Box<dyn RelaySession>, TransportError> {
+                Ok(Box::new(TalkingSession))
+            }
+        }
+
+        let closed = Arc::new(AtomicUsize::new(0));
+        let mut worker = RelayWorker::spawn(
+            endpoint(),
+            Box::new(TalkingTransport),
+            Box::new(ClosingSink {
+                closed: Arc::clone(&closed),
+            }),
+            Arc::new(IgnoreObserver),
+            deadlines(),
+            fast_backoff(),
+        );
+        worker.enable();
+        assert!(
+            wait_until(Duration::from_secs(5), || closed.load(Ordering::SeqCst) > 0),
+            "싱크가 닫으라고 했는데 세션이 끝나지 않았다"
+        );
+        worker.shutdown();
     }
 
     /// 명령 큐는 유계다 — UI 클릭이 큐를 무한정 밀어 넣지 못한다.
